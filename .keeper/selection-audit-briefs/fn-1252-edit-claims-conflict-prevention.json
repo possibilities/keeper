@@ -1,0 +1,155 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 232
+      },
+      "done_summary": "Added measureBaseDrift, a pure injected-git primitive in worktree-git.ts returning behind-count (git rev-list --left-right --count) and merge-base commit timestamp (git show %ct), with a distinct inconclusive kind on timeout/ambiguous-ref/spawn-fail so callers defer rather than misread drift.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2318,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/worktree-git.ts, test/worktree-git.test.ts\n\n### Approach\n\nAdd pure, injected-git primitives to MEASURE base-drift \u2014 none exists today\n(`git-worker.ts:396 parseBranchAheadBehind` parses only per-status upstream ahead/behind,\nNOT base-vs-default). Two reads through the GitRunner/`gitExec` seam (bounded by\n`GIT_LOCAL_TIMEOUT_MS`): (a) behind-count via `git rev-list --left-right --count <base>...<default>`\n(default commits the base lacks); (b) merge-base age via `git show -s --format=%ct\n$(git merge-base <base> <default>)`. Tri-state discipline: a definite magnitude on git\nexit 0, a DISTINCT inconclusive on timeout(124)/ambiguous-ref(128)/spawn-fail so callers\nDEFER \u2014 never treat inconclusive as high drift. Never throw.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified at authoring time; the repo moves.*\n\n**Required:**\n- src/worktree-git.ts:603 \u2014 `isAncestorOf` (the runner-seam wrapper pattern to mirror)\n- src/worktree-git.ts:1554 \u2014 `mergeBranchInto` (GitRunner injection seam)\n- src/git-worker.ts:396 \u2014 `parseBranchAheadBehind` (the wrong axis \u2014 confirms this is net-new)\n\n**Optional:**\n- src/autopilot-worker.ts:2895-2917 \u2014 inlined tri-state exit-code discipline to copy\n\n### Risks\n\nRef order in the `--left-right` count decides which side is \"behind\" \u2014 get it wrong and every lane reads drifted. A freshly-cut lane is behind by every post-fork commit (high count) but has a recent merge-base age; both feed the OR trigger in `.2`.\n\n### Test notes\n\nUnit-test with a faked GitRunner: exit-0 magnitudes; inconclusive on 124/128/spawn-fail \u2192 a distinct value callers defer on. No real git in the fast tier (a slow variant may drive real git).\n\n## Acceptance\n\n- [ ] A primitive returns the base's behind-count vs the local default AND the merge-base age, through the injected git seam.\n- [ ] Timeout / ambiguous-ref / spawn failure returns a DISTINCT inconclusive value (never a false magnitude); the function never throws.\n\n## Done summary\nAdded measureBaseDrift, a pure injected-git primitive in worktree-git.ts returning behind-count (git rev-list --left-right --count) and merge-base commit timestamp (git show %ct), with a distinct inconclusive kind on timeout/ambiguous-ref/spawn-fail so callers defer rather than misread drift.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.1",
+      "tier": "high",
+      "title": "Conflict cause diagnostic spike"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Added a worktree-gated computeBaseDriftEntries producer probe (autopilot-worker.ts) that measures per-lane base drift via measureBaseDrift and thresholds, threading plain baseDriftEntries snapshot data through the pure reconcile core with no git/fs imports there; OFF worktreeMode is zero-git-spawn, inconclusive/vacuous-ancestor lanes defer rather than false-positive.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "sonnet",
+      "spec_chars": 2890,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, src/reconcile-core.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nAdd a `computeBaseDriftEntries` PRODUCER probe modeled on `computeStaleBaseLaneEntries`\n(:2863) / `computeDeferredEpicIds` (:2403): per (epic, laneRepo), call `.1`'s primitives,\ncompare against `.3`'s thresholds, and emit `baseDriftEntries` (plain serializable data:\nwhich lanes exceed drift + magnitude) into the snapshot alongside deferred/landed/staleBase\nat the `loadReconcileSnapshot` hook (:7399-7423). Gate strictly on `worktreeMode` (OFF cycle =\nzero git spawns, empty result); memoize per-repo; never throw out of the snapshot build.\nThread the data onto `ReconcileSnapshot` and read it in the PURE reconcile core as plain\ndata ONLY \u2014 no git/clock/fold (`reconcile-core-depgraph.test.ts` bans git value-imports into\nthe pure core). Mind the vacuous-ancestor trap (:2839-2848): a freshly-cut/empty lane must\nresolve NOT-drifted unless it genuinely exceeds threshold; defer on any inconclusive primitive.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- src/autopilot-worker.ts:2863 \u2014 `computeStaleBaseLaneEntries` (closest prior art; vacuous-ancestor trap :2839-2848)\n- src/autopilot-worker.ts:2403 \u2014 `computeDeferredEpicIds` (merge-gate probe idiom)\n- src/autopilot-worker.ts:7399-7423 \u2014 `loadReconcileSnapshot` hook site (deferred/landed/staleBase computed side-by-side)\n- src/autopilot-worker.ts:4118-4122 \u2014 provision fork-source (the drift origin: base never refreshed until finalize)\n\n**Optional:**\n- src/reconcile-core.ts:2446 / :2618 \u2014 pure geometry consuming the snapshot\n- src/worktree-plan.ts:133 \u2014 `baseBranchFor`\n\n### Risks\n\nPer-(epic,repo) keying must mirror existing distress keying for `worktree_multi_repo`. This probe is READ-only \u2014 it emits data, it does NOT merge (that is `.4`).\n\n### Test notes\n\n`test/autopilot-worker.test.ts` with a faked `WorktreeGitRunner`: drifted lane \u2192 entry with magnitude; fresh lane \u2192 no entry; inconclusive \u2192 no entry (defer). Keep `reconcile-core-depgraph.test.ts` green.\n\n## Acceptance\n\n- [ ] `loadReconcileSnapshot` emits `baseDriftEntries` as plain snapshot data for lanes exceeding the configured drift threshold, worktreeMode-gated (OFF \u21d2 empty, zero git spawns).\n- [ ] A fresh-lane / inconclusive case yields no drift entry (defer), never a false positive.\n- [ ] The pure reconcile core reads the data without importing git/fs; the dep-pin test stays green.\n\n## Done summary\nAdded a worktree-gated computeBaseDriftEntries producer probe (autopilot-worker.ts) that measures per-lane base drift via measureBaseDrift and thresholds, threading plain baseDriftEntries snapshot data through the pure reconcile core with no git/fs imports there; OFF worktreeMode is zero-git-spawn, inconclusive/vacuous-ancestor lanes defer rather than false-positive.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.2",
+      "tier": "high",
+      "title": "Edit claims field and render"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 4,
+        "files_changed": 9,
+        "insertions": 506
+      },
+      "done_summary": "Added drift_behind_threshold and drift_age_threshold_days to autopilot_state (SCHEMA_STEPS v119, FINGERPRINT re-pinned), settable via the existing set_autopilot_config RPC with default-OFF sentinel/0-disables semantics; added a resolveDriftThresholds resolver in autopilot-worker.ts for .2/.4 to consume.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2239,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/db.ts, src/reducer.ts, src/autopilot-worker.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nAdd two durable `autopilot_state` config fields \u2014 a drift behind-count threshold and a\nmerge-base-age (days) threshold \u2014 set via the GENERIC `set_autopilot_config` RPC (a partial\nautopilot_state patch; NO new RPC \u2014 a new setting is a column + patch field, per the\nwrites-are-tightly-scoped invariant). Add columns via `addColumnIfMissing` (pattern\ndb.ts:3524/:3800) + one `SCHEMA_STEPS` entry (version assigned at MERGE time, never\nhardcoded; re-pin `SCHEMA_FINGERPRINT`). The base-freshness gate is DEFAULT OFF (sentinel/0\ndisables), opt-in like `worktree_mode`; when unset, the drift probe (`.2`) and refresh (`.4`)\nare inert. Suggested enabled defaults ~behind 15 / age 5 days (tunable; there is no universal\nvalue).\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- src/db.ts:3524, :3800 \u2014 `addColumnIfMissing` prior art (`merge_escalated_at`, `human_notified_at`)\n- src/db.ts \u2014 the `autopilot_state` schema + `SCHEMA_STEPS` ladder tail\n- the `set_autopilot_config` handler + the `autopilot_state` column set it patches\n\n### Risks\n\nThe migration ladder is a singleton \u2014 the `SCHEMA_STEPS` version is assigned at merge, never hardcoded (docs/adr/0020). Shares the db.ts schema ladder with `.6` (dep edge serializes them).\n\n### Test notes\n\nConfig round-trips through `set_autopilot_config`; default OFF disables detection + refresh; re-fold determinism preserved.\n\n## Acceptance\n\n- [ ] Two durable autopilot_state fields (drift behind-threshold, drift age-threshold) are settable via the EXISTING `set_autopilot_config` RPC \u2014 no new RPC surface.\n- [ ] The gate is OFF by default; when off, no drift detection or refresh occurs.\n- [ ] The schema change is one forward-only `SCHEMA_STEPS` entry with `SCHEMA_FINGERPRINT` re-pinned.\n\n## Done summary\nAdded drift_behind_threshold and drift_age_threshold_days to autopilot_state (SCHEMA_STEPS v119, FINGERPRINT re-pinned), settable via the existing set_autopilot_config RPC with default-OFF sentinel/0-disables semantics; added a resolveDriftThresholds resolver in autopilot-worker.ts for .2/.4 to consume.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.3",
+      "tier": "high",
+      "title": "Scaffold overlap gate"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 3,
+        "files_changed": 3,
+        "insertions": 421
+      },
+      "done_summary": "Added a quiescence-gated producer pass that refreshes drifted lane bases from local default (default-into-base) via mergeBranchInto, rate-limited by a git-derived cooldown; refresh conflicts route through the existing worktree-merge-conflict/resolver/deconflict chain, lock/timeout is a non-sticky retry-skip, and a real-git slow variant exercises the actual merge.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "opus",
+      "spec_chars": 3680,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, test/autopilot-worker.test.ts, test/worktree-git-catchup-realgit.slow.test.ts\n\n### Approach\n\nAdd a SEPARATE producer pass (a recover/finalize SIBLING \u2014 NOT inside the read-only snapshot\nprobe) that consumes `.2`'s `baseDriftEntries` and, for each drifted lane that is QUIESCENT\n(clean tree + no live worker via `liveAttributedDirtyByWorktree` :7430 + `mergeReadiness`/\n`losslessPremergeClean`), MERGES the local default INTO the lane's base worktree \u2014 default\u2192base,\nthe OPPOSITE direction from finalize's base\u2192default, into the lane's OWN worktree, never the\nshared checkout \u2014 via `mergeBranchInto` (:1554, flock-guarded, ancestor-skip, conflict-abort).\nRate-limit via a git-derived cooldown (skip if the base's last refresh-merge `%ct` is within the\ncooldown) so a fast-moving default cannot trigger per-cycle churn. On `mergeBranchInto` conflict,\nroute to the EXISTING `worktree-merge-conflict` \u2192 resolver \u2192 deconflict chain (no new code) \u2014\nsurfacing the drift conflict early, on the isolated delta, at a quiescent point, is the intended\nwin. Lock/local timeout is a non-sticky retry-skip minting no distress (DEGRADE-to-retry\ndiscipline); defer on any inconclusive input. Verify the added merge commit does NOT turn\nfinalize's base\u2192default into a non-ff (`classifyPremergeRedundancy` :918).\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- src/autopilot-worker.ts:4261-4600 \u2014 `finalizeEpic` (sibling-pass shape; base\u2192default direction to invert)\n- src/autopilot-worker.ts:7048-7091, :8271 \u2014 distress tracker mint/level-clear + consumption\n- src/autopilot-worker.ts:7430 \u2014 `liveAttributedDirtyByWorktree` (the live-worker quiescence signal)\n- src/worktree-git.ts:1554 `mergeBranchInto`, :767 `mergeReadiness`, :1107 `losslessPremergeClean`, :918 `classifyPremergeRedundancy`\n\n**Optional:**\n- docs/adr/0016 (two-tree catch-up), docs/adr/0008 (plumbing merge direction / why merges avoid the shared checkout)\n\n### Risks\n\nRefreshing mid-lane-work can MANUFACTURE the conflict it prevents \u2014 the quiescence gate is load-bearing (the flock is commit-only, it does not protect an uncommitted dirty tree). NEVER rebase/force-push the base (dependent lanes build on it). Relationship to `computeStaleBaseLaneEntries`: a default\u2192base refresh REMEDIATES the very drift stale-base only SURFACES \u2014 ensure the two do not double-escalate.\n\n### Test notes\n\nFaked `WorktreeGitRunner`: drifted+quiescent \u2192 one default\u2192base merge; dirty/live-worker lane \u2192 deferred, no merge, no distress; conflict \u2192 existing escalation chain; within cooldown \u2192 skipped. A slow real-git variant exercises the actual merge.\n\n## Acceptance\n\n- [ ] When enabled, a producer pass merges the local default into a drifted, QUIESCENT lane's own base worktree (default\u2192base) \u2014 never the shared checkout, never a rebase.\n- [ ] A non-quiescent lane (dirty tree or live worker) is deferred with no merge and no distress row.\n- [ ] A refresh-merge conflict routes to the existing worktree-merge-conflict/resolver/deconflict chain; lock/timeout is a non-sticky retry-skip.\n- [ ] Refresh is rate-limited so a fast-moving default cannot trigger a merge every cycle; the refresh commit does not turn finalize into a non-fast-forward.\n\n## Done summary\nAdded a quiescence-gated producer pass that refreshes drifted lane bases from local default (default-into-base) via mergeBranchInto, rate-limited by a git-derived cooldown; refresh conflicts route through the existing worktree-merge-conflict/resolver/deconflict chain, lock/timeout is a non-sticky retry-skip, and a real-git slow variant exercises the actual merge.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.4",
+      "tier": "xhigh",
+      "title": "Pre-arm portfolio overlap sweep"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 2,
+        "deletions": 75,
+        "files_changed": 3,
+        "insertions": 66
+      },
+      "done_summary": "Revised ADR 0042 in place from the abandoned edit-claims/overlap-gate design to the base-freshness/rebase-cadence design (title, Context, decisions 1-3 rewritten; decisions 4-5 kept and reframed). CONTEXT.md drops Edit claim/Overlap gate, adds Base-drift/Base-freshness/Lane-base beside Merge-gate. CLAUDE.md's merge-gate line gains one producer-only base-freshness clause. docs/problem-codes.md untouched (task .4 reused worktree-merge-conflict, no new code).",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "sonnet",
+      "spec_chars": 2472,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** docs/adr/0042-edit-claims-and-risk-tiered-overlap-wiring.md, CONTEXT.md, CLAUDE.md, docs/problem-codes.md\n\n### Approach\n\nRevise ADR 0042 IN PLACE \u2014 it is Status: Proposed / never-landed, so do NOT move it to\n`superseded/` and do NOT mint a supersession. Rewrite title + Context + decisions #1-#3\n(edit_claims field, overlap gate, risk-tiered wiring) to the base-freshness gate /\nrebase-cadence design; KEEP decision #4 (conflicted-file-set capture = task `.6`) and #5's\nmeasurement framing (task `.7`); PRUNE the dead edit-claims prose rather than appending beside\nit. In CONTEXT.md remove the now-dead `Edit claim` (L26) + `Overlap gate` (L27) terms and add\ncanonical `base-drift` / `base-freshness` / `lane-base` entries relating them to `Merge-gate`\n(L86). Add ONE producer-only base-freshness guardrail clause to the CLAUDE.md merge-gate line\n(L114) \u2014 one line, not a paragraph. Add a docs/problem-codes.md row ONLY if `.4` minted a new\ndistress code (else it reuses `worktree-merge-conflict`).\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- docs/adr/0042-edit-claims-and-risk-tiered-overlap-wiring.md \u2014 Status line + decisions #1-#5\n- CONTEXT.md:26, :27, :86 \u2014 Edit claim / Overlap gate / Merge-gate entries\n- CLAUDE.md:114 \u2014 the worktree/merge-gate invariant line\n- docs/problem-codes.md \u2014 the `worktree-*` distress rows\n\n### Test notes\n\n`bun scripts/lint-claude-md.ts` stays green (size + no re-narration). MADR headings preserved in the ADR.\n\n## Acceptance\n\n- [ ] ADR 0042 documents the base-freshness/rebase-cadence design (revised in place, not superseded), keeping the conflicted-file-capture and measurement decisions.\n- [ ] CONTEXT.md no longer defines the dropped Edit claim / Overlap gate terms and defines base-drift/base-freshness relative to Merge-gate.\n- [ ] Any new distress code has a problem-codes.md row; the CLAUDE.md merge-gate line names the producer-only base-freshness rule.\n\n## Done summary\nRevised ADR 0042 in place from the abandoned edit-claims/overlap-gate design to the base-freshness/rebase-cadence design (title, Context, decisions 1-3 rewritten; decisions 4-5 kept and reframed). CONTEXT.md drops Edit claim/Overlap gate, adds Base-drift/Base-freshness/Lane-base beside Merge-gate. CLAUDE.md's merge-gate line gains one producer-only base-freshness clause. docs/problem-codes.md untouched (task .4 reused worktree-merge-conflict, no new code).\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.5",
+      "tier": "high",
+      "title": "Authoring guidance and scout templates"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 29,
+        "files_changed": 8,
+        "insertions": 195
+      },
+      "done_summary": "mergeBranchInto captures the conflicted-file set (git diff --diff-filter=U for fan-in, merge-tree plumbing for finalize) before its internal abort; threaded through WorktreeDriver into a new nullable dispatch_failures.conflicted_files column via one forward-only v120 SCHEMA_STEPS entry, populated only from the DispatchFailed event payload for deterministic re-fold.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "opus",
+      "spec_chars": 2642,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/worktree-git.ts, src/db.ts, src/reducer.ts, src/autopilot-worker.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nMake `mergeBranchInto` (:1554) capture the conflicted-file set BEFORE its internal abort (:1636\ndestroys the `U` index) \u2014 extract `git diff --name-only --diff-filter=U` producer-side and\nreturn it as `conflictedFiles` on the `MergeResult` conflict variant (:98). Add a nullable\n`conflicted_files` column to `dispatch_failures` (`addColumnIfMissing` pattern db.ts:3524/:3800;\none `SCHEMA_STEPS` entry) and populate it through the synthetic event that mints the\n`DispatchFailed` \u2014 the FOLD stores the event-carried set, NEVER a live git re-probe\n(`dispatch_failures` is deterministic-replayed; re-fold must be byte-identical). Cover ALL\nconflict paths: fan-in pre-merge, finalize, and the new refresh (`.4`). Today conflicted files\nlive only as free-text in `reason` \u2014 this makes them structured.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- src/worktree-git.ts:1554 `mergeBranchInto`, :1636 internal abort (capture BEFORE it), :98 `MergeResult.conflict`\n- src/db.ts:5441 `dispatch_failures` schema, :5474-5476 (deterministic-replayed), :3524/:3800 `addColumnIfMissing`\n- the `DispatchFailed` synthetic-event mint path (producer captures, fold stores)\n\n**Optional:**\n- docs/adr/0039 (escalation pipeline)\n\n### Risks\n\nRe-fold determinism: the conflicted set MUST come from the event payload, never a live re-probe in the fold. Shares the db.ts schema ladder with `.3` (dep) and worktree-git.ts with `.1` (dep).\n\n### Test notes\n\nFaked git: a conflicting merge returns `conflictedFiles`; the fold stores them from the event; re-fold is byte-identical. The escalation brief consumes the structured set without stderr regex when present.\n\n## Acceptance\n\n- [ ] `mergeBranchInto` returns the structured conflicted-file set (captured before its internal abort) on a conflict.\n- [ ] `dispatch_failures` carries a nullable `conflicted_files` field, populated from the escalation event for fan-in, finalize, AND refresh conflicts; re-fold is deterministic.\n- [ ] The schema change is one forward-only `SCHEMA_STEPS` entry with `SCHEMA_FINGERPRINT` re-pinned.\n\n## Done summary\nmergeBranchInto captures the conflicted-file set (git diff --diff-filter=U for fan-in, merge-tree plumbing for finalize) before its internal abort; threaded through WorktreeDriver into a new nullable dispatch_failures.conflicted_files column via one forward-only v120 SCHEMA_STEPS entry, populated only from the DispatchFailed event payload for deterministic re-fold.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.6",
+      "tier": "xhigh",
+      "title": "Record conflicted files on escalation"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 2,
+        "insertions": 482
+      },
+      "done_summary": "Added a read-only historical conflict-classification report (scripts/conflict-classification-report.ts) that buckets DispatchFailed conflict incidents into base-drift vs file-overlap vs other from the structured conflictedFiles payload, and once the base-freshness gate is enabled, surfaces failed refresh-attempt counts and a before/after base-drift proxy around an operator-supplied cutover.",
+      "input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2185,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/ or scripts/ (a read-only report surface \u2014 determined at build), a reducer read helper, test/\n\n### Approach\n\nAdd an out-of-band measurement report that validates the re-scope's hypothesis and the gate's\neffect: classify merge-conflict incidents (from keeper.db history + the new structured\n`conflicted_files` from `.6`) into base-drift vs file-overlap vs other, report the split (the\ndiagnostic found 66/29), and \u2014 once the gate is enabled \u2014 track drift-refreshes performed and\na proxy for conflicts prevented. Out-of-band, read-only (the ADR 0042 #5 measurement framing),\nNEVER in the reconcile/fold path. It quantifies whether the base-freshness gate actually reduces\nthe 66% base-drift conflict rate.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required:**\n- the `dispatch_failures.conflicted_files` structured data from `.6`\n- existing conflict / merge-escalation history in keeper.db (the `events` + `dispatch_failures` surface)\n- the read-only report/query verb conventions (out-of-band, never a fold)\n\n**Optional:**\n- docs/adr/0042 decision #5 (measurement framing)\n\n### Risks\n\nThis is a measurement/validation deliverable \u2014 it READS history, it does not gate execution. Keep it out-of-band (never in the reconcile path or a fold).\n\n### Test notes\n\nTest the classifier over a fixture of conflict incidents produces a base-drift-vs-other split; the report shape is stable.\n\n## Acceptance\n\n- [ ] A read-only report classifies conflict incidents into base-drift vs other and reports the split, sourced from structured conflict data.\n- [ ] When the gate is enabled, the report surfaces drift-refreshes performed and a proxy for conflicts prevented, validating the base-drift hypothesis.\n\n## Done summary\nAdded a read-only historical conflict-classification report (scripts/conflict-classification-report.ts) that buckets DispatchFailed conflict incidents into base-drift vs file-overlap vs other from the structured conflictedFiles payload, and once the base-freshness gate is enabled, surfaces failed refresh-attempt counts and a before/after base-drift proxy around an operator-supplied cutover.\n## Evidence\n",
+      "task_id": "fn-1252-edit-claims-conflict-prevention.7",
+      "tier": "high",
+      "title": "Claims calibration report"
+    }
+  ],
+  "created_at": "2026-07-13T02:44:05.557000Z",
+  "epic_id": "fn-1252-edit-claims-conflict-prevention",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "9e2f267c6cd29907a10225cbf21bb3393bbbce9bd32535a635663a57f7b290cc",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
