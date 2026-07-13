@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-boundary guard that must survive --dangerously-skip-permissions with subtle argument-injection invariants across four flag-inspection arms and a fail-closed posture \u2014 a hard opus gate, at xhigh for the correctness-critical blast radius spanning exec/write/dispatch vectors.",
+      "task_id": "fn-1284-harden-pretooluse-guard-flag-allowlists.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical fail-open guard whose correctness crux is a silent-bypass argument-injection invariant (quoted/spaced value-token consumption) \u2014 opus by the security gate, but a single well-specified function keeps it at the high default band.",
+      "task_id": "fn-1284-harden-pretooluse-guard-flag-allowlists.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T18:16:32.295000Z",
+  "epic_id": "fn-1284-harden-pretooluse-guard-flag-allowlists",
+  "input_hash": "ba62f8d96d2ab7a50a87e1e9612099dddf777e9fe7c7ad8c0e040dda3be9592c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3127048409,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1284-harden-pretooluse-guard-flag-allowlists.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security-boundary guard that must survive --dangerously-skip-permissions with subtle argument-injection invariants across four flag-inspection arms and a fail-closed posture \u2014 a hard opus gate, at xhigh for the correctness-critical blast radius spanning exec/write/dispatch vectors.\",\"confidence\":0.83},{\"task_id\":\"fn-1284-harden-pretooluse-guard-flag-allowlists.2\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Security-critical fail-open guard whose correctness crux is a silent-bypass argument-injection invariant (quoted/spaced value-token consumption) \u2014 opus by the security gate, but a single well-specified function keeps it at the high default band.\",\"confidence\":0.78}]}\n"
+}
