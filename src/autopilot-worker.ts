@@ -129,6 +129,7 @@ import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
 import { loadReadinessInputs } from "./readiness-inputs";
 import {
+  type BaseDriftEntry,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   type DispatchKey,
@@ -197,6 +198,7 @@ import {
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
   losslessPremergeClean as gitLosslessPremergeClean,
+  measureBaseDrift as gitMeasureBaseDrift,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
@@ -256,6 +258,7 @@ export {
   WORKTREE_RECOVER_REASON_PREFIX,
 } from "./dispatch-failure-key";
 export type {
+  BaseDriftEntry,
   DispatchKey,
   EpicRecoverVerdict,
   HostMatrixSnapshot,
@@ -862,6 +865,16 @@ export type MergeSuiteProbe = (args: {
  */
 export interface WorktreeDriver {
   /**
+   * Refresh one drifted, quiescent epic base by merging the local default branch
+   * into the base branch in the base's own linked worktree. A content conflict is
+   * a genuine block routed through the existing merge-conflict escalation; every
+   * inconclusive/readiness/lock/timeout outcome is a non-sticky retry-skip.
+   */
+  refreshBase(
+    entry: BaseDriftEntry,
+    nowSeconds: number,
+  ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
+  /**
    * Provision the lane for one launch: ensure the worktree exists (lazily, off
    * the parent lane's committed tip), run the assignment's fan-in pre-merges in
    * order, then assert the worktree HEAD equals the derived branch. Returns the
@@ -895,7 +908,13 @@ export interface WorktreeDriver {
     liveAttributedDirty: ReadonlySet<string> | null,
   ): Promise<
     | { ok: true; cwd: string }
-    | { ok: false; reason: string; retry?: boolean; dir?: string }
+    | {
+        ok: false;
+        reason: string;
+        retry?: boolean;
+        dir?: string;
+        conflictedFiles?: string[];
+      }
   >;
   /**
    * After the epic closer reaches done: merge the epic base branch into the repo's
@@ -933,7 +952,15 @@ export interface WorktreeDriver {
     info: WorktreeLaunchInfo,
     isEpicDone: (epicId: string) => Promise<boolean>,
     runMergeSuite?: MergeSuiteProbe,
-  ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
+  ): Promise<
+    | { ok: true }
+    | {
+        ok: false;
+        reason: string;
+        retry?: boolean;
+        conflictedFiles?: string[];
+      }
+  >;
   /**
    * OFF-mode assertion: confirm `cwd` is on the repo's resolved default branch.
    * Returns `{ ok: true }` when it is, else `{ ok: false, reason }` (a sticky
@@ -1016,6 +1043,7 @@ export interface DispatchFailedPayload {
   id: string;
   reason: string;
   dir: string | null;
+  conflictedFiles: string[] | null;
   ts: number;
 }
 
@@ -2913,6 +2941,117 @@ export async function computeMergedLaneEntries(
   return out;
 }
 
+/** Defaults until durable autopilot config supplies these producer inputs. */
+export const DEFAULT_BASE_DRIFT_THRESHOLDS = {
+  behindCount: 15,
+  mergeBaseAgeSeconds: 24 * 60 * 60,
+} as const;
+
+export interface BaseDriftThresholds {
+  behindCount: number;
+  mergeBaseAgeSeconds: number;
+}
+
+/** Injectable producer inputs so durable config can replace only the values. */
+export interface BaseDriftProbeOptions {
+  thresholds?: Readonly<BaseDriftThresholds>;
+  nowSeconds?: number;
+}
+
+/**
+ * Compute the bases that have genuinely drifted from their local default branch.
+ * A lane must be both sufficiently behind and old enough: a fresh/empty lane at
+ * its fork point has zero behind commits, so the ancestry-vacuity case cannot
+ * manufacture a drift entry. Any inconclusive measurement defers to no entry.
+ */
+export async function computeBaseDriftEntries(
+  epics: readonly Epic[],
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+  options: BaseDriftProbeOptions = {},
+): Promise<BaseDriftEntry[]> {
+  const supplied = options.thresholds;
+  const thresholds: BaseDriftThresholds = {
+    behindCount:
+      supplied !== undefined &&
+      Number.isFinite(supplied.behindCount) &&
+      supplied.behindCount >= 0
+        ? supplied.behindCount
+        : DEFAULT_BASE_DRIFT_THRESHOLDS.behindCount,
+    mergeBaseAgeSeconds:
+      supplied !== undefined &&
+      Number.isFinite(supplied.mergeBaseAgeSeconds) &&
+      supplied.mergeBaseAgeSeconds >= 0
+        ? supplied.mergeBaseAgeSeconds
+        : DEFAULT_BASE_DRIFT_THRESHOLDS.mergeBaseAgeSeconds,
+  };
+  const nowSeconds =
+    options.nowSeconds !== undefined && Number.isFinite(options.nowSeconds)
+      ? options.nowSeconds
+      : Math.floor(Date.now() / 1000);
+
+  // Every lane in one repo shares its local default; resolve it at most once.
+  const defaultBranchByRepo = new Map<string, string | null>();
+  const resolveLocalDefault = async (
+    repoDir: string,
+  ): Promise<string | null> => {
+    const hit = defaultBranchByRepo.get(repoDir);
+    if (hit !== undefined) return hit;
+    let branch: string | null;
+    try {
+      branch = await gitResolveDefaultBranch(repoDir, run);
+    } catch {
+      branch = null;
+    }
+    defaultBranchByRepo.set(repoDir, branch);
+    return branch;
+  };
+
+  const out: BaseDriftEntry[] = [];
+  for (const epic of epics) {
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined) continue;
+    const laneRepos = worktreeLaneRepoDirs(resolution);
+    const base = baseBranchFor(epic.epic_id);
+    for (const repoDir of laneRepos) {
+      try {
+        const defaultBranch = await resolveLocalDefault(repoDir);
+        if (defaultBranch === null) continue;
+        const measurement = await gitMeasureBaseDrift(
+          repoDir,
+          base,
+          defaultBranch,
+          run,
+        );
+        if (measurement.kind !== "measured") continue;
+        const mergeBaseAgeSeconds = Math.max(
+          0,
+          nowSeconds - measurement.mergeBaseEpochSeconds,
+        );
+        if (
+          measurement.behindCount >= thresholds.behindCount &&
+          mergeBaseAgeSeconds >= thresholds.mergeBaseAgeSeconds
+        ) {
+          out.push({
+            epic_id: epic.epic_id,
+            repo_dir: repoDir,
+            behind_count: measurement.behindCount,
+            merge_base_age_seconds: mergeBaseAgeSeconds,
+          });
+        }
+      } catch {
+        // A producer probe is advisory; defer this lane rather than fail a cycle.
+      }
+    }
+  }
+  out.sort((a, b) =>
+    a.epic_id === b.epic_id
+      ? a.repo_dir.localeCompare(b.repo_dir)
+      : a.epic_id.localeCompare(b.epic_id),
+  );
+  return out;
+}
+
 /**
  * Compute the EPHEMERAL STALE-BASE lane set (fn-1127): every epic whose ALREADY-CUT
  * worktree lane `keeper/epic/<id>` was forked off a base DEFINITIVELY MISSING a
@@ -3408,6 +3547,7 @@ export async function confirmRunning(
       id,
       reason: launchResult.error,
       dir: cwd === "" ? null : cwd,
+      conflictedFiles: null,
       ts: deps.now(),
     });
     return "failed";
@@ -3493,16 +3633,23 @@ function computeLiveAttributedDirtyByWorktree(
 ): Map<string, ReadonlySet<string>> | null {
   try {
     const liveSessions = new Set<string>();
+    const byWorktree = new Map<string, Set<string>>();
     for (const job of jobs.values()) {
       const live =
         job.state === "working" ||
         (job.state === "stopped" && isStoppedJobLive(job, livePaneIds));
       if (live) {
         liveSessions.add(job.job_id);
+        // Preserve an empty keyed entry for a clean live lane. The refresh producer
+        // uses key presence as its no-live-worker quiescence gate, while provision
+        // still consumes the value as the dirty-path attribution set.
+        if (job.worktree !== null && job.cwd !== null) {
+          byWorktree.set(normalizeWorktreeAttributionKey(job.cwd), new Set());
+        }
       }
     }
     if (liveSessions.size === 0) {
-      return new Map();
+      return byWorktree;
     }
     const rows = db
       .query(
@@ -3514,7 +3661,6 @@ function computeLiveAttributedDirtyByWorktree(
       session_id: string;
       file_path: string;
     }>;
-    const byWorktree = new Map<string, Set<string>>();
     for (const r of rows) {
       if (
         typeof r.project_dir !== "string" ||
@@ -3565,6 +3711,8 @@ function normalizeWorktreeAttributionKey(p: string): string {
  * flips its `key` into `state.inFlight` BEFORE the await and removes it on
  * resolution. Returns when every launch has resolved OR the abort signal fired.
  */
+export const BASE_REFRESH_COOLDOWN_SEC = 15 * 60;
+
 export async function runReconcileCycle(
   decision: ReconcileDecision,
   state: ReconcileState,
@@ -3641,6 +3789,7 @@ export async function runReconcileCycle(
       id: sig.id,
       reason: sig.reason,
       dir: sig.dir,
+      conflictedFiles: null,
       ts: deps.now(),
     });
     if (sig.reclaimPaneId !== null) {
@@ -3653,9 +3802,49 @@ export async function runReconcileCycle(
     }
     deps.emitDispatchCleared({ verb: clr.verb, id: clr.id });
   }
+  // Refresh drifted bases before dispatching new work. This is a producer sibling
+  // of recover/finalize: it mutates only the lane's own linked worktree and never
+  // runs from the observational snapshot probe. A null attribution snapshot is
+  // inconclusive; a keyed lane has a live worker mutation and is not quiescent.
+  const refreshBlockedEpics = new Set<string>();
+  if (deps.worktree !== undefined && !state.paused) {
+    for (const entry of decision.baseDriftEntries) {
+      if (signal.aborted) return;
+      if (liveAttributedDirtyByWorktree === null) continue;
+      const baseBranch = baseBranchFor(entry.epic_id);
+      const basePath = stripTrailingSlashPath(
+        realpath(worktreePathFor(entry.repo_dir, baseBranch)),
+      );
+      if (liveAttributedDirtyByWorktree.has(basePath)) continue;
+      const refreshed = await deps.worktree.refreshBase(entry, deps.now());
+      if (!refreshed.ok) {
+        if (refreshed.retry === true) {
+          console.error(
+            `[autopilot-worker] base refresh ${entry.epic_id} (${entry.repo_dir}): ${refreshed.reason}`,
+          );
+          continue;
+        }
+        refreshBlockedEpics.add(entry.epic_id);
+        deps.emitDispatchFailed({
+          verb: "close",
+          id: entry.epic_id,
+          reason: refreshed.reason,
+          dir: basePath,
+          conflictedFiles: null,
+          ts: deps.now(),
+        });
+      }
+    }
+  }
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
+    if (
+      plan.worktree !== undefined &&
+      refreshBlockedEpics.has(closeKeyEpicId(plan.worktree))
+    ) {
+      continue;
+    }
     if (signal.aborted) {
       return;
     }
@@ -3676,6 +3865,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason: plan.worktreeReject.reason,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3695,6 +3885,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason: `cwd-missing: ${plan.cwd}`,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3785,6 +3976,7 @@ export async function runReconcileCycle(
         id: plan.id,
         reason,
         dir: plan.cwd,
+        conflictedFiles: null,
         ts: deps.now(),
       });
       continue;
@@ -3834,6 +4026,7 @@ export async function runReconcileCycle(
           id: plan.id,
           reason: wt.reason,
           dir: wt.dir,
+          conflictedFiles: wt.conflictedFiles ?? null,
           ts: deps.now(),
         });
         continue;
@@ -4042,6 +4235,7 @@ export async function runReconcileCycle(
             id: closeKeyEpicId(sink),
             reason: provisioned.reason,
             dir: provisioned.dir ?? sink.repoDir,
+            conflictedFiles: provisioned.conflictedFiles ?? null,
             ts: deps.now(),
           });
         }
@@ -4087,6 +4281,7 @@ export async function runReconcileCycle(
           id: finalizeKey,
           reason: result.reason,
           dir: info.repoDir,
+          conflictedFiles: result.conflictedFiles ?? null,
           ts: deps.now(),
         });
       }
@@ -4138,7 +4333,13 @@ async function runWorktreeProducerStep(
   liveAttributedDirty: ReadonlySet<string> | null,
 ): Promise<
   | { ok: true; cwd: string }
-  | { ok: false; reason: string; dir: string; retry?: boolean }
+  | {
+      ok: false;
+      reason: string;
+      dir: string;
+      retry?: boolean;
+      conflictedFiles?: string[];
+    }
 > {
   if (plan.worktree !== undefined) {
     const provisioned = await driver.provision(
@@ -4156,6 +4357,7 @@ async function runWorktreeProducerStep(
         reason: provisioned.reason,
         dir: provisioned.dir ?? launchCwd,
         retry: provisioned.retry,
+        conflictedFiles: provisioned.conflictedFiles,
       };
     }
     return { ok: true, cwd: provisioned.cwd };
@@ -4204,6 +4406,91 @@ export function createWorktreeDriver(
   // one long-lived driver, and is fresh per driver in a test.
   const mergeSuiteMemo = new Map<string, MergeSuiteVerdict>();
   return {
+    async refreshBase(entry, nowSeconds) {
+      const baseBranch = baseBranchFor(entry.epic_id);
+      const baseWorktreePath = worktreePathFor(entry.repo_dir, baseBranch);
+      const retry = (
+        reason: string,
+      ): { ok: false; reason: string; retry: true } => ({
+        ok: false,
+        retry: true,
+        reason,
+      });
+      try {
+        const defaultBranch = await gitResolveDefaultBranch(
+          entry.repo_dir,
+          run,
+        );
+        const ready = await gitMergeReadiness(
+          baseWorktreePath,
+          baseBranch,
+          run,
+          defaultBranch,
+        );
+        if (ready.kind !== "ready") {
+          return retry(
+            `worktree-base-refresh-not-quiescent: ${baseWorktreePath} is ${ready.kind} — deferring the default-into-base merge`,
+          );
+        }
+
+        const marker = `Merge branch '${defaultBranch}'`;
+        const lastRefresh = await run(
+          [
+            "log",
+            "-1",
+            "--format=%ct",
+            "--first-parent",
+            "--merges",
+            "--fixed-strings",
+            `--grep=${marker}`,
+            baseBranch,
+          ],
+          { cwd: baseWorktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+        );
+        if (lastRefresh.code !== 0) {
+          return retry(
+            `worktree-base-refresh-cooldown-inconclusive: could not read the last refresh merge for ${baseBranch}`,
+          );
+        }
+        const lastRefreshAt = Number.parseInt(lastRefresh.stdout.trim(), 10);
+        if (
+          Number.isFinite(lastRefreshAt) &&
+          nowSeconds - lastRefreshAt < BASE_REFRESH_COOLDOWN_SEC
+        ) {
+          return { ok: true };
+        }
+
+        const merge = await gitMergeBranchInto(
+          baseWorktreePath,
+          defaultBranch,
+          run,
+          acquireLock,
+        );
+        switch (merge.kind) {
+          case "merged":
+          case "already-merged":
+            return { ok: true };
+          case "conflict":
+          case "abort-failed":
+            return {
+              ok: false,
+              reason: `worktree-merge-conflict: merging ${defaultBranch} into ${baseBranch} — ${merge.stderr}`,
+            };
+          case "lock-timeout":
+          case "local-timeout":
+          case "missing-source":
+            return retry(
+              `worktree-base-refresh-${merge.kind}: deferring the merge of ${defaultBranch} into ${baseBranch}`,
+            );
+          default:
+            assertNever(merge);
+        }
+      } catch (err) {
+        return retry(
+          `worktree-base-refresh-inconclusive: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
     async provision(info, liveAttributedDirty) {
       const { assignment, repoDir, parentBranch } = info;
       const { branch, worktreePath, preMerges } = assignment;
@@ -4302,10 +4589,16 @@ export function createWorktreeDriver(
           if (merge.kind === "missing-source") {
             continue; // phantom lane: nothing to merge, never created
           }
-          // `abort-failed` (the conflict/timeout abort itself failed, leaving the
-          // lane worktree mid-merge) folds into today's conflict fail-loud; task 2
-          // specializes it into the distinct wedge-escalation reason.
-          if (merge.kind === "conflict" || merge.kind === "abort-failed") {
+          if (merge.kind === "conflict") {
+            return {
+              ok: false,
+              reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
+              conflictedFiles: merge.conflictedFiles,
+            };
+          }
+          // The conflict/timeout abort itself failed, leaving the lane worktree
+          // mid-merge. Keep this distinct wedge shape free of conflictedFiles.
+          if (merge.kind === "abort-failed") {
             return {
               ok: false,
               reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
@@ -4558,6 +4851,7 @@ export function createWorktreeDriver(
             return {
               ok: false,
               reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+              conflictedFiles: merge.conflictedFiles,
             };
           case "push-failed":
             return {
@@ -4753,7 +5047,7 @@ export type MergeLaneResult =
   | { kind: "would-clobber"; paths: string[] }
   | { kind: "non-ff" }
   | { kind: "not-turn-key"; reason: PushNotReadyReason }
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   // The conflict/timeout guarded `git merge --abort` ITSELF failed, leaving the
   // shared checkout mid-merge (MERGE_HEAD + unresolved paths) — DISTINCT from
   // `conflict` (which aborted cleanly): the residue did NOT clear, so the caller
@@ -4970,7 +5264,7 @@ function isPlausibleBranchName(name: string): boolean {
  */
 type ProspectiveMerge =
   | { kind: "computed"; defaultTip: string; newValue: string }
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   | { kind: "local-timeout" }
   | { kind: "merge-tree-unsupported" }
   | { kind: "plumbing-failed"; detail: string };
@@ -5022,7 +5316,27 @@ async function computeProspectiveMerge(
   // so it detects content conflicts equivalently to a porcelain merge without ever
   // touching (or seeing) the working tree.
   if (mt.code === 1) {
-    return { kind: "conflict", stderr: (mt.stdout + mt.stderr).trim() };
+    // `merge-tree --write-tree` reports one stage record per conflicted side as
+    // `<mode> <oid> <stage>\t<path>`. Collect and de-duplicate those paths from
+    // the plumbing output; unlike a porcelain merge there is no live index to
+    // query because this path deliberately never touches the shared checkout.
+    const conflictedFiles = [
+      ...new Set(
+        mt.stdout
+          .split("\n")
+          .map((line) =>
+            line.match(/^\d{6} [0-9a-f]{7,64} [123]\t(.+)$/)?.[1]?.trim(),
+          )
+          .filter(
+            (path): path is string => path !== undefined && path.length > 0,
+          ),
+      ),
+    ];
+    return {
+      kind: "conflict",
+      stderr: (mt.stdout + mt.stderr).trim(),
+      conflictedFiles,
+    };
   }
   if (mt.code !== 0) {
     return {
@@ -7046,6 +7360,53 @@ type IncomingMessage =
 // the worker keys against its pending-ack map.
 
 /**
+ * The two durable base-drift thresholds resolved off the `autopilot_state`
+ * singleton row — `null` on an axis means that axis is OFF (not configured).
+ */
+export interface DriftThresholds {
+  /** The lane-base behind-count threshold vs the local default, or `null`
+   *  when this axis is OFF. */
+  behindThreshold: number | null;
+  /** The merge-base age threshold in days, or `null` when this axis is OFF. */
+  ageThresholdDays: number | null;
+}
+
+/**
+ * Resolve the durable base-drift thresholds off the `autopilot_state`
+ * singleton row — the producer-side counterpart of the `worktreeMode`/
+ * `worktreeMultiRepo` `?? OFF` resolution pattern in {@link loadReconcileSnapshot}.
+ * An absent/never-set row, NULL, or a non-positive/non-integer value on either
+ * column resolves that axis to `null` (OFF), mirroring the
+ * `set_autopilot_config` sentinel/0-disables discipline
+ * (`extractAutopilotConfigSetPayload` in `reducer.ts`). Both axes `null` is the
+ * base-freshness gate's byte-identical no-detection default: `.2`'s drift probe
+ * and `.4`'s refresh pass both stay inert until a positive threshold is set.
+ * Pure — exported so a future drift-probe pass can resolve the same row this
+ * function reads without re-deriving the coercion rule.
+ */
+export function resolveDriftThresholds(
+  autopilotRow: Record<string, unknown> | undefined,
+): DriftThresholds {
+  const behindRaw = (
+    autopilotRow as { drift_behind_threshold?: unknown } | undefined
+  )?.drift_behind_threshold;
+  const behindThreshold =
+    typeof behindRaw === "number" &&
+    Number.isInteger(behindRaw) &&
+    behindRaw > 0
+      ? behindRaw
+      : null;
+  const ageRaw = (
+    autopilotRow as { drift_age_threshold_days?: unknown } | undefined
+  )?.drift_age_threshold_days;
+  const ageThresholdDays =
+    typeof ageRaw === "number" && Number.isInteger(ageRaw) && ageRaw > 0
+      ? ageRaw
+      : null;
+  return { behindThreshold, ageThresholdDays };
+}
+
+/**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
  * client subscriptions with, so the reconciler's view matches the board's
@@ -7510,6 +7871,13 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  // Base drift is a separate producer observation. It reuses the resolved lane
+  // repos, resolves each local default once, and remains inert (including all git
+  // reads) while worktree mode is OFF.
+  const baseDriftEntries = worktreeMode
+    ? await computeBaseDriftEntries(epics, worktreeRepoByEpicId)
+    : [];
+
   // The STALE-BASE lane set (fn-1127) — every already-cut lane forked off a base
   // missing a landed same-repo upstream's work. A SIBLING probe to the merge-gate /
   // merge-landed passes (never modifying them), reusing `worktreeRepoByEpicId`'s
@@ -7577,6 +7945,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    baseDriftEntries,
     staleBaseLaneEntries,
     liveAttributedDirtyByWorktree,
     worktreesRoot,
@@ -8230,6 +8599,7 @@ function main(): void {
                 id: recoverFailureDispatchId(f),
                 reason: f.reason,
                 dir: f.dir,
+                conflictedFiles: null,
                 ts: deps.now(),
               });
             }
@@ -8246,6 +8616,7 @@ function main(): void {
                 id: e.epicId,
                 reason: e.reason,
                 dir: e.dir,
+                conflictedFiles: null,
                 ts: deps.now(),
               });
             }
@@ -8368,7 +8739,15 @@ function main(): void {
         if (snapshot.worktreeMode && !state.paused) {
           try {
             const staleObs = new Map<string, StaleBaseLaneObservation>();
+            const refreshing = new Set(
+              (snapshot.baseDriftEntries ?? []).map(
+                (e) => `${e.epic_id}\0${e.repo_dir}`,
+              ),
+            );
             for (const e of snapshot.staleBaseLaneEntries ?? []) {
+              // Base drift is actively remediated by the refresh producer; do not
+              // also age the detection-only stale-base distress in this cycle.
+              if (refreshing.has(`${e.epic_id}\0${e.repo_dir}`)) continue;
               const id = staleBaseLaneDistressId(e.epic_id, e.repo_dir);
               // First entry per id wins (the probe already dedupes per (epic,repo)).
               if (!staleObs.has(id)) {

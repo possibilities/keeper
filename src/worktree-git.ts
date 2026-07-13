@@ -95,7 +95,7 @@ export type MergeResult =
    * `MERGE_HEAD` was present). The caller fails loud + stops; `stderr` carries
    * git's conflict output for the sticky DispatchFailed.
    */
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   /**
    * The bounded {@link LockAcquirer} could not take the per-worktree commit-work
    * flock within its deadline — another holder (a concurrent commit-work or a
@@ -611,6 +611,96 @@ export async function isAncestorOf(
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
   });
   return r.code === 0;
+}
+
+/**
+ * Tri-state outcome of {@link measureBaseDrift}: a definite magnitude, or a
+ * DISTINCT inconclusive signal a caller must DEFER on (never coerce to zero
+ * drift, and never a false high-drift reading). Mirrors the containment
+ * tri-state in `computeStaleBaseLaneEntries` (autopilot-worker.ts) — a
+ * timeout(124)/ambiguous-ref(128)/spawn-fail(127) exit, or an unparseable
+ * output, collapses to `inconclusive` rather than a fabricated 0.
+ */
+export type BaseDriftMeasurement =
+  | {
+      kind: "measured";
+      /** Commits `defaultBranch` has that `base` lacks (`base` is behind by). */
+      behindCount: number;
+      /**
+       * Committer-date (`%ct`, UNIX epoch seconds) of `merge-base(base,
+       * defaultBranch)` — a raw snapshot timestamp, NOT a pre-subtracted age
+       * (no wall-clock read here); the caller derives age as `now -
+       * mergeBaseEpochSeconds`.
+       */
+      mergeBaseEpochSeconds: number;
+    }
+  | { kind: "inconclusive" };
+
+/**
+ * Measure a lane base's drift from the local default branch: the behind-count
+ * (default commits the base lacks, via `git rev-list --left-right --count
+ * <base>...<defaultBranch>`) and the merge-base's commit timestamp (via `git
+ * show -s --format=%ct $(git merge-base <base> <defaultBranch>)`). Both reads
+ * go through the injected {@link GitRunner} seam, bounded by
+ * {@link GIT_LOCAL_TIMEOUT_MS}.
+ *
+ * `--left-right <base>...<defaultBranch>` prints "`<base-only>\t<default-only>`"
+ * (left = first ref) — `default-only` (the second count) is the behind-count,
+ * since those are the commits on `defaultBranch` that `base` lacks. Getting
+ * this order backwards silently inverts every lane's drift reading, so the
+ * parse asserts exactly two whitespace-separated non-negative integers.
+ *
+ * A non-zero exit at ANY step (timeout, ambiguous/unresolvable ref, spawn
+ * failure) or unparseable output returns the distinct `inconclusive` kind —
+ * never a fabricated magnitude. Never throws.
+ */
+export async function measureBaseDrift(
+  cwd: string,
+  base: string,
+  defaultBranch: string,
+  run: GitRunner = gitExec,
+): Promise<BaseDriftMeasurement> {
+  const behind = await run(
+    ["rev-list", "--left-right", "--count", `${base}...${defaultBranch}`],
+    { cwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (behind.code !== 0) {
+    return { kind: "inconclusive" };
+  }
+  const counts = behind.stdout.trim().split(/\s+/);
+  if (counts.length !== 2) {
+    return { kind: "inconclusive" };
+  }
+  const behindCount = Number(counts[1]);
+  if (!Number.isInteger(behindCount) || behindCount < 0) {
+    return { kind: "inconclusive" };
+  }
+
+  const mergeBase = await run(["merge-base", base, defaultBranch], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (mergeBase.code !== 0) {
+    return { kind: "inconclusive" };
+  }
+  const mergeBaseSha = mergeBase.stdout.trim();
+  if (mergeBaseSha.length === 0) {
+    return { kind: "inconclusive" };
+  }
+
+  const show = await run(["show", "-s", "--format=%ct", mergeBaseSha], {
+    cwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (show.code !== 0) {
+    return { kind: "inconclusive" };
+  }
+  const mergeBaseEpochSeconds = Number(show.stdout.trim());
+  if (!Number.isInteger(mergeBaseEpochSeconds) || mergeBaseEpochSeconds < 0) {
+    return { kind: "inconclusive" };
+  }
+
+  return { kind: "measured", behindCount, mergeBaseEpochSeconds };
 }
 
 /**
@@ -1629,10 +1719,24 @@ export async function mergeBranchInto(
       }
       return { kind: "local-timeout" };
     }
-    // Non-zero: a conflict (or other failure). Abort iff a MERGE_HEAD exists,
-    // so a merge that never started is not spuriously "aborted". A clean abort
-    // (or nothing to abort) → the sticky `conflict`; an abort that ITSELF failed
-    // left the checkout mid-merge → the distinct `abort-failed` wedge signal.
+    // Non-zero: a conflict (or other failure). Capture the unmerged index paths
+    // BEFORE the guarded abort destroys the stage-1/2/3 entries. Best-effort only:
+    // a failed/timed-out diff must never replace the merge's real outcome.
+    const unmerged = await run(["diff", "--name-only", "--diff-filter=U"], {
+      cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    const conflictedFiles =
+      unmerged.code === 0
+        ? unmerged.stdout
+            .split("\n")
+            .map((path) => path.trim())
+            .filter((path) => path.length > 0)
+        : [];
+    // Abort iff a MERGE_HEAD exists, so a merge that never started is not
+    // spuriously "aborted". A clean abort (or nothing to abort) → the sticky
+    // `conflict`; an abort that ITSELF failed left the checkout mid-merge → the
+    // distinct `abort-failed` wedge signal.
     const aborted = await abortMergeIfInProgress(worktreePath, run);
     if (aborted.kind === "abort-failed") {
       return { kind: "abort-failed", stderr: aborted.stderr };
@@ -1640,6 +1744,7 @@ export async function mergeBranchInto(
     return {
       kind: "conflict",
       stderr: (merge.stdout + merge.stderr).trim(),
+      conflictedFiles,
     };
   } finally {
     lock.release();

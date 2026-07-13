@@ -18,8 +18,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mergeLaneBaseIntoDefault } from "../src/autopilot-worker";
+import {
+  createWorktreeDriver,
+  mergeLaneBaseIntoDefault,
+} from "../src/autopilot-worker";
 import { gitExec } from "../src/commit-work/git-exec";
+import { worktreePathFor } from "../src/worktree-plan";
 
 const SLOW_ENABLED = process.env.KEEPER_RUN_SLOW !== undefined;
 
@@ -69,12 +73,14 @@ describe.skipIf(!SLOW_ENABLED)(
     let origin = "";
     let main = "";
     let baseTip = "";
+    let baseWorktree = "";
 
     beforeEach(() => {
       origin = mkdtempSync(join(tmpdir(), "kpr-catchup-origin-"));
       git(["init", "-q", "--bare", "-b", DEFAULT_BRANCH], origin);
 
       main = mkdtempSync(join(tmpdir(), "kpr-catchup-main-"));
+      baseWorktree = worktreePathFor(main, BASE_BRANCH);
       git(["init", "-q", "-b", DEFAULT_BRANCH], main);
       git(["config", "user.email", "test@keeper.local"], main);
       git(["config", "user.name", "Keeper Test"], main);
@@ -102,8 +108,46 @@ describe.skipIf(!SLOW_ENABLED)(
     });
 
     afterEach(() => {
+      rmSync(baseWorktree, { recursive: true, force: true });
       rmSync(origin, { recursive: true, force: true });
       rmSync(main, { recursive: true, force: true });
+    });
+
+    test("default-into-base refresh lands in the lane worktree and leaves finalize fast-forwardable", async () => {
+      writeFileSync(join(main, "default-only.ts"), "new default work\n");
+      git(["add", "default-only.ts"], main);
+      git(["commit", "-q", "-m", "default advances"], main);
+      const defaultTip = git(["rev-parse", "HEAD"], main).trim();
+      git(["worktree", "add", "-q", baseWorktree, BASE_BRANCH], main);
+
+      const result = await createWorktreeDriver(gitExec, stubLock).refreshBase(
+        {
+          epic_id: "fn-1-foo",
+          repo_dir: main,
+          behind_count: 1,
+          merge_base_age_seconds: 90_000,
+        },
+        Math.floor(Date.now() / 1000),
+      );
+
+      expect(result).toEqual({ ok: true });
+      expect(git(["rev-parse", "--abbrev-ref", "HEAD"], main).trim()).toBe(
+        DEFAULT_BRANCH,
+      );
+      expect(
+        git(["rev-parse", "--abbrev-ref", "HEAD"], baseWorktree).trim(),
+      ).toBe(BASE_BRANCH);
+      expect(
+        Bun.spawnSync(
+          ["git", "merge-base", "--is-ancestor", defaultTip, BASE_BRANCH],
+          { cwd: main, env: isoEnv() },
+        ).success,
+      ).toBe(true);
+      expect(
+        git(["rev-list", "--parents", "-1", BASE_BRANCH], main)
+          .trim()
+          .split(" "),
+      ).toHaveLength(3);
     });
 
     test("an unrelated local edit is preserved byte-identical while the stale path advances to the new tip (no desync seed)", async () => {
