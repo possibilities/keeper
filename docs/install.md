@@ -17,15 +17,32 @@ owned by you and mode `644` or macOS silently ignores it. Optional account-routi
 discovered through their CLIs; there is no keeper config map to author for them. The autoclose worker
 force-closes the tmux window of a done-and-quiescent keeper-dispatched agent (an autopilot
 `work::`/`close::` worker or a finished claude panel leg) after a grace. It cancels the grace on
-renewed Harness activity or a parked prompt and acts only after an exact claim release plus canonical
+renewed Harness activity or a parked prompt and acts only after an exact Dispatch claim release plus canonical
 tmux-generation and recycle-safe process checks. `autoclose_enabled` (default `true`; set
 `false`/`off`/`no`/`0` to disable — re-read every pulse, so a flip needs no daemon restart) and
 `autoclose_grace_seconds` (default `30`) govern it. A finished `unblock`/`deconflict`/`resolve`
 escalation window is reaped under the same knobs once its block or conflict instance is resolved.
 Logical worktree merge may land while that inspection window remains open; lane/worktree/cwd removal
 waits until the exact Resource hold clears. A generation mismatch, recycled pid, reused lane path, or
-failed probe defers cleanup rather than targeting a replacement owner. Generic crash restore excludes
+failed probe defers cleanup rather than targeting a replacement owner. Generic Restore excludes
 both autopilot `work` and `close` sessions; manual and Adopted sessions remain restore candidates.
+
+For lifecycle diagnosis, run the bounded audit against an explicit copied snapshot or a database the
+operator has made read-only; it opens SQLite read-only and does not contact the daemon or socket:
+
+```sh
+bun scripts/audit-session-activity.ts --db /path/to/keeper.snapshot.db --limit 200
+```
+
+The JSON reports aggregate Harness activity reasons, Dispatch attempt evidence, Dispatch claim states,
+legacy classification deltas, and only the session/target identifiers needed for follow-up. It never
+prints transcript bodies, prompts, shell output, credentials, titles, cwd values, or transcript paths.
+`selected_truncated`, `child_rows_truncated_for`, `claim_rows_truncated_for`, and
+`stale_attempts_truncated` identify an incomplete bounded reading; increase `--limit` up to the tool's
+cap or take a narrower snapshot rather than querying the resident daemon. After deploying matching code,
+use the normal status/query surfaces to verify the same identifiers against the resident daemon; do not
+treat moving live counts as an acceptance threshold.
+Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidence-diagnostics).
 
 ### Account routing (optional)
 
