@@ -48,5 +48,5 @@ dispatch on a fresh board. Drive grace/clock via injected now; retryUntil for as
 - [ ] Regression tests cover both paths in the fast suite
 
 ## Done summary
-
+Readiness reads now distinguish an ERROR frame (readinessDegraded) from a genuine empty result; a degraded tick defers dispatch, reaper slot-reclaim, and autoclose reaping while preserving grace state, and a fresh empty board still dispatches. Regression tests cover both paths in autopilot-worker.test.ts and autoclose-worker.test.ts. CLI audit (query.ts/watch.ts/autopilot.ts) found no analogous swallow-to-empty path.
 ## Evidence

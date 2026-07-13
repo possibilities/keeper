@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Degraded readiness reads defer",
-  "updated_at": "2026-07-13T05:45:18.958000Z"
+  "updated_at": "2026-07-13T06:10:25.007000Z",
+  "worker_done_at": "2026-07-13T06:10:25.007000Z"
 }
