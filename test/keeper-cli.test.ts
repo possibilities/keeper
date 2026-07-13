@@ -85,6 +85,7 @@ function makeHarness(): Harness {
       frames: mkHandler("frames"),
       dash: mkHandler("dash"),
       status: mkHandler("status"),
+      daemon: mkHandler("daemon"),
       query: mkHandler("query"),
       watch: mkHandler("watch"),
       await: mkHandler("await"),
@@ -228,6 +229,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
     expect(isSubcommand("status")).toBe(true);
+    expect(isSubcommand("daemon")).toBe(true);
     expect(isSubcommand("query")).toBe(true);
     expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("commit-work")).toBe(true);

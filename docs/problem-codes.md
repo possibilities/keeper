@@ -12,6 +12,22 @@ stable and never repurposed; `message` is corrective (never a stack trace or a
 filesystem path); `recovery` is the actionable next step. New codes are added
 here in the same change that introduces them.
 
+
+## Daemon restart (`keeper daemon restart`)
+
+The restart verb asks launchd to restart the already bootstrapped keeperd job, then
+waits for a socket reply whose boot status is caught up. It never opens keeper.db
+or invokes a daemon RPC. A refused socket while the old process releases its flock
+is transient. Plist edits are a different operation: use `launchctl bootout` plus
+`launchctl bootstrap`, not `kickstart`.
+
+| code | meaning | recovery | retry-safe |
+| ---- | ------- | -------- | ---------- |
+| `kickstart-failed` | `launchctl kickstart -k` could not ask launchd to restart the job. | Confirm the LaunchAgent is bootstrapped. For plist edits, bootout then bootstrap it before retrying. | yes (restart request) |
+| `health-timeout` | The bounded wait ended before the daemon answered healthy and caught up. | Inspect launchd status and daemon stderr, fix the boot fault, then retry. | yes (restart request) |
+| `throttled-respawn` | launchd is delaying keeperd after repeated respawns. | Inspect daemon stderr for the crash loop, fix it, then retry. | yes (after fixing the boot fault) |
+
+
 ## Shared-helper family (`keeper status`, `keeper query`)
 
 These ride the `{schema_version, ok, error, data}` envelope on stdout. A bad
