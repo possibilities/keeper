@@ -310,6 +310,7 @@ export {
   reconcile,
   recoverFailureDispatchId,
   SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,

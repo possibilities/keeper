@@ -1686,6 +1686,17 @@ export function isStoppedJobLive(
 export const SLOT_RECLAIM_GRACE_SEC = 120;
 
 /**
+ * Blast-radius bound on pane KILLS a single occupancy sweep may issue — mirrors
+ * autoclose's {@link AUTOCLOSE_MAX_KILLS_PER_PULSE} so one bad projection frame
+ * cannot cascade into a mass window close. Over-cap dead candidates DOWNGRADE to
+ * visibility-only `slot-occupied` (never dropped) and are reconsidered next cycle,
+ * since their `updated_at`/`state` persist — no local grace map is needed. The
+ * kept set is chosen deterministically (lowest `(verb, id)` slot key wins) so it is
+ * stable across cycles, never flaky.
+ */
+export const SLOT_RECLAIM_MAX_PER_SWEEP = 5;
+
+/**
  * The idle-shell foreground command names the launch wrapper's trailing
  * `exec $SHELL -l -i` tail reports via tmux `pane_current_command` once the hosted
  * claude exits. CONSERVATIVE by construction — every entry is unambiguously a shell,
@@ -1770,19 +1781,28 @@ export interface SlotOccupancyDecision {
 const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
 
 /**
- * Surface — and, when provably dead, reclaim — a slot held by a stopped-but-LIVE
- * session, so a wedged dispatch slot is never silent. For each `stopped` job whose
- * pane is still live AND whose key `reconcile` still wants to dispatch (the mint is
- * blocked): a bare-shell pane past its grace is DEAD → kill it and mint
- * `slot-reclaimed`; anything else (a live/parked `claude`, or a bare shell still in
- * grace) is `slot-occupied` visibility-only. Every OPEN slot row whose key got no
- * fresh signal (occupant gone / resumed to `working` / verdict completed) is cleared.
+ * Surface — and, when dead, reclaim — a slot held by a stopped-but-LIVE session, so
+ * a wedged dispatch slot is never silent. For each `stopped` job whose pane is still
+ * live AND whose key `reconcile` still wants to dispatch (the mint is blocked), a
+ * pane past its grace is DEAD → kill it and mint `slot-reclaimed` when ANY of three
+ * proofs hold: the daemon's proven-dead pid verdict, a bare-shell tail command, or
+ * DERIVED IDLE — a session that went `working` (`active_since` non-null) and ended
+ * its turn but stays resident. A NEVER-started row (`active_since` null) is not
+ * derived-idle: it never ran a turn, so the derived arm never reclaims it (the
+ * proven-dead / bare-shell arms still fire on their own evidence). Anything else (a
+ * live/parked `claude` still mid-turn, or any candidate still in grace) is
+ * `slot-occupied` visibility-only. Every OPEN slot row whose key got no fresh signal
+ * (occupant gone / resumed to `working` / verdict completed) is cleared.
+ *
+ * Reclaims are blast-capped at {@link SLOT_RECLAIM_MAX_PER_SWEEP} per sweep, chosen
+ * by lowest `(verb, id)` key; over-cap dead candidates downgrade to `slot-occupied`
+ * (never dropped) and are reconsidered next cycle.
  *
  * Pure + re-fold-safe: reads only the snapshot's liveness fields and the readiness-
  * derived `wantsDispatch` gate. INERT (empty) when paused or the probe is degraded
  * (`livePaneIds`/`paneCommandById` null) — the conservative silent-occupy fallback.
- * A killed resumable session is the catastrophic failure, so the DEAD criterion is
- * strictly the bare-shell-past-grace conjunction; when in doubt it surfaces only.
+ * A killed session mid-turn is the catastrophic failure, so a `working` row is never
+ * a candidate and every DEAD criterion is grace-aged; when in doubt it surfaces only.
  */
 export function computeSlotOccupancy(
   input: SlotOccupancyInput,
@@ -1796,6 +1816,17 @@ export function computeSlotOccupancy(
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
   const activeKeys = new Set<string>();
+  // Per-key candidates collected before any signal is pushed, so the reclaim blast
+  // cap selects deterministically across the WHOLE sweep, not per iteration.
+  const candidates: {
+    key: string;
+    verb: Verb;
+    id: string;
+    paneId: string;
+    command: string | undefined;
+    dir: string | null;
+    dead: boolean;
+  }[] = [];
   for (const job of input.jobs.values()) {
     if (job.state !== "stopped") {
       continue;
@@ -1828,30 +1859,55 @@ export function computeSlotOccupancy(
     // whatever its pane's foreground command shows — a lingering launch-wrapper
     // shell or launcher process holding the pane never masks the verdict. The
     // bare-shell tail stays a SECONDARY proof for the degraded-probe cycle that
-    // carries no pid verdict. Grace-aged either way (never immediate): the kill
+    // carries no pid verdict. Grace-aged every way (never immediate): the kill
     // waits `graceSec` past the last fold so a transient teardown frame is never
     // reaped, and the `wantsDispatch` gate already scopes it to a slot in demand.
     const provenDead = input.provenDeadJobIds?.has(job.job_id) ?? false;
     const graceElapsed = input.now - job.updated_at >= graceSec;
-    const dead = graceElapsed && (provenDead || isBareShellCommand(command));
+    // Derived idle: a session that went `working` (`active_since` non-null) and
+    // ended its turn but stays resident — the residual, once the pid verdict and
+    // bare-shell tail are excluded. A NEVER-started row (`active_since` null) never
+    // ran a turn (a still-binding launch, not a finished one), so it is NOT
+    // derived-idle; only the pid/bare-shell arms may reclaim it. `active_since` is
+    // held across turn end (never cleared / backfilled), so it reads solely as a
+    // never-started gate here, never as a turn-activity signal.
+    const neverStarted = job.active_since == null;
+    const derivedIdle =
+      !neverStarted && !provenDead && !isBareShellCommand(command);
+    const dead =
+      graceElapsed &&
+      (provenDead || isBareShellCommand(command) || derivedIdle);
+    candidates.push({ key, verb, id, paneId, command, dir: job.cwd, dead });
+  }
+  // Blast cap: at most SLOT_RECLAIM_MAX_PER_SWEEP dead candidates become real kills
+  // this sweep (lowest `(verb, id)` key wins, deterministic); the rest downgrade to
+  // visibility-only `slot-occupied`, retried next cycle.
+  const reclaimKeys = new Set(
+    candidates
+      .filter((c) => c.dead)
+      .map((c) => c.key)
+      .sort()
+      .slice(0, SLOT_RECLAIM_MAX_PER_SWEEP),
+  );
+  for (const c of candidates) {
     // Reason text is STABLE across cycles (pane id + command only, never the growing
     // idle age) so the producer change-gate suppresses re-emits — one event per
     // condition, not one per cycle. The row's `ts` carries the age. The
     // occupied→dead transition IS a reason change, so it re-emits (actionable).
-    if (dead) {
+    if (c.dead && reclaimKeys.has(c.key)) {
       failures.push({
-        verb,
-        id,
-        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${verb} session (pane ${paneId} ${command ?? "?"})`,
-        dir: job.cwd,
-        reclaimPaneId: paneId,
+        verb: c.verb,
+        id: c.id,
+        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${c.verb} session (pane ${c.paneId} ${c.command ?? "?"})`,
+        dir: c.dir,
+        reclaimPaneId: c.paneId,
       });
     } else {
       failures.push({
-        verb,
-        id,
-        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${verb} session holds the slot (pane ${paneId} ${command ?? "?"})`,
-        dir: job.cwd,
+        verb: c.verb,
+        id: c.id,
+        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${c.verb} session holds the slot (pane ${c.paneId} ${c.command ?? "?"})`,
+        dir: c.dir,
         reclaimPaneId: null,
       });
     }

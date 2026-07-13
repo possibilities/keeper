@@ -144,6 +144,7 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   type SlotOccupancySignal,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
@@ -303,6 +304,7 @@ function makeJob(overrides: Partial<Job>): Job {
     start_time: null,
     plan_verb: null,
     plan_ref: null,
+    active_since: null,
     epic_links: [],
     last_api_error_at: null,
     last_api_error_kind: null,
@@ -1069,6 +1071,7 @@ function oneOccupant(over: {
   pane?: string;
   command?: string;
   updated_at?: number;
+  active_since?: number | null;
 }): {
   jobs: Map<string, Job>;
   livePaneIds: Set<string>;
@@ -1085,6 +1088,7 @@ function oneOccupant(over: {
         state: over.state ?? "stopped",
         backend_exec_pane_id: pane,
         updated_at: over.updated_at ?? 800,
+        active_since: over.active_since ?? null,
       }),
     ],
   ]);
@@ -1135,13 +1139,103 @@ test("computeSlotOccupancy: bare shell but WITHIN grace → slot-occupied, NO ki
 });
 
 test("computeSlotOccupancy: a live/parked claude pane → slot-occupied, NEVER killed (even past grace)", () => {
-  // The resumable session: its pane still runs `claude`, so it is NOT provably dead
-  // regardless of age — killing it would be the catastrophic failure.
+  // NEVER-started: `oneOccupant`'s default `active_since` is null, so this row never
+  // ran a turn — the derived-idle arm skips it (it is a still-binding launch, not a
+  // finished session), and its `claude` foreground command is neither a bare shell
+  // nor a proven-dead verdict. Surfaced only, never killed.
   const occ = oneOccupant({ command: "claude", updated_at: 0 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
   expect(out.failures[0].reclaimPaneId).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim + slot-reclaimed", () => {
+  // ADR 0052 core case: a session that WENT working (`active_since` set) then ended
+  // its turn but stays resident holding a wanted slot. Its pane still reads `claude`
+  // (not a bare shell, no proven-dead verdict), yet past grace it is derived-idle →
+  // reclaimed, unlike the never-started row above.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 800,
+    active_since: 500,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  const sig: SlotOccupancySignal = out.failures[0];
+  expect(sig.reclaimPaneId).toBe("%7");
+  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupied, NO kill", () => {
+  // idle 50s < 120s grace: a just-ended turn could be a transient frame, so the
+  // derived-idle arm waits out the grace exactly like the bare-shell arm.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 950,
+    active_since: 500,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: never-started (active_since null) + idle pane past grace → derived-idle arm NEVER reclaims", () => {
+  // The startup-grace guard for the derived-idle arm specifically: a row that never
+  // went `working` is a still-binding launch, not a finished turn — killing it would
+  // race a booting session. Only the proven-dead / bare-shell arms may reclaim it.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 800,
+    active_since: null,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgrades to visibility-only", () => {
+  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct started + derived-idle + wanted zombies
+  // past grace. At most the cap are real kills (lowest `(verb, id)` key wins,
+  // deterministic); the rest surface as slot-occupied — never dropped from failures.
+  const n = SLOT_RECLAIM_MAX_PER_SWEEP + 3;
+  const jobs = new Map<string, Job>();
+  const livePaneIds = new Set<string>();
+  const paneCommandById = new Map<string, string>();
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const id = `fn-1-foo.${String(i).padStart(2, "0")}`;
+    const pane = `%${100 + i}`;
+    ids.push(id);
+    jobs.set(
+      `j-${i}`,
+      makeJob({
+        job_id: `j-${i}`,
+        plan_verb: "work",
+        plan_ref: id,
+        state: "stopped",
+        backend_exec_pane_id: pane,
+        updated_at: 800,
+        active_since: 500,
+      }),
+    );
+    livePaneIds.add(pane);
+    paneCommandById.set(pane, "claude");
+  }
+  const out = computeSlotOccupancy(
+    slotInput({ jobs, livePaneIds, paneCommandById }),
+  );
+  // Every candidate is surfaced — nothing silently dropped.
+  expect(out.failures).toHaveLength(n);
+  const reclaimed = out.failures.filter((f) => f.reclaimPaneId !== null);
+  const occupied = out.failures.filter((f) => f.reclaimPaneId === null);
+  expect(reclaimed).toHaveLength(SLOT_RECLAIM_MAX_PER_SWEEP);
+  expect(occupied).toHaveLength(n - SLOT_RECLAIM_MAX_PER_SWEEP);
+  // Deterministic selection: the lowest `(verb, id)` keys are the real reclaims.
+  const reclaimedIds = reclaimed.map((f) => f.id).sort();
+  expect(reclaimedIds).toEqual(ids.slice(0, SLOT_RECLAIM_MAX_PER_SWEEP));
 });
 
 test("computeSlotOccupancy: login `-zsh` past grace is still reclaimed (dash stripped)", () => {
