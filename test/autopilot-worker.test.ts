@@ -208,9 +208,12 @@ import {
   computeLandedEpicIds,
   projectPendingDispatches,
 } from "../src/readiness-client";
-import { loadReadinessInputs } from "../src/readiness-inputs";
+import {
+  loadReadinessInputs,
+  type ReadinessQuery,
+} from "../src/readiness-inputs";
 import { drain } from "../src/reducer";
-import { readBootStatus } from "../src/server-worker";
+import { readBootStatus, runQuery } from "../src/server-worker";
 import type {
   EmbeddedJob,
   Epic,
@@ -317,6 +320,7 @@ function makeSnapshot(
   overrides: Partial<ReconcileSnapshot>,
 ): ReconcileSnapshot {
   const snapshot: ReconcileSnapshot = {
+    readinessDegraded: false,
     epics: [],
     jobs: new Map(),
     subagentInvocations: [],
@@ -4632,6 +4636,7 @@ function seedEpicRow(
     status: string;
     updated_at?: number;
     last_validated_at?: string | null;
+    tasks?: Task[];
     /** Epic-level (close-scope) embedded jobs, JSON-serialized. */
     jobs?: EmbeddedJob[];
   },
@@ -4647,7 +4652,7 @@ function seedEpicRow(
     opts.status,
     0,
     opts.updated_at ?? Math.floor(Date.now() / 1000),
-    "[]",
+    JSON.stringify(opts.tasks ?? []),
     "[]",
     JSON.stringify(opts.jobs ?? []),
     "[]",
@@ -4679,6 +4684,22 @@ async function withSeededDb(
   }
 }
 
+function errorReadinessQuery(collection: string): ReadinessQuery {
+  return (db, worldRev, frame, out, nowSec) => {
+    if (frame.collection === collection) {
+      return {
+        type: "error",
+        id: frame.id,
+        collection,
+        rev: worldRev,
+        code: "read_failed",
+        message: `${collection} unavailable`,
+      };
+    }
+    return runQuery(db, worldRev, frame, out, nowSec);
+  };
+}
+
 /** Fold one emitted failure, then prove its structured conflict list re-folds. */
 async function expectConflictedFilesRefold(
   payload: DispatchFailedPayload,
@@ -4708,6 +4729,76 @@ async function expectConflictedFilesRefold(
     expect(select()).toEqual(before);
   });
 }
+
+for (const collection of ["jobs", "epics"]) {
+  test(`loadReadinessInputs marks an ERROR frame for ${collection} as degraded`, async () => {
+    await withSeededDb((db) => {
+      const inputs = loadReadinessInputs(db, errorReadinessQuery(collection));
+      expect(inputs.readinessDegraded).toBe(true);
+    });
+  });
+}
+
+test("an errored jobs read defers dispatch and slot-reclaim classification", async () => {
+  await withSeededDb(async (db) => {
+    const epicId = "fn-20-ready";
+    seedEpicRow(db, epicId, {
+      epic_number: 20,
+      status: "open",
+      tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+    });
+    const snap = await loadReconcileSnapshot(
+      db,
+      undefined,
+      undefined,
+      errorReadinessQuery("jobs"),
+    );
+    expect(snap.readinessDegraded).toBe(true);
+
+    const decision = reconcile(snap, makeState(), 1_000);
+    expect(decision.launches).toEqual([]);
+    expect(decision.slotOccupancy).toEqual([]);
+    expect(decision.slotOccupancyClears).toEqual([]);
+  });
+});
+
+test("a degraded readiness snapshot preserves an open occupancy row", () => {
+  const occupant = oneOccupant({
+    id: "fn-21-ready",
+    command: "zsh",
+    updated_at: 1,
+  });
+  const snap = makeSnapshot({
+    readinessDegraded: true,
+    epics: [readyEpic("fn-21-ready", "/repo-21")],
+    jobs: occupant.jobs,
+    livePaneIds: occupant.livePaneIds,
+    paneCommandById: occupant.paneCommandById,
+    slotOccupancyFailures: [{ verb: "close", id: "fn-21-ready" }],
+  });
+
+  const decision = reconcile(snap, makeState(), 1_000);
+  expect(decision.slotOccupancy).toEqual([]);
+  expect(decision.slotOccupancyClears).toEqual([]);
+});
+
+test("a genuinely empty jobs result still dispatches ready work", async () => {
+  await withSeededDb(async (db) => {
+    const epicId = "fn-22-fresh";
+    seedEpicRow(db, epicId, {
+      epic_number: 22,
+      status: "open",
+      tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+    });
+
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.readinessDegraded).toBe(false);
+    expect(snap.jobs.size).toBe(0);
+    expect(
+      reconcile(snap, makeState(), 1_000).launches.map((p) => p.key),
+    ).toEqual([`work::${epicId}.1`]);
+  });
+});
 
 test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcileSnapshot path", async () => {
   await withSeededDb(async (db) => {

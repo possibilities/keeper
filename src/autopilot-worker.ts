@@ -127,7 +127,7 @@ import {
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
-import { loadReadinessInputs } from "./readiness-inputs";
+import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
 import {
   type BaseDriftEntry,
   buildPlannedLaunchSpec,
@@ -7444,6 +7444,7 @@ export async function loadReconcileSnapshot(
   // pane shows a lingering wrapper/launcher command. Injectable so tests drive the
   // dead/live matrix without a real process; defaults to {@link isPidAlive}.
   pidAlive: (pid: number) => boolean = isPidAlive,
+  readinessQuery: ReadinessQuery = runQuery,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -7464,6 +7465,7 @@ export async function loadReconcileSnapshot(
   // MOVED (not copied) — the epics merge/dedup, the pending-dispatch builder, and
   // the git-seed gate all live in that ONE place now.
   const {
+    readinessDegraded,
     epics,
     jobs,
     subagentInvocations,
@@ -7471,7 +7473,7 @@ export async function loadReconcileSnapshot(
     pendingDispatches,
     unseededRoots,
     maxConcurrentPerRoot,
-  } = loadReadinessInputs(db);
+  } = loadReadinessInputs(db, readinessQuery);
 
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
@@ -7908,6 +7910,7 @@ export async function loadReconcileSnapshot(
   const worktreesRoot = worktreeMode ? `${homedir()}/worktrees` : undefined;
 
   return {
+    readinessDegraded,
     epics,
     jobs,
     subagentInvocations,
@@ -8436,6 +8439,9 @@ function main(): void {
         const snapshot = await loadReconcileSnapshot(db, () =>
           paneOps.listPanes(),
         );
+        if (snapshot.readinessDegraded) {
+          continue;
+        }
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
         // operator projection. Once per cycle, regardless of paused/playing (the
         // verdict is observational, not a dispatch action); the dep dedupes so a

@@ -57,7 +57,7 @@ import {
   type TmuxPaneOps,
 } from "./exec-backend";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
-import { loadReadinessInputs } from "./readiness-inputs";
+import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
 import { watchLoop } from "./wake-worker";
 
 /** Cap on kills per pulse — the blast-radius bound so a bad projection state
@@ -450,6 +450,7 @@ export interface AutoclosePulseDeps {
   now: () => number;
   postIntent: (msg: AutocloseIntentMessage) => void;
   noteLine: (line: string) => void;
+  readinessQuery?: ReadinessQuery;
 }
 
 /** Read the autopilot `paused` flag off the singleton `autopilot_state` row.
@@ -555,7 +556,10 @@ export async function autoclosePulse(
     return;
   }
 
-  const inputs = loadReadinessInputs(db);
+  const inputs = loadReadinessInputs(db, deps.readinessQuery);
+  if (inputs.readinessDegraded) {
+    return;
+  }
   const now = deps.now();
   const readiness = computeReadiness(
     inputs.epics,

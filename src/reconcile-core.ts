@@ -616,6 +616,9 @@ export function isInCooldown(
  * decides "did anything actually change this wake".
  */
 export interface ReconcileSnapshot {
+  /** The shared readiness-input read returned an ERROR frame. This is an
+   *  absence of observation, so dispatch and reap decisions defer this cycle. */
+  readinessDegraded: boolean;
   epics: Epic[];
   jobs: Map<string, Job>;
   subagentInvocations: SubagentInvocation[];
@@ -1953,6 +1956,19 @@ export function reconcile(
   state: ReconcileState,
   now: number,
 ): ReconcileDecision {
+  if (snapshot.readinessDegraded) {
+    return {
+      launches: [],
+      completedRowIds: new Set(),
+      baseDriftEntries: [],
+      worktreeFinalize: [],
+      worktreeSinkProvision: [],
+      finalizeFailureIds: new Set(),
+      slotOccupancy: [],
+      slotOccupancyClears: [],
+    };
+  }
+
   const launches: PlannedLaunch[] = [];
 
   // The EPHEMERAL cross-epic merge-gate defer map (epic id → its deferred lane
