@@ -1,0 +1,17 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T17:13:42.563000Z",
+  "depends_on": [
+    "fn-1281-radical-deterministic-test-gate.1",
+    "fn-1281-radical-deterministic-test-gate.2"
+  ],
+  "epic": "fn-1281-radical-deterministic-test-gate",
+  "id": "fn-1281-radical-deterministic-test-gate.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Enforce suite manifest budgets",
+  "updated_at": "2026-07-13T17:13:42.563000Z"
+}

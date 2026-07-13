@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T17:13:42.563000Z",
+  "depends_on": [],
+  "epic": "fn-1281-radical-deterministic-test-gate",
+  "id": "fn-1281-radical-deterministic-test-gate.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Canonicalize fast gate entrypoints",
+  "updated_at": "2026-07-13T17:13:42.563000Z"
+}
