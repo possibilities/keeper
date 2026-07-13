@@ -44,5 +44,5 @@ its distinct exit; overall bound enforced.
 - [ ] The verb never touches the DB and adds no RPC; problem-codes gains the restart family
 
 ## Done summary
-
+Added keeper daemon restart CLI verb: kickstarts the LaunchAgent via launchctl kickstart -k, then bounded-polls the socket for consecutive caught-up health probes with jittered backoff, distinguishing a launchd throttled respawn from a plain health timeout. Never opens the DB or adds an RPC. Documented the kickstart-failed/health-timeout/throttled-respawn problem-code family.
 ## Evidence
