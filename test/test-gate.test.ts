@@ -8,11 +8,22 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  classifyTestInvocation,
+  TEST_GATE_MARKER,
+  TEST_GATE_MARKER_VALUE,
+  TEST_GATE_REPLACEMENT,
+} from "../scripts/test-entrypoint";
+import {
   buildBunTestArgs,
+  buildBunTestEnv,
   isOrphanTestWorker,
   type ProcRow,
   parseEtimeSeconds,
 } from "../scripts/test-gate";
+
+test("the preload consumes the aggregate marker before test code runs", () => {
+  expect(process.env[TEST_GATE_MARKER]).toBeUndefined();
+});
 
 describe("buildBunTestArgs", () => {
   test("forwards args verbatim and injects --parallel default + --no-orphans", () => {
@@ -72,6 +83,85 @@ describe("buildBunTestArgs", () => {
       "--no-orphans",
       "--parallel=4",
     ]);
+  });
+});
+
+describe("test entrypoint invocation contract", () => {
+  const allow = [
+    {
+      name: "root cwd explicit file",
+      argv: ["bun", "test", "test/test-gate.test.ts"],
+    },
+    {
+      name: "plan package cwd explicit file",
+      argv: ["bun", "test", "test/harness.test.ts"],
+    },
+    {
+      name: "prompt package cwd explicit file",
+      argv: ["bun", "test", "test/parity.test.ts"],
+    },
+    {
+      name: "multiple explicit files",
+      argv: ["bun", "test", "test/a.test.ts", "test/b.test.ts"],
+    },
+    {
+      name: "file-scoped long name filter",
+      argv: [
+        "bun",
+        "test",
+        "--test-name-pattern",
+        "one case",
+        "test/a.test.ts",
+      ],
+    },
+    {
+      name: "file-scoped short name filter through a shell wrapper",
+      argv: ["timeout", "300", "bun", "test", "test/a.test.ts", "-t", "case"],
+    },
+  ];
+  for (const { name, argv } of allow) {
+    test(`allows ${name}`, () => {
+      expect(classifyTestInvocation(argv, undefined)).toEqual({
+        allowed: true,
+        posture: "explicit-files",
+      });
+    });
+  }
+
+  const deny = [
+    ["bare", ["bun", "test"]],
+    ["broad dot", ["bun", "test", "."]],
+    ["broad directory", ["bun", "test", "test"]],
+    ["broad glob", ["bun", "test", "test/*.test.*"]],
+    ["name only", ["bun", "test", "--test-name-pattern", "case"]],
+    ["test-shaped name only", ["bun", "test", "-t", "fake.test.ts"]],
+    ["watch only", ["bun", "test", "--watch"]],
+    ["coverage only", ["bun", "test", "--coverage"]],
+    ["wrapped aggregate", ["nohup", "bun", "test", "--coverage"]],
+  ] as const;
+  for (const [name, argv] of deny) {
+    test(`denies ${name}`, () => {
+      const decision = classifyTestInvocation(argv, undefined);
+      expect(decision.allowed).toBe(false);
+      if (!decision.allowed) {
+        expect(decision.message).toContain(TEST_GATE_REPLACEMENT);
+        expect(decision.message.split("\n").filter(Boolean)).toHaveLength(1);
+      }
+    });
+  }
+
+  test("allows a sanctioned aggregate child and pins its short-lived marker", () => {
+    expect(
+      classifyTestInvocation(["bun", "test", "test"], TEST_GATE_MARKER_VALUE),
+    ).toEqual({ allowed: true, posture: "named-gate" });
+    expect(
+      classifyTestInvocation(["bun", "test"], "ambient-junk").allowed,
+    ).toBe(false);
+
+    const env = buildBunTestEnv({ KEEP: "yes", [TEST_GATE_MARKER]: "stale" });
+    expect(env.KEEP).toBe("yes");
+    expect(env.BUN_FEATURE_FLAG_NO_ORPHANS).toBe("1");
+    expect(env[TEST_GATE_MARKER]).toBe(TEST_GATE_MARKER_VALUE);
   });
 });
 

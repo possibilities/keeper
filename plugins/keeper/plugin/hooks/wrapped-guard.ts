@@ -479,6 +479,51 @@ function classifyGitReset(resetArgs: string[]): string | null {
   return "git `reset` is permitted only in its `--soft` form for a wrapped worker (bare reset defaults to --mixed and unstages)";
 }
 
+const BUN_TEST_VALUE_FLAGS = new Set([
+  "--timeout",
+  "--rerun-each",
+  "--retry",
+  "--seed",
+  "--coverage-reporter",
+  "--coverage-dir",
+  "--test-name-pattern",
+  "-t",
+  "--reporter",
+  "--reporter-outfile",
+  "--max-concurrency",
+  "--path-ignore-patterns",
+  "--changed",
+  "--parallel",
+  "--parallel-delay",
+  "--shard",
+  "--preload",
+]);
+
+/** A direct Bun test is targeted only when it names a literal TypeScript test
+ * file. Directories, globs, and option-only/name/watch/coverage forms are broad
+ * discovery and must go through the named package gate. */
+function classifyBunTest(tokens: string[]): string | null {
+  const args = tokens.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "--") {
+      return args
+        .slice(i + 1)
+        .some((value) => !value.startsWith("-") && value.endsWith(".test.ts"))
+        ? null
+        : "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
+    }
+    if (BUN_TEST_VALUE_FLAGS.has(arg)) {
+      i += 1;
+      continue;
+    }
+    if (!arg.startsWith("-") && arg.endsWith(".test.ts")) {
+      return null;
+    }
+  }
+  return "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
+}
+
 /** Classify one already-wrapper-stripped segment's executable for a wrapped
  *  worker. Returns a deny reason, or null when the command is on the allowlist. */
 function classifyWrappedExecutable(tokens: string[]): string | null {
@@ -523,7 +568,7 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     ) {
       return "`bun` inline-eval (-e/--eval/-p/--print) is never permitted";
     }
-    if (sub === "test") return null;
+    if (sub === "test") return classifyBunTest(tokens);
     if (sub === "run") {
       const target = tokens[2];
       if (
@@ -608,8 +653,8 @@ function bashReason(violation: string): string {
     `wait/wait-for-stop/show-last-message/providers), \`keeper commit-work\`, ` +
     `\`keeper plan done\` + reads, \`keeper session state\`, the permitted git ` +
     `surface (add / commit / reset --soft / log / status / diff / show / rev-parse), ` +
-    `and the ` +
-    `test runner. Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
+    `and explicit \`bun test *.test.ts\` / named \`bun run test:gate\` gates. ` +
+    `Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
     `patch, cp/mv/tar, git apply/am, interpreters, and re-entrant shells — is denied.`
   );
 }

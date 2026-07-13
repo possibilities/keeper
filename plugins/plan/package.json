@@ -8,8 +8,9 @@
     "promote": "bash scripts/promote.sh",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check --no-errors-on-unmatched plugin/hooks test src",
-    "test": "bun test --timeout 30000",
-    "test:slow": "KEEPER_PLAN_RUN_SLOW=1 bun test --timeout 30000"
+    "test:gate": "bun ../../scripts/test-gate.ts --timeout 30000 ./test",
+    "test": "bun run test:gate",
+    "test:slow": "KEEPER_PLAN_RUN_SLOW=1 bun run test:gate"
   },
   "dependencies": {
     "yaml": "2.8.1"

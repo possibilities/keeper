@@ -288,13 +288,12 @@ test("gatePhaseCommand returns null for an empty script", () => {
   expect(gatePhaseCommand("   ")).toBeNull();
 });
 
-test("gatePhaseCommand extracts the real repo's gate phase without the opentui phase", () => {
+test("gatePhaseCommand extracts the real repo's named gate without the opentui phase", () => {
   const pkg = JSON.parse(
     readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"),
   ) as { scripts: { test: string } };
   const gate = gatePhaseCommand(pkg.scripts.test);
-  expect(gate).not.toBeNull();
-  expect(gate).toContain("test-gate");
+  expect(gate).toBe("bun run test:gate");
   expect(gate).not.toContain("test:opentui");
 });
 

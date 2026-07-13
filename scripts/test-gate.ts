@@ -29,6 +29,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { TEST_GATE_MARKER, TEST_GATE_MARKER_VALUE } from "./test-entrypoint";
 
 // Default per-run worker cap; `KEEPER_TEST_PARALLEL` overrides. Five keeps a
 // single run near its floor on this class of box (a few performance cores) while
@@ -185,6 +186,16 @@ function sweepOrphanTestWorkers(minAgeSec = ORPHAN_MIN_AGE_SEC): void {
   }
 }
 
+/** Build the bounded child's environment. The entrypoint marker is intentionally
+ * short-lived: every worker's first preload consumes it before test code runs. */
+export function buildBunTestEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    BUN_FEATURE_FLAG_NO_ORPHANS: "1",
+    [TEST_GATE_MARKER]: TEST_GATE_MARKER_VALUE,
+  };
+}
+
 /**
  * Spawn `bun test` with inherited stdio and return its exit code.
  */
@@ -193,10 +204,9 @@ async function runBunTest(args: string[]): Promise<number> {
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
-    // Env form of `--no-orphans`: it propagates to bun's `--parallel` worker
-    // children (the argv flag does not), so a worker dies with the coordinator
-    // even when the coordinator is SIGKILLed and its on-exit reaper never runs.
-    env: { ...process.env, BUN_FEATURE_FLAG_NO_ORPHANS: "1" },
+    // Both controls propagate to bun's `--parallel` workers: no-orphans bounds
+    // their lifetime, while the gate marker sanctions aggregate discovery.
+    env: buildBunTestEnv(process.env),
   });
   await child.exited;
   return child.exitCode ?? 1;

@@ -1,4 +1,5 @@
 [test]
-# Pin KEEPER_CONFIG_DIR to a seeded claude-only host matrix before any test runs,
-# so no plan test reads the live ~/.config/keeper (see test/preload-host-matrix.ts).
-preload = ["./test/preload-host-matrix.ts"]
+# Bare discovery runs the shared fail-fast sentinel. Keep the entrypoint first so
+# its aggregate marker is consumed before matrix setup or test code executes.
+root = "../../scripts/test-entrypoint.ts"
+preload = ["../../scripts/test-entrypoint.ts", "./test/preload-host-matrix.ts"]
