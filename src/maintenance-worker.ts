@@ -158,11 +158,12 @@ export function runBackupPass(
   dbPath: string,
   post: (msg: MaintenanceMessage) => void,
   isShuttingDown: () => boolean,
+  execute: (path: string) => BackupResult = backupDb,
 ): void {
   if (isShuttingDown()) return;
   let result: BackupResult;
   try {
-    result = backupDb(dbPath);
+    result = execute(dbPath);
   } catch (err) {
     // A backup throw is non-fatal: synthesize a failure result so main's
     // existing failure-log+page branch fires, then return. The next interval
@@ -172,6 +173,7 @@ export function runBackupPass(
       verified: false,
       bytes: 0,
       pruned: [],
+      cleanupFailures: [],
       error: err instanceof Error ? err.message : String(err),
     };
   }
@@ -194,10 +196,11 @@ export function runProbePass(
   dbPath: string,
   post: (msg: MaintenanceMessage) => void,
   isShuttingDown: () => boolean,
+  quickCheck?: () => string[],
 ): void {
   if (isShuttingDown()) return;
   const deps: IntegrityProbeDeps = {
-    quickCheck: liveQuickCheck(dbPath),
+    quickCheck: quickCheck ?? liveQuickCheck(dbPath),
     log: (message) => post({ kind: "maintenance-log", message }),
     page: (message) => post({ kind: "maintenance-page", message }),
   };

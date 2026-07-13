@@ -159,26 +159,133 @@ export function daemonUp(sockPath: string): {
   return isPidAlive(pid) ? { up: true, pid } : { up: false, pid: null };
 }
 
-/** Drop the stale `-wal`/`-shm` sidecars of the OLD file post-swap. */
-function dropSidecars(dbPath: string): void {
-  for (const suffix of ["-wal", "-shm"]) {
-    try {
-      rmSync(`${dbPath}${suffix}`, { force: true });
-    } catch {
-      /* best-effort */
-    }
-  }
+export interface ReclaimCommandPlan {
+  dbPath: string;
+  sockPath: string;
+  outputPath: string;
+  sidecarPaths: [string, string];
 }
 
-interface RunDeps {
+export function planReclaimCommand(
+  args: Pick<ParsedReclaimArgs, "dbPath" | "sockPath">,
+): ReclaimCommandPlan {
+  return {
+    dbPath: args.dbPath,
+    sockPath: args.sockPath,
+    outputPath: `${args.dbPath}.reclaim`,
+    sidecarPaths: [`${args.dbPath}-wal`, `${args.dbPath}-shm`],
+  };
+}
+
+export interface SidecarCleanupResult {
+  removed: string[];
+  failed: string[];
+}
+
+export function cleanupReclaimSidecars(
+  paths: readonly string[],
+  remove: (path: string) => void = (path) => rmSync(path, { force: true }),
+): SidecarCleanupResult {
+  const result: SidecarCleanupResult = { removed: [], failed: [] };
+  for (const path of paths) {
+    try {
+      remove(path);
+      result.removed.push(path);
+    } catch {
+      result.failed.push(path);
+    }
+  }
+  return result;
+}
+
+export interface ReclaimSwapResult {
+  ok: boolean;
+  error: string | null;
+  sidecars: SidecarCleanupResult;
+}
+
+export interface ReclaimSwapOperations {
+  sourceMode(path: string): number;
+  chmod(path: string, mode: number): void;
+  rename(source: string, destination: string): void;
+  remove(path: string): void;
+}
+
+function defaultSwapOperations(): ReclaimSwapOperations {
+  return {
+    sourceMode: (path) => statSync(path).mode,
+    chmod: chmodSync,
+    rename: renameSync,
+    remove: (path) => rmSync(path, { force: true }),
+  };
+}
+
+export function executeReclaimSwap(
+  plan: ReclaimCommandPlan,
+  operations: ReclaimSwapOperations = defaultSwapOperations(),
+): ReclaimSwapResult {
+  try {
+    try {
+      operations.chmod(
+        plan.outputPath,
+        operations.sourceMode(plan.dbPath) & 0o777,
+      );
+    } catch {
+      // Reclaim already copied permissions; this is a defensive best effort.
+    }
+    operations.rename(plan.outputPath, plan.dbPath);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      sidecars: { removed: [], failed: [] },
+    };
+  }
+  return {
+    ok: true,
+    error: null,
+    sidecars: cleanupReclaimSidecars(plan.sidecarPaths, operations.remove),
+  };
+}
+
+export interface ReclaimRunOperations {
+  daemonStatus(sockPath: string): { up: boolean; pid: number | null };
+  sourceExists(path: string): boolean;
+  sourceSize(path: string): number;
+  backup(path: string): ReturnType<typeof backupDb>;
+  reclaim(sourcePath: string, outputPath: string): ReturnType<typeof reclaimDb>;
+  verify(
+    sourcePath: string,
+    outputPath: string,
+  ): ReturnType<typeof verifyReclaim>;
+  removeOutput(path: string): void;
+  swap(plan: ReclaimCommandPlan): ReclaimSwapResult;
+}
+
+function defaultRunOperations(): ReclaimRunOperations {
+  return {
+    daemonStatus: daemonUp,
+    sourceExists: existsSync,
+    sourceSize: (path) => statSync(path).size,
+    backup: backupDb,
+    reclaim: reclaimDb,
+    verify: verifyReclaim,
+    removeOutput: (path) => rmSync(path, { force: true }),
+    swap: executeReclaimSwap,
+  };
+}
+
+export interface RunDeps {
   stdout: (s: string) => void;
   stderr: (s: string) => void;
   exit: (code: number) => never;
+  operations?: ReclaimRunOperations;
 }
 
 export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
-  const { dbPath, sockPath } = args;
-  const outputPath = `${dbPath}.reclaim`;
+  const plan = planReclaimCommand(args);
+  const { dbPath, sockPath, outputPath } = plan;
+  const operations = deps.operations ?? defaultRunOperations();
 
   if (args.dryRun) {
     deps.stdout(`${reclaimInstructions(outputPath, dbPath)}\n`);
@@ -186,7 +293,7 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
   }
 
   // 1. HARD-GUARD: refuse while the daemon holds the DB.
-  const daemon = daemonUp(sockPath);
+  const daemon = operations.daemonStatus(sockPath);
   if (daemon.up) {
     deps.stderr(
       `keeper reclaim: REFUSING — keeperd is up (pid ${daemon.pid} holds ${sockPath}.lock).\n` +
@@ -197,14 +304,14 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
     deps.exit(1);
   }
 
-  if (!existsSync(dbPath)) {
+  if (!operations.sourceExists(dbPath)) {
     deps.stderr(`keeper reclaim: source DB not found: ${dbPath}\n`);
     deps.exit(1);
   }
 
   let sourceBytes = 0;
   try {
-    sourceBytes = statSync(dbPath).size;
+    sourceBytes = operations.sourceSize(dbPath);
   } catch {
     /* informational */
   }
@@ -212,7 +319,7 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
 
   // 2. Pre-reclaim snapshot — the rollback until self-verify passes.
   deps.stdout("[reclaim] taking pre-reclaim snapshot (rollback) …\n");
-  const snap = backupDb(dbPath);
+  const snap = operations.backup(dbPath);
   if (!snap.verified || snap.snapshotPath === null) {
     deps.stderr(
       `keeper reclaim: pre-reclaim snapshot FAILED (${snap.error ?? "unknown"}) — refusing to proceed without a rollback.\n`,
@@ -223,7 +330,7 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
 
   // 3. Reclaim into the output file (VACUUM INTO + auto_vacuum bake + quick_check).
   deps.stdout("[reclaim] reclaiming (VACUUM INTO + quick_check) …\n");
-  const result = reclaimDb(dbPath, outputPath);
+  const result = operations.reclaim(dbPath, outputPath);
   if (!result.ok || result.outputPath === null) {
     deps.stderr(
       `keeper reclaim: reclaim FAILED (${result.error ?? "unknown"}) — DB untouched, snapshot kept at ${snap.snapshotPath}.\n`,
@@ -236,12 +343,12 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
 
   // 4. SELF-VERIFY before the swap — schema_version, auto_vacuum, row counts.
   deps.stdout("[reclaim] self-verifying reclaimed DB vs source …\n");
-  const verify = verifyReclaim(dbPath, outputPath);
+  const verify = operations.verify(dbPath, outputPath);
   if (!verify.ok) {
     // Leave the original DB untouched and the snapshot in place; delete the
     // unverified output so a later run isn't fooled by a stale reclaim.
     try {
-      rmSync(outputPath, { force: true });
+      operations.removeOutput(outputPath);
     } catch {
       /* best-effort */
     }
@@ -255,22 +362,18 @@ export function run(args: ParsedReclaimArgs, deps: RunDeps): void {
   );
 
   // 5. Atomic same-fs swap + drop the stale sidecars of the OLD file.
-  try {
-    // Preserve the source's permission bits across the swap (reclaimDb already
-    // chmod'd the output to match, but re-assert defensively).
-    try {
-      chmodSync(outputPath, statSync(dbPath).mode & 0o777);
-    } catch {
-      /* best-effort */
-    }
-    renameSync(outputPath, dbPath);
-  } catch (err) {
+  const swap = operations.swap(plan);
+  if (!swap.ok) {
     deps.stderr(
-      `keeper reclaim: atomic swap FAILED (${err instanceof Error ? err.message : String(err)}) — verified output left at ${outputPath}, original DB still in place; snapshot at ${snap.snapshotPath}.\n`,
+      `keeper reclaim: atomic swap FAILED (${swap.error ?? "unknown"}) — verified output left at ${outputPath}, original DB still in place; snapshot at ${snap.snapshotPath}.\n`,
     );
     deps.exit(1);
   }
-  dropSidecars(dbPath);
+  if (swap.sidecars.failed.length > 0) {
+    deps.stderr(
+      `keeper reclaim: swapped successfully but stale sidecar cleanup FAILED for: ${swap.sidecars.failed.join(", ")} (safe to retry cleanup).\n`,
+    );
+  }
 
   const saved = sourceBytes - result.outputBytes;
   deps.stdout(

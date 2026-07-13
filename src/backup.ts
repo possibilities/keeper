@@ -167,13 +167,9 @@ export const BACKUP_CATCHUP_DELAY_MS = 45_000;
  * Pure read of the dir; never throws (a missing dir or unparseable name ⇒
  * `null`).
  */
-export function newestSnapshotMs(backupDir: string): number | null {
-  let names: string[];
-  try {
-    names = readdirSync(backupDir);
-  } catch {
-    return null; // dir missing ⇒ no snapshots
-  }
+export function newestSnapshotMsFromNames(
+  names: readonly string[],
+): number | null {
   const newest = names
     .filter((n) => /^keeper-\d{8}T\d{6}\.db$/.test(n))
     .sort()
@@ -196,6 +192,22 @@ export function newestSnapshotMs(backupDir: string): number | null {
   return Number.isNaN(ts) ? null : ts;
 }
 
+export function newestSnapshotMs(backupDir: string): number | null {
+  try {
+    return newestSnapshotMsFromNames(readdirSync(backupDir));
+  } catch {
+    return null;
+  }
+}
+
+export function isCatchUpDueFromNewest(
+  newestMs: number | null,
+  nowMs: number,
+  intervalMs: number = BACKUP_INTERVAL_MS,
+): boolean {
+  return newestMs === null || nowMs - newestMs >= intervalMs;
+}
+
 /**
  * Whether a boot-time catch-up backup is due (fn-753): true iff there is NO
  * newest snapshot, OR the newest is at least `intervalMs` old as of `nowMs`.
@@ -208,9 +220,7 @@ export function isCatchUpDue(
   nowMs: number,
   intervalMs: number = BACKUP_INTERVAL_MS,
 ): boolean {
-  const newest = newestSnapshotMs(backupDir);
-  if (newest === null) return true;
-  return nowMs - newest >= intervalMs;
+  return isCatchUpDueFromNewest(newestSnapshotMs(backupDir), nowMs, intervalMs);
 }
 
 /** Outcome of a single backup run — pure data the caller logs / asserts. */
@@ -223,6 +233,8 @@ export interface BackupResult {
   bytes: number;
   /** Snapshot paths pruned this run (oldest beyond the retention count). */
   pruned: string[];
+  /** Paths whose best-effort cleanup failed. */
+  cleanupFailures: string[];
   /** Human-readable error when `verified` is false; `null` on success. */
   error: string | null;
 }
@@ -239,6 +251,8 @@ export interface BackupOptions {
    * compacts to a sizable copy, so the default is conservative.
    */
   retain?: number;
+  /** Physical storage boundary; production uses SQLite and the filesystem. */
+  operations?: BackupStorageOperations;
 }
 
 /**
@@ -288,30 +302,181 @@ export function isVerifiedOk(rows: string[]): boolean {
  * matching the `keeper-<stamp>.db` shape are considered, so an operator's
  * hand-placed file in the dir is never deleted.
  */
+export interface PruneResult {
+  pruned: string[];
+  failed: string[];
+}
+
+export function planSnapshotPrune(
+  backupDir: string,
+  names: readonly string[],
+  retain: number,
+): string[] {
+  return names
+    .filter((name) => /^keeper-\d{8}T\d{6}\.db$/.test(name))
+    .sort()
+    .reverse()
+    .slice(Math.max(0, retain))
+    .map((name) => join(backupDir, name));
+}
+
+export function executeSnapshotPrune(
+  stale: readonly string[],
+  remove: (path: string) => void,
+): PruneResult {
+  const result: PruneResult = { pruned: [], failed: [] };
+  for (const path of stale) {
+    try {
+      remove(path);
+      result.pruned.push(path);
+    } catch {
+      result.failed.push(path);
+    }
+  }
+  return result;
+}
+
 export function pruneSnapshots(backupDir: string, retain: number): string[] {
   let names: string[];
   try {
     names = readdirSync(backupDir);
   } catch {
-    return []; // dir missing ⇒ nothing to prune
+    return [];
   }
-  const snapshots = names
-    .filter((n) => /^keeper-\d{8}T\d{6}\.db$/.test(n))
-    .sort()
-    .reverse(); // newest (lexically-greatest stamp) first
-  const stale = snapshots.slice(Math.max(0, retain));
-  const pruned: string[] = [];
-  for (const name of stale) {
-    const path = join(backupDir, name);
-    try {
-      rmSync(path, { force: true });
-      pruned.push(path);
-    } catch {
-      // Best-effort: a prune failure (perm, race) must not fail the backup
-      // itself — the snapshot we just verified is the load-bearing output.
-    }
+  return executeSnapshotPrune(
+    planSnapshotPrune(backupDir, names, retain),
+    (path) => rmSync(path, { force: true }),
+  ).pruned;
+}
+
+export interface BackupPlan {
+  sourcePath: string;
+  backupDir: string;
+  snapshotPath: string;
+  retain: number;
+}
+
+export interface BackupStorageOperations {
+  ensureDirectory(path: string): void;
+  createSnapshot(sourcePath: string, snapshotPath: string): void;
+  verify(snapshotPath: string): string[];
+  remove(path: string): void;
+  size(path: string): number;
+  list(path: string): string[];
+}
+
+export function planBackup(
+  dbPath: string,
+  options: Pick<BackupOptions, "backupDir" | "now" | "retain"> = {},
+): BackupPlan {
+  const backupDir = options.backupDir ?? resolveBackupDir(dbPath);
+  return {
+    sourcePath: dbPath,
+    backupDir,
+    snapshotPath: join(backupDir, snapshotName(options.now ?? new Date())),
+    retain: options.retain ?? DEFAULT_BACKUP_RETENTION,
+  };
+}
+
+function defaultBackupStorage(): BackupStorageOperations {
+  return {
+    ensureDirectory: (path) => mkdirSync(path, { recursive: true }),
+    createSnapshot: (sourcePath, snapshotPath) => {
+      const src = new Database(sourcePath, { readonly: true });
+      try {
+        src.run(`VACUUM INTO '${snapshotPath.replace(/'/g, "''")}'`);
+      } finally {
+        src.close();
+      }
+    },
+    verify: verifySnapshot,
+    remove: (path) => rmSync(path, { force: true }),
+    size: (path) => statSync(path).size,
+    list: readdirSync,
+  };
+}
+
+function cleanupPath(
+  path: string,
+  operations: { remove(path: string): void },
+): string[] {
+  try {
+    operations.remove(path);
+    return [];
+  } catch {
+    return [path];
   }
-  return pruned;
+}
+
+export function executeBackupPlan(
+  plan: BackupPlan,
+  operations: BackupStorageOperations,
+): BackupResult {
+  operations.ensureDirectory(plan.backupDir);
+  try {
+    operations.createSnapshot(plan.sourcePath, plan.snapshotPath);
+  } catch (err) {
+    return {
+      snapshotPath: null,
+      verified: false,
+      bytes: 0,
+      pruned: [],
+      cleanupFailures: cleanupPath(plan.snapshotPath, operations),
+      error: `VACUUM INTO failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  let rows: string[];
+  try {
+    rows = operations.verify(plan.snapshotPath);
+  } catch (err) {
+    return {
+      snapshotPath: null,
+      verified: false,
+      bytes: 0,
+      pruned: [],
+      cleanupFailures: cleanupPath(plan.snapshotPath, operations),
+      error: `snapshot verification threw (deleted): ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!isVerifiedOk(rows)) {
+    return {
+      snapshotPath: null,
+      verified: false,
+      bytes: 0,
+      pruned: [],
+      cleanupFailures: cleanupPath(plan.snapshotPath, operations),
+      error: `snapshot failed integrity_check (deleted): ${rows.slice(0, 5).join("; ")}`,
+    };
+  }
+
+  let bytes = 0;
+  try {
+    bytes = operations.size(plan.snapshotPath);
+  } catch {
+    // Size is informational only.
+  }
+  let prune: PruneResult = { pruned: [], failed: [] };
+  try {
+    prune = executeSnapshotPrune(
+      planSnapshotPrune(
+        plan.backupDir,
+        operations.list(plan.backupDir),
+        plan.retain,
+      ),
+      operations.remove,
+    );
+  } catch {
+    // Listing failure does not invalidate a verified snapshot.
+  }
+  return {
+    snapshotPath: plan.snapshotPath,
+    verified: true,
+    bytes,
+    pruned: prune.pruned,
+    cleanupFailures: prune.failed,
+    error: null,
+  };
 }
 
 /**
@@ -331,92 +496,10 @@ export function backupDb(
   dbPath: string,
   options: BackupOptions = {},
 ): BackupResult {
-  const backupDir = options.backupDir ?? resolveBackupDir(dbPath);
-  const now = options.now ?? new Date();
-  const retain = options.retain ?? DEFAULT_BACKUP_RETENTION;
-
-  mkdirSync(backupDir, { recursive: true });
-  const snapshotPath = join(backupDir, snapshotName(now));
-
-  // VACUUM INTO on a DEDICATED read-only source connection — never the daemon's
-  // writer connection. Read-only on the source ⇒ no writer-lock contention.
-  // The destination is a path literal; quote single-quotes defensively even
-  // though our names never contain them.
-  const src = new Database(dbPath, { readonly: true });
-  try {
-    const quoted = snapshotPath.replace(/'/g, "''");
-    src.run(`VACUUM INTO '${quoted}'`);
-  } catch (err) {
-    // A VACUUM INTO failure (disk full, source mid-corruption) leaves no usable
-    // snapshot. Clean up any partial file and report failure — do not page or
-    // throw here; the caller decides escalation.
-    try {
-      rmSync(snapshotPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
-    return {
-      snapshotPath: null,
-      verified: false,
-      bytes: 0,
-      pruned: [],
-      error: `VACUUM INTO failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    };
-  } finally {
-    src.close();
-  }
-
-  // VERIFY — a backup is only a backup if it opens and passes integrity_check.
-  let verifyRows: string[];
-  try {
-    verifyRows = verifySnapshot(snapshotPath);
-  } catch (err) {
-    try {
-      rmSync(snapshotPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
-    return {
-      snapshotPath: null,
-      verified: false,
-      bytes: 0,
-      pruned: [],
-      error: `snapshot verification threw (deleted): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    };
-  }
-
-  if (!isVerifiedOk(verifyRows)) {
-    // A snapshot that fails integrity_check is worse than none — delete it.
-    try {
-      rmSync(snapshotPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
-    return {
-      snapshotPath: null,
-      verified: false,
-      bytes: 0,
-      pruned: [],
-      error: `snapshot failed integrity_check (deleted): ${verifyRows
-        .slice(0, 5)
-        .join("; ")}`,
-    };
-  }
-
-  let bytes = 0;
-  try {
-    bytes = statSync(snapshotPath).size;
-  } catch {
-    /* size is informational only */
-  }
-
-  const pruned = pruneSnapshots(backupDir, retain);
-
-  return { snapshotPath, verified: true, bytes, pruned, error: null };
+  return executeBackupPlan(
+    planBackup(dbPath, options),
+    options.operations ?? defaultBackupStorage(),
+  );
 }
 
 /** Outcome of a single {@link reclaimDb} run — pure data the caller logs. */
@@ -429,6 +512,8 @@ export interface ReclaimResult {
   sourceBytes: number;
   /** Byte size of the reclaimed output (0 on failure). */
   outputBytes: number;
+  /** Output paths whose best-effort cleanup failed. */
+  cleanupFailures: string[];
   /** Human-readable error when `ok` is false; `null` on success. */
   error: string | null;
 }
@@ -464,133 +549,175 @@ export interface ReclaimResult {
  * `-wal`/`-shm` cleanup (see {@link reclaimInstructions}); this function only
  * produces and gates the output.
  */
-export function reclaimDb(dbPath: string, outputPath: string): ReclaimResult {
-  let sourceBytes = 0;
-  let sourceMode: number | null = null;
+export interface ReclaimPlan {
+  sourcePath: string;
+  outputPath: string;
+}
+
+export interface ReclaimOutputInspection {
+  quickCheckRows: string[];
+  autoVacuum: number;
+}
+
+export interface ReclaimStorageOperations {
+  sourceInfo(path: string): { bytes: number; mode: number };
+  remove(path: string): void;
+  createReclaimed(sourcePath: string, outputPath: string): void;
+  inspectOutput(path: string): ReclaimOutputInspection;
+  chmod(path: string, mode: number): void;
+  size(path: string): number;
+}
+
+export function planReclaim(
+  sourcePath: string,
+  outputPath: string,
+): ReclaimPlan {
+  return { sourcePath, outputPath };
+}
+
+export function decideReclaimOutput(
+  inspection: ReclaimOutputInspection,
+): string | null {
+  if (!isVerifiedOk(inspection.quickCheckRows)) {
+    return "reclaimed output failed quick_check (deleted)";
+  }
+  if (inspection.autoVacuum !== 2) {
+    return `reclaimed output did not bake auto_vacuum=INCREMENTAL (got ${inspection.autoVacuum}, deleted)`;
+  }
+  return null;
+}
+
+function defaultReclaimStorage(): ReclaimStorageOperations {
+  return {
+    sourceInfo: (path) => {
+      const st = statSync(path);
+      return { bytes: st.size, mode: st.mode };
+    },
+    remove: (path) => rmSync(path, { force: true }),
+    createReclaimed: (sourcePath, outputPath) => {
+      const src = new Database(sourcePath, { readonly: true });
+      try {
+        src.run(`VACUUM INTO '${outputPath.replace(/'/g, "''")}'`);
+      } finally {
+        src.close();
+      }
+    },
+    inspectOutput: (path) => {
+      const out = new Database(path, { readonly: true });
+      try {
+        const qc = out.query("PRAGMA quick_check").all() as Record<
+          string,
+          unknown
+        >[];
+        const quickCheckRows = qc.map((row) =>
+          String(
+            "quick_check" in row ? row.quick_check : Object.values(row)[0],
+          ),
+        );
+        const av = out.query("PRAGMA auto_vacuum").get() as {
+          auto_vacuum?: unknown;
+        } | null;
+        return {
+          quickCheckRows,
+          autoVacuum: typeof av?.auto_vacuum === "number" ? av.auto_vacuum : 0,
+        };
+      } finally {
+        out.close();
+      }
+    },
+    chmod: chmodSync,
+    size: (path) => statSync(path).size,
+  };
+}
+
+export function executeReclaimPlan(
+  plan: ReclaimPlan,
+  operations: ReclaimStorageOperations,
+): ReclaimResult {
+  let source: { bytes: number; mode: number };
   try {
-    const st = statSync(dbPath);
-    sourceBytes = st.size;
-    sourceMode = st.mode;
+    source = operations.sourceInfo(plan.sourcePath);
   } catch {
     return {
       outputPath: null,
       ok: false,
       sourceBytes: 0,
       outputBytes: 0,
-      error: `source DB not readable: ${dbPath}`,
+      cleanupFailures: [],
+      error: `source DB not readable: ${plan.sourcePath}`,
     };
   }
 
-  // Remove any stale output from an interrupted prior attempt so VACUUM INTO
-  // (which refuses to overwrite an existing file) does not error.
   try {
-    rmSync(outputPath, { force: true });
+    operations.remove(plan.outputPath);
   } catch {
-    /* best-effort */
+    // Creation reports a useful error if an existing output cannot be removed.
   }
-
-  // VACUUM INTO on a DEDICATED read-only source connection — no writer-lock
-  // contention with a concurrent process. The output INHERITS the source's
-  // auto_vacuum mode (the live DB is born auto_vacuum=INCREMENTAL=2), so the
-  // generated file reads back auto_vacuum=2 with NO explicit bake. A bake here
-  // would be both redundant AND illegal: `PRAGMA auto_vacuum=...` writes the DB
-  // header, which throws "attempt to write a readonly database" on a read-only
-  // handle whose stored mode already differs. The post-VACUUM self-verify gate
-  // asserts the inherited mode is 2, deleting any output that did not inherit.
-  const src = new Database(dbPath, { readonly: true });
   try {
-    const quoted = outputPath.replace(/'/g, "''");
-    src.run(`VACUUM INTO '${quoted}'`);
+    operations.createReclaimed(plan.sourcePath, plan.outputPath);
   } catch (err) {
-    try {
-      rmSync(outputPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
     return {
       outputPath: null,
       ok: false,
-      sourceBytes,
+      sourceBytes: source.bytes,
       outputBytes: 0,
-      error: `VACUUM INTO failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      cleanupFailures: cleanupPath(plan.outputPath, operations),
+      error: `VACUUM INTO failed: ${err instanceof Error ? err.message : String(err)}`,
     };
-  } finally {
-    src.close();
   }
 
-  // GATE on quick_check + assert the auto_vacuum mode actually baked in. A
-  // failing output is deleted (a corrupt reclaim is worse than none).
-  let quickOk = false;
-  let autoVacuum = 0;
+  let inspection: ReclaimOutputInspection;
   try {
-    const out = new Database(outputPath, { readonly: true });
-    try {
-      const qc = out.query("PRAGMA quick_check").get() as {
-        quick_check?: unknown;
-      } | null;
-      const v = qc && "quick_check" in qc ? qc.quick_check : null;
-      quickOk = v === INTEGRITY_CHECK_OK;
-      const av = out.query("PRAGMA auto_vacuum").get() as {
-        auto_vacuum?: unknown;
-      } | null;
-      autoVacuum = typeof av?.auto_vacuum === "number" ? av.auto_vacuum : 0;
-    } finally {
-      out.close();
-    }
+    inspection = operations.inspectOutput(plan.outputPath);
   } catch (err) {
-    try {
-      rmSync(outputPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
     return {
       outputPath: null,
       ok: false,
-      sourceBytes,
+      sourceBytes: source.bytes,
       outputBytes: 0,
-      error: `quick_check threw (deleted): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      cleanupFailures: cleanupPath(plan.outputPath, operations),
+      error: `quick_check threw (deleted): ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-
-  if (!quickOk || autoVacuum !== 2) {
-    try {
-      rmSync(outputPath, { force: true });
-    } catch {
-      /* best-effort */
-    }
+  const refusal = decideReclaimOutput(inspection);
+  if (refusal !== null) {
     return {
       outputPath: null,
       ok: false,
-      sourceBytes,
+      sourceBytes: source.bytes,
       outputBytes: 0,
-      error: !quickOk
-        ? "reclaimed output failed quick_check (deleted)"
-        : `reclaimed output did not bake auto_vacuum=INCREMENTAL (got ${autoVacuum}, deleted)`,
+      cleanupFailures: cleanupPath(plan.outputPath, operations),
+      error: refusal,
     };
   }
 
-  // Match source permissions so the atomic mv preserves them. Best-effort: a
-  // chmod failure does not invalidate the (verified) reclaim.
-  if (sourceMode !== null) {
-    try {
-      chmodSync(outputPath, sourceMode & 0o777);
-    } catch {
-      /* best-effort */
-    }
+  try {
+    operations.chmod(plan.outputPath, source.mode & 0o777);
+  } catch {
+    // Permissions are best-effort and reasserted by the swap.
   }
-
   let outputBytes = 0;
   try {
-    outputBytes = statSync(outputPath).size;
+    outputBytes = operations.size(plan.outputPath);
   } catch {
-    /* size is informational only */
+    // Size is informational only.
   }
+  return {
+    outputPath: plan.outputPath,
+    ok: true,
+    sourceBytes: source.bytes,
+    outputBytes,
+    cleanupFailures: [],
+    error: null,
+  };
+}
 
-  return { outputPath, ok: true, sourceBytes, outputBytes, error: null };
+export function reclaimDb(
+  dbPath: string,
+  outputPath: string,
+  operations: ReclaimStorageOperations = defaultReclaimStorage(),
+): ReclaimResult {
+  return executeReclaimPlan(planReclaim(dbPath, outputPath), operations);
 }
 
 /**
@@ -658,6 +785,60 @@ export interface ReclaimVerifyResult {
   error: string | null;
 }
 
+export interface ReclaimVerificationSnapshot {
+  schemaVersion: number | null;
+  autoVacuum: number;
+  tableRowCounts: Record<string, number>;
+}
+
+export function decideReclaimVerification(
+  source: ReclaimVerificationSnapshot,
+  output: ReclaimVerificationSnapshot,
+): ReclaimVerifyResult {
+  const base = {
+    sourceSchemaVersion: source.schemaVersion,
+    outputSchemaVersion: output.schemaVersion,
+    outputAutoVacuum: output.autoVacuum,
+  };
+  if (
+    source.schemaVersion === null ||
+    output.schemaVersion === null ||
+    source.schemaVersion !== output.schemaVersion
+  ) {
+    return {
+      ...base,
+      ok: false,
+      error: `schema_version mismatch (source=${source.schemaVersion}, output=${output.schemaVersion})`,
+    };
+  }
+  if (output.autoVacuum !== 2) {
+    return {
+      ...base,
+      ok: false,
+      error: `output auto_vacuum is ${output.autoVacuum}, expected 2 (INCREMENTAL)`,
+    };
+  }
+  const srcTables = Object.keys(source.tableRowCounts).sort();
+  const outTables = Object.keys(output.tableRowCounts).sort();
+  if (srcTables.join(",") !== outTables.join(",")) {
+    return {
+      ...base,
+      ok: false,
+      error: `table set differs (source: ${srcTables.join("|")}; output: ${outTables.join("|")})`,
+    };
+  }
+  for (const table of srcTables) {
+    if (source.tableRowCounts[table] !== output.tableRowCounts[table]) {
+      return {
+        ...base,
+        ok: false,
+        error: `row-count mismatch on '${table}' (source=${source.tableRowCounts[table]}, output=${output.tableRowCounts[table]})`,
+      };
+    }
+  }
+  return { ...base, ok: true, error: null };
+}
+
 /**
  * Self-verify a freshly-{@link reclaimDb}'d OUTPUT against its SOURCE before the
  * operator swaps it in: the reclaimed copy must open clean, carry the SAME
@@ -682,61 +863,22 @@ export function verifyReclaim(
     src = new Database(sourcePath, { readonly: true });
     out = new Database(outputPath, { readonly: true });
 
-    const sourceSchemaVersion = readSchemaVersion(src);
-    const outputSchemaVersion = readSchemaVersion(out);
     const avRow = out.query("PRAGMA auto_vacuum").get() as {
       auto_vacuum?: unknown;
     } | null;
-    const outputAutoVacuum =
-      typeof avRow?.auto_vacuum === "number" ? avRow.auto_vacuum : 0;
-
-    const base: Omit<ReclaimVerifyResult, "ok" | "error"> = {
-      sourceSchemaVersion,
-      outputSchemaVersion,
-      outputAutoVacuum,
-    };
-
-    if (
-      sourceSchemaVersion === null ||
-      outputSchemaVersion === null ||
-      sourceSchemaVersion !== outputSchemaVersion
-    ) {
-      return {
-        ...base,
-        ok: false,
-        error: `schema_version mismatch (source=${sourceSchemaVersion}, output=${outputSchemaVersion})`,
-      };
-    }
-    if (outputAutoVacuum !== 2) {
-      return {
-        ...base,
-        ok: false,
-        error: `output auto_vacuum is ${outputAutoVacuum}, expected 2 (INCREMENTAL)`,
-      };
-    }
-
-    const srcCounts = readTableRowCounts(src);
-    const outCounts = readTableRowCounts(out);
-    const srcTables = Object.keys(srcCounts).sort();
-    const outTables = Object.keys(outCounts).sort();
-    if (srcTables.join(",") !== outTables.join(",")) {
-      return {
-        ...base,
-        ok: false,
-        error: `table set differs (source: ${srcTables.join("|")}; output: ${outTables.join("|")})`,
-      };
-    }
-    for (const t of srcTables) {
-      if (srcCounts[t] !== outCounts[t]) {
-        return {
-          ...base,
-          ok: false,
-          error: `row-count mismatch on '${t}' (source=${srcCounts[t]}, output=${outCounts[t]})`,
-        };
-      }
-    }
-
-    return { ...base, ok: true, error: null };
+    return decideReclaimVerification(
+      {
+        schemaVersion: readSchemaVersion(src),
+        autoVacuum: 0,
+        tableRowCounts: readTableRowCounts(src),
+      },
+      {
+        schemaVersion: readSchemaVersion(out),
+        autoVacuum:
+          typeof avRow?.auto_vacuum === "number" ? avRow.auto_vacuum : 0,
+        tableRowCounts: readTableRowCounts(out),
+      },
+    );
   } catch (err) {
     return {
       ok: false,
