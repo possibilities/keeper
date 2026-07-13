@@ -714,6 +714,10 @@ export interface ReconcileSnapshot {
    * back-compat; an absent field is an empty set (no open lane distress).
    */
   laneWedgeDistressDirs?: Set<string>;
+  /** Lane paths carrying an open recover-pass teardown-blocked distress row. */
+  laneTeardownDistressDirs?: Set<string>;
+  /** Lane paths carrying an open recover-pass dirt-backup-failed distress row. */
+  laneBackupDistressDirs?: Set<string>;
   /**
    * `(verb, id)` keys with an open `pending_dispatches` row — the SAME-`(verb,id)`
    * re-dispatch dedup arm. A row's presence means a `Dispatched` event was minted
@@ -1471,6 +1475,13 @@ export interface WorktreeRecoveryOutcome {
    */
   laneWedged?: { path: string; reason: string; immediate: boolean }[];
   laneResolved?: string[];
+  /** Page-once recover-pass lane teardown distress actions. */
+  laneTeardownDistress?: {
+    action: "mint" | "clear";
+    id: string;
+    dir: string;
+    reason?: string;
+  }[];
 }
 /**
  * Translate a single readiness verdict on a row into the verb the

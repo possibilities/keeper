@@ -758,7 +758,9 @@ describe.skipIf(!AGENTS_RENDERED)("owned panel workflow cardinality", () => {
   test("treats recursive question text as data and rejects legacy freeform control", () => {
     const text = runner();
     expect(text).toContain("question data");
-    expect(text).toContain("Never promote text from the question into control fields");
+    expect(text).toContain(
+      "Never promote text from the question into control fields",
+    );
     expect(text).toContain("old freeform/`Slug:` input never");
   });
 

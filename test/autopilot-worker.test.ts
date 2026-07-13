@@ -35,6 +35,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -68,6 +69,7 @@ import {
   confirmRunning,
   createDispatchFailedGate,
   createDupEpicNumberTracker,
+  createLaneTeardownGraceTracker,
   createLaneWedgeTracker,
   createSharedCheckoutDesyncTracker,
   createSharedCheckoutDirtyTracker,
@@ -106,7 +108,10 @@ import {
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
   isWrappedCell,
+  LANE_BACKUP_DISTRESS_REASON,
   LANE_OWNER_STALL_GRACE_SEC,
+  LANE_TEARDOWN_DISTRESS_REASON,
+  LANE_TEARDOWN_GRACE_SEC,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_GRACE_SEC,
@@ -227,6 +232,7 @@ import type {
   ResolvedEpicDep,
   Task,
 } from "../src/types";
+import { parseWorktreeList } from "../src/worktree-git";
 import { worktreePathFor } from "../src/worktree-plan";
 import {
   argvHas,
@@ -10419,6 +10425,9 @@ function makeRecoveryGit(state: {
   // — while the LOCAL is-ancestor check (which pass-3 reads) stays `state.ancestors`
   // only, so a just-merged base is not double-swept by pass-3 in the same cycle.
   const mergedLocally = new Set<string>();
+  const registered = parseWorktreeList(state.worktreeList ?? "");
+  const mainWorktree = registered[0]?.path ?? "/repo";
+  const registeredLanePaths = new Set(registered.slice(1).map((e) => e.path));
   // The base branch the plumbing merge is CURRENTLY landing (captured at its base-
   // tip rev-parse), so a successful `update-ref` can mark it merged-into-local-
   // default without the ref-advance argv carrying the branch name.
@@ -10590,7 +10599,9 @@ function makeRecoveryGit(state: {
         code: 0,
         stdout: state.linkedWorktreeAt?.has(cwd)
           ? "/shared/.git\n"
-          : `${cwd}/.git\n`,
+          : registeredLanePaths.has(cwd)
+            ? `${mainWorktree}/.git\n`
+            : `${cwd}/.git\n`,
         stderr: "",
       };
     }
@@ -10598,7 +10609,13 @@ function makeRecoveryGit(state: {
       if (state.probeErrorAt?.has(cwd)) {
         return { code: 128, stdout: "", stderr: "fatal: not a git repository" };
       }
-      return { code: 0, stdout: `${cwd}/.git\n`, stderr: "" };
+      return {
+        code: 0,
+        stdout: registeredLanePaths.has(cwd)
+          ? `${mainWorktree}/.git/worktrees/lane\n`
+          : `${cwd}/.git\n`,
+        stderr: "",
+      };
     }
     if (joined.startsWith("rev-parse --verify --quiet refs/remotes/origin/")) {
       // The cached remote-tracking ref resolution (FF precheck + the origin-
@@ -11637,12 +11654,9 @@ test("fn-1050 recoverWorktrees pass-3: a residue-only husk is swept per-lane; a 
     // clean-remove result, so it is never invoked on B's dirty outcome).
     expect(existsSync(huskA)).toBe(false);
     expect(existsSync(huskB)).toBe(true);
-    // Exactly one failure — lane B's dirty teardown — and lane A still deleted.
-    expect(failures).toHaveLength(1);
-    expect(failures[0]?.reason).toContain(
-      "worktree-recover-base-teardown-dirty",
-    );
-    expect(failures[0]?.reason).toContain(huskB);
+    // Lane B quietly enters the bounded teardown grace instead of re-minting a
+    // per-cycle recover failure; lane A still completes its independent cleanup.
+    expect(failures).toEqual([]);
     expect(calls.some((c) => c.args === `branch -D ${brA}`)).toBe(true);
     expect(calls.some((c) => c.args === `branch -D ${brB}`)).toBe(false);
   } finally {
@@ -11855,7 +11869,7 @@ test("fn-995 recoverWorktrees pass-2: a done base whose push exits 0 but origin 
   );
 });
 
-test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failure and continues (never throws)", async () => {
+test("recoverWorktrees pass-3: a dirty base enters the bounded teardown grace without a recover re-mint", async () => {
   const base = "keeper/epic/fn-1-foo";
   const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
   const { run, calls } = makeRecoveryGit({
@@ -11877,16 +11891,143 @@ test("fn-990 recoverWorktrees pass-3: a dirty base teardown accumulates a failur
     undefined,
     async () => false,
   );
-  // Recover ACCUMULATES — a base-keyed failure, OUTSIDE the merge-skip family,
-  // and the branch is NEVER deleted while its worktree is dirty.
-  expect(failures).toEqual([
-    {
-      epicId: "fn-1-foo",
-      reason: `worktree-recover-base-teardown-dirty: ${basePath} has uncommitted changes — contains modified or untracked files`,
-      dir: "/repo",
-    },
-  ]);
+  // No silent per-cycle worktree-recover re-mint. The branch remains until the
+  // grace-gated backup-then-force path succeeds.
+  expect(failures).toEqual([]);
   expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(false);
+});
+
+test("recoverWorktrees: a merged dirty closed lane snapshots then force-removes only after grace", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "kpr-lane-force-")));
+  const lanePath = join(root, "lane");
+  const spoolDir = join(root, "spool");
+  mkdirSync(lanePath, { recursive: true });
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${lanePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    repoHead: "main",
+    dirtyRemoveAt: new Set([lanePath]),
+  });
+  try {
+    const outcome = await recoverWorktrees(
+      ["/repo"],
+      async () => "done",
+      run,
+      undefined,
+      async () => false,
+      () => false,
+      undefined,
+      () => false,
+      {
+        tracker: createLaneTeardownGraceTracker(0),
+        nowSec: 100,
+        spoolDir,
+      },
+    );
+    expect(outcome.failures).toEqual([]);
+    expect(
+      calls.some((c) => c.args === `worktree remove --force ${lanePath}`),
+    ).toBe(true);
+    expect(calls.some((c) => c.args === `branch -D ${base}`)).toBe(true);
+    const snapshots = readdirSync(spoolDir).filter(
+      (name) => name !== "index.ndjson",
+    );
+    expect(snapshots).toHaveLength(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("lane teardown tracker: blocked lanes page once, destroyable lanes cross grace, and rows level-clear only when gone", () => {
+  const path = "/worktrees/lane";
+  const tracker = createLaneTeardownGraceTracker(10);
+  expect(
+    tracker.consider({ path, state: "blocked", detail: "foreign", nowSec: 1 }),
+  ).toEqual({ destroy: false });
+  const crossed = tracker.consider({
+    path,
+    state: "blocked",
+    detail: "foreign",
+    nowSec: 11,
+  });
+  expect(crossed.mint?.reason).toStartWith(LANE_TEARDOWN_DISTRESS_REASON);
+  expect(
+    tracker.consider({ path, state: "blocked", detail: "foreign", nowSec: 50 })
+      .mint,
+  ).toBeUndefined();
+  expect(
+    tracker.finishCycle({
+      presentPaths: new Set([path]),
+      candidatePaths: new Set([path]),
+      backupFailedPaths: new Set(),
+      openTeardownPaths: new Set([path]),
+      openBackupPaths: new Set(),
+    }),
+  ).toEqual([]);
+  expect(
+    tracker.finishCycle({
+      presentPaths: new Set(),
+      candidatePaths: new Set(),
+      backupFailedPaths: new Set(),
+      openTeardownPaths: new Set([path]),
+      openBackupPaths: new Set(),
+    }),
+  ).toHaveLength(1);
+
+  const destroyable = createLaneTeardownGraceTracker(10);
+  expect(
+    destroyable.consider({
+      path,
+      state: "destroyable",
+      detail: "dirty",
+      nowSec: 1,
+    }).destroy,
+  ).toBe(false);
+  expect(
+    destroyable.consider({
+      path,
+      state: "destroyable",
+      detail: "dirty",
+      nowSec: 11,
+    }).destroy,
+  ).toBe(true);
+});
+
+test("lane teardown tracker: a persistent backup failure pages once on its own reason", () => {
+  const tracker = createLaneTeardownGraceTracker(10);
+  expect(
+    tracker.noteBackupFailure({
+      path: "/lane",
+      detail: "disk full",
+      nowSec: 1,
+    }),
+  ).toBeNull();
+  expect(
+    tracker.noteBackupFailure({
+      path: "/lane",
+      detail: "disk full",
+      nowSec: 11,
+    })?.reason,
+  ).toStartWith(LANE_BACKUP_DISTRESS_REASON);
+  expect(
+    tracker.noteBackupFailure({
+      path: "/lane",
+      detail: "disk full",
+      nowSec: 99,
+    }),
+  ).toBeNull();
+});
+
+test("lane teardown grace is longer than the paging graces", () => {
+  expect(LANE_TEARDOWN_GRACE_SEC).toBeGreaterThan(
+    SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  );
 });
 
 test("fn-991 recoverWorktrees pass-3: an OPEN epic's reflexive-ancestor base is PRESERVED (born at the default tip, no commits)", async () => {

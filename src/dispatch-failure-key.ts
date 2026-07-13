@@ -283,6 +283,21 @@ export function isLaneWedgeDistressKey(verb: string, id: string): boolean {
   );
 }
 
+/** Recover-pass lane teardown signals, keyed per lane path and level-cleared on absence. */
+export const LANE_TEARDOWN_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const LANE_TEARDOWN_DISTRESS_ID_PREFIX = "worktree-lane-teardown:";
+export const LANE_BACKUP_DISTRESS_ID_PREFIX = "worktree-lane-backup-failed:";
+export const LANE_TEARDOWN_DISTRESS_REASON = "worktree-lane-teardown";
+export const LANE_BACKUP_DISTRESS_REASON = "worktree-lane-backup-failed";
+
+export function isLaneTeardownDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === LANE_TEARDOWN_DISTRESS_VERB &&
+    (id.startsWith(LANE_TEARDOWN_DISTRESS_ID_PREFIX) ||
+      id.startsWith(LANE_BACKUP_DISTRESS_ID_PREFIX))
+  );
+}
+
 /**
  * The synthetic PER-(EPIC,REPO) distress signal for an already-cut worktree lane
  * whose base is STALE — a lane forked off its repo's default BEFORE a satisfied
@@ -522,6 +537,8 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // prefix of the other, but ordering keeps the table's stated invariant true even
   // if a future rename shortens one.
   { prefix: LANE_WEDGE_DISTRESS_REASON, kind: "lane-wedge" },
+  { prefix: LANE_BACKUP_DISTRESS_REASON, kind: "lane-wedge" },
+  { prefix: LANE_TEARDOWN_DISTRESS_REASON, kind: "lane-wedge" },
   { prefix: WORKTREE_LANE_PREMERGE_REASON_PREFIX, kind: "lane-premerge" },
   // Prefix-disjoint from every rule above (`stale-base-lane` shares no stem), so
   // ordering is not load-bearing here — appended last, its own kind.

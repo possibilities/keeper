@@ -306,20 +306,21 @@ function proofGate(step: LadderStep): RefusalReason | null {
 // Rewriters — apply the version-shift map to each surface.
 // ---------------------------------------------------------------------------
 
-/** Rewrite the `version:` numeric literal of each shifted ladder entry in place.
- * Replacements run last-offset-first so earlier offsets stay valid. */
+/** Rewrite the `version:` numeric literal of each shifted ladder entry in place,
+ * targeting each step by its SOURCE OFFSET rather than its version number — in
+ * the post-merge union shape a shared step and a branch-local step can carry the
+ * SAME version (main's landed step stays put; the lane's own collision moves), so
+ * a number-keyed rewrite would wrongly move both. Replacements run
+ * last-offset-first so earlier offsets stay valid. */
 function rewriteLadderVersions(
   dbSource: string,
-  steps: LadderStep[],
-  shiftMap: Map<number, number>,
+  laneShift: { step: LadderStep; to: number }[],
 ): string {
-  const edits = steps
-    .filter((s) => shiftMap.has(s.version))
-    .map((s) => ({
-      start: s.versionStart,
-      end: s.versionEnd,
-      // biome-ignore lint/style/noNonNullAssertion: filtered on has() above.
-      text: String(shiftMap.get(s.version)!),
+  const edits = laneShift
+    .map(({ step, to }) => ({
+      start: step.versionStart,
+      end: step.versionEnd,
+      text: String(to),
     }))
     .sort((a, b) => b.start - a.start);
   let out = dbSource;
@@ -361,7 +362,7 @@ function refuse(step: number, reason: RefusalReason): RefusalEnvelope {
     "create-literal":
       "step contains an inline CREATE TABLE — table shape is not mechanically renumberable",
     "identical-content":
-      "lane and main added byte-identical bodies at the same version — dedup is a human judgment about intent, refusing",
+      "lane re-added a body byte-identical to main's at a different version — dedup is a human judgment about intent, refusing",
     unknown: "step kind is not provably additive — refusing to renumber",
   };
   return { refused: true, step, reason, message: messages[reason] };
@@ -371,13 +372,16 @@ function refuse(step: number, reason: RefusalReason): RefusalEnvelope {
  * Renumber the lane's branch-local schema steps onto main-tip+1..+k, or refuse.
  * Pure over its two {@link FileSet} inputs — no filesystem, no git.
  *
- * Branch-local detection walks the lane ladder ascending against main:
- *   - a leading run of steps byte-equal to main's same-version step is the
- *     shared landed prefix (kept, never renumbered);
- *   - the first differing (or main-absent) step marks divergence — everything
- *     from there is branch-local;
- *   - a branch-local step that is byte-identical to main's same-version step is
- *     a coincidental identical collision → REFUSE (never silently dedup).
+ * Branch-local detection keys on step IDENTITY (version + canonicalized body
+ * signature), never file position:
+ *   - a lane step matching a main step on BOTH version and body-signature is
+ *     main's own shared step — kept, never renumbered, wherever it sits in the
+ *     file (a branch-local step may appear mid-ladder, so a shared step can
+ *     follow it);
+ *   - a lane step whose body appears nowhere in main is a genuine branch-local
+ *     candidate;
+ *   - a lane step whose body IS main's but at a DIFFERENT version is a
+ *     coincidental re-add → REFUSE (dedup is a human judgment, never silent).
  *
  * Only branch-local steps that COLLIDE (version ≤ main's tail) force a renumber;
  * a lane already sitting above main's tail is a no-op (this is what makes the
@@ -386,23 +390,24 @@ function refuse(step: number, reason: RefusalReason): RefusalEnvelope {
 export function apply(main: FileSet, lane: FileSet): ApplyResult {
   const mainSteps = parseLadder(main.db);
   const laneSteps = parseLadder(lane.db).sort((a, b) => a.version - b.version);
-  const mainByVersion = new Map(mainSteps.map((s) => [s.version, s]));
+  const identityOf = (step: LadderStep): string =>
+    `${step.version}\u0000${step.bodySignature}`;
+  const mainIdentities = new Set(mainSteps.map(identityOf));
+  const mainBodies = new Set(mainSteps.map((s) => s.bodySignature));
   const mainTail = mainSteps.reduce((mx, s) => Math.max(mx, s.version), 0);
 
   const branchLocal: LadderStep[] = [];
-  let diverged = false;
   for (const l of laneSteps) {
-    const m = mainByVersion.get(l.version);
-    const identical = m !== undefined && m.bodySignature === l.bodySignature;
-    if (!diverged && identical) {
-      // still inside the shared landed prefix
+    if (mainIdentities.has(identityOf(l))) {
+      // main's own step (same version AND body) — shared, absorb regardless of
+      // where it sits relative to the lane's branch-local steps.
       continue;
     }
-    if (identical) {
-      // past divergence, yet byte-identical at a colliding version
+    if (mainBodies.has(l.bodySignature)) {
+      // main carries this exact body, but at a DIFFERENT version — dedup is a
+      // human judgment about intent, never silent.
       return refuse(l.version, "identical-content");
     }
-    diverged = true;
     branchLocal.push(l);
   }
 
@@ -419,9 +424,15 @@ export function apply(main: FileSet, lane: FileSet): ApplyResult {
   }
 
   // Shift all branch-local steps onto main-tip+1.., preserving relative order.
-  const shifts: VersionShift[] = branchLocal.map((s, i) => ({
-    from: s.version,
+  // Each shift carries its own step so the ladder rewrite targets it by source
+  // offset — a shared step sharing its version is never touched.
+  const laneShift = branchLocal.map((s, i) => ({
+    step: s,
     to: mainTail + 1 + i,
+  }));
+  const shifts: VersionShift[] = laneShift.map(({ step, to }) => ({
+    from: step.version,
+    to,
   }));
   const shiftMap = new Map(shifts.map((s) => [s.from, s.to]));
 
@@ -434,7 +445,7 @@ export function apply(main: FileSet, lane: FileSet): ApplyResult {
     refused: false,
     shifts,
     files: {
-      db: rewriteLadderVersions(lane.db, laneSteps, shiftMap),
+      db: rewriteLadderVersions(lane.db, laneShift),
       tests: rewrittenTests,
     },
   };

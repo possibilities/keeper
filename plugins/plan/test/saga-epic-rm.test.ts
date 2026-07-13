@@ -16,6 +16,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -25,10 +26,12 @@ import { join } from "node:path";
 
 import {
   firstJsonPayload,
+  git,
   gitBaseline,
   gitFilesInHead,
   gitHeadMessage,
   gitInit,
+  gitIsolationEnv,
   gitLogCount,
   type ProjectHandle,
   parseCliOutput,
@@ -52,6 +55,42 @@ function run(args: string[], env?: Record<string, string>) {
 
 function artifact(...parts: string[]): string {
   return join(project.root, ".keeper", ...parts);
+}
+
+function commitRealRepo(root: string, message: string): void {
+  git(["add", "-A"], root);
+  git(["commit", "-m", message], root);
+}
+
+function initRealRepo(root: string): void {
+  git(["init"], root);
+  writeFileSync(join(root, "README.md"), "seed\n", "utf-8");
+  commitRealRepo(root, "baseline");
+}
+
+function createLane(repo: string, parent: string, branch: string): string {
+  const lane = join(parent, branch.replace(/[^A-Za-z0-9._-]/g, "-"));
+  git(["branch", branch], repo);
+  git(["worktree", "add", lane, branch], repo);
+  return realpathSync(lane);
+}
+
+function branchExists(repo: string, branch: string): boolean {
+  const proc = Bun.spawnSync(
+    ["git", "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+    { cwd: repo, env: gitIsolationEnv(repo) },
+  );
+  return proc.exitCode === 0;
+}
+
+function setEpicTouchedRepos(epicId: string, repos: string[]): void {
+  const path = artifact("epics", `${epicId}.json`);
+  const data = JSON.parse(readFileSync(path, "utf-8")) as Record<
+    string,
+    unknown
+  >;
+  data.touched_repos = repos;
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
 }
 
 // Tolerant payload parser mirroring the Python _invoke: read verbs (dry-run /
@@ -95,6 +134,8 @@ describe("epic rm happy path", () => {
     expect(obj.success).toBe(true);
     expect(obj.epic_id).toBe(epicId);
     expect(obj.task_count).toBe(taskIds.length);
+    expect(obj.torn_down_lanes).toEqual([]);
+    expect(obj.skipped_lanes).toEqual([]);
 
     for (const p of [
       epicJson,
@@ -147,10 +188,227 @@ describe("epic rm --dry-run", () => {
     const rels = obj.removed_files as string[];
     expect(rels).toContain(`.keeper/epics/${epicId}.json`);
     expect(rels).toContain(`.keeper/tasks/${taskIds[0]}.json`);
+    expect(obj.torn_down_lanes).toEqual([]);
+    expect(obj.skipped_lanes).toEqual([]);
 
     expect(existsSync(epicJson)).toBe(true);
     expect(existsSync(taskJson)).toBe(true);
     expect(gitLogCount(project.root)).toBe(logBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Worktree lane teardown
+// ---------------------------------------------------------------------------
+
+describe("epic rm worktree lane teardown", () => {
+  const created: string[] = [];
+  afterEach(() => {
+    for (const dir of created) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    created.length = 0;
+  });
+
+  function freshDir(prefix: string): string {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+    created.push(dir);
+    return dir;
+  }
+
+  test("tears down an owned lane after backing up dirt and deleting the local ref", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    initRealRepo(project.root);
+    const lanes = freshDir("planctl-rm-lanes-");
+    const spool = freshDir("planctl-rm-spool-");
+    const branch = `keeper/epic/${epicId}`;
+    const lane = createLane(project.root, lanes, branch);
+
+    writeFileSync(join(lane, "README.md"), "staged dirt\n", "utf-8");
+    git(["add", "README.md"], lane);
+    writeFileSync(
+      join(lane, ".keeper", "specs", `${taskIds[0]}.md`),
+      "unstaged dirt\n",
+      "utf-8",
+    );
+    writeFileSync(join(lane, "scratch.txt"), "untracked dirt\n", "utf-8");
+
+    const r = run(["epic", "rm", epicId], {
+      KEEPER_LANE_DIRT_SPOOL_DIR: spool,
+    });
+    expect(r.code).toBe(0);
+    const obj = payload(r.output);
+    expect(obj.success).toBe(true);
+    const torn = obj.torn_down_lanes as Record<string, string>[];
+    expect(torn).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: lane,
+        branch: `refs/heads/${branch}`,
+      },
+    ]);
+    expect(obj.skipped_lanes).toEqual([]);
+    expect(existsSync(lane)).toBe(false);
+    expect(branchExists(project.root, branch)).toBe(false);
+
+    const indexPath = join(spool, "index.ndjson");
+    expect(existsSync(indexPath)).toBe(true);
+    const indexLines = readFileSync(indexPath, "utf-8").trim().split("\n");
+    expect(indexLines.length).toBe(1);
+    const index = JSON.parse(indexLines[0] as string) as Record<
+      string,
+      unknown
+    >;
+    expect(index.schema_version).toBe(1);
+    expect(index.repo).toBe(realpathSync(project.root));
+    expect(index.lane).toBe(lane);
+    expect(index.branch).toBe(`refs/heads/${branch}`);
+    expect(index.staged_patch).toBe("staged.patch");
+    expect(index.unstaged_patch).toBe("unstaged.patch");
+    expect(index.untracked_root).toBe("untracked");
+    expect(index.untracked_count).toBe(1);
+    expect(index.untracked_paths).toEqual(["scratch.txt"]);
+    const snapshotDir = join(spool, index.snapshot_id as string);
+    expect(readFileSync(join(snapshotDir, "staged.patch"), "utf-8")).toContain(
+      "staged dirt",
+    );
+    expect(
+      readFileSync(join(snapshotDir, "unstaged.patch"), "utf-8"),
+    ).toContain("unstaged dirt");
+    expect(
+      readFileSync(join(snapshotDir, "untracked", "scratch.txt"), "utf-8"),
+    ).toBe("untracked dirt\n");
+  });
+
+  test("reports locked matching lanes as skipped and leaves them registered", () => {
+    const { epicId } = scaffoldEpic(project, { nTasks: 1 });
+    initRealRepo(project.root);
+    const lanes = freshDir("planctl-rm-locked-lanes-");
+    const branch = `keeper/epic/${epicId}`;
+    const lane = createLane(project.root, lanes, branch);
+    git(["worktree", "lock", "--reason", "busy", lane], project.root);
+
+    const r = run(["epic", "rm", epicId]);
+    expect(r.code).toBe(0);
+    const obj = payload(r.output);
+    expect(obj.torn_down_lanes).toEqual([]);
+    expect(obj.skipped_lanes).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: lane,
+        branch: `refs/heads/${branch}`,
+        reason: "locked",
+      },
+    ]);
+    expect(existsSync(lane)).toBe(true);
+    expect(branchExists(project.root, branch)).toBe(true);
+    expect(existsSync(artifact("epics", `${epicId}.json`))).toBe(false);
+  });
+
+  test("skips destroy on backup failure while removing keeper artifacts", () => {
+    const { epicId } = scaffoldEpic(project, { nTasks: 1 });
+    initRealRepo(project.root);
+    const lanes = freshDir("planctl-rm-backup-fail-lanes-");
+    const spoolParent = freshDir("planctl-rm-backup-fail-spool-");
+    const spoolFile = join(spoolParent, "not-a-directory");
+    writeFileSync(spoolFile, "file blocks spool mkdir\n", "utf-8");
+    const branch = `keeper/epic/${epicId}`;
+    const lane = createLane(project.root, lanes, branch);
+
+    const r = run(["epic", "rm", epicId], {
+      KEEPER_LANE_DIRT_SPOOL_DIR: spoolFile,
+    });
+    expect(r.code).toBe(0);
+    const obj = payload(r.output);
+    expect(obj.torn_down_lanes).toEqual([]);
+    expect(obj.skipped_lanes).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: lane,
+        branch: `refs/heads/${branch}`,
+        reason: "backup-failed",
+      },
+    ]);
+    expect(existsSync(lane)).toBe(true);
+    expect(branchExists(project.root, branch)).toBe(true);
+    expect(existsSync(artifact("epics", `${epicId}.json`))).toBe(false);
+  });
+
+  test("tears down matching lanes across primary and touched repos", () => {
+    const { epicId } = scaffoldEpic(project, { nTasks: 1 });
+    const touched = freshDir("planctl-rm-touched-repo-");
+    initRealRepo(touched);
+    setEpicTouchedRepos(epicId, [touched]);
+    initRealRepo(project.root);
+    const lanes = freshDir("planctl-rm-multi-lanes-");
+    const primaryBranch = `keeper/epic/${epicId}`;
+    const touchedBranch = `keeper/epic/${epicId}--${epicId}.1`;
+    const primaryLane = createLane(project.root, lanes, primaryBranch);
+    const touchedLane = createLane(touched, lanes, touchedBranch);
+
+    const r = run(["epic", "rm", epicId]);
+    expect(r.code).toBe(0);
+    const obj = payload(r.output);
+    expect(obj.skipped_lanes).toEqual([]);
+    expect(obj.torn_down_lanes).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: primaryLane,
+        branch: `refs/heads/${primaryBranch}`,
+      },
+      {
+        repo: realpathSync(touched),
+        path: touchedLane,
+        branch: `refs/heads/${touchedBranch}`,
+      },
+    ]);
+    expect(existsSync(primaryLane)).toBe(false);
+    expect(existsSync(touchedLane)).toBe(false);
+    expect(branchExists(project.root, primaryBranch)).toBe(false);
+    expect(branchExists(touched, touchedBranch)).toBe(false);
+  });
+
+  test("dry-run reports lane actions without backup, removal, or ref deletion", () => {
+    const { epicId } = scaffoldEpic(project, { nTasks: 1 });
+    initRealRepo(project.root);
+    const lanes = freshDir("planctl-rm-dry-lanes-");
+    const spool = freshDir("planctl-rm-dry-spool-");
+    const ownedBranch = `keeper/epic/${epicId}`;
+    const lockedBranch = `keeper/epic/${epicId}--${epicId}.1`;
+    const otherBranch = `keeper/epic/${epicId}0--not-this-epic`;
+    const ownedLane = createLane(project.root, lanes, ownedBranch);
+    const lockedLane = createLane(project.root, lanes, lockedBranch);
+    const otherLane = createLane(project.root, lanes, otherBranch);
+    git(["worktree", "lock", "--reason", "busy", lockedLane], project.root);
+
+    const r = run(["epic", "rm", epicId, "--dry-run"], {
+      KEEPER_LANE_DIRT_SPOOL_DIR: spool,
+    });
+    expect(r.code).toBe(0);
+    const obj = payload(r.output);
+    expect(obj.dry_run).toBe(true);
+    expect(obj.torn_down_lanes).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: ownedLane,
+        branch: `refs/heads/${ownedBranch}`,
+      },
+    ]);
+    expect(obj.skipped_lanes).toEqual([
+      {
+        repo: realpathSync(project.root),
+        path: lockedLane,
+        branch: `refs/heads/${lockedBranch}`,
+        reason: "locked",
+      },
+    ]);
+    expect(existsSync(ownedLane)).toBe(true);
+    expect(existsSync(lockedLane)).toBe(true);
+    expect(existsSync(otherLane)).toBe(true);
+    expect(branchExists(project.root, ownedBranch)).toBe(true);
+    expect(branchExists(project.root, lockedBranch)).toBe(true);
+    expect(branchExists(project.root, otherBranch)).toBe(true);
+    expect(existsSync(join(spool, "index.ndjson"))).toBe(false);
   });
 });
 

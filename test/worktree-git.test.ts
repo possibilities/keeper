@@ -14,6 +14,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -26,13 +27,16 @@ import {
 } from "../src/commit-work/git-exec";
 import {
   BASELINE_SCRATCH_PREFIX,
+  backupThenForceRemoveWorktree,
   baselineScratchPathFor,
   branchExists,
+  classifyLaneOwnership,
   classifyLinkedWorktree,
   classifyPremergeRedundancy,
   commitWorkLockPath,
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
+  ensureLaneNodeModulesLink,
   ensureWorktree,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
@@ -40,6 +44,7 @@ import {
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
+  LANE_DIRT_INDEX_MAX_BYTES,
   type LockAcquirer,
   listEpicLaneBranches,
   losslessPremergeClean,
@@ -206,6 +211,14 @@ test("parseWorktreeList: a detached entry has null branch; bare flag parses", ()
 
 test("parseWorktreeList: empty output → no entries", () => {
   expect(parseWorktreeList("")).toEqual([]);
+});
+
+test("parseWorktreeList: preserves the porcelain lock annotation", () => {
+  expect(
+    parseWorktreeList(
+      "worktree /lane\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1\nlocked maintenance\n\n",
+    )[0]?.locked,
+  ).toBe("maintenance");
 });
 
 // ---------------------------------------------------------------------------
@@ -447,6 +460,82 @@ test("classifyLinkedWorktree: a git-dir probe nonzero exit → error (defer, nev
   expect(await classifyLinkedWorktree("/nowhere", run)).toBe("error");
 });
 
+test("classifyLaneOwnership: owned / foreign / ambiguous / locked truth table", async () => {
+  const keeperEntry = entry({
+    path: "/lane",
+    branch: "refs/heads/keeper/epic/fn-1-foo",
+  });
+  const identityRunner =
+    (laneGit: string, laneCommon: string, fail = false): GitRunner =>
+    async (args, options) => {
+      if (fail) return { code: 128, stdout: "", stderr: "probe failed" };
+      const cwd = options?.cwd ?? "";
+      const common = args.includes("--git-common-dir");
+      return {
+        code: 0,
+        stdout:
+          cwd === "/repo"
+            ? "/repo/.git\n"
+            : common
+              ? `${laneCommon}\n`
+              : `${laneGit}\n`,
+        stderr: "",
+      };
+    };
+  expect(
+    await classifyLaneOwnership(
+      "/repo",
+      keeperEntry,
+      identityRunner("/repo/.git/worktrees/lane", "/repo/.git"),
+    ),
+  ).toEqual({ kind: "owned", epicId: "fn-1-foo" });
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("/other/.git/worktrees/lane", "/other/.git"),
+      )
+    ).kind,
+  ).toBe("foreign");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("/lane/.git", "/lane/.git"),
+      )
+    ).kind,
+  ).toBe("foreign");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("", "", true),
+      )
+    ).kind,
+  ).toBe("ambiguous");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        { ...keeperEntry, locked: "busy" },
+        identityRunner("", ""),
+      )
+    ).kind,
+  ).toBe("locked");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        { ...keeperEntry, branch: "refs/heads/feature" },
+        identityRunner("", ""),
+      )
+    ).kind,
+  ).toBe("ambiguous");
+});
+
 // ---------------------------------------------------------------------------
 // pruneWorktrees — must always carry --expire now (default is 14 days).
 // ---------------------------------------------------------------------------
@@ -607,6 +696,117 @@ test("ensureWorktree: a failing add throws with git stderr", async () => {
   expect(ensureWorktree("/repo", "/p", "b", "c", run)).rejects.toThrow(
     /fatal: boom/,
   );
+});
+
+type LaneNodeModulesEntry =
+  | { kind: "dir" }
+  | { kind: "symlink"; resolvesTo: string | null }
+  | null;
+
+function fakeLaneNodeModulesFs(
+  sourcePresent: boolean,
+  initialLaneEntry: LaneNodeModulesEntry,
+) {
+  const source = "/repo/node_modules";
+  const lane = "/repo.worktrees/lane/node_modules";
+  const sourceReal = "/private/repo/node_modules";
+  let laneEntry = initialLaneEntry;
+  const symlinks: Array<[string, string, string]> = [];
+  let unlinks = 0;
+  const missing = () => Object.assign(new Error("missing"), { code: "ENOENT" });
+  return {
+    fs: {
+      async lstat(path: string) {
+        expect(path).toBe(lane);
+        if (laneEntry === null) throw missing();
+        return { isSymbolicLink: () => laneEntry?.kind === "symlink" };
+      },
+      async realpath(path: string) {
+        if (path === source) {
+          if (!sourcePresent) throw missing();
+          return sourceReal;
+        }
+        expect(path).toBe(lane);
+        if (laneEntry?.kind !== "symlink" || laneEntry.resolvesTo === null) {
+          throw missing();
+        }
+        return laneEntry.resolvesTo;
+      },
+      async symlink(target: string, path: string, type: "dir") {
+        symlinks.push([target, path, type]);
+        laneEntry = { kind: "symlink", resolvesTo: sourceReal };
+      },
+      async unlink(path: string) {
+        expect(path).toBe(lane);
+        unlinks += 1;
+        laneEntry = null;
+      },
+    },
+    laneEntry: () => laneEntry,
+    symlinks,
+    unlinks: () => unlinks,
+  };
+}
+
+test("ensureLaneNodeModulesLink: a bare lane links to its source dependency store", async () => {
+  const fake = fakeLaneNodeModulesFs(true, null);
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+  expect(fake.laneEntry()).toEqual({
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
+});
+
+test("ensureLaneNodeModulesLink: a correct link is an idempotent no-op", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([]);
+  expect(fake.unlinks()).toBe(0);
+});
+
+test("ensureLaneNodeModulesLink: a real lane directory is left untouched", async () => {
+  const fake = fakeLaneNodeModulesFs(true, { kind: "dir" });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.laneEntry()).toEqual({ kind: "dir" });
+  expect(fake.symlinks).toEqual([]);
+});
+
+test("ensureLaneNodeModulesLink: a missing source dependency store is skipped", async () => {
+  const fake = fakeLaneNodeModulesFs(false, null);
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.symlinks).toEqual([]);
+  expect(fake.laneEntry()).toBeNull();
+});
+
+test("ensureLaneNodeModulesLink: a broken lane link is replaced", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: null,
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.unlinks()).toBe(1);
+  expect(fake.symlinks).toEqual([
+    ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
+  ]);
+});
+
+test("ensureLaneNodeModulesLink: a stale lane link is replaced", async () => {
+  const fake = fakeLaneNodeModulesFs(true, {
+    kind: "symlink",
+    resolvesTo: "/other/node_modules",
+  });
+  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.unlinks()).toBe(1);
+  expect(fake.laneEntry()).toEqual({
+    kind: "symlink",
+    resolvesTo: "/private/repo/node_modules",
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1304,101 @@ test("removeWorktree: dirty tree → remove fails → dirty result, never forced
   expect(
     calls.filter((c) => argvStartsWith(c.args, "worktree", "remove")),
   ).toHaveLength(1);
+});
+
+test("backupThenForceRemoveWorktree: snapshots staged, unstaged, and untracked dirt before force-remove", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-dirt-"));
+  const lane = join(root, "lane");
+  const spool = join(root, "spool");
+  mkdirSync(join(lane, "nested"), { recursive: true });
+  writeFileSync(join(lane, "loose.txt"), "loose dirt\n");
+  writeFileSync(join(lane, "nested", "other.txt"), "other dirt\n");
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { stdout: "staged patch\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "diff", "--binary"),
+      result: { stdout: "unstaged patch\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: "loose.txt\0nested/other.txt\0" },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      "/repo",
+      entry({
+        path: lane,
+        branch: "refs/heads/keeper/epic/fn-1-foo",
+      }),
+      run,
+      { spoolDir: spool, nowMs: () => 1234, snapshotId: () => "snap" },
+    );
+    expect(result).toEqual({
+      kind: "removed",
+      snapshotDir: join(spool, "snap"),
+    });
+    expect(readFileSync(join(spool, "snap", "staged.patch"), "utf8")).toBe(
+      "staged patch\n",
+    );
+    expect(readFileSync(join(spool, "snap", "unstaged.patch"), "utf8")).toBe(
+      "unstaged patch\n",
+    );
+    expect(
+      readFileSync(join(spool, "snap", "untracked", "loose.txt"), "utf8"),
+    ).toBe("loose dirt\n");
+    expect(
+      readFileSync(
+        join(spool, "snap", "untracked", "nested", "other.txt"),
+        "utf8",
+      ),
+    ).toBe("other dirt\n");
+    const indexLine = readFileSync(join(spool, "index.ndjson"), "utf8");
+    expect(Buffer.byteLength(indexLine)).toBeLessThanOrEqual(
+      LANE_DIRT_INDEX_MAX_BYTES,
+    );
+    expect(JSON.parse(indexLine).untracked_count).toBe(2);
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "worktree", "remove", "--force", lane),
+      ),
+    ).toBe(true);
+    expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+      true,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenForceRemoveWorktree: a failed snapshot never destroys", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-dirt-fail-"));
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { exitCode: 128, stderr: "cannot diff" },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      "/repo",
+      entry({
+        path: join(root, "lane"),
+        branch: "refs/heads/keeper/epic/fn-1-foo",
+      }),
+      run,
+      { spoolDir: join(root, "spool") },
+    );
+    expect(result.kind).toBe("backup-failed");
+    expect(
+      calls.some((c) => argvStartsWith(c.args, "worktree", "remove")),
+    ).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

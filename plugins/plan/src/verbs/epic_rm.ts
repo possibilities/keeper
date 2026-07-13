@@ -28,6 +28,7 @@ import {
 import { join, relative, resolve as resolvePath } from "node:path";
 
 import { emitMutating, emitReadonly } from "../emit.ts";
+import { teardownEpicLanes } from "../epic_lane_teardown.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
@@ -229,6 +230,11 @@ export function runEpicRm(args: EpicRmArgs): void {
   const epicDef = loadJsonSafe(epicPath) ?? {};
   const primaryRepo =
     (epicDef.primary_repo as string | null | undefined) ?? null;
+  const touchedRepos = Array.isArray(epicDef.touched_repos)
+    ? epicDef.touched_repos.filter(
+        (repo): repo is string => typeof repo === "string",
+      )
+    : [];
 
   // Guard: refuse if any task is in_progress or holds a lock unless --force.
   if (!force) {
@@ -244,6 +250,11 @@ export function runEpicRm(args: EpicRmArgs): void {
 
   const unlinkSet = collectUnlinkSet(epicId, ctx);
   const dependents = collectDanglingDependents(epicId, ctx);
+  const laneTeardown = teardownEpicLanes(
+    epicId,
+    [primaryRepo, ...touchedRepos],
+    dryRun,
+  );
 
   // Repo-relative POSIX paths for the envelope payload.
   const repoRoot = ctx.projectPath;
@@ -258,6 +269,7 @@ export function runEpicRm(args: EpicRmArgs): void {
       `${dependents.length} dependent epic(s) will become dangling: ${dependents.join(", ")}`,
     );
   }
+  warnings.push(...laneTeardown.warnings);
 
   // Count only task DEFINITION JSONs (tasks/<id>.M.json).
   const taskCount = unlinkSet.filter((p) => isTaskDefJson(p)).length;
@@ -274,6 +286,8 @@ export function runEpicRm(args: EpicRmArgs): void {
         task_count: taskCount,
         dependents,
         warnings,
+        torn_down_lanes: laneTeardown.tornDownLanes,
+        skipped_lanes: laneTeardown.skippedLanes,
       },
       pc,
     );
@@ -303,6 +317,8 @@ export function runEpicRm(args: EpicRmArgs): void {
       task_count: taskCount,
       dependents,
       warnings,
+      torn_down_lanes: laneTeardown.tornDownLanes,
+      skipped_lanes: laneTeardown.skippedLanes,
     },
     {
       verb: "rm",
