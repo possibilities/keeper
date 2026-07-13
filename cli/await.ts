@@ -63,6 +63,8 @@
  * last `connected` lifecycle event).
  */
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   type AwaitInputs,
@@ -93,9 +95,13 @@ import {
   needsHumanState,
   type PlanCondition,
 } from "../src/await-conditions";
-import { resolveSockPath } from "../src/db";
+import { resolveAwaitSpillDir, resolveSockPath } from "../src/db";
 import type { MonitorEntry } from "../src/derivers";
 import { projectNeedsHuman } from "../src/needs-human";
+import type {
+  DurableAwaitCondition,
+  DurableAwaitConditionSpec,
+} from "../src/protocol";
 import type { GiveUpPolicy } from "../src/readiness-client";
 import {
   type ConnectFactory,
@@ -106,7 +112,9 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import type { Epic, GitStatus, Job } from "../src/types";
+import { queryCollection, roundTrip } from "./control-rpc";
 import { parseOptions } from "./descriptor";
+import { resolveSession } from "./dispatch";
 import { parseDuration } from "./duration";
 
 // ---------------------------------------------------------------------------
@@ -163,6 +171,8 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      already-triaged signal holds; a genuinely new one fires
 
 Flags:
+  --durable              Persist a server-evaluable wait and return immediately;
+                         keeperd fires its fresh follow-up when it is met
   --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3
   --connect-timeout <dur>  Bounded reach-server deadline → reason=unreachable
                          exit 1. Default off = reconnect forever
@@ -387,6 +397,8 @@ export interface ParsedArgs {
    * `--connect-timeout` still wins) — see `runAwait`'s `giveUpExtras`.
    */
   probe: boolean;
+  /** Persist this server-evaluable wait and return instead of blocking. */
+  durable?: boolean;
 }
 
 /**
@@ -949,6 +961,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       sock,
       heartbeatMs,
       probe: values.probe === true,
+      durable: values.durable === true,
     },
   };
 }
@@ -3062,7 +3075,73 @@ function resolveCwdGitRoot(): string | null {
 // Production main — wires the real process semantics.
 // ---------------------------------------------------------------------------
 
+function durableConditionSpec(
+  segments: readonly ConditionSegment[],
+  gitRoot: string | null,
+  drainedScope: DrainedScope,
+): DurableAwaitConditionSpec | null {
+  const supported = new Set([
+    "complete",
+    "unblocked",
+    "started",
+    "git-clean",
+    "agents-idle",
+    "drained",
+    "landed",
+    "dead-letter",
+    "block-escalation",
+    "parked-question",
+    "stuck-dispatch",
+    "finalize-non-ff",
+    "instant-death-wall",
+    "needs-human",
+  ]);
+  const out: DurableAwaitCondition[] = [];
+  for (const segment of segments) {
+    if (!supported.has(segment.condition)) return null;
+    if (
+      "target" in segment &&
+      typeof segment.target === "object" &&
+      segment.target !== null &&
+      "id" in segment.target
+    )
+      out.push({
+        condition: segment.condition as DurableAwaitCondition["condition"],
+        target: segment.target.id,
+      });
+    else if (segment.condition === "landed")
+      out.push({ condition: "landed", target: segment.target });
+    else if (
+      segment.condition === "git-clean" ||
+      segment.condition === "agents-idle"
+    ) {
+      if (gitRoot === null) return null;
+      out.push({ condition: segment.condition, git_root: gitRoot });
+    } else if (segment.condition === "drained")
+      out.push({ condition: "drained", scope: drainedScope });
+    else
+      out.push({
+        condition: segment.condition as DurableAwaitCondition["condition"],
+        ...(typeof (segment as { since?: unknown }).since === "string"
+          ? { since: (segment as { since: string }).since }
+          : {}),
+      });
+  }
+  return out;
+}
+
+async function listDurableAwaits(sock: string): Promise<void> {
+  const rows = await queryCollection(sock, "awaits");
+  process.stdout.write(`${JSON.stringify(rows)}\n`);
+}
+
 export async function main(argv: string[]): Promise<void> {
+  // `list` is a read-only durable-intent surface, intentionally outside the
+  // in-process condition grammar.
+  if (argv[0] === "list" || (argv[0] === "--durable" && argv[1] === "list")) {
+    await listDurableAwaits(resolveSockPath());
+    return;
+  }
   const parsed = parseAwaitArgs(argv);
   if (!parsed.ok) {
     if (parsed.message === "__help__") {
@@ -3085,6 +3164,64 @@ export async function main(argv: string[]): Promise<void> {
   );
   const gitRoot = needsRoot ? resolveCwdGitRoot() : null;
   const ownSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? null;
+
+  if (parsed.args.durable) {
+    const conditionSpec = durableConditionSpec(
+      parsed.args.segments,
+      gitRoot,
+      parsed.args.scope,
+    );
+    if (conditionSpec === null) {
+      process.stderr.write(
+        "keeper await: --durable only supports server-evaluable conditions\n",
+      );
+      process.exit(EXIT_USAGE);
+    }
+    const rpcId = crypto.randomUUID();
+    const spillDir = resolveAwaitSpillDir();
+    mkdirSync(spillDir, { recursive: true });
+    const docPath = join(spillDir, `${rpcId}.txt`);
+    // The fresh session gets an explicit durable-await handoff, never a pointer
+    // to the arming session which may already be gone.
+    writeFileSync(
+      docPath,
+      `A durable keeper await has fired. Re-orient on the board and continue the requested follow-up. Conditions: ${JSON.stringify(conditionSpec)}.`,
+      "utf8",
+    );
+    const { session } = resolveSession({ sessionFlag: undefined });
+    try {
+      const response = await roundTrip(
+        parsed.args.sock,
+        {
+          type: "rpc",
+          id: rpcId,
+          method: "request_await",
+          params: {
+            op: "request",
+            await_id: `await-${rpcId}`,
+            condition_spec: conditionSpec,
+            doc_path: docPath,
+            target_session: session,
+            target_dir: process.cwd(),
+            timeout_ms: parsed.args.timeoutMs,
+          },
+        },
+        rpcId,
+      );
+      if (response.type !== "rpc_result")
+        throw new Error(
+          response.type === "error" ? response.message : "unexpected response",
+        );
+      rmSync(docPath, { force: true });
+      process.stdout.write(`${JSON.stringify(response.value)}\n`);
+      return;
+    } catch (err) {
+      process.stderr.write(
+        `keeper await: ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      process.exit(1);
+    }
+  }
 
   await runAwait(parsed.args, {
     writeStdout: (line, cb) => process.stdout.write(line, () => cb()),

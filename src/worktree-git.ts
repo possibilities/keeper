@@ -44,6 +44,7 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   readlink,
   realpath,
   rm,
@@ -1917,6 +1918,14 @@ export function laneDirtSnapshotId(lanePath: string): string {
   return `lane-${createHash("sha256").update(lanePath).digest("hex")}`;
 }
 
+export function sharedCheckoutDirtSnapshotId(
+  checkoutPath: string,
+  dirtDigest?: string,
+): string {
+  const base = `shared-${createHash("sha256").update(checkoutPath).digest("hex")}`;
+  return dirtDigest === undefined ? base : `${base}-${dirtDigest.slice(0, 24)}`;
+}
+
 /** Resolve the operator-managed lane dirt spool. Pure; performs no I/O. */
 export function resolveLaneDirtSpoolDir(): string {
   const override = process.env.KEEPER_LANE_DIRT_SPOOL_DIR;
@@ -1935,6 +1944,142 @@ export interface BackupForceRemoveOptions {
   snapshotId?: () => string;
 }
 
+interface DirtSnapshotInput {
+  repoCwd: string;
+  checkoutPath: string;
+  branch: string;
+  snapshotId: string | null;
+  snapshotIdPrefix?: string;
+  spoolDir: string;
+  createdAtMs: number;
+}
+
+type DirtSnapshotResult =
+  | { kind: "snapshotted"; snapshotDir: string }
+  | { kind: "backup-failed"; detail: string };
+
+async function snapshotCheckoutDirt(
+  input: DirtSnapshotInput,
+  run: GitRunner,
+): Promise<DirtSnapshotResult> {
+  const { spoolDir } = input;
+  let snapshotId = input.snapshotId;
+  let snapshotDir = snapshotId === null ? "" : resolve(spoolDir, snapshotId);
+  let createdSnapshot = false;
+  const existingSnapshot = async (): Promise<"absent" | "directory"> => {
+    try {
+      const st = await lstat(snapshotDir);
+      if (!st.isDirectory())
+        throw new Error("snapshot path is not a directory");
+      return "directory";
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        (err as NodeJS.ErrnoException).code === "ENOENT"
+      ) {
+        return "absent";
+      }
+      throw err;
+    }
+  };
+  try {
+    if (snapshotId !== null) {
+      if (!/^[A-Za-z0-9._-]+$/.test(snapshotId) || snapshotId.includes("..")) {
+        return { kind: "backup-failed", detail: "invalid snapshot id" };
+      }
+      if ((await existingSnapshot()) === "directory") {
+        return { kind: "snapshotted", snapshotDir };
+      }
+    }
+
+    const [staged, unstaged, untracked] = await Promise.all([
+      run(["diff", "--cached", "--binary", "--no-ext-diff"], {
+        cwd: input.checkoutPath,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+      run(["diff", "--binary", "--no-ext-diff"], {
+        cwd: input.checkoutPath,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+      run(["ls-files", "--others", "--exclude-standard", "-z"], {
+        cwd: input.checkoutPath,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+    ]);
+    if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
+      return { kind: "backup-failed", detail: "git dirt probe failed" };
+    }
+    const untrackedPaths = untracked.stdout
+      .split("\0")
+      .filter((p) => p.length > 0);
+    for (const relativePath of untrackedPaths) {
+      if (!isSafeLaneRelativePath(relativePath)) {
+        return {
+          kind: "backup-failed",
+          detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
+        };
+      }
+    }
+    if (snapshotId === null) {
+      if (input.snapshotIdPrefix === undefined) {
+        return { kind: "backup-failed", detail: "missing snapshot id prefix" };
+      }
+      const digest = createHash("sha256")
+        .update("staged\0")
+        .update(staged.stdout)
+        .update("\0unstaged\0")
+        .update(unstaged.stdout);
+      for (const relativePath of untrackedPaths) {
+        await updateUntrackedNodeDigest(
+          input.checkoutPath,
+          relativePath,
+          digest,
+        );
+      }
+      snapshotId = `${input.snapshotIdPrefix}-${digest.digest("hex").slice(0, 24)}`;
+      if (!/^[A-Za-z0-9._-]+$/.test(snapshotId) || snapshotId.includes("..")) {
+        return { kind: "backup-failed", detail: "invalid snapshot id" };
+      }
+      snapshotDir = resolve(spoolDir, snapshotId);
+      if ((await existingSnapshot()) === "directory") {
+        return { kind: "snapshotted", snapshotDir };
+      }
+    }
+    await mkdir(spoolDir, { recursive: true });
+    await mkdir(snapshotDir, { recursive: false });
+    createdSnapshot = true;
+    await writeFile(resolve(snapshotDir, "staged.patch"), staged.stdout);
+    await writeFile(resolve(snapshotDir, "unstaged.patch"), unstaged.stdout);
+    for (const relativePath of untrackedPaths) {
+      await snapshotUntrackedNode(
+        input.checkoutPath,
+        relativePath,
+        resolve(snapshotDir, "untracked", relativePath),
+      );
+    }
+    await appendFile(
+      resolve(spoolDir, "index.ndjson"),
+      serializeLaneDirtIndex({
+        snapshotId,
+        createdAtMs: input.createdAtMs,
+        repoCwd: input.repoCwd,
+        lanePath: input.checkoutPath,
+        branch: input.branch,
+        untrackedPaths,
+      }),
+    );
+    return { kind: "snapshotted", snapshotDir };
+  } catch (err) {
+    if (createdSnapshot) {
+      await rm(snapshotDir, { recursive: true, force: true }).catch(() => {});
+    }
+    return {
+      kind: "backup-failed",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 /**
  * Snapshot every dirt class, append one bounded index record, then and only then
  * force-remove the worktree and prune its registration. This is intentionally a
@@ -1946,92 +2091,18 @@ export async function backupThenForceRemoveWorktree(
   run: GitRunner = gitExec,
   options: BackupForceRemoveOptions = {},
 ): Promise<BackupForceRemoveResult> {
-  const spoolDir = options.spoolDir ?? resolveLaneDirtSpoolDir();
-  const nowMs = options.nowMs?.() ?? Date.now();
-  const snapshotId = options.snapshotId?.() ?? laneDirtSnapshotId(entry.path);
-  if (!/^[A-Za-z0-9._-]+$/.test(snapshotId) || snapshotId.includes("..")) {
-    return { kind: "backup-failed", detail: "invalid snapshot id" };
-  }
-  const snapshotDir = resolve(spoolDir, snapshotId);
-  let createdSnapshot = false;
-  try {
-    let existingSnapshot: Awaited<ReturnType<typeof lstat>> | undefined;
-    try {
-      existingSnapshot = await lstat(snapshotDir);
-    } catch (err) {
-      if (
-        !(err instanceof Error) ||
-        (err as NodeJS.ErrnoException).code !== "ENOENT"
-      ) {
-        throw err;
-      }
-    }
-    if (existingSnapshot !== undefined) {
-      if (!existingSnapshot.isDirectory()) {
-        return {
-          kind: "backup-failed",
-          detail: "snapshot path is not a directory",
-        };
-      }
-    } else {
-      const [staged, unstaged, untracked] = await Promise.all([
-        run(["diff", "--cached", "--binary", "--no-ext-diff"], {
-          cwd: entry.path,
-          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-        }),
-        run(["diff", "--binary", "--no-ext-diff"], {
-          cwd: entry.path,
-          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-        }),
-        run(["ls-files", "--others", "--exclude-standard", "-z"], {
-          cwd: entry.path,
-          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-        }),
-      ]);
-      if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
-        return { kind: "backup-failed", detail: "git dirt probe failed" };
-      }
-      const untrackedPaths = untracked.stdout
-        .split("\0")
-        .filter((p) => p.length > 0);
-      for (const relativePath of untrackedPaths) {
-        if (!isSafeLaneRelativePath(relativePath)) {
-          return {
-            kind: "backup-failed",
-            detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
-          };
-        }
-      }
-      await mkdir(spoolDir, { recursive: true });
-      await mkdir(snapshotDir, { recursive: false });
-      createdSnapshot = true;
-      await writeFile(resolve(snapshotDir, "staged.patch"), staged.stdout);
-      await writeFile(resolve(snapshotDir, "unstaged.patch"), unstaged.stdout);
-      for (const relativePath of untrackedPaths) {
-        await snapshotUntrackedNode(
-          resolve(entry.path, relativePath),
-          resolve(snapshotDir, "untracked", relativePath),
-        );
-      }
-      const indexLine = serializeLaneDirtIndex({
-        snapshotId,
-        createdAtMs: nowMs,
-        repoCwd,
-        lanePath: entry.path,
-        branch: entry.branch ?? "",
-        untrackedPaths,
-      });
-      await appendFile(resolve(spoolDir, "index.ndjson"), indexLine);
-    }
-  } catch (err) {
-    if (createdSnapshot) {
-      await rm(snapshotDir, { recursive: true, force: true }).catch(() => {});
-    }
-    return {
-      kind: "backup-failed",
-      detail: err instanceof Error ? err.message : String(err),
-    };
-  }
+  const snapshot = await snapshotCheckoutDirt(
+    {
+      repoCwd,
+      checkoutPath: entry.path,
+      branch: entry.branch ?? "",
+      snapshotId: options.snapshotId?.() ?? laneDirtSnapshotId(entry.path),
+      spoolDir: options.spoolDir ?? resolveLaneDirtSpoolDir(),
+      createdAtMs: options.nowMs?.() ?? Date.now(),
+    },
+    run,
+  );
+  if (snapshot.kind === "backup-failed") return snapshot;
 
   const removed = await run(["worktree", "remove", "--force", entry.path], {
     cwd: repoCwd,
@@ -2041,11 +2112,63 @@ export async function backupThenForceRemoveWorktree(
     return {
       kind: "remove-failed",
       detail: (removed.stdout + removed.stderr).trim(),
-      snapshotDir,
+      snapshotDir: snapshot.snapshotDir,
     };
   }
   await pruneWorktrees(repoCwd, run);
-  return { kind: "removed", snapshotDir };
+  return { kind: "removed", snapshotDir: snapshot.snapshotDir };
+}
+
+export type BackupCleanSharedCheckoutResult =
+  | { kind: "cleaned"; snapshotDir: string }
+  | { kind: "backup-failed"; detail: string }
+  | { kind: "clean-failed"; detail: string; snapshotDir: string };
+
+export interface BackupCleanSharedCheckoutOptions
+  extends BackupForceRemoveOptions {}
+
+export async function backupThenCleanSharedCheckout(
+  checkoutPath: string,
+  run: GitRunner = gitExec,
+  options: BackupCleanSharedCheckoutOptions = {},
+): Promise<BackupCleanSharedCheckoutResult> {
+  const snapshot = await snapshotCheckoutDirt(
+    {
+      repoCwd: checkoutPath,
+      checkoutPath,
+      branch: "",
+      snapshotId: options.snapshotId?.() ?? null,
+      snapshotIdPrefix: sharedCheckoutDirtSnapshotId(checkoutPath),
+      spoolDir: options.spoolDir ?? resolveLaneDirtSpoolDir(),
+      createdAtMs: options.nowMs?.() ?? Date.now(),
+    },
+    run,
+  );
+  if (snapshot.kind === "backup-failed") return snapshot;
+
+  const reset = await run(["reset", "--hard", "HEAD"], {
+    cwd: checkoutPath,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (reset.code !== 0) {
+    return {
+      kind: "clean-failed",
+      detail: (reset.stdout + reset.stderr).trim(),
+      snapshotDir: snapshot.snapshotDir,
+    };
+  }
+  const clean = await run(["clean", "-f", "-d"], {
+    cwd: checkoutPath,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (clean.code !== 0) {
+    return {
+      kind: "clean-failed",
+      detail: (clean.stdout + clean.stderr).trim(),
+      snapshotDir: snapshot.snapshotDir,
+    };
+  }
+  return { kind: "cleaned", snapshotDir: snapshot.snapshotDir };
 }
 
 function isSafeLaneRelativePath(path: string): boolean {
@@ -2055,18 +2178,69 @@ function isSafeLaneRelativePath(path: string): boolean {
   return !normalized.split("/").some((part) => part === "" || part === "..");
 }
 
+async function safeUntrackedNode(
+  checkoutRoot: string,
+  relativePath: string,
+): Promise<{
+  source: string;
+  kind: "file" | "symlink";
+  linkTarget?: string;
+}> {
+  const parts = relativePath.replaceAll("\\", "/").split("/");
+  let source = checkoutRoot;
+  let st: Awaited<ReturnType<typeof lstat>> | null = null;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === undefined)
+      throw new Error(`unsafe untracked path: ${relativePath}`);
+    source = resolve(source, part);
+    st = await lstat(source);
+    if (i < parts.length - 1 && st.isSymbolicLink()) {
+      throw new Error(`unsafe symlink parent: ${relativePath}`);
+    }
+  }
+  if (st?.isSymbolicLink()) {
+    const linkTarget = await readlink(source);
+    const resolvedTarget = resolve(dirname(source), linkTarget);
+    const root = resolve(checkoutRoot);
+    if (
+      resolvedTarget !== root &&
+      !resolvedTarget.startsWith(`${root}${sep}`)
+    ) {
+      throw new Error(`unsafe symlink target: ${relativePath}`);
+    }
+    return { source, kind: "symlink", linkTarget };
+  }
+  if (!st?.isFile()) throw new Error(`unsupported untracked node: ${source}`);
+  return { source, kind: "file" };
+}
+
+async function updateUntrackedNodeDigest(
+  checkoutRoot: string,
+  relativePath: string,
+  digest: ReturnType<typeof createHash>,
+): Promise<void> {
+  const node = await safeUntrackedNode(checkoutRoot, relativePath);
+  digest.update("\0path\0").update(relativePath).update(`\0${node.kind}\0`);
+  if (node.kind === "symlink") {
+    digest.update(node.linkTarget ?? "");
+  } else {
+    digest.update(await readFile(node.source));
+  }
+}
+
 async function snapshotUntrackedNode(
-  source: string,
+  checkoutRoot: string,
+  relativePath: string,
   target: string,
 ): Promise<void> {
-  const st = await lstat(source);
+  const node = await safeUntrackedNode(checkoutRoot, relativePath);
   await mkdir(dirname(target), { recursive: true });
-  if (st.isSymbolicLink()) {
-    await symlink(await readlink(source), target);
+  if (node.kind === "symlink") {
+    await symlink(node.linkTarget ?? "", target);
     return;
   }
-  if (!st.isFile()) throw new Error(`unsupported untracked node: ${source}`);
-  await copyFile(source, target);
+  await copyFile(node.source, target);
 }
 
 function serializeLaneDirtIndex(input: {

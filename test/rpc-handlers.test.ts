@@ -27,6 +27,7 @@ import {
   parseDispatchKey,
   perRootStoredWhileOffNote,
   replayDeadLetterHandler,
+  requestAwaitHandler,
   requestHandoffHandler,
   retryDispatchHandler,
   setAutopilotConfigHandler,
@@ -119,6 +120,9 @@ function stubBridge(
     async requestHandoff() {
       return { ok: true };
     },
+    async requestAwait() {
+      return { ok: true };
+    },
   };
   return { bridge, state };
 }
@@ -195,6 +199,7 @@ function autopilotStubBridge(opts: {
   setConfig?: { ok: boolean; error?: string; note?: string };
   setArmed?: { ok: boolean; error?: string };
   requestHandoff?: { ok: boolean; error?: string; conflict?: boolean };
+  requestAwait?: { ok: boolean; error?: string };
 }): {
   bridge: ReplayBridge;
   state: {
@@ -221,6 +226,7 @@ function autopilotStubBridge(opts: {
       initiator_session: string | null;
       initiator_pane: string | null;
     }>;
+    requestAwaitCalls: unknown[];
   };
 } {
   const state = {
@@ -244,6 +250,7 @@ function autopilotStubBridge(opts: {
       initiator_session: string | null;
       initiator_pane: string | null;
     }>,
+    requestAwaitCalls: [] as unknown[],
   };
   const bridge: ReplayBridge = {
     async replay() {
@@ -272,6 +279,10 @@ function autopilotStubBridge(opts: {
     async requestHandoff(req) {
       state.requestHandoffCalls.push(req);
       return opts.requestHandoff ?? { ok: true };
+    },
+    async requestAwait(req) {
+      state.requestAwaitCalls.push(req);
+      return opts.requestAwait ?? { ok: true };
     },
   };
   return { bridge, state };
@@ -937,6 +948,100 @@ test("request_handoff throws SlugConflictError when the bridge reports a collisi
   );
   expect(p).rejects.toBeInstanceOf(SlugConflictError);
   expect(p).rejects.toThrow(/already in use/);
+});
+
+// ---------------------------------------------------------------------------
+// `request_await`
+// ---------------------------------------------------------------------------
+
+const validAwaitRequest = {
+  op: "request",
+  await_id: "land-epic",
+  condition_spec: [{ condition: "landed", target: "fn-1-foo" }],
+  doc_path: "/state/await/rpc-1.txt",
+  target_session: "work",
+  target_dir: "/Users/dev/code/repo",
+  timeout_ms: 60_000,
+} as const;
+
+test("request_await forwards a validated durable request", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await requestAwaitHandler(validAwaitRequest, bridge);
+  expect(result).toEqual({
+    ok: true,
+    op: "request",
+    await_id: "land-epic",
+  });
+  expect(state.requestAwaitCalls).toEqual([validAwaitRequest]);
+});
+
+test("request_await forwards the cancel variant", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await requestAwaitHandler(
+    { op: "cancel", await_id: "land-epic" },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    op: "cancel",
+    await_id: "land-epic",
+  });
+  expect(state.requestAwaitCalls).toEqual([
+    { op: "cancel", await_id: "land-epic" },
+  ]);
+});
+
+test("request_await rejects unknown and session-local condition kinds loudly", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const condition of ["monitor-running", "server-up", "unknown-kind"]) {
+    const promise = requestAwaitHandler(
+      {
+        ...validAwaitRequest,
+        condition_spec: [{ condition }],
+      },
+      bridge,
+    );
+    expect(promise).rejects.toBeInstanceOf(BadParamsError);
+    expect(promise).rejects.toThrow(/allowed kinds: complete, unblocked/);
+  }
+  expect(state.requestAwaitCalls).toEqual([]);
+});
+
+test("request_await rejects unknown top-level payload keys for both variants", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  expect(
+    requestAwaitHandler({ ...validAwaitRequest, command: "rm -rf /" }, bridge),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(
+    requestAwaitHandler(
+      { op: "cancel", await_id: "land-epic", reason: "typo" },
+      bridge,
+    ),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(state.requestAwaitCalls).toEqual([]);
+});
+
+test("request_await rejects malformed request fields and bridge failures", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const params of [
+    { ...validAwaitRequest, condition_spec: [] },
+    { ...validAwaitRequest, doc_path: "" },
+    { ...validAwaitRequest, target_session: "" },
+    { ...validAwaitRequest, target_dir: "relative" },
+    { ...validAwaitRequest, timeout_ms: 0 },
+  ]) {
+    expect(requestAwaitHandler(params, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.requestAwaitCalls).toEqual([]);
+
+  const failed = autopilotStubBridge({
+    requestAwait: { ok: false, error: "writer failed" },
+  });
+  expect(requestAwaitHandler(validAwaitRequest, failed.bridge)).rejects.toThrow(
+    /writer failed/,
+  );
 });
 
 // ---------------------------------------------------------------------------

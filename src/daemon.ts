@@ -62,9 +62,16 @@ import type {
 import {
   classifyResolverOutcome,
   createSharedCheckoutDirtyTracker,
+  runDeadWriterCheckoutSweep,
+  type SharedCheckoutWriter,
   WORKER_EFFORT,
   WORKER_MODEL,
 } from "./autopilot-worker";
+import type {
+  AwaitIncomingMessage,
+  AwaitOutboundMessage,
+  AwaitWorkerData,
+} from "./await-worker";
 import {
   backfillMutationPath,
   isMutationPathBackfillComplete,
@@ -118,6 +125,7 @@ import {
   evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
+  resolveAwaitSpillDir,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
   resolveBusSockPath,
@@ -221,6 +229,7 @@ import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   isStoppedJobLive,
+  REPAIR_TERMINAL_GRACE_SEC,
 } from "./reconcile-core";
 import {
   DEFAULT_BATCH_SIZE,
@@ -235,26 +244,29 @@ import type {
 } from "./restore-worker";
 import { nodeResumeResolveFs } from "./resume-resolve";
 import { perRootStoredWhileOffNote } from "./rpc-handlers";
-import { seedKilledSweep } from "./seed-sweep";
-import type {
-  BootCompleteMessage,
-  KickMessage,
-  ReplayRequestMessage,
-  ReplayResultMessage,
-  RequestHandoffRequestMessage,
-  RequestHandoffResultMessage,
-  RetryDispatchRequestMessage,
-  RetryDispatchResultMessage,
-  ServeHealthMessage,
-  ServerWorkerData,
-  SetAutopilotConfigRequestMessage,
-  SetAutopilotConfigResultMessage,
-  SetAutopilotModeRequestMessage,
-  SetAutopilotModeResultMessage,
-  SetAutopilotPausedRequestMessage,
-  SetAutopilotPausedResultMessage,
-  SetEpicArmedRequestMessage,
-  SetEpicArmedResultMessage,
+import { readOsStartTime, seedKilledSweep } from "./seed-sweep";
+import {
+  type BootCompleteMessage,
+  isPidAlive,
+  type KickMessage,
+  type ReplayRequestMessage,
+  type ReplayResultMessage,
+  type RequestAwaitRequestMessage,
+  type RequestAwaitResultMessage,
+  type RequestHandoffRequestMessage,
+  type RequestHandoffResultMessage,
+  type RetryDispatchRequestMessage,
+  type RetryDispatchResultMessage,
+  type ServeHealthMessage,
+  type ServerWorkerData,
+  type SetAutopilotConfigRequestMessage,
+  type SetAutopilotConfigResultMessage,
+  type SetAutopilotModeRequestMessage,
+  type SetAutopilotModeResultMessage,
+  type SetAutopilotPausedRequestMessage,
+  type SetAutopilotPausedResultMessage,
+  type SetEpicArmedRequestMessage,
+  type SetEpicArmedResultMessage,
 } from "./server-worker";
 import type { StatuslineWorkerData } from "./statusline-worker";
 import { type PiRepairJob, proposePiRepair } from "./tabs-core";
@@ -280,6 +292,10 @@ import type {
   WakeWorkerData,
   WakeWorkerOutbound,
 } from "./wake-worker";
+import {
+  backupThenCleanSharedCheckout,
+  probeLaneMergeHead,
+} from "./worktree-git";
 import { repoToken, worktreePathFor } from "./worktree-plan";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
@@ -1389,7 +1405,7 @@ export function buildRepairHumanNotifyBody(args: {
   const verdictLine =
     args.verdict === "died"
       ? `its job DIED before landing a fix`
-      : `it DECLINED (could not repair the shared base — stamped BLOCKED)`;
+      : `it DECLINED (could not repair the shared base, or stayed stopped past grace while parked on a question)`;
   const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
   return [
     `🔴 keeper: repair::${args.repoToken} needs you — the autonomous shared-base`,
@@ -1561,10 +1577,26 @@ export async function runBlockHumanNotifySweep(
  *  producer; the fingerprint half is a `\S+` token (see {@link fingerprintFailure}). */
 export const REPAIR_REASON_PREFIX = "shared-base-broken";
 
+/** Baseline diagnosis carried from a confirmed-red leaf onto the durable repair row. */
+export interface RepairBaselineDiagnosis {
+  baseline_leaf_key: string;
+  failing_tests_digest: string;
+}
+
 /** Build the sticky repair row's `reason` for a fingerprint — the mint-side twin of
- *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE`. Pure. */
-export function repairReasonFor(fingerprint: string): string {
-  return `${REPAIR_REASON_PREFIX}:${fingerprint}`;
+ *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE`. Baseline evidence is appended as
+ *  JSON-quoted attacker-influenced text so whitespace/newlines cannot blur the two
+ *  fields; the leading fingerprint token remains backward-compatible. Pure. */
+export function repairReasonFor(
+  fingerprint: string,
+  diagnosis?: RepairBaselineDiagnosis,
+): string {
+  const prefix = `${REPAIR_REASON_PREFIX}:${fingerprint}`;
+  if (diagnosis == null) return prefix;
+  return (
+    `${prefix} baseline_leaf=${JSON.stringify(diagnosis.baseline_leaf_key)}` +
+    ` failing_tests=${JSON.stringify(diagnosis.failing_tests_digest)}`
+  );
 }
 
 /** One `SHARED_BASE_BROKEN` blocked task resolved to the shared repo it hashes to — the
@@ -1579,6 +1611,8 @@ export interface RepairCandidate {
   repo_token: string;
   /** {@link fingerprintFailure}(blocked reason) — the defect identity in the row reason. */
   fingerprint: string;
+  /** Present only for a candidate sourced from a confirmed-red baseline leaf. */
+  baseline_diagnosis?: RepairBaselineDiagnosis;
 }
 
 /** The coalesced representative of a repo token's candidate group — the (repo_dir,
@@ -1587,6 +1621,8 @@ export interface RepairGroup {
   repo_token: string;
   repo_dir: string;
   fingerprint: string;
+  /** Durable diagnosis reference copied from the representative baseline candidate. */
+  baseline_diagnosis?: RepairBaselineDiagnosis;
 }
 
 /** An existing sticky `dispatch_failures` repair row (verb `repair`, id the repo
@@ -1804,6 +1840,16 @@ export function baselineRepairFingerprint(leaf: SuiteRedResult): string {
   return fingerprintFailure(hard.join("\n"));
 }
 
+/** The merge-gate-shaped bounded join carried on a baseline repair incident. */
+export function baselineRepairFailingTestsDigest(leaf: SuiteRedResult): string {
+  const names = leaf.failing.slice(0, 8).map((f) => f.id);
+  const more =
+    leaf.failing.length > names.length
+      ? ` (+${leaf.failing.length - names.length} more)`
+      : "";
+  return `${names.join("; ")}${more}`;
+}
+
 /**
  * Build the baseline-sourced repair candidates from each open-epic repo's newest-tip
  * leaf. A CONFIRMED-red leaf yields one task-less {@link RepairCandidate} keyed on
@@ -1842,6 +1888,10 @@ export function buildBaselineRepairCandidates(
       repo_dir: repoDir,
       repo_token: token,
       fingerprint: baselineRepairFingerprint(leaf),
+      baseline_diagnosis: {
+        baseline_leaf_key: leaf.key,
+        failing_tests_digest: baselineRepairFailingTestsDigest(leaf),
+      },
     });
   }
   return out;
@@ -1910,12 +1960,18 @@ export interface RepairEscalationSweepDeps {
   readonly dispatchRepair: (
     group: RepairGroup,
   ) => Promise<EscalationDispatchOutcome>;
-  /** Classify the dispatched `repair::<token>` session's outcome (DELEGATES to
-   *  {@link classifyEscalationOutcome} over the live `jobs` in production). The human is
-   *  paged only on a terminal decline/death; while it is live or unfolded it returns
-   *  `{terminal:false}` and the sweep skips (a successful repair unblocks the tasks,
-   *  emptying the candidate set so this row reaches the CLEAR pass, not the notify). */
+  /** Classify the dispatched `repair::<token>` session's recorded outcome (DELEGATES to
+   *  {@link classifyEscalationOutcome} over the live `jobs` in production). Its existing
+   *  terminal died/declined verdict always wins. A missing terminal verdict is promoted
+   *  producer-side only after the injected grace below. */
   readonly repairOutcome: (repoToken: string) => ResolverOutcome;
+  /** Fail-safe turn-activity probe. A working repair NEVER grace-promotes, regardless of
+   *  dispatch age. Production returns true on a jobs-read failure. */
+  readonly repairSessionWorking: (repoToken: string) => boolean;
+  /** Producer clock and generous grace, in unix seconds. The durable anchor is the
+   *  existing `repair_dispatched_at` marker; no second timestamp/column is needed. */
+  readonly nowSec: () => number;
+  readonly terminalGraceSec: number;
   /** Send the ONE botctl page about a declined/dead `repair::<token>` session. Async +
    *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
   readonly notifyHuman: (
@@ -2010,10 +2066,11 @@ export function buildSharedDirtyObservation(
  * repo token (representative = the (repo_dir, fingerprint) of the lexicographically-first
  * candidate), then per token:
  *
- *  - A row with `repair_dispatched_at` set and candidates STILL remaining means the
- *    dispatched repair DECLINED / DIED (a success would have unblocked the tasks, emptying
- *    the group): page the human ONCE via the `human_notified_at` gate, then leave the row
- *    sticky until `retry_dispatch` re-arms it.
+ *  - A row with `repair_dispatched_at` set and candidates STILL remaining waits for the
+ *    recorded repair verdict. A terminal DECLINED / DIED verdict pages immediately; a
+ *    stopped/vanished repair with no recorded verdict promotes to DECLINED only after the
+ *    injected dispatch-marker grace. A working repair never promotes. The page fires ONCE
+ *    via `human_notified_at`, then the row stays sticky until `retry_dispatch` re-arms it.
  *  - A token with no dispatched repair yet DISPATCHES one `repair::<token>` session (the
  *    global cap + per-key occupancy guard apply via `dispatchRepair`), minting the sticky
  *    latch first when none exists. A DIRTY shared checkout DEFERS — no attempt consumed,
@@ -2072,6 +2129,9 @@ export async function runRepairEscalationSweep(
         repo_token: c.repo_token,
         repo_dir: c.repo_dir,
         fingerprint: c.fingerprint,
+        ...(c.baseline_diagnosis == null
+          ? {}
+          : { baseline_diagnosis: c.baseline_diagnosis }),
       });
     }
   }
@@ -2086,10 +2146,27 @@ export async function runRepairEscalationSweep(
       // verdict; the row then stays sticky until `retry_dispatch`.
       if (existing.human_notified_at != null) continue; // already paged
       const outcome = deps.repairOutcome(token);
-      if (!outcome.terminal) continue; // still live / job not folded yet
+      let verdict: "declined" | "died";
+      if (outcome.terminal) {
+        // Preserve the shared classifier's recorded stopped→declined / dead→died split.
+        verdict = outcome.verdict;
+      } else {
+        // A healthy slow repair is exempt forever. Only a non-working session with no
+        // recorded terminal verdict may be promoted, and only after the dispatch-marker
+        // grace. This producer-local fallback deliberately does not alter unblock or
+        // deconflict classification.
+        if (deps.repairSessionWorking(token)) continue;
+        if (
+          deps.nowSec() - existing.repair_dispatched_at <
+          deps.terminalGraceSec
+        ) {
+          continue;
+        }
+        verdict = "declined";
+      }
       let result: RepairHumanNotifiedOutcome;
       try {
-        result = await deps.notifyHuman(existing, outcome.verdict);
+        result = await deps.notifyHuman(existing, verdict);
       } catch (err) {
         note(
           `# warn: repair human-notify threw for ${token} (non-fatal): ${
@@ -6774,6 +6851,7 @@ export type WorkerName =
   | "birthIngest"
   | "autopilot"
   | "handoff"
+  | "await"
   | "maintenance"
   | "restore"
   | "renamer"
@@ -6802,6 +6880,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "birthIngest",
   "autopilot",
   "handoff",
+  "await",
   "maintenance",
   "restore",
   "renamer",
@@ -7260,6 +7339,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // daemon-readable path and exfiltrate its bytes into the durable `handoffs`
   // projection. See the read site below.
   const handoffSpillDir = resolveHandoffSpillDir();
+  const awaitSpillDir = resolveAwaitSpillDir();
 
   // fn-897 B1: the boot drain + seed + ephemeral-truncate runs in `serveBootDrain`
   // below, INVOKED after the server-worker spawn so the read socket is up during
@@ -7727,6 +7807,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetAutopilotConfigRequestMessage
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
+        | RequestAwaitRequestMessage
         | BackstopMessage
         | ServeHealthMessage
         | { kind: "ready" }
@@ -8251,6 +8332,132 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           reply = {
             type: "request-handoff-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "request-await-request") {
+        const id = msg.id;
+        let reply: RequestAwaitResultMessage;
+        try {
+          const request = msg.request;
+          const ts = Date.now() / 1000;
+          let data: Record<string, unknown>;
+          if (request.op === "cancel") {
+            data = { op: "cancel", await_id: request.await_id };
+          } else {
+            const realDir = ((): string => {
+              try {
+                return realpathSync(awaitSpillDir);
+              } catch {
+                return resolvePath(awaitSpillDir);
+              }
+            })();
+            const realDoc = ((): string => {
+              try {
+                return realpathSync(request.doc_path);
+              } catch {
+                return resolvePath(request.doc_path);
+              }
+            })();
+            if (realDoc !== realDir && !realDoc.startsWith(realDir + sep)) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` resolves outside the spill dir \`${awaitSpillDir}\``,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            let followUp: string;
+            try {
+              followUp = readFileSync(realDoc, "utf8");
+            } catch (readErr) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `cannot read await spill file \`${request.doc_path}\`: ${
+                  readErr instanceof Error ? readErr.message : String(readErr)
+                }`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            if (followUp.length === 0) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` is empty`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            const bytes = Buffer.byteLength(followUp, "utf8");
+            if (bytes > HANDOFF_DOC_MAX_BYTES) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` is ${bytes} bytes, over the ${HANDOFF_DOC_MAX_BYTES}-byte cap`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            data = {
+              op: "request",
+              await_id: request.await_id,
+              condition_spec: request.condition_spec,
+              follow_up: followUp,
+              target_session: request.target_session,
+              target_dir: request.target_dir ?? null,
+              timeout_at:
+                request.timeout_ms == null
+                  ? null
+                  : ts + request.timeout_ms / 1000,
+            };
+          }
+          stmts.insertEvent.run({
+            $ts: ts,
+            $session_id: request.await_id,
+            $pid: null,
+            $hook_event: "AwaitRequested",
+            $event_type: "awaits",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify(data),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $plan_op: null,
+            $plan_target: null,
+            $plan_epic_id: null,
+            $plan_task_id: null,
+            $plan_subject_present: null,
+            $config_dir: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $plan_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+            $worktree: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "request-await-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "request-await-result",
             id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
@@ -9704,6 +9911,100 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (handoffWorkerInstance)`
+
+  // Durable awaits mirror the handoff worker's supervised, read-only reactor.
+  // Main alone turns its lifecycle messages into deterministic synthetic events.
+  const awaitWorkerInstance = want("await")
+    ? new Worker(new URL("./await-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          launcherArgvPrefix,
+          cwd: process.cwd(),
+        } satisfies AwaitWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+  if (awaitWorkerInstance) {
+    const aw = awaitWorkerInstance;
+    aw.onmessage = (
+      ev: MessageEvent<AwaitOutboundMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "await-firing-request") {
+        const ok = mintAwaitLifecycle("AwaitFiring", msg.payload);
+        aw.postMessage({
+          type: "await-firing-ack",
+          id: msg.id,
+          ok,
+        } satisfies AwaitIncomingMessage);
+      } else if (msg.kind === "await-terminal") {
+        mintAwaitLifecycle(
+          msg.terminal === "done"
+            ? "AwaitDone"
+            : msg.terminal === "timed_out"
+              ? "AwaitTimedOut"
+              : "AwaitFailed",
+          msg.payload,
+        );
+      }
+    };
+    aw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] await worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+    aw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
+  function mintAwaitLifecycle(
+    hookEvent: "AwaitFiring" | "AwaitDone" | "AwaitFailed" | "AwaitTimedOut",
+    payload: { await_id: string; reason?: string },
+  ): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: payload.await_id,
+        $pid: null,
+        $hook_event: hookEvent,
+        $event_type: "awaits",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify(payload),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return true;
+    } catch (err) {
+      console.error(
+        `[keeperd] ${hookEvent} mint threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
 
   /**
    * Mint a synthetic `HandoffDispatching` event AND reply a durable
@@ -12187,6 +12488,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // per-repo `shared-checkout-dirty:<hash>` row, level-cleared on observed-clean. In
   // main memory only; a restart re-arms it (the projection-driven clear still fires).
   const sharedDirtyDistressTracker = createSharedCheckoutDirtyTracker();
+  const sharedDirtyCleanedAwaitingClear = new Set<string>();
 
   // The OPEN `shared-checkout-dirty` distress rows (per-repo `daemon`-verb) — the grace
   // tracker's clear surface + the id the repair-defer diagnostic names. A read failure
@@ -12215,24 +12517,56 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // — the page-once sweep's current-state working set. Both families share the daemon
   // distress verb; the two id prefixes are disjoint. A read failure degrades to an empty
   // set (the next tick re-reads).
-  function selectUnpagedSharedCheckoutRows(): SharedCheckoutPageRow[] {
+  function selectUnpagedSharedCheckoutRows(
+    excludeIds: ReadonlySet<string> = new Set(),
+  ): SharedCheckoutPageRow[] {
     try {
-      return db
-        .query(
-          `SELECT id, dir, reason FROM dispatch_failures
-             WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
-               AND human_notified_at IS NULL`,
-        )
-        .all(
-          SHARED_DIRTY_DISTRESS_VERB,
-          `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
-          `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
-          `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
-          `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
-        ) as SharedCheckoutPageRow[];
+      return (
+        db
+          .query(
+            `SELECT id, dir, reason FROM dispatch_failures
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+                 AND human_notified_at IS NULL`,
+          )
+          .all(
+            SHARED_DIRTY_DISTRESS_VERB,
+            `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
+            `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
+            `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
+            `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
+          ) as SharedCheckoutPageRow[]
+      ).filter((row) => !excludeIds.has(row.id));
     } catch {
       return [];
     }
+  }
+
+  function selectSharedCheckoutWriters(
+    checkoutDir: string,
+  ): SharedCheckoutWriter[] {
+    const canonical = (() => {
+      try {
+        return realpathSync(checkoutDir);
+      } catch {
+        return checkoutDir;
+      }
+    })();
+    return db
+      .query(
+        `SELECT job_id, state, pid, start_time, updated_at FROM jobs
+           WHERE cwd = ? OR cwd = ?`,
+      )
+      .all(checkoutDir, canonical) as SharedCheckoutWriter[];
+  }
+
+  function sharedCheckoutWriterLiveness(
+    writer: SharedCheckoutWriter,
+  ): "dead" | "live" | "inconclusive" {
+    if (writer.pid == null || writer.start_time == null) return "inconclusive";
+    if (!isPidAlive(writer.pid)) return "dead";
+    const liveStartTime = readOsStartTime(writer.pid);
+    if (liveStartTime == null) return "inconclusive";
+    return liveStartTime === writer.start_time ? "live" : "dead";
   }
 
   // Send the ONE botctl page about a live shared-checkout dirty/desync distress row.
@@ -12315,6 +12649,33 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
       return "notify_failed";
+    }
+  }
+
+  // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
+  // read failure returns TRUE so an old dispatch marker can never false-decline a healthy
+  // repair merely because its job row was temporarily unreadable.
+  function repairSessionWorking(token: string): boolean {
+    try {
+      const instance = stickyRepairInstanceFor(token);
+      const jobs =
+        instance == null
+          ? (db
+              .query(
+                "SELECT state FROM jobs WHERE plan_verb = 'repair' AND plan_ref = ?",
+              )
+              .all(token) as Array<Pick<Job, "state">>)
+          : (db
+              .query(
+                `SELECT state FROM jobs
+                   WHERE plan_verb = 'repair' AND plan_ref = ?
+                     AND (escalation_instance = ? OR
+                       (escalation_instance IS NULL AND last_event_id >= ?))`,
+              )
+              .all(token, instance, instance) as Array<Pick<Job, "state">>);
+      return jobs.some((job) => job.state === "working");
+    } catch {
+      return true;
     }
   }
 
@@ -12404,7 +12765,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     const candidatesAll = [...candidates, ...baselineCandidates];
     const openDirty = selectOpenSharedDirtyRows();
+    const openDirtyIds = new Set(openDirty.map((row) => row.id));
+    for (const id of sharedDirtyCleanedAwaitingClear) {
+      if (!openDirtyIds.has(id)) sharedDirtyCleanedAwaitingClear.delete(id);
+    }
     const openDirtyById = new Map(openDirty.map((r) => [r.dir, r.id]));
+    const deadWriterOutcomes = await runDeadWriterCheckoutSweep({
+      rows: openDirty.filter(
+        (row) => !sharedDirtyCleanedAwaitingClear.has(row.id),
+      ),
+      nowSec: () => Date.now() / 1000,
+      selectWriters: (dir) => selectSharedCheckoutWriters(dir),
+      identityLiveness: (writer) => sharedCheckoutWriterLiveness(writer),
+      probeMergeHead: (dir) => probeLaneMergeHead(dir),
+      backupThenClean: (dir) => backupThenCleanSharedCheckout(dir),
+      noteLine: note,
+    });
+    const cleanedDirtyIds = new Set(
+      deadWriterOutcomes
+        .filter((outcome) => outcome.kind === "cleaned")
+        .map((outcome) => outcome.id),
+    );
+    for (const id of cleanedDirtyIds) sharedDirtyCleanedAwaitingClear.add(id);
 
     await runRepairEscalationSweep({
       selectCandidates: () => candidatesAll,
@@ -12434,11 +12816,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           token,
           repairIncidentOpen(token),
         ),
+      repairSessionWorking: (token) => repairSessionWorking(token),
+      nowSec: () => Date.now() / 1000,
+      terminalGraceSec: REPAIR_TERMINAL_GRACE_SEC,
       notifyHuman: (row, verdict) => notifyHumanOfRepair(row, verdict),
       mintRow: (group) =>
         mintRepairRowEvent(
           group.repo_token,
-          repairReasonFor(group.fingerprint),
+          repairReasonFor(group.fingerprint, group.baseline_diagnosis),
           group.repo_dir,
           Date.now() / 1000,
         ),
@@ -12482,7 +12867,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // dropped out of `human_notified_at IS NULL` selection. Inherits this tick's
     // not-paused / not-shutting-down gating; a paused board defers the page until play.
     await runSharedCheckoutPageSweep({
-      selectUnpaged: () => selectUnpagedSharedCheckoutRows(),
+      selectUnpaged: () => selectUnpagedSharedCheckoutRows(cleanedDirtyIds),
       notifyHuman: (row) => notifyHumanOfSharedCheckout(row),
       mintNotified: (id, outcome) =>
         mintSharedCheckoutHumanNotifiedEvent(id, outcome),
@@ -13916,6 +14301,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       birthIngestWorker,
       autopilotWorkerInstance,
       handoffWorkerInstance,
+      awaitWorkerInstance,
       maintenanceWorker,
       restoreWorker,
       renamerWorker,

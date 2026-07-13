@@ -637,6 +637,34 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
+    name: "daemon",
+    summary: "Daemon lifecycle operations",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: [],
+    verbs: [
+      {
+        name: "restart",
+        summary: "Restart keeperd and wait for a caught-up serve",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        flags: [
+          FLAG_HELP,
+          {
+            name: "timeout",
+            type: "string",
+            summary: "Overall restart timeout (duration, e.g. 30s, 2m)",
+          },
+          FLAG_SOCK,
+        ],
+      },
+    ],
+  },
+  {
     name: "query",
     summary: "One-shot read of an allowlisted daemon collection (JSON)",
     visibility: "public",
@@ -696,6 +724,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     flags: [
       FLAG_HELP,
       FLAG_AGENT_HELP_DEFAULTED,
+      {
+        name: "durable",
+        type: "boolean",
+        summary:
+          "Persist the await and return immediately; keeperd fires a fresh follow-up",
+      },
       {
         name: "timeout",
         type: "string",

@@ -72,8 +72,8 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * v9 adds the additive `in_flight.board_work_jobs` count — working Board-work
  * sessions only (autopilot/escalation dispatches), excluding the caller's own
  * session, distinct from `running_jobs` (every working job, supervising
- * session included). */
-export const STATUS_SCHEMA_VERSION = 9;
+ * session included); v10 adds display-only `needs_human.finalize_pending`. */
+export const STATUS_SCHEMA_VERSION = 10;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -222,6 +222,9 @@ export interface StatusData {
     // `stuck_dispatches` (never double-counted into `total`, like
     // `finalize_non_ff` / `instant_death_wall`).
     blocked_work: number;
+    // Done worktree epics which are not yet landed while the board is paused.
+    // Display-only: a deliberate pause is never a jam or total contributor.
+    finalize_pending: number;
     total: number;
   };
   rev: number | null;
@@ -370,6 +373,13 @@ export function buildStatusEnvelope(
     epicIds,
   }).counts;
   const needsHumanTotal = needsHuman.total;
+  const landed = new Set(snap.landedEpicIds ?? []);
+  const finalizePending =
+    snap.autopilotPaused && snap.worktreeMode
+      ? snap.epics.filter(
+          (epic) => epic.status === "done" && !landed.has(epic.epic_id),
+        ).length
+      : 0;
 
   // At rest: nothing the autopilot could dispatch right now (no ready/running
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
@@ -413,6 +423,7 @@ export function buildStatusEnvelope(
       parked_questions: needsHuman.parkedQuestions,
       instant_death_wall: needsHuman.instantDeathWall,
       blocked_work: needsHuman.blockedWork,
+      finalize_pending: finalizePending,
       total: needsHuman.total,
     },
     rev: boot.rev,
@@ -604,6 +615,9 @@ export async function runStatus(
     // epic never changes `needs_human.total` — only which board row the row's
     // kinds attach to.
     includePinnedEpics: true,
+    // Include recent done epics and their landed set: paused worktree finalizes
+    // age off the open board otherwise, making the display-only count invisible.
+    includeRecentDoneEpics: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
       latestBoot = { rev: boot.rev, catching_up: boot.catching_up };

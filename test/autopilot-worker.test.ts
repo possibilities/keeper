@@ -78,6 +78,7 @@ import {
   createStaleBaseLaneTracker,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
+  type DeadWriterCheckoutSweepOutcome,
   DISPATCH_FAILED_WATERMARK_SEC,
   type DispatchClearedPayload,
   type DispatchedAck,
@@ -142,12 +143,14 @@ import {
   refreshSuppressionForOpenPending,
   reposForRecovery,
   resolveDriftThresholds,
+  runDeadWriterCheckoutSweep,
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
   SHARED_CHECKOUT_DESYNC_GRACE_SEC,
   SHARED_CHECKOUT_DIRTY_GRACE_SEC,
   SHARED_CHECKOUT_WEDGE_GRACE_SEC,
+  SHARED_CHECKOUT_WRITER_GRACE_SEC,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -199,6 +202,7 @@ import {
   MERGE_ESCALATION_REASON_TOKEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
@@ -17071,6 +17075,172 @@ test("wedge tracker: a restart (fresh tracker) still level-clears a row minted b
 
 const DIRTY_REASON =
   "worktree-recover-dirty-checkout: /repo has a dirty working tree — skipping the merge until it is clean — M src/x.ts";
+
+const DEAD_WRITER_ROW = {
+  id: "shared-checkout-dirty:repo-a",
+  dir: REPO_A,
+};
+
+function staleWriter(overrides: Record<string, unknown> = {}) {
+  return {
+    job_id: "writer-1",
+    state: "ended",
+    pid: 101,
+    start_time: "linux:100",
+    updated_at: 1000,
+    ...overrides,
+  } as {
+    job_id: string;
+    state: string;
+    pid: number | null;
+    start_time: string | null;
+    updated_at: number;
+  };
+}
+
+async function pageUnsuppressedOutcomeOnce(
+  outcome: DeadWriterCheckoutSweepOutcome | undefined,
+): Promise<number> {
+  if (outcome === undefined) throw new Error("missing sweep outcome");
+  let notified = false;
+  let pages = 0;
+  const deps = {
+    selectUnpaged: () =>
+      !notified && outcome.kind !== "cleaned"
+        ? [{ ...DEAD_WRITER_ROW, reason: DIRTY_REASON }]
+        : [],
+    notifyHuman: async () => {
+      pages++;
+      return "notified" as const;
+    },
+    mintNotified: (_id: string, result: string) => {
+      if (result === "notified") notified = true;
+    },
+  };
+  await runSharedCheckoutPageSweep(deps);
+  await runSharedCheckoutPageSweep(deps);
+  return pages;
+}
+
+test("dead-writer checkout sweep: all cwd writers dead past grace backs up and cleans, then the dirty tracker level-clears", async () => {
+  let cleanCalls = 0;
+  const outcomes = await runDeadWriterCheckoutSweep({
+    rows: [DEAD_WRITER_ROW],
+    nowSec: () => 1000 + SHARED_CHECKOUT_WRITER_GRACE_SEC,
+    selectWriters: () => [staleWriter()],
+    identityLiveness: () => "dead",
+    probeMergeHead: () => "absent",
+    backupThenClean: async () => {
+      cleanCalls++;
+      return { kind: "cleaned", snapshotDir: "/spool/shared" };
+    },
+  });
+  expect(outcomes).toEqual([
+    {
+      ...DEAD_WRITER_ROW,
+      kind: "cleaned",
+      snapshotDir: "/spool/shared",
+    },
+  ]);
+  expect(cleanCalls).toBe(1);
+  expect(await pageUnsuppressedOutcomeOnce(outcomes[0])).toBe(0);
+
+  const tracker = createSharedCheckoutDirtyTracker(300);
+  const decision = tracker.step({
+    dirty: new Map(),
+    openDistressDirs: new Set([REPO_A]),
+    nowSec: 2000,
+  });
+  expect(decision.clear.map((entry) => entry.id)).toEqual([
+    sharedDirtyDistressId(REPO_A),
+  ]);
+});
+
+test("dead-writer checkout sweep: live, working, and unprovable writers refuse and remain page-once eligible", async () => {
+  const cases = [
+    {
+      writer: staleWriter(),
+      liveness: "live" as const,
+      detail: "is live",
+    },
+    {
+      writer: staleWriter({ state: "working" }),
+      liveness: "dead" as const,
+      detail: "is working",
+    },
+    {
+      writer: staleWriter({ start_time: null }),
+      liveness: "dead" as const,
+      detail: "no provable process identity",
+    },
+  ];
+  for (const item of cases) {
+    let cleanCalls = 0;
+    const outcomes = await runDeadWriterCheckoutSweep({
+      rows: [DEAD_WRITER_ROW],
+      nowSec: () => 1300,
+      graceSec: 300,
+      selectWriters: () => [item.writer],
+      identityLiveness: () => item.liveness,
+      probeMergeHead: () => "absent",
+      backupThenClean: async () => {
+        cleanCalls++;
+        return { kind: "cleaned", snapshotDir: "/spool/shared" };
+      },
+    });
+    expect(outcomes[0]?.kind).toBe("refused");
+    expect(outcomes[0]).toHaveProperty(
+      "detail",
+      expect.stringContaining(item.detail),
+    );
+    expect(cleanCalls).toBe(0);
+    expect(await pageUnsuppressedOutcomeOnce(outcomes[0])).toBe(1);
+  }
+});
+
+test("dead-writer checkout sweep: MERGE_HEAD presence or an inconclusive probe refuses before backup", async () => {
+  for (const mergeHead of ["present", "inconclusive"] as const) {
+    let cleanCalls = 0;
+    const outcomes = await runDeadWriterCheckoutSweep({
+      rows: [DEAD_WRITER_ROW],
+      nowSec: () => 1300,
+      graceSec: 300,
+      selectWriters: () => [staleWriter()],
+      identityLiveness: () => "dead",
+      probeMergeHead: () => mergeHead,
+      backupThenClean: async () => {
+        cleanCalls++;
+        return { kind: "cleaned", snapshotDir: "/spool/shared" };
+      },
+    });
+    expect(outcomes[0]?.kind).toBe("refused");
+    expect(cleanCalls).toBe(0);
+    expect(await pageUnsuppressedOutcomeOnce(outcomes[0])).toBe(1);
+  }
+});
+
+test("dead-writer checkout sweep: backup failure stays visible and never reports a clean", async () => {
+  const outcomes = await runDeadWriterCheckoutSweep({
+    rows: [DEAD_WRITER_ROW],
+    nowSec: () => 1300,
+    graceSec: 300,
+    selectWriters: () => [staleWriter()],
+    identityLiveness: () => "dead",
+    probeMergeHead: () => "absent",
+    backupThenClean: async () => ({
+      kind: "backup-failed",
+      detail: "spool unavailable",
+    }),
+  });
+  expect(outcomes).toEqual([
+    {
+      ...DEAD_WRITER_ROW,
+      kind: "failed",
+      detail: "spool unavailable",
+    },
+  ]);
+  expect(await pageUnsuppressedOutcomeOnce(outcomes[0])).toBe(1);
+});
 
 test("sharedDirtyDistressId is stable per repo, distinct across repos, prefix-tagged + distinct from the wedge id", () => {
   const a = sharedDirtyDistressId(REPO_A);

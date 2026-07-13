@@ -12,6 +12,22 @@ stable and never repurposed; `message` is corrective (never a stack trace or a
 filesystem path); `recovery` is the actionable next step. New codes are added
 here in the same change that introduces them.
 
+
+## Daemon restart (`keeper daemon restart`)
+
+The restart verb asks launchd to restart the already bootstrapped keeperd job, then
+waits for a socket reply whose boot status is caught up. It never opens keeper.db
+or invokes a daemon RPC. A refused socket while the old process releases its flock
+is transient. Plist edits are a different operation: use `launchctl bootout` plus
+`launchctl bootstrap`, not `kickstart`.
+
+| code | meaning | recovery | retry-safe |
+| ---- | ------- | -------- | ---------- |
+| `kickstart-failed` | `launchctl kickstart -k` could not ask launchd to restart the job. | Confirm the LaunchAgent is bootstrapped. For plist edits, bootout then bootstrap it before retrying. | yes (restart request) |
+| `health-timeout` | The bounded wait ended before the daemon answered healthy and caught up. | Inspect launchd status and daemon stderr, fix the boot fault, then retry. | yes (restart request) |
+| `throttled-respawn` | launchd is delaying keeperd after repeated respawns. | Inspect daemon stderr for the crash loop, fix it, then retry. | yes (after fixing the boot fault) |
+
+
 ## Shared-helper family (`keeper status`, `keeper query`)
 
 These ride the `{schema_version, ok, error, data}` envelope on stdout. A bad
@@ -288,7 +304,7 @@ pathspec-limited even when a gate is overridden, so a poisoned index never enter
 | code                     | meaning                                                                                                                                                                                                 | recovery                                                                                                                                                                            | retry-safe |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `operation_in_progress`  | Gate 1 (pre-lock, NO override). The repo is mid-merge / -cherry-pick / -revert / -rebase / -bisect (probed worktree-portably via `rev-parse`); `operation` names it. A full commit here silently makes a two-parent merge commit — the shape that spread the incident's stale blobs through an auto-merge. Nothing was staged or committed. | Conclude the operation (finish it, or `git bisect reset`) or abort it (`git <op> --abort`), then re-run unchanged. No override — a mid-operation partial commit is never correct. | yes (after the op concludes / aborts) |
-| `shared_checkout_jam`    | Gate 2 (pre-lock, `--override-jam`). A live `dispatch_failures` shared-checkout **dirty** / **desync** distress row (`shared-checkout-{dirty,desync}:<hash>`) matches this repo under a normalized dir compare — the working tree may trail landed history, so a commit risks sweeping stale content. FAIL-OPEN: a repo with no keeper.db (or an unreadable one) commits normally. | Let the daemon's repair/desync recovery clear the row (inspect via `keeper query dispatch_failures`); or, if the staged set is certainly correct and current, re-run with `--override-jam`. | yes (once the jam clears, or with `--override-jam`) |
+| `shared_checkout_jam`    | Gate 2 (pre-lock, `--override-jam`). A live `dispatch_failures` shared-checkout **dirty** / **desync** distress row (`shared-checkout-{dirty,desync}:<hash>`) matches this repo under a normalized dir compare — the working tree may trail landed history, so a commit risks sweeping stale content. FAIL-OPEN: a repo with no keeper.db (or an unreadable one) commits normally. | Let the daemon recover the checkout: dirt is backed up to the lane dirt spool and cleaned only when every cwd-matched writer is grace-stale and provably dead, with no merge in progress; ambiguous ownership pages once and remains untouched. Desync recovery and the observed-clean tracker clear the row. Inspect with `keeper query dispatch_failures`; if the staged set is certainly correct and current, `--override-jam` remains available. | yes (once the jam clears, or with `--override-jam`) |
 | `mass_reversion`         | Gate 3 (in-lock, `--allow-mass-reversion`). The staged set mass-matches ANCESTOR blobs while differing from HEAD (≥ 5 paths AND ≥ 30% of the staged set, excluding gitlinks + regenerated surfaces) — the desynced-checkout bulk-revert signature green suites cannot catch (the tests revert in the same sweep). `count` / `staged` / `sample` name the flagged paths. Nothing was committed. | Inspect the flagged paths against landed history (`git log -p -- <path>`). For a genuine intended bulk revert, re-run with `--allow-mass-reversion`; otherwise the checkout is stale — reconcile it with landed history first. | yes (with `--allow-mass-reversion`, or after reconciling the checkout) |
 | `unmerged_paths`         | Gate 3. The index carries unmerged (stage 1/2/3) paths — committing now would record a half-resolved conflict. `sample` names them. Nothing was committed. | Resolve the conflicted paths (`git add` each once fixed) or abort the in-progress operation, then re-run. | yes (once the conflict is resolved) |
 | `stale_index_carryover`  | Index-purity gate (in-lock, `--allow-stale-unstage`). Staged content sits OUTSIDE the session-attributed set — a dead worker's residue, a shared checkout trailing landed history, or a git-apply / codegen / script write the attribution hooks never saw. `sample` lists the offending paths. The default refuses (never a silent unstage); the commit is always pathspec-limited so the extras cannot leak. | If the extra paths are genuinely yours, commit the mixed set with plain git + explicit paths; otherwise re-run with `--allow-stale-unstage` to unstage the extras and commit only the attributed set. | yes (with either recovery path) |

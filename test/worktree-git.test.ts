@@ -14,6 +14,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -27,6 +28,7 @@ import {
 } from "../src/commit-work/git-exec";
 import {
   BASELINE_SCRATCH_PREFIX,
+  backupThenCleanSharedCheckout,
   backupThenForceRemoveWorktree,
   baselineScratchPathFor,
   branchExists,
@@ -61,6 +63,7 @@ import {
   removeWorktree,
   resolveDefaultBranch,
   resolveDefaultBranchPure,
+  sharedCheckoutDirtSnapshotId,
   type WorktreeEntry,
 } from "../src/worktree-git";
 import { repoDirHash } from "../src/worktree-plan";
@@ -1396,6 +1399,172 @@ test("backupThenForceRemoveWorktree: a failed snapshot never destroys", async ()
     expect(
       calls.some((c) => argvStartsWith(c.args, "worktree", "remove")),
     ).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenCleanSharedCheckout: snapshots before reset and removes only non-ignored untracked files", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-shared-dirt-"));
+  const checkout = join(root, "repo");
+  const spool = join(root, "spool");
+  mkdirSync(checkout, { recursive: true });
+  writeFileSync(join(checkout, "loose.txt"), "untracked\n");
+  writeFileSync(join(checkout, "ignored.cache"), "ignored\n");
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { stdout: "staged\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "diff", "--binary"),
+      result: { stdout: "unstaged\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: "loose.txt\0" },
+    },
+  ]);
+  try {
+    const result = await backupThenCleanSharedCheckout(checkout, run, {
+      spoolDir: spool,
+      nowMs: () => 4567,
+      snapshotId: () => "shared-snap",
+    });
+    expect(result).toEqual({
+      kind: "cleaned",
+      snapshotDir: join(spool, "shared-snap"),
+    });
+    expect(
+      readFileSync(
+        join(spool, "shared-snap", "untracked", "loose.txt"),
+        "utf8",
+      ),
+    ).toBe("untracked\n");
+    const resetAt = calls.findIndex((c) =>
+      argvStartsWith(c.args, "reset", "--hard", "HEAD"),
+    );
+    const cleanAt = calls.findIndex((c) =>
+      argvStartsWith(c.args, "clean", "-f", "-d"),
+    );
+    expect(resetAt).toBeGreaterThan(2);
+    expect(cleanAt).toBeGreaterThan(resetAt);
+    expect(calls[cleanAt]?.args).toEqual(["clean", "-f", "-d"]);
+    expect(calls[cleanAt]?.args).not.toContain("-x");
+    expect(existsSync(join(checkout, "ignored.cache"))).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenCleanSharedCheckout: backup failure never resets or cleans", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-shared-dirt-fail-"));
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { exitCode: 128, stderr: "cannot snapshot" },
+    },
+  ]);
+  try {
+    const result = await backupThenCleanSharedCheckout(root, run, {
+      spoolDir: join(root, "spool"),
+    });
+    expect(result.kind).toBe("backup-failed");
+    expect(calls.some((c) => argvStartsWith(c.args, "reset"))).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "clean"))).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenCleanSharedCheckout: out-of-tree untracked symlinks fail backup before clean", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-shared-dirt-link-"));
+  const checkout = join(root, "repo");
+  const outside = join(root, "outside.txt");
+  mkdirSync(checkout, { recursive: true });
+  writeFileSync(outside, "outside\n");
+  symlinkSync(outside, join(checkout, "escape"));
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: "escape\0" },
+    },
+  ]);
+  try {
+    const result = await backupThenCleanSharedCheckout(checkout, run, {
+      spoolDir: join(root, "spool"),
+    });
+    expect(result.kind).toBe("backup-failed");
+    expect(calls.some((c) => argvStartsWith(c.args, "reset"))).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "clean"))).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenCleanSharedCheckout: retry dedups the content-keyed shared-checkout snapshot", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-shared-dirt-retry-"));
+  const checkout = join(root, "repo");
+  const spool = join(root, "spool");
+  mkdirSync(checkout, { recursive: true });
+  const { run, calls } = fakeAsyncGit();
+  try {
+    const options = { spoolDir: spool };
+    expect(
+      (await backupThenCleanSharedCheckout(checkout, run, options)).kind,
+    ).toBe("cleaned");
+    expect(
+      (await backupThenCleanSharedCheckout(checkout, run, options)).kind,
+    ).toBe("cleaned");
+    expect(
+      calls.filter((c) => argvStartsWith(c.args, "diff", "--cached")),
+    ).toHaveLength(2);
+    expect(
+      readFileSync(join(spool, "index.ndjson"), "utf8").trim().split("\n"),
+    ).toHaveLength(1);
+    const entries = readdirSync(spool).sort();
+    expect(entries).toHaveLength(2);
+    expect(entries).toContain("index.ndjson");
+    expect(
+      entries.some((entry) =>
+        entry.startsWith(`${sharedCheckoutDirtSnapshotId(checkout)}-`),
+      ),
+    ).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenCleanSharedCheckout: changed dirt in the same checkout gets a distinct snapshot", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-shared-dirt-new-episode-"));
+  const checkout = join(root, "repo");
+  const spool = join(root, "spool");
+  mkdirSync(checkout, { recursive: true });
+  const loose = join(checkout, "loose.txt");
+  writeFileSync(loose, "first\n");
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: "loose.txt\0" },
+    },
+  ]);
+  try {
+    expect(
+      (await backupThenCleanSharedCheckout(checkout, run, { spoolDir: spool }))
+        .kind,
+    ).toBe("cleaned");
+    writeFileSync(loose, "second\n");
+    expect(
+      (await backupThenCleanSharedCheckout(checkout, run, { spoolDir: spool }))
+        .kind,
+    ).toBe("cleaned");
+    const snapshots = readdirSync(spool).filter(
+      (entry) => entry !== "index.ndjson",
+    );
+    expect(snapshots).toHaveLength(2);
+    expect(
+      readFileSync(join(spool, "index.ndjson"), "utf8").trim().split("\n"),
+    ).toHaveLength(2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

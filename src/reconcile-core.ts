@@ -160,6 +160,15 @@ export const REDISPATCH_COOLDOWN_S = 200;
  */
 export const FINALIZER_GUARD_S = REDISPATCH_COOLDOWN_S;
 
+/**
+ * Grace, in seconds, before the repair producer promotes a dispatched repair with no
+ * recorded terminal verdict to DECLINED. A genuinely working repair is exempt no matter
+ * how old its dispatch marker is; this window only absorbs launch/fold lag around a
+ * stopped or vanished session. The producer injects the value into its sweep so tests
+ * never wait on wall-clock time.
+ */
+export const REPAIR_TERMINAL_GRACE_SEC = 15 * 60;
+
 /** The sole epic-level finalizer verb the per-epic guard serializes. */
 const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close"]);
 

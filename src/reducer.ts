@@ -5577,6 +5577,159 @@ function foldHandoffRequested(db: Database, event: Event): void {
   }
 }
 
+/** Persisted request/cancel payload for one Durable await intent. */
+type AwaitRequestedPayload =
+  | {
+      op: "request";
+      await_id: string;
+      condition_spec: unknown[];
+      follow_up: string;
+      target_session: string | null;
+      target_dir: string | null;
+      timeout_at: number | null;
+    }
+  | { op: "cancel"; await_id: string };
+
+/** Parse without throwing; malformed Durable await Events Fold to a no-op. */
+function extractAwaitRequestedPayload(
+  event: Event,
+): AwaitRequestedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    if (typeof parsed.await_id !== "string" || parsed.await_id.length === 0) {
+      return null;
+    }
+    if (parsed.op === "cancel") {
+      return { op: "cancel", await_id: parsed.await_id };
+    }
+    if (
+      parsed.op !== "request" ||
+      !Array.isArray(parsed.condition_spec) ||
+      parsed.condition_spec.length === 0 ||
+      typeof parsed.follow_up !== "string"
+    ) {
+      return null;
+    }
+    const nullableString = (value: unknown): string | null =>
+      typeof value === "string" ? value : null;
+    const timeout_at =
+      typeof parsed.timeout_at === "number" &&
+      Number.isFinite(parsed.timeout_at)
+        ? parsed.timeout_at
+        : null;
+    return {
+      op: "request",
+      await_id: parsed.await_id,
+      condition_spec: parsed.condition_spec,
+      follow_up: parsed.follow_up,
+      target_session: nullableString(parsed.target_session),
+      target_dir: nullableString(parsed.target_dir),
+      timeout_at,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse AwaitRequested payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/** Fold one request/cancel Synthetic event into the Durable await Projection. */
+function foldAwaitRequested(db: Database, event: Event): void {
+  const payload = extractAwaitRequestedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.op === "cancel") {
+    db.run(
+      `UPDATE awaits
+          SET status = 'cancelled', claimed_at = NULL, last_event_id = ?
+        WHERE await_id = ? AND status = 'waiting'`,
+      [event.id, payload.await_id],
+    );
+    return;
+  }
+  db.run(
+    `INSERT INTO awaits (
+       await_id, condition_spec, follow_up, target_session, target_dir,
+       timeout_at, status, claimed_at, attempt_count, never_bound_count,
+       last_event_id
+     ) VALUES (?, ?, ?, ?, ?, ?, 'waiting', NULL, 0, 0, ?)
+     ON CONFLICT(await_id) DO UPDATE SET
+       condition_spec = excluded.condition_spec,
+       follow_up = excluded.follow_up,
+       target_session = excluded.target_session,
+       target_dir = excluded.target_dir,
+       timeout_at = excluded.timeout_at,
+       last_event_id = excluded.last_event_id`,
+    [
+      payload.await_id,
+      JSON.stringify(payload.condition_spec),
+      payload.follow_up,
+      payload.target_session,
+      payload.target_dir,
+      payload.timeout_at,
+      event.id,
+    ],
+  );
+}
+
+/** Await worker lifecycle marker. The producer owns clocks/launches; this fold
+ * only records their event-stamped outcomes and is therefore replay-safe. */
+function foldAwaitLifecycle(db: Database, event: Event): void {
+  let payload: { await_id?: unknown } = {};
+  try {
+    payload = JSON.parse(event.data ?? "{}") as typeof payload;
+  } catch {
+    return;
+  }
+  if (typeof payload.await_id !== "string" || payload.await_id.length === 0) {
+    return;
+  }
+  if (event.hook_event === "AwaitFiring") {
+    const row = db
+      .query("SELECT status, never_bound_count FROM awaits WHERE await_id = ?")
+      .get(payload.await_id) as
+      | { status: string; never_bound_count: number }
+      | undefined;
+    if (row === undefined || !["waiting", "firing"].includes(row.status)) {
+      return;
+    }
+    const neverBoundCount = row.never_bound_count + 1;
+    db.run(
+      `UPDATE awaits
+          SET status = ?, claimed_at = ?, attempt_count = attempt_count + 1,
+              never_bound_count = ?, last_event_id = ?
+        WHERE await_id = ? AND status IN ('waiting', 'firing')`,
+      [
+        neverBoundCount >= 3 ? "failed" : "firing",
+        event.ts,
+        neverBoundCount,
+        event.id,
+        payload.await_id,
+      ],
+    );
+    return;
+  }
+  const status =
+    event.hook_event === "AwaitDone"
+      ? "done"
+      : event.hook_event === "AwaitTimedOut"
+        ? "timed_out"
+        : "failed";
+  // Terminal outcomes never regress: a late failure may not overwrite a timeout
+  // (or a completed effect) after a lease-reclaim race.
+  db.run(
+    `UPDATE awaits
+        SET status = ?, claimed_at = NULL, last_event_id = ?
+      WHERE await_id = ? AND status IN ('waiting', 'firing')`,
+    [status, event.id, payload.await_id],
+  );
+}
+
 /**
  * Never-bound circuit-breaker threshold for handoffs: K CONSECUTIVE
  * `HandoffDispatching` events for one handoff WITHOUT an intervening bind flip
@@ -9708,6 +9861,15 @@ export function applyEvent(
       foldAutopilotMode(db, event);
     } else if (event.hook_event === "EpicArmed") {
       foldEpicArmed(db, event);
+    } else if (event.hook_event === "AwaitRequested") {
+      foldAwaitRequested(db, event);
+    } else if (
+      event.hook_event === "AwaitFiring" ||
+      event.hook_event === "AwaitDone" ||
+      event.hook_event === "AwaitFailed" ||
+      event.hook_event === "AwaitTimedOut"
+    ) {
+      foldAwaitLifecycle(db, event);
     } else if (event.hook_event === "HandoffRequested") {
       foldHandoffRequested(db, event);
     } else if (event.hook_event === "HandoffDispatching") {

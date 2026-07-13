@@ -1611,6 +1611,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -2636,6 +2637,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -2899,6 +2901,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -2968,6 +2971,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -3288,6 +3292,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -3904,6 +3909,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
         db.run("DELETE FROM epic_dep_edges");
@@ -4046,6 +4052,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM block_escalations");
         db.run("DELETE FROM handoffs");
+        db.run("DELETE FROM awaits");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
         db.run("DELETE FROM epic_dep_edges");
@@ -4268,6 +4275,13 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 125,
+    kind: "additive",
+    apply: (ctx) => {
+      ctx.db.run(CREATE_AWAITS);
+    },
+  },
 ];
 
 /**
@@ -4288,7 +4302,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v124:73e4772d1debfccd459b74b8150cf979d1f019dbdcf2346f8ae1056452fd761c";
+  "v125:82c112aa72cbf716ec425913734c29756c70c3bf067210b71235d098582d162a";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4389,6 +4403,15 @@ export function resolveHandoffSpillDir(): string {
     return override;
   }
   return join(homedir(), ".local", "state", "keeper", "handoff");
+}
+
+/** Filesystem spill directory for durable-await follow-up documents. */
+export function resolveAwaitSpillDir(): string {
+  const override = process.env.KEEPER_AWAIT_SPILL_DIR;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "await");
 }
 
 const DEFAULT_PLAN_ROOTS = ["~/code"];
@@ -5823,6 +5846,27 @@ CREATE TABLE IF NOT EXISTS handoffs (
 `;
 
 /**
+ * Durable-await intent Projection. Conditions and follow-ups are frozen into
+ * Events before the Fold; lease timestamps and counters are advanced only by
+ * lifecycle Events so a Re-fold is deterministic.
+ */
+const CREATE_AWAITS = `
+CREATE TABLE IF NOT EXISTS awaits (
+    await_id TEXT PRIMARY KEY,
+    condition_spec TEXT NOT NULL,
+    follow_up TEXT NOT NULL,
+    target_session TEXT,
+    target_dir TEXT,
+    timeout_at REAL,
+    status TEXT NOT NULL,
+    claimed_at REAL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    never_bound_count INTEGER NOT NULL DEFAULT 0,
+    last_event_id INTEGER NOT NULL
+)
+`;
+
+/**
  * `event_blobs` cold-blob relocation side table — HISTORICAL (fn-836.4 shed it).
  * Created at v57 and read by the v67 Commit-trailer backfill, so a 0→latest
  * from-scratch walk still materializes it transiently; the v74 tail then DROPs
@@ -6917,6 +6961,7 @@ function migrate(db: Database): void {
       db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_HANDOFFS);
+      db.run(CREATE_AWAITS);
       // `event_blobs` is HISTORICAL (fn-836.4 shed): NOT created in the
       // steady-state schema-setup block, so a post-shed boot never resurrects
       // it. A fresh 0→latest walk still materializes it transiently at the v57
