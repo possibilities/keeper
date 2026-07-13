@@ -989,7 +989,7 @@ test("start: one reservation has an opaque identity and never implicitly re-fans
 
 test("resume is capped to one replacement attempt per member", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("bounded resume");
@@ -1035,7 +1035,7 @@ test("resume is capped to one replacement attempt per member", async () => {
 
 test("cancel tombstones first, tears down exact live attempts, and is idempotent", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("cancel me");
@@ -1067,9 +1067,39 @@ test("cancel tombstones first, tears down exact live attempts, and is idempotent
   expect(signalled).toEqual([42]);
 });
 
+test("cancel reports a launched member with an absent pidfile as unresolved", async () => {
+  const selections: PanelSelections = {
+    panels: { one: panelDef([T_CLAUDE]) },
+    default: "one",
+  };
+  await panelStart(
+    {
+      promptFile: writePrompt("pidfile race"),
+      slug: "pidfile-race",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [member] = readManifest().members;
+  expect(member?.attempts?.[0]?.launched_at).not.toBeNull();
+  expect(member?.pidfile).not.toBeNull();
+  expect(existsSync(member?.pidfile ?? "")).toBe(false);
+
+  const cancel = makeDeps({ selections, pollIntervalMs: 1 });
+  expect(await panelCancel({ dir, cleanupMs: 2 }, cancel.deps)).toBe(1);
+
+  const cancelled = readManifest();
+  const identity = `${cancelled.members[0]?.name}#1`;
+  expect(cancelled.state).toBe("cleanup_failed");
+  expect(cancelled.unresolved_cleanup).toEqual([identity]);
+  expect(cancelled.members[0]?.attempts?.[0]?.state).toBe("cleanup_failed");
+});
+
 test("cancel reports exact unresolved identities and duplicate cancellation does not signal twice", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("wedged cleanup");
@@ -1102,7 +1132,7 @@ test("cancel reports exact unresolved identities and duplicate cancellation does
 
 test("cancel refuses to signal a recycled pid", async () => {
   const selections: PanelSelections = {
-    panels: { one: [T_CLAUDE] },
+    panels: { one: panelDef([T_CLAUDE]) },
     default: "one",
   };
   const prompt = writePrompt("recycled cancel");
