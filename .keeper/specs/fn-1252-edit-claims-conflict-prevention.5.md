@@ -37,5 +37,5 @@ distress code (else it reuses `worktree-merge-conflict`).
 - [ ] Any new distress code has a problem-codes.md row; the CLAUDE.md merge-gate line names the producer-only base-freshness rule.
 
 ## Done summary
-
+Revised ADR 0042 in place from the abandoned edit-claims/overlap-gate design to the base-freshness/rebase-cadence design (title, Context, decisions 1-3 rewritten; decisions 4-5 kept and reframed). CONTEXT.md drops Edit claim/Overlap gate, adds Base-drift/Base-freshness/Lane-base beside Merge-gate. CLAUDE.md's merge-gate line gains one producer-only base-freshness clause. docs/problem-codes.md untouched (task .4 reused worktree-merge-conflict, no new code).
 ## Evidence
