@@ -3733,6 +3733,7 @@ interface DispatchFailedPayload {
   dir: string | null;
   conflictedFiles: string[] | null;
   ts: number;
+  attemptId: number | null;
 }
 
 /**
@@ -3758,7 +3759,8 @@ function extractDispatchFailedPayload(
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<DispatchFailedPayload>;
+    const parsed = JSON.parse(event.data) as Partial<DispatchFailedPayload> &
+      Record<string, unknown>;
     if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
       return null;
     }
@@ -3780,6 +3782,14 @@ function extractDispatchFailedPayload(
           (path): path is string => typeof path === "string",
         )
       : null;
+    const attemptId = dispatchAttemptField(
+      parsed,
+      "attempt_id",
+      "dispatch_attempt_id",
+    );
+    if (attemptId === undefined) {
+      return null;
+    }
     return {
       verb: parsed.verb,
       id: parsed.id,
@@ -3787,6 +3797,7 @@ function extractDispatchFailedPayload(
       dir,
       conflictedFiles,
       ts: parsed.ts,
+      attemptId,
     };
   } catch (err) {
     console.error(
@@ -3885,10 +3896,17 @@ function foldDispatchFailed(db: Database, event: Event): void {
   // for the same pair: the outbox ordering (mint `Dispatched` BEFORE `launch()`)
   // means a launch failure leaves both rows, and this arm reconciles them in the
   // same fold. Idempotent DELETE — no-op when no pending row exists.
-  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
+  if (payload.attemptId == null) {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+      [payload.verb, payload.id],
+    );
+  } else {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+      [payload.verb, payload.id, payload.attemptId],
+    );
+  }
 }
 
 /**
@@ -3943,6 +3961,8 @@ interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
+  attemptId: number | null;
+  expectedAttemptId: number | null;
 }
 
 /**
@@ -3954,6 +3974,487 @@ interface DispatchedPayload {
 interface DispatchExpiredPayload {
   verb: string;
   id: string;
+  attemptId: number | null;
+}
+
+interface DispatchClaimTarget {
+  verb: string;
+  id: string;
+}
+
+interface DispatchClaimAcquirePayload extends DispatchClaimTarget {
+  attemptId: number | null;
+  expectedAttemptId: number | null;
+  dir: string | null;
+}
+
+interface DispatchClaimMutationPayload extends DispatchClaimTarget {
+  expectedAttemptId: number | null;
+  sessionId: string | null;
+}
+
+interface DispatchClaimSupersedePayload extends DispatchClaimTarget {
+  expectedAttemptId: number | null;
+  nextAttemptId: number;
+  dir: string | null;
+}
+
+function parseDispatchAttempt(value: unknown): number | null | undefined {
+  if (value == null) {
+    return null;
+  }
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function dispatchAttemptField(
+  parsed: Record<string, unknown>,
+  ...names: string[]
+): number | null | undefined {
+  for (const name of names) {
+    if (Object.hasOwn(parsed, name)) {
+      return parseDispatchAttempt(parsed[name]);
+    }
+  }
+  return null;
+}
+
+function extractDispatchClaimTarget(
+  parsed: Record<string, unknown>,
+): DispatchClaimTarget | null {
+  if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
+    return null;
+  }
+  if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+    return null;
+  }
+  return { verb: parsed.verb, id: parsed.id };
+}
+
+function extractDispatchClaimAcquirePayload(
+  event: Event,
+): DispatchClaimAcquirePayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    const target = extractDispatchClaimTarget(parsed);
+    const attemptId = dispatchAttemptField(
+      parsed,
+      "attempt_id",
+      "dispatch_attempt_id",
+    );
+    const expectedAttemptId = dispatchAttemptField(
+      parsed,
+      "expected_attempt_id",
+    );
+    if (
+      target == null ||
+      attemptId === undefined ||
+      expectedAttemptId === undefined
+    ) {
+      return null;
+    }
+    const dir =
+      typeof parsed.dir === "string" && parsed.dir.length > 0
+        ? parsed.dir
+        : null;
+    return { ...target, attemptId, expectedAttemptId, dir };
+  } catch {
+    return null;
+  }
+}
+
+function extractDispatchClaimMutationPayload(
+  event: Event,
+): DispatchClaimMutationPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    const target = extractDispatchClaimTarget(parsed);
+    const expectedAttemptId = dispatchAttemptField(
+      parsed,
+      "expected_attempt_id",
+      "attempt_id",
+      "dispatch_attempt_id",
+    );
+    if (target == null || expectedAttemptId === undefined) {
+      return null;
+    }
+    const sessionId =
+      typeof parsed.session_id === "string" && parsed.session_id.length > 0
+        ? parsed.session_id
+        : null;
+    return { ...target, expectedAttemptId, sessionId };
+  } catch {
+    return null;
+  }
+}
+
+function extractDispatchClaimSupersedePayload(
+  event: Event,
+): DispatchClaimSupersedePayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    const target = extractDispatchClaimTarget(parsed);
+    const expectedAttemptId = dispatchAttemptField(
+      parsed,
+      "expected_attempt_id",
+    );
+    const nextAttemptId = dispatchAttemptField(
+      parsed,
+      "next_attempt_id",
+      "new_attempt_id",
+      "attempt_id",
+    );
+    if (
+      target == null ||
+      expectedAttemptId === undefined ||
+      nextAttemptId == null
+    ) {
+      return null;
+    }
+    const dir =
+      typeof parsed.dir === "string" && parsed.dir.length > 0
+        ? parsed.dir
+        : null;
+    return { ...target, expectedAttemptId, nextAttemptId, dir };
+  } catch {
+    return null;
+  }
+}
+
+function acquireDispatchClaim(
+  db: Database,
+  event: Event,
+  payload: DispatchClaimAcquirePayload,
+): boolean {
+  if (payload.attemptId == null) {
+    db.run(
+      `INSERT INTO dispatch_claims (
+         verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+         acquired_at, bound_at, resume_acknowledged_at, released_at,
+         last_event_id, updated_at
+       ) VALUES (?, ?, NULL, 'legacy_unfenced', NULL, ?, 1, ?, NULL, NULL, NULL, ?, ?)
+       ON CONFLICT(verb, id) DO UPDATE SET
+         state = 'legacy_unfenced', session_id = NULL, dir = excluded.dir,
+         acquired_at = excluded.acquired_at, bound_at = NULL,
+         resume_acknowledged_at = NULL, released_at = NULL,
+         last_event_id = excluded.last_event_id, updated_at = excluded.updated_at
+       WHERE dispatch_claims.attempt_id IS NULL
+         AND dispatch_claims.legacy_unfenced = 1`,
+      [payload.verb, payload.id, payload.dir, event.ts, event.id, event.ts],
+    );
+  } else if (payload.expectedAttemptId == null) {
+    db.run(
+      `INSERT OR IGNORE INTO dispatch_claims (
+         verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+         acquired_at, bound_at, resume_acknowledged_at, released_at,
+         last_event_id, updated_at
+       ) VALUES (?, ?, ?, 'acquired', NULL, ?, 0, ?, NULL, NULL, NULL, ?, ?)`,
+      [
+        payload.verb,
+        payload.id,
+        payload.attemptId,
+        payload.dir,
+        event.ts,
+        event.id,
+        event.ts,
+      ],
+    );
+  } else if (payload.attemptId > payload.expectedAttemptId) {
+    db.run(
+      `UPDATE OR IGNORE dispatch_claims
+          SET attempt_id = ?, state = 'acquired', session_id = NULL, dir = ?,
+              legacy_unfenced = 0, acquired_at = ?, bound_at = NULL,
+              resume_acknowledged_at = NULL, released_at = NULL,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ? AND legacy_unfenced = 0
+          AND state = 'released'`,
+      [
+        payload.attemptId,
+        payload.dir,
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+      ],
+    );
+  }
+  const row = db
+    .query(
+      "SELECT attempt_id, state, session_id, legacy_unfenced FROM dispatch_claims WHERE verb = ? AND id = ?",
+    )
+    .get(payload.verb, payload.id) as {
+    attempt_id: number | null;
+    state: string;
+    session_id: string | null;
+    legacy_unfenced: number;
+  } | null;
+  return payload.attemptId == null
+    ? row?.attempt_id == null &&
+        row?.legacy_unfenced === 1 &&
+        row.state === "legacy_unfenced" &&
+        row.session_id == null
+    : row?.attempt_id === payload.attemptId &&
+        row.legacy_unfenced === 0 &&
+        row.state === "acquired";
+}
+
+function foldDispatchClaimAcquired(db: Database, event: Event): void {
+  const payload = extractDispatchClaimAcquirePayload(event);
+  if (payload != null) {
+    acquireDispatchClaim(db, event, payload);
+  }
+}
+
+function bindDispatchClaim(
+  db: Database,
+  event: Event,
+  payload: DispatchClaimMutationPayload,
+): boolean {
+  if (payload.sessionId == null) {
+    return false;
+  }
+  if (payload.expectedAttemptId == null) {
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'legacy_unfenced', session_id = ?, bound_at = ?,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL
+          AND legacy_unfenced = 1 AND session_id IS NULL`,
+      [
+        payload.sessionId,
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+      ],
+    );
+  } else {
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'bound', session_id = ?, bound_at = ?,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ?
+          AND legacy_unfenced = 0 AND state = 'acquired' AND session_id IS NULL`,
+      [
+        payload.sessionId,
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+      ],
+    );
+  }
+  const row = db
+    .query(
+      "SELECT attempt_id, state, legacy_unfenced, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+    )
+    .get(payload.verb, payload.id) as {
+    attempt_id: number | null;
+    state: string;
+    legacy_unfenced: number;
+    session_id: string | null;
+  } | null;
+  return (
+    row?.session_id === payload.sessionId &&
+    (payload.expectedAttemptId == null
+      ? row.attempt_id == null &&
+        row.legacy_unfenced === 1 &&
+        row.state === "legacy_unfenced"
+      : row.attempt_id === payload.expectedAttemptId &&
+        row.legacy_unfenced === 0 &&
+        row.state === "bound")
+  );
+}
+
+function foldDispatchClaimBound(db: Database, event: Event): void {
+  const payload = extractDispatchClaimMutationPayload(event);
+  if (payload != null) {
+    bindDispatchClaim(db, event, payload);
+  }
+}
+
+function foldDispatchClaimResumeAcknowledged(db: Database, event: Event): void {
+  const payload = extractDispatchClaimMutationPayload(event);
+  if (payload == null || payload.sessionId == null) {
+    return;
+  }
+  if (payload.expectedAttemptId == null) {
+    db.run(
+      `UPDATE dispatch_claims
+          SET resume_acknowledged_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL
+          AND legacy_unfenced = 1 AND session_id = ?
+          AND resume_acknowledged_at IS NULL AND released_at IS NULL`,
+      [
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+        payload.sessionId,
+      ],
+    );
+  } else {
+    db.run(
+      `UPDATE dispatch_claims
+          SET resume_acknowledged_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ?
+          AND legacy_unfenced = 0 AND state = 'bound' AND session_id = ?
+          AND resume_acknowledged_at IS NULL`,
+      [
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+        payload.sessionId,
+      ],
+    );
+  }
+}
+
+function foldDispatchClaimReleased(db: Database, event: Event): void {
+  const payload = extractDispatchClaimMutationPayload(event);
+  if (payload == null) {
+    return;
+  }
+  const sessionClause = payload.sessionId == null ? "" : " AND session_id = ?";
+  const bindings: Array<string | number> = [
+    event.ts,
+    event.id,
+    event.ts,
+    payload.verb,
+    payload.id,
+  ];
+  if (payload.expectedAttemptId == null) {
+    if (payload.sessionId != null) bindings.push(payload.sessionId);
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL
+          AND legacy_unfenced = 1 AND state != 'released'${sessionClause}`,
+      bindings,
+    );
+  } else {
+    bindings.push(payload.expectedAttemptId);
+    if (payload.sessionId != null) bindings.push(payload.sessionId);
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ?
+          AND legacy_unfenced = 0 AND state != 'released'${sessionClause}`,
+      bindings,
+    );
+  }
+  const released = db
+    .query(
+      "SELECT attempt_id, legacy_unfenced FROM dispatch_claims WHERE verb = ? AND id = ? AND state = 'released'",
+    )
+    .get(payload.verb, payload.id) as {
+    attempt_id: number | null;
+    legacy_unfenced: number;
+  } | null;
+  const exactRelease =
+    payload.expectedAttemptId == null
+      ? released?.attempt_id == null && released?.legacy_unfenced === 1
+      : released?.attempt_id === payload.expectedAttemptId &&
+        released.legacy_unfenced === 0;
+  if (exactRelease) {
+    if (payload.expectedAttemptId == null) {
+      db.run(
+        "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+        [payload.verb, payload.id],
+      );
+    } else {
+      db.run(
+        "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+        [payload.verb, payload.id, payload.expectedAttemptId],
+      );
+    }
+  }
+}
+
+function extractSessionDispatchAttempt(
+  event: Event,
+): number | null | undefined {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    const direct = dispatchAttemptField(
+      parsed,
+      "dispatch_attempt_id",
+      "attempt_id",
+    );
+    if (direct != null || direct === undefined) {
+      return direct;
+    }
+    const dispatch = parsed.dispatch;
+    return dispatch != null && typeof dispatch === "object"
+      ? dispatchAttemptField(
+          dispatch as Record<string, unknown>,
+          "attempt_id",
+          "dispatch_attempt_id",
+        )
+      : null;
+  } catch {
+    return undefined;
+  }
+}
+
+function foldDispatchClaimSuperseded(db: Database, event: Event): void {
+  const payload = extractDispatchClaimSupersedePayload(event);
+  if (payload == null) {
+    return;
+  }
+  const commonBindings: Array<string | number | null> = [
+    payload.nextAttemptId,
+    payload.dir,
+    event.ts,
+    event.id,
+    event.ts,
+    payload.verb,
+    payload.id,
+  ];
+  if (payload.expectedAttemptId == null) {
+    db.run(
+      `UPDATE OR IGNORE dispatch_claims
+          SET attempt_id = ?, state = 'acquired', session_id = NULL, dir = ?,
+              legacy_unfenced = 0, acquired_at = ?, bound_at = NULL,
+              resume_acknowledged_at = NULL, released_at = NULL,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL AND legacy_unfenced = 1`,
+      commonBindings,
+    );
+  } else if (payload.nextAttemptId > payload.expectedAttemptId) {
+    commonBindings.push(payload.expectedAttemptId);
+    db.run(
+      `UPDATE OR IGNORE dispatch_claims
+          SET attempt_id = ?, state = 'acquired', session_id = NULL, dir = ?,
+              legacy_unfenced = 0, acquired_at = ?, bound_at = NULL,
+              resume_acknowledged_at = NULL, released_at = NULL,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ? AND legacy_unfenced = 0`,
+      commonBindings,
+    );
+  }
 }
 
 /**
@@ -3966,7 +4467,7 @@ function extractDispatchedPayload(event: Event): DispatchedPayload | null {
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<DispatchedPayload>;
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
     if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
       return null;
     }
@@ -3976,11 +4477,30 @@ function extractDispatchedPayload(event: Event): DispatchedPayload | null {
     if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) {
       return null;
     }
+    const attemptId = dispatchAttemptField(
+      parsed,
+      "attempt_id",
+      "dispatch_attempt_id",
+    );
+    const expectedAttemptId = dispatchAttemptField(
+      parsed,
+      "expected_attempt_id",
+    );
+    if (attemptId === undefined || expectedAttemptId === undefined) {
+      return null;
+    }
     const dir =
       typeof parsed.dir === "string" && parsed.dir.length > 0
         ? parsed.dir
         : null;
-    return { verb: parsed.verb, id: parsed.id, dir, ts: parsed.ts };
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      dir,
+      ts: parsed.ts,
+      attemptId,
+      expectedAttemptId,
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse Dispatched payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4002,14 +4522,22 @@ function extractDispatchExpiredPayload(
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<DispatchExpiredPayload>;
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
     if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
       return null;
     }
     if (typeof parsed.id !== "string" || parsed.id.length === 0) {
       return null;
     }
-    return { verb: parsed.verb, id: parsed.id };
+    const attemptId = dispatchAttemptField(
+      parsed,
+      "attempt_id",
+      "dispatch_attempt_id",
+    );
+    if (attemptId === undefined) {
+      return null;
+    }
+    return { verb: parsed.verb, id: parsed.id, attemptId };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse DispatchExpired payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4031,15 +4559,36 @@ function foldDispatched(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
+  const ownsClaim = acquireDispatchClaim(db, event, {
+    verb: payload.verb,
+    id: payload.id,
+    attemptId: payload.attemptId,
+    expectedAttemptId: payload.expectedAttemptId,
+    dir: payload.dir,
+  });
+  if (!ownsClaim) {
+    return;
+  }
   db.run(
     `INSERT INTO pending_dispatches (
-       verb, id, dir, dispatched_at, last_event_id
-     ) VALUES (?, ?, ?, ?, ?)
+       verb, id, dir, dispatched_at, last_event_id, attempt_id
+     ) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
        dir = excluded.dir,
        dispatched_at = excluded.dispatched_at,
-       last_event_id = excluded.last_event_id`,
-    [payload.verb, payload.id, payload.dir, payload.ts, event.id],
+       last_event_id = excluded.last_event_id,
+       attempt_id = excluded.attempt_id
+     WHERE pending_dispatches.attempt_id IS NULL
+        OR (pending_dispatches.attempt_id IS NOT NULL
+            AND excluded.attempt_id > pending_dispatches.attempt_id)`,
+    [
+      payload.verb,
+      payload.id,
+      payload.dir,
+      payload.ts,
+      event.id,
+      payload.attemptId,
+    ],
   );
 }
 
@@ -4093,10 +4642,17 @@ function foldDispatchExpired(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
-  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
+  if (payload.attemptId == null) {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+      [payload.verb, payload.id],
+    );
+  } else {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+      [payload.verb, payload.id, payload.attemptId],
+    );
+  }
   // Breaker-loop safety: an expiry of a key that ALREADY has a sticky
   // `dispatch_failures` row is a slot release, not a target failure — skip the
   // counter arm entirely (no bump, no re-trip, no `last_event_id` churn). With the
@@ -8259,6 +8815,7 @@ function projectJobsRow(db: Database, event: Event): void {
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
+        const dispatchAttemptId = extractSessionDispatchAttempt(event);
         // Discharge-on-bind gating: read the jobs row's PRIOR pair BEFORE the
         // UPSERT. This distinguishes a spawn-INSERT (no prior row) from a resume
         // ON CONFLICT, AND captures whether the prior pair was NULL — the heal
@@ -8426,43 +8983,48 @@ function projectJobsRow(db: Database, event: Event): void {
         if (
           (isSpawnInsert || priorJob.plan_ref == null) &&
           plan_verb != null &&
-          plan_ref != null
+          plan_ref != null &&
+          dispatchAttemptId !== undefined
         ) {
-          const dischargeRes = db.run(
-            "DELETE FROM pending_dispatches WHERE verb = ? AND id = ?",
-            [plan_verb, plan_ref],
-          );
-          // Provenance stamp: the ONLY airtight autopilot-vs-manual
-          // discriminator. Gate on the ACTUAL discharge — `dischargeRes.changes`
-          // read HERE, before the sibling `dispatch_never_bound` DELETE below
-          // overwrites the changes counter — NEVER on `plan_verb`/`plan_ref`
-          // presence: a manual `keeper dispatch work::fn-N.M` is plan-form but
-          // mints no `Dispatched` event and thus no pending row (`cli/dispatch.ts`
-          // only READS the table as a race guard), so its discharge removes
-          // nothing and the row correctly stays NULL (= manual/unknown). A removed
-          // row means the autopilot's `Dispatched` intent materialized into this
-          // job, so it is autopilot-owned. The `Dispatched` event precedes this
-          // binding SessionStart in the log, so a from-scratch re-fold reproduces
-          // the same discharge and the same stamp byte-identically. The enclosing
-          // UPSERT already wrote this row's `last_event_id`/`updated_at` to this
-          // event in the same fold, so this narrow set-once UPDATE need not touch
-          // them. Pure fold.
-          if (dischargeRes.changes > 0) {
+          const claimBeforeBind = db
+            .query(
+              "SELECT attempt_id, legacy_unfenced FROM dispatch_claims WHERE verb = ? AND id = ?",
+            )
+            .get(plan_verb, plan_ref) as {
+            attempt_id: number | null;
+            legacy_unfenced: number;
+          } | null;
+          const claimAuthorized =
+            claimBeforeBind == null
+              ? dispatchAttemptId == null
+              : bindDispatchClaim(db, event, {
+                  verb: plan_verb,
+                  id: plan_ref,
+                  expectedAttemptId: dispatchAttemptId,
+                  sessionId: jobId,
+                });
+          if (claimAuthorized) {
+            const dischargeRes =
+              dispatchAttemptId == null
+                ? db.run(
+                    "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+                    [plan_verb, plan_ref],
+                  )
+                : db.run(
+                    "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+                    [plan_verb, plan_ref, dispatchAttemptId],
+                  );
+            if (dischargeRes.changes > 0) {
+              db.run(
+                "UPDATE jobs SET dispatch_origin = 'autopilot' WHERE job_id = ?",
+                [jobId],
+              );
+            }
             db.run(
-              "UPDATE jobs SET dispatch_origin = 'autopilot' WHERE job_id = ?",
-              [jobId],
+              "DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?",
+              [plan_verb, plan_ref],
             );
           }
-          // Never-bound circuit-breaker reset: a successful bind for this pair
-          // zeroes the consecutive-no-bind counter (DELETE), so a bind between
-          // expires never trips the breaker and a "bound-then-died" worker (whose
-          // death is the exit-watcher's path) never counts toward never-bound.
-          // Same discharge gate as the pending DELETE above — fires on spawn-
-          // INSERT or NULL->non-NULL heal, never on a genuine resume. Idempotent.
-          db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
-            plan_verb,
-            plan_ref,
-          ]);
         }
         // Escalation-instance binding: an `unblock::<task>` / `deconflict::<epic>`
         // / `resolve::<epic>` session is a first-class dispatch key
@@ -9839,6 +10401,16 @@ export function applyEvent(
       foldDispatched(db, event);
     } else if (event.hook_event === "DispatchExpired") {
       foldDispatchExpired(db, event);
+    } else if (event.hook_event === "DispatchClaimAcquired") {
+      foldDispatchClaimAcquired(db, event);
+    } else if (event.hook_event === "DispatchClaimBound") {
+      foldDispatchClaimBound(db, event);
+    } else if (event.hook_event === "DispatchClaimResumeAcknowledged") {
+      foldDispatchClaimResumeAcknowledged(db, event);
+    } else if (event.hook_event === "DispatchClaimReleased") {
+      foldDispatchClaimReleased(db, event);
+    } else if (event.hook_event === "DispatchClaimSuperseded") {
+      foldDispatchClaimSuperseded(db, event);
     } else if (event.hook_event === "BlockEscalationRequested") {
       foldBlockEscalationRequested(db, event);
     } else if (event.hook_event === "BlockEscalationAttempted") {

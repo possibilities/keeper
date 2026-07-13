@@ -39,6 +39,22 @@ import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 
 export type ReadinessQuery = typeof runQuery;
 
+export interface DispatchClaim {
+  verb: string;
+  id: string;
+  attempt_id: number | null;
+  state: string;
+  session_id: string | null;
+  dir: string | null;
+  legacy_unfenced: number;
+  acquired_at: number;
+  bound_at: number | null;
+  resume_acknowledged_at: number | null;
+  released_at: number | null;
+  last_event_id: number;
+  updated_at: number;
+}
+
 /**
  * The DB-sourced argument set both readiness consumers feed to
  * {@link computeReadiness} identically. Field names/shapes mirror the
@@ -63,6 +79,8 @@ export interface ReadinessInputs {
   /** Open `pending_dispatches` rows (launched-but-not-yet-bound workers), built
    *  through the SOLE `projectPendingDispatches` builder. */
   pendingDispatches: PendingDispatch[];
+  /** Durable Dispatch claims remain separate from launch-window reservations. */
+  dispatchClaims: DispatchClaim[];
   /** The per-root git-seed gate: roots whose live-only git surface is unseeded
    *  (post-restart, pre-seed). EMPTY whenever `seed_required` is clear. A plain
    *  `Set` (not `ReadonlySet`) so it drops straight into the reconciler's snapshot
@@ -144,6 +162,7 @@ export function loadReadinessInputs(
   const pendingDispatches = projectPendingDispatches(
     read("pending_dispatches"),
   );
+  const dispatchClaims = read("dispatch_claims") as unknown as DispatchClaim[];
 
   // The per-root dispatch concurrency count N is the EFFECTIVE cap derived from
   // the `autopilot_state` singleton's stored intent and worktree mode (both on
@@ -173,6 +192,7 @@ export function loadReadinessInputs(
     subagentInvocations,
     gitStatusByProjectDir,
     pendingDispatches,
+    dispatchClaims,
     unseededRoots,
     maxConcurrentPerRoot,
   };

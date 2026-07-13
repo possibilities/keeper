@@ -24,6 +24,7 @@ import {
   type CollectionDescriptor,
   countAndToken,
   DEAD_LETTERS_DESCRIPTOR,
+  DISPATCH_CLAIMS_DESCRIPTOR,
   DISPATCH_FAILURES_DESCRIPTOR,
   DONE_EPICS_REAP_WINDOW_SEC,
   EPICS_DESCRIPTOR,
@@ -49,6 +50,7 @@ import {
 } from "../src/dispatch-failure-key";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import type { Verdict } from "../src/readiness";
+import { loadReadinessInputs } from "../src/readiness-inputs";
 import { runQuery } from "../src/server-worker";
 import type { Job } from "../src/types";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
@@ -402,6 +404,132 @@ test("getCollection resolves the pending_dispatches collection (schema v50, fn-6
   // (an unconstrained pane shows the live launch window).
   expect(PENDING_DISPATCHES_DESCRIPTOR.defaultFilter).toBeUndefined();
   expect(PENDING_DISPATCHES_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("dispatch_claims descriptor exposes the durable attempt fence", () => {
+  expect(getCollection("dispatch_claims")).toBe(DISPATCH_CLAIMS_DESCRIPTOR);
+  expect(DISPATCH_CLAIMS_DESCRIPTOR.table).toBe("dispatch_claims");
+  expect(DISPATCH_CLAIMS_DESCRIPTOR.pk).toBe("verb");
+  expect(DISPATCH_CLAIMS_DESCRIPTOR.liveKeyColumns).toEqual(["verb", "id"]);
+  expect(DISPATCH_CLAIMS_DESCRIPTOR.version).toBe("last_event_id");
+  expect(DISPATCH_CLAIMS_DESCRIPTOR.columns).toEqual([
+    "verb",
+    "id",
+    "attempt_id",
+    "state",
+    "session_id",
+    "dir",
+    "legacy_unfenced",
+    "acquired_at",
+    "bound_at",
+    "resume_acknowledged_at",
+    "released_at",
+    "last_event_id",
+    "updated_at",
+  ]);
+  const { db } = freshMemDb();
+  const indexes = db.query("PRAGMA index_list(dispatch_claims)").all() as {
+    name: string;
+  }[];
+  expect(indexes.map((row) => row.name).sort()).toEqual([
+    "idx_dispatch_claims_attempt_id",
+    "idx_dispatch_claims_session_id",
+    "sqlite_autoindex_dispatch_claims_1",
+  ]);
+  expect(
+    (
+      db.query("PRAGMA table_info(pending_dispatches)").all() as {
+        name: string;
+      }[]
+    )
+      .map((column) => column.name)
+      .includes("attempt_id"),
+  ).toBe(true);
+  db.close();
+});
+
+test("runQuery serves empty and exact Dispatch-claim projection rows", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  expect(
+    asResult(runQuery(db, 0, { type: "query", collection: "dispatch_claims" }))
+      .rows,
+  ).toEqual([]);
+  db.query(
+    `INSERT INTO dispatch_claims (
+       verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+       acquired_at, bound_at, resume_acknowledged_at, released_at,
+       last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "work",
+    "fn-claim.1",
+    17,
+    "bound",
+    "session-17",
+    "/repo",
+    0,
+    100,
+    101,
+    null,
+    null,
+    42,
+    101,
+  );
+  const result = asResult(
+    runQuery(db, 42, { type: "query", collection: "dispatch_claims" }),
+  );
+  expect(result.total).toBe(1);
+  expect(result.rows).toEqual([
+    {
+      verb: "work",
+      id: "fn-claim.1",
+      attempt_id: 17,
+      state: "bound",
+      session_id: "session-17",
+      dir: "/repo",
+      legacy_unfenced: 0,
+      acquired_at: 100,
+      bound_at: 101,
+      resume_acknowledged_at: null,
+      released_at: null,
+      last_event_id: 42,
+      updated_at: 101,
+    },
+  ]);
+  db.close();
+});
+
+test("loadReadinessInputs exposes Dispatch claims separately from pending dispatches", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedDispatchClaim(db, "work", "fn-claim.2", 18, 43);
+  seedPendingDispatch(db, "close", "fn-pending", 44);
+  const inputs = loadReadinessInputs(db);
+  expect(inputs.dispatchClaims).toEqual([
+    {
+      verb: "work",
+      id: "fn-claim.2",
+      attempt_id: 18,
+      state: "acquired",
+      session_id: null,
+      dir: null,
+      legacy_unfenced: 0,
+      acquired_at: 1,
+      bound_at: null,
+      resume_acknowledged_at: null,
+      released_at: null,
+      last_event_id: 43,
+      updated_at: 1,
+    },
+  ]);
+  expect(inputs.pendingDispatches).toEqual([
+    {
+      verb: "close",
+      id: "fn-pending",
+      dir: null,
+      dispatched_at: 1,
+    },
+  ]);
+  db.close();
 });
 
 test("getCollection resolves the builds collection (schema v64, fn-781)", () => {
@@ -1601,6 +1729,21 @@ function seedDispatchFailure(
   );
 }
 
+function seedDispatchClaim(
+  db: Database,
+  verb: string,
+  id: string,
+  attemptId: number,
+  lastEventId: number,
+): void {
+  db.query(
+    `INSERT INTO dispatch_claims (
+       verb, id, attempt_id, state, legacy_unfenced, acquired_at,
+       last_event_id, updated_at
+     ) VALUES (?, ?, ?, 'acquired', 0, 1.0, ?, 1.0)`,
+  ).run(verb, id, attemptId, lastEventId);
+}
+
 function seedSubagentInvocation(
   db: Database,
   jobId: string,
@@ -1740,6 +1883,19 @@ test("pending_dispatches: same-verb rows retain distinct live identities", () =>
     (db) => {
       seedPendingDispatch(db, "work", "task-a", 5);
       seedPendingDispatch(db, "work", "task-b", 7);
+    },
+  );
+});
+
+test("dispatch_claims: same-verb rows retain distinct live identities", () => {
+  expectCompositeLiveIdentity(
+    DISPATCH_CLAIMS_DESCRIPTOR,
+    "verb || char(31) || id",
+    { verb: "work", id: "task-a" },
+    { verb: "work", id: "task-b" },
+    (db) => {
+      seedDispatchClaim(db, "work", "task-a", 101, 5);
+      seedDispatchClaim(db, "work", "task-b", 102, 7);
     },
   );
 });
