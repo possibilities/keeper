@@ -572,7 +572,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       if (typeof opts.dispatchedAck === "function") {
         return opts.dispatchedAck();
       }
-      return opts.dispatchedAck ?? { ok: true };
+      return opts.dispatchedAck ?? { ok: true, attemptId: 101 };
     },
     maxEventId() {
       log.maxEventIdCalls += 1;
@@ -4087,10 +4087,11 @@ test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack r
   // CRITICAL: launch must NOT have fired while the ack is unresolved.
   expect(log.launches.length).toBe(0);
   // Resolve the durable ack → the launch may now proceed.
-  ackGate.resolve({ ok: true });
+  ackGate.resolve({ ok: true, attemptId: 101 });
   const outcome = await promise;
   expect(outcome).toBe("ok");
   expect(log.launches.length).toBe(1);
+  expect(log.launches[0]?.spec?.dispatchAttemptId).toBe(101);
 });
 
 test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted-prelaunch, NO DispatchFailed", async () => {

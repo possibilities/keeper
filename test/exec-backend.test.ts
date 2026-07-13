@@ -1365,6 +1365,31 @@ test("buildKeeperAgentLaunchArgv: a wrapped-cell work launch carries the marker 
   expect(cellIdx).toBeLessThan(argv.indexOf("--permission-mode"));
 });
 
+test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and argv-safe", () => {
+  const base = {
+    launcherArgvPrefix: ["/bun", "/keeper.ts", "agent"],
+    session: "work",
+    prompt: "/plan:work fn-1-x.1",
+    noConfirm: true,
+    dispatchAttemptId: 42,
+  } as const;
+  const claude = buildKeeperAgentLaunchArgv(base);
+  expect(
+    claude.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
+  ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
+  const pi = buildKeeperAgentLaunchArgv({ ...base, harness: "pi" });
+  expect(
+    pi.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
+  ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
+  for (const harness of ["codex", "hermes"] as const) {
+    expect(
+      buildKeeperAgentLaunchArgv({ ...base, harness }).some((arg) =>
+        arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
+      ),
+    ).toBe(false);
+  }
+});
+
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {
   // The load-bearing severance: a worker is a detached automated session with no
   // human to answer a prompt, so keeper OWNS its permission posture rather than

@@ -170,6 +170,7 @@ import {
   type WorktreeRepoGroup,
   type WorktreeRepoResolution,
   type WorktreeRepoStatusEntry,
+  withDispatchAttempt,
   worktreeRecoverDispatchId,
   wrappedEnvelopePath,
 } from "./reconcile-core";
@@ -1082,6 +1083,8 @@ export interface DispatchFailedPayload {
   dir: string | null;
   conflictedFiles: string[] | null;
   ts: number;
+  /** Exact admitted attempt when the failure happened after admission. */
+  attempt_id?: number;
 }
 
 /**
@@ -2471,6 +2474,8 @@ export interface DispatchedPayload {
 export interface DispatchedAck {
   ok: boolean;
   suppressed?: boolean;
+  /** Immutable Event id used as the exact Dispatch-attempt fence on success. */
+  attemptId?: number;
 }
 
 /**
@@ -2489,6 +2494,7 @@ export interface DispatchExpiredPayload {
   verb: Verb;
   id: string;
   reason?: string;
+  attempt_id?: number;
 }
 
 /**
@@ -3909,11 +3915,21 @@ export async function confirmRunning(
     // Shutdown raced the ack. Abort before the side-effect.
     return "aborted-prelaunch";
   }
-  // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`. `spec` is the
-  // structured input keeper agent (keeper's sole launch transport) builds its
-  // invocation from; the pre-wrapped `argv` is ignored by the launch impl.
+  if (
+    ack.attemptId === undefined ||
+    !Number.isSafeInteger(ack.attemptId) ||
+    ack.attemptId <= 0
+  ) {
+    // A successful admission without its exact fence cannot launch safely: the
+    // resulting SessionStart would be indistinguishable from unfenced evidence.
+    return "aborted-prelaunch";
+  }
+  // 3. Launch — ONLY after the durable ack returned the admitted attempt. The
+  // generic metadata rides the structured spec; prompts, names, cells, and the
+  // pre-wrapped command remain unchanged.
+  const admittedSpec = withDispatchAttempt(spec, ack.attemptId);
   const launchResult: LaunchResult = await deps
-    .launch(argv, key, cwd, spec)
+    .launch(argv, key, cwd, admittedSpec)
     .catch((err) => ({
       ok: false as const,
       // A thrown launch is a PERMANENT (sticky) fail — `retryable` absent.
@@ -3941,6 +3957,7 @@ export async function confirmRunning(
       dir: cwd === "" ? null : cwd,
       conflictedFiles: null,
       ts: deps.now(),
+      attempt_id: ack.attemptId,
     });
     return "failed";
   }
@@ -8011,6 +8028,7 @@ export interface DispatchedAckMessage {
   id: number;
   ok: boolean;
   suppressed?: boolean;
+  attemptId?: number;
 }
 
 /**
@@ -8852,7 +8870,11 @@ function main(): void {
       const pending = pendingDispatchAcks.get(msg.id);
       if (pending) {
         pendingDispatchAcks.delete(msg.id);
-        pending.resolve({ ok: msg.ok, suppressed: msg.suppressed });
+        pending.resolve({
+          ok: msg.ok,
+          suppressed: msg.suppressed,
+          attemptId: msg.attemptId,
+        });
       }
       return;
     }

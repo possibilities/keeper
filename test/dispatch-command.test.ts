@@ -9,13 +9,33 @@ import { expect, test } from "bun:test";
 import {
   buildDispatchLaunchArgv,
   defaultPlanPrompt,
+  formatDispatchAttemptCarrier,
   isEscalationVerb,
   isRetryableDispatchKey,
   PROMPT_MAX_BYTES,
+  parseDispatchAttemptCarrier,
   parseDispatchableKey,
   parseDispatchKey,
   validatePromptBytes,
 } from "../src/dispatch-command";
+
+test("Dispatch-attempt carrier accepts only bounded positive safe integers", () => {
+  expect(parseDispatchAttemptCarrier("42")).toBe(42);
+  for (const value of [
+    undefined,
+    "",
+    "0",
+    "-1",
+    "01",
+    "1;echo",
+    "9".repeat(20),
+  ]) {
+    expect(parseDispatchAttemptCarrier(value)).toBeNull();
+  }
+  expect(formatDispatchAttemptCarrier(42)).toBe("42");
+  expect(formatDispatchAttemptCarrier(Number.NaN)).toBe("");
+  expect(formatDispatchAttemptCarrier(-1)).toBe("");
+});
 
 // ---------------------------------------------------------------------------
 // parseDispatchKey — discriminated result

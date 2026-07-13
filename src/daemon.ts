@@ -662,10 +662,20 @@ export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
 export function selectExpiredPendingDispatches(
   db: Database,
   nowMs: number,
-): { verb: string; id: string; dispatched_at: number }[] {
+): {
+  verb: string;
+  id: string;
+  dispatched_at: number;
+  attempt_id: number | null;
+}[] {
   const rows = db
-    .query(`SELECT verb, id, dispatched_at FROM pending_dispatches`)
-    .all() as { verb: string; id: string; dispatched_at: number }[];
+    .query(`SELECT verb, id, dispatched_at, attempt_id FROM pending_dispatches`)
+    .all() as {
+    verb: string;
+    id: string;
+    dispatched_at: number;
+    attempt_id: number | null;
+  }[];
   const cutoffMs = nowMs - PENDING_DISPATCH_TTL_MS;
   // `dispatched_at` is unix-epoch SECONDS; compare in ms.
   return rows.filter((r) => r.dispatched_at * 1000 < cutoffMs);
@@ -6020,7 +6030,8 @@ function birthEventTs(record: BirthRecord): number {
  * seed would be `boot_unwatchable`-reaped; a birth record always carries the
  * child pid), `spawn_name` becomes the title, and the `backend_exec_*` coords
  * fold via the every-event backend arm so the renamer + exit-watcher inherit the
- * row. `data` is NULL (no transcript at birth). SQLite assigns `id`, landing the
+ * row. `data` carries only the bounded Dispatch-attempt identity when the birth
+ * adapter supplied one; otherwise it is NULL. SQLite assigns `id`, landing the
  * row at the tail of the log.
  *
  * The column list matches CREATE_EVENTS verbatim (a future column add updates
@@ -6053,7 +6064,11 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
       null, // agent_id
       null, // agent_type
       null, // stop_hook_active
-      null, // data (no transcript at birth)
+      record.dispatch_attempt_id == null
+        ? null
+        : JSON.stringify({
+            dispatch_attempt_id: record.dispatch_attempt_id,
+          }),
       null, // subagent_agent_id
       record.spawn_name,
       record.start_time,
@@ -10630,10 +10645,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   function handleDispatchedMint(msg: DispatchedMessage): void {
     const { id, payload } = msg;
     const dispatchKey = `${payload.verb}::${payload.id}`;
-    const data = JSON.stringify(payload);
     let ok = false;
     let suppressed = false;
+    let attemptId: number | undefined;
     try {
+      const currentClaim = db
+        .query(
+          "SELECT attempt_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+        )
+        .get(payload.verb, payload.id) as {
+        attempt_id: number | null;
+      } | null;
+      const data = JSON.stringify({
+        ...payload,
+        attempt_from_event_id: true,
+        expected_attempt_id: currentClaim?.attempt_id ?? null,
+      });
       const nowMs = Date.now();
       // The gate read + the conditional insert run atomically in ONE
       // `BEGIN IMMEDIATE`. `onFreshMint` runs only on the mint branch (gate empty
@@ -10645,7 +10672,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         nowMs,
         DISPATCH_MINT_GATE_WINDOW_MS,
         () => {
-          stmts.insertEvent.run({
+          const inserted = stmts.insertEvent.run({
             $ts: nowMs / 1000,
             $session_id: dispatchKey,
             $pid: null,
@@ -10678,8 +10705,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $backend_exec_pane_id: null,
             $worktree: null,
           });
-          // The ack promises INSERT durability ONLY — not the fold (idempotent on
-          // the next drain). The committed INSERT is the whole contract.
+          const insertedId = Number(inserted.lastInsertRowid);
+          if (!Number.isSafeInteger(insertedId) || insertedId <= 0) {
+            throw new Error("Dispatched insert returned an invalid event id");
+          }
+          // The immutable Event id is the exact attempt fence. The reducer
+          // derives the same value from the marker in `data`; the ack carries it
+          // into the launch metadata envelope before any backend execution.
+          attemptId = insertedId;
           ok = true;
         },
       ));
@@ -10715,6 +10748,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       type: "dispatched-ack",
       id,
       ok,
+      ...(attemptId === undefined ? {} : { attemptId }),
     } satisfies DispatchedAckMessage);
     // Pump the reducer AFTER the ack, in its own guarded block — a pump throw is
     // logged but can neither flip the sent ack nor escape this handler. Only pump
@@ -11389,7 +11423,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
-    let aged: { verb: string; id: string; dispatched_at: number }[];
+    let aged: {
+      verb: string;
+      id: string;
+      dispatched_at: number;
+      attempt_id: number | null;
+    }[];
     try {
       aged = selectExpiredPendingDispatches(db, Date.now());
     } catch (err) {
@@ -11422,6 +11461,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // past its ceiling. Attribution telemetry on the event blob; the reducer
         // fold reads only `(verb, id)`.
         reason: "dispatch_expiry_timeout",
+        ...(row.attempt_id == null ? {} : { attempt_id: row.attempt_id }),
       });
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
     }

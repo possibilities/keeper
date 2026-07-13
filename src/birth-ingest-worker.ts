@@ -12,7 +12,8 @@
  * MAIN owns all writes: on each message (and once at boot) main runs
  * {@link import("./daemon").scanBirthDir}, which parses each record under `new/`,
  * mints ONE synthetic `SessionStart` event carrying every record field
- * (harness + resume_target included), and retires the file. The fold turns that
+ * (including bounded Dispatch-attempt metadata for capable adapters), and
+ * retires the file. The fold turns that
  * into a tracked `jobs` row the exit-watcher / renamer / tmux poller inherit with
  * zero changes.
  *

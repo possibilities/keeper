@@ -58,6 +58,7 @@ const FULL: BirthRecord = {
   worktree: "keeper/epic/fn-1",
   launch_ts: "2026-07-03T12:00:00.000Z",
   resume_target: null,
+  dispatch_attempt_id: null,
 };
 
 describe("serialize / parse round-trip", () => {
@@ -248,6 +249,35 @@ describe("env-derived coords / worktree / draft", () => {
     });
   });
 
+  test("a capable adapter carries only a bounded exact Dispatch attempt", () => {
+    const common = {
+      session_id: "j",
+      cwd: "/c",
+      spawn_name: "work::fn-1.1",
+      config_dir: null,
+      resume_target: "j",
+      launch_ts: "2026-07-03T00:00:00.000Z",
+    };
+    expect(
+      buildBirthDraft(
+        { KEEPER_DISPATCH_ATTEMPT_ID: "42" },
+        { ...common, harness: "pi" },
+      ).dispatch_attempt_id,
+    ).toBe(42);
+    expect(
+      buildBirthDraft(
+        { KEEPER_DISPATCH_ATTEMPT_ID: "not-an-attempt" },
+        { ...common, harness: "pi" },
+      ).dispatch_attempt_id,
+    ).toBeNull();
+    expect(
+      buildBirthDraft(
+        { KEEPER_DISPATCH_ATTEMPT_ID: "42" },
+        { ...common, harness: "codex" },
+      ).dispatch_attempt_id,
+    ).toBeNull();
+  });
+
   test("worktree reads KEEPER_PLAN_WORKTREE_BRANCH; empty → null", () => {
     expect(
       birthWorktreeFromEnv({ KEEPER_PLAN_WORKTREE_BRANCH: "keeper/epic/x" }),
@@ -288,6 +318,7 @@ describe("env-derived coords / worktree / draft", () => {
       worktree: "wt",
       launch_ts: "2026-07-03T00:00:00.000Z",
       resume_target: "j",
+      dispatch_attempt_id: null,
     });
   });
 });

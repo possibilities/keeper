@@ -60,6 +60,7 @@ describe("harness registry — descriptor completeness", () => {
       expect(SECOND_AXES.has(d.secondAxis)).toBe(true);
       expect(typeof d.capturable).toBe("boolean");
       expect(typeof d.mintsOwnSessionId).toBe("boolean");
+      expect(typeof d.carriesDispatchAttempt).toBe("boolean");
       expect(HOOK_MECHANISMS.has(d.hookMechanism)).toBe(true);
       expect(["flag", "subcommand"]).toContain(d.resumeArgv.kind);
       expect(typeof d.resumeArgv.token).toBe("string");
@@ -90,6 +91,10 @@ describe("harness registry — descriptor completeness", () => {
     expect(HARNESS_DESCRIPTORS.hermes.mintsOwnSessionId).toBe(true);
     expect(HARNESS_DESCRIPTORS.claude.mintsOwnSessionId).toBe(false);
     expect(HARNESS_DESCRIPTORS.pi.mintsOwnSessionId).toBe(false);
+    expect(HARNESS_DESCRIPTORS.claude.carriesDispatchAttempt).toBe(true);
+    expect(HARNESS_DESCRIPTORS.pi.carriesDispatchAttempt).toBe(true);
+    expect(HARNESS_DESCRIPTORS.codex.carriesDispatchAttempt).toBe(false);
+    expect(HARNESS_DESCRIPTORS.hermes.carriesDispatchAttempt).toBe(false);
     // Live-churn mechanism: claude via native hooks, pi via the in-process
     // extension (M3b), codex via the daemon-side rollout tailer (stop-only);
     // hermes is presence-only today.

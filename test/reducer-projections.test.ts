@@ -2852,6 +2852,34 @@ test("malformed Dispatch claim Events are safe no-ops with Cursor advance", () =
   expect(getCursor()).toBe(lastId);
 });
 
+test("a newly admitted Dispatched event uses its immutable event id as the exact attempt", () => {
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: "work::fn-1276-event-attempt.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-1276-event-attempt.1",
+      dir: "/repo",
+      ts: 1890,
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "event-attempt-session",
+    spawn_name: "work::fn-1276-event-attempt.1",
+    data: JSON.stringify({ dispatch_attempt_id: attemptId }),
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-1276-event-attempt.1")).toMatchObject({
+    attempt_id: attemptId,
+    state: "bound",
+    session_id: "event-attempt-session",
+  });
+  expect(getDispatchOrigin("event-attempt-session")).toBe("autopilot");
+});
+
 test("a delayed old SessionStart cannot consume a newer exact pending attempt", () => {
   dispatchClaimEvent("DispatchClaimAcquired", {
     verb: "work",

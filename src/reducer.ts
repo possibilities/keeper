@@ -4477,11 +4477,19 @@ function extractDispatchedPayload(event: Event): DispatchedPayload | null {
     if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) {
       return null;
     }
-    const attemptId = dispatchAttemptField(
+    const carriedAttemptId = dispatchAttemptField(
       parsed,
       "attempt_id",
       "dispatch_attempt_id",
     );
+    // A newly admitted dispatch uses its immutable Event id as the globally
+    // ordered attempt fence. The producer marks that derivation before insert
+    // and receives the inserted id in its durable ack; legacy events without the
+    // marker remain unfenced rather than being guessed during re-fold.
+    const attemptId =
+      carriedAttemptId == null && parsed.attempt_from_event_id === true
+        ? event.id
+        : carriedAttemptId;
     const expectedAttemptId = dispatchAttemptField(
       parsed,
       "expected_attempt_id",

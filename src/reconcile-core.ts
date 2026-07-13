@@ -500,6 +500,13 @@ export const ESCALATION_EFFORT = "high" as const;
  * {model, effort} `work` plugin); null/absent leaves it off (the byte-unchanged
  * cell-less default). Pure — exported for tests.
  */
+export function withDispatchAttempt(
+  spec: LaunchSpec,
+  attemptId: number,
+): LaunchSpec {
+  return { ...spec, dispatchAttemptId: attemptId };
+}
+
 export function buildPlannedLaunchSpec(
   verb: Verb,
   id: string,
