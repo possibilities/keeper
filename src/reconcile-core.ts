@@ -918,6 +918,13 @@ export interface ReconcileSnapshot {
    */
   landedLaneEntries?: readonly LaneMergedEntry[];
   /**
+   * Epic ids whose producer-side live-git probe proved the recovery-only close
+   * conditions: every task is done, the still-present epic lane is an ancestor of
+   * local default, and a prior closer finished while the epic remains open. The
+   * pure reconciler reads only this plain fact; it never probes git itself.
+   */
+  closeRecoveryEligibleIds?: ReadonlySet<string>;
+  /**
    * The STALE-BASE lane set (fn-1127) — every epic whose already-cut worktree lane
    * `keeper/epic/<id>` was forked off a base DEFINITIVELY MISSING a satisfied
    * same-resolved-repo upstream's landed work (probed via
@@ -1333,8 +1340,15 @@ export interface WorktreeReject {
  * must NOT recompute readiness) and holds task ids + epic ids; the completion-reap
  * predicate keys off `<id>` only.
  */
+export interface CloseRecoveryStamp {
+  epicId: string;
+  key: DispatchKey;
+  projectDir: string;
+}
+
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
+  closeRecoveryStamps: CloseRecoveryStamp[];
   completedRowIds: Set<string>;
   /** Plain producer-probed base-drift data, carried without any git/clock reads. */
   baseDriftEntries: readonly BaseDriftEntry[];
@@ -2008,6 +2022,7 @@ export function reconcile(
   if (snapshot.readinessDegraded) {
     return {
       launches: [],
+      closeRecoveryStamps: [],
       completedRowIds: new Set(),
       baseDriftEntries: [],
       worktreeFinalize: [],
@@ -2019,6 +2034,7 @@ export function reconcile(
   }
 
   const launches: PlannedLaunch[] = [];
+  const closeRecoveryStamps: CloseRecoveryStamp[] = [];
 
   // The EPHEMERAL cross-epic merge-gate defer map (epic id → its deferred lane
   // repos), probed git-side ONCE per cycle in `loadReconcileSnapshot` and read here
@@ -2418,30 +2434,42 @@ export function reconcile(
         // task push, so a closer can't blow the cap.
         budget > 0;
       if (okToPlan && projectDir !== "") {
-        launches.push({
-          verb: closeVerb,
-          id: epicId,
-          key: closeKey,
-          cwd: projectDir,
-          workerCommand: buildWorkerCommand(
-            closeVerb,
-            epicId,
-            projectDir,
-            snapshot.closeModel,
-            snapshot.closeEffort,
-          ),
-          model: snapshot.closeModel,
-          effort: snapshot.closeEffort,
-          tier: null,
-          // A `close` row is cell-less — it loads no per-cell worker plugin, and
-          // names no capability model.
-          cellModel: null,
-          pluginDir: null,
-          // Every close-row launch is an epic finalizer (`close`);
-          // the cycle glue stamps the per-epic guard for these.
-          isEpicFinalizer: true,
-        });
-        budget--;
+        const recoverDirectly =
+          snapshot.worktreeMode &&
+          snapshot.closeRecoveryEligibleIds?.has(epicId) === true &&
+          epic.tasks.every((task) => task.worker_phase === "done") &&
+          closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds);
+        if (recoverDirectly) {
+          if (!epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)) {
+            closeRecoveryStamps.push({ epicId, key: closeKey, projectDir });
+            budget--;
+          }
+        } else {
+          launches.push({
+            verb: closeVerb,
+            id: epicId,
+            key: closeKey,
+            cwd: projectDir,
+            workerCommand: buildWorkerCommand(
+              closeVerb,
+              epicId,
+              projectDir,
+              snapshot.closeModel,
+              snapshot.closeEffort,
+            ),
+            model: snapshot.closeModel,
+            effort: snapshot.closeEffort,
+            tier: null,
+            // A `close` row is cell-less — it loads no per-cell worker plugin, and
+            // names no capability model.
+            cellModel: null,
+            pluginDir: null,
+            // Every close-row launch is an epic finalizer (`close`);
+            // the cycle glue stamps the per-epic guard for these.
+            isEpicFinalizer: true,
+          });
+          budget--;
+        }
       }
     }
   }
@@ -2531,6 +2559,7 @@ export function reconcile(
 
   return {
     launches,
+    closeRecoveryStamps,
     completedRowIds,
     baseDriftEntries,
     worktreeFinalize,
