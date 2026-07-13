@@ -21,6 +21,7 @@ import { drainedState } from "../src/await-conditions";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
   BUILDS_DESCRIPTOR,
+  type CollectionDescriptor,
   countAndToken,
   DEAD_LETTERS_DESCRIPTOR,
   DISPATCH_FAILURES_DESCRIPTOR,
@@ -1741,6 +1742,88 @@ test("pending_dispatches: same-verb rows retain distinct live identities", () =>
       seedPendingDispatch(db, "work", "task-b", 7);
     },
   );
+});
+
+function expectStableCompositePageOrder({
+  descriptor,
+  filter,
+  sortColumn,
+  expected,
+  seed,
+}: {
+  descriptor: CollectionDescriptor;
+  filter: Record<string, string>;
+  sortColumn: string;
+  expected: string[];
+  seed: (db: Database) => void;
+}): void {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seed(db);
+
+  const fetch = () =>
+    asResult(
+      runQuery(db, 1, {
+        type: "query",
+        collection: descriptor.name,
+        filter,
+      }),
+    ).rows;
+  const first = fetch();
+  const refetch = fetch();
+
+  // Every fixture ties on both the displayed sort column and its single wire
+  // pk. The composite live key is therefore the only total-order tie-break.
+  expect(new Set(first.map((row) => String(row[sortColumn]))).size).toBe(1);
+  expect(new Set(first.map((row) => String(row[descriptor.pk]))).size).toBe(1);
+  expect(first.map((row) => liveKeyOf(descriptor, row))).toEqual(expected);
+  expect(refetch).toEqual(first);
+  db.close();
+}
+
+test("runQuery uses composite live keys for stable tied page order", () => {
+  expectStableCompositePageOrder({
+    descriptor: SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    filter: { job_id: "job-1" },
+    sortColumn: "ts",
+    expected: [
+      "job-1\u001fagent-a\u001f1",
+      "job-1\u001fagent-b\u001f2",
+    ],
+    seed: (db) => {
+      seedSubagentInvocation(db, "job-1", "agent-b", 2, 7);
+      seedSubagentInvocation(db, "job-1", "agent-a", 1, 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: SCHEDULED_TASKS_DESCRIPTOR,
+    filter: { job_id: "job-1" },
+    sortColumn: "ts",
+    expected: ["job-1\u001fcron-a", "job-1\u001fcron-b"],
+    seed: (db) => {
+      seedScheduledTask(db, "job-1", "cron-b", 7);
+      seedScheduledTask(db, "job-1", "cron-a", 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: PENDING_DISPATCHES_DESCRIPTOR,
+    filter: { verb: "work" },
+    sortColumn: "dispatched_at",
+    expected: ["work\u001ftask-a", "work\u001ftask-b"],
+    seed: (db) => {
+      seedPendingDispatch(db, "work", "task-b", 7);
+      seedPendingDispatch(db, "work", "task-a", 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: DISPATCH_FAILURES_DESCRIPTOR,
+    filter: { verb: "work" },
+    sortColumn: "ts",
+    expected: ["work\u001ffn-a", "work\u001ffn-b"],
+    seed: (db) => {
+      seedDispatchFailure(db, "work", "fn-b", { last_event_id: 7 });
+      seedDispatchFailure(db, "work", "fn-a", { last_event_id: 5 });
+    },
+  });
 });
 
 test("liveKeyExpr: single-pk descriptor falls back to the bare pk column (SQL unchanged)", () => {
