@@ -35,6 +35,7 @@
  * per-slug advisory lock) leaves only.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -45,7 +46,6 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
 import { uptime } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -352,7 +352,8 @@ export interface PanelDeps {
 
 /** Discriminated member-resolution result. */
 export type ResolveMembersResult =
-  { ok: true; members: PanelMember[] } | { ok: false; error: string };
+  | { ok: true; members: PanelMember[] }
+  | { ok: false; error: string };
 
 // ---------------------------------------------------------------------------
 // Member resolution (mirrors src/agent/main.ts runPresetsResolve)
@@ -1508,7 +1509,13 @@ async function panelLaunch(
           if (attempts.length >= MAX_PANEL_MEMBER_ATTEMPTS) {
             continue;
           }
-          attempts[attempts.length - 1]!.state = "lost";
+          const previousAttempt = attempts[attempts.length - 1];
+          if (previousAttempt === undefined) {
+            throw new Error(
+              `panel member '${member.name}' has no prior attempt`,
+            );
+          }
+          previousAttempt.state = "lost";
           const base = legBaseName(member.name, newGeneration);
           const attempt: PanelMemberAttempt = {
             attempt: attempts.length + 1,
@@ -1521,10 +1528,18 @@ async function panelLaunch(
           attempts.push(attempt);
           syncMemberFromAttempt(member, attempt);
           relaunched = true;
+          const resolvedMember =
+            member.spec ??
+            resolved.members.find(
+              (candidate) => candidate.name === member.name,
+            );
+          if (resolvedMember === undefined) {
+            throw new Error(
+              `panel member '${member.name}' could not be resolved`,
+            );
+          }
           launchTasks.push({
-            member:
-              member.spec ??
-              resolved.members.find((m) => m.name === member.name)!,
+            member: resolvedMember,
             entry: member,
             logPath: join(dir, `${base}.log`),
           });

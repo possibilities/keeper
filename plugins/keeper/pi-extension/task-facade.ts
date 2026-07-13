@@ -59,9 +59,12 @@ interface TerminalEvent {
   tokens?: unknown;
 }
 
-const RPC_VERSION = 2;
+const RPC_VERSION = 3;
 const RPC_TIMEOUT_MS = 2_000;
-const PACKAGE_NAME = "@tintinweb/pi-subagents@0.13.0";
+// The owner finalizer has its own five-second bound. Leave enough transport
+// headroom for it to report either terminal cleanup or exact failures.
+const STOP_RPC_TIMEOUT_MS = 7_000;
+const PACKAGE_NAME = "@tintinweb/pi-subagents@0.14.0";
 
 const TASK_PARAMETERS: Record<string, unknown> = {
   type: "object",
@@ -87,10 +90,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function abortError(): Error {
+function cancellationReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason;
   const error = new Error("Task cancelled");
   error.name = "AbortError";
   return error;
+}
+
+function cancellationReasonText(signal: AbortSignal): string {
+  const reason = cancellationReason(signal);
+  return reason instanceof Error ? reason.message : String(reason);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -192,17 +201,33 @@ function validateParams(params: PiTaskParams): void {
   }
 }
 
+function beforeSpawnOrAbort<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal === undefined) return operation;
+  if (signal.aborted) return Promise.reject(cancellationReason(signal));
+  let removeAbort = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    const onAbort = (): void => reject(cancellationReason(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbort = () => signal.removeEventListener("abort", onAbort);
+  });
+  return Promise.race([operation, cancelled]).finally(removeAbort);
+}
+
 async function executeTask(
   events: PiTaskEventBus,
   params: PiTaskParams,
   signal?: AbortSignal,
 ): Promise<PiTaskToolResult> {
   validateParams(params);
-  if (signal?.aborted) throw abortError();
-  await requireProtocol(events);
-  if (signal?.aborted) throw abortError();
+  if (signal?.aborted) throw cancellationReason(signal);
+  await beforeSpawnOrAbort(requireProtocol(events), signal);
+  if (signal?.aborted) throw cancellationReason(signal);
 
   let agentId: string | null = null;
+  let ownerHandle: string | null = null;
   let resolveTerminal: (event: TerminalEvent) => void = () => {};
   const buffered = new Map<string, TerminalEvent>();
   const terminal = new Promise<TerminalEvent>((resolve) => {
@@ -226,13 +251,56 @@ async function executeTask(
     unsubscribeFailed();
   };
 
-  const stop = (): void => {
-    if (agentId === null) return;
-    void rpcCall(events, "subagents:rpc:stop", { agentId }).catch(() => {});
+  let stopPromise: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopPromise !== null) return stopPromise;
+    if (ownerHandle === null || signal === undefined) {
+      return Promise.reject(
+        new Error(
+          `${PACKAGE_NAME} cannot cancel Task without its ownership scope`,
+        ),
+      );
+    }
+    stopPromise = (async () => {
+      const reply = await rpcCall(
+        events,
+        "subagents:rpc:stop",
+        {
+          version: RPC_VERSION,
+          handle: ownerHandle,
+          reason: cancellationReasonText(signal),
+        },
+        STOP_RPC_TIMEOUT_MS,
+      );
+      if (!reply.success) {
+        throw new Error(
+          `${PACKAGE_NAME} scoped cancellation failed: ${String(reply.error)}`,
+        );
+      }
+      if (
+        !isRecord(reply.data) ||
+        typeof reply.data.settled !== "boolean" ||
+        !Array.isArray(reply.data.failures) ||
+        !reply.data.failures.every((failure) => typeof failure === "string")
+      ) {
+        throw new Error(
+          `${PACKAGE_NAME} scoped cancellation returned a malformed acknowledgement`,
+        );
+      }
+      if (!reply.data.settled || reply.data.failures.length > 0) {
+        const failures =
+          reply.data.failures.join("; ") || "cleanup did not settle";
+        throw new Error(
+          `${PACKAGE_NAME} scoped cancellation did not settle: ${failures}`,
+        );
+      }
+    })();
+    return stopPromise;
   };
 
   try {
     const spawn = await rpcCall(events, "subagents:rpc:spawn", {
+      version: RPC_VERSION,
       type: params.subagent_type,
       prompt: params.prompt,
       options: {
@@ -244,24 +312,30 @@ async function executeTask(
     if (!spawn.success) {
       throw new Error(`${PACKAGE_NAME} spawn failed: ${String(spawn.error)}`);
     }
-    if (!isRecord(spawn.data) || typeof spawn.data.id !== "string") {
-      throw new Error(`${PACKAGE_NAME} spawn returned no agent id`);
+    if (
+      !isRecord(spawn.data) ||
+      typeof spawn.data.id !== "string" ||
+      spawn.data.id.length === 0 ||
+      typeof spawn.data.handle !== "string" ||
+      spawn.data.handle.length === 0
+    ) {
+      throw new Error(`${PACKAGE_NAME} spawn returned no owned agent scope`);
     }
     agentId = spawn.data.id;
+    ownerHandle = spawn.data.handle;
     const early = buffered.get(agentId);
     if (early !== undefined) resolveTerminal(early);
 
     if (signal?.aborted) {
-      stop();
-      throw abortError();
+      await stop();
+      throw cancellationReason(signal);
     }
 
     let removeAbort = () => {};
     const cancelled = new Promise<never>((_resolve, reject) => {
       if (signal === undefined) return;
       const onAbort = (): void => {
-        stop();
-        reject(abortError());
+        void stop().then(() => reject(cancellationReason(signal)), reject);
       };
       signal.addEventListener("abort", onAbort, { once: true });
       removeAbort = () => signal.removeEventListener("abort", onAbort);
@@ -269,6 +343,12 @@ async function executeTask(
 
     try {
       const event = await Promise.race([terminal, cancelled]);
+      // An abort owns the outcome once observed. A terminal event racing ahead
+      // of the acknowledged recursive stop must never leak a late success.
+      if (signal?.aborted) {
+        await stop();
+        throw cancellationReason(signal);
+      }
       if (
         event.status === "error" ||
         event.status === "stopped" ||
@@ -323,6 +403,16 @@ export function createTaskFacadeTool(
       try {
         return await executeTask(events, params, signal);
       } catch (error) {
+        // Pi passes the caller's AbortSignal through the tool boundary. Keep
+        // its native reason object and AbortError typing instead of converting
+        // cancellation into an ordinary Task failure.
+        if (
+          signal?.aborted &&
+          (error === signal.reason ||
+            (error instanceof Error && error.name === "AbortError"))
+        ) {
+          throw error;
+        }
         throw new Error(`Task facade: ${errorMessage(error)}`);
       }
     },
@@ -337,7 +427,8 @@ export function createTaskFacadeTool(
 export default function taskFacadeExtension(pi: PiTaskExtensionApi): void {
   try {
     if ((process.env.KEEPER_JOB_ID ?? "").trim() === "") return;
-    if (pi.events === undefined || typeof pi.registerTool !== "function") return;
+    if (pi.events === undefined || typeof pi.registerTool !== "function")
+      return;
     pi.registerTool(createTaskFacadeTool(pi.events));
   } catch {
     // A Task-facade load failure must never prevent the child session starting.

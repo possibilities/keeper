@@ -170,24 +170,28 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
     fi
     echo "install: pi-subagents fork rebased cleanly onto upstream/master"
   ) || echo "install: pi-subagents fork sync errored (non-fatal); continuing" >&2
-  # The point of the fork install is that BOTH live fixes are in the tree pi
-  # loads — verify their markers in the checkout as it stands (whatever branch
-  # or dirty state the steps above left in place). A missing marker means pi
-  # is running without that fix — wrong branch, lost commit, or an upstream
-  # refactor that renamed the seam — and an operator must reconcile; notify
-  # loudly, never fail the install.
+  # The fork must carry every contract Keeper consumes. Verify stable seam
+  # markers in the loaded checkout after sync; a missing marker means wrong
+  # branch, lost commit, or incompatible upstream refactor. Notify loudly but
+  # keep installation fail-open so an unrelated harness remains usable.
   pi_subagents_missing=""
   grep -q "classifyEmptyResult" "${pi_subagents_fork}/src/agent-runner.ts" 2>/dev/null || \
     pi_subagents_missing="the terminal-status fix (tintinweb/pi-subagents#144)"
   grep -q "compaction_end" "${pi_subagents_fork}/src/output-file.ts" 2>/dev/null || \
     pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the compaction fix (tintinweb/pi-subagents#145)"
+  grep -q "getActiveScopeContext" "${pi_subagents_fork}/src/index.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the nested Task context contract"
+  grep -Eq "PROTOCOL_VERSION[[:space:]]*=[[:space:]]*3" "${pi_subagents_fork}/src/cross-extension-rpc.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the owner-scoped RPC v3 contract"
+  grep -q "manager.cancelScope(handle" "${pi_subagents_fork}/src/cross-extension-rpc.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }acknowledged recursive cancellation"
   if [ -n "${pi_subagents_missing}" ]; then
     pi_subagents_notify "loaded tree is missing ${pi_subagents_missing} — pi runs without it"
   else
-    echo "install: pi-subagents fixes verified in the loaded tree (terminal status + compaction)"
+    echo "install: pi-subagents contracts verified in the loaded tree (terminal status + compaction + nested Task context + scoped cancellation)"
   fi
 else
-  pi_subagents_notify "fork unavailable — pi keeps its current package source and may be missing both fixes"
+  pi_subagents_notify "fork unavailable — pi keeps its current package source and may be missing required fixes or RPC contracts"
 fi
 
 # 3c. CodexBar CLI: install the latest signed upstream release directly into
