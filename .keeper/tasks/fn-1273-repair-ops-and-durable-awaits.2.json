@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T09:40:25.416000Z",
+  "depends_on": [
+    "fn-1273-repair-ops-and-durable-awaits.1"
+  ],
+  "epic": "fn-1273-repair-ops-and-durable-awaits",
+  "id": "fn-1273-repair-ops-and-durable-awaits.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Dead writer checkout sweep",
+  "updated_at": "2026-07-13T09:40:25.416000Z"
+}
