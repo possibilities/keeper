@@ -21,11 +21,10 @@ panels:
   featherweight:
     strength: weak
     members:
-      - codex::gpt-5.3-codex-spark::high
+      - pi::openai-codex/gpt-5.3-codex-spark::high
       - pi::openai-codex/gpt-5.4-mini::high
     description: >-
-      The floor — the two lightest GPT tiers across two harnesses, at high
-      effort. A cheap, near-instant sanity duo: bring a trivial or low-stakes
+      The floor — the two lightest GPT tiers, at high effort. A cheap, near-instant sanity duo: bring a trivial or low-stakes
       question where you mostly want a second pair of eyes on an obvious miss,
       not deep reasoning. Low ceiling by model tier, not by effort, and no
       claude leg — single-family agreement is weak evidence. Never bring hard,
@@ -35,11 +34,11 @@ panels:
   light-duo:
     strength: weak
     members:
-      - codex::gpt-5.6-luna::high
+      - pi::openai-codex/gpt-5.6-luna::high
       - pi::openai-codex/gpt-5.4::high
     description: >-
-      Two newer-generation light GPT tiers across two harnesses, at high
-      effort — a slightly higher floor than featherweight at similar speed.
+      Two newer-generation light GPT tiers, at high effort — a slightly
+      higher floor than featherweight at similar speed.
       Best for mechanical, fully-specified cross-checks — "does this small
       change look right", straight test-shape or refactor review — where you
       want quick independent agreement without paying for a flagship. Still one
@@ -50,7 +49,7 @@ panels:
     strength: light
     members:
       - claude::sonnet::high
-      - codex::gpt-5.6-luna::high
+      - pi::openai-codex/gpt-5.6-luna::high
       - pi::openai-codex/gpt-5.4-mini::high
     description: >-
       A claude workhorse anchor over two light GPT legs, all at high effort —
@@ -65,7 +64,7 @@ panels:
     strength: standard
     members:
       - claude::sonnet::high
-      - codex::gpt-5.6-terra::high
+      - pi::openai-codex/gpt-5.6-terra::high
     description: >-
       The calibrated everyday default — one Claude workhorse and one balanced GPT
       tier, cross-family at high effort. The right reach for an ordinary
@@ -78,11 +77,11 @@ panels:
     strength: standard
     members:
       - claude::sonnet::xhigh
-      - codex::gpt-5.6-terra::high
+      - pi::openai-codex/gpt-5.6-terra::high
       - pi::openai-codex/gpt-5.4::high
     description: >-
-      A three-leg everyday panel — the workhorse duo plus a third GPT leg on a
-      distinct harness, Claude pushed to xhigh. Buys a tie-breaker and wider
+      A three-leg everyday panel — the workhorse duo plus a third leg on a
+      distinct GPT model, Claude pushed to xhigh. Buys a tie-breaker and wider
       coverage over `workhorse` when a moderate question has several plausible
       answers and you want a majority signal, not just two-way agree/disagree.
       Standard cost, one slower leg. Step up to a strong rung when being wrong is
@@ -107,7 +106,7 @@ panels:
     strength: strong
     members:
       - claude::sonnet::xhigh
-      - codex::gpt-5.5::xhigh
+      - pi::openai-codex/gpt-5.5::xhigh
     description: >-
       The strong balanced duo — a Claude workhorse and a frontier-class GPT tier,
       both at xhigh, maximum family diversity at two legs. Reach for it when the
@@ -120,7 +119,7 @@ panels:
     strength: strong
     members:
       - claude::opus::xhigh
-      - codex::gpt-5.6-sol::xhigh
+      - pi::openai-codex/gpt-5.6-sol::xhigh
     description: >-
       Two flagships, cross-family, at xhigh — opus and the top GPT tier. For
       genuinely hard questions: a subtle correctness or security invariant, a
@@ -134,11 +133,11 @@ panels:
     strength: strong
     members:
       - claude::opus::xhigh
-      - codex::gpt-5.6-sol::xhigh
+      - pi::openai-codex/gpt-5.6-sol::xhigh
       - pi::openai-codex/gpt-5.5::xhigh
     description: >-
       The three-leg strong panel — opus plus two frontier GPT legs on distinct
-      harnesses, two families across all three harnesses, at xhigh. Adds a
+      models, two model families, at xhigh. Adds a
       decisive third vote and broader coverage over `deep-duo` for a hard question
       with real branch risk — adversarial design review, a schema/API/migration
       contract, a security boundary — where a two-way split would leave you stuck.
@@ -149,11 +148,11 @@ panels:
     strength: max
     members:
       - claude::opus::max
-      - codex::gpt-5.6-sol::max
+      - pi::openai-codex/gpt-5.6-sol::max
       - pi::openai-codex/gpt-5.5::max
     description: >-
-      The ceiling — three flagships across two families and all three harnesses,
-      every leg at max effort. The most cross-checking keeper can convene, and the
+      The ceiling — three flagships across both model families, every leg at
+      max effort. The most cross-checking keeper can convene, and the
       most expensive and slowest. Reserve it for decisions where confidently-wrong
       is very expensive and hard to reverse: a security or data-integrity call, an
       irreversible migration or wire contract, an architecture choice a whole epic
