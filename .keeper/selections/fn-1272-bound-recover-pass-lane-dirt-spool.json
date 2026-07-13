@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded bug fix with a named root cause and named files, but it lives in the invariant-dense recover-pass/worktree-git degrade path and must preserve subtle page-once distress and positive-evidence level-clear semantics while changing snapshot behavior \u2014 delicate in-repo idiom matching where a wrong change propagates past the task, warranting sonnet's judgment at xhigh rather than opus (no novel algorithm or cross-cutting cascade) or a GPT tier.",
+      "task_id": "fn-1272-bound-recover-pass-lane-dirt-spool.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T09:08:16.661000Z",
+  "epic_id": "fn-1272-bound-recover-pass-lane-dirt-spool",
+  "input_hash": "a661379e355789e148f0ef0af6b28c6c7f395662c28405b24d25ac774bec0075",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2791389086,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Bounded bug fix with a named root cause and named files, but it lives in the invariant-dense recover-pass/worktree-git degrade path and must preserve subtle page-once distress and positive-evidence level-clear semantics while changing snapshot behavior \u2014 delicate in-repo idiom matching where a wrong change propagates past the task, warranting sonnet's judgment at xhigh rather than opus (no novel algorithm or cross-cutting cascade) or a GPT tier.\",\"confidence\":0.7}]}\n"
+}
