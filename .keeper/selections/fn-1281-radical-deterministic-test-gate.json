@@ -1,0 +1,93 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Bun preload ordering, marker consumption, and cross-package command classification form a subtle correctness invariant across many surfaces.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.88,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "The explicit acceptance supports GPT execution, while preserving result classifications, retries, deadlines, and process cleanup requires substantial multi-file reasoning.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Fail-closed discovery, structural linting, timing policy, and bounded orchestration introduce a cross-cutting correctness contract where a flawed abstraction would propagate broadly.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is substantial but well-specified multi-suite migration work with explicit rules for memory clones, file clones, and preserved integrity cases.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.93,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Separating storage orchestration while preserving corruption, atomic replacement, cleanup confinement, and reopen semantics involves subtle correctness invariants.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting scheduler and state-machine extraction must preserve delicate promise, cancellation, deadline, and microtask ordering invariants.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.6",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.87,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "The implementation needs judgment-heavy assertion accounting and delicate seam extraction across heterogeneous process-shaped tests without requiring a novel design.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.7",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.89,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Pruning broad coverage across three packages requires careful judgment about equivalent survivors and explicit retirements more than novel architecture.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.8",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.93,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Consolidating user-facing guidance across several documents requires wording judgment, terse house-style matching, and command-surface consistency.",
+      "task_id": "fn-1281-radical-deterministic-test-gate.9",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T17:14:50.713000Z",
+  "epic_id": "fn-1281-radical-deterministic-test-gate",
+  "input_hash": "26bdd2208e6bad652a6dde640280f252f0635a6108a45df15bbd64bc1f333281",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 649974304,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1281-radical-deterministic-test-gate.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Bun preload ordering, marker consumption, and cross-package command classification form a subtle correctness invariant across many surfaces.\",\"confidence\":0.94},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"The explicit acceptance supports GPT execution, while preserving result classifications, retries, deadlines, and process cleanup requires substantial multi-file reasoning.\",\"confidence\":0.88},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Fail-closed discovery, structural linting, timing policy, and bounded orchestration introduce a cross-cutting correctness contract where a flawed abstraction would propagate broadly.\",\"confidence\":0.96},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.4\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"This is substantial but well-specified multi-suite migration work with explicit rules for memory clones, file clones, and preserved integrity cases.\",\"confidence\":0.9},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Separating storage orchestration while preserving corruption, atomic replacement, cleanup confinement, and reopen semantics involves subtle correctness invariants.\",\"confidence\":0.93},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting scheduler and state-machine extraction must preserve delicate promise, cancellation, deadline, and microtask ordering invariants.\",\"confidence\":0.95},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.7\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"The implementation needs judgment-heavy assertion accounting and delicate seam extraction across heterogeneous process-shaped tests without requiring a novel design.\",\"confidence\":0.87},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.8\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Pruning broad coverage across three packages requires careful judgment about equivalent survivors and explicit retirements more than novel architecture.\",\"confidence\":0.89},{\"task_id\":\"fn-1281-radical-deterministic-test-gate.9\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Consolidating user-facing guidance across several documents requires wording judgment, terse house-style matching, and command-surface consistency.\",\"confidence\":0.93}]}\n"
+}
