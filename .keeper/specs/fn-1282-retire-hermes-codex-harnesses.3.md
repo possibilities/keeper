@@ -56,5 +56,5 @@ Use the normal DB backup; never hardcode a provisional version in prose.
 - [ ] Fingerprint and migration tests pass.
 
 ## Done summary
-
+Added a forward migration (schema v127) that rebuilds autopilot_state without the retired codex_adoption column, preserving every surviving setting including worker_provider=gpt byte-for-byte; re-pinned SCHEMA_FINGERPRINT and replaced the old adoption schema/fold tests with migration-parity, fresh-vs-migrated-shape, and replay-safe-cursor coverage.
 ## Evidence
