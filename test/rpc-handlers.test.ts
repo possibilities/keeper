@@ -211,7 +211,6 @@ function autopilotStubBridge(opts: {
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
-      codex_adoption?: boolean;
       worker_provider?: "claude" | "gpt" | null;
       drift_behind_threshold?: number | null;
       drift_age_threshold_days?: number | null;
@@ -238,7 +237,6 @@ function autopilotStubBridge(opts: {
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
       worktree_multi_repo?: boolean;
-      codex_adoption?: boolean;
     }>,
     setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
     requestHandoffCalls: [] as Array<{
@@ -550,33 +548,11 @@ test("set_autopilot_config rejects a non-boolean worktree_multi_repo (fn-1034)",
   expect(state.setConfigCalls).toEqual([]);
 });
 
-test("set_autopilot_config forwards a codex_adoption boolean patch (fn-1131)", async () => {
+test("set_autopilot_config rejects the retired codex_adoption key", async () => {
   const { bridge, state } = autopilotStubBridge({});
-  const on = await setAutopilotConfigHandler({ codex_adoption: true }, bridge);
-  expect(on).toEqual({ ok: true, patch: { codex_adoption: true } });
-  const off = await setAutopilotConfigHandler(
-    { codex_adoption: false },
-    bridge,
-  );
-  expect(off).toEqual({ ok: true, patch: { codex_adoption: false } });
-  expect(state.setConfigCalls).toEqual([
-    { codex_adoption: true },
-    { codex_adoption: false },
-  ]);
-});
-
-test("set_autopilot_config rejects a non-boolean codex_adoption (fn-1131)", async () => {
-  const { bridge, state } = autopilotStubBridge({});
-  for (const bad of [
-    { codex_adoption: 1 },
-    { codex_adoption: 0 },
-    { codex_adoption: "true" },
-    { codex_adoption: null },
-  ]) {
-    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
-      BadParamsError,
-    );
-  }
+  expect(
+    setAutopilotConfigHandler({ codex_adoption: true }, bridge),
+  ).rejects.toBeInstanceOf(BadParamsError);
   expect(state.setConfigCalls).toEqual([]);
 });
 

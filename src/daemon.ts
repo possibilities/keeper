@@ -36,11 +36,6 @@ import {
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AccountObserverWorkerData } from "./account-observer-worker";
 import { resolveAccountRoutingRoot } from "./account-routing-config";
-import {
-  type AdoptableCodexRollout,
-  findAdoptableCodexRollouts,
-  resolveCodexResumeTarget,
-} from "./agent/codex-session-index";
 import type {
   AutocloseWorkerData,
   AutocloseWorkerMessage,
@@ -104,12 +99,6 @@ import {
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
-import {
-  type CodexStopSignal,
-  collectCodexStopSignals,
-  type LiveCodexJob,
-  type RolloutCursor,
-} from "./codex-state-worker";
 import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
@@ -727,43 +716,8 @@ export function buildPendingDispatchSweepRecords(
  */
 export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
 
-/**
- * Cadence of the codex resume-target back-fill sweep (fn-1103). A tracked codex
- * job is born with `resume_target` NULL (it mints its own rollout uuid); this
- * sweep resolves the uuid from the rollout head and mints a `ResumeTargetResolved`
- * synthetic event. Seconds-scale so a freshly-launched session becomes resumable
- * promptly, yet the tick is cheap: the candidate query is an indexed point-read and
- * the rollout-tree read runs ONLY when a NULL-target codex job exists.
- */
-export const CODEX_RESUME_SWEEP_INTERVAL_MS = 5_000;
-
-/**
- * Recency floor for codex resume candidates: a job whose rollout uuid stays
- * unresolved past this (a same-cwd collision with the originator override
- * stripped, or a rollout that never persisted) drops out of the candidate set so
- * the sweep goes quiet instead of scanning the tree forever. Its presence is
- * unaffected — it simply stays `resume_target` NULL (not-resumable).
- */
-export const CODEX_RESUME_RECENT_WINDOW_SEC = 600;
-
-/**
- * Recency window for codex rollout-ADOPTION discovery (fn-1131). Only rollout
- * day-dirs whose sessions started within this window are scanned, so a knob-flip
- * on a codex install with months of history reads a bounded, fixed number of
- * day-dirs — scan cost is a function of THIS window, never of harness lifetime.
- * A day old enough that its whole rollout set predates the floor is skipped. A
- * genuinely stale session (started before the window) is simply never adopted.
- */
-export const CODEX_ADOPTION_RECENT_WINDOW_SEC = 24 * 60 * 60;
-
-/**
- * Per-tick adoption mint cap (fn-1131). Bounds how many adopted jobs one sweep
- * tick mints, so a knob-flip that finds a burst of eligible rollouts drains
- * gradually across ticks rather than minting them all under one write lock. The
- * window bounds the scan; this bounds the mints — both invariants are
- * acceptance-bound, the constants themselves are tunable.
- */
-export const CODEX_ADOPTION_MINT_CAP_PER_TICK = 8;
+/** Cadence for the Pi resume-target repair sweep. */
+export const PI_RESUME_REPAIR_SWEEP_INTERVAL_MS = 5_000;
 
 /**
  * The ONE blocked category that does NOT escalate to the planner: a
@@ -6148,100 +6102,10 @@ function retireBirthFile(full: string): void {
 }
 
 /**
- * Resolve CODEX_HOME for the resume-target sweep — an explicit non-empty
- * `CODEX_HOME` wins, else `<home>/.codex` (the same rule
- * `transcript-watch` uses).
- */
-export function resolveCodexHomeDir(
-  env: Record<string, string | undefined> = process.env,
-): string {
-  return (env.CODEX_HOME ?? "").trim() || join(homedir(), ".codex");
-}
-
-/** A codex job awaiting resume-target back-fill — see {@link findCodexResumeCandidates}. */
-export interface CodexResumeCandidate {
-  jobId: string;
-  cwd: string | null;
-  /** Job launch instant in ms (jobs.created_at seconds × 1000). */
-  startedAtMs: number;
-}
-
-/**
- * The live codex jobs whose native rollout uuid is not yet back-filled: harness
- * `codex`, `resume_target` still NULL, a non-terminal (`working`/`stopped`) state,
- * and launched within `recentWindowSec` of `nowSec`. The recency floor is what
- * makes the sweep go quiet — an old unresolved job (collision, override stripped)
- * drops out instead of provoking a tree scan every tick. Pure over the db + clock.
- */
-export function findCodexResumeCandidates(
-  db: Database,
-  nowSec: number,
-  recentWindowSec: number,
-): CodexResumeCandidate[] {
-  const rows = db
-    .query(
-      `SELECT job_id, cwd, created_at FROM jobs
-         WHERE harness = 'codex' AND resume_target IS NULL
-           AND state IN ('working', 'stopped')
-           AND created_at >= ?`,
-    )
-    .all(nowSec - recentWindowSec) as {
-    job_id: string;
-    cwd: string | null;
-    created_at: number;
-  }[];
-  return rows.map((r) => ({
-    jobId: r.job_id,
-    cwd: r.cwd,
-    startedAtMs: r.created_at * 1000,
-  }));
-}
-
-/** A resolved (jobId → native rollout uuid) pair the sweep mints as `ResumeTargetResolved`. */
-export interface CodexResumeResolution {
-  jobId: string;
-  resumeTarget: string;
-}
-
-/**
- * Resolve the native rollout uuid for every current codex resume candidate,
- * reading each candidate's rollout `SessionMeta` head via
- * {@link resolveCodexResumeTarget} (originator exact-match first, cwd+created-at
- * fallback with refuse-to-guess). An unresolvable candidate is omitted — it keeps
- * its NULL resume_target (not-resumable) and is retried next tick until it ages
- * out of the recency window. Reads NO session content. Returns [] with NO tree
- * read when there are no candidates (the sweep's idle path).
- */
-export function resolveCodexResumeCandidates(
-  db: Database,
-  codexHome: string,
-  nowSec: number,
-  recentWindowSec: number,
-): CodexResumeResolution[] {
-  const resolutions: CodexResumeResolution[] = [];
-  for (const candidate of findCodexResumeCandidates(
-    db,
-    nowSec,
-    recentWindowSec,
-  )) {
-    const resumeTarget = resolveCodexResumeTarget({
-      codexHome,
-      jobId: candidate.jobId,
-      expectedCwd: candidate.cwd,
-      startedAtMs: candidate.startedAtMs,
-    });
-    if (resumeTarget !== null) {
-      resolutions.push({ jobId: candidate.jobId, resumeTarget });
-    }
-  }
-  return resolutions;
-}
-
-/**
  * The recency floor (seconds) for the pi resume-target REPAIR pass — a live pi
  * job launched within this window whose recorded target rotted (names no on-disk
- * artifact) is eligible for an auto-repair. Generous relative to the codex NULL
- * back-fill window because rot is discovered over a session's life, not at launch;
+ * artifact) is eligible for an auto-repair. Rot is discovered over a session's
+ * life, not at launch;
  * the non-terminal state filter already bounds the pass to live jobs, so this is a
  * belt-and-suspenders cap keeping a permanently-unmatchable old job from
  * re-scanning its store forever.
@@ -6263,9 +6127,9 @@ export interface PiResumeRepair {
 /**
  * The live pi jobs whose recorded resume target may have rotted: harness `pi`, a
  * non-empty `resume_target`, a non-terminal (`working`/`stopped`) state, and
- * launched within `recentWindowSec` of `nowSec`. Same shape as
- * {@link findCodexResumeCandidates} — the recency floor keeps the sweep quiet. The
- * rot check itself (target names no artifact) is deferred to {@link proposePiRepair}.
+ * launched within `recentWindowSec` of `nowSec`. The recency floor keeps the
+ * sweep quiet. The rot check itself (target names no artifact) is deferred to
+ * {@link proposePiRepair}.
  * Pure over the db + clock.
  */
 export function findRottedPiResumeCandidates(
@@ -6329,223 +6193,6 @@ export function resolvePiResumeRepairs(
     }
   }
   return repairs;
-}
-
-/**
- * The tracked codex jobs whose live stop-churn the state producer tails: harness
- * `codex`, a resolved (non-NULL) `resume_target` — the attributed rollout uuid
- * the tailer keys on, so an unattributed job idles presence-only — and a
- * non-terminal (`working`/`stopped`) state. No recency floor: a non-terminal job
- * is recent by construction (the reapers drive stale sessions terminal), and
- * following a long-lived session's ongoing churn is the point. Pure over the db.
- */
-export function findLiveCodexStateJobs(db: Database): LiveCodexJob[] {
-  const rows = db
-    .query(
-      `SELECT job_id, resume_target, created_at FROM jobs
-         WHERE harness = 'codex' AND resume_target IS NOT NULL
-           AND state IN ('working', 'stopped')`,
-    )
-    .all() as {
-    job_id: string;
-    resume_target: string;
-    created_at: number;
-  }[];
-  return rows.map((r) => ({
-    jobId: r.job_id,
-    resumeTarget: r.resume_target,
-    createdAtMs: r.created_at * 1000,
-  }));
-}
-
-/**
- * Read the durable codex rollout-adoption knob off the `autopilot_state`
- * singleton. Absent row / NULL / 0 all resolve to OFF (the byte-identical
- * default — no fold reads this column). Re-read every sweep tick so a knob flip
- * is a live kill-switch: flipping OFF stops adoption within one tick.
- */
-export function isCodexAdoptionEnabled(db: Database): boolean {
-  const row = db
-    .query("SELECT codex_adoption FROM autopilot_state WHERE id = 1")
-    .get() as { codex_adoption: number | null } | null;
-  return row?.codex_adoption === 1;
-}
-
-/**
- * The dedup predicate for codex adoption: does ANY tracked job already claim this
- * rollout uuid — either as its own `job_id` (a prior adoption of the same
- * rollout) or as its `resume_target` (a launcher-owned session the resume
- * back-fill attributed to this rollout)? Reads the folded `jobs` projection, so
- * it enforces the "discovery never adopts a launcher-owned session" +
- * idempotent-re-mint invariants across ticks.
- */
-function codexRolloutClaimed(db: Database, uuid: string): boolean {
-  return (
-    db
-      .query("SELECT 1 FROM jobs WHERE job_id = ? OR resume_target = ? LIMIT 1")
-      .get(uuid, uuid) != null
-  );
-}
-
-/**
- * Canonicalize a rollout's RAW cwd before it enters the adopted `jobs` row —
- * `realpathSync` to defeat symlink escapes when the path exists, falling back to
- * a lexical `resolve` (collapsing `.`/`..`) when it does not. The raw value is
- * user-writable (a rollout file is untrusted input), so canonicalizing here
- * neutralizes path-traversal / injection before the value is stored.
- */
-export function canonicalizeAdoptedCwd(rawCwd: string): string {
-  try {
-    return realpathSync(rawCwd);
-  } catch {
-    return resolvePath(rawCwd);
-  }
-}
-
-/**
- * Mint ONE synthetic `SessionStart` for an ADOPTED codex rollout — the pull-side
- * sibling of {@link insertBirthSessionStart}. COORDLESS by design: main mints
- * from a rollout FILE, owning no process and no tmux pane, so `pid`,
- * `start_time`, and every `backend_exec_*`/`worktree` coord bind NULL. The job id
- * AND `resume_target` are both the rollout `uuid` (so the live-state tailer keys
- * on it immediately), `harness` is `codex`, `adopted` is 1 (the non-launcher
- * marker the SessionStart COALESCE arm preserves set-once), `cwd` is the
- * pre-canonicalized value, and `ts` is the rollout's OWN immutable session-start
- * (seconds) — never file mtime, never wall-clock — so a from-scratch re-fold
- * reproduces a byte-identical row. Column list matches CREATE_EVENTS verbatim
- * (a future column add updates this site alongside its `insertBirthSessionStart`
- * sibling); values bind positionally. MUST run on `db` = main's WRITER connection.
- */
-export function insertAdoptedCodexSessionStart(
-  db: Database,
-  uuid: string,
-  canonicalCwd: string,
-  sessionStartSec: number,
-): void {
-  db.run(
-    `INSERT INTO events (
-       ts, session_id, pid, hook_event, event_type, tool_name, matcher,
-       cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-       plan_op, plan_target, plan_epic_id, plan_task_id,
-       plan_subject_present, tool_use_id, config_dir,
-       bash_mutation_kind, bash_mutation_targets, plan_files,
-       backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id, mutation_path, worktree, harness, resume_target,
-       adopted
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      sessionStartSec, // ts — the rollout's own immutable session-start
-      uuid, // session_id — the adopted job id
-      null, // pid — coordless/pidless: main owns no process for this session
-      "SessionStart",
-      "session_start",
-      null, // tool_name
-      null, // matcher
-      canonicalCwd, // cwd — canonicalized on the raw rollout value
-      null, // permission_mode
-      null, // agent_id
-      null, // agent_type
-      null, // stop_hook_active
-      null, // data (no transcript captured at adoption)
-      null, // subagent_agent_id
-      null, // spawn_name
-      null, // start_time
-      null, // slash_command
-      null, // skill_name
-      null, // plan_op
-      null, // plan_target
-      null, // plan_epic_id
-      null, // plan_task_id
-      null, // plan_subject_present
-      null, // tool_use_id
-      null, // config_dir
-      null, // bash_mutation_kind
-      null, // bash_mutation_targets
-      null, // plan_files
-      null, // backend_exec_type — COORDLESS
-      null, // backend_exec_session_id — COORDLESS
-      null, // backend_exec_pane_id — COORDLESS
-      null, // background_task_id
-      null, // mutation_path
-      null, // worktree
-      "codex", // harness
-      uuid, // resume_target — the native rollout uuid (== job id)
-      1, // adopted — the non-launcher adoption marker
-    ],
-  );
-}
-
-/**
- * One codex rollout-adoption sweep tick (fn-1131) — the pull-side sibling of the
- * resume back-fill. Knob-gated (re-read each tick, so OFF stops adoption within
- * one tick), it discovers originator-less, sole-for-their-cwd rollouts within the
- * recency window ({@link findAdoptableCodexRollouts}), then for each — newest
- * first, up to `mintCap` — has MAIN mint a coordless adopted SessionStart inside
- * a `BEGIN IMMEDIATE` guarded by a re-read of {@link codexRolloutClaimed} (skip
- * if any job already claims the uuid). cwd is canonicalized BEFORE the
- * transaction so the write lock never spans that IO. A mint throw rolls its own
- * row back and is logged non-fatally; the tick continues. Returns the number of
- * jobs minted (the caller wakes the fold when > 0). MUST run on `db` = main's
- * WRITER connection.
- */
-export function runCodexAdoptionSweep(
-  db: Database,
-  codexHome: string,
-  nowSec: number,
-  recentWindowSec: number,
-  mintCap: number,
-): number {
-  if (!isCodexAdoptionEnabled(db)) {
-    return 0; // knob OFF — nothing scanned, nothing minted (the default).
-  }
-  const candidates: AdoptableCodexRollout[] = findAdoptableCodexRollouts(
-    codexHome,
-    nowSec,
-    recentWindowSec,
-  );
-  let minted = 0;
-  for (const candidate of candidates) {
-    if (minted >= mintCap) {
-      break; // per-tick cap reached — the rest drains on later ticks.
-    }
-    // Cheap pre-filter (single-threaded main is the sole writer, so the folded
-    // `jobs` view is authoritative between ticks): skip an already-claimed uuid
-    // WITHOUT a write lock so re-scanned adopted rollouts never churn a txn.
-    if (codexRolloutClaimed(db, candidate.uuid)) {
-      continue;
-    }
-    const canonicalCwd = canonicalizeAdoptedCwd(candidate.cwd);
-    db.run("BEGIN IMMEDIATE");
-    try {
-      // Authoritative re-read INSIDE the write lock — the mint is idempotent even
-      // against a racing resume back-fill that attributed the same rollout.
-      if (codexRolloutClaimed(db, candidate.uuid)) {
-        db.run("COMMIT");
-        continue;
-      }
-      insertAdoptedCodexSessionStart(
-        db,
-        candidate.uuid,
-        canonicalCwd,
-        candidate.sessionStartMs / 1000,
-      );
-      db.run("COMMIT");
-      minted += 1;
-    } catch (err) {
-      try {
-        db.run("ROLLBACK");
-      } catch {
-        // best-effort — a rollback failure never escalates a sweep tick.
-      }
-      console.error(
-        `[keeperd] codex-adoption mint failed for ${candidate.uuid} (skipped this tick): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
-  return minted;
 }
 
 /**
@@ -7368,7 +7015,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Step 1c — births boot ingest (fn-1103). The non-hook presence channel's twin
   // of the events-log boot scan: fold every birth record the `keeper agent`
-  // launcher dropped for a non-claude harness during downtime into a synthetic
+  // launcher dropped for Pi during downtime into a synthetic
   // SessionStart BEFORE the boot drain, so the drain mints the tracked jobs rows
   // this pass. `mkdir` the maildir `new/` HERE — before the boot scan AND the
   // birth-ingest worker spawn — so the watcher always finds an existing dir
@@ -7618,14 +7265,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * and runs before the event insert so a clear is never swallowed.
    */
   /**
-   * Mint ONE `ResumeTargetResolved` synthetic event that back-fills a job's
-   * `resume_target`. Two producers ride this seam: the codex rollout back-fill (a
-   * NULL target → its resolved native rollout uuid) and the pi rot repair (a
-   * rotted target → its disk-anchored replacement). MAIN is the sole event writer,
-   * so both mint here rather than writing `jobs` directly — the fold's dedicated
-   * `ResumeTargetResolved` arm folds ONLY `jobs.resume_target` (never lifecycle
-   * state, so a late back-fill can never revive a terminal row) and a from-scratch
-   * re-fold reproduces it from the event's `resume_target` COLUMN. The caller sets
+   * Mint ONE `ResumeTargetResolved` synthetic event that repairs a job's
+   * `resume_target`. MAIN is the sole event writer, so the repair producer mints
+   * here rather than writing `jobs` directly; the fold's dedicated arm updates
+   * only `jobs.resume_target` and never lifecycle state. The caller sets
    * `wakePending` + pumps.
    */
   function mintResumeTargetResolved(resolution: {
@@ -7665,52 +7308,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       $backend_exec_pane_id: null,
       $worktree: null,
       $resume_target: resolution.resumeTarget,
-    });
-  }
-
-  /**
-   * Mint ONE synthetic `Stop` event (fn-1103) carrying a codex turn-completion
-   * the daemon-side rollout tailer parsed. Stamped with the ROLLOUT LINE's own
-   * timestamp (never wall-clock), so a boot-scan / tail-catch-up replay of a dead
-   * session's rollout folds through the Stop arm's terminal guard as a no-op and
-   * can never flicker a killed/ended row back to life. MAIN is the sole event
-   * writer, so the tailer mints here rather than writing `jobs` directly — a
-   * from-scratch re-fold reproduces the row. Caller sets `wakePending` + pumps.
-   */
-  function mintCodexStop(signal: CodexStopSignal): void {
-    stmts.insertEvent.run({
-      $ts: signal.tsSec,
-      $session_id: signal.jobId,
-      $pid: null,
-      $hook_event: "Stop",
-      $event_type: "stop",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: null,
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $plan_op: null,
-      $plan_target: null,
-      $plan_epic_id: null,
-      $plan_task_id: null,
-      $plan_subject_present: null,
-      $config_dir: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $plan_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
-      $worktree: null,
-      $resume_target: null,
     });
   }
 
@@ -13106,66 +12703,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
-  // Codex resume-target back-fill producer (fn-1103). A tracked codex job is born
-  // with resume_target NULL (it mints its own rollout uuid post-launch); this
-  // sweep resolves that uuid from the rollout SessionMeta head — originator
-  // exact-match (the launcher's CODEX_INTERNAL_ORIGINATOR_OVERRIDE) first, cwd +
-  // created-at with refuse-to-guess fallback — and has MAIN mint a
-  // `ResumeTargetResolved` synthetic event (never a direct jobs write, so a
-  // from-scratch re-fold reproduces it). Reads ONLY session metadata, never
-  // content, and does NO tree read when no NULL-target codex job exists (the
-  // candidate query is an indexed point-read). Gated on the `exit` lifecycle role
-  // — the sibling steady-state jobs producer — so a server-only boot skips it. A
-  // per-tick no-throw guard keeps a transient rollout-read error off fatalExit.
-  const codexResumeHome = resolveCodexHomeDir();
-  // Codex live-state producer cursors (fn-1103): per-job rollout forward-tail
-  // offsets, EOF-anchored on first sight and GC'd once a job leaves the live set,
-  // so the map stays bounded by the live codex sessions, never history. Rides the
-  // same `exit`-role sweep tick as the resume back-fill below.
-  const codexStateCursors = new Map<string, RolloutCursor>();
-  const codexResumeSweepTimer = want("exit")
+  // Pi resume-target repair producer. Heals a live pi job whose recorded
+  // resume target names no on-disk artifact by disk-anchoring a same-cwd session
+  // via the same confidence gate `keeper tabs repair` reports with.
+  const piResumeRepairSweepTimer = want("exit")
     ? setInterval(() => {
         if (shuttingDown) return;
-        try {
-          const resolutions = resolveCodexResumeCandidates(
-            db,
-            codexResumeHome,
-            Date.now() / 1000,
-            CODEX_RESUME_RECENT_WINDOW_SEC,
-          );
-          let minted = false;
-          for (const resolution of resolutions) {
-            // Re-read: mint only while resume_target is still NULL. The candidate
-            // query already filters it, but a concurrent fold (a resume re-seed)
-            // could have set it since — never overwrite a resolved target.
-            const row = db
-              .query("SELECT resume_target FROM jobs WHERE job_id = ?")
-              .get(resolution.jobId) as { resume_target: string | null } | null;
-            if (!row || row.resume_target != null) {
-              continue;
-            }
-            mintResumeTargetResolved(resolution);
-            minted = true;
-          }
-          if (minted) {
-            wakePending = true;
-            pumpWakes();
-          }
-        } catch (err) {
-          console.error(
-            `[keeperd] codex-resume sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        }
-        // Pi resume-target REPAIR (fn-1162) — the twin pass beside the codex NULL
-        // back-fill, under its OWN guard so a pi store throw never skips the codex
-        // mints (and vice versa). Heals a LIVE pi job whose recorded resume target
-        // rotted (names no on-disk artifact) by disk-anchoring a same-cwd session
-        // via the SAME confidence gate `keeper tabs repair` reports with — only an
-        // UNAMBIGUOUS single-candidate match. Re-reads resume_target before minting
-        // and applies only while it still equals the rotted target the proposal was
-        // computed against, so a concurrent fix is never clobbered.
         try {
           const repairs = resolvePiResumeRepairs(
             db,
@@ -13177,13 +12720,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           let repaired = false;
           for (const repair of repairs) {
             if (repair.newTarget === repair.oldTarget) {
-              continue; // no-op — never mint an identity re-pin.
+              continue;
             }
             const row = db
               .query("SELECT resume_target FROM jobs WHERE job_id = ?")
               .get(repair.jobId) as { resume_target: string | null } | null;
             if (!row || row.resume_target !== repair.oldTarget) {
-              continue; // changed concurrently — never clobber a resolved target.
+              continue;
             }
             mintResumeTargetResolved({
               jobId: repair.jobId,
@@ -13202,59 +12745,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             }`,
           );
         }
-        // Codex live stop-churn (fn-1103) rides the same tick under its OWN guard,
-        // so a rollout-tail throw never skips the resume mint above (and vice
-        // versa). Forward-tails each attributed codex job's rollout and mints a
-        // synthetic Stop per turn-completion — an unattributed job is absent from
-        // the query and stays presence-only. A job attributed THIS tick is folded
-        // by a later tick, so the state read here always sees the settled target.
-        try {
-          const stopSignals = collectCodexStopSignals(
-            findLiveCodexStateJobs(db),
-            codexResumeHome,
-            codexStateCursors,
-          );
-          if (stopSignals.length > 0) {
-            for (const signal of stopSignals) {
-              mintCodexStop(signal);
-            }
-            wakePending = true;
-            pumpWakes();
-          }
-        } catch (err) {
-          console.error(
-            `[keeperd] codex-state sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        }
-        // Codex rollout-ADOPTION discovery (fn-1131) rides the same tick under its
-        // OWN guard, so a scan/mint throw here never skips the resume/state mints
-        // above (and vice versa). Knob-gated OFF by default and re-read inside the
-        // sweep (a live kill-switch); when ON it discovers originator-less,
-        // sole-for-cwd rollouts within the recency window and has MAIN mint each,
-        // capped, as a coordless adopted job. A just-adopted job (resume_target =
-        // its own uuid) is picked up by the live-state tailer on a later tick.
-        try {
-          const adopted = runCodexAdoptionSweep(
-            db,
-            codexResumeHome,
-            Date.now() / 1000,
-            CODEX_ADOPTION_RECENT_WINDOW_SEC,
-            CODEX_ADOPTION_MINT_CAP_PER_TICK,
-          );
-          if (adopted > 0) {
-            wakePending = true;
-            pumpWakes();
-          }
-        } catch (err) {
-          console.error(
-            `[keeperd] codex-adoption sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        }
-      }, CODEX_RESUME_SWEEP_INTERVAL_MS)
+      }, PI_RESUME_REPAIR_SWEEP_INTERVAL_MS)
     : null;
 
   // Poll-is-truth fallback for the events-log live ingest. The watcher hint is
@@ -14409,8 +13900,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
     }
-    if (codexResumeSweepTimer !== null) {
-      clearInterval(codexResumeSweepTimer);
+    if (piResumeRepairSweepTimer !== null) {
+      clearInterval(piResumeRepairSweepTimer);
     }
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(retentionTimer);

@@ -5,7 +5,7 @@
  * ALL_WORKERS pin). These tests focus on the main-side ingest contract, the
  * process-then-retire twin of `scanEventsLogDir`:
  *
- *  - mint + fold: a birth record mints ONE synthetic SessionStart that the
+ *  - mint + fold: a Pi birth record mints ONE synthetic SessionStart that the
  *    EXISTING jobs fold turns into a tracked row (harness / title / pid /
  *    backend coords / resume_target), with no reducer arm added;
  *  - exactly-once: a processed record is retired, so a re-scan mints nothing new;
@@ -59,7 +59,7 @@ afterEach(() => {
 const LIVE_PID = process.pid;
 
 /**
- * A fully-populated non-claude birth record. Every field the launcher captures
+ * A fully-populated Pi birth record. Every field the launcher captures
  * is set (all nullable coords non-null) so the fold + parity assertions exercise
  * the whole column mapping. `launch_ts` is fixed so the minted `events.ts` is
  * deterministic.
@@ -68,18 +68,18 @@ function makeBirthRecord(overrides: Partial<BirthRecord> = {}): BirthRecord {
   return {
     schema_version: BIRTH_RECORD_SCHEMA_VERSION,
     session_id: "birth-sess-a",
-    harness: "codex",
+    harness: "pi",
     pid: LIVE_PID,
     start_time: "darwin:Mon Jun  8 00:00:00 2026",
     cwd: "/Users/x/code/keeper",
     spawn_name: "pair",
-    config_dir: "/Users/x/.codex",
+    config_dir: "/Users/x/.pi",
     backend_exec_type: "tmux",
     backend_exec_session_id: "tsess",
     backend_exec_pane_id: "%7",
     worktree: "keeper/epic/fn-1103",
     launch_ts: "2026-07-03T12:00:00.000Z",
-    resume_target: "codex-rollout-uuid",
+    resume_target: "pi-session-id",
     dispatch_attempt_id: null,
     ...overrides,
   };
@@ -139,15 +139,15 @@ test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs r
     .get(record.session_id) as Record<string, unknown> | null;
   if (!job) throw new Error("expected a jobs row for the birth session");
 
-  // Presence: a fresh non-claude session lands as `stopped` (present, no live
+  // Presence: a fresh Pi session lands as `stopped` (present, no live
   // activity yet), with the recycle-safe (pid, start_time) identity so the
   // exit-watcher can arm killed-detection.
   expect(job.state).toBe("stopped");
   expect(job.pid).toBe(record.pid);
   expect(job.start_time).toBe(record.start_time);
   // Harness tag + resume target ride the v107 columns (no reducer arm added).
-  expect(job.harness).toBe("codex");
-  expect(job.resume_target).toBe("codex-rollout-uuid");
+  expect(job.harness).toBe("pi");
+  expect(job.resume_target).toBe("pi-session-id");
   // Title from spawn_name (priority-1 'spawn' source) → drives the tmux rename.
   expect(job.title).toBe("pair");
   expect(job.title_source).toBe("spawn");
@@ -161,6 +161,40 @@ test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs r
   expect(job.backend_exec_pane_id).toBe("%7");
 
   // The record was retired from the maildir.
+  expect(pendingRecords()).toEqual([]);
+
+  db.close();
+});
+
+test("unsupported harness and wrong-version births cannot mint jobs", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(join(birthDir, "new"), { recursive: true });
+  const rawRecords: Record<string, unknown>[] = [
+    { ...makeBirthRecord({ session_id: "codex-birth" }), harness: "codex" },
+    { ...makeBirthRecord({ session_id: "hermes-birth" }), harness: "hermes" },
+    {
+      ...makeBirthRecord({ session_id: "wrong-version-birth" }),
+      schema_version: BIRTH_RECORD_SCHEMA_VERSION + 1,
+    },
+  ];
+  rawRecords.forEach((record, index) => {
+    writeFileSync(
+      join(birthDir, "new", `${index}.json`),
+      `${JSON.stringify(record)}\n`,
+    );
+  });
+
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+
+  const events = db.query("SELECT COUNT(*) AS n FROM events").get() as {
+    n: number;
+  };
+  expect(events.n).toBe(0);
+  const jobs = db.query("SELECT COUNT(*) AS n FROM jobs").get() as {
+    n: number;
+  };
+  expect(jobs.n).toBe(0);
   expect(pendingRecords()).toEqual([]);
 
   db.close();

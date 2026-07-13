@@ -4355,7 +4355,6 @@ function autopilotConfigSetEvent(
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
-    codex_adoption?: boolean;
     worker_provider?: "claude" | "gpt" | "codex" | null;
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
@@ -4812,96 +4811,10 @@ test("AutopilotConfigSet present-but-non-boolean worktree_multi_repo coerces to 
 });
 
 // ---------------------------------------------------------------------------
-// Schema v110 (fn-1131) — `codex_adoption` is the FIFTH scalar config column
-// riding the generic `AutopilotConfigSet` fold, mirroring `worktree_multi_repo`:
-// a BOOLEAN wire field stored as INTEGER 0/1 (DEFAULT NULL/absent = OFF), the
-// codex adoption producer resolving `?? OFF` at read time — NEVER in a fold.
-// ---------------------------------------------------------------------------
-
-test("fresh DB has no autopilot_state row → codex_adoption resolves to OFF (absent = NULL) (fn-1131)", () => {
-  // No AutopilotConfigSet has folded, so the singleton row does not exist yet —
-  // an absent column reads OFF at the producer's `?? OFF` resolve. No fold reads
-  // it, so this is the byte-identical zero-event default.
-  expect(getAutopilotStateConfig()).toBeNull();
-});
-
-test("AutopilotConfigSet {codex_adoption:true} sets the column to 1 and advances the cursor (fn-1131)", () => {
-  const eventId = autopilotConfigSetEvent({ codex_adoption: true });
-  expect(drainAll()).toBe(1);
-  const row = getAutopilotStateConfig();
-  expect(row?.codex_adoption).toBe(1);
-  expect(row?.last_event_id).toBe(eventId);
-  expect(getCursor()).toBe(eventId);
-  // INSERT path still materializes the boots-paused / yolo defaults.
-  expect(row?.paused).toBe(1);
-  expect(row?.mode).toBe("yolo");
-});
-
-test("AutopilotConfigSet {codex_adoption:false} sets the column to 0 (explicit OFF) (fn-1131)", () => {
-  autopilotConfigSetEvent({ codex_adoption: true });
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(1);
-  autopilotConfigSetEvent({ codex_adoption: false });
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(0);
-});
-
-test("AutopilotConfigSet {codex_adoption} PRESERVES paused, mode, worktree flags, and both concurrency columns (fn-1131)", () => {
-  autopilotPausedEvent(false);
-  autopilotModeEvent("armed");
-  autopilotConfigSetEvent({
-    max_concurrent_jobs: 4,
-    max_concurrent_per_root: 3,
-    worktree_mode: true,
-    worktree_multi_repo: true,
-  });
-  drainAll();
-  autopilotConfigSetEvent({ codex_adoption: true });
-  drainAll();
-  const row = getAutopilotStateConfig();
-  expect(row?.codex_adoption).toBe(1); // landed
-  expect(row?.worktree_mode).toBe(1); // worktree_mode PRESERVED
-  expect(row?.worktree_multi_repo).toBe(1); // worktree_multi_repo PRESERVED
-  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
-  expect(row?.max_concurrent_per_root).toBe(3); // per-root PRESERVED
-  expect(row?.paused).toBe(0); // play PRESERVED
-  expect(row?.mode).toBe("armed"); // mode PRESERVED
-});
-
-test("a worktree patch and a pause toggle PRESERVE codex_adoption (fn-1131)", () => {
-  autopilotConfigSetEvent({ codex_adoption: true });
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(1);
-  autopilotConfigSetEvent({ worktree_mode: true });
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(1); // preserved
-  autopilotPausedEvent(true);
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(1); // preserved
-});
-
-test("AutopilotConfigSet present-but-non-boolean codex_adoption coerces to 0 (OFF) (fn-1131)", () => {
-  autopilotConfigSetEvent({ codex_adoption: true });
-  drainAll();
-  expect(getAutopilotStateConfig()?.codex_adoption).toBe(1);
-  for (const bad of [1, 0, "true", null]) {
-    insertEvent({
-      hook_event: "AutopilotConfigSet",
-      session_id: "autopilot",
-      data: JSON.stringify({ codex_adoption: bad }),
-    });
-    drainAll();
-    expect(getAutopilotStateConfig()?.codex_adoption).toBe(0);
-    autopilotConfigSetEvent({ codex_adoption: true });
-    drainAll();
-  }
-});
-
-// ---------------------------------------------------------------------------
 // fn-1256 task .3 — `worker_provider` is the durable work-dispatch provider
 // pin (docs/adr/0047), riding the same generic `AutopilotConfigSet` fold as
-// `codex_adoption` but the FIRST non-numeric config column: a STRICT string
-// enum (`"claude"` | `"gpt"` | `null`, with the deprecated `"codex"` folded to
+// a STRICT string enum (`"claude"` | `"gpt"` | `null`, with the deprecated
+// `"codex"` folded to
 // `"gpt"` for re-fold determinism), never coerced to a sentinel.
 // ---------------------------------------------------------------------------
 
@@ -4960,11 +4873,11 @@ test("AutopilotConfigSet {worker_provider} PRESERVES paused, mode, worktree flag
   expect(row?.mode).toBe("armed"); // mode PRESERVED
 });
 
-test("a codex_adoption patch and a pause toggle PRESERVE worker_provider (fn-1256)", () => {
+test("a worktree_multi_repo patch and a pause toggle PRESERVE worker_provider (fn-1256)", () => {
   autopilotConfigSetEvent({ worker_provider: "claude" });
   drainAll();
   expect(getAutopilotStateConfig()?.worker_provider).toBe("claude");
-  autopilotConfigSetEvent({ codex_adoption: true });
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
   drainAll();
   expect(getAutopilotStateConfig()?.worker_provider).toBe("claude"); // preserved
   autopilotPausedEvent(true);
@@ -9536,7 +9449,7 @@ test("AutopilotConfigSet {drift_age_threshold_days:null} clears the column (expl
   expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBeNull();
 });
 
-test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree flags, codex_adoption, and both concurrency columns (fn-1252 task .3)", () => {
+test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree flags, and both concurrency columns (fn-1252 task .3)", () => {
   autopilotPausedEvent(false);
   autopilotModeEvent("armed");
   autopilotConfigSetEvent({
@@ -9544,7 +9457,6 @@ test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree fla
     max_concurrent_per_root: 3,
     worktree_mode: true,
     worktree_multi_repo: true,
-    codex_adoption: true,
   });
   drainAll();
   autopilotConfigSetEvent({
@@ -9555,7 +9467,6 @@ test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree fla
   const row = getAutopilotStateConfig();
   expect(row?.drift_behind_threshold).toBe(15); // landed
   expect(row?.drift_age_threshold_days).toBe(5); // landed
-  expect(row?.codex_adoption).toBe(1); // PRESERVED
   expect(row?.worktree_mode).toBe(1); // PRESERVED
   expect(row?.worktree_multi_repo).toBe(1); // PRESERVED
   expect(row?.max_concurrent_jobs).toBe(4); // PRESERVED
@@ -9564,7 +9475,7 @@ test("AutopilotConfigSet {drift thresholds} PRESERVES paused, mode, worktree fla
   expect(row?.mode).toBe("armed"); // PRESERVED
 });
 
-test("a codex_adoption patch and a pause toggle PRESERVE both drift thresholds (fn-1252 task .3)", () => {
+test("a worktree_multi_repo patch and a pause toggle PRESERVE both drift thresholds (fn-1252 task .3)", () => {
   autopilotConfigSetEvent({
     drift_behind_threshold: 15,
     drift_age_threshold_days: 5,
@@ -9572,7 +9483,7 @@ test("a codex_adoption patch and a pause toggle PRESERVE both drift thresholds (
   drainAll();
   expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15);
   expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5);
-  autopilotConfigSetEvent({ codex_adoption: true });
+  autopilotConfigSetEvent({ worktree_multi_repo: true });
   drainAll();
   expect(getAutopilotStateConfig()?.drift_behind_threshold).toBe(15); // preserved
   expect(getAutopilotStateConfig()?.drift_age_threshold_days).toBe(5); // preserved

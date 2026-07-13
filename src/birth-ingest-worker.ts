@@ -3,9 +3,8 @@
  * the non-hook presence channel, the architectural twin of
  * {@link import("./events-ingest-worker")}. Where the events-ingest worker
  * watches the hook's per-pid NDJSON log, this one watches the BIRTHS TREE the
- * `keeper agent` launcher drops a maildir record into whenever it spawns a
- * non-claude harness (codex / pi / hermes — claude announces itself through its
- * own SessionStart hook, so it never births).
+ * `keeper agent` launcher drops a maildir record into whenever it spawns Pi
+ * (claude announces itself through its own SessionStart hook, so it never births).
  *
  * The worker subscribes to the births dir with `@parcel/watcher` and posts a
  * contentless `{kind:"birth-records-changed"}` message to main on every change.
@@ -36,7 +35,7 @@
  * ban does not apply — same carve-out as `events-ingest-worker` /
  * `dead-letter-worker`.
  *
- * Missing-dir tolerance: a machine that has never launched a non-claude harness
+ * Missing-dir tolerance: a machine that has never launched Pi
  * has no births tree. `@parcel/watcher`'s `subscribe` requires an existing dir,
  * so the worker skip-and-logs and stays alive for the shutdown handshake — same
  * shape as `events-ingest-worker`. Main mkdirs the tree before spawn AND its
@@ -152,7 +151,7 @@ function main(): void {
     }
   });
 
-  // The births tree may not exist until the first non-claude launch. Tolerate
+  // The births tree may not exist until the first Pi launch. Tolerate
   // absence the same way `events-ingest-worker` does: skip-and-log, stay alive
   // (the parentPort listener keeps the event loop running for the shutdown
   // handshake). Main mkdirs the tree before spawn, so a normal boot finds it;

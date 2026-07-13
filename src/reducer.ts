@@ -5719,7 +5719,6 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_per_root: "max_concurrent_per_root",
   worktree_mode: "worktree_mode",
   worktree_multi_repo: "worktree_multi_repo",
-  codex_adoption: "codex_adoption",
   worker_provider: "worker_provider",
   drift_behind_threshold: "drift_behind_threshold",
   drift_age_threshold_days: "drift_age_threshold_days",
@@ -5759,14 +5758,6 @@ interface AutopilotConfigSetPayload {
    *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
    *  resolves to a concrete 0/1. */
   worktree_multi_repo?: number;
-  /** The durable codex rollout-adoption knob, stored as INTEGER 0/1 (`1` = ON =
-   *  positive-evidence codex rollout adoption enabled, `0` = OFF = the
-   *  byte-identical default, nothing adopted). Same shape/coercion as
-   *  {@link worktree_mode}: the wire field is a BOOLEAN; the parser coerces
-   *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
-   *  resolves to a concrete 0/1. No fold reads it — the codex adoption producer
-   *  resolves an absent column `?? OFF` at read time. */
-  codex_adoption?: number;
   /** The durable worker-provider dispatch pin (docs/adr/0047), stored as TEXT —
    *  the FIRST non-numeric config column. `"claude"` / `"gpt"` pin every work
    *  dispatch to that provider family; `null` clears the pin (unconstrained,
@@ -5851,14 +5842,6 @@ function extractAutopilotConfigSetPayload(
       // present field always resolves to a concrete 0/1 — the reconciler resolves
       // an absent column `?? OFF`.
       patch.worktree_multi_repo = raw === true ? 1 : 0;
-    }
-    if ("codex_adoption" in parsed) {
-      const raw = parsed.codex_adoption;
-      // BOOLEAN wire field stored as INTEGER 0/1, mirroring `worktree_multi_repo`:
-      // `true` → 1 (ON), anything else (false / null / non-boolean) → 0 (OFF). A
-      // present field always resolves to a concrete 0/1 — the codex adoption
-      // producer resolves an absent column `?? OFF` at read time.
-      patch.codex_adoption = raw === true ? 1 : 0;
     }
     if ("worker_provider" in parsed) {
       const raw = parsed.worker_provider;

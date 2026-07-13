@@ -686,10 +686,6 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // Durable multi-repo worktree rollout flag (INTEGER 0/1), read by the
     // reconciler's `classifyWorktreeRepos` partition each cycle. NOT a jsonColumn.
     "worktree_multi_repo",
-    // Durable codex rollout-adoption knob (INTEGER 0/1, DEFAULT NULL/absent =
-    // OFF), served so `keeper query autopilot_state` reflects the real durable
-    // state. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
-    "codex_adoption",
     // Durable worker-provider dispatch pin (TEXT, NULL | 'claude' | 'codex' —
     // docs/adr/0047), served so `keeper query autopilot_state` reflects the
     // real durable pin. NOT a jsonColumn — decoding a scalar as JSON corrupts it.

@@ -2678,19 +2678,7 @@ export async function main(deps: MainDeps): Promise<never> {
       deps.write("~ launching hermes\n");
     }
 
-    const hermesSpawnName = resolveLaunchSessionName(
-      remainingArgs,
-      deps.cwd,
-      deps.nextCwdOrdinalFn,
-    ).sessionName;
-    const onHermesSpawned = armBirthRecord(deps, "hermes", {
-      spawnName: hermesSpawnName,
-      configDir: null,
-      pinnedSessionId: null,
-      hasContinueOrResume,
-      remainingArgs,
-    });
-    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned);
+    return runWithJobControl(runCmd, deps.spawn, deps.exit);
   }
 
   if (agent === "claude") {
@@ -2992,43 +2980,28 @@ export async function main(deps: MainDeps): Promise<never> {
 }
 
 /**
- * Arm the birth record for a non-claude launch: resolve the keeper job identity,
- * export it to the harness child, and
- * return the post-spawn callback that writes the maildir record. A birth record
- * is the only presence channel for Pi/Hermes (they fire no keeper hook);
- * claude is exempt — its SessionStart hook is authoritative for both presence and
- * resume seed — and never calls this.
- *
- * Identity: Pi pins its session id at launch (`job_id = session_id`); Hermes
- * gets a keeper-minted uuid. A RESUME relaunch reuses the ORIGINAL job id carried
- * back in `KEEPER_JOB_ID` (set by the revive script / keeper tabs restore) so the
- * revived session folds onto its existing row instead of minting an orphan. The
- * callback runs shared by interactive AND detached launches: a detached pane
- * re-execs `keeper agent` and passes back through this same spawn choke point, so
- * the record is written by the pane's own launcher, never the outer wrapper.
+ * Arm the birth record for a Pi launch: resolve the keeper job identity,
+ * export it to the harness child, and return the post-spawn callback that writes
+ * the maildir record. Claude is exempt because its SessionStart hook is
+ * authoritative for both presence and resume seed.
  *
  * Identity (the job id) and the resume key (the harness-native target) stay
- * DISTINCT per the glossary: on a resume the `resume_target` is read from the
- * harness-native argv token ({@link resumeTargetFromArgv}), NEVER the carried job
- * id — an adopted-then-resumed session whose job id diverged from its native
- * session id must re-emit the SESSION id as its next resume key, not its identity.
+ * distinct: on a resume the `resume_target` is read from the harness-native argv
+ * token ({@link resumeTargetFromArgv}), never the carried job id.
  */
 function armBirthRecord(
   deps: MainDeps,
-  agent: Exclude<AgentKind, "claude">,
+  agent: "pi",
   opts: {
     spawnName: string | null;
     configDir: string | null;
-    /** The session id keeper pinned at launch (pi), or null for a harness that
-     *  mints its own (Hermes). */
+    /** The session id keeper pinned at launch. */
     pinnedSessionId: string | null;
     hasContinueOrResume: boolean;
-    /** The harness-native argv forwarded to the child — the source the resume
-     *  target is read from on a resume relaunch (Pi `--session`, Hermes `--resume`). */
+    /** The harness-native argv forwarded to the child. */
     remainingArgs: string[];
   },
 ): ChildSpawnedFn {
-  const descriptor = HARNESS_DESCRIPTORS[agent];
   const carried = (deps.env.KEEPER_JOB_ID ?? "").trim();
   let jobId: string;
   if (opts.hasContinueOrResume && carried !== "") {
@@ -3039,14 +3012,9 @@ function armBirthRecord(
     jobId = deps.randomUuid();
   }
   deps.env.KEEPER_JOB_ID = jobId;
-  // Resume: the native resume key lives in the argv, distinct from the job id.
-  // Fresh: pi's key is its pinned session id (= job id, authoritative at launch);
-  // Hermes back-fills its id post-stop, so it is null at birth.
   const resumeTarget = opts.hasContinueOrResume
     ? resumeTargetFromArgv(opts.remainingArgs, agent)
-    : descriptor.mintsOwnSessionId
-      ? null
-      : jobId;
+    : jobId;
   const draft = buildBirthDraft(deps.env, {
     session_id: jobId,
     harness: agent,
@@ -3061,7 +3029,7 @@ function armBirthRecord(
 
 /**
  * The harness-native resume key present in a resume launch's forwarded argv —
- * the token FOLLOWING the harness's own resume verb/flag (Pi `--session <t>`, Hermes `--resume <t>`, sourced from the descriptor). Returns
+ * the token following the harness's own resume flag. Returns
  * null when the token is absent or has no following value (a target-less
  * `--continue`/`resume`), so the caller stamps a null resume key rather than the
  * job id. Scanned ONLY on a resume relaunch, so a fresh launch whose prompt
@@ -3069,7 +3037,7 @@ function armBirthRecord(
  */
 function resumeTargetFromArgv(
   args: string[],
-  agent: Exclude<AgentKind, "claude">,
+  agent: "pi",
 ): string | null {
   const token = HARNESS_DESCRIPTORS[agent].resumeArgv.token;
   const idx = args.indexOf(token);

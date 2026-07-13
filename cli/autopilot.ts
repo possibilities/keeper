@@ -196,7 +196,7 @@ Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
   keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
   keeper autopilot arm <epic> | disarm <epic>
   keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
-  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption | worker_provider
+  keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | worker_provider
   keeper autopilot worktree <on|off> [--force]
 
 Read state from the [paused]/mode/armed banner (\`keeper autopilot --snapshot\`).
@@ -770,7 +770,6 @@ export function buildSetConfigFrame(
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
     worktree_multi_repo?: boolean;
-    codex_adoption?: boolean;
     worker_provider?: "claude" | "gpt" | null;
   },
 ): ClientFrame {
@@ -1371,9 +1370,7 @@ export async function main(argv: string[]): Promise<void> {
     // (a positive integer count, `default`/`null` → the in-memory default = 1; NO
     // 'unlimited'), `worktree_multi_repo` (an on/off boolean — the durable
     // rollout flag that clusters a >1-toplevel epic into per-repo lane groups
-    // instead of rejecting it; mirrors the `worktree` verb's on/off parsing),
-    // and `codex_adoption` (an on/off boolean — the durable codex
-    // rollout-adoption knob).
+    // instead of rejecting it; mirrors the `worktree` verb's on/off parsing).
     if (rest.length !== 2) {
       die(
         `'config' takes exactly two positionals <key> <value> (got ${rest.length}); pass --help for usage.`,
@@ -1439,22 +1436,6 @@ export async function main(argv: string[]): Promise<void> {
       );
       return;
     }
-    if (key === "codex_adoption") {
-      // The durable codex rollout-adoption knob — same on/off boolean shape as
-      // worktree_multi_repo, patched through the same generic RPC.
-      if (value !== "on" && value !== "off") {
-        die(
-          `'config codex_adoption' value must be one of on | off (got ${JSON.stringify(value)})`,
-        );
-      }
-      await sendControlRpc(
-        sockPath,
-        buildSetConfigFrame(id, { codex_adoption: value === "on" }),
-        id,
-        AUTOPILOT_CONTROL_SCHEMA_VERSION,
-      );
-      return;
-    }
     if (key === "worker_provider") {
       // The durable work-dispatch provider pin (docs/adr/0047) — `claude` /
       // `gpt` set the pin, `none` clears it to NULL (mirrors the
@@ -1481,7 +1462,7 @@ export async function main(argv: string[]): Promise<void> {
       return;
     }
     die(
-      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | codex_adoption | worker_provider (got ${JSON.stringify(key)})`,
+      `'config' key must be one of max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | worker_provider (got ${JSON.stringify(key)})`,
     );
   }
 
