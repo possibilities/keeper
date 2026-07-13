@@ -53,8 +53,9 @@ The committed policy is closed and non-negotiable:
 - Use only the strength bands `weak`, `light`, `standard`, `strong`, and `max`, with at least one
   weak and one max rung. Weakness is model-tier weakness, never a shortcut created by dropping
   effort.
-- Reserve the premium GPT flagship `gpt-5.6-sol` for exactly one high-effort slot in the ceiling
-  (`max`) panel. Do not scatter it through strong rungs or use it as a routine tie-breaker.
+- Reserve the premium GPT flagship `gpt-5.6-sol` for the strong-and-max rungs, the flagship-grade
+  panels convened for genuinely hard or high-stakes questions. Never place it in weak, light, or
+  standard rungs or use it as a routine tie-breaker below that band.
 - Define a default panel in the roster itself. It is a normal, panel-worthy baseline, not an
   instruction to fan out whenever one direct answer would suffice.
 
@@ -67,8 +68,8 @@ that a larger member count alone makes a panel stronger.
 Be candid about diversity. A single-family panel can be appropriate for a family-specific strength,
 but must say that same-family agreement is weaker evidence because of shared blind spots. A
 cross-family panel should say what independent disagreement or corroboration buys. Keep the
-premium flagship in its reserved ceiling slot rather than falsely implying every strong rung has a
-flagship ceiling.
+premium flagship in its reserved strong-and-max slots without falsely implying that every strong
+rung carries it or has a flagship ceiling.
 
 ### 3. Gate the committed roster
 
