@@ -30,5 +30,5 @@ src/worktree-git.ts (backupThenForceRemoveWorktree / remove-failed path).
       recover cycles and asserts the spool stays bounded (folds in TG1).
 
 ## Done summary
-
+Bounded the recover-pass lane-dirt spool: backupThenForceRemoveWorktree now derives a stable per-lane snapshot id and reuses an existing snapshot dir instead of minting a fresh one each cycle, so a lane wedged in remove-failed accretes at most one snapshot + one index.ndjson record across repeated recover cycles. Page-once distress and level-clear semantics unchanged; added a regression test driving 3 repeated force-remove-failure cycles asserting the bound.
 ## Evidence
