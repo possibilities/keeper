@@ -60,5 +60,5 @@ Keep old runner invocations fail-loud until they reserve a request handle; do no
 - [ ] Claude and Pi generated agent bodies remain equivalent apart from harness metadata.
 
 ## Done summary
-
+Reserve one panel request before the runner Task launches, pass its opaque run handle through a structured control header separate from question text, and bind the single fan-out round plus one generic Task judge invocation to that handle so malformed output, a fresh slug, or a retry can never re-drive either; cancellation of the runner Task scope now reaches active member execution and the nested judge scope.
 ## Evidence
