@@ -52,5 +52,5 @@ No data migration; ambient Codex files become unsupported.
 - [ ] Generic and Claude/Pi transcript behavior remains intact.
 
 ## Done summary
-
+Removed the Codex transcript reader (src/transcript/codex.ts) and its registry entry, leaving Claude/Pi as the only registered transcript harnesses; codex now fails with the ordinary unregistered-harness error. Added CLI coverage asserting this.
 ## Evidence
