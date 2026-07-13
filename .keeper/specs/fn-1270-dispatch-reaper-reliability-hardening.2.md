@@ -57,5 +57,5 @@ grace → occupied; active_since null → never reclaimed; working → never; de
 - [ ] No shared occupancy predicate is forked; existing occupancy/board/autoclose tests stay green
 
 ## Done summary
-
+Extended computeSlotOccupancy with the ADR-0052 idle-slot reclaim arm: a stopped job with a live, turn-ended (started) pane past grace on a wanted slot is now reclaimed via the existing kill path, blast-capped at 5 per sweep; never-started/working/degraded-input rows stay unreclaimed.
 ## Evidence
