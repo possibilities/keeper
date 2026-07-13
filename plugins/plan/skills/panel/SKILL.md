@@ -2,10 +2,12 @@
 name: panel
 description: >-
   Fan a hard question out to a panel of models answering in parallel and independently, then fuse their
-  answers into one with consensus and blind spots surfaced. Use for any non-tiny inquiry where being
-  confidently wrong is expensive, or whenever the human wants a multi-model / panel / ensemble answer or a
-  cross-checked, higher-confidence answer — even if they don't say "panel". Skip it for tiny or low-stakes
-  questions where one direct answer will do.
+  answers into one with consensus and blind spots surfaced. Use for a non-tiny inquiry decided by judgment
+  — design calls, ambiguous-evidence reasoning, expensive-if-wrong troubleshooting — or whenever the human
+  wants a multi-model / panel / ensemble answer or a cross-checked, higher-confidence answer — even if they
+  don't say "panel". Skip it for tiny or low-stakes questions where one direct answer will do, and for
+  mechanical retrieval — inventories, enumerations, code/file lookups — where tools, not consensus, verify
+  the answer.
 argument-hint: "[hard question]"
 ---
 
