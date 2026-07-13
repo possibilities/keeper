@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-13T18:15:37.310000Z",
+  "depends_on_epics": [
+    "fn-1281-radical-deterministic-test-gate"
+  ],
+  "id": "fn-1284-harden-pretooluse-guard-flag-allowlists",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden PreToolUse guard flag allowlists",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-13T18:15:37.310000Z"
+}

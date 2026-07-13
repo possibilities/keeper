@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T18:15:37.310000Z",
+  "depends_on": [],
+  "epic": "fn-1284-harden-pretooluse-guard-flag-allowlists",
+  "id": "fn-1284-harden-pretooluse-guard-flag-allowlists.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Close branch-guard space-form global-flag bypass",
+  "updated_at": "2026-07-13T18:15:37.310000Z"
+}
