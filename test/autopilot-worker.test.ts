@@ -136,7 +136,6 @@ import {
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
-  readPkgGateCommand,
   reconcile,
   recoverFailureDispatchId,
   recoverFailuresToClear,
@@ -192,7 +191,7 @@ import {
   worktreeRecoverDispatchId,
   worktreeRecoverEpicDispatchId,
 } from "../src/autopilot-worker";
-import type { SpawnFn } from "../src/baseline-worker";
+import { readTestGateCommand, type SpawnFn } from "../src/baseline-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
   GIT_SPAWN_TIMEOUT_CODE,
@@ -13903,7 +13902,7 @@ test("fn-1204 finalizeEpic gate: OMITTING the probe skips the gate entirely — 
 // never how the PRODUCTION probe maps a real install+suite run to one. These
 // tests drive `runMergeSuiteGate` itself through its `run`/`worktreesRoot`/
 // `installTimeoutMs`/`suiteDeadlineMs`/`spawnFn` seams: a fake `WorktreeGitRunner`
-// makes the scratch "checkout" a real tmp directory (so `readPkgGateCommand`
+// makes the scratch "checkout" a real tmp directory (so `readTestGateCommand`
 // reads real files) and a fake `spawnFn` replaces the real `bun install` /
 // `/bin/sh -c <gate>` subprocess so no real subprocess ever runs.
 
@@ -13928,7 +13927,7 @@ function makeMergeSuiteGit(opts?: {
       mkdirSync(path, { recursive: true });
       const pkgJson =
         opts?.pkgJson === undefined
-          ? { scripts: { test: "true" } }
+          ? { scripts: { "test:gate": "true" } }
           : opts.pkgJson;
       if (pkgJson !== null) {
         writeFileSync(join(path, "package.json"), JSON.stringify(pkgJson));
@@ -14044,8 +14043,6 @@ test("fn-1213 runMergeSuiteGate: an install FAILURE (non-zero exit) degrades to 
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-// `runDetached`'s default kill-grace (5s, unexposed through this seam) pushes
-// the force-resolve past bun's own default 5s per-test timeout — bump it.
 test("fn-1213 runMergeSuiteGate: an install TIMEOUT degrades to cannot-run", async () => {
   const { run } = makeMergeSuiteGit();
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-install-to-"));
@@ -14058,6 +14055,7 @@ test("fn-1213 runMergeSuiteGate: an install TIMEOUT degrades to cannot-run", asy
       installTimeoutMs: 5,
       suiteDeadlineMs: 2_000,
       spawnFn,
+      killGraceMs: 5,
     },
   );
   expect(verdict.kind).toBe("cannot-run");
@@ -14066,9 +14064,9 @@ test("fn-1213 runMergeSuiteGate: an install TIMEOUT degrades to cannot-run", asy
   }
   expect(calls.length).toBe(1);
   rmSync(worktreesRoot, { recursive: true, force: true });
-}, 8_000);
+});
 
-test("fn-1213 runMergeSuiteGate: NO test-gate script (readPkgGateCommand -> null) degrades to cannot-run after a clean install", async () => {
+test("fn-1213 runMergeSuiteGate: NO named test:gate script degrades to cannot-run after a clean install", async () => {
   const { run } = makeMergeSuiteGit({ pkgJson: { scripts: {} } });
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-no-gate-"));
   const { spawnFn, calls } = makeQueuedSpawn([resolved(0)]);
@@ -14090,7 +14088,6 @@ test("fn-1213 runMergeSuiteGate: NO test-gate script (readPkgGateCommand -> null
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-// Same kill-grace note as the install-timeout test above.
 test("fn-1213 runMergeSuiteGate: a suite TIMEOUT degrades to cannot-run", async () => {
   const { run } = makeMergeSuiteGit();
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-suite-to-"));
@@ -14106,6 +14103,7 @@ test("fn-1213 runMergeSuiteGate: a suite TIMEOUT degrades to cannot-run", async 
       installTimeoutMs: 2_000,
       suiteDeadlineMs: 5,
       spawnFn,
+      killGraceMs: 5,
     },
   );
   expect(verdict.kind).toBe("cannot-run");
@@ -14114,7 +14112,7 @@ test("fn-1213 runMergeSuiteGate: a suite TIMEOUT degrades to cannot-run", async 
   }
   expect(calls.length).toBe(2);
   rmSync(worktreesRoot, { recursive: true, force: true });
-}, 8_000);
+});
 
 test("fn-1213 runMergeSuiteGate: classifyRun == crashed (non-zero exit, no failing-test signal) maps to red, never green/cannot-run", async () => {
   const { run } = makeMergeSuiteGit();
@@ -14163,7 +14161,7 @@ test("fn-1213 runMergeSuiteGate: a passing suite (exit 0) maps to green", async 
 
 test("fn-1213 runMergeSuiteGate: root green + runsPlanSuite=true chains the plan-package suite (runPackageSuiteGate runs on plugins/plan)", async () => {
   const { run } = makeMergeSuiteGit({
-    planPkgJson: { scripts: { test: "true" } },
+    planPkgJson: { scripts: { "test:gate": "true" } },
   });
   const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-chain-"));
   const { spawnFn, calls } = makeQueuedSpawn([
@@ -14284,40 +14282,39 @@ test("fn-1213 runMergeSuiteGate: the scratch worktree is reaped on EVERY verdict
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
-test("fn-1213 readPkgGateCommand: reads the gate-phase segment of a real package.json's test script, and null for none", () => {
+test("fn-1213 readTestGateCommand: reads the exact named script and returns null for malformed or absent scripts", () => {
   const dir = mkdtempSync(join(tmpdir(), "keeper-mg-pkgcmd-"));
+  const malformedDir = mkdtempSync(join(tmpdir(), "keeper-mg-pkgcmd-bad-"));
+  const missingDir = mkdtempSync(join(tmpdir(), "keeper-mg-pkgcmd-missing-"));
+  const command = "bun scripts/test-gate.ts --timeout=30000 ./test";
   writeFileSync(
     join(dir, "package.json"),
     JSON.stringify({
-      scripts: { test: "bun scripts/test-gate.ts && bun run test:opentui" },
+      scripts: { test: "do-not-read", "test:gate": command },
     }),
   );
-  expect(readPkgGateCommand(dir)).toBe("bun scripts/test-gate.ts");
-
-  const emptyDir = mkdtempSync(join(tmpdir(), "keeper-mg-pkgcmd-empty-"));
   writeFileSync(
-    join(emptyDir, "package.json"),
-    JSON.stringify({ scripts: {} }),
+    join(malformedDir, "package.json"),
+    JSON.stringify({ scripts: { "test:gate": 42 } }),
   );
-  expect(readPkgGateCommand(emptyDir)).toBeNull();
-
-  const missingDir = mkdtempSync(join(tmpdir(), "keeper-mg-pkgcmd-missing-"));
-  expect(readPkgGateCommand(missingDir)).toBeNull();
+  expect(readTestGateCommand(dir)).toBe(command);
+  expect(readTestGateCommand(malformedDir)).toBeNull();
+  expect(readTestGateCommand(missingDir)).toBeNull();
 
   rmSync(dir, { recursive: true, force: true });
-  rmSync(emptyDir, { recursive: true, force: true });
+  rmSync(malformedDir, { recursive: true, force: true });
   rmSync(missingDir, { recursive: true, force: true });
 });
 
-test("fn-1213 runPackageSuiteGate: driven directly against a real tmp pkgDir through the injected spawnFn seam", async () => {
+test("fn-1213 runPackageSuiteGate: a clean gate with a performance-budget warning stays green", async () => {
   const pkgDir = mkdtempSync(join(tmpdir(), "keeper-mg-pkggate-"));
   writeFileSync(
     join(pkgDir, "package.json"),
-    JSON.stringify({ scripts: { test: "true" } }),
+    JSON.stringify({ scripts: { "test:gate": "true" } }),
   );
   const { spawnFn } = makeQueuedSpawn([
     resolved(0), // install
-    resolved(0, "1 pass\n0 fail\n"), // gate: clean
+    resolved(0, "warning: performance budget exceeded\n1 pass\n0 fail\n"),
   ]);
   const verdict = await runPackageSuiteGate(pkgDir, {
     installTimeoutMs: 2_000,
