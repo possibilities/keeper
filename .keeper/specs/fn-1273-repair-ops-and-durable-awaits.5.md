@@ -49,5 +49,5 @@ version 10.
 - [ ] needs_human.finalize_pending reports a paused done-but-unlanded epic, is never jam-counted, and ships with the version bump + golden update
 
 ## Done summary
-
+Added the leased durable-await worker (src/await-worker.ts) mirroring handoff-worker's shape, wired daemon supervision + synthetic lifecycle events, added cli/await.ts --durable and list surfaces, and the display-only needs_human.finalize_pending status field with STATUS_SCHEMA_VERSION bumped to 10.
 ## Evidence

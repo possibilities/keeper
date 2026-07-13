@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Await worker and finalize pending",
-  "updated_at": "2026-07-13T09:43:56.759000Z"
+  "updated_at": "2026-07-13T10:47:05.951000Z",
+  "worker_done_at": "2026-07-13T10:47:05.951000Z"
 }
