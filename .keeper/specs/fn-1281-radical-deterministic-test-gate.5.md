@@ -58,5 +58,5 @@ Preserve the old tests until each unique invariant has a named replacement, then
 - [ ] No storage correctness test requires a scoped timeout above the package default.
 
 ## Done summary
-
+Extracted injectable backup/reclaim plans and typed executor operations, converted maintenance-worker relays to injected seams, and replaced repeated VACUUM/bloat physical journeys with deterministic unit tests; retained only tiny file-backed SQLite checks for restore, corruption, persistence/reopen, and atomic-swap semantics.
 ## Evidence
