@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 2,
+        "insertions": 166
+      },
+      "done_summary": "Generalized liveKeyColumns to subagent_invocations, scheduled_tasks, and pending_dispatches (served agent_id); added a schema-derived REGISTRY contract test walking PRAGMA table_info to enforce composite-PK live identity, with block_escalations as the explicit single-key exemption.",
+      "input_hash": "d32c38f130f53b7b96b00677d7bbe78b0ebd2038f9bb7f17b27d01506fd54dff",
+      "model": "opus",
+      "spec_chars": 5556,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/collections.ts, test/collections.test.ts\n\n### Approach\n\nGeneralize the existing `liveKeyColumns` composite live-identity mechanism (today declared only on `dispatch_failures`) to the three REGISTRY descriptors whose SQLite primary key is composite but whose descriptor `pk` names a single column, so the diff layer stops collapsing sibling rows into one watched slot and silently dropping existing-row version transitions. The identity helpers (`liveKeyExpr`/`liveKeyOf`) and all five diff-path consumers (version probe, full-row fanout, membership token, watched-set seed, diff byId) already route through them, so this is a descriptor-only change plus one served-column addition:\n\n- `subagent_invocations`: add `agent_id` to `columns` AND declare `liveKeyColumns: [\"job_id\",\"agent_id\",\"turn_seq\"]`.\n- `scheduled_tasks`: declare `liveKeyColumns: [\"job_id\",\"cron_id\"]` (`cron_id` already served).\n- `pending_dispatches`: declare `liveKeyColumns: [\"verb\",\"id\"]` (`id` already served) \u2014 mirror the `dispatch_failures` exemplar exactly.\n\nUpdate the SERVER-side \"byId collapses\" rationale in the descriptor doc comments, but PRESERVE the client-facing \"read `state.rows`, not `byId`\" guidance \u2014 the client `byId` still keys on the single wire `pk` and still collapses, so that guidance stays true and load-bearing. Do NOT change wire/filter/page-detail `pk`. This is the live serve path, outside the re-fold charter: no `SCHEMA_VERSION`/`SCHEMA_FINGERPRINT` bump (the columns already exist; `liveKeyColumns` is a TypeScript descriptor constant).\n\nAdd a schema-derived registry contract test: walk `REGISTRY`, read each table's SQLite primary-key columns via `PRAGMA table_info`, and fail when a composite-PK collection's declared live-identity key does not set-match its PK columns \u2014 so the next composite-PK collection added must either declare its key or be an explicit, justified exemption.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/collections.ts:623 \u2014 `dispatch_failures` descriptor: the exact `pk` + `liveKeyColumns` exemplar to mirror.\n- src/collections.ts:1020 \u2014 `liveKeyExpr` / `liveKeyOf` / `LIVE_KEY_DELIM`: the identity helpers; reuse, never hand-roll.\n- src/collections.ts:497, :537, :726 \u2014 the three descriptors to fix (subagent_invocations, scheduled_tasks, pending_dispatches) and their existing `columns`/doc comments.\n- src/collections.ts:943 \u2014 `REGISTRY`: the walk root for the contract test (composite tables outside REGISTRY like `dispatch_never_bound` are correctly skipped).\n- test/collections.test.ts:1580 \u2014 `seedDispatchFailure` helper + the exemplar test cluster at :1601 (liveKeyExpr composes / liveKeyOf distinct / `selectVersionsByIds` map.size===2 / countAndToken) to clone for the three descriptors.\n- src/db.ts:5053, :5083, :5454 \u2014 schema: confirm `agent_id` / `turn_seq` / `cron_id` / `id` are NOT NULL before adding any to a live key.\n\n**Optional**:\n- src/collections.ts:1192 \u2014 `countAndToken` membership-token doc + impl (already keys by `liveKeyExpr`).\n- src/readiness-client.ts:1234 \u2014 `mergePatchRow` (single-pk keyed) \u2014 confirms why the client \"read state.rows\" guidance stays.\n\n### Risks\n\n- A live-key column that is NULL or absent from `columns` collapses every row to a NULL/\"undefined\" key, re-introducing the bug. All four identity columns are NOT NULL and only `agent_id` needs adding to `columns` \u2014 verify both before relying.\n- The contract test must NOT false-positive on `block_escalations` (composite PK `(epic_id, task_id)` but wire `pk` `task_id` is globally unique, so it correctly needs no `liveKeyColumns`). Carry an explicit per-collection classification / exemption rather than a bare \"composite PK \u27f9 liveKeyColumns required\" rule; compare PK columns as sets.\n\n### Test notes\n\nClone the exemplar cluster at test/collections.test.ts:1601 for all three descriptors (add sibling `seedSubagentInvocation` / `seedScheduledTask` / `seedPendingDispatch` helpers). Assert `map.size === 2` for two same-parent rows \u2014 the regression guard for the collapse bug. The contract test needs a migrated DB for `PRAGMA` introspection: use `freshMemDb()` + `migrate()` to stay in the fast `bun test` tier (no subprocess/socket/Worker).\n\n## Acceptance\n\n- [ ] The three composite-PK collections each declare a live-identity key covering their full SQLite primary key, and `agent_id` is served on `subagent_invocations`.\n- [ ] Two rows sharing the descriptor's wire `pk` but differing in the rest of the composite key are tracked as two independent identities: a version transition on one is detected (the version probe returns both, not one), verified by cloned unit tests asserting two distinct tracked keys.\n- [ ] A schema-derived registry contract test walks `REGISTRY` and fails if any composite-PK collection lacks a live-identity key set-matching its PK columns, with `block_escalations` classified as an intentional single-key exemption.\n- [ ] The client-facing \"read `state.rows`, not `byId`\" guidance is preserved; only the server-side collapse rationale is updated.\n- [ ] `bun test` (fast tier) is green and no schema version or fingerprint changes.\n\n## Done summary\nGeneralized liveKeyColumns to subagent_invocations, scheduled_tasks, and pending_dispatches (served agent_id); added a schema-derived REGISTRY contract test walking PRAGMA table_info to enforce composite-PK live identity, with block_escalations as the explicit single-key exemption.\n## Evidence\n",
+      "task_id": "fn-1262-fix-composite-key-collections-losing.1",
+      "tier": "xhigh",
+      "title": "Generalize liveKeyColumns to composite-PK collections"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 3,
+        "files_changed": 2,
+        "insertions": 87
+      },
+      "done_summary": "Replaced the subscribe page ORDER BY tie-break's bare descriptor.pk with liveKeyExpr(descriptor), giving a total stable order for composite-PK collections and dispatch_failures; added coverage across all four collections for stable tied-order across refetches.",
+      "input_hash": "d32c38f130f53b7b96b00677d7bbe78b0ebd2038f9bb7f17b27d01506fd54dff",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2451,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/server-worker.ts, test/collections.test.ts\n\n### Approach\n\nMake subscribe page ordering total and stable: the page query tie-break hardcodes `descriptor.pk` as the final `ORDER BY` key, so two rows sharing `(sort-column value, wire pk)` can shuffle between refetches \u2014 for composite-PK collections and for `dispatch_failures` today. Replace the bare `descriptor.pk` tie-break with the descriptor's composite live-key SQL expression (`liveKeyExpr(descriptor)`, already a trusted SQL-identifier constant) so the order is total and deterministic. This alters the `ORDER BY` for the already-working `dispatch_failures` collection too, so re-check and update any order-sensitive snapshot/assertion tests on the affected collections. Display-order only \u2014 no dropped-update semantics \u2014 which is why it is isolated from task 1.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required**:\n- src/server-worker.ts:1459 \u2014 the page `ORDER BY` tie-break hardcoding `descriptor.pk`.\n- src/collections.ts:1020 \u2014 `liveKeyExpr`: the trusted composite-key SQL expression to use as the tie-break (interpolate it directly; it is already a trusted identifier, not routed through the `sortable` allowlist).\n\n**Optional**:\n- test/collections.test.ts and any server/board snapshot tests asserting `dispatch_failures` / subagent row order.\n\n### Risks\n\n- Changing `dispatch_failures`' `ORDER BY` can break an order-sensitive snapshot on a currently-green collection. Grep for order-dependent assertions on these collections and update expectations to the new deterministic order.\n\n### Test notes\n\nAdd a test asserting stable page order across two refetches for two rows sharing `(sortCol, pk)`. Fast tier.\n\n## Acceptance\n\n- [ ] The subscribe page query orders rows by a total, stable key (composite live-key tie-break), so two rows sharing sort-column value and wire `pk` have deterministic order across refetches.\n- [ ] Page order for `dispatch_failures` and the three fixed collections is verified stable by a test; any pre-existing order-sensitive test is updated to the new deterministic order.\n- [ ] `bun test` (fast tier) is green.\n\n## Done summary\nReplaced the subscribe page ORDER BY tie-break's bare descriptor.pk with liveKeyExpr(descriptor), giving a total stable order for composite-PK collections and dispatch_failures; added coverage across all four collections for stable tied-order across refetches.\n## Evidence\n",
+      "task_id": "fn-1262-fix-composite-key-collections-losing.2",
+      "tier": "medium",
+      "title": "Stabilize subscribe page tie-break via composite key"
+    }
+  ],
+  "created_at": "2026-07-13T01:38:55.158000Z",
+  "epic_id": "fn-1262-fix-composite-key-collections-losing",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "0c273a79e6385ae7b242fe00c53f86fea3e10b76e6592ae6d2320093bd229d83",
+  "selection_input_hash": "d32c38f130f53b7b96b00677d7bbe78b0ebd2038f9bb7f17b27d01506fd54dff",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
