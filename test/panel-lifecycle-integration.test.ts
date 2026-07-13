@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { PanelSelections } from "../src/agent/config";
+import type { PanelDefinition, PanelSelections } from "../src/agent/config";
 import { createExactRunTeardown } from "../src/agent/run-capture";
 import {
   type PanelDeps,
@@ -21,8 +21,13 @@ import {
 } from "../src/pair/panel";
 
 const MEMBERS = ["claude::opus::high", "codex::gpt-5.3::high", "pi::glm::high"];
+const INCIDENT_PANEL: PanelDefinition = {
+  strength: "standard",
+  members: MEMBERS,
+  description: "integration fixture",
+};
 const SELECTIONS: PanelSelections = {
-  panels: { incident: MEMBERS },
+  panels: { incident: INCIDENT_PANEL },
   default: "incident",
 };
 
@@ -111,6 +116,13 @@ function seedPid(index: number, pid: number, fx: FakeEffects): void {
     throw new Error(`missing pidfile ${index}`);
   writeFileSync(member.pidfile, `${pid}\n`);
   fx.alive.add(pid);
+}
+
+function seedDeadPid(index: number, pid: number): void {
+  const member = manifest().members[index];
+  if (member?.pidfile === null || member?.pidfile === undefined)
+    throw new Error(`missing pidfile ${index}`);
+  writeFileSync(member.pidfile, `${pid}\n`);
 }
 
 async function start(fx: FakeEffects, promptText: string): Promise<number> {
@@ -243,6 +255,8 @@ test("output publication failure follows the same explicit cancellation path", a
   const fx = effects();
   await start(fx, "output failure");
   seedPid(0, 301, fx);
+  seedDeadPid(1, 302);
+  seedDeadPid(2, 303);
   const publish = (): never => {
     throw new Error("answer output is read-only");
   };
@@ -261,7 +275,9 @@ test("output publication failure follows the same explicit cancellation path", a
 test("TERM-resistant child becomes cleanup_failed with its exact identity and no broad reap", async () => {
   const fx = effects({ resistant: true });
   await start(fx, "resistant cleanup");
+  seedDeadPid(0, 401);
   seedPid(1, 402, fx);
+  seedDeadPid(2, 403);
   expect(await panelCancel({ dir, cleanupMs: 2 }, fx.deps)).toBe(1);
   expect(fx.signals).toEqual([402]);
   expect(manifest().state).toBe("cleanup_failed");

@@ -1749,8 +1749,13 @@ export async function panelCancel(
             target.attempt.pidfile !== null &&
             readPid(target.attempt.pidfile) === null &&
             target.attempt.launched_at !== null;
-          if (pidMissing && deps.now() < deadline) awaitingCleanup = true;
-          else target.attempt.state = "cancelled";
+          if (pidMissing) {
+            if (deps.now() < deadline) awaitingCleanup = true;
+            else {
+              unresolved.add(target.id);
+              target.attempt.state = "cleanup_failed";
+            }
+          } else target.attempt.state = "cancelled";
           continue;
         }
         awaitingCleanup = true;

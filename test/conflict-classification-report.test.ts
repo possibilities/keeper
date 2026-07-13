@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import {
   buildConflictClassificationReport,
   classifyConflictIncident,
-  decodeDispatchFailedPayload,
   type DispatchFailedIncident,
+  decodeDispatchFailedPayload,
 } from "../scripts/conflict-classification-report";
 
 test("classifies literal producer conflict reasons and excludes non-conflicts", () => {
@@ -25,11 +25,13 @@ test("classifies literal producer conflict reasons and excludes non-conflicts", 
     ),
   ).toBe("file-overlap");
   expect(
-    classifyConflictIncident("worktree-merge-conflict: merge output unavailable"),
+    classifyConflictIncident(
+      "worktree-merge-conflict: merge output unavailable",
+    ),
   ).toBe("other");
-  expect(classifyConflictIncident("worktree-finalize-non-fast-forward: main")).toBe(
-    "not-a-conflict",
-  );
+  expect(
+    classifyConflictIncident("worktree-finalize-non-fast-forward: main"),
+  ).toBe("not-a-conflict");
   expect(classifyConflictIncident("cwd-missing")).toBe("not-a-conflict");
 });
 
@@ -147,7 +149,7 @@ test("defensively decodes structured historical payloads and skips malformed dat
     conflictedFiles: ["src/a.ts", "src/b.ts"],
     ts: 12_345,
   });
-  expect(decodeDispatchFailedPayload('{not-json')).toBeNull();
+  expect(decodeDispatchFailedPayload("{not-json")).toBeNull();
   expect(
     decodeDispatchFailedPayload(
       JSON.stringify({ id: "missing-fields", reason: "cwd-missing", ts: 1 }),

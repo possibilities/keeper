@@ -1785,10 +1785,7 @@ test("runQuery uses composite live keys for stable tied page order", () => {
     descriptor: SUBAGENT_INVOCATIONS_DESCRIPTOR,
     filter: { job_id: "job-1" },
     sortColumn: "ts",
-    expected: [
-      "job-1\u001fagent-a\u001f1",
-      "job-1\u001fagent-b\u001f2",
-    ],
+    expected: ["job-1\u001fagent-a\u001f1", "job-1\u001fagent-b\u001f2"],
     seed: (db) => {
       seedSubagentInvocation(db, "job-1", "agent-b", 2, 7);
       seedSubagentInvocation(db, "job-1", "agent-a", 1, 5);
