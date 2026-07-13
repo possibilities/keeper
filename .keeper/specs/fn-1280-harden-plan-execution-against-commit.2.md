@@ -44,5 +44,5 @@ Clone the `saga-done-commit-atomic` pattern (fake-VCS `failNextCommit` + `gitBas
 - [ ] The plan suite is green, including a new close-commit-failure conformance test.
 
 ## Done summary
-
+Close-commit-failure now unwinds cleanly: epic_close registers a snapshot/rollback onCommitFailure hook and close_finalize threads a marker-clear callback composed into it, so a clean rollback restores the done def and releases the close-claim marker (re-closable), while an incomplete rollback keeps the marker as a fail-closed needs-human wedge. The standalone cli.ts close path is untouched (no marker, same commit_failed+exit-1 contract). Added close-commit-failure conformance tests to saga-close-finalize.test.ts.
 ## Evidence
