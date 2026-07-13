@@ -12,17 +12,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scanDeadLetterDir } from "../src/daemon";
-import { openDb } from "../src/db";
 import type { DeadLetterRecord } from "../src/dead-letter";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
-let dbPath: string;
 let deadLetterDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-dead-letter-import-test-"));
-  dbPath = join(tmpDir, "keeper.db");
   deadLetterDir = join(tmpDir, "dead-letters");
 });
 
@@ -50,7 +48,7 @@ function makeRecord(
 }
 
 test("scanDeadLetterDir imports each NDJSON line as a `waiting` row", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const records = [makeRecord("aaa"), makeRecord("bbb"), makeRecord("ccc")];
@@ -90,7 +88,7 @@ test("scanDeadLetterDir imports each NDJSON line as a `waiting` row", () => {
 });
 
 test("scanDeadLetterDir skips a truncated trailing line", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const valid = [makeRecord("aaa"), makeRecord("bbb")];
@@ -114,7 +112,7 @@ test("scanDeadLetterDir skips a truncated trailing line", () => {
 });
 
 test("scanDeadLetterDir is idempotent — a re-scan adds nothing", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const records = [makeRecord("aaa"), makeRecord("bbb")];
@@ -138,7 +136,7 @@ test("scanDeadLetterDir is idempotent — a re-scan adds nothing", () => {
 });
 
 test("scanDeadLetterDir picks up a new record appended to an existing file", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const file = join(deadLetterDir, "12345.ndjson");
@@ -166,7 +164,7 @@ test("scanDeadLetterDir picks up a new record appended to an existing file", () 
 });
 
 test("scanDeadLetterDir reads multiple per-pid files in one pass", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   writeFileSync(
@@ -189,7 +187,7 @@ test("scanDeadLetterDir reads multiple per-pid files in one pass", () => {
 });
 
 test("scanDeadLetterDir ignores non-ndjson files in the dir", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   // A stray file that does NOT match the per-pid `<pid>.ndjson` shape (e.g.
@@ -213,7 +211,7 @@ test("scanDeadLetterDir ignores non-ndjson files in the dir", () => {
 });
 
 test("scanDeadLetterDir tolerates a missing dir (fresh machine)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Do NOT create deadLetterDir — simulating a fresh machine where the hook
   // has never hit a drop.
 
@@ -228,7 +226,7 @@ test("scanDeadLetterDir tolerates a missing dir (fresh machine)", () => {
 });
 
 test("scanDeadLetterDir skips a malformed-JSON line and imports the rest", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   // Mix valid records around a malformed line (bad JSON, missing braces). The
@@ -251,7 +249,7 @@ test("scanDeadLetterDir skips a malformed-JSON line and imports the rest", () =>
 });
 
 test("scanDeadLetterDir preserves a null pid", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const record: DeadLetterRecord = { ...makeRecord("aaa"), pid: null };
@@ -271,7 +269,7 @@ test("scanDeadLetterDir preserves a null pid", () => {
 });
 
 test("scanDeadLetterDir round-trips bindings as JSON-TEXT", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(deadLetterDir, { recursive: true });
 
   const record: DeadLetterRecord = {

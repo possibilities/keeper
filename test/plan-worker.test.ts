@@ -33,7 +33,6 @@ import type {
   BackstopRollup,
 } from "../src/backstop-telemetry";
 import { buildMissedWakeRecord } from "../src/backstop-telemetry";
-import { openDb } from "../src/db";
 import {
   attributePlanDirToRoot,
   buildEpicMessage,
@@ -67,6 +66,7 @@ import {
   taskIdFromStatePath,
   taskNumberFromId,
 } from "../src/plan-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 
@@ -707,8 +707,7 @@ test("onDelete on an un-seeded path emits nothing (nothing to retract)", () => {
 });
 
 test("seedFromDb suppresses a re-emit of an already-folded projection row", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Insert a row matching exactly what a scan of the file would produce.
   db.run(
     `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at)
@@ -749,8 +748,7 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row", () =
 });
 
 test("seedFromDb reconstructs from epics.tasks so an embedded task is not re-emitted on restart", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Seed an epic carrying ONE task in its embedded array — the element shape
   // the reducer folds. `task_number` matches taskNumberFromId("fn-3-demo.1").
   const tasks = JSON.stringify([
@@ -810,8 +808,7 @@ test("seedFromDb is jobs-blind: epic.jobs / task.jobs never re-emit on restart",
   // changes whenever a job tick fans into the embedded arrays, and the boot
   // scan re-emits a synthetic snapshot for every epic and task on every boot
   // (the worst-case feedback loop documented in the epic's Risks section).
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // Seed an epic carrying BOTH epic-level jobs AND a task whose own embedded
   // jobs sub-array is populated. A jobs-blind seed signature must produce the
@@ -898,8 +895,7 @@ test("seedFromDb reconstructs last_validated_at field-identically (no synthetic 
   // Two epics cover both branches:
   //   (a) a stored last_validated_at TEXT → reconstructed string passes through
   //   (b) NULL stored → reconstructed `null` matches a file that omits the field
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, last_validated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1012,8 +1008,7 @@ test("buildEpicMessage extracts blocks_closing_of; seedFromDb reconstructs it id
     })?.blocksClosingOf,
   ).toBe("fn-1-source");
 
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, blocks_closing_of)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1092,8 +1087,7 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
   // byte-identity invariant by direct serialization compare, exercising both
   // the live-stored shape (`worker_phase` + `runtime_status` keys) and the
   // bare shape (`status` only) to prove defensive parity.
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Live v19 shape: embedded task carries BOTH new keys. A re-fold from the
   // event log writes this shape; the seed reconstruction must read it back
   // identically.
@@ -1253,8 +1247,7 @@ test("isWithinRoots: segment-aware prefix scoping", () => {
 });
 
 test("sweep retracts a deleted epic + embedded task, leaves present ones", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Two epics, each with one task, both project_dir inside the configured root
   // (tmpDir). On disk we keep only the SURVIVING epic's files.
   const survivorTasks = JSON.stringify([
@@ -1346,8 +1339,7 @@ test("sweep retracts a deleted epic + embedded task, leaves present ones", () =>
 });
 
 test("sweep never retracts an epic whose project_dir is outside the configured roots", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // An epic from an UNCONFIGURED root: no file on disk under tmpDir, but its
   // project_dir is elsewhere — the sweep must leave it entirely alone (its file
   // lives under a tree this boot never scanned).
@@ -1383,8 +1375,7 @@ test("sweep never retracts an epic whose project_dir is outside the configured r
 });
 
 test("sweep does not retract a file mid-rewrite that fails to parse", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

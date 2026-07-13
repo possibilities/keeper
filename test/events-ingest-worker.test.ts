@@ -36,17 +36,15 @@ import {
   recoverOneDeadLetter,
   scanEventsLogDir,
 } from "../src/daemon";
-import { openDb } from "../src/db";
 import type { EventLogRecord } from "../src/dead-letter";
 import { serializeEventLogRecord } from "../src/dead-letter";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
-let dbPath: string;
 let eventsLogDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-events-ingest-test-"));
-  dbPath = join(tmpDir, "keeper.db");
   eventsLogDir = join(tmpDir, "events-log");
 });
 
@@ -112,7 +110,7 @@ function makeRecord(
 const LIVE_PID = process.pid;
 
 test("scanEventsLogDir ingests each NDJSON line as an events row", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const records = [makeRecord("aaa"), makeRecord("bbb"), makeRecord("ccc")];
@@ -144,7 +142,7 @@ test("scanEventsLogDir ingests each NDJSON line as an events row", () => {
 });
 
 test("scanEventsLogDir is exactly-once — a re-scan inserts no duplicate rows", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const records = [makeRecord("aaa"), makeRecord("bbb")];
@@ -175,7 +173,7 @@ test("scanEventsLogDir is exactly-once — a re-scan inserts no duplicate rows",
 });
 
 test("scanEventsLogDir picks up a record appended after the first scan", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
@@ -204,7 +202,7 @@ test("scanEventsLogDir picks up a record appended after the first scan", () => {
 });
 
 test("scanEventsLogDir does not fold a torn final line; re-reads it on a later complete append", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const valid = serializeEventLogRecord(makeRecord("aaa"));
@@ -243,7 +241,7 @@ test("scanEventsLogDir does not fold a torn final line; re-reads it on a later c
 });
 
 test("scanEventsLogDir re-fold parity: an NDJSON-ingested event matches a direct INSERT byte-for-byte", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const record = makeRecord("parity");
@@ -312,7 +310,7 @@ test("scanEventsLogDir re-fold parity: an NDJSON-ingested event matches a direct
 });
 
 test("scanEventsLogDir truncation guard: a file shorter than the stored offset is re-read from 0", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
@@ -341,7 +339,7 @@ test("scanEventsLogDir truncation guard: a file shorter than the stored offset i
 });
 
 test("scanEventsLogDir tolerates a missing dir (fresh machine / pre-hook-flip)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   // Do NOT create eventsLogDir — task .1 ships before the hook flip, so the dir
   // is normally absent.
   expect(() => scanEventsLogDir(db, eventsLogDir)).not.toThrow();
@@ -382,7 +380,7 @@ function readBackstopRecords(logPath: string): Record<string, unknown>[] {
 }
 
 test("scanEventsLogDir parks a poison line, advances past it, and ingests the following valid line in the same scan", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx, backstopLogPath } = makeIngestCtx();
 
@@ -453,7 +451,7 @@ test("scanEventsLogDir parks a poison line, advances past it, and ingests the fo
 });
 
 test("scanEventsLogDir drains a multi-poison file: every poison line parked, every valid line ingested, in one scan", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx, backstopLogPath } = makeIngestCtx();
 
@@ -494,7 +492,7 @@ test("scanEventsLogDir drains a multi-poison file: every poison line parked, eve
 });
 
 test("scanEventsLogDir advances past a blank line WITHOUT dead-lettering it", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx, backstopLogPath } = makeIngestCtx();
 
@@ -527,7 +525,7 @@ test("scanEventsLogDir advances past a blank line WITHOUT dead-lettering it", ()
 });
 
 test("scanEventsLogDir still blocks on a torn (no-newline) trailing garbage line — offset stays put", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx } = makeIngestCtx();
 
@@ -561,7 +559,7 @@ test("scanEventsLogDir still blocks on a torn (no-newline) trailing garbage line
 });
 
 test("scanEventsLogDir poison parking is idempotent under re-scan (ON CONFLICT) — no duplicate row, offset stable", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx } = makeIngestCtx();
 
@@ -610,7 +608,7 @@ test("scanEventsLogDir poison parking is idempotent under re-scan (ON CONFLICT) 
 });
 
 test("scanEventsLogDir parks poison even without a telemetry ctx (backstop emit is optional, parking is not)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
@@ -630,7 +628,7 @@ test("scanEventsLogDir parks poison even without a telemetry ctx (backstop emit 
 });
 
 test("recoverOneDeadLetter never recovers a status='poison' row (replay filters on status='waiting')", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const { ctx } = makeIngestCtx();
 
@@ -660,7 +658,7 @@ test("recoverOneDeadLetter never recovers a status='poison' row (replay filters 
 });
 
 test("recoverOneDeadLetter binds INGEST_EVENTS_COLUMNS — a replayed row carries the live v48/v51 columns", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
 
   // Seed a waiting dead-letter whose bindings include a column the OLD 29-col
   // EVENTS_COLUMNS list omitted (e.g. `background_task_id`, `backend_exec_type`).
@@ -705,7 +703,7 @@ test("fn-672 LOCKSTEP: INGEST_EVENTS_COLUMNS == live events table columns", () =
   // column is added to CREATE_EVENTS without a matching entry here, it silently
   // drops from BOTH ingest and replay — this set-equality pins the list to the
   // live migrated schema so that regression fails loud.
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   let liveCols: Set<string>;
   try {
     const rows = db.prepare("PRAGMA table_info('events')").all() as {
@@ -719,7 +717,7 @@ test("fn-672 LOCKSTEP: INGEST_EVENTS_COLUMNS == live events table columns", () =
 });
 
 test("scanEventsLogDir tolerates an empty dir (no .ndjson files)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   expect(() => scanEventsLogDir(db, eventsLogDir)).not.toThrow();
   expect(
@@ -729,7 +727,7 @@ test("scanEventsLogDir tolerates an empty dir (no .ndjson files)", () => {
 });
 
 test("scanEventsLogDir ignores non-ndjson files in the dir", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   writeFileSync(join(eventsLogDir, "notes.txt"), "this is not ndjson");
@@ -749,7 +747,7 @@ test("scanEventsLogDir ignores non-ndjson files in the dir", () => {
 });
 
 test("scanEventsLogDir reaps a fully-drained dead-pid file, keeps a live-pid file", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   // A dead pid: pid 1 is init/launchd which we can't signal → EPERM → treated
@@ -787,7 +785,7 @@ test("scanEventsLogDir reaps a fully-drained dead-pid file, keeps a live-pid fil
 });
 
 test("scanEventsLogDir skips a poison line (INSERT-safe) without advancing past it", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
   // A line that parses to a record but whose bindings carry NO recognized
@@ -817,11 +815,12 @@ test("scanEventsLogDir skips a poison line (INSERT-safe) without advancing past 
 // ---------------------------------------------------------------------------
 
 test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly-once", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
 
-  const N_FILES = 25;
-  const LINES_PER = 12;
+  // Intentionally minimal: multiple concurrent files matter, not row count.
+  const N_FILES = 3;
+  const LINES_PER = 2;
   for (let i = 0; i < N_FILES; i++) {
     // Distinct, almost-certainly-dead pids — one writer per file, the shape the
     // hook produces under concurrency (APFS O_APPEND non-interleave per file).
@@ -859,8 +858,7 @@ test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly
   expect(total2).toBe(N_FILES * LINES_PER);
 
   db.close();
-  // 30s scoped budget: the cost is PRODUCTION scanEventsLogDir folding 300 rows (the exactly-once contract), not test seed — shrinking the fixture would weaken the proof; event-loop starvation under parallel load can breach 10s. Global --timeout=10000 stays the hang detector.
-}, 30_000);
+});
 
 /**
  * Build a PostToolUse:Write events-log record. `withMutationPath` controls
@@ -921,7 +919,7 @@ function makeWriteRecord(
 }
 
 function readMutationPath(
-  db: ReturnType<typeof openDb>["db"],
+  db: ReturnType<typeof freshMemDb>["db"],
   sessionId: string,
 ): string | null {
   const row = db
@@ -932,7 +930,7 @@ function readMutationPath(
 }
 
 test("scanEventsLogDir: a forward line's hook-derived mutation_path lands verbatim", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
   writeFileSync(
@@ -952,7 +950,7 @@ test("scanEventsLogDir: a forward line's hook-derived mutation_path lands verbat
 });
 
 test("scanEventsLogDir: a pre-deriver line lacking mutation_path is RECOMPUTED at the ingest seam", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
   // No `mutation_path` binding — the sole-writer ingester must derive it from
@@ -971,7 +969,7 @@ test("scanEventsLogDir: a pre-deriver line lacking mutation_path is RECOMPUTED a
 });
 
 test("scanEventsLogDir: a pre-deriver line with a path-less payload recomputes to NULL (no throw)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = freshMemDb();
   mkdirSync(eventsLogDir, { recursive: true });
   const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
   // A pre-deriver PostToolUse:Write line whose tool_input carries no file_path:

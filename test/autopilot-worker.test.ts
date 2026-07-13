@@ -205,7 +205,7 @@ import {
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
 } from "../src/daemon";
-import { DEFAULT_MAX_CONCURRENT_JOBS, openDb } from "../src/db";
+import { DEFAULT_MAX_CONCURRENT_JOBS } from "../src/db";
 import {
   isRetryableDispatchKey,
   parseDispatchKey,
@@ -249,6 +249,7 @@ import {
   type FakeGitRule,
   fakeAsyncGit,
 } from "./helpers/fake-git";
+import { freshDbFile } from "./helpers/template-db";
 
 // A clean shared checkout has NO in-progress pseudo-ref present. mergeReadiness
 // now probes these via `rev-parse --verify --quiet <REF>`; real git exits 1 on
@@ -5071,9 +5072,7 @@ async function withSeededDb(
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-reap-test-"));
   const dbPath = join(dir, "keeper.db");
-  // Migrate the schema, then reopen writable for the test body.
-  openDb(dbPath).db.close();
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = freshDbFile(dbPath);
   // fn-897 B1: these tests model the RUNNING daemon — by the time the autopilot
   // calls `loadReconcileSnapshot`, the boot-seed has already cleared
   // `seed_required`. A freshly-migrated DB defaults `seed_required = 1`, which
