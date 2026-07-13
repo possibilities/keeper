@@ -6,7 +6,7 @@
     "fn-1281-radical-deterministic-test-gate"
   ],
   "id": "fn-1284-harden-pretooluse-guard-flag-allowlists",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-13T18:16:32.853000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T18:16:32.384000Z"
+  "updated_at": "2026-07-13T18:16:32.853000Z"
 }
