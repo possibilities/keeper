@@ -1,78 +1,38 @@
-/**
- * `keeper reclaim` run() orchestration tests (fn-850.1).
- *
- * The per-helper pieces (backupDb / reclaimDb / verifyReclaim / daemonUp) are
- * covered in backup.test.ts. This file locks the ONE irreversible operation the
- * helpers are strung into — the atomic same-fs swap of the live DB plus the
- * stale `-wal`/`-shm` sidecar drop — which had no run()-level coverage.
- *
- * Both tests drive the exported run() with injected RunDeps (stdout/stderr/exit)
- * against a real temp DB, so a future edit cannot silently break the swap:
- *  - F4 (happy path): the live dbPath is swapped to the reclaimed (smaller,
- *    vacuumed) copy, the `.reclaim` output is consumed by the swap, and the OLD
- *    file's `-wal`/`-shm` sidecars are removed.
- *  - F5 (daemon-up refusal): a `<sock>.lock` with a live pid makes run() exit 1
- *    via the injected exit, emit the REFUSING message, and leave the source DB
- *    byte-identical (no snapshot / reclaim / swap performed).
- */
-
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   existsSync,
-  mkdirSync,
-  readdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ParsedReclaimArgs, run } from "../cli/reclaim";
-import { openDb } from "../src/db";
-import { freshDbFile } from "./helpers/template-db";
+import {
+  cleanupReclaimSidecars,
+  daemonUp,
+  executeReclaimSwap,
+  type ParsedReclaimArgs,
+  planReclaimCommand,
+  type ReclaimRunOperations,
+  type RunDeps,
+  run,
+} from "../cli/reclaim";
 
-let tmpDir: string;
+let root: string;
 let dbPath: string;
 let sockPath: string;
 
 beforeEach(() => {
-  tmpDir = join(
-    tmpdir(),
-    `keeper-reclaim-test-${process.pid}-${Math.random().toString(36).slice(2)}`,
-  );
-  mkdirSync(tmpDir, { recursive: true });
-  dbPath = join(tmpDir, "keeper.db");
-  sockPath = join(tmpDir, "keeperd.sock");
-  // Multi-connection: run() opens the source over its own read-only connection
-  // (backupDb / reclaimDb / verifyReclaim), so the migrated schema must live on
-  // disk. Pre-write the template image (skips the ladder); the wal_checkpoint in
-  // freshDbFile leaves no `-wal` sidecar stranded.
-  freshDbFile(dbPath).db.close();
+  root = mkdtempSync(join(tmpdir(), "keeper-reclaim-test-"));
+  dbPath = join(root, "keeper.db");
+  sockPath = join(root, "keeperd.sock");
 });
 
 afterEach(() => {
-  rmSync(tmpDir, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
 });
 
-/**
- * Rebuild `dbPath` BORN `auto_vacuum=INCREMENTAL` (=2), like the live keeper.db.
- * The template image ships auto_vacuum=0 (NONE), which does NOT exercise the
- * production reclaim path: reclaimDb opens its source READ-ONLY and relies on
- * VACUUM INTO INHERITING the source's mode. A source whose stored mode already
- * differs from NONE is the precise condition that made the old read-only-source
- * `PRAGMA auto_vacuum=...` bake throw "attempt to write a readonly database"
- * (fn-851); a NONE source silently staged the bake and hid the bug.
- */
-function makeSourceAutoVacuum2(path: string): void {
-  const { db } = openDb(path, { migrate: false });
-  db.run("PRAGMA auto_vacuum=INCREMENTAL");
-  db.run("VACUUM");
-  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-  db.close();
-}
-
-/** A non-dry-run, non-help args object pointing at the temp DB + sock. */
 function args(): ParsedReclaimArgs {
   return {
     dbPath,
@@ -83,168 +43,224 @@ function args(): ParsedReclaimArgs {
   };
 }
 
-/** Sentinel thrown by the injected exit() so it faithfully UNWINDS. */
 class ExitSignal extends Error {
   constructor(readonly code: number) {
     super(`exit(${code})`);
   }
 }
 
-/**
- * RunDeps that capture stdout/stderr and make exit() THROW. The production
- * contract types `exit` as `never` and the code after a `deps.exit(1)` only ever
- * runs because real `process.exit` does not return — a recording no-op would let
- * execution fall through past the guard into the swap, which is not how run()
- * behaves in prod. Throwing an `ExitSignal` reproduces the non-returning
- * semantics; the caller drives run() inside `runCatching` to record the code.
- */
-function captureDeps() {
+function harness(overrides: Partial<ReclaimRunOperations> = {}): {
+  calls: string[];
+  out: string[];
+  err: string[];
+  exits: number[];
+  deps: RunDeps;
+} {
+  const calls: string[] = [];
   const out: string[] = [];
   const err: string[] = [];
   const exits: number[] = [];
-  const deps = {
-    stdout: (s: string) => out.push(s),
-    stderr: (s: string) => err.push(s),
-    exit: ((code: number) => {
-      exits.push(code);
-      throw new ExitSignal(code);
-    }) as (code: number) => never,
+  const operations: ReclaimRunOperations = {
+    daemonStatus: (path) => {
+      calls.push(`daemon:${path}`);
+      return { up: false, pid: null };
+    },
+    sourceExists: (path) => {
+      calls.push(`exists:${path}`);
+      return true;
+    },
+    sourceSize: (path) => {
+      calls.push(`size:${path}`);
+      return 100;
+    },
+    backup: (path) => {
+      calls.push(`backup:${path}`);
+      return {
+        snapshotPath: "/backups/rollback.db",
+        verified: true,
+        bytes: 90,
+        pruned: [],
+        cleanupFailures: [],
+        error: null,
+      };
+    },
+    reclaim: (source, output) => {
+      calls.push(`reclaim:${source}:${output}`);
+      return {
+        outputPath: output,
+        ok: true,
+        sourceBytes: 100,
+        outputBytes: 60,
+        cleanupFailures: [],
+        error: null,
+      };
+    },
+    verify: (source, output) => {
+      calls.push(`verify:${source}:${output}`);
+      return {
+        ok: true,
+        sourceSchemaVersion: 9,
+        outputSchemaVersion: 9,
+        outputAutoVacuum: 2,
+        error: null,
+      };
+    },
+    removeOutput: (path) => calls.push(`remove:${path}`),
+    swap: (plan) => {
+      calls.push(`swap:${plan.outputPath}:${plan.dbPath}`);
+      return {
+        ok: true,
+        error: null,
+        sidecars: { removed: [...plan.sidecarPaths], failed: [] },
+      };
+    },
+    ...overrides,
   };
-  return { out, err, exits, deps };
+  return {
+    calls,
+    out,
+    err,
+    exits,
+    deps: {
+      stdout: (text) => out.push(text),
+      stderr: (text) => err.push(text),
+      exit: ((code: number) => {
+        exits.push(code);
+        throw new ExitSignal(code);
+      }) as (code: number) => never,
+      operations,
+    },
+  };
 }
 
-/** Run run() catching the ExitSignal so a refusal/abort does not fail the test. */
-function runCatching(
-  a: ParsedReclaimArgs,
-  deps: ReturnType<typeof captureDeps>["deps"],
-): void {
+function invoke(deps: RunDeps): void {
   try {
-    run(a, deps);
-  } catch (e) {
-    if (!(e instanceof ExitSignal)) throw e;
+    run(args(), deps);
+  } catch (err) {
+    if (!(err instanceof ExitSignal)) throw err;
   }
 }
 
-// ---------------------------------------------------------------------------
-// F4 — happy path: irreversible swap + sidecar drop
-// ---------------------------------------------------------------------------
+test("reclaim command plan confines output and sidecars to the DB basename", () => {
+  expect(planReclaimCommand(args())).toEqual({
+    dbPath,
+    sockPath,
+    outputPath: `${dbPath}.reclaim`,
+    sidecarPaths: [`${dbPath}-wal`, `${dbPath}-shm`],
+  });
+});
 
-test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars", () => {
-  // Make the source faithful to production: born auto_vacuum=2 and read by
-  // reclaimDb over its own read-only connection (no explicit bake — the output
-  // INHERITS the mode). Done BEFORE bloating so the VACUUM here does not consume
-  // the freelist the strictly-smaller-output assertion relies on.
-  makeSourceAutoVacuum2(dbPath);
+test("run orchestrates guard, rollback, reclaim, verify, and swap in order", () => {
+  const h = harness();
+  invoke(h.deps);
+  expect(h.exits).toEqual([]);
+  expect(h.err).toEqual([]);
+  expect(h.out.join("")).toContain("[reclaim] DONE");
+  expect(h.calls).toEqual([
+    `daemon:${sockPath}`,
+    `exists:${dbPath}`,
+    `size:${dbPath}`,
+    `backup:${dbPath}`,
+    `reclaim:${dbPath}:${dbPath}.reclaim`,
+    `verify:${dbPath}:${dbPath}.reclaim`,
+    `swap:${dbPath}.reclaim:${dbPath}`,
+  ]);
+});
 
-  // Bloat the source: insert+delete a large payload so the freelist grows but
-  // the file does not shrink — the reclaim's VACUUM INTO then yields a strictly
-  // smaller output, proving the live file was actually swapped.
-  const { db } = openDb(dbPath, { migrate: false });
-  for (let i = 0; i < 500; i++) {
-    db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
-      `bloat-${i}`,
-      "y".repeat(4000),
-    ]);
-  }
-  db.run("DELETE FROM meta WHERE key LIKE 'bloat-%'");
-  // Insert a sentinel row that MUST survive the swap, confirming the live file
-  // now holds the reclaimed contents (not an empty/replaced DB).
-  db.run("INSERT INTO meta (key, value) VALUES ('sentinel', 'survives')");
-  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-  db.close();
+test("run refuses a live daemon before any storage operation", () => {
+  const h = harness({
+    daemonStatus: () => ({ up: true, pid: 321 }),
+    sourceExists: () => {
+      throw new Error("must not inspect source");
+    },
+  });
+  invoke(h.deps);
+  expect(h.exits).toEqual([1]);
+  expect(h.err.join("")).toContain("REFUSING");
+  expect(h.err.join("")).toContain("pid 321");
+  expect(h.calls).toEqual([]);
+});
 
-  const sourceBytes = statSync(dbPath).size;
+test("run keeps rollback and removes rejected output after verify refusal", () => {
+  const h = harness({
+    verify: () => ({
+      ok: false,
+      sourceSchemaVersion: 9,
+      outputSchemaVersion: 8,
+      outputAutoVacuum: 2,
+      error: "schema mismatch",
+    }),
+  });
+  invoke(h.deps);
+  expect(h.exits).toEqual([1]);
+  expect(h.calls).toContain(`remove:${dbPath}.reclaim`);
+  expect(h.calls.some((call) => call.startsWith("swap:"))).toBe(false);
+  expect(h.err.join("")).toContain("snapshot kept at /backups/rollback.db");
+});
 
-  const { out, err, exits, deps } = captureDeps();
-  runCatching(args(), deps);
+test("run reports partial sidecar cleanup without undoing a successful swap", () => {
+  const failed = `${dbPath}-shm`;
+  const h = harness({
+    swap: () => ({
+      ok: true,
+      error: null,
+      sidecars: { removed: [`${dbPath}-wal`], failed: [failed] },
+    }),
+  });
+  invoke(h.deps);
+  expect(h.exits).toEqual([]);
+  expect(h.out.join("")).toContain("[reclaim] DONE");
+  expect(h.err.join("")).toContain(failed);
+  expect(h.err.join("")).toContain("safe to retry");
+});
 
-  // No exit() — the happy path runs to completion.
-  expect(exits).toEqual([]);
-  expect(err).toEqual([]);
-  expect(out.join("")).toContain("[reclaim] DONE");
+test("sidecar cleanup exposes partial failure, retries, and idempotence", () => {
+  const plan = planReclaimCommand(args());
+  const existing = new Set(plan.sidecarPaths);
+  let failShm = true;
+  const remove = (path: string): void => {
+    expect(plan.sidecarPaths).toContain(path);
+    if (path.endsWith("-shm") && failShm) throw new Error("busy");
+    existing.delete(path);
+  };
+  const first = cleanupReclaimSidecars(plan.sidecarPaths, remove);
+  expect(first).toEqual({
+    removed: [`${dbPath}-wal`],
+    failed: [`${dbPath}-shm`],
+  });
+  failShm = false;
+  expect(cleanupReclaimSidecars(first.failed, remove)).toEqual({
+    removed: [`${dbPath}-shm`],
+    failed: [],
+  });
+  expect(cleanupReclaimSidecars(plan.sidecarPaths, remove).failed).toEqual([]);
+  expect(existing.size).toBe(0);
+});
 
-  // The intermediate `.reclaim` output was consumed by the atomic rename.
-  expect(existsSync(`${dbPath}.reclaim`)).toBe(false);
+test("one tiny atomic swap replaces the file and removes old sidecars", () => {
+  const output = `${dbPath}.reclaim`;
+  writeFileSync(dbPath, "old");
+  writeFileSync(output, "new");
+  writeFileSync(`${dbPath}-wal`, "wal");
+  writeFileSync(`${dbPath}-shm`, "shm");
 
-  // The live DB is now the reclaimed (vacuumed) copy: strictly smaller, opens
-  // clean, and still carries the sentinel row.
-  const swappedBytes = statSync(dbPath).size;
-  expect(swappedBytes).toBeLessThan(sourceBytes);
-
-  const ro = openDb(dbPath, { migrate: false });
-  try {
-    const row = ro.db
-      .query("SELECT value FROM meta WHERE key = 'sentinel'")
-      .get() as { value: string } | null;
-    expect(row?.value).toBe("survives");
-    const av = ro.db.query("PRAGMA auto_vacuum").get() as {
-      auto_vacuum: number;
-    };
-    expect(av.auto_vacuum).toBe(2); // INCREMENTAL inherited from the source.
-  } finally {
-    // Explicit TRUNCATE checkpoint drains + zeroes the WAL synchronously before close; close's passive last-connection checkpoint can silently no-op under lock contention on a loaded box and strand the sidecars.
-    ro.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-    ro.db.close();
-    rmSync(`${dbPath}-wal`, { force: true });
-    rmSync(`${dbPath}-shm`, { force: true });
-  }
-
-  // The rollback snapshot is kept (the swap path completed). Focused sidecar-drop
-  // assertion lives in the next test, before any reopen can recreate them.
-  expect(out.join("")).toContain("Snapshot kept at");
-
-  // A pre-reclaim snapshot (the rollback) was produced under the default backup
-  // dir for the temp DB.
-  const backupDir = join(tmpDir, "backups");
-  const snaps = readdirSync(backupDir).filter((n) => n.startsWith("keeper-"));
-  expect(snaps.length).toBeGreaterThanOrEqual(1);
-  // 30s scoped budget: real VACUUM + backup + VACUUM INTO + verify + atomic swap — genuine disk I/O that host contention can push past 10s. Global --timeout=10000 stays the hang detector.
-}, 30_000);
-
-test("run(): the stale OLD-file sidecars are removed by the swap", () => {
-  // Focused assertion on sidecar drop: plant distinctively-sized sidecars, run
-  // the swap, and confirm they are gone immediately after run() returns (before
-  // any reopen of the swapped DB can recreate them). Source born auto_vacuum=2
-  // so reclaimDb's inheritance gate passes (production-faithful read-only path).
-  makeSourceAutoVacuum2(dbPath);
-
-  writeFileSync(`${dbPath}-wal`, Buffer.alloc(128, 0xab));
-  writeFileSync(`${dbPath}-shm`, Buffer.alloc(128, 0xcd));
-
-  const { exits, deps } = captureDeps();
-  runCatching(args(), deps);
-
-  expect(exits).toEqual([]);
+  const result = executeReclaimSwap(planReclaimCommand(args()));
+  expect(result).toEqual({
+    ok: true,
+    error: null,
+    sidecars: {
+      removed: [`${dbPath}-wal`, `${dbPath}-shm`],
+      failed: [],
+    },
+  });
+  expect(readFileSync(dbPath, "utf8")).toBe("new");
+  expect(existsSync(output)).toBe(false);
   expect(existsSync(`${dbPath}-wal`)).toBe(false);
   expect(existsSync(`${dbPath}-shm`)).toBe(false);
-  // 30s scoped budget: same real VACUUM + backup + reclaim + swap I/O as the sibling — host contention can push past 10s. Global --timeout=10000 stays the hang detector.
-}, 30_000);
+});
 
-// ---------------------------------------------------------------------------
-// F5 — daemon-up HARD-GUARD refusal
-// ---------------------------------------------------------------------------
-
-test("run(): refuses while keeperd holds the lock, leaving the DB byte-identical", () => {
-  // A live pid in `<sock>.lock` ⇒ daemon up ⇒ HARD-GUARD refusal.
+test("daemon guard recognizes missing and live ownership locks", () => {
+  expect(daemonUp(sockPath)).toEqual({ up: false, pid: null });
   writeFileSync(`${sockPath}.lock`, `${process.pid}\n`);
-
-  const before = readFileSync(dbPath);
-
-  const { out, err, exits, deps } = captureDeps();
-  runCatching(args(), deps);
-
-  // Exited 1 via the injected exit; the REFUSING message names the live pid.
-  expect(exits).toEqual([1]);
-  const stderr = err.join("");
-  expect(stderr).toContain("REFUSING");
-  expect(stderr).toContain(`pid ${process.pid}`);
-
-  // No snapshot, no reclaim, no swap performed: the source DB is byte-identical
-  // and no `.reclaim` output / backup dir was created.
-  const after = readFileSync(dbPath);
-  expect(after.equals(before)).toBe(true);
-  expect(existsSync(`${dbPath}.reclaim`)).toBe(false);
-  expect(existsSync(join(tmpDir, "backups"))).toBe(false);
-  // Nothing was written to stdout (the source-size log comes AFTER the guard).
-  expect(out.join("")).toBe("");
+  expect(daemonUp(sockPath)).toEqual({ up: true, pid: process.pid });
 });
