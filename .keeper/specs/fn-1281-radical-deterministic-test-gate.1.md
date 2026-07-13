@@ -60,5 +60,5 @@ Keep the existing aggregate behavior behind the new names until task 2 migrates 
 - [ ] Plan's host-matrix preload and the root OpenTUI split remain intact.
 
 ## Done summary
-
+Established bun run test:gate as the stable root fast-phase contract with plan/prompt package scripts delegating to their own named gates; a shared scripts/test-entrypoint.ts sentinel wired via each package's bunfig.toml rejects direct aggregate bun test discovery before any test loads while explicit *.test.ts targets remain runnable, and the wrapped/escalation Bash guards were reconciled to deny bare/broad discovery while allowing named gates and explicit targeted tests.
 ## Evidence

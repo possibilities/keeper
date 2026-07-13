@@ -97,7 +97,7 @@ const wrappedLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_type: "tmux",
   backend_exec_pane_id: "%5",
   backend_exec_birth_session_id: WRAPPED_EXEC_SESSION,
-  backend_exec_generation_id: "gen-5",
+  backend_exec_generation_id: "105:1005",
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -107,7 +107,7 @@ const wrappedLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
 /** A swept pane matching the wrapped provider-leg fixture's exact identity. */
 const wrappedPane = (over: Partial<PaneInfo> = {}): PaneInfo =>
   pane({
-    tmuxGenerationId: "gen-5",
+    tmuxGenerationId: "105:1005",
     paneId: "%5",
     windowId: "@5",
     sessionName: WRAPPED_EXEC_SESSION,
@@ -1130,11 +1130,11 @@ test("autoclosePulse: failed exact wrapped kill preserves eligibility and retrie
         last_input_request_at, last_permission_prompt_at, pid, start_time)
      VALUES
        ('wrappedjob', 1, 1, 'stopped', 'fn-1277-autoclose-wrapped-provider-legs.1', NULL, NULL,
-        NULL, 'tmux', '%5', 'wrapped', 'gen-5', NULL, NULL, 444, '400')`,
+        NULL, 'tmux', '%5', 'wrapped', '105:1005', NULL, NULL, 444, '400')`,
   );
 
   const killed: string[] = [];
-  const intents: AutocloseIntentMessage[] = [];
+  const intents: AutocloseWorkerMessage[] = [];
   const notes: string[] = [];
   let paneStillLive = true;
   const backend = {
@@ -1153,14 +1153,19 @@ test("autoclosePulse: failed exact wrapped kill preserves eligibility and retrie
   const deps = {
     resolveConfig: () => CONFIG,
     now: () => 1000,
-    postIntent: (intent: AutocloseIntentMessage) => intents.push(intent),
+    postIntent: (intent: AutocloseWorkerMessage) => intents.push(intent),
     noteLine: (line: string) => notes.push(line),
+    isPidAlive: () => false,
   };
 
   await autoclosePulse(db, backend, state, deps);
   await autoclosePulse(db, backend, state, deps);
   expect(killed).toEqual(["%5", "%5"]);
-  expect(intents.map((intent) => intent.paneId)).toEqual(["%5", "%5"]);
+  expect(
+    intents
+      .filter((intent) => intent.kind === "autoclose-intent")
+      .map((intent) => intent.paneId),
+  ).toEqual(["%5", "%5"]);
   expect(state.graceMap.get("wrappedjob")).toBe(1);
   expect(notes.every((line) => line.startsWith("close deferred"))).toBe(true);
 
@@ -1184,10 +1189,10 @@ test("autoclosePulse: disappearance of the last wrapped window is a normal no-op
        (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
         dispatch_origin, backend_exec_type, backend_exec_pane_id,
         backend_exec_birth_session_id, backend_exec_generation_id,
-        last_input_request_at, last_permission_prompt_at)
+        last_input_request_at, last_permission_prompt_at, pid, start_time)
      VALUES
        ('lastwrapped', 1, 1, 'stopped', 'fn-1-x.1', NULL, NULL,
-        NULL, 'tmux', '%5', 'wrapped', 'gen-5', NULL, NULL)`,
+        NULL, 'tmux', '%5', 'wrapped', '105:1005', NULL, NULL, 444, '400')`,
   );
 
   let sessionExists = true;
@@ -1209,6 +1214,7 @@ test("autoclosePulse: disappearance of the last wrapped window is a normal no-op
     now: () => 1000,
     postIntent: () => {},
     noteLine: () => {},
+    isPidAlive: () => false,
   };
 
   await autoclosePulse(db, backend, state, deps);
