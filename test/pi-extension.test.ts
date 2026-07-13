@@ -23,6 +23,7 @@ import keeperEvents, {
   type PiExtensionApi,
   type PiObservedEvent,
   type PiTranslateMeta,
+  piDispatchAttemptFromEnv,
   piEventBindings,
   resolvePiEventsLogDir,
   sendPiBusMessage,
@@ -64,6 +65,25 @@ const META: PiTranslateMeta = {
 };
 
 describe("pi extension — pure translation", () => {
+  test("exact attempt metadata rides lifecycle data without changing bindings", () => {
+    const b = piEventBindings(
+      { type: "agent_start" },
+      { ...META, dispatchAttemptId: 42 },
+    );
+    expect(JSON.parse(b?.data as string)).toEqual({
+      hook_event_name: "UserPromptSubmit",
+      dispatch_attempt_id: 42,
+    });
+    expect(piDispatchAttemptFromEnv({ KEEPER_DISPATCH_ATTEMPT_ID: "42" })).toBe(
+      42,
+    );
+    for (const raw of ["", "0", "bad", "1;rm", "9".repeat(40)]) {
+      expect(
+        piDispatchAttemptFromEnv({ KEEPER_DISPATCH_ATTEMPT_ID: raw }),
+      ).toBeNull();
+    }
+  });
+
   test("agent_start folds to a working-driving UserPromptSubmit", () => {
     const b = piEventBindings({ type: "agent_start" }, META);
     expect(b).toEqual({
@@ -493,13 +513,19 @@ describe("pi extension — factory arming + fail-open", () => {
   beforeEach(() => {
     saved.KEEPER_JOB_ID = process.env.KEEPER_JOB_ID;
     saved.KEEPER_EVENTS_LOG = process.env.KEEPER_EVENTS_LOG;
+    saved.KEEPER_DISPATCH_ATTEMPT_ID = process.env.KEEPER_DISPATCH_ATTEMPT_ID;
     logDir = mkdtempSync(join(tmpdir(), "pi-ext-"));
     process.env.KEEPER_EVENTS_LOG = logDir;
     delete process.env.KEEPER_JOB_ID;
+    delete process.env.KEEPER_DISPATCH_ATTEMPT_ID;
   });
 
   afterEach(() => {
-    for (const k of ["KEEPER_JOB_ID", "KEEPER_EVENTS_LOG"]) {
+    for (const k of [
+      "KEEPER_JOB_ID",
+      "KEEPER_EVENTS_LOG",
+      "KEEPER_DISPATCH_ATTEMPT_ID",
+    ]) {
       if (saved[k] === undefined) {
         delete process.env[k];
       } else {
@@ -546,6 +572,19 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(parsed?.bindings.session_id).toBe("job-live");
     expect(parsed?.bindings.hook_event).toBe("UserPromptSubmit");
     expect(parsed?.bindings.pid).toBe(process.pid);
+  });
+
+  test("malformed attempt metadata stays fail-open and unfenced", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    process.env.KEEPER_DISPATCH_ATTEMPT_ID = "not-an-attempt";
+    const pi = fakePi();
+    expect(() => keeperEvents(pi)).not.toThrow();
+    pi.fire("agent_start", { type: "agent_start" });
+    const body = readFileSync(join(logDir, `${process.pid}.ndjson`), "utf8");
+    const parsed = parseEventLogLine(body.trim());
+    expect(
+      JSON.parse(parsed?.bindings.data as string).dispatch_attempt_id,
+    ).toBeUndefined();
   });
 
   test("an unmapped fired event writes no line", () => {

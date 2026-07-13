@@ -10,7 +10,8 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
-  lanes, merge handling, and escalation
+  lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
+  Resource holds remain independently observable and recoverable
 - **History forensics** — `keeper transcript <harness>` extracts bounded main/subagent
   conversations; `keeper search-history`, `keeper find-file-history`, and
   `keeper session events` answer who/when/what across sessions
@@ -24,6 +25,6 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   [installation and smoke checks](./docs/install.md#pi-task-and-panel-operations) and
   [machine-visible failures](./docs/problem-codes.md#panel-run-lifecycle).
 
-Install & uninstall: [docs/install.md](./docs/install.md) · Guardrails:
+Install, lifecycle audit, and uninstall: [docs/install.md](./docs/install.md) · Guardrails:
 [CLAUDE.md](./CLAUDE.md) · Vocabulary: [CONTEXT.md](./CONTEXT.md) · Decisions:
 [docs/adr/](./docs/adr/)

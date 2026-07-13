@@ -222,6 +222,20 @@ export function accountRouteFromEnv(env: NodeJS.ProcessEnv): string | null {
   return /^claude-swap:\d{1,10}$/.test(raw) ? raw : null;
 }
 
+/** Parse the bounded exact-attempt carrier injected by the generic dispatcher.
+ * Kept local because this hook's dependency-free island cannot import launch
+ * configuration. Malformed or missing metadata is unfenced evidence. */
+export function dispatchAttemptFromEnv(
+  env: NodeJS.ProcessEnv,
+): number | null {
+  const raw = env.KEEPER_DISPATCH_ATTEMPT_ID;
+  if (raw === undefined || !/^[1-9]\d{0,15}$/.test(raw)) {
+    return null;
+  }
+  const attemptId = Number(raw);
+  return Number.isSafeInteger(attemptId) ? attemptId : null;
+}
+
 /**
  * Three-tuple of backend-exec coordinates captured on EVERY hook event
  * (not SessionStart-gated like {@link configDirFromEnv}). Each field is
@@ -771,6 +785,16 @@ export function buildEventBindings(
   // lockstep (a bare-NULL binding, mirroring resume_target).
   const adopted: number | null = null;
 
+  // SessionStart only: enrich the hook payload with the exact Dispatch attempt.
+  // The carrier is parsed and bounded before persistence; missing or malformed
+  // metadata leaves the original payload byte-for-byte unchanged.
+  const dispatchAttemptId =
+    hookEvent === "SessionStart" ? dispatchAttemptFromEnv(env) : null;
+  const eventData =
+    dispatchAttemptId == null
+      ? raw
+      : JSON.stringify({ ...data, dispatch_attempt_id: dispatchAttemptId });
+
   // SessionStart only: capture the PII-free account ROUTE from the launcher-
   // injected `KEEPER_ACCOUNT_ROUTE` env (mirrors config_dir / worktree). NULL on
   // every non-SessionStart row and whenever the launcher supplied no route, so
@@ -832,7 +856,7 @@ export function buildEventBindings(
     // returns an updatedInput (python3→uv run, npm→pnpm, …) that changes what
     // runs. Miners must not read `data`'s command as the executed process; see
     // docs/plugin-composition-map.md (logged-vs-executed skew).
-    data: raw,
+    data: eventData,
     subagent_agent_id: subagentAgentId,
     spawn_name: spawnName,
     start_time: startTime,

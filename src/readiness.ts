@@ -53,12 +53,12 @@
  *   - else `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
-import { hasLiveWorkerMonitor } from "./derivers";
 import {
   type EpicDepResolution,
   resolveEpicDep as resolveEpicDepLeaf,
 } from "./epic-deps";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
+import { deriveHarnessActivity } from "./session-activity";
 import { isOpenTurnRow } from "./subagent-invocations";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 
@@ -299,13 +299,9 @@ export type BlockReason =
  * session in motion, distinct from a `blocked` verdict (stuck waiting on a
  * dependency, repo state, or mutex).
  *
- * `sub-agent-stale` is a PURE visibility affordance for an open-turn sub-agent
- * whose age exceeds `SUBAGENT_STALENESS_SEC`. Predicate 6 itself is deliberately
- * UNBOUNDED (an open sub keeps it firing no matter how old) so a slow-but-alive
- * sub is never re-dispatched; this variant only re-colors the board pill so a
- * human can see WHICH row is holding the gate. It no longer tracks the reducer's
- * release window — the reducer's Stop/ApiError guards now release on last-activity
- * `updated_at`, while this pill ages on the frozen spawn `ts`.
+ * `sub-agent-stale` is readiness's conservative rendering of unknown child
+ * evidence. It keeps the mutex occupied while making the uncertainty visible;
+ * age alone never proves terminality.
  */
 export type RunningReason =
   | { kind: "job-running" }
@@ -315,16 +311,11 @@ export type RunningReason =
   | { kind: "monitor-stale" };
 
 /**
- * Staleness threshold for the `sub-agent-stale` board pill (a pure visibility
- * affordance — see {@link RunningReason}). An open-turn sub-agent whose spawn
- * `ts` is older than the injected `now` by strictly more than this re-colors to
- * `sub-agent-stale`. This is NOT a release window: predicate 6 stays in-flight
- * regardless, and the reducer's Stop/ApiError guards release on last-activity
- * `updated_at`, not on this `ts`-anchored pill — so the two no longer track the
- * same population. The 120s value is kept only as a reasonable "looks stuck"
- * cutoff. Held as a local constant (not imported) to keep readiness leaf-ish.
+ * Staleness threshold for child evidence. It is anchored on the invocation's
+ * `updated_at` last-activity stamp, matching the canonical Harness activity
+ * derivation and reducer guards. Crossing it yields unknown, not quiescent.
  *
- * Determinism: `now - inv.ts > SUBAGENT_STALENESS_SEC` reads the injected
+ * Determinism: `now - inv.updated_at > SUBAGENT_STALENESS_SEC` reads the injected
  * `now`, NOT `Date.now()`. This is a CLIENT computation over the live
  * projection, not a reducer fold — re-fold determinism does not apply. Live
  * callers supply `Math.floor(Date.now()/1000)`; the simulator/tests pass the
@@ -340,9 +331,8 @@ export const SUBAGENT_STALENESS_SEC = 120;
  * `monitor-stale` — STILL occupying, but flagged "may be abandoned".
  *
  * Lease, NOT heartbeat: the anchor is `updated_at`, which bumps per agent
- * turn-end — NOT the backgrounded suite's own runtime. 600s ≈ a generous
- * turn-end cadence with a 3–5× safety factor; the hard ceiling
- * {@link MONITOR_RELEASE_SEC} catches the genuinely abandoned case.
+ * turn-end — NOT the backgrounded suite's own runtime. Past the lease the
+ * Harness activity fact is unknown and readiness conservatively keeps its hold.
  *
  * Determinism: read-time `now`-injected comparison, NEVER folded — the
  * sanctioned exception, mirroring {@link SUBAGENT_STALENESS_SEC}. Live callers
@@ -352,18 +342,9 @@ export const SUBAGENT_STALENESS_SEC = 120;
 export const MONITOR_STALENESS_SEC = 600;
 
 /**
- * Hard release ceiling for a live-worker-monitor occupant — the second lease
- * knob ("whichever fires first"). Once the freshest occupying job's
- * `updated_at` is older than the injected `now` by strictly more than this,
- * the monitor fact NO LONGER occupies the mutex; the slot is released so a
- * stopped-but-abandoned session can't wedge it forever. 1800s ≫
- * MONITOR_STALENESS_SEC so the `monitor-stale` window is visible before the
- * slot frees.
- *
- * Terminal `ended`/`killed` already clears the fact for free, so this ceiling
- * only matters for a session that Stopped but whose Stop snapshot listed a
- * live monitor that then never updated. Same read-time / never-folded
- * determinism as {@link MONITOR_STALENESS_SEC}.
+ * Resource-age horizon retained for consumers that display or bound historical
+ * monitor snapshots. Harness activity does not treat age as terminal evidence;
+ * a stale worker resource is unknown until positive terminality arrives.
  */
 export const MONITOR_RELEASE_SEC = 1800;
 
@@ -572,18 +553,11 @@ export function computeReadiness(
   const matchedPendingKeys = new Set<string>();
 
   // Build a job_id → SubagentInvocation[] index so predicate 6 is O(1) per row.
-  // Filtered to the canonical open-turn predicate (`isOpenTurnRow`: NULL
-  // `duration_ms` AND status running|ok) at index time — a backgrounded `ok` sub
-  // (NULL `duration_ms`) is still in flight and must block, while a FINISHED `ok`
-  // (non-null `duration_ms`) and the terminal statuses pass silently. NO time /
-  // staleness bound here (deliberate asymmetry vs. the reducer's bounded guards):
-  // a long Bash/build freezes `updated_at` by emitting no SubagentTurn, so a
-  // readiness bound would re-dispatch a slow-but-alive sub.
+  // Keep terminal and malformed evidence in the bounded collection: the
+  // canonical Harness activity derivation decides open/terminal/unknown, so an
+  // incomplete row can never disappear into an idle verdict at this boundary.
   const subRunningByJobId = new Map<string, SubagentInvocation[]>();
   for (const inv of subagentInvocations) {
-    if (!isOpenTurnRow(inv)) {
-      continue;
-    }
     const arr = subRunningByJobId.get(inv.job_id);
     if (arr === undefined) {
       subRunningByJobId.set(inv.job_id, [inv]);
@@ -950,12 +924,9 @@ function evaluateTask(
   // per-root mutex but is non-dispatchable, so the closer/approve can't
   // dispatch into a not-actually-idle session.
   //
-  // Lease/TTL floor (`occupying = monitor-present AND snapshot-fresh`,
-  // whichever knob fires first): the anchor is the embedded job's `updated_at`
-  // (re-stamps per agent turn-end). Past the soft `MONITOR_STALENESS_SEC` →
-  // `monitor-stale` (still occupying, flagged); past the hard
-  // `MONITOR_RELEASE_SEC` → NO LONGER occupies. Read-time, never folded — the
-  // same exception as the sub-agent split.
+  // The anchor is the embedded job's `updated_at` (re-stamped per agent
+  // turn-end). Past `MONITOR_STALENESS_SEC` the canonical fact is unknown;
+  // readiness conservatively renders `monitor-stale` and keeps the mutex hold.
   if (embeddedMonitorOccupies(task.jobs, now)) {
     // Within the hard ceiling (the release case is already excluded by
     // `embeddedMonitorOccupies`). Split on the soft lease.
@@ -2152,13 +2123,14 @@ function excludeProvenDeadJobs<T extends { job_id: string }>(
 }
 
 function anyEmbeddedJobWorking(
-  embedded: { state: string }[] | undefined,
+  embedded: { state: string; updated_at?: number }[] | undefined,
 ): boolean {
   if (embedded === undefined) {
     return false;
   }
   for (const job of embedded) {
-    if (job.state === "working") {
+    const activity = deriveHarnessActivity({ parent: job });
+    if (activity.status === "active" && activity.reason === "main-turn") {
       return true;
     }
   }
@@ -2204,15 +2176,25 @@ function anyEmbeddedJobBoundPending(
 }
 
 function anyEmbeddedJobHasRunningSubagent(
-  embedded: { job_id: string }[] | undefined,
+  embedded:
+    | { job_id: string; state?: string; updated_at?: number }[]
+    | undefined,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
 ): boolean {
   if (embedded === undefined) {
     return false;
   }
   for (const job of embedded) {
-    const hits = subRunningByJobId.get(job.job_id);
-    if (hits !== undefined && hits.length > 0) {
+    const activity = deriveHarnessActivity({
+      parent: job,
+      children: subRunningByJobId.get(job.job_id),
+    });
+    if (
+      (activity.status === "active" && activity.reason === "open-child") ||
+      (activity.status === "unknown" &&
+        (activity.reason === "child-evidence-incomplete" ||
+          activity.reason === "child-evidence-stale"))
+    ) {
       return true;
     }
   }
@@ -2221,7 +2203,7 @@ function anyEmbeddedJobHasRunningSubagent(
 
 /**
  * Predicate 6 staleness companion to {@link anyEmbeddedJobHasRunningSubagent}.
- * Returns `true` iff EVERY surviving `running` sub-agent has `now - inv.ts >
+ * Returns `true` iff EVERY surviving `running` sub-agent has `now - inv.updated_at >
  * threshold`. Vacuous-truth on no running sub-agents — callers MUST gate on
  * {@link anyEmbeddedJobHasRunningSubagent} first. Strict `>` so the boundary
  * tick doesn't flip the pill. "Every" not "any": a single fresh sub-agent
@@ -2242,7 +2224,10 @@ function allRunningSubagentsAreStale(
       continue;
     }
     for (const inv of hits) {
-      if (now - inv.ts <= threshold) {
+      if (!isOpenTurnRow(inv)) {
+        continue;
+      }
+      if (now - inv.updated_at <= threshold) {
         return false;
       }
     }
@@ -2251,29 +2236,7 @@ function allRunningSubagentsAreStale(
 }
 
 /**
- * Predicate-6.6 entry — does any embedded job carry the
- * `has_live_worker_monitor` occupancy fact? `true` iff at least one element
- * has a TRUE flag. A pre-v59 stored element decodes the field as `undefined` →
- * `false`. Provenance is already filtered at the reducer (only worker-launched
- * `monitor`/`bash-bg` monitors set it; `ambient` watchers never do), so an
- * ambient-only job reads `false` and stays dispatchable.
- */
-function anyEmbeddedJobHasLiveMonitor(
-  embedded: { has_live_worker_monitor?: boolean }[] | undefined,
-): boolean {
-  if (embedded === undefined) {
-    return false;
-  }
-  for (const job of embedded) {
-    if (job.has_live_worker_monitor === true) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Soft-TTL staleness companion to {@link anyEmbeddedJobHasLiveMonitor}. Returns
+ * Soft-TTL staleness helper for embedded live-monitor facts. Returns
  * `true` iff EVERY live-monitor job has `now - updated_at > threshold`. A single
  * fresh job keeps the verdict at `monitor-running` (same "every, not any"
  * discipline as {@link allRunningSubagentsAreStale}). Vacuous-truth otherwise —
@@ -2302,27 +2265,36 @@ function allLiveMonitorsAreStale(
 }
 
 /**
- * The OCCUPANCY predicate for a live worker monitor — `occupying = (monitor
- * present) AND (NOT all past the hard {@link MONITOR_RELEASE_SEC} ceiling)`. A
- * `monitor-stale` occupant (past the SOFT lease but within the ceiling) STILL
- * occupies — the staleness split is a visibility affordance, not a release.
- *
- * Used in BOTH the predicate-1 terminal-completed gate and the predicate-6.6
- * verdict so they release on the SAME boundary: when this is false, predicate 1
- * may collapse to `completed` and predicate 6.6 falls through. Threading the
- * raw `anyEmbeddedJobHasLiveMonitor` into predicate 1 would wedge a
- * past-ceiling abandoned monitor as an occupant forever.
+ * The occupancy policy for worker-resource Harness activity. Both active and
+ * unknown resource evidence hold readiness; only quiescent evidence releases.
+ * Predicate 1 and predicate 6.6 share this helper so completion and the running
+ * verdict move on the same positive boundary.
  */
 function embeddedMonitorOccupies(
   embedded:
-    | { has_live_worker_monitor?: boolean; updated_at: number }[]
+    | {
+        state: string;
+        has_live_worker_monitor?: boolean;
+        updated_at: number;
+      }[]
     | undefined,
   now: number,
 ): boolean {
-  return (
-    anyEmbeddedJobHasLiveMonitor(embedded) &&
-    !allLiveMonitorsAreStale(embedded, now, MONITOR_RELEASE_SEC)
-  );
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    const activity = deriveHarnessActivity({ parent: job, now });
+    if (
+      (activity.status === "active" && activity.reason === "worker-resource") ||
+      (activity.status === "unknown" &&
+        (activity.reason === "resource-evidence-incomplete" ||
+          activity.reason === "resource-evidence-stale"))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -2359,48 +2331,34 @@ export function rolledUpJobVerdict(
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   now: number,
 ): Verdict | null {
-  // 1. The job's own working state outranks everything — `running:job-running`.
-  if (anyEmbeddedJobWorking([job])) {
-    return { tag: "running", reason: { kind: "job-running" } };
+  const activity = deriveHarnessActivity({
+    parent: job,
+    children: subRunningByJobId.get(job.job_id),
+    now,
+  });
+  if (activity.status === "active") {
+    if (activity.reason === "main-turn") {
+      return { tag: "running", reason: { kind: "job-running" } };
+    }
+    if (activity.reason === "open-child") {
+      return { tag: "running", reason: { kind: "sub-agent-running" } };
+    }
+    return { tag: "running", reason: { kind: "monitor-running" } };
   }
-
-  // 2. A running sub-agent on this job — fresh vs. stale split.
-  const oneJob = [{ job_id: job.job_id }];
-  if (anyEmbeddedJobHasRunningSubagent(oneJob, subRunningByJobId)) {
-    const stale = allRunningSubagentsAreStale(
-      oneJob,
-      subRunningByJobId,
-      now,
-      SUBAGENT_STALENESS_SEC,
-    );
-    return {
-      tag: "running",
-      reason: { kind: stale ? "sub-agent-stale" : "sub-agent-running" },
-    };
+  if (activity.status === "unknown") {
+    if (
+      activity.reason === "child-evidence-incomplete" ||
+      activity.reason === "child-evidence-stale"
+    ) {
+      return { tag: "running", reason: { kind: "sub-agent-stale" } };
+    }
+    if (
+      activity.reason === "resource-evidence-incomplete" ||
+      activity.reason === "resource-evidence-stale"
+    ) {
+      return { tag: "running", reason: { kind: "monitor-stale" } };
+    }
   }
-
-  // 3. A live worker-launched monitor — derived from raw `monitors` the SAME
-  // way `buildEmbeddedJob` stamps `has_live_worker_monitor`. Fresh vs. stale
-  // split on the job's `updated_at` lease.
-  const monitorJob = [
-    {
-      has_live_worker_monitor: hasLiveWorkerMonitor(job.monitors ?? "[]"),
-      updated_at: job.updated_at,
-    },
-  ];
-  if (anyEmbeddedJobHasLiveMonitor(monitorJob)) {
-    const stale = allLiveMonitorsAreStale(
-      monitorJob,
-      now,
-      MONITOR_STALENESS_SEC,
-    );
-    return {
-      tag: "running",
-      reason: { kind: stale ? "monitor-stale" : "monitor-running" },
-    };
-  }
-
-  // 4. Idle — no live worker / sub-agent / monitor.
   return null;
 }
 
@@ -2477,8 +2435,8 @@ function allCloseRowRunningSubagentsAreStale(
 /**
  * Close-row variant of {@link embeddedMonitorOccupies}, pooling every
  * contributing scope (epic-level close jobs + every ALREADY-COMPLETED task's
- * work jobs). Returns `true` iff SOME job in any scope carries a live monitor
- * NOT past the hard {@link MONITOR_RELEASE_SEC} ceiling. `completed`-scoped to
+ * work jobs). Returns `true` iff SOME job carries active or unknown worker
+ * resource evidence. `completed`-scoped to
  * mirror the sub-agent twin. The completed-task scan is normally unreachable
  * (the per-task predicates hold such a task at `running:monitor-*`); the
  * PRIMARY value is the epic-level close-verb monitor case. Retained as a
@@ -2533,8 +2491,7 @@ function allCloseRowMonitorsAreStale(
  * gate. Returns `true` iff the upstream — already status-done, so this is the
  * closer winding down — still carries ANY live close-scope work: an
  * epic-level OR task-level embedded job `working`, ANY running sub-agent under
- * those jobs, or ANY live monitor lease (within the hard
- * {@link MONITOR_RELEASE_SEC} ceiling).
+ * those jobs, or ANY active/unknown worker resource evidence.
  *
  * DELIBERATELY pools RAW epic state across `epic.jobs` AND every `task.jobs`
  * unconditionally — NOT gated on `perTask` completed tags and NOT reading

@@ -26,6 +26,7 @@ import {
   backendExecCoordsFromEnv,
   buildEventBindings,
   configDirFromEnv,
+  dispatchAttemptFromEnv,
   KNOWN_EVENT_COLUMNS,
   nameFromArgs,
   parseLinuxStarttime,
@@ -842,6 +843,25 @@ test("accountRouteFromEnv: an unrecognized shape is rejected to null (PII-free b
 test("accountRouteFromEnv: an over-long value is rejected to null (size-bounded)", () => {
   const huge = `claude-swap:${"9".repeat(200)}`;
   expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: huge })).toBeNull();
+});
+
+test("dispatch attempt carrier is bounded and enriches only SessionStart data", () => {
+  expect(dispatchAttemptFromEnv({ KEEPER_DISPATCH_ATTEMPT_ID: "42" })).toBe(42);
+  for (const raw of ["", "0", "-1", "1;rm", "9".repeat(40)]) {
+    expect(
+      dispatchAttemptFromEnv({ KEEPER_DISPATCH_ATTEMPT_ID: raw }),
+    ).toBeNull();
+  }
+  const start = build(
+    { hook_event_name: "SessionStart", session_id: "s" },
+    { env: { KEEPER_DISPATCH_ATTEMPT_ID: "42" } },
+  );
+  expect(JSON.parse(start.data as string).dispatch_attempt_id).toBe(42);
+  const prompt = build(
+    { hook_event_name: "UserPromptSubmit", session_id: "s" },
+    { env: { KEEPER_DISPATCH_ATTEMPT_ID: "42" } },
+  );
+  expect(JSON.parse(prompt.data as string).dispatch_attempt_id).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------

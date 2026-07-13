@@ -32,6 +32,7 @@ import {
   buildMissedWakeRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
+import { NotadbTolerance } from "./notadb-tolerance";
 import { isDropError, RescanScheduler } from "./rescan";
 import type {
   ApiErrorKind,
@@ -102,14 +103,11 @@ export interface InputRequestMessage {
 }
 
 /**
- * Message posted to the parent on each subagent assistant turn observed in a
- * subagent sidecar transcript (`<sid>/subagents/agent-<agentId>.jsonl`). Carries
- * the turn's terminal {@link SubagentDisposition} — `'cut'` when the stream was
- * interrupted mid-turn (the SILENT_STREAM_CUT signature), `'clean'` on a normal
- * `end_turn`. Main mints a synthetic `SubagentTurn` event keyed `(sessionId,
- * agentId)`; the reducer stamps it onto the subagent row and the SubagentStop
- * fold reads it to recognize a silent stream cut and drive auto-resume. NOT
- * change-gated — the reducer fold is idempotent (last-write-wins on the row).
+ * Message posted only after a subagent invocation's transcript disposition has
+ * settled. A clean terminal response settles directly; a cut candidate settles
+ * only after the matching projected invocation closes and a bounded final tail
+ * scan confirms that no later clean response superseded it. Main mints the
+ * synthetic `SubagentTurn` event keyed by `(sessionId, agentId)`.
  */
 export interface SubagentTurnMessage {
   kind: "subagent-turn";
@@ -312,7 +310,9 @@ export function matchAskUserQuestion(parsed: unknown): InputRequestLine | null {
 interface SubagentTurnLine {
   sessionId: string;
   agentId: string;
+  invocationId: string;
   disposition: SubagentDisposition;
+  settled: boolean;
 }
 
 /**
@@ -328,15 +328,12 @@ interface SubagentTurnLine {
  *   - `parsed.message.stop_reason` is present (a real model response, not a
  *     synthetic/streaming-partial frame).
  *
- * Disposition: `stop_reason` of `"tool_use"` or `null` is the SILENT_STREAM_CUT
- * signature — `null` is an interrupted stream (per Anthropic streaming docs,
- * never a real end), and a `tool_use` turn that becomes the LAST turn means the
- * stream was cut between the tool_result and the model's next response. Any
- * other `stop_reason` (`"end_turn"`, `"max_tokens"`, `"stop_sequence"`,
- * `"pause_turn"`, …) is a legitimate model-side end → `'clean'`. The LAST-turn
- * determination is the reducer's job (the SubagentStop fold reads the final
- * stamped disposition); this matcher reports the per-turn disposition and the
- * reducer's last-write-wins on the row makes the closing turn's value win.
+ * A `stop_reason` of `"tool_use"` or `null` is a provisional cut candidate:
+ * both occur before a later assistant response during an ordinary tool cycle.
+ * Any other stop reason is a settled clean response. `requestId` (falling back
+ * to `uuid`) correlates response chunks without inspecting transcript content.
+ * The provider boundary is joined later with the projected SubagentStop before
+ * a provisional candidate may be emitted as a true cut.
  *
  * Returns `null` for any non-subagent / non-assistant / stop_reason-absent line.
  */
@@ -348,6 +345,8 @@ export function matchSubagentTurn(parsed: unknown): SubagentTurnLine | null {
     type?: unknown;
     agentId?: unknown;
     sessionId?: unknown;
+    requestId?: unknown;
+    uuid?: unknown;
     message?: unknown;
   };
   if (obj.type !== "assistant") {
@@ -357,6 +356,15 @@ export function matchSubagentTurn(parsed: unknown): SubagentTurnLine | null {
     return null;
   }
   if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
+    return null;
+  }
+  const invocationId =
+    typeof obj.requestId === "string" && obj.requestId.length > 0
+      ? obj.requestId
+      : typeof obj.uuid === "string" && obj.uuid.length > 0
+        ? obj.uuid
+        : null;
+  if (invocationId == null) {
     return null;
   }
   const msg = obj.message;
@@ -374,7 +382,9 @@ export function matchSubagentTurn(parsed: unknown): SubagentTurnLine | null {
   return {
     sessionId: obj.sessionId,
     agentId: obj.agentId,
+    invocationId,
     disposition: isCut ? "cut" : "clean",
+    settled: !isCut,
   };
 }
 
@@ -390,6 +400,51 @@ interface PathState {
   offset: number;
   decoder: StringDecoder;
   partial: string;
+}
+
+function latestSubagentTurnAtBoundary(
+  path: string,
+  sessionId: string,
+  agentId: string,
+): SubagentTurnLine | null {
+  let fd: number | null = null;
+  try {
+    const size = statSync(path).size;
+    const readSize = Math.min(size, READ_CHUNK_BYTES * 4);
+    const start = size - readSize;
+    const bytes = Buffer.allocUnsafe(readSize);
+    fd = openSync(path, "r");
+    const count = readSync(fd, bytes, 0, readSize, start);
+    const lines = bytes.subarray(0, count).toString("utf8").split("\n");
+    if (start > 0) {
+      lines.shift();
+    }
+    let latest: SubagentTurnLine | null = null;
+    for (const line of lines) {
+      if (!line.includes('"agentId":')) {
+        continue;
+      }
+      try {
+        const match = matchSubagentTurn(JSON.parse(line));
+        if (
+          match !== null &&
+          match.sessionId === sessionId &&
+          match.agentId === agentId
+        ) {
+          latest = match;
+        }
+      } catch {
+        // Ignore malformed transcript records at the settlement boundary.
+      }
+    }
+    return latest;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      closeSync(fd);
+    }
+  }
 }
 
 /**
@@ -431,6 +486,10 @@ export class TranscriptLineStream {
     string,
     { size: number; mtimeMs: number }
   >();
+  private readonly pendingSubagentTurns = new Map<
+    string,
+    { path: string; match: SubagentTurnLine }
+  >();
 
   /**
    * Live forward-tail driver. `onTitle` is called for each NEW (changed)
@@ -466,6 +525,29 @@ export class TranscriptLineStream {
    */
   seedLastEmitted(sessionId: string, title: string): void {
     this.lastEmitted.set(sessionId, title);
+  }
+
+  hasPendingSubagentTurns(): boolean {
+    return this.pendingSubagentTurns.size > 0;
+  }
+
+  settleSubagentTurn(sessionId: string, agentId: string): boolean {
+    const key = `${sessionId}\x00${agentId}`;
+    const pending = this.pendingSubagentTurns.get(key);
+    if (pending === undefined) {
+      return false;
+    }
+    const boundary = latestSubagentTurnAtBoundary(
+      pending.path,
+      sessionId,
+      agentId,
+    );
+    if (boundary == null) {
+      return false;
+    }
+    this.pendingSubagentTurns.delete(key);
+    this.onSubagentTurn(sessionId, agentId, boundary.disposition);
+    return true;
   }
 
   /**
@@ -837,14 +919,16 @@ export class TranscriptLineStream {
       this.onInputRequest(match.sessionId, match.requestKind);
       return;
     }
-    // Subagent assistant turn. No change-gate (idempotent fold — last-write-wins
-    // on the row's `last_disposition`). The reducer's SubagentStop fold reads the
-    // final stamped disposition, so streaming every per-turn disposition is
-    // correct: the closing turn's value is whatever folded last.
     const match = matchSubagentTurn(parsed);
     if (!match) {
       return;
     }
+    const key = `${match.sessionId}\x00${match.agentId}`;
+    if (!match.settled) {
+      this.pendingSubagentTurns.set(key, { path, match });
+      return;
+    }
+    this.pendingSubagentTurns.delete(key);
     this.onSubagentTurn(match.sessionId, match.agentId, match.disposition);
   }
 }
@@ -869,6 +953,36 @@ export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
   for (const row of rows) {
     stream.seedLastEmitted(row.job_id, row.title);
   }
+}
+
+export function settleClosedSubagentTurns(
+  db: Database,
+  stream: TranscriptLineStream,
+): number {
+  const rows = db
+    .query(
+      `SELECT s.job_id, s.agent_id
+         FROM subagent_invocations s
+         JOIN jobs j ON j.job_id = s.job_id
+        WHERE s.duration_ms IS NOT NULL
+          AND s.last_disposition IS NULL
+          AND j.state = 'working'
+          AND NOT EXISTS (
+            SELECT 1 FROM subagent_invocations newer
+             WHERE newer.job_id = s.job_id
+               AND newer.agent_id = s.agent_id
+               AND newer.turn_seq > s.turn_seq
+          )
+        ORDER BY s.job_id, s.agent_id`,
+    )
+    .all() as { job_id: string; agent_id: string }[];
+  let settled = 0;
+  for (const row of rows) {
+    if (stream.settleSubagentTurn(row.job_id, row.agent_id)) {
+      settled += 1;
+    }
+  }
+  return settled;
 }
 
 /**
@@ -1053,8 +1167,34 @@ function main(): void {
     );
   }
 
-  let subscription: AsyncSubscription | null = null;
   let shuttingDown = false;
+  const dataVersionTolerance = new NotadbTolerance();
+  const dataVersionQuery = db.query("PRAGMA data_version");
+  let lastDataVersion: number | null = null;
+  const SUBAGENT_SETTLEMENT_POLL_MS = 250;
+  const settlementTimer = setInterval(() => {
+    if (shuttingDown) {
+      return;
+    }
+    const outcome = dataVersionTolerance.poll(
+      () =>
+        (
+          dataVersionQuery.get() as {
+            data_version: number;
+          }
+        ).data_version,
+    );
+    if (outcome.skipped) {
+      return;
+    }
+    const changed = outcome.value !== lastDataVersion;
+    lastDataVersion = outcome.value;
+    if (changed || stream.hasPendingSubagentTurns()) {
+      settleClosedSubagentTurns(db, stream);
+    }
+  }, SUBAGENT_SETTLEMENT_POLL_MS);
+
+  let subscription: AsyncSubscription | null = null;
   // Monotonic subscribe generation. Bumped on every (re)subscribe; the watcher
   // callback captures its generation and no-ops if it has been superseded — a
   // batch can fire AFTER `unsubscribe()` resolves (the parcel/watcher #190
@@ -1230,6 +1370,7 @@ function main(): void {
       // heartbeat timer carries the same constraint (its body runs scanJobsForTitles).
       rescan.cancel();
       clearInterval(heartbeatTimer);
+      clearInterval(settlementTimer);
       // Cancel the periodic rollup flush, then flush ONE final rollup so the
       // denominator survives a clean stop.
       if (rollupTimer != null) {

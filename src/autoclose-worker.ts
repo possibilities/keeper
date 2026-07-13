@@ -15,10 +15,10 @@
  * data_version` via {@link watchLoop}, WITH a non-zero idle wake so a grace that
  * elapses on a quiet board — no DB write to bump data_version — still gets
  * re-examined), and writes ONLY to tmux (`kill-window`). It NEVER writes
- * keeper.db and mints NO events: the exit-watcher remains the sole `Killed`
- * producer. The one worker→main message is the pre-kill intent hint
- * ({@link AutocloseIntentMessage}); main owns the `kill_reason: 'autoclosed'`
- * labeling (a sibling task).
+ * keeper.db: the exit-watcher remains the sole `Killed` producer. Before an
+ * autopilot reap it asks main to mint an exact `DispatchClaimReleased`; after
+ * that release folds it sends the pre-kill intent hint
+ * ({@link AutocloseIntentMessage}) so main owns `kill_reason: 'autoclosed'`.
  *
  * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic: the
  * autopilot bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only
@@ -41,8 +41,8 @@
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.
  *  - Own read-only `openDb` connection (`prepareStmts:false`, `bootRetry:true`).
- *  - Typed messages: `{type:"shutdown"}` main→worker; the intent hint
- *    worker→main. Exit 0 clean / 1 crash.
+ *  - Typed messages: `{type:"shutdown"}` main→worker; exact claim-release and
+ *    intent hints worker→main. Exit 0 clean / 1 crash.
  *  - The read-only DB connection is closed in the shutdown path before exit.
  */
 
@@ -50,6 +50,8 @@ import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb, resolveConfig } from "./db";
 import {
+  classifyProcessIdentity,
+  compareCanonicalGeneration,
   createTmuxPaneOps,
   MANAGED_EXEC_SESSION,
   PANELS_EXEC_SESSION,
@@ -57,7 +59,11 @@ import {
   type TmuxPaneOps,
 } from "./exec-backend";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
+import type { DispatchClaim } from "./readiness-inputs";
 import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
+import { readOsStartTime } from "./seed-sweep";
+import { isPidAlive } from "./server-worker";
+import type { HarnessActivity } from "./session-activity";
 import { watchLoop } from "./wake-worker";
 
 /** Cap on kills per pulse — the blast-radius bound so a bad projection state
@@ -92,7 +98,7 @@ export interface ShutdownMessage {
 }
 
 /**
- * The pre-kill intent hint — the ONLY worker→main message. Posted IMMEDIATELY
+ * The pre-kill intent hint. Posted IMMEDIATELY
  * before {@link TmuxPaneOps.killWindow} so main can label the resulting `Killed`
  * row `kill_reason: 'autoclosed'`. Carries the recycle-safe identity tuple
  * (`jobId`, `pid`, `startTime`, `paneId`) plus the audit context (`bucket`,
@@ -108,6 +114,19 @@ export interface AutocloseIntentMessage {
   bucket: AutocloseBucket;
   ref: string | null;
 }
+
+/** Exact claim release requested before an autopilot-owned resource is reaped. */
+export interface AutocloseClaimReleaseMessage {
+  kind: "autoclose-claim-release";
+  verb: "work" | "close";
+  id: string;
+  expectedAttemptId: number;
+  sessionId: string;
+}
+
+export type AutocloseWorkerMessage =
+  | AutocloseIntentMessage
+  | AutocloseClaimReleaseMessage;
 
 /** Which ownership bucket a reap belongs to — the three provably-keeper-owned
  *  window classes. */
@@ -181,12 +200,21 @@ export interface ComputeAutocloseReapsArgs {
   /** Reference instant, unix SECONDS (same clock as the grace map + the config
    *  grace seconds). */
   now: number;
+  /** Canonical activity and claims. Omitted only by compatibility callers. */
+  activityByJobId?: ReadonlyMap<string, HarnessActivity>;
+  dispatchClaims?: readonly DispatchClaim[];
+  /** Fresh recycle-safe process verdicts keyed by job id. */
+  processIdentityByJobId?: ReadonlyMap<
+    string,
+    "alive" | "dead" | "recycled" | "unknown"
+  >;
 }
 
 /** The decision core's output: the (capped, deterministically ordered) reaps and
  *  the NEXT grace map to carry into the following pulse. */
 export interface AutocloseReapsResult {
   reaps: AutocloseReapDecision[];
+  claimReleases: AutocloseClaimReleaseMessage[];
   graceMap: Map<string, number>;
 }
 
@@ -219,6 +247,11 @@ function classifyEligible(
   paneById: ReadonlyMap<string, PaneInfo>,
   paneCountByWindow: ReadonlyMap<string, number>,
   autopilotPaused: boolean,
+  activityByJobId?: ReadonlyMap<string, HarnessActivity>,
+  processIdentityByJobId?: ReadonlyMap<
+    string,
+    "alive" | "dead" | "recycled" | "unknown"
+  >,
 ): { bucket: AutocloseBucket; ref: string | null } | null {
   // Precondition rails common to every bucket. A terminal (killed/ended) row
   // has a NULLed pane id — untargetable by design; never touch it.
@@ -247,6 +280,18 @@ function classifyEligible(
     return null;
   }
   if (job.last_permission_prompt_at != null) {
+    return null;
+  }
+  const activity = activityByJobId?.get(job.job_id);
+  if (activityByJobId !== undefined) {
+    if (activity?.status !== "quiescent" || activity.reservation !== null) {
+      return null;
+    }
+  }
+  if (
+    processIdentityByJobId?.get(job.job_id) === "unknown" ||
+    processIdentityByJobId?.get(job.job_id) === "recycled"
+  ) {
     return null;
   }
 
@@ -328,7 +373,10 @@ function classifyEligible(
   }
   // Same tmux generation: `%N` pane ids are scoped to one server lifetime, so a
   // generation mismatch means this live `%N` is not the job's pane.
-  if (pane.tmuxGenerationId !== jobGenerationId) {
+  if (
+    compareCanonicalGeneration(jobGenerationId, pane.tmuxGenerationId) !==
+    "match"
+  ) {
     return null;
   }
   // Live session membership — a window moved out of the bucket's managed session
@@ -371,18 +419,25 @@ export function computeAutocloseReaps(
     config,
     autopilotPaused,
     now,
+    activityByJobId,
+    dispatchClaims,
+    processIdentityByJobId,
   } = args;
 
   // Config off-switch: disabled ⇒ clear state, mint nothing (a re-enable then
   // restarts every grace clock — a flip only ever DELAYS a close).
   if (!config.autocloseEnabled) {
-    return { reaps: [], graceMap: new Map() };
+    return { reaps: [], claimReleases: [], graceMap: new Map() };
   }
 
   // Degraded (null) OR empty sweep: skip the whole pulse, mint nothing. A
   // non-observation, so the grace map is PRESERVED (neither advanced nor reset).
   if (panes == null || panes.length === 0) {
-    return { reaps: [], graceMap: new Map(graceMap) };
+    return {
+      reaps: [],
+      claimReleases: [],
+      graceMap: new Map(graceMap),
+    };
   }
 
   const paneById = new Map<string, PaneInfo>();
@@ -397,6 +452,13 @@ export function computeAutocloseReaps(
 
   const nextGrace = new Map<string, number>();
   const due: AutocloseReapDecision[] = [];
+  const claimReleases: AutocloseClaimReleaseMessage[] = [];
+  const claimByTarget = new Map(
+    (dispatchClaims ?? []).map((claim) => [
+      `${claim.verb}::${claim.id}`,
+      claim,
+    ]),
+  );
   for (const job of jobs) {
     const elig = classifyEligible(
       job,
@@ -405,10 +467,48 @@ export function computeAutocloseReaps(
       paneById,
       paneCountByWindow,
       autopilotPaused,
+      activityByJobId,
+      processIdentityByJobId,
     );
     if (elig === null) {
       // Ineligible ⇒ prune (absent from nextGrace resets the clock).
       continue;
+    }
+    if (
+      dispatchClaims !== undefined &&
+      elig.bucket === "autopilot" &&
+      (job.plan_verb === "work" || job.plan_verb === "close") &&
+      job.plan_ref != null
+    ) {
+      const claim = claimByTarget.get(`${job.plan_verb}::${job.plan_ref}`);
+      if (
+        claim == null ||
+        claim.legacy_unfenced !== 0 ||
+        claim.attempt_id == null
+      ) {
+        continue;
+      }
+      if (claim.session_id === job.job_id && claim.state !== "released") {
+        if (claim.state === "bound") {
+          claimReleases.push({
+            kind: "autoclose-claim-release",
+            verb: job.plan_verb,
+            id: job.plan_ref,
+            expectedAttemptId: claim.attempt_id,
+            sessionId: job.job_id,
+          });
+        }
+        continue;
+      }
+      if (claim.session_id == null && claim.state === "acquired") {
+        // A newer exact attempt revoked this owner; its old pane remains safe to
+        // reap only through the exact resource identity rails above.
+      } else if (
+        claim.session_id !== job.job_id &&
+        claim.state !== "released"
+      ) {
+        continue;
+      }
     }
     const firstObserved = graceMap.get(job.job_id) ?? now;
     nextGrace.set(job.job_id, firstObserved);
@@ -426,8 +526,10 @@ export function computeAutocloseReaps(
   }
 
   due.sort((a, b) => (a.jobId < b.jobId ? -1 : a.jobId > b.jobId ? 1 : 0));
+  claimReleases.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
   return {
     reaps: due.slice(0, AUTOCLOSE_MAX_KILLS_PER_PULSE),
+    claimReleases,
     graceMap: nextGrace,
   };
 }
@@ -439,7 +541,7 @@ export interface AutoclosePulseState {
   graceMap: Map<string, number>;
 }
 
-/** Injected pulse collaborators — clock, config re-read, the intent-hint sink,
+/** Injected pulse collaborators — clock, config re-read, the worker-message sink,
  *  and the stderr audit line. All injectable so the pulse drives against a
  *  seeded DB + fake backend with no real Worker / tmux. */
 export interface AutoclosePulseDeps {
@@ -448,9 +550,11 @@ export interface AutoclosePulseDeps {
     autocloseGraceSeconds: number;
   };
   now: () => number;
-  postIntent: (msg: AutocloseIntentMessage) => void;
+  postIntent: (msg: AutocloseWorkerMessage) => void;
   noteLine: (line: string) => void;
   readinessQuery?: ReadinessQuery;
+  isPidAlive?: (pid: number) => boolean;
+  readStartTime?: (pid: number) => string | null;
 }
 
 /** Read the autopilot `paused` flag off the singleton `autopilot_state` row.
@@ -592,7 +696,23 @@ export async function autoclosePulse(
     return;
   }
 
-  const { reaps, graceMap } = computeAutocloseReaps({
+  const processIdentityByJobId = new Map<
+    string,
+    "alive" | "dead" | "recycled" | "unknown"
+  >();
+  const alive = deps.isPidAlive ?? isPidAlive;
+  const readStart = deps.readStartTime ?? readOsStartTime;
+  for (const job of jobs) {
+    processIdentityByJobId.set(
+      job.job_id,
+      classifyProcessIdentity(job.pid, job.start_time, {
+        isPidAlive: alive,
+        readStartTime: readStart,
+      }),
+    );
+  }
+
+  const { reaps, claimReleases, graceMap } = computeAutocloseReaps({
     jobs,
     readiness,
     escalationDone,
@@ -601,9 +721,15 @@ export async function autoclosePulse(
     config,
     autopilotPaused,
     now,
+    activityByJobId: inputs.harnessActivityByJobId,
+    dispatchClaims: inputs.dispatchClaims,
+    processIdentityByJobId,
   });
   state.graceMap = graceMap;
 
+  for (const release of claimReleases) {
+    deps.postIntent(release);
+  }
   for (const decision of reaps) {
     // Post the hint BEFORE the kill so main can label the Killed row; the
     // exit-watcher remains the sole Killed producer.
@@ -662,7 +788,7 @@ function main(): void {
       };
     },
     now: () => Math.floor(Date.now() / 1000),
-    postIntent: (msg: AutocloseIntentMessage): void => {
+    postIntent: (msg: AutocloseWorkerMessage): void => {
       parentPort?.postMessage(msg);
     },
     noteLine: (line: string): void => {

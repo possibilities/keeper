@@ -10,9 +10,9 @@ import { expect, test } from "bun:test";
 import {
   AUTOCLOSE_IDLE_MS,
   AUTOCLOSE_MAX_KILLS_PER_PULSE,
-  type AutocloseIntentMessage,
   type AutocloseJob,
   type AutoclosePulseState,
+  type AutocloseWorkerMessage,
   autoclosePulse,
   type ComputeAutocloseReapsArgs,
   computeAutocloseReaps,
@@ -41,7 +41,7 @@ const autopilotWork = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_type: "tmux",
   backend_exec_pane_id: "%1",
   backend_exec_birth_session_id: "autopilot",
-  backend_exec_generation_id: "gen-1",
+  backend_exec_generation_id: "101:1001",
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -72,7 +72,7 @@ const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_type: "tmux",
   backend_exec_pane_id: "%3",
   backend_exec_birth_session_id: "panels",
-  backend_exec_generation_id: "gen-3",
+  backend_exec_generation_id: "103:1003",
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -96,7 +96,7 @@ const escalationSession = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_type: "tmux",
   backend_exec_pane_id: "%4",
   backend_exec_birth_session_id: "autopilot",
-  backend_exec_generation_id: "gen-4",
+  backend_exec_generation_id: "104:1004",
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: 500,
@@ -107,7 +107,7 @@ const escalationSession = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
  *  managed ("autopilot") session. */
 const escalationPane = (over: Partial<PaneInfo> = {}): PaneInfo =>
   pane({
-    tmuxGenerationId: "gen-4",
+    tmuxGenerationId: "104:1004",
     paneId: "%4",
     windowId: "@4",
     windowName: "unblock::fn-1-x.2",
@@ -116,7 +116,7 @@ const escalationPane = (over: Partial<PaneInfo> = {}): PaneInfo =>
 
 /** A swept pane matching a job's pane id and tmux generation. */
 const pane = (over: Partial<PaneInfo> = {}): PaneInfo => ({
-  tmuxGenerationId: "gen-1",
+  tmuxGenerationId: "101:1001",
   paneId: "%1",
   windowId: "@1",
   currentCommand: "claude",
@@ -190,6 +190,117 @@ test("IN: autopilot close, completed via perCloseRow (epic id), past grace → r
   expect(reaps[0]).toMatchObject({ bucket: "autopilot", ref: "fn-1-x" });
 });
 
+test("autopilot cleanup releases the exact bound claim before starting grace", () => {
+  const job = autopilotWork();
+  const claim = {
+    verb: "work",
+    id: "fn-1-x.2",
+    attempt_id: 41,
+    state: "bound",
+    session_id: "j-work",
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: 2,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 2,
+    updated_at: 2,
+  };
+  const result = run({
+    jobs: [job],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+    activityByJobId: new Map([
+      [
+        "j-work",
+        {
+          status: "quiescent" as const,
+          reason: "parent-quiescent" as const,
+          reservation: null,
+        },
+      ],
+    ]),
+    processIdentityByJobId: new Map([["j-work", "alive"]]),
+    dispatchClaims: [claim],
+  });
+  expect(result.reaps).toEqual([]);
+  expect(result.graceMap.has("j-work")).toBe(false);
+  expect(result.claimReleases).toEqual([
+    {
+      kind: "autoclose-claim-release",
+      verb: "work",
+      id: "fn-1-x.2",
+      expectedAttemptId: 41,
+      sessionId: "j-work",
+    },
+  ]);
+
+  const released = run({
+    jobs: [job],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+    activityByJobId: new Map([
+      [
+        "j-work",
+        {
+          status: "quiescent" as const,
+          reason: "parent-quiescent" as const,
+          reservation: null,
+        },
+      ],
+    ]),
+    processIdentityByJobId: new Map([["j-work", "alive"]]),
+    dispatchClaims: [{ ...claim, state: "released", released_at: NOW - 40 }],
+  });
+  expect(released.claimReleases).toEqual([]);
+  expect(released.reaps.map((decision) => decision.jobId)).toEqual(["j-work"]);
+});
+
+test("renewed activity, unknown probes, and recycled pids cancel autoclose", () => {
+  const base = {
+    jobs: [autopilotWork()],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+  };
+  for (const activity of [
+    {
+      status: "active" as const,
+      reason: "main-turn" as const,
+      reservation: null,
+    },
+    {
+      status: "unknown" as const,
+      reason: "child-evidence-stale" as const,
+      reservation: null,
+    },
+  ]) {
+    const result = run({
+      ...base,
+      activityByJobId: new Map([["j-work", activity]]),
+    });
+    expect(result.reaps).toEqual([]);
+    expect(result.graceMap.has("j-work")).toBe(false);
+  }
+  for (const identity of ["unknown", "recycled"] as const) {
+    const result = run({
+      ...base,
+      activityByJobId: new Map([
+        [
+          "j-work",
+          {
+            status: "quiescent" as const,
+            reason: "parent-quiescent" as const,
+            reservation: null,
+          },
+        ],
+      ]),
+      processIdentityByJobId: new Map([["j-work", identity]]),
+    });
+    expect(result.reaps).toEqual([]);
+  }
+});
+
 test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
   const { reaps } = run({
     jobs: [panelLeg()],
@@ -197,7 +308,7 @@ test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
     readiness: { perTask: new Map(), perCloseRow: new Map() },
     panes: [
       pane({
-        tmuxGenerationId: "gen-3",
+        tmuxGenerationId: "103:1003",
         paneId: "%3",
         windowId: "@3",
         sessionName: "panels",
@@ -448,7 +559,7 @@ test("OUT: dead pane (pane_dead = 1) → never reaped", () => {
 test("OUT: tmux generation mismatch → never reaped", () => {
   const { reaps } = run({
     jobs: [autopilotWork()],
-    panes: [pane({ tmuxGenerationId: "other-gen" })],
+    panes: [pane({ tmuxGenerationId: "999:9999" })],
     graceMap: elapsed("j-work"),
   });
   expect(reaps).toHaveLength(0);
@@ -504,7 +615,7 @@ test("paused suspends the autopilot bucket but NOT the panel bucket", () => {
     panes: [
       pane(),
       pane({
-        tmuxGenerationId: "gen-3",
+        tmuxGenerationId: "103:1003",
         paneId: "%3",
         windowId: "@3",
         sessionName: "panels",
@@ -730,15 +841,15 @@ test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", as
         last_input_request_at, last_permission_prompt_at, pid, start_time)
      VALUES
        ('paneljob', 1, 1, 'stopped', 'panel::claude::q1', NULL, NULL,
-        NULL, 'tmux', '%9', 'panels', 'gen-9', NULL, NULL, 4242, '55')`,
+        NULL, 'tmux', '%9', 'panels', '109:1009', NULL, NULL, 4242, '55')`,
   );
 
   const killed: string[] = [];
-  const intents: AutocloseIntentMessage[] = [];
+  const intents: AutocloseWorkerMessage[] = [];
   const backend = {
     listPanes: async (): Promise<PaneInfo[] | null> => [
       pane({
-        tmuxGenerationId: "gen-9",
+        tmuxGenerationId: "109:1009",
         paneId: "%9",
         windowId: "@9",
         sessionName: "panels",
@@ -758,7 +869,7 @@ test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", as
   const deps = {
     resolveConfig: () => CONFIG,
     now: () => clock,
-    postIntent: (m: AutocloseIntentMessage) => intents.push(m),
+    postIntent: (m: AutocloseWorkerMessage) => intents.push(m),
     noteLine: () => {},
   };
 
@@ -816,7 +927,7 @@ test("autoclosePulse: disabled config kills nothing and clears grace state", asy
 // Pulse smoke test — escalation bucket done-signal against the real tables
 // ---------------------------------------------------------------------------
 
-/** Seed an UNPAUSED autopilot + one stopped escalation session (pane %9 / gen-9,
+/** Seed an UNPAUSED autopilot + one stopped escalation session (pane %9 / 109:1009,
  *  in the managed "autopilot" session). The escalation bucket is pause-suspended,
  *  so the state row must exist with paused=0. */
 const seedEscalationPulse = (
@@ -836,7 +947,7 @@ const seedEscalationPulse = (
         escalation_instance)
      VALUES
        ('escaljob', 1, 1, 'stopped', ?, ?, ?,
-        'escalation', 'tmux', '%9', 'autopilot', 'gen-9', NULL, NULL, 4242, '55',
+        'escalation', 'tmux', '%9', 'autopilot', '109:1009', NULL, NULL, 4242, '55',
         ?)`,
     [`${opts.verb}::${opts.ref}`, opts.verb, opts.ref, opts.instance],
   );
@@ -845,7 +956,7 @@ const seedEscalationPulse = (
 const escalationBackend = (killed: string[], windowName: string) => ({
   listPanes: async (): Promise<PaneInfo[] | null> => [
     pane({
-      tmuxGenerationId: "gen-9",
+      tmuxGenerationId: "109:1009",
       paneId: "%9",
       windowId: "@9",
       sessionName: "autopilot",
@@ -882,11 +993,11 @@ test("autoclosePulse: an errored jobs read defers reaping and preserves grace", 
         last_input_request_at, last_permission_prompt_at, pid, start_time)
      VALUES
        ('paneljob', 1, 1, 'stopped', 'panel::claude::q1', NULL, NULL,
-        NULL, 'tmux', '%9', 'panels', 'gen-9', NULL, NULL, 4242, '55')`,
+        NULL, 'tmux', '%9', 'panels', '109:1009', NULL, NULL, 4242, '55')`,
   );
 
   const killed: string[] = [];
-  const intents: AutocloseIntentMessage[] = [];
+  const intents: AutocloseWorkerMessage[] = [];
   const state: AutoclosePulseState = {
     graceMap: new Map([["paneljob", 1]]),
   };
@@ -895,7 +1006,7 @@ test("autoclosePulse: an errored jobs read defers reaping and preserves grace", 
     {
       listPanes: async () => [
         pane({
-          tmuxGenerationId: "gen-9",
+          tmuxGenerationId: "109:1009",
           paneId: "%9",
           windowId: "@9",
           sessionName: "panels",
@@ -929,14 +1040,14 @@ test("autoclosePulse: a due unblock session whose block instance is resolved is 
   // No block_escalations row carries blocked_since=500 → the instance is resolved.
 
   const killed: string[] = [];
-  const intents: AutocloseIntentMessage[] = [];
+  const intents: AutocloseWorkerMessage[] = [];
   const backend = escalationBackend(killed, "unblock::fn-x.2");
   let clock = 1000;
   const state: AutoclosePulseState = { graceMap: new Map() };
   const deps = {
     resolveConfig: () => CONFIG,
     now: () => clock,
-    postIntent: (m: AutocloseIntentMessage) => intents.push(m),
+    postIntent: (m: AutocloseWorkerMessage) => intents.push(m),
     noteLine: () => {},
   };
 

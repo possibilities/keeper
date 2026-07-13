@@ -129,8 +129,12 @@ async function resolveNativeMain(
         version: "9.9.9",
       });
   }
+  // The daemon descriptor routes to the restart leaf in keeper.ts; test that
+  // real handler rather than inventing a cli/daemon.ts module.
   if (name === "daemon") {
-    return (await import("../cli/restart.ts")).main;
+    const restartMain = (await import("../cli/restart.ts")).main;
+    return (argv) =>
+      restartMain(argv[0] === "restart" ? argv : ["restart", ...argv]);
   }
   const mod = (await import(`../cli/${name}.ts`)) as {
     main: (argv: string[]) => unknown;

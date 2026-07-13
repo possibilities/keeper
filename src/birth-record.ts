@@ -31,6 +31,11 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { HARNESS_DESCRIPTORS, isHarnessName } from "./agent/harness";
+import {
+  DISPATCH_ATTEMPT_ENV,
+  parseDispatchAttemptCarrier,
+} from "./dispatch-command";
 import { execBackendEnvMeta, isDefaultTmuxEnvValue } from "./exec-backend";
 
 /** Bumped only on an incompatible birth-record shape change; the ingest worker
@@ -75,6 +80,9 @@ export interface BirthRecord {
   launch_ts: string;
   /** Harness-native resume id, or null when back-filled later. */
   resume_target: string | null;
+  /** Exact Dispatch attempt carried by a capable lifecycle adapter, or null for
+   *  manual, legacy, malformed, and capability-absent launches. */
+  dispatch_attempt_id: number | null;
 }
 
 /** The record MINUS the two post-spawn fields the launcher cannot know until it
@@ -152,6 +160,14 @@ export function parseBirthRecord(line: string): BirthRecord | null {
     worktree: o.worktree,
     launch_ts: o.launch_ts,
     resume_target: o.resume_target,
+    // Additive compatibility: records from a producer without this carrier
+    // remain valid and fold as unfenced evidence.
+    dispatch_attempt_id:
+      typeof o.dispatch_attempt_id === "number" &&
+      Number.isSafeInteger(o.dispatch_attempt_id) &&
+      o.dispatch_attempt_id > 0
+        ? o.dispatch_attempt_id
+        : null,
   };
 }
 
@@ -293,6 +309,11 @@ export function buildBirthDraft(
     worktree: birthWorktreeFromEnv(env),
     launch_ts: inputs.launch_ts,
     resume_target: inputs.resume_target,
+    dispatch_attempt_id:
+      isHarnessName(inputs.harness) &&
+      HARNESS_DESCRIPTORS[inputs.harness].carriesDispatchAttempt
+        ? parseDispatchAttemptCarrier(env[DISPATCH_ATTEMPT_ENV])
+        : null,
   };
 }
 

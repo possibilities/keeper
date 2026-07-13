@@ -17,6 +17,33 @@
  */
 import { REPO_TOKEN_RE } from "./derivers";
 
+/** Environment carrier for an exact Dispatch attempt. The value is an opaque,
+ * positive safe integer rendered as decimal; an empty or malformed value means
+ * no fenced attempt evidence. */
+export const DISPATCH_ATTEMPT_ENV = "KEEPER_DISPATCH_ATTEMPT_ID";
+
+/** Parse the bounded environment form of a Dispatch-attempt identity. */
+export function parseDispatchAttemptCarrier(
+  value: string | undefined,
+): number | null {
+  if (value === undefined || !/^[1-9]\d{0,15}$/.test(value)) {
+    return null;
+  }
+  const attemptId = Number(value);
+  return Number.isSafeInteger(attemptId) ? attemptId : null;
+}
+
+/** Render a Dispatch-attempt identity for an argv-safe `KEY=VALUE` carrier. */
+export function formatDispatchAttemptCarrier(
+  attemptId: number | undefined,
+): string {
+  return attemptId !== undefined &&
+    Number.isSafeInteger(attemptId) &&
+    attemptId > 0
+    ? String(attemptId)
+    : "";
+}
+
 // ---------------------------------------------------------------------------
 // `${verb}::${id}` composite-key validator
 // ---------------------------------------------------------------------------

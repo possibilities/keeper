@@ -321,7 +321,10 @@ export function evaluateDurableAwaitConditions(
     inputs.epics,
   );
   const runningJobs: DrainedJob[] = [...inputs.jobs.values()]
-    .filter((job) => job.state === "working")
+    .filter(
+      (job) =>
+        inputs.harnessActivityByJobId.get(job.job_id)?.status !== "quiescent",
+    )
     .map((job) => ({
       jobId: job.job_id,
       dispatchOrigin: job.dispatch_origin,
@@ -379,7 +382,12 @@ export function evaluateDurableAwaitConditions(
       case "agents-idle": {
         const root = asNonEmptyString(condition.git_root);
         if (root === null) return "unknown";
-        state = agentsIdleState(root, null, inputs.jobs.values());
+        state = agentsIdleState(
+          root,
+          null,
+          inputs.jobs.values(),
+          inputs.harnessActivityByJobId,
+        );
         break;
       }
       case "drained": {

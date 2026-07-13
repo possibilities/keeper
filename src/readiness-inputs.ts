@@ -30,14 +30,34 @@ import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
 import { orderEpicsForScheduling, type PendingDispatch } from "./readiness";
 import {
-  collapseSubagentsByName,
   projectGitStatusByProjectDir,
   projectPendingDispatches,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
+import {
+  deriveHarnessActivities,
+  type HarnessActivity,
+} from "./session-activity";
+import { canonicalSubagentInvocations } from "./subagent-invocations";
 import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 
 export type ReadinessQuery = typeof runQuery;
+
+export interface DispatchClaim {
+  verb: string;
+  id: string;
+  attempt_id: number | null;
+  state: string;
+  session_id: string | null;
+  dir: string | null;
+  legacy_unfenced: number;
+  acquired_at: number;
+  bound_at: number | null;
+  resume_acknowledged_at: number | null;
+  released_at: number | null;
+  last_event_id: number;
+  updated_at: number;
+}
 
 /**
  * The DB-sourced argument set both readiness consumers feed to
@@ -63,6 +83,10 @@ export interface ReadinessInputs {
   /** Open `pending_dispatches` rows (launched-but-not-yet-bound workers), built
    *  through the SOLE `projectPendingDispatches` builder. */
   pendingDispatches: PendingDispatch[];
+  /** Durable Dispatch claims remain separate from launch-window reservations. */
+  dispatchClaims: DispatchClaim[];
+  /** Canonical Harness activity keyed by Harness session id. */
+  harnessActivityByJobId: Map<string, HarnessActivity>;
   /** The per-root git-seed gate: roots whose live-only git surface is unseeded
    *  (post-restart, pre-seed). EMPTY whenever `seed_required` is clear. A plain
    *  `Set` (not `ReadonlySet`) so it drops straight into the reconciler's snapshot
@@ -83,6 +107,7 @@ export interface ReadinessInputs {
 export function loadReadinessInputs(
   db: Database,
   query: ReadinessQuery = runQuery,
+  now: number = Math.floor(Date.now() / 1000),
 ): ReadinessInputs {
   let readinessDegraded = false;
   const read = (collection: string): Record<string, unknown>[] => {
@@ -131,9 +156,9 @@ export function loadReadinessInputs(
     jobs.set(row.job_id, row);
   }
 
-  const subagentInvocations = collapseSubagentsByName(
+  const subagentInvocations = canonicalSubagentInvocations(
     read("subagent_invocations") as unknown as SubagentInvocation[],
-  ).map((g) => g.row);
+  );
 
   const gitStatusByProjectDir = projectGitStatusByProjectDir(
     read("git") as unknown as GitStatus[],
@@ -143,6 +168,25 @@ export function loadReadinessInputs(
   // paths agree on the launch-window occupancy set.
   const pendingDispatches = projectPendingDispatches(
     read("pending_dispatches"),
+  );
+  const dispatchClaims = read("dispatch_claims") as unknown as DispatchClaim[];
+  const reservationByJobId = new Map<string, "bound" | "resume">();
+  for (const claim of dispatchClaims) {
+    if (claim.session_id == null || claim.state === "released") continue;
+    if (claim.state === "resume_requested") {
+      reservationByJobId.set(claim.session_id, "resume");
+      continue;
+    }
+    const job = jobs.get(claim.session_id);
+    if (claim.state === "bound" && job?.active_since == null) {
+      reservationByJobId.set(claim.session_id, "bound");
+    }
+  }
+  const harnessActivityByJobId = deriveHarnessActivities(
+    jobs.values(),
+    subagentInvocations,
+    now,
+    reservationByJobId,
   );
 
   // The per-root dispatch concurrency count N is the EFFECTIVE cap derived from
@@ -173,6 +217,8 @@ export function loadReadinessInputs(
     subagentInvocations,
     gitStatusByProjectDir,
     pendingDispatches,
+    dispatchClaims,
+    harnessActivityByJobId,
     unseededRoots,
     maxConcurrentPerRoot,
   };

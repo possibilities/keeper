@@ -54,6 +54,11 @@ import {
   type PendingDispatch,
   type Verdict,
 } from "./readiness";
+import type { DispatchClaim } from "./readiness-inputs";
+import {
+  deriveHarnessActivity,
+  type HarnessActivity,
+} from "./session-activity";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 import {
   CLOSE_SINK_ID,
@@ -500,6 +505,13 @@ export const ESCALATION_EFFORT = "high" as const;
  * {model, effort} `work` plugin); null/absent leaves it off (the byte-unchanged
  * cell-less default). Pure — exported for tests.
  */
+export function withDispatchAttempt(
+  spec: LaunchSpec,
+  attemptId: number,
+): LaunchSpec {
+  return { ...spec, dispatchAttemptId: attemptId };
+}
+
 export function buildPlannedLaunchSpec(
   verb: Verb,
   id: string,
@@ -735,6 +747,12 @@ export interface ReconcileSnapshot {
    * (same-key dedup vs cross-sibling demotion — both needed).
    */
   liveTabKeys: Set<DispatchKey>;
+  /** Durable current Dispatch claim keyed by `verb::id`, including released fences. */
+  dispatchClaims?: ReadonlyMap<DispatchKey, DispatchClaim>;
+  /** Canonical Harness activity keyed by Harness session id. */
+  harnessActivityByJobId?: ReadonlyMap<string, HarnessActivity>;
+  /** Exact live-resource observation for each job. Unknown/conflict block teardown. */
+  resourceHoldByJobId?: ReadonlyMap<string, ResourceHoldObservation>;
   /**
    * The LIVE backend pane ids from the read-time `listPanes()` probe, used to
    * gate the `stopped` arm of {@link isOccupyingJob}: a stopped job whose
@@ -1327,6 +1345,8 @@ export interface WorktreeLaunchInfo {
    * sink (always base).
    */
   parentBranch: string;
+  /** False when an exact Resource hold still protects this epic's lanes. */
+  teardownAllowed?: boolean;
 }
 
 /**
@@ -1546,6 +1566,83 @@ export function verbForVerdict(
  * predicate never probes the backend itself (and folds never read liveness —
  * re-fold determinism is sacrosanct). Returns on first match.
  */
+export function dispatchClaimBlocksReplacement(
+  claim: DispatchClaim | undefined,
+): boolean {
+  return claim !== undefined && claim.state !== "released";
+}
+
+export function dispatchTargetHasActivityCollision(
+  jobs: Map<string, Job>,
+  activityByJobId: ReadonlyMap<string, HarnessActivity>,
+  verb: Verb | "resolve",
+  id: string,
+): boolean {
+  for (const job of jobs.values()) {
+    if (job.plan_verb !== verb || job.plan_ref !== id) continue;
+    const activity =
+      activityByJobId.get(job.job_id) ?? deriveHarnessActivity({ parent: job });
+    if (activity.status !== "quiescent") return true;
+  }
+  return false;
+}
+
+export function dispatchTargetIsOwned(
+  snapshot: Pick<
+    ReconcileSnapshot,
+    "jobs" | "dispatchClaims" | "harnessActivityByJobId" | "livePaneIds"
+  >,
+  verb: Verb | "resolve",
+  id: string,
+): boolean {
+  if (
+    snapshot.dispatchClaims === undefined &&
+    snapshot.harnessActivityByJobId === undefined
+  ) {
+    return isOccupyingJob(snapshot.jobs, verb, id, snapshot.livePaneIds);
+  }
+  return (
+    dispatchClaimBlocksReplacement(
+      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
+    ) ||
+    dispatchTargetHasActivityCollision(
+      snapshot.jobs,
+      snapshot.harnessActivityByJobId ?? new Map(),
+      verb,
+      id,
+    )
+  );
+}
+
+export type ResourceHoldObservation =
+  | { status: "held"; paneId: string; generationId: string }
+  | { status: "clear" }
+  | { status: "unknown" | "conflict"; reason: string };
+
+/**
+ * Resource teardown is stricter than logical activity. Every matching work/close
+ * owner must have a positive clear observation; a live hold, malformed identity,
+ * generation conflict, or degraded probe blocks destruction.
+ */
+export function epicResourceTeardownBlocked(
+  epic: Epic,
+  jobs: Map<string, Job>,
+  observations: ReadonlyMap<string, ResourceHoldObservation> | undefined,
+): boolean {
+  if (observations === undefined) return true;
+  const taskIds = new Set(epic.tasks.map((task) => task.task_id));
+  for (const job of jobs.values()) {
+    const matches =
+      (job.plan_verb === "close" && job.plan_ref === epic.epic_id) ||
+      (job.plan_verb === "work" &&
+        job.plan_ref != null &&
+        taskIds.has(job.plan_ref));
+    if (!matches) continue;
+    if (observations.get(job.job_id)?.status !== "clear") return true;
+  }
+  return false;
+}
+
 export function isOccupyingJob(
   jobs: Map<string, Job>,
   // `Verb | "resolve"`: the reconciler's own dispatch verbs PLUS the daemon's
@@ -1965,16 +2062,38 @@ export function isEpicInFlight(
   jobs: Map<string, Job>,
   liveTabKeys: Set<DispatchKey>,
   livePaneIds: ReadonlySet<string> | null,
+  dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> = new Map(),
+  harnessActivityByJobId: ReadonlyMap<string, HarnessActivity> = new Map(),
 ): boolean {
   if (
-    isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds) ||
+    (dispatchClaims.size === 0 && harnessActivityByJobId.size === 0
+      ? isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds)
+      : dispatchClaimBlocksReplacement(
+          dispatchClaims.get(dispatchKey("close", epic.epic_id)),
+        ) ||
+        dispatchTargetHasActivityCollision(
+          jobs,
+          harnessActivityByJobId,
+          "close",
+          epic.epic_id,
+        )) ||
     liveTabKeys.has(dispatchKey("close", epic.epic_id))
   ) {
     return true;
   }
   for (const task of epic.tasks) {
     if (
-      isOccupyingJob(jobs, "work", task.task_id, livePaneIds) ||
+      (dispatchClaims.size === 0 && harnessActivityByJobId.size === 0
+        ? isOccupyingJob(jobs, "work", task.task_id, livePaneIds)
+        : dispatchClaimBlocksReplacement(
+            dispatchClaims.get(dispatchKey("work", task.task_id)),
+          ) ||
+          dispatchTargetHasActivityCollision(
+            jobs,
+            harnessActivityByJobId,
+            "work",
+            task.task_id,
+          )) ||
       liveTabKeys.has(dispatchKey("work", task.task_id))
     ) {
       return true;
@@ -2171,17 +2290,29 @@ export function reconcile(
   // drift. `budget` is the remaining admittance for NEWLY-planned launches; a
   // `null` cap is a fast-path bypass. Strict `budget > 0`: cap=1 occupied=1 →
   // admit nothing.
-  let occupied = 0;
-  for (const verdict of readiness.perTask.values()) {
+  const occupiedKeys = new Set<DispatchKey>();
+  for (const [id, verdict] of readiness.perTask) {
     if (isRootOccupant(verdict)) {
-      occupied++;
+      occupiedKeys.add(dispatchKey("work", id));
     }
   }
-  for (const verdict of readiness.perCloseRow.values()) {
+  for (const [id, verdict] of readiness.perCloseRow) {
     if (isRootOccupant(verdict)) {
-      occupied++;
+      occupiedKeys.add(dispatchKey("close", id));
     }
   }
+  for (const job of snapshot.jobs.values()) {
+    if (job.plan_verb !== "work" && job.plan_verb !== "close") continue;
+    if (job.plan_ref == null || job.plan_ref === "") continue;
+    const activity = snapshot.harnessActivityByJobId?.get(job.job_id);
+    if (
+      activity !== undefined &&
+      (activity.status !== "quiescent" || activity.reservation !== null)
+    ) {
+      occupiedKeys.add(dispatchKey(job.plan_verb, job.plan_ref));
+    }
+  }
+  const occupied = occupiedKeys.size;
   const cap = state.maxConcurrentJobs;
   let budget =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - occupied);
@@ -2240,7 +2371,7 @@ export function reconcile(
       if (snapshot.failedKeys.has(key)) {
         continue;
       }
-      if (isOccupyingJob(snapshot.jobs, verb, taskId, snapshot.livePaneIds)) {
+      if (dispatchTargetIsOwned(snapshot, verb, taskId)) {
         continue;
       }
       if (snapshot.liveTabKeys.has(key)) {
@@ -2408,12 +2539,7 @@ export function reconcile(
         !state.paused &&
         !state.inFlight.has(closeKey) &&
         !snapshot.failedKeys.has(closeKey) &&
-        !isOccupyingJob(
-          snapshot.jobs,
-          closeVerb,
-          epicId,
-          snapshot.livePaneIds,
-        ) &&
+        !dispatchTargetIsOwned(snapshot, closeVerb, epicId) &&
         // Standing dedup arm: a live `close::<epic>` tab proves a launched closer
         // occupies the slot before its SessionStart binds.
         !snapshot.liveTabKeys.has(closeKey) &&
@@ -2442,6 +2568,8 @@ export function reconcile(
             snapshot.jobs,
             snapshot.liveTabKeys,
             snapshot.livePaneIds,
+            snapshot.dispatchClaims ?? new Map(),
+            snapshot.harnessActivityByJobId ?? new Map(),
           )
         ) &&
         // Cross-epic merge-gate: suppress the single plan-close while ANY of the
@@ -2536,11 +2664,16 @@ export function reconcile(
     const finalizeEpicIds = new Set<string>();
     for (const epic of snapshot.epics) {
       const epicId = epic.epic_id;
-      if (
-        isOccupyingJob(snapshot.jobs, "close", epicId, snapshot.livePaneIds)
-      ) {
-        continue;
-      }
+      const closeIsActive =
+        snapshot.harnessActivityByJobId === undefined
+          ? isOccupyingJob(snapshot.jobs, "close", epicId, snapshot.livePaneIds)
+          : dispatchTargetHasActivityCollision(
+              snapshot.jobs,
+              snapshot.harnessActivityByJobId,
+              "close",
+              epicId,
+            );
+      if (closeIsActive) continue;
       if (
         completedRowIds.has(epicId) ||
         closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds)
@@ -2556,6 +2689,25 @@ export function reconcile(
       worktreeSinkProvision,
       worktreeGeometry.byEpicId,
     );
+    const epicById = new Map(
+      snapshot.epics.map((epic) => [epic.epic_id, epic]),
+    );
+    for (const info of worktreeFinalize) {
+      const prefix = "keeper/epic/";
+      const epicId = info.baseBranch.startsWith(prefix)
+        ? info.baseBranch.slice(prefix.length)
+        : info.baseBranch;
+      const epic = epicById.get(epicId);
+      info.teardownAllowed =
+        epic !== undefined &&
+        (snapshot.resourceHoldByJobId === undefined
+          ? !epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)
+          : !epicResourceTeardownBlocked(
+              epic,
+              snapshot.jobs,
+              snapshot.resourceHoldByJobId,
+            ));
+    }
   }
 
   // Slot-occupancy visibility + auto-reclaim: surface (and, when provably dead,

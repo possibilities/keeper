@@ -31,6 +31,7 @@ import {
   type LaunchResult,
 } from "./exec-backend";
 import { resumeTarget } from "./resume-descriptor";
+import { deriveHarnessActivity } from "./session-activity";
 
 /**
  * The minimal `jobs`-row slice a wake reads — decoupled from the full {@link
@@ -59,6 +60,18 @@ export interface WakeCreator {
   /** Harness-native resume target (`jobs.resume_target`) — the token
    *  {@link resumeTarget} returns for a non-claude creator (claude uses `job_id`). */
   resume_target?: string | null;
+  monitors?: unknown;
+  has_live_worker_monitor?: unknown;
+  dispatchClaim?: WakeDispatchClaim | null;
+}
+
+export interface WakeDispatchClaim {
+  verb: string;
+  id: string;
+  attempt_id: number | null;
+  state: string;
+  session_id: string | null;
+  legacy_unfenced: number;
 }
 
 /**
@@ -89,6 +102,8 @@ export interface WakeCooldownRecord {
 export type WakeOutcome =
   | "launched"
   | "already_live"
+  | "claim_conflict"
+  | "acknowledgement_missed"
   | "in_flight"
   | "cooldown"
   | "unknown_creator"
@@ -123,13 +138,28 @@ export function creatorIsLive(
   liveSessionIds: ReadonlySet<string>,
   livePaneIds: ReadonlySet<string> | null,
 ): boolean {
-  if (liveSessionIds.has(job.job_id)) {
-    return true;
+  if (job.dispatchClaim == null) {
+    return (
+      liveSessionIds.has(job.job_id) ||
+      isRunningState(job.state) ||
+      isStoppedPaneLive(job, livePaneIds)
+    );
   }
-  if (isRunningState(job.state)) {
-    return true;
-  }
-  return isStoppedPaneLive(job, livePaneIds);
+  return deriveHarnessActivity({ parent: job }).status !== "quiescent";
+}
+
+export function claimAuthorizesResume(
+  job: WakeCreator,
+  claim: WakeDispatchClaim,
+): boolean {
+  return (
+    claim.attempt_id !== null &&
+    Number.isSafeInteger(claim.attempt_id) &&
+    claim.attempt_id > 0 &&
+    claim.legacy_unfenced === 0 &&
+    claim.session_id === job.job_id &&
+    claim.state !== "released"
+  );
 }
 
 /** The `jobs.state` values that mean "this session is currently alive". A wake
@@ -240,7 +270,14 @@ export interface WakeDeps {
     resumeTarget: string,
     cwd: string,
     harness: string,
+    attemptId?: number,
   ) => Promise<LaunchResult>;
+  /** Persist an exact-attempt resume request before launch. */
+  readonly requestResume?: (claim: WakeDispatchClaim) => boolean;
+  /** Confirm that the resumed lifecycle accepted the exact attempt. */
+  readonly awaitResumeAccepted?: (claim: WakeDispatchClaim) => Promise<boolean>;
+  /** Revoke the old exact attempt after a missed acknowledgement. */
+  readonly revokeAttempt?: (claim: WakeDispatchClaim) => boolean;
   /** Clock (epoch-ms). */
   readonly now: () => number;
   /** Warn sink for non-fatal launch diagnostics. */
@@ -284,6 +321,14 @@ export async function runWake(
     };
   }
   const sessionId = job.job_id;
+  const claim = job.dispatchClaim ?? null;
+  if (claim !== null && !claimAuthorizesResume(job, claim)) {
+    return {
+      outcome: "claim_conflict",
+      sessionId,
+      detail: `creator ${sessionId} does not own an exact resumable Dispatch claim`,
+    };
+  }
 
   if (creatorIsLive(job, deps.liveSessionIds(), deps.livePaneIds())) {
     return {
@@ -314,12 +359,23 @@ export async function runWake(
       };
     }
 
+    if (claim !== null && deps.requestResume !== undefined) {
+      if (!deps.requestResume(claim)) {
+        return {
+          outcome: "claim_conflict",
+          sessionId,
+          detail: `resume request for Dispatch attempt ${claim.attempt_id} was rejected`,
+        };
+      }
+    }
+
     const cwd = job.cwd ?? "";
     const result = await launch(
       AGENTBUS_EXEC_SESSION,
       resumeTarget(job),
       cwd,
       harnessOrClaude(job.harness),
+      claim?.attempt_id ?? undefined,
     );
     if (!result.ok) {
       const failures = (cd?.failures ?? 0) + 1;
@@ -332,6 +388,19 @@ export async function runWake(
         outcome: "launch_failed",
         sessionId,
         detail: `launch failed: ${result.error}`,
+      };
+    }
+
+    if (
+      claim !== null &&
+      deps.awaitResumeAccepted !== undefined &&
+      !(await deps.awaitResumeAccepted(claim))
+    ) {
+      deps.revokeAttempt?.(claim);
+      return {
+        outcome: "acknowledgement_missed",
+        sessionId,
+        detail: `Dispatch attempt ${claim.attempt_id} did not acknowledge resume; replacement remains fenced until revocation folds`,
       };
     }
 
@@ -365,14 +434,20 @@ function defaultWakeLaunch(
   resumeTarget: string,
   cwd: string,
   harness: string,
+  attemptId?: number,
 ) => Promise<LaunchResult> {
-  return (session, target, cwd, harness) =>
+  return (session, target, cwd, harness, attemptId) =>
     keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix: launcherPrefix,
       session,
       cwd,
       label: `wake resume ${harness} ${target}`,
-      spec: { prompt: "", resumeTarget: target, harness },
+      spec: {
+        prompt: "",
+        resumeTarget: target,
+        harness,
+        ...(attemptId === undefined ? {} : { dispatchAttemptId: attemptId }),
+      },
     });
 }

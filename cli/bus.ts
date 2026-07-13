@@ -544,10 +544,25 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
     for (const id of ids) {
       const row = db.db
         .query(
-          "SELECT job_id, cwd, title, state, backend_exec_pane_id, updated_at, harness, resume_target FROM jobs WHERE job_id = ?",
+          "SELECT job_id, cwd, title, state, backend_exec_pane_id, updated_at, harness, resume_target, monitors, has_live_worker_monitor, plan_verb, plan_ref FROM jobs WHERE job_id = ?",
         )
         .get(id) as WakeCreator | null;
       if (row != null) {
+        const keyed = row as WakeCreator & {
+          plan_verb?: string | null;
+          plan_ref?: string | null;
+        };
+        const dispatchClaim =
+          keyed.plan_verb != null && keyed.plan_ref != null
+            ? (db.db
+                .query(
+                  "SELECT verb, id, attempt_id, state, session_id, legacy_unfenced FROM dispatch_claims WHERE verb = ? AND id = ?",
+                )
+                .get(
+                  keyed.plan_verb,
+                  keyed.plan_ref,
+                ) as WakeCreator["dispatchClaim"])
+            : null;
         rows.push({
           job_id: String(row.job_id),
           cwd: row.cwd == null ? null : String(row.cwd),
@@ -563,6 +578,9 @@ function resolveCreatorJobs(epic: string): WakeCreator[] {
           harness: row.harness == null ? null : String(row.harness),
           resume_target:
             row.resume_target == null ? null : String(row.resume_target),
+          monitors: row.monitors,
+          has_live_worker_monitor: row.has_live_worker_monitor,
+          dispatchClaim,
         });
       }
     }

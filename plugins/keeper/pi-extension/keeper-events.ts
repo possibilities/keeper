@@ -173,6 +173,9 @@ export interface PiTranslateMeta {
   /** Event timestamp in Unix SECONDS (the live fire instant — this is a live
    *  channel, not a replay tail, so wall-clock at emit is authoritative). */
   tsSec: number;
+  /** Exact Dispatch attempt carried by the launch adapter. Omitted for manual,
+   *  legacy, or malformed metadata. */
+  dispatchAttemptId?: number;
   /** Harness-armed background resources reflected on Stop as ambient monitors. */
   backgroundTasks?: AmbientBusWatchTask[];
 }
@@ -187,6 +190,30 @@ export type PiEventBindings = Record<string, string | number | null>;
  * valid-JSON envelope, so `data` is ALWAYS parseable (the fold JSON-parses it).
  */
 const MAX_DATA_BYTES = 16_384;
+
+/** Parse Pi's local copy of the bounded Dispatch-attempt environment contract.
+ * This isolated extension cannot import keeper source; every malformed shape
+ * degrades to absent evidence. */
+export function piDispatchAttemptFromEnv(
+  env: NodeJS.ProcessEnv,
+): number | null {
+  const raw = env.KEEPER_DISPATCH_ATTEMPT_ID;
+  if (raw === undefined || !/^[1-9]\d{0,15}$/.test(raw)) {
+    return null;
+  }
+  const attemptId = Number(raw);
+  return Number.isSafeInteger(attemptId) ? attemptId : null;
+}
+
+function dispatchAttemptPayload(
+  meta: PiTranslateMeta,
+): { dispatch_attempt_id: number } | Record<string, never> {
+  return meta.dispatchAttemptId !== undefined &&
+    Number.isSafeInteger(meta.dispatchAttemptId) &&
+    meta.dispatchAttemptId > 0
+    ? { dispatch_attempt_id: meta.dispatchAttemptId }
+    : {};
+}
 
 /** JSON-encode a hook-shaped payload, bounded: over {@link MAX_DATA_BYTES} we
  *  fall back to a minimal `{hook_event_name, truncated}` envelope so the result
@@ -244,6 +271,7 @@ export function piEventBindings(
         ...base("UserPromptSubmit", "user_prompt_submit"),
         data: boundedData("UserPromptSubmit", {
           hook_event_name: "UserPromptSubmit",
+          ...dispatchAttemptPayload(meta),
         }),
       };
     case "agent_end":
@@ -251,6 +279,7 @@ export function piEventBindings(
         ...base("Stop", "stop"),
         data: boundedData("Stop", {
           hook_event_name: "Stop",
+          ...dispatchAttemptPayload(meta),
           ...(meta.backgroundTasks === undefined
             ? {}
             : { background_tasks: meta.backgroundTasks }),
@@ -267,6 +296,7 @@ export function piEventBindings(
         // data in a valid NDJSON line, never interpolated anywhere).
         data: boundedData("PreToolUse", {
           hook_event_name: "PreToolUse",
+          ...dispatchAttemptPayload(meta),
           tool_name: toolName,
           tool_input: event.input ?? null,
         }),
@@ -280,6 +310,7 @@ export function piEventBindings(
         tool_name: toolName,
         data: boundedData("PostToolUse", {
           hook_event_name: "PostToolUse",
+          ...dispatchAttemptPayload(meta),
           tool_name: toolName,
           is_error: event.isError === true,
         }),
@@ -295,7 +326,10 @@ export function piEventBindings(
       }
       return {
         ...base("SessionEnd", "session_end"),
-        data: boundedData("SessionEnd", { hook_event_name: "SessionEnd" }),
+        data: boundedData("SessionEnd", {
+          hook_event_name: "SessionEnd",
+          ...dispatchAttemptPayload(meta),
+        }),
       };
     default:
       // Unknown / unmapped event kind — a no-op, never an error. Keeps the
@@ -770,6 +804,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     }
     const pid = process.pid;
     const cwd = process.cwd();
+    const dispatchAttemptId = piDispatchAttemptFromEnv(process.env);
     const busInbox =
       typeof pi.sendMessage === "function"
         ? new PiBusInboxController({
@@ -787,6 +822,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
           pid,
           cwd,
           tsSec: Date.now() / 1000,
+          ...(dispatchAttemptId == null ? {} : { dispatchAttemptId }),
           ...(event.type === "agent_end" && busInbox !== null
             ? {
                 backgroundTasks: [busInbox.ambientTask()].filter(

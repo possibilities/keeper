@@ -194,6 +194,36 @@ task's assigned worker cell through the committed equivalence map at launch. The
 override's observability contract: an untranslatable cell spikes a visible sticky rather
 than silently starving the board or falling back to the wrong provider family.
 
+## Lifecycle evidence diagnostics
+
+`bun scripts/audit-session-activity.ts --db <snapshot> --limit <n>` is the offline, read-only view of
+Harness activity, Dispatch attempts, Dispatch claims, and their classification deltas. Its reasons are diagnostic
+values, not shared-envelope codes. Follow up by identifier; never infer activity from a pane, pid, path,
+or title alone.
+
+| output / reason | meaning | recovery |
+| --------------- | ------- | -------- |
+| `child-evidence-incomplete`, `resource-evidence-incomplete`, `parent-state-incomplete` | Harness activity is `unknown` because required projected evidence is absent, malformed, or contradictory. Capacity, conflicting dispatch, autoclose, finalize, and destructive cleanup fail closed. | Check projection health and the named session's recent lifecycle events. Repair the producer or replay a dead letter when one is present, then take a fresh snapshot; do not force the session quiescent. |
+| `child-evidence-stale`, `resource-evidence-stale` | An open child or work-bearing resource has not supplied freshness evidence, so elapsed time cannot prove idle. | Confirm the exact child/resource identity. If it is live, restore its event producer; if positively dead, let the normal exit/reconcile path record terminal evidence. Re-run the audit on a fresh snapshot. |
+| `stale_attempts` / `stale-pending` | A Dispatch attempt remains pending beyond the launch-window ceiling. A delayed start does not gain authority unless its attempt identity still matches the current Dispatch claim. | Inspect the target's `pending_dispatches`, `dispatch_claims`, and dispatch-failure row. Let the expiry/reconciler path fence it; retry a sticky failure only after confirming no current exact Dispatch claim or live activity owns the target. |
+| provisional or absent cut/clean settlement | Provider transcript evidence has not crossed its terminal settlement boundary. An intermediate cut cannot stop the parent or unlock lifecycle consumers. | Preserve the complete transcript tail and restore the transcript worker/read path. A later clean terminal record settles the same invocation; a torn partial line is ignored rather than repaired by hand. |
+| `legacy-unfenced` | The session has no exact Dispatch attempt identity. It may still carry Harness activity and a Resource hold, but cannot acquire or consume a newer exact Dispatch claim. | Let the session reach a positive terminal boundary. Use a fresh exact attempt for later dispatch; do not assign a guessed attempt id to the legacy row. |
+
+## Resource cleanup diagnostics
+
+Autoclose and worktree teardown fail closed when exact Resource hold identity cannot be re-proved. These
+reason prefixes are operator-visible diagnostics, not shared-envelope codes.
+
+| reason prefix | meaning | recovery | retry-safe |
+| ------------- | ------- | -------- | ---------- |
+| `worktree-finalize-cleanup-conflict` | The recorded lane path is registered to a different branch or no longer proves keeper lane ownership. Keeper will not remove it. | Inspect the named worktree and owner; remove or relocate the replacement only if intentional. The next reconcile retries from fresh identity evidence. | yes (after identity is reconciled) |
+| `resource-generation-unknown` / `resource-generation-unobserved` | The tmux probe did not provide a canonical generation matching the recorded Resource hold. Cleanup remains deferred. | Restore tmux probe health and let the next pulse re-observe it; do not delete by pane id or path manually. | yes (automatic read retry) |
+| `resource-generation-mismatch` | The pane id now belongs to another tmux server generation. The old cleanup intent is fenced and cannot target it. | Leave the replacement pane alone. Keeper retries only after current projection evidence settles. | yes (automatic read retry) |
+
+A live plan session whose cwd vanished remains the separate detect-only `stuck-sentinel: cwd-missing`
+condition: it pages for operator diagnosis and never authorizes `StopReconciled`, pane kill, or lane
+removal.
+
 ## Wrapped-delegation advisory (autopilot producer)
 
 A wrapped-cell `work` dispatch (its effective model not served natively by

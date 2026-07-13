@@ -80,6 +80,7 @@ function makeBirthRecord(overrides: Partial<BirthRecord> = {}): BirthRecord {
     worktree: "keeper/epic/fn-1103",
     launch_ts: "2026-07-03T12:00:00.000Z",
     resume_target: "codex-rollout-uuid",
+    dispatch_attempt_id: null,
     ...overrides,
   };
 }
@@ -162,6 +163,54 @@ test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs r
   // The record was retired from the maildir.
   expect(pendingRecords()).toEqual([]);
 
+  db.close();
+});
+
+test("a Pi birth binds only the exact current Dispatch claim", () => {
+  const { db } = openDb(dbPath);
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'Dispatched', 'pending_dispatches', ?)`,
+    [
+      1_700_000_000,
+      "work::fn-1276-pi.1",
+      JSON.stringify({
+        verb: "work",
+        id: "fn-1276-pi.1",
+        dir: "/repo",
+        ts: 1_700_000_000,
+        attempt_id: 42,
+        expected_attempt_id: null,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  writeBirthRecord(
+    birthDir,
+    makeBirthRecord({
+      session_id: "pi-exact",
+      harness: "pi",
+      spawn_name: "work::fn-1276-pi.1",
+      dispatch_attempt_id: 42,
+    }),
+  );
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+
+  const claim = db
+    .query(
+      "SELECT attempt_id, state, session_id FROM dispatch_claims WHERE verb = 'work' AND id = 'fn-1276-pi.1'",
+    )
+    .get() as Record<string, unknown>;
+  expect(claim).toEqual({
+    attempt_id: 42,
+    state: "bound",
+    session_id: "pi-exact",
+  });
+  const job = db
+    .query("SELECT dispatch_origin FROM jobs WHERE job_id = 'pi-exact'")
+    .get() as { dispatch_origin: string | null };
+  expect(job.dispatch_origin).toBe("autopilot");
   db.close();
 });
 

@@ -18,6 +18,7 @@ import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { raiseTmuxProjectionFloor } from "../src/db";
 import {
+  applyEvent,
   type BuildSnapshotPayload,
   drain,
   extractBuildSnapshot,
@@ -2161,6 +2162,38 @@ function getPendingDispatch(verb: string, id: string) {
     dir: string | null;
     dispatched_at: number;
     last_event_id: number;
+    attempt_id: number | null;
+  } | null;
+}
+
+function dispatchClaimEvent(
+  hook_event: string,
+  payload: Record<string, unknown>,
+): number {
+  return insertEvent({
+    hook_event,
+    session_id: "reconciler",
+    data: JSON.stringify(payload),
+  });
+}
+
+function getDispatchClaim(verb: string, id: string) {
+  return db
+    .query("SELECT * FROM dispatch_claims WHERE verb = ? AND id = ?")
+    .get(verb, id) as {
+    verb: string;
+    id: string;
+    attempt_id: number | null;
+    state: string;
+    session_id: string | null;
+    dir: string | null;
+    legacy_unfenced: number;
+    acquired_at: number;
+    bound_at: number | null;
+    resume_acknowledged_at: number | null;
+    released_at: number | null;
+    last_event_id: number;
+    updated_at: number;
   } | null;
 }
 
@@ -2624,6 +2657,398 @@ test("from-scratch re-fold reproduces the pending_dispatches projection byte-ide
     .query("SELECT * FROM pending_dispatches ORDER BY verb ASC, id ASC")
     .all();
   expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
+// Durable Dispatch claims.
+// ---------------------------------------------------------------------------
+
+test("Dispatch claim exact lifecycle is attempt-fenced and idempotent", () => {
+  const acquired = insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-claim.1",
+      dir: "/repo",
+      ts: 1800,
+      attempt_id: 10,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")).toMatchObject({
+    attempt_id: 10,
+    state: "acquired",
+    legacy_unfenced: 0,
+    last_event_id: acquired,
+  });
+  expect(getPendingDispatch("work", "fn-claim.1")?.attempt_id).toBe(10);
+
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-claim.1",
+    attempt_id: 10,
+    expected_attempt_id: null,
+    dir: "/different",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")?.last_event_id).toBe(acquired);
+
+  dispatchClaimEvent("DispatchClaimBound", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 9,
+    session_id: "stale-session",
+  });
+  const bound = dispatchClaimEvent("DispatchClaimBound", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")).toMatchObject({
+    attempt_id: 10,
+    state: "bound",
+    session_id: "session-10",
+    last_event_id: bound,
+  });
+
+  dispatchClaimEvent("DispatchClaimResumeRequested", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 9,
+    session_id: "session-10",
+  });
+  const requested = dispatchClaimEvent("DispatchClaimResumeRequested", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")).toMatchObject({
+    state: "resume_requested",
+    last_event_id: requested,
+  });
+
+  const acknowledged = dispatchClaimEvent("DispatchClaimResumeAcknowledged", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  const acknowledgementAt = getDispatchClaim(
+    "work",
+    "fn-claim.1",
+  )?.resume_acknowledged_at;
+  expect(acknowledgementAt).not.toBeNull();
+  expect(getDispatchClaim("work", "fn-claim.1")?.state).toBe("bound");
+  expect(getDispatchClaim("work", "fn-claim.1")?.last_event_id).toBe(
+    acknowledged,
+  );
+  dispatchClaimEvent("DispatchClaimResumeAcknowledged", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")?.resume_acknowledged_at).toBe(
+    acknowledgementAt,
+  );
+  expect(getDispatchClaim("work", "fn-claim.1")?.last_event_id).toBe(
+    acknowledged,
+  );
+
+  const released = dispatchClaimEvent("DispatchClaimReleased", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")).toMatchObject({
+    attempt_id: 10,
+    state: "released",
+    last_event_id: released,
+  });
+  expect(getPendingDispatch("work", "fn-claim.1")).toBeNull();
+});
+
+test("concurrent acquisition and supersession preserve the current attempt fence", () => {
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "close",
+    id: "fn-race",
+    attempt_id: 100,
+    expected_attempt_id: null,
+    dir: "/first",
+  });
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "close",
+    id: "fn-race",
+    attempt_id: 101,
+    expected_attempt_id: null,
+    dir: "/loser",
+  });
+  drainAll();
+  expect(getDispatchClaim("close", "fn-race")).toMatchObject({
+    attempt_id: 100,
+    dir: "/first",
+  });
+
+  dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb: "close",
+    id: "fn-race",
+    expected_attempt_id: 99,
+    next_attempt_id: 102,
+    dir: "/stale",
+  });
+  const superseded = dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb: "close",
+    id: "fn-race",
+    expected_attempt_id: 100,
+    next_attempt_id: 103,
+    dir: "/new",
+  });
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb: "close",
+    id: "fn-race",
+    expected_attempt_id: 100,
+  });
+  drainAll();
+  expect(getDispatchClaim("close", "fn-race")).toMatchObject({
+    attempt_id: 103,
+    state: "acquired",
+    dir: "/new",
+    last_event_id: superseded,
+  });
+
+  const reused = dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-1276-reused.1",
+    attempt_id: 103,
+    expected_attempt_id: null,
+  });
+  expect(() => drainAll()).not.toThrow();
+  expect(getDispatchClaim("work", "fn-1276-reused.1")).toBeNull();
+  expect(getCursor()).toBe(reused);
+});
+
+test("malformed Dispatch claim Events are safe no-ops with Cursor advance", () => {
+  const events = [
+    { hook_event: "DispatchClaimAcquired", data: "{" },
+    {
+      hook_event: "DispatchClaimBound",
+      data: JSON.stringify({ verb: "work", id: "x", attempt_id: -1 }),
+    },
+    {
+      hook_event: "DispatchClaimResumeAcknowledged",
+      data: JSON.stringify({ verb: "", id: "x", attempt_id: 1 }),
+    },
+    {
+      hook_event: "DispatchClaimReleased",
+      data: JSON.stringify({ verb: "work" }),
+    },
+    {
+      hook_event: "DispatchClaimSuperseded",
+      data: JSON.stringify({
+        verb: "work",
+        id: "x",
+        expected_attempt_id: 1,
+        next_attempt_id: "later",
+      }),
+    },
+  ];
+  let lastId = 0;
+  for (const event of events) {
+    lastId = insertEvent({ ...event, session_id: "reconciler" });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(db.query("SELECT * FROM dispatch_claims").all()).toEqual([]);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("a newly admitted Dispatched event uses its immutable event id as the exact attempt", () => {
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: "work::fn-1276-event-attempt.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-1276-event-attempt.1",
+      dir: "/repo",
+      ts: 1890,
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "event-attempt-session",
+    spawn_name: "work::fn-1276-event-attempt.1",
+    data: JSON.stringify({ dispatch_attempt_id: attemptId }),
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-1276-event-attempt.1")).toMatchObject({
+    attempt_id: attemptId,
+    state: "bound",
+    session_id: "event-attempt-session",
+  });
+  expect(getDispatchOrigin("event-attempt-session")).toBe("autopilot");
+});
+
+test("a delayed old SessionStart cannot consume a newer exact pending attempt", () => {
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-1276-delayed.1",
+    attempt_id: 20,
+    expected_attempt_id: null,
+  });
+  dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb: "work",
+    id: "fn-1276-delayed.1",
+    expected_attempt_id: 20,
+    next_attempt_id: 21,
+  });
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-1276-delayed.1",
+      dir: "/repo",
+      ts: 1900,
+      attempt_id: 21,
+      expected_attempt_id: 20,
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "old-session",
+    spawn_name: "work::fn-1276-delayed.1",
+    data: JSON.stringify({ dispatch_attempt_id: 20 }),
+  });
+  drainAll();
+  expect(getPendingDispatch("work", "fn-1276-delayed.1")?.attempt_id).toBe(21);
+  expect(getDispatchClaim("work", "fn-1276-delayed.1")).toMatchObject({
+    attempt_id: 21,
+    state: "acquired",
+    session_id: null,
+  });
+  expect(getDispatchOrigin("old-session")).toBeNull();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "new-session",
+    spawn_name: "work::fn-1276-delayed.1",
+    data: JSON.stringify({ dispatch_attempt_id: 21 }),
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-1276-delayed.1")).toMatchObject({
+    attempt_id: 21,
+    state: "bound",
+    session_id: "new-session",
+  });
+  expect(getPendingDispatch("work", "fn-1276-delayed.1")).toBeNull();
+  expect(getDispatchOrigin("new-session")).toBe("autopilot");
+});
+
+test("legacy-unfenced events never consume a newer exact claim", () => {
+  dispatchedEvent("work", "fn-1276-legacy.1", "/legacy", 1700);
+  drainAll();
+  expect(getDispatchClaim("work", "fn-1276-legacy.1")).toMatchObject({
+    attempt_id: null,
+    state: "legacy_unfenced",
+    legacy_unfenced: 1,
+  });
+
+  dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb: "work",
+    id: "fn-1276-legacy.1",
+    expected_attempt_id: null,
+    next_attempt_id: 30,
+    dir: "/exact",
+  });
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-1276-legacy.1",
+      dir: "/exact",
+      ts: 1800,
+      attempt_id: 30,
+      expected_attempt_id: null,
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "late-legacy",
+    spawn_name: "work::fn-1276-legacy.1",
+    data: "{}",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-1276-legacy.1")).toMatchObject({
+    attempt_id: 30,
+    state: "acquired",
+    legacy_unfenced: 0,
+  });
+  expect(getPendingDispatch("work", "fn-1276-legacy.1")?.attempt_id).toBe(30);
+});
+
+test("Dispatch claims are zero-event empty and reproduce byte-identically on re-fold", () => {
+  expect(db.query("SELECT * FROM dispatch_claims").all()).toEqual([]);
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-refold.1",
+    attempt_id: 40,
+    expected_attempt_id: null,
+    dir: "/repo",
+  });
+  dispatchClaimEvent("DispatchClaimBound", {
+    verb: "work",
+    id: "fn-refold.1",
+    expected_attempt_id: 40,
+    session_id: "session-refold",
+  });
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb: "work",
+    id: "fn-refold.1",
+    expected_attempt_id: 40,
+    session_id: "session-refold",
+  });
+  drainAll();
+  const before = db.query("SELECT * FROM dispatch_claims").all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_claims");
+  drainAll();
+  expect(db.query("SELECT * FROM dispatch_claims").all()).toEqual(before);
+});
+
+test("Dispatch claim projection and Cursor roll back together", () => {
+  const eventId = dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-atomic.1",
+    attempt_id: 50,
+    expected_attempt_id: null,
+  });
+  const event = db
+    .query("SELECT * FROM events WHERE id = ?")
+    .get(eventId) as Event;
+  expect(() =>
+    applyEvent(db, event, {
+      onBeforeCursorAdvance: () => {
+        throw new Error("simulated crash");
+      },
+    }),
+  ).toThrow("simulated crash");
+  expect(getDispatchClaim("work", "fn-atomic.1")).toBeNull();
+  expect(getCursor()).toBe(0);
+  applyEvent(db, event);
+  expect(getDispatchClaim("work", "fn-atomic.1")?.attempt_id).toBe(50);
+  expect(getCursor()).toBe(eventId);
 });
 
 // ---------------------------------------------------------------------------

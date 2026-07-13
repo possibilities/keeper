@@ -124,6 +124,7 @@ import {
 } from "./dispatch-failure-key";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
+  compareCanonicalGeneration,
   createTmuxPaneOps,
   keeperAgentLaunch,
   type LaunchSpec,
@@ -143,6 +144,7 @@ import {
   type EpicRecoverVerdict,
   epicHasActiveResolver,
   epicHasOccupyingJob,
+  epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
   type HostMatrixSnapshot,
   isFinalizerVerb,
@@ -156,6 +158,7 @@ import {
   type ReconcileDecision,
   type ReconcileSnapshot,
   type ReconcileState,
+  type ResourceHoldObservation,
   reconcile,
   recoverFailureDispatchId,
   type StaleBaseLaneEntry,
@@ -170,6 +173,7 @@ import {
   type WorktreeRepoGroup,
   type WorktreeRepoResolution,
   type WorktreeRepoStatusEntry,
+  withDispatchAttempt,
   worktreeRecoverDispatchId,
   wrappedEnvelopePath,
 } from "./reconcile-core";
@@ -314,6 +318,7 @@ export {
   dispatchKey,
   epicHasActiveResolver,
   epicHasOccupyingJob,
+  epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
   isBareShellCommand,
   isEpicInFlight,
@@ -1082,6 +1087,8 @@ export interface DispatchFailedPayload {
   dir: string | null;
   conflictedFiles: string[] | null;
   ts: number;
+  /** Exact admitted attempt when the failure happened after admission. */
+  attempt_id?: number;
 }
 
 /**
@@ -2471,6 +2478,8 @@ export interface DispatchedPayload {
 export interface DispatchedAck {
   ok: boolean;
   suppressed?: boolean;
+  /** Immutable Event id used as the exact Dispatch-attempt fence on success. */
+  attemptId?: number;
 }
 
 /**
@@ -2489,6 +2498,7 @@ export interface DispatchExpiredPayload {
   verb: Verb;
   id: string;
   reason?: string;
+  attempt_id?: number;
 }
 
 /**
@@ -3909,11 +3919,21 @@ export async function confirmRunning(
     // Shutdown raced the ack. Abort before the side-effect.
     return "aborted-prelaunch";
   }
-  // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`. `spec` is the
-  // structured input keeper agent (keeper's sole launch transport) builds its
-  // invocation from; the pre-wrapped `argv` is ignored by the launch impl.
+  if (
+    ack.attemptId === undefined ||
+    !Number.isSafeInteger(ack.attemptId) ||
+    ack.attemptId <= 0
+  ) {
+    // A successful admission without its exact fence cannot launch safely: the
+    // resulting SessionStart would be indistinguishable from unfenced evidence.
+    return "aborted-prelaunch";
+  }
+  // 3. Launch — ONLY after the durable ack returned the admitted attempt. The
+  // generic metadata rides the structured spec; prompts, names, cells, and the
+  // pre-wrapped command remain unchanged.
+  const admittedSpec = withDispatchAttempt(spec, ack.attemptId);
   const launchResult: LaunchResult = await deps
-    .launch(argv, key, cwd, spec)
+    .launch(argv, key, cwd, admittedSpec)
     .catch((err) => ({
       ok: false as const,
       // A thrown launch is a PERMANENT (sticky) fail — `retryable` absent.
@@ -3941,6 +3961,7 @@ export async function confirmRunning(
       dir: cwd === "" ? null : cwd,
       conflictedFiles: null,
       ts: deps.now(),
+      attempt_id: ack.attemptId,
     });
     return "failed";
   }
@@ -5438,6 +5459,17 @@ export function createWorktreeDriver(
             };
           }
         }
+        // Logical merge is independent of resource destruction. A live or
+        // unprobeable exact hold leaves the now-merged lane in place; the
+        // level-triggered finalize/recover pass retries teardown after the hold
+        // positively clears.
+        if (info.teardownAllowed === false) {
+          console.error(
+            `[autopilot-worker] finalize ${epicId}: resource hold still protects the lane; merge landed, teardown deferred`,
+          );
+          return { ok: true };
+        }
+
         // Enumerate EVERY rib of this epic — the snapshot's `laneOrder` ribs UNIONED
         // with EVERY live-git `keeper/epic/<id>--*` ref, so a rib forked in a cycle
         // the snapshot never saw (or one a crash orphaned) is torn down rather than
@@ -5461,19 +5493,43 @@ export function createWorktreeDriver(
         // `laneOrder` omitted), so no orphan worktree survives teardown.
         const laneBranchShorts = new Set<string>([baseBranch, ...ribBranches]);
         const paths = new Set<string>([baseWorktreePath]);
+        const expectedBranchByPath = new Map<string, string>([
+          [normalizeLanePath(baseWorktreePath), baseBranch],
+        ]);
         for (const lane of laneOrder) {
           paths.add(lane.worktreePath);
+          expectedBranchByPath.set(
+            normalizeLanePath(lane.worktreePath),
+            lane.branch,
+          );
         }
-        for (const entry of await gitListWorktrees(repoDir, run)) {
+        const registered = await gitListWorktrees(repoDir, run);
+        const registeredByPath = new Map(
+          registered.map((entry) => [normalizeLanePath(entry.path), entry]),
+        );
+        for (const entry of registered) {
           if (entry.branch === null) {
             continue;
           }
           const short = shortBranchName(entry.branch);
           if (laneBranchShorts.has(short)) {
             paths.add(entry.path);
+            expectedBranchByPath.set(normalizeLanePath(entry.path), short);
           }
         }
         for (const p of paths) {
+          const key = normalizeLanePath(p);
+          const current = registeredByPath.get(key);
+          const expectedBranch = expectedBranchByPath.get(key);
+          if (current !== undefined) {
+            const currentBranch =
+              current.branch == null ? null : shortBranchName(current.branch);
+            if (expectedBranch == null || currentBranch !== expectedBranch) {
+              return retrySkip(
+                `worktree-finalize-cleanup-conflict: ${p} is now registered on ${currentBranch ?? "a detached HEAD"}, expected ${expectedBranch ?? "the recorded epic lane"} — refusing to remove a reused lane path`,
+              );
+            }
+          }
           const removed = await gitRemoveWorktree(repoDir, p, run);
           if (removed.kind === "dirty") {
             return retrySkip(
@@ -8011,6 +8067,7 @@ export interface DispatchedAckMessage {
   id: number;
   ok: boolean;
   suppressed?: boolean;
+  attemptId?: number;
 }
 
 /**
@@ -8104,6 +8161,76 @@ export function resolveDriftThresholds(
 }
 
 /**
+ * Resolve each plan job's exact terminal resource incarnation from one complete
+ * tmux sweep. An absent pane clears only when the sweep contains the same
+ * canonical server generation; malformed, empty, or conflicting observations
+ * stay unknown/conflict and therefore fail closed at teardown.
+ */
+export function deriveResourceHoldObservations(
+  jobs: ReadonlyMap<string, Job>,
+  panes: readonly PaneInfo[] | null,
+): Map<string, ResourceHoldObservation> {
+  const out = new Map<string, ResourceHoldObservation>();
+  if (panes == null || panes.length === 0) {
+    for (const job of jobs.values()) {
+      if (job.plan_verb === "work" || job.plan_verb === "close") {
+        out.set(job.job_id, {
+          status: "unknown",
+          reason: "resource-probe-unavailable",
+        });
+      }
+    }
+    return out;
+  }
+  const byPane = new Map(panes.map((pane) => [pane.paneId, pane]));
+  for (const job of jobs.values()) {
+    if (job.plan_verb !== "work" && job.plan_verb !== "close") continue;
+    if (job.state === "ended" || job.state === "killed") {
+      out.set(job.job_id, { status: "clear" });
+      continue;
+    }
+    const paneId = job.backend_exec_pane_id;
+    const generationId = job.backend_exec_generation_id;
+    if (paneId == null || paneId === "" || generationId == null) {
+      out.set(job.job_id, {
+        status: "unknown",
+        reason: "resource-identity-incomplete",
+      });
+      continue;
+    }
+    const pane = byPane.get(paneId);
+    if (pane !== undefined) {
+      const generation = compareCanonicalGeneration(
+        generationId,
+        pane.tmuxGenerationId,
+      );
+      out.set(
+        job.job_id,
+        generation === "match"
+          ? { status: "held", paneId, generationId }
+          : {
+              status: generation === "mismatch" ? "conflict" : "unknown",
+              reason: `resource-generation-${generation}`,
+            },
+      );
+      continue;
+    }
+    const sameGenerationObserved = panes.some(
+      (candidate) =>
+        compareCanonicalGeneration(generationId, candidate.tmuxGenerationId) ===
+        "match",
+    );
+    out.set(
+      job.job_id,
+      sameGenerationObserved
+        ? { status: "clear" }
+        : { status: "unknown", reason: "resource-generation-unobserved" },
+    );
+  }
+  return out;
+}
+
+/**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
  * client subscriptions with, so the reconciler's view matches the board's
@@ -8168,9 +8295,34 @@ export async function loadReconcileSnapshot(
     subagentInvocations,
     gitStatusByProjectDir,
     pendingDispatches,
+    dispatchClaims,
+    harnessActivityByJobId,
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery);
+
+  // The shared jobs descriptor intentionally omits the live-only generation
+  // column; exact Resource holds require it, so enrich the producer snapshot
+  // directly without changing the public collection shape.
+  try {
+    const generations = db
+      .query(
+        "SELECT job_id, backend_exec_generation_id FROM jobs WHERE plan_verb IN ('work', 'close')",
+      )
+      .all() as {
+      job_id: string;
+      backend_exec_generation_id: string | null;
+    }[];
+    for (const row of generations) {
+      const job = jobs.get(row.job_id);
+      if (job !== undefined) {
+        job.backend_exec_generation_id = row.backend_exec_generation_id;
+      }
+    }
+  } catch {
+    // Missing/inconclusive enrichment leaves identities incomplete; teardown
+    // fails closed through deriveResourceHoldObservations.
+  }
 
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
@@ -8343,6 +8495,13 @@ export async function loadReconcileSnapshot(
     }
   }
 
+  const dispatchClaimsByKey = new Map(
+    dispatchClaims.map((claim) => [
+      dispatchKey(claim.verb as Verb, claim.id),
+      claim,
+    ]),
+  );
+
   // Read the autopilot `mode` and the armed id set — PROJECTION-PULL only (no
   // `workerData`, no cache) so the gate survives a restart with one source of
   // truth. A missing/malformed `mode` defaults to `'yolo'`.
@@ -8423,6 +8582,7 @@ export async function loadReconcileSnapshot(
   // null fallback keeps every stopped row occupying, so an un-probeable cycle
   // can only over-suppress, never double-dispatch.
   let livePaneIds: ReadonlySet<string> | null = null;
+  let observedPanes: readonly PaneInfo[] | null = null;
   // Live pane id → foreground command, from the SAME sweep — the slot-occupancy gate
   // reads it to tell a live/parked `claude` from the dead `exec $SHELL -l -i` tail.
   // Null in lockstep with `livePaneIds` (degraded/absent probe), so the slot gate
@@ -8432,6 +8592,7 @@ export async function loadReconcileSnapshot(
     try {
       const panes = await listPanes();
       if (panes !== null) {
+        observedPanes = panes;
         livePaneIds = new Set(panes.map((pane) => pane.paneId));
         paneCommandById = new Map(
           panes.map((pane) => [pane.paneId, pane.currentCommand]),
@@ -8444,6 +8605,11 @@ export async function loadReconcileSnapshot(
       );
     }
   }
+
+  const resourceHoldByJobId = deriveResourceHoldObservations(
+    jobs,
+    observedPanes,
+  );
 
   // Slot authority from the job LIFECYCLE, not pane cosmetics: re-prove dead the
   // recorded claude pid of every STOPPED job still holding a LIVE pane, mirroring
@@ -8647,6 +8813,9 @@ export async function loadReconcileSnapshot(
     staleBaseDistressIds,
     dupEpicNumberDistressIds,
     liveTabKeys,
+    dispatchClaims: dispatchClaimsByKey,
+    harnessActivityByJobId,
+    resourceHoldByJobId,
     livePaneIds,
     paneCommandById,
     provenDeadJobIds,
@@ -8852,7 +9021,11 @@ function main(): void {
       const pending = pendingDispatchAcks.get(msg.id);
       if (pending) {
         pendingDispatchAcks.delete(msg.id);
-        pending.resolve({ ok: msg.ok, suppressed: msg.suppressed });
+        pending.resolve({
+          ok: msg.ok,
+          suppressed: msg.suppressed,
+          attemptId: msg.attemptId,
+        });
       }
       return;
     }
@@ -9316,7 +9489,17 @@ function main(): void {
                 const epic = epicById.get(epicId);
                 return (
                   epic !== undefined &&
-                  epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)
+                  (snapshot.resourceHoldByJobId === undefined
+                    ? epicHasOccupyingJob(
+                        epic,
+                        snapshot.jobs,
+                        snapshot.livePaneIds,
+                      )
+                    : epicResourceTeardownBlocked(
+                        epic,
+                        snapshot.jobs,
+                        snapshot.resourceHoldByJobId,
+                      ))
                 );
               },
               {

@@ -22,7 +22,15 @@
 // ISLAND — it imports nothing — so pulling the resume-argv builder here keeps
 // exec-backend within the "node:* + dep-free helper" hook budget while sourcing
 // the resume verb from the SINGLE registry, never a re-inlined harness switch.
-import { buildHarnessResumeArgv } from "./agent/harness";
+import {
+  buildHarnessResumeArgv,
+  HARNESS_DESCRIPTORS,
+  isHarnessName,
+} from "./agent/harness";
+import {
+  DISPATCH_ATTEMPT_ENV,
+  formatDispatchAttemptCarrier,
+} from "./dispatch-command";
 
 /** Bun.spawn-shaped subset the backend needs; injectable for tests. */
 export type SpawnFn = (
@@ -177,6 +185,9 @@ export interface LaunchSpec {
    */
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
+  /** Exact Dispatch-attempt identity admitted before this launch. Present only
+   *  for reconciler-managed dispatch; manual and legacy launches omit it. */
+  readonly dispatchAttemptId?: number;
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
@@ -542,6 +553,40 @@ export function buildGenerationId(rawProbeOutput: string): string | null {
     return null;
   }
   return `${parsed.pid}:${parsed.startTime}`;
+}
+
+/**
+ * Compare two tmux generation handles without accepting legacy or malformed
+ * values as cleanup authority. A canonical generation contains both server pid
+ * and start time; bare-pid history remains readable but can never authorize a
+ * destructive operation.
+ */
+export function compareCanonicalGeneration(
+  expected: string | null | undefined,
+  observed: string | null | undefined,
+): "match" | "mismatch" | "unknown" {
+  if (expected == null || observed == null) return "unknown";
+  const a = parseGenerationId(expected);
+  const b = parseGenerationId(observed);
+  if (a?.startTime == null || b?.startTime == null) return "unknown";
+  return a.pid === b.pid && a.startTime === b.startTime ? "match" : "mismatch";
+}
+
+/** Recycle-safe process identity classification shared by restore and cleanup. */
+export function classifyProcessIdentity(
+  pid: number | null | undefined,
+  startTime: string | null | undefined,
+  deps: {
+    isPidAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+  },
+): "alive" | "dead" | "recycled" | "unknown" {
+  if (pid == null || !Number.isInteger(pid) || pid <= 0) return "unknown";
+  if (!deps.isPidAlive(pid)) return "dead";
+  if (startTime == null || startTime === "") return "unknown";
+  const current = deps.readStartTime(pid);
+  if (current == null) return "unknown";
+  return current === startTime ? "alive" : "recycled";
 }
 
 /**
@@ -1085,6 +1130,8 @@ export interface KeeperAgentLaunchOpts {
    */
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
+  /** Exact Dispatch-attempt identity carried as generic launch metadata. */
+  readonly dispatchAttemptId?: number;
 }
 
 /**
@@ -1172,6 +1219,17 @@ export function buildKeeperAgentLaunchArgv(
   const permissionPosture = isClaude
     ? ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"]
     : [];
+  const descriptor = isHarnessName(harness)
+    ? HARNESS_DESCRIPTORS[harness]
+    : undefined;
+  const dispatchAttemptCarrier =
+    descriptor?.carriesDispatchAttempt === true &&
+    opts.dispatchAttemptId !== undefined
+      ? [
+          "--x-tmux-env",
+          `${DISPATCH_ATTEMPT_ENV}=${formatDispatchAttemptCarrier(opts.dispatchAttemptId)}`,
+        ]
+      : [];
   return [
     ...opts.launcherArgvPrefix,
     harness,
@@ -1236,6 +1294,9 @@ export function buildKeeperAgentLaunchArgv(
     `KEEPER_WRAPPED_CELL=${opts.wrappedCell ?? ""}`,
     "--x-tmux-env",
     `KEEPER_WRAPPED_ENVELOPE=${opts.wrappedEnvelope ?? ""}`,
+    // Exact Dispatch attempt metadata is capability-gated by the descriptor.
+    // It is a standalone argv element, never shell interpolation or display data.
+    ...dispatchAttemptCarrier,
     // Keeper-owned worker permission posture, mirroring the pair-launch precedent
     // (`nativeClaudeArgs`): every claude launch this builder mints is a detached
     // automated worker with NO human to answer a prompt, so it skips permission
@@ -1472,6 +1533,9 @@ export async function keeperAgentLaunch(
       : {}),
     ...(deps.spec.wrappedEnvelope !== undefined
       ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
+      : {}),
+    ...(deps.spec.dispatchAttemptId !== undefined
+      ? { dispatchAttemptId: deps.spec.dispatchAttemptId }
       : {}),
     noConfirm: true,
   });

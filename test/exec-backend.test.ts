@@ -36,6 +36,8 @@ import {
   buildTmuxSelectWindowArgs,
   buildTmuxServerGenerationArgs,
   classifyCloseKind,
+  classifyProcessIdentity,
+  compareCanonicalGeneration,
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
@@ -239,6 +241,30 @@ test("parseGenerationId splits the full form and the legacy bare-pid form", () =
   // Bare pid is accepted as a legacy read (startTime null) — the alias source.
   expect(parseGenerationId("21705")).toEqual({ pid: "21705", startTime: null });
   expect(parseGenerationId("  9:9 ")).toEqual({ pid: "9", startTime: "9" });
+});
+
+test("canonical generation comparison refuses legacy/malformed cleanup authority", () => {
+  expect(compareCanonicalGeneration("123:456", "123:456")).toBe("match");
+  expect(compareCanonicalGeneration("123:456", "123:457")).toBe("mismatch");
+  expect(compareCanonicalGeneration("123", "123:456")).toBe("unknown");
+  expect(compareCanonicalGeneration("bad", "123:456")).toBe("unknown");
+});
+
+test("process identity separates a recycled pid from a gone process", () => {
+  expect(
+    classifyProcessIdentity(42, "start-a", {
+      isPidAlive: () => true,
+      readStartTime: () => "start-b",
+    }),
+  ).toBe("recycled");
+  expect(
+    classifyProcessIdentity(42, "start-a", {
+      isPidAlive: () => false,
+      readStartTime: () => {
+        throw new Error("must not read a dead pid");
+      },
+    }),
+  ).toBe("dead");
 });
 
 test("parseGenerationId rejects non-positive-integer fields and >2 segments", () => {
@@ -1363,6 +1389,31 @@ test("buildKeeperAgentLaunchArgv: a wrapped-cell work launch carries the marker 
     cellIdx,
   );
   expect(cellIdx).toBeLessThan(argv.indexOf("--permission-mode"));
+});
+
+test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and argv-safe", () => {
+  const base = {
+    launcherArgvPrefix: ["/bun", "/keeper.ts", "agent"],
+    session: "work",
+    prompt: "/plan:work fn-1-x.1",
+    noConfirm: true,
+    dispatchAttemptId: 42,
+  } as const;
+  const claude = buildKeeperAgentLaunchArgv(base);
+  expect(
+    claude.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
+  ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
+  const pi = buildKeeperAgentLaunchArgv({ ...base, harness: "pi" });
+  expect(
+    pi.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
+  ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
+  for (const harness of ["codex", "hermes"] as const) {
+    expect(
+      buildKeeperAgentLaunchArgv({ ...base, harness }).some((arg) =>
+        arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
+      ),
+    ).toBe(false);
+  }
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {

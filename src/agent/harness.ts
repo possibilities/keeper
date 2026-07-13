@@ -133,6 +133,10 @@ export interface HarnessDescriptor {
    *  False when keeper pins the session id at launch (claude/pi), so it is
    *  authoritative immediately. */
   mintsOwnSessionId: boolean;
+  /** Whether this harness can carry an exact Dispatch-attempt identity through
+   *  its lifecycle adapter. Consumers use this capability instead of branching
+   *  on harness names. */
+  carriesDispatchAttempt: boolean;
   /** How this harness's live churn reaches the jobs projection. */
   hookMechanism: HookMechanism;
   /** How this harness's resume target is spelled on its native CLI (the verb
@@ -170,6 +174,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     effortAxisMap: null,
     capturable: true,
     mintsOwnSessionId: false,
+    carriesDispatchAttempt: true,
     hookMechanism: "claude-hooks",
     resumeArgv: { kind: "flag", token: "--resume" },
     // Probe-verified (live claude binary): a bare `--` ahead of the prompt
@@ -185,6 +190,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
     mintsOwnSessionId: true,
+    carriesDispatchAttempt: false,
     // M3b: live stop-churn via the daemon-side rollout tailer. Stop-only — codex's
     // rollout has no turn-START marker — and degrades to presence-only when the
     // session is unattributed.
@@ -206,6 +212,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
     capturable: true,
     mintsOwnSessionId: false,
+    carriesDispatchAttempt: true,
     // M3b: an ephemeral in-process extension (plugins/keeper/pi-extension,
     // armed per-launch via `-e`) mirrors pi's AgentHarness lifecycle into the
     // events-log channel, so pi shows the same working/stopped churn as claude.
@@ -234,6 +241,7 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // Hermes mints its own session id keeper cannot pin at launch; the resume
     // target is its native session id, discovered post-stop from the store.
     mintsOwnSessionId: true,
+    carriesDispatchAttempt: false,
     hookMechanism: "none",
     // Hermes resumes by native session id: `hermes --resume <id>` (option flag,
     // MEDIUM confidence — verified against `src/agent/args.ts`'s hermes predicate).

@@ -172,11 +172,12 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
 }
 
 function makeSub(overrides: Partial<SubagentInvocation>): SubagentInvocation {
+  const ts = overrides.ts ?? 0;
   return {
     job_id: "session-1",
     agent_id: "agent-1",
     turn_seq: 0,
-    ts: 0,
+    ts,
     tool_use_id: null,
     subagent_type: null,
     description: null,
@@ -184,7 +185,7 @@ function makeSub(overrides: Partial<SubagentInvocation>): SubagentInvocation {
     status: "running",
     duration_ms: null,
     last_event_id: 0,
-    updated_at: 0,
+    updated_at: overrides.updated_at ?? ts,
     ...overrides,
   };
 }
@@ -784,8 +785,8 @@ test("fn-1048: task with null epic_id in a done epic falls back to worker_phase-
 // provenance-filtered `has_live_worker_monitor` fact; predicate 1 ANDs in the
 // live-monitor check (so it can't collapse to `completed`) and predicate 6.6
 // surfaces `running:monitor-running` (a mutex occupant that NEVER dispatches).
-// MONITOR_STALENESS_SEC=600 (soft → `monitor-stale`), MONITOR_RELEASE_SEC=1800
-// (hard → release). The direct fn-715.2 repro is the first test.
+// MONITOR_STALENESS_SEC=600 changes the reason to `monitor-stale`; stale
+// evidence remains unknown and occupying until a positive terminal boundary.
 // ---------------------------------------------------------------------------
 
 test("fn-719: done+approved task with live worker monitor → running:monitor-running, NOT completed (fn-715.2 repro+fix)", () => {
@@ -2807,11 +2808,9 @@ test("fn-1013 all-disabled cycle: two DIFFERING raw roots resolving to ONE tople
   expect(ready.length).toBe(1);
 });
 
-test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {
-  // updated_at=1000, now=1700 → age=700 > MONITOR_STALENESS_SEC(600), and
-  // 700 < MONITOR_RELEASE_SEC(1800). Surfaces `monitor-stale` for human
-  // visibility but STILL occupies the mutex (no auto-release until the hard
-  // ceiling) — same correctness-over-throughput stance as `sub-agent-stale`.
+test("fn-719: stale live worker monitor → running:monitor-stale, still occupies", () => {
+  // updated_at=1000, now=1700 → age=700 > MONITOR_STALENESS_SEC(600).
+  // Unknown resource evidence stays visible and conservatively occupies.
   const task = makeTask({
     worker_phase: "done",
     jobs: [
@@ -2829,11 +2828,9 @@ test("fn-719: live worker monitor past soft TTL (within hard ceiling) → runnin
   );
 });
 
-test("fn-719: live worker monitor past hard ceiling → slot RELEASED (collapses to completed)", () => {
-  // updated_at=1000, now=3000 → age=2000 > MONITOR_RELEASE_SEC(1800). The
-  // hard ceiling fires: the monitor fact NO LONGER occupies, so predicate 1
-  // is free to collapse the done+approved task to `completed` and free the
-  // mutex. An abandoned session can't wedge the slot forever.
+test("stale worker-monitor evidence stays unknown and conservatively occupies", () => {
+  // A release ceiling is not terminal evidence. The canonical activity fact is
+  // unknown, and readiness keeps its consumer-specific conservative hold.
   const task = makeTask({
     worker_phase: "done",
     jobs: [
@@ -2846,7 +2843,9 @@ test("fn-719: live worker monitor past hard ceiling → slot RELEASED (collapses
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = runWithNow([epic], [], 3000);
-  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "monitor-stale" }),
+  );
 });
 
 test("fn-719: a fresh live monitor alongside a stale one keeps the task at monitor-running (every, not any)", () => {
@@ -3013,7 +3012,7 @@ test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => 
 });
 
 // fn-638.4: predicate 6 splits its running-sub-agent verdict on age.
-// A still-`running` sub-agent whose `ts` is older than the caller-
+// A still-`running` sub-agent whose `updated_at` is older than the caller-
 // injected `now` by strictly more than `SUBAGENT_STALENESS_SEC` (120s,
 // mirroring the reducer's bounded Stop guard window) surfaces as
 // `sub-agent-stale` instead of `sub-agent-running`. Both directions
@@ -3082,7 +3081,7 @@ test("predicate 6: a mix of stale + fresh running sub-agents stays at sub-agent-
   );
 });
 
-test("predicate 6: exact boundary tick (now - ts === threshold) is not yet stale", () => {
+test("predicate 6: exact boundary tick (now - updated_at === threshold) is not yet stale", () => {
   // Strict `>` boundary mirrors the reducer's bounded Stop guard
   // (`age > MAX_STOP_YIELD_GAP_SEC`). At the boundary tick, the row
   // stays at `sub-agent-running`; the next-tick comparison would flip.
@@ -3912,6 +3911,33 @@ test("formatPill defaults to [blocked:unknown] for the unknown reason", () => {
 // ---------------------------------------------------------------------------
 // Subagent_invocations status filter
 // ---------------------------------------------------------------------------
+
+test("terminal parent overrides an orphan open child row", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "ended" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "worker-1", status: "running" })];
+  expect(run([epic], new Map(), subs).perTask.get(task.task_id)).toEqual({
+    tag: "completed",
+  });
+});
+
+test("malformed child evidence does not unlock readiness", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const malformed = {
+    ...makeSub({ job_id: "worker-1" }),
+    status: "future-status",
+  } as unknown as SubagentInvocation;
+  expect(run([epic], new Map(), [malformed]).perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+});
 
 test("subagent_invocations: FINISHED ok (non-null duration_ms) → ignored", () => {
   // fn-1008: predicate 6 now keys on the canonical open-turn predicate

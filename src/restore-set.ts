@@ -30,8 +30,8 @@
  *
  * FILTERS (applied after membership):
  *   - require `backend_exec_session_id` — no backend coords ⇒ nothing to replay.
- *   - exclude `plan_verb='work'` — autopilot workers are reconciler-managed; the
- *     reconciler re-dispatches them, restore must not double-spawn them.
+ *   - exclude `plan_verb IN ('work','close')` — autopilot workers are
+ *     reconciler-managed; generic restore must not double-spawn either verb.
  *   - exclude Keeper job ids and harness-native resume identities already LIVE
  *     (the idempotence guard — prevents both a respawn race and two Keeper launch
  *     associations from reopening one Codex/Pi/Hermes conversation). The live set
@@ -132,6 +132,7 @@ interface KilledJobRow {
    * resolved by a `TmuxTopologySnapshot` still restores under its launch session. */
   backend_exec_session_id: string | null;
   plan_verb: string | null;
+  dispatch_origin: string | null;
   /** The Killed event's rowid — the burst-cluster sort key. */
   last_event_id: number | null;
   /** Launching harness (`jobs.harness`); NULL reads as claude. */
@@ -497,7 +498,7 @@ function loadRows(db: Database): {
               window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              plan_verb, last_event_id, harness, resume_target, adopted
+              plan_verb, dispatch_origin, last_event_id, harness, resume_target, adopted
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -610,8 +611,12 @@ function collectCrashCandidates(
       }
       continue;
     }
-    // Filter: autopilot workers are reconciler-managed; never restore them.
-    if (row.plan_verb === "work") {
+    // Only reconciler-owned work/close sessions are excluded. A manual session
+    // with a plan-shaped title retains generic restore behavior.
+    if (
+      row.dispatch_origin === "autopilot" &&
+      (row.plan_verb === "work" || row.plan_verb === "close")
+    ) {
       continue;
     }
     const harness = harnessOrClaude(row.harness);
@@ -811,6 +816,7 @@ interface TopologyJobRow {
   cwd: string | null;
   backend_exec_session_id: string | null;
   plan_verb: string | null;
+  dispatch_origin: string | null;
   harness: string | null;
   resume_target: string | null;
 }
@@ -944,8 +950,8 @@ export function selectGenerationFromEnriched(
  * `created_at`; `resume_target` is the session UUID (`job_id`). The pane's
  * `session_name` is the restore location and
  * its `window_index` the visual order. The idempotence filters are reused
- * VERBATIM: require backend coords, exclude `plan_verb='work'`
- * (reconciler-managed), and exclude any Keeper id or harness-native resume
+ * VERBATIM: require backend coords, exclude reconciler-managed
+ * `plan_verb IN ('work','close')`, and exclude any Keeper id or harness-native resume
  * identity already LIVE (the double-spawn guard). Candidates sort by
  * {@link compareCandidates}.
  *
@@ -1350,7 +1356,7 @@ function readGenerationSnapshotsDesc(
  * Build the restore candidates from one decoded snapshot's panes: resolve each
  * pane's `job_id` (payload, then the `(generation_id, pane_id)` projection join),
  * apply the idempotence filters VERBATIM (backend coords required,
- * `plan_verb='work'` excluded, live identity excluded), and sort by
+ * reconciler-managed work/close verbs excluded, live identity excluded), and sort by
  * {@link compareCandidates}. Returns `[]` when no pane yields a candidate — the
  * signal {@link enrichGeneration} uses to step back to the attributed sibling.
  *
@@ -1380,9 +1386,11 @@ function buildCandidatesFromSnapshot(
     if (row === null) {
       continue; // job row gone — nothing to resume.
     }
-    // Idempotence filters reused VERBATIM from collectCrashCandidates:
-    //  - autopilot workers are reconciler-managed; never restore them.
-    if (row.plan_verb === "work") {
+    // Idempotence filters reused VERBATIM from collectCrashCandidates.
+    if (
+      row.dispatch_origin === "autopilot" &&
+      (row.plan_verb === "work" || row.plan_verb === "close")
+    ) {
       continue;
     }
     const harness = harnessOrClaude(row.harness);
@@ -1496,7 +1504,7 @@ function loadTopologyJobRow(
         `SELECT job_id, created_at, title, cwd,
                 COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                   AS backend_exec_session_id,
-                plan_verb, harness, resume_target
+                plan_verb, dispatch_origin, harness, resume_target
            FROM jobs
           WHERE job_id = ?
           LIMIT 1`,

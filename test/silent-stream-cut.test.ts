@@ -138,7 +138,7 @@ test("cut disposition then SubagentStop flips the still-working parent to stoppe
     hook_event: "SubagentTurn",
     session_id: "sess-a",
     agent_id: "agent-cut",
-    data: JSON.stringify({ disposition: "cut" }),
+    data: JSON.stringify({ disposition: "cut", settled: true }),
   });
   // Then the harness emits SubagentStop with no terminal error.
   insertEvent({
@@ -177,6 +177,60 @@ test("clean (end_turn) turn then SubagentStop leaves the parent working (negativ
   expect(subRow("sess-a", "agent-clean")?.last_disposition).toBe("clean");
 });
 
+test("an intermediate cut, SubagentStop, then clean settlement never stops the parent", () => {
+  seedWorkingWithSubagent("agent-provisional");
+  insertEvent({
+    hook_event: "SubagentTurn",
+    session_id: "sess-a",
+    agent_id: "agent-provisional",
+    data: JSON.stringify({ disposition: "cut", settled: false }),
+  });
+  insertEvent({
+    hook_event: "SubagentStop",
+    session_id: "sess-a",
+    agent_id: "agent-provisional",
+  });
+  drainAll();
+  expect(jobState()).toBe("working");
+  expect(subRow("sess-a", "agent-provisional")?.last_disposition).toBeNull();
+
+  insertEvent({
+    hook_event: "SubagentTurn",
+    session_id: "sess-a",
+    agent_id: "agent-provisional",
+    data: JSON.stringify({ disposition: "clean", settled: true }),
+  });
+  drainAll();
+  expect(jobState()).toBe("working");
+  expect(subRow("sess-a", "agent-provisional")?.last_disposition).toBe("clean");
+});
+
+test("SubagentStop before intermediate cut and clean settlement also stays working", () => {
+  seedWorkingWithSubagent("agent-reordered-clean");
+  insertEvent({
+    hook_event: "SubagentStop",
+    session_id: "sess-a",
+    agent_id: "agent-reordered-clean",
+  });
+  insertEvent({
+    hook_event: "SubagentTurn",
+    session_id: "sess-a",
+    agent_id: "agent-reordered-clean",
+    data: JSON.stringify({ disposition: "cut", settled: false }),
+  });
+  insertEvent({
+    hook_event: "SubagentTurn",
+    session_id: "sess-a",
+    agent_id: "agent-reordered-clean",
+    data: JSON.stringify({ disposition: "clean", settled: true }),
+  });
+  drainAll();
+  expect(jobState()).toBe("working");
+  expect(subRow("sess-a", "agent-reordered-clean")?.last_disposition).toBe(
+    "clean",
+  );
+});
+
 test("SubagentStop with NO disposition stamped leaves the parent working", () => {
   // The disposition fact never folded (no SubagentTurn) — the SubagentStop fold
   // must not invent a cut. Parent stays working.
@@ -209,7 +263,7 @@ test("race tail: a cut SubagentTurn landing AFTER SubagentStop still flips the p
     hook_event: "SubagentTurn",
     session_id: "sess-a",
     agent_id: "agent-race",
-    data: JSON.stringify({ disposition: "cut" }),
+    data: JSON.stringify({ disposition: "cut", settled: true }),
   });
   drainAll();
   expect(jobState()).toBe("stopped");

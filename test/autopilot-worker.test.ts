@@ -87,6 +87,7 @@ import {
   type DispatchKey,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   type DupEpicNumberObservation,
+  deriveResourceHoldObservations,
   dupEpicNumberDistressId,
   epicFrameVerdict,
   epicHasActiveResolver,
@@ -228,6 +229,10 @@ import {
   loadReadinessInputs,
   type ReadinessQuery,
 } from "../src/readiness-inputs";
+import {
+  dispatchClaimBlocksReplacement,
+  dispatchTargetHasActivityCollision,
+} from "../src/reconcile-core";
 import { drain } from "../src/reducer";
 import { readBootStatus, runQuery } from "../src/server-worker";
 import type {
@@ -572,7 +577,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       if (typeof opts.dispatchedAck === "function") {
         return opts.dispatchedAck();
       }
-      return opts.dispatchedAck ?? { ok: true };
+      return opts.dispatchedAck ?? { ok: true, attemptId: 101 };
     },
     maxEventId() {
       log.maxEventIdCalls += 1;
@@ -632,6 +637,114 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Harness activity + Dispatch claim ownership
+// ---------------------------------------------------------------------------
+
+test("exact Resource holds distinguish held, cleared, generation-conflict, and degraded observations", () => {
+  const job = makeJob({
+    job_id: "owner",
+    plan_verb: "close",
+    plan_ref: "fn-1-a",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%7",
+    backend_exec_generation_id: "700:7000",
+  });
+  const jobs = new Map([[job.job_id, job]]);
+  const pane: PaneInfo = {
+    tmuxGenerationId: "700:7000",
+    paneId: "%7",
+    windowId: "@7",
+    currentCommand: "claude",
+    paneDead: "0",
+    sessionName: "autopilot",
+    windowName: "close::fn-1-a",
+  };
+  expect(
+    deriveResourceHoldObservations(jobs, [pane]).get("owner")?.status,
+  ).toBe("held");
+  expect(
+    deriveResourceHoldObservations(jobs, [
+      { ...pane, paneId: "%8", windowId: "@8" },
+    ]).get("owner")?.status,
+  ).toBe("clear");
+  expect(
+    deriveResourceHoldObservations(jobs, [
+      { ...pane, tmuxGenerationId: "701:7001" },
+    ]).get("owner")?.status,
+  ).toBe("conflict");
+  expect(deriveResourceHoldObservations(jobs, null).get("owner")?.status).toBe(
+    "unknown",
+  );
+});
+
+test("parked exact claim owns its target without consuming activity; active and unknown collide", () => {
+  const claim = {
+    verb: "work",
+    id: "fn-1-a.1",
+    attempt_id: 41,
+    state: "bound",
+    session_id: "s1",
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: 2,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 2,
+    updated_at: 2,
+  };
+  expect(dispatchClaimBlocksReplacement(claim)).toBe(true);
+  expect(dispatchClaimBlocksReplacement({ ...claim, state: "released" })).toBe(
+    false,
+  );
+  const jobs = new Map([
+    [
+      "s1",
+      {
+        job_id: "s1",
+        plan_verb: "work",
+        plan_ref: "fn-1-a.1",
+        state: "stopped",
+      },
+    ],
+  ]) as unknown as Map<string, Job>;
+  expect(
+    dispatchTargetHasActivityCollision(
+      jobs,
+      new Map([
+        [
+          "s1",
+          {
+            status: "quiescent",
+            reason: "ambient-resource",
+            reservation: null,
+          },
+        ],
+      ]),
+      "work",
+      "fn-1-a.1",
+    ),
+  ).toBe(false);
+  expect(
+    dispatchTargetHasActivityCollision(
+      jobs,
+      new Map([
+        [
+          "s1",
+          {
+            status: "unknown",
+            reason: "child-evidence-stale",
+            reservation: null,
+          },
+        ],
+      ]),
+      "work",
+      "fn-1-a.1",
+    ),
+  ).toBe(true);
+});
 
 // ---------------------------------------------------------------------------
 // verbForVerdict
@@ -4087,10 +4200,11 @@ test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack r
   // CRITICAL: launch must NOT have fired while the ack is unresolved.
   expect(log.launches.length).toBe(0);
   // Resolve the durable ack → the launch may now proceed.
-  ackGate.resolve({ ok: true });
+  ackGate.resolve({ ok: true, attemptId: 101 });
   const outcome = await promise;
   expect(outcome).toBe("ok");
   expect(log.launches.length).toBe(1);
+  expect(log.launches[0]?.spec?.dispatchAttemptId).toBe(101);
 });
 
 test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted-prelaunch, NO DispatchFailed", async () => {

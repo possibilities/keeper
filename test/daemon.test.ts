@@ -4310,7 +4310,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // onto the tail, and to 124 appending fn-1252 task .6's
   // `dispatch_failures.conflicted_files` TEXT column — both idempotent additive
   // ALTERs, NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(125);
+  expect(SCHEMA_VERSION).toBe(126);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5406,6 +5406,7 @@ function orchJob(
   updatedAt: number,
 ): Job {
   return {
+    job_id: `${planVerb}-${planRef}-${updatedAt}`,
     plan_verb: planVerb,
     plan_ref: planRef,
     state,
@@ -5433,6 +5434,45 @@ test("probeAuditOrchestrator: a stopped owner with a live backend reads live (sh
   expect(probeAuditOrchestrator(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
     state: "live",
   });
+});
+
+test("probeAuditOrchestrator: canonical quiescent stopped owner reads dead while unknown holds", () => {
+  const jobs: Job[] = [orchJob("work", "fn-1-foo.1", "stopped", 100)];
+  const id = jobs[0]?.job_id ?? "";
+  expect(
+    probeAuditOrchestrator(
+      jobs,
+      "fn-1-foo",
+      "fn-1-foo.1",
+      new Map([
+        [
+          id,
+          {
+            status: "quiescent",
+            reason: "ambient-resource",
+            reservation: null,
+          },
+        ],
+      ]),
+    ),
+  ).toEqual({ state: "dead", diedAtMs: 100_000 });
+  expect(
+    probeAuditOrchestrator(
+      jobs,
+      "fn-1-foo",
+      "fn-1-foo.1",
+      new Map([
+        [
+          id,
+          {
+            status: "unknown",
+            reason: "child-evidence-stale",
+            reservation: null,
+          },
+        ],
+      ]),
+    ),
+  ).toEqual({ state: "live" });
 });
 
 test("probeAuditOrchestrator: only-dead owners read dead at the MOST-RECENT death (updated_at → ms)", () => {

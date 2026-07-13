@@ -4282,6 +4282,17 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       ctx.db.run(CREATE_AWAITS);
     },
   },
+  {
+    version: 126,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(ctx.db, "pending_dispatches", "attempt_id", "INTEGER");
+      ctx.db.run(CREATE_DISPATCH_CLAIMS);
+      for (const sql of CREATE_DISPATCH_CLAIMS_INDEXES) {
+        ctx.db.run(sql);
+      }
+    },
+  },
 ];
 
 /**
@@ -4302,7 +4313,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v125:82c112aa72cbf716ec425913734c29756c70c3bf067210b71235d098582d162a";
+  "v126:1aedde7dc902769e00f549d7f0e30bf242f683606496f7de1dd6d343810b0f97";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5572,9 +5583,42 @@ CREATE TABLE IF NOT EXISTS pending_dispatches (
     dir TEXT,
     dispatched_at REAL NOT NULL,
     last_event_id INTEGER NOT NULL,
+    attempt_id INTEGER,
     PRIMARY KEY (verb, id)
 )
 `;
+
+/**
+ * Durable Dispatch-claim Projection. One row fences the current Dispatch attempt
+ * for a `(verb, id)` target. Released rows remain as tombstones so a delayed
+ * acquire, bind, acknowledgement, or release from an older attempt cannot regain
+ * authority. `attempt_id` is a positive, monotonically ordered Dispatch-attempt
+ * identity; NULL is reserved for deterministic legacy-unfenced events and never
+ * aliases an exact attempt.
+ */
+const CREATE_DISPATCH_CLAIMS = `
+CREATE TABLE IF NOT EXISTS dispatch_claims (
+    verb TEXT NOT NULL,
+    id TEXT NOT NULL,
+    attempt_id INTEGER,
+    state TEXT NOT NULL,
+    session_id TEXT,
+    dir TEXT,
+    legacy_unfenced INTEGER NOT NULL DEFAULT 0,
+    acquired_at REAL NOT NULL,
+    bound_at REAL,
+    resume_acknowledged_at REAL,
+    released_at REAL,
+    last_event_id INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (verb, id)
+)
+`;
+
+const CREATE_DISPATCH_CLAIMS_INDEXES = [
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_claims_attempt_id ON dispatch_claims(attempt_id) WHERE attempt_id IS NOT NULL",
+  "CREATE INDEX IF NOT EXISTS idx_dispatch_claims_session_id ON dispatch_claims(session_id) WHERE session_id IS NOT NULL",
+];
 
 /**
  * `dispatch_never_bound` projection table — the never-bound circuit breaker's
@@ -6955,6 +6999,10 @@ function migrate(db: Database): void {
       }
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
+      db.run(CREATE_DISPATCH_CLAIMS);
+      for (const sql of CREATE_DISPATCH_CLAIMS_INDEXES) {
+        db.run(sql);
+      }
       db.run(CREATE_DISPATCH_NEVER_BOUND);
       db.run(CREATE_DISPATCH_INSTANT_DEATH);
       db.run(CREATE_DISPATCH_MINT_GATE);
