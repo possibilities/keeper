@@ -60,5 +60,5 @@ Land pure replacements and deletions atomically so the named fast gate never has
 - [ ] The fast manifest contains no unapproved real process/daemon/Worker/socket/git/tmux execution.
 
 ## Done summary
-
+Converted process/daemon-shaped fast tests to importable decision cores and injected adapters: retired-name classification is now a pure classifyRetiredNames() core (live-tree scan moved to the lint entrypoint), daemon worker-selection/spill-document/archive-eligibility/seed-sweep liveness are pure unit-tested functions instead of real Worker/ps/subprocess boots, pi-task-facade RPC calls take an injected deadline seam instead of a real 2s wait, docs-pusher lock staleness takes an injected pid-liveness seam instead of spawning true, and the duplicate restore-sim/panel-lifecycle-integration pseudo-E2E files were deleted with their assertions already covered by existing focused unit suites (restore-set/resume-resolve/restore-verify/tabs, agent-panel-cli/pair-panel).
 ## Evidence
