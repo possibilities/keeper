@@ -33,5 +33,5 @@ escalation fires and clears; assert no force-release).
 - [ ] The escalation clears on positive settle/exit evidence.
 
 ## Done summary
-
+Added a producer-only monitor-slot backstop: a stopped, pid-alive session whose worker-monitor evidence stays resource-evidence-stale past a 30-minute horizon mints one page-once needs_human distress for its wedged per-root dispatch slot, level-clearing only on positive settle/exit/monitor-clear evidence; readiness occupancy and the monitor-stale mutex hold are unchanged, and no age-based release/kill path was added.
 ## Evidence
