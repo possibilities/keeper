@@ -652,9 +652,21 @@ async function supervise(ctx: {
       maxAttempts: RECONNECT_MAX_ATTEMPTS,
     });
     if (decision.action === "escalate") {
-      throw new Error(
-        `tmux control client exceeded ${RECONNECT_MAX_ATTEMPTS} consecutive reconnects — escalating for a process restart`,
-      );
+      // Degrade focus observation in place rather than escalating a daemon
+      // restart: a restart cannot recover a persistent control-mode
+      // incompatibility, so escalating would crash-loop the whole daemon over a
+      // non-critical feature. Stay gated at the max backoff and keep retrying —
+      // a connect that later makes progress resets the counter and restores
+      // observation.
+      if (attempts === RECONNECT_MAX_ATTEMPTS) {
+        console.error(
+          "[tmux-control-worker] focus observation degraded — control client could not sustain a connection; retrying at max backoff, daemon stays up",
+        );
+      }
+      attempts = RECONNECT_MAX_ATTEMPTS;
+      ctx.postLiveness();
+      await interruptibleSleep(RECONNECT_MAX_DELAY_MS, ctx.isStopping);
+      continue;
     }
     ctx.postLiveness();
     await interruptibleSleep(decision.delayMs, ctx.isStopping);
