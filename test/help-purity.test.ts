@@ -116,7 +116,7 @@ async function runPure(fn: () => unknown | Promise<unknown>): Promise<PureRun> {
 
 /** Resolve a native leaf's `main(argv)`. `completions` has no `cli/` module — it
  *  is served by `runCompletionsCommand` in `cli/keeper.ts` — so it is wired to an
- *  equivalent argv-only main here. */
+ *  equivalent argv-only main here. `daemon` dispatches to the restart module. */
 async function resolveNativeMain(
   name: string,
 ): Promise<(argv: string[]) => unknown> {
@@ -128,6 +128,9 @@ async function resolveNativeMain(
         exit: (c) => process.exit(c),
         version: "9.9.9",
       });
+  }
+  if (name === "daemon") {
+    return (await import("../cli/restart.ts")).main;
   }
   const mod = (await import(`../cli/${name}.ts`)) as {
     main: (argv: string[]) => unknown;

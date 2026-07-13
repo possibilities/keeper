@@ -16,6 +16,16 @@ export const REQUIRED_HEALTHY_PROBES = 3;
 export const INITIAL_BACKOFF_MS = 100;
 export const MAX_BACKOFF_MS = 1_500;
 
+export const DAEMON_HELP = `keeper daemon — daemon lifecycle operations
+
+Usage:
+  keeper daemon restart [--timeout <duration>] [--sock <path>]
+  keeper daemon --help
+
+Subcommands:
+  restart  Restart keeperd and wait for a caught-up serve
+`;
+
 export const HELP = `keeper daemon restart — restart keeperd and wait for a caught-up serve
 
 Usage:
@@ -319,6 +329,10 @@ export async function runRestart(
 }
 
 export async function main(argv: string[]): Promise<void> {
+  if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+    process.stdout.write(DAEMON_HELP);
+    process.exit(0);
+  }
   const parsed = parseRestartArgs(argv);
   if (!parsed.ok) {
     if (parsed.help) {
