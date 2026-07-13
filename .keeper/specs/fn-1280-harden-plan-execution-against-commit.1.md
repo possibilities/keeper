@@ -38,5 +38,5 @@ Empty `scannedRoots` must retract nothing (`isWithinRoots` over `[]` matches no 
 - [ ] `bun test test/plan-worker.test.ts` is green, including a new test for the skipped-root case.
 
 ## Done summary
-
+Boot-reconciliation sweep now scopes retraction to roots whose boot scan actually completed: a scannedRoots subset (populated in both the native-watcher and poll-tier boot loops only on a clean scanRoot return) replaces data.roots as the sweep argument, while the barrier still counts every configured root. A subscribe-failed/skipped root's epics and tasks are preserved instead of false-tombstoned; a sibling root that scanned cleanly still has its genuinely-absent rows retracted. New test covers empty scannedRoots (retracts nothing), skipped-root retention, and sibling scanned-root retraction. bun test test/plan-worker.test.ts: 99 pass, 0 fail.
 ## Evidence

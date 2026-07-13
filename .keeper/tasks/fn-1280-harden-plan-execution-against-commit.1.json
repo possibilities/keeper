@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Scope boot sweep to scanned roots only",
-  "updated_at": "2026-07-13T16:32:53.960000Z"
+  "updated_at": "2026-07-13T17:19:31.139000Z",
+  "worker_done_at": "2026-07-13T17:19:31.139000Z"
 }
