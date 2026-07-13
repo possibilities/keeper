@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-13T17:29:46.463000Z",
+  "created_by_close_of": "fn-1279-backstop-wedged-dispatch-slot-occupants",
+  "depends_on_epics": [
+    "fn-1279-backstop-wedged-dispatch-slot-occupants"
+  ],
+  "id": "fn-1283-prune-stale-monitor-slot-backstop",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Prune stale monitor-slot backstop comments",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-13T17:29:46.463000Z"
+}
