@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 10,
+        "insertions": 536
+      },
+      "done_summary": "Added a producer-only monitor-slot backstop: a stopped, pid-alive session whose worker-monitor evidence stays resource-evidence-stale past a 30-minute horizon mints one page-once needs_human distress for its wedged per-root dispatch slot, level-clearing only on positive settle/exit/monitor-clear evidence; readiness occupancy and the monitor-stale mutex hold are unchanged, and no age-based release/kill path was added.",
+      "input_hash": "d3c7f64b3f2604f9ffa2471fe96ec00216587be79ebe6bad3db9b7caa794da2d",
+      "model": "opus",
+      "spec_chars": 2445,
+      "spec_md": "## Description\n\nOriginating finding F1 (evidence path: `src/session-activity.ts:222` returns\n`{status:\"unknown\", reason:\"resource-evidence-stale\"}` for a stopped+alive session\nwhose `has_live_worker_monitor` snapshot ages past `HARNESS_RESOURCE_STALE_SEC`;\nthe old `MONITOR_RELEASE_SEC` force-release ceiling is deleted, confirmed by\n`test/readiness.test.ts:2831` asserting `running({kind:\"monitor-stale\"})` still\noccupies at age 2000s > the former 1800s ceiling; `src/autopilot-worker.ts`\nstuck-sentinel escalation keys only on the `cwd-missing` case). Net: a genuinely\nabandoned but pid-alive worker wedges its per-root dispatch mutex indefinitely with\nonly a passive `monitor-stale` board flag and no active recovery.\n\nAdd an operator-visible backstop in the autopilot producer that mints exactly one\n`needs_human` escalation (page-once, producer-level-cleared \u2014 same discipline as the\nexisting sticky distress rows) for a per-root dispatch slot held by a\npermanently-`unknown` (`resource-evidence-stale`) monitor occupant past a bounded\nthreshold. PAGE, never force-release or kill \u2014 preserve the epic's \"age never proves\nterminality\" thesis. Clear the escalation on positive evidence only (occupant settles\nto active, pid exits, or the fact clears).\n\nFiles: `src/autopilot-worker.ts` (producer escalation + page-once level-clear),\n`src/session-activity.ts` / `src/readiness.ts` (surface the long-unknown occupant\nsignal to the producer as needed), `test/readiness.test.ts` (assert the page-once\nescalation fires and clears; assert no force-release).\n\n## Acceptance\n\n- [ ] A stopped+alive session whose worker-monitor stays `resource-evidence-stale`\n      past the threshold raises one `needs_human` escalation for the wedged per-root\n      slot; a re-page happens only after a producer level-clear.\n- [ ] The backstop never force-releases or kills the occupant; a fresh or\n      within-threshold monitor occupant is unaffected.\n- [ ] The escalation clears on positive settle/exit evidence.\n\n## Done summary\nAdded a producer-only monitor-slot backstop: a stopped, pid-alive session whose worker-monitor evidence stays resource-evidence-stale past a 30-minute horizon mints one page-once needs_human distress for its wedged per-root dispatch slot, level-clearing only on positive settle/exit/monitor-clear evidence; readiness occupancy and the monitor-stale mutex hold are unchanged, and no age-based release/kill path was added.\n## Evidence\n",
+      "task_id": "fn-1279-backstop-wedged-dispatch-slot-occupants.1",
+      "tier": "xhigh",
+      "title": "Page wedged stale-monitor slots"
+    }
+  ],
+  "created_at": "2026-07-13T17:29:39.979000Z",
+  "epic_id": "fn-1279-backstop-wedged-dispatch-slot-occupants",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "d3c7f64b3f2604f9ffa2471fe96ec00216587be79ebe6bad3db9b7caa794da2d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
