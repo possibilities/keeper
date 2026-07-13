@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 1,
+        "insertions": 8
+      },
+      "done_summary": "test/await-worker.test.ts now imports DURABLE_AWAIT_CONDITION_KINDS and asserts the durableAwaitCases keyset matches the enum exactly, so an untied condition kind turns the coverage suite red.",
+      "input_hash": "864d41c32d9d2268d87c292c4d6542eee4a3227714e0af92d90557adde25bb19",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1452,
+      "spec_md": "## Description\n\nFinding F2 (evidence: `test/await-worker.test.ts:319`, the `evaluateDurableAwaitConditions\ncovers every server-side condition kind` test and the `durableAwaitCases` table it iterates).\nThe table is the coverage source of truth but is never tied to the canonical enum\n`DURABLE_AWAIT_CONDITION_KINDS` (exported from `src/protocol.ts`) \u2014 the test file does not\neven import it. Add an enforced tie so a new condition kind cannot ship untested.\n\nFiles:\n- `test/await-worker.test.ts` \u2014 import `DURABLE_AWAIT_CONDITION_KINDS` and assert the table\n  covers exactly the enum: prefer keying the table by `kind` and asserting the key set equals\n  the enum set (catches both a missing case AND a stray/renamed one), falling back to a\n  length assertion (`durableAwaitCases.length === DURABLE_AWAIT_CONDITION_KINDS.length`) if a\n  keyset comparison is awkward with the current table shape.\n\n## Acceptance\n\n- [ ] `test/await-worker.test.ts` imports `DURABLE_AWAIT_CONDITION_KINDS` and asserts the `durableAwaitCases` coverage matches the enum (keyset equality preferred, length tie acceptable).\n- [ ] Removing or adding a case to the table (or a kind to the enum) without the other turns the suite red.\n- [ ] `bun test` passes.\n\n## Done summary\ntest/await-worker.test.ts now imports DURABLE_AWAIT_CONDITION_KINDS and asserts the durableAwaitCases keyset matches the enum exactly, so an untied condition kind turns the coverage suite red.\n## Evidence\n",
+      "task_id": "fn-1275-enforce-durable-await-condition-kind.1",
+      "tier": "medium",
+      "title": "Tie coverage table to enum"
+    }
+  ],
+  "created_at": "2026-07-13T11:46:19.770000Z",
+  "epic_id": "fn-1275-enforce-durable-await-condition-kind",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "864d41c32d9d2268d87c292c4d6542eee4a3227714e0af92d90557adde25bb19",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
