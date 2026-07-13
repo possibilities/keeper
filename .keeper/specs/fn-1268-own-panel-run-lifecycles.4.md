@@ -57,5 +57,5 @@ Require the new protocol only after the upstream package task lands; protocol mi
 - [ ] Generated runner and judge definitions retain shared body parity, wildcard extension loading, and intended delegation restrictions.
 
 ## Done summary
-
+Bumped the Pi Task facade to owner-scoped RPC v3: spawn/stop now carry an opaque owner handle, cancellation blocks on an acknowledged recursive-cleanup settlement (not fire-and-forget), and the caller's native AbortError/reason survives spawn/completion/abort races with late-terminal-event suppression. Installer verification now pins the nested-context and scoped-cancellation contract markers. Schema, result contract, and renderer/judge delegation restrictions are unchanged.
 ## Evidence
