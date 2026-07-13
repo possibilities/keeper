@@ -1,0 +1,61 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.63,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Consolidation of page-spawn sites in a known distress-key pattern, but the load-bearing notify_failed-never-stamps invariant and event-sourcing producer-owned level-clear idiom need Claude judgment over a GPT tier.",
+      "task_id": "fn-1286-daemon-rides-through-subsystem-failure.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in the daemon's fatalExit liveness doctrine: the both-probes-dead server-first safety proof plus the SQLITE_BUSY-safe recoverable-event mint that must not re-introduce the crash-loop is a nameable intelligence-bound reason.",
+      "task_id": "fn-1286-daemon-rides-through-subsystem-failure.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.58,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy concurrency work with a client-visible typed-rejection contract change and a bounded non-blocking accept-loop probe, but the design is fully settled with a truth-table so sonnet's workhorse judgment fits without an opus gate.",
+      "task_id": "fn-1286-daemon-rides-through-subsystem-failure.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.62,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small pure-pass predicate change whose real work is tracing which proven-dead liveness facts reach readiness and preserving the live-session mutex invariant, judgment-heavy but single-surface and bounded.",
+      "task_id": "fn-1286-daemon-rides-through-subsystem-failure.4",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Real process-signaling with pid-reuse/identity re-verify safety, a defunct-never-signaled boundary, and explicit cross-producer coordination against the monitor-slot backstop is a subtle safety invariant with cross-cutting blast radius warranting opus.",
+      "task_id": "fn-1286-daemon-rides-through-subsystem-failure.5",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T21:49:11.119000Z",
+  "epic_id": "fn-1286-daemon-rides-through-subsystem-failure",
+  "input_hash": "5141100e8e824c11750a08e22a8e60811d9940d375e1108d548e6962e5fb148c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1363218446,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1286-daemon-rides-through-subsystem-failure.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Consolidation of page-spawn sites in a known distress-key pattern, but the load-bearing notify_failed-never-stamps invariant and event-sourcing producer-owned level-clear idiom need Claude judgment over a GPT tier.\",\"confidence\":0.63},{\"task_id\":\"fn-1286-daemon-rides-through-subsystem-failure.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant in the daemon's fatalExit liveness doctrine: the both-probes-dead server-first safety proof plus the SQLITE_BUSY-safe recoverable-event mint that must not re-introduce the crash-loop is a nameable intelligence-bound reason.\",\"confidence\":0.7},{\"task_id\":\"fn-1286-daemon-rides-through-subsystem-failure.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy concurrency work with a client-visible typed-rejection contract change and a bounded non-blocking accept-loop probe, but the design is fully settled with a truth-table so sonnet's workhorse judgment fits without an opus gate.\",\"confidence\":0.58},{\"task_id\":\"fn-1286-daemon-rides-through-subsystem-failure.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Small pure-pass predicate change whose real work is tracing which proven-dead liveness facts reach readiness and preserving the live-session mutex invariant, judgment-heavy but single-surface and bounded.\",\"confidence\":0.62},{\"task_id\":\"fn-1286-daemon-rides-through-subsystem-failure.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Real process-signaling with pid-reuse/identity re-verify safety, a defunct-never-signaled boundary, and explicit cross-producer coordination against the monitor-slot backstop is a subtle safety invariant with cross-cutting blast radius warranting opus.\",\"confidence\":0.72}]}\n"
+}
