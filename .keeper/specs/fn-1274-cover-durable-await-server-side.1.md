@@ -39,5 +39,5 @@ Files: `test/await-worker.test.ts`, `test/daemon.test.ts`.
 - [ ] `bun test` green; no production source changed.
 
 ## Done summary
-
+Added table-driven server-side coverage for evaluateDurableAwaitConditions (all 14 condition kinds, target-null guard, task-vs-epic split, drained scope) and a daemon-level test for the request-await spill guard rejecting escaping/empty/oversized doc_path without minting AwaitRequested. Test-only; no production source changed.
 ## Evidence

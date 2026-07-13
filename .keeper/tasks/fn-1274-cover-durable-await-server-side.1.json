@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Test durable-await server surface",
-  "updated_at": "2026-07-13T10:59:14.448000Z"
+  "updated_at": "2026-07-13T11:22:29.438000Z",
+  "worker_done_at": "2026-07-13T11:22:29.438000Z"
 }
