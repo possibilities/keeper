@@ -6020,6 +6020,7 @@ function tmuxTopologyEvent(
     pane_id: string;
     session_name: string;
     window_index: number | null;
+    job_id?: string;
   }>,
 ): number {
   return insertEvent({
@@ -6069,6 +6070,64 @@ test("TmuxTopologySnapshot overwrites a live job's session + window_index and ad
   expect(moved?.backend_exec_session_id).toBe("background");
   expect(moved?.window_index).toBe(7);
   expect(moved?.backend_exec_generation_id).toBe("gen-100");
+});
+
+test("a later attributed topology observation repairs a pane observed before SessionStart", () => {
+  // The physical pane exists first, but no jobs row can adopt its generation.
+  tmuxTopologyEvent("gen-race", [
+    { pane_id: "%55", session_name: "steady", window_index: 4 },
+  ]);
+  drainAll();
+
+  seedTmuxJob("topo-race", "%55");
+  expect(getTmuxLocation("topo-race")?.backend_exec_generation_id).toBeNull();
+
+  // Byte-identical physical topology, now carrying the producer's exact owner,
+  // folds after SessionStart and adopts the canonical Generation.
+  tmuxTopologyEvent("gen-race", [
+    {
+      pane_id: "%55",
+      session_name: "steady",
+      window_index: 4,
+      job_id: "topo-race",
+    },
+  ]);
+  drainAll();
+  expect(getTmuxLocation("topo-race")).toMatchObject({
+    backend_exec_session_id: "steady",
+    backend_exec_generation_id: "gen-race",
+    window_index: 4,
+  });
+});
+
+test("an unattributed topology pane with multiple live claimants no-ops fail-closed", () => {
+  seedTmuxJob("topo-ambiguous-a", "%66");
+  seedTmuxJob("topo-ambiguous-b", "%66");
+  tmuxTopologyEvent("gen-ambiguous", [
+    { pane_id: "%66", session_name: "unsafe", window_index: 6 },
+  ]);
+  drainAll();
+
+  expect(
+    getTmuxLocation("topo-ambiguous-a")?.backend_exec_generation_id,
+  ).toBeNull();
+  expect(
+    getTmuxLocation("topo-ambiguous-b")?.backend_exec_generation_id,
+  ).toBeNull();
+});
+
+test("an attributed topology pane cannot update a different claimant", () => {
+  seedTmuxJob("topo-owner", "%67");
+  tmuxTopologyEvent("gen-owner", [
+    {
+      pane_id: "%67",
+      session_name: "unsafe",
+      window_index: 7,
+      job_id: "some-other-job",
+    },
+  ]);
+  drainAll();
+  expect(getTmuxLocation("topo-owner")?.backend_exec_generation_id).toBeNull();
 });
 
 test("TmuxTopologySnapshot recycle guard: a NEW generation never overwrites a prior-generation job", () => {

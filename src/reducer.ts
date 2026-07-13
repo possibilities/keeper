@@ -3079,10 +3079,10 @@ export interface TmuxTopologyPaneEntry {
   session_name: string;
   window_index: number | null;
   // OPTIONAL keeper job that owned the pane at post time (producer-stamped via
-  // the `pane_id → jobs.backend_exec_pane_id` join). Decoded for the
-  // topology-anchored crash-restore deriver, which reads job identity from the
-  // event payload; the FOLD ignores it (re-fold determinism). Absent when no
-  // keeper job owned the pane, or when the field is missing / non-string.
+  // the `pane_id → jobs.backend_exec_pane_id` join). The topology-anchored
+  // crash-restore deriver reads it from the event payload; the live Fold uses it
+  // as an exact ownership binding. Absent is accepted for boot-seed and legacy
+  // observations only when exactly one live matching job claims the pane.
   job_id?: string;
 }
 
@@ -3157,12 +3157,15 @@ export function extractTmuxTopologySnapshot(
         typeof rawIndex === "number" && Number.isInteger(rawIndex)
           ? rawIndex
           : null;
-      // OPTIONAL: a non-empty string decodes; anything else (absent / non-string
-      // / empty) leaves `job_id` undefined. The deriver tolerates the absence;
-      // the fold never reads it.
+      // OPTIONAL: absence is a valid unattributed observation. If the field is
+      // present it must be a non-empty string; malformed ownership is dropped
+      // with the pane rather than being mistaken for a valid unattributed row.
+      const hasJobId = Object.hasOwn(rec, "job_id");
       const rawJobId = rec.job_id;
-      const jobId =
-        typeof rawJobId === "string" && rawJobId !== "" ? rawJobId : undefined;
+      if (hasJobId && (typeof rawJobId !== "string" || rawJobId === "")) {
+        continue;
+      }
+      const jobId = hasJobId ? (rawJobId as string) : undefined;
       panes.push({
         pane_id: paneId,
         session_name: sessionName,
@@ -3171,7 +3174,16 @@ export function extractTmuxTopologySnapshot(
       });
     }
   }
-  return { generation_id: generationId, panes };
+  // Duplicate pane identities are a degraded observation. Drop every duplicate
+  // rather than allowing payload order to choose coordinates or ownership.
+  const paneCounts = new Map<string, number>();
+  for (const pane of panes) {
+    paneCounts.set(pane.pane_id, (paneCounts.get(pane.pane_id) ?? 0) + 1);
+  }
+  return {
+    generation_id: generationId,
+    panes: panes.filter((pane) => paneCounts.get(pane.pane_id) === 1),
+  };
 }
 
 function tmuxGenerationPidPart(generationId: string): string | null {
@@ -3195,11 +3207,12 @@ function tmuxGenerationPidPart(generationId: string): string | null {
  *
  * Match: `backend_exec_type = 'tmux'` AND `backend_exec_pane_id = pane_id` AND a
  * live state (NOT ended/killed) AND the generation either EQUALS the snapshot's
- * or is still NULL. A NULL-generation match ADOPTS the snapshot generation
- * (first-match stamping) — the launch env never carried it. The live-state
- * filter is load-bearing: a killed job must NOT adopt a new generation (the
- * recycle-guard risk note), so a recycled pane in a fresh server can't resurrect
- * a dead row's location.
+ * or is still NULL. An attributed pane additionally requires exact `job_id`.
+ * An unattributed boot-seed/legacy pane is accepted only when exactly one live
+ * job matches; multiple claimants no-op fail-closed. A NULL-generation match
+ * ADOPTS the snapshot generation (first-match stamping) — the launch env never
+ * carried it. The live-state filter is load-bearing: a killed job must NOT adopt
+ * a recycled pane's new generation.
  *
  * OVERWRITE semantics (NOT fill-only, unlike {@link foldTmuxPaneSnapshot}): a
  * pane MOVE re-points an already-resolved session, so a later snapshot must
@@ -3232,13 +3245,38 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
   }
   const pidGenerationId = tmuxGenerationPidPart(snapshot.generation_id);
   for (const pane of snapshot.panes) {
+    const candidates = db
+      .query(
+        `SELECT job_id FROM jobs
+         WHERE backend_exec_type = 'tmux'
+           AND backend_exec_pane_id = ?
+           AND state NOT IN ('${ENDED}','${KILLED}')
+           AND (backend_exec_generation_id = ?
+                OR backend_exec_generation_id IS NULL
+                OR backend_exec_generation_id = ?)`,
+      )
+      .all(pane.pane_id, snapshot.generation_id, pidGenerationId) as Array<{
+      job_id: string;
+    }>;
+
+    // Producer attribution is an exact binding. Unattributed boot-seed/legacy
+    // rows retain compatibility only when current projection ownership is unique.
+    const targetJobId =
+      pane.job_id !== undefined
+        ? candidates.some((row) => row.job_id === pane.job_id)
+          ? pane.job_id
+          : null
+        : candidates.length === 1
+          ? (candidates[0]?.job_id ?? null)
+          : null;
+    if (targetJobId === null) {
+      continue;
+    }
+
     // OVERWRITE session (always present per validated pane); COALESCE the
-    // window_index so a NULL-in-payload preserves the last-known good index
-    // (crash-restore sorting depends on it). ADOPT the snapshot generation on a
-    // first match (`backend_exec_generation_id IS NULL`) or a pid-only generation
-    // that names this same server; otherwise the generation must EQUAL the
-    // snapshot's recycle guard. Live-state filter blocks a killed job from
-    // adopting a recycled pane's new generation.
+    // window_index so a NULL-in-payload preserves the last-known good index.
+    // Re-state every identity guard on UPDATE so the exact ownership decision is
+    // visible at the write boundary as well as in the candidate read above.
     db.run(
       `UPDATE jobs SET
          backend_exec_session_id = ?,
@@ -3246,7 +3284,8 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
          window_index = COALESCE(?, window_index),
          last_event_id = ?,
          updated_at = ?
-       WHERE backend_exec_type = 'tmux'
+       WHERE job_id = ?
+         AND backend_exec_type = 'tmux'
          AND backend_exec_pane_id = ?
          AND state NOT IN ('${ENDED}','${KILLED}')
          AND (backend_exec_generation_id = ?
@@ -3258,6 +3297,7 @@ function foldTmuxTopologySnapshot(db: Database, event: Event): void {
         pane.window_index,
         event.id,
         event.ts,
+        targetJobId,
         pane.pane_id,
         snapshot.generation_id,
         pidGenerationId,

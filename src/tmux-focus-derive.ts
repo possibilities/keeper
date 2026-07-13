@@ -184,9 +184,10 @@ export function pickCurrentClient(
  *
  * `job_id` is the keeper job that owns the pane at post time, resolved by the
  * producer's `(pane_id → jobs.backend_exec_pane_id)` join. OPTIONAL: a pane
- * keeper never launched (or one whose job row is not yet written) carries no
- * `job_id`. EXCLUDED from {@link hashTopology} — stable per pane, never gates a
- * re-post; the fold ignores it (re-fold determinism), so it is purely additive.
+ * keeper never launched, one whose job row is not yet written, or one claimed by
+ * multiple live jobs carries no `job_id`. Ownership is part of
+ * {@link hashTopology}: a jobs-projection-only transition must re-post the steady
+ * physical topology so the live-location Fold can converge.
  *
  * Lives here (the pure, dependency-free focus-derive seam) so BOTH the
  * restore-worker poll and the control-worker feed map their rows through the SAME
@@ -205,22 +206,31 @@ export interface TmuxTopologyPane {
  * gate. INCLUDES the `generation_id`, every pane's `session_name`, AND its
  * `window_index` — a pane MOVE (session or window-index change) or a server-
  * generation flip MUST re-fire the post so the live-location fold tracks reality.
- * Sorts panes by `pane_id` so the probe's row order doesn't churn the hash. An
- * empty pane set still hashes the generation (a generation change with no panes is
- * still a change). EXCLUDES the per-pane `job_id` — stable per pane; stamping it
- * must never re-fire the post. Pure.
+ * Sorts panes by a stable total order so the probe's row order doesn't churn the
+ * hash. An empty pane set still hashes the generation (a generation change with
+ * no panes is still a change). INCLUDES the optional per-pane `job_id`: ownership
+ * acquisition, removal, or transfer is a semantic topology transition even when
+ * tmux's physical rows are unchanged. Pure.
  */
 export function hashTopology(
   generationId: string,
   panes: TmuxTopologyPane[],
 ): string {
-  const sorted = [...panes].sort((a, b) =>
-    a.pane_id < b.pane_id ? -1 : a.pane_id > b.pane_id ? 1 : 0,
+  const tuples = panes.map(
+    (pane) =>
+      [
+        pane.pane_id,
+        pane.session_name,
+        pane.window_index,
+        pane.job_id ?? null,
+      ] as const,
   );
-  const body = sorted
-    .map((p) => `${p.pane_id}\t${p.session_name}\t${p.window_index ?? ""}`)
-    .join("\n");
-  return String(Bun.hash(`${generationId}\n${body}`));
+  tuples.sort((a, b) => {
+    const left = JSON.stringify(a);
+    const right = JSON.stringify(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  return String(Bun.hash(JSON.stringify([generationId, tuples])));
 }
 
 /**
