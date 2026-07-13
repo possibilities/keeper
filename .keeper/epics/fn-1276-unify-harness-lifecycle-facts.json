@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-13T16:07:31.799000Z",
   "created_at": "2026-07-13T12:31:14.779000Z",
   "depends_on_epics": [],
   "id": "fn-1276-unify-harness-lifecycle-facts",
   "last_validated_at": "2026-07-13T12:32:20.039000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Unify harness lifecycle facts",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T12:32:20.039000Z"
+  "updated_at": "2026-07-13T16:07:31.799000Z"
 }
