@@ -14,6 +14,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -26,8 +27,10 @@ import {
 } from "../src/commit-work/git-exec";
 import {
   BASELINE_SCRATCH_PREFIX,
+  backupThenForceRemoveWorktree,
   baselineScratchPathFor,
   branchExists,
+  classifyLaneOwnership,
   classifyLinkedWorktree,
   classifyPremergeRedundancy,
   commitWorkLockPath,
@@ -40,6 +43,7 @@ import {
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
+  LANE_DIRT_INDEX_MAX_BYTES,
   type LockAcquirer,
   listEpicLaneBranches,
   losslessPremergeClean,
@@ -206,6 +210,14 @@ test("parseWorktreeList: a detached entry has null branch; bare flag parses", ()
 
 test("parseWorktreeList: empty output → no entries", () => {
   expect(parseWorktreeList("")).toEqual([]);
+});
+
+test("parseWorktreeList: preserves the porcelain lock annotation", () => {
+  expect(
+    parseWorktreeList(
+      "worktree /lane\nHEAD abc\nbranch refs/heads/keeper/epic/fn-1\nlocked maintenance\n\n",
+    )[0]?.locked,
+  ).toBe("maintenance");
 });
 
 // ---------------------------------------------------------------------------
@@ -445,6 +457,82 @@ test("classifyLinkedWorktree: a git-dir probe nonzero exit → error (defer, nev
     },
   ]);
   expect(await classifyLinkedWorktree("/nowhere", run)).toBe("error");
+});
+
+test("classifyLaneOwnership: owned / foreign / ambiguous / locked truth table", async () => {
+  const keeperEntry = entry({
+    path: "/lane",
+    branch: "refs/heads/keeper/epic/fn-1-foo",
+  });
+  const identityRunner =
+    (laneGit: string, laneCommon: string, fail = false): GitRunner =>
+    async (args, options) => {
+      if (fail) return { code: 128, stdout: "", stderr: "probe failed" };
+      const cwd = options?.cwd ?? "";
+      const common = args.includes("--git-common-dir");
+      return {
+        code: 0,
+        stdout:
+          cwd === "/repo"
+            ? "/repo/.git\n"
+            : common
+              ? `${laneCommon}\n`
+              : `${laneGit}\n`,
+        stderr: "",
+      };
+    };
+  expect(
+    await classifyLaneOwnership(
+      "/repo",
+      keeperEntry,
+      identityRunner("/repo/.git/worktrees/lane", "/repo/.git"),
+    ),
+  ).toEqual({ kind: "owned", epicId: "fn-1-foo" });
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("/other/.git/worktrees/lane", "/other/.git"),
+      )
+    ).kind,
+  ).toBe("foreign");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("/lane/.git", "/lane/.git"),
+      )
+    ).kind,
+  ).toBe("foreign");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        keeperEntry,
+        identityRunner("", "", true),
+      )
+    ).kind,
+  ).toBe("ambiguous");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        { ...keeperEntry, locked: "busy" },
+        identityRunner("", ""),
+      )
+    ).kind,
+  ).toBe("locked");
+  expect(
+    (
+      await classifyLaneOwnership(
+        "/repo",
+        { ...keeperEntry, branch: "refs/heads/feature" },
+        identityRunner("", ""),
+      )
+    ).kind,
+  ).toBe("ambiguous");
 });
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1192,101 @@ test("removeWorktree: dirty tree → remove fails → dirty result, never forced
   expect(
     calls.filter((c) => argvStartsWith(c.args, "worktree", "remove")),
   ).toHaveLength(1);
+});
+
+test("backupThenForceRemoveWorktree: snapshots staged, unstaged, and untracked dirt before force-remove", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-dirt-"));
+  const lane = join(root, "lane");
+  const spool = join(root, "spool");
+  mkdirSync(join(lane, "nested"), { recursive: true });
+  writeFileSync(join(lane, "loose.txt"), "loose dirt\n");
+  writeFileSync(join(lane, "nested", "other.txt"), "other dirt\n");
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { stdout: "staged patch\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "diff", "--binary"),
+      result: { stdout: "unstaged patch\n" },
+    },
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: "loose.txt\0nested/other.txt\0" },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      "/repo",
+      entry({
+        path: lane,
+        branch: "refs/heads/keeper/epic/fn-1-foo",
+      }),
+      run,
+      { spoolDir: spool, nowMs: () => 1234, snapshotId: () => "snap" },
+    );
+    expect(result).toEqual({
+      kind: "removed",
+      snapshotDir: join(spool, "snap"),
+    });
+    expect(readFileSync(join(spool, "snap", "staged.patch"), "utf8")).toBe(
+      "staged patch\n",
+    );
+    expect(readFileSync(join(spool, "snap", "unstaged.patch"), "utf8")).toBe(
+      "unstaged patch\n",
+    );
+    expect(
+      readFileSync(join(spool, "snap", "untracked", "loose.txt"), "utf8"),
+    ).toBe("loose dirt\n");
+    expect(
+      readFileSync(
+        join(spool, "snap", "untracked", "nested", "other.txt"),
+        "utf8",
+      ),
+    ).toBe("other dirt\n");
+    const indexLine = readFileSync(join(spool, "index.ndjson"), "utf8");
+    expect(Buffer.byteLength(indexLine)).toBeLessThanOrEqual(
+      LANE_DIRT_INDEX_MAX_BYTES,
+    );
+    expect(JSON.parse(indexLine).untracked_count).toBe(2);
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "worktree", "remove", "--force", lane),
+      ),
+    ).toBe(true);
+    expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+      true,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenForceRemoveWorktree: a failed snapshot never destroys", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-dirt-fail-"));
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "diff", "--cached"),
+      result: { exitCode: 128, stderr: "cannot diff" },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      "/repo",
+      entry({
+        path: join(root, "lane"),
+        branch: "refs/heads/keeper/epic/fn-1-foo",
+      }),
+      run,
+      { spoolDir: join(root, "spool") },
+    );
+    expect(result.kind).toBe("backup-failed");
+    expect(
+      calls.some((c) => argvStartsWith(c.args, "worktree", "remove")),
+    ).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

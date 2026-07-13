@@ -92,6 +92,7 @@ import {
   DUP_EPIC_NUMBER_DISTRESS_ID_PREFIX,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   isDupEpicNumberDistressKey,
+  isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
@@ -100,6 +101,10 @@ import {
   isStaleBaseDistressKey,
   isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
+  LANE_BACKUP_DISTRESS_ID_PREFIX,
+  LANE_BACKUP_DISTRESS_REASON,
+  LANE_TEARDOWN_DISTRESS_ID_PREFIX,
+  LANE_TEARDOWN_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   routeDispatchFailure,
@@ -186,8 +191,10 @@ import {
   type EpicLaneBranchSet,
   epicIdFromKeeperLaneEntry,
   abortInterruptedMerge as gitAbortInterruptedMerge,
+  backupThenForceRemoveWorktree as gitBackupThenForceRemoveWorktree,
   baseMergeLockPath as gitBaseMergeLockPath,
   branchExists as gitBranchExists,
+  classifyLaneOwnership as gitClassifyLaneOwnership,
   classifyLinkedWorktree as gitClassifyLinkedWorktree,
   commitWorkLockPath as gitCommitWorkLockPath,
   currentBranch as gitCurrentBranch,
@@ -202,6 +209,8 @@ import {
   measureBaseDrift as gitMeasureBaseDrift,
   mergeBranchInto as gitMergeBranchInto,
   mergeReadiness as gitMergeReadiness,
+  parseWorktreeList as gitParseWorktreeList,
+  probeLaneMergeHead as gitProbeLaneMergeHead,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
   pruneWorktrees as gitPruneWorktrees,
   remotePushFastForwardable as gitRemotePushFastForwardable,
@@ -227,6 +236,7 @@ export {
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   DUP_EPIC_NUMBER_DISTRESS_VERB,
   isDupEpicNumberDistressKey,
+  isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
@@ -236,6 +246,11 @@ export {
   isStuckSentinelDistressKey,
   isWorktreeLanePremergeReason,
   isWorktreeRecoverReason,
+  LANE_BACKUP_DISTRESS_ID_PREFIX,
+  LANE_BACKUP_DISTRESS_REASON,
+  LANE_TEARDOWN_DISTRESS_ID_PREFIX,
+  LANE_TEARDOWN_DISTRESS_REASON,
+  LANE_TEARDOWN_DISTRESS_VERB,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_VERB,
@@ -1033,6 +1048,7 @@ export interface WorktreeDriver {
     epicPresentAndNotDone: (epicId: string) => Promise<boolean>,
     hasActiveResolver: (epicId: string) => boolean,
     epicHasOccupyingJob: (epicId: string) => boolean,
+    laneTeardown?: LaneTeardownRecoveryOptions,
   ): Promise<WorktreeRecoveryOutcome>;
 }
 
@@ -1440,6 +1456,132 @@ export function sharedCheckoutDistressObservations(): {
   dirty: Map<string, string>;
 } {
   return { wedged: new Map(), dirty: new Map() };
+}
+
+/** Recover-pass grace for an un-tearable closed/tombstoned lane. */
+export const LANE_TEARDOWN_GRACE_SEC = 30 * 60;
+
+export interface LaneTeardownGraceTracker {
+  consider(input: {
+    path: string;
+    state: "destroyable" | "blocked";
+    detail: string;
+    nowSec: number;
+  }): { destroy: boolean; mint?: SharedWedgeDistressAction };
+  noteBackupFailure(input: {
+    path: string;
+    detail: string;
+    nowSec: number;
+  }): SharedWedgeDistressAction | null;
+  finishCycle(input: {
+    presentPaths: ReadonlySet<string>;
+    candidatePaths: ReadonlySet<string>;
+    backupFailedPaths: ReadonlySet<string>;
+    openTeardownPaths: ReadonlySet<string>;
+    openBackupPaths: ReadonlySet<string>;
+    allowClear?: boolean;
+  }): SharedWedgeDistressAction[];
+}
+
+export function laneTeardownDistressId(path: string): string {
+  return `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}${repoDirHash(normalizeLanePath(path))}`;
+}
+
+export function laneBackupDistressId(path: string): string {
+  return `${LANE_BACKUP_DISTRESS_ID_PREFIX}${repoDirHash(normalizeLanePath(path))}`;
+}
+
+/** Pure in-memory grace/page-once tracker; the producer supplies the only clock. */
+export function createLaneTeardownGraceTracker(
+  graceSec: number = LANE_TEARDOWN_GRACE_SEC,
+): LaneTeardownGraceTracker {
+  const firstSeen = new Map<string, { sinceSec: number; minted: boolean }>();
+  const firstBackupFailure = new Map<
+    string,
+    { sinceSec: number; minted: boolean }
+  >();
+  const graceMin = Math.round(graceSec / 60);
+  return {
+    consider({ path, state, detail, nowSec }) {
+      const key = normalizeLanePath(path);
+      let episode = firstSeen.get(key);
+      if (episode === undefined) {
+        episode = { sinceSec: nowSec, minted: false };
+        firstSeen.set(key, episode);
+      }
+      if (nowSec - episode.sinceSec < graceSec) return { destroy: false };
+      if (state === "destroyable") return { destroy: true };
+      if (episode.minted) return { destroy: false };
+      episode.minted = true;
+      return {
+        destroy: false,
+        mint: {
+          id: laneTeardownDistressId(key),
+          dir: key,
+          reason:
+            `${LANE_TEARDOWN_DISTRESS_REASON}: ${key} stayed un-tearable past ` +
+            `the ${graceMin}min recover-pass grace and will never be destroyed ` +
+            `automatically (${detail})`,
+        },
+      };
+    },
+    noteBackupFailure({ path, detail, nowSec }) {
+      const key = normalizeLanePath(path);
+      let episode = firstBackupFailure.get(key);
+      if (episode === undefined) {
+        episode = { sinceSec: nowSec, minted: false };
+        firstBackupFailure.set(key, episode);
+      }
+      if (episode.minted || nowSec - episode.sinceSec < graceSec) return null;
+      episode.minted = true;
+      return {
+        id: laneBackupDistressId(key),
+        dir: key,
+        reason:
+          `${LANE_BACKUP_DISTRESS_REASON}: the lane dirt spool snapshot for ${key} ` +
+          `has failed throughout the ${graceMin}min recover-pass grace; the lane ` +
+          `was not destroyed (${detail})`,
+      };
+    },
+    finishCycle({
+      presentPaths,
+      candidatePaths,
+      backupFailedPaths,
+      openTeardownPaths,
+      openBackupPaths,
+      allowClear = true,
+    }) {
+      for (const path of firstSeen.keys()) {
+        if (!candidatePaths.has(path)) firstSeen.delete(path);
+      }
+      for (const path of firstBackupFailure.keys()) {
+        if (!backupFailedPaths.has(path)) firstBackupFailure.delete(path);
+      }
+      const clear: SharedWedgeDistressAction[] = [];
+      if (!allowClear) return clear;
+      for (const path of openTeardownPaths) {
+        const key = normalizeLanePath(path);
+        if (!presentPaths.has(key)) {
+          clear.push({ id: laneTeardownDistressId(key), dir: key });
+        }
+      }
+      for (const path of openBackupPaths) {
+        const key = normalizeLanePath(path);
+        if (!presentPaths.has(key)) {
+          clear.push({ id: laneBackupDistressId(key), dir: key });
+        }
+      }
+      return clear;
+    },
+  };
+}
+
+export interface LaneTeardownRecoveryOptions {
+  tracker: LaneTeardownGraceTracker;
+  nowSec: number;
+  spoolDir?: string;
+  openTeardownPaths?: ReadonlySet<string>;
+  openBackupPaths?: ReadonlySet<string>;
 }
 
 /**
@@ -5168,10 +5310,9 @@ export function createWorktreeDriver(
         for (const p of paths) {
           const removed = await gitRemoveWorktree(repoDir, p, run);
           if (removed.kind === "dirty") {
-            return {
-              ok: false,
-              reason: `worktree-teardown-dirty: ${p} has uncommitted changes — ${removed.stderr}`,
-            };
+            return retrySkip(
+              `worktree-finalize-teardown-deferred: ${p} has uncommitted changes — the recover pass owns backup-then-force teardown after its grace (${removed.stderr})`,
+            );
           }
           // Removed clean (THIS path's own result): sweep a residue-only `.claude`
           // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
@@ -5238,6 +5379,7 @@ export function createWorktreeDriver(
       epicPresentAndNotDone,
       hasActiveResolver,
       epicHasOccupyingJob,
+      laneTeardown,
     ) {
       return recoverWorktrees(
         repos,
@@ -5248,6 +5390,7 @@ export function createWorktreeDriver(
         hasActiveResolver,
         onResyncSkipped,
         epicHasOccupyingJob,
+        laneTeardown,
       );
     },
   };
@@ -6404,10 +6547,11 @@ export async function recoverWorktrees(
   // Per-epic occupancy gate: true while a `close::<epic>` OR `work::<task>` job still
   // OCCUPIES the epic's slot (`epicHasOccupyingJob` off the SAME snapshot the cycle
   // reconciled). Pass-3's orphan-lane teardown SKIPS such a lane — a done epic's
-  // closer is still mid-turn INSIDE it, so removing its cwd would zombie the session
+  // closer is still mid-turn INSIDE it, so removing its cwd would create Phantom-working
   // (ADR 0031). Defaults to "never occupying" so every existing caller (and the OFF
   // path) is byte-identical. A pure projection read (jobs + read-time liveness).
   epicHasOccupyingJob: (epicId: string) => boolean = () => false,
+  laneTeardown?: LaneTeardownRecoveryOptions,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -6422,6 +6566,16 @@ export async function recoverWorktrees(
   // passes settle the tree) and by pass-3's teardown (a torn-down lane resolves).
   const laneWedged: { path: string; reason: string; immediate: boolean }[] = [];
   const laneResolved: string[] = [];
+  const laneTeardownDistress: NonNullable<
+    WorktreeRecoveryOutcome["laneTeardownDistress"]
+  > = [];
+  const teardownTracker =
+    laneTeardown?.tracker ?? createLaneTeardownGraceTracker();
+  const teardownNowSec = laneTeardown?.nowSec ?? 0;
+  const presentLanePaths = new Set<string>();
+  const teardownCandidatePaths = new Set<string>();
+  const backupFailedPaths = new Set<string>();
+  let laneEnumerationComplete = true;
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
   // once. A repo whose main worktree is the same path is collapsed by the set.
   const seen = new Set<string>();
@@ -6434,6 +6588,7 @@ export async function recoverWorktrees(
     seen.add(key);
     uniqueRepos.push(r);
   }
+  laneEnumerationComplete = uniqueRepos.length > 0;
 
   for (const repo of uniqueRepos) {
     // A linked-worktree lane is NOT a repo to sweep. `git rev-parse
@@ -6445,6 +6600,7 @@ export async function recoverWorktrees(
     // level-triggered retry re-sweeps next cycle.
     const laneState = await gitClassifyLinkedWorktree(repo, run);
     if (laneState !== "standalone") {
+      laneEnumerationComplete = false;
       continue;
     }
     // POSITIVE observation for the PATH-TIED (null-epic) recover row of this dir: the
@@ -6459,8 +6615,22 @@ export async function recoverWorktrees(
     // --- Pass 1: abort any interrupted merge in a live linked worktree. ---
     let entries: WorktreeEntry[];
     try {
-      entries = await gitListWorktrees(repo, run);
+      const listed = await run(["worktree", "list", "--porcelain"], {
+        cwd: repo,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      });
+      if (listed.code !== 0) {
+        laneEnumerationComplete = false;
+        failures.push({
+          epicId: null,
+          reason: `worktree-recover-list-failed: git worktree list exited ${listed.code}`,
+          dir: repo,
+        });
+        continue;
+      }
+      entries = gitParseWorktreeList(listed.stdout);
     } catch (err) {
+      laneEnumerationComplete = false;
       failures.push({
         epicId: null,
         reason: `worktree-recover-list-failed: ${errMsg(err)}`,
@@ -6818,49 +6988,89 @@ export async function recoverWorktrees(
       });
       continue;
     }
-    const wtByShortBranch = new Map<string, string>();
+    const wtByShortBranch = new Map<string, WorktreeEntry>();
     for (const entry of entries) {
       if (entry.branch === null) {
         continue;
       }
       const short = shortBranchName(entry.branch);
-      wtByShortBranch.set(short, entry.path);
+      wtByShortBranch.set(short, entry);
+      if (isKeeperLaneEntry(entry)) {
+        const key = normalizeLanePath(entry.path);
+        presentLanePaths.add(key);
+        if (epicIdFromKeeperLaneEntry(entry) === null) {
+          teardownCandidatePaths.add(key);
+          const decision = teardownTracker.consider({
+            path: key,
+            state: "blocked",
+            detail: "ambiguous: unparseable keeper lane branch",
+            nowSec: teardownNowSec,
+          });
+          if (decision.mint) {
+            laneTeardownDistress.push({ action: "mint", ...decision.mint });
+          }
+        }
+      }
     }
     for (const lane of laneBranches) {
-      // Bases AND ribs share ONE sweep. On a dirty teardown recover ACCUMULATES a
-      // failure and continues (never throws) — the recover contract; finalize's
-      // inline sweep returns a hard result instead. `kind` labels the reason so a
-      // base and a rib stay distinguishable in the failure feed.
       const kind = lane.isRib ? "rib" : "base";
       try {
-        if (await epicPresentAndNotDone(lane.epicId)) {
-          continue; // epic still active — preserve its lane (finalize reclaims it)
-        }
-        // ADR 0031: an OCCUPYING close/work job holds this lane — a done epic's
-        // closer is still mid-turn INSIDE it (or a work session is), so tearing the
-        // worktree down would delete its cwd (posix_spawn ENOENT → a `working`
-        // zombie). Defer teardown: a live occupant is SELF-RESOLVING (its pane dies,
-        // normally via autoclose's reap), so this is a plain `continue`, never a
-        // failure row — the same shared occupancy seam the finalize collection gates
-        // on, so reconciler and board never drift. A genuinely orphaned base
-        // (absent/done epic, no live job) is unaffected and still swept below.
-        if (epicHasOccupyingJob(lane.epicId)) {
+        if (await epicPresentAndNotDone(lane.epicId)) continue;
+        const rawEpicVerdict = await isEpicDone(lane.epicId);
+        const epicVerdict = normalizeEpicVerdict(rawEpicVerdict);
+        if (
+          epicVerdict === "inconclusive" ||
+          (epicVerdict === "open" && rawEpicVerdict !== false)
+        ) {
           continue;
         }
-        if (!(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))) {
-          continue; // unmerged lane — leave it for a human, never force-delete
+        const tombstoned = epicVerdict === "absent";
+        if (epicHasOccupyingJob(lane.epicId)) continue;
+
+        const wt = wtByShortBranch.get(lane.branch);
+        const merged = await gitIsAncestorOf(
+          repo,
+          lane.branch,
+          defaultBranch,
+          run,
+        );
+        if (wt === undefined) {
+          if (merged || tombstoned)
+            await gitDeleteBranch(repo, lane.branch, run);
+          continue;
         }
-        // Origin-containment guard — the SECOND teardown seam. Pass-3 sweeps
-        // WITHOUT mergeLaneBaseIntoDefault, so it runs its own check: a lane merged
-        // into LOCAL default whose push timed out is an ancestor of local default
-        // yet absent from origin, and deleting it strands the merge
-        // (origin/<default> never advances, yet autopilot reports the epic
-        // finalized). Verify origin contains it via the cached remote-tracking ref
-        // (NO fetch); if origin lacks it, RE-PUSH default (the shared push-only
-        // gating) and tear down ONLY after origin provably contains the lane. A
-        // push-side degrade DEFERS — a transient `worktree-recover-*` retry-skip
-        // INSIDE the auto-clear prefix (no sticky, no teardown), never a delete.
+        const wtKey = normalizeLanePath(wt.path);
+        const ownership = await gitClassifyLaneOwnership(repo, wt, run);
+        if (ownership.kind !== "owned") {
+          teardownCandidatePaths.add(wtKey);
+          const decision = teardownTracker.consider({
+            path: wtKey,
+            state: "blocked",
+            detail: `${ownership.kind}: ${ownership.detail}`,
+            nowSec: teardownNowSec,
+          });
+          if (decision.mint) {
+            laneTeardownDistress.push({ action: "mint", ...decision.mint });
+          }
+          continue;
+        }
+        if (!merged && !tombstoned) {
+          teardownCandidatePaths.add(wtKey);
+          const decision = teardownTracker.consider({
+            path: wtKey,
+            state: "blocked",
+            detail: "closed-but-unmerged",
+            nowSec: teardownNowSec,
+          });
+          if (decision.mint) {
+            laneTeardownDistress.push({ action: "mint", ...decision.mint });
+          }
+          continue;
+        }
+        if ((await gitProbeLaneMergeHead(wt.path, run)) !== "absent") continue;
+
         if (
+          !tombstoned &&
           !(await gitIsAncestorOf(
             repo,
             lane.branch,
@@ -6882,9 +7092,6 @@ export async function recoverWorktrees(
             });
             continue;
           }
-          // Post-push origin-containment recheck (the second teardown seam): a
-          // push can exit 0 yet leave origin/<default> un-advanced — tear down
-          // ONLY once origin PROVABLY contains the lane (cached ref, NO fetch).
           if (
             !(await gitIsAncestorOf(
               repo,
@@ -6901,35 +7108,107 @@ export async function recoverWorktrees(
             continue;
           }
         }
-        const wt = wtByShortBranch.get(lane.branch);
-        if (wt !== undefined) {
-          const removed = await gitRemoveWorktree(repo, wt, run);
-          if (removed.kind === "dirty") {
-            failures.push({
-              epicId: lane.epicId,
-              reason: `worktree-recover-${kind}-teardown-dirty: ${wt} has uncommitted changes — ${removed.stderr}`,
-              dir: repo,
-            });
+
+        const removed = await gitRemoveWorktree(repo, wt.path, run);
+        if (removed.kind === "dirty") {
+          teardownCandidatePaths.add(wtKey);
+          const decision = teardownTracker.consider({
+            path: wtKey,
+            state: "destroyable",
+            detail: removed.stderr,
+            nowSec: teardownNowSec,
+          });
+          if (!decision.destroy) continue;
+
+          const freshList = await run(["worktree", "list", "--porcelain"], {
+            cwd: repo,
+            timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+          });
+          if (freshList.code !== 0) continue;
+          const fresh = gitParseWorktreeList(freshList.stdout).find(
+            (entry) => normalizeLanePath(entry.path) === wtKey,
+          );
+          if (fresh === undefined) {
+            presentLanePaths.delete(wtKey);
+            laneResolved.push(wt.path);
+            prunedLanePaths.add(wt.path);
             continue;
           }
-          // A torn-down lane is a POSITIVE resolution for any open lane pre-merge row
-          // / distress keyed on it — the wedge condition is gone, so the self-clearing
-          // `work::<taskId>` row clears rather than stranding on a lane that no longer
-          // exists (the probe below skips a pruned path, never re-observing it wedged).
-          laneResolved.push(wt);
-          prunedLanePaths.add(wt);
-          // Removed clean (THIS lane's own result): sweep a residue-only `.claude`
-          // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
-          // must NEVER mint a recover failure row (teardown already succeeded).
-          try {
-            await gitPruneWorktreeHusk(repo, wt, run);
-          } catch (err) {
-            console.error(
-              `[autopilot-worker] worktree husk prune ${wt}: ${errMsg(err)}`,
-            );
+          if (await epicPresentAndNotDone(lane.epicId)) continue;
+          const rawFreshVerdict = await isEpicDone(lane.epicId);
+          const freshVerdict = normalizeEpicVerdict(rawFreshVerdict);
+          const freshTombstoned = freshVerdict === "absent";
+          const freshClosed =
+            freshVerdict === "done" || rawFreshVerdict === false;
+          if (
+            (!freshClosed && !freshTombstoned) ||
+            epicHasOccupyingJob(lane.epicId) ||
+            (await gitProbeLaneMergeHead(fresh.path, run)) !== "absent"
+          ) {
+            continue;
           }
-          await gitPruneWorktrees(repo, run);
+          const freshOwnership = await gitClassifyLaneOwnership(
+            repo,
+            fresh,
+            run,
+          );
+          if (freshOwnership.kind !== "owned") continue;
+          if (
+            !freshTombstoned &&
+            !(await gitIsAncestorOf(repo, lane.branch, defaultBranch, run))
+          ) {
+            continue;
+          }
+          const cleanliness = await gitRemoveWorktree(repo, fresh.path, run);
+          if (cleanliness.kind === "removed") {
+            presentLanePaths.delete(wtKey);
+          } else {
+            const forced = await gitBackupThenForceRemoveWorktree(
+              repo,
+              fresh,
+              run,
+              laneTeardown?.spoolDir
+                ? { spoolDir: laneTeardown.spoolDir }
+                : undefined,
+            );
+            if (forced.kind === "backup-failed") {
+              backupFailedPaths.add(wtKey);
+              const mint = teardownTracker.noteBackupFailure({
+                path: wtKey,
+                detail: forced.detail,
+                nowSec: teardownNowSec,
+              });
+              if (mint) laneTeardownDistress.push({ action: "mint", ...mint });
+              continue;
+            }
+            if (forced.kind === "remove-failed") {
+              const retry = teardownTracker.consider({
+                path: wtKey,
+                state: "blocked",
+                detail: `force-remove-failed: ${forced.detail}`,
+                nowSec: teardownNowSec,
+              });
+              if (retry.mint) {
+                laneTeardownDistress.push({ action: "mint", ...retry.mint });
+              }
+              continue;
+            }
+            presentLanePaths.delete(wtKey);
+          }
+        } else {
+          presentLanePaths.delete(wtKey);
         }
+
+        laneResolved.push(wt.path);
+        prunedLanePaths.add(wt.path);
+        try {
+          await gitPruneWorktreeHusk(repo, wt.path, run);
+        } catch (err) {
+          console.error(
+            `[autopilot-worker] worktree husk prune ${wt.path}: ${errMsg(err)}`,
+          );
+        }
+        await gitPruneWorktrees(repo, run);
         await gitDeleteBranch(repo, lane.branch, run);
       } catch (err) {
         failures.push({
@@ -6967,7 +7246,24 @@ export async function recoverWorktrees(
       );
     }
   }
-  return { failures, escalations, resolved, laneWedged, laneResolved };
+  for (const clear of teardownTracker.finishCycle({
+    presentPaths: presentLanePaths,
+    candidatePaths: teardownCandidatePaths,
+    backupFailedPaths,
+    openTeardownPaths: laneTeardown?.openTeardownPaths ?? new Set(),
+    openBackupPaths: laneTeardown?.openBackupPaths ?? new Set(),
+    allowClear: laneEnumerationComplete,
+  })) {
+    laneTeardownDistress.push({ action: "clear", ...clear });
+  }
+  return {
+    failures,
+    escalations,
+    resolved,
+    laneWedged,
+    laneResolved,
+    laneTeardownDistress,
+  };
 }
 
 /**
@@ -7734,6 +8030,8 @@ export async function loadReconcileSnapshot(
   // The lane PATHS with an OPEN per-lane wedge distress row — the level-clear set the
   // recover pass's lane grace tracker clears against (a lane ready/gone this cycle).
   const laneWedgeDistressDirs = new Set<string>();
+  const laneTeardownDistressDirs = new Set<string>();
+  const laneBackupDistressDirs = new Set<string>();
   // The distress IDS with an OPEN per-(epic,repo) stale-base-lane distress row — the
   // level-clear set the stale-base grace tracker clears against (a lane re-based past
   // its upstream or torn down this cycle). Collected off the row's ID (the
@@ -7776,6 +8074,16 @@ export async function loadReconcileSnapshot(
         const dir = (row as { dir?: unknown }).dir;
         if (typeof dir === "string" && dir.length > 0) {
           laneWedgeDistressDirs.add(dir);
+        }
+      }
+      if (isLaneTeardownDistressKey(verb, id)) {
+        const dir = (row as { dir?: unknown }).dir;
+        if (typeof dir === "string" && dir.length > 0) {
+          if (id.startsWith(LANE_BACKUP_DISTRESS_ID_PREFIX)) {
+            laneBackupDistressDirs.add(dir);
+          } else {
+            laneTeardownDistressDirs.add(dir);
+          }
         }
       }
       if (isStaleBaseDistressKey(verb, id)) {
@@ -8165,6 +8473,8 @@ export async function loadReconcileSnapshot(
     sharedDesyncDistressDirs,
     laneFailures,
     laneWedgeDistressDirs,
+    laneTeardownDistressDirs,
+    laneBackupDistressDirs,
     staleBaseDistressIds,
     dupEpicNumberDistressIds,
     liveTabKeys,
@@ -8316,6 +8626,7 @@ function main(): void {
   // per-lane distress row. In-worker memory only; a restart re-arms it. Distinct
   // surface from the shared-checkout trackers so the rows never cross-clear.
   const laneWedgeTracker = createLaneWedgeTracker();
+  const laneTeardownTracker = createLaneTeardownGraceTracker();
   // Per-(epic,repo) grace tracker escalating an already-cut lane whose base is STALE
   // (forked before a landed same-repo upstream merged) past the grace into its own
   // per-(epic,repo) distress row. Fed off the producer probe on the snapshot (NOT the
@@ -8810,6 +9121,7 @@ function main(): void {
               resolved,
               laneWedged,
               laneResolved,
+              laneTeardownDistress,
             } = await deps.worktree.recover(
               repos,
               // Pass-2's TRI-STATE done-probe — surfaces authoritatively-absent and
@@ -8838,7 +9150,29 @@ function main(): void {
                   epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)
                 );
               },
+              {
+                tracker: laneTeardownTracker,
+                nowSec: deps.now(),
+                openTeardownPaths:
+                  snapshot.laneTeardownDistressDirs ?? new Set(),
+                openBackupPaths: snapshot.laneBackupDistressDirs ?? new Set(),
+              },
             );
+            for (const action of laneTeardownDistress ?? []) {
+              if (action.action === "mint") {
+                deps.emitSharedWedgeDistress?.({
+                  id: action.id,
+                  dir: action.dir,
+                  reason: action.reason ?? LANE_TEARDOWN_DISTRESS_REASON,
+                  ts: deps.now(),
+                });
+              } else {
+                deps.clearSharedWedgeDistress?.({
+                  id: action.id,
+                  dir: action.dir,
+                });
+              }
+            }
             for (const f of failures) {
               deps.emitDispatchFailed({
                 verb: "close",

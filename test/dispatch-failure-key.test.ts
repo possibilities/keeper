@@ -672,6 +672,8 @@ describe("single vocabulary source", () => {
       ["shared-checkout-dirty", "shared-dirty"],
       ["shared-checkout-desync", "shared-desync"],
       ["worktree-lane-wedge", "lane-wedge"],
+      ["worktree-lane-backup-failed", "lane-wedge"],
+      ["worktree-lane-teardown", "lane-wedge"],
       ["worktree-lane-premerge", "lane-premerge"],
       ["stale-base-lane", "stale-base"],
       ["dup-epic-number", "dup-epic-number"],

@@ -152,11 +152,14 @@ import {
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
   isDupEpicNumberDistressKey,
+  isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
+  LANE_BACKUP_DISTRESS_ID_PREFIX,
+  LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -437,6 +440,9 @@ export function gcUnretryableDispatchFailures(
     // recover-pass level-clear discipline on its own `worktree-lane-wedge:` id prefix;
     // the operator surface never clears it, so the orphan sweep must not reap it.
     if (isLaneWedgeDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    if (isLaneTeardownDistressKey(row.verb, row.id)) {
       continue;
     }
     // And the per-(epic,repo) stale-base-lane distress row — same synthetic `daemon`-
@@ -1410,6 +1416,18 @@ export function buildSharedCheckoutPageBody(row: {
   reason: string;
 }): string {
   const repo = row.dir != null && row.dir !== "" ? row.dir : "?";
+  if (
+    row.id.startsWith(LANE_TEARDOWN_DISTRESS_ID_PREFIX) ||
+    row.id.startsWith(LANE_BACKUP_DISTRESS_ID_PREFIX)
+  ) {
+    return [
+      `🔴 keeper: ${row.id} needs you — lane ${repo} could not be retired safely.`,
+      row.reason,
+      ``,
+      `Inspect the lane and its lane dirt spool state. The row clears itself only`,
+      `after the recover pass observes the lane gone.`,
+    ].join("\n");
+  }
   const isDesync = row.id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX);
   const hazard = isDesync
     ? `DESYNCED — its ref advanced but the working tree never caught up, so it`
@@ -12202,13 +12220,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       return db
         .query(
           `SELECT id, dir, reason FROM dispatch_failures
-             WHERE verb = ? AND (id LIKE ? OR id LIKE ?)
+             WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
                AND human_notified_at IS NULL`,
         )
         .all(
           SHARED_DIRTY_DISTRESS_VERB,
           `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
           `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
+          `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
+          `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
         ) as SharedCheckoutPageRow[];
     } catch {
       return [];
