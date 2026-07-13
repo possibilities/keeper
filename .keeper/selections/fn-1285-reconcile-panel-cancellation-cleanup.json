@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Durable ownership, atomic publication, and cancellation races create subtle cross-module correctness invariants where an unsafe abstraction can leak or destroy windows.",
+      "task_id": "fn-1285-reconcile-panel-cancellation-cleanup.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Restart-safe finalizer convergence spans maintenance, persistence, garbage collection, pruning, CLI semantics, and race handling as a cross-cutting architectural cascade.",
+      "task_id": "fn-1285-reconcile-panel-cancellation-cleanup.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.91,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The edit path is clear, but autoclose authorization depends on preserving a subtle provenance invariant that must fail closed against cross-run destruction.",
+      "task_id": "fn-1285-reconcile-panel-cancellation-cleanup.3",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T21:45:42.784000Z",
+  "epic_id": "fn-1285-reconcile-panel-cancellation-cleanup",
+  "input_hash": "a67be86946ee1bafa9c5e87c2855a488daa7c4725e5a3d93f9a841cc1cdf5646",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2793138281,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1285-reconcile-panel-cancellation-cleanup.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Durable ownership, atomic publication, and cancellation races create subtle cross-module correctness invariants where an unsafe abstraction can leak or destroy windows.\",\"confidence\":0.97},{\"task_id\":\"fn-1285-reconcile-panel-cancellation-cleanup.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Restart-safe finalizer convergence spans maintenance, persistence, garbage collection, pruning, CLI semantics, and race handling as a cross-cutting architectural cascade.\",\"confidence\":0.96},{\"task_id\":\"fn-1285-reconcile-panel-cancellation-cleanup.3\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"The edit path is clear, but autoclose authorization depends on preserving a subtle provenance invariant that must fail closed against cross-run destruction.\",\"confidence\":0.91}]}\n"
+}
