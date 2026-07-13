@@ -1900,19 +1900,17 @@ export class PlanScanner {
   }
 
   /**
-   * Boot-reconciliation sweep. After every configured root's boot scan has run
-   * (so {@link seenOnDisk} is the complete on-disk census), retract any
-   * projection id with no backing file — a deletion that happened while the
-   * daemon was down never fired a live `onDelete`, so without this pass it would
-   * leave a permanent ghost.
+   * Boot-reconciliation sweep. After every configured root has reached a boot
+   * barrier outcome, retract projection ids with no backing file only for roots
+   * whose scan completed.
    *
    * Over-retraction is the danger this method is built to avoid:
-   * - **Run AFTER snapshot emission** (the caller invokes it once all boot scans
-   *   finished), so a moved/rewritten file is re-emitted, not retracted.
-   * - **Scope strictly to configured roots** via the epic's `project_dir`: an
-   *   epic whose `project_dir` is outside every `root` (or NULL) is never
-   *   touched — its file lives under an unscanned tree, so absence from the
-   *   census means nothing. Embedded tasks inherit their parent epic's scope.
+   * - **Run AFTER snapshot emission** (the caller invokes it once all boot roots
+   *   reached the barrier), so a moved/rewritten file is re-emitted, not retracted.
+   * - **Scope strictly to scanned roots** via the epic's `project_dir`: an epic
+   *   whose `project_dir` is outside every `root` (or NULL) is never touched —
+   *   its file lives under an unscanned tree, so absence from the census means
+   *   nothing. Embedded tasks inherit their parent epic's scope.
    * - **Diff against the actually-enumerated census** ({@link markSeen}, keyed
    *   by filename so a mid-rewrite parse failure still counts as present).
    *
@@ -1976,7 +1974,7 @@ export class PlanScanner {
 }
 
 /**
- * Is `projectDir` inside (or equal to) one of the configured `roots`? Used to
+ * Is `projectDir` inside (or equal to) one of the supplied `roots`? Used to
  * scope the boot sweep so an epic from an unconfigured/unscanned root is never
  * retracted. A NULL/empty `projectDir` is never in scope (we can't attribute it
  * to a scanned tree). Path-segment-aware so `/a/code-x` is NOT treated as inside
@@ -3834,23 +3832,19 @@ function main(): void {
   // addon (which rejects every subscribe) effectively wedges the worker, and the
   // launchd restart is the recovery. We register each subscription as it
   // resolves; if shutdown raced ahead, we release it immediately.
-  // Boot-reconciliation barrier: the sweep can only run once EVERY root's boot
-  // scan has populated the on-disk census (a ghost is "a projection id no root
-  // saw"). Count per-root boot-scan completions (success OR failure — a root
-  // whose subscribe rejected contributes nothing to the census but must not
-  // stall the barrier) and fire the sweep on the last one. `data.roots` is fixed
-  // at spawn, so the target count is known up front.
+  // Boot-reconciliation barrier: the sweep can only run once EVERY root has
+  // either completed its boot scan or been ruled unobserved for this pass. Count
+  // all roots for the barrier, but scope retraction only to completed scans.
   const rootCount = data.roots.length;
+  const scannedRoots: string[] = [];
   let bootScansDone = 0;
   const noteBootScanDone = (): void => {
     bootScansDone += 1;
     if (bootScansDone < rootCount || shuttingDown) {
       return;
     }
-    // All roots scanned. Retract any projection ghost (file deleted while the
-    // daemon was down) — scoped to configured roots, AFTER snapshot emission.
     try {
-      scanner.sweep(db, data.roots);
+      scanner.sweep(db, scannedRoots);
     } catch (err) {
       console.error(`[plan-worker] boot sweep failed: ${stringifyErr(err)}`);
     }
@@ -3879,6 +3873,7 @@ function main(): void {
       // barrier so a bad root can't stall the sweep for the others.
       try {
         scanRoot(root, scanner);
+        scannedRoots.push(root);
       } catch (err) {
         console.error(
           `[plan-worker] boot scan failed for ${root}: ${stringifyErr(err)}`,
@@ -4172,9 +4167,10 @@ function main(): void {
           // (or were changed while keeperd was down) without waiting for a
           // watcher event. The change-gate suppresses unchanged files.
           scanRoot(root, scanner);
+          scannedRoots.push(root);
         }
-        // This root's census is now recorded (or its subscribe failed/raced
-        // shutdown — either way it must not stall the barrier); advance it.
+        // This root reached a boot outcome (scanned, subscribe failed, or raced
+        // shutdown); advance the all-roots barrier.
         noteBootScanDone();
       }
     })

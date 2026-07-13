@@ -1382,6 +1382,89 @@ test("sweep never retracts an epic whose project_dir is outside the configured r
   expect(emitted).toEqual([]);
 });
 
+test("sweep only retracts absent rows under roots scanned this boot", () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  const { db } = openDb(dbPath);
+  const scannedRoot = join(tmpDir, "scanned");
+  const skippedRoot = join(tmpDir, "skipped");
+  mkdirSync(scannedRoot, { recursive: true });
+  mkdirSync(skippedRoot, { recursive: true });
+
+  const scannedTasks = JSON.stringify([
+    {
+      task_id: "fn-10-scanned.1",
+      epic_id: "fn-10-scanned",
+      task_number: 1,
+      title: "S",
+      target_repo: scannedRoot,
+      status: "open",
+    },
+  ]);
+  const skippedTasks = JSON.stringify([
+    {
+      task_id: "fn-11-skipped.1",
+      epic_id: "fn-11-skipped",
+      task_number: 1,
+      title: "K",
+      target_repo: skippedRoot,
+      status: "open",
+    },
+  ]);
+  db.run(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "fn-10-scanned",
+      10,
+      "Scanned",
+      scannedRoot,
+      "open",
+      1,
+      0,
+      scannedTasks,
+      "fn-11-skipped",
+      11,
+      "Skipped",
+      skippedRoot,
+      "open",
+      2,
+      0,
+      skippedTasks,
+    ],
+  );
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  seedFromDb(db, scanner);
+
+  scanner.sweep(db, []);
+  expect(emitted).toEqual([]);
+
+  scanRoot(scannedRoot, scanner);
+  scanner.sweep(db, [scannedRoot]);
+  db.close();
+
+  expect(emitted).toContainEqual({
+    kind: "plan-task-deleted",
+    id: "fn-10-scanned.1",
+    epicId: "fn-10-scanned",
+  });
+  expect(emitted).toContainEqual({
+    kind: "plan-epic-deleted",
+    id: "fn-10-scanned",
+  });
+  expect(
+    emitted.some(
+      (m) =>
+        (m.kind === "plan-epic-deleted" && m.id === "fn-11-skipped") ||
+        (m.kind === "plan-task-deleted" && m.id === "fn-11-skipped.1"),
+    ),
+  ).toBe(false);
+});
+
 test("sweep does not retract a file mid-rewrite that fails to parse", () => {
   const dbPath = join(tmpDir, "keeper.db");
   const { db } = openDb(dbPath);
