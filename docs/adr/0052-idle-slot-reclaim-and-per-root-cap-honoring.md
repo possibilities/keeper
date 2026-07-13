@@ -3,9 +3,9 @@
 ## Status
 
 Accepted (provisional number; fan-in renumber per ADR 0020/0022 applies). Amends
-[ADR 0031](0031-finalize-defers-on-occupying-closer.md) — 0031 §3 deferred slot reclaim to "the
-operator (or a future decision once the clause's false-positive rate is proven)"; this is that
-decision. Touches ADR 0017 (turn-active escalation occupancy, unchanged) and ADR 0013/0024
+[superseded ADR 0031](superseded/0031-finalize-defers-on-occupying-closer.md) — 0031 §3 deferred
+slot reclaim to "the operator (or a future decision once the clause's false-positive rate is
+proven)"; this is that decision. Touches ADR 0017 (turn-active escalation occupancy, unchanged) and ADR 0013/0024
 (phantom-working / stuck-sentinel, complemented not replaced).
 
 ## Context

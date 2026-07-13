@@ -2,11 +2,10 @@
 
 ## Status
 
-Accepted. Amends [ADR 0016](0016-worktree-recover-pass.md) (recover-pass teardown
-gains an occupancy pre-condition) and [ADR 0024](0024-stuck-sentinel-tiers.md) /
-[ADR 0025](0025-stuck-sentinel-heal.md) (the sentinel family gains a
-cwd-missing detect-only clause). Provisional number — fan-in renumbering per
-ADR 0020/0022.
+Superseded by [ADR 0055](../0055-harness-activity-dispatch-claims-and-resource-holds.md),
+which carries forward the cwd-missing detect-only belt and fail-closed destructive-cleanup
+posture while replacing the stopped-pane occupancy coupling. This record originally amended
+the worktree recover-pass teardown and stuck-sentinel decisions.
 
 ## Context
 
