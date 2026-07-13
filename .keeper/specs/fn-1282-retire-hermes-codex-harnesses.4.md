@@ -55,5 +55,5 @@ Delete external state before or with the shim; standalone Hermes may fail and is
 - [ ] Claude/Pi launch and capture tests pass.
 
 ## Done summary
-
+Retired Hermes across launch, config, argv, capture, resume/restore, trust, hooks, and tests, deleting all Hermes-owned host state and plugin artifacts while preserving Claude/Pi launch and CodexBar routing.
 ## Evidence
