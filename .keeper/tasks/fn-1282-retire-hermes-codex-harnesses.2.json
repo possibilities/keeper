@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Remove Codex lifecycle producers",
-  "updated_at": "2026-07-13T17:20:39.533000Z"
+  "updated_at": "2026-07-13T19:19:08.130000Z",
+  "worker_done_at": "2026-07-13T19:19:08.130000Z"
 }

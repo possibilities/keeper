@@ -56,5 +56,5 @@ Land before task 3 drops the column.
 - [ ] Unsupported or wrong-version births cannot mint jobs.
 
 ## Done summary
-
+Removed Codex daemon lifecycle producers (rollout attribution, resume backfill, stop tailing, timers) and the codex_adoption CLI/RPC/collection control surface, while preserving the Pi repair sweep. Restricted birth records/ingestion to Pi and rejected unsupported/wrong-version births before they can mint jobs. Left the codex_adoption schema column in place for a later task.
 ## Evidence
