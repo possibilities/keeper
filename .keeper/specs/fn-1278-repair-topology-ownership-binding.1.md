@@ -49,5 +49,5 @@ Drive one deterministic schedule where the first control reread sees a pane and 
 - [ ] Existing restore handling still accepts unattributed then attributed snapshot pairs, and focused plus root fast suites pass in process isolation.
 
 ## Done summary
-
+Added ownership as part of the topology dedup identity and a connected DB-only reconciliation reread path (PRAGMA data_version watch with coalesced, post-refresh-recheck serialized rereads), so a pane observed before its job exists is re-attributed once the job commits without needing a tmux structural change. The attributed topology event now stamps the live matching job's canonical Generation via the existing Fold. Ambiguous multi-job pane claims, malformed/degraded observations, absent panes, terminal jobs, and cross-Generation reuse remain fail-closed.
 ## Evidence
