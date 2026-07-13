@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 18,
+        "files_changed": 5,
+        "insertions": 68
+      },
+      "done_summary": "panelCancel now classifies a launched member whose pidfile never becomes readable by the cancel deadline as cleanup_failed/unresolved (non-zero exit, in unresolved_cleanup) instead of cancelled, matching the pass's fail-toward-unresolved discipline; genuinely-gone members still report cancelled/exit 0. Added a regression test driving the pidfile-not-yet-present-at-cancel race.",
+      "input_hash": "4cec13645360a83cd7eb91c962efc66a07423e395a1fbbdf7abb923388b74113",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1986,
+      "spec_md": "## Description\n\nFixes finding F2 (evidence: `f099b4d7:src/pair/panel.ts`, `panelCancel`). In the\nbounded cleanup pass, when `ownedLivePid(target)` is null and the target's pidfile\nnever becomes readable (`readPid(...) === null`) for a launched member\n(`launched_at !== null`), the loop only defers while `deps.now() < deadline`; past\nthe deadline it falls to `target.attempt.state = \"cancelled\"`, and the post-loop\nsweep escalates to `cleanup_failed` only when `ownedLivePid(target) !== null`. So a\nlaunched member whose pidfile never materializes within the cleanup window is\nreported torn-down-clean even though a live, never-signalled child may exist.\n\nClassify that case (launched, pidfile never readable by the deadline, liveness\nunknowable) as `cleanup_failed`/unresolved instead of `cancelled` \u2014 fail toward\n\"unresolved\" when liveness is unknowable, matching the fail-open,\nloud-reporting intent of the rest of the pass (`legIdentityHolds` already reasons\n\"a false 'alive' only extends a bounded wait\").\n\nFiles: `src/pair/panel.ts` (panelCancel cleanup pass), plus test coverage.\n\n## Acceptance\n\n- [ ] A launched member whose pidfile never becomes readable by the cancel deadline lands in `unresolved_cleanup` with `state=\"cleanup_failed\"` and a non-zero exit.\n- [ ] Members that are genuinely gone (readable dead/recycled pid) still report `cancelled` (exit 0) \u2014 no regression on the clean-teardown path.\n- [ ] A new regression test drives the pidfile-not-yet-present-at-cancel race (do not seed the pidfile before cancelling), asserting the unresolved classification.\n\n## Done summary\npanelCancel now classifies a launched member whose pidfile never becomes readable by the cancel deadline as cleanup_failed/unresolved (non-zero exit, in unresolved_cleanup) instead of cancelled, matching the pass's fail-toward-unresolved discipline; genuinely-gone members still report cancelled/exit 0. Added a regression test driving the pidfile-not-yet-present-at-cancel race.\n## Evidence\n",
+      "task_id": "fn-1269-fix-panel-cancel-liveness-reporting.1",
+      "tier": "high",
+      "title": "Fail panel cancel toward unresolved"
+    }
+  ],
+  "created_at": "2026-07-13T03:38:20.742000Z",
+  "epic_id": "fn-1269-fix-panel-cancel-liveness-reporting",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "4cec13645360a83cd7eb91c962efc66a07423e395a1fbbdf7abb923388b74113",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
