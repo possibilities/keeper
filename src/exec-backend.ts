@@ -241,6 +241,9 @@ export const PAIR_EXEC_SESSION = "pair" as const;
 /** tmux session name `/plan:panel` legs land in. */
 export const PANELS_EXEC_SESSION = "panels" as const;
 
+/** Shared tmux session name wrapped-cell provider legs land in. */
+export const WRAPPED_EXEC_SESSION = "wrapped" as const;
+
 /** Read a `ReadableStream` into a string. Returns `""` on null/empty. */
 async function streamToText(s: ReadableStream | null): Promise<string> {
   if (s == null) {

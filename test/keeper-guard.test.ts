@@ -6,6 +6,7 @@ import {
   MANAGED_EXEC_SESSION,
   PAIR_EXEC_SESSION,
   PANELS_EXEC_SESSION,
+  WRAPPED_EXEC_SESSION,
 } from "../src/exec-backend";
 
 // Fast, in-process content guard for the static tmux drop-in. No tmux is
@@ -19,15 +20,20 @@ const CONF = readFileSync(
 );
 
 describe("keeper-guard.conf content", () => {
-  test("includes all 4 managed session-name literals from exec-backend", () => {
-    for (const name of [
+  test("includes all 5 managed sessions in the future hook and load-time sweep", () => {
+    const managedSessions = [
       MANAGED_EXEC_SESSION,
       PAIR_EXEC_SESSION,
       PANELS_EXEC_SESSION,
       AGENTBUS_EXEC_SESSION,
-    ]) {
+      WRAPPED_EXEC_SESSION,
+    ];
+    for (const name of managedSessions) {
       expect(CONF).toContain(`#{==:#{session_name},${name}}`);
     }
+    expect(/for s in ([^;]+);/.exec(CONF)?.[1]?.split(" ")).toEqual(
+      managedSessions,
+    );
   });
 
   test("stamps the session-scoped marker @keeper_managed_session", () => {
