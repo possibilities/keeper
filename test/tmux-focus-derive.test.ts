@@ -321,7 +321,7 @@ describe("deriveFocusAndPanes", () => {
 });
 
 // ---------------------------------------------------------------------------
-// hashTopology — the shared dedup hash (excludes job_id, sorts by pane_id).
+// hashTopology — the shared ownership-sensitive dedup hash.
 // ---------------------------------------------------------------------------
 
 describe("hashTopology", () => {
@@ -336,12 +336,28 @@ describe("hashTopology", () => {
     );
   });
 
-  test("EXCLUDES job_id — stamping a job id never re-fires the post", () => {
-    const stamped: TmuxTopologyPane[] = [
-      { ...panes[0], job_id: "sess-a" } as TmuxTopologyPane,
-      { ...panes[1], job_id: "sess-b" } as TmuxTopologyPane,
+  test("ownership acquisition, removal, and transfer each re-fire", () => {
+    const ownedA: TmuxTopologyPane[] = [
+      { ...panes[0], job_id: "sess-a" },
+      panes[1] as TmuxTopologyPane,
     ];
-    expect(hashTopology("g1", stamped)).toBe(hashTopology("g1", panes));
+    const ownedB: TmuxTopologyPane[] = [
+      { ...panes[0], job_id: "sess-b" },
+      panes[1] as TmuxTopologyPane,
+    ];
+    expect(hashTopology("g1", ownedA)).not.toBe(hashTopology("g1", panes));
+    expect(hashTopology("g1", ownedB)).not.toBe(hashTopology("g1", ownedA));
+    expect(hashTopology("g1", panes)).not.toBe(hashTopology("g1", ownedB));
+  });
+
+  test("ownership plus physical row reordering remains stable", () => {
+    const owned: TmuxTopologyPane[] = [
+      { ...panes[0], job_id: "sess-a" },
+      { ...panes[1], job_id: "sess-b" },
+    ];
+    expect(hashTopology("g1", owned)).toBe(
+      hashTopology("g1", [...owned].reverse()),
+    );
   });
 
   test("a session_name change re-fires", () => {

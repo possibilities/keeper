@@ -302,7 +302,7 @@ test("extractTmuxTopologySnapshot: a pane WITHOUT job_id decodes cleanly (field 
   expect(snap?.panes[0]).not.toHaveProperty("job_id");
 });
 
-test("extractTmuxTopologySnapshot: an empty / non-string job_id is dropped, never coerced", () => {
+test("extractTmuxTopologySnapshot: a pane with malformed job_id is dropped fail-closed", () => {
   // Hand-craft a payload with a non-string + empty-string job_id (the seed
   // helper only emits strings) to exercise the type-narrow.
   kdb.db.run(
@@ -321,16 +321,12 @@ test("extractTmuxTopologySnapshot: an empty / non-string job_id is dropped, neve
     ],
   );
   const snap = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
-  expect(snap?.panes).toEqual([
-    { pane_id: "%1", session_name: "a", window_index: 0 },
-    { pane_id: "%2", session_name: "b", window_index: 1 },
-  ]);
+  expect(snap?.panes).toEqual([]);
 });
 
-test("extractTmuxTopologySnapshot: job_id presence does NOT change the rest of the decode (fold invariance)", () => {
-  // Same generation + panes, one with job_id and one without — the
-  // generation/pane_id/session_name/window_index the FOLD keys on must be
-  // byte-identical across the two, proving job_id is inert to fold inputs.
+test("extractTmuxTopologySnapshot: job_id presence does not change physical coordinates", () => {
+  // Same generation + panes, one with job_id and one without — ownership differs,
+  // while the decoded physical coordinates remain byte-identical.
   seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
     { pane_id: "%5", session_name: "fg", window_index: 3, job_id: "job-a" },
   ]);

@@ -754,6 +754,25 @@ describe("mapPaneRowsToTopology", () => {
     ]);
   });
 
+  test("multiple live claims leave the pane unattributed regardless of row order", () => {
+    const claims = [
+      fakeJob({
+        job_id: "sess-a",
+        backend_exec_type: "tmux",
+        backend_exec_pane_id: "%42",
+      }),
+      fakeJob({
+        job_id: "sess-b",
+        backend_exec_type: "tmux",
+        backend_exec_pane_id: "%42",
+      }),
+    ];
+    expect(mapPaneRowsToTopology(rows, claims)[0].job_id).toBeUndefined();
+    expect(
+      mapPaneRowsToTopology(rows, [...claims].reverse())[0].job_id,
+    ).toBeUndefined();
+  });
+
   test("a dead (not working/stopped) tmux job does NOT stamp its pane", () => {
     const jobs = [
       fakeJob({
@@ -829,7 +848,7 @@ describe("dual-source equivalence vs the restore-worker poll", () => {
     expect(controlPanes).toEqual(restoreProbe.panes);
   });
 
-  test("job_id stamping is hash-irrelevant — the stamped control payload still matches the unstamped restore hash", () => {
+  test("job_id stamping is ownership-significant and differs from an unstamped boot probe", () => {
     const restoreProbe = probeTmuxTopology(restoreSpawn);
     if (restoreProbe.kind !== "panes") throw new Error("expected panes");
     const jobs = [
@@ -845,7 +864,7 @@ describe("dual-source equivalence vs the restore-worker poll", () => {
       jobs,
     );
     expect(controlPanes[0].job_id).toBe("sess-a");
-    expect(hashTopology(generationId, controlPanes)).toBe(
+    expect(hashTopology(generationId, controlPanes)).not.toBe(
       hashTopology(generationId, restoreProbe.panes),
     );
   });
@@ -1001,6 +1020,88 @@ describe("runConnection — topology emit + skip-gates", () => {
     // generation context — topology must stay empty.
     await Bun.sleep(200);
     expect(topos).toHaveLength(0);
+
+    stopping = true;
+    child.eof();
+    await conn;
+  });
+
+  test("a DB-only ownership claim re-posts steady topology; bursts coalesce and a true duplicate stays silent", async () => {
+    const topos: TmuxTopologySnapshotMessage[] = [];
+    let stopping = false;
+    let paneReads = 0;
+    let cmdNum = 350;
+    let requestDbRefresh: () => void = () => {
+      throw new Error("ownership watcher not initialized");
+    };
+    const unrelated = fakeJob({
+      job_id: "unrelated",
+      backend_exec_type: "tmux",
+      backend_exec_pane_id: "%10",
+    });
+    const claimed = fakeJob({
+      job_id: "sess-a",
+      backend_exec_type: "tmux",
+      backend_exec_pane_id: "%42",
+    });
+    let jobs: Job[] = [unrelated];
+    let child!: ReturnType<typeof makeScriptedChild>;
+    child = makeScriptedChild((cmd) => {
+      cmdNum += 1;
+      if (cmd.startsWith("refresh-client") || cmd.startsWith("copy-mode")) {
+        child.pushStdout(replyBlock(cmdNum, []));
+      } else if (cmd.startsWith("display-message")) {
+        child.pushStdout(replyBlock(cmdNum, ["48271:10"]));
+      } else if (cmd.startsWith("list-clients")) {
+        child.pushStdout(replyBlock(cmdNum, clients));
+      } else if (cmd.startsWith("list-panes")) {
+        paneReads += 1;
+        child.pushStdout(replyBlock(cmdNum, panes));
+      }
+    });
+    const conn = runConnection(child.child, {
+      isStopping: () => stopping,
+      postFocus: () => {},
+      postTopology: (message) => {
+        topos.push(message);
+        if (topos.length === 1) {
+          // SessionStart commits while the first refresh is still in flight.
+          // Several write pulses collapse into one final-state refresh.
+          jobs = [unrelated, claimed];
+          requestDbRefresh();
+          requestDbRefresh();
+          requestDbRefresh();
+        }
+      },
+      postLiveness: () => {},
+      readJobs: () => jobs,
+      watchDbChanges: (onChange) => {
+        requestDbRefresh = onChange;
+      },
+    });
+    child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+
+    const repaired = await retryUntil(
+      () => (topos.length >= 2 ? topos[1] : null),
+      5000,
+    );
+    expect(
+      topos[0]?.panes.find((pane) => pane.pane_id === "%42")?.job_id,
+    ).toBeUndefined();
+    expect(repaired?.panes.find((pane) => pane.pane_id === "%42")?.job_id).toBe(
+      "sess-a",
+    );
+    expect(paneReads).toBe(2);
+
+    // A later DB pulse rereads once, but unchanged ownership + physical topology
+    // hashes identically and emits no third topology observation.
+    requestDbRefresh();
+    await retryUntil(
+      () => (paneReads >= 3 && topos.length === 2 ? true : null),
+      5000,
+    );
+    expect(paneReads).toBe(3);
+    expect(topos).toHaveLength(2);
 
     stopping = true;
     child.eof();

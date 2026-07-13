@@ -10,8 +10,9 @@
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import (the fast-tier pure-fn tests) is inert.
- *  - OWN read-only `openDb` connection (`prepareStmts:false`) — jobs reads only,
- *    for the `hasLiveTmuxJob` connect gate. A reader open does NOT migrate.
+ *  - OWN read-only `openDb` connection (`prepareStmts:false`) — jobs reads feed
+ *    the connect gate + ownership join, while `PRAGMA data_version` wakes a
+ *    connected ownership refresh. A reader open does NOT migrate.
  *  - Typed messages: `{type:"shutdown"}` main→worker; `tmux-client-focus-snapshot`
  *    + `tmux-control-liveness` worker→main. The child + pipes are an EXTERNAL
  *    resource released in the shutdown handler (mirror `bus-worker`).
@@ -57,12 +58,13 @@ import {
   type TmuxTopologyPane,
 } from "./tmux-focus-derive";
 import type { Job } from "./types";
+import { watchLoop } from "./wake-worker";
 
 /** Data the parent passes via `new Worker(url, { workerData })`. Only the db path
  *  crosses the boundary — the connection (a thread-affine handle) is opened on
  *  the worker thread. `pollMs` tunes the connect-gate poll cadence in tests. */
 export interface TmuxControlWorkerData {
-  /** keeper.db path (read-only jobs reads for the connect gate). */
+  /** keeper.db path (read-only jobs reads + data-version polling). */
   dbPath: string;
   /** Connect-gate poll cadence (ms); defaults to {@link CONNECT_GATE_POLL_MS}. */
   pollMs?: number;
@@ -327,9 +329,9 @@ export function deriveFocus(
  * pane shape (`paneId→pane_id`, `session→session_name`, `windowIndex→
  * window_index`), stamping an OPTIONAL `job_id` for the keeper job that owns each
  * pane (`pane_id → job.backend_exec_pane_id` over all live tmux jobs — a pane MOVE
- * happens to an already-resolved job, so resolved jobs are joined too). Mirrors
- * the restore-worker's `stampPaneJobIds` join so the two producers emit a
- * byte-identical payload for the same tmux state. The focus parser's
+ * happens to an already-resolved job, so resolved jobs are joined too). A pane
+ * claimed by multiple live jobs is ambiguous and remains unattributed rather
+ * than choosing an owner by projection row order. The focus parser's
  * `windowActive`/`paneActive` flags are dropped — topology is whole-server, not
  * the focused pane. Pure; reads only its args.
  */
@@ -337,11 +339,19 @@ export function mapPaneRowsToTopology(
   rows: readonly TmuxPaneRow[],
   jobs: readonly Job[],
 ): TmuxTopologyPane[] {
-  const jobByPaneId = new Map<string, string>();
+  const jobByPaneId = new Map<string, string | null>();
   for (const job of jobs) {
     if (job.state !== "working" && job.state !== "stopped") continue;
-    if (job.backend_exec_type === "tmux" && job.backend_exec_pane_id != null) {
-      jobByPaneId.set(job.backend_exec_pane_id, job.job_id);
+    if (job.backend_exec_type !== "tmux" || job.backend_exec_pane_id == null) {
+      continue;
+    }
+    const paneId = job.backend_exec_pane_id;
+    if (jobByPaneId.has(paneId)) {
+      // More than one live claim is unsafe regardless of query order. `null` is
+      // an explicit ambiguous marker; the mapped pane remains unattributed.
+      jobByPaneId.set(paneId, null);
+    } else {
+      jobByPaneId.set(paneId, job.job_id);
     }
   }
   return rows.map((r) => {
@@ -362,6 +372,10 @@ export function mapPaneRowsToTopology(
 /** Connect-gate poll cadence (ms): how often the worker re-checks `hasLiveTmuxJob`
  *  while disconnected (no live tmux job ⇒ nothing to observe). */
 const CONNECT_GATE_POLL_MS = 1_000;
+/** Connected jobs-projection poll cadence. The shared data-version watcher floors
+ * this at 25ms; paired with the reread debounce this remains well below the
+ * autoclose grace while collapsing write bursts. */
+const OWNERSHIP_POLL_MS = 25;
 /** Debounce window (ms) for the framed re-read: a notification burst coalesces
  *  into a single re-read rather than re-reading per notification. */
 const REREAD_DEBOUNCE_MS = 50;
@@ -521,6 +535,8 @@ function main(): void {
     postLiveness,
     readJobs: () => readJobs(db),
     spawn: spawnControlChild,
+    watchDbChanges: (onChange, isDone) =>
+      watchLoop(db, onChange, isDone, OWNERSHIP_POLL_MS),
   })
     .then(() => {
       clearInterval(livenessTimer);
@@ -579,6 +595,10 @@ async function supervise(ctx: {
   postLiveness: () => void;
   readJobs: () => Job[];
   spawn: (anchor: string) => ControlChild;
+  watchDbChanges: (
+    onChange: () => void,
+    isDone: () => boolean,
+  ) => Promise<void>;
 }): Promise<void> {
   let attempts = 0;
   while (!ctx.isStopping()) {
@@ -666,7 +686,8 @@ function pickAnchorForConnect(jobs: readonly Job[]): string | null {
  *
  * Bootstrap order on connect: re-assert `no-output` (never toggle), defensive
  * `copy-mode -q`, read the server generation FIRST, then the initial framed
- * focus read. A notification landing mid-re-read re-arms dirty and re-reads once.
+ * focus read. A tmux notification or DB wake landing mid-re-read re-arms dirty
+ * and re-reads once.
  */
 export async function runConnection(
   child: ControlChild,
@@ -676,6 +697,13 @@ export async function runConnection(
     postTopology: (msg: TmuxTopologySnapshotMessage) => void;
     postLiveness: () => void;
     readJobs: () => Job[];
+    /** Connection-scoped jobs-projection change watcher. Production supplies the
+     * shared read-only `PRAGMA data_version` loop; tests may inject a deterministic
+     * trigger. It starts before bootstrap and resolves after `isDone()` flips. */
+    watchDbChanges?: (
+      onChange: () => void,
+      isDone: () => boolean,
+    ) => Promise<void> | void;
   },
 ): Promise<boolean> {
   const decoder = new TextDecoder();
@@ -741,9 +769,10 @@ export async function runConnection(
   let exited = false;
   let exitReason: string | null = null;
 
-  // Dirty/re-read coordination — a single-in-flight, debounced re-read. A
-  // notification sets `dirty`; if a re-read is in flight, `redirty` re-arms so the
-  // worker re-reads exactly once more after it completes.
+  // Dirty/re-read coordination — a single-in-flight, debounced re-read. A tmux
+  // notification OR a jobs-projection commit sets `dirty`; if a re-read is in
+  // flight, `redirty` re-arms so the worker re-reads exactly once more after it
+  // completes.
   let dirty = true; // bootstrap: read once on connect
   let rereadInFlight = false;
   let redirty = false;
@@ -826,8 +855,8 @@ export async function runConnection(
     }
   })();
 
-  /** Schedule the debounced re-read. Coalesces a burst into one re-read; a
-   *  notification arriving while a re-read is in flight sets `redirty` so exactly
+  /** Schedule the debounced re-read. Coalesces a tmux/DB burst into one re-read;
+   *  a request arriving while a re-read is in flight sets `redirty` so exactly
    *  one more re-read runs after. */
   function scheduleReread(): void {
     if (rereadTimer !== null) return;
@@ -908,9 +937,9 @@ export async function runConnection(
       //  2. emit-gate `hasLiveTmuxJob` — pointless with no jobs to locate;
       //  3. empty pane set — a wiping empty topology would clobber every location;
       //  4. read-fault — handled by the outer `catch` (no post).
-      // Deduped via the SHARED `hashTopology` over the SAME `{pane_id,
-      // session_name, window_index}` triples (job_id excluded), so a steady
-      // topology never churns and the hash matches the old poll's byte-for-byte.
+      // Deduped via the SHARED `hashTopology` over physical coordinates PLUS
+      // optional owner identity. A true duplicate stays silent, while a DB-only
+      // ownership acquisition/removal/transfer re-posts steady physical rows.
       if (generationId !== null) {
         const jobs = ctx.readJobs();
         if (hasLiveTmuxJob(jobs)) {
@@ -943,6 +972,37 @@ export async function runConnection(
     }
   }
 
+  // Start the connection-scoped data-version watcher BEFORE bootstrap. Its
+  // baseline read happens before the initial topology read: a commit before the
+  // baseline is included by bootstrap, while one after it requests a reread. A
+  // commit during an in-flight reread redirties the serialized loop, so no
+  // initialization or refresh window can permanently lose ownership.
+  let watchDone = false;
+  let ownershipWatch: Promise<void> | null = null;
+  if (ctx.watchDbChanges) {
+    try {
+      ownershipWatch = Promise.resolve(
+        ctx.watchDbChanges(
+          () => {
+            dirty = true;
+            scheduleReread();
+          },
+          () => watchDone || ctx.isStopping(),
+        ),
+      ).catch((err) => {
+        // The shared watcher already tolerates transient SQLITE_NOTADB. Any other
+        // failure is diagnostic; bootstrap/structural notifications remain live.
+        console.error(
+          `[tmux-control-worker] ownership watcher stopped: ${String(err)}`,
+        );
+      });
+    } catch (err) {
+      console.error(
+        `[tmux-control-worker] ownership watcher failed to start: ${String(err)}`,
+      );
+    }
+  }
+
   // Bootstrap the connection. WAIT for the unsolicited attach handshake to fully
   // settle first — tmux emits its own `%begin`/`%end` handshake block on attach,
   // which must be drained (and dropped, the reply queue being empty) BEFORE we
@@ -972,6 +1032,10 @@ export async function runConnection(
   // dependent and deliberately ignored. The supervisor backs off + reconnects;
   // neither path is an error.
   await readerDone;
+  watchDone = true;
+  if (ownershipWatch !== null) {
+    await ownershipWatch;
+  }
   if (rereadTimer !== null) {
     clearTimeout(rereadTimer);
     rereadTimer = null;
