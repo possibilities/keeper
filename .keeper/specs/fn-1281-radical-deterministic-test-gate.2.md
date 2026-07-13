@@ -57,5 +57,5 @@ Land only after task 1 names every consumed script. A missing named gate fails l
 - [ ] Scratch checkout install/run/reap and bounded-output behavior remain unchanged.
 
 ## Done summary
-
+Baseline and merge-finalize now resolve scripts["test:gate"] directly via a shared readTestGateCommand (baseline-worker.ts), replacing the old first-&&-segment scripts.test parser (gatePhaseCommand/readGateCommand/readPkgGateCommand, all removed). runPackageSuiteGate and runMergeSuiteGate now accept an injectable killGraceMs forwarded to runDetached, so the two merge-suite timeout tests in test/autopilot-worker.test.ts settle in ~5ms instead of padding bun tests per-test timeout to 8s for a real 5s production grace. A missing/malformed test:gate script still classifies as an infra error on both paths, never clean. Root/plan conditional suite coverage in runMergeSuiteGate is unchanged. Verified: bun run typecheck clean; bun test ./test/baseline-worker.test.ts (29 pass) and ./test/autopilot-worker.test.ts (628 pass) green in 3.5s; bun run test:gate full root pass (8781 pass/0 fail/34 expected skips). Landed as d05cc886.
 ## Evidence
