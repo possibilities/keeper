@@ -713,6 +713,13 @@ export interface ReconcileSnapshot {
    * is an empty set (no open desync distress).
    */
   sharedDesyncDistressDirs?: Set<string>;
+  /** Producer-only monitor-slot page/level-clear actions derived from canonical
+   * Harness activity plus a live pid probe. They never feed `reconcile`, release
+   * capacity, or kill an occupant. */
+  monitorSlotWedgeActions?: {
+    mint: { id: string; dir: string; reason: string }[];
+    clear: { id: string; dir: string }[];
+  };
   /**
    * The `(verb, id, dir)` of every OPEN fan-in LANE pre-merge `dispatch_failures`
    * row (its `reason` carries {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}; minted by

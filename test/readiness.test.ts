@@ -20,18 +20,25 @@
 import { expect, test } from "bun:test";
 import {
   classifyWorktreeRepos,
+  decideMonitorSlotWedgeDistress,
+  MONITOR_SLOT_WEDGE_PAGE_SEC,
+  monitorSlotHasPositiveClearEvidence,
+  monitorSlotWedgeDistressId,
   prepareWorktreeGeometry,
 } from "../src/autopilot-worker";
+import { isJamReason } from "../src/await-conditions";
 import {
   effectivePerRootCap,
   MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
 } from "../src/db";
+import { classifyDispatchFailure } from "../src/dispatch-failure-pill";
 import {
   applyPerRootRoundRobinAllocator,
   applySingleTaskPerEpicMutex,
   applySingleTaskPerRootMutex,
   type BlockReason,
   computeReadiness,
+  findLongUnknownMonitorOccupants,
   formatPill,
   isEpicStarted,
   isRootOccupant,
@@ -41,6 +48,7 @@ import {
   type RunningReason,
   type Verdict,
 } from "../src/readiness";
+import type { HarnessActivity } from "../src/session-activity";
 import type {
   EmbeddedJob,
   Epic,
@@ -2846,6 +2854,173 @@ test("stale worker-monitor evidence stays unknown and conservatively occupies", 
   expect(snap.perTask.get(task.task_id)).toEqual(
     running({ kind: "monitor-stale" }),
   );
+});
+
+test("long-unknown monitor slot pages once, never releases, and re-pages only after level-clear", () => {
+  const updatedAt = 1_000;
+  const now = updatedAt + MONITOR_SLOT_WEDGE_PAGE_SEC + 1;
+  const embedded = makeEmbeddedJob({
+    job_id: "worker-wedged",
+    state: "stopped",
+    has_live_worker_monitor: true,
+    updated_at: updatedAt,
+  });
+  const task = makeTask({
+    target_repo: "/repo/root-a",
+    worker_phase: "done",
+    jobs: [embedded],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const staleActivity: HarnessActivity = {
+    status: "unknown",
+    reason: "resource-evidence-stale",
+    reservation: null,
+  };
+  const occupants = findLongUnknownMonitorOccupants(
+    [epic],
+    new Map([[embedded.job_id, staleActivity]]),
+    now,
+    MONITOR_SLOT_WEDGE_PAGE_SEC,
+  );
+  expect(occupants).toEqual([
+    {
+      jobId: "worker-wedged",
+      root: "/repo/root-a",
+      updatedAt,
+    },
+  ]);
+
+  // Paging is additive visibility only: readiness still holds the mutex even
+  // beyond the paging horizon; no age-based release is reintroduced.
+  expect(runWithNow([epic], [], now).perTask.get(task.task_id)).toEqual(
+    running({ kind: "monitor-stale" }),
+  );
+
+  const first = decideMonitorSlotWedgeDistress({
+    occupants,
+    open: new Map(),
+    positivelyClearedJobIds: new Set(),
+  });
+  expect(first.mint).toHaveLength(1);
+  expect(first.clear).toEqual([]);
+  const firstMint = first.mint[0];
+  expect(firstMint?.id).toBe(monitorSlotWedgeDistressId("worker-wedged"));
+  expect(firstMint?.reason).toContain("will not release or kill");
+  if (firstMint === undefined) throw new Error("expected monitor-slot mint");
+  expect(isJamReason(firstMint.reason)).toBe(true);
+  expect(classifyDispatchFailure(firstMint.reason)).toBe("monitor-slot-wedge");
+
+  const open = new Map([
+    [
+      firstMint.id,
+      {
+        id: firstMint.id,
+        jobId: "worker-wedged",
+        dir: "/repo/root-a",
+      },
+    ],
+  ]);
+  const stillOpen = decideMonitorSlotWedgeDistress({
+    occupants,
+    open,
+    positivelyClearedJobIds: new Set(),
+  });
+  expect(stillOpen).toEqual({ mint: [], clear: [] });
+
+  const cleared = decideMonitorSlotWedgeDistress({
+    occupants: [],
+    open,
+    positivelyClearedJobIds: new Set(["worker-wedged"]),
+  });
+  expect(cleared).toEqual({
+    mint: [],
+    clear: [{ id: firstMint.id, dir: "/repo/root-a" }],
+  });
+
+  // Once the clear DELETE has folded, a genuinely fresh stale episode can page.
+  const rearmed = decideMonitorSlotWedgeDistress({
+    occupants,
+    open: new Map(),
+    positivelyClearedJobIds: new Set(),
+  });
+  expect(rearmed.mint).toHaveLength(1);
+});
+
+test("monitor-slot paging ignores fresh/within-horizon evidence and clears only positively", () => {
+  const updatedAt = 1_000;
+  const embedded = makeEmbeddedJob({
+    job_id: "worker-monitor",
+    state: "stopped",
+    has_live_worker_monitor: true,
+    updated_at: updatedAt,
+  });
+  const epic = makeEpic({ tasks: [makeTask({ jobs: [embedded] })] });
+  const staleActivity: HarnessActivity = {
+    status: "unknown",
+    reason: "resource-evidence-stale",
+    reservation: null,
+  };
+  expect(
+    findLongUnknownMonitorOccupants(
+      [epic],
+      new Map([[embedded.job_id, staleActivity]]),
+      updatedAt + MONITOR_SLOT_WEDGE_PAGE_SEC,
+      MONITOR_SLOT_WEDGE_PAGE_SEC,
+    ),
+  ).toEqual([]);
+  expect(
+    findLongUnknownMonitorOccupants(
+      [epic],
+      new Map([
+        [
+          embedded.job_id,
+          {
+            status: "active",
+            reason: "worker-resource",
+            reservation: null,
+          } satisfies HarnessActivity,
+        ],
+      ]),
+      updatedAt + MONITOR_SLOT_WEDGE_PAGE_SEC + 1,
+      MONITOR_SLOT_WEDGE_PAGE_SEC,
+    ),
+  ).toEqual([]);
+
+  const unknownLive = {
+    activity: staleActivity,
+    pidAlive: true,
+    jobState: "present" as const,
+  };
+  expect(monitorSlotHasPositiveClearEvidence(unknownLive)).toBe(false);
+  expect(
+    monitorSlotHasPositiveClearEvidence({
+      ...unknownLive,
+      activity: {
+        status: "active",
+        reason: "worker-resource",
+        reservation: null,
+      },
+    }),
+  ).toBe(true);
+  expect(
+    monitorSlotHasPositiveClearEvidence({
+      ...unknownLive,
+      activity: {
+        status: "quiescent",
+        reason: "parent-quiescent",
+        reservation: null,
+      },
+    }),
+  ).toBe(true);
+  expect(
+    monitorSlotHasPositiveClearEvidence({ ...unknownLive, pidAlive: false }),
+  ).toBe(true);
+  expect(
+    monitorSlotHasPositiveClearEvidence({
+      ...unknownLive,
+      jobState: "terminal",
+    }),
+  ).toBe(true);
 });
 
 test("fn-719: a fresh live monitor alongside a stale one keeps the task at monitor-running (every, not any)", () => {

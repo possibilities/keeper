@@ -429,6 +429,38 @@ export function isSharedDesyncDistressKey(verb: string, id: string): boolean {
 }
 
 /**
+ * A stopped, pid-alive worker-monitor occupant that has kept its dispatch root
+ * reserved with canonical `resource-evidence-stale` activity past the producer's
+ * paging horizon. This is a PAGING operator jam, never a release signal: the
+ * synthetic daemon row does not enter `failedKeys`, and no age-based path kills
+ * the session or frees its mutex. The id is per occupant
+ * (`monitor-slot-wedge:<jobId>`), while `dir` carries the affected root.
+ *
+ * Its producer level-clears only on positive settle/exit/fact-clear evidence.
+ * The daemon page-once sweep stamps `human_notified_at`; clearing and later
+ * re-minting the row re-arms that marker for a fresh episode.
+ */
+export const MONITOR_SLOT_WEDGE_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX = "monitor-slot-wedge:";
+export const MONITOR_SLOT_WEDGE_DISTRESS_REASON = "monitor-slot-wedge";
+
+export function isMonitorSlotWedgeDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === MONITOR_SLOT_WEDGE_DISTRESS_VERB &&
+    id.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX)
+  );
+}
+
+export function monitorSlotWedgeJobId(id: string): string | null {
+  return id.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX)
+    ? id.slice(MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * The stuck-state-sentinel anomaly distress signal (ADR 0013 layer 3) — the
  * PER-SESSION sticky the producer mints when the board says `working` but the
  * session is demonstrably idle (a worker-done-but-working contradiction, or a
@@ -497,6 +529,7 @@ export type DispatchFailureDisplayKind =
   | "shared-wedge"
   | "shared-dirty"
   | "shared-desync"
+  | "monitor-slot-wedge"
   | "lane-premerge"
   | "lane-wedge"
   | "stale-base"
@@ -532,6 +565,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // `-de` vs `-di`/`-w`, neither a prefix of the other), so ordering is not load-bearing;
   // grouped with the shared-checkout family for readability.
   { prefix: SHARED_DESYNC_DISTRESS_REASON, kind: "shared-desync" },
+  { prefix: MONITOR_SLOT_WEDGE_DISTRESS_REASON, kind: "monitor-slot-wedge" },
   // MOST-SPECIFIC-FIRST: the lane WEDGE distress prefix (`worktree-lane-wedge`)
   // must precede the lane PREMERGE prefix (`worktree-lane-premerge`) — neither is a
   // prefix of the other, but ordering keeps the table's stated invariant true even
