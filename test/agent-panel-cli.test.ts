@@ -216,10 +216,10 @@ function seedTerminalPanel(): string {
         pidfile: join(pdir, "opus.pidfile"),
       },
       {
-        name: "codex",
-        harness: "codex",
-        yaml: join(pdir, "codex.yaml"),
-        pidfile: join(pdir, "codex.pidfile"),
+        name: "pi",
+        harness: "pi",
+        yaml: join(pdir, "pi.yaml"),
+        pidfile: join(pdir, "pi.pidfile"),
       },
     ],
   };
@@ -229,8 +229,8 @@ function seedTerminalPanel(): string {
     `${JSON.stringify({ schema_version: 1, outcome: "completed", message: "SECRET_ANSWER_DO_NOT_LEAK" })}\n`,
   );
   writeFileSync(
-    join(pdir, "codex.yaml"),
-    `${JSON.stringify({ schema_version: 1, outcome: "completed", message: "codex answer body" })}\n`,
+    join(pdir, "pi.yaml"),
+    `${JSON.stringify({ schema_version: 1, outcome: "completed", message: "pi answer body" })}\n`,
   );
   return pdir;
 }
@@ -243,16 +243,16 @@ function seedEmptyMessagePanel(): string {
     slug: "empty-run",
     members: [
       {
-        name: "codex",
-        harness: "codex",
-        yaml: join(pdir, "codex.yaml"),
-        pidfile: join(pdir, "codex.pidfile"),
+        name: "pi",
+        harness: "pi",
+        yaml: join(pdir, "pi.yaml"),
+        pidfile: join(pdir, "pi.pidfile"),
       },
     ],
   };
   writeFileSync(join(pdir, "manifest.json"), JSON.stringify(manifest));
   writeFileSync(
-    join(pdir, "codex.yaml"),
+    join(pdir, "pi.yaml"),
     `${JSON.stringify({ schema_version: 1, outcome: "completed", message: null })}\n`,
   );
   return pdir;
@@ -272,7 +272,7 @@ test("agent panel wait: terminal panel → exit 0 + verdict JSON (content-blind)
   const v: PanelVerdict = JSON.parse(r.stdout.trim());
   expect(v.ok).toBe(true);
   expect(v.dir).toBe(pdir);
-  expect(v.members.map((m) => m.name)).toEqual(["opus", "codex"]);
+  expect(v.members.map((m) => m.name)).toEqual(["opus", "pi"]);
   // The verdict never leaks a panelist's answer.
   expect(r.stdout).not.toContain("SECRET_ANSWER_DO_NOT_LEAK");
 });
@@ -458,9 +458,9 @@ function mkPreset(
   };
 }
 
-/** A catalog with one codex preset for the ad-hoc `--preset` member. */
+/** A catalog with one Pi preset for the ad-hoc `--preset` member. */
 const AD_HOC_CATALOG: PresetCatalog = {
-  presets: { "codex-review": mkPreset("codex", { model: "gpt-5" }) },
+  presets: { "pi-review": mkPreset("pi", { model: "gpt-5" }) },
 };
 const AD_HOC_SELECTIONS: PanelSelections = { panels: {}, default: null };
 
@@ -509,16 +509,16 @@ function legOf(spawn: AdHocSpawn): string[] {
 describe("resolveAdHocMember (pure)", () => {
   test("--preset resolves the catalog harness + carries the preset name", () => {
     const r = resolveAdHocMember(AD_HOC_CATALOG, {
-      preset: "codex-review",
+      preset: "pi-review",
       readOnly: true,
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.members).toEqual([
       {
-        name: "codex-review",
-        harness: "codex",
-        preset: "codex-review",
+        name: "pi-review",
+        harness: "pi",
+        preset: "pi-review",
         model: undefined,
         effort: undefined,
         system: undefined,
@@ -529,7 +529,7 @@ describe("resolveAdHocMember (pure)", () => {
 
   test("--cli is a bare harness with explicit model/effort, no preset", () => {
     const r = resolveAdHocMember(AD_HOC_CATALOG, {
-      cli: "codex",
+      cli: "claude",
       model: "gpt-5",
       effort: "high",
       readOnly: false,
@@ -538,8 +538,8 @@ describe("resolveAdHocMember (pure)", () => {
     if (!r.ok) return;
     expect(r.members).toEqual([
       {
-        name: "codex",
-        harness: "codex",
+        name: "claude",
+        harness: "claude",
         preset: undefined,
         model: "gpt-5",
         effort: "high",
@@ -551,8 +551,8 @@ describe("resolveAdHocMember (pure)", () => {
 
   test("--preset + --cli together → mutually exclusive error", () => {
     const r = resolveAdHocMember(AD_HOC_CATALOG, {
-      preset: "codex-review",
-      cli: "codex",
+      preset: "pi-review",
+      cli: "pi",
       readOnly: true,
     });
     expect(r.ok).toBe(false);
@@ -560,15 +560,15 @@ describe("resolveAdHocMember (pure)", () => {
     expect(r.error).toContain("mutually exclusive");
   });
 
-  test("--effort on a non-codex member → error", () => {
+  test("--effort on a non-Claude member → error", () => {
     const r = resolveAdHocMember(AD_HOC_CATALOG, {
-      cli: "claude",
+      cli: "pi",
       effort: "high",
       readOnly: true,
     });
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.error).toContain("--effort is only supported for codex");
+    expect(r.error).toContain("--effort is only supported for claude");
   });
 
   test("an unknown preset / harness / empty selector each fail loud", () => {
@@ -591,15 +591,15 @@ describe("buildPanelLegArgv (ad-hoc posture)", () => {
       keeperAgentPath: AD_HOC_KEEPER_AGENT,
       prompt: "review this",
       member: {
-        name: "codex",
-        harness: "codex",
-        model: "gpt-5",
+        name: "claude",
+        harness: "claude",
+        model: "sonnet",
         effort: "high",
         system: "You are a code reviewer.",
         readOnly: true,
       },
       slug: "adhoc-run",
-      yamlPath: "/d/codex.yaml",
+      yamlPath: "/d/pi.yaml",
       stopTimeoutMs: 900000,
     });
     expect(leg.slice(0, 5)).toEqual([
@@ -607,14 +607,14 @@ describe("buildPanelLegArgv (ad-hoc posture)", () => {
       AD_HOC_KEEPER_AGENT,
       "agent",
       "run",
-      "codex",
+      "claude",
     ]);
     expect(leg[leg.indexOf("--system") + 1]).toBe("You are a code reviewer.");
-    expect(leg[leg.indexOf("--model") + 1]).toBe("gpt-5");
+    expect(leg[leg.indexOf("--model") + 1]).toBe("sonnet");
     expect(leg[leg.indexOf("--effort") + 1]).toBe("high");
     expect(leg).toContain("--read-only");
     // The leg is named panel::<slug>::<member.name>.
-    expect(leg[leg.indexOf("--name") + 1]).toBe("panel::adhoc-run::codex");
+    expect(leg[leg.indexOf("--name") + 1]).toBe("panel::adhoc-run::claude");
   });
 
   test("an ad-hoc member with readOnly=false drops --read-only + omits posture flags", () => {
@@ -646,7 +646,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
         promptFile,
         slug: "adhoc-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         dir: pdir,
         timeoutSeconds: 900,
       },
@@ -660,20 +660,18 @@ describe("panelStart (ad-hoc member fan-out)", () => {
       AD_HOC_KEEPER_AGENT,
       "agent",
       "run",
-      "codex",
+      "pi",
     ]);
-    expect(leg[leg.indexOf("--preset") + 1]).toBe("codex-review");
+    expect(leg[leg.indexOf("--preset") + 1]).toBe("pi-review");
     expect(leg).toContain("--read-only");
     // The ad-hoc leg is named panel::<slug>::<member.name>.
-    expect(leg[leg.indexOf("--name") + 1]).toBe(
-      "panel::adhoc-run::codex-review",
-    );
+    expect(leg[leg.indexOf("--name") + 1]).toBe("panel::adhoc-run::pi-review");
     const manifest: PanelManifest = JSON.parse(
       readFileSync(join(pdir, "manifest.json"), "utf8"),
     );
     expect(manifest.members).toHaveLength(1);
-    expect(manifest.members[0]?.name).toBe("codex-review");
-    expect(manifest.members[0]?.harness).toBe("codex");
+    expect(manifest.members[0]?.name).toBe("pi-review");
+    expect(manifest.members[0]?.harness).toBe("pi");
   });
 
   test("--cli member with --model/--effort → 1-entry manifest; leg carries them", async () => {
@@ -687,8 +685,8 @@ describe("panelStart (ad-hoc member fan-out)", () => {
         slug: "adhoc-run",
         panel: undefined,
         adHoc: {
-          cli: "codex",
-          model: "gpt-5",
+          cli: "claude",
+          model: "sonnet",
           effort: "high",
           readOnly: false,
         },
@@ -700,8 +698,8 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     expect(code).toBe(0);
     expect(spawns.length).toBe(1);
     const leg = legOf(spawns[0] as AdHocSpawn);
-    expect(leg[4]).toBe("codex");
-    expect(leg[leg.indexOf("--model") + 1]).toBe("gpt-5");
+    expect(leg[4]).toBe("claude");
+    expect(leg[leg.indexOf("--model") + 1]).toBe("sonnet");
     expect(leg[leg.indexOf("--effort") + 1]).toBe("high");
     expect(leg).not.toContain("--preset");
     expect(leg).not.toContain("--read-only");
@@ -709,7 +707,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
       readFileSync(join(pdir, "manifest.json"), "utf8"),
     );
     expect(manifest.members).toHaveLength(1);
-    expect(manifest.members[0]?.name).toBe("codex");
+    expect(manifest.members[0]?.name).toBe("claude");
   });
 
   test("--role codereviewer rides the leg as --system with the catalog text", async () => {
@@ -752,7 +750,10 @@ describe("panelStart (ad-hoc member fan-out)", () => {
         catalog: { presets: {} },
         selections: {
           panels: {
-            duo: panelDef(["claude::opus::high", "codex::gpt-5.3::high"]),
+            duo: panelDef([
+              "claude::opus::high",
+              "pi::openai-codex/gpt-5.3::high",
+            ]),
           },
           default: null,
         },
@@ -782,9 +783,11 @@ describe("panelStart (ad-hoc member fan-out)", () => {
     );
     expect(legA[legA.indexOf("--preset") + 1]).toBe("claude::opus::high");
     expect(legB[legB.indexOf("--name") + 1]).toMatch(
-      /^panel::duo-run::codex-gpt-5-3-high-[0-9a-z]{6}-1$/,
+      /^panel::duo-run::pi-openai-codex-gpt-5-3-high-[0-9a-z]{6}-1$/,
     );
-    expect(legB[legB.indexOf("--preset") + 1]).toBe("codex::gpt-5.3::high");
+    expect(legB[legB.indexOf("--preset") + 1]).toBe(
+      "pi::openai-codex/gpt-5.3::high",
+    );
     // The manifest records the run slug top-level.
     const manifest: PanelManifest = JSON.parse(
       readFileSync(join(pdir, "manifest.json"), "utf8"),
@@ -807,7 +810,7 @@ describe("panelStart (ad-hoc member fan-out)", () => {
         promptFile,
         slug: "adhoc-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         dir: pdir,
         timeoutSeconds: dur.ms / 1000,
       },
@@ -829,7 +832,7 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
         promptFile,
         slug: "durable-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       deps,
@@ -866,7 +869,7 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
         promptFile,
         slug: "override-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         dir: pdir,
         timeoutSeconds: 900,
       },
@@ -897,7 +900,10 @@ describe("panelStart (durable slug-keyed dir + boot-epoch manifest)", () => {
         catalog: { presets: {} },
         selections: {
           panels: {
-            duo: panelDef(["claude::opus::high", "codex::gpt-5.3::high"]),
+            duo: panelDef([
+              "claude::opus::high",
+              "pi::openai-codex/gpt-5.3::high",
+            ]),
           },
           default: null,
         },
@@ -958,7 +964,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
         promptFile,
         slug: "resume-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       first.deps,
@@ -966,7 +972,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
     expect(first.spawns.length).toBe(1);
     // The single leg completed (a terminal result file lands in the durable dir).
     writeFileSync(
-      join(panelDir, "codex-review.yaml"),
+      join(panelDir, "pi-review.yaml"),
       `${JSON.stringify({ schema_version: 1, outcome: "completed", message: null })}\n`,
     );
     const second = makeAdHocDeps();
@@ -975,7 +981,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
         promptFile,
         slug: "resume-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       second.deps,
@@ -998,13 +1004,13 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
         promptFile,
         slug: "relaunch-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       first.deps,
     );
     // The leg recorded a pidfile but died before any result (dead pid).
-    writeFileSync(join(panelDir, "codex-review.pidfile"), "9999\n");
+    writeFileSync(join(panelDir, "pi-review.pidfile"), "9999\n");
     // graceMs 0 so the same-boot dead pid is not grace-held; makeAdHocDeps's
     // pidAlive already reads dead.
     const base = makeAdHocDeps();
@@ -1014,7 +1020,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
         promptFile,
         slug: "relaunch-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       deps2,
@@ -1023,7 +1029,7 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
     expect(base.spawns.length).toBe(1);
     const leg = legOf(base.spawns[0] as AdHocSpawn);
     expect(leg[leg.indexOf("--output") + 1]).toBe(
-      join(panelDir, "codex-review.g2.yaml"),
+      join(panelDir, "pi-review.g2.yaml"),
     );
     const manifest: PanelManifest = JSON.parse(
       readFileSync(join(panelDir, "manifest.json"), "utf8"),
@@ -1040,19 +1046,19 @@ describe("panelStart (reconcile / idempotent-by-slug)", () => {
         promptFile,
         slug: "collide-run",
         panel: undefined,
-        adHoc: { preset: "codex-review", readOnly: true },
+        adHoc: { preset: "pi-review", readOnly: true },
         timeoutSeconds: 900,
       },
       first.deps,
     );
-    // Same prompt + slug, a DIFFERENT member (--cli codex → name "codex").
+    // Same prompt + slug, a DIFFERENT member (--cli pi → name "pi").
     const second = makeAdHocDeps();
     const code = await panelStart(
       {
         promptFile,
         slug: "collide-run",
         panel: undefined,
-        adHoc: { cli: "codex", readOnly: true },
+        adHoc: { cli: "pi", readOnly: true },
         timeoutSeconds: 900,
       },
       second.deps,
@@ -1072,7 +1078,7 @@ describe("parseManifest (durable fields)", () => {
       members: [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: "/d/x.yaml",
           pidfile: "/d/x.pidfile",
           launched_at: 7,
@@ -1099,9 +1105,7 @@ describe("parseManifest (durable fields)", () => {
       dir: "/d",
       slug: "run-x",
       boot_epoch_ms: "not-a-number",
-      members: [
-        { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
-      ],
+      members: [{ name: "x", harness: "pi", yaml: "/d/x.yaml", pidfile: null }],
     });
     expect(r.ok).toBe(false);
   });
@@ -1113,7 +1117,7 @@ describe("parseManifest (durable fields)", () => {
       members: [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: "/d/x.yaml",
           pidfile: null,
           launched_at: "soon",
@@ -1127,9 +1131,7 @@ describe("parseManifest (durable fields)", () => {
     const r = parseManifest({
       dir: "/d",
       slug: "run-x",
-      members: [
-        { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
-      ],
+      members: [{ name: "x", harness: "pi", yaml: "/d/x.yaml", pidfile: null }],
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -1147,7 +1149,7 @@ describe("parseManifest (durable fields)", () => {
       members: [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: "/d/x.yaml",
           pidfile: "/d/x.pidfile",
           startfile: "/d/x.starttime",
@@ -1168,7 +1170,7 @@ describe("parseManifest (durable fields)", () => {
       members: [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: "/d/x.yaml",
           pidfile: null,
           startfile: 42,
@@ -1191,7 +1193,7 @@ test("agent panel start: --panel + --preset together → exit 2 (mutually exclus
     "--panel",
     "default",
     "--preset",
-    "codex-review",
+    "pi-review",
     "--run-dir",
     join(dir, "scratch-mx"),
   ]);
@@ -1307,7 +1309,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
       },
       {
         name: "bad",
-        harness: "codex",
+        harness: "pi",
         yaml: join(pdir, "bad.yaml"),
         pidfile: join(pdir, "bad.pid"),
         launched_at: NOW - 10_000,
@@ -1321,7 +1323,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
       },
       {
         name: "deadold",
-        harness: "codex",
+        harness: "pi",
         yaml: join(pdir, "deadold.yaml"),
         pidfile: join(pdir, "deadold.pid"),
         launched_at: NOW - 10_000,
@@ -1335,7 +1337,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
       },
       {
         name: "nolaunch",
-        harness: "codex",
+        harness: "pi",
         yaml: join(pdir, "nolaunch.yaml"),
         pidfile: null,
         launched_at: null,
@@ -1403,7 +1405,7 @@ describe("panelStatus (launched_at grace, no false running)", () => {
     seedRunDir(pdir, "term-run", [
       {
         name: "x",
-        harness: "codex",
+        harness: "pi",
         yaml: join(pdir, "x.yaml"),
         pidfile: null,
         launched_at: null,
@@ -1577,7 +1579,7 @@ describe("panelPrune (lock-free AND pid-dead AND past TTL)", () => {
       [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: join(d, "x.yaml"),
           pidfile: join(d, "x.pid"),
         },
@@ -1604,7 +1606,7 @@ describe("panelPrune (lock-free AND pid-dead AND past TTL)", () => {
       [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: join(d, "x.yaml"),
           pidfile: join(d, "x.pid"),
         },
@@ -1631,7 +1633,7 @@ describe("panelPrune (lock-free AND pid-dead AND past TTL)", () => {
       [
         {
           name: "x",
-          harness: "codex",
+          harness: "pi",
           yaml: join(d, "x.yaml"),
           pidfile: join(d, "x.pid"),
           startfile: join(d, "x.starttime"),
@@ -1726,7 +1728,7 @@ test("panelStart writes a started-at sentinel on fresh start (prune age anchor)"
       promptFile,
       slug: "sentinel-run",
       panel: undefined,
-      adHoc: { preset: "codex-review", readOnly: true },
+      adHoc: { preset: "pi-review", readOnly: true },
       timeoutSeconds: 900,
     },
     deps,

@@ -59,11 +59,7 @@ import {
   type PresetCatalog,
   resolvePreset,
 } from "../agent/config";
-import {
-  AGENT_CLIS,
-  type AgentCli,
-  loadRolePrompt,
-} from "../agent/launch-config";
+import { type AgentCli, loadRolePrompt } from "../agent/launch-config";
 import {
   formatTriple,
   parseTriple,
@@ -388,7 +384,7 @@ function buildTripleMembers(
     if (!isPanelEligibleHarness(parsed.triple.harness)) {
       return {
         ok: false,
-        error: `${label} member '${raw}' pins harness ${parsed.triple.harness}, which is not panel-eligible (claude|codex|pi only)`,
+        error: `${label} member '${raw}' pins harness ${parsed.triple.harness}, which is not panel-eligible (claude|pi only)`,
       };
     }
     triples.push(parsed.triple);
@@ -475,8 +471,8 @@ export interface AdHocMemberSpec {
  * that drives one member through the shared panel leg path. `--preset <name>`
  * resolves its harness (+ model/effort launcher-side via the leg's `--preset`);
  * `--cli <x>` is a bare harness with the explicit `--model`/`--effort` overrides.
- * `--effort` is codex-only. A harness outside claude|codex|pi, an unknown
- * preset, or effort on a non-codex member fails loud (the caller exits 2). Pure —
+ * `--effort` is Claude-only. A harness outside Claude/Pi, an unknown
+ * preset, or effort on a non-Claude member fails loud (the caller exits 2). Pure —
  * the resulting member converges on the SAME manifest + leg path a configured
  * panel produces.
  */
@@ -507,20 +503,20 @@ export function resolveAdHocMember(
         error: err instanceof ConfigError ? err.message : String(err),
       };
     }
-    if (!AGENT_CLIS.has(resolved.harness)) {
+    if (!isPanelEligibleHarness(resolved.harness)) {
       return {
         ok: false,
-        error: `preset '${spec.preset}' pins harness ${resolved.harness}, which is not pair-launchable (claude|codex|pi only)`,
+        error: `preset '${spec.preset}' pins harness ${resolved.harness}, which is not pair-launchable (claude|pi only)`,
       };
     }
     harness = resolved.harness as AgentCli;
     name = spec.preset as string;
     preset = spec.preset as string;
   } else if (hasCli) {
-    if (!AGENT_CLIS.has(spec.cli as string)) {
+    if (!isPanelEligibleHarness(spec.cli as string)) {
       return {
         ok: false,
-        error: `--cli must be claude|codex|pi (got ${spec.cli})`,
+        error: `--cli must be claude|pi (got ${spec.cli})`,
       };
     }
     harness = spec.cli as AgentCli;
@@ -528,13 +524,12 @@ export function resolveAdHocMember(
   } else {
     return {
       ok: false,
-      error:
-        "an ad-hoc member requires --preset <name> or --cli <claude|codex|pi>",
+      error: "an ad-hoc member requires --preset <name> or --cli <claude|pi>",
     };
   }
 
-  if (spec.effort !== undefined && spec.effort !== "" && harness !== "codex") {
-    return { ok: false, error: "--effort is only supported for codex" };
+  if (spec.effort !== undefined && spec.effort !== "" && harness !== "claude") {
+    return { ok: false, error: "--effort is only supported for claude" };
   }
 
   return {
@@ -2223,7 +2218,7 @@ export const PANEL_HELP = `keeper agent panel — cross-OS panel fan-out (start 
 Usage:
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]
   keeper agent panel resume <prompt-file> --slug <slug> [--panel <name>] [--run-dir <d>] [--timeout <dur>]
-  keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|codex|pi>)
+  keeper agent panel start <prompt-file> --slug <slug> (--preset <name> | --cli <claude|pi>)
        [--role <r>] [--model <m>] [--effort <e>] [--read-only] [--run-dir <d>] [--timeout <dur>]
   keeper agent panel wait   (--slug <slug> | --run-dir <d>) [--chunk <dur>]
   keeper agent panel status (--slug <slug> | --run-dir <d>)
@@ -2262,11 +2257,11 @@ Options:
   --panel <name>    Panel name, a launch triple (panel of one), or 'default' to
                     resolve the configured default panel in panel.yaml
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
-  --cli <x>         Ad-hoc single member harness: claude|codex|pi
+  --cli <x>         Ad-hoc single member harness: claude|pi
   --role <r>        Ad-hoc role prompt: default|planner|codereviewer|coplanner
                     (rides the leg as --system; default/empty adds no block)
   --model <m>       Ad-hoc model override (rides onto the leg)
-  --effort <e>      Ad-hoc reasoning effort (codex only)
+  --effort <e>      Ad-hoc reasoning effort (claude only)
   --read-only       Ad-hoc read-only posture (forwarded to the leg)
   --run-dir <d>     Location override for the run dir. start: replaces the durable
                     slug dir; wait/status: an alternative to --slug (--run-dir wins

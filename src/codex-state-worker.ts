@@ -27,7 +27,12 @@
 
 import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { CODEX_STOP_MARKERS } from "./agent/transcript-watch";
+
+const CODEX_STOP_MARKERS: ReadonlySet<string> = new Set([
+  "task_complete",
+  "turn_aborted",
+  "error",
+]);
 
 /**
  * A tracked, attributed codex job the producer tails — the caller queries these

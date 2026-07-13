@@ -79,6 +79,11 @@ export function hostMatrixPath(): string {
  * underscore, dot — no leading dot, so a dotted capability id like `gpt-5.5` is
  * valid while a path-escape or scalar-coerced value fails loud. */
 const MATRIX_TOKEN_RE = /^[a-z0-9._-]+$/;
+const SUPPORTED_HARNESSES: ReadonlySet<string> = new Set([
+  "claude",
+  "pi",
+  "hermes",
+]);
 
 function isMatrixToken(value: unknown): value is string {
   return (
@@ -453,9 +458,9 @@ function coerceV2Providers(
         );
       }
     }
-    if (!isMatrixToken(rec.name)) {
+    if (!isMatrixToken(rec.name) || !SUPPORTED_HARNESSES.has(rec.name)) {
       throw new SubagentsConfigError(
-        "host matrix provider `name` must be a valid token",
+        `host matrix provider \`name\` must be one of ${[...SUPPORTED_HARNESSES].join("|")}`,
         label,
       );
     }

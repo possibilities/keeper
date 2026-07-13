@@ -78,9 +78,9 @@ afterEach(() => {
  *  their base slugs never collide (the disambiguated slug + ordinal is what the
  *  resolution tests assert). */
 const T_CLAUDE = "claude::opus::high";
-const T_CODEX = "codex::gpt-5.3::high";
+const T_CODEX = "pi::openai-codex/gpt-5.3::high";
 const T_CLAUDE2 = "claude::sonnet::high";
-const T_CODEX2 = "codex::gpt-5.1::high";
+const T_CODEX2 = "pi::openai-codex/gpt-5.1::high";
 const T_PI = "pi::glm::high";
 
 /** Build a fixture `PanelDefinition` from an ordered member list — strength +
@@ -90,7 +90,7 @@ function panelDef(members: string[]): PanelDefinition {
   return { strength: "standard", members, description: "fixture panel." };
 }
 
-/** A two-member `default` panel of a claude + a codex triple — the stand-in for the
+/** A two-member `default` panel of a Claude + a Pi triple — the stand-in for the
  *  removed zero-config fallback in the start/wait tests. */
 const DEFAULT_SELECTIONS: PanelSelections = {
   panels: { default: panelDef([T_CLAUDE, T_CODEX]) },
@@ -232,8 +232,8 @@ test("resolvePanelMembers: panel hit → triple members with slug names + ordina
   const [a, b] = r.members;
   expect(a).toMatchObject({ harness: "claude", preset: T_CLAUDE, ordinal: 1 });
   expect(a?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
-  expect(b).toMatchObject({ harness: "codex", preset: T_CODEX, ordinal: 1 });
-  expect(b?.name).toMatch(/^codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
+  expect(b).toMatchObject({ harness: "pi", preset: T_CODEX, ordinal: 1 });
+  expect(b?.name).toMatch(/^pi-openai-codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
 });
 
 test("resolvePanelMembers: a single triple → a one-member panel", () => {
@@ -387,7 +387,7 @@ test("buildPanelLegArgv: leg carries the RAW triple as --preset + the slug as --
     keeperBin: KEEPER_BIN,
     keeperAgentPath: KEEPER_AGENT,
     prompt: "q",
-    member: { name: "codex", harness: "codex" },
+    member: { name: "pi", harness: "pi" },
     slug: "my-run",
     yamlPath: "/d/codex.yaml",
     stopTimeoutMs: 1_800_000,
@@ -397,7 +397,7 @@ test("buildPanelLegArgv: leg carries the RAW triple as --preset + the slug as --
     KEEPER_AGENT,
     "agent",
     "run",
-    "codex",
+    "pi",
   ]);
   expect(presetlessArgv).not.toContain("--preset");
   expect(presetlessArgv).not.toContain("--cli");
@@ -463,7 +463,7 @@ test("start: persists + prints a manifest, launches every leg detached", async (
     // Each leg is named panel::<slug>::<member-slug> (a disambiguated slugifyTriple).
     const nameIdx = leg.indexOf("--name");
     expect(leg[nameIdx + 1]).toMatch(
-      /^panel::my-run::(claude-opus-high|codex-gpt-5-3-high)-[0-9a-z]{6}-1$/,
+      /^panel::my-run::(claude-opus-high|pi-openai-codex-gpt-5-3-high)-[0-9a-z]{6}-1$/,
     );
   }
 
@@ -475,7 +475,7 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   expect(persisted.slug).toBe("my-run");
   const [a, b] = persisted.members;
   expect(a?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
-  expect(b?.name).toMatch(/^codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
+  expect(b?.name).toMatch(/^pi-openai-codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
   // The result-file + pidfile basenames derive from the disambiguated slug.
   expect(a?.yaml).toBe(join(dir, `${a?.name}.yaml`));
   expect(a?.pidfile).toBe(join(dir, `${a?.name}.pidfile`));
@@ -597,7 +597,7 @@ test("start: a per-leg spawn failure records a null pidfile (no crash)", async (
   const m = readManifest();
   expect(m.members[0]?.harness).toBe("claude");
   expect(typeof m.members[0]?.pidfile).toBe("string");
-  expect(m.members[1]?.harness).toBe("codex");
+  expect(m.members[1]?.harness).toBe("pi");
   expect(m.members[1]?.pidfile).toBeNull();
 });
 
@@ -1224,7 +1224,7 @@ test("wait: full-success N-of-N → exit 0, ok:true (manifest round-trip)", asyn
     },
     {
       name: codex,
-      harness: "codex",
+      harness: "pi",
       status: "ok",
       yaml: join(dir, `${codex}.yaml`),
       reason: null,
@@ -1362,9 +1362,9 @@ test("wait: a null-pidfile (launch-failed) leg is a terminal fail", async () => 
     slug: "run-x",
     members: [
       {
-        name: "codex",
-        harness: "codex",
-        yaml: join(dir, "codex.yaml"),
+        name: "pi",
+        harness: "pi",
+        yaml: join(dir, "pi.yaml"),
         pidfile: null,
       },
     ],
@@ -1414,9 +1414,7 @@ test("parseManifest: rejects a malformed members entry", () => {
 test("parseManifest: rejects a manifest missing a top-level slug", () => {
   const r = parseManifest({
     dir: "/d",
-    members: [
-      { name: "x", harness: "codex", yaml: "/d/x.yaml", pidfile: null },
-    ],
+    members: [{ name: "x", harness: "pi", yaml: "/d/x.yaml", pidfile: null }],
   });
   expect(r.ok).toBe(false);
 });
@@ -1640,15 +1638,15 @@ test("wait reboot guard: an absent boot-epoch (pre-durable manifest) does NOT fi
     slug: "run-x",
     members: [
       {
-        name: "codex",
-        harness: "codex",
-        yaml: join(dir, "codex.yaml"),
-        pidfile: join(dir, "codex.pidfile"),
+        name: "pi",
+        harness: "pi",
+        yaml: join(dir, "pi.yaml"),
+        pidfile: join(dir, "pi.pidfile"),
       },
     ],
   };
   writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest));
-  seedPidfile("codex", 4242);
+  seedPidfile("pi", 4242);
   const { deps } = makeDeps({
     pidAlive: (pid) => pid === 4242,
     bootEpochMs: () => TEST_BOOT_EPOCH_MS + 999 * 60_000, // no stored epoch to compare
@@ -1769,7 +1767,7 @@ test("runPanelPrunePass reaps an aged-out lock-free pid-dead dir and relays a lo
     [
       {
         name: "x",
-        harness: "codex",
+        harness: "pi",
         yaml: join(root, "old-run", "x.yaml"),
         pidfile,
       },
@@ -1804,7 +1802,7 @@ test("runPanelPrunePass preserves a live-pid dir and relays no log (nothing reap
     [
       {
         name: "x",
-        harness: "codex",
+        harness: "pi",
         yaml: join(root, "live-run", "x.yaml"),
         pidfile,
       },
@@ -1853,7 +1851,7 @@ test("runPanelPrunePass preserves a recycle-guarded live dir (matching start-tim
     [
       {
         name: "x",
-        harness: "codex",
+        harness: "pi",
         yaml: join(root, "id-run", "x.yaml"),
         pidfile,
         startfile,
@@ -1886,7 +1884,7 @@ test("runPanelPrunePass is a no-op when shutting down — dir untouched, nothing
     [
       {
         name: "x",
-        harness: "codex",
+        harness: "pi",
         yaml: join(root, "old-run", "x.yaml"),
         pidfile,
       },

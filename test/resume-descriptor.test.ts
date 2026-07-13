@@ -60,17 +60,6 @@ test("resumeTarget coerces an empty job_id to the empty string; a title never re
   expect(resumeTarget(fixtureJob({ job_id: "", title: "has-name" }))).toBe("");
 });
 
-test("resumeTarget: a codex job resolves to the stored resume_target, not job_id", () => {
-  // A non-claude harness resumes via its OWN native id (back-filled into
-  // resume_target), never the keeper-minted job_id.
-  const job = fixtureJob({
-    job_id: "keeper-job-1",
-    harness: "codex",
-    resume_target: "codex-rollout-uuid",
-  });
-  expect(resumeTarget(job)).toBe("codex-rollout-uuid");
-});
-
 test("resumeTarget: a pi job resolves to its stored session id", () => {
   const job = fixtureJob({
     job_id: "keeper-job-2",
@@ -127,11 +116,6 @@ test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (f
 test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
   const cmd = buildResumeCommand("/repo", "fn-1.1", "");
   expect(cmd).toBe('cd /repo && claude --resume "fn-1.1"');
-});
-
-test("buildResumeCommand: codex renders the native `codex resume` subcommand form", () => {
-  const cmd = buildResumeCommand("/repo", "rollout-uuid", null, "codex");
-  expect(cmd).toBe('cd /repo && codex resume "rollout-uuid"');
 });
 
 test("buildResumeCommand: pi renders `pi --session`", () => {

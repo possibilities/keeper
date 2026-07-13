@@ -30,7 +30,7 @@ import {
 
 /** The partner CLIs `keeper agent` can fan out to — the full agent-kind set,
  *  derived from the harness registry (`src/agent/harness.ts`) so the name set
- *  lives in one place. pi launches read-only and read-write like claude/codex;
+ *  lives in one place. Pi launches read-only and read-write like Claude;
  *  its read-only posture is the prompt directive only (prompting, not enforcement
  *  — pi has no native sandbox of its own). */
 export type AgentCli = HarnessName;
@@ -142,11 +142,10 @@ export interface AgentLaunchOpts {
   cli: AgentCli;
   /** The assembled prompt — the FINAL positional argv element. */
   prompt: string;
-  /** `--model <m>` (claude/pi `--model`, codex `-m`). Omitted when absent. */
+  /** `--model <m>` (Claude/Pi `--model`, Hermes `-m`). Omitted when absent. */
   model?: string;
   /** Keeper reasoning effort, mapped per-harness onto the native second axis at
-   *  argv-build time: codex `-c model_reasoning_effort=`, pi `--thinking`. Claude
-   *  and hermes ignore it here (claude effort rides the run-handler `--effort`;
+   *  argv-build time: Pi `--thinking`. Claude and Hermes ignore it here (claude effort rides the run-handler `--effort`;
    *  hermes has no second axis). Omitted when absent. */
   effort?: string;
   /** Target tmux session keeper agent mints/targets. Omitted = keeper agent default. */
@@ -157,8 +156,7 @@ export interface AgentLaunchOpts {
    *  `--model`/`--effort`). */
   preset?: string;
   /** Launch NAME. Rides as `--x-tmux-window-name <name>` (the tmux window name,
-   *  EVERY harness) and, for claude/pi only, as the harness-native `--name <name>`
-   *  (codex has no native name flag). Omitted/empty = no name flag. */
+   *  EVERY harness) and, for Claude/Pi only, as the harness-native `--name <name>`. Omitted/empty = no name flag. */
   name?: string;
   /** Resume-launch target: when set, the native builder composes a RESUME
    *  argv (the harness's own resume token/target from {@link
@@ -167,8 +165,7 @@ export interface AgentLaunchOpts {
    *  of a fresh-launch one. The prompt then rides INSIDE the native builder's
    *  own returned array — {@link buildAgentLaunchArgv} does NOT append it
    *  again — since where it lands relative to the other resume flags is
-   *  harness-specific (codex needs verb-position LEADING; claude/pi/hermes
-   *  trail their own resume flags). Omitted/empty = fresh launch, byte-
+   *  harness-specific. Omitted/empty = fresh launch, byte-
    *  unchanged. */
   resumeTarget?: string;
   /** claude-only: the FRESH CHILD session uuid `--resume` forks into. Minted
@@ -189,7 +186,6 @@ const NATIVE_ARGS_BUILDERS: Record<
   (opts: AgentLaunchOpts) => string[]
 > = {
   claude: nativeClaudeArgs,
-  codex: nativeCodexArgs,
   pi: nativePiArgs,
   hermes: nativeHermesArgs,
 };
@@ -207,7 +203,7 @@ const NATIVE_ARGS_BUILDERS: Record<
  * the caller from `process.execPath` + the resolved keeper-agent path), since under
  * keeper `process.argv[1]` is `cli/keeper.ts` / `src/daemon.ts` — neither carries
  * the `agent` token. The native flags differ per CLI (see {@link nativeClaudeArgs}
- * / {@link nativeCodexArgs}). The `--x-no-confirm` flag suppresses the
+ *). The `--x-no-confirm` flag suppresses the
  * cwd-confirm prompt; `--x-tmux-detached` creates the window without
  * stealing focus, so the orchestrating session keeps control.
  *
@@ -216,10 +212,7 @@ const NATIVE_ARGS_BUILDERS: Record<
  * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
  * the `jobs` projection as a tracked job — the launcher injects it into the pane
  * env via tmux `-e`, so the SessionStart hook stamps the session name as the
- * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). codex
- * also launches as an interactive TUI now, but fires no keeper hooks, so it never
- * becomes a tracked job and omits the carrier (it stays UNTRACKED and is reaped
- * CLI-side). The carrier needs a session to name, so it is added only when
+ * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). The carrier needs a session to name, so it is added only when
  * `session` is present.
  *
  * A RESUME launch ({@link AgentLaunchOpts.resumeTarget} set) drops the
@@ -249,7 +242,7 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   }
   // The name lands on the tmux window name UNIFORMLY (every harness) via the
   // launcher's window-name knob; the harness-native `--name` (claude/pi) is added
-  // in the per-CLI native args, so codex legs carry no native name flag.
+  // in the per-CLI native args.
   if (opts.name !== undefined && opts.name !== "") {
     wrapperFlags.push("--x-tmux-window-name", opts.name);
   }
@@ -319,53 +312,6 @@ export function nativeClaudeArgs(opts: AgentLaunchOpts): string[] {
 }
 
 /**
- * Native codex flags for a one-turn partner launched as an INTERACTIVE
- * TUI (not the headless `codex exec` one-shot). `--dangerously-bypass-approvals
- * -and-sandbox` runs the turn in YOLO mode so it never stalls on an approval
- * prompt; `-m`/`-c model_reasoning_effort` are valid global/interactive flags.
- * Web search is ON by default in the interactive TUI, so the deprecated `--enable
- * web_search_request` is dropped (and `exec`/`--skip-git-repo-check` are
- * exec-only with no interactive analog). codex read-only is carried by the
- * prompt directive ONLY (no native codex flag fits "politely explore" — `-s
- * read-only` would also disable web search), so read-only KEEPS the same flags
- * as write; keeper enforces nothing. The detached interactive window does
- * not hang on codex's directory-trust prompt because the launch pre-seeds the
- * cwd's trust (via `src/codex-trust.ts`, fail-open) before launch.
- *
- * RESUME mode ({@link AgentLaunchOpts.resumeTarget} set) LEADS the returned
- * array with the VERB-POSITION `resume <target>` — probe-settled
- * (docs/adr/0034): `codex resume <uuid>` appends to the SAME rollout file —
- * and ENDS it with a `--` end-of-options guard ahead of the prompt
- * (probe-verified against a live codex binary; clap itself suggests `--` on
- * a rejected dash-led positional). `resume` must lead the forwarded
- * harness-visible argv ({@link buildAgentLaunchArgv} strips keeper's own
- * `--x-*` wrapper flags before the native array reaches codex), so unlike
- * claude/pi/hermes this resume branch cannot simply append at the end. Pure
- * — exported for tests.
- */
-export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
-  const isResumeLaunch =
-    opts.resumeTarget !== undefined && opts.resumeTarget !== "";
-  const args: string[] = isResumeLaunch
-    ? buildHarnessResumeArgv("codex", opts.resumeTarget as string)
-    : [];
-  args.push("--dangerously-bypass-approvals-and-sandbox");
-  if (opts.model !== undefined && opts.model !== "") {
-    args.push("-m", opts.model);
-  }
-  if (opts.effort !== undefined && opts.effort !== "") {
-    // codex `-c` parses TOML, so the value is quoted. The keeper effort maps onto
-    // codex's reasoning band via the descriptor (keeper `max` → codex `xhigh`).
-    const band = mapKeeperEffortToAxis("codex", opts.effort);
-    args.push("-c", `model_reasoning_effort="${band}"`);
-  }
-  if (isResumeLaunch) {
-    args.push(...buildResumeLaunchPromptTail("codex", opts.prompt));
-  }
-  return args;
-}
-
-/**
  * Native pi flags for a one-turn partner launched as an INTERACTIVE TUI.
  * pi has NO per-tool approval gate and NO native sandbox — tools are gated only
  * by allow/deny lists, so it never stalls on an approval prompt (no
@@ -373,8 +319,7 @@ export function nativeCodexArgs(opts: AgentLaunchOpts): string[] {
  * partner IGNORE the repo's project-local `.pi/` resources for this run — partner
  * isolation mirroring the CLAUDE*-env strip — which ALSO sidesteps pi's
  * directory-trust prompt (the one headless hang), so pi needs no trust-seeder the
- * way codex does (its `trust.json` is a shared profile path a seeder would
- * collide with). Posture-independent: pi read-only is carried by the prompt
+ * way a persistent shared-profile seeder would. Posture-independent: pi read-only is carried by the prompt
  * directive alone (no `--exclude-tools` strip — bash stays leaky, so a strip was
  * never a sandbox), so the flags are the same either way. pi's second axis is
  * `--thinking`; a keeper effort maps onto it via the descriptor (keeper `max` →
@@ -424,7 +369,7 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
  * trailing `opts.prompt` that {@link buildAgentLaunchArgv} appends the value of
  * `-z`: `hermes --yolo -m <model> -z <prompt>`. The one-shot prints only the
  * final message and records the session in hermes's store for post-stop capture.
- * Hermes has no native `--name` flag (like codex), so `opts.name` rides only the
+ * Hermes has no native `--name` flag, so `opts.name` rides only the
  * tmux window name. Consent for its shell hooks is seeded via the
  * `HERMES_ACCEPT_HOOKS=1` pane env (set by the inner launch), not a flag here.
  *

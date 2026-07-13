@@ -24,30 +24,6 @@ export const PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
   "upgrade",
 ]);
 
-/** Built-in Codex subcommands that bypass launch-session wrapper setup. */
-export const CODEX_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
-  "app",
-  "app-server",
-  "apply",
-  "archive",
-  "cloud",
-  "completion",
-  "debug",
-  "delete",
-  "doctor",
-  "features",
-  "help",
-  "login",
-  "logout",
-  "mcp",
-  "mcp-server",
-  "plugin",
-  "remote-control",
-  "sandbox",
-  "unarchive",
-  "update",
-]);
-
 /** Built-in Pi package/config commands that bypass launch-session setup. */
 export const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
   "config",
@@ -137,34 +113,6 @@ export const CLAUDE_OPTIONS_WITH_OPTIONAL_VALUE: ReadonlySet<string> = new Set([
   "--worktree",
 ]);
 
-/** Codex global options whose next token is always a value. */
-export const CODEX_OPTIONS_WITH_REQUIRED_VALUE: ReadonlySet<string> = new Set([
-  "-a",
-  "--add-dir",
-  "--ask-for-approval",
-  "-c",
-  "-C",
-  "--cd",
-  "--color",
-  "--config",
-  "--disable",
-  "--enable",
-  "-i",
-  "--image",
-  "--local-provider",
-  "-m",
-  "--model",
-  "-o",
-  "--output-last-message",
-  "--output-schema",
-  "-p",
-  "--profile",
-  "--remote",
-  "--remote-auth-token-env",
-  "-s",
-  "--sandbox",
-]);
-
 /** Pi options whose next token is always a value. */
 export const PI_OPTIONS_WITH_REQUIRED_VALUE: ReadonlySet<string> = new Set([
   "--api-key",
@@ -235,16 +183,6 @@ export function findPassthroughCommand(args: string[]): string | null {
     PASSTHROUGH_COMMANDS,
     CLAUDE_OPTIONS_WITH_REQUIRED_VALUE,
     CLAUDE_OPTIONS_WITH_OPTIONAL_VALUE,
-  );
-}
-
-/** Detect a built-in Codex management subcommand after global options. */
-export function findCodexPassthroughCommand(args: string[]): string | null {
-  return findAgentPassthroughCommand(
-    args,
-    CODEX_PASSTHROUGH_COMMANDS,
-    CODEX_OPTIONS_WITH_REQUIRED_VALUE,
-    new Set(),
   );
 }
 
@@ -370,7 +308,7 @@ export function hasExplicitModelArg(args: string[]): boolean {
 }
 
 /** True iff `-m`/`--model` (split or joined) appears before a bare `--`. */
-export function hasExplicitCodexModelArg(args: string[]): boolean {
+export function hasExplicitShortModelArg(args: string[]): boolean {
   for (const arg of args) {
     if (arg === "--") {
       return false;
@@ -393,47 +331,6 @@ export function hasExplicitThinkingArg(args: string[]): boolean {
     }
   }
   return false;
-}
-
-/** True iff `-p`/`--profile` (split or joined) appears before a bare `--`. */
-export function hasExplicitCodexProfileArg(args: string[]): boolean {
-  for (const arg of args) {
-    if (arg === "--") {
-      return false;
-    }
-    if (arg === "-p" || arg === "--profile" || arg.startsWith("--profile=")) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** True iff Codex reasoning effort is explicitly set through `-c/--config`. */
-export function hasExplicitCodexEffortArg(args: string[]): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === "--") {
-      return false;
-    }
-    if (arg === "-c" || arg === "--config") {
-      const value = args[i + 1] ?? "";
-      if (isCodexEffortConfig(value)) {
-        return true;
-      }
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--config=")) {
-      if (isCodexEffortConfig(arg.slice("--config=".length))) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function isCodexEffortConfig(value: string): boolean {
-  return value.trim().startsWith("model_reasoning_effort=");
 }
 
 /**

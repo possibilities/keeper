@@ -2,7 +2,7 @@
  * Hermes M2 capture — the PURE parsers behind `keeper agent run hermes` / a
  * hermes panel leg. Hermes sessions live in a SQLite store (`~/.hermes/state.db`),
  * NOT per-session JSONL files, so keeper cannot watch a transcript file the way it
- * does for claude/codex/pi. Instead the launcher's capture path polls
+ * does for Claude/Pi. Instead the launcher's capture path polls
  * `hermes sessions export` (JSONL out, read-only) and feeds its text here.
  *
  * Every function is a PURE reducer over that export text — no fs, no subprocess,
@@ -11,7 +11,7 @@
  * `main.ts` binds the export), so these parsers are unit-tested on synthetic
  * fixtures with no live hermes.
  *
- * Attribution mirrors the codex refuse-to-guess precedent: a hermes session is
+ * Attribution is refuse-to-guess: a Hermes session is
  * attributable to a leg only when it is rooted at the leg's cwd AND created at or
  * after the launch instant. Exactly one survivor IS the leg's session; more than
  * one is an unresolvable concurrent-session collision (ambiguous, never guessed);
@@ -21,7 +21,7 @@
 import type { LastMessage, TranscriptStop } from "./transcript-watch";
 
 /** Slop (ms) absorbing clock skew between the launch instant and the session's
- *  recorded `started_at` — mirrors the codex attribution floor. */
+ *  recorded `started_at`. */
 const START_SLOP_MS = 1_000;
 
 /**

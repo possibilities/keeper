@@ -1,7 +1,6 @@
 /**
  * Canonical global-instruction state sharing — the launch-time guard that keeps
- * each harness's shared instruction leaf (Claude's `CLAUDE.md`, Codex's and Pi's
- * `AGENTS.md`) symlinked back to keeper's one real `system/shared/AGENTS.md`
+ * each harness's shared instruction leaf (Claude's `CLAUDE.md` and Pi's `AGENTS.md`) symlinked back to keeper's one real `system/shared/AGENTS.md`
  * source, plus Claude's canonical `CLAUDE.md` and Pi's canonical account root.
  *
  * There is no Keeper-owned profile farm: claude-swap exclusively owns any
@@ -25,7 +24,6 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCodexHome } from "../codex-trust";
 
 /** Raised for fail-loud state errors; main() prints `Error: <msg>` + exit 1. */
 export class StateError extends Error {}
@@ -125,17 +123,17 @@ function normalizeAbsolute(p: string): string {
 /**
  * What the guard does when a leaf's regular-file clobber diverges from its source:
  * `error` hard-throws (keeper-owned leaves); `warn` leaves the live file in place
- * and logs (human-owned global-instruction leaves — codex/pi).
+ * and logs (human-owned global-instruction leaves — Pi).
  */
 export type LeafDivergence = "error" | "warn";
 
 /**
  * One canonical global-instruction leaf the launch guard re-asserts: a symlink at
  * `linkPath` that must resolve to the real stow `source`. A per-harness row so
- * claude's `CLAUDE.md`, codex's `AGENTS.md`, and pi's canonical `AGENTS.md` all
+ * Claude's `CLAUDE.md` and Pi's canonical `AGENTS.md` all
  * re-link to keeper's one shared source on every launch. `onDivergence` picks the
  * hard-error vs warn-and-respect split (a wrong-TARGET symlink is always repaired
- * regardless — that repair is the codex/pi cutover onto keeper).
+ * regardless — that repair reasserts Keeper's source).
  */
 export interface CanonicalStowLeaf {
   source: string;
@@ -194,23 +192,6 @@ function ensureClaudeSettingsSeed(
   actionLog?.push(`Seeded Claude settings: ${linkPath} -> ${source}`);
 }
 
-/** The codex leaf: `<CODEX_HOME|~/.codex>/AGENTS.md` sourced from the shared file,
- *  warn-and-respect (a human-edited codex AGENTS.md is never clobbered; only a
- *  wrong-target symlink is repaired, which cuts codex over onto keeper). */
-function codexStowLeaves(
-  sharedStowDir: string,
-  homeDir: string,
-  env: NodeJS.ProcessEnv,
-): CanonicalStowLeaf[] {
-  return [
-    {
-      source: join(sharedStowDir, "AGENTS.md"),
-      linkPath: join(resolveCodexHome(env, homeDir), "AGENTS.md"),
-      onDivergence: "warn",
-    },
-  ];
-}
-
 /** The pi canonical leaf: `<canonicalDir>/AGENTS.md` sourced from the shared file,
  *  warn-and-respect. */
 function piCanonicalStowLeaves(
@@ -256,7 +237,7 @@ function divergentClobberMessage(
 
 /**
  * Non-throwing sibling of `divergentClobberMessage` for a warn-and-respect leaf
- * (codex / pi). Their global-instruction files are human-owned, so keeper never
+ * (Pi). Its global-instruction files are human-owned, so keeper never
  * clobbers a divergent regular file and — critically — never THROWS: main() maps
  * StateError → exit(1), so a throw here would abort a benign human-edited launch.
  * A single WARNING line the caller pushes onto the action log.
@@ -272,13 +253,12 @@ function divergentRespectMessage(linkPath: string, target: string): string {
 /**
  * Re-assert every canonical global-instruction symlink in `leaves` on each launch —
  * one keeper-owned `system/shared/AGENTS.md` behind claude's `~/.claude/CLAUDE.md`,
- * codex's `AGENTS.md`, and pi's canonical `AGENTS.md`. A direct edit can replace a
+ * Pi's canonical `AGENTS.md`. A direct edit can replace a
  * relative symlink with a regular file; this guard force-restores the link.
  *
  * Per leaf (via lstat, so a clobber is never silently dereferenced):
  *   - correct symlink (resolves to the leaf's source) → no-op
- *   - symlink to the wrong target → repair + loud log (the codex/pi cutover onto
- *     keeper's shared source, for EVERY leaf regardless of `onDivergence`)
+ *   - symlink to the wrong target → repair + loud log (the correction to Keeper's shared source, for EVERY leaf regardless of `onDivergence`)
  *   - regular-file clobber, contents identical to the source → repair + loud log
  *   - regular-file clobber, divergent contents → `onDivergence: "error"` throws
  *     StateError with recovery; `"warn"` leaves the live file + logs a WARNING
@@ -402,34 +382,6 @@ export function ensureClaudeStateSharing(
       actionLog,
     );
   }
-}
-
-/**
- * Re-assert codex's canonical global-instruction link on every launch (codex is
- * almost always a passthrough invocation, so this runs unconditionally to reach
- * ALL codex launches). codex reads `<CODEX_HOME|~/.codex>/AGENTS.md`; this points
- * that leaf at keeper's one shared `system/shared/AGENTS.md`. Warn-and-respect: a
- * human-edited regular file is left in place with a WARNING and NEVER throws (main()
- * maps StateError → exit 1, so a throw would abort a benign launch) — but a
- * wrong-TARGET symlink IS repaired, and that repair is the codex cutover onto
- * keeper. `sharedStowDir` null disables the guard (test-only fail-open); production
- * resolves a real path via `defaultSharedStowDir()`. keeper only READS CODEX_HOME
- * (via `resolveCodexHome`) — it never sets or forces it.
- */
-export function ensureCodexStateSharing(
-  actionLog: string[] | null = null,
-  homeDir: string = homedir(),
-  env: NodeJS.ProcessEnv = process.env,
-  sharedStowDir: string | null = null,
-): void {
-  if (sharedStowDir === null) {
-    return;
-  }
-  ensureCanonicalStowLinks(
-    codexStowLeaves(sharedStowDir, homeDir, env),
-    actionLog,
-    env,
-  );
 }
 
 /**

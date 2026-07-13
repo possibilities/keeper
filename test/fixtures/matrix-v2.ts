@@ -55,7 +55,7 @@ export const MULTI_PROVIDER = [
   "    models:",
   "      - opus",
   "      - sonnet",
-  "  - name: codex",
+  "  - name: hermes",
   "    efforts:",
   "      - high",
   "      - xhigh",
@@ -98,7 +98,7 @@ export const MULTI_PROVIDER_EXPECTED = {
       provider: "pi",
       capability: "gpt-5.3-codex-spark",
       launchId: "openai-codex/gpt-5.3-codex-spark",
-      winner: "codex",
+      winner: "hermes",
     },
   ],
 };
@@ -113,7 +113,7 @@ export const CROSS_PROVIDER_DEDUP = [
   "subagent_models:",
   "  - gpt-5.5",
   "providers:",
-  "  - name: codex",
+  "  - name: hermes",
   "    models:",
   "      - gpt-5.5",
   "  - name: pi",
@@ -136,7 +136,7 @@ export const LAUNCH_ONLY = [
   "subagent_models:",
   "  - gpt-5.5",
   "providers:",
-  "  - name: codex",
+  "  - name: hermes",
   "    models:",
   "      - gpt-5.5",
   "      - gpt-5.5-preview",
@@ -156,7 +156,7 @@ export const SAME_PROVIDER_COLLISION = [
   "subagent_models:",
   "  - gpt-5.5",
   "providers:",
-  "  - name: codex",
+  "  - name: hermes",
   "    models:",
   "      - openai/gpt-5.5",
   "      - anthropic/gpt-5.5",
@@ -176,7 +176,7 @@ export const SUBAGENT_MODEL_UNSERVED = [
   "  - gpt-5.5",
   "  - ghost-model",
   "providers:",
-  "  - name: codex",
+  "  - name: hermes",
   "    models:",
   "      - gpt-5.5",
   "wrapper_driver:",
@@ -310,7 +310,7 @@ export const RETIRED_KEY_FIXTURES: {
   {
     key: "route",
     body: claudeBase([
-      "  - name: codex",
+      "  - name: hermes",
       "    route: false",
       "    models:",
       "      - gpt-5.5",
@@ -319,7 +319,7 @@ export const RETIRED_KEY_FIXTURES: {
   {
     key: "native",
     body: claudeBase([
-      "  - name: codex",
+      "  - name: hermes",
       "    models:",
       "      - id: gpt-5.5",
       "        native: gpt-5.5-codex",
@@ -328,7 +328,7 @@ export const RETIRED_KEY_FIXTURES: {
   {
     key: "name",
     body: claudeBase([
-      "  - name: codex",
+      "  - name: hermes",
       "    models:",
       "      - name: gpt-5.5",
     ]),

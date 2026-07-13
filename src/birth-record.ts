@@ -3,7 +3,7 @@
  *
  * The `keeper agent` launcher cannot write keeper.db (it is a db-free cold-start
  * path), and a claude session announces its own presence through the SessionStart
- * hook. codex/pi/hermes fire no such hook, so the launcher instead drops a BIRTH
+ * hook. Pi/Hermes fire no such hook, so the launcher instead drops a BIRTH
  * RECORD the moment it spawns the harness child: a maildir-style file the
  * birth-ingest worker reacts to and turns into a MAIN-minted synthetic
  * SessionStart. This module is that record's contract — the shape, the
@@ -48,16 +48,16 @@ export const BIRTH_RECORD_SCHEMA_VERSION = 1;
  * SessionStart WITHOUT re-reading any live process or env.
  *
  * `session_id` is the keeper job identity (becomes `jobs.job_id`): pi pins it at
- * launch, codex/hermes get a keeper-minted uuid. `resume_target` is the
+ * launch; Hermes gets a keeper-minted UUID. `resume_target` is the
  * harness-native id a `--resume` reuses — pinned for pi, null-at-birth (back-filled
- * post-stop) for codex/hermes. `pid` + `start_time` are the recycle-safe identity
+ * post-stop) for Hermes. `pid` + `start_time` are the recycle-safe identity
  * (the child's, never the launcher wrapper's).
  */
 export interface BirthRecord {
   schema_version: number;
   /** Keeper job identity — folds to `jobs.job_id`. */
   session_id: string;
-  /** Harness name (`codex` | `pi` | `hermes`; never `claude`). */
+  /** Harness name (`pi` | `hermes`; never `claude`). */
   harness: string;
   /** The spawned harness CHILD's pid (not the launcher wrapper's). */
   pid: number;

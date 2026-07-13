@@ -22,8 +22,8 @@
  *
  * RESULT. Each candidate carries a `harness` tag and a harness-native
  * `resume_target`: a claude candidate re-attaches by session UUID
- * (`claude --resume <uuid>`), while codex/pi/hermes resume via their own verb
- * (`codex resume`, `pi --session`, `hermes --resume`) off the stored target. A
+ * (`claude --resume <uuid>`), while Pi/Hermes resume via their own verb
+ * (`pi --session`, `hermes --resume`) off the stored target. A
  * non-claude agent whose target keeper never resolved is reported NOT-RESUMABLE
  * (never launched) so the rest of the generation still restores. The `label` is
  * the latest title (read live from the jobs projection) for display only. The
@@ -54,8 +54,8 @@
  * ONE plausible match within the proximity window, proposes the re-pin — two or
  * more is AMBIGUOUS and never resolved. `keeper tabs repair` REPORTS these
  * proposals read-only ({@link loadRepairProposals}); the actual re-pin is landed
- * by the daemon's resume-target back-fill producer (a twin pass beside the codex
- * back-fill), which mints the sanctioned `ResumeTargetResolved` synthetic event —
+ * by the daemon's resume-target back-fill producer, which mints the sanctioned
+ * `ResumeTargetResolved` synthetic event —
  * never a direct `jobs` write, never a new RPC surface.
  *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
@@ -591,8 +591,8 @@ export function renderOutcomes(
       );
       continue;
     }
-    // The resume command is per-harness (claude --resume / codex resume /
-    // pi --session / hermes --resume), sourced from the candidate's harness tag.
+    // The resume command is per-harness (Claude --resume / Pi --session /
+    // Hermes --resume), sourced from the candidate's harness tag.
     const cmd = buildResumeCommand(cwd, c.resume_target, null, c.harness);
     if (o.kind === "would-restore") {
       stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);

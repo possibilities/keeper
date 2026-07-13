@@ -7,7 +7,7 @@
 //
 // Dep-free by contract: node:fs/node:path only — NO bun:sqlite, NO src/db.ts, NO
 // third-party deps, NO subprocess. A leaf producer module mirroring
-// src/git-toplevel.ts (the per-cycle memo shape) and src/codex-trust.ts (the
+// src/git-toplevel.ts (the per-cycle memo shape) and the
 // hand-rolled, no-parser-dep TOML peek). NEVER call from a fold.
 //
 // FAIL CLOSED by contract: a worktree against a monorepo / submodule repo would

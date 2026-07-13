@@ -1,5 +1,5 @@
 # Committed v2 host matrix with BOTH provider families (opus/sonnet native,
-# seven codex-served capabilities wrapped) — the test-isolation fixture the
+# seven Pi-served capabilities wrapped) — the test-isolation fixture the
 # provider-equivalence consistency test pins via KEEPER_CONFIG_DIR so a
 # totality check against the full dispatchable roster runs with no live-host
 # read. Mirrors the production roster's model set exactly (no per-model
@@ -27,15 +27,15 @@ providers:
     models:
       - opus
       - sonnet
-  - name: codex
+  - name: pi
     models:
-      - gpt-5.3-codex-spark
-      - gpt-5.4
-      - gpt-5.4-mini
-      - gpt-5.5
-      - gpt-5.6-sol
-      - gpt-5.6-luna
-      - gpt-5.6-terra
+      - openai-codex/gpt-5.3-codex-spark
+      - openai-codex/gpt-5.4
+      - openai-codex/gpt-5.4-mini
+      - openai-codex/gpt-5.5
+      - openai-codex/gpt-5.6-sol
+      - openai-codex/gpt-5.6-luna
+      - openai-codex/gpt-5.6-terra
 wrapper_driver:
   model: sonnet
   effort: high

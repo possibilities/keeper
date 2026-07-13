@@ -50,11 +50,8 @@ export interface ResolvedHandle {
    */
   stopTimeoutMs: number | null;
   /**
-   * Resume marker threaded into transcript discovery: a resumed codex leg resolves
-   * its PRE-EXISTING rollout by the known uuid (`sessionId`) rather than the
-   * fresh-launch created-at floor. claude/pi stay strict-pinned. codex/claude
-   * anchor the stop-scan at `startedAtMs` so a pre-resume stop is skipped; a
-   * resumed pi wait anchors on a structural stop-count watermark instead, since pi
+   * Resume marker threaded into transcript discovery. Claude/Pi stay
+   * strict-pinned; a resumed Pi wait anchors on a structural stop-count watermark instead, since pi
    * re-stamps its copied history with resume-time timestamps. Absent/false = fresh
    * launch, byte-unchanged.
    */
@@ -229,7 +226,7 @@ export interface VerbDeps {
    * (or null on failure). Hermes has no per-session transcript FILE — its sessions
    * live in a SQLite store — so its wait/show path polls this export instead of
    * watching the filesystem. Bound in `main.ts` (a bounded subprocess); absent for
-   * the claude/codex/pi file-transcript verbs, which never read it.
+   * the Claude/Pi file-transcript verbs, which never read it.
    */
   hermesExport?: HermesExportFn;
 }
@@ -352,9 +349,7 @@ export async function runShowLastMessage(
 
 /**
  * A direct-path handle resolves to itself; a run-id handle polls for the
- * backend's transcript file (bounded by the watcher's path timeout). The
- * `ambiguous` failure — a codex leg colliding with a concurrent same-cwd session
- * — is propagated distinctly so the caller never degrades it into a plain
+ * backend's transcript file (bounded by the watcher's path timeout). The `ambiguous` failure is propagated distinctly so the caller never degrades it into a plain
  * path-timeout (or, worse, a guessed foreign transcript).
  */
 async function resolveTranscriptPath(

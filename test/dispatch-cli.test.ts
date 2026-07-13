@@ -71,7 +71,7 @@ const CLAUDE_MATRIX = [
   "",
 ].join("\n");
 
-/** A v2 roster: claude native (opus/sonnet) + a wrapped `gpt-5.5` served by codex,
+/** A v2 roster: Claude-native opus/sonnet plus wrapped `gpt-5.5` served by Pi,
  *  all three listed in subagent_models (so gpt-5.5 composes its own cell). */
 const WRAPPED_MATRIX = [
   "efforts: [high]",
@@ -80,8 +80,8 @@ const WRAPPED_MATRIX = [
   "providers:",
   "  - name: claude",
   "    models: [opus, sonnet]",
-  "  - name: codex",
-  "    models: [gpt-5.5]",
+  "  - name: pi",
+  "    models: [openai-codex/gpt-5.5]",
   "wrapper_driver: { model: sonnet, effort: high }",
   "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
   "",
@@ -352,7 +352,7 @@ test("plan form unblock:: honors the race guard (parity with work/close)", async
   expect(r.spec).toBeUndefined();
 });
 
-test("a codex --preset triple handed to dispatch fails loud (claude-only, exit 2)", async () => {
+test("a retired harness --preset triple fails loud (exit 2)", async () => {
   const r = await runDispatch([
     "--prompt",
     "x",
@@ -360,7 +360,7 @@ test("a codex --preset triple handed to dispatch fails loud (claude-only, exit 2
     "codex::gpt::high",
   ]);
   expect(r.code).toBe(2);
-  expect(r.stderr).toContain("claude-only");
+  expect(r.stderr).toContain("not a registered harness");
 });
 
 test("a malformed --preset triple fails loud (exit 2)", async () => {
@@ -491,8 +491,8 @@ test("plan work: a shadowing work plugin refuses (exit 1) naming the offending m
 // SAME `applyProviderConstraint` seam the autopilot producer does.
 // ---------------------------------------------------------------------------
 
-/** A v2 roster: claude native (opus/sonnet) + the codex harness serving
- *  gpt-5.6-sol (the committed map's opus→gpt target), all in subagent_models. */
+/** A v2 roster: Claude-native opus/sonnet plus Pi serving gpt-5.6-sol
+ *  (the committed map's opus→gpt target), all in subagent_models. */
 const SOL_MATRIX = [
   "efforts: [low, medium, high, xhigh, max]",
   "subagent_templates: [template/agents/worker.md.tmpl]",
@@ -500,8 +500,8 @@ const SOL_MATRIX = [
   "providers:",
   "  - name: claude",
   "    models: [opus, sonnet]",
-  "  - name: codex",
-  "    models: [gpt-5.6-sol]",
+  "  - name: pi",
+  "    models: [openai-codex/gpt-5.6-sol]",
   "wrapper_driver: { model: sonnet, effort: high }",
   "defaults: { stop_timeout_ms: 3600000, max_attempts: 2 }",
   "",

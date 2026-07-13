@@ -12,7 +12,6 @@
  *
  * Pure module — fixture DB via `freshDbFile`, no subprocess, no daemon.
  */
-
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -43,16 +42,13 @@ import { freshDbFile } from "./helpers/template-db";
 let tmpDir: string;
 let dbPath: string;
 let kdb: ReturnType<typeof freshDbFile>;
-
 // Fixed "now" so idle-cutoff assertions are deterministic.
-const NOW = 1_750_000_000; // ~2025-06-15
-
+const NOW = 1750000000; // ~2025-06-15
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-restore-set-test-"));
   dbPath = join(tmpDir, "keeper.db");
   kdb = freshDbFile(dbPath);
 });
-
 afterEach(() => {
   try {
     kdb.db.close();
@@ -61,7 +57,6 @@ afterEach(() => {
   }
   rmSync(tmpDir, { recursive: true, force: true });
 });
-
 interface SeedJob {
   job_id: string;
   state?: string;
@@ -91,7 +86,6 @@ interface SeedJob {
    *  non-launcher path minted, NULL a launcher-owned/legacy one. */
   adopted?: number | null;
 }
-
 /** Insert one jobs row with sensible defaults; only the fields a test cares
  *  about need to be passed. Writes raw — exercising the read path, not the fold. */
 function seedJob(db: Database, j: SeedJob): void {
@@ -132,15 +126,12 @@ function seedJob(db: Database, j: SeedJob): void {
     ],
   );
 }
-
 function derive(opts?: { now?: number; idleCutoffSecs?: number }) {
   return deriveRestoreSet(kdb.db, { now: NOW, ...opts });
 }
-
 function deriveLastGen(opts?: { now?: number; idleCutoffSecs?: number }) {
   return deriveLastGenerationSet(kdb.db, { now: NOW, ...opts });
 }
-
 /**
  * Insert a synthetic `BackendExecStart` generation-boundary event at an EXPLICIT
  * rowid (so a test pins the boundary relative to its seeded Killed `event_id`s).
@@ -162,14 +153,12 @@ function seedBackendExecStart(
     ],
   );
 }
-
 interface SeedTopologyPane {
   pane_id: string;
   session_name: string;
   window_index?: number | null;
   job_id?: string;
 }
-
 /**
  * Insert a synthetic `TmuxTopologySnapshot` event at an EXPLICIT rowid carrying
  * `{generation_id, panes}` — mirrors {@link seedBackendExecStart}'s explicit-id
@@ -203,7 +192,6 @@ function seedTmuxTopologySnapshot(
     ],
   );
 }
-
 /**
  * A pane that resolves to NO job (unowned — no payload `job_id`, no projection
  * match on `%pad`). Padding a single-pane snapshot with it lifts the
@@ -217,65 +205,53 @@ const PAD_PANE: SeedTopologyPane = {
   session_name: "work",
   window_index: 98,
 };
-
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
-
 test("burstEventIds: a contiguous run >= BURST_MIN_SIZE is a burst", () => {
   const burst = burstEventIds([10, 11, 12, 13]);
   expect([...burst].sort((a, b) => a - b)).toEqual([10, 11, 12, 13]);
 });
-
 test("burstEventIds: an isolated rowid is never a burst", () => {
   const burst = burstEventIds([10, 50, 99]);
   expect(burst.size).toBe(0);
 });
-
 test("burstEventIds: mixed — only the contiguous cluster qualifies", () => {
   // 100..102 is a 3-run; 200 and 300 are isolated.
   const burst = burstEventIds([300, 100, 200, 101, 102]);
   expect([...burst].sort((a, b) => a - b)).toEqual([100, 101, 102]);
 });
-
 test("burstEventIds: NULL/non-finite rowids are dropped, never in a burst", () => {
   const burst = burstEventIds([null, 10, 11, null, NaN]);
   expect([...burst].sort((a, b) => a - b)).toEqual([10, 11]);
 });
-
 test("burstEventIds: BURST_MIN_SIZE is the threshold (a run just under fails)", () => {
   // A single isolated rowid is below the 2-wide threshold.
   expect(burstEventIds([42]).size).toBe(0);
   expect(BURST_MIN_SIZE).toBe(2);
 });
-
 test("isCrashLike: server_gone / pid_died qualify regardless of burst", () => {
   expect(isCrashLike("server_gone", false)).toBe(true);
   expect(isCrashLike("pid_died", false)).toBe(true);
 });
-
 test("isCrashLike: window_gone_server_alive never qualifies, even in a burst", () => {
   expect(isCrashLike("window_gone_server_alive", true)).toBe(false);
 });
-
 test("isCrashLike: unknown/NULL qualify ONLY inside a burst", () => {
   expect(isCrashLike("unknown", false)).toBe(false);
   expect(isCrashLike("unknown", true)).toBe(true);
   expect(isCrashLike(null, false)).toBe(false);
   expect(isCrashLike(null, true)).toBe(true);
 });
-
 // ---------------------------------------------------------------------------
 // TmuxTopologySnapshot job_id payload (T1) — the additive per-pane job identity
 // the topology-anchored deriver reads from the EVENT PAYLOAD. The decoder must
 // round-trip job_id, tolerate its absence, and the field must NOT perturb the
 // fold (a no-op here: the decoder is the fold's only payload reader).
 // ---------------------------------------------------------------------------
-
 function readEvent(db: Database, id: number): Event {
   return db.query("SELECT * FROM events WHERE id = ?").get(id) as Event;
 }
-
 test("extractTmuxTopologySnapshot: round-trips a present job_id", () => {
   seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
     { pane_id: "%5", session_name: "fg", window_index: 3, job_id: "job-a" },
@@ -288,7 +264,6 @@ test("extractTmuxTopologySnapshot: round-trips a present job_id", () => {
     ],
   });
 });
-
 test("extractTmuxTopologySnapshot: a pane WITHOUT job_id decodes cleanly (field absent)", () => {
   seedTmuxTopologySnapshot(kdb.db, 100, "gen-100", [
     { pane_id: "%5", session_name: "fg", window_index: 3 },
@@ -301,7 +276,6 @@ test("extractTmuxTopologySnapshot: a pane WITHOUT job_id decodes cleanly (field 
   // The absent field decodes to `undefined`, never an empty string or null.
   expect(snap?.panes[0]).not.toHaveProperty("job_id");
 });
-
 test("extractTmuxTopologySnapshot: a pane with malformed job_id is dropped fail-closed", () => {
   // Hand-craft a payload with a non-string + empty-string job_id (the seed
   // helper only emits strings) to exercise the type-narrow.
@@ -323,7 +297,6 @@ test("extractTmuxTopologySnapshot: a pane with malformed job_id is dropped fail-
   const snap = extractTmuxTopologySnapshot(readEvent(kdb.db, 100));
   expect(snap?.panes).toEqual([]);
 });
-
 test("extractTmuxTopologySnapshot: job_id presence does not change physical coordinates", () => {
   // Same generation + panes, one with job_id and one without — ownership differs,
   // while the decoded physical coordinates remain byte-identical.
@@ -345,17 +318,14 @@ test("extractTmuxTopologySnapshot: job_id presence does not change physical coor
   });
   expect(foldInputs(withJob)).toEqual(foldInputs(without));
 });
-
 // ---------------------------------------------------------------------------
 // Membership
 // ---------------------------------------------------------------------------
-
 test("deriveRestoreSet: empty DB returns cleanly", () => {
   const res = derive();
   expect(res.candidates).toEqual([]);
   expect(res.excludedIdleCount).toBe(0);
 });
-
 test("deriveRestoreSet: crash-like close_kinds are offered, user-close excluded", () => {
   seedJob(kdb.db, {
     job_id: "srv",
@@ -373,7 +343,6 @@ test("deriveRestoreSet: crash-like close_kinds are offered, user-close excluded"
   expect(ids).toEqual(["srv", "pid"]);
   expect(ids).not.toContain("closed");
 });
-
 test("deriveRestoreSet: isolated unknown/NULL killed row is NOT offered", () => {
   seedJob(kdb.db, {
     job_id: "lonely-unknown",
@@ -388,7 +357,6 @@ test("deriveRestoreSet: isolated unknown/NULL killed row is NOT offered", () => 
   const res = derive();
   expect(res.candidates).toEqual([]);
 });
-
 test("deriveRestoreSet: a burst of unknown/NULL killed rows IS offered (legacy backstop)", () => {
   // Contiguous Killed event_ids 2000..2002 = a boot-sweep crash cluster.
   seedJob(kdb.db, {
@@ -416,7 +384,6 @@ test("deriveRestoreSet: a burst of unknown/NULL killed rows IS offered (legacy b
     "burst-c",
   ]);
 });
-
 test("deriveRestoreSet: user-close inside a burst stays excluded", () => {
   // Three contiguous Killed rowids, but the middle one is a deliberate close.
   seedJob(kdb.db, {
@@ -440,11 +407,9 @@ test("deriveRestoreSet: user-close inside a burst stays excluded", () => {
   const res = derive();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["b0", "b2"]);
 });
-
 // ---------------------------------------------------------------------------
 // Filters
 // ---------------------------------------------------------------------------
-
 test("deriveRestoreSet: a row with no backend coords is excluded", () => {
   seedJob(kdb.db, {
     job_id: "no-backend",
@@ -453,7 +418,6 @@ test("deriveRestoreSet: a row with no backend coords is excluded", () => {
   });
   expect(derive().candidates).toEqual([]);
 });
-
 test("deriveRestoreSet: a NULL live session falls back to the birth session for candidacy", () => {
   seedJob(kdb.db, {
     job_id: "born",
@@ -467,7 +431,6 @@ test("deriveRestoreSet: a NULL live session falls back to the birth session for 
   // under its launch session rather than dropping it.
   expect(candidates[0]?.backend_exec_session_id).toBe("work");
 });
-
 test("deriveRestoreSet: reconciler-managed work and close sessions are excluded; manual restore is unchanged", () => {
   seedJob(kdb.db, {
     job_id: "autopilot-work",
@@ -498,7 +461,6 @@ test("deriveRestoreSet: reconciler-managed work and close sessions are excluded;
       .sort(),
   ).toEqual(["human", "manual-close"]);
 });
-
 test("deriveRestoreSet: live working/stopped rows never surface as candidates", () => {
   // A live row (working/stopped) is not killed, so it is never a candidate and
   // its presence does not perturb a real killed candidate.
@@ -508,7 +470,6 @@ test("deriveRestoreSet: live working/stopped rows never surface as candidates", 
   const res = derive();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["dead-1"]);
 });
-
 test("deriveRestoreSet: live-UUID dedup — a killed id re-occupying a backend is skipped", () => {
   // The dedup is the idempotence guard against a concurrent re-spawn: when the
   // live set (built from working/stopped rows) contains the candidate's UUID,
@@ -533,7 +494,6 @@ test("deriveRestoreSet: live-UUID dedup — a killed id re-occupying a backend i
   const res = derive();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["candidate"]);
 });
-
 test("deriveRestoreSet: idle past the cutoff is excluded but COUNTED", () => {
   seedJob(kdb.db, {
     job_id: "fresh",
@@ -551,7 +511,6 @@ test("deriveRestoreSet: idle past the cutoff is excluded but COUNTED", () => {
   expect(res.candidates.map((c) => c.job_id)).toEqual(["fresh"]);
   expect(res.excludedIdleCount).toBe(1);
 });
-
 test("deriveRestoreSet: idle cutoff boundary — exactly at the cutoff is kept", () => {
   // updated_at == idleBefore is NOT "older than"; it stays a candidate.
   seedJob(kdb.db, {
@@ -563,11 +522,9 @@ test("deriveRestoreSet: idle cutoff boundary — exactly at the cutoff is kept",
   expect(res.candidates.map((c) => c.job_id)).toEqual(["edge"]);
   expect(res.excludedIdleCount).toBe(0);
 });
-
 // ---------------------------------------------------------------------------
 // Order, label, resume target
 // ---------------------------------------------------------------------------
-
 test("deriveRestoreSet: ordered by window_index, nulls to tail", () => {
   seedJob(kdb.db, {
     job_id: "w2",
@@ -602,7 +559,6 @@ test("deriveRestoreSet: ordered by window_index, nulls to tail", () => {
     "wnull-late",
   ]);
 });
-
 test("deriveRestoreSet: label = latest title, falls back to job_id", () => {
   seedJob(kdb.db, {
     job_id: "titled",
@@ -621,7 +577,6 @@ test("deriveRestoreSet: label = latest title, falls back to job_id", () => {
   expect(byId.get("titled")?.label).toBe("my-agent");
   expect(byId.get("untitled-uuid")?.label).toBe("untitled-uuid");
 });
-
 test("deriveRestoreSet: resume_target is the session UUID (exact resume), label carries the latest name", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   seedJob(kdb.db, {
@@ -636,72 +591,12 @@ test("deriveRestoreSet: resume_target is the session UUID (exact resume), label 
   expect(res.candidates[0]?.resume_target).toBe(uuid);
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
 });
-
 test("deriveRestoreSet: a NULL harness reads as claude and resumes by job_id", () => {
   seedJob(kdb.db, { job_id: "legacy-uuid", close_kind: "server_gone" });
   const c = derive().candidates[0];
   expect(c?.harness).toBe("claude");
   expect(c?.resume_target).toBe("legacy-uuid");
 });
-
-test("deriveRestoreSet: a codex candidate is harness-tagged and resumes by its stored resume_target", () => {
-  seedJob(kdb.db, {
-    job_id: "keeper-codex-1",
-    close_kind: "server_gone",
-    harness: "codex",
-    resume_target: "codex-rollout-id",
-  });
-  const c = derive().candidates[0];
-  expect(c?.harness).toBe("codex");
-  // The harness-native id, NOT the keeper-minted job_id.
-  expect(c?.resume_target).toBe("codex-rollout-id");
-  expect(isRestorableCandidate(c as RestoreCandidate)).toBe(true);
-});
-
-test("deriveRestoreSet: duplicate native resume identities keep the newest Keeper association", () => {
-  seedJob(kdb.db, {
-    job_id: "dotfiles-job",
-    close_kind: "server_gone",
-    harness: "codex",
-    resume_target: "shared-rollout",
-    title: "dotfiles-102",
-    cwd: "/repo/dotfiles",
-    window_index: 4,
-    created_at: NOW - 200,
-  });
-  seedJob(kdb.db, {
-    job_id: "keeper-job",
-    close_kind: "server_gone",
-    harness: "codex",
-    resume_target: "shared-rollout",
-    title: "keeper-840",
-    cwd: "/repo/keeper",
-    window_index: 2,
-    created_at: NOW - 100,
-  });
-
-  const candidates = derive().candidates;
-  expect(candidates.map((c) => c.job_id)).toEqual(["keeper-job"]);
-  expect(candidates[0]?.cwd).toBe("/repo/keeper");
-});
-
-test("deriveRestoreSet: a live native identity suppresses a stale killed association", () => {
-  seedJob(kdb.db, {
-    job_id: "dotfiles-job",
-    close_kind: "server_gone",
-    harness: "codex",
-    resume_target: "shared-rollout",
-  });
-  seedJob(kdb.db, {
-    job_id: "keeper-job",
-    state: "stopped",
-    harness: "codex",
-    resume_target: "shared-rollout",
-  });
-
-  expect(derive().candidates).toEqual([]);
-});
-
 test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED but not-resumable", () => {
   // The rest of the generation still restores — the not-resumable agent is
   // surfaced (an empty resume_target), never dropped.
@@ -726,56 +621,6 @@ test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED b
   expect(hermes?.resume_target).toBe("");
   expect(isRestorableCandidate(hermes as RestoreCandidate)).toBe(false);
 });
-
-// ---------------------------------------------------------------------------
-// Adopted-coordless surfacing — an ADOPTED job (jobs.adopted = 1: a hand-started
-// hermes self-seed or an adopted codex rollout) with no backend coords is COUNTED
-// on the result (adoptedCoordlessSkipCount), never silently dropped. Harness-
-// agnostic: classification keys on coord-absence PLUS the marker, so a coordless
-// adopted hermes job reports identically to codex, while a coordless NON-adopted
-// row keeps today's silent skip. Covered on BOTH the retrospective killed-cohort
-// path and the topology-anchored path.
-// ---------------------------------------------------------------------------
-
-test("deriveRestoreSet: a coordless adopted row is surfaced as a count while coordful/launched rows restore", () => {
-  // Coordless adopted (codex-by-design, or a hermes self-seed keeper never
-  // resolved coords for): crash-like but no backend coords ⇒ counted, not offered.
-  seedJob(kdb.db, {
-    job_id: "codex-coordless",
-    close_kind: "server_gone",
-    backend_exec_session_id: null,
-    adopted: 1,
-    harness: "codex",
-    resume_target: "codex-rollout",
-  });
-  // Coordful adopted (hermes self-seed with full pane coords) — restores like a
-  // launched session, its harness-native resume target intact.
-  seedJob(kdb.db, {
-    job_id: "hermes-coordful",
-    close_kind: "server_gone",
-    window_index: 0,
-    adopted: 1,
-    harness: "hermes",
-    resume_target: "hermes-session",
-    backend_exec_session_id: "work",
-  });
-  // A plain launched crash candidate — unaffected.
-  seedJob(kdb.db, {
-    job_id: "launched",
-    close_kind: "server_gone",
-    window_index: 1,
-    backend_exec_session_id: "work",
-  });
-  const res = derive();
-  expect(res.candidates.map((c) => c.job_id)).toEqual([
-    "hermes-coordful",
-    "launched",
-  ]);
-  expect(res.candidates[0]?.resume_target).toBe("hermes-session");
-  expect(res.adoptedCoordlessSkipCount).toBe(1);
-  expect(res.excludedIdleCount).toBe(0);
-});
-
 test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (not counted)", () => {
   seedJob(kdb.db, {
     job_id: "plain-coordless",
@@ -787,7 +632,6 @@ test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (n
   expect(res.candidates).toEqual([]);
   expect(res.adoptedCoordlessSkipCount).toBe(0);
 });
-
 test("deriveRestoreSet: a user-closed coordless adopted row is not a crash candidate and not counted", () => {
   // Membership (crash-like) is checked BEFORE the coords filter, so a deliberately
   // closed adopted session never reaches the adopted-coordless counter — the count
@@ -802,54 +646,6 @@ test("deriveRestoreSet: a user-closed coordless adopted row is not a crash candi
   expect(res.candidates).toEqual([]);
   expect(res.adoptedCoordlessSkipCount).toBe(0);
 });
-
-test("deriveLastGenerationSet: surfaces the adopted-coordless skip count (unbounded, mirrors excludedIdleCount)", () => {
-  seedBackendExecStart(kdb.db, 100);
-  seedJob(kdb.db, {
-    job_id: "kept",
-    close_kind: "server_gone",
-    window_index: 0,
-    last_event_id: 150,
-    backend_exec_session_id: "work",
-  });
-  seedJob(kdb.db, {
-    job_id: "codex-coordless",
-    close_kind: "server_gone",
-    last_event_id: 151,
-    backend_exec_session_id: null,
-    adopted: 1,
-  });
-  const res = deriveLastGen();
-  expect(res.candidates.map((c) => c.job_id)).toEqual(["kept"]);
-  expect(res.adoptedCoordlessSkipCount).toBe(1);
-});
-
-test("deriveLastGenerationSetFromTopology: the killed-cohort fallback carries the adopted-coordless skip count", () => {
-  // A coordless adopted job (codex-by-design) has NO pane, so it never rides the
-  // topology-anchored path — it is surfaced only when the deriver degrades to the
-  // retrospective killed-cohort fallback (no dying-generation topology here). The
-  // fallback's count rides through `...fallback`, so it is never dropped.
-  seedBackendExecStart(kdb.db, 100);
-  seedJob(kdb.db, {
-    job_id: "kept",
-    close_kind: "server_gone",
-    window_index: 0,
-    last_event_id: 150,
-    backend_exec_session_id: "work",
-  });
-  seedJob(kdb.db, {
-    job_id: "codex-coordless",
-    close_kind: "server_gone",
-    last_event_id: 151,
-    backend_exec_session_id: null,
-    adopted: 1,
-  });
-  const res = deriveTopo("gen-now");
-  expect(res.candidates.map((c) => c.job_id)).toEqual(["kept"]);
-  expect(res.fallbackNote).toBeDefined();
-  expect(res.adoptedCoordlessSkipCount).toBe(1);
-});
-
 test("deriveLastGenerationSetFromTopology: a coordful adopted pane restores like a launched one (no skip count)", () => {
   seedJob(kdb.db, {
     job_id: "hermes-adopted",
@@ -874,11 +670,9 @@ test("deriveLastGenerationSetFromTopology: a coordful adopted pane restores like
   expect(res.adoptedCoordlessSkipCount).toBe(0);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 // ---------------------------------------------------------------------------
 // deriveCurrentSet — the --snapshot-current source (live set, not crash set)
 // ---------------------------------------------------------------------------
-
 test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by window_index", () => {
   // Two live sessions out of window order — must come back window-ordered.
   seedJob(kdb.db, {
@@ -909,7 +703,6 @@ test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by w
     title: "x",
     backend_exec_session_id: null,
   });
-
   const cur = deriveCurrentSet(kdb.db);
   expect(cur.map((c) => c.job_id)).toEqual(["w1", "w2"]);
   // Resume target is the session UUID (job_id); the label keeps the latest name.
@@ -918,7 +711,6 @@ test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by w
   expect(cur[0].label).toBe("first");
   expect(cur[1].label).toBe("second");
 });
-
 test("deriveCurrentSet: resume_target is always the job_id; a never-named session's label falls back to it too", () => {
   seedJob(kdb.db, {
     job_id: "unnamed-uuid",
@@ -933,11 +725,9 @@ test("deriveCurrentSet: resume_target is always the job_id; a never-named sessio
   expect(cur[0].resume_target).toBe("unnamed-uuid");
   expect(cur[0].label).toBe("unnamed-uuid");
 });
-
 // ---------------------------------------------------------------------------
 // deriveCurrentSet — recycle-safe `(pid, start_time)` liveness gate
 // ---------------------------------------------------------------------------
-
 test("deriveCurrentSet: a recycled pid (OS start_time differs from stored) is excluded, not surfaced as current", () => {
   seedJob(kdb.db, {
     job_id: "recycled",
@@ -956,7 +746,6 @@ test("deriveCurrentSet: a recycled pid (OS start_time differs from stored) is ex
   });
   expect(cur.map((c) => c.job_id)).not.toContain("recycled");
 });
-
 test("deriveCurrentSet: a live (pid, start_time)-matched row is kept", () => {
   seedJob(kdb.db, {
     job_id: "still-live",
@@ -972,7 +761,6 @@ test("deriveCurrentSet: a live (pid, start_time)-matched row is kept", () => {
   });
   expect(cur.map((c) => c.job_id)).toEqual(["still-live"]);
 });
-
 test("deriveCurrentSet: a verifiably dead pid (isAlive false) is excluded regardless of start_time", () => {
   seedJob(kdb.db, {
     job_id: "verified-dead",
@@ -988,7 +776,6 @@ test("deriveCurrentSet: a verifiably dead pid (isAlive false) is excluded regard
   });
   expect(cur.map((c) => c.job_id)).not.toContain("verified-dead");
 });
-
 test("deriveCurrentSet: null stored start_time on an alive pid resolves to KEEP (documented fail-direction) — not dropped, not treated as a phantom", () => {
   seedJob(kdb.db, {
     job_id: "no-start-time",
@@ -1010,7 +797,6 @@ test("deriveCurrentSet: null stored start_time on an alive pid resolves to KEEP 
   // No stored start_time to compare against — the probe is never consulted.
   expect(readStartTimeCalled).toBe(false);
 });
-
 test("deriveCurrentSet: a probe failure (readStartTime returns null) on an alive pid resolves to KEEP, the same conservative can't-tell stance", () => {
   seedJob(kdb.db, {
     job_id: "probe-failed",
@@ -1026,7 +812,6 @@ test("deriveCurrentSet: a probe failure (readStartTime returns null) on an alive
   });
   expect(cur.map((c) => c.job_id)).toEqual(["probe-failed"]);
 });
-
 test("deriveCurrentSet: a NULL pid (never tracked) is kept unconditionally — the probe is never consulted", () => {
   seedJob(kdb.db, {
     job_id: "no-pid",
@@ -1045,7 +830,6 @@ test("deriveCurrentSet: a NULL pid (never tracked) is kept unconditionally — t
   expect(cur.map((c) => c.job_id)).toEqual(["no-pid"]);
   expect(isAliveCalled).toBe(false);
 });
-
 test("deriveCurrentSet: never throws when an injected probe itself throws — caught and treated as KEEP", () => {
   seedJob(kdb.db, {
     job_id: "throwy",
@@ -1065,7 +849,6 @@ test("deriveCurrentSet: never throws when an injected probe itself throws — ca
   }).not.toThrow();
   expect(cur.map((c) => c.job_id)).toEqual(["throwy"]);
 });
-
 test("deriveCurrentSet: terminal row with later live-pid backend evidence is current", () => {
   const livePid = process.pid;
   seedJob(kdb.db, {
@@ -1083,7 +866,7 @@ test("deriveCurrentSet: terminal row with later live-pid backend evidence is cur
     title: "dead",
     backend_exec_session_id: "work",
     last_event_id: 10,
-    pid: 2_000_000_000,
+    pid: 2000000000,
   });
   kdb.db.run(
     `INSERT INTO events (
@@ -1097,19 +880,17 @@ test("deriveCurrentSet: terminal row with later live-pid backend evidence is cur
        id, ts, session_id, pid, hook_event, event_type, data,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id
      ) VALUES (?, ?, ?, ?, 'Notification', 'idle_prompt', '{}', 'tmux', 'work', ?)`,
-    [12, NOW, "dead-terminal", 2_000_000_000, "%dead"],
+    [12, NOW, "dead-terminal", 2000000000, "%dead"],
   );
   seedTmuxTopologySnapshot(kdb.db, 13, "gen-now", [
     { pane_id: "%live", session_name: "work", window_index: 5 },
     { pane_id: "%dead", session_name: "work", window_index: 6 },
   ]);
-
   const cur = deriveCurrentSet(kdb.db);
   expect(cur.map((c) => c.job_id)).toEqual(["resumed-live"]);
   expect(cur[0].label).toBe("resumed");
   expect(cur[0].window_index).toBe(5);
 });
-
 test("deriveCurrentSet: a terminal row whose stale pane id was recycled to a DIFFERENT job is NOT resurrected", () => {
   // The phantom-window incident: a terminal job's last event named pid P and
   // pane %57. Both got recycled — P to an unrelated live process (pidAlive still
@@ -1149,13 +930,11 @@ test("deriveCurrentSet: a terminal row whose stale pane id was recycled to a DIF
       job_id: "owner-live",
     },
   ]);
-
   const cur = deriveCurrentSet(kdb.db);
   const ids = cur.map((c) => c.job_id);
   expect(ids).toContain("owner-live");
   expect(ids).not.toContain("phantom");
 });
-
 test("deriveCurrentSet: a terminal row whose pane id still owns its OWN job_id in the latest snapshot is resurrected", () => {
   // The guard must not over-reject: when the snapshot confirms the pane still
   // belongs to THIS job, the premature-terminal recovery stands.
@@ -1184,12 +963,10 @@ test("deriveCurrentSet: a terminal row whose pane id still owns its OWN job_id i
       job_id: "resumed-own",
     },
   ]);
-
   const cur = deriveCurrentSet(kdb.db);
   expect(cur.map((c) => c.job_id)).toEqual(["resumed-own"]);
   expect(cur[0].window_index).toBe(5);
 });
-
 test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → null", () => {
   seedJob(kdb.db, {
     job_id: "with-cwd",
@@ -1215,11 +992,9 @@ test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → nul
   expect(byId.get("empty-cwd")?.cwd).toBeNull();
   expect(byId.get("null-cwd")?.cwd).toBeNull();
 });
-
 // ---------------------------------------------------------------------------
 // Daemon-down: read-only connection works
 // ---------------------------------------------------------------------------
-
 test("deriveRestoreSet: works against a read-only connection (daemon-down path)", () => {
   seedJob(kdb.db, {
     job_id: "ro",
@@ -1238,18 +1013,16 @@ test("deriveRestoreSet: works against a read-only connection (daemon-down path)"
   // Re-point kdb so afterEach's close() is a harmless no-op double-close.
   kdb = { db: ro, stmts: kdb.stmts };
 });
-
 // ---------------------------------------------------------------------------
 // Regression: the recorded 2026-06-16 incident cohort
 // ---------------------------------------------------------------------------
-
 test("deriveRestoreSet: 2026-06-16 incident — 13-wide Killed burst restores in order", () => {
   // The recorded incident left a CONTIGUOUS run of 13 Killed event_ids
   // (4260388..4260400, all stamped at the same boot instant), every row
   // close_kind-NULL (pre-v70). The burst backstop must offer all 13, ordered by
   // window_index. Surrounding ISOLATED Killed rows (large event_id gaps) must
   // NOT be swept in.
-  const BURST_START = 4_260_388;
+  const BURST_START = 4260388;
   const BURST_N = 13;
   for (let i = 0; i < BURST_N; i++) {
     seedJob(kdb.db, {
@@ -1275,7 +1048,6 @@ test("deriveRestoreSet: 2026-06-16 incident — 13-wide Killed burst restores in
     last_event_id: BURST_START + BURST_N + 5000,
     updated_at: NOW - 60,
   });
-
   const res = derive();
   // All 13 burst rows offered, in window_index ascending order (so the reversed
   // seeding comes back sorted incident-12, incident-11, ... incident-0).
@@ -1290,17 +1062,14 @@ test("deriveRestoreSet: 2026-06-16 incident — 13-wide Killed burst restores in
   expect(ids.has("isolated-before")).toBe(false);
   expect(ids.has("isolated-after")).toBe(false);
 });
-
 // ---------------------------------------------------------------------------
 // deriveLastGenerationSet — the kill-anchored generation window (epic fn-819 T2)
 // ---------------------------------------------------------------------------
-
 test("deriveLastGenerationSet: empty DB returns cleanly", () => {
   const res = deriveLastGen();
   expect(res.candidates).toEqual([]);
   expect(res.excludedIdleCount).toBe(0);
 });
-
 test("deriveLastGenerationSet: bounds to the last generation, excludes the prior-gen straggler", () => {
   // Two generation boundaries: gen-A starts at event id 100, gen-B at id 200.
   seedBackendExecStart(kdb.db, 100);
@@ -1325,7 +1094,6 @@ test("deriveLastGenerationSet: bounds to the last generation, excludes the prior
     window_index: 2,
     last_event_id: 251,
   });
-
   // The full restore set offers all three (the 7-day pool); last-generation
   // bounds to gen-B only.
   expect(derive().candidates.map((c) => c.job_id)).toEqual([
@@ -1339,7 +1107,6 @@ test("deriveLastGenerationSet: bounds to the last generation, excludes the prior
     "last-gen-b",
   ]);
 });
-
 test("deriveLastGenerationSet: REGRESSION — boot-ordering race (kills BEFORE the new boundary)", () => {
   // The load-bearing scenario: seedKilledSweep mints the dead-generation Killed
   // events BEFORE the restore-worker posts the NEW BackendExecStart, so the
@@ -1366,7 +1133,6 @@ test("deriveLastGenerationSet: REGRESSION — boot-ordering race (kills BEFORE t
     last_event_id: 151,
   });
   seedBackendExecStart(kdb.db, 200, "gen-B");
-
   // Naive bound: MAX(BackendExecStart.id) = 200; "kills after 200" = EMPTY.
   // Prove the trap is real, then prove deriveLastGenerationSet avoids it.
   const naiveBoundary = (
@@ -1374,7 +1140,9 @@ test("deriveLastGenerationSet: REGRESSION — boot-ordering race (kills BEFORE t
       .query(
         "SELECT MAX(id) AS m FROM events WHERE hook_event='BackendExecStart'",
       )
-      .get() as { m: number }
+      .get() as {
+      m: number;
+    }
   ).m;
   expect(naiveBoundary).toBe(200);
   // K_max over the kills = 151; B_boundary = MAX(id <= 151) = 100 (gen-A start).
@@ -1385,7 +1153,6 @@ test("deriveLastGenerationSet: REGRESSION — boot-ordering race (kills BEFORE t
     "dead-gen-2",
   ]);
 });
-
 test("deriveLastGenerationSet: NULL boundary (no BackendExecStart) falls back to the burst, not the full pool", () => {
   // No BackendExecStart row at all (fresh / pre-feature DB). Fall back to the
   // most-recent contiguous Killed burst — NOT the 7-day pool.
@@ -1417,7 +1184,6 @@ test("deriveLastGenerationSet: NULL boundary (no BackendExecStart) falls back to
     window_index: 3,
     last_event_id: 501,
   });
-
   // The full pool (deriveRestoreSet) offers BOTH bursts (4 candidates).
   expect(derive().candidates.length).toBe(4);
   // Last-generation, NULL-boundary fallback: only the most-recent burst.
@@ -1427,7 +1193,6 @@ test("deriveLastGenerationSet: NULL boundary (no BackendExecStart) falls back to
     "recent-burst-b",
   ]);
 });
-
 test("deriveLastGenerationSet: no candidates returns empty cleanly", () => {
   // A user-closed window is never a candidate — empty set, no throw, even with a
   // boundary present.
@@ -1440,7 +1205,6 @@ test("deriveLastGenerationSet: no candidates returns empty cleanly", () => {
   const res = deriveLastGen();
   expect(res.candidates).toEqual([]);
 });
-
 test("deriveLastGenerationSet: a single server_gone with no boundary keeps the most-recent kill", () => {
   // Lone crash kill, no BackendExecStart, no burst (isolated). The most-recent
   // kill is the only last-generation signal — keep it (don't silently drop).
@@ -1453,7 +1217,6 @@ test("deriveLastGenerationSet: a single server_gone with no boundary keeps the m
   const res = deriveLastGen();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["lone-crash"]);
 });
-
 test("deriveLastGenerationSet: resume_target is the session UUID, label the latest name + idle counting", () => {
   seedBackendExecStart(kdb.db, 100);
   seedJob(kdb.db, {
@@ -1478,7 +1241,6 @@ test("deriveLastGenerationSet: resume_target is the session UUID, label the late
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
   expect(res.excludedIdleCount).toBe(1);
 });
-
 test("deriveLastGenerationSet: works against a read-only connection (daemon-down path)", () => {
   seedBackendExecStart(kdb.db, 100);
   seedJob(kdb.db, {
@@ -1497,21 +1259,18 @@ test("deriveLastGenerationSet: works against a read-only connection (daemon-down
   }
   kdb = { db: ro, stmts: kdb.stmts };
 });
-
 // ---------------------------------------------------------------------------
 // deriveLastGenerationSetFromTopology — the PRIMARY topology-anchored deriver
 // (epic fn-955). Derives the restore set from the DYING generation's last
 // TmuxTopologySnapshot (positive pre-crash evidence), not the retrospective
 // killed cohort. Selected by probing G_now and excluding its still-live snapshot.
 // ---------------------------------------------------------------------------
-
 function deriveTopo(currentGenerationId: string | null) {
   return deriveLastGenerationSetFromTopology(kdb.db, {
     now: NOW,
     currentGenerationId,
   });
 }
-
 test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot panes (job_id from payload)", () => {
   // The dying generation (gen-dead) left a snapshot carrying its live panes,
   // each with the producer-stamped job_id. The respawned server is gen-now.
@@ -1544,74 +1303,6 @@ test("deriveLastGenerationSetFromTopology: derives from the dying-gen snapshot p
   expect(res.candidates[0]?.backend_exec_session_id).toBe("work");
   expect(res.fallbackNote).toBeUndefined();
 });
-
-test("deriveLastGenerationSetFromTopology: one Codex rollout is restored only once", () => {
-  seedJob(kdb.db, {
-    job_id: "dotfiles-job",
-    state: "killed",
-    title: "dotfiles-102",
-    cwd: "/repo/dotfiles",
-    harness: "codex",
-    resume_target: "shared-rollout",
-    created_at: NOW - 200,
-  });
-  seedJob(kdb.db, {
-    job_id: "keeper-job",
-    state: "killed",
-    title: "keeper-840",
-    cwd: "/repo/keeper",
-    harness: "codex",
-    resume_target: "shared-rollout",
-    created_at: NOW - 100,
-  });
-  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
-    {
-      pane_id: "%1",
-      session_name: "work",
-      window_index: 4,
-      job_id: "dotfiles-job",
-    },
-    {
-      pane_id: "%2",
-      session_name: "work",
-      window_index: 2,
-      job_id: "keeper-job",
-    },
-  ]);
-
-  const res = deriveTopo("gen-now");
-  expect(res.candidates.map((c) => c.job_id)).toEqual(["keeper-job"]);
-  expect(res.candidates[0]?.cwd).toBe("/repo/keeper");
-});
-
-test("deriveLastGenerationSetFromTopology: a live Codex rollout suppresses a stale snapshot association", () => {
-  seedJob(kdb.db, {
-    job_id: "dotfiles-job",
-    state: "killed",
-    title: "dotfiles-102",
-    harness: "codex",
-    resume_target: "shared-rollout",
-  });
-  seedJob(kdb.db, {
-    job_id: "keeper-job",
-    state: "stopped",
-    title: "keeper-840",
-    harness: "codex",
-    resume_target: "shared-rollout",
-  });
-  seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
-    {
-      pane_id: "%1",
-      session_name: "work",
-      window_index: 4,
-      job_id: "dotfiles-job",
-    },
-    PAD_PANE,
-  ]);
-
-  expect(deriveTopo("gen-now").candidates).toEqual([]);
-});
-
 test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback when payload carries no job_id", () => {
   // The snapshot pane omits job_id (a pane whose job row was not yet written at
   // post time); the deriver resolves it via the (generation_id, pane_id) join.
@@ -1634,7 +1325,6 @@ test("deriveLastGenerationSetFromTopology: per-pane projection-join fallback whe
   expect(res.candidates[0]?.label).toBe("joined");
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded — a recycled pane_id from another generation never resolves the wrong job", () => {
   // Recycle-guard pin: the join keys on (generation_id, pane_id) precisely so a
   // tmux pane id reused across server generations cannot cross-resolve. Two jobs
@@ -1671,7 +1361,6 @@ test("deriveLastGenerationSetFromTopology: projection-join is %N-recycle-guarded
   expect(res.candidates[0]?.label).toBe("dying-occupant");
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (bound): a richer generation beyond the newest K is never considered", () => {
   // The selection is bounded to the newest RECENT_GENERATION_BOUND dead
   // generations. The OLDEST generation (lowest rowid, one past the bound) is
@@ -1711,7 +1400,6 @@ test("deriveLastGenerationSetFromTopology (bound): a richer generation beyond th
   }
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (bound): a rich dead generation past the idle cutoff is never considered", () => {
   // gen-stale is richer AND has the higher rowid (newer by recency), but its
   // newest snapshot ts is older than the idle cutoff — so it is excluded by ts,
@@ -1748,7 +1436,6 @@ test("deriveLastGenerationSetFromTopology (bound): a rich dead generation past t
   expect(res.candidates.map((c) => c.job_id)).toEqual(["fresh"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot overall is the dying generation", () => {
   // No server up at restore time. The newest snapshot (id 600, gen-late) is the
   // dying generation; an older snapshot (id 500, gen-early) is ignored.
@@ -1766,7 +1453,6 @@ test("deriveLastGenerationSetFromTopology: G_now == null ⇒ the newest snapshot
   expect(res.candidates.map((c) => c.job_id)).toEqual(["late"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: equally-rich dead generations ⇒ the SINGLE newest is picked (only its candidates)", () => {
   // gen-now is live; gen-dead-2 (id 600) is the most-recent crash; gen-dead-1
   // (id 500) an older crash. Both are equally rich (1 restorable), so the auto-
@@ -1806,7 +1492,6 @@ test("deriveLastGenerationSetFromTopology: equally-rich dead generations ⇒ the
   expect(res.ambiguous).toBeUndefined(); // equal richness, newest wins → unambiguous
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: a malformed snapshot is excluded from the walk, never derailing selection", () => {
   seedJob(kdb.db, { job_id: "good-agent", state: "killed", title: "good" });
   // A good dying-gen snapshot at id 500.
@@ -1832,7 +1517,6 @@ test("deriveLastGenerationSetFromTopology: a malformed snapshot is excluded from
   expect(res.candidates.map((c) => c.job_id)).toEqual(["good-agent"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: no snapshot ⇒ labeled fallback to the killed-cohort model", () => {
   // No TmuxTopologySnapshot at all — degrade to deriveLastGenerationSet and set
   // the visible fallback note.
@@ -1848,7 +1532,6 @@ test("deriveLastGenerationSetFromTopology: no snapshot ⇒ labeled fallback to t
   expect(res.fallbackNote).toBeDefined();
   expect(res.fallbackNote).toContain("retrospective");
 });
-
 test("deriveLastGenerationSetFromTopology: every snapshot is G_now ⇒ labeled fallback (no dying generation)", () => {
   // The only snapshot belongs to the still-live server (gen-now) — there is no
   // dying generation to anchor on, so fall back (labeled).
@@ -1872,7 +1555,6 @@ test("deriveLastGenerationSetFromTopology: every snapshot is G_now ⇒ labeled f
   expect(res.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
   expect(res.fallbackNote).toBeDefined();
 });
-
 test("deriveLastGenerationSetFromTopology: reuses the idempotence filters (worker / live-UUID / no-coords excluded)", () => {
   // An autopilot worker (plan_verb='work') — reconciler-managed, never restored.
   seedJob(kdb.db, {
@@ -1903,7 +1585,6 @@ test("deriveLastGenerationSetFromTopology: reuses the idempotence filters (worke
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["keepme"]);
 });
-
 test("deriveLastGenerationSetFromTopology: an unowned pane (no job_id, no projection match) is dropped", () => {
   seedJob(kdb.db, { job_id: "owned", state: "killed", title: "owned-agent" });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
@@ -1913,13 +1594,11 @@ test("deriveLastGenerationSetFromTopology: an unowned pane (no job_id, no projec
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["owned"]);
 });
-
 test("deriveLastGenerationSetFromTopology: REGRESSION — respawned server + day-old killed rows offers ONLY the live windows", () => {
   // The real-incident scenario this epic fixes: the tmux server respawned (so
   // G_now is the NEW generation), and a full day of historically-closed killed rows
   // sits in the DB. The retrospective killed-cohort model swept those in; the
   // topology-anchored model offers ONLY the dying generation's 2 live panes.
-
   // A day of older killed rows (close_kind-NULL legacy + crash-like), all from a
   // prior generation, plus a stale BackendExecStart anchor the OLD model would
   // sweep from. None of these belong to the dying-gen snapshot.
@@ -1936,7 +1615,6 @@ test("deriveLastGenerationSetFromTopology: REGRESSION — respawned server + day
       updated_at: NOW - 3600,
     });
   }
-
   // The dying generation's snapshot: exactly 2 panes that were genuinely live at
   // the crash. The jobs are also present as killed rows (the boot sweep killed
   // them), but the snapshot is what anchors the restore.
@@ -1962,18 +1640,15 @@ test("deriveLastGenerationSetFromTopology: REGRESSION — respawned server + day
     { pane_id: "%1", session_name: "work", window_index: 0, job_id: "live-1" },
     { pane_id: "%2", session_name: "work", window_index: 1, job_id: "live-2" },
   ]);
-
   // The OLD retrospective model swept the whole day-old pool + the 2 live (40).
   const old = deriveLastGenerationSet(kdb.db, { now: NOW });
   expect(old.candidates.length).toBeGreaterThan(2);
-
   // The topology-anchored model (respawned server = gen-now) offers ONLY the 2
   // genuinely-live windows.
   const res = deriveTopo("gen-now");
   expect(res.candidates.map((c) => c.job_id)).toEqual(["live-1", "live-2"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology: works against a read-only connection (daemon-down path)", () => {
   seedJob(kdb.db, { job_id: "ro-topo", state: "killed", title: "ro-agent" });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-dead", [
@@ -1993,14 +1668,12 @@ test("deriveLastGenerationSetFromTopology: works against a read-only connection 
   }
   kdb = { db: ro, stmts: kdb.stmts };
 });
-
 // ---------------------------------------------------------------------------
 // Bounded recency-first selection — the auto-pick is the NEWEST eligible dead
 // generation (the one just lost), bounded to the newest K inside the idle cutoff,
 // excluding short-lived single-pane skeletons and stepping back to the newest
 // attributed snapshot; an older substantially-richer generation flags ambiguity.
 // ---------------------------------------------------------------------------
-
 /** Seed N killed jobs + N owned panes (window_index 0..N-1) for a generation. */
 function ownedPanes(jobIds: string[]): SeedTopologyPane[] {
   return jobIds.map((jid, i) => {
@@ -2013,7 +1686,6 @@ function ownedPanes(jobIds: string[]): SeedTopologyPane[] {
     };
   });
 }
-
 test("deriveLastGenerationSetFromTopology (incident): a richer dead generation is picked over a newer degenerate skeleton", () => {
   // The recorded 2026-06-16 hazard: a rich dead generation was shadowed by a
   // NEWER 1-pane short-lived skeleton generation, and the skeleton got restored.
@@ -2050,7 +1722,6 @@ test("deriveLastGenerationSetFromTopology (incident): a richer dead generation i
   expect(res.ambiguous).toBeUndefined();
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (pairing race): the newest ATTRIBUTED snapshot feeds the set when the newest snapshot carries zero job_ids", () => {
   // The chosen generation's NEWEST snapshot is the unattributed (0-job_id) half
   // of the emission pair — it yields no candidate. The deriver steps back to the
@@ -2088,7 +1759,6 @@ test("deriveLastGenerationSetFromTopology (pairing race): the newest ATTRIBUTED 
   expect(res.candidates.map((c) => c.job_id)).toEqual(["attributed-job"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (ambiguity): an older substantially-richer generation contests the recency-first pick", () => {
   // Two non-degenerate dead generations. The NEWER (gen-new, id 600) has 1
   // restorable; the OLDER (gen-old, id 500) has 3. Recency-first PICKS the newer
@@ -2118,7 +1788,6 @@ test("deriveLastGenerationSetFromTopology (ambiguity): an older substantially-ri
   expect(res.ambiguous).toBe(true);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (ambiguity): a marginally-richer older generation does NOT contest — just-killed wins silently", () => {
   // The common case: the newer pick has 2 restorable, the older has 3 — richer,
   // but not SUBSTANTIALLY (below the factor+gap threshold). Recency-first takes
@@ -2142,7 +1811,6 @@ test("deriveLastGenerationSetFromTopology (ambiguity): a marginally-richer older
   expect(res.ambiguous).toBeUndefined();
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("deriveLastGenerationSetFromTopology (ambiguity): newest IS the richest ⇒ NOT ambiguous", () => {
   // The NEWER generation is also the richest, so no older cohort out-riches the
   // recency-first pick — no ambiguity.
@@ -2174,13 +1842,11 @@ test("deriveLastGenerationSetFromTopology (ambiguity): newest IS the richest ⇒
   expect(res.ambiguous).toBeUndefined();
   expect(res.fallbackNote).toBeUndefined();
 });
-
 // ---------------------------------------------------------------------------
 // Read-time generation canonicalizer — a boot observed under a bare-pid and a
 // full-form probe reads as ONE generation, so a probe-format change can never
 // fork one server boot into two competing generations.
 // ---------------------------------------------------------------------------
-
 test("summarizeTopologyGenerations: a bare-pid id and its full-form sibling fold into ONE generation", () => {
   // The v107 column groups on the STORED id, so these are two rows out of the
   // index walk; the canonicalizer folds them into one canonical (full-form) boot.
@@ -2204,7 +1870,6 @@ test("summarizeTopologyGenerations: a bare-pid id and its full-form sibling fold
   expect(summaries[0]?.last_event_id).toBe(600);
   expect(summaries[0]?.snapshot_count).toBe(2);
 });
-
 test("deriveLastGenerationSetFromTopology: the canonicalized boot restores from its newest snapshot across BOTH source ids", () => {
   // The newest snapshot (id 600) was stored under the BARE id; the union decode
   // must still reach it (reading only the canonical full-form id would return the
@@ -2223,7 +1888,6 @@ test("deriveLastGenerationSetFromTopology: the canonicalized boot restores from 
   expect(res.candidates.map((c) => c.job_id)).toEqual(["j-bare"]);
   expect(res.ambiguous).toBeUndefined();
 });
-
 test("canonicalizeGenerationSummaries: a bare-pid alias folds into its full-form sibling", () => {
   const raw = (
     id: string,
@@ -2250,7 +1914,6 @@ test("canonicalizeGenerationSummaries: a bare-pid alias folds into its full-form
   expect(out[0]?.snapshot_count).toBe(2);
   expect([...(out[0]?.source_ids ?? [])].sort()).toEqual(["21705", "21705:99"]);
 });
-
 test("canonicalizeGenerationSummaries: two full forms with DIFFERENT start_time stay two boots (pid recycle guard)", () => {
   const raw = (id: string, last: number): RawGenerationSummary => ({
     generation_id: id,
@@ -2267,7 +1930,6 @@ test("canonicalizeGenerationSummaries: two full forms with DIFFERENT start_time 
   ]);
   expect(out.map((g) => g.generation_id)).toEqual(["21705:200", "21705:100"]);
 });
-
 test("canonicalizeGenerationSummaries: a bare pid with no full-form sibling stays its own generation (ages out)", () => {
   const raw = (id: string, last: number): RawGenerationSummary => ({
     generation_id: id,
@@ -2285,7 +1947,6 @@ test("canonicalizeGenerationSummaries: a bare pid with no full-form sibling stay
   // 999 has no full-form sibling → not aliased; stays separate, newest-first.
   expect(out.map((g) => g.generation_id)).toEqual(["999", "21705:100"]);
 });
-
 test("deriveLastGenerationSetFromTopology (fallback): an all-degenerate board degrades to the labeled killed-cohort fallback", () => {
   // Two dead generations, each a 1-pane short-lived skeleton → both degenerate →
   // no eligible generation. Degrade to the retrospective killed-cohort model
@@ -2334,7 +1995,6 @@ test("deriveLastGenerationSetFromTopology (fallback): an all-degenerate board de
   // The skeleton generations' panes are NOT what got restored.
   expect(res.candidates.map((c) => c.job_id)).toEqual(["cohort"]);
 });
-
 test("deriveLastGenerationSetFromTopology (fallback): a non-degenerate generation with zero restorable degrades to the labeled fallback", () => {
   // gen-workers is non-degenerate (2 panes) but every pane is an autopilot worker
   // (plan_verb='work') → 0 restorable → no eligible generation → labeled fallback.
@@ -2367,7 +2027,6 @@ test("deriveLastGenerationSetFromTopology (fallback): a non-degenerate generatio
   expect(res.fallbackNote).toBeDefined();
   expect(res.candidates.map((c) => c.job_id)).toEqual(["cohort"]);
 });
-
 test("deriveLastGenerationSetFromTopology (degeneracy AND-clause): a long-lived single-pane generation is legitimate, not a skeleton", () => {
   // A single-agent session observed for >30min is NOT degenerate (the rule is
   // <=1 pane AND short-span, never OR) — it stays restorable. Two snapshots of
@@ -2392,7 +2051,6 @@ test("deriveLastGenerationSetFromTopology (degeneracy AND-clause): a long-lived 
   expect(res.candidates.map((c) => c.job_id)).toEqual(["solo"]);
   expect(res.fallbackNote).toBeUndefined();
 });
-
 test("summarizeTopologyGenerations: exposes ranked per-generation summaries for the list view", () => {
   // gen-now (live), gen-rich (2 restorable, older), gen-skel (1-pane short-lived
   // skeleton, newer). Summaries come back newest-first with the list enrichment.
@@ -2440,7 +2098,6 @@ test("summarizeTopologyGenerations: exposes ranked per-generation summaries for 
   expect(byId.get("gen-skel")?.degenerate).toBe(true);
   expect(byId.get("gen-skel")?.max_pane_count).toBe(1);
 });
-
 test("summarizeTopologyGenerations (bound): only the current + newest K dead generations are decoded", () => {
   // Seed MORE than RECENT_GENERATION_BOUND dead generations plus the live one.
   // The index-only summary walk sees them all, but only the current generation
@@ -2476,7 +2133,6 @@ test("summarizeTopologyGenerations (bound): only the current + newest K dead gen
     ],
     NOW - 10,
   );
-
   const gens = summarizeTopologyGenerations(kdb.db, {
     now: NOW,
     currentGenerationId: "gen-now",
@@ -2497,7 +2153,6 @@ test("summarizeTopologyGenerations (bound): only the current + newest K dead gen
   expect(now?.is_current).toBe(true);
   expect(now?.max_pane_count).toBe(1);
 });
-
 test("GENERATION_SUMMARY_SQL: the summary walk is served by the v107 partial index (EXPLAIN QUERY PLAN)", () => {
   // Seed a spread of snapshot generations + ANALYZE so the planner has stats,
   // then assert the summary walk hits idx_events_tmux_generation and never does a
@@ -2523,13 +2178,14 @@ test("GENERATION_SUMMARY_SQL: the summary walk is served by the v107 partial ind
   kdb.db.run("ANALYZE");
   const plan = kdb.db
     .prepare(`EXPLAIN QUERY PLAN ${GENERATION_SUMMARY_SQL}`)
-    .all() as { detail: string }[];
+    .all() as {
+    detail: string;
+  }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toContain("idx_events_tmux_generation");
   // A bare full-table `SCAN events` (not qualified by USING INDEX) must not appear.
   expect(detail).not.toMatch(/SCAN events(?! USING)/);
 });
-
 test("v107 fresh DB carries the tmux_generation_id generated column + its partial index", () => {
   // Fresh-vs-migrated parity for acceptance 5: a fresh migrated DB (freshDbFile)
   // has the generated column (visible only to table_xinfo) AND the partial index,

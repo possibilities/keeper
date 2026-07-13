@@ -20,7 +20,11 @@ import {
   panelWait,
 } from "../src/pair/panel";
 
-const MEMBERS = ["claude::opus::high", "codex::gpt-5.3::high", "pi::glm::high"];
+const MEMBERS = [
+  "claude::opus::high",
+  "pi::openai-codex/gpt-5.3::high",
+  "pi::glm::high",
+];
 const INCIDENT_PANEL: PanelDefinition = {
   strength: "standard",
   members: MEMBERS,

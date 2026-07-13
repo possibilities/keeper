@@ -6150,7 +6150,7 @@ function retireBirthFile(full: string): void {
 /**
  * Resolve CODEX_HOME for the resume-target sweep — an explicit non-empty
  * `CODEX_HOME` wins, else `<home>/.codex` (the same rule
- * `codex-trust` / `transcript-watch` use).
+ * `transcript-watch` uses).
  */
 export function resolveCodexHomeDir(
   env: Record<string, string | undefined> = process.env,

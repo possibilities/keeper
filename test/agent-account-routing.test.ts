@@ -12,7 +12,6 @@
  * observation sidecar is touched by the fast suite (the `inspectRouting` unit
  * pins a sidecar under a per-test tmpdir and asserts no ledger is written).
  */
-
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,7 +37,6 @@ import {
 
 const CSWAP = "/fake-home/.local/bin/cswap";
 const UUID = "11111111-1111-1111-1111-111111111111";
-
 /** A managed route selection for `slot`. */
 function managed(slot: number): () => RouteSelection {
   return () => ({
@@ -48,7 +46,6 @@ function managed(slot: number): () => RouteSelection {
     reason: "selected",
   });
 }
-
 /** A native route selection (the fail-open default). */
 function native(): () => RouteSelection {
   return () => ({
@@ -58,11 +55,9 @@ function native(): () => RouteSelection {
     reason: "no-observation",
   });
 }
-
 // ---------------------------------------------------------------------------
 // managed wrap composition
 // ---------------------------------------------------------------------------
-
 describe("Claude managed route wraps the built argv in the cswap contract", () => {
   test("a managed route wraps native args after `run <slot> --share-history --`", async () => {
     const nativeH = makeHarness({
@@ -72,7 +67,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
       selectAccountRoute: native(),
     });
     const nativeCmd = await runAndCapture(nativeH, main);
-
     const managedH = makeHarness({
       argv: ["claude", "hello"],
       rawArgv: true,
@@ -80,7 +74,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
       selectAccountRoute: managed(2),
     });
     const managedCmd = await runAndCapture(managedH, main);
-
     // The wrapper drops the native claude executable (cswap resolves `claude`
     // from PATH) and forwards every native ARGUMENT byte-for-byte after `--`.
     expect(managedCmd).toEqual([
@@ -94,7 +87,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
     // Byte-for-byte: the forwarded tail is exactly the native args, unreordered.
     expect(managedCmd.slice(5)).toEqual(nativeCmd.slice(1));
   });
-
   test("a managed route carries the PII-free route id and sets no CLAUDE_CONFIG_DIR", async () => {
     const h = makeHarness({
       argv: ["claude", "hello"],
@@ -108,7 +100,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:5");
   });
-
   test("managed preserves model/effort/session-id/name after the -- boundary", async () => {
     const nativeH = makeHarness({
       argv: ["claude", "--model", "sonnet", "--effort", "xhigh", "task"],
@@ -117,7 +108,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
       selectAccountRoute: native(),
     });
     const nativeCmd = await runAndCapture(nativeH, main);
-
     const managedH = makeHarness({
       argv: ["claude", "--model", "sonnet", "--effort", "xhigh", "task"],
       rawArgv: true,
@@ -125,7 +115,6 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
       selectAccountRoute: managed(7),
     });
     const managedCmd = await runAndCapture(managedH, main);
-
     const tail = managedCmd.slice(5);
     expect(tail).toEqual(nativeCmd.slice(1));
     expect(tail).toContain("--model");
@@ -134,11 +123,9 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
     expect(tail[tail.indexOf("--session-id") + 1]).toBe(UUID);
   });
 });
-
 // ---------------------------------------------------------------------------
 // native fallback preserves the launch
 // ---------------------------------------------------------------------------
-
 describe("Claude native route preserves the launch and carries the route id", () => {
   test("a native route runs Claude directly and sets the carrier", async () => {
     const h = makeHarness({
@@ -156,11 +143,9 @@ describe("Claude native route preserves the launch and carries the route id", ()
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 });
-
 // ---------------------------------------------------------------------------
 // independence across fresh / resume / restore
 // ---------------------------------------------------------------------------
-
 describe("route selection is independent per launch", () => {
   test("a fresh launch resolves exactly one route", async () => {
     const h = makeHarness({
@@ -171,7 +156,6 @@ describe("route selection is independent per launch", () => {
     await runAndCapture(h, main);
     expect(h.routerCalls()).toBe(1);
   });
-
   test("a resume launch resolves its own route (no prior attribution input)", async () => {
     // The router seam takes NO conversation/attribution argument, so a resume
     // cannot feed a prior route back into selection — it re-resolves cold.
@@ -183,7 +167,6 @@ describe("route selection is independent per launch", () => {
     await runAndCapture(h, main);
     expect(h.routerCalls()).toBe(1);
   });
-
   test("a managed resume preserves the resume argv after --", async () => {
     const h = makeHarness({
       argv: ["claude", "--resume", UUID],
@@ -203,11 +186,9 @@ describe("route selection is independent per launch", () => {
     expect(tail[tail.indexOf("--resume") + 1]).toBe(UUID);
   });
 });
-
 // ---------------------------------------------------------------------------
 // every Claude launch routes; non-claude harnesses are exempt
 // ---------------------------------------------------------------------------
-
 describe("routing applies to every Claude launch; non-claude harnesses are exempt", () => {
   test("an explicit --x-profile no longer bypasses the router — there is no profile farm to defer to", async () => {
     const h = makeHarness({
@@ -220,25 +201,10 @@ describe("routing applies to every Claude launch; non-claude harnesses are exemp
     expect(cmd[0]).toBe("/fake-home/.local/bin/claude");
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
-
-  test("a codex launch is never routed", async () => {
-    const h = makeHarness({
-      argv: ["hello"],
-      agent: "codex",
-      selectAccountRoute: () => {
-        throw new Error("router must not run for a non-claude harness");
-      },
-    });
-    await runAndCapture(h, main);
-    expect(h.routerCalls()).toBe(0);
-    expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBeUndefined();
-  });
 });
-
 // ---------------------------------------------------------------------------
 // `accounts check` read-only diagnostic
 // ---------------------------------------------------------------------------
-
 describe("keeper agent accounts check", () => {
   const inspection = {
     health: "ok" as const,
@@ -267,7 +233,6 @@ describe("keeper agent accounts check", () => {
       },
     ],
   };
-
   test("--json emits the inspection snapshot and reserves nothing", async () => {
     const h = makeHarness({
       argv: ["accounts", "check", "--json"],
@@ -284,7 +249,6 @@ describe("keeper agent accounts check", () => {
     expect(h.spawned.length).toBe(0);
     expect(JSON.parse(h.out.join(""))).toEqual(inspection);
   });
-
   test("without --json prints a human summary and exits 0", async () => {
     const h = makeHarness({
       argv: ["accounts", "check"],
@@ -299,11 +263,9 @@ describe("keeper agent accounts check", () => {
     expect(text).toContain("claude-swap:2 [managed]");
   });
 });
-
 // ---------------------------------------------------------------------------
 // inspectRouting — read-only snapshot over a real sidecar fixture
 // ---------------------------------------------------------------------------
-
 function win(
   key: string,
   utilization: number,
@@ -311,9 +273,7 @@ function win(
 ): NormalizedWindow {
   return { key, utilization, resetsAt };
 }
-
 const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
-
 function seed(stateDir: string, routes: Route[]): void {
   const obs: Observation = {
     schema_version: 1,
@@ -324,7 +284,6 @@ function seed(stateDir: string, routes: Route[]): void {
   };
   writeObservationSidecar(observationSidecarPath(stateDir), obs);
 }
-
 describe("inspectRouting is read-only", () => {
   test("reports the route the policy would pick without writing a ledger", () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-inspect-"));
@@ -362,7 +321,6 @@ describe("inspectRouting is read-only", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-
   test("no observation → disabled native snapshot", () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-inspect-"));
     try {

@@ -140,8 +140,8 @@ export interface TmuxLaunchRequest {
   env: NodeJS.ProcessEnv;
   cwd: string;
   /**
-   * The transcript session id the inner launch will mint for claude/pi (null
-   * for codex, which has no pre-known id). Recorded in run.json so a later
+   * The transcript session id the inner launch will mint for Claude/Pi (null
+   * when a launch has no pre-known id). Recorded in run.json so a later
    * `wait-for-stop`/`show-last-message` resolves the right transcript by id.
    */
   transcriptSessionId: string | null;
@@ -492,8 +492,8 @@ export function launchKeeperAgentInTmux(
   // inner re-exec's `--session-id` push (`main.ts`) uses the SAME uuid recorded
   // in run.json `transcriptSessionId`. On an existing tmux server, without this
   // the inner mints a FRESH uuid and writes `<fresh>.jsonl`, which the strict
-  // resolver then misses. Codex carries no id (`transcriptSessionId:null`), so
-  // the carrier is absent and the env stays byte-identical to the pre-pin form.
+  // resolver then misses. A launch with no id (`transcriptSessionId:null`) omits
+  // the carrier and keeps the env byte-identical to the pre-pin form.
   const paneEnv = withTranscriptSessionCarrier(
     req.options.env,
     req.transcriptSessionId,
@@ -673,7 +673,7 @@ function envArgs(env: [string, string][]): string[] {
  * Append the pinned transcript session-id carrier to the pane env so the inner
  * re-exec pushes a matching `--session-id`. Appended LAST (tmux applies later
  * `-e` entries as wins on a duplicate key) so the pin is the single source of
- * truth even against a stray caller-injected key. A null id (codex, or a
+ * truth even against a stray caller-injected key. A null id (for example, a
  * continue/resume launch) leaves the env unchanged — byte-identical to before.
  */
 function withTranscriptSessionCarrier(

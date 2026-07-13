@@ -24,11 +24,11 @@
  * worktree) ALSO fails preflight naming the project dir — never a dropped `cd` or
  * a `$HOME` fallback.
  *
- * NON-CLAUDE. Artifact-existence gates: a pi session file under the cwd's pi
- * project dir (or anywhere in the sessions tree) matching the resume target, a
- * codex rollout file carrying the target uuid, or the hermes session store's
- * presence. A resume target that names no on-disk artifact is typed
- * not-resumable with a reason rather than launched into a broken resume.
+ * NON-CLAUDE. Artifact-existence gates: a Pi session file under the cwd's Pi
+ * project dir (or anywhere in the sessions tree) matching the resume target, or
+ * the Hermes session store's presence. A resume target that names no on-disk
+ * artifact is typed not-resumable with a reason rather than launched into a
+ * broken resume.
  *
  * All filesystem access rides the injectable {@link ResumeResolveFs} seam — the
  * pure resolution logic is exercised against an in-memory fake, and the
@@ -110,12 +110,6 @@ export type ResumeResolver = (
  *  Generous enough to span several claude lines (each carries a top-level `cwd`)
  *  even when a recent line holds a large tool-output blob. */
 export const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
-
-/** Bounded node budget for the codex rollout tree walk — a machine with a deep
- *  sessions history must not turn one existence probe into a full-disk scan. On
- *  hitting the cap without a match the gate degrades PERMISSIVE (can't prove
- *  absence), never a false not-resumable. */
-const CODEX_SCAN_MAX_NODES = 4000;
 
 /**
  * Forward-only claude project-dir slug: `/` and `.` both collapse to `-`. LOSSY
@@ -383,9 +377,6 @@ export function resolveNonClaudeArtifact(
   if (harness === "pi") {
     return piArtifact(fs, input);
   }
-  if (harness === "codex") {
-    return codexArtifact(fs, input);
-  }
   if (harness === "hermes") {
     return hermesArtifact(fs, input);
   }
@@ -432,33 +423,6 @@ function piArtifact(
   };
 }
 
-function codexArtifact(
-  fs: ResumeResolveFs,
-  input: NonClaudeResolveInput,
-): ResumeResolution {
-  const { resumeTarget: target, homeDir, env } = input;
-  const codexHome = (env.CODEX_HOME ?? "").trim() || join(homeDir, ".codex");
-  const sessionsDir = join(codexHome, "sessions");
-  const verdict = scanForFile(
-    fs,
-    sessionsDir,
-    CODEX_SCAN_MAX_NODES,
-    (name) =>
-      name.startsWith("rollout-") &&
-      name.endsWith(".jsonl") &&
-      name.includes(target),
-  );
-  if (verdict === "found" || verdict === "capped") {
-    // `capped` couldn't prove absence — stay permissive rather than falsely
-    // marking a live rollout not-resumable.
-    return { kind: "resumable" };
-  }
-  return {
-    kind: "not-resumable",
-    reason: `codex rollout ${target} has no on-disk artifact under ${sessionsDir}`,
-  };
-}
-
 function hermesArtifact(
   _fs: ResumeResolveFs,
   input: NonClaudeResolveInput,
@@ -475,44 +439,6 @@ function hermesArtifact(
     kind: "not-resumable",
     reason: `hermes session store ${store} is absent — session ${target} not resumable`,
   };
-}
-
-type ScanVerdict = "found" | "exhausted" | "capped";
-
-/** Bounded depth-first walk of `root` for a file whose NAME satisfies `pred`.
- *  `found` on the first hit, `exhausted` when the whole (bounded) tree was walked
- *  without one, `capped` when the node budget ran out first. Uses only
- *  {@link ResumeResolveFs.listDir}: a leaf file's `listDir` returns `[]`, so
- *  recursion stops there naturally. */
-function scanForFile(
-  fs: ResumeResolveFs,
-  root: string,
-  maxNodes: number,
-  pred: (name: string) => boolean,
-): ScanVerdict {
-  let budget = maxNodes;
-  const stack: string[] = [root];
-  while (stack.length > 0) {
-    if (budget <= 0) {
-      return "capped";
-    }
-    const dir = stack.pop();
-    if (dir === undefined) {
-      break;
-    }
-    budget -= 1;
-    for (const name of fs.listDir(dir)) {
-      if (pred(name)) {
-        return "found";
-      }
-      budget -= 1;
-      if (budget <= 0) {
-        return "capped";
-      }
-      stack.push(join(dir, name));
-    }
-  }
-  return "exhausted";
 }
 
 /** Options for {@link makeResumeResolver} — the seam plus the roots it derives

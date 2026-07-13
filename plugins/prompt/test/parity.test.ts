@@ -448,9 +448,7 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "",
   ].join("\n");
 
-  // claude serves opus (native); codex serves the wrapped capability
-  // gpt-5.5 (cost-ascending first among wrapped providers, so it wins); pi's
-  // gpt-5.5 entry is shadowed cross-provider (first provider wins, logged).
+  // Claude serves opus natively; Pi serves the wrapped gpt-5.5 capability.
   const MULTI_PROVIDER_MATRIX = [
     "efforts: [medium, high]",
     "subagent_templates: [template/agents/worker.md.tmpl]",
@@ -458,10 +456,8 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "providers:",
     "  - name: claude",
     "    models: [opus]",
-    "  - name: codex",
-    "    models: [gpt-5.5]",
     "  - name: pi",
-    "    models: [gpt-5.5]",
+    "    models: [openai-codex/gpt-5.5]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -481,9 +477,9 @@ describe("worker cells: the required v2 host worker matrix", () => {
     "    models:",
     "      - id: opus",
     "        efforts: [high]",
-    "  - name: codex",
+    "  - name: pi",
     "    models:",
-    "      - id: gpt-5.5",
+    "      - id: openai-codex/gpt-5.5",
     "        efforts: [medium]",
     "wrapper_driver:",
     "  model: sonnet",
@@ -577,23 +573,15 @@ describe("worker cells: the required v2 host worker matrix", () => {
     expect(m.wrapper_driver).toEqual({ model: "sonnet", effort: "high" });
   });
 
-  test("a multi-provider matrix: wrapped model + driver + wrapper + shadow log from the host", () => {
+  test("a multi-provider matrix: wrapped model + driver + wrapper from the host", () => {
     const m = matrixUnder(tmpConfig(MULTI_PROVIDER_MATRIX));
     expect([...m.models].sort()).toEqual(["gpt-5.5", "opus"]);
     expect([...m.efforts]).toEqual(["medium", "high"]);
-    // claude membership → native; a capability served only by codex/pi → wrapped.
+    // Claude membership is native; a capability served only by Pi is wrapped.
     expect(m.driverByModel.get("opus")).toBe("native");
     expect(m.driverByModel.get("gpt-5.5")).toBe("wrapped");
     expect(m.wrapper_driver).toEqual({ model: "sonnet", effort: "xhigh" });
-    // pi's gpt-5.5 is shadowed by codex (first provider wins).
-    expect(m.shadowed).toEqual([
-      {
-        provider: "pi",
-        capability: "gpt-5.5",
-        launchId: "gpt-5.5",
-        winner: "codex",
-      },
-    ]);
+    expect(m.shadowed).toEqual([]);
   });
 
   test("an absent matrix throws the typed four-state 'absent' error (no silent fallback)", () => {
@@ -867,7 +855,7 @@ describe("worker cells: the required v2 host worker matrix", () => {
       expect(native).toContain('effort: "high"');
       expect(native).toContain("maxTurns: 300");
       expect(native).not.toContain("model: sonnet");
-      // A wrapped cell (gpt-5.5 served by codex/pi) runs as the wrapper driver at
+      // A wrapped cell (gpt-5.5 served by Pi) runs as the wrapper driver at
       // the shorter wrapper budget, never the capability model in the frontmatter.
       const wrapped = readFileSync(
         join(work, "workers", "gpt-5.5-high", "agents", "worker.md"),

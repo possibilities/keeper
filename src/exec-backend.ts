@@ -95,8 +95,8 @@ export interface LaunchSpec {
    *  `--resume <target>` and NO trailing prompt positional. */
   readonly prompt: string;
   /** Resume mode: when set (non-empty), the launch emits the harness's own resume
-   *  argv (`--resume <target>` for claude/hermes, `resume <target>` for codex,
-   *  `--session <target>` for pi) and DROPS the trailing prompt positional — a
+   *  argv (`--resume <target>` for Claude/Hermes, `--session <target>` for Pi)
+   *  and DROPS the trailing prompt positional — a
    *  re-attach rather than a fresh prompted session. Omitted for the prompt-mode
    *  worker/dispatch launch (the byte-unchanged default). */
   readonly resumeTarget?: string;
@@ -108,7 +108,7 @@ export interface LaunchSpec {
    *  stale identity in a reused tmux session env can never poison it. Omitted for
    *  the prompt-mode worker/dispatch launch. */
   readonly jobId?: string;
-  /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). Absent/NULL ⇒
+  /** Launching harness (`"claude"`/`"pi"`/`"hermes"`). Absent/NULL ⇒
    *  claude: the agent token stays `claude` and the claude worker-permission
    *  posture is emitted (byte-unchanged). A non-claude value routes `keeper agent
    *  <harness>` with its native resume verb and NO claude permission flags (keeper
@@ -1203,8 +1203,8 @@ export function buildKeeperAgentLaunchArgv(
   const harness = opts.harness ?? "claude";
   const isClaude = harness === "claude";
   // Resume mode drops the trailing prompt positional and emits the harness's OWN
-  // resume argv (claude/hermes `--resume <t>`, codex `resume <t>`, pi `--session
-  // <t>`) sourced from the descriptor registry — never a re-inlined switch.
+  // resume argv (Claude/Hermes `--resume <t>`, Pi `--session <t>`) sourced from
+  // the descriptor registry — never a re-inlined switch.
   // Prompt mode keeps the prompt as the UNCONDITIONAL final positional, so the
   // claude worker/dispatch argv is byte-unchanged.
   const isResume = opts.resumeTarget !== undefined && opts.resumeTarget !== "";
@@ -1214,8 +1214,8 @@ export function buildKeeperAgentLaunchArgv(
   // The claude worker-permission posture (`--permission-mode acceptEdits
   // --dangerously-skip-permissions`) is CLAUDE-native and forwarded to the claude
   // CLI. A non-claude harness omits it — keeper agent applies that harness's own
-  // no-approval default (codex `--dangerously-bypass-approvals-and-sandbox`,
-  // hermes `--yolo`) at launch, so a claude flag here would reach the wrong CLI.
+  // no-approval default (Hermes `--yolo`) at launch, so a Claude flag here
+  // would reach the wrong CLI.
   const permissionPosture = isClaude
     ? ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"]
     : [];

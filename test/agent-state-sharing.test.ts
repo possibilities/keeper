@@ -32,7 +32,6 @@ import {
   defaultSharedStowDir,
   ensureCanonicalStowLinks,
   ensureClaudeStateSharing,
-  ensureCodexStateSharing,
   ensurePiStateSharing,
   StateError,
 } from "../src/agent/state-sharing";
@@ -47,11 +46,10 @@ afterEach(() => {
 });
 
 // The four core guard behaviors are IDENTICAL across every leaf (they never touch
-// the divergence branch); parallelize them across the claude / codex / pi doc
-// leaves so each harness's byte-compared AGENTS.md/CLAUDE.md leaf is pinned.
+// the divergence branch); parallelize them across the Claude and Pi doc leaves.
+// Each harness's byte-compared AGENTS.md/CLAUDE.md leaf is pinned.
 const DOC_LEAF_CASES = [
   { harness: "claude", onDivergence: "error" as const },
-  { harness: "codex", onDivergence: "warn" as const },
   { harness: "pi", onDivergence: "warn" as const },
 ];
 
@@ -259,45 +257,12 @@ describe("per-harness wiring resolves the leaf to the shared source", () => {
     expect(readlinkSync(claudeMd)).toBe(relTo(claudeMd, sharedSrc));
   });
 
-  test("codex: ~/.codex/AGENTS.md → shared AGENTS.md (passthrough-shaped)", () => {
-    ensureCodexStateSharing([], homeDir, {}, sharedDir);
-    const codexAgents = join(homeDir, ".codex", "AGENTS.md");
-    expect(lstatSync(codexAgents).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(codexAgents)).toBe(relTo(codexAgents, sharedSrc));
-  });
-
-  test("codex honors CODEX_HOME for the leaf link path (keeper only reads it)", () => {
-    const codexHome = join(tmpDir, "custom-codex");
-    ensureCodexStateSharing([], homeDir, { CODEX_HOME: codexHome }, sharedDir);
-    // The leaf lands under CODEX_HOME, and the default ~/.codex is untouched.
-    const codexAgents = join(codexHome, "AGENTS.md");
-    expect(lstatSync(codexAgents).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(codexAgents)).toBe(relTo(codexAgents, sharedSrc));
-    expect(existsSync(join(homeDir, ".codex", "AGENTS.md"))).toBe(false);
-  });
-
   test("pi: ~/.pi/agent/AGENTS.md → shared AGENTS.md, plus a sessions dir", () => {
     ensurePiStateSharing([], homeDir, sharedDir, {});
     const piAgents = join(homeDir, ".pi", "agent", "AGENTS.md");
     expect(lstatSync(piAgents).isSymbolicLink()).toBe(true);
     expect(readlinkSync(piAgents)).toBe(relTo(piAgents, sharedSrc));
     expect(existsSync(join(homeDir, ".pi", "agent", "sessions"))).toBe(true);
-  });
-
-  test("codex leaves a human-edited AGENTS.md in place (warn, no throw)", () => {
-    const codexDir = join(homeDir, ".codex");
-    mkdirSync(codexDir, { recursive: true });
-    const codexAgents = join(codexDir, "AGENTS.md");
-    writeFileSync(codexAgents, "# my own codex instructions\n");
-    const log: string[] = [];
-    expect(() =>
-      ensureCodexStateSharing(log, homeDir, {}, sharedDir),
-    ).not.toThrow();
-    expect(lstatSync(codexAgents).isSymbolicLink()).toBe(false);
-    expect(readFileSync(codexAgents, "utf8")).toBe(
-      "# my own codex instructions\n",
-    );
-    expect(log.some((l) => l.startsWith("WARNING"))).toBe(true);
   });
 
   test("no profile farm: claude and pi state sharing create no .claude-profiles or .pi-profiles dir", () => {

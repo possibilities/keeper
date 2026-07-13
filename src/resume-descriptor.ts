@@ -4,14 +4,14 @@
  *
  *  - DISPLAY ({@link buildResumeCommand}): the human-facing resume shell string
  *    `scripts/resume.ts` prints. PER-HARNESS: `claude --resume "<uuid>"` for
- *    claude, or the harness's own native form (`codex resume`, `pi --session`,
+ *    Claude, or the harness's own native form (`pi --session`,
  *    `hermes --resume`) off the descriptor registry.
  *
  * There is NO separate LAUNCH form here: `keeper bus wake` and crash-restore
  * both resume via keeper's sole launch transport (`keeperAgentLaunch` in resume
  * mode, `src/exec-backend.ts`), which builds the harness-native resume invocation
  * itself. {@link resumeTarget} is the shared key both paths resolve — per-harness:
- * the session UUID for claude, the stored native id for codex/pi/hermes.
+ * the session UUID for Claude, or the stored native id for Pi/Hermes.
  *
  * Everything in this module is PURE — no socket, no fs, no `Date.now()`, no
  * env reads. `scripts/resume.ts` still owns the lazy per-epic UDS fetch loop
@@ -37,8 +37,8 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  *    `claude --resume "<uuid>"` resolves the EXACT session (browser-grade
  *    restore), where a name would only fuzzy-filter the /resume picker. pi pins
  *    its session id at launch too, but stores it in `resume_target`.
- *  - codex/pi/hermes: the stored `jobs.resume_target` — the harness's own native
- *    resume id (codex/hermes back-fill it post-stop, pi at seed). NULL/empty when
+ *  - Pi/Hermes: the stored `jobs.resume_target` — the harness's own native
+ *    resume id (Hermes fills it post-stop, Pi at seed). NULL/empty when
  *    keeper never resolved one, which renders that agent NOT-RESUMABLE (an empty
  *    string the restore surfaces surfaces with a reason, never a broken argv).
  *
@@ -82,8 +82,8 @@ export function resumeTarget(
  *
  * `target` is the harness-native resume target (see {@link resumeTarget}). The
  * DISPLAY twin is per-harness: claude renders `claude --resume "<uuid>"`; a
- * non-claude harness renders its OWN native form — `codex resume "<t>"`,
- * `pi --session "<t>"`, `hermes --resume "<t>"` — off the descriptor's
+ * non-Claude harness renders its own native form — `pi --session "<t>"` or
+ * `hermes --resume "<t>"` — off the descriptor's
  * `binaryName` + resume token. Neither carries a keeper launcher-only flag, so
  * the emitted string runs in any shell, alias or not. The
  * `cd <cwd> &&` prefix is LOAD-BEARING: a session id resolves only within the

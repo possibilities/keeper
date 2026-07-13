@@ -593,7 +593,7 @@ export function claudeAttachEvidence(
 /**
  * The re-attached non-claude harness's identity iff a birth record in the births
  * `new/` tree carries the resumed job id with a `launch_ts` AT OR AFTER `sinceMs`
- * — the non-claude attach proof (codex/pi/hermes fire no SessionStart hook) — else
+ * — the non-Claude attach proof (Pi/Hermes fire no SessionStart hook) — else
  * `null`. Reads every `*.json`, parses via the shared {@link parseBirthRecord},
  * matches on `session_id`, and returns the record's `(pid, start_time)` for the
  * dwell probe + later no-op gate. The `sinceMs` gate (default 0 = ungated) rejects

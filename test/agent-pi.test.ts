@@ -170,13 +170,6 @@ describe("Pi passthrough commands", () => {
     ]);
   });
 
-  test("an explicit --x-profile still has no effect for passthrough", async () => {
-    const h = piHarness(["--x-profile", "work", "list"]);
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).toEqual([h.deps.piBin, "list"]);
-    expect(h.deps.env.PI_CODING_AGENT_DIR).toBeUndefined();
-  });
-
   test("the canonical AGENTS.md leaf-guard fn runs on a passthrough launch", async () => {
     // Pi passthrough launches (package commands like `list`) must still reach
     // the leaf guard exactly once, matching every other pi launch — there is no

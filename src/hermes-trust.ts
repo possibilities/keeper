@@ -7,7 +7,7 @@
 //
 // Dep-free by contract: node:fs/node:os/node:path only — NO bun:sqlite, NO
 // src/db.ts, NO third-party deps (NO YAML parser), NO subprocess. A leaf module
-// like src/codex-trust.ts, whose locking / fail-open / idempotency shape this
+// with a locking / fail-open / idempotency shape this
 // mirrors.
 //
 // FAIL-OPEN by contract: every path is wrapped so the function NEVER throws and
@@ -41,7 +41,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-// Staleness threshold for an orphaned lock — mirrors the codex-trust / docs-pusher
+// Staleness threshold for an orphaned lock — mirrors the docs-pusher
 // LOCK_STALE_MS. The only way a lock outlives its holder is a hard kill between
 // acquire and release; a healthy holder holds it for a single read + write.
 const LOCK_STALE_MS = 60_000;
@@ -144,7 +144,7 @@ function logTrust(env: Record<string, string | undefined>, line: string): void {
   }
 }
 
-// --- Lock primitives (mirror src/codex-trust.ts) --------------------------------
+// --- Lock primitives -------------------------------------------------------------
 
 function stampLock(lockPath: string): boolean {
   try {

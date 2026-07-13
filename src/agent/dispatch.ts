@@ -3,8 +3,7 @@
  * `keeper agent` is a subcommand dispatcher. `splitSubcommand` strips exactly ONE
  * leading agent token and hands the rest to the launcher flow, so the composed
  * agent argv stays byte-identical to what the bare launcher produced.
- * `keeper agent claude claude` keeps the second `claude` as a prompt arg; the same
- * contract applies to `codex` and `pi`.
+ * `keeper agent claude claude` keeps the second `claude` as a prompt arg; the same contract applies to Pi and Hermes.
  *
  * Informational flags (`-h`/`--help`, `-v`/`--version`) and the bare/unknown
  * invocation are owned here — they print and exit before `parseArgs` and the
@@ -71,7 +70,6 @@ export const USAGE = `keeper agent — launch agent CLIs with keeper agent routi
 
 Usage:
   keeper agent claude [args...]        Launch Claude Code.
-  keeper agent codex [args...]         Launch Codex CLI.
   keeper agent pi [args...]            Launch pi.
   keeper agent hermes [args...]        Launch Hermes (Nous Research).
   keeper agent --x-preset <name> [args...]
@@ -161,7 +159,6 @@ export const KEEPER_AGENT_HELP = `keeper agent — launch agent CLIs with keeper
 
 Usage:
   keeper agent claude [args...]   Launch Claude Code.
-  keeper agent codex [args...]    Launch Codex CLI.
   keeper agent pi [args...]       Launch pi.
   keeper agent hermes [args...]   Launch Hermes (Nous Research).
 
@@ -175,10 +172,6 @@ Wrapper flags:
   --x-very-verbose          Add per-phase timing and the composed
                                     agent command. Implies --x-verbose.
   --x-no-confirm            Skip the cwd-confirmation prompt.
-  --x-profile <name>        Codex only: forwarded as its native --profile
-                                    <name> ('default'/'auto' = native config).
-                                    No effect on Claude (account routing chooses
-                                    automatically) or Pi (always native).
   --x-preset <name>         Apply a named launch-config preset from
                                     presets.yaml (harness/model/effort BELOW any
                                     explicit --model/--effort or effort env).
@@ -240,9 +233,8 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         changed-files audit). --system-file/--system compose a
                                         caller-side System:-prepend into the prompt
                                         (mutually exclusive; missing file → bad_args),
-                                        UNIFORM across claude/codex/pi — user-turn
-                                        text, NOT a privileged system prompt. codex/pi
-                                        launch with CLAUDE* env stripped by default
+                                        uniform across Claude/Pi/Hermes — user-turn
+                                        text, not a privileged system prompt. Pi launches with CLAUDE* env stripped by default
                                         (partner isolation). --preset applies a named
                                         launch-config preset (its resolved harness
                                         must == <cli>, else bad_args); --session
@@ -258,12 +250,8 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         outcome ∈ completed|no_message (exit 0) /
                                         timed_out|no_transcript|transcript_ambiguous
                                         (4) / launch_failed (1) / bad_args (2).
-                                        codex's resume_target is discovered from its
-                                        rollout file post-stop; claude/pi's from the
-                                        session id pinned at launch. transcript_
-                                        ambiguous means a concurrent same-cwd codex
-                                        session collided and the leg refused to guess
-                                        a foreign transcript.
+                                        the resume_target comes from the pinned session
+                                        id or the harness's post-stop attribution.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with
@@ -325,10 +313,6 @@ tmux-mode exit codes (a structured JSON error is emitted on every non-zero exit)
                                     4  transient/retryable (timeout, lock contention)
 
 Agent-specific wrapper flags:
-  --x-codex-session-name <name>
-                                    Index this synthetic name for the Codex
-                                    session once its live id is known.
-
 Top-level flags:
   --help, -h                        Show short usage.
   --version, -v                     Show the version.
@@ -343,7 +327,7 @@ export const KEEPER_AGENT_RUNBOOK = `keeper agent — operator runbook (agent-fa
 
 Launch or drive a partner model CLI from this session.
 
-  keeper agent run <claude|codex|pi|hermes> "<prompt>" [--read-only] [--system <text>]
+  keeper agent run <claude|pi|hermes> "<prompt>" [--read-only] [--system <text>]
                                     # launch, wait, capture — one uniform JSON envelope
   keeper agent run <cli> "<prompt>" --preset <name> --output <path>
                                     # apply a launch-config preset; mirror the envelope to a file
@@ -355,14 +339,14 @@ Launch or drive a partner model CLI from this session.
 
 Exit codes: 0 terminal answer · 124 panel wait chunk elapsed with no terminal answer
 (a re-issue SIGNAL, not a failure — call wait again) · 2 absent slug / bad config.
-Footguns: codex/pi launch with CLAUDE* env stripped (partner isolation); 'run' blocks,
+Footguns: pi launches with CLAUDE* env stripped (partner isolation); 'run' blocks,
 so fan a long or multi-model ask out via 'panel start' + chunked 'panel wait'. NOT a
 keeper worker on plan work (that is keeper dispatch).
 `;
 
 /**
- * Classify the leading argv token. `claude`/`codex`/`pi` → run with the remaining
- * args (even when empty, so a bare `keeper agent claude`, `keeper agent codex`, or `keeper agent pi`
+ * Classify the leading argv token. registered harness token → run with the remaining
+ * args (even when empty, so a bare registered harness command
  * still launches interactively); a leading `--x-preset <name>` (no head
  * agent token) → the harnessless run-preset form whose harness comes from the
  * preset (the whole argv stays in `rest` so parseArgs strips the flag);

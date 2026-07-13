@@ -35,7 +35,7 @@ const INVALID_FIXTURE_PATH = join(
   "provider-equivalence-invalid.yaml",
 );
 const CLAUDE_AND_CODEX_MATRIX = readFileSync(
-  join(FIXTURES_DIR, "matrix-claude-and-codex.yaml"),
+  join(FIXTURES_DIR, "matrix-claude-and-pi.yaml"),
   "utf-8",
 );
 

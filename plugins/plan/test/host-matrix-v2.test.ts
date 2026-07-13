@@ -141,7 +141,7 @@ describe("loadHostMatrixV2 — dedup + launch-only", () => {
         provider: "pi",
         capability: "gpt-5.5",
         launchId: "openai/gpt-5.5",
-        winner: "codex",
+        winner: "hermes",
       },
     ]);
   });
@@ -325,7 +325,7 @@ describe("cross-island parity (launcher matrix.ts vs plan host_matrix.ts)", () =
     }
   });
 
-  test("both islands reduce the committed example to the same projection", () => {
+  test("both islands accept the committed Claude/Pi example", () => {
     const examplePath = join(
       import.meta.dir,
       "..",
@@ -335,8 +335,13 @@ describe("cross-island parity (launcher matrix.ts vs plan host_matrix.ts)", () =
       "examples",
       "matrix.example.yaml",
     );
-    expect(projectPlan(loadHostMatrixV2(examplePath))).toEqual(
-      projectLauncher(loadMatrixV2(examplePath)),
-    );
+    const host = loadHostMatrixV2(examplePath);
+    const launcher = loadMatrixV2(examplePath);
+    expect(host.models).toEqual(["opus", "sonnet", "gpt-5.3-codex-spark"]);
+    expect(host.shadowed).toEqual([]);
+    expect(launcher.providers.map((provider) => provider.name)).toEqual([
+      "claude",
+      "pi",
+    ]);
   });
 });

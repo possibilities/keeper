@@ -13,7 +13,6 @@ import type {
   RouteSelection,
   RoutingInspection,
 } from "../../src/account-router";
-import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
 import type { MainDeps } from "../../src/agent/main";
@@ -52,7 +51,6 @@ export const DEFAULT_HOST_TRIPLES: HostTriples = {
 export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
   presets: {},
   claude_default: { harness: "claude", model: "opus", effort: "high" },
-  codex_default: { harness: "codex", model: "gpt", effort: "high" },
   pi_default: { harness: "pi", model: "glm", effort: "high" },
   hermes_default: { harness: "hermes", model: "gpt-5.5", effort: "na" },
 };
@@ -90,15 +88,10 @@ export interface Harness {
   out: string[];
   /** stderr sink. */
   err: string[];
-  /** Action logs ensureCodexStateSharingFn was invoked with, in order (call count
-   *  = length) — the codex leaf-guard reaches every codex launch, passthrough too. */
-  codexStateSharingCalls: string[][];
   /** Action logs ensurePiStateSharingFn was invoked with, in order (call count =
    *  length) — the pi leaf-guard reaches every pi launch, passthrough included;
    *  there is no Keeper-owned Pi profile farm to gate it behind. */
   piStateSharingCalls: string[][];
-  /** Codex synthetic session-name indexer starts, in order. */
-  codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
   /** Every birth record the launcher emitted (draft + child pid), in order. */
   birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
@@ -116,11 +109,10 @@ export interface HarnessOptions {
    * the dispatch suite to test bare/unknown/help/version classification.
    */
   rawArgv?: boolean;
-  agent?: "claude" | "codex" | "pi" | "hermes";
+  agent?: "claude" | "pi" | "hermes";
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeBin?: string;
-  codexBin?: string;
   piBin?: string;
   hermesBin?: string;
   /**
@@ -187,9 +179,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const spawned: string[][] = [];
   const out: string[] = [];
   const err: string[] = [];
-  const codexStateSharingCalls: string[][] = [];
   const piStateSharingCalls: string[][] = [];
-  const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let routerCalls = 0;
@@ -204,7 +194,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
     }));
 
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
-  const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
   const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
 
@@ -229,7 +218,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
     writeErr: (s) => err.push(s),
     exit: throwingExit,
     claudeBin: homeBin,
-    codexBin,
     piBin,
     hermesBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
@@ -239,9 +227,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.panelSelections ?? { panels: {}, default: null },
     loadHostTriplesFn: () => opts.hostTriples ?? DEFAULT_HOST_TRIPLES,
     ensureClaudeStateSharingFn: () => {},
-    ensureCodexStateSharingFn: (actionLog: string[]) => {
-      codexStateSharingCalls.push(actionLog);
-    },
     ensurePiStateSharingFn: (actionLog: string[]) => {
       piStateSharingCalls.push(actionLog);
     },
@@ -256,10 +241,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return opts.matrix;
     },
     providerReachableFn: opts.providerReachable ?? (() => true),
-    startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
-      codexSessionNameIndexers.push(opts);
-      return () => {};
-    },
     emitBirthRecord: (draft: BirthRecordDraft, pid: number) => {
       birthRecords.push({ draft, pid });
     },
@@ -317,9 +298,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     spawned,
     out,
     err,
-    codexStateSharingCalls,
     piStateSharingCalls,
-    codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,
     routerCalls: () => routerCalls,

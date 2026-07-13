@@ -4,8 +4,8 @@
  * harness union (`AgentKind`, `AgentCli`, `PresetHarness`) and its runtime name
  * set (`AGENT_CLIS`, `PRESET_HARNESSES`, the run-capture agent set) is DERIVED
  * from {@link HARNESS_DESCRIPTORS} here, so a harness name lives in exactly one
- * place. Downstream gates read a capability flag, NEVER a harness-name allowlist:
- * panel eligibility is `capturable`, not a `claude|codex` literal.
+ * place. Downstream gates read capability flags, never a parallel harness-name
+ * allowlist.
  *
  * DEP-FREE ISLAND: this module imports NOTHING. It sits at the bottom of the
  * launch-config / config / dispatch / run-capture cluster (they import it; it
@@ -16,14 +16,14 @@
 
 /** The canonical, ordered set of harness names keeper drives. The one literal
  *  list — every union's membership check derives from it. */
-export const HARNESS_NAMES = ["claude", "codex", "pi", "hermes"] as const;
+export const HARNESS_NAMES = ["claude", "pi", "hermes"] as const;
 
 /** A harness keeper can drive — the derivation root for `AgentKind`/`AgentCli`/
  *  `PresetHarness`. */
 export type HarnessName = (typeof HARNESS_NAMES)[number];
 
-/** The second reasoning axis a harness exposes. claude/codex take `effort`; pi
- *  takes `thinking`; the two are mutually exclusive per harness. `none` means the
+/** The second reasoning axis a harness exposes. Claude takes `effort`; Pi takes
+ *  `thinking`; the two are mutually exclusive per harness. `none` means the
  *  harness is model-only (hermes) — a preset for it may set neither axis. */
 export type SecondAxis = "effort" | "thinking" | "none";
 
@@ -44,25 +44,14 @@ export type KeeperEffort = (typeof KEEPER_EFFORTS)[number];
  *  `claude-hooks`: keeper's native hook set feeds the events-log channel.
  *  `pi-extension`: an ephemeral in-process pi extension (armed per-launch via
  *  `-e`) translates pi's AgentHarness events into the same events-log channel.
- *  `codex-rollout-tail`: the daemon-side producer forward-tails the attributed
- *  rollout and mints a synthetic Stop per turn-completion — STOP-ONLY, since
- *  codex's rollout carries no turn-START marker (degrades to presence-only when a
- *  rollout is unattributed or absent).
- *  `none`: no live hook channel — presence-only (hermes today). */
-export type HookMechanism =
-  | "claude-hooks"
-  | "pi-extension"
-  | "codex-rollout-tail"
-  | "none";
+ *  `none`: no live hook channel — presence-only (Hermes today). */
+export type HookMechanism = "claude-hooks" | "pi-extension" | "none";
 
 /**
  * How a harness's resume target is passed on its OWN native CLI argv.
- *  - `flag`: an `<token> <target>` OPTION pair that may follow other flags —
- *    claude `--resume <uuid>`, pi `--session <id>`, hermes `--resume <id>`.
- *  - `subcommand`: a VERB-POSITION `<token> <target>` that must LEAD the
- *    forwarded harness argv — codex `resume <uuid>`. The launcher strips its own
- *    `--x-*` flags before forwarding, so a subcommand token still lands first
- *    among the harness-visible args.
+ *  - `flag`: an `<token> <target>` option pair that may follow other flags.
+ *  - `subcommand`: a verb-position `<token> <target>` that must lead the
+ *    forwarded harness argv.
  * `token` is the literal first element (`--resume` / `--session` / `resume`).
  */
 export interface ResumeArgvForm {
@@ -79,7 +68,7 @@ export interface ResumeArgvForm {
  * against a live binary (a bogus resume target isolates whether a failure is
  * the CLI's own argv-parse error or its target-validation error):
  *  - `double-dash`: a bare `--` immediately before the prompt reliably ends
- *    option parsing (claude, codex — both probe-confirmed).
+ *    option parsing (Claude).
  *  - `equals-join`: the prompt must ride joined by `=` onto the flag that
  *    owns it, never as a separate token (hermes `-z=<prompt>`; argparse reads
  *    a separate `-z <dash-prompt>` token as a NEW unrecognized flag).
@@ -96,7 +85,7 @@ export type DashPromptGuard = "double-dash" | "equals-join" | "unsupported";
  * resume target ALONGSIDE a brand-new prompt, the shape `keeper agent run
  * <cli> "<ask>" --resume <x>` composes. Distinct from the bare {@link
  * ResumeArgvForm} the prompt-less daemon-restore path uses. Probe-settled per
- * docs/adr/0034 (claude/codex) plus live CLI probes run for this capability
+ * docs/adr/0034 plus live CLI probes run for this capability
  * (pi/hermes).
  */
 export interface ResumeLaunchForm {
@@ -128,9 +117,9 @@ export interface HarnessDescriptor {
    *  panel member. */
   capturable: boolean;
   /** True when the harness mints its OWN session id keeper cannot pin at launch
-   *  (codex/hermes): the resume target is discovered post-stop by positive
-   *  attribution (codex from its rollout file, hermes from its session store).
-   *  False when keeper pins the session id at launch (claude/pi), so it is
+   *  (Hermes): the resume target is discovered post-stop by positive
+   *  attribution from its session store. False when keeper pins the session id
+   *  at launch (Claude/Pi), so it is
    *  authoritative immediately. */
   mintsOwnSessionId: boolean;
   /** Whether this harness can carry an exact Dispatch-attempt identity through
@@ -148,10 +137,8 @@ export interface HarnessDescriptor {
   resumeLaunch: ResumeLaunchForm;
 }
 
-/** codex and pi expose the same reasoning-band vocabulary
- *  (minimal/low/medium/high/xhigh), so keeper's efforts map onto it identically:
- *  identity for the four shared rungs, with keeper's top `max` capped at the
- *  shared `xhigh` band. */
+/** Pi's reasoning-band vocabulary is minimal/low/medium/high/xhigh: identity
+ *  for the four shared rungs, with keeper's top `max` capped at `xhigh`. */
 const KEEPER_EFFORT_TO_REASONING_BAND: Record<KeeperEffort, string> = {
   low: "low",
   medium: "medium",
@@ -180,28 +167,6 @@ export const HARNESS_DESCRIPTORS: Record<HarnessName, HarnessDescriptor> = {
     // Probe-verified (live claude binary): a bare `--` ahead of the prompt
     // ends option parsing cleanly, so a leading-dash prompt reaches claude's
     // resume-target validation instead of an "unknown option" parse error.
-    resumeLaunch: { dashGuard: "double-dash" },
-  },
-  codex: {
-    name: "codex",
-    displayName: "Codex",
-    binaryName: "codex",
-    secondAxis: "effort",
-    effortAxisMap: KEEPER_EFFORT_TO_REASONING_BAND,
-    capturable: true,
-    mintsOwnSessionId: true,
-    carriesDispatchAttempt: false,
-    // M3b: live stop-churn via the daemon-side rollout tailer. Stop-only — codex's
-    // rollout has no turn-START marker — and degrades to presence-only when the
-    // session is unattributed.
-    hookMechanism: "codex-rollout-tail",
-    // Codex resumes via a VERB-POSITION subcommand (`codex resume <uuid>`), not an
-    // option flag — the argv builder must lead the forwarded args with it.
-    resumeArgv: { kind: "subcommand", token: "resume" },
-    // Probe-verified (live codex binary, clap parser): a bare `--` ahead of
-    // the prompt ends option parsing (clap itself suggests it on a rejected
-    // dash-led positional), so it reaches the TUI/session layer rather than
-    // an argv-parse error.
     resumeLaunch: { dashGuard: "double-dash" },
   },
   pi: {
@@ -275,8 +240,8 @@ export function harnessDescriptor(name: string): HarnessDescriptor | undefined {
  * descriptor {@link HarnessDescriptor.effortAxisMap}. A null map (claude effort
  * is native, hermes has none) returns the token unchanged, so those argvs stay
  * byte-identical. A token outside {@link KEEPER_EFFORTS} — an already-native band
- * such as codex/pi `minimal` — also passes through untouched, so the map rewrites
- * only genuine keeper efforts (in practice just `max` → `xhigh` for codex/pi).
+ * such as Pi's `minimal` — also passes through untouched, so the map rewrites
+ * only genuine keeper efforts (in practice just `max` → `xhigh` for Pi).
  */
 export function mapKeeperEffortToAxis(
   harness: HarnessName,
@@ -303,16 +268,21 @@ export function isCapturableHarness(name: string): boolean {
  */
 export function harnessOrClaude(name: string | null | undefined): HarnessName {
   const n = (name ?? "").trim();
-  return isHarnessName(n) ? n : "claude";
+  if (n === "") {
+    return "claude";
+  }
+  if (!isHarnessName(n)) {
+    throw new Error(`unknown harness '${n}'`);
+  }
+  return n;
 }
 
 /**
  * The per-harness resume argv tokens for a target — the verb-position or
  * option-flag pair the harness's own CLI re-attaches with (`--resume <t>` /
  * `resume <t>` / `--session <t>`). Both forms yield `[token, target]`; the
- * descriptor's {@link ResumeArgvForm.kind} documents WHY codex's token carries no
- * dashes (a subcommand, not an option) and is asserted by the builder's tests. An
- * unknown harness falls back to claude's `--resume` form. Pure.
+ * descriptor's {@link ResumeArgvForm.kind} records whether the token is a
+ * subcommand or option. An unknown non-empty harness throws. Pure.
  */
 export function buildHarnessResumeArgv(
   name: string | null | undefined,
@@ -336,7 +306,7 @@ export class ResumeLaunchUnsupportedError extends Error {}
  * applying `name`'s {@link ResumeLaunchForm.dashGuard} (probe-verified per
  * harness) so a leading-dash prompt is never misread as a flag by the
  * harness's own CLI parser:
- *  - `double-dash` (claude, codex): `["--", prompt]`, emitted UNCONDITIONALLY
+ *  - `double-dash` (Claude): `["--", prompt]`, emitted unconditionally
  *    — not just for a leading-dash prompt — so the argv shape is one
  *    deterministic path, not two, and "--" is a no-op ahead of a normal
  *    prompt.

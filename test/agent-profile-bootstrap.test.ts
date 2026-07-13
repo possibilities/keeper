@@ -40,24 +40,6 @@ afterEach(() => {
 });
 
 describe("main() passthrough commands", () => {
-  test("a profiled `auth status` passes through without session flags or CLAUDE_CONFIG_DIR", async () => {
-    const h = makeHarness({
-      argv: ["--x-profile", "multi-claude-1", "auth", "status"],
-      env: {},
-      homeBin: join(home, ".local", "bin", "claude"),
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).toEqual([
-      join(home, ".local", "bin", "claude"),
-      "auth",
-      "status",
-    ]);
-    expect(cmd).not.toContain("--strict-mcp-config");
-    expect(cmd).not.toContain("--session-id");
-    expect(cmd).not.toContain("--name");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
-  });
-
   test("native global flags pass through with subcommands; router not run", async () => {
     const h = makeHarness({
       argv: ["--debug", "auth", "status"],

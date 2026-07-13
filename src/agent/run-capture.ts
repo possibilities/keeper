@@ -196,9 +196,8 @@ export function cancelRunFromControlArtifact(args: {
  * {@link runCaptureExitCode}: completed/no_message succeed (0), timed_out/
  * no_transcript/transcript_ambiguous are retryable (4), launch_failed is internal
  * (1), bad_args is a malformed invocation (2). `transcript_ambiguous` is distinct
- * from `no_transcript`: the transcript did NOT simply fail to appear — a codex
- * leg found more than one same-cwd rollout it could not attribute to itself (a
- * concurrent session collided), so it refuses to guess a foreign answer.
+ * from `no_transcript`: attribution collided, so Keeper refused to guess a
+ * foreign answer.
  */
 export type RunCaptureOutcome =
   | "completed"
@@ -307,8 +306,7 @@ export type ParseRunArgsResult =
       /** Raw `--model` override — rides onto the launch posture (an explicit
        *  --model wins over the preset). Null when unset. */
       model: string | null;
-      /** Raw `--effort` override — rides onto the launch posture (codex reasoning
-       *  effort). Null when unset. */
+      /** Raw `--effort` override — rides onto the launch posture. Null when unset. */
       effort: string | null;
       /** Raw `--session` name — the tmux session GROUPING (rides as
        *  `--x-tmux-session`), NOT the transcript session id, so co-grouped runs
@@ -318,9 +316,9 @@ export type ParseRunArgsResult =
        *  envelope to on EVERY outcome, in addition to stdout. Null when unset. */
       output: string | null;
       /** Raw `--name` value — the launch NAME. Rides onto the tmux window name for
-       *  every harness, and onto the harness-native `--name` for claude/pi (codex
-       *  has none). An explicit name suppresses the interactive auto-mint on the
-       *  detached re-exec. Null when unset. */
+       *  every harness, and onto the harness-native `--name` for claude/pi. An
+       *  explicit name suppresses the interactive auto-mint on the detached
+       *  re-exec. Null when unset. */
       name: string | null;
       /** Raw `--resume` value — a partner name / former name / session id / id
        *  prefix / current-title substring to RESUME (resolution, refuse-live, and
@@ -334,7 +332,7 @@ export type ParseRunArgsResult =
 /**
  * Parse `agent run <cli> <prompt> [--read-only] [--reap-window-on-terminal]
  * [--stop-timeout <dur>]`. Two
- * positionals — the partner CLI (claude|codex|pi) and the prompt — plus the
+ * positionals — the partner CLI (Claude/Pi/Hermes) and the prompt — plus the
  * optional read-only posture, the one-shot reap posture, and stop-wait override. A malformed/missing
  * positional, an unknown flag, or an extra positional maps to BAD_ARGS upstream.
  * `--read-only` is prompting-only: it prepends the read-only directive to the
@@ -579,16 +577,6 @@ export interface RunCaptureDeps {
   ) => Promise<ShowLastMessageResult>;
   /** Monotonic-enough wall clock (ms) for deterministic `elapsed_seconds`. */
   now: () => number;
-  /**
-   * Resolve a codex resume target (its session uuid) from the ALREADY-resolved
-   * rollout transcript path. Optional + codex-only: bound in `main.ts` to the
-   * pure `codexSessionIdFromRolloutPath` parser (this module keeps its
-   * types-only, dep-free contract). claude/pi never reach it — their
-   * `handle.sessionId` is pinned at launch and stays authoritative.
-   */
-  resolveCodexResumeTarget?: (args: {
-    transcriptPath: string;
-  }) => string | null;
 }
 
 /**
@@ -633,25 +621,13 @@ export async function captureFromHandle(
 ): Promise<RunCaptureResult> {
   const { handle, handleId, agent, startMs } = args;
   const baseResume = handle.sessionId;
-  // claude/pi pin `handle.sessionId` at launch — authoritative, keep it. codex
-  // and hermes can't be pinned (they mint their own id): discover it POST-STOP.
-  // codex parses the resolved rollout path via the seam; hermes's wait/show carry
-  // its native session id AS the `transcriptPath` (it has no transcript file), so
-  // that value IS the resume target directly.
+  // Claude/Pi pin `handle.sessionId` at launch. Hermes mints its own id; its
+  // wait/show path carries that native session id as `transcriptPath`.
   const resolveResume = (transcriptPath: string | null): string | null => {
     if (baseResume !== null) {
       return baseResume;
     }
-    if (transcriptPath === null) {
-      return null;
-    }
-    if (agent === "hermes") {
-      return transcriptPath;
-    }
-    if (agent !== "codex") {
-      return null;
-    }
-    return deps.resolveCodexResumeTarget?.({ transcriptPath }) ?? null;
+    return agent === "hermes" ? transcriptPath : null;
   };
   const elapsed = (): number => roundTenths((deps.now() - startMs) / 1000);
 
@@ -712,7 +688,7 @@ export async function captureFromHandle(
   // For claude, the gated wait stop is the BLESSED settled turn: prefer its own
   // message so a later human-resume turn's whole-file re-scan cannot displace
   // the answer. Only a structural claude stop (null text) falls back to the
-  // re-scan. codex/pi/hermes keep the re-scan-first preference (their stop text
+  // re-scan. Pi/Hermes keep the re-scan-first preference (their stop text
   // is a subset of what show-last-message resolves).
   let message: string | null;
   let messageFound: boolean;
