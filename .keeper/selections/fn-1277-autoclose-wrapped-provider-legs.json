@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Exact-identity teardown and positive-stop gating form a subtle correctness invariant where a classifier mistake could kill unrelated live work.",
+      "task_id": "fn-1277-autoclose-wrapped-provider-legs.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is substantial but well-specified contract-touching work spanning resume plumbing, cross-harness tests, templates, and documentation.",
+      "task_id": "fn-1277-autoclose-wrapped-provider-legs.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T14:24:49.618000Z",
+  "epic_id": "fn-1277-autoclose-wrapped-provider-legs",
+  "input_hash": "b4acfa58fd7a34ebbf8b4f028b01efe66da598d2ad0d921ae40ee119e766343e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3031235160,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1277-autoclose-wrapped-provider-legs.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Exact-identity teardown and positive-stop gating form a subtle correctness invariant where a classifier mistake could kill unrelated live work.\",\"confidence\":0.94},{\"task_id\":\"fn-1277-autoclose-wrapped-provider-legs.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"This is substantial but well-specified contract-touching work spanning resume plumbing, cross-harness tests, templates, and documentation.\",\"confidence\":0.9}]}\n"
+}
