@@ -67,6 +67,11 @@ import {
   WORKER_EFFORT,
   WORKER_MODEL,
 } from "./autopilot-worker";
+import type {
+  AwaitIncomingMessage,
+  AwaitOutboundMessage,
+  AwaitWorkerData,
+} from "./await-worker";
 import {
   backfillMutationPath,
   isMutationPathBackfillComplete,
@@ -6846,6 +6851,7 @@ export type WorkerName =
   | "birthIngest"
   | "autopilot"
   | "handoff"
+  | "await"
   | "maintenance"
   | "restore"
   | "renamer"
@@ -6874,6 +6880,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "birthIngest",
   "autopilot",
   "handoff",
+  "await",
   "maintenance",
   "restore",
   "renamer",
@@ -9904,6 +9911,100 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (handoffWorkerInstance)`
+
+  // Durable awaits mirror the handoff worker's supervised, read-only reactor.
+  // Main alone turns its lifecycle messages into deterministic synthetic events.
+  const awaitWorkerInstance = want("await")
+    ? new Worker(new URL("./await-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          launcherArgvPrefix,
+          cwd: process.cwd(),
+        } satisfies AwaitWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+  if (awaitWorkerInstance) {
+    const aw = awaitWorkerInstance;
+    aw.onmessage = (
+      ev: MessageEvent<AwaitOutboundMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "await-firing-request") {
+        const ok = mintAwaitLifecycle("AwaitFiring", msg.payload);
+        aw.postMessage({
+          type: "await-firing-ack",
+          id: msg.id,
+          ok,
+        } satisfies AwaitIncomingMessage);
+      } else if (msg.kind === "await-terminal") {
+        mintAwaitLifecycle(
+          msg.terminal === "done"
+            ? "AwaitDone"
+            : msg.terminal === "timed_out"
+              ? "AwaitTimedOut"
+              : "AwaitFailed",
+          msg.payload,
+        );
+      }
+    };
+    aw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] await worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+    aw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
+  function mintAwaitLifecycle(
+    hookEvent: "AwaitFiring" | "AwaitDone" | "AwaitFailed" | "AwaitTimedOut",
+    payload: { await_id: string; reason?: string },
+  ): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: payload.await_id,
+        $pid: null,
+        $hook_event: hookEvent,
+        $event_type: "awaits",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify(payload),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return true;
+    } catch (err) {
+      console.error(
+        `[keeperd] ${hookEvent} mint threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
 
   /**
    * Mint a synthetic `HandoffDispatching` event AND reply a durable
@@ -14200,6 +14301,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       birthIngestWorker,
       autopilotWorkerInstance,
       handoffWorkerInstance,
+      awaitWorkerInstance,
       maintenanceWorker,
       restoreWorker,
       renamerWorker,

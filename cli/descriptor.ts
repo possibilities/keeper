@@ -697,6 +697,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       FLAG_HELP,
       FLAG_AGENT_HELP_DEFAULTED,
       {
+        name: "durable",
+        type: "boolean",
+        summary:
+          "Persist the await and return immediately; keeperd fires a fresh follow-up",
+      },
+      {
         name: "timeout",
         type: "string",
         summary: "Own-deadline before giving up (duration, e.g. 30s, 5m)",

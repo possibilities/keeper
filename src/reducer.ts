@@ -5677,6 +5677,59 @@ function foldAwaitRequested(db: Database, event: Event): void {
   );
 }
 
+/** Await worker lifecycle marker. The producer owns clocks/launches; this fold
+ * only records their event-stamped outcomes and is therefore replay-safe. */
+function foldAwaitLifecycle(db: Database, event: Event): void {
+  let payload: { await_id?: unknown } = {};
+  try {
+    payload = JSON.parse(event.data ?? "{}") as typeof payload;
+  } catch {
+    return;
+  }
+  if (typeof payload.await_id !== "string" || payload.await_id.length === 0) {
+    return;
+  }
+  if (event.hook_event === "AwaitFiring") {
+    const row = db
+      .query("SELECT status, never_bound_count FROM awaits WHERE await_id = ?")
+      .get(payload.await_id) as
+      | { status: string; never_bound_count: number }
+      | undefined;
+    if (row === undefined || !["waiting", "firing"].includes(row.status)) {
+      return;
+    }
+    const neverBoundCount = row.never_bound_count + 1;
+    db.run(
+      `UPDATE awaits
+          SET status = ?, claimed_at = ?, attempt_count = attempt_count + 1,
+              never_bound_count = ?, last_event_id = ?
+        WHERE await_id = ? AND status IN ('waiting', 'firing')`,
+      [
+        neverBoundCount >= 3 ? "failed" : "firing",
+        event.ts,
+        neverBoundCount,
+        event.id,
+        payload.await_id,
+      ],
+    );
+    return;
+  }
+  const status =
+    event.hook_event === "AwaitDone"
+      ? "done"
+      : event.hook_event === "AwaitTimedOut"
+        ? "timed_out"
+        : "failed";
+  // Terminal outcomes never regress: a late failure may not overwrite a timeout
+  // (or a completed effect) after a lease-reclaim race.
+  db.run(
+    `UPDATE awaits
+        SET status = ?, claimed_at = NULL, last_event_id = ?
+      WHERE await_id = ? AND status IN ('waiting', 'firing')`,
+    [status, event.id, payload.await_id],
+  );
+}
+
 /**
  * Never-bound circuit-breaker threshold for handoffs: K CONSECUTIVE
  * `HandoffDispatching` events for one handoff WITHOUT an intervening bind flip
@@ -9810,6 +9863,13 @@ export function applyEvent(
       foldEpicArmed(db, event);
     } else if (event.hook_event === "AwaitRequested") {
       foldAwaitRequested(db, event);
+    } else if (
+      event.hook_event === "AwaitFiring" ||
+      event.hook_event === "AwaitDone" ||
+      event.hook_event === "AwaitFailed" ||
+      event.hook_event === "AwaitTimedOut"
+    ) {
+      foldAwaitLifecycle(db, event);
     } else if (event.hook_event === "HandoffRequested") {
       foldHandoffRequested(db, event);
     } else if (event.hook_event === "HandoffDispatching") {

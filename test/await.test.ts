@@ -703,6 +703,14 @@ test("parseAwaitArgs: flags wire through", () => {
   expect(r.args.sock).toBe("/tmp/x.sock");
 });
 
+test("parseAwaitArgs: --durable persists intent mode without changing the normal default", () => {
+  const normal = parseAwaitArgs(["landed", "fn-1-foo"]);
+  const durable = parseAwaitArgs(["landed", "fn-1-foo", "--durable"]);
+  if (!normal.ok || !durable.ok) throw new Error("expected valid await args");
+  expect(normal.args.durable).toBe(false);
+  expect(durable.args.durable).toBe(true);
+});
+
 test("parseAwaitArgs: bad condition → usage error", () => {
   const r = parseAwaitArgs(["bogus", "fn-1-foo.1"]);
   expect(r.ok).toBe(false);

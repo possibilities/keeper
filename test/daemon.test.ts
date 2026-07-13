@@ -9523,6 +9523,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "birth-ingest-worker.ts": "birthIngest",
   "autopilot-worker.ts": "autopilot",
   "handoff-worker.ts": "handoff",
+  "await-worker.ts": "await",
   "maintenance-worker.ts": "maintenance",
   "restore-worker.ts": "restore",
   "renamer-worker.ts": "renamer",
@@ -9622,7 +9623,7 @@ test("the production boot spawns the complete worker set", () => {
   // configured buildbot URL makes the optional builds worker deterministic.
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(21);
+  expect(spawned).toHaveLength(22);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -9640,6 +9641,7 @@ test("the production boot spawns the complete worker set", () => {
     "birthIngest",
     "autopilot",
     "handoff",
+    "await",
     "maintenance",
     "restore",
     "renamer",

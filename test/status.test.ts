@@ -89,6 +89,7 @@ interface SnapOverrides {
   maxConcurrentPerRootStored?: number;
   worktreeMode?: boolean;
   worktreeMultiRepo?: boolean;
+  landedEpicIds?: string[];
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
@@ -141,6 +142,9 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
       : { maxConcurrentPerRootStored: o.maxConcurrentPerRootStored }),
     worktreeMode: o.worktreeMode ?? false,
     worktreeMultiRepo: o.worktreeMultiRepo ?? false,
+    ...(o.landedEpicIds === undefined
+      ? {}
+      : { landedEpicIds: o.landedEpicIds }),
     readiness: {
       perTask: toMap(o.perTask),
       perCloseRow: toMap(o.perCloseRow),
@@ -157,6 +161,10 @@ const BOOT: StatusBootInfo = { rev: 4242, catching_up: false };
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
+  test("status schema version is v10", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(10);
+  });
+
   test("envelope carries every documented field", () => {
     const snap = makeSnap({
       epics: [
@@ -556,6 +564,7 @@ describe("buildStatusEnvelope drained/jammed", () => {
       "parked_questions",
       "instant_death_wall",
       "blocked_work",
+      "finalize_pending",
       "total",
     ]);
     expect(d?.needs_human).toEqual({
@@ -567,8 +576,36 @@ describe("buildStatusEnvelope drained/jammed", () => {
       parked_questions: 1,
       instant_death_wall: 2,
       blocked_work: 0,
+      finalize_pending: 0,
       total: 9,
     });
+  });
+
+  test("finalize_pending is paused, unlanded worktree done epics only and never jams", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-42-lane", status: "done", tasks: [] }],
+      worktreeMode: true,
+      autopilotPaused: true,
+      landedEpicIds: [],
+      perEpic: { "fn-42-lane": { tag: "completed" } },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.needs_human.finalize_pending).toBe(1);
+    expect(d?.needs_human.total).toBe(0);
+    expect(d?.jammed).toBe(false);
+    expect(d?.drained).toBe(true);
+    expect(
+      buildStatusEnvelope(
+        makeSnap({
+          epics: [{ epic_id: "fn-42-lane", status: "done", tasks: [] }],
+          worktreeMode: true,
+          autopilotPaused: true,
+          landedEpicIds: ["fn-42-lane"],
+        }),
+        BOOT,
+        [],
+      ).data?.needs_human.finalize_pending,
+    ).toBe(0);
   });
 
   test("in-flight counts pending dispatches + working jobs", () => {
@@ -670,10 +707,9 @@ function makeStatusMockConnect(): {
   return { factory, sockets };
 }
 
-/** The eleven base readiness collections + the `dispatch_failures` opt-in +
- *  the `epics_pinned` opt-in (ADR 0018), as a single `result` batch. Routed by
- *  collection, so no idPrefix bookkeeping. `pinnedEpics` defaults empty — most
- *  callers don't care about the pin window, only that its gate clears. */
+/** The eleven base readiness collections + `epics_recent_done`/`lane_merged`
+ *  landed-set opt-in + the `dispatch_failures`/`epics_pinned` opt-ins, as one
+ *  result batch. Routed by collection, so no idPrefix bookkeeping. */
 function statusReadinessFrames(
   dispatchFailures: Record<string, unknown>[],
   epics: Record<string, unknown>[] = [],
@@ -706,6 +742,8 @@ function statusReadinessFrames(
     empty("scheduled_tasks"),
     empty("block_escalations"),
     empty("tmux_client_focus"),
+    empty("epics_recent_done"),
+    empty("lane_merged"),
     {
       type: "result",
       id: "dispatch_failures",
