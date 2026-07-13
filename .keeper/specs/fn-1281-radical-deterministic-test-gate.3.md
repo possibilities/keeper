@@ -59,5 +59,5 @@ Ship timing in report-only mode. Enable reference enforcement only after ten qua
 - [ ] The policy lint prevents reintroduction of forbidden slow-test dependencies without an explicit semantic allowlist.
 
 ## Done summary
-
+Added an exhaustive phase/package test manifest with fail-closed classification, default root+OpenTUI orchestration, full root/plan/prompt suite reporting, monotonic JSON/JUnit timing artifacts with objective/hard-ceiling budgets, and a syntax-aware fast-test dependency policy lint with a reviewed allowlist.
 ## Evidence
