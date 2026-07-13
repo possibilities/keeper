@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-13T11:30:25.262000Z",
+  "created_by_close_of": "fn-1274-cover-durable-await-server-side",
+  "depends_on_epics": [
+    "fn-1274-cover-durable-await-server-side"
+  ],
+  "id": "fn-1275-enforce-durable-await-condition-kind",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Enforce durable-await condition-kind coverage tie",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-13T11:30:25.262000Z"
+}
