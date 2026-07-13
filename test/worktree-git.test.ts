@@ -838,19 +838,29 @@ test("mergeBranchInto: conflict with MERGE_HEAD → abort, conflict, lock releas
       result: { exitCode: 1, stdout: "CONFLICT (content): foo.ts" },
     },
     {
+      when: (a) => argvStartsWith(a, "diff", "--name-only", "--diff-filter=U"),
+      result: { stdout: "src/foo.ts\ndocs/conflicted guide.md\n" },
+    },
+    {
       when: (a) => argvStartsWith(a, "rev-parse", "--verify", "--quiet"),
       result: { exitCode: 0, stdout: "mergehead\n" }, // MERGE_HEAD present
     },
   ]);
   const lock = recordingLock();
   const res = await mergeBranchInto("/wt", "src", run, lock.acquire);
-  expect(res.kind).toBe("conflict");
-  if (res.kind === "conflict") {
-    expect(res.stderr).toContain("CONFLICT");
-  }
-  expect(calls.some((c) => argvStartsWith(c.args, "merge", "--abort"))).toBe(
-    true,
+  expect(res).toEqual({
+    kind: "conflict",
+    stderr: "CONFLICT (content): foo.ts",
+    conflictedFiles: ["src/foo.ts", "docs/conflicted guide.md"],
+  });
+  const diffIndex = calls.findIndex((c) =>
+    argvStartsWith(c.args, "diff", "--name-only", "--diff-filter=U"),
   );
+  const abortIndex = calls.findIndex((c) =>
+    argvStartsWith(c.args, "merge", "--abort"),
+  );
+  expect(diffIndex).toBeGreaterThan(-1);
+  expect(abortIndex).toBeGreaterThan(diffIndex);
   expect(lock.events).toEqual([
     "acquire:/wt/.git/keeper-commit-work.lock",
     "release",

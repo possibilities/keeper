@@ -4250,6 +4250,24 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       );
     },
   },
+  {
+    version: 124,
+    kind: "additive",
+    apply: (ctx) => {
+      // v123→v124 (fn-1252 task .6): record the conflicted-file list on an
+      // escalation row (`dispatch_failures.conflicted_files`). Renumbered from
+      // the lane's original v120 — which collided with the landed v120
+      // usage/profiles drop — to the new additive tail. Nullable TEXT, NO
+      // default, re-fold-safe (addColumnIfMissing append leaves existing rows
+      // NULL, the zero-event shape). Declared in CREATE_DISPATCH_FAILURES too.
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "conflicted_files",
+        "TEXT",
+      );
+    },
+  },
 ];
 
 /**
@@ -4270,7 +4288,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v123:cdbe086dcc488d88d42a522d42e8e4973afb4ad94ddae61315db84c692508369";
+  "v124:73e4772d1debfccd459b74b8150cf979d1f019dbdcf2346f8ae1056452fd761c";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

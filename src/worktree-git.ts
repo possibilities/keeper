@@ -95,7 +95,7 @@ export type MergeResult =
    * `MERGE_HEAD` was present). The caller fails loud + stops; `stderr` carries
    * git's conflict output for the sticky DispatchFailed.
    */
-  | { kind: "conflict"; stderr: string }
+  | { kind: "conflict"; stderr: string; conflictedFiles: string[] }
   /**
    * The bounded {@link LockAcquirer} could not take the per-worktree commit-work
    * flock within its deadline — another holder (a concurrent commit-work or a
@@ -1719,10 +1719,24 @@ export async function mergeBranchInto(
       }
       return { kind: "local-timeout" };
     }
-    // Non-zero: a conflict (or other failure). Abort iff a MERGE_HEAD exists,
-    // so a merge that never started is not spuriously "aborted". A clean abort
-    // (or nothing to abort) → the sticky `conflict`; an abort that ITSELF failed
-    // left the checkout mid-merge → the distinct `abort-failed` wedge signal.
+    // Non-zero: a conflict (or other failure). Capture the unmerged index paths
+    // BEFORE the guarded abort destroys the stage-1/2/3 entries. Best-effort only:
+    // a failed/timed-out diff must never replace the merge's real outcome.
+    const unmerged = await run(["diff", "--name-only", "--diff-filter=U"], {
+      cwd: worktreePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    const conflictedFiles =
+      unmerged.code === 0
+        ? unmerged.stdout
+            .split("\n")
+            .map((path) => path.trim())
+            .filter((path) => path.length > 0)
+        : [];
+    // Abort iff a MERGE_HEAD exists, so a merge that never started is not
+    // spuriously "aborted". A clean abort (or nothing to abort) → the sticky
+    // `conflict`; an abort that ITSELF failed left the checkout mid-merge → the
+    // distinct `abort-failed` wedge signal.
     const aborted = await abortMergeIfInProgress(worktreePath, run);
     if (aborted.kind === "abort-failed") {
       return { kind: "abort-failed", stderr: aborted.stderr };
@@ -1730,6 +1744,7 @@ export async function mergeBranchInto(
     return {
       kind: "conflict",
       stderr: (merge.stdout + merge.stderr).trim(),
+      conflictedFiles,
     };
   } finally {
     lock.release();
