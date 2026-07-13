@@ -61,5 +61,5 @@ Recognize legacy prefixed titles only for eligibility compatibility; all new lau
 - [ ] The wrapped bucket remains blast-capped and deterministic when several provider legs become eligible together.
 
 ## Done summary
-
+Wrapped autoclose bucket (positive stopped state, exact tmux topology, wrapped birth session, bare/legacy provider-leg title) already landed in f9874e45; verified via targeted tests and diff review, no further changes needed.
 ## Evidence
