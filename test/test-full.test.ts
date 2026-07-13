@@ -1,179 +1,145 @@
-/**
- * Tests for the serial three-suite gate (`scripts/test-full.ts`). The runner
- * itself is a thin spawner — a live `bun run test:full` is the integration proof.
- * These drive the pure seam in-process: the suite plan (order, cwd, env
- * scrub/inject, timeout budgets), env patching, verdict classification, bail, and
- * the env parsers. No real second suite is spawned.
- */
-
 import { describe, expect, test } from "bun:test";
+import { buildDefaultPlan } from "../scripts/test-default";
 import {
   buildChildEnv,
   buildSuitePlan,
   classifyVerdict,
+  executeSuitePlan,
+  type ProcessResult,
   parseBail,
   parseSuiteTimeoutMs,
-  shouldContinue,
-  type Verdict,
 } from "../scripts/test-full";
 
-const T = 300_000;
+function take<T>(values: T[]): T {
+  const value = values.shift();
+  if (value === undefined) throw new Error("fixture exhausted");
+  return value;
+}
 
-describe("buildSuitePlan", () => {
-  test("runs the three suites serially with prompt last", () => {
-    expect(
-      buildSuitePlan("fast", { suiteTimeoutMs: T }).map((s) => s.name),
-    ).toEqual(["root", "plan", "prompt"]);
+describe("default and full package plans", () => {
+  test("default owns root and serial OpenTUI with report-all-compatible stages", () => {
+    const plan = buildDefaultPlan();
+    expect(plan.map((stage) => stage.name)).toEqual(["root", "opentui"]);
+    expect(plan[0].cmd).toEqual(["bun", "run", "test:gate"]);
+    expect(plan[1].cmd.slice(0, 2)).toEqual(["bun", "test"]);
+    expect(plan[1].cmd).toContain("./test/live-shell.test.ts");
   });
 
-  test("each suite runs in its own cwd (bunfig/import resolution is cwd-relative)", () => {
-    const byName = Object.fromEntries(
-      buildSuitePlan("fast", { suiteTimeoutMs: T }).map((s) => [s.name, s.cwd]),
-    );
-    expect(byName).toEqual({
-      root: ".",
-      plan: "plugins/plan",
-      prompt: "plugins/prompt",
+  test("covers root, plan, and prompt exactly once in order", () => {
+    const plan = buildSuitePlan({ suiteTimeoutMs: 42_000 });
+    expect(plan.map((stage) => stage.name)).toEqual(["root", "plan", "prompt"]);
+    expect(plan.map((stage) => stage.cwd)).toEqual([
+      ".",
+      "plugins/plan",
+      "plugins/prompt",
+    ]);
+    expect(plan.map((stage) => stage.timeoutMs)).toEqual([
+      42_000, 42_000, 42_000,
+    ]);
+  });
+
+  test("all children scrub obsolete slow tiers and nested budget/artifact ownership", () => {
+    for (const stage of buildSuitePlan()) {
+      expect(stage.envPatch).toEqual({
+        KEEPER_RUN_SLOW: undefined,
+        KEEPER_PLAN_RUN_SLOW: undefined,
+        KEEPER_TEST_ENFORCE_BUDGET: undefined,
+        KEEPER_TEST_TIMING_DIR: undefined,
+      });
+    }
+  });
+
+  test("uses explicit named phases for plugin package coverage", () => {
+    const plan = buildSuitePlan();
+    expect(plan[0].cmd).toEqual(["bun", "run", "test"]);
+    expect(plan[1].cmd).toContain("--phase=plan");
+    expect(plan[2].cmd).toContain("--phase=prompt");
+  });
+});
+
+describe("full runner seam", () => {
+  test("runs serially and reports all outcomes when bail is off", async () => {
+    const calls: string[] = [];
+    const clock = [0, 3, 3, 8, 8, 13];
+    const results: ProcessResult[] = [
+      { exitCode: 0 },
+      { exitCode: 2 },
+      { exitCode: 0 },
+    ];
+    const executions = await executeSuitePlan(buildSuitePlan(), {
+      run: async (stage) => {
+        calls.push(stage.name);
+        return take(results);
+      },
+      now: () => take(clock),
+      bail: false,
     });
+    expect(calls).toEqual(["root", "plan", "prompt"]);
+    expect(executions.map((entry) => entry.verdict.ok)).toEqual([
+      true,
+      false,
+      true,
+    ]);
   });
 
-  test("fast mode scrubs BOTH slow gates from every child env", () => {
-    for (const spec of buildSuitePlan("fast", { suiteTimeoutMs: T })) {
-      expect(spec.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
-      expect(spec.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
-      expect("KEEPER_RUN_SLOW" in spec.envPatch).toBe(true);
-      expect("KEEPER_PLAN_RUN_SLOW" in spec.envPatch).toBe(true);
-    }
+  test("bail stops after the first failure", async () => {
+    const executions = await executeSuitePlan(buildSuitePlan(), {
+      run: async () => ({ exitCode: 1 }),
+      now: (() => {
+        let now = 0;
+        return () => now++;
+      })(),
+      bail: true,
+    });
+    expect(executions).toHaveLength(1);
   });
 
-  test("slow mode injects KEEPER_RUN_SLOW into root and swaps plan to test:slow", () => {
-    const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    const root = plan.find((s) => s.name === "root");
-    const planSuite = plan.find((s) => s.name === "plan");
-    if (root === undefined || planSuite === undefined) {
-      throw new Error("expected root + plan suites in the plan");
-    }
-
-    expect(root.envPatch.KEEPER_RUN_SLOW).toBe("1");
-    expect(root.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
-
-    expect(planSuite.cmd).toEqual(["bun", "run", "test:slow"]);
-    expect(planSuite.envPatch.KEEPER_PLAN_RUN_SLOW).toBe("1");
-    expect(planSuite.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
-  });
-
-  test("slow mode leaves prompt scrubbed (no slow tier)", () => {
-    const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    const prompt = plan.find((s) => s.name === "prompt");
-    if (prompt === undefined) {
-      throw new Error("expected prompt suite in the plan");
-    }
-    expect(prompt.envPatch.KEEPER_RUN_SLOW).toBeUndefined();
-    expect(prompt.envPatch.KEEPER_PLAN_RUN_SLOW).toBeUndefined();
-    expect(prompt.cmd).toEqual(["bun", "run", "test"]);
-  });
-
-  test("fast mode applies the per-suite timeout to every suite", () => {
-    for (const spec of buildSuitePlan("fast", { suiteTimeoutMs: T })) {
-      expect(spec.timeoutMs).toBe(T);
-    }
-  });
-
-  test("slow root gets a 600s floor while other suites keep the base budget", () => {
-    const plan = buildSuitePlan("slow", { suiteTimeoutMs: T });
-    expect(plan.find((s) => s.name === "root")?.timeoutMs).toBe(600_000);
-    expect(plan.find((s) => s.name === "plan")?.timeoutMs).toBe(T);
-  });
-
-  test("slow root floor never shrinks a larger configured budget", () => {
-    const plan = buildSuitePlan("slow", { suiteTimeoutMs: 900_000 });
-    expect(plan.find((s) => s.name === "root")?.timeoutMs).toBe(900_000);
+  test("rejects a non-monotonic injected clock", async () => {
+    const clock = [2, 1];
+    await expect(
+      executeSuitePlan(buildSuitePlan().slice(0, 1), {
+        run: async () => ({ exitCode: 0 }),
+        now: () => take(clock),
+        bail: false,
+      }),
+    ).rejects.toThrow("non-monotonic clock");
   });
 });
 
-describe("buildChildEnv", () => {
-  test("deletes keys with an undefined patch value (ambient tier can't leak in)", () => {
-    const env = buildChildEnv(
-      { KEEPER_RUN_SLOW: "1", KEEPER_PLAN_RUN_SLOW: "1", PATH: "/bin" },
-      { KEEPER_RUN_SLOW: undefined, KEEPER_PLAN_RUN_SLOW: undefined },
-    );
-    expect("KEEPER_RUN_SLOW" in env).toBe(false);
-    expect("KEEPER_PLAN_RUN_SLOW" in env).toBe(false);
-    expect(env.PATH).toBe("/bin");
-  });
-
-  test("sets keys with a defined patch value", () => {
-    const env = buildChildEnv({ PATH: "/bin" }, { KEEPER_RUN_SLOW: "1" });
-    expect(env.KEEPER_RUN_SLOW).toBe("1");
-  });
-});
-
-describe("classifyVerdict", () => {
-  test("passes on exit 0", () => {
+describe("process verdicts and env", () => {
+  test("distinguishes exit, signal, timeout, spawn failure, and cleanup failure", () => {
     expect(classifyVerdict({ exitCode: 0 })).toEqual({
       ok: true,
       reason: "passed",
     });
+    expect(classifyVerdict({ exitCode: 2 }).reason).toBe("exited 2");
+    expect(classifyVerdict({ exitCode: null, signal: "SIGTERM" }).reason).toBe(
+      "terminated by SIGTERM",
+    );
+    expect(
+      classifyVerdict({ exitCode: null, timedOut: true }).reason,
+    ).toContain("hang deadline");
+    expect(
+      classifyVerdict({ exitCode: null, spawnError: "ENOENT" }).reason,
+    ).toContain("missing binary");
+    expect(
+      classifyVerdict({ exitCode: 0, cleanupError: "EPERM" }).reason,
+    ).toContain("cleanup failed");
   });
 
-  test("fails on a non-zero exit", () => {
-    expect(classifyVerdict({ exitCode: 2 })).toEqual({
-      ok: false,
-      reason: "exited 2",
-    });
+  test("env patches delete ambient ownership switches", () => {
+    expect(
+      buildChildEnv(
+        { KEEP: "yes", KEEPER_RUN_SLOW: "1" },
+        { KEEPER_RUN_SLOW: undefined },
+      ),
+    ).toEqual({ KEEP: "yes" });
   });
 
-  test("classifies a spawn ENOENT as a distinct missing-binary failure", () => {
-    expect(classifyVerdict({ spawnError: "ENOENT", exitCode: null })).toEqual({
-      ok: false,
-      reason: "missing binary (spawn ENOENT)",
-    });
-  });
-
-  test("surfaces a non-ENOENT spawn error verbatim", () => {
-    const v = classifyVerdict({ spawnError: "EACCES", exitCode: null });
-    expect(v.ok).toBe(false);
-    expect(v.reason).toContain("EACCES");
-  });
-
-  test("classifies a timeout as a distinct failure even with a zero exit", () => {
-    expect(classifyVerdict({ timedOut: true, exitCode: 0 })).toEqual({
-      ok: false,
-      reason: "timed out (process group killed)",
-    });
-  });
-});
-
-describe("shouldContinue (bail)", () => {
-  const pass: Verdict = { ok: true, reason: "passed" };
-  const fail: Verdict = { ok: false, reason: "exited 1" };
-
-  test("with bail off, always continues", () => {
-    expect(shouldContinue([fail], false)).toBe(true);
-  });
-
-  test("with bail on, continues while everything passes", () => {
-    expect(shouldContinue([pass, pass], true)).toBe(true);
-  });
-
-  test("with bail on, cuts after the first failure", () => {
-    expect(shouldContinue([pass, fail], true)).toBe(false);
-  });
-});
-
-describe("env parsers", () => {
-  test("parseBail: any non-empty value is on, empty/unset is off", () => {
+  test("parsers pin bail and bounded timeout defaults", () => {
     expect(parseBail("1")).toBe(true);
-    expect(parseBail("anything")).toBe(true);
     expect(parseBail("")).toBe(false);
-    expect(parseBail(undefined)).toBe(false);
-  });
-
-  test("parseSuiteTimeoutMs: seconds → ms, default on a bad value", () => {
-    expect(parseSuiteTimeoutMs("120")).toBe(120_000);
-    expect(parseSuiteTimeoutMs(undefined)).toBe(300_000);
-    expect(parseSuiteTimeoutMs("")).toBe(300_000);
-    expect(parseSuiteTimeoutMs("0")).toBe(300_000);
-    expect(parseSuiteTimeoutMs("nope")).toBe(300_000);
+    expect(parseSuiteTimeoutMs("42")).toBe(42_000);
+    expect(parseSuiteTimeoutMs("bad")).toBe(180_000);
   });
 });

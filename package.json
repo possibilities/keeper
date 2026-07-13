@@ -14,12 +14,12 @@
     "lint:retired-name": "bash scripts/lint-retired-name.sh",
     "lint:claude-md": "bun scripts/lint-claude-md.ts",
     "lint:skill-ids": "bun scripts/lint-skill-ids.ts",
+    "lint:fast-tests": "bun scripts/lint-fast-tests.ts",
     "typecheck": "tsc --noEmit",
     "test:opentui": "bun test ./test/ansi-to-styled.test.ts ./test/live-shell.test.ts ./test/dash-app.test.ts ./test/dash-shell.test.ts",
-    "test:gate": "bun scripts/test-gate.ts --timeout=10000 --path-ignore-patterns='plugins/**' --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts' --path-ignore-patterns='test/dash-app.test.ts' --path-ignore-patterns='test/dash-shell.test.ts' ./test",
-    "test": "bun run test:gate && bun run test:opentui",
-    "test:full": "bun scripts/test-full.ts",
-    "test:full:slow": "bun scripts/test-full.ts --slow"
+    "test:gate": "bun scripts/test-gate.ts --phase=root --timeout=10000",
+    "test": "bun scripts/test-default.ts",
+    "test:full": "bun scripts/test-full.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",
@@ -38,5 +38,7 @@
     "yaml": "2.8.1",
     "zod": "^4.4.3"
   },
-  "trustedDependencies": ["@parcel/watcher"]
+  "trustedDependencies": [
+    "@parcel/watcher"
+  ]
 }

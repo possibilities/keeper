@@ -19,10 +19,25 @@ import {
   isOrphanTestWorker,
   type ProcRow,
   parseEtimeSeconds,
+  parseGateArgs,
 } from "../scripts/test-gate";
 
 test("the preload consumes the aggregate marker before test code runs", () => {
   expect(process.env[TEST_GATE_MARKER]).toBeUndefined();
+});
+
+describe("named phase arguments", () => {
+  test("defaults to root and strips only the explicit phase selector", () => {
+    expect(parseGateArgs(["--timeout=10000"])).toEqual({
+      phase: "root",
+      forwarded: ["--timeout=10000"],
+    });
+    expect(parseGateArgs(["--phase=plan", "--timeout=5000"])).toEqual({
+      phase: "plan",
+      forwarded: ["--timeout=5000"],
+    });
+    expect(() => parseGateArgs(["--phase=slow"])).toThrow("unknown test phase");
+  });
 });
 
 describe("buildBunTestArgs", () => {
