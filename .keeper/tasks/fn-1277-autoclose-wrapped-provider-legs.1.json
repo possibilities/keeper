@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T14:24:19.932000Z",
+  "depends_on": [],
+  "epic": "fn-1277-autoclose-wrapped-provider-legs",
+  "id": "fn-1277-autoclose-wrapped-provider-legs.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Autoclose wrapped session windows",
+  "updated_at": "2026-07-13T14:24:19.932000Z"
+}
