@@ -7,7 +7,7 @@
     "fn-1271-worktree-lane-hygiene-hardening"
   ],
   "id": "fn-1272-bound-recover-pass-lane-dirt-spool",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-13T09:08:16.734000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T09:08:16.546000Z"
+  "updated_at": "2026-07-13T09:08:16.734000Z"
 }
