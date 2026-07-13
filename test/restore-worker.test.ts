@@ -463,6 +463,20 @@ test("buildRestoreTier stamps resume_target as the session UUID (job_id), indepe
   ).toBe("sess-abc");
 });
 
+test("buildRestoreTier rejects an unregistered harness", () => {
+  const jobs: Job[] = [
+    fakeJob({
+      job_id: "retired",
+      backend_exec_session_id: "s1",
+      harness: "hermes",
+      resume_target: "legacy-target",
+    }),
+  ];
+  expect(() => buildRestoreTier(jobs, new Map(), 1000)).toThrow(
+    "unknown harness 'hermes'",
+  );
+});
+
 test("buildRestoreTier sets captured_at on the tier shape (empty live set)", () => {
   const out = buildRestoreTier([], new Map(), 1234);
   expect(out.captured_at).toBe(1234);

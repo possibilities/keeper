@@ -139,6 +139,18 @@ test("buildResumeCommand: the claude arm carries no --x- launcher-alias flag", (
   expect(cmd).not.toMatch(/--x-/);
 });
 
+test("resume descriptors reject unregistered harnesses instead of rendering commands", () => {
+  const job = fixtureJob({
+    job_id: "legacy-job",
+    harness: "codex",
+    resume_target: "legacy-target",
+  });
+  expect(() => resumeTarget(job)).toThrow("unknown harness 'codex'");
+  expect(() =>
+    buildResumeCommand("/repo", "legacy-target", null, "hermes"),
+  ).toThrow("unknown harness 'hermes'");
+});
+
 test("tierForJobFromEpics resolves the tier for a work job whose epic is in the map", () => {
   const epic = fixtureEpic({
     epic_id: "fn-677-restore-previous-session",

@@ -338,7 +338,7 @@ test("pi: a session drifted onto a DIFFERENT cwd dir is still found by the sessi
   });
   expect(res).toEqual({ kind: "resumable" });
 });
-test("non-claude with an empty resume target is not-resumable (no artifact to name)", () => {
+test("pi with an empty resume target is not-resumable (no artifact to name)", () => {
   const fs = makeFakeFs({ files: {} });
   const res = resolveNonClaudeArtifact(fs, {
     harness: "pi",
@@ -348,6 +348,19 @@ test("non-claude with an empty resume target is not-resumable (no artifact to na
     env: {},
   });
   expect(res.kind).toBe("not-resumable");
+});
+
+test("the non-Claude artifact resolver rejects an unregistered harness", () => {
+  const fs = makeFakeFs({ files: {} });
+  expect(() =>
+    resolveNonClaudeArtifact(fs, {
+      harness: "codex" as "pi",
+      resumeTarget: "legacy-target",
+      cwd: "/repo",
+      homeDir: HOME,
+      env: {},
+    }),
+  ).toThrow("unknown harness 'codex'");
 });
 // ---------------------------------------------------------------------------
 // makeResumeResolver — the candidate → verdict seam
@@ -395,4 +408,12 @@ test("makeResumeResolver routes claude to disk anchoring and non-claude to the g
       harness: "pi",
     }).kind,
   ).toBe("not-resumable");
+  expect(() =>
+    resolver({
+      job_id: "retired",
+      resume_target: "legacy-target",
+      cwd: B,
+      harness: "hermes",
+    }),
+  ).toThrow("unknown harness 'hermes'");
 });

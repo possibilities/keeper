@@ -1327,7 +1327,7 @@ test("buildKeeperAgentLaunchArgv: a wrapped-cell work launch carries the marker 
   expect(cellIdx).toBeLessThan(argv.indexOf("--permission-mode"));
 });
 
-test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and argv-safe", () => {
+test("buildKeeperAgentLaunchArgv: exact attempt metadata is emitted for Claude and Pi", () => {
   const base = {
     launcherArgvPrefix: ["/bun", "/keeper.ts", "agent"],
     session: "work",
@@ -1343,11 +1343,25 @@ test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and
   expect(
     pi.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
   ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
-  expect(
-    buildKeeperAgentLaunchArgv({ ...base, harness: "codex" }).some((arg) =>
-      arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
-    ),
-  ).toBe(false);
+});
+
+test("buildKeeperAgentLaunchArgv: empty harness remains Claude; unregistered harnesses are rejected", () => {
+  const base = {
+    launcherArgvPrefix: LAP,
+    session: "agentbus",
+    prompt: "",
+    resumeTarget: "session-1",
+    noConfirm: true,
+  } as const;
+  expect(buildKeeperAgentLaunchArgv({ ...base, harness: "" })).toEqual(
+    buildKeeperAgentLaunchArgv(base),
+  );
+  expect(() =>
+    buildKeeperAgentLaunchArgv({ ...base, harness: "codex" }),
+  ).toThrow("unknown harness 'codex'");
+  expect(() =>
+    buildKeeperAgentLaunchArgv({ ...base, harness: "hermes" }),
+  ).toThrow("unknown harness 'hermes'");
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {
@@ -1493,6 +1507,32 @@ test("fixture-fed keeperAgentLaunch: exit 0 + real stdout → ok (full launch→
     spawn,
   });
   expect(res).toEqual({ ok: true });
+});
+
+test("keeperAgentLaunch: an unregistered harness fails before spawn", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const warnings: string[] = [];
+  const spawn = makeKeeperAgentSpawnStub(
+    LAP,
+    { stdout: KEEPER_AGENT_FIXTURE_STDOUT, exitCode: 0 },
+    records,
+  );
+  const res = await keeperAgentLaunch({
+    noteLine: (line) => warnings.push(line),
+    launcherArgvPrefix: LAP,
+    session: "agentbus",
+    cwd: "/repo",
+    label: "retired resume",
+    spec: { prompt: "", resumeTarget: "old-session", harness: "codex" },
+    spawn,
+  });
+  expect(res).toEqual({
+    ok: false,
+    error:
+      "keeper agent launch rejected for retired resume: unknown harness 'codex'",
+  });
+  expect(records).toEqual([]);
+  expect(warnings.join("\n")).toContain("unknown harness 'codex'");
 });
 
 test("KEEPER_AGENT_TMUX_EXIT mirrors keeper agent's landed TMUX_EXIT taxonomy (1/2/3/4) and maps to the right outcome class", () => {

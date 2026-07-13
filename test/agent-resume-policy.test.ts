@@ -3,8 +3,8 @@
  * resume-by-name policy layer over the bus's `resolveTarget`.
  * Seeds synthetic `jobs` rows into a `freshMemDb` clone (mirroring
  * `test/bus-identity.test.ts`'s `seedJob` shape) plus `harness` /
- * `resume_target` / `cwd`. Every liveness / codex-back-fill probe is injected
- * via `ResumePolicyDeps` — no real pid, subprocess, or filesystem read.
+ * `resume_target` / `cwd`. Every liveness probe is injected via
+ * `ResumePolicyDeps` — no real pid, subprocess, or filesystem read.
  */
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
@@ -228,4 +228,17 @@ test("a NULL harness column normalizes to claude", () => {
   const result = resolveResumeDecision("xi", db, undefined, deps());
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") expect(result.harness).toBe("claude");
+});
+
+test("an unregistered stored harness fails resolution normally", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-retired",
+    title: "old-agent",
+    harness: "hermes",
+    resume_target: "legacy-target",
+  });
+  expect(() =>
+    resolveResumeDecision("old-agent", db, undefined, deps()),
+  ).toThrow("unknown harness 'hermes'");
 });

@@ -60,7 +60,8 @@
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
  * wall-clock outside the injected `now`. Empty inputs (first boot, zero killed
- * rows) return cleanly — never throw.
+ * rows) return cleanly. An unregistered non-empty harness fails the derivation
+ * before any restore plan can be returned.
  */
 
 import type { Database } from "bun:sqlite";
@@ -195,11 +196,10 @@ export interface RestoreSetResult {
    *  cutoff (a false-negative risk we make visible — never a silent drop). */
   excludedIdleCount: number;
   /**
-   * Count of ADOPTED jobs (`jobs.adopted = 1` — a non-launcher mint or
-   * an adopted codex rollout) dropped from candidacy ONLY because they carry no
-   * backend coords (coordless-by-design for codex; harness-agnostic here). Surfaced
-   * like {@link excludedIdleCount} so an adopted session keeper cannot auto-restore
-   * is VISIBLE, never a silent drop. Classification keys on coord-absence PLUS the
+   * Count of ADOPTED jobs (`jobs.adopted = 1` — a non-launcher mint) dropped from
+   * candidacy ONLY because they carry no backend coords. Surfaced like
+   * {@link excludedIdleCount} so an adopted session keeper cannot auto-restore is
+   * VISIBLE, never a silent drop. Classification keys on coord-absence PLUS the
    * marker — a coordless NON-adopted row keeps today's silent skip (never counted).
    */
   adoptedCoordlessSkipCount: number;
@@ -543,8 +543,8 @@ function loadRows(db: Database): {
  * idle cutoff), and visual-order sort — folded into one read.
  *
  * Empty / zero-killed inputs return `{ candidates: [], excludedIdleCount: 0 }`
- * cleanly. Never throws on data; a malformed `window_index` coerces to "unknown
- * order" (tail) rather than poisoning the sort.
+ * cleanly. Malformed structural values such as `window_index` coerce safely; an
+ * unregistered harness throws so no partial restore plan can escape.
  */
 export function deriveRestoreSet(
   db: Database,
@@ -600,6 +600,9 @@ function collectCrashCandidates(
     if (!isCrashLike(row.close_kind, inBurst)) {
       continue; // user-closed, or isolated unknown/legacy — not a candidate.
     }
+    // Validate before any per-candidate filter so an unsupported row cannot be
+    // hidden inside an otherwise actionable partial restore set.
+    const harness = harnessOrClaude(row.harness);
     // Filter: no backend coords ⇒ nothing to replay. An ADOPTED coordless row
     // (for example, when keeper never resolved coordinates) is
     // COUNTED and surfaced rather than silently dropped; a non-adopted coordless
@@ -619,7 +622,6 @@ function collectCrashCandidates(
     ) {
       continue;
     }
-    const harness = harnessOrClaude(row.harness);
     const nativeTarget = resumeTarget({
       job_id: jobId,
       harness: row.harness,
@@ -1363,7 +1365,7 @@ function readGenerationSnapshotsDesc(
  * A coordless job never reaches here as a pane: {@link extractTmuxTopologySnapshot}
  * drops any pane with an empty `session_name`, so the no-coords guard below is a
  * defensive backstop, not the adopted-coordless surface. Coordless ADOPTED jobs
- * (codex-by-design) carry no pane at all and are surfaced by the retrospective
+ * carry no pane at all and are surfaced by the retrospective
  * {@link collectCrashCandidates} path (`adoptedCoordlessSkipCount`), which the
  * topology deriver's fallback carries through.
  */
@@ -1386,6 +1388,7 @@ function buildCandidatesFromSnapshot(
     if (row === null) {
       continue; // job row gone — nothing to resume.
     }
+    const harness = harnessOrClaude(row.harness);
     // Idempotence filters reused VERBATIM from collectCrashCandidates.
     if (
       row.dispatch_origin === "autopilot" &&
@@ -1393,7 +1396,6 @@ function buildCandidatesFromSnapshot(
     ) {
       continue;
     }
-    const harness = harnessOrClaude(row.harness);
     const nativeTarget = resumeTarget({
       job_id: jobId,
       harness: row.harness,
@@ -1401,7 +1403,7 @@ function buildCandidatesFromSnapshot(
     });
     const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
     //  - already live under this Keeper id OR native conversation ⇒ restoring
-    //    would double-spawn, even when two job rows adopted one Codex rollout.
+    //    would double-spawn, even when two job rows point at one Pi session.
     if (
       liveJobIds.has(jobId) ||
       (nativeIdentity !== null && liveResumeIdentities.has(nativeIdentity))

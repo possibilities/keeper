@@ -597,7 +597,7 @@ test("deriveRestoreSet: a NULL harness reads as claude and resumes by job_id", (
   expect(c?.harness).toBe("claude");
   expect(c?.resume_target).toBe("legacy-uuid");
 });
-test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED but not-resumable", () => {
+test("deriveRestoreSet: a Pi candidate with no resume_target is LISTED but not-resumable", () => {
   // The rest of the generation still restores — the not-resumable agent is
   // surfaced (an empty resume_target), never dropped.
   seedJob(kdb.db, {
@@ -620,6 +620,22 @@ test("deriveRestoreSet: a non-claude candidate with no resume_target is LISTED b
   const pi = res.candidates.find((c) => c.job_id === "pi-no-target");
   expect(pi?.resume_target).toBe("");
   expect(isRestorableCandidate(pi as RestoreCandidate)).toBe(false);
+});
+
+test("deriveRestoreSet rejects an unregistered harness before returning a partial set", () => {
+  seedJob(kdb.db, {
+    job_id: "claude-ok",
+    close_kind: "server_gone",
+  });
+  seedJob(kdb.db, {
+    job_id: "retired-coordless",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "legacy-target",
+    backend_exec_session_id: null,
+    adopted: 1,
+  });
+  expect(() => derive()).toThrow("unknown harness 'codex'");
 });
 test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (not counted)", () => {
   seedJob(kdb.db, {

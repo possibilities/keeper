@@ -172,11 +172,27 @@ export type AgentOutcome =
  *    `"not-resumable"` with a reason.
  * The `--apply` path upgrades each `"would-restore"` to `"restored"` / `"failed"`.
  */
+function assertSupportedCandidateHarnesses(
+  candidates: readonly RestoreCandidate[],
+): void {
+  for (const candidate of candidates) {
+    harnessOrClaude(candidate.harness);
+  }
+}
+
+function assertSupportedPlanHarnesses(plan: readonly AgentOutcome[]): void {
+  assertSupportedCandidateHarnesses(plan.map((entry) => entry.candidate));
+}
+
 export function planRestore(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
   resolver: ResumeResolver = defaultResumeResolver,
 ): AgentOutcome[] {
+  // Validate the complete set before deriving any per-candidate policy. A stale
+  // unregistered harness rejects the restore as one ordinary failure; it cannot
+  // become a special not-resumable entry beside a partially actionable plan.
+  assertSupportedCandidateHarnesses(candidates);
   const out: AgentOutcome[] = [];
   for (const candidate of candidates) {
     if (
@@ -258,6 +274,8 @@ export async function applyRestore(
   ensureLaunched: EnsureLaunchedFn,
   sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
+  // Reject the whole externally supplied plan before the first process launch.
+  assertSupportedPlanHarnesses(plan);
   const out: AgentOutcome[] = [];
   let launched = 0;
   for (const entry of plan) {
@@ -369,6 +387,9 @@ export async function applyRestoreVerified(
   plan: AgentOutcome[],
   deps: VerifiedApplyDeps,
 ): Promise<AgentOutcome[]> {
+  // Reject the whole externally supplied plan before writing an intent or
+  // launching a process; unsupported rows never produce a partial restore.
+  assertSupportedPlanHarnesses(plan);
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
   const out: Promise<AgentOutcome>[] = [];
@@ -693,6 +714,7 @@ export function renderSnapshotScript(
   const excludedManagedCount = options.excludedManagedCount ?? 0;
   const resolver = options.resolver ?? defaultResumeResolver;
   const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
+  assertSupportedCandidateHarnesses(candidates);
   const included = candidates.filter(
     (c) =>
       sessionFilter === null || c.backend_exec_session_id === sessionFilter,

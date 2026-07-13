@@ -422,6 +422,35 @@ test("runWake: threads the creator's harness to the launch — claude by default
   expect(piCalls).toEqual([{ target: "pi-rollout-id", harness: "pi" }]);
 });
 
+test("runWake: an unregistered creator harness fails before launch", async () => {
+  let launched = false;
+  const notes: string[] = [];
+  const cooldowns = new Map<string, WakeCooldownRecord>();
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({
+          job_id: "retired",
+          harness: "codex",
+          resume_target: "legacy-target",
+        }),
+      ],
+      cooldowns,
+      noteLine: (line) => notes.push(line),
+      launch: async () => {
+        launched = true;
+        return { ok: true };
+      },
+    }),
+  );
+  expect(res.outcome).toBe("launch_failed");
+  expect(res.detail).toContain("unknown harness 'codex'");
+  expect(launched).toBe(false);
+  expect(cooldowns.get("retired")?.failures).toBe(1);
+  expect(notes.join("\n")).toContain("unknown harness 'codex'");
+});
+
 test("runWake: resume target is the creator's session UUID (job_id) even with no name", async () => {
   const launchArgs: { session: string; target: string; cwd: string }[] = [];
   const res = await runWake(

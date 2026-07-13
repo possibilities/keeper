@@ -1169,8 +1169,8 @@ test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wi
       fakeCandidate({ job_id: "pf", resume_target: "pf", cwd: "/stale" }),
       fakeCandidate({
         job_id: "nr",
-        harness: "codex",
-        resume_target: "cx",
+        harness: "pi",
+        resume_target: "pi-missing",
         cwd: "/repo",
       }),
     ],
@@ -1187,6 +1187,54 @@ test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wi
   expect((plan[1] as { fixCommand: string }).fixCommand).toBe(
     "# not resumable",
   );
+});
+
+test("planRestore rejects an unregistered harness before deriving a partial plan", () => {
+  let resolverCalls = 0;
+  const resolver: ResumeResolver = () => {
+    resolverCalls++;
+    return { kind: "resumable" };
+  };
+  expect(() =>
+    planRestoreRaw(
+      [
+        fakeCandidate({ job_id: "ok", resume_target: "ok" }),
+        fakeCandidate({
+          job_id: "retired",
+          harness: "hermes",
+          resume_target: "legacy-target",
+        }),
+      ],
+      null,
+      resolver,
+    ),
+  ).toThrow("unknown harness 'hermes'");
+  expect(resolverCalls).toBe(0);
+});
+
+test("applyRestore rejects an unregistered harness before any launch", async () => {
+  let launches = 0;
+  const plan: AgentOutcome[] = [
+    {
+      kind: "would-restore",
+      candidate: fakeCandidate({ job_id: "ok", resume_target: "ok" }),
+    },
+    {
+      kind: "would-restore",
+      candidate: fakeCandidate({
+        job_id: "retired",
+        harness: "codex",
+        resume_target: "legacy-target",
+      }),
+    },
+  ];
+  await expect(
+    applyRestore(plan, async () => {
+      launches++;
+      return { ok: true };
+    }),
+  ).rejects.toThrow("unknown harness 'codex'");
+  expect(launches).toBe(0);
 });
 
 test("renderOutcomes surfaces the preflight-failed stanza + summary note", () => {
@@ -1805,8 +1853,8 @@ function writePiSession(
   writeFileSync(join(dir, piFileName(uuid, createdAtMs)), "{}\n");
 }
 
-/** Insert a raw event row (all columns default NULL; overrides win) — mirrors the
- *  codex-resume harness so the reducer folds it exactly as MAIN would. */
+/** Insert a raw event row (all columns default NULL; overrides win) so the
+ *  reducer folds it exactly as MAIN would. */
 function insertRawEvent(
   db: Database,
   overrides: {

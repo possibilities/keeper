@@ -47,7 +47,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type HarnessName, harnessOrClaude } from "./agent/harness";
+import { harnessOrClaude } from "./agent/harness";
 
 /**
  * The injectable filesystem seam. Every method is TOTAL — a binding catches its
@@ -350,7 +350,7 @@ function claudeFixCommand(uuid: string, targets: string[]): string {
 
 /** Inputs for {@link resolveNonClaudeArtifact}. */
 export interface NonClaudeResolveInput {
-  harness: HarnessName;
+  harness: "pi";
   resumeTarget: string;
   cwd: string | null;
   homeDir: string;
@@ -366,21 +366,20 @@ export function resolveNonClaudeArtifact(
   fs: ResumeResolveFs,
   input: NonClaudeResolveInput,
 ): ResumeResolution {
-  const { harness, resumeTarget } = input;
-  if (resumeTarget === "") {
+  // Keep a runtime guard despite the narrow type: persisted rows and JavaScript
+  // callers are untrusted at this boundary. Only Pi has a non-Claude artifact
+  // store; an unregistered value is an ordinary unsupported-harness failure.
+  const harness = harnessOrClaude(input.harness);
+  if (harness !== "pi") {
+    throw new Error(`harness '${harness}' has no non-Claude resume resolver`);
+  }
+  if (input.resumeTarget === "") {
     return {
       kind: "not-resumable",
-      reason: `${harness} session has no resolved resume target`,
+      reason: "pi session has no resolved resume target",
     };
   }
-  if (harness === "pi") {
-    return piArtifact(fs, input);
-  }
-  // Claude never reaches here.
-  return {
-    kind: "not-resumable",
-    reason: `${harness} is not a non-Claude harness`,
-  };
+  return piArtifact(fs, input);
 }
 
 function piArtifact(

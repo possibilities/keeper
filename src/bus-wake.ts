@@ -359,6 +359,32 @@ export async function runWake(
       };
     }
 
+    const failLaunch = (error: string): WakeResult => {
+      const failures = (cd?.failures ?? 0) + 1;
+      deps.writeCooldown(sessionId, {
+        failures,
+        last_failure_ms: deps.now(),
+      });
+      note(`# warn: wake launch for ${sessionId} failed: ${error}`);
+      return {
+        outcome: "launch_failed",
+        sessionId,
+        detail: `launch failed: ${error}`,
+      };
+    };
+
+    // Resolve and validate the stored harness before mutating claim state or
+    // invoking the launch seam. NULL/empty remains Claude; an unregistered value
+    // follows the ordinary launch-failure path and cannot reach process creation.
+    let harness: ReturnType<typeof harnessOrClaude>;
+    let target: string;
+    try {
+      harness = harnessOrClaude(job.harness);
+      target = resumeTarget(job);
+    } catch (err) {
+      return failLaunch(err instanceof Error ? err.message : String(err));
+    }
+
     if (claim !== null && deps.requestResume !== undefined) {
       if (!deps.requestResume(claim)) {
         return {
@@ -370,25 +396,20 @@ export async function runWake(
     }
 
     const cwd = job.cwd ?? "";
-    const result = await launch(
-      AGENTBUS_EXEC_SESSION,
-      resumeTarget(job),
-      cwd,
-      harnessOrClaude(job.harness),
-      claim?.attempt_id ?? undefined,
-    );
+    let result: LaunchResult;
+    try {
+      result = await launch(
+        AGENTBUS_EXEC_SESSION,
+        target,
+        cwd,
+        harness,
+        claim?.attempt_id ?? undefined,
+      );
+    } catch (err) {
+      return failLaunch(err instanceof Error ? err.message : String(err));
+    }
     if (!result.ok) {
-      const failures = (cd?.failures ?? 0) + 1;
-      deps.writeCooldown(sessionId, {
-        failures,
-        last_failure_ms: deps.now(),
-      });
-      note(`# warn: wake launch for ${sessionId} failed: ${result.error}`);
-      return {
-        outcome: "launch_failed",
-        sessionId,
-        detail: `launch failed: ${result.error}`,
-      };
+      return failLaunch(result.error);
     }
 
     if (
