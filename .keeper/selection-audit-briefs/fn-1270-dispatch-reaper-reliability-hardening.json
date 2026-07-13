@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 6,
+        "insertions": 208
+      },
+      "done_summary": "Readiness reads now distinguish an ERROR frame (readinessDegraded) from a genuine empty result; a degraded tick defers dispatch, reaper slot-reclaim, and autoclose reaping while preserving grace state, and a fresh empty board still dispatches. Regression tests cover both paths in autopilot-worker.test.ts and autoclose-worker.test.ts. CLI audit (query.ts/watch.ts/autopilot.ts) found no analogous swallow-to-empty path.",
+      "input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+      "model": "opus",
+      "spec_chars": 3123,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/readiness-inputs.ts, src/reconcile-core.ts, src/autopilot-worker.ts, src/autoclose-worker.ts, test/autopilot-worker.test.ts, test/autoclose-worker.test.ts\n\n### Approach\n\nMake the readiness-input reader distinguish an ERROR frame from a genuinely-empty result\n(today `read()` coerces any non-result frame to `[]`, so a transient read error looks like\nan empty board). Surface it as a `degraded` marker on the loaded inputs (in-memory shape\nonly \u2014 no schema). A degraded tick DEFERS: reap/occupancy consumers (slot reclaim sweep,\nautoclose pulse) mint nothing and preserve their grace maps, and the dispatch pass skips\nthe cycle (the level-triggered reconciler re-runs next tick). A genuine empty set remains\na valid observation \u2014 a fresh board must still dispatch. This is the \"absence of an\nobservation is never resolution\" idiom the recover pass already uses, generalized to the\none input seam both reapers and the reconciler share.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/readiness-inputs.ts:79 \u2014 the read() coercion of non-result frames to []; the seam to change\n- src/autoclose-worker.ts:172 \u2014 the null-or-empty pane sweep skip; the deferral pattern to mirror\n- src/reconcile-core.ts:1791 \u2014 computeSlotOccupancy's existing livePaneIds===null degraded guard\n\n**Optional** (reference as needed):\n- src/reconcile-core.ts \u2014 EpicRecoverVerdict \"inconclusive\" DEFER idiom (non-result read frame)\n- cli/query.ts, cli/watch.ts, cli/autopilot.ts \u2014 audit for the same swallow-to-empty; report findings in Done summary, fix only if trivially local\n\n### Risks\n\n- The same read() feeds dispatch: a blanket empty\u2192skip would freeze a fresh board. Only the\n  ERROR case may defer; empty-result frames stay valid.\n- Skipping the dispatch pass on a degraded tick must not wedge: the reconciler is\n  level-triggered, so the retry is the next data_version tick \u2014 verify no consumer latches.\n\n### Test notes\n\nIn-process regression tests: an error frame on the jobs read \u2192 the tick defers (no reclaim\nclassification, no autoclose reaps, no new dispatch plans); an empty result frame \u2192 normal\ndispatch on a fresh board. Drive grace/clock via injected now; retryUntil for async.\n\n## Acceptance\n\n- [ ] An errored jobs/epics read marks the loaded readiness inputs degraded, and that tick performs no reap classification, no autoclose reap, and no new dispatch\n- [ ] A genuinely empty jobs result still dispatches ready work (fresh-board behavior unchanged)\n- [ ] Regression tests cover both paths in the fast suite\n\n## Done summary\nReadiness reads now distinguish an ERROR frame (readinessDegraded) from a genuine empty result; a degraded tick defers dispatch, reaper slot-reclaim, and autoclose reaping while preserving grace state, and a fresh empty board still dispatches. Regression tests cover both paths in autopilot-worker.test.ts and autoclose-worker.test.ts. CLI audit (query.ts/watch.ts/autopilot.ts) found no analogous swallow-to-empty path.\n## Evidence\n",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.1",
+      "tier": "high",
+      "title": "Degraded readiness reads defer"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 23,
+        "files_changed": 3,
+        "insertions": 174
+      },
+      "done_summary": "Extended computeSlotOccupancy with the ADR-0052 idle-slot reclaim arm: a stopped job with a live, turn-ended (started) pane past grace on a wanted slot is now reclaimed via the existing kill path, blast-capped at 5 per sweep; never-started/working/degraded-input rows stay unreclaimed.",
+      "input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+      "model": "opus",
+      "spec_chars": 3673,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/reconcile-core.ts, src/autopilot-worker.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nExtend computeSlotOccupancy (the existing slot reaper) with a new dead-classification arm\nper ADR 0052: a job with state=stopped whose backend is derived-idle (live pane, turn\nended) past an injectable grace, holding a slot another dispatch wants, is reclaimed via\nthe existing reclaimSlotPane\u2192killWindow path. Do NOT fork isStoppedJobLive or any shared\noccupancy predicate \u2014 the slot releases when the pane actually dies, keeping board\ndisplay, escalation-cap accounting, and autoclose byte-consistent. A working session is\nnever reclaimable (existing fail-safe test stays green). The arm inherits: a per-sweep\nblast cap (mirror autoclose), the null-livePaneIds conservative fallback (unknown\u2192alive),\na startup grace (a never-started row \u2014 active_since null \u2014 is not idle), and pane-identity\nre-verification at kill time (never signal a re-looked-up bare pid; reuse\nsrc/proc-starttime.ts discipline where processes are touched). The occupied-reason string\nmust stay stable across cycles (no growing age text) so the producer change-gate\nsuppresses re-emits.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/reconcile-core.ts:1784 \u2014 computeSlotOccupancy; the dead criterion at :1833 (graceElapsed && (provenDead || bare-shell)) this arm extends\n- src/reconcile-core.ts:1683 \u2014 SLOT_RECLAIM_GRACE_SEC + :1832 graceElapsed-from-updated_at idiom\n- src/reconcile-core.ts:1659 \u2014 isStoppedJobLive (read-only context: why an idle claude occupies today; do not modify)\n- src/autopilot-worker.ts:3775 \u2014 reclaimPaneId application; :8271 wiring to paneOps.killWindow\n- src/autoclose-worker.ts \u2014 the separate done-and-idle reaper + its blast cap; confirm remit disjointness, do not modify its behavior\n\n**Optional** (reference as needed):\n- src/types.ts \u2014 Job fields state/updated_at/active_since/worker_phase/backend_exec_pane_id (idleness is derived; no new column)\n- src/proc-starttime.ts \u2014 pid+start-time identity helper\n- test/autopilot-worker.test.ts:1056 \u2014 the slotInput() suite; working-is-healthy at :1192\n\n### Risks\n\n- Double-kill race with autoclose: benign only because killWindow no-ops on a dead pane \u2014\n  verify that, and confirm what bumps a stopped job's updated_at (a heartbeat that bumps it\n  would make the grace never elapse \u2014 the defect would silently persist).\n- Reclaiming a session about to resume: the grace plus wantsDispatch scoping is the guard;\n  never widen to slots nobody wants.\n\n### Test notes\n\nExtend the slotInput suite: stopped+idle-pane past grace + wanted slot \u2192 reclaim; within\ngrace \u2192 occupied; active_since null \u2192 never reclaimed; working \u2192 never; degraded inputs\n(task 1) \u2192 arm inert; blast cap honored across a many-zombie sweep.\n\n## Acceptance\n\n- [ ] A stopped, backend-idle keeper session past the grace on a wanted slot is reclaimed automatically and the slot dispatches\n- [ ] working sessions, never-started rows, within-grace rows, and degraded-input ticks are never reclaimed\n- [ ] A per-sweep blast cap bounds reclaims and the occupied-reason stays cycle-stable\n- [ ] No shared occupancy predicate is forked; existing occupancy/board/autoclose tests stay green\n\n## Done summary\nExtended computeSlotOccupancy with the ADR-0052 idle-slot reclaim arm: a stopped job with a live, turn-ended (started) pane past grace on a wanted slot is now reclaimed via the existing kill path, blast-capped at 5 per sweep; never-started/working/degraded-input rows stay unreclaimed.\n## Evidence\n",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.2",
+      "tier": "xhigh",
+      "title": "Idle-slot reclaim dead-arm"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 92,
+        "files_changed": 6,
+        "insertions": 138
+      },
+      "done_summary": "",
+      "input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+      "model": "gpt-5.5",
+      "spec_chars": 2690,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/readiness.ts, src/reconcile-core.ts, src/db.ts, test/readiness.test.ts\n\n### Approach\n\nFlip the worktree-mode branch of applyPerRootRoundRobinAllocator to honor the stored\nmax_concurrent_per_root while worktree mode is ON \u2014 N distinct lanes of one root may run\nconcurrently, each lane itself staying cap-1 \u2014 and floor to one when worktree mode is OFF,\nexactly as CONTEXT.md's Per-root cap entry specifies (the glossary is the spec; today's\ncode is the inverse). Verify the round-robin fill groups by true ROOT (rootKeyForRow),\nnot by lane, when lanes are present. Delete the stale \"hardcoded N=1 / carried but\nunconsumed\" comments in reconcile-core. Add a modest sanity clamp on the stored N at the\nread-time effective-cap seam (a fat-fingered set_autopilot_config must not flood\ndispatch). No schema change \u2014 the column and RPC patch field already exist.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/readiness.ts:1746 \u2014 the worktree-ON cap-1 forcing branch (the real defect); :1776 the N>1 round-robin fill; :1730 the allocator entry\n- src/readiness.ts:1376 \u2014 isRootOccupant/isLiveWorkOccupant (shared predicate; global-cap accounting at reconcile-core.ts:2067 loops it, so no drift if unforked)\n- src/db.ts:4532 \u2014 effectivePerRootCap (read-time derivation; clamp lands here)\n- src/reconcile-core.ts:844 and :1131 \u2014 the stale N=1 comments to delete\n\n**Optional** (reference as needed):\n- test/readiness.test.ts:2061 \u2014 the fn-954 allocator suite (N=2/N=3 already tested for the non-worktree path)\n\n### Risks\n\n- Raising effective concurrency un-serializes shared-checkout git ops and SQLite writes the\n  accidental cap-1 hid \u2014 the code change is small, but note the operational ramp guidance\n  (ADR 0052 consequences); do not add locking here.\n- N-per-lane instead of N-per-root would be a silent mis-fix \u2014 the grouping test is the guard.\n\n### Test notes\n\nfn-954-suite additions: worktree ON + N=2 \u2192 two distinct lanes of one root allocated, third\ndefers; each lane still cap-1; worktree OFF \u2192 floor-to-one regardless of stored N; clamp\ncaps an absurd stored N.\n\n## Acceptance\n\n- [ ] With worktree mode ON and stored cap 2, the allocator admits two distinct lanes of one root concurrently and defers the third; each lane stays cap-1\n- [ ] With worktree mode OFF the effective cap floors to one regardless of the stored value\n- [ ] The stored N is sanity-clamped at read time and the stale N=1 comments are gone\n- [ ] fn-954 allocator suite extended and green; no shared predicate forked\n\n## Done summary\n\n## Evidence\n",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.3",
+      "tier": "high",
+      "title": "Honor per-root cap under worktree"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 24,
+        "files_changed": 3,
+        "insertions": 646
+      },
+      "done_summary": "Recovery-only direct close: a producer-side probe (computeCloseRecoveryEligibleIds) proves an all-done epic's lane is positively an ancestor of local default, then the reconciler stamps the epic done directly via the plan CLI's epic close verb (recording an explicit CLOSE_RECOVERY_MARKER close_reason) instead of dispatching another closer, guarded single-flight + epicHasOccupyingJob, idempotent, and retrying on a failed/timed-out shell without wedging.",
+      "input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+      "model": "opus",
+      "spec_chars": 3835,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, src/reconcile-core.ts, test/autopilot-worker.test.ts\n\n### Approach\n\nRecovery-only direct close per ADR 0052: a producer-side probe (mirroring the recover\npass \u2014 the pure reconcile core only reads the resulting snapshot fact) detects an epic\nwhere (a) every task is done, (b) the epic lane is POSITIVELY an ancestor of the local\ndefault branch (absence is never evidence; worktree-OFF epics never qualify), and (c) at\nleast one prior closer session finished without landing the terminal stamp. For such an\nepic the close path lands the stamp directly by shelling the plan CLI's epic close verb\n(the daemon never writes plan state) instead of dispatching another closer \u2014 single-flight\nbehind the same per-epic in-flight dedup the closer dispatch uses, guarded by\nepicHasOccupyingJob (never stamp under a live closer \u2014 ADR 0031 hazard), recording an\nexplicit recovery marker so the audit bypass is visible and auditable. Subprocess\nfailure/timeout logs and retries next cycle (level-triggered); the stamp is idempotent\nagainst an already-closed epic.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/reconcile-core.ts:2300 \u2014 the close-row dispatch site + okToPlan gate; per-epic inFlight dedup at :2325\n- src/reconcile-core.ts:1919 \u2014 closerJobFinished; :1575 epicHasOccupyingJob\n- src/autopilot-worker.ts:8547 \u2014 the recover pass producer step to mirror; :8568 epicRecoverVerdictById; :196 gitIsAncestorOf; :8462 emitLaneMerged / lane_merged projection\n- plugins/plan/src/verbs/epic_close.ts and close_finalize.ts \u2014 the stamp semantics being emulated (\"epic close is NEVER called twice\"; confirm the already-done response is a safe no-op)\n\n**Optional** (reference as needed):\n- src/reconcile-core.ts:1355 \u2014 finalizeEpic's idempotent skip of an already-merged base\n- test/reconcile-core-depgraph.test.ts \u2014 the import boundary the pure core must keep\n\n### Risks\n\n- Audit bypass creep: the trigger MUST require prior-closer-finished-without-stamp evidence;\n  a done+merged epic with no closer history dispatches a normal closer (the audit pipeline\n  is the default path, always).\n- The daemon\u2192plan-CLI shell is a new coupling: bound its runtime, never block the cycle on\n  it, and treat a non-zero exit as retry-next-tick, not distress.\n\n### Test notes\n\nPure-core tests via injected snapshot facts: recovery conditions met \u2192 stamp planned (not a\ndispatch); missing any leg (task not done / no positive ancestor fact / no failed-closer\nhistory / occupying closer live / worktree OFF) \u2192 normal closer dispatch; stamp single-flight\nacross cycles; degraded tick (task 1) \u2192 inert.\n\n## Acceptance\n\n- [ ] An all-done epic with positive lane-merged evidence and a prior closer that finished without stamping closes via the recovery stamp, with the recovery marker recorded\n- [ ] Any epic missing one of the three recovery legs (or worktree OFF, or a live occupying closer) dispatches the normal closer \u2014 the audit pipeline remains the default path\n- [ ] The stamp is single-flight, idempotent against already-closed, and a failed shell retries next cycle without wedging\n- [ ] Pure-core import boundary preserved (probe is producer-side; reconcile reads a snapshot fact)\n\n## Done summary\nRecovery-only direct close: a producer-side probe (computeCloseRecoveryEligibleIds) proves an all-done epic's lane is positively an ancestor of local default, then the reconciler stamps the epic done directly via the plan CLI's epic close verb (recording an explicit CLOSE_RECOVERY_MARKER close_reason) instead of dispatching another closer, guarded single-flight + epicHasOccupyingJob, idempotent, and retrying on a failed/timed-out shell without wedging.\n## Evidence\n",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.4",
+      "tier": "xhigh",
+      "title": "Close recovery stamp"
+    }
+  ],
+  "created_at": "2026-07-13T07:36:25.778000Z",
+  "epic_id": "fn-1270-dispatch-reaper-reliability-hardening",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
