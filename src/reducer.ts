@@ -246,18 +246,23 @@ function extractInputRequestKind(event: Event): InputRequestKind {
 }
 
 /**
- * Parse the `disposition` out of a `SubagentTurn` event's `data` blob. Returns
- * `'cut'` | `'clean'` for the two canonical values, `null` for a malformed blob
- * or any other string (the fold treats `null` as a safe no-op, never throwing
- * inside the transaction). Only `'cut'` and `'clean'` are recognized — a
- * forward-compat disposition string folds to `null` rather than a misclassified
- * cut.
+ * Parse a `SubagentTurn` disposition and its settlement bit. Missing settlement
+ * defaults true for replay compatibility; explicit `false` remains provisional
+ * and cannot drive a lifecycle transition. Malformed values return `null`.
  */
-function extractSubagentDisposition(event: Event): SubagentDisposition | null {
+function extractSubagentDisposition(
+  event: Event,
+): { disposition: SubagentDisposition; settled: boolean } | null {
   try {
-    const parsed = JSON.parse(event.data) as { disposition?: unknown };
+    const parsed = JSON.parse(event.data) as {
+      disposition?: unknown;
+      settled?: unknown;
+    };
     const raw = parsed?.disposition;
-    return raw === "cut" || raw === "clean" ? raw : null;
+    if (raw !== "cut" && raw !== "clean") {
+      return null;
+    }
+    return { disposition: raw, settled: parsed.settled !== false };
   } catch {
     return null;
   }
@@ -6142,15 +6147,16 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       // Synthetic event (transcript worker → main): the terminal disposition of
       // a subagent's most recent assistant turn. Stamp it onto the row so the
       // SubagentStop fold can recognize a SILENT_STREAM_CUT. `agent_id` carries
-      // the subagent identity; `data.disposition` is 'cut' | 'clean'.
+      // the subagent identity; provisional (`settled:false`) evidence is inert.
       const agentId = event.agent_id;
       if (agentId == null || agentId.length === 0) {
         return; // no subagent identity — safe no-op.
       }
-      const disposition = extractSubagentDisposition(event);
-      if (disposition == null) {
-        return; // malformed/unknown disposition — safe no-op.
+      const evidence = extractSubagentDisposition(event);
+      if (evidence == null || !evidence.settled) {
+        return;
       }
+      const disposition = evidence.disposition;
       // Stamp the LATEST turn for this (job_id, agent_id) — open or just-closed.
       // Targeting max(turn_seq) (NOT only the open turn) makes the stamp
       // race-tolerant: a `SubagentTurn` landing AFTER SubagentStop closed the

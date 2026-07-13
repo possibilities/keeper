@@ -211,6 +211,47 @@ export function isOpenTurnRow(row: {
   return row.duration_ms == null && OPEN_TURN_STATUSES.has(row.status);
 }
 
+export function canonicalSubagentInvocations<
+  T extends {
+    job_id?: unknown;
+    agent_id?: unknown;
+    turn_seq?: unknown;
+    subagent_type?: unknown;
+  },
+>(rows: readonly T[]): T[] {
+  const groups = new Map<string, T>();
+  const malformed: T[] = [];
+  for (const row of rows) {
+    if (
+      typeof row.job_id !== "string" ||
+      typeof row.agent_id !== "string" ||
+      typeof row.turn_seq !== "number" ||
+      !Number.isFinite(row.turn_seq) ||
+      !(typeof row.subagent_type === "string" || row.subagent_type == null)
+    ) {
+      malformed.push(row);
+      continue;
+    }
+    const key = `${row.job_id}\x00${row.subagent_type ?? ""}`;
+    const prior = groups.get(key);
+    if (
+      prior === undefined ||
+      (row.turn_seq as number) > (prior.turn_seq as number) ||
+      ((row.turn_seq as number) === (prior.turn_seq as number) &&
+        (row.agent_id as string) < (prior.agent_id as string))
+    ) {
+      groups.set(key, row);
+    }
+  }
+  const canonical = [...groups.values()];
+  canonical.sort((a, b) => {
+    const aKey = `${a.job_id as string}\x00${a.subagent_type ?? ""}\x00${a.agent_id as string}`;
+    const bKey = `${b.job_id as string}\x00${b.subagent_type ?? ""}\x00${b.agent_id as string}`;
+    return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+  });
+  return canonical.concat(malformed);
+}
+
 /**
  * Liveness decision for the reducer's Stop + ApiError/RateLimited guards: should
  * the parent job's state flip be SUPPRESSED because a fresh in-flight subagent is

@@ -30,11 +30,11 @@ import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
 import { orderEpicsForScheduling, type PendingDispatch } from "./readiness";
 import {
-  collapseSubagentsByName,
   projectGitStatusByProjectDir,
   projectPendingDispatches,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
+import { canonicalSubagentInvocations } from "./subagent-invocations";
 import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 
 export type ReadinessQuery = typeof runQuery;
@@ -131,9 +131,9 @@ export function loadReadinessInputs(
     jobs.set(row.job_id, row);
   }
 
-  const subagentInvocations = collapseSubagentsByName(
+  const subagentInvocations = canonicalSubagentInvocations(
     read("subagent_invocations") as unknown as SubagentInvocation[],
-  ).map((g) => g.row);
+  );
 
   const gitStatusByProjectDir = projectGitStatusByProjectDir(
     read("git") as unknown as GitStatus[],

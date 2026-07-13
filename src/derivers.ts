@@ -374,23 +374,48 @@ export function extractBackgroundTasks(
  * SessionEnd / Killed) yields `false` — so a terminal job auto-resolves
  * the fact to `false` for free, riding the existing `monitors='[]'` clear.
  */
-export function hasLiveWorkerMonitor(monitorsJson: string): boolean {
+export type MonitorActivity = "none" | "ambient" | "worker" | "malformed";
+
+export function classifyMonitorActivity(
+  monitorsJson: unknown,
+): MonitorActivity {
+  if (monitorsJson == null) {
+    return "none";
+  }
+  if (typeof monitorsJson !== "string") {
+    return "malformed";
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(monitorsJson);
   } catch {
-    return false;
+    return "malformed";
   }
   if (!Array.isArray(parsed)) {
-    return false;
+    return "malformed";
   }
-  return parsed.some(
-    (entry) =>
-      entry != null &&
-      typeof entry === "object" &&
-      (entry as { kind?: unknown }).kind !== "ambient" &&
-      typeof (entry as { kind?: unknown }).kind === "string",
-  );
+  let ambient = false;
+  let worker = false;
+  for (const entry of parsed) {
+    if (entry == null || typeof entry !== "object") {
+      return "malformed";
+    }
+    const kind = (entry as { kind?: unknown }).kind;
+    if (kind === "monitor" || kind === "bash-bg") {
+      worker = true;
+      continue;
+    }
+    if (kind === "ambient") {
+      ambient = true;
+      continue;
+    }
+    return "malformed";
+  }
+  return worker ? "worker" : ambient ? "ambient" : "none";
+}
+
+export function hasLiveWorkerMonitor(monitorsJson: string): boolean {
+  return classifyMonitorActivity(monitorsJson) === "worker";
 }
 
 /**

@@ -7,6 +7,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  classifyMonitorActivity,
   extractBackgroundTaskId,
   extractBackgroundTasks,
   extractBashMutation,
@@ -18,6 +19,10 @@ import {
   planVerbRefFromSpawnName,
   REPO_TOKEN_RE,
 } from "../src/derivers";
+import {
+  deriveHarnessActivity,
+  type HarnessActivity,
+} from "../src/session-activity";
 
 // Minimal helper to build a PostToolUse:Bash deriver call shape.
 function bashMutation(command: string, cwd: string | null = "/repo") {
@@ -28,6 +33,194 @@ function bashMutation(command: string, cwd: string | null = "/repo") {
     cwd,
   );
 }
+
+// ---------------------------------------------------------------------------
+// Harness activity
+// ---------------------------------------------------------------------------
+
+test("Harness activity derives active, quiescent, and unknown without conflating reservations", () => {
+  const openChild = {
+    job_id: "job",
+    agent_id: "child",
+    turn_seq: 0,
+    subagent_type: "Explore",
+    status: "running",
+    duration_ms: null,
+    updated_at: 990,
+  };
+  const cases = [
+    {
+      name: "Claude main turn",
+      input: { parent: { job_id: "job", state: "working" } },
+      expected: { status: "active", reason: "main-turn", reservation: null },
+    },
+    {
+      name: "Pi attributable open child",
+      input: {
+        parent: { job_id: "job", state: "stopped" },
+        children: [openChild],
+        now: 1_000,
+      },
+      expected: { status: "active", reason: "open-child", reservation: null },
+    },
+    {
+      name: "ambient bus resource",
+      input: {
+        parent: {
+          job_id: "job",
+          state: "stopped",
+          updated_at: 1_000,
+          monitors: JSON.stringify([{ id: "bus", kind: "ambient" }]),
+        },
+      },
+      expected: {
+        status: "quiescent",
+        reason: "ambient-resource",
+        reservation: null,
+      },
+    },
+    {
+      name: "worker monitor",
+      input: {
+        parent: {
+          job_id: "job",
+          state: "stopped",
+          updated_at: 990,
+          monitors: JSON.stringify([{ id: "build", kind: "monitor" }]),
+        },
+        now: 1_000,
+      },
+      expected: {
+        status: "active",
+        reason: "worker-resource",
+        reservation: null,
+      },
+    },
+    {
+      name: "stale child evidence",
+      input: {
+        parent: { job_id: "job", state: "stopped" },
+        children: [{ ...openChild, updated_at: 100 }],
+        now: 1_000,
+      },
+      expected: {
+        status: "unknown",
+        reason: "child-evidence-stale",
+        reservation: null,
+      },
+    },
+    {
+      name: "one fresh child keeps multiple open children active",
+      input: {
+        parent: { job_id: "job", state: "stopped" },
+        children: [
+          { ...openChild, agent_id: "stale", updated_at: 100 },
+          {
+            ...openChild,
+            agent_id: "fresh",
+            subagent_type: "Plan",
+            updated_at: 990,
+          },
+        ],
+        now: 1_000,
+      },
+      expected: { status: "active", reason: "open-child", reservation: null },
+    },
+    {
+      name: "malformed child evidence",
+      input: {
+        parent: { job_id: "job", state: "stopped" },
+        children: [{ ...openChild, updated_at: "bad" }],
+      },
+      expected: {
+        status: "unknown",
+        reason: "child-evidence-incomplete",
+        reservation: null,
+      },
+    },
+    {
+      name: "launch reservation",
+      input: { parent: null, reservation: "launch" as const },
+      expected: {
+        status: "unknown",
+        reason: "parent-missing",
+        reservation: "launch",
+      },
+    },
+    {
+      name: "bound reservation",
+      input: {
+        parent: { job_id: "job", state: "stopped" },
+        reservation: "bound" as const,
+      },
+      expected: {
+        status: "quiescent",
+        reason: "parent-quiescent",
+        reservation: "bound",
+      },
+    },
+    {
+      name: "terminal parent overrides orphan child",
+      input: {
+        parent: { job_id: "job", state: "ended" },
+        children: [openChild],
+      },
+      expected: {
+        status: "quiescent",
+        reason: "parent-terminal",
+        reservation: null,
+      },
+    },
+  ];
+  for (const c of cases) {
+    expect({ name: c.name, result: deriveHarnessActivity(c.input) }).toEqual({
+      name: c.name,
+      result: c.expected as HarnessActivity,
+    });
+  }
+});
+
+test("Harness activity chooses the canonical latest child and rejects malformed monitor provenance", () => {
+  const result = deriveHarnessActivity({
+    parent: { job_id: "job", state: "stopped", updated_at: 1_000 },
+    children: [
+      {
+        job_id: "job",
+        agent_id: "old",
+        turn_seq: 0,
+        subagent_type: "Explore",
+        status: "running",
+        duration_ms: null,
+        updated_at: 100,
+      },
+      {
+        job_id: "job",
+        agent_id: "new",
+        turn_seq: 1,
+        subagent_type: "Explore",
+        status: "ok",
+        duration_ms: 10,
+        updated_at: 1_000,
+      },
+    ],
+    now: 1_000,
+  });
+  expect(result).toEqual({
+    status: "quiescent",
+    reason: "parent-quiescent",
+    reservation: null,
+  });
+  expect(classifyMonitorActivity('[{"kind":"future"}]')).toBe("malformed");
+  expect(
+    deriveHarnessActivity({
+      parent: { job_id: "job", state: "stopped", monitors: "not-json" },
+    }),
+  ).toEqual({
+    status: "unknown",
+    reason: "resource-evidence-incomplete",
+    reservation: null,
+  });
+});
 
 // ---------------------------------------------------------------------------
 // parsePlanRef

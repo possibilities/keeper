@@ -42,6 +42,7 @@ import {
   matchSubagentTurn,
   scanJobsForTitles,
   seedFromDb,
+  settleClosedSubagentTurns,
   TRANSCRIPT_REARM_FLAP_GUARD_MS,
   TranscriptLineStream,
 } from "../src/transcript-worker";
@@ -1330,6 +1331,7 @@ function subagentTurnLine(
     isSidechain: true,
     agentId,
     sessionId,
+    requestId: `req-${agentId}`,
     message,
   });
 }
@@ -1341,7 +1343,9 @@ test("matchSubagentTurn: stop_reason='tool_use' is a cut (SILENT_STREAM_CUT sign
   expect(m).toEqual({
     sessionId: "sess",
     agentId: "agent-abc",
+    invocationId: "req-agent-abc",
     disposition: "cut",
+    settled: false,
   });
 });
 
@@ -1359,7 +1363,9 @@ test("matchSubagentTurn: stop_reason='end_turn' is clean (negative control)", ()
   expect(m).toEqual({
     sessionId: "sess",
     agentId: "agent-abc",
+    invocationId: "req-agent-abc",
     disposition: "clean",
+    settled: true,
   });
 });
 
@@ -1420,7 +1426,7 @@ test('subagent-turn needle: the `"agentId":` pre-filter pins to subagent lines o
   expect(parentToolUse.includes('"agentId":')).toBe(false);
 });
 
-test("TranscriptLineStream routes a subagent cut turn to onSubagentTurn", () => {
+test("TranscriptLineStream keeps a cut provisional until invocation settlement", () => {
   const path = join(tmpDir, "agent-abc.jsonl");
   writeFileSync(path, "");
   const seen: Array<{
@@ -1442,9 +1448,111 @@ test("TranscriptLineStream routes a subagent cut turn to onSubagentTurn", () => 
     `${subagentTurnLine("sess", "agent-abc", "tool_use")}\n`,
   );
   stream.onChange(path);
+  expect(seen).toEqual([]);
+  expect(stream.settleSubagentTurn("sess", "agent-abc")).toBe(true);
   expect(seen).toEqual([
     { sessionId: "sess", agentId: "agent-abc", disposition: "cut" },
   ]);
+  expect(stream.settleSubagentTurn("sess", "agent-abc")).toBe(false);
+});
+
+test("a closed invocation is the positive boundary that settles a true cut", () => {
+  const { db } = freshMemDb();
+  try {
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, updated_at, state) VALUES ('sess', 1, 1, 'working')",
+    );
+    db.run(
+      `INSERT INTO subagent_invocations
+         (job_id, agent_id, turn_seq, ts, status, duration_ms, last_event_id, updated_at)
+       VALUES ('sess', 'agent-cut', 0, 1, 'ok', 10, 1, 2)`,
+    );
+    const path = join(tmpDir, "agent-cut.jsonl");
+    writeFileSync(path, "");
+    const seen: SubagentDisposition[] = [];
+    const stream = new TranscriptLineStream(
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      (_sessionId, _agentId, disposition) => seen.push(disposition),
+    );
+    stream.register(path);
+    appendFileSync(
+      path,
+      `${subagentTurnLine("sess", "agent-cut", "tool_use")}\n`,
+    );
+    stream.onChange(path);
+    expect(settleClosedSubagentTurns(db, stream)).toBe(1);
+    expect(seen).toEqual(["cut"]);
+    expect(settleClosedSubagentTurns(db, stream)).toBe(0);
+  } finally {
+    db.close();
+  }
+});
+
+test("boundary scan sees a clean response even when its watcher event is delayed", () => {
+  const { db } = freshMemDb();
+  try {
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, updated_at, state) VALUES ('sess', 1, 1, 'working')",
+    );
+    db.run(
+      `INSERT INTO subagent_invocations
+         (job_id, agent_id, turn_seq, ts, status, duration_ms, last_event_id, updated_at)
+       VALUES ('sess', 'agent-lag', 0, 1, 'ok', 10, 1, 2)`,
+    );
+    const path = join(tmpDir, "agent-lag.jsonl");
+    writeFileSync(path, "");
+    const seen: SubagentDisposition[] = [];
+    const stream = new TranscriptLineStream(
+      () => {},
+      () => {},
+      () => {},
+      () => {},
+      (_sessionId, _agentId, disposition) => seen.push(disposition),
+    );
+    stream.register(path);
+    appendFileSync(
+      path,
+      `${subagentTurnLine("sess", "agent-lag", "tool_use")}\n`,
+    );
+    stream.onChange(path);
+    appendFileSync(
+      path,
+      `${subagentTurnLine("sess", "agent-lag", "end_turn")}\n`,
+    );
+    expect(settleClosedSubagentTurns(db, stream)).toBe(1);
+    expect(seen).toEqual(["clean"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("TranscriptLineStream clean settlement supersedes an intermediate cut", () => {
+  const path = join(tmpDir, "agent-clean.jsonl");
+  writeFileSync(path, "");
+  const seen: SubagentDisposition[] = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    (_sessionId, _agentId, disposition) => seen.push(disposition),
+  );
+  stream.register(path);
+  appendFileSync(
+    path,
+    `${subagentTurnLine("sess", "agent-clean", "tool_use")}\n`,
+  );
+  stream.onChange(path);
+  appendFileSync(
+    path,
+    `${subagentTurnLine("sess", "agent-clean", "end_turn")}\n`,
+  );
+  stream.onChange(path);
+  expect(seen).toEqual(["clean"]);
+  expect(stream.settleSubagentTurn("sess", "agent-clean")).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
