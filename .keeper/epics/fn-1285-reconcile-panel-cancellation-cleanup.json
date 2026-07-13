@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-13T21:45:01.669000Z",
+  "depends_on_epics": [
+    "fn-1277-autoclose-wrapped-provider-legs"
+  ],
+  "id": "fn-1285-reconcile-panel-cancellation-cleanup",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Reconcile panel cancellation cleanup",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-13T21:45:01.669000Z"
+}
