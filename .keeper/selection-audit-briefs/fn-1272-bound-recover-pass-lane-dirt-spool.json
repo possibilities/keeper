@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Bounded the recover-pass lane-dirt spool: backupThenForceRemoveWorktree now derives a stable per-lane snapshot id and reuses an existing snapshot dir instead of minting a fresh one each cycle, so a lane wedged in remove-failed accretes at most one snapshot + one index.ndjson record across repeated recover cycles. Page-once distress and level-clear semantics unchanged; added a regression test driving 3 repeated force-remove-failure cycles asserting the bound.",
+      "input_hash": "a661379e355789e148f0ef0af6b28c6c7f395662c28405b24d25ac774bec0075",
+      "model": "sonnet",
+      "spec_chars": 2184,
+      "spec_md": "## Description\n\nFix F3 (with TG1 folded in). In src/autopilot-worker.ts the recover-pass\ndirty-teardown branch (~L7168) calls gitBackupThenForceRemoveWorktree,\nand the tracker's consider({state:\"destroyable\"}) (src worktree-git tracker,\n~L1514) returns destroy:true on every post-grace cycle, so a lane wedged in\nremove-failed re-enters the backup-then-force path each reconcile cycle. In\nsrc/worktree-git.ts backupThenForceRemoveWorktree mints a fresh snapshotId\n(timestamp + uuid) dir, writes staged/unstaged patches + copies untracked\ndirt, appends one index.ndjson line, and on remove-failed returns without\nremoving snapshotDir (only the backup try/catch and backup-failed rm it) \u2014\nso each wedged cycle accretes a duplicate snapshot + index line unboundedly.\n\nBound it: reuse a stable per-lane snapshot id (or skip re-snapshotting once\na snapshot for this lane path already exists) so a persistently un-removable\nlane produces at most one snapshot + index record. Preserve the existing\npage-once distress and positive-evidence level-clear semantics, and keep a\ngenuinely re-tearable lane's teardown unchanged.\n\nFiles: src/autopilot-worker.ts (recover-pass dirty-teardown branch),\nsrc/worktree-git.ts (backupThenForceRemoveWorktree / remove-failed path).\n\n## Acceptance\n\n- [ ] A lane stuck in remove-failed yields at most one dirt snapshot + one\n      index.ndjson record across repeated recover cycles.\n- [ ] remove-failed no longer leaves an orphaned snapshot per cycle; the\n      page-once distress + level-clear behavior is unchanged.\n- [ ] A regression test drives repeated force-remove failures over multiple\n      recover cycles and asserts the spool stays bounded (folds in TG1).\n\n## Done summary\nBounded the recover-pass lane-dirt spool: backupThenForceRemoveWorktree now derives a stable per-lane snapshot id and reuses an existing snapshot dir instead of minting a fresh one each cycle, so a lane wedged in remove-failed accretes at most one snapshot + one index.ndjson record across repeated recover cycles. Page-once distress and level-clear semantics unchanged; added a regression test driving 3 repeated force-remove-failure cycles asserting the bound.\n## Evidence\n",
+      "task_id": "fn-1272-bound-recover-pass-lane-dirt-spool.1",
+      "tier": "xhigh",
+      "title": "Bound wedged-lane spool re-snapshot"
+    }
+  ],
+  "created_at": "2026-07-13T09:22:26.293000Z",
+  "epic_id": "fn-1272-bound-recover-pass-lane-dirt-spool",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "a661379e355789e148f0ef0af6b28c6c7f395662c28405b24d25ac774bec0075",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
