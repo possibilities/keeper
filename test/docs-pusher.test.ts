@@ -51,12 +51,8 @@ function lockPath(): string {
   return join(repo, ".git", "keeper-push.lock");
 }
 
-/** A pid that is certainly gone: spawn `true`, wait for it to exit, reuse its
- * pid. `process.kill(pid, 0)` then throws ESRCH, marking the lock reclaimable. */
-function findDeadPid(): number {
-  const proc = Bun.spawnSync(["true"]);
-  return proc.pid ?? 999_999;
-}
+const testPidAlive = (pid: number): boolean => pid === process.pid;
+const findDeadPid = (): number => 999_999;
 
 beforeEach(() => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), "keeper-docs-pusher-")));
@@ -122,7 +118,7 @@ function baseRules(
 describe("pushDocs — guards", () => {
   test("pushes when local is ahead of @{u}", () => {
     const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("pushed");
     // The push was actually issued (decision: push, not skip).
     expect(
       fake.calls.some((c) => argvStartsWith(c.args, "push", "--no-progress")),
@@ -133,13 +129,13 @@ describe("pushDocs — guards", () => {
 
   test("no-op when not ahead (0 commits) — no push issued", () => {
     const fake = fakePusherGit(baseRules("0"));
-    expect(pushDocs(repo, fake.run)).toBe("not-ahead");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("not-ahead");
     expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 
   test("no-op when there is no upstream — no push issued", () => {
     const fake = fakePusherGit(baseRules(null));
-    expect(pushDocs(repo, fake.run)).toBe("no-upstream");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("no-upstream");
     expect(aheadOfUpstream(repo, fake.run)).toBeNull();
     expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
@@ -153,7 +149,7 @@ describe("pushDocs — guards", () => {
         result: { exitCode: 0, stdout: ".git/MERGE_HEAD" },
       },
     ]);
-    expect(pushDocs(repo, fake.run)).toBe("mid-op");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("mid-op");
     expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 
@@ -170,7 +166,7 @@ describe("pushDocs — guards", () => {
         result: { exitCode: 1, stdout: "" },
       },
     ]);
-    expect(pushDocs(repo, fake.run)).toBe("detached");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("detached");
     expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 });
@@ -182,7 +178,7 @@ describe("pushDocs — push failure is classified, logged, and never throws", ()
     );
     let outcome = "";
     expect(() => {
-      outcome = pushDocs(repo, fake.run);
+      outcome = pushDocs(repo, fake.run, testPidAlive);
     }).not.toThrow();
     expect(outcome).toBe("push-failed");
     // No rebase / force ever issued — only the single push attempt.
@@ -201,7 +197,7 @@ describe("pushDocs — push failure is classified, logged, and never throws", ()
     const fake = fakePusherGit(
       baseRules("2", { exitCode: 128, stderr: PUSH_AUTH_FAILED }),
     );
-    expect(pushDocs(repo, fake.run)).toBe("push-failed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("push-failed");
     expect(readFileSync(logFile, "utf8")).toContain("class=auth");
   });
 
@@ -209,7 +205,7 @@ describe("pushDocs — push failure is classified, logged, and never throws", ()
     const fake = fakePusherGit(
       baseRules("1", { exitCode: 128, stderr: PUSH_NETWORK }),
     );
-    expect(pushDocs(repo, fake.run)).toBe("push-failed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("push-failed");
     expect(readFileSync(logFile, "utf8")).toContain("class=network");
   });
 });
@@ -219,7 +215,7 @@ describe("pushDocs — lockfile decision (real files, no git)", () => {
     // Pre-create the lock stamped with THIS (live) pid — a live holder blocks.
     writeFileSync(lockPath(), `${process.pid}\n`);
     const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake.run)).toBe("locked");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("locked");
     // No push issued — the lock gated it.
     expect(fake.calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
     expect(readFileSync(logFile, "utf8")).toContain("class=locked");
@@ -228,7 +224,7 @@ describe("pushDocs — lockfile decision (real files, no git)", () => {
   test("an orphaned lock (holder pid gone) is reclaimed and the push proceeds", () => {
     writeFileSync(lockPath(), `${findDeadPid()}\n`);
     const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("pushed");
     expect(existsSync(lockPath())).toBe(false);
   });
 
@@ -238,17 +234,17 @@ describe("pushDocs — lockfile decision (real files, no git)", () => {
     const old = new Date(Date.now() - 120_000);
     utimesSync(lockPath(), old, old);
     const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("pushed");
     expect(existsSync(lockPath())).toBe(false);
   });
 
   test("a released lock allows the next push", () => {
     const fake = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake.run)).toBe("pushed");
+    expect(pushDocs(repo, fake.run, testPidAlive)).toBe("pushed");
     expect(existsSync(lockPath())).toBe(false);
     // Second turn: lock is gone, push proceeds again.
     const fake2 = fakePusherGit(baseRules("1", { exitCode: 0 }));
-    expect(pushDocs(repo, fake2.run)).toBe("pushed");
+    expect(pushDocs(repo, fake2.run, testPidAlive)).toBe("pushed");
   });
 });
 
