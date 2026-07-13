@@ -63,5 +63,5 @@ Run the audit against a copied or read-only production snapshot before close, th
 - [ ] Operator docs use the canonical lifecycle vocabulary and give actionable recovery for unknown activity, stale attempts, settlement failures, and cleanup conflicts without duplicating ADR rationale.
 
 ## Done summary
-
+Added a hermetic cross-consumer lifecycle scenario matrix, a bounded read-only audit script (scripts/audit-session-activity.ts) over Harness activity/Dispatch claims/Resource holds, and consolidated install/problem-codes/README operator guidance, closing the epic.
 ## Evidence
