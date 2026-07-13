@@ -55,5 +55,5 @@ across cycles; degraded tick (task 1) → inert.
 - [ ] Pure-core import boundary preserved (probe is producer-side; reconcile reads a snapshot fact)
 
 ## Done summary
-
+Recovery-only direct close: a producer-side probe (computeCloseRecoveryEligibleIds) proves an all-done epic's lane is positively an ancestor of local default, then the reconciler stamps the epic done directly via the plan CLI's epic close verb (recording an explicit CLOSE_RECOVERY_MARKER close_reason) instead of dispatching another closer, guarded single-flight + epicHasOccupyingJob, idempotent, and retrying on a failed/timed-out shell without wedging.
 ## Evidence
