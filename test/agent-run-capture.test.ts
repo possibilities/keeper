@@ -1621,7 +1621,17 @@ describe("main() — agent run --resume", () => {
     let seenTarget: string | undefined;
     let seenHarness: string | undefined;
     const h = makeHarness({
-      argv: ["run", "claude", "follow up", "--resume", "reviewer"],
+      argv: [
+        "run",
+        "claude",
+        "follow up",
+        "--resume",
+        "reviewer",
+        "--session",
+        "wrapped",
+        "--name",
+        "task-123",
+      ],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -1655,8 +1665,25 @@ describe("main() — agent run --resume", () => {
       message: "resumed answer",
       transcript_path: transcriptPath,
     });
-    // A launch actually fired in the RECORDED cwd (not the caller cwd).
+    // A launch actually fired in the RECORDED cwd (not the caller cwd), while
+    // the explicit presentation posture still groups/titles the resumed leg.
     expect(h.tmuxCommands.length).toBeGreaterThan(0);
+    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-s"))).toContain(
+      "wrapped",
+    );
+    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-n"))).toContain(
+      "task-123",
+    );
+    const launchScript = readFileSync(
+      join(stateDir, "tmux-runs", `tmux-${childUuid}`, "launch.sh"),
+      "utf8",
+    );
+    expect(launchScript).toContain(`cd -- '${resumeCwd}'`);
+    expect(launchScript).toContain(`'--resume' '${parentUuid}'`);
+    expect(launchScript).toContain("'--name' 'task-123'");
+    expect(launchScript).not.toContain("'--model'");
+    expect(launchScript).not.toContain("'--effort'");
+    expect(launchScript).not.toContain("'--preset'");
   });
 
   test("codex resume: discovers the rollout by uuid, resume_target = the unchanged rollout uuid", async () => {
@@ -1677,7 +1704,17 @@ describe("main() — agent run --resume", () => {
     const startedAtMs = Date.parse("2026-07-10T12:00:00.000Z");
 
     const h = makeHarness({
-      argv: ["run", "codex", "again", "--resume", uuid],
+      argv: [
+        "run",
+        "codex",
+        "again",
+        "--resume",
+        uuid,
+        "--session",
+        "wrapped",
+        "--name",
+        "fn-1277.2",
+      ],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -1703,6 +1740,12 @@ describe("main() — agent run --resume", () => {
       resume_target: uuid,
       message: "NEW answer",
     });
+    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-s"))).toContain(
+      "wrapped",
+    );
+    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-n"))).toContain(
+      "fn-1277.2",
+    );
   });
 
   test("harness mismatch → bad_args naming both harnesses, no launch", async () => {
@@ -1767,7 +1810,7 @@ describe("main() — agent run --resume", () => {
     expect(h.tmuxCommands.length).toBe(0);
   });
 
-  test("config flags alongside --resume → bad_args BEFORE the resolver is consulted, envelope written to --output", async () => {
+  test("model/effort/preset alongside --resume → bad_args BEFORE the resolver is consulted, envelope written to --output", async () => {
     const outDir = tempDir();
     const outPath = join(outDir, "leg.json");
     let consulted = false;
@@ -1780,6 +1823,10 @@ describe("main() — agent run --resume", () => {
         "reviewer",
         "--model",
         "opus",
+        "--effort",
+        "high",
+        "--preset",
+        "claude::opus::high",
         "--output",
         outPath,
       ],

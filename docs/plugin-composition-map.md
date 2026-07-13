@@ -88,7 +88,11 @@ launch path. Its manifest's driver is the fixed claude wrapper (the `wrapper_dri
 model/effort from the host matrix); the wrapper is a dumb courier — it delegates ALL
 implementation, test, and lint iteration to the resolved foreign provider leg via
 `keeper agent run`/`--resume` and never edits source itself, owning only tests-
-adjudication and the keeper close-out (`commit-work` + `plan done`). The launch
+adjudication and the keeper close-out (`commit-work` + `plan done`). Provider legs
+launch and resume in the shared `wrapped` tmux session with a bare task-ID title;
+the title is presentation-only, while waiting uses the returned run handle,
+continuation uses the captured harness resume target (or exact resolved stopped
+session), and daemon autoclose uses the exact tmux window identity. The launch
 boundary always emits the `KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE` env pair
 (empty for a native cell; the effective `<model>::<effort>` plus the provider-leg
 result-envelope path for a wrapped one, keyed on effective-cell wrappedness rather

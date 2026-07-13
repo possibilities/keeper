@@ -17,7 +17,11 @@ import {
   type ComputeAutocloseReapsArgs,
   computeAutocloseReaps,
 } from "../src/autoclose-worker";
-import type { LaunchResult, PaneInfo } from "../src/exec-backend";
+import {
+  type LaunchResult,
+  type PaneInfo,
+  WRAPPED_EXEC_SESSION,
+} from "../src/exec-backend";
 import type { ReadinessSnapshot, Verdict } from "../src/readiness";
 import type { ReadinessQuery } from "../src/readiness-inputs";
 import { runQuery } from "../src/server-worker";
@@ -78,6 +82,38 @@ const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   escalation_instance: null,
   ...over,
 });
+
+/** A stopped wrapped provider leg with a canonical bare task-id title. It owns
+ *  no Plan readiness row; positive stopped state is its done signal. */
+const wrappedLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
+  job_id: "j-wrapped",
+  state: "stopped",
+  pid: 444,
+  start_time: "400",
+  plan_verb: null,
+  plan_ref: null,
+  title: "fn-1277-autoclose-wrapped-provider-legs.1",
+  dispatch_origin: null,
+  backend_exec_type: "tmux",
+  backend_exec_pane_id: "%5",
+  backend_exec_birth_session_id: WRAPPED_EXEC_SESSION,
+  backend_exec_generation_id: "gen-5",
+  last_input_request_at: null,
+  last_permission_prompt_at: null,
+  escalation_instance: null,
+  ...over,
+});
+
+/** A swept pane matching the wrapped provider-leg fixture's exact identity. */
+const wrappedPane = (over: Partial<PaneInfo> = {}): PaneInfo =>
+  pane({
+    tmuxGenerationId: "gen-5",
+    paneId: "%5",
+    windowId: "@5",
+    sessionName: WRAPPED_EXEC_SESSION,
+    windowName: "fn-1277-autoclose-wrapped-provider-legs.1",
+    ...over,
+  });
 
 /** A stopped, escalation-dispatched session that passes every rail. Defaults to
  *  `unblock`; override `plan_verb`/`plan_ref`/`title` for the other two verbs.
@@ -321,6 +357,45 @@ test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
   expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::claude::q1" });
 });
 
+test("IN: wrapped provider leg with bare task-id title targets its exact pane identity", () => {
+  const { reaps } = run({
+    jobs: [wrappedLeg()],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    // Deliberately unrelated display name: teardown is authorized by the birth
+    // session + job title but targets only the resolved pane identity.
+    panes: [
+      wrappedPane({ windowName: "duplicate-display-title-is-irrelevant" }),
+    ],
+    graceMap: elapsed("j-wrapped"),
+  });
+  expect(reaps).toEqual([
+    {
+      jobId: "j-wrapped",
+      pid: 444,
+      startTime: "400",
+      paneId: "%5",
+      bucket: "wrapped",
+      ref: "fn-1277-autoclose-wrapped-provider-legs.1",
+    },
+  ]);
+});
+
+test("IN: wrapped provider leg accepts the legacy wrapped:: task-id title", () => {
+  const legacyTitle = "wrapped::fn-1277-autoclose-wrapped-provider-legs.1";
+  const { reaps } = run({
+    jobs: [wrappedLeg({ title: legacyTitle })],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [wrappedPane({ windowName: legacyTitle })],
+    graceMap: elapsed("j-wrapped"),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({
+    paneId: "%5",
+    bucket: "wrapped",
+    ref: legacyTitle,
+  });
+});
+
 test("IN: escalation unblock session, resolved instance, past grace → reaped", () => {
   const { reaps } = run({
     jobs: [escalationSession()],
@@ -382,6 +457,73 @@ test("IN: escalation resolve session, resolved instance, past grace → reaped (
 // ---------------------------------------------------------------------------
 // OUT — exclusion classes (never keeper-owned or not done)
 // ---------------------------------------------------------------------------
+
+test("OUT: wrapped provider-leg ownership and live-topology rails fail closed", () => {
+  const cases: Array<{
+    name: string;
+    job?: Partial<AutocloseJob>;
+    pane?: Partial<PaneInfo>;
+  }> = [
+    { name: "working", job: { state: "working" } },
+    {
+      name: "wrong birth session",
+      job: { backend_exec_birth_session_id: "autopilot" },
+    },
+    {
+      name: "unresolved generation",
+      job: { backend_exec_generation_id: null },
+    },
+    { name: "moved pane", pane: { sessionName: "manual" } },
+    { name: "generation mismatch", pane: { tmuxGenerationId: "gen-other" } },
+  ];
+  for (const c of cases) {
+    const { reaps, graceMap } = run({
+      jobs: [wrappedLeg(c.job)],
+      readiness: { perTask: new Map(), perCloseRow: new Map() },
+      panes: [wrappedPane(c.pane)],
+      graceMap: elapsed("j-wrapped"),
+    });
+    expect(reaps, c.name).toHaveLength(0);
+    expect(graceMap.has("j-wrapped"), c.name).toBe(false);
+  }
+});
+
+test("OUT: malformed wrapped provider-leg titles never authorize teardown", () => {
+  const malformedTitles: Array<string | null> = [
+    null,
+    "",
+    "fn-1277-autoclose-wrapped-provider-legs",
+    "wrapped::fn-1277-autoclose-wrapped-provider-legs",
+    "work::fn-1277-autoclose-wrapped-provider-legs.1",
+    "wrapped::wrapped::fn-1277-autoclose-wrapped-provider-legs.1",
+    "fn-no-number.1",
+    "fn-1277-UPPER.1",
+  ];
+  for (const title of malformedTitles) {
+    const { reaps } = run({
+      jobs: [wrappedLeg({ title })],
+      readiness: { perTask: new Map(), perCloseRow: new Map() },
+      panes: [wrappedPane()],
+      graceMap: elapsed("j-wrapped"),
+    });
+    expect(reaps, String(title)).toHaveLength(0);
+  }
+});
+
+test("OUT: prompt-active wrapped provider legs remain resident", () => {
+  for (const prompt of [
+    { last_input_request_at: NOW - 5 },
+    { last_permission_prompt_at: NOW - 5 },
+  ]) {
+    const { reaps } = run({
+      jobs: [wrappedLeg(prompt)],
+      readiness: { perTask: new Map(), perCloseRow: new Map() },
+      panes: [wrappedPane()],
+      graceMap: elapsed("j-wrapped"),
+    });
+    expect(reaps).toHaveLength(0);
+  }
+});
 
 test("OUT: manual plan-form worker (dispatch_origin NULL) → never reaped", () => {
   const { reaps } = run({
@@ -632,6 +774,18 @@ test("paused suspends the autopilot bucket but NOT the panel bucket", () => {
   expect(reaps[0]).toMatchObject({ jobId: "j-panel", bucket: "panel" });
 });
 
+test("paused suspends the wrapped bucket", () => {
+  const { reaps, graceMap } = run({
+    jobs: [wrappedLeg()],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [wrappedPane()],
+    graceMap: elapsed("j-wrapped"),
+    autopilotPaused: true,
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.has("j-wrapped")).toBe(false);
+});
+
 test("paused suspends the escalation bucket (like the autopilot bucket)", () => {
   const { reaps } = run({
     jobs: [escalationSession()],
@@ -652,6 +806,18 @@ test("disabled config → zero decisions and grace state CLEARED", () => {
     jobs: [autopilotWork()],
     panes: [pane()],
     graceMap: elapsed("j-work"),
+    config: { autocloseEnabled: false, autocloseGraceSeconds: 30 },
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.size).toBe(0);
+});
+
+test("disabled config excludes a wrapped provider leg and clears its grace", () => {
+  const { reaps, graceMap } = run({
+    jobs: [wrappedLeg()],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [wrappedPane()],
+    graceMap: elapsed("j-wrapped"),
     config: { autocloseEnabled: false, autocloseGraceSeconds: 30 },
   });
   expect(reaps).toHaveLength(0);
@@ -690,6 +856,17 @@ test("grace not yet elapsed → not reaped, first observation recorded at now", 
   });
   expect(reaps).toHaveLength(0);
   expect(graceMap.get("j-work")).toBe(NOW);
+});
+
+test("wrapped provider leg before grace is ineligible for this pulse and records first observation", () => {
+  const { reaps, graceMap } = run({
+    jobs: [wrappedLeg()],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [wrappedPane()],
+    graceMap: new Map(),
+  });
+  expect(reaps).toHaveLength(0);
+  expect(graceMap.get("j-wrapped")).toBe(NOW);
 });
 
 test("grace resets on an intervening ineligible observation", () => {
@@ -805,6 +982,48 @@ test("blast cap enforced: > MAX due → only MAX reaped, all stay in the grace m
 // Degraded / empty sweep
 // ---------------------------------------------------------------------------
 
+test("wrapped blast cap is deterministic and retains capped-out candidates", () => {
+  const count = AUTOCLOSE_MAX_KILLS_PER_PULSE + 3;
+  const jobs: AutocloseJob[] = [];
+  const panes: PaneInfo[] = [];
+  const graceMap = new Map<string, number>();
+  for (let i = count - 1; i >= 0; i--) {
+    const suffix = String(i).padStart(2, "0");
+    const jobId = `wrapped-${suffix}`;
+    const paneId = `%w${suffix}`;
+    jobs.push(wrappedLeg({ job_id: jobId, backend_exec_pane_id: paneId }));
+    panes.push(wrappedPane({ paneId, windowId: `@w${suffix}` }));
+    graceMap.set(jobId, NOW - 31);
+  }
+
+  const result = run({
+    jobs,
+    panes,
+    graceMap,
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+  });
+  expect(result.reaps.map((reap) => reap.jobId)).toEqual([
+    "wrapped-00",
+    "wrapped-01",
+    "wrapped-02",
+    "wrapped-03",
+    "wrapped-04",
+  ]);
+  expect(result.reaps.every((reap) => reap.bucket === "wrapped")).toBe(true);
+  expect(result.graceMap.size).toBe(count);
+});
+
+test("wrapped pane already absent from a live server is converged without a title-derived target", () => {
+  const { reaps, graceMap } = run({
+    jobs: [wrappedLeg()],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [pane({ paneId: "%unrelated", windowId: "@unrelated" })],
+    graceMap: elapsed("j-wrapped"),
+  });
+  expect(reaps).toEqual([]);
+  expect(graceMap.has("j-wrapped")).toBe(false);
+});
+
 test("degraded sweep (null) → zero decisions, grace PRESERVED", () => {
   const incoming = elapsed("j-work");
   const { reaps, graceMap } = run({
@@ -894,6 +1113,107 @@ test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", as
     ref: "panel::claude::q1",
   });
 
+  db.close();
+});
+
+test("autoclosePulse: failed exact wrapped kill preserves eligibility and retries the same pane", async () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at)
+       VALUES (1, 0, 0, 0, 0)`,
+  );
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at, pid, start_time)
+     VALUES
+       ('wrappedjob', 1, 1, 'stopped', 'fn-1277-autoclose-wrapped-provider-legs.1', NULL, NULL,
+        NULL, 'tmux', '%5', 'wrapped', 'gen-5', NULL, NULL, 444, '400')`,
+  );
+
+  const killed: string[] = [];
+  const intents: AutocloseIntentMessage[] = [];
+  const notes: string[] = [];
+  let paneStillLive = true;
+  const backend = {
+    listPanes: async (): Promise<PaneInfo[] | null> =>
+      paneStillLive
+        ? [wrappedPane()]
+        : [pane({ paneId: "%other", windowId: "@other" })],
+    killWindow: async (paneId: string): Promise<LaunchResult> => {
+      killed.push(paneId);
+      return { ok: false, error: "injected exact kill failure" };
+    },
+  };
+  const state: AutoclosePulseState = {
+    graceMap: new Map([["wrappedjob", 1]]),
+  };
+  const deps = {
+    resolveConfig: () => CONFIG,
+    now: () => 1000,
+    postIntent: (intent: AutocloseIntentMessage) => intents.push(intent),
+    noteLine: (line: string) => notes.push(line),
+  };
+
+  await autoclosePulse(db, backend, state, deps);
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toEqual(["%5", "%5"]);
+  expect(intents.map((intent) => intent.paneId)).toEqual(["%5", "%5"]);
+  expect(state.graceMap.get("wrappedjob")).toBe(1);
+  expect(notes.every((line) => line.startsWith("close deferred"))).toBe(true);
+
+  // Once a later live sweep positively shows the exact pane absent, cleanup is
+  // converged and the stale grace entry is removed without another kill.
+  paneStillLive = false;
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toEqual(["%5", "%5"]);
+  expect(state.graceMap.has("wrappedjob")).toBe(false);
+  db.close();
+});
+
+test("autoclosePulse: disappearance of the last wrapped window is a normal no-op on the next pulse", async () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at)
+       VALUES (1, 0, 0, 0, 0)`,
+  );
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at)
+     VALUES
+       ('lastwrapped', 1, 1, 'stopped', 'fn-1-x.1', NULL, NULL,
+        NULL, 'tmux', '%5', 'wrapped', 'gen-5', NULL, NULL)`,
+  );
+
+  let sessionExists = true;
+  const killed: string[] = [];
+  const state: AutoclosePulseState = {
+    graceMap: new Map([["lastwrapped", 1]]),
+  };
+  const backend = {
+    listPanes: async (): Promise<PaneInfo[] | null> =>
+      sessionExists ? [wrappedPane()] : [],
+    killWindow: async (paneId: string): Promise<LaunchResult> => {
+      killed.push(paneId);
+      sessionExists = false;
+      return { ok: true };
+    },
+  };
+  const deps = {
+    resolveConfig: () => CONFIG,
+    now: () => 1000,
+    postIntent: () => {},
+    noteLine: () => {},
+  };
+
+  await autoclosePulse(db, backend, state, deps);
+  await autoclosePulse(db, backend, state, deps);
+  expect(killed).toEqual(["%5"]);
   db.close();
 });
 

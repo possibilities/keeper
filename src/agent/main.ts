@@ -1722,8 +1722,13 @@ async function runResumeCaptureSubcommand(
             deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
             agent,
             prompt: composed.prompt,
-            // The resumed session owns its config — no posture overlay.
-            posture: {},
+            // The resumed session owns its config, but presentation still rides
+            // the shared launch-posture seam so a resumed provider leg can
+            // rejoin its tmux grouping and keep a display-only title.
+            posture: {
+              session: parsed.session ?? undefined,
+              name: parsed.name ?? undefined,
+            },
             stopTimeoutMs: parsed.stopTimeoutMs,
             resume: {
               target: decision.resume_target,

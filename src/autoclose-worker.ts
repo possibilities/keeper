@@ -2,9 +2,10 @@
  * autoclose worker. A daemon Bun Worker thread that force-closes
  * the tmux window of a done-and-idle agent keeper itself dispatched — an
  * autopilot `work::`/`close::` worker whose plan row reached a `completed`
- * verdict, a finished claude `/plan:panel` leg, or an
- * `unblock::`/`deconflict::`/`resolve::` escalation session whose block/conflict
- * INSTANCE is provably resolved — ~grace after it is provably done. Every other
+ * verdict, a finished claude `/plan:panel` leg, a stopped wrapped provider leg,
+ * or an `unblock::`/`deconflict::`/`resolve::` escalation session whose
+ * block/conflict INSTANCE is provably resolved — ~grace after it is provably
+ * done. Every other
  * window (a manual session, a hand-run `keeper dispatch`, a handoff, a pair
  * partner, a bus-woken planner) keeps its stay-open-until-hand-closed behavior.
  * Off-switch: `autoclose_enabled: false` in the config, re-read every pulse (a
@@ -23,10 +24,12 @@
  * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic: the
  * autopilot bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only
  * when a SessionStart discharged a real `pending_dispatches` row), the panel
- * bucket on the `panels` birth-session + the `panel::x::y` name shape, and the
- * escalation bucket on `jobs.dispatch_origin === 'escalation'` + one of the three
- * escalation verbs + a non-null `escalation_instance` stamp (never the window
- * title). The autopilot bucket's `completed` verdict is read through the SHARED
+ * bucket on the `panels` birth-session + the `panel::x::y` name shape, the
+ * wrapped bucket on the `wrapped` birth-session + a bare or legacy-prefixed Plan
+ * task-id title, and the escalation bucket on
+ * `jobs.dispatch_origin === 'escalation'` + one of the three escalation verbs +
+ * a non-null `escalation_instance` stamp (never the window title). The autopilot
+ * bucket's `completed` verdict is read through the SHARED
  * {@link loadReadinessInputs} + {@link computeReadiness} seam so autoclose's
  * notion of "done" can never drift from the reconciler's; the escalation bucket's
  * done-signal is instance-precise, read fail-closed in the pulse (see
@@ -57,6 +60,7 @@ import {
   PANELS_EXEC_SESSION,
   type PaneInfo,
   type TmuxPaneOps,
+  WRAPPED_EXEC_SESSION,
 } from "./exec-backend";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
 import type { DispatchClaim } from "./readiness-inputs";
@@ -81,6 +85,14 @@ export const AUTOCLOSE_IDLE_MS = 5000;
  *  exactly two `::` separators, no colon inside a segment. Part of the panel
  *  bucket's positive allowlist alongside the `panels` birth session. */
 const PANEL_TITLE_RE = /^panel::[^:]+::[^:]+$/;
+
+/** A wrapped provider leg's display title: the canonical bare Plan task id or
+ *  the legacy `wrapped::`-prefixed form accepted during rollout. Mirrors Plan's
+ *  `fn-<number>[-slug].<task-number>` grammar; an epic id is not a provider-leg
+ *  task title. Exact pane identity, not this display string, remains the kill
+ *  target. */
+const WRAPPED_PROVIDER_TITLE_RE =
+  /^(?:wrapped::)?fn-\d+(?:-[a-z0-9][a-z0-9-]*[a-z0-9]|-[a-z0-9]{1,3})?\.\d+$/;
 
 /** Data the parent passes via `new Worker(url, { workerData })`. Only the DB
  *  path crosses the boundary — the read-only connection is opened on the worker
@@ -128,9 +140,9 @@ export type AutocloseWorkerMessage =
   | AutocloseIntentMessage
   | AutocloseClaimReleaseMessage;
 
-/** Which ownership bucket a reap belongs to — the three provably-keeper-owned
- *  window classes. */
-export type AutocloseBucket = "autopilot" | "panel" | "escalation";
+/** Which ownership bucket a reap belongs to — the four positively-owned window
+ *  classes. */
+export type AutocloseBucket = "autopilot" | "panel" | "wrapped" | "escalation";
 
 /**
  * The narrow `jobs` row the decision core reads. A PURPOSE-BUILT projection, not
@@ -194,8 +206,8 @@ export interface ComputeAutocloseReapsArgs {
   /** Worker-local first-observed-eligible clock: `job_id → unix-seconds`. */
   graceMap: ReadonlyMap<string, number>;
   config: { autocloseEnabled: boolean; autocloseGraceSeconds: number };
-  /** Autopilot `paused` — suspends the AUTOPILOT bucket only (the panel bucket
-   *  is governed solely by the config key). */
+  /** Autopilot `paused` — suspends the autopilot, wrapped, and escalation
+   *  buckets; panel cleanup is governed solely by the config key. */
   autopilotPaused: boolean;
   /** Reference instant, unix SECONDS (same clock as the grace map + the config
    *  grace seconds). */
@@ -333,6 +345,20 @@ function classifyEligible(
   ) {
     bucket = "panel";
     managedSession = PANELS_EXEC_SESSION;
+    ref = job.title;
+  } else if (
+    job.backend_exec_birth_session_id === WRAPPED_EXEC_SESSION &&
+    job.title != null &&
+    WRAPPED_PROVIDER_TITLE_RE.test(job.title)
+  ) {
+    // Wrapped provider legs own no Plan readiness row: their positive stopped
+    // state (checked above) is the done signal. Pause suspends cleanup just like
+    // the autopilot and escalation buckets.
+    if (autopilotPaused) {
+      return null;
+    }
+    bucket = "wrapped";
+    managedSession = WRAPPED_EXEC_SESSION;
     ref = job.title;
   } else if (isEscalationCandidate(job)) {
     // Escalation bucket: an `unblock::`/`deconflict::`/`resolve::` session
@@ -634,8 +660,10 @@ function readEscalationDoneJobIds(
  * (degraded/empty → skip), loads the shared readiness inputs + verdict, reads
  * the paused flag + candidate rows, runs the pure {@link computeAutocloseReaps},
  * then for each capped decision posts the intent hint and IMMEDIATELY fires
- * `killWindow`. A non-zero kill exit is an expected TOCTOU no-op — treated as
- * done, never re-enqueued, no retry. NEVER throws for an expected degradation.
+ * `killWindow`. The level-triggered grace entry remains after a failed exact
+ * kill, so a still-live eligible pane retries on a later pulse; an absent pane
+ * converges through the next topology sweep. NEVER throws for an expected
+ * degradation.
  *
  * Exported for unit reach: tests drive it directly against a seeded DB with an
  * injected backend + deps.
@@ -742,9 +770,9 @@ export async function autoclosePulse(
       bucket: decision.bucket,
       ref: decision.ref,
     });
-    await backend.killWindow(decision.paneId);
+    const killed = await backend.killWindow(decision.paneId);
     deps.noteLine(
-      `closed job=${decision.jobId} bucket=${decision.bucket} ref=${
+      `${killed.ok ? "closed" : "close deferred"} job=${decision.jobId} bucket=${decision.bucket} ref=${
         decision.ref ?? "-"
       } pane=${decision.paneId}`,
     );
