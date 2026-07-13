@@ -225,6 +225,67 @@ describe("golden: buildAgentLaunchArgv", () => {
     ]);
   });
 
+  test("codex RESUME launch with shared wrapped presentation — window title is display-only", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "codex",
+        prompt: "keep going",
+        session: "wrapped",
+        name: "fn-1277.2",
+        resumeTarget: "rollout-uuid",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "codex",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "--x-tmux-session",
+      "wrapped",
+      "--x-tmux-window-name",
+      "fn-1277.2",
+      "resume",
+      "rollout-uuid",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--",
+      "keep going",
+    ]);
+  });
+
+  test("pi RESUME launch with shared wrapped presentation — native target is retained", () => {
+    expect(
+      buildAgentLaunchArgv({
+        launcherArgvPrefix: PREFIX,
+        cli: "pi",
+        prompt: "keep going",
+        session: "wrapped",
+        name: "fn-1277.2",
+        resumeTarget: "pi-session-id",
+      }),
+    ).toEqual([
+      "/fake-home/.bun/bin/bun",
+      "/fake-home/code/keeper/cli/keeper.ts",
+      "agent",
+      "pi",
+      "--x-tmux",
+      "--x-tmux-detached",
+      "--x-no-confirm",
+      "--x-tmux-session",
+      "wrapped",
+      "--x-tmux-window-name",
+      "fn-1277.2",
+      "-na",
+      "--name",
+      "fn-1277.2",
+      "--session",
+      "pi-session-id",
+      "keep going",
+    ]);
+  });
+
   test("pi read-only launch (model + session) — posture-independent flags (no strip)", () => {
     expect(
       buildAgentLaunchArgv({

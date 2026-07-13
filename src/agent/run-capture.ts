@@ -348,9 +348,11 @@ export type ParseRunArgsResult =
  * resolution, the launch-posture overlay, the atomic write, and resume resolution
  * all happen handler-side). `--resume` is DISTINCT from `--session`: `--session`
  * names the tmux window GROUPING, `--resume` continues a prior partner
- * conversation (and forbids `--model`/`--effort`/`--preset`, which the resumed
- * session already owns — enforced handler-side). ALL default-absent, so an argv
- * without them stays byte-identical. Pure — exported for tests.
+ * conversation. On resume, `--session`/`--name` remain presentation-only launch
+ * posture, while `--model`/`--effort`/`--preset` are forbidden because the
+ * resumed session already owns its config — enforced handler-side. ALL
+ * default-absent, so an argv without them stays byte-identical. Pure — exported
+ * for tests.
  */
 export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   const positionals: string[] = [];

@@ -574,7 +574,7 @@ export async function main(): Promise<void> {
     frames: async (argv) => (await import("./frames")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
     status: async (argv) => (await import("./status")).main(argv),
-    daemon: async (argv) => (await import("./restart")).main(argv),
+    daemon: async (argv) => (await import("./daemon")).main(argv),
     query: async (argv) => (await import("./query")).main(argv),
     watch: async (argv) => (await import("./watch")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
