@@ -4380,7 +4380,6 @@ function getAutopilotStateConfig() {
     max_concurrent_per_root: number | null;
     worktree_mode: number | null;
     worktree_multi_repo: number | null;
-    codex_adoption: number | null;
     worker_provider: string | null;
     drift_behind_threshold: number | null;
     drift_age_threshold_days: number | null;
@@ -4808,6 +4807,23 @@ test("AutopilotConfigSet present-but-non-boolean worktree_multi_repo coerces to 
     autopilotConfigSetEvent({ worktree_multi_repo: true });
     drainAll();
   }
+});
+
+test("historical adoption-only config events are replay-safe no-ops that advance the cursor", () => {
+  const eventId = insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: "autopilot",
+    data: JSON.stringify({ codex_adoption: true }),
+  });
+
+  expect(drainAll()).toBe(1);
+  expect(getCursor()).toBe(eventId);
+  expect(getAutopilotStateConfig()).toBeNull();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBe(1);
+  expect(getCursor()).toBe(eventId);
+  expect(getAutopilotStateConfig()).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

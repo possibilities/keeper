@@ -4319,8 +4319,10 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // (`autopilot_state.drift_behind_threshold` / `drift_age_threshold_days`)
   // onto the tail, and to 124 appending fn-1252 task .6's
   // `dispatch_failures.conflicted_files` TEXT column — both idempotent additive
-  // ALTERs, NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(126);
+  // ALTERs, NO cursor rewind. The current tail rebuilds `autopilot_state`
+  // without its retired rollout-only adoption column while preserving every
+  // surviving setting.
+  expect(SCHEMA_VERSION).toBe(127);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

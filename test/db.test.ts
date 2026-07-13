@@ -649,12 +649,10 @@ test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1
   db.close();
 });
 
-test("openDb adds nullable adopted to BOTH events and jobs + codex_adoption to autopilot_state (fn-1131 task .1)", () => {
-  // The v109->v110 step adds the adoption primitive across three surfaces:
-  // `events.adopted` via the FIVE-place lockstep (CREATE literal + migration
-  // append), `jobs.adopted` migration-only, and `autopilot_state.codex_adoption`
-  // (CREATE literal + migration append). All INTEGER, nullable, NO default (the
-  // NULL=absent + re-fold byte-identity invariant). A bare-inserted row reads NULL.
+test("openDb adds nullable adopted to BOTH events and jobs (fn-1131 task .1)", () => {
+  // The durable adopted marker remains on both harness-agnostic lifecycle
+  // surfaces: events via the column lockstep and jobs migration-only. It is
+  // nullable with no default, preserving the NULL=absent replay invariant.
   const { db } = openDb(":memory:");
   for (const table of ["events", "jobs"] as const) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all() as {
@@ -669,19 +667,7 @@ test("openDb adds nullable adopted to BOTH events and jobs + codex_adoption to a
     expect(col?.notnull).toBe(0);
     expect(col?.dflt_value).toBeNull();
   }
-  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
-    name: string;
-    type: string;
-    notnull: number;
-    dflt_value: string | null;
-  }[];
-  const knob = stateCols.find((c) => c.name === "codex_adoption");
-  expect(knob).toBeDefined();
-  expect(knob?.type).toBe("INTEGER");
-  expect(knob?.notnull).toBe(0);
-  expect(knob?.dflt_value).toBeNull();
 
-  // A bare-inserted jobs row reads NULL for adopted (the zero-event shape).
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('ja', 1, 0, 1)",
   ).run();
@@ -689,22 +675,98 @@ test("openDb adds nullable adopted to BOTH events and jobs + codex_adoption to a
     .prepare("SELECT adopted FROM jobs WHERE job_id = 'ja'")
     .get() as { adopted: number | null };
   expect(r.adopted).toBeNull();
-  // A bare autopilot_state row omitting codex_adoption reads NULL (= OFF).
-  db.prepare(
-    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
-  ).run();
-  const s = db
-    .prepare("SELECT codex_adoption FROM autopilot_state WHERE id = 1")
-    .get() as { codex_adoption: number | null };
-  expect(s.codex_adoption).toBeNull();
   db.close();
+});
+
+test("autopilot_state adoption-column drop preserves every surviving value and fresh-schema order", () => {
+  const seeded = openDb(dbPath);
+  seeded.db.run(
+    "ALTER TABLE autopilot_state ADD COLUMN codex_adoption INTEGER",
+  );
+  seeded.db.run("UPDATE meta SET value = '126' WHERE key = 'schema_version'");
+  const fixture = {
+    id: 1,
+    paused: 0,
+    last_event_id: 9_007_199_254_740_001,
+    created_at: 1234.125,
+    updated_at: 9876.875,
+    max_concurrent_jobs: 17,
+    mode: "armed",
+    max_concurrent_per_root: 4,
+    worktree_mode: 1,
+    worktree_multi_repo: 0,
+    worker_provider: "gpt",
+    drift_behind_threshold: 23,
+    drift_age_threshold_days: 11,
+  };
+  seeded.db
+    .prepare(`
+      INSERT INTO autopilot_state (
+        id, paused, last_event_id, created_at, updated_at,
+        max_concurrent_jobs, mode, max_concurrent_per_root,
+        worktree_mode, worktree_multi_repo, codex_adoption, worker_provider,
+        drift_behind_threshold, drift_age_threshold_days
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      fixture.id,
+      fixture.paused,
+      fixture.last_event_id,
+      fixture.created_at,
+      fixture.updated_at,
+      fixture.max_concurrent_jobs,
+      fixture.mode,
+      fixture.max_concurrent_per_root,
+      fixture.worktree_mode,
+      fixture.worktree_multi_repo,
+      1,
+      fixture.worker_provider,
+      fixture.drift_behind_threshold,
+      fixture.drift_age_threshold_days,
+    );
+  seeded.db.close();
+
+  const migrated = openDb(dbPath);
+  const migratedInfo = migrated.db
+    .prepare("PRAGMA table_info(autopilot_state)")
+    .all();
+  expect(
+    (migratedInfo as { name: string }[]).some(
+      (column) => column.name === "codex_adoption",
+    ),
+  ).toBe(false);
+  expect(
+    migrated.db.prepare("SELECT * FROM autopilot_state WHERE id = 1").get(),
+  ).toEqual(fixture);
+
+  const fresh = openDb(":memory:");
+  const freshInfo = fresh.db
+    .prepare("PRAGMA table_info(autopilot_state)")
+    .all();
+  expect(migratedInfo).toEqual(freshInfo);
+  fresh.db.close();
+  migrated.db.close();
+
+  // Historical additive steps run on every open; the tail drop must therefore
+  // converge on re-open rather than allowing the retired column to return.
+  const reopened = openDb(dbPath);
+  const reopenedInfo = reopened.db
+    .prepare("PRAGMA table_info(autopilot_state)")
+    .all() as { name: string }[];
+  expect(reopenedInfo.some((column) => column.name === "codex_adoption")).toBe(
+    false,
+  );
+  expect(
+    reopened.db.prepare("SELECT * FROM autopilot_state WHERE id = 1").get(),
+  ).toEqual(fixture);
+  reopened.db.close();
 });
 
 test("openDb adds nullable drift_behind_threshold + drift_age_threshold_days to autopilot_state (fn-1252 task .3)", () => {
   // The v118->v119 step adds the two durable base-drift threshold config
   // columns — both INTEGER, nullable, NO default (the NULL=absent + re-fold
-  // byte-identity invariant, mirroring codex_adoption). A bare-inserted row
-  // reads NULL for both (the OFF/no-detection default).
+  // byte-identity invariant). A bare-inserted row reads NULL for both (the
+  // OFF/no-detection default).
   const { db } = openDb(":memory:");
   const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
     name: string;
@@ -3097,7 +3159,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(126);
+  expect(SCHEMA_VERSION).toBe(127);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

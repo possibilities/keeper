@@ -4293,6 +4293,50 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    version: 127,
+    kind: "drop",
+    apply: (ctx) => {
+      const { db } = ctx;
+      // Retire the rollout-only adoption knob with a full table rebuild. The
+      // historical additive step still converges old database shapes before
+      // this tail step runs, so the shape guard is intentionally the sole gate:
+      // every open finishes without the retired column, including reopens of an
+      // already-current database. The explicit copy list preserves every
+      // surviving value and pins the canonical fresh-schema column order.
+      const stateColumns = db
+        .prepare("PRAGMA table_info(autopilot_state)")
+        .all() as { name: string }[];
+      if (stateColumns.some((column) => column.name === "codex_adoption")) {
+        db.run("DROP TABLE IF EXISTS autopilot_state_v127_tmp");
+        db.run(
+          CREATE_AUTOPILOT_STATE.replace(
+            "CREATE TABLE IF NOT EXISTS autopilot_state",
+            "CREATE TABLE autopilot_state_v127_tmp",
+          ),
+        );
+        db.run(`
+          INSERT INTO autopilot_state_v127_tmp (
+            id, paused, last_event_id, created_at, updated_at,
+            max_concurrent_jobs, mode, max_concurrent_per_root,
+            worktree_mode, worktree_multi_repo, worker_provider,
+            drift_behind_threshold, drift_age_threshold_days
+          )
+          SELECT
+            id, paused, last_event_id, created_at, updated_at,
+            max_concurrent_jobs, mode, max_concurrent_per_root,
+            worktree_mode, worktree_multi_repo, worker_provider,
+            drift_behind_threshold, drift_age_threshold_days
+          FROM autopilot_state
+          ORDER BY rowid
+        `);
+        db.run("DROP TABLE autopilot_state");
+        db.run(
+          "ALTER TABLE autopilot_state_v127_tmp RENAME TO autopilot_state",
+        );
+      }
+    },
+  },
 ];
 
 /**
@@ -4313,7 +4357,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v126:1aedde7dc902769e00f549d7f0e30bf242f683606496f7de1dd6d343810b0f97";
+  "v127:87db65c70c88962c402705a65b572a834008060b808355b973ae5e9b4d6df598";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5959,7 +6003,6 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     max_concurrent_per_root INTEGER,
     worktree_mode INTEGER,
     worktree_multi_repo INTEGER,
-    codex_adoption INTEGER,
     worker_provider TEXT,
     drift_behind_threshold INTEGER,
     drift_age_threshold_days INTEGER

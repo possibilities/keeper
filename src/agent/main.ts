@@ -3035,10 +3035,7 @@ function armBirthRecord(
  * job id. Scanned ONLY on a resume relaunch, so a fresh launch whose prompt
  * happens to contain the verb never false-matches. Pure.
  */
-function resumeTargetFromArgv(
-  args: string[],
-  agent: "pi",
-): string | null {
+function resumeTargetFromArgv(args: string[], agent: "pi"): string | null {
   const token = HARNESS_DESCRIPTORS[agent].resumeArgv.token;
   const idx = args.indexOf(token);
   if (idx === -1) {
