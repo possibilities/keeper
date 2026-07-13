@@ -1,0 +1,69 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting transcript ordering and lifecycle invariants make false terminal transitions a subtle correctness risk.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Atomic attempt fencing, replay determinism, and schema migration form a distributed correctness contract.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Exact cross-harness binding combines stale-event correctness with injection-safe metadata carriage across many boundaries.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "This architectural consumer migration must preserve distinct policies while enforcing durable resume and dispatch fencing invariants.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.98,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Destructive cleanup requires subtle recycle-safe identity and filesystem safety invariants across restore and finalize races.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.93,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The cross-consumer adversarial matrix and read-only audit require long-horizon validation of race, mutation, and data-exposure invariants.",
+      "task_id": "fn-1276-unify-harness-lifecycle-facts.6",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T12:32:14.736000Z",
+  "epic_id": "fn-1276-unify-harness-lifecycle-facts",
+  "input_hash": "bc54c3dd0adfb7af640ff180188b9368fd1285fd9094ee3aa15de019367e2d1e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3159671773,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting transcript ordering and lifecycle invariants make false terminal transitions a subtle correctness risk.\",\"confidence\":0.95},{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Atomic attempt fencing, replay determinism, and schema migration form a distributed correctness contract.\",\"confidence\":0.97},{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Exact cross-harness binding combines stale-event correctness with injection-safe metadata carriage across many boundaries.\",\"confidence\":0.94},{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"This architectural consumer migration must preserve distinct policies while enforcing durable resume and dispatch fencing invariants.\",\"confidence\":0.96},{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Destructive cleanup requires subtle recycle-safe identity and filesystem safety invariants across restore and finalize races.\",\"confidence\":0.98},{\"task_id\":\"fn-1276-unify-harness-lifecycle-facts.6\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The cross-consumer adversarial matrix and read-only audit require long-horizon validation of race, mutation, and data-exposure invariants.\",\"confidence\":0.93}]}\n"
+}
