@@ -739,6 +739,65 @@ test("buildAgentLaunchArgv: claude resume launch composes the full pinned-child-
   expect(argv.filter((a) => a === "follow-up ask")).toHaveLength(1);
 });
 
+test("buildAgentLaunchArgv: claude resume keeps presentation session/name separate from native resume identity", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "claude",
+    prompt: "follow-up ask",
+    session: "wrapped",
+    name: "fn-1277.2",
+    resumeTarget: "parent-uuid",
+    resumeSessionId: "child-uuid",
+  });
+  expect(argv).toContain("--x-tmux-session");
+  expect(argv[argv.indexOf("--x-tmux-session") + 1]).toBe("wrapped");
+  expect(argv).toContain("--x-tmux-window-name");
+  expect(argv[argv.indexOf("--x-tmux-window-name") + 1]).toBe("fn-1277.2");
+  expect(argv).toContain("--x-tmux-env");
+  expect(argv[argv.indexOf("--x-tmux-env") + 1]).toBe(
+    "KEEPER_TMUX_SESSION=wrapped",
+  );
+  expect(argv[argv.indexOf("--resume") + 1]).toBe("parent-uuid");
+  expect(argv[argv.indexOf("--session-id") + 1]).toBe("child-uuid");
+  expect(argv[argv.indexOf("--name") + 1]).toBe("fn-1277.2");
+  expect(argv).not.toContain("--model");
+  expect(argv).not.toContain("--effort");
+  expect(argv).not.toContain("--preset");
+});
+
+test("buildAgentLaunchArgv: pi resume keeps shared wrapped presentation while preserving native session target", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    cli: "pi",
+    prompt: "follow-up ask",
+    session: "wrapped",
+    name: "fn-1277.2",
+    resumeTarget: "pi-session-id",
+  });
+  expect(argv).toEqual([
+    "/abs/bun",
+    "/abs/cli/keeper.ts",
+    "agent",
+    "pi",
+    "--x-tmux",
+    "--x-tmux-detached",
+    "--x-no-confirm",
+    "--x-tmux-session",
+    "wrapped",
+    "--x-tmux-window-name",
+    "fn-1277.2",
+    "-na",
+    "--name",
+    "fn-1277.2",
+    "--session",
+    "pi-session-id",
+    "follow-up ask",
+  ]);
+  expect(argv).not.toContain("--model");
+  expect(argv).not.toContain("--effort");
+  expect(argv).not.toContain("--preset");
+});
+
 test("buildAgentLaunchArgv: fresh launch is unaffected when resumeTarget is absent (byte-unchanged)", () => {
   for (const cli of ["claude", "codex", "pi", "hermes"] as const) {
     const argv = buildAgentLaunchArgv({

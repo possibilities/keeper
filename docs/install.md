@@ -15,11 +15,13 @@ Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, 
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
 owned by you and mode `644` or macOS silently ignores it. Optional account-routing integrations are
 discovered through their CLIs; there is no keeper config map to author for them. The autoclose worker
-force-closes the tmux window of a done-and-idle keeper-dispatched agent (an autopilot `work::`/`close::`
-worker or a finished claude panel leg) after a grace: `autoclose_enabled` (default `true`; set
-`false`/`off`/`no`/`0` to disable — re-read every pulse, so a flip needs no daemon restart) and
-`autoclose_grace_seconds` (default `30`) govern it. A finished `unblock`/`deconflict`/`resolve`
-escalation window is reaped under the same knobs once its block or conflict instance is resolved.
+force-closes the exact tmux window of a done-and-idle keeper-dispatched agent after a grace: autopilot
+`work::`/`close::` workers, finished claude panel legs, escalation windows whose block or conflict
+instance is resolved, and wrapped provider legs in the shared `wrapped` tmux session all use the same
+run-handle/window identity cleanup. `autoclose_enabled` (default `true`; set `false`/`off`/`no`/`0` to
+disable — re-read every pulse, so a flip needs no daemon restart) and `autoclose_grace_seconds`
+(default `30`) govern it. Wrapped provider-leg titles are bare task IDs for display; resume and cleanup
+continue by the captured harness resume target and exact tmux identity, not by title.
 
 ### Account routing (optional)
 

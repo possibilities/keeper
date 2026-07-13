@@ -910,14 +910,12 @@ describe("worker cells: the required v2 host worker matrix", () => {
       expect(wrapped).toContain(
         "keeper agent providers resolve gpt-5.5 medium",
       );
-      expect(wrapped).toContain("--session wrapped --name wrapped::<task-id>");
+      expect(wrapped).toContain("--session wrapped --name <task-id>");
+      expect(wrapped).not.toContain("wrapped::<task-id>");
       expect(wrapped).not.toContain("--session wrapped::<task-id>");
-      expect(wrapped).toContain(
-        "that window closes when its agent process exits",
-      );
-      expect(wrapped).toContain(
-        "tmux closes the shared session after its last window exits",
-      );
+      expect(wrapped).not.toContain("--reap-window-on-terminal");
+      expect(wrapped).toContain("daemon-owned by the run handle/window identity");
+      expect(wrapped).toContain("the bare task-ID name is display-only");
       expect(wrapped).toContain("keeper agent run");
       expect(wrapped).not.toContain("sh -c 'nohup");
       expect(wrapped).not.toContain("PIDFILE");
@@ -927,7 +925,8 @@ describe("worker cells: the required v2 host worker matrix", () => {
       expect(wrapped).toContain('--output "$KEEPER_WRAPPED_ENVELOPE"');
       // Dumb courier: every fix (impl, test, lint) is re-delegated to the leg via
       // `--resume`, never patched by the wrapper directly.
-      expect(wrapped).toContain("--resume wrapped::<task-id>");
+      expect(wrapped).toContain("--resume <captured-resume-target-or-exact-session>");
+      expect(wrapped).toContain("--session wrapped --name <task-id>");
       expect(wrapped).toContain("lint_failed");
       expect(wrapped).not.toContain("read the named files, fix per the stderr");
       // Failure map: launch-fail falls through the pecking order, timeout retries
