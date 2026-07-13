@@ -8182,6 +8182,112 @@ test("scheduled_tasks is re-fold deterministic: rewind + DELETE + re-drain repro
 });
 
 // ---------------------------------------------------------------------------
+// Durable await request/cancel Projection
+// ---------------------------------------------------------------------------
+
+function awaitRequestedEvent(
+  awaitId: string,
+  overrides: Record<string, unknown> = {},
+): number {
+  return insertEvent({
+    hook_event: "AwaitRequested",
+    event_type: "awaits",
+    session_id: awaitId,
+    data: JSON.stringify({
+      op: "request",
+      await_id: awaitId,
+      condition_spec: [{ condition: "landed", target: "fn-1-await" }],
+      follow_up: "review the landed epic",
+      target_session: "work",
+      target_dir: "/tmp/work",
+      timeout_at: 1_700_000_000,
+      ...overrides,
+    }),
+  });
+}
+
+function getAwaits() {
+  return db.query("SELECT * FROM awaits ORDER BY await_id").all();
+}
+
+test("AwaitRequested folds a waiting Durable await and advances the Cursor", () => {
+  const eventId = awaitRequestedEvent("await-one");
+  drainAll();
+  expect(getAwaits()).toEqual([
+    {
+      await_id: "await-one",
+      condition_spec: JSON.stringify([
+        { condition: "landed", target: "fn-1-await" },
+      ]),
+      follow_up: "review the landed epic",
+      target_session: "work",
+      target_dir: "/tmp/work",
+      timeout_at: 1_700_000_000,
+      status: "waiting",
+      claimed_at: null,
+      attempt_count: 0,
+      never_bound_count: 0,
+      last_event_id: eventId,
+    },
+  ]);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AwaitRequested cancel folds a waiting row to cancelled", () => {
+  awaitRequestedEvent("await-cancel");
+  drainAll();
+  const cancelId = insertEvent({
+    hook_event: "AwaitRequested",
+    event_type: "awaits",
+    session_id: "await-cancel",
+    data: JSON.stringify({ op: "cancel", await_id: "await-cancel" }),
+  });
+  drainAll();
+  expect(getAwaits()).toMatchObject([
+    {
+      await_id: "await-cancel",
+      status: "cancelled",
+      claimed_at: null,
+      last_event_id: cancelId,
+    },
+  ]);
+});
+
+test("malformed AwaitRequested is a safe no-op while the Cursor advances", () => {
+  const malformedId = insertEvent({
+    hook_event: "AwaitRequested",
+    event_type: "awaits",
+    session_id: "await-bad",
+    data: "{bad json",
+  });
+  drainAll();
+  expect(getAwaits()).toEqual([]);
+  expect(getCursor()).toBe(malformedId);
+});
+
+test("Durable awaits Re-fold byte-identically", () => {
+  awaitRequestedEvent("await-a");
+  awaitRequestedEvent("await-b", {
+    condition_spec: [{ condition: "drained" }],
+    follow_up: "start planning",
+    timeout_at: null,
+  });
+  insertEvent({
+    hook_event: "AwaitRequested",
+    event_type: "awaits",
+    session_id: "await-b",
+    data: JSON.stringify({ op: "cancel", await_id: "await-b" }),
+  });
+  drainAll();
+  const before = getAwaits();
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM awaits");
+  drainAll();
+  expect(getAwaits()).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // `HandoffRequested` (fn-946 task .2): folds into the durable `handoffs`
 // projection (status='requested') AND writes the `handoff-from` HandoffLinkEntry
 // onto the initiator job's `handoff_links` array. Pure (no Date.now/env), never

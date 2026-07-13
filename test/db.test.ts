@@ -11,7 +11,11 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
+import {
+  AWAITS_DESCRIPTOR,
+  JOBS_DESCRIPTOR,
+  selectByIds,
+} from "../src/collections";
 import {
   computeSchemaFingerprint,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
@@ -200,6 +204,55 @@ test("openDb creates the handoffs table with the documented columns (fn-946)", (
   // `never_bound_count` defaults to 0 when omitted.
   expect(row?.never_bound_count).toBe(0);
   expect(row?.last_event_id).toBe(7);
+  db.close();
+});
+
+test("openDb creates the Durable awaits Projection and its collection descriptor lists rows", () => {
+  const { db } = openDb(dbPath);
+  const cols = db.prepare("PRAGMA table_info(awaits)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  expect(cols.map((column) => column.name)).toEqual([
+    "await_id",
+    "condition_spec",
+    "follow_up",
+    "target_session",
+    "target_dir",
+    "timeout_at",
+    "status",
+    "claimed_at",
+    "attempt_count",
+    "never_bound_count",
+    "last_event_id",
+  ]);
+  db.prepare(
+    `INSERT INTO awaits (
+       await_id, condition_spec, follow_up, target_session, status, last_event_id
+     ) VALUES (?, ?, ?, ?, 'waiting', ?)`,
+  ).run(
+    "await-listable",
+    JSON.stringify([{ condition: "drained" }]),
+    "plan the next epic",
+    "work",
+    12,
+  );
+  expect(selectByIds(db, AWAITS_DESCRIPTOR, ["await-listable"])).toEqual([
+    {
+      await_id: "await-listable",
+      condition_spec: [{ condition: "drained" }],
+      follow_up: "plan the next epic",
+      target_session: "work",
+      target_dir: null,
+      timeout_at: null,
+      status: "waiting",
+      claimed_at: null,
+      attempt_count: 0,
+      never_bound_count: 0,
+      last_event_id: 12,
+    },
+  ]);
   db.close();
 });
 
@@ -685,17 +738,15 @@ test("openDb adds nullable drift_behind_threshold + drift_age_threshold_days to 
   db.close();
 });
 
-test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
-  // The schema default matches the zero-event projection: a fresh DB with no
-  // `HandoffRequested` events drains to an empty `handoffs` table. (Folds land
-  // in tasks .2/.3; here the deterministic-replayed default must be empty so a
-  // pre-feature log re-folds byte-identically.)
+test("a from-scratch re-fold over zero handoff or Durable await Events leaves both Projections empty", () => {
   const { db } = openDb(dbPath);
   drainAll(db);
-  const count = db.prepare("SELECT COUNT(*) AS n FROM handoffs").get() as {
-    n: number;
-  };
-  expect(count.n).toBe(0);
+  for (const table of ["handoffs", "awaits"]) {
+    const count = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+      n: number;
+    };
+    expect(count.n).toBe(0);
+  }
   db.close();
 });
 
@@ -3046,7 +3097,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(124);
+  expect(SCHEMA_VERSION).toBe(125);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

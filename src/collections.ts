@@ -862,6 +862,31 @@ export const HANDOFFS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/** Query/watch descriptor for the deterministic-replayed Durable await Projection. */
+export const AWAITS_DESCRIPTOR: CollectionDescriptor = {
+  name: "awaits",
+  table: "awaits",
+  columns: [
+    "await_id",
+    "condition_spec",
+    "follow_up",
+    "target_session",
+    "target_dir",
+    "timeout_at",
+    "status",
+    "claimed_at",
+    "attempt_count",
+    "never_bound_count",
+    "last_event_id",
+  ],
+  pk: "await_id",
+  version: "last_event_id",
+  sortable: new Set(["await_id", "status", "claimed_at", "last_event_id"]),
+  defaultSort: { column: "await_id", dir: "asc" },
+  filters: { await_id: "await_id", status: "status" },
+  jsonColumns: new Set(["condition_spec"]),
+};
+
 /**
  * The `tmux_client_focus` singleton descriptor (fn-952) — the persistent
  * `tmux -C` control worker's live-only view of which session/window/pane the
@@ -971,6 +996,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
+  [AWAITS_DESCRIPTOR.name, AWAITS_DESCRIPTOR],
   [TMUX_CLIENT_FOCUS_DESCRIPTOR.name, TMUX_CLIENT_FOCUS_DESCRIPTOR],
   [WORKTREE_REPO_STATUS_DESCRIPTOR.name, WORKTREE_REPO_STATUS_DESCRIPTOR],
   [LANE_MERGED_DESCRIPTOR.name, LANE_MERGED_DESCRIPTOR],
@@ -1005,6 +1031,7 @@ export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
   "builds",
   "block_escalations",
   "handoffs",
+  "awaits",
   "tmux_client_focus",
   "worktree_repo_status",
   "lane_merged",

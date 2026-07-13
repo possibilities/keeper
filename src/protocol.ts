@@ -285,6 +285,56 @@ export interface MetaFrame {
   total: number;
 }
 
+/** Condition kinds a Durable await worker can evaluate from server projections. */
+export const DURABLE_AWAIT_CONDITION_KINDS = [
+  "complete",
+  "unblocked",
+  "started",
+  "git-clean",
+  "agents-idle",
+  "drained",
+  "landed",
+  "dead-letter",
+  "block-escalation",
+  "parked-question",
+  "stuck-dispatch",
+  "finalize-non-ff",
+  "instant-death-wall",
+  "needs-human",
+] as const;
+
+export type DurableAwaitConditionKind =
+  (typeof DURABLE_AWAIT_CONDITION_KINDS)[number];
+
+export type DurableAwaitStatus =
+  | "waiting"
+  | "firing"
+  | "done"
+  | "failed"
+  | "timed_out"
+  | "cancelled";
+
+/** One persisted condition segment. Kind-specific fields stay JSON-shaped. */
+export interface DurableAwaitCondition {
+  condition: DurableAwaitConditionKind;
+  [key: string]: unknown;
+}
+
+export type DurableAwaitConditionSpec = readonly DurableAwaitCondition[];
+
+/** Wire payload for the eighth mutating RPC. */
+export type RequestAwaitRpcParams =
+  | {
+      op: "request";
+      await_id: string;
+      condition_spec: DurableAwaitConditionSpec;
+      doc_path: string;
+      target_session: string;
+      target_dir?: string | null;
+      timeout_ms?: number | null;
+    }
+  | { op: "cancel"; await_id: string };
+
 /**
  * Client → server: invoke a registered RPC handler. The server looks up
  * `method` in its RPC registry; a missing entry yields an `error` frame with
