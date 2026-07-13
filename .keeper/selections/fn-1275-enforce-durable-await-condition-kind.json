@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.4-mini",
+      "rationale": "Single-file, fully-specified test addition (import an enum, assert coverage keyset/length tie) with a named acceptance and no design or contract judgment, so a light GPT tier at a bounded band fits; 5.4-mini carries the small keyset-vs-length decision spark might strand.",
+      "task_id": "fn-1275-enforce-durable-await-condition-kind.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T11:30:25.396000Z",
+  "epic_id": "fn-1275-enforce-durable-await-condition-kind",
+  "input_hash": "864d41c32d9d2268d87c292c4d6542eee4a3227714e0af92d90557adde25bb19",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2253210051,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.4-mini\",\"rationale\":\"Single-file, fully-specified test addition (import an enum, assert coverage keyset/length tie) with a named acceptance and no design or contract judgment, so a light GPT tier at a bounded band fits; 5.4-mini carries the small keyset-vs-length decision spark might strand.\",\"confidence\":0.8}]}\n"
+}
