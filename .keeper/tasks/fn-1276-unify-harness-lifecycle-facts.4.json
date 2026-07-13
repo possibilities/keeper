@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Migrate activity and dispatch policy",
-  "updated_at": "2026-07-13T12:32:14.736000Z"
+  "updated_at": "2026-07-13T14:51:44.741000Z",
+  "worker_done_at": "2026-07-13T14:51:44.741000Z"
 }

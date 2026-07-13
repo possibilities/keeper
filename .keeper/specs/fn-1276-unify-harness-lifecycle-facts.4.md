@@ -64,5 +64,5 @@ Switch consumers only after attempt binding is live. Keep a compatibility branch
 - [ ] Focused readiness, reconcile, bus-wake, await, daemon, and status suites pass without live daemon or tmux access.
 
 ## Done summary
-
+Unified Harness-activity and Dispatch-claim consumption across readiness capacity, status, await, audit ownership, autopilot, and bus wake; resume request/acceptance is now attempt-scoped with revoke-and-fence before replacement dispatch, while Resource-hold cleanup checks are unchanged.
 ## Evidence
