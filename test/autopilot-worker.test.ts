@@ -43,6 +43,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
 import {
+  BASE_REFRESH_COOLDOWN_SEC,
+  type BaseDriftEntry,
   buildLaunchArgv,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
@@ -5621,6 +5623,7 @@ test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
 // test force a failure on any leg (the sticky-DispatchFailed paths).
 interface FakeWorktreeLog {
   calls: string[];
+  refreshes: BaseDriftEntry[];
   provisions: WorktreeLaunchInfo[];
   provisionAttributions: (ReadonlySet<string> | null)[];
   finalizes: WorktreeLaunchInfo[];
@@ -5628,6 +5631,8 @@ interface FakeWorktreeLog {
   recoverRepos: string[][];
 }
 function makeFakeWorktreeDriver(opts?: {
+  refreshFail?: (entry: BaseDriftEntry) => string | null;
+  refreshRetry?: (entry: BaseDriftEntry) => string | null;
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
   // A fan-in LANE pre-merge failure — the self-clearing shape `{ ok:false, reason,
@@ -5647,6 +5652,7 @@ function makeFakeWorktreeDriver(opts?: {
 }): { driver: WorktreeDriver; log: FakeWorktreeLog } {
   const log: FakeWorktreeLog = {
     calls: [],
+    refreshes: [],
     provisions: [],
     provisionAttributions: [],
     finalizes: [],
@@ -5654,6 +5660,15 @@ function makeFakeWorktreeDriver(opts?: {
     recoverRepos: [],
   };
   const driver: WorktreeDriver = {
+    async refreshBase(entry) {
+      log.calls.push(`refresh:${entry.epic_id}:${entry.repo_dir}`);
+      log.refreshes.push(entry);
+      const retry = opts?.refreshRetry?.(entry) ?? null;
+      if (retry !== null) return { ok: false, retry: true, reason: retry };
+      const reason = opts?.refreshFail?.(entry) ?? null;
+      if (reason !== null) return { ok: false, reason };
+      return { ok: true };
+    },
     async provision(info, liveAttributedDirty) {
       log.calls.push(`provision:${info.assignment.nodeId}`);
       log.provisions.push(info);
@@ -7720,6 +7735,215 @@ test("fn-959 runReconcileCycle: worktree ON multi-repo reject → sticky Dispatc
   for (const e of depsLog.emissions) {
     expect(e.reason).toContain("worktree-multi-repo");
   }
+});
+
+test("base refresh producer: a drifted quiescent lane refreshes exactly once in its own worktree", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const drift: BaseDriftEntry = {
+    epic_id: epic.epic_id,
+    repo_dir: "/repo",
+    behind_count: 20,
+    merge_base_age_seconds: 90_000,
+  };
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      worktreeMode: true,
+      baseDriftEntries: [drift],
+    }),
+    makeState(),
+    0,
+  );
+  decision.launches = [];
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+    new Map(),
+  );
+
+  expect(log.refreshes).toEqual([drift]);
+  expect(depsLog.emissions).toEqual([]);
+});
+
+test("base refresh producer: a live-worker lane defers with no merge and no distress row", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const drift: BaseDriftEntry = {
+    epic_id: epic.epic_id,
+    repo_dir: "/repo",
+    behind_count: 20,
+    merge_base_age_seconds: 90_000,
+  };
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      worktreeMode: true,
+      baseDriftEntries: [drift],
+    }),
+    makeState(),
+    0,
+  );
+  decision.launches = [];
+  const lanePath = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+    new Map([[lanePath, new Set(["src/live.ts"])]]),
+  );
+
+  expect(log.refreshes).toEqual([]);
+  expect(depsLog.emissions).toEqual([]);
+});
+
+test("base refresh producer: conflict uses the existing bare close merge-conflict row and suppresses same-cycle lane launch", async () => {
+  const reason =
+    "worktree-merge-conflict: merging main into keeper/epic/fn-1-foo — CONFLICT";
+  const { driver, log } = makeFakeWorktreeDriver({
+    refreshFail: () => reason,
+  });
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      worktreeMode: true,
+      baseDriftEntries: [
+        {
+          epic_id: epic.epic_id,
+          repo_dir: "/repo",
+          behind_count: 20,
+          merge_base_age_seconds: 90_000,
+        },
+      ],
+    }),
+    makeState(),
+    0,
+  );
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+    new Map(),
+  );
+
+  expect(log.refreshes).toHaveLength(1);
+  expect(log.provisions).toEqual([]);
+  expect(depsLog.emissions).toHaveLength(1);
+  expect(depsLog.emissions[0]).toMatchObject({
+    verb: "close",
+    id: "fn-1-foo",
+    reason,
+  });
+});
+
+function makeBaseRefreshGitRun(
+  opts: { dirty?: boolean; lastRefreshAt?: number; mergeCode?: number } = {},
+): { run: GitRunner; commands: string[][] } {
+  const commands: string[][] = [];
+  const run: GitRunner = async (args) => {
+    commands.push([...args]);
+    const command = args.join(" ");
+    if (args[0] === "symbolic-ref") return { code: 1, stdout: "", stderr: "" };
+    if (args[0] === "for-each-ref") {
+      return { code: 0, stdout: "main\nkeeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (args[0] === "status") {
+      return {
+        code: 0,
+        stdout: opts.dirty ? " M src/live.ts\n" : "",
+        stderr: "",
+      };
+    }
+    if (command === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (args[0] === "ls-files") return { code: 0, stdout: "", stderr: "" };
+    if (args[0] === "log") {
+      return {
+        code: 0,
+        stdout:
+          opts.lastRefreshAt === undefined ? "" : `${opts.lastRefreshAt}\n`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "rev-parse" && args.includes("--end-of-options")) {
+      return { code: 0, stdout: "default-tip\n", stderr: "" };
+    }
+    if (args[0] === "merge-base") return { code: 1, stdout: "", stderr: "" };
+    if (command === "rev-parse --git-common-dir") {
+      return { code: 0, stdout: "/repo/.git\n", stderr: "" };
+    }
+    if (args[0] === "merge") {
+      return {
+        code: opts.mergeCode ?? 0,
+        stdout: opts.mergeCode ? "" : "merged\n",
+        stderr: opts.mergeCode ? "CONFLICT" : "",
+      };
+    }
+    // Pseudo-ref probes: no merge/rebase operation is in flight.
+    if (args[0] === "rev-parse") return { code: 1, stdout: "", stderr: "" };
+    throw new Error(`unexpected git command: ${command}`);
+  };
+  return { run, commands };
+}
+
+test("base refresh driver: dirty lane is a retry-skip and never invokes merge", async () => {
+  const { run, commands } = makeBaseRefreshGitRun({ dirty: true });
+  const result = await createWorktreeDriver(run).refreshBase(
+    {
+      epic_id: "fn-1-foo",
+      repo_dir: "/repo",
+      behind_count: 20,
+      merge_base_age_seconds: 90_000,
+    },
+    10_000,
+  );
+
+  expect(result).toMatchObject({ ok: false, retry: true });
+  expect(commands.some((args) => args[0] === "merge")).toBe(false);
+});
+
+test("base refresh driver: cooldown skips churn; after expiry merges local default into the base worktree exactly once", async () => {
+  const recent = makeBaseRefreshGitRun({ lastRefreshAt: 10_000 });
+  const entry: BaseDriftEntry = {
+    epic_id: "fn-1-foo",
+    repo_dir: "/repo",
+    behind_count: 20,
+    merge_base_age_seconds: 90_000,
+  };
+  expect(
+    await createWorktreeDriver(recent.run).refreshBase(
+      entry,
+      10_000 + BASE_REFRESH_COOLDOWN_SEC - 1,
+    ),
+  ).toEqual({ ok: true });
+  expect(recent.commands.some((args) => args[0] === "merge")).toBe(false);
+
+  const expired = makeBaseRefreshGitRun({ lastRefreshAt: 10_000 });
+  expect(
+    await createWorktreeDriver(expired.run, async () => ({
+      release() {},
+    })).refreshBase(entry, 10_000 + BASE_REFRESH_COOLDOWN_SEC),
+  ).toEqual({ ok: true });
+  const merges = expired.commands.filter((args) => args[0] === "merge");
+  expect(merges).toEqual([["merge", "--no-edit", "main"]]);
 });
 
 test("fn-959 runReconcileCycle: closer-done epic → finalizeEpic runs AFTER the launch loop, merges base into default", async () => {
