@@ -53,6 +53,7 @@ import {
   countAndToken,
   decodeRow,
   getCollection,
+  liveKeyExpr,
   liveKeyOf,
   type Row,
   selectByIdsChunked,
@@ -1446,8 +1447,8 @@ export function runQuery(
   );
   const _t1 = TRACE ? performance.now() : 0;
 
-  // table/columns/pk/sortCol/dir are descriptor constants, never wire text —
-  // safe to interpolate. filter values + limit/offset are bound. A wire
+  // table/columns/pk/sortCol/dir/liveKeyExpr are descriptor constants, never
+  // wire text — safe to interpolate. filter values + limit/offset are bound. A wire
   // `limit: 0` ("no limit" sentinel from clampLimit) is rebound as SQLite's
   // `LIMIT -1` — the documented "all remaining rows" form, which still
   // honors `OFFSET` so a paged scan of the full set works the same way.
@@ -1456,7 +1457,7 @@ export function runQuery(
     SELECT ${descriptor.columns.join(", ")}
       FROM ${descriptor.table}
       ${where.clause}
-     ORDER BY ${sortCol} ${dir.toUpperCase()}, ${descriptor.pk} ASC
+     ORDER BY ${sortCol} ${dir.toUpperCase()}, ${liveKeyExpr(descriptor)} ASC
      LIMIT ? OFFSET ?
   `;
   const rawRows = db

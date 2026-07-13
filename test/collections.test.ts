@@ -21,6 +21,7 @@ import { drainedState } from "../src/await-conditions";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
   BUILDS_DESCRIPTOR,
+  type CollectionDescriptor,
   countAndToken,
   DEAD_LETTERS_DESCRIPTOR,
   DISPATCH_FAILURES_DESCRIPTOR,
@@ -34,7 +35,9 @@ import {
   liveKeyExpr,
   liveKeyOf,
   PENDING_DISPATCHES_DESCRIPTOR,
+  REGISTRY,
   SCHEDULED_TASKS_DESCRIPTOR,
+  SUBAGENT_INVOCATIONS_DESCRIPTOR,
   selectByIdsChunked,
   selectVersionsByIds,
   selectVersionsByIdsChunked,
@@ -48,7 +51,7 @@ import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import type { Verdict } from "../src/readiness";
 import { runQuery } from "../src/server-worker";
 import type { Job } from "../src/types";
-import { freshDbFile } from "./helpers/template-db";
+import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -1597,6 +1600,231 @@ function seedDispatchFailure(
     1.0,
   );
 }
+
+function seedSubagentInvocation(
+  db: Database,
+  jobId: string,
+  agentId: string,
+  turnSeq: number,
+  lastEventId: number,
+): void {
+  db.query(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(jobId, agentId, turnSeq, 1.0, lastEventId, 1.0);
+}
+
+function seedScheduledTask(
+  db: Database,
+  jobId: string,
+  cronId: string,
+  lastEventId: number,
+): void {
+  db.query(
+    `INSERT INTO scheduled_tasks
+       (job_id, cron_id, ts, last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(jobId, cronId, 1.0, lastEventId, 1.0);
+}
+
+function seedPendingDispatch(
+  db: Database,
+  verb: string,
+  id: string,
+  lastEventId: number,
+): void {
+  db.query(
+    `INSERT INTO pending_dispatches
+       (verb, id, dispatched_at, last_event_id)
+     VALUES (?, ?, ?, ?)`,
+  ).run(verb, id, 1.0, lastEventId);
+}
+
+test("REGISTRY composite live identities match their SQLite primary keys", () => {
+  const { db } = freshMemDb();
+  const singleWireKeyExemptions = new Set(["block_escalations"]);
+
+  for (const descriptor of REGISTRY.values()) {
+    const tableInfo = db
+      .query(`PRAGMA table_info(${descriptor.table})`)
+      .all() as { name: string; pk: number }[];
+    const primaryKeyColumns = tableInfo
+      .filter((column) => column.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((column) => column.name);
+    if (primaryKeyColumns.length < 2) continue;
+
+    if (singleWireKeyExemptions.has(descriptor.name)) {
+      // task_id is globally unique, so the wire key is also a safe live key.
+      expect(descriptor.liveKeyColumns).toBeUndefined();
+      continue;
+    }
+    if (descriptor.liveKeyColumns == null) {
+      throw new Error(
+        `${descriptor.name}: composite SQLite primary key requires liveKeyColumns or an explicit exemption`,
+      );
+    }
+    expect([...descriptor.liveKeyColumns].sort()).toEqual(
+      [...primaryKeyColumns].sort(),
+    );
+  }
+  db.close();
+});
+
+function expectCompositeLiveIdentity(
+  descriptor: typeof SUBAGENT_INVOCATIONS_DESCRIPTOR,
+  expectedExpr: string,
+  first: Record<string, unknown>,
+  second: Record<string, unknown>,
+  seed: (db: Database) => void,
+): void {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seed(db);
+  const firstKey = liveKeyOf(descriptor, first);
+  const secondKey = liveKeyOf(descriptor, second);
+
+  expect(liveKeyExpr(descriptor)).toBe(expectedExpr);
+  expect(firstKey).not.toBe(secondKey);
+
+  const versions = selectVersionsByIds(db, descriptor, [firstKey, secondKey]);
+  expect(versions.size).toBe(2);
+  expect(versions.get(firstKey)).toBe(5);
+  expect(versions.get(secondKey)).toBe(7);
+
+  const rows = selectByIdsChunked(db, descriptor, [firstKey, secondKey]);
+  const byLiveKey = new Map(
+    rows.map((row) => [liveKeyOf(descriptor, row), row]),
+  );
+  expect(byLiveKey.size).toBe(2);
+
+  const membership = countAndToken(db, descriptor, "", []);
+  expect(membership.total).toBe(2);
+  expect(membership.token).toContain(firstKey);
+  expect(membership.token).toContain(secondKey);
+  db.close();
+}
+
+test("subagent_invocations: same-job rows retain distinct live identities", () => {
+  expectCompositeLiveIdentity(
+    SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    "job_id || char(31) || agent_id || char(31) || turn_seq",
+    { job_id: "job-1", agent_id: "agent-a", turn_seq: 1 },
+    { job_id: "job-1", agent_id: "agent-b", turn_seq: 2 },
+    (db) => {
+      seedSubagentInvocation(db, "job-1", "agent-a", 1, 5);
+      seedSubagentInvocation(db, "job-1", "agent-b", 2, 7);
+    },
+  );
+});
+
+test("scheduled_tasks: same-job rows retain distinct live identities", () => {
+  expectCompositeLiveIdentity(
+    SCHEDULED_TASKS_DESCRIPTOR,
+    "job_id || char(31) || cron_id",
+    { job_id: "job-1", cron_id: "cron-a" },
+    { job_id: "job-1", cron_id: "cron-b" },
+    (db) => {
+      seedScheduledTask(db, "job-1", "cron-a", 5);
+      seedScheduledTask(db, "job-1", "cron-b", 7);
+    },
+  );
+});
+
+test("pending_dispatches: same-verb rows retain distinct live identities", () => {
+  expectCompositeLiveIdentity(
+    PENDING_DISPATCHES_DESCRIPTOR,
+    "verb || char(31) || id",
+    { verb: "work", id: "task-a" },
+    { verb: "work", id: "task-b" },
+    (db) => {
+      seedPendingDispatch(db, "work", "task-a", 5);
+      seedPendingDispatch(db, "work", "task-b", 7);
+    },
+  );
+});
+
+function expectStableCompositePageOrder({
+  descriptor,
+  filter,
+  sortColumn,
+  expected,
+  seed,
+}: {
+  descriptor: CollectionDescriptor;
+  filter: Record<string, string>;
+  sortColumn: string;
+  expected: string[];
+  seed: (db: Database) => void;
+}): void {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seed(db);
+
+  const fetch = () =>
+    asResult(
+      runQuery(db, 1, {
+        type: "query",
+        collection: descriptor.name,
+        filter,
+      }),
+    ).rows;
+  const first = fetch();
+  const refetch = fetch();
+
+  // Every fixture ties on both the displayed sort column and its single wire
+  // pk. The composite live key is therefore the only total-order tie-break.
+  expect(new Set(first.map((row) => String(row[sortColumn]))).size).toBe(1);
+  expect(new Set(first.map((row) => String(row[descriptor.pk]))).size).toBe(1);
+  expect(first.map((row) => liveKeyOf(descriptor, row))).toEqual(expected);
+  expect(refetch).toEqual(first);
+  db.close();
+}
+
+test("runQuery uses composite live keys for stable tied page order", () => {
+  expectStableCompositePageOrder({
+    descriptor: SUBAGENT_INVOCATIONS_DESCRIPTOR,
+    filter: { job_id: "job-1" },
+    sortColumn: "ts",
+    expected: [
+      "job-1\u001fagent-a\u001f1",
+      "job-1\u001fagent-b\u001f2",
+    ],
+    seed: (db) => {
+      seedSubagentInvocation(db, "job-1", "agent-b", 2, 7);
+      seedSubagentInvocation(db, "job-1", "agent-a", 1, 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: SCHEDULED_TASKS_DESCRIPTOR,
+    filter: { job_id: "job-1" },
+    sortColumn: "ts",
+    expected: ["job-1\u001fcron-a", "job-1\u001fcron-b"],
+    seed: (db) => {
+      seedScheduledTask(db, "job-1", "cron-b", 7);
+      seedScheduledTask(db, "job-1", "cron-a", 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: PENDING_DISPATCHES_DESCRIPTOR,
+    filter: { verb: "work" },
+    sortColumn: "dispatched_at",
+    expected: ["work\u001ftask-a", "work\u001ftask-b"],
+    seed: (db) => {
+      seedPendingDispatch(db, "work", "task-b", 7);
+      seedPendingDispatch(db, "work", "task-a", 5);
+    },
+  });
+  expectStableCompositePageOrder({
+    descriptor: DISPATCH_FAILURES_DESCRIPTOR,
+    filter: { verb: "work" },
+    sortColumn: "ts",
+    expected: ["work\u001ffn-a", "work\u001ffn-b"],
+    seed: (db) => {
+      seedDispatchFailure(db, "work", "fn-b", { last_event_id: 7 });
+      seedDispatchFailure(db, "work", "fn-a", { last_event_id: 5 });
+    },
+  });
+});
 
 test("liveKeyExpr: single-pk descriptor falls back to the bare pk column (SQL unchanged)", () => {
   expect(liveKeyExpr(EPICS_DESCRIPTOR)).toBe(EPICS_DESCRIPTOR.pk);
