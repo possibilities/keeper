@@ -20,5 +20,5 @@ Files:
 - [ ] `bun test` passes.
 
 ## Done summary
-
+test/await-worker.test.ts now imports DURABLE_AWAIT_CONDITION_KINDS and asserts the durableAwaitCases keyset matches the enum exactly, so an untied condition kind turns the coverage suite red.
 ## Evidence
