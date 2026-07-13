@@ -59,5 +59,5 @@ Ship the protocol and tests in pi-subagents before Keeper changes its required R
 - [ ] Package tests cover protocol mismatch, lifecycle races, strict resolution, and recursive teardown without real inference.
 
 ## Done summary
-
+Strengthened pi-subagents' RPC (v2->v3) with strict named-agent resolution, opaque hierarchical ownership scopes via AsyncLocalStorage, nested active-context propagation, and idempotent recursive cancellation that settles only after descendant AgentSessions terminate or report bounded failure.
 ## Evidence

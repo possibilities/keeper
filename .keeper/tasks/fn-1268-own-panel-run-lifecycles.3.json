@@ -11,5 +11,6 @@
   "target_repo": "/Volumes/Scratch/src/possibilities--pi-subagents",
   "tier": "xhigh",
   "title": "Add scoped Pi Task ownership",
-  "updated_at": "2026-07-12T23:46:28.435000Z"
+  "updated_at": "2026-07-13T00:08:12.179000Z",
+  "worker_done_at": "2026-07-13T00:08:12.179000Z"
 }
