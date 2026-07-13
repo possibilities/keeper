@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T16:31:36.464000Z",
+  "depends_on": [],
+  "epic": "fn-1280-harden-plan-execution-against-commit",
+  "id": "fn-1280-harden-plan-execution-against-commit.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Scope boot sweep to scanned roots only",
+  "updated_at": "2026-07-13T16:31:36.464000Z"
+}
