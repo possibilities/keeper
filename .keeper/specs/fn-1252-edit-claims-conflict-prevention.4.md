@@ -48,5 +48,5 @@ Faked `WorktreeGitRunner`: drifted+quiescent → one default→base merge; dirty
 - [ ] Refresh is rate-limited so a fast-moving default cannot trigger a merge every cycle; the refresh commit does not turn finalize into a non-fast-forward.
 
 ## Done summary
-
+Added a quiescence-gated producer pass that refreshes drifted lane bases from local default (default-into-base) via mergeBranchInto, rate-limited by a git-derived cooldown; refresh conflicts route through the existing worktree-merge-conflict/resolver/deconflict chain, lock/timeout is a non-sticky retry-skip, and a real-git slow variant exercises the actual merge.
 ## Evidence
