@@ -61,5 +61,5 @@ The migration is additive and its version is assigned at merge time. Existing co
 - [ ] The additive migration, indexes, schema fingerprint, zero-event defaults, and composite-key subscription behavior pass isolated database tests.
 
 ## Done summary
-
+Added a deterministic-replayed Dispatch-claim projection keyed by target and fenced by a monotonic Dispatch-attempt identity: acquire/bind/ack/release/supersede folds validate the expected attempt atomically, duplicates are idempotent, stale/concurrent losers leave the current claim unchanged, legacy pre-change history is interpreted as unfenced, and the additive migration/indexes/fingerprint/zero-event defaults/composite-key subscriptions are covered by isolated tests.
 ## Evidence
