@@ -37,11 +37,17 @@ import {
   CLOSE_OUTCOMES,
   type CloseOutcome,
 } from "../src/verbs/close_finalize.ts";
-import { armInProgressOp } from "./fake-vcs.ts";
+import {
+  armInProgressOp,
+  armRestoreFailure,
+  failNextCommit,
+} from "./fake-vcs.ts";
 import {
   fakeDirtyPaths,
   firstJsonPayload,
+  gitBaseline,
   gitInit,
+  gitLogCount,
   parseCliOutput,
   runCli,
   scaffoldEpic,
@@ -200,6 +206,17 @@ function blockingMarkerPath(root: string, sourceEpicId: string): string {
   );
 }
 
+function closeClaimMarkerPath(home: string, sessionId: string): string {
+  return join(
+    home,
+    ".local",
+    "state",
+    "keeper",
+    "sessions",
+    `${sessionId}.json`,
+  );
+}
+
 function finalize(
   proj: { root: string; home: string },
   epicId: string,
@@ -282,6 +299,132 @@ describe("close-finalize closed_clean", () => {
     const second = finalize(proj, epicId);
     expect(second.env.outcome).toBe("closed_clean");
     expect(second.env.epic_id).toBe(epicId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Commit failure: epic definition + close claim unwind together.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize commit failure rollback", () => {
+  const getProj = withProject("planctl-cf-commit-fail-");
+  const COMMIT_FAILURE = "fake close commit failure";
+
+  test("clean rollback restores the epic and releases the claim for a re-close", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    gitBaseline(proj.root);
+    const epicPath = join(proj.root, ".keeper", "epics", `${epicId}.json`);
+    const before = readFileSync(epicPath, "utf-8");
+    const failedSid = "close-commit-failed";
+
+    const preflight = runCli(
+      ["close-preflight", epicId, "--project", proj.root],
+      {
+        cwd: proj.root,
+        home: proj.home,
+        env: { CLAUDE_CODE_SESSION_ID: failedSid },
+      },
+    );
+    expect(preflight.code).toBe(0);
+    expect(existsSync(closeClaimMarkerPath(proj.home, failedSid))).toBe(true);
+
+    failNextCommit(proj.root, COMMIT_FAILURE);
+    const failed = runCli(["close-finalize", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: failedSid },
+    });
+    expect(failed.code).toBe(1);
+    expect(readFileSync(epicPath, "utf-8")).toBe(before);
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+    expect(gitLogCount(proj.root)).toBe(0);
+    expect(fakeDirtyPaths(proj.root)).toEqual([]);
+    expect(existsSync(closeClaimMarkerPath(proj.home, failedSid))).toBe(false);
+
+    const retrySid = "close-commit-retry";
+    const retryPreflight = runCli(
+      ["close-preflight", epicId, "--project", proj.root],
+      {
+        cwd: proj.root,
+        home: proj.home,
+        env: { CLAUDE_CODE_SESSION_ID: retrySid },
+      },
+    );
+    expect(retryPreflight.code).toBe(0);
+
+    const retry = runCli(["close-finalize", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: retrySid },
+    });
+    expect(retry.code).toBe(0);
+    expect(parseCliOutput(retry.output).outcome).toBe("closed_clean");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+    expect(gitLogCount(proj.root)).toBe(1);
+  });
+
+  test("standalone epic close keeps its commit_failed exit contract without a marker", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    gitBaseline(proj.root);
+    const epicPath = join(proj.root, ".keeper", "epics", `${epicId}.json`);
+    const before = readFileSync(epicPath, "utf-8");
+    const sid = "standalone-close-commit-failed";
+
+    failNextCommit(proj.root, COMMIT_FAILURE);
+    const failed = runCli(["epic", "close", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: sid },
+    });
+    expect(failed.code).toBe(1);
+    const payload = firstJsonPayload(failed.output);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toBe("commit_failed");
+    expect((payload.details as Record<string, unknown>).message).toBe(
+      `git commit failed: ${COMMIT_FAILURE}`,
+    );
+    expect(readFileSync(epicPath, "utf-8")).toBe(before);
+    expect(gitLogCount(proj.root)).toBe(0);
+    expect(existsSync(closeClaimMarkerPath(proj.home, sid))).toBe(false);
+  });
+
+  test("incomplete rollback retains the close claim", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    gitBaseline(proj.root);
+    const sid = "close-rollback-incomplete";
+
+    const preflight = runCli(
+      ["close-preflight", epicId, "--project", proj.root],
+      {
+        cwd: proj.root,
+        home: proj.home,
+        env: { CLAUDE_CODE_SESSION_ID: sid },
+      },
+    );
+    expect(preflight.code).toBe(0);
+
+    failNextCommit(proj.root, COMMIT_FAILURE);
+    armRestoreFailure(proj.root);
+    const failed = runCli(["close-finalize", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+      env: { CLAUDE_CODE_SESSION_ID: sid },
+    });
+    expect(failed.code).toBe(1);
+    expect(gitLogCount(proj.root)).toBe(0);
+    expect(existsSync(closeClaimMarkerPath(proj.home, sid))).toBe(true);
   });
 });
 

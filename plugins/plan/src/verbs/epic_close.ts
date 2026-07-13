@@ -14,6 +14,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { restoreForRollback, snapshotForRollback } from "../commit.ts";
 import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { mergeTaskState } from "../models.ts";
@@ -32,6 +33,9 @@ export interface EpicCloseArgs {
   reason: string | null;
   project: string | null;
   format: OutputFormat | null;
+  /** Release saga-owned state only after the epic definition was cleanly
+   * restored following a failed commit. Standalone closes leave this absent. */
+  onCleanCommitFailureRollback?: () => void;
 }
 
 export function runEpicClose(args: EpicCloseArgs): void {
@@ -103,6 +107,7 @@ export function runEpicClose(args: EpicCloseArgs): void {
   if (reason !== null) {
     epicDef.close_reason = reason;
   }
+  const rollback = snapshotForRollback([epicPath]);
   atomicWriteJson(epicPath, epicDef, dataDir);
 
   emitMutating(
@@ -113,6 +118,17 @@ export function runEpicClose(args: EpicCloseArgs): void {
       tasks_total: tasksTotal,
       close_reason: reason,
     },
-    { verb: "close", target: epicId, repoRoot: ctx.projectPath },
+    {
+      verb: "close",
+      target: epicId,
+      repoRoot: ctx.projectPath,
+      onCommitFailure: () => {
+        const result = restoreForRollback(rollback, ctx.projectPath);
+        if (result === null) {
+          args.onCleanCommitFailureRollback?.();
+        }
+        return result;
+      },
+    },
   );
 }

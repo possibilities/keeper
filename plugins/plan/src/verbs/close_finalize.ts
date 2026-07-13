@@ -352,6 +352,7 @@ function closeEpic(ctx: ProjectContext, epicId: string): void {
       reason: null,
       project: null,
       format: null,
+      onCleanCommitFailureRollback: () => clearCloseMarker(epicId),
     });
   });
 }
