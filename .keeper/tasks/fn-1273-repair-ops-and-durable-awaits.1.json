@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Repair terminal watchdog and digest",
-  "updated_at": "2026-07-13T09:43:56.759000Z"
+  "updated_at": "2026-07-13T10:03:16.580000Z",
+  "worker_done_at": "2026-07-13T10:03:16.580000Z"
 }

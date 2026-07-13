@@ -49,5 +49,5 @@ brief/reason; classifier verdict table unchanged for unblock/deconflict.
 - [ ] CLAUDE.md's repair prose matches shipped behavior and lint stays green
 
 ## Done summary
-
+Repair escalation sweep now classifies a stopped-without-outcome repair as declined past an injectable grace anchored on the existing dispatch marker, paging once and re-arming only via the retry wire, while working sessions never classify. The shared escalation classifier's verdict mapping is untouched. SHARED_BASE_BROKEN stickies/briefs now carry a bounded failing-tests digest (first 8 + more-count) and baseline leaf key. CLAUDE.md's repair prose revised to match.
 ## Evidence
