@@ -846,14 +846,10 @@ export interface ReconcileSnapshot {
   maxConcurrentJobs: number | null;
   /**
    * The PER-ROOT dispatch concurrency count N, read FRESH from the
-   * `autopilot_state` singleton's `max_concurrent_per_root` column each cycle
-   * (resolved `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT` = 1 — an absent/never-set
-   * row, NULL, or a non-positive value = the in-memory default, byte-identical to
-   * today's one-task-per-root mutex). Projection-pull only (no `workerData`, no
-   * config) so a runtime `set_autopilot_config` lands the next cycle and N survives
-   * a restart. Refreshed onto {@link ReconcileState.maxConcurrentPerRoot} in the
-   * cycle glue. RESERVED for task .2's round-robin allocator; until .2 lands it is
-   * carried but unconsumed (the hardcoded N=1 mutex still runs).
+   * `autopilot_state` singleton's effective per-root cap each cycle. Projection-pull
+   * only (no `workerData`, no config) so a runtime `set_autopilot_config` lands
+   * the next cycle and N survives a restart. Refreshed onto
+   * {@link ReconcileState.maxConcurrentPerRoot} in the cycle glue.
    */
   maxConcurrentPerRoot: number;
   /**
@@ -862,8 +858,7 @@ export interface ReconcileSnapshot {
    * absent/never-set row, NULL, or 0 = OFF, the byte-identical no-worktree
    * dispatch; only a stored `1` = ON). Projection-pull only (no `workerData`, no
    * config) so a runtime `set_autopilot_config` lands the very next cycle and the
-   * toggle survives a restart for free. RESERVED for the downstream worktree tasks
-   * (.2+); until they land it is carried but unconsumed (dispatch is unchanged).
+   * toggle survives a restart for free.
    */
   worktreeMode: boolean;
   /**
@@ -1130,12 +1125,10 @@ export interface ReconcileState {
   maxConcurrentJobs: number | null;
   /**
    * Per-root dispatch concurrency count N this reconciler grants per root.
-   * REFRESHED each cycle from {@link ReconcileSnapshot.maxConcurrentPerRoot}
-   * (`autopilot_state.max_concurrent_per_root ?? DEFAULT` = 1) in the cycle glue
-   * BEFORE `reconcile()` reads it — so a runtime `set_autopilot_config` lands on
-   * the next cycle. Held on `state` (not read straight off the snapshot) for the
-   * same reason as `maxConcurrentJobs`. RESERVED for task .2's round-robin
-   * allocator; until .2 lands the hardcoded N=1 mutex still runs.
+   * REFRESHED each cycle from {@link ReconcileSnapshot.maxConcurrentPerRoot} in
+   * the cycle glue BEFORE `reconcile()` reads it — so a runtime
+   * `set_autopilot_config` lands on the next cycle. Held on `state` (not read
+   * straight off the snapshot) for the same reason as `maxConcurrentJobs`.
    */
   maxConcurrentPerRoot: number;
 }
@@ -2064,8 +2057,8 @@ export function reconcile(
   // (the default) whenever worktree mode is OFF — then `computeReadiness` keys on
   // `effectiveRoot`, byte-identical to today. ON: `laneKeyById` re-keys each row on
   // its derived lane worktree path so every worktree is a CAP-1 lane (two agents in
-  // one index = corruption) while parallel sibling lanes run concurrently, and
-  // `byEpicId` feeds the dispatch-side `attachWorktreeGeometry` post-pass — both
+  // one index = corruption); the allocator then applies the per-root cap over true
+  // roots. `byEpicId` feeds the dispatch-side `attachWorktreeGeometry` post-pass — both
   // consuming the SAME plan, so the gate and dispatch never diverge.
   const worktreeGeometry: PreparedWorktreeGeometry = snapshot.worktreeMode
     ? prepareWorktreeGeometry(
@@ -2107,9 +2100,9 @@ export function reconcile(
     // across its epics. The board latches the SAME N off `BootStatus`, so both
     // consumers compute identical demotions. Default 1 = one-task-per-root.
     state.maxConcurrentPerRoot,
-    // The worktree-mode lane re-key (empty when OFF). Re-keys the allocator
-    // onto lane paths (cap-1 per lane) without diverging from the dispatch-side
-    // worktree geometry, which derives the SAME plan in `attachWorktreeGeometry`.
+    // The worktree-mode lane re-key (empty when OFF). Enforces cap-1 per lane
+    // before the per-root fill without diverging from the dispatch-side worktree
+    // geometry, which derives the SAME plan in `attachWorktreeGeometry`.
     laneKeyById,
     // The proven-dead owning-worker set (recorded pid re-proved gone at snapshot
     // load — the SAME lifecycle verdict `computeSlotOccupancy` reclaims a slot
@@ -2632,10 +2625,9 @@ export function prepareWorktreeGeometry(
     if (resolution !== undefined && resolution.kind === "disabled") {
       // A worktree-DISABLED repo: dispatch SEQUENTIALLY on the shared checkout,
       // never a lane. Key EVERY task id AND the epic id (close row) to the bare
-      // resolved toplevel (NOT a per-lane path) so the allocator's lane-keyed cap-1
-      // mutex serializes one worker per repo — the load-bearing safety invariant
-      // (a non-empty `laneKeyById` is what forces cap-1 even under
-      // `max_concurrent_per_root>1`). Record the `disabled` geometry, NOT a reject.
+      // resolved toplevel (NOT a per-lane path) so the allocator's lane-keyed
+      // cap-1 pass serializes one worker per repo before the root-cap fill. Record
+      // the `disabled` geometry, NOT a reject.
       const repoDir = resolution.repoDir;
       byEpicId.set(epic.epic_id, {
         kind: "disabled",

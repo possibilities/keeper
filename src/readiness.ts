@@ -513,21 +513,21 @@ export function computeReadiness(
   // The per-root dispatch concurrency count N — how many tasks may
   // dispatch concurrently into a single root, distributed fairly across the
   // root's epics by `applyPerRootRoundRobinAllocator` (which REPLACES the
-  // per-epic + per-root mutexes). Default 1 = today's hardcoded one-task-per-root
-  // behavior (byte-identical — the allocator delegates verbatim to the two legacy
-  // passes at N=1). Both readiness consumers (board + reconciler) carry the SAME
-  // N off `BootStatus` so they compute identical demotions. A LITERAL default
+  // per-epic + per-root mutexes). Default 1 = one-task-per-root behavior
+  // (byte-identical in non-worktree mode — the allocator delegates verbatim to
+  // the two legacy passes at N=1). Both readiness consumers (board + reconciler)
+  // carry the SAME N off `BootStatus` so they compute identical demotions. A LITERAL default
   // (not the imported `DEFAULT_MAX_CONCURRENT_PER_ROOT`) keeps readiness an import
   // LEAF. Appended LAST so default-reliant call sites stay valid.
   maxConcurrentPerRoot: number = 1,
   // The worktree-mode LANE re-key. When worktree mode is ON the producer
   // derives, per epic, the pure DAG → worktree topology and threads each node's
   // worktree path here (task_id → lane path, plus epic_id → the BASE lane path
-  // for the close sink). The per-root allocator then keys on the lane path
-  // instead of `effectiveRoot`, making each worktree a CAP-1 lane — two agents in
-  // one worktree index would corrupt it — while parallel sibling lanes (distinct
-  // paths) dispatch CONCURRENTLY. ABSENT/empty (the default — OFF mode, tests,
-  // simulator) selects today's `effectiveRoot` keying, byte-identical. Threaded
+  // for the close sink). The allocator first keys on the lane path, making each
+  // worktree a CAP-1 lane — two agents in one worktree index would corrupt it —
+  // then applies the per-root cap over the rows' true roots. ABSENT/empty (the
+  // default — OFF mode, tests, simulator) selects today's `effectiveRoot` keying,
+  // byte-identical. Threaded
   // into BOTH `applyPerRootRoundRobinAllocator` and (via it) the legacy
   // per-root mutex so the gate never diverges from the dispatch-side resolver,
   // which builds the SAME map off the SAME `deriveWorktreePlan`. Appended LAST so
@@ -1718,14 +1718,10 @@ export function applySingleTaskPerRootMutex(
  * `maxConcurrentJobs` budget as an absolute ceiling (demoted rows never reach
  * it). Exported so the test suite can drive N>1 directly.
  *
- * Worktree mode (`laneKeyById` non-empty): every row keys on its lane
- * worktree path, and each lane is FORCED cap-1 (two agents in one worktree index
- * = corruption) REGARDLESS of `maxConcurrentPerRoot`. Worktree mode therefore
- * routes through the lane-keyed per-root mutex ONLY — NOT the per-epic mutex,
- * because parallel sibling lanes belong to the SAME epic and must dispatch
- * concurrently (the per-epic mutex would wrongly collapse them to one). The
- * round-robin N>1 fill is moot under per-lane keying (each lane is its own cap-1
- * key), so it is bypassed. OFF mode (empty `laneKeyById`) is byte-identical.
+ * Worktree mode (`laneKeyById` non-empty): first serializes each lane at cap-1
+ * (two agents in one worktree index = corruption), then applies the stored
+ * per-root cap across the rows' true roots. Parallel sibling lanes may share one
+ * epic, so the per-epic mutex is not part of the worktree-mode path.
  */
 export function applyPerRootRoundRobinAllocator(
   epicsArr: Epic[],
@@ -1739,11 +1735,8 @@ export function applyPerRootRoundRobinAllocator(
   // {@link rootKeyForRow} + the worktree-mode note above.
   laneKeyById: ReadonlyMap<string, string> = new Map(),
 ): void {
-  // Worktree mode: lane-keyed, cap-1-per-lane, NO per-epic collapse. Run
-  // ONLY the per-root mutex (re-keyed on lane paths) so parallel sibling lanes of
-  // one epic dispatch concurrently while same-lane rows serialize. `N` is
-  // deliberately ignored — a lane is never N>1.
-  if (laneKeyById.size > 0) {
+  const worktreeMode = laneKeyById.size > 0;
+  if (worktreeMode) {
     applySingleTaskPerRootMutex(
       epicsArr,
       perTask,
@@ -1753,7 +1746,17 @@ export function applyPerRootRoundRobinAllocator(
       eligibleEpicIds,
       laneKeyById,
     );
-    return;
+    if (maxConcurrentPerRoot <= 1) {
+      applySingleTaskPerRootMutex(
+        epicsArr,
+        perTask,
+        perCloseRow,
+        subRunningByJobId,
+        fallbackRoots,
+        eligibleEpicIds,
+      );
+      return;
+    }
   }
 
   // N=1 (or any degenerate ≤1 from a misconfig — the config validation guards
@@ -2024,8 +2027,8 @@ function effectiveRoot(
  * The per-row ALLOCATOR key. In worktree mode the producer supplies a
  * `rowId → lane-worktree-path` map (`laneKeyById`); a row whose id is present
  * keys on its lane path (each worktree a CAP-1 lane), so two parallel sibling
- * lanes — even within ONE epic — are DISTINCT keys and dispatch concurrently,
- * while two tasks targeting the SAME lane serialize. A row with NO lane entry
+ * lanes — even within ONE epic — are DISTINCT lane keys for the later root-cap
+ * fill, while two tasks targeting the SAME lane serialize. A row with NO lane entry
  * (OFF mode, a row outside any worktree plan, every test/simulator caller that
  * passes the empty default) falls through to today's `effectiveRoot`, BYTE-FOR-
  * BYTE unchanged. `rowId` is the `task_id` for a task row, the `epic_id` for the
@@ -2036,11 +2039,10 @@ function effectiveRoot(
  * A worktree-DISABLED epic (see `WorktreeRepoResolution.disabled`) is a third
  * shape: the producer maps EVERY task id + the epic id to the BARE resolved
  * toplevel (one shared key, NOT per-lane paths), so all its rows collapse to ONE
- * cap-1 mutex key and serialize on the shared checkout. A non-empty `laneKeyById`
- * is exactly what routes {@link applyPerRootRoundRobinAllocator} through the cap-1
- * mutex (bypassing the `max_concurrent_per_root>1` round-robin), so same-toplevel
- * rows of a disabled repo can NEVER parallelize into one shared checkout. The keys
- * are opaque strings; this function needs no special case for them.
+ * cap-1 mutex key and serialize on the shared checkout before the root-cap fill,
+ * so same-toplevel rows of a disabled repo can NEVER parallelize into one shared
+ * checkout. The keys are opaque strings; this function needs no special case for
+ * them.
  */
 function rootKeyForRow(
   rowId: string,

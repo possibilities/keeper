@@ -23,6 +23,10 @@ import {
   prepareWorktreeGeometry,
 } from "../src/autopilot-worker";
 import {
+  effectivePerRootCap,
+  MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
+} from "../src/db";
+import {
   applyPerRootRoundRobinAllocator,
   applySingleTaskPerEpicMutex,
   applySingleTaskPerRootMutex,
@@ -2439,12 +2443,60 @@ test("fn-954 alloc terminates on exhausted ready work (N greater than ready coun
   expect(snap.perTask.get("fn-2-b.1")).toEqual({ tag: "ready" });
 });
 
+test("fn-954 worktree ON honors N across true root while each lane stays cap-1", () => {
+  const tasks = [
+    makeTask({ task_id: "fn-1-foo.1", task_number: 1, target_repo: "/repo" }),
+    makeTask({ task_id: "fn-1-foo.2", task_number: 2, target_repo: "/repo" }),
+    makeTask({ task_id: "fn-1-foo.3", task_number: 3, target_repo: "/repo" }),
+    makeTask({ task_id: "fn-1-foo.4", task_number: 4, target_repo: "/repo" }),
+  ];
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    tasks,
+  });
+  const laneKeyById = new Map<string, string>([
+    ["fn-1-foo.1", "/wt/repo/lane-a"],
+    ["fn-1-foo.2", "/wt/repo/lane-b"],
+    ["fn-1-foo.3", "/wt/repo/lane-c"],
+    ["fn-1-foo.4", "/wt/repo/lane-a"],
+  ]);
+
+  const snap = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    new Set<string>(),
+    2,
+    laneKeyById,
+  );
+
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-1-foo.3")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.4")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-954 effective per-root cap floors OFF mode and clamps absurd stored values", () => {
+  expect(effectivePerRootCap(5, false)).toBe(1);
+  expect(effectivePerRootCap(9999, true)).toBe(
+    MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
+  );
+});
+
 // ---------------------------------------------------------------------------
-// fn-959 — worktree-mode LANE re-key of the allocator (task .5). The allocator
-// keys on the derived lane worktree path instead of `effectiveRoot`, so each
-// worktree is a CAP-1 lane (regardless of max_concurrent_per_root) and parallel
-// sibling lanes in ONE repo (even ONE epic) dispatch concurrently. OFF mode (an
-// empty lane map) is byte-identical to today.
+// fn-959 — worktree-mode LANE re-key of the allocator. The allocator uses the
+// derived lane worktree path for the cap-1 lane pass, then applies the per-root
+// cap across true roots. OFF mode (an empty lane map) is byte-identical.
 // ---------------------------------------------------------------------------
 
 // Run `computeReadiness` with the trailing worktree lane-key map.
@@ -2501,7 +2553,7 @@ test("fn-959 OFF byte-identical: an EMPTY lane map keys exactly as today (no beh
 
 test("fn-959 cap-1 per lane: two ready tasks on the SAME lane → only the first stays ready (even at N=5)", () => {
   // Two tasks keyed to the SAME lane path. A worktree index holds one agent; the
-  // second MUST be demoted regardless of max_concurrent_per_root. (In real DAGs a
+  // second MUST be demoted even with a roomy per-root cap. (In real DAGs a
   // shared lane is a linear chain where the downstream isn't ready until the
   // upstream is done — this drives the invariant directly.)
   const t1 = makeTask({ task_id: "fn-1-foo.1", task_number: 1 });
@@ -2522,11 +2574,11 @@ test("fn-959 cap-1 per lane: two ready tasks on the SAME lane → only the first
   expect(snap.perTask.get("fn-1-foo.2")?.tag).toBe("blocked");
 });
 
-test("fn-959 parallel sibling lanes in ONE epic run concurrently (the whole point)", () => {
+test("fn-959 parallel sibling lanes in ONE epic run concurrently when the root cap allows it", () => {
   // Fan-out P(done) → {A, B}. A inherits the base lane, B forks a rib → DISTINCT
   // lane paths. Both are ready (P done). Under today's effectiveRoot keying they
   // share the epic's one root and the per-epic mutex would keep only ONE; under
-  // the lane re-key they are distinct cap-1 lanes → BOTH dispatch, even at N=1.
+  // the lane re-key they are distinct cap-1 lanes and N=2 admits both.
   const p = makeTask({
     task_id: "P",
     epic_id: "fn-1-foo",
@@ -2560,9 +2612,9 @@ test("fn-959 parallel sibling lanes in ONE epic run concurrently (the whole poin
   );
   expect(offReady.length).toBe(1);
   // With the lane re-key (gate-built off the real plan), A and B are distinct
-  // lanes → both ready at N=1.
+  // lanes → both ready at N=2.
   const laneKeyById = laneKeysFor([epic]);
-  const snap = runWithLanes([epic], 1, laneKeyById);
+  const snap = runWithLanes([epic], 2, laneKeyById);
   expect(snap.perTask.get("A")).toEqual({ tag: "ready" });
   expect(snap.perTask.get("B")).toEqual({ tag: "ready" });
 });
@@ -2687,14 +2739,14 @@ test("fn-959 distinct sibling lanes both cap-1 at N=5 (parallel, not stacked)", 
 // fn-1013 — worktree-DISABLED repos. The producer keys EVERY task id + the epic
 // id to the BARE resolved toplevel (one shared key, NOT per-lane paths), so an
 // all-disabled cycle serializes one worker per repo on the shared checkout. This
-// is THE load-bearing safety invariant: an empty laneKeyById would fall through
-// to the N>1 round-robin and run multiple workers in ONE shared checkout.
+// is THE load-bearing safety invariant: an empty laneKeyById would let the
+// root-cap fill run multiple workers in ONE shared checkout.
 // ---------------------------------------------------------------------------
 
 test("fn-1013 all-disabled cycle: two ready tasks keyed on the BARE toplevel → cap-1 per repo even at max_concurrent_per_root=5", () => {
   // The disabled-repo geometry: both tasks (and the epic/close id) map to the
-  // SAME bare toplevel. At N=5 the lane-keyed cap-1 mutex MUST keep only ONE
-  // ready — never the N>1 round-robin (two workers in one shared checkout).
+  // SAME bare toplevel. At N=5 the lane cap MUST keep only ONE ready — never two
+  // workers in one shared checkout.
   const t1 = makeTask({ task_id: "fn-1-foo.1", task_number: 1 });
   const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({

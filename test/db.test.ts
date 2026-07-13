@@ -20,6 +20,7 @@ import {
   DEFAULT_REPO_FORK_ROOT,
   effectivePerRootCap,
   isTransientBootOpenError,
+  MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
   MAX_IN_PARAMS,
   openDb,
   resolveClaudeProjectsRoot,
@@ -9617,15 +9618,16 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
 // ---------------------------------------------------------------------------
 // fn-1134 — `effectivePerRootCap`: the single stored-intent → effective-cap
 // derivation seam. Worktree off ⇒ always 1 (shared checkout safety); worktree on
-// ⇒ the stored positive integer, else the default (1). Fails closed on every
-// malformed shape; no upper clamp.
+// ⇒ the stored positive integer capped at a sanity ceiling, else the default
+// (1). Fails closed on every malformed shape.
 // ---------------------------------------------------------------------------
 
-test("effectivePerRootCap — worktree ON passes a positive-integer stored value through unclamped (fn-1134)", () => {
+test("effectivePerRootCap — worktree ON passes a positive-integer stored value through the sanity clamp (fn-1134)", () => {
   expect(effectivePerRootCap(5, true)).toBe(5);
   expect(effectivePerRootCap(1, true)).toBe(1);
-  // No upper clamp — a large stored value is honored verbatim.
-  expect(effectivePerRootCap(9999, true)).toBe(9999);
+  expect(effectivePerRootCap(9999, true)).toBe(
+    MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
+  );
 });
 
 test("effectivePerRootCap — worktree OFF floors every stored value to 1 (fn-1134)", () => {
