@@ -66,6 +66,22 @@ const RPC_TIMEOUT_MS = 2_000;
 const STOP_RPC_TIMEOUT_MS = 7_000;
 const PACKAGE_NAME = "@tintinweb/pi-subagents@0.14.0";
 
+export interface RpcDeadline {
+  schedule(callback: () => void, timeoutMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+export interface TaskFacadeOptions {
+  rpcTimeoutMs?: number;
+  stopRpcTimeoutMs?: number;
+  deadline?: RpcDeadline;
+}
+
+const systemDeadline: RpcDeadline = {
+  schedule: (callback, timeoutMs) => setTimeout(callback, timeoutMs),
+  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 const TASK_PARAMETERS: Record<string, unknown> = {
   type: "object",
   properties: {
@@ -140,20 +156,22 @@ function rpcCall(
   channel: string,
   payload: Record<string, unknown>,
   timeoutMs = RPC_TIMEOUT_MS,
+  deadline: RpcDeadline = systemDeadline,
 ): Promise<RpcEnvelope> {
   const requestId = randomUUID();
   const replyChannel = `${channel}:reply:${requestId}`;
   return new Promise((resolve, reject) => {
     let settled = false;
     let unsubscribe = () => {};
+    let timer: unknown;
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      deadline.cancel(timer);
       unsubscribe();
       fn();
     };
-    const timer = setTimeout(() => {
+    timer = deadline.schedule(() => {
       finish(() =>
         reject(
           new Error(
@@ -180,8 +198,17 @@ function rpcCall(
   });
 }
 
-async function requireProtocol(events: PiTaskEventBus): Promise<void> {
-  const reply = await rpcCall(events, "subagents:rpc:ping", {});
+async function requireProtocol(
+  events: PiTaskEventBus,
+  options: Required<TaskFacadeOptions>,
+): Promise<void> {
+  const reply = await rpcCall(
+    events,
+    "subagents:rpc:ping",
+    {},
+    options.rpcTimeoutMs,
+    options.deadline,
+  );
   if (!reply.success) {
     throw new Error(`${PACKAGE_NAME} ping failed: ${String(reply.error)}`);
   }
@@ -219,11 +246,12 @@ function beforeSpawnOrAbort<T>(
 async function executeTask(
   events: PiTaskEventBus,
   params: PiTaskParams,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  options: Required<TaskFacadeOptions>,
 ): Promise<PiTaskToolResult> {
   validateParams(params);
   if (signal?.aborted) throw cancellationReason(signal);
-  await beforeSpawnOrAbort(requireProtocol(events), signal);
+  await beforeSpawnOrAbort(requireProtocol(events, options), signal);
   if (signal?.aborted) throw cancellationReason(signal);
 
   let agentId: string | null = null;
@@ -270,7 +298,8 @@ async function executeTask(
           handle: ownerHandle,
           reason: cancellationReasonText(signal),
         },
-        STOP_RPC_TIMEOUT_MS,
+        options.stopRpcTimeoutMs,
+        options.deadline,
       );
       if (!reply.success) {
         throw new Error(
@@ -299,16 +328,22 @@ async function executeTask(
   };
 
   try {
-    const spawn = await rpcCall(events, "subagents:rpc:spawn", {
-      version: RPC_VERSION,
-      type: params.subagent_type,
-      prompt: params.prompt,
-      options: {
-        description: params.description,
-        isBackground: false,
-        ...(signal === undefined ? {} : { signal }),
+    const spawn = await rpcCall(
+      events,
+      "subagents:rpc:spawn",
+      {
+        version: RPC_VERSION,
+        type: params.subagent_type,
+        prompt: params.prompt,
+        options: {
+          description: params.description,
+          isBackground: false,
+          ...(signal === undefined ? {} : { signal }),
+        },
       },
-    });
+      options.rpcTimeoutMs,
+      options.deadline,
+    );
     if (!spawn.success) {
       throw new Error(`${PACKAGE_NAME} spawn failed: ${String(spawn.error)}`);
     }
@@ -391,7 +426,13 @@ async function executeTask(
 
 export function createTaskFacadeTool(
   events: PiTaskEventBus,
+  overrides: TaskFacadeOptions = {},
 ): PiTaskToolDefinition {
+  const options: Required<TaskFacadeOptions> = {
+    rpcTimeoutMs: overrides.rpcTimeoutMs ?? RPC_TIMEOUT_MS,
+    stopRpcTimeoutMs: overrides.stopRpcTimeoutMs ?? STOP_RPC_TIMEOUT_MS,
+    deadline: overrides.deadline ?? systemDeadline,
+  };
   return {
     name: "Task",
     label: "Task",
@@ -401,7 +442,7 @@ export function createTaskFacadeTool(
     parameters: TASK_PARAMETERS,
     async execute(_toolCallId, params, signal) {
       try {
-        return await executeTask(events, params, signal);
+        return await executeTask(events, params, signal, options);
       } catch (error) {
         // Pi passes the caller's AbortSignal through the tool boundary. Keep
         // its native reason object and AbortError typing instead of converting

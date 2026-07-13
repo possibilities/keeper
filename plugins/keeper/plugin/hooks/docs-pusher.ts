@@ -303,7 +303,18 @@ function releaseLock(lockPath: string): void {
  * Any probe error is treated as "not reclaimable" — never reclaim on doubt, so a
  * live holder is never raced.
  */
-function isLockStale(lockPath: string): boolean {
+export type PidAlive = (pid: number) => boolean;
+
+function processPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function isLockStale(lockPath: string, pidAlive: PidAlive): boolean {
   let mtimeMs: number;
   try {
     mtimeMs = statSync(lockPath).mtimeMs;
@@ -325,15 +336,7 @@ function isLockStale(lockPath: string): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }
-  try {
-    // Signal 0 probes liveness without delivering a signal: throws ESRCH when no
-    // such process exists (reclaimable). An EPERM (process exists, not ours) or
-    // any other error means the holder is alive — do not reclaim.
-    process.kill(pid, 0);
-    return false;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ESRCH";
-  }
+  return !pidAlive(pid);
 }
 
 /**
@@ -344,14 +347,14 @@ function isLockStale(lockPath: string): boolean {
  * fresh lock (a concurrent session mid-push) returns false so the caller skips.
  * Any other open / reclaim error returns false (skip rather than race a push).
  */
-function tryAcquireLock(lockPath: string): boolean {
+function tryAcquireLock(lockPath: string, pidAlive: PidAlive): boolean {
   if (stampLock(lockPath)) {
     return true;
   }
   // The exclusive create failed — a lock already exists (or an IO error). If the
   // existing lock is orphaned, reclaim it and retry the exclusive create ONCE; a
   // reclaim failure or a still-live lock falls through to a skip.
-  if (!isLockStale(lockPath)) {
+  if (!isLockStale(lockPath, pidAlive)) {
     return false;
   }
   try {
@@ -398,6 +401,7 @@ function stampLock(lockPath: string): boolean {
 export function pushDocs(
   docsDir: string,
   run: PusherGitRunner = spawnGit,
+  pidAlive: PidAlive = processPidAlive,
 ): string {
   if (!existsSync(docsDir)) {
     return "not-a-repo";
@@ -418,7 +422,7 @@ export function pushDocs(
   }
 
   const lockPath = lockfilePath(docsDir, run);
-  if (!tryAcquireLock(lockPath)) {
+  if (!tryAcquireLock(lockPath, pidAlive)) {
     // A live, fresh lock — a concurrent session is mid-push. Log so a stuck lock
     // (one that never clears across turns) is diagnosable from the skip-log.
     logSkip(

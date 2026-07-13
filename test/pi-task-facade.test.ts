@@ -25,6 +25,14 @@ const flushMicrotasks = async (): Promise<void> => {
   for (let i = 0; i < 8; i += 1) await Promise.resolve();
 };
 
+const immediateDeadline = {
+  schedule(callback: () => void): undefined {
+    queueMicrotask(callback);
+    return undefined;
+  },
+  cancel(): void {},
+};
+
 function withKeeperJobId(value: string | undefined, run: () => void): void {
   const saved = process.env.KEEPER_JOB_ID;
   try {
@@ -277,7 +285,10 @@ describe("Pi Task facade", () => {
 
     const absent = new FakeBus();
     await expect(
-      createTaskFacadeTool(absent).execute("call", {
+      createTaskFacadeTool(absent, {
+        rpcTimeoutMs: 1,
+        deadline: immediateDeadline,
+      }).execute("call", {
         subagent_type: "plan:repo-scout",
         description: "repo",
         prompt: "scan",

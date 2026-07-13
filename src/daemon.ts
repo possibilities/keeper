@@ -6912,6 +6912,74 @@ export type WorkerName =
  * passes no `workers` selector, so {@link startDaemon} defaults here). Source of
  * truth for the "production boot spawns all workers" regression test.
  */
+export function selectWorkerNames(
+  workers?: readonly WorkerName[],
+): readonly WorkerName[] {
+  const selected = new Set<WorkerName>(workers ?? ALL_WORKERS);
+  return ALL_WORKERS.filter((name) => selected.has(name));
+}
+
+export interface SpillDocumentDeps {
+  canonicalize?: (path: string) => string;
+  read?: (path: string) => string;
+  byteLength?: (text: string) => number;
+}
+
+export type SpillDocumentResult =
+  | { ok: true; text: string }
+  | { ok: false; error: string };
+
+/** Validate an RPC spill document before its bytes can enter an event payload. */
+export function readSpillDocument(
+  label: string,
+  spillDir: string,
+  docPath: string,
+  maxBytes: number,
+  deps: SpillDocumentDeps = {},
+): SpillDocumentResult {
+  const canonicalize =
+    deps.canonicalize ??
+    ((path: string): string => {
+      try {
+        return realpathSync(path);
+      } catch {
+        return resolvePath(path);
+      }
+    });
+  const realDir = canonicalize(spillDir);
+  const realDoc = canonicalize(docPath);
+  if (realDoc !== realDir && !realDoc.startsWith(realDir + sep)) {
+    return {
+      ok: false,
+      error: `${label} spill file \`${docPath}\` resolves outside the spill dir \`${spillDir}\``,
+    };
+  }
+  let text: string;
+  try {
+    text = (deps.read ?? ((path: string) => readFileSync(path, "utf8")))(realDoc);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `cannot read ${label} spill file \`${docPath}\`: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+  if (text.length === 0) {
+    return { ok: false, error: `${label} spill file \`${docPath}\` is empty` };
+  }
+  const bytes = (deps.byteLength ?? ((value: string) => Buffer.byteLength(value, "utf8")))(
+    text,
+  );
+  if (bytes > maxBytes) {
+    return {
+      ok: false,
+      error: `${label} spill file \`${docPath}\` is ${bytes} bytes, over the ${maxBytes}-byte cap`,
+    };
+  }
+  return { ok: true, text };
+}
+
 export const ALL_WORKERS: readonly WorkerName[] = [
   "wake",
   "server",
@@ -7272,7 +7340,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   );
   // Worker-set selector; omitted → ALL_WORKERS. `want(name)` gates each
   // `new Worker(...)` site below. The fold REDUCER runs on MAIN regardless.
-  const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);
+  const selectedWorkers = new Set<WorkerName>(selectWorkerNames(opts.workers));
   const want = (name: WorkerName): boolean => selectedWorkers.has(name);
   // Resolve the UDS path the same way the server worker does, so the returned
   // handle exposes it for `waitForDaemon`.
@@ -8397,59 +8465,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           if (request.op === "cancel") {
             data = { op: "cancel", await_id: request.await_id };
           } else {
-            const realDir = ((): string => {
-              try {
-                return realpathSync(awaitSpillDir);
-              } catch {
-                return resolvePath(awaitSpillDir);
-              }
-            })();
-            const realDoc = ((): string => {
-              try {
-                return realpathSync(request.doc_path);
-              } catch {
-                return resolvePath(request.doc_path);
-              }
-            })();
-            if (realDoc !== realDir && !realDoc.startsWith(realDir + sep)) {
+            const document = readSpillDocument(
+              "await",
+              awaitSpillDir,
+              request.doc_path,
+              HANDOFF_DOC_MAX_BYTES,
+            );
+            if (!document.ok) {
               sw.postMessage({
                 type: "request-await-result",
                 id,
                 ok: false,
-                error: `await spill file \`${request.doc_path}\` resolves outside the spill dir \`${awaitSpillDir}\``,
-              } satisfies RequestAwaitResultMessage);
-              return;
-            }
-            let followUp: string;
-            try {
-              followUp = readFileSync(realDoc, "utf8");
-            } catch (readErr) {
-              sw.postMessage({
-                type: "request-await-result",
-                id,
-                ok: false,
-                error: `cannot read await spill file \`${request.doc_path}\`: ${
-                  readErr instanceof Error ? readErr.message : String(readErr)
-                }`,
-              } satisfies RequestAwaitResultMessage);
-              return;
-            }
-            if (followUp.length === 0) {
-              sw.postMessage({
-                type: "request-await-result",
-                id,
-                ok: false,
-                error: `await spill file \`${request.doc_path}\` is empty`,
-              } satisfies RequestAwaitResultMessage);
-              return;
-            }
-            const bytes = Buffer.byteLength(followUp, "utf8");
-            if (bytes > HANDOFF_DOC_MAX_BYTES) {
-              sw.postMessage({
-                type: "request-await-result",
-                id,
-                ok: false,
-                error: `await spill file \`${request.doc_path}\` is ${bytes} bytes, over the ${HANDOFF_DOC_MAX_BYTES}-byte cap`,
+                error: document.error,
               } satisfies RequestAwaitResultMessage);
               return;
             }
@@ -8457,7 +8484,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               op: "request",
               await_id: request.await_id,
               condition_spec: request.condition_spec,
-              follow_up: followUp,
+              follow_up: document.text,
               target_session: request.target_session,
               target_dir: request.target_dir ?? null,
               timeout_at:

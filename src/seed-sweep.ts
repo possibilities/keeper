@@ -208,7 +208,19 @@ function insertKilledEvent(
  * insert failure (write contention against the writer lock) also logs and
  * continues — the next boot will re-probe the row anyway.
  */
-export function seedKilledSweep(db: Database): void {
+export interface SeedKilledSweepDeps {
+  isPidAlive?: (pid: number) => boolean;
+  readOsStartTime?: (pid: number) => string | null;
+  classifyCloseKind?: (paneId: string | null) => string | null;
+}
+
+export function seedKilledSweep(
+  db: Database,
+  deps: SeedKilledSweepDeps = {},
+): void {
+  const probeAlive = deps.isPidAlive ?? isPidAlive;
+  const probeStartTime = deps.readOsStartTime ?? readOsStartTime;
+  const closeKindFor = deps.classifyCloseKind ?? classifyCloseKind;
   // Candidate set: every non-terminal lifecycle row (Q7 scope), INCLUDING
   // NULL-pid rows (no `pid IS NOT NULL` filter). Invariant: a NULL-pid row is
   // unwatchable and unprobeable; excluding it strands the session in `stopped`
@@ -233,7 +245,7 @@ export function seedKilledSweep(db: Database): void {
       // the steady-state half, sharing the SAME `classifyCloseKind` so both
       // stamp identically). Done once per candidate, BEFORE the Q7 dead/recycle
       // arms — the kind is orthogonal to which arm emits the Killed.
-      const closeKind = classifyCloseKind(row.backend_exec_pane_id);
+      const closeKind = closeKindFor(row.backend_exec_pane_id);
       if (row.pid == null) {
         // NULL-pid non-terminal row. Nothing to probe — it can never be
         // watched and we can never prove it alive, so it's terminal by
@@ -250,7 +262,7 @@ export function seedKilledSweep(db: Database): void {
         );
         continue;
       }
-      const alive = isPidAlive(row.pid);
+      const alive = probeAlive(row.pid);
       if (!alive) {
         // Q7 dead-pid rule: emit Killed regardless of stored start_time. The
         // payload carries the stored start_time so the reducer's match rule
@@ -271,7 +283,7 @@ export function seedKilledSweep(db: Database): void {
         // recycle. Leave alone.
         continue;
       }
-      const osStart = readOsStartTime(row.pid);
+      const osStart = probeStartTime(row.pid);
       if (osStart == null) {
         // Probe failed (ps timeout, /proc race, unknown platform). We can't
         // distinguish recycled from same-process — be conservative and leave

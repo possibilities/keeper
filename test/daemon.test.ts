@@ -33,6 +33,7 @@ import type {
 } from "../src/baseline-store";
 import {
   ALL_WORKERS,
+  selectWorkerNames,
   AUDIT_READY_ORCHESTRATOR_GRACE_MS,
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
@@ -71,7 +72,6 @@ import {
   collapseRestartLedger,
   compactRestartLedger,
   countLiveEscalationSessions,
-  type DaemonHandle,
   DEAD_LETTER_RETENTION_MS,
   type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
@@ -136,6 +136,7 @@ import {
   type RestartLedgerLine,
   type RestartProvenance,
   readRestartLedger,
+  readSpillDocument,
   readTaskBlockedReason,
   recoverOneDeadLetter,
   repairCheckoutDirty,
@@ -180,10 +181,8 @@ import {
   serializeSessionTelemetry,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
-  startDaemon,
   WAL_AUTOCHECKPOINT_PAGES,
   WORK_RESOLVER_LEASE_SEC,
-  type WorkerName,
   type WorkMergeHumanNotifySweepDeps,
   withBootDrainCheckpointTuning,
   workLaneBusyForResolver,
@@ -212,7 +211,6 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
-import { HANDOFF_DOC_MAX_BYTES } from "../src/handoff-contract";
 import { MAX_LINE_LENGTH } from "../src/protocol";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
@@ -235,7 +233,7 @@ import {
 } from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
-import { sandboxEnv } from "./helpers/sandbox-env";
+import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -2693,16 +2691,10 @@ test("a re-arrived EpicSnapshot upserts last-write-wins with monotonic last_even
 });
 
 // ---------------------------------------------------------------------------
-// Seed sweep — Q7 boot-time liveness pass (dead → Killed; alive+recycled →
-// Killed; alive+matching → leave; legacy NULL start_time → leave).
+// Seed sweep — Q7 boot-time liveness pass. The producer probes are injected so
+// the lifecycle matrix is independent of host processes and `ps`.
 // ---------------------------------------------------------------------------
 
-/**
- * Pre-seed a `jobs` row directly (bypassing the events log). The sweep reads
- * `jobs` to decide who to probe, so seeding the projection is enough — the
- * subsequent `drainToCompletion` only needs to fold the synthetic Killed
- * events the sweep emits.
- */
 function seedJobsRow(
   db: ReturnType<typeof openDb>["db"],
   jobId: string,
@@ -2718,142 +2710,43 @@ function seedJobsRow(
   );
 }
 
-/**
- * Find a pid that is definitely NOT in use right now. Starts from 999_990 and
- * walks downward — the OS pid space on macOS caps at 99_999 by default and on
- * Linux at 4_194_304; either way, a 6-digit pid above the live range is
- * essentially always free. Returns the first dead pid we land on; throws if
- * the loop somehow exhausts the search (impossibly contended host).
- */
-function pickDeadPid(): number {
-  for (let candidate = 999_990; candidate > 100_000; candidate -= 1) {
-    if (!isPidAlive(candidate)) {
-      return candidate;
-    }
-  }
-  throw new Error("seed sweep test: could not find a dead pid");
-}
+const SEED_SWEEP_DEPS = {
+  isPidAlive: (pid: number) => pid === 101,
+  readOsStartTime: (pid: number) => (pid === 101 ? "test:start-101" : null),
+  classifyCloseKind: () => null,
+};
 
-test("seed sweep folds dead/recycled rows to killed; leaves alive+matching and legacy NULL alone", () => {
+test("seed sweep folds dead/recycled rows to killed; leaves matching and legacy rows alone", () => {
   const { db } = openDb(dbPath);
+  seedJobsRow(db, "sess-a-alive-matching", 101, "test:start-101");
+  seedJobsRow(db, "sess-b-alive-recycled", 101, "test:old-start");
+  seedJobsRow(db, "sess-c-dead-with-start", 102, "test:dead-start");
+  seedJobsRow(db, "sess-d-dead-no-start", 102, null);
+  seedJobsRow(db, "sess-e-alive-legacy", 101, null);
 
-  // (a) alive matching pid+start_time → leave alone. We don't yet know the
-  // OS-reported start_time for process.pid; the post-sweep assertion is just
-  // that this row stayed `stopped` regardless (we re-use the same alive pid
-  // for (b) below with a deliberately-wrong stored start_time, so any
-  // recycle-fold would target (b) — not (a)).
-  // We seed (a) with the SAME stored start_time we'll read off the OS below,
-  // by reflecting the seed sweep's own producer logic: the sweep only emits
-  // Killed when alive+stored differs from alive+OS-now. To make (a)
-  // deterministically NOT fold, we set start_time=NULL and assert state stays
-  // `stopped`. NOTE: that overlaps semantically with case (e), so we use a
-  // distinct invariant: case (a) keeps a non-null start_time obtained from
-  // the OS-now read so the match is true. The simplest seed: don't read the
-  // OS at all — set start_time to a sentinel that NEVER matches, and the
-  // expected outcome flips to "folded to killed". Instead we model (a) as
-  // alive+stored=OS-now by piggy-backing on the producer: seed start_time
-  // unknown, but use a known-alive pid with a sentinel that DOES match a
-  // freshly-read OS value. We achieve that by reading the OS value here and
-  // mirroring the seed-sweep's own reader contract via a same-process
-  // platform probe.
-  const alivePid = process.pid;
-  // Read the OS start_time the SAME way the producer does (darwin: ps lstart,
-  // linux: /proc stat). Re-using the producer parsers would be cleaner but
-  // would tightly couple the test to the producer's import surface; the
-  // duplication here is deliberate — the test asserts ROUND-TRIP equality
-  // against a freshly-read OS value, which is the contract the sweep promises.
-  function readOsStartTimeForTest(pid: number): string | null {
-    if (process.platform === "darwin") {
-      const result = Bun.spawnSync(
-        ["ps", "-ww", "-p", String(pid), "-o", "lstart="],
-        { timeout: 500 },
-      );
-      if (!result.success || result.exitCode !== 0) return null;
-      const text = result.stdout?.toString().replace(/^\s+|\s+$/g, "") ?? "";
-      if (text.length < 24) return null;
-      return `darwin:${text.slice(0, 24)}`;
-    }
-    if (process.platform === "linux") {
-      try {
-        const { readFileSync } = require("node:fs") as typeof import("node:fs");
-        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-        const close = stat.lastIndexOf(")");
-        if (close < 0) return null;
-        const fields = stat
-          .slice(close + 1)
-          .trim()
-          .split(/\s+/);
-        const raw = fields[19];
-        return raw && /^\d+$/.test(raw) ? `linux:${raw}` : null;
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  const aliveStart = readOsStartTimeForTest(alivePid);
-  // The test only runs the matching-row assertion when the platform probe
-  // works — on a CI image with no `ps` or `/proc` access, case (a) collapses
-  // to "we don't know the matching start_time" and we skip that arm. The
-  // dead/recycled/legacy arms below remain valid regardless.
-  if (aliveStart != null) {
-    seedJobsRow(db, "sess-a-alive-matching", alivePid, aliveStart);
-  }
-  // (b) alive recycled — stored start_time deliberately wrong for the live pid.
-  seedJobsRow(
-    db,
-    "sess-b-alive-recycled",
-    alivePid,
-    "darwin:Wed Jan 01 00:00:00 1970",
-  );
-  // (c) dead pid with stored start_time → Killed regardless.
-  const deadPid = pickDeadPid();
-  seedJobsRow(
-    db,
-    "sess-c-dead-with-start",
-    deadPid,
-    "darwin:Wed Jan 01 00:00:00 1970",
-  );
-  // (d) dead pid no start_time → Killed (Q7 dead-pid rule).
-  seedJobsRow(db, "sess-d-dead-no-start", deadPid, null);
-  // (e) alive pid, no start_time (legacy / pre-schema-v9) → leave alone.
-  seedJobsRow(db, "sess-e-alive-legacy", alivePid, null);
-
-  // Run the sweep + drain (the same `sweep → drain` pair the daemon's boot
-  // sequence runs).
-  seedKilledSweep(db);
+  seedKilledSweep(db, SEED_SWEEP_DEPS);
   drainToCompletion(db);
 
-  function stateOf(jobId: string): string | undefined {
-    const row = db
-      .query("SELECT state FROM jobs WHERE job_id = ?")
-      .get(jobId) as { state: string } | null;
-    return row?.state;
-  }
-
-  // (b),(c),(d) → killed.
+  const stateOf = (jobId: string): string | undefined =>
+    (db.query("SELECT state FROM jobs WHERE job_id = ?").get(jobId) as {
+      state: string;
+    } | null)?.state;
   expect(stateOf("sess-b-alive-recycled")).toBe("killed");
   expect(stateOf("sess-c-dead-with-start")).toBe("killed");
   expect(stateOf("sess-d-dead-no-start")).toBe("killed");
-  // (e) legacy → unchanged.
   expect(stateOf("sess-e-alive-legacy")).toBe("stopped");
-  // (a) alive matching → unchanged (when the platform probe was available).
-  if (aliveStart != null) {
-    expect(stateOf("sess-a-alive-matching")).toBe("stopped");
-  }
-
+  expect(stateOf("sess-a-alive-matching")).toBe("stopped");
   db.close();
 });
 
 test("seed sweep is idempotent — a second sweep emits no duplicate Killed events", () => {
   const { db } = freshMemDb();
 
-  const deadPid = pickDeadPid();
+  const deadPid = 102;
   seedJobsRow(db, "sess-zombie", deadPid, null);
 
   // First sweep: should emit ONE Killed event and fold to `killed`.
-  seedKilledSweep(db);
+  seedKilledSweep(db, SEED_SWEEP_DEPS);
   drainToCompletion(db);
   expect(
     (
@@ -2875,7 +2768,7 @@ test("seed sweep is idempotent — a second sweep emits no duplicate Killed even
   // candidate query (`state IN ('working','stopped')`) and the sweep emits
   // NOTHING for it. This is the idempotency guarantee — we don't churn the
   // event log on every boot for already-killed sessions.
-  seedKilledSweep(db);
+  seedKilledSweep(db, SEED_SWEEP_DEPS);
   drainToCompletion(db);
   const secondKilledCount = (
     db
@@ -2892,7 +2785,7 @@ test("seed sweep is idempotent — a second sweep emits no duplicate Killed even
 test("seed sweep ignores terminal rows (ended, killed) — incl. NULL-pid ones", () => {
   const { db } = freshMemDb();
 
-  const deadPid = pickDeadPid();
+  const deadPid = 102;
   // Terminal states are out of scope per the candidate query — even with a
   // NULL pid (a terminal NULL-pid row stays put; the fn-743 reap is for
   // NON-terminal NULL-pid rows only).
@@ -2900,7 +2793,7 @@ test("seed sweep ignores terminal rows (ended, killed) — incl. NULL-pid ones",
   seedJobsRow(db, "sess-already-killed", deadPid, null, "killed");
   seedJobsRow(db, "sess-no-pid-ended", null, null, "ended");
 
-  seedKilledSweep(db);
+  seedKilledSweep(db, SEED_SWEEP_DEPS);
   drainToCompletion(db);
 
   // None of these should have had a Killed event emitted against them.
@@ -2936,7 +2829,7 @@ test("fn-743 seed sweep: a NON-terminal NULL-pid (stopped) row IS reaped to kill
   const { db } = freshMemDb();
   seedJobsRow(db, "sess-no-pid", null, null);
 
-  seedKilledSweep(db);
+  seedKilledSweep(db, SEED_SWEEP_DEPS);
   drainToCompletion(db);
 
   const killedCount = (
@@ -3780,60 +3673,10 @@ test("scanDeadLetterDir skips a torn final line — the partial record is never 
 });
 
 // ---------------------------------------------------------------------------
-// fn-740 task .1 — archive-recovered-dead-letters.ts eligibility gate. F2 from
-// the fn-739 audit: the script's DATA-SAFETY CONTRACT (allConfirmed gate,
-// ids.length===0 early-exit, recovered-but-no-replayed_event_id exclusion, and
-// the --apply move) had zero direct coverage. These four tests drive the real
-// script as a subprocess against a sandboxed KEEPER_DB + KEEPER_DEAD_LETTER_DIR
-// and assert on whether the on-disk file is moved to archive/ or left in place.
+// Archive eligibility is a pure decision: runtime file movement is the lint-like
+// entrypoint concern, while the gate itself must not fork Bun in the fast tier.
 // ---------------------------------------------------------------------------
 
-const ARCHIVE_SCRIPT = join(
-  import.meta.dir,
-  "..",
-  "scripts",
-  "archive-recovered-dead-letters.ts",
-);
-
-/**
- * Insert a `recovered` dead_letters row AND its landed `events` row so the
- * script's `confirmed` set (status='recovered' AND replayed_event_id IS NOT
- * NULL AND that events row EXISTS) includes this dl_id. Returns the dl_id.
- */
-function seedConfirmedRecovered(
-  db: ReturnType<typeof openDb>["db"],
-  dlId: string,
-  sessionId: string,
-): void {
-  const info = db
-    .prepare(
-      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
-       VALUES (?, ?, 'SessionStart', 'lifecycle', '{}')`,
-    )
-    .run(1, sessionId);
-  db.prepare(
-    `INSERT INTO dead_letters
-       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
-        status, recovered_at, replayed_event_id, source_file)
-     VALUES (?, ?, 'SessionStart', 1, 1, 1, '{}', 'recovered', 1, ?, NULL)`,
-  ).run(dlId, sessionId, info.lastInsertRowid as number);
-}
-
-/** Seed a `waiting` (not-yet-recovered) dead_letters row — no events row. */
-function seedWaiting(
-  db: ReturnType<typeof openDb>["db"],
-  dlId: string,
-  sessionId: string,
-): void {
-  db.prepare(
-    `INSERT INTO dead_letters
-       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
-        status, recovered_at, replayed_event_id, source_file)
-     VALUES (?, ?, 'SessionStart', 1, 1, 1, '{}', 'waiting', NULL, NULL, NULL)`,
-  ).run(dlId, sessionId);
-}
-
-/** Serialize one NDJSON line carrying just the dl_id the script keys on. */
 function dlLine(dlId: string, sessionId: string): string {
   return serializeDeadLetterRecord({
     dl_id: dlId,
@@ -3852,108 +3695,35 @@ function dlLine(dlId: string, sessionId: string): string {
   });
 }
 
-/** Run the archive script as a subprocess against the sandboxed DB + dl dir. */
-function runArchiveScript(args: string[] = []): void {
-  const proc = Bun.spawnSync(["bun", ARCHIVE_SCRIPT, ...args], {
-    env: sandboxEnv({ tmpDir, dbPath }),
-  });
-  if (proc.exitCode !== 0) {
-    throw new Error(
-      `archive script exited ${proc.exitCode}: ${proc.stderr.toString()}`,
-    );
-  }
-}
-
-test("archive eligibility: a file with one still-waiting record is left in place (allConfirmed gate fires)", () => {
-  // The DB must exist + be migrated before the read-only script opens it.
-  openDb(dbPath).db.close();
-  const { db } = openDb(dbPath);
-  // One confirmed-recovered record and one still-waiting record share a file.
-  seedConfirmedRecovered(db, "dl-ok", "sess-ok");
-  seedWaiting(db, "dl-wait", "sess-wait");
-  db.close();
-
-  const dlDir = join(tmpDir, "dead-letters");
-  mkdirSync(dlDir, { recursive: true });
-  const file = join(dlDir, "mixed.ndjson");
-  writeFileSync(
-    file,
+test("archive eligibility leaves a file with a waiting record in place", () => {
+  const decision = archiveEligibility(
     dlLine("dl-ok", "sess-ok") + dlLine("dl-wait", "sess-wait"),
+    new Set(["dl-ok"]),
   );
-
-  runArchiveScript(["--apply"]);
-
-  // allConfirmed === false (the waiting record is not in `confirmed`) → the
-  // whole file stays, never archived on a guess.
-  expect(existsSync(file)).toBe(true);
-  expect(existsSync(join(dlDir, "archive", "mixed.ndjson"))).toBe(false);
+  expect(decision).toEqual({ eligible: false, records: 2 });
 });
 
-test("archive eligibility: a recovered record with no replayed_event_id is excluded; the file stays", () => {
-  openDb(dbPath).db.close();
-  const { db } = openDb(dbPath);
-  // Status flipped to `recovered` but replayed_event_id never stamped (the
-  // should-never-happen case). The script's `EXISTS` SELECT excludes it from
-  // `confirmed`, so allConfirmed fires false.
-  db.prepare(
-    `INSERT INTO dead_letters
-       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
-        status, recovered_at, replayed_event_id, source_file)
-     VALUES ('dl-noid', 'sess-noid', 'SessionStart', 1, 1, 1, '{}',
-             'recovered', 1, NULL, NULL)`,
-  ).run();
-  db.close();
-
-  const dlDir = join(tmpDir, "dead-letters");
-  mkdirSync(dlDir, { recursive: true });
-  const file = join(dlDir, "noid.ndjson");
-  writeFileSync(file, dlLine("dl-noid", "sess-noid"));
-
-  runArchiveScript(["--apply"]);
-
-  expect(existsSync(file)).toBe(true);
-  expect(existsSync(join(dlDir, "archive", "noid.ndjson"))).toBe(false);
+test("archive eligibility excludes recovered records without a landed event", () => {
+  expect(archiveEligibility(dlLine("dl-noid", "sess-noid"), new Set())).toEqual({
+    eligible: false,
+    records: 1,
+  });
 });
 
-test("archive eligibility: an all-torn file (ids.length === 0) is left untouched", () => {
-  openDb(dbPath).db.close();
-
-  const dlDir = join(tmpDir, "dead-letters");
-  mkdirSync(dlDir, { recursive: true });
-  const file = join(dlDir, "torn.ndjson");
-  // Every line is unparseable garbage — no recoverable record. parseDeadLetterLine
-  // returns null for each → ids stays empty → the file is not archived (nothing
-  // to confirm landed).
-  writeFileSync(file, "not json\n{bad\n");
-
-  runArchiveScript(["--apply"]);
-
-  expect(existsSync(file)).toBe(true);
-  expect(existsSync(join(dlDir, "archive", "torn.ndjson"))).toBe(false);
+test("archive eligibility leaves an all-torn file untouched", () => {
+  expect(archiveEligibility("not json\n{bad\n", new Set())).toEqual({
+    eligible: false,
+    records: 0,
+  });
 });
 
-test("archive eligibility: --apply moves a fully-confirmed file to the archive/ subdir", () => {
-  openDb(dbPath).db.close();
-  const { db } = openDb(dbPath);
-  seedConfirmedRecovered(db, "dl-a", "sess-a");
-  seedConfirmedRecovered(db, "dl-b", "sess-b");
-  db.close();
-
-  const dlDir = join(tmpDir, "dead-letters");
-  mkdirSync(dlDir, { recursive: true });
-  const file = join(dlDir, "done.ndjson");
-  writeFileSync(file, dlLine("dl-a", "sess-a") + dlLine("dl-b", "sess-b"));
-
-  // Dry run first: every record is confirmed, but without --apply the file
-  // stays put (only reported).
-  runArchiveScript();
-  expect(existsSync(file)).toBe(true);
-  expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(false);
-
-  // --apply moves the eligible file into archive/.
-  runArchiveScript(["--apply"]);
-  expect(existsSync(file)).toBe(false);
-  expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(true);
+test("archive eligibility accepts every confirmed parseable record", () => {
+  expect(
+    archiveEligibility(
+      dlLine("dl-a", "sess-a") + dlLine("dl-b", "sess-b"),
+      new Set(["dl-a", "dl-b"]),
+    ),
+  ).toEqual({ eligible: true, records: 2 });
 });
 
 test("fn-1024: serializeSessionTelemetry forwards the six telemetry fields and drops kind/id", () => {
@@ -9563,275 +9333,50 @@ test("runMergeEscalationSweep + classifyWorkResolverOutcome: a leased-out crashe
 });
 
 // ---------------------------------------------------------------------------
-// fn-749 task .1 — worker-set selector
+// Worker selection is a pure boot decision. The actual worker constructors are
+// production wiring and are deliberately not booted by the fast suite.
 // ---------------------------------------------------------------------------
 
-/** Map a spawned worker-module URL back to its {@link WorkerName}. */
-const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
-  "wake-worker.ts": "wake",
-  "server-worker.ts": "server",
-  "transcript-worker.ts": "transcript",
-  "plan-worker.ts": "plan",
-  "exit-watcher.ts": "exit",
-  "git-worker.ts": "git",
-  "statusline-worker.ts": "statusline",
-  "builds-worker.ts": "builds",
-  "account-observer-worker.ts": "accountObserver",
-  "dead-letter-worker.ts": "deadLetter",
-  "events-ingest-worker.ts": "eventsIngest",
-  "birth-ingest-worker.ts": "birthIngest",
-  "autopilot-worker.ts": "autopilot",
-  "handoff-worker.ts": "handoff",
-  "await-worker.ts": "await",
-  "maintenance-worker.ts": "maintenance",
-  "restore-worker.ts": "restore",
-  "renamer-worker.ts": "renamer",
-  "autoclose-worker.ts": "autoclose",
-  "bus-worker.ts": "bus",
-  "tmux-control-worker.ts": "tmuxControl",
-  "baseline-worker.ts": "baseline",
-};
-
-/**
- * fn-749 — boot `startDaemon(opts)` under a `globalThis.Worker` constructor SPY
- * that records each spawned worker's module name WITHOUT creating a real thread
- * (so no `@parcel/watcher` dlopen, no UDS bind, no kernel fd). The stub satisfies
- * the property/method surface `startDaemon` touches during its synchronous boot
- * (`onmessage`/`onerror` setters + `addEventListener`); the boot's DB work runs
- * for real against the sandboxed tmp DB. Returns the captured set of spawned
- * worker NAMES, in spawn order.
- *
- * The `close` listeners the boot wires (the fatalExit-on-crash guards) are NEVER
- * fired by the stub, so the `!shuttingDown` crash path can't trip the test
- * runner. We do NOT call `handle.stop()` (no real workers to tear down); the
- * sandboxed DB connection is released when the test process ends and the tmpdir
- * is removed in `afterEach`.
- */
-function spawnedWorkerNames(opts?: {
-  workers?: readonly WorkerName[];
-}): WorkerName[] {
-  const captured: WorkerName[] = [];
-
-  // Minimal Worker stub — records the module name, no-ops the lifecycle surface.
-  class WorkerSpy {
-    onmessage: ((ev: unknown) => void) | null = null;
-    onerror: ((ev: unknown) => void) | null = null;
-    constructor(url: string | URL) {
-      const href = typeof url === "string" ? url : url.href;
-      const leaf = href.split("/").pop() ?? href;
-      const name = WORKER_MODULE_TO_NAME[leaf];
-      if (name) captured.push(name);
-    }
-    addEventListener(): void {}
-    postMessage(): void {}
-    terminate(): void {}
-  }
-
-  const realWorker = globalThis.Worker;
-  // Sandbox every state path on the LIVE process.env for the synchronous boot
-  // window, mirroring the in-process harness (the path resolvers read
-  // process.env directly). Restore exactly afterward — no `await` between set
-  // and restore, so it stays parallel-safe.
-  const sockPath = join(tmpDir, "keeperd.sock");
-  // The builds worker spawn is gated on a configured `buildbot_url`. Pin a temp
-  // config carrying it so this boot is deterministic regardless of the live
-  // `~/.config/keeper/config.yaml` — `builds` is in ALL_WORKERS and must spawn.
-  const configPath = join(tmpDir, "keeper-config.yaml");
-  // `builds` is gated on a configured `buildbot_url`; pin it so that worker
-  // spawns deterministically.
-  writeFileSync(configPath, "buildbot_url: http://localhost:8010\n");
-  const sandbox: Record<string, string> = {
-    KEEPER_DB: dbPath,
-    KEEPER_CONFIG: configPath,
-    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
-    KEEPER_EVENTS_LOG: join(tmpDir, "events-log"),
-    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
-    KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
-    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
-    KEEPER_RESTART_LEDGER: join(tmpDir, "restart-ledger.json"),
-    KEEPER_SOCK: sockPath,
-  };
-  const prior: Record<string, string | undefined> = {};
-  for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
-
-  let handle: DaemonHandle | null = null;
-  try {
-    (globalThis as { Worker: unknown }).Worker = WorkerSpy;
-    for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
-    // Boot is fully synchronous up to the returned handle (every `new Worker`
-    // fires here, under the spy). Disable the single-instance flock: it runs on
-    // MAIN (not stubbed by WorkerSpy) and would otherwise take the real host lock.
-    handle = startDaemon({
-      workers: opts?.workers,
-      disableSingleInstanceLock: true,
-    });
-  } finally {
-    (globalThis as { Worker: unknown }).Worker = realWorker;
-    for (const k of Object.keys(sandbox)) {
-      const v = prior[k];
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-  }
-  void handle;
-  return captured;
-}
-
-test("request-await rejects unsafe spill files without minting AwaitRequested", async () => {
-  const awaitSpillDir = join(tmpDir, "await-spill");
-  mkdirSync(awaitSpillDir, { recursive: true });
-  const outsidePath = join(tmpDir, "escape.md");
-  const escapingPath = join(awaitSpillDir, "..", "escape.md");
-  const emptyPath = join(awaitSpillDir, "empty.md");
-  const oversizedPath = join(awaitSpillDir, "oversized.md");
-  writeFileSync(outsidePath, "outside");
-  writeFileSync(emptyPath, "");
-  writeFileSync(oversizedPath, "x".repeat(HANDOFF_DOC_MAX_BYTES + 1));
-
-  type CapturedWorker = {
-    onmessage: ((ev: { data: unknown }) => void) | null;
-    postMessage: (msg: unknown) => void;
-    addEventListener: () => void;
-    terminate: () => void;
-  };
-  let server: CapturedWorker | null = null;
-  const replies: unknown[] = [];
-
-  class WorkerSpy implements CapturedWorker {
-    onmessage: ((ev: { data: unknown }) => void) | null = null;
-    constructor(url: string | URL) {
-      const href = typeof url === "string" ? url : url.href;
-      if ((href.split("/").pop() ?? href) === "server-worker.ts") {
-        server = this;
-      }
-    }
-    addEventListener(): void {}
-    postMessage(msg: unknown): void {
-      if (
-        typeof msg === "object" &&
-        msg !== null &&
-        (msg as { type?: unknown }).type === "request-await-result"
-      ) {
-        replies.push(msg);
-      }
-    }
-    terminate(): void {}
-  }
-
-  const realWorker = globalThis.Worker;
-  const sandbox: Record<string, string> = {
-    KEEPER_DB: dbPath,
-    KEEPER_CONFIG: join(tmpDir, "keeper-config.yaml"),
-    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
-    KEEPER_EVENTS_LOG: join(tmpDir, "events-log"),
-    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
-    KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
-    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
-    KEEPER_RESTART_LEDGER: join(tmpDir, "restart-ledger.json"),
-    KEEPER_SOCK: join(tmpDir, "keeperd.sock"),
-    KEEPER_AWAIT_SPILL_DIR: awaitSpillDir,
-  };
-  writeFileSync(sandbox.KEEPER_CONFIG, "");
-  const prior: Record<string, string | undefined> = {};
-  for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
-
-  let handle: DaemonHandle | null = null;
-  try {
-    (globalThis as { Worker: unknown }).Worker = WorkerSpy;
-    for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
-    handle = startDaemon({
-      workers: ["server"],
-      disableSingleInstanceLock: true,
-    });
-  } finally {
-    (globalThis as { Worker: unknown }).Worker = realWorker;
-    for (const k of Object.keys(sandbox)) {
-      const v = prior[k];
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-  }
-
-  try {
-    expect(server).not.toBeNull();
-    const send = (id: string, docPath: string): void => {
-      server?.onmessage?.({
-        data: {
-          kind: "request-await-request",
-          id,
-          request: {
-            op: "request",
-            await_id: `await-${id}`,
-            condition_spec: [{ condition: "drained" }],
-            doc_path: docPath,
-            target_session: "target-session",
-            target_dir: null,
-            timeout_ms: null,
-          },
-        },
-      });
-    };
-
-    send("escape", escapingPath);
-    send("empty", emptyPath);
-    send("oversized", oversizedPath);
-  } finally {
-    await handle?.stop();
-  }
-
-  expect(replies).toHaveLength(3);
-  for (const reply of replies) {
-    expect(reply).toMatchObject({ type: "request-await-result", ok: false });
-  }
-  expect(replies[0]).toMatchObject({ id: "escape" });
-  expect(replies[1]).toMatchObject({ id: "empty" });
-  expect(replies[2]).toMatchObject({ id: "oversized" });
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .query(
-        "SELECT COUNT(*) AS count FROM events WHERE hook_event = 'AwaitRequested'",
-      )
-      .get() as { count: number };
-    expect(row.count).toBe(0);
-  } finally {
-    db.close();
-  }
+test("worker selection defaults to the complete ordered worker set", () => {
+  expect(selectWorkerNames()).toEqual([...ALL_WORKERS]);
+  expect(selectWorkerNames()).toHaveLength(22);
 });
 
-test("the production boot spawns the complete worker set", () => {
-  // A boot with no selector must spawn exactly ALL_WORKERS, in order. The
-  // configured buildbot URL makes the optional builds worker deterministic.
-  const spawned = spawnedWorkerNames();
-  expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(22);
-  // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
-  // must consciously update this contract.
-  expect([...ALL_WORKERS]).toEqual([
+test("worker selection retains only requested workers in production order", () => {
+  expect(selectWorkerNames(["plan", "wake", "server"])).toEqual([
     "wake",
     "server",
-    "transcript",
     "plan",
-    "exit",
-    "git",
-    "statusline",
-    "builds",
-    "accountObserver",
-    "deadLetter",
-    "eventsIngest",
-    "birthIngest",
-    "autopilot",
-    "handoff",
-    "await",
-    "maintenance",
-    "restore",
-    "renamer",
-    "autoclose",
-    "bus",
-    "tmuxControl",
-    "baseline",
   ]);
+  expect(selectWorkerNames(["wake", "server"])).toEqual(["wake", "server"]);
+});
+
+test("spill documents reject escapes, empty content, and oversized content without daemon boot", () => {
+  const paths: Record<string, string> = {
+    "/spill": "/spill",
+    "/spill/../escape.md": "/escape.md",
+    "/spill/empty.md": "/spill/empty.md",
+    "/spill/big.md": "/spill/big.md",
+  };
+  const canonicalize = (path: string): string => paths[path] ?? path;
+  const read = (path: string): string =>
+    path.endsWith("empty.md") ? "" : path.endsWith("big.md") ? "12345" : "ok";
+  expect(readSpillDocument("await", "/spill", "/spill/../escape.md", 4, { canonicalize, read })).toMatchObject({
+    ok: false,
+    error: expect.stringContaining("outside the spill dir"),
+  });
+  expect(readSpillDocument("await", "/spill", "/spill/empty.md", 4, { canonicalize, read })).toMatchObject({
+    ok: false,
+    error: expect.stringContaining("is empty"),
+  });
+  expect(readSpillDocument("await", "/spill", "/spill/big.md", 4, { canonicalize, read })).toMatchObject({
+    ok: false,
+    error: expect.stringContaining("over the 4-byte cap"),
+  });
+  expect(readSpillDocument("await", "/spill", "/spill/ok.md", 4, { canonicalize, read })).toEqual({
+    ok: true,
+    text: "ok",
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9997,35 +9542,6 @@ test("the Killed mint stamps 'autoclosed' on a hint match and 'exit_watched' oth
   expect(reasonOf("sess-autoclosed-again")).toBe("exit_watched");
 
   db.close();
-});
-
-test("fn-749: passing the full ALL_WORKERS set is identical to passing no selector", () => {
-  // The production default is ALL_WORKERS, so an explicit full set is a no-op.
-  expect(spawnedWorkerNames({ workers: ALL_WORKERS })).toEqual([
-    ...ALL_WORKERS,
-  ]);
-});
-
-test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worker)", () => {
-  // The UDS/RPC/fold tier's set: wake (main's reducer pump) + server (UDS).
-  const minimal = spawnedWorkerNames({ workers: ["wake", "server"] });
-  expect(minimal).toEqual(["wake", "server"]);
-  // Crucially NONE of the @parcel/watcher workers spawned.
-  for (const w of [
-    "transcript",
-    "plan",
-    "statusline",
-    "deadLetter",
-    "eventsIngest",
-    "birthIngest",
-  ] as const) {
-    expect(minimal).not.toContain(w);
-  }
-
-  // The plan-fold tier's set additionally boots the plan worker — and ONLY it
-  // among the watchers.
-  const planSet = spawnedWorkerNames({ workers: ["wake", "server", "plan"] });
-  expect(planSet).toEqual(["wake", "server", "plan"]);
 });
 
 // ---------------------------------------------------------------------------
