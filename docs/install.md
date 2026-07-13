@@ -111,9 +111,39 @@ gate that drops those scanned third-party plugins from worker launches (interact
 [plugin-composition-map.md](./plugin-composition-map.md) is the full map;
 `bun scripts/clean-machine-check.ts` proves the arthack-free launch path end to end.
 
-### Pi `/rename`
+### Pi Task and panel operations
 
-Every keeper-launched Pi session (`keeper agent pi`) gets one extra command, `/rename`, which derives
+Keeper's Pi compatibility layer requires `@tintinweb/pi-subagents` with its supported event-bus RPC.
+The installer renders Keeper's named `plan:*` agents into Pi's canonical agent directory and loads the
+tracked Task facade only for keeper-launched Pi sessions. A Task call fails loudly if the package is
+absent, its RPC protocol is incompatible, or the requested named agent is unresolved; there is no
+fallback to a generic agent. Cancellation is owner-scoped and does not settle until nested Task scopes
+acknowledge termination or report their exact unresolved identity. Re-run `scripts/install.sh` after
+agent-template or extension changes, then use the rendered-agent parity tests before a Pi panel.
+
+Panel retries are identity-sensitive: repeat `wait` after exit 124 against the same run directory, use
+`resume` only for its bounded positively-dead recovery, and never rerun `start` under a fresh slug as an
+error handler. `cleanup_failed` withholds success and names exact `member#attempt` survivors; inspect
+those identities and their exported `tmux-runs/<run-id>/control.json` commands instead of using
+session-wide tmux cleanup or process-name matching. Detailed states are in
+[problem-codes.md](./problem-codes.md#panel-run-lifecycle).
+
+The post-install lifecycle gate uses a configured panel containing two or three inexpensive members and
+never reuses the production design inquiry:
+
+```sh
+bun test test/panel-lifecycle-integration.test.ts
+KEEPER_RUN_SLOW=1 bun test test/pair-panel.slow.test.ts
+bun scripts/panel-smoke.ts --panel <small-panel> --outer-timeout 120
+bun scripts/panel-smoke.ts --panel <small-panel> --outer-timeout 120 --abort-after 5
+```
+
+Both smoke reports must show `launch_count` equal to the configured member count exactly once,
+settled cancellation, and `exact_survivor_count: 0`. Keep the original design inquiry gated until both
+the terminal run and explicit-abort run satisfy those checks; do not retry that inquiry as validation.
+A `cleanup_failed` report keeps the gate closed until its listed exact identities are reconciled.
+
+Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which derives
 a short Session title from the current branch's Latest turn and applies it through Pi's own
 `setSessionName()`. It requires Pi's own OAuth login to serve the one fixed cheap
 `openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate keeper credential. Absent
