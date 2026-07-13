@@ -15,7 +15,10 @@ import {
   WORKTREE_FINALIZE_NON_FF_REASON,
 } from "../src/dispatch-failure-key";
 import type { LaunchResult } from "../src/exec-backend";
-import type { DurableAwaitCondition } from "../src/protocol";
+import {
+  DURABLE_AWAIT_CONDITION_KINDS,
+  type DurableAwaitCondition,
+} from "../src/protocol";
 import { freshMemDb } from "./helpers/template-db";
 
 const NOW = 1_700_000_000_000;
@@ -317,6 +320,10 @@ const durableAwaitCases: Array<{
 ];
 
 test("evaluateDurableAwaitConditions covers every server-side condition kind", () => {
+  expect(durableAwaitCases.map(({ kind }) => kind).sort()).toEqual(
+    [...DURABLE_AWAIT_CONDITION_KINDS].sort(),
+  );
+
   for (const c of durableAwaitCases) {
     const metDb = freshAwaitDb();
     c.seedMet(metDb);
