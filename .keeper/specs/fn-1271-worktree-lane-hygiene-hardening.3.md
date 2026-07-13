@@ -43,5 +43,5 @@ lane has real dir → untouched; source lacks node_modules → skipped; broken l
 - [ ] The husk-sweep interaction is documented and unweakened
 
 ## Done summary
-
+Added an idempotent node_modules symlink step at lane provision (source checkout -> lane, repair-on-drift, skip when source lacks it, real dirs left untouched), documented the isResidueOnlyDir husk-sweep interaction, and covered all link lifecycle cases with fake-fs tests.
 ## Evidence
