@@ -47,6 +47,21 @@ describe("on-disk panel roster", () => {
       void name;
     }
   });
+
+  test("the premium GPT flagship (gpt-5.6-sol) is reserved for the strong-and-max rungs", () => {
+    const doc = loadYamlInput(join(PLAN_ROOT, "panel-selector.yaml")) as {
+      panels: Record<string, { strength: string; members: string[] }>;
+    };
+    const flagshipStrengths = new Set(["strong", "max"]);
+    const flagshipPanels = Object.values(doc.panels).filter((panel) =>
+      panel.members.some((member) => member.includes("gpt-5.6-sol")),
+    );
+
+    for (const panel of flagshipPanels) {
+      expect(flagshipStrengths.has(panel.strength)).toBe(true);
+    }
+    expect(flagshipPanels.some((panel) => panel.strength === "max")).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
