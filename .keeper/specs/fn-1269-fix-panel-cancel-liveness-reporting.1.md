@@ -24,5 +24,5 @@ Files: `src/pair/panel.ts` (panelCancel cleanup pass), plus test coverage.
 - [ ] A new regression test drives the pidfile-not-yet-present-at-cancel race (do not seed the pidfile before cancelling), asserting the unresolved classification.
 
 ## Done summary
-
+panelCancel now classifies a launched member whose pidfile never becomes readable by the cancel deadline as cleanup_failed/unresolved (non-zero exit, in unresolved_cleanup) instead of cancelled, matching the pass's fail-toward-unresolved discipline; genuinely-gone members still report cancelled/exit 0. Added a regression test driving the pidfile-not-yet-present-at-cancel race.
 ## Evidence
