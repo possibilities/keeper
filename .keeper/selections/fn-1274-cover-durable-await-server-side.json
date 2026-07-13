@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified test-only work with a fully nameable acceptance across two test files (14-kind table-driven evaluator test plus daemon-level spill-guard rejections), routing GPT-first per hand_tuned; substantial multi-surface scope with real DB-seeding and repo test-isolation idiom demands fits gpt-5.5 at the high default band, with no intelligence-bound reason for opus or judgment gap for sonnet.",
+      "task_id": "fn-1274-cover-durable-await-server-side.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T10:59:14.644000Z",
+  "epic_id": "fn-1274-cover-durable-await-server-side",
+  "input_hash": "a79f87da05e9dca2c8555e1f013029d9e2fad69c00657adb416fa682ae077b39",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2812250074,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified test-only work with a fully nameable acceptance across two test files (14-kind table-driven evaluator test plus daemon-level spill-guard rejections), routing GPT-first per hand_tuned; substantial multi-surface scope with real DB-seeding and repo test-isolation idiom demands fits gpt-5.5 at the high default band, with no intelligence-bound reason for opus or judgment gap for sonnet.\",\"confidence\":0.72}]}\n"
+}
