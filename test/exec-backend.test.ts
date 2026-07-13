@@ -36,6 +36,8 @@ import {
   buildTmuxSelectWindowArgs,
   buildTmuxServerGenerationArgs,
   classifyCloseKind,
+  classifyProcessIdentity,
+  compareCanonicalGeneration,
   createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
@@ -239,6 +241,30 @@ test("parseGenerationId splits the full form and the legacy bare-pid form", () =
   // Bare pid is accepted as a legacy read (startTime null) — the alias source.
   expect(parseGenerationId("21705")).toEqual({ pid: "21705", startTime: null });
   expect(parseGenerationId("  9:9 ")).toEqual({ pid: "9", startTime: "9" });
+});
+
+test("canonical generation comparison refuses legacy/malformed cleanup authority", () => {
+  expect(compareCanonicalGeneration("123:456", "123:456")).toBe("match");
+  expect(compareCanonicalGeneration("123:456", "123:457")).toBe("mismatch");
+  expect(compareCanonicalGeneration("123", "123:456")).toBe("unknown");
+  expect(compareCanonicalGeneration("bad", "123:456")).toBe("unknown");
+});
+
+test("process identity separates a recycled pid from a gone process", () => {
+  expect(
+    classifyProcessIdentity(42, "start-a", {
+      isPidAlive: () => true,
+      readStartTime: () => "start-b",
+    }),
+  ).toBe("recycled");
+  expect(
+    classifyProcessIdentity(42, "start-a", {
+      isPidAlive: () => false,
+      readStartTime: () => {
+        throw new Error("must not read a dead pid");
+      },
+    }),
+  ).toBe("dead");
 });
 
 test("parseGenerationId rejects non-positive-integer fields and >2 segments", () => {

@@ -74,6 +74,7 @@ interface SeedJob {
   backend_exec_session_id?: string | null;
   backend_exec_birth_session_id?: string | null;
   plan_verb?: string | null;
+  dispatch_origin?: string | null;
   last_event_id?: number | null;
   pid?: number | null;
   /** The stored `(pid, start_time)` recycle-identity companion to `pid`. */
@@ -99,8 +100,9 @@ function seedJob(db: Database, j: SeedJob): void {
        job_id, created_at, updated_at, state, title, close_kind, window_index,
        cwd, backend_exec_session_id, backend_exec_birth_session_id, plan_verb,
        last_event_id, pid, start_time, backend_exec_type, backend_exec_pane_id,
-       backend_exec_generation_id, harness, resume_target, adopted
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       backend_exec_generation_id, harness, resume_target, adopted,
+       dispatch_origin
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -126,6 +128,7 @@ function seedJob(db: Database, j: SeedJob): void {
       j.harness ?? null,
       j.resume_target ?? null,
       j.adopted ?? null,
+      j.dispatch_origin ?? null,
     ],
   );
 }
@@ -469,18 +472,35 @@ test("deriveRestoreSet: a NULL live session falls back to the birth session for 
   expect(candidates[0]?.backend_exec_session_id).toBe("work");
 });
 
-test("deriveRestoreSet: autopilot workers (plan_verb='work') are excluded", () => {
+test("deriveRestoreSet: reconciler-managed work and close sessions are excluded; manual restore is unchanged", () => {
   seedJob(kdb.db, {
-    job_id: "autopilot",
+    job_id: "autopilot-work",
     close_kind: "server_gone",
     plan_verb: "work",
+    dispatch_origin: "autopilot",
+  });
+  seedJob(kdb.db, {
+    job_id: "autopilot-close",
+    close_kind: "server_gone",
+    plan_verb: "close",
+    dispatch_origin: "autopilot",
   });
   seedJob(kdb.db, {
     job_id: "human",
     close_kind: "server_gone",
     plan_verb: null,
   });
-  expect(derive().candidates.map((c) => c.job_id)).toEqual(["human"]);
+  seedJob(kdb.db, {
+    job_id: "manual-close",
+    close_kind: "server_gone",
+    plan_verb: "close",
+    dispatch_origin: null,
+  });
+  expect(
+    derive()
+      .candidates.map((c) => c.job_id)
+      .sort(),
+  ).toEqual(["human", "manual-close"]);
 });
 
 test("deriveRestoreSet: live working/stopped rows never surface as candidates", () => {
@@ -1864,6 +1884,7 @@ test("deriveLastGenerationSetFromTopology: reuses the idempotence filters (worke
     state: "killed",
     title: "worker-agent",
     plan_verb: "work",
+    dispatch_origin: "autopilot",
   });
   // A job already live under its UUID (would double-spawn) — excluded.
   seedJob(kdb.db, {
@@ -2326,12 +2347,14 @@ test("deriveLastGenerationSetFromTopology (fallback): a non-degenerate generatio
     state: "killed",
     title: "w1",
     plan_verb: "work",
+    dispatch_origin: "autopilot",
   });
   seedJob(kdb.db, {
     job_id: "w2",
     state: "killed",
     title: "w2",
     plan_verb: "work",
+    dispatch_origin: "autopilot",
   });
   seedTmuxTopologySnapshot(kdb.db, 500, "gen-workers", [
     { pane_id: "%1", session_name: "work", window_index: 0, job_id: "w1" },

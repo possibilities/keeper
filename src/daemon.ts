@@ -42,8 +42,8 @@ import {
   resolveCodexResumeTarget,
 } from "./agent/codex-session-index";
 import type {
-  AutocloseIntentMessage,
   AutocloseWorkerData,
+  AutocloseWorkerMessage,
 } from "./autoclose-worker";
 import { projectAutopilotPaused } from "./autopilot-projection";
 import type {
@@ -13755,13 +13755,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Gated on the selector — `null` when unselected. The autoclose worker
-  // is a pure external actuator cloned from the renamer — reads the
-  // jobs projection READ-ONLY, self-gates on `autoclose_enabled` every pulse, and
-  // writes ONLY to tmux (`kill-window`), NEVER keeper.db. ALWAYS spawned (a
+  // reads the jobs projection READ-ONLY, self-gates on `autoclose_enabled` every
+  // pulse, and writes externally only to tmux (`kill-window`). ALWAYS spawned (a
   // runtime enable/disable flip needs no restart); NOT a WATCHER_WORKER (dlopens
-  // no parcel watcher). Unlike the renamer it DOES post to main — the pre-kill
-  // intent hint — which `autocloseHints` records so the exit-watcher's sole
-  // Killed mint labels the row 'autoclosed'.
+  // no parcel watcher). It posts exact claim-release requests and pre-kill intent
+  // hints to main; main alone mints the synthetic release event, while
+  // `autocloseHints` lets the exit-watcher's sole Killed mint label the row
+  // 'autoclosed'.
   const autocloseWorker = want("autoclose")
     ? new Worker(new URL("./autoclose-worker.ts", import.meta.url).href, {
         workerData: { dbPath } satisfies AutocloseWorkerData,
@@ -13771,13 +13771,63 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   if (autocloseWorker) {
     const aw = autocloseWorker;
     aw.onmessage = (
-      ev: MessageEvent<AutocloseIntentMessage | undefined>,
+      ev: MessageEvent<AutocloseWorkerMessage | undefined>,
     ): void => {
       const msg = ev.data;
-      if (!msg || msg.kind !== "autoclose-intent") return;
-      // Record the pre-kill hint keyed by jobId; the exit-watcher's SOLE Killed
-      // mint consumes it (identity-checked, once) to stamp 'autoclosed'.
-      autocloseHints.post(msg.jobId, msg.pid, msg.startTime);
+      if (!msg) return;
+      if (msg.kind === "autoclose-intent") {
+        // Record the pre-kill hint keyed by jobId; the exit-watcher's SOLE Killed
+        // mint consumes it (identity-checked, once) to stamp 'autoclosed'.
+        autocloseHints.post(msg.jobId, msg.pid, msg.startTime);
+        return;
+      }
+      if (msg.kind !== "autoclose-claim-release") return;
+      try {
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: `${msg.verb}::${msg.id}`,
+          $pid: null,
+          $hook_event: "DispatchClaimReleased",
+          $event_type: "dispatch_claims",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({
+            verb: msg.verb,
+            id: msg.id,
+            expected_attempt_id: msg.expectedAttemptId,
+            session_id: msg.sessionId,
+          }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+          $worktree: null,
+        });
+        wakePending = true;
+        pumpWakes();
+      } catch (err) {
+        console.error(
+          `[keeperd] autoclose claim release failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     };
     aw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] autoclose worker error:", err.message ?? err);

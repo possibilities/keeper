@@ -556,6 +556,40 @@ export function buildGenerationId(rawProbeOutput: string): string | null {
 }
 
 /**
+ * Compare two tmux generation handles without accepting legacy or malformed
+ * values as cleanup authority. A canonical generation contains both server pid
+ * and start time; bare-pid history remains readable but can never authorize a
+ * destructive operation.
+ */
+export function compareCanonicalGeneration(
+  expected: string | null | undefined,
+  observed: string | null | undefined,
+): "match" | "mismatch" | "unknown" {
+  if (expected == null || observed == null) return "unknown";
+  const a = parseGenerationId(expected);
+  const b = parseGenerationId(observed);
+  if (a?.startTime == null || b?.startTime == null) return "unknown";
+  return a.pid === b.pid && a.startTime === b.startTime ? "match" : "mismatch";
+}
+
+/** Recycle-safe process identity classification shared by restore and cleanup. */
+export function classifyProcessIdentity(
+  pid: number | null | undefined,
+  startTime: string | null | undefined,
+  deps: {
+    isPidAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+  },
+): "alive" | "dead" | "recycled" | "unknown" {
+  if (pid == null || !Number.isInteger(pid) || pid <= 0) return "unknown";
+  if (!deps.isPidAlive(pid)) return "dead";
+  if (startTime == null || startTime === "") return "unknown";
+  const current = deps.readStartTime(pid);
+  if (current == null) return "unknown";
+  return current === startTime ? "alive" : "recycled";
+}
+
+/**
  * Build the tmux `list-panes -a -F '#{pid}:#{start_time}\t#{pane_id}\t
  * #{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t
  * #{window_name}'` sweep argv. Pure — exported for tests. `-a` spans every

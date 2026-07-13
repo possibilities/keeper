@@ -751,6 +751,8 @@ export interface ReconcileSnapshot {
   dispatchClaims?: ReadonlyMap<DispatchKey, DispatchClaim>;
   /** Canonical Harness activity keyed by Harness session id. */
   harnessActivityByJobId?: ReadonlyMap<string, HarnessActivity>;
+  /** Exact live-resource observation for each job. Unknown/conflict block teardown. */
+  resourceHoldByJobId?: ReadonlyMap<string, ResourceHoldObservation>;
   /**
    * The LIVE backend pane ids from the read-time `listPanes()` probe, used to
    * gate the `stopped` arm of {@link isOccupyingJob}: a stopped job whose
@@ -1343,6 +1345,8 @@ export interface WorktreeLaunchInfo {
    * sink (always base).
    */
   parentBranch: string;
+  /** False when an exact Resource hold still protects this epic's lanes. */
+  teardownAllowed?: boolean;
 }
 
 /**
@@ -1608,6 +1612,35 @@ export function dispatchTargetIsOwned(
       id,
     )
   );
+}
+
+export type ResourceHoldObservation =
+  | { status: "held"; paneId: string; generationId: string }
+  | { status: "clear" }
+  | { status: "unknown" | "conflict"; reason: string };
+
+/**
+ * Resource teardown is stricter than logical activity. Every matching work/close
+ * owner must have a positive clear observation; a live hold, malformed identity,
+ * generation conflict, or degraded probe blocks destruction.
+ */
+export function epicResourceTeardownBlocked(
+  epic: Epic,
+  jobs: Map<string, Job>,
+  observations: ReadonlyMap<string, ResourceHoldObservation> | undefined,
+): boolean {
+  if (observations === undefined) return true;
+  const taskIds = new Set(epic.tasks.map((task) => task.task_id));
+  for (const job of jobs.values()) {
+    const matches =
+      (job.plan_verb === "close" && job.plan_ref === epic.epic_id) ||
+      (job.plan_verb === "work" &&
+        job.plan_ref != null &&
+        taskIds.has(job.plan_ref));
+    if (!matches) continue;
+    if (observations.get(job.job_id)?.status !== "clear") return true;
+  }
+  return false;
 }
 
 export function isOccupyingJob(
@@ -2631,11 +2664,16 @@ export function reconcile(
     const finalizeEpicIds = new Set<string>();
     for (const epic of snapshot.epics) {
       const epicId = epic.epic_id;
-      if (
-        isOccupyingJob(snapshot.jobs, "close", epicId, snapshot.livePaneIds)
-      ) {
-        continue;
-      }
+      const closeIsActive =
+        snapshot.harnessActivityByJobId === undefined
+          ? isOccupyingJob(snapshot.jobs, "close", epicId, snapshot.livePaneIds)
+          : dispatchTargetHasActivityCollision(
+              snapshot.jobs,
+              snapshot.harnessActivityByJobId,
+              "close",
+              epicId,
+            );
+      if (closeIsActive) continue;
       if (
         completedRowIds.has(epicId) ||
         closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds)
@@ -2651,6 +2689,25 @@ export function reconcile(
       worktreeSinkProvision,
       worktreeGeometry.byEpicId,
     );
+    const epicById = new Map(
+      snapshot.epics.map((epic) => [epic.epic_id, epic]),
+    );
+    for (const info of worktreeFinalize) {
+      const prefix = "keeper/epic/";
+      const epicId = info.baseBranch.startsWith(prefix)
+        ? info.baseBranch.slice(prefix.length)
+        : info.baseBranch;
+      const epic = epicById.get(epicId);
+      info.teardownAllowed =
+        epic !== undefined &&
+        (snapshot.resourceHoldByJobId === undefined
+          ? !epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)
+          : !epicResourceTeardownBlocked(
+              epic,
+              snapshot.jobs,
+              snapshot.resourceHoldByJobId,
+            ));
+    }
   }
 
   // Slot-occupancy visibility + auto-reclaim: surface (and, when provably dead,

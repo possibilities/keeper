@@ -87,6 +87,7 @@ import {
   type DispatchKey,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   type DupEpicNumberObservation,
+  deriveResourceHoldObservations,
   dupEpicNumberDistressId,
   epicFrameVerdict,
   epicHasActiveResolver,
@@ -640,6 +641,43 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
 // ---------------------------------------------------------------------------
 // Harness activity + Dispatch claim ownership
 // ---------------------------------------------------------------------------
+
+test("exact Resource holds distinguish held, cleared, generation-conflict, and degraded observations", () => {
+  const job = makeJob({
+    job_id: "owner",
+    plan_verb: "close",
+    plan_ref: "fn-1-a",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%7",
+    backend_exec_generation_id: "700:7000",
+  });
+  const jobs = new Map([[job.job_id, job]]);
+  const pane: PaneInfo = {
+    tmuxGenerationId: "700:7000",
+    paneId: "%7",
+    windowId: "@7",
+    currentCommand: "claude",
+    paneDead: "0",
+    sessionName: "autopilot",
+    windowName: "close::fn-1-a",
+  };
+  expect(
+    deriveResourceHoldObservations(jobs, [pane]).get("owner")?.status,
+  ).toBe("held");
+  expect(
+    deriveResourceHoldObservations(jobs, [
+      { ...pane, paneId: "%8", windowId: "@8" },
+    ]).get("owner")?.status,
+  ).toBe("clear");
+  expect(
+    deriveResourceHoldObservations(jobs, [
+      { ...pane, tmuxGenerationId: "701:7001" },
+    ]).get("owner")?.status,
+  ).toBe("conflict");
+  expect(deriveResourceHoldObservations(jobs, null).get("owner")?.status).toBe(
+    "unknown",
+  );
+});
 
 test("parked exact claim owns its target without consuming activity; active and unknown collide", () => {
   const claim = {
