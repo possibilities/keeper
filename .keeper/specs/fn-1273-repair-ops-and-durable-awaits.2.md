@@ -48,5 +48,5 @@ backup failure → no clean; retry dedups the snapshot; ignored files survive th
 - [ ] The lane force-remove path's behavior and tests are unchanged
 
 ## Done summary
-
+Producer sweep in the autopilot reconciler now backs up and cleans shared-checkout dirt once every cwd-matched writer is provably dead past the grace (liveness via (pid,start_time), MERGE_HEAD absent); a factored, content-deduped snapshot core is shared with the lane force-remove path, which stays byte-equivalent. Any live/working/unprovable writer or an in-progress merge refuses and pages once; a failed backup never cleans. docs/problem-codes.md shared_checkout_jam entry documents the self-heal.
 ## Evidence
