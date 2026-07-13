@@ -65,5 +65,5 @@ Enable close’s reconciler-managed recovery only after claims and exact binding
 - [ ] Focused autoclose, finalize, restore, generation, and exit-watcher suites pass in process isolation.
 
 ## Done summary
-
+Decoupled logical worktree merge from destructive pane/lane/worktree teardown: autoclose now consumes canonical Harness activity and Dispatch-claim disposition (never bare pane death), teardown requires an exact Resource-hold/incarnation match (tmux generation, recycle-safe pid start-time, lane identity), and autopilot-origin close sessions join work under reconciler-managed recovery while manual/Adopted restore is unchanged; degraded probes fail closed and cwd-missing stays detect-only.
 ## Evidence
