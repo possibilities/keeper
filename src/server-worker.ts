@@ -80,6 +80,7 @@ import {
   OversizedLineError,
   type PatchFrame,
   type QueryFrame,
+  type RequestAwaitRpcParams,
   type ResultFrame,
   type RpcFrame,
   type RpcResultFrame,
@@ -349,6 +350,21 @@ export interface RequestHandoffResultMessage {
    *  handler throws {@link SlugConflictError} → the distinct `slug_conflict`
    *  wire code → CLI exit 3. */
   conflict?: boolean;
+}
+
+/** Worker→main request to mint one durable-await request/cancel Event. */
+export interface RequestAwaitRequestMessage {
+  kind: "request-await-request";
+  id: string;
+  request: RequestAwaitRpcParams;
+}
+
+/** Main→worker reply paired with {@link RequestAwaitRequestMessage}. */
+export interface RequestAwaitResultMessage {
+  type: "request-await-result";
+  id: string;
+  ok: boolean;
+  error?: string;
 }
 
 /**
@@ -1637,6 +1653,11 @@ export interface ReplayBridge {
     /** Set when the failure is a slug collision (vs an ordinary failure). */
     conflict?: boolean;
   }>;
+  /** APPEND one AwaitRequested Synthetic event and pump a wake. */
+  requestAwait(req: RequestAwaitRpcParams): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
 }
 
 /**
@@ -2278,6 +2299,7 @@ const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
   "set_epic_armed",
   "retry_dispatch",
   "request_handoff",
+  "request_await",
 ]);
 
 /**
@@ -3817,6 +3839,15 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  /** Pending `request_await` requests, correlated by id. */
+  const pendingRequestAwait = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   const bridge: ReplayBridge = {
     replay(): Promise<ReplayResolution> {
       return new Promise<ReplayResolution>((resolve, reject) => {
@@ -3979,6 +4010,27 @@ function main(): void {
         } satisfies RequestHandoffRequestMessage);
       });
     },
+    requestAwait(request): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingRequestAwait.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingRequestAwait.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "request-await-request",
+          id: reqId,
+          request,
+        } satisfies RequestAwaitRequestMessage);
+      });
+    },
   };
 
   // fn-897 B1 boot gate. The server worker now spawns right after `migrate()`,
@@ -4097,6 +4149,7 @@ function main(): void {
         | SetAutopilotConfigResultMessage
         | SetEpicArmedResultMessage
         | RequestHandoffResultMessage
+        | RequestAwaitResultMessage
         | undefined,
     ) => {
       if (!msg) return;
@@ -4201,6 +4254,15 @@ function main(): void {
         pendingRequestHandoff.delete(r.id);
         clearTimeout(entry.timer);
         entry.resolve({ ok: r.ok, error: r.error, conflict: r.conflict });
+        return;
+      }
+      if ((msg as RequestAwaitResultMessage).type === "request-await-result") {
+        const r = msg as RequestAwaitResultMessage;
+        const entry = pendingRequestAwait.get(r.id);
+        if (!entry) return;
+        pendingRequestAwait.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
         return;
       }
     },

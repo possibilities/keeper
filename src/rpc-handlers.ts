@@ -49,6 +49,11 @@ import {
 } from "./dispatch-command";
 import { validateHandoffSlug } from "./handoff-slug";
 import {
+  DURABLE_AWAIT_CONDITION_KINDS,
+  type DurableAwaitConditionSpec,
+  type RequestAwaitRpcParams,
+} from "./protocol";
+import {
   BadParamsError,
   type ReplayBridge,
   registerAsyncRpc,
@@ -728,6 +733,159 @@ export async function requestHandoffHandler(
 }
 
 // ---------------------------------------------------------------------------
+// `request_await` — durable await request/cancel intent
+// ---------------------------------------------------------------------------
+
+export type RequestAwaitParams = RequestAwaitRpcParams;
+
+export interface RequestAwaitResult {
+  ok: true;
+  op: "request" | "cancel";
+  await_id: string;
+}
+
+const DURABLE_AWAIT_KINDS = new Set<string>(DURABLE_AWAIT_CONDITION_KINDS);
+const DURABLE_AWAIT_KINDS_TEXT = DURABLE_AWAIT_CONDITION_KINDS.join(", ");
+
+function requestAwaitBadCondition(kind: unknown): BadParamsError {
+  return new BadParamsError(
+    `request_await: condition kind ${JSON.stringify(kind)} is not server-evaluable; allowed kinds: ${DURABLE_AWAIT_KINDS_TEXT}`,
+  );
+}
+
+function validateDurableConditionSpec(raw: unknown): DurableAwaitConditionSpec {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new BadParamsError(
+      `request_await: \`condition_spec\` must be a non-empty condition array; allowed kinds: ${DURABLE_AWAIT_KINDS_TEXT}`,
+    );
+  }
+  for (const segment of raw) {
+    if (
+      segment === null ||
+      typeof segment !== "object" ||
+      Array.isArray(segment)
+    ) {
+      throw requestAwaitBadCondition(undefined);
+    }
+    const kind = (segment as Record<string, unknown>).condition;
+    if (typeof kind !== "string" || !DURABLE_AWAIT_KINDS.has(kind)) {
+      throw requestAwaitBadCondition(kind);
+    }
+  }
+  try {
+    JSON.stringify(raw);
+  } catch {
+    throw new BadParamsError(
+      "request_await: `condition_spec` must be JSON-serializable",
+    );
+  }
+  return raw as unknown as DurableAwaitConditionSpec;
+}
+
+function validateAwaitId(raw: unknown): string {
+  const checked = validateHandoffSlug(raw);
+  if (!checked.ok) {
+    throw new BadParamsError(
+      `request_await: invalid \`await_id\`: ${checked.error}`,
+    );
+  }
+  return raw as string;
+}
+
+function validateRequestAwaitParams(params: unknown): RequestAwaitParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "request_await: params must be an object with `op: 'request'|'cancel', await_id: string`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (obj.op !== "request" && obj.op !== "cancel") {
+    throw new BadParamsError(
+      "request_await: `op` must be one of request|cancel",
+    );
+  }
+  const await_id = validateAwaitId(obj.await_id);
+  const known =
+    obj.op === "cancel"
+      ? new Set(["op", "await_id"])
+      : new Set([
+          "op",
+          "await_id",
+          "condition_spec",
+          "doc_path",
+          "target_session",
+          "target_dir",
+          "timeout_ms",
+        ]);
+  const stray = Object.keys(obj).filter((key) => !known.has(key));
+  if (stray.length > 0) {
+    throw new BadParamsError(
+      `request_await: unknown payload key(s): ${stray.join(", ")} (known for ${obj.op}: ${[...known].join(", ")})`,
+    );
+  }
+  if (obj.op === "cancel") {
+    return { op: "cancel", await_id };
+  }
+  const condition_spec = validateDurableConditionSpec(obj.condition_spec);
+  if (typeof obj.doc_path !== "string" || obj.doc_path.length === 0) {
+    throw new BadParamsError(
+      "request_await: `doc_path` must be a non-empty string",
+    );
+  }
+  if (
+    typeof obj.target_session !== "string" ||
+    obj.target_session.length === 0
+  ) {
+    throw new BadParamsError(
+      "request_await: `target_session` must be a non-empty string",
+    );
+  }
+  const target_dir = obj.target_dir ?? null;
+  if (
+    target_dir !== null &&
+    (typeof target_dir !== "string" ||
+      (target_dir.length > 0 && !isAbsolute(target_dir)))
+  ) {
+    throw new BadParamsError(
+      "request_await: `target_dir` must be an absolute path or null",
+    );
+  }
+  const timeout_ms = obj.timeout_ms ?? null;
+  if (
+    timeout_ms !== null &&
+    (typeof timeout_ms !== "number" ||
+      !Number.isInteger(timeout_ms) ||
+      timeout_ms <= 0)
+  ) {
+    throw new BadParamsError(
+      "request_await: `timeout_ms` must be a positive integer or null",
+    );
+  }
+  return {
+    op: "request",
+    await_id,
+    condition_spec,
+    doc_path: obj.doc_path,
+    target_session: obj.target_session,
+    target_dir: target_dir as string | null,
+    timeout_ms: timeout_ms as number | null,
+  };
+}
+
+/** Validate a durable await intent and bridge it to one Synthetic event. */
+export async function requestAwaitHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<RequestAwaitResult> {
+  const req = validateRequestAwaitParams(params);
+  const result = await bridge.requestAwait(req);
+  if (!result.ok) {
+    throw new Error(result.error ?? "request_await: main reported failure");
+  }
+  return { ok: true, op: req.op, await_id: req.await_id };
+}
+
+// ---------------------------------------------------------------------------
 // `retry_dispatch` (async — bridges through main to mint a `DispatchCleared`
 // synthetic event; fn-661 task .4)
 // ---------------------------------------------------------------------------
@@ -830,4 +988,5 @@ export function installRpcHandlers(): void {
   registerAsyncRpc("set_epic_armed", setEpicArmedHandler);
   registerAsyncRpc("retry_dispatch", retryDispatchHandler);
   registerAsyncRpc("request_handoff", requestHandoffHandler);
+  registerAsyncRpc("request_await", requestAwaitHandler);
 }

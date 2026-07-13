@@ -118,6 +118,7 @@ import {
   evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
+  resolveAwaitSpillDir,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
   resolveBusSockPath,
@@ -241,6 +242,8 @@ import type {
   KickMessage,
   ReplayRequestMessage,
   ReplayResultMessage,
+  RequestAwaitRequestMessage,
+  RequestAwaitResultMessage,
   RequestHandoffRequestMessage,
   RequestHandoffResultMessage,
   RetryDispatchRequestMessage,
@@ -7260,6 +7263,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // daemon-readable path and exfiltrate its bytes into the durable `handoffs`
   // projection. See the read site below.
   const handoffSpillDir = resolveHandoffSpillDir();
+  const awaitSpillDir = resolveAwaitSpillDir();
 
   // fn-897 B1: the boot drain + seed + ephemeral-truncate runs in `serveBootDrain`
   // below, INVOKED after the server-worker spawn so the read socket is up during
@@ -7727,6 +7731,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | SetAutopilotConfigRequestMessage
         | SetEpicArmedRequestMessage
         | RequestHandoffRequestMessage
+        | RequestAwaitRequestMessage
         | BackstopMessage
         | ServeHealthMessage
         | { kind: "ready" }
@@ -8251,6 +8256,132 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } catch (err) {
           reply = {
             type: "request-handoff-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "request-await-request") {
+        const id = msg.id;
+        let reply: RequestAwaitResultMessage;
+        try {
+          const request = msg.request;
+          const ts = Date.now() / 1000;
+          let data: Record<string, unknown>;
+          if (request.op === "cancel") {
+            data = { op: "cancel", await_id: request.await_id };
+          } else {
+            const realDir = ((): string => {
+              try {
+                return realpathSync(awaitSpillDir);
+              } catch {
+                return resolvePath(awaitSpillDir);
+              }
+            })();
+            const realDoc = ((): string => {
+              try {
+                return realpathSync(request.doc_path);
+              } catch {
+                return resolvePath(request.doc_path);
+              }
+            })();
+            if (realDoc !== realDir && !realDoc.startsWith(realDir + sep)) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` resolves outside the spill dir \`${awaitSpillDir}\``,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            let followUp: string;
+            try {
+              followUp = readFileSync(realDoc, "utf8");
+            } catch (readErr) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `cannot read await spill file \`${request.doc_path}\`: ${
+                  readErr instanceof Error ? readErr.message : String(readErr)
+                }`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            if (followUp.length === 0) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` is empty`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            const bytes = Buffer.byteLength(followUp, "utf8");
+            if (bytes > HANDOFF_DOC_MAX_BYTES) {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: false,
+                error: `await spill file \`${request.doc_path}\` is ${bytes} bytes, over the ${HANDOFF_DOC_MAX_BYTES}-byte cap`,
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            data = {
+              op: "request",
+              await_id: request.await_id,
+              condition_spec: request.condition_spec,
+              follow_up: followUp,
+              target_session: request.target_session,
+              target_dir: request.target_dir ?? null,
+              timeout_at:
+                request.timeout_ms == null
+                  ? null
+                  : ts + request.timeout_ms / 1000,
+            };
+          }
+          stmts.insertEvent.run({
+            $ts: ts,
+            $session_id: request.await_id,
+            $pid: null,
+            $hook_event: "AwaitRequested",
+            $event_type: "awaits",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify(data),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $plan_op: null,
+            $plan_target: null,
+            $plan_epic_id: null,
+            $plan_task_id: null,
+            $plan_subject_present: null,
+            $config_dir: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $plan_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+            $worktree: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "request-await-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "request-await-result",
             id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
