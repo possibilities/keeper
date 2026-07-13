@@ -39,5 +39,5 @@ Files: `plugins/plan/skills/panel-guidance/SKILL.md`,
 - [ ] Plan suite green (`bun test` in `plugins/plan`), and the panel gate exits 0 (`bun plugins/plan/scripts/panel-guidance-check.ts --check`).
 
 ## Done summary
-
+Reconciled the panel-guidance skill's reserve-policy prose with the committed roster: gpt-5.6-sol is now described as reserved for the strong-and-max rungs (matching its actual deep-duo/triad/apex placement), and a new consistency test pins that placement so the two artifacts cannot silently diverge again.
 ## Evidence

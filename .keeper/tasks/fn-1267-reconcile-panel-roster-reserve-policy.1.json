@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reconcile reserve policy",
-  "updated_at": "2026-07-12T23:02:54.843000Z"
+  "updated_at": "2026-07-13T01:00:49.260000Z",
+  "worker_done_at": "2026-07-13T01:00:49.260000Z"
 }
