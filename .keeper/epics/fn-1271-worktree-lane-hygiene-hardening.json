@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-13T07:59:47.438000Z",
+  "depends_on_epics": [],
+  "id": "fn-1271-worktree-lane-hygiene-hardening",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Worktree lane hygiene hardening",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-13T07:59:47.438000Z"
+}

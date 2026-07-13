@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T07:59:47.438000Z",
+  "depends_on": [],
+  "epic": "fn-1271-worktree-lane-hygiene-hardening",
+  "id": "fn-1271-worktree-lane-hygiene-hardening.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Bounded lane teardown with backup",
+  "updated_at": "2026-07-13T07:59:47.438000Z"
+}
