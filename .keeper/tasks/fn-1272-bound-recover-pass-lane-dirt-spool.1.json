@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T09:08:16.546000Z",
+  "depends_on": [],
+  "epic": "fn-1272-bound-recover-pass-lane-dirt-spool",
+  "id": "fn-1272-bound-recover-pass-lane-dirt-spool.1",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Bound wedged-lane spool re-snapshot",
+  "updated_at": "2026-07-13T09:08:16.546000Z"
+}
