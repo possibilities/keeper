@@ -30,7 +30,7 @@
   "skipDangerousModePermissionPrompt": true,
   "theme": "auto",
   "preferredNotifChannel": "notifications_disabled",
-  "autoCompactEnabled": false,
+  "autoCompactEnabled": true,
   "autoScrollEnabled": true,
   "terminalProgressBarEnabled": true,
   "teammateMode": "in-process",
