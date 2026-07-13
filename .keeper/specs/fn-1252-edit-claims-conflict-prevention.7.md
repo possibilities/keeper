@@ -39,5 +39,5 @@ Test the classifier over a fixture of conflict incidents produces a base-drift-v
 - [ ] When the gate is enabled, the report surfaces drift-refreshes performed and a proxy for conflicts prevented, validating the base-drift hypothesis.
 
 ## Done summary
-
+Added a read-only historical conflict-classification report (scripts/conflict-classification-report.ts) that buckets DispatchFailed conflict incidents into base-drift vs file-overlap vs other from the structured conflictedFiles payload, and once the base-freshness gate is enabled, surfaces failed refresh-attempt counts and a before/after base-drift proxy around an operator-supplied cutover.
 ## Evidence
