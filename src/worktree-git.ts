@@ -37,9 +37,22 @@
  * the worktree/merge lifecycle are covered by the real-git `*.slow.test.ts`.
  */
 
-import { lstat, readdir, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  appendFile,
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readlink,
+  realpath,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 import { CommitWorkLock } from "./commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -207,6 +220,8 @@ export interface WorktreeEntry {
   head: string | null;
   /** True when the entry is a bare repo (the main worktree of a bare clone). */
   bare: boolean;
+  /** Porcelain `locked` annotation; absent/null means the worktree is unlocked. */
+  locked?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +305,7 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
         branch: cur.branch ?? null,
         head: cur.head ?? null,
         bare: cur.bare ?? false,
+        ...(cur.locked !== undefined ? { locked: cur.locked } : {}),
       });
     }
     cur = null;
@@ -313,6 +329,8 @@ export function parseWorktreeList(stdout: string): WorktreeEntry[] {
         cur.head = value;
       } else if (key === "bare") {
         cur.bare = true;
+      } else if (key === "locked") {
+        cur.locked = value.length > 0 ? value : "locked";
       }
     }
   }
@@ -1369,6 +1387,7 @@ export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
     return null;
   }
   const sep = rest.indexOf("--");
+  if (sep === 0) return null;
   return sep === -1 ? rest : rest.slice(0, sep);
 }
 
@@ -1434,7 +1453,7 @@ export async function listEpicLaneBranches(
     const sep = rest.indexOf("--");
     if (sep === -1) {
       out.push({ branch, epicId: rest, isRib: false });
-    } else {
+    } else if (sep > 0) {
       out.push({ branch, epicId: rest.slice(0, sep), isRib: true });
     }
   }
@@ -1489,6 +1508,61 @@ export async function enumerateEpicLaneBranches(
     }
   }
   return { ok: true, branches };
+}
+
+export interface LaneNodeModulesLinkFs {
+  lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
+  realpath(path: string): Promise<string>;
+  symlink(target: string, path: string, type: "dir"): Promise<void>;
+  unlink(path: string): Promise<void>;
+}
+
+const laneNodeModulesLinkFs: LaneNodeModulesLinkFs = {
+  lstat,
+  realpath,
+  symlink,
+  unlink,
+};
+
+export async function ensureLaneNodeModulesLink(
+  sourceCheckout: string,
+  lanePath: string,
+  fs: LaneNodeModulesLinkFs = laneNodeModulesLinkFs,
+): Promise<void> {
+  const sourceNodeModules = resolve(sourceCheckout, "node_modules");
+  let sourceRealPath: string;
+  try {
+    sourceRealPath = await fs.realpath(sourceNodeModules);
+  } catch (err) {
+    if (isEnoent(err) || isEnotdir(err)) {
+      return;
+    }
+    throw err;
+  }
+
+  const laneNodeModules = resolve(lanePath, "node_modules");
+  let laneEntry: { isSymbolicLink(): boolean } | null;
+  try {
+    laneEntry = await fs.lstat(laneNodeModules);
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+    laneEntry = null;
+  }
+
+  if (laneEntry !== null && !laneEntry.isSymbolicLink()) {
+    return;
+  }
+  if (laneEntry !== null) {
+    try {
+      if ((await fs.realpath(laneNodeModules)) === sourceRealPath) {
+        return;
+      }
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+    }
+    await fs.unlink(laneNodeModules);
+  }
+  await fs.symlink(sourceNodeModules, laneNodeModules, "dir");
 }
 
 /**
@@ -1751,6 +1825,271 @@ export async function mergeBranchInto(
   }
 }
 
+/** A recover-pass lane ownership verdict. Only `owned` permits teardown. */
+export type LaneOwnership =
+  | { kind: "owned"; epicId: string }
+  | { kind: "foreign"; detail: string }
+  | { kind: "ambiguous"; detail: string }
+  | { kind: "locked"; detail: string };
+
+/**
+ * Classify a registered lane using live git identity, not its path spelling. The
+ * lane is ours only when its branch parses as `keeper/epic/*`, its git dir is a
+ * linked-worktree admin dir, and its common dir equals the main repo's common dir.
+ */
+export async function classifyLaneOwnership(
+  repoCwd: string,
+  entry: WorktreeEntry,
+  run: GitRunner = gitExec,
+): Promise<LaneOwnership> {
+  if (entry.locked != null) {
+    return { kind: "locked", detail: entry.locked };
+  }
+  const epicId = epicIdFromKeeperLaneEntry(entry);
+  if (epicId === null) {
+    return { kind: "ambiguous", detail: "unparseable keeper lane branch" };
+  }
+  try {
+    const repoCommon = await run(
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: repoCwd, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    const laneGit = await run(
+      ["rev-parse", "--path-format=absolute", "--git-dir"],
+      { cwd: entry.path, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    const laneCommon = await run(
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: entry.path, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (
+      repoCommon.code !== 0 ||
+      laneGit.code !== 0 ||
+      laneCommon.code !== 0 ||
+      repoCommon.stdout.trim() === "" ||
+      laneGit.stdout.trim() === "" ||
+      laneCommon.stdout.trim() === ""
+    ) {
+      return { kind: "ambiguous", detail: "git identity probe failed" };
+    }
+    const repoCommonPath = resolve(repoCommon.stdout.trim());
+    const laneGitPath = resolve(laneGit.stdout.trim());
+    const laneCommonPath = resolve(laneCommon.stdout.trim());
+    if (laneGitPath === laneCommonPath) {
+      return { kind: "foreign", detail: "standalone .git directory" };
+    }
+    if (laneCommonPath !== repoCommonPath) {
+      return {
+        kind: "foreign",
+        detail: `git common dir ${laneCommonPath} is outside ${repoCommonPath}`,
+      };
+    }
+    return { kind: "owned", epicId };
+  } catch (err) {
+    return {
+      kind: "ambiguous",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** A conservative, tri-state MERGE_HEAD probe for a lane destroy gate. */
+export async function probeLaneMergeHead(
+  lanePath: string,
+  run: GitRunner = gitExec,
+): Promise<"absent" | "present" | "inconclusive"> {
+  try {
+    const r = await run(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], {
+      cwd: lanePath,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (r.code === 0 && r.stdout.trim().length > 0) return "present";
+    if (r.code === 1) return "absent";
+    return "inconclusive";
+  } catch {
+    return "inconclusive";
+  }
+}
+
+export const LANE_DIRT_INDEX_MAX_BYTES = 4096;
+
+/** Resolve the operator-managed lane dirt spool. Pure; performs no I/O. */
+export function resolveLaneDirtSpoolDir(): string {
+  const override = process.env.KEEPER_LANE_DIRT_SPOOL_DIR;
+  if (override && override.length > 0) return override;
+  return resolve(homedir(), ".local", "state", "keeper", "lane-dirt-spool");
+}
+
+export type BackupForceRemoveResult =
+  | { kind: "removed"; snapshotDir: string }
+  | { kind: "backup-failed"; detail: string }
+  | { kind: "remove-failed"; detail: string; snapshotDir: string };
+
+export interface BackupForceRemoveOptions {
+  spoolDir?: string;
+  nowMs?: () => number;
+  snapshotId?: () => string;
+}
+
+/**
+ * Snapshot every dirt class, append one bounded index record, then and only then
+ * force-remove the worktree and prune its registration. This is intentionally a
+ * separate recover-only path; {@link removeWorktree} remains lossless.
+ */
+export async function backupThenForceRemoveWorktree(
+  repoCwd: string,
+  entry: WorktreeEntry,
+  run: GitRunner = gitExec,
+  options: BackupForceRemoveOptions = {},
+): Promise<BackupForceRemoveResult> {
+  const spoolDir = options.spoolDir ?? resolveLaneDirtSpoolDir();
+  const nowMs = options.nowMs?.() ?? Date.now();
+  const snapshotId =
+    options.snapshotId?.() ?? `${nowMs}-${randomUUID().replaceAll("-", "")}`;
+  if (!/^[A-Za-z0-9._-]+$/.test(snapshotId) || snapshotId.includes("..")) {
+    return { kind: "backup-failed", detail: "invalid snapshot id" };
+  }
+  const snapshotDir = resolve(spoolDir, snapshotId);
+  try {
+    const [staged, unstaged, untracked] = await Promise.all([
+      run(["diff", "--cached", "--binary", "--no-ext-diff"], {
+        cwd: entry.path,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+      run(["diff", "--binary", "--no-ext-diff"], {
+        cwd: entry.path,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+      run(["ls-files", "--others", "--exclude-standard", "-z"], {
+        cwd: entry.path,
+        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+      }),
+    ]);
+    if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
+      return { kind: "backup-failed", detail: "git dirt probe failed" };
+    }
+    const untrackedPaths = untracked.stdout
+      .split("\0")
+      .filter((p) => p.length > 0);
+    for (const relativePath of untrackedPaths) {
+      if (!isSafeLaneRelativePath(relativePath)) {
+        return {
+          kind: "backup-failed",
+          detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
+        };
+      }
+    }
+    await mkdir(spoolDir, { recursive: true });
+    await mkdir(snapshotDir, { recursive: false });
+    await writeFile(resolve(snapshotDir, "staged.patch"), staged.stdout);
+    await writeFile(resolve(snapshotDir, "unstaged.patch"), unstaged.stdout);
+    for (const relativePath of untrackedPaths) {
+      await snapshotUntrackedNode(
+        resolve(entry.path, relativePath),
+        resolve(snapshotDir, "untracked", relativePath),
+      );
+    }
+    const indexLine = serializeLaneDirtIndex({
+      snapshotId,
+      createdAtMs: nowMs,
+      repoCwd,
+      lanePath: entry.path,
+      branch: entry.branch ?? "",
+      untrackedPaths,
+    });
+    await appendFile(resolve(spoolDir, "index.ndjson"), indexLine);
+  } catch (err) {
+    await rm(snapshotDir, { recursive: true, force: true }).catch(() => {});
+    return {
+      kind: "backup-failed",
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const removed = await run(["worktree", "remove", "--force", entry.path], {
+    cwd: repoCwd,
+    timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+  });
+  if (removed.code !== 0) {
+    return {
+      kind: "remove-failed",
+      detail: (removed.stdout + removed.stderr).trim(),
+      snapshotDir,
+    };
+  }
+  await pruneWorktrees(repoCwd, run);
+  return { kind: "removed", snapshotDir };
+}
+
+function isSafeLaneRelativePath(path: string): boolean {
+  if (path.length === 0 || isAbsolute(path) || path.includes("\0"))
+    return false;
+  const normalized = path.replaceAll("\\", "/");
+  return !normalized.split("/").some((part) => part === "" || part === "..");
+}
+
+async function snapshotUntrackedNode(
+  source: string,
+  target: string,
+): Promise<void> {
+  const st = await lstat(source);
+  await mkdir(dirname(target), { recursive: true });
+  if (st.isSymbolicLink()) {
+    await symlink(await readlink(source), target);
+    return;
+  }
+  if (!st.isFile()) throw new Error(`unsupported untracked node: ${source}`);
+  await copyFile(source, target);
+}
+
+function serializeLaneDirtIndex(input: {
+  snapshotId: string;
+  createdAtMs: number;
+  repoCwd: string;
+  lanePath: string;
+  branch: string;
+  untrackedPaths: string[];
+}): string {
+  const bounded = (s: string): string => s.slice(0, 128);
+  const record = {
+    schema_version: 1,
+    snapshot_id: bounded(input.snapshotId),
+    created_at_ms: input.createdAtMs,
+    repo: bounded(input.repoCwd),
+    lane: bounded(input.lanePath),
+    branch: bounded(input.branch),
+    staged_patch: "staged.patch",
+    unstaged_patch: "unstaged.patch",
+    untracked_root: "untracked",
+    untracked_count: input.untrackedPaths.length,
+    untracked_paths: [] as string[],
+    truncated: false,
+  };
+  for (const path of input.untrackedPaths) {
+    record.untracked_paths.push(bounded(path));
+    const line = `${JSON.stringify(record)}\n`;
+    if (Buffer.byteLength(line) > LANE_DIRT_INDEX_MAX_BYTES) {
+      record.untracked_paths.pop();
+      record.truncated = true;
+      break;
+    }
+  }
+  let line = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(line) > LANE_DIRT_INDEX_MAX_BYTES) {
+    record.untracked_paths = [];
+    record.truncated = true;
+    line = `${JSON.stringify(record)}\n`;
+  }
+  if (Buffer.byteLength(line) > LANE_DIRT_INDEX_MAX_BYTES) {
+    line = `${JSON.stringify({
+      schema_version: 1,
+      snapshot_id: input.snapshotId.slice(0, 32),
+      truncated: true,
+    })}\n`;
+  }
+  return line;
+}
+
 /**
  * Remove the worktree at `path`. NEVER blind-`--force`: a `git worktree remove`
  * without `--force` already refuses a worktree with uncommitted changes, so we
@@ -1879,6 +2218,14 @@ function isEnoent(err: unknown): boolean {
     typeof err === "object" &&
     err !== null &&
     (err as { code?: string }).code === "ENOENT"
+  );
+}
+
+function isEnotdir(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: string }).code === "ENOTDIR"
   );
 }
 

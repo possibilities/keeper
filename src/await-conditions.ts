@@ -83,6 +83,8 @@
 
 import type { MonitorEntry } from "./derivers";
 import {
+  LANE_BACKUP_DISTRESS_REASON,
+  LANE_TEARDOWN_DISTRESS_REASON,
   MERGE_ESCALATION_REASON_TOKEN,
   SHARED_DESYNC_DISTRESS_REASON,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -1306,7 +1308,9 @@ export function isJamReason(reason: string): boolean {
     reason === WORKTREE_FINALIZE_SUITE_RED_REASON ||
     reason.startsWith(MERGE_ESCALATION_REASON_TOKEN) ||
     reason.startsWith(SHARED_DIRTY_DISTRESS_REASON) ||
-    reason.startsWith(SHARED_DESYNC_DISTRESS_REASON)
+    reason.startsWith(SHARED_DESYNC_DISTRESS_REASON) ||
+    reason.startsWith(LANE_TEARDOWN_DISTRESS_REASON) ||
+    reason.startsWith(LANE_BACKUP_DISTRESS_REASON)
   );
 }
 
