@@ -56,5 +56,5 @@ Remove Codex harness rows from live presets/matrix first; leave ambient `.codex`
 - [ ] Relevant Claude/Pi tests pass and Codex-only launcher tests are removed.
 
 ## Done summary
-
+Retired the standalone Codex harness from the registry, config defaults, launch-config builders, argv construction, run-capture, state-sharing, trust, restore, panels, and CLI surfaces, keeping Claude and Pi as the only supported harnesses. Unknown non-empty harness names now throw instead of falling back to Claude. Pi openai-codex/... launch ids and the gpt Worker provider family are untouched. Deleted src/codex-trust.ts, test/agent-codex.test.ts, test/codex-trust.test.ts, and the Codex plan-matrix fixture; renamed it to a Claude/Pi fixture.
 ## Evidence
