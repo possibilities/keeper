@@ -43,7 +43,7 @@ import type {
   ExitWatcher,
   WaitResult,
 } from "../src/exit-watcher-ffi";
-import { retryUntil } from "./helpers/retry-until";
+import { ManualScheduler, retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -58,6 +58,13 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
+
+function exitScheduler(clock: ManualScheduler) {
+  return {
+    sleep: (ms: number) => clock.sleep(ms),
+    nowMs: () => clock.now,
+  };
+}
 
 /**
  * Seed a `jobs` row directly (bypassing the events log). Mirrors the helper
@@ -92,6 +99,7 @@ test("diffLoop fires onTick once at boot and again on each commit by another con
     start_time: string | null;
   }[][] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
 
   // Seed an initial candidate row so the boot tick is non-empty.
   seedJobsRow(writer, "sess-pre-boot", 4242, "darwin:foo");
@@ -103,21 +111,20 @@ test("diffLoop fires onTick once at boot and again on each commit by another con
     },
     () => shutdown,
     25,
+    undefined,
+    exitScheduler(clock),
   );
 
-  // Boot tick fires synchronously inside diffLoop — give the event loop one
-  // turn to let the awaited Bun.sleep enter the polling phase.
-  await Bun.sleep(50);
+  expect(clock.pendingCount()).toBe(1);
 
   // A SEPARATE writer commit (another seed) must drive a second tick that
   // observes BOTH rows (positive gate).
   seedJobsRow(writer, "sess-after-boot", 5252, "darwin:bar");
-  await retryUntil(() => {
-    const last = ticks[ticks.length - 1];
-    return last && last.length === 2 ? last : null;
-  });
+  await clock.advanceBy(25);
+  expect(ticks.at(-1)?.length).toBe(2);
 
   shutdown = true;
+  await clock.runNext();
   await loop;
 
   // Boot tick: just the pre-boot row.
@@ -191,6 +198,7 @@ test("diffLoop resolves once isShutdown flips with no writes", async () => {
   const reader = openDb(dbPath, { readonly: true }).db;
   let ticks = 0;
   let shutdown = false;
+  const clock = new ManualScheduler();
 
   const loop = diffLoop(
     reader,
@@ -199,12 +207,17 @@ test("diffLoop resolves once isShutdown flips with no writes", async () => {
     },
     () => shutdown,
     25,
+    undefined,
+    exitScheduler(clock),
   );
 
-  // Boot tick fires synchronously; subsequent ticks require commits.
-  await Bun.sleep(80);
+  expect(ticks).toBe(1);
+  expect(clock.pendingCount()).toBe(1);
+  await clock.advanceBy(75);
+  expect(ticks).toBe(1);
   shutdown = true;
-  await loop; // must resolve, not hang
+  await clock.runNext();
+  await loop;
 
   // Exactly the boot tick (empty rows, no commits drove additional ticks).
   expect(ticks).toBe(1);
@@ -234,9 +247,7 @@ function buildMockWatcher(scriptedAdd: AddResult[]): {
       const next = scriptedAdd.shift();
       return next ?? { registered: true };
     },
-    async wait(timeoutMs): Promise<WaitResult> {
-      // Park for the requested slice so the diff loop drives the show.
-      await Bun.sleep(Math.min(timeoutMs, 50));
+    async wait(_timeoutMs): Promise<WaitResult> {
       return { kind: "timeout" };
     },
     wake() {
@@ -258,6 +269,7 @@ test("diffLoop+mock: every new candidate row triggers exactly one add()", async 
   // worker's own dedup behavior.
   const tracked = new Set<string>();
   let shutdown = false;
+  const clock = new ManualScheduler();
 
   seedJobsRow(writer, "sess-a", 7001, "darwin:a");
 
@@ -275,22 +287,23 @@ test("diffLoop+mock: every new candidate row triggers exactly one add()", async 
     },
     () => shutdown,
     25,
+    undefined,
+    exitScheduler(clock),
   );
 
-  // Boot tick: sess-a only.
-  await Bun.sleep(50);
+  expect(addCalls.map((c) => c.pid)).toEqual([7001]);
   seedJobsRow(writer, "sess-b", 7002, "darwin:b");
-  // Wait for the sess-b add (positive gate) before re-triggering.
-  await retryUntil(() => (addCalls.some((c) => c.pid === 7002) ? true : null));
+  await clock.advanceBy(25);
+  expect(addCalls.some((c) => c.pid === 7002)).toBe(true);
   // Re-trigger another commit to confirm no DUPLICATE add for sess-a.
   writer.run(
     "UPDATE jobs SET last_event_id = last_event_id + 1 WHERE job_id = 'sess-a'",
   );
-  // Settle: the re-trigger must NOT fire a second add for sess-a (dedup
-  // negative — only a wait can disprove a duplicate).
-  await Bun.sleep(80);
+  await clock.advanceBy(25);
+  expect(clock.pendingCount()).toBe(1);
 
   shutdown = true;
+  await clock.runNext();
   await loop;
 
   // One add per unique pid, in arrival order.
@@ -448,6 +461,7 @@ test("reprobeLoop posts an exit message for a dead-pid stopped row past the age 
 
   const posted: { jobId: string; pid: number | null }[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = reprobeLoop(
     reader,
     (msg) => posted.push({ jobId: msg.jobId, pid: msg.pid }),
@@ -457,20 +471,16 @@ test("reprobeLoop posts an exit message for a dead-pid stopped row past the age 
       nowSecs: () => nowSecs,
       isAlive: (pid) => pid !== 8888 && pid !== 8889, // both dead
       readStartTime: () => null,
+      scheduler: exitScheduler(clock),
     },
   );
 
-  // Wait for at least one tick to post the dead candidate.
-  const got = await retryUntil(
-    () => (posted.length > 0 ? posted : null),
-    5_000,
-  );
+  await clock.advanceBy(25);
+  expect(posted.map((p) => p.jobId)).toEqual(["sess-dead"]);
+  expect(posted[0]?.pid).toBe(8888);
   shutdown = true;
+  await clock.runNext();
   await loop;
-
-  expect(got).not.toBeNull();
-  expect(got?.map((p) => p.jobId)).toEqual(["sess-dead"]);
-  expect(got?.[0]?.pid).toBe(8888);
 
   writer.close();
   reader.close();
@@ -492,6 +502,7 @@ test("reprobeLoop: a re-sweep of a row that left the candidate set is a no-op", 
 
   const posted: string[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = reprobeLoop(
     reader,
     (msg) => posted.push(msg.jobId),
@@ -501,13 +512,14 @@ test("reprobeLoop: a re-sweep of a row that left the candidate set is a no-op", 
       nowSecs: () => nowSecs,
       isAlive: () => false, // would reap if it were a candidate
       readStartTime: () => null,
+      scheduler: exitScheduler(clock),
     },
   );
 
-  // Give it several ticks — a 'killed' row is outside the candidate query, so
-  // nothing should ever be posted.
-  await Bun.sleep(120);
+  await clock.advanceBy(100);
+  expect(clock.pendingCount()).toBe(1);
   shutdown = true;
+  await clock.runNext();
   await loop;
 
   expect(posted).toEqual([]);
@@ -1145,6 +1157,7 @@ test("sentinelLoop: a worker-done working row with stale events heals ONCE (chan
 
   const posted: StuckSentinelMessage[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = sentinelLoop(
     reader,
     (msg) => posted.push(msg),
@@ -1156,19 +1169,18 @@ test("sentinelLoop: a worker-done working row with stale events heals ONCE (chan
       reemitMs: 10 * 60_000,
       nowSecs: () => nowSecs,
       isAlive: (pid) => pid === 6001, // the stuck pid is alive
+      scheduler: exitScheduler(clock),
     },
   );
 
-  const got = await retryUntil(
-    () => (posted.length > 0 ? posted : null),
-    5_000,
-  );
-  // Give the loop several MORE ticks to prove the change-gate holds it at one.
-  await Bun.sleep(150);
+  await clock.advanceBy(25);
+  expect(posted).toHaveLength(1);
+  await clock.advanceBy(150);
+  expect(clock.pendingCount()).toBe(1);
   shutdown = true;
+  await clock.runNext();
   await loop;
 
-  expect(got).not.toBeNull();
   expect(posted.length).toBe(1); // change-gated — exactly one emission.
   expect(posted[0]?.jobId).toBe("sess-stuck");
   expect(posted[0]?.heal).toBe(true);
@@ -1204,6 +1216,7 @@ test("sentinelLoop: a parked-idle interactive session (no plan_ref) past the tie
 
   const posted: StuckSentinelMessage[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = sentinelLoop(
     reader,
     (msg) => posted.push(msg),
@@ -1213,12 +1226,14 @@ test("sentinelLoop: a parked-idle interactive session (no plan_ref) past the tie
       reemitMs: 10 * 60_000,
       nowSecs: () => nowSecs,
       isAlive: (pid) => pid === 6002,
+      scheduler: exitScheduler(clock),
     },
   );
 
-  // Give the loop several ticks to prove it never emits for this row.
-  await Bun.sleep(150);
+  await clock.advanceBy(150);
+  expect(clock.pendingCount()).toBe(1);
   shutdown = true;
+  await clock.runNext();
   await loop;
 
   expect(posted).toEqual([]);
@@ -1283,6 +1298,7 @@ test("sentinelLoop: a plan job whose recorded cwd is missing pages ONCE with the
 
   const posted: StuckSentinelMessage[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = sentinelLoop(
     reader,
     (msg) => posted.push(msg),
@@ -1294,19 +1310,20 @@ test("sentinelLoop: a plan job whose recorded cwd is missing pages ONCE with the
       isAlive: (pid) => pid === 7001, // live, same-process
       dirExists: () => false, // the launch dir is gone
       readStartTime: () => "darwin:launch-a", // matches → not recycled
+      scheduler: exitScheduler(clock),
     },
   );
 
-  const got = await retryUntil(
-    () => (posted.length > 0 ? posted : null),
-    5_000,
-  );
-  // Prove the change-gate holds it at one across several more ticks.
-  await Bun.sleep(150);
+  await clock.advanceBy(49);
+  expect(posted).toEqual([]);
+  await clock.advanceBy(1);
+  expect(posted).toHaveLength(1);
+  await clock.advanceBy(150);
+  expect(clock.pendingCount()).toBe(1);
   shutdown = true;
+  await clock.runNext();
   await loop;
 
-  expect(got).not.toBeNull();
   expect(posted.length).toBe(1);
   expect(posted[0]?.jobId).toBe("sess-zombie");
   expect(posted[0]?.heal).toBe(false); // detect-only — no StopReconciled
@@ -1335,6 +1352,7 @@ test("sentinelLoop: a plan job whose recorded cwd still exists never pages", asy
 
   const posted: StuckSentinelMessage[] = [];
   let shutdown = false;
+  const clock = new ManualScheduler();
   const loop = sentinelLoop(
     reader,
     (msg) => posted.push(msg),
@@ -1346,12 +1364,14 @@ test("sentinelLoop: a plan job whose recorded cwd still exists never pages", asy
       isAlive: (pid) => pid === 7002,
       dirExists: () => true, // the launch dir is present
       readStartTime: () => "darwin:launch-b",
+      scheduler: exitScheduler(clock),
     },
   );
 
-  // Several ticks prove the cwd-missing clause never trips for a live dir.
-  await Bun.sleep(150);
+  await clock.advanceBy(150);
+  expect(clock.pendingCount()).toBe(1);
   shutdown = true;
+  await clock.runNext();
   await loop;
 
   expect(posted).toEqual([]);

@@ -83,6 +83,42 @@ interface DataVersionRow {
   data_version: number;
 }
 
+export interface WatchLoopScheduler {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+const realWatchLoopScheduler: WatchLoopScheduler = {
+  now: () => Date.now(),
+  sleep: (ms) => Bun.sleep(ms),
+};
+
+export interface WatchLoopState {
+  lastVersion: number | null;
+  lastWakeAt: number;
+}
+
+export function stepWatchLoop(
+  state: WatchLoopState,
+  currentVersion: number | null,
+  now: number,
+  maxIdleMs: number,
+): { state: WatchLoopState; wake: boolean } {
+  if (currentVersion !== null && currentVersion !== state.lastVersion) {
+    return {
+      state: { lastVersion: currentVersion, lastWakeAt: now },
+      wake: true,
+    };
+  }
+  if (maxIdleMs > 0 && now - state.lastWakeAt >= maxIdleMs) {
+    return {
+      state: { lastVersion: state.lastVersion, lastWakeAt: now },
+      wake: true,
+    };
+  }
+  return { state, wake: false };
+}
+
 /**
  * Run the watch loop against an already-open read-only connection. Exported so
  * the loop can be driven directly in tests without spawning a real Worker.
@@ -118,6 +154,7 @@ export async function watchLoop(
   pollMs: number = DEFAULT_POLL_MS,
   maxIdleMs = 0,
   onNotadbSkip?: (consecutiveMisses: number) => void,
+  scheduler: WatchLoopScheduler = realWatchLoopScheduler,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   // Naked autocommit read — no BEGIN, or the counter freezes for this conn.
@@ -146,25 +183,24 @@ export async function watchLoop(
   // A tolerated NOTADB on this VERY FIRST read seeds a `null` baseline — the
   // loop below treats `last === null` as "unknown, always re-diff on the
   // next successful read," never a false suppression.
-  let last: number | null = readVersion();
-  let lastWakeAt = Date.now();
+  let state: WatchLoopState = {
+    lastVersion: readVersion(),
+    lastWakeAt: scheduler.now(),
+  };
 
   while (!isShutdown()) {
-    await Bun.sleep(interval);
+    await scheduler.sleep(interval);
     if (isShutdown()) {
       break;
     }
-    const cur = readVersion();
-    if (cur !== null && cur !== last) {
-      // A real commit — fire and reset the idle clock so an overdue idle tick
-      // doesn't also fire this turn (the coalesce).
-      last = cur;
-      lastWakeAt = Date.now();
-      onWake();
-    } else if (maxIdleMs > 0 && Date.now() - lastWakeAt >= maxIdleMs) {
-      // No commit (or a tolerated skip), but the idle budget elapsed —
-      // pulse anyway.
-      lastWakeAt = Date.now();
+    const step = stepWatchLoop(
+      state,
+      readVersion(),
+      scheduler.now(),
+      maxIdleMs,
+    );
+    state = step.state;
+    if (step.wake) {
       onWake();
     }
   }

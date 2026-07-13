@@ -249,6 +249,7 @@ import {
   type FakeGitRule,
   fakeAsyncGit,
 } from "./helpers/fake-git";
+import { drainMicrotasks } from "./helpers/retry-until";
 import { freshDbFile } from "./helpers/template-db";
 
 // A clean shared checkout has NO in-progress pseudo-ref present. mergeReadiness
@@ -485,6 +486,7 @@ interface FakeDepsOptions {
   now?: number | (() => number);
   pollIntervalMs?: number;
   ceilingMs?: number;
+  sleep?: ConfirmRunningDeps["sleep"];
   /**
    * fn-724: control the durable `dispatched-ack` `emitDispatched` returns.
    * - omitted → resolves `{ok:true}` (the happy durable-mint path).
@@ -593,22 +595,11 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     now: nowFn,
     dirExists: opts.dirExists ?? (() => true),
-    async sleep(ms, signal) {
-      // Synchronous-ish microtask sleep so tests don't spin real time.
-      // Honor abort: a pre-aborted signal resolves immediately.
-      if (signal.aborted) return;
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, Math.min(ms, 10));
-        signal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(t);
-            resolve();
-          },
-          { once: true },
-        );
-      });
-    },
+    sleep:
+      opts.sleep ??
+      (async (_ms, _signal) => {
+        await Promise.resolve();
+      }),
     recordTimeoutBackstop(args) {
       log.timeoutBackstops.push({ ...args });
     },
@@ -3988,6 +3979,10 @@ test("confirmRunning aborted: no timeout-backstop record (shutdown is not a resc
     maxEventId: 100,
     pollIntervalMs: 5,
     ceilingMs: 1000,
+    sleep: (_ms, signal) =>
+      new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      }),
   });
   const ctrl = new AbortController();
   const promise = confirmRunning(
@@ -4000,7 +3995,8 @@ test("confirmRunning aborted: no timeout-backstop record (shutdown is not a resc
     deps,
   );
   // Abort mid-poll.
-  setTimeout(() => ctrl.abort(), 8);
+  await drainMicrotasks();
+  ctrl.abort();
   const outcome = await promise;
   expect(outcome).toBe("aborted-postlaunch");
   expect(log.emissions).toEqual([]);
@@ -4142,6 +4138,10 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted-postlaunch
   const { deps, log } = makeFakeDeps({
     pollIntervalMs: 50,
     ceilingMs: 500,
+    sleep: (_ms, signal) =>
+      new Promise<void>((resolve) => {
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      }),
   });
   const ctrl = new AbortController();
   const promise = confirmRunning(
@@ -4154,7 +4154,7 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted-postlaunch
     deps,
   );
   // Abort after first launch lands but before the first poll resolves.
-  await Bun.sleep(20);
+  await drainMicrotasks();
   ctrl.abort();
   const outcome = await promise;
   // fn-762: the launch fired, then a mid-poll shutdown → post-launch flavor.
@@ -4195,7 +4195,7 @@ test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack r
     deps,
   );
   // Give the microtask queue room to run up to (but not past) the ack await.
-  await Bun.sleep(20);
+  await drainMicrotasks();
   expect(ackRequested).toBe(true);
   // CRITICAL: launch must NOT have fired while the ack is unresolved.
   expect(log.launches.length).toBe(0);
@@ -4286,7 +4286,7 @@ test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signa
     ctrl.signal,
     deps,
   );
-  await Bun.sleep(20);
+  await drainMicrotasks();
   // Still parked on the ack — no launch yet.
   expect(log.launches.length).toBe(0);
   // Reject the ack-wait (the timeout/shutdown flavor) → confirm aborts.
@@ -4379,7 +4379,7 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
 
   // Let the first launch get to its gate. The second must NOT have
   // started yet — that's the stagger.
-  await Bun.sleep(20);
+  await drainMicrotasks();
   expect(order.filter((s) => s.startsWith("launch-start:"))).toEqual([
     "launch-start:work::fn-1-foo.1",
   ]);

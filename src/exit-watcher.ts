@@ -150,6 +150,16 @@ const MIN_POLL_MS = 25;
  * unblocks within ~1s without relying on a wake() race.
  */
 const WAIT_TIMEOUT_MS = 1000;
+
+export interface ExitLoopScheduler {
+  sleep: (ms: number) => Promise<void>;
+  nowMs: () => number;
+}
+
+const realExitLoopScheduler: ExitLoopScheduler = {
+  sleep: (ms) => Bun.sleep(ms),
+  nowMs: () => Date.now(),
+};
 /**
  * Periodic dead-pid re-probe cadence (ms). The kernel arm (kqueue
  * `EV_ONESHOT` / pidfd `EPOLLONESHOT`) occasionally misses or races, and the
@@ -233,6 +243,7 @@ export async function diffLoop(
   isShutdown: () => boolean,
   pollMs: number = DEFAULT_POLL_MS,
   onNotadbSkip?: (consecutiveMisses: number) => void,
+  scheduler: ExitLoopScheduler = realExitLoopScheduler,
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   const versionQuery = db.query("PRAGMA data_version");
@@ -270,7 +281,7 @@ export async function diffLoop(
   // read," never a false suppression.
   let last: number | null = readVersion();
   while (!isShutdown()) {
-    await Bun.sleep(interval);
+    await scheduler.sleep(interval);
     if (isShutdown()) {
       break;
     }
@@ -395,12 +406,14 @@ export async function reprobeLoop(
     nowSecs?: () => number;
     isAlive?: (pid: number) => boolean;
     readStartTime?: (pid: number) => string | null;
+    scheduler?: ExitLoopScheduler;
   } = {},
 ): Promise<void> {
   const interval = opts.intervalMs ?? REPROBE_MS;
   const nowSecs = opts.nowSecs ?? (() => Date.now() / 1000);
   const isAlive = opts.isAlive ?? isPidAlive;
   const readStartTime = opts.readStartTime ?? readOsStartTime;
+  const scheduler = opts.scheduler ?? realExitLoopScheduler;
   // Same candidate scope as the diff loop, plus `created_at` for the age gate.
   // The pidless arm of the diff loop handles NULL-pid rows; we filter to
   // pid-bearing rows here (the predicate also skips NULL pids defensively).
@@ -417,7 +430,7 @@ export async function reprobeLoop(
     const slice = Math.min(interval, WAIT_TIMEOUT_MS);
     let waited = 0;
     while (waited < interval && !isShutdown()) {
-      await Bun.sleep(slice);
+      await scheduler.sleep(slice);
       waited += slice;
     }
     if (isShutdown()) {
@@ -874,6 +887,7 @@ export async function sentinelLoop(
     isAlive?: (pid: number) => boolean;
     dirExists?: (dir: string) => boolean;
     readStartTime?: (pid: number) => string | null;
+    scheduler?: ExitLoopScheduler;
   } = {},
 ): Promise<void> {
   const interval = opts.intervalMs ?? STUCK_SENTINEL_MS;
@@ -882,6 +896,7 @@ export async function sentinelLoop(
   const isAlive = opts.isAlive ?? isPidAlive;
   const dirExists = opts.dirExists ?? ((dir: string) => existsSync(dir));
   const readStartTime = opts.readStartTime ?? readOsStartTime;
+  const scheduler = opts.scheduler ?? realExitLoopScheduler;
   const candidatesQuery = db.query(
     `SELECT job_id, pid, plan_verb, plan_ref, last_lifecycle_ts, adopted, cwd,
             start_time FROM jobs
@@ -903,7 +918,7 @@ export async function sentinelLoop(
     const slice = Math.min(interval, WAIT_TIMEOUT_MS);
     let waited = 0;
     while (waited < interval && !isShutdown()) {
-      await Bun.sleep(slice);
+      await scheduler.sleep(slice);
       waited += slice;
     }
     if (isShutdown()) {
@@ -993,7 +1008,7 @@ export async function sentinelLoop(
       console.error("[exit-watcher] sentinel predicate failed:", err);
       continue;
     }
-    const nowMs = Date.now();
+    const nowMs = scheduler.nowMs();
     const seen = new Set<string>();
     for (const v of verdicts) {
       seen.add(v.jobId);
