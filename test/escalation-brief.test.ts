@@ -555,7 +555,9 @@ test("a repair brief resolves the repo, fingerprint, base evidence, and affected
   });
   seedRepairFailure(db, {
     repo_token: token,
-    reason: "shared-base-broken:fp-deadbeef",
+    reason:
+      'shared-base-broken:fp-deadbeef baseline_leaf="repo-deadbeef-tc" ' +
+      'failing_tests="alpha; beta (+3 more)"',
   });
 
   const r = buildEscalationBrief(db, `repair::${token}`, tmp);
@@ -579,6 +581,8 @@ test("a repair brief resolves the repo, fingerprint, base evidence, and affected
     repo_token: string;
     repo: string | null;
     fingerprint: string | null;
+    baseline_leaf_key: string | null;
+    failing_tests_digest: string | null;
     base_evidence: {
       base_sha: string | null;
       failing_command: string | null;
@@ -592,6 +596,8 @@ test("a repair brief resolves the repo, fingerprint, base evidence, and affected
   expect(inc.repo_token).toBe(token);
   expect(inc.repo).toBe(repoDir);
   expect(inc.fingerprint).toBe("fp-deadbeef");
+  expect(inc.baseline_leaf_key).toBe("repo-deadbeef-tc");
+  expect(inc.failing_tests_digest).toBe("alpha; beta (+3 more)");
   expect(inc.base_evidence).toEqual({
     base_sha: "deadbeef",
     failing_command: "bun test",
@@ -631,10 +637,14 @@ test("a repair brief with no dispatch_failures row and no matching blocked task 
   expect(b.primary_repo).toBe(repoDir);
   const inc = b.incident as {
     fingerprint: string | null;
+    baseline_leaf_key: string | null;
+    failing_tests_digest: string | null;
     base_evidence: unknown;
     affected_tasks: unknown[];
   };
   expect(inc.fingerprint).toBeNull();
+  expect(inc.baseline_leaf_key).toBeNull();
+  expect(inc.failing_tests_digest).toBeNull();
   expect(inc.base_evidence).toBeNull();
   expect(inc.affected_tasks).toEqual([]);
   expect(b.degraded).toEqual([

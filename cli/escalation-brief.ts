@@ -170,6 +170,9 @@ export interface RepairIncident {
   repo_token: string;
   repo: string | null;
   fingerprint: string | null;
+  /** Durable diagnosis reference carried by a baseline-sourced repair row. */
+  baseline_leaf_key: string | null;
+  failing_tests_digest: string | null;
   base_evidence: RepairBaseEvidence | null;
   affected_tasks: RepairAffectedTask[];
 }
@@ -603,6 +606,23 @@ function buildUnblockIncident(
  *  mis-parsing, and no row at all degrades (`incident_repair_row_missing`)
  *  rather than failing the whole brief — a session must always get a brief. */
 const REPAIR_REASON_RE = /^shared-base-broken:\s*(\S+)/;
+const REPAIR_BASELINE_LEAF_RE = /\sbaseline_leaf=("(?:\\.|[^"\\])*")/;
+const REPAIR_FAILING_TESTS_RE = /\sfailing_tests=("(?:\\.|[^"\\])*")/;
+
+/** Parse one JSON-quoted string field appended to a repair row reason. */
+function parseRepairReasonString(
+  reason: string,
+  pattern: RegExp,
+): string | null {
+  const match = pattern.exec(reason);
+  if (match == null) return null;
+  try {
+    const parsed: unknown = JSON.parse(match[1]);
+    return typeof parsed === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Best-effort extraction of a SHARED_BASE_BROKEN blocked reason's "base sha"
  *  and failing-command evidence — mirrors {@link parseMergeConflictReason}'s
@@ -759,6 +779,8 @@ function buildRepairBrief(
     )
     .get(repoToken) as { reason: string } | null;
   let fingerprint: string | null = null;
+  let baselineLeafKey: string | null = null;
+  let failingTestsDigest: string | null = null;
   if (dfRow == null) {
     degraded.push("incident_repair_row_missing");
   } else {
@@ -768,6 +790,14 @@ function buildRepairBrief(
     } else {
       fingerprint = m[1];
     }
+    baselineLeafKey = parseRepairReasonString(
+      dfRow.reason,
+      REPAIR_BASELINE_LEAF_RE,
+    );
+    failingTestsDigest = parseRepairReasonString(
+      dfRow.reason,
+      REPAIR_FAILING_TESTS_RE,
+    );
   }
 
   if (scan.affected.length === 0) {
@@ -795,6 +825,8 @@ function buildRepairBrief(
         repo_token: repoToken,
         repo: scan.repo,
         fingerprint,
+        baseline_leaf_key: baselineLeafKey,
+        failing_tests_digest: failingTestsDigest,
         base_evidence: baseEvidence,
         affected_tasks: scan.affected,
       },

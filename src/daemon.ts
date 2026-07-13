@@ -221,6 +221,7 @@ import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   isStoppedJobLive,
+  REPAIR_TERMINAL_GRACE_SEC,
 } from "./reconcile-core";
 import {
   DEFAULT_BATCH_SIZE,
@@ -1389,7 +1390,7 @@ export function buildRepairHumanNotifyBody(args: {
   const verdictLine =
     args.verdict === "died"
       ? `its job DIED before landing a fix`
-      : `it DECLINED (could not repair the shared base — stamped BLOCKED)`;
+      : `it DECLINED (could not repair the shared base, or stayed stopped past grace while parked on a question)`;
   const repo = args.repoDir != null && args.repoDir !== "" ? args.repoDir : "?";
   return [
     `🔴 keeper: repair::${args.repoToken} needs you — the autonomous shared-base`,
@@ -1561,10 +1562,26 @@ export async function runBlockHumanNotifySweep(
  *  producer; the fingerprint half is a `\S+` token (see {@link fingerprintFailure}). */
 export const REPAIR_REASON_PREFIX = "shared-base-broken";
 
+/** Baseline diagnosis carried from a confirmed-red leaf onto the durable repair row. */
+export interface RepairBaselineDiagnosis {
+  baseline_leaf_key: string;
+  failing_tests_digest: string;
+}
+
 /** Build the sticky repair row's `reason` for a fingerprint — the mint-side twin of
- *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE`. Pure. */
-export function repairReasonFor(fingerprint: string): string {
-  return `${REPAIR_REASON_PREFIX}:${fingerprint}`;
+ *  `cli/escalation-brief.ts`'s `REPAIR_REASON_RE`. Baseline evidence is appended as
+ *  JSON-quoted attacker-influenced text so whitespace/newlines cannot blur the two
+ *  fields; the leading fingerprint token remains backward-compatible. Pure. */
+export function repairReasonFor(
+  fingerprint: string,
+  diagnosis?: RepairBaselineDiagnosis,
+): string {
+  const prefix = `${REPAIR_REASON_PREFIX}:${fingerprint}`;
+  if (diagnosis == null) return prefix;
+  return (
+    `${prefix} baseline_leaf=${JSON.stringify(diagnosis.baseline_leaf_key)}` +
+    ` failing_tests=${JSON.stringify(diagnosis.failing_tests_digest)}`
+  );
 }
 
 /** One `SHARED_BASE_BROKEN` blocked task resolved to the shared repo it hashes to — the
@@ -1579,6 +1596,8 @@ export interface RepairCandidate {
   repo_token: string;
   /** {@link fingerprintFailure}(blocked reason) — the defect identity in the row reason. */
   fingerprint: string;
+  /** Present only for a candidate sourced from a confirmed-red baseline leaf. */
+  baseline_diagnosis?: RepairBaselineDiagnosis;
 }
 
 /** The coalesced representative of a repo token's candidate group — the (repo_dir,
@@ -1587,6 +1606,8 @@ export interface RepairGroup {
   repo_token: string;
   repo_dir: string;
   fingerprint: string;
+  /** Durable diagnosis reference copied from the representative baseline candidate. */
+  baseline_diagnosis?: RepairBaselineDiagnosis;
 }
 
 /** An existing sticky `dispatch_failures` repair row (verb `repair`, id the repo
@@ -1804,6 +1825,16 @@ export function baselineRepairFingerprint(leaf: SuiteRedResult): string {
   return fingerprintFailure(hard.join("\n"));
 }
 
+/** The merge-gate-shaped bounded join carried on a baseline repair incident. */
+export function baselineRepairFailingTestsDigest(leaf: SuiteRedResult): string {
+  const names = leaf.failing.slice(0, 8).map((f) => f.id);
+  const more =
+    leaf.failing.length > names.length
+      ? ` (+${leaf.failing.length - names.length} more)`
+      : "";
+  return `${names.join("; ")}${more}`;
+}
+
 /**
  * Build the baseline-sourced repair candidates from each open-epic repo's newest-tip
  * leaf. A CONFIRMED-red leaf yields one task-less {@link RepairCandidate} keyed on
@@ -1842,6 +1873,10 @@ export function buildBaselineRepairCandidates(
       repo_dir: repoDir,
       repo_token: token,
       fingerprint: baselineRepairFingerprint(leaf),
+      baseline_diagnosis: {
+        baseline_leaf_key: leaf.key,
+        failing_tests_digest: baselineRepairFailingTestsDigest(leaf),
+      },
     });
   }
   return out;
@@ -1910,12 +1945,18 @@ export interface RepairEscalationSweepDeps {
   readonly dispatchRepair: (
     group: RepairGroup,
   ) => Promise<EscalationDispatchOutcome>;
-  /** Classify the dispatched `repair::<token>` session's outcome (DELEGATES to
-   *  {@link classifyEscalationOutcome} over the live `jobs` in production). The human is
-   *  paged only on a terminal decline/death; while it is live or unfolded it returns
-   *  `{terminal:false}` and the sweep skips (a successful repair unblocks the tasks,
-   *  emptying the candidate set so this row reaches the CLEAR pass, not the notify). */
+  /** Classify the dispatched `repair::<token>` session's recorded outcome (DELEGATES to
+   *  {@link classifyEscalationOutcome} over the live `jobs` in production). Its existing
+   *  terminal died/declined verdict always wins. A missing terminal verdict is promoted
+   *  producer-side only after the injected grace below. */
   readonly repairOutcome: (repoToken: string) => ResolverOutcome;
+  /** Fail-safe turn-activity probe. A working repair NEVER grace-promotes, regardless of
+   *  dispatch age. Production returns true on a jobs-read failure. */
+  readonly repairSessionWorking: (repoToken: string) => boolean;
+  /** Producer clock and generous grace, in unix seconds. The durable anchor is the
+   *  existing `repair_dispatched_at` marker; no second timestamp/column is needed. */
+  readonly nowSec: () => number;
+  readonly terminalGraceSec: number;
   /** Send the ONE botctl page about a declined/dead `repair::<token>` session. Async +
    *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
   readonly notifyHuman: (
@@ -2010,10 +2051,11 @@ export function buildSharedDirtyObservation(
  * repo token (representative = the (repo_dir, fingerprint) of the lexicographically-first
  * candidate), then per token:
  *
- *  - A row with `repair_dispatched_at` set and candidates STILL remaining means the
- *    dispatched repair DECLINED / DIED (a success would have unblocked the tasks, emptying
- *    the group): page the human ONCE via the `human_notified_at` gate, then leave the row
- *    sticky until `retry_dispatch` re-arms it.
+ *  - A row with `repair_dispatched_at` set and candidates STILL remaining waits for the
+ *    recorded repair verdict. A terminal DECLINED / DIED verdict pages immediately; a
+ *    stopped/vanished repair with no recorded verdict promotes to DECLINED only after the
+ *    injected dispatch-marker grace. A working repair never promotes. The page fires ONCE
+ *    via `human_notified_at`, then the row stays sticky until `retry_dispatch` re-arms it.
  *  - A token with no dispatched repair yet DISPATCHES one `repair::<token>` session (the
  *    global cap + per-key occupancy guard apply via `dispatchRepair`), minting the sticky
  *    latch first when none exists. A DIRTY shared checkout DEFERS — no attempt consumed,
@@ -2072,6 +2114,9 @@ export async function runRepairEscalationSweep(
         repo_token: c.repo_token,
         repo_dir: c.repo_dir,
         fingerprint: c.fingerprint,
+        ...(c.baseline_diagnosis == null
+          ? {}
+          : { baseline_diagnosis: c.baseline_diagnosis }),
       });
     }
   }
@@ -2086,10 +2131,27 @@ export async function runRepairEscalationSweep(
       // verdict; the row then stays sticky until `retry_dispatch`.
       if (existing.human_notified_at != null) continue; // already paged
       const outcome = deps.repairOutcome(token);
-      if (!outcome.terminal) continue; // still live / job not folded yet
+      let verdict: "declined" | "died";
+      if (outcome.terminal) {
+        // Preserve the shared classifier's recorded stopped→declined / dead→died split.
+        verdict = outcome.verdict;
+      } else {
+        // A healthy slow repair is exempt forever. Only a non-working session with no
+        // recorded terminal verdict may be promoted, and only after the dispatch-marker
+        // grace. This producer-local fallback deliberately does not alter unblock or
+        // deconflict classification.
+        if (deps.repairSessionWorking(token)) continue;
+        if (
+          deps.nowSec() - existing.repair_dispatched_at <
+          deps.terminalGraceSec
+        ) {
+          continue;
+        }
+        verdict = "declined";
+      }
       let result: RepairHumanNotifiedOutcome;
       try {
-        result = await deps.notifyHuman(existing, outcome.verdict);
+        result = await deps.notifyHuman(existing, verdict);
       } catch (err) {
         note(
           `# warn: repair human-notify threw for ${token} (non-fatal): ${
@@ -12318,6 +12380,33 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
+  // read failure returns TRUE so an old dispatch marker can never false-decline a healthy
+  // repair merely because its job row was temporarily unreadable.
+  function repairSessionWorking(token: string): boolean {
+    try {
+      const instance = stickyRepairInstanceFor(token);
+      const jobs =
+        instance == null
+          ? (db
+              .query(
+                "SELECT state FROM jobs WHERE plan_verb = 'repair' AND plan_ref = ?",
+              )
+              .all(token) as Array<Pick<Job, "state">>)
+          : (db
+              .query(
+                `SELECT state FROM jobs
+                   WHERE plan_verb = 'repair' AND plan_ref = ?
+                     AND (escalation_instance = ? OR
+                       (escalation_instance IS NULL AND last_event_id >= ?))`,
+              )
+              .all(token, instance, instance) as Array<Pick<Job, "state">>);
+      return jobs.some((job) => job.state === "working");
+    } catch {
+      return true;
+    }
+  }
+
   // The stage-3 board-state gate for the repair notify: is the sticky
   // `repair::<token>` row still present? A successful repair clears it (the sweep's
   // positive-evidence `DispatchCleared`) before the notify fires, so a surviving row
@@ -12434,11 +12523,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           token,
           repairIncidentOpen(token),
         ),
+      repairSessionWorking: (token) => repairSessionWorking(token),
+      nowSec: () => Date.now() / 1000,
+      terminalGraceSec: REPAIR_TERMINAL_GRACE_SEC,
       notifyHuman: (row, verdict) => notifyHumanOfRepair(row, verdict),
       mintRow: (group) =>
         mintRepairRowEvent(
           group.repo_token,
-          repairReasonFor(group.fingerprint),
+          repairReasonFor(group.fingerprint, group.baseline_diagnosis),
           group.repo_dir,
           Date.now() / 1000,
         ),

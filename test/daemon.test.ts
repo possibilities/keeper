@@ -49,6 +49,7 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   baselineRedIsConfirmed,
+  baselineRepairFailingTestsDigest,
   baselineRepairFingerprint,
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
@@ -5669,6 +5670,9 @@ function fakeRepairSweepDeps(opts: {
   green?: Set<string>;
   dispatch?: (group: RepairGroup) => Promise<EscalationDispatchOutcome>;
   repairOutcome?: (token: string) => ResolverOutcome;
+  repairWorking?: (token: string) => boolean;
+  nowSec?: number;
+  terminalGraceSec?: number;
   notify?: (
     row: PendingRepairRow,
     verdict: "declined" | "died",
@@ -5705,6 +5709,9 @@ function fakeRepairSweepDeps(opts: {
     },
     repairOutcome:
       opts.repairOutcome ?? (() => ({ terminal: true, verdict: "declined" })),
+    repairSessionWorking: opts.repairWorking ?? (() => false),
+    nowSec: () => opts.nowSec ?? 1_000,
+    terminalGraceSec: opts.terminalGraceSec ?? 300,
     notifyHuman: async (row, verdict) => {
       notifies.push({ token: row.id, verdict });
       return (await opts.notify?.(row, verdict)) ?? "notified";
@@ -5713,7 +5720,7 @@ function fakeRepairSweepDeps(opts: {
       mints.push({
         kind: "row",
         token: group.repo_token,
-        reason: repairReasonFor(group.fingerprint),
+        reason: repairReasonFor(group.fingerprint, group.baseline_diagnosis),
         dir: group.repo_dir,
       }),
     mintDispatched: (token, outcome) =>
@@ -5896,9 +5903,79 @@ test("runRepairEscalationSweep: a LIVE repair (row dispatched, session not termi
     candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
     rows: [repairRow({ repair_dispatched_at: 100 })],
     repairOutcome: () => ({ terminal: false }),
+    repairWorking: () => true,
   });
   await runRepairEscalationSweep(deps);
   expect(dispatches).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a stopped repair without a terminal outcome waits inside grace", async () => {
+  const { deps, mints, dispatches, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 800 })],
+    repairOutcome: () => ({ terminal: false }),
+    repairWorking: () => false,
+    nowSec: 1_000,
+    terminalGraceSec: 300,
+  });
+  await runRepairEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(notifies).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runRepairEscalationSweep: a stopped repair past grace promotes to declined, pages once, and retry re-arms dispatch", async () => {
+  const candidate = repairCandidate("fn-1-foo", "fn-1-foo.2");
+  const stale = fakeRepairSweepDeps({
+    candidates: [candidate],
+    rows: [repairRow({ repair_dispatched_at: 600 })],
+    repairOutcome: () => ({ terminal: false }),
+    repairWorking: () => false,
+    nowSec: 1_000,
+    terminalGraceSec: 300,
+  });
+  await runRepairEscalationSweep(stale.deps);
+  expect(stale.notifies).toEqual([{ token: "repo-abc", verdict: "declined" }]);
+  expect(stale.mints).toEqual([
+    { kind: "notified", token: "repo-abc", outcome: "notified" },
+  ]);
+
+  // The folded page marker makes every later sweep inert: exactly one page.
+  const paged = fakeRepairSweepDeps({
+    candidates: [candidate],
+    rows: [repairRow({ repair_dispatched_at: 600, human_notified_at: 1_000 })],
+    nowSec: 2_000,
+  });
+  await runRepairEscalationSweep(paged.deps);
+  expect(paged.notifies).toEqual([]);
+  expect(paged.dispatches).toEqual([]);
+
+  // retry_dispatch clears the once markers while retaining the sticky row. The next
+  // sweep therefore dispatches exactly one fresh repair instead of re-notifying.
+  const retried = fakeRepairSweepDeps({
+    candidates: [candidate],
+    rows: [repairRow()],
+  });
+  await runRepairEscalationSweep(retried.deps);
+  expect(retried.notifies).toEqual([]);
+  expect(retried.dispatches).toHaveLength(1);
+  expect(retried.mints).toEqual([
+    { kind: "dispatched", token: "repo-abc", outcome: "dispatched" },
+  ]);
+});
+
+test("runRepairEscalationSweep: an old but working repair never grace-promotes", async () => {
+  const { deps, mints, notifies } = fakeRepairSweepDeps({
+    candidates: [repairCandidate("fn-1-foo", "fn-1-foo.2")],
+    rows: [repairRow({ repair_dispatched_at: 1 })],
+    repairOutcome: () => ({ terminal: false }),
+    repairWorking: () => true,
+    nowSec: 100_000,
+    terminalGraceSec: 1,
+  });
+  await runRepairEscalationSweep(deps);
   expect(notifies).toEqual([]);
   expect(mints).toEqual([]);
 });
@@ -5967,6 +6044,7 @@ test("runRepairEscalationSweep: a row whose token STILL has candidates is never 
     rows: [repairRow({ repair_dispatched_at: 100 })],
     green: new Set(["/repo"]), // green, but candidates remain → NOT cleared
     repairOutcome: () => ({ terminal: false }),
+    repairWorking: () => true,
   });
   await runRepairEscalationSweep(deps);
   expect(mints.find((m) => m.kind === "clear")).toBeUndefined();
@@ -6303,6 +6381,9 @@ test("selectRepairCandidates: the real round-trip drives an actual dispatch deci
       return "dispatched";
     },
     repairOutcome: () => ({ terminal: false }),
+    repairSessionWorking: () => true,
+    nowSec: () => 1_000,
+    terminalGraceSec: 300,
     notifyHuman: async () => "notified",
     mintRow: () => {},
     mintDispatched: () => {},
@@ -6568,6 +6649,34 @@ test("buildBaselineRepairCandidates: a confirmed-red leaf with ZERO blocked task
   expect(c.fingerprint.length).toBeGreaterThan(0);
   // A confirmed-red is a candidate, NOT a rerun trace.
   expect(notes).toEqual([]);
+});
+
+test("buildBaselineRepairCandidates: confirmed-red diagnosis carries leaf key and first 8 failing names plus remainder", () => {
+  const hard = Array.from({ length: 10 }, (_, i) => `failure_${i + 1}`);
+  const leaf = suiteRedLeaf({ runs: 2, hard, sha: "deadbee" });
+  const out = buildBaselineRepairCandidates([{ repoDir: "/repo", leaf }]);
+  const c = out[0] as RepairCandidate;
+  expect(c.baseline_diagnosis).toEqual({
+    baseline_leaf_key: "k-deadbee",
+    failing_tests_digest:
+      "failure_1; failure_2; failure_3; failure_4; failure_5; failure_6; " +
+      "failure_7; failure_8 (+2 more)",
+  });
+  expect(c.baseline_diagnosis).toBeDefined();
+  expect(baselineRepairFailingTestsDigest(leaf)).toBe(
+    c.baseline_diagnosis?.failing_tests_digest ?? "",
+  );
+
+  const { deps, mints } = fakeRepairSweepDeps({ candidates: out });
+  return runRepairEscalationSweep(deps).then(() => {
+    const reason = mints.find((m) => m.kind === "row")?.reason ?? "";
+    expect(reason).toContain('baseline_leaf="k-deadbee"');
+    expect(reason).toContain(
+      'failing_tests="failure_1; failure_2; failure_3; failure_4; failure_5; failure_6; failure_7; failure_8 (+2 more)"',
+    );
+    expect(reason).not.toContain("failure_9");
+    expect(reason).not.toContain("failure_10");
+  });
 });
 
 test("buildBaselineRepairCandidates: a single-run red yields NO candidate + a class=single_run rerun trace", () => {
