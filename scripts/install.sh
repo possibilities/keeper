@@ -168,6 +168,12 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
       pi_subagents_notify "typecheck failed after rebase onto upstream/master; rolled back to pre-rebase tip ${safe_tip:0:10}"
       exit 0
     fi
+    # Republish the rewritten master so origin mirrors the local lineage —
+    # without this every rebase leaves origin diverged, and the next keeper
+    # lane finalize push into the fork lands as a non-fast-forward wedge.
+    if ! git push --force-with-lease origin "${pi_subagents_branch}" >/dev/null 2>&1; then
+      pi_subagents_notify "rebased locally but could not republish master to origin — the next finalize push into the fork will non-fast-forward"
+    fi
     echo "install: pi-subagents fork rebased cleanly onto upstream/master"
   ) || echo "install: pi-subagents fork sync errored (non-fatal); continuing" >&2
   # The point of the fork install is that BOTH live fixes are in the tree pi
