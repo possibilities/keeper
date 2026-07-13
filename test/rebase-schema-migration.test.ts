@@ -87,23 +87,138 @@ test("renumbers a single colliding additive lane step onto main-tip+1", () => {
   expect(t).toContain("toBe(99)");
 });
 
-test("shifts a multi-step lane preserving relative order", () => {
-  const main = fileset(dbFile(additive(2, "a"), additive(3, "b")));
+test("union-shaped ladder renumbers the local collision without mistaking later main steps for duplicates", () => {
+  const mainDb = dbFile(
+    additive(119, "account_route"),
+    rawStep(120, "drop", 'ctx.db.run("PRAGMA main_drop");'),
+    additive(121, "main_121"),
+    additive(122, "main_122"),
+  );
+  // Recorded merge shape: main's complete v119..v122 ladder followed by the
+  // lane's independently-authored v119. The old divergence walk sorted by
+  // version, then falsely refused when it encountered main's own v120.
+  const laneDb = dbFile(
+    additive(119, "account_route"),
+    rawStep(120, "drop", 'ctx.db.run("PRAGMA main_drop");'),
+    additive(121, "main_121"),
+    additive(122, "main_122"),
+    additive(119, "lane_local"),
+  );
+
+  const r = apply(fileset(mainDb), fileset(laneDb));
+  expect(r.refused).toBe(false);
+  if (r.refused) return;
+  expect(r.shifts).toEqual([{ from: 119, to: 123 }]);
+
+  const steps = parseLadder(r.files.db);
+  expect(
+    steps.find((step) => step.bodyText.includes('"account_route"'))?.version,
+  ).toBe(119);
+  expect(
+    steps.find((step) => step.bodyText.includes('"lane_local"'))?.version,
+  ).toBe(123);
+
+  const fingerprint = computeRepinnedFingerprint(r.files.db);
+  expect(fingerprint).toBe(hashSchemaAt(123));
+  const repinned = applyFingerprintRepin(r.files.db, fingerprint);
+  expect(repinned).toContain(`"${fingerprint}"`);
+  expect(repinned).not.toContain('"v3:0000"');
+});
+
+test("detects and renumbers a branch-local additive step in the middle of shared main entries", () => {
+  const main = fileset(
+    dbFile(additive(2, "a"), additive(3, "b"), additive(4, "c")),
+  );
   const lane = fileset(
-    dbFile(additive(2, "a"), additive(3, "c"), additive(4, "d")),
+    dbFile(
+      additive(2, "a"),
+      additive(3, "lane_mid"),
+      additive(3, "b"),
+      additive(4, "c"),
+    ),
   );
 
   const r = apply(main, lane);
   expect(r.refused).toBe(false);
   if (r.refused) return;
+  expect(r.shifts).toEqual([{ from: 3, to: 5 }]);
+  const steps = parseLadder(r.files.db);
+  expect(steps.find((s) => s.bodyText.includes('"lane_mid"'))?.version).toBe(5);
+  expect(steps.find((s) => s.bodyText.includes('"b"'))?.version).toBe(3);
+  expect(steps.find((s) => s.bodyText.includes('"c"'))?.version).toBe(4);
+});
 
+test("absorbs a same-version same-body main step after a local collision", () => {
+  const main = fileset(
+    dbFile(additive(2, "a"), additive(3, "b"), additive(4, "shared")),
+  );
+  const lane = fileset(
+    dbFile(
+      additive(2, "a"),
+      additive(3, "lane_local"),
+      additive(3, "b"),
+      additive(4, "shared"),
+    ),
+  );
+
+  const r = apply(main, lane);
+  expect(r.refused).toBe(false);
+  if (r.refused) return;
+  expect(r.shifts).toEqual([{ from: 3, to: 5 }]);
+  expect(
+    parseLadder(r.files.db).find((s) => s.bodyText.includes('"shared"'))
+      ?.version,
+  ).toBe(4);
+});
+
+test("shifts multiple local steps to tail+1..+k and rewrites fingerprint and test pins", () => {
+  const main = fileset(
+    dbFile(additive(2, "a"), additive(3, "b"), additive(4, "c")),
+  );
+  const lane = fileset(
+    dbFile(
+      additive(2, "a"),
+      additive(3, "lane_first"),
+      additive(3, "b"),
+      additive(4, "c"),
+      additive(4, "lane_second"),
+    ),
+    {
+      "schema.test.ts": [
+        "expect(SCHEMA_VERSION).toBe(4);",
+        'const fingerprint = "v4:old";',
+        "expect(unrelated).toBe(99);",
+      ].join("\n"),
+    },
+  );
+
+  const r = apply(main, lane);
+  expect(r.refused).toBe(false);
+  if (r.refused) return;
   expect(r.shifts).toEqual([
-    { from: 3, to: 4 },
-    { from: 4, to: 5 },
+    { from: 3, to: 5 },
+    { from: 4, to: 6 },
   ]);
   const steps = parseLadder(r.files.db);
+  expect(steps.find((s) => s.bodyText.includes('"lane_first"'))?.version).toBe(
+    5,
+  );
+  expect(steps.find((s) => s.bodyText.includes('"lane_second"'))?.version).toBe(
+    6,
+  );
+  expect(steps.find((s) => s.bodyText.includes('"b"'))?.version).toBe(3);
   expect(steps.find((s) => s.bodyText.includes('"c"'))?.version).toBe(4);
-  expect(steps.find((s) => s.bodyText.includes('"d"'))?.version).toBe(5);
+
+  const rewrittenTest = r.files.tests["schema.test.ts"];
+  expect(rewrittenTest).toContain("toBe(6)");
+  expect(rewrittenTest).toContain('"v6:old"');
+  expect(rewrittenTest).toContain("toBe(99)");
+
+  const fingerprint = computeRepinnedFingerprint(r.files.db);
+  expect(fingerprint).toBe(hashSchemaAt(6));
+  expect(applyFingerprintRepin(r.files.db, fingerprint)).toContain(
+    `"${fingerprint}"`,
+  );
 });
 
 // --- refusal cases -----------------------------------------------------------
@@ -188,19 +303,39 @@ test("an additive body whose COMMENTS name destructive ops is NOT refused", () =
   expect(r.shifts).toEqual([{ from: 3, to: 4 }]);
 });
 
-test("refuses a coincidental identical-content collision instead of deduping", () => {
-  const dup = 'addColumnIfMissing(ctx.db, "jobs", "z", "TEXT");';
-  const main = fileset(
-    dbFile(additive(2, "a"), additive(3, "b"), rawStep(4, "additive", dup)),
-  );
+test("refuses the same body at a different version instead of silently deduping", () => {
+  const main = fileset(dbFile(additive(2, "a"), additive(3, "same_body")));
   const lane = fileset(
-    dbFile(additive(2, "a"), additive(3, "c"), rawStep(4, "additive", dup)),
+    dbFile(
+      additive(2, "a"),
+      additive(3, "same_body"),
+      additive(4, "same_body"),
+    ),
   );
   const r = apply(main, lane);
   expect(r.refused).toBe(true);
   if (!r.refused) return;
   expect(r.reason).toBe("identical-content");
   expect(r.step).toBe(4);
+});
+
+test("still refuses a destructive branch-local step among later shared main entries", () => {
+  const main = fileset(
+    dbFile(additive(2, "a"), additive(3, "b"), additive(4, "c")),
+  );
+  const lane = fileset(
+    dbFile(
+      additive(2, "a"),
+      rawStep(3, "drop", 'ctx.db.run("PRAGMA destructive_local");'),
+      additive(3, "b"),
+      additive(4, "c"),
+    ),
+  );
+  const r = apply(main, lane);
+  expect(r.refused).toBe(true);
+  if (!r.refused) return;
+  expect(r.reason).toBe("drop");
+  expect(r.step).toBe(3);
 });
 
 // --- idempotency -------------------------------------------------------------
