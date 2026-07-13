@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Remove real-time scheduling tests",
-  "updated_at": "2026-07-13T17:14:50.713000Z"
+  "updated_at": "2026-07-13T22:46:01.148000Z",
+  "worker_done_at": "2026-07-13T22:46:01.148000Z"
 }

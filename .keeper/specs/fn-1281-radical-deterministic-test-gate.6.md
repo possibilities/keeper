@@ -59,5 +59,5 @@ Keep production loop signatures backward-compatible through default dependencies
 - [ ] Production timing, cancellation, and shutdown behavior remains observable through thin injected drivers.
 
 ## Done summary
-
+Extracted pure step/transition functions and injected scheduler seams into watchLoop, diffLoop, reprobeLoop, sentinelLoop, and the tmux control-worker's debounced re-read timer; rewrote the corresponding fast tests around a shared ManualScheduler/drainMicrotasks helper instead of Bun.sleep and real setTimeout, proving deadline boundaries, coalescing, and no-extra-work negatives against explicit pending/idle state.
 ## Evidence
