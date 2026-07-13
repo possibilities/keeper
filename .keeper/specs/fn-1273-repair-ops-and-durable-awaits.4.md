@@ -51,5 +51,5 @@ fingerprint re-pin green, descriptor lists rows.
 - [ ] CLAUDE.md enumerates eight RPC surfaces including request_await in this same change
 
 ## Done summary
-
+Added the awaits deterministic-replayed projection (CREATE + one SCHEMA_STEPS entry, all seven rewind DELETE sites, fingerprint re-pin) and the eighth mutating RPC request_await (request/cancel variants), mirroring the request_handoff template: trust-boundary validation rejects unknown/session-local condition kinds by name, the synthetic-event bridge mints AwaitRequested with spilled follow-up docs, the fold is null-safe and byte-identically re-foldable, and AWAITS_DESCRIPTOR makes awaits listable via the collection registry. CLAUDE.md's RPC enumeration moves seven to eight.
 ## Evidence
