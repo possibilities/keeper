@@ -60,5 +60,5 @@ Read existing manifests compatibly for inspection and pruning, but require a res
 - [ ] A panel-member execution cannot admit another panel request.
 
 ## Done summary
-
+Replaced slug-as-ownership in src/pair/panel.ts with an atomically reserved panel request: opaque request identity, immutable argument digest, monotonic request/attempt state, one normal fan-out round, idempotent start reconciliation distinct from a bounded explicit resume, cancellation tombstones with exact identity-checked teardown and cleanup-failure reporting, and CLI-level nested panel-member admission refusal.
 ## Evidence
