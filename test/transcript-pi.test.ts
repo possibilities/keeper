@@ -702,9 +702,7 @@ describe("keeper transcript pi turn", () => {
     expect(raw.data.turn.prompt).toContain('<skill name="hack">');
     expect(raw.data.turn.prompt).not.toContain("Fix wrapped dispatch");
 
-    const stripped = JSON.parse(
-      runTurn("u_skill", ["--strip-skills"]).stdout,
-    );
+    const stripped = JSON.parse(runTurn("u_skill", ["--strip-skills"]).stdout);
     expect(stripped.data.turn).toEqual({
       prompt: "Fix wrapped dispatch",
       promptTruncated: false,

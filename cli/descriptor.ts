@@ -1178,7 +1178,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           {
             name: "strip-skills",
             type: "boolean",
-            summary: "Remove expanded skill envelopes before bounding prompt text",
+            summary:
+              "Remove expanded skill envelopes before bounding prompt text",
           },
           FLAG_FORMAT,
           FLAG_JSON_ALIAS,
