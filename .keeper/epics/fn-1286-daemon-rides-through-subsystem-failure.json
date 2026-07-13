@@ -2,7 +2,11 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-07-13T21:46:46.099000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-1281-radical-deterministic-test-gate",
+    "fn-1282-retire-hermes-codex-harnesses",
+    "fn-1283-prune-stale-monitor-slot-backstop"
+  ],
   "id": "fn-1286-daemon-rides-through-subsystem-failure",
   "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
@@ -12,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T21:46:46.099000Z"
+  "updated_at": "2026-07-13T21:46:56.302000Z"
 }
