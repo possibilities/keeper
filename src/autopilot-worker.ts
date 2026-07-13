@@ -7160,6 +7160,53 @@ type IncomingMessage =
 // the worker keys against its pending-ack map.
 
 /**
+ * The two durable base-drift thresholds resolved off the `autopilot_state`
+ * singleton row — `null` on an axis means that axis is OFF (not configured).
+ */
+export interface DriftThresholds {
+  /** The lane-base behind-count threshold vs the local default, or `null`
+   *  when this axis is OFF. */
+  behindThreshold: number | null;
+  /** The merge-base age threshold in days, or `null` when this axis is OFF. */
+  ageThresholdDays: number | null;
+}
+
+/**
+ * Resolve the durable base-drift thresholds off the `autopilot_state`
+ * singleton row — the producer-side counterpart of the `worktreeMode`/
+ * `worktreeMultiRepo` `?? OFF` resolution pattern in {@link loadReconcileSnapshot}.
+ * An absent/never-set row, NULL, or a non-positive/non-integer value on either
+ * column resolves that axis to `null` (OFF), mirroring the
+ * `set_autopilot_config` sentinel/0-disables discipline
+ * (`extractAutopilotConfigSetPayload` in `reducer.ts`). Both axes `null` is the
+ * base-freshness gate's byte-identical no-detection default: `.2`'s drift probe
+ * and `.4`'s refresh pass both stay inert until a positive threshold is set.
+ * Pure — exported so a future drift-probe pass can resolve the same row this
+ * function reads without re-deriving the coercion rule.
+ */
+export function resolveDriftThresholds(
+  autopilotRow: Record<string, unknown> | undefined,
+): DriftThresholds {
+  const behindRaw = (
+    autopilotRow as { drift_behind_threshold?: unknown } | undefined
+  )?.drift_behind_threshold;
+  const behindThreshold =
+    typeof behindRaw === "number" &&
+    Number.isInteger(behindRaw) &&
+    behindRaw > 0
+      ? behindRaw
+      : null;
+  const ageRaw = (
+    autopilotRow as { drift_age_threshold_days?: unknown } | undefined
+  )?.drift_age_threshold_days;
+  const ageThresholdDays =
+    typeof ageRaw === "number" && Number.isInteger(ageRaw) && ageRaw > 0
+      ? ageRaw
+      : null;
+  return { behindThreshold, ageThresholdDays };
+}
+
+/**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
  * client subscriptions with, so the reconciler's view matches the board's

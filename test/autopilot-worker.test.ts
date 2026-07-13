@@ -128,6 +128,7 @@ import {
   recoverWorktrees,
   refreshSuppressionForOpenPending,
   reposForRecovery,
+  resolveDriftThresholds,
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
@@ -4929,6 +4930,79 @@ test("fn-953: a snapshot-resolved cap drives the reconcile budget once refreshed
     const state = makeState();
     state.maxConcurrentJobs = snap.maxConcurrentJobs;
     expect(state.maxConcurrentJobs).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fn-1252 task .3 — `resolveDriftThresholds` resolves the two durable
+// base-drift threshold columns off the `autopilot_state` singleton row, the
+// producer-side counterpart of the `worktreeMode`/`worktreeMultiRepo` `?? OFF`
+// resolution `loadReconcileSnapshot` performs inline. `.2`'s drift probe
+// consumes this seam; here it is exercised directly as a pure function.
+// ---------------------------------------------------------------------------
+
+test("resolveDriftThresholds resolves both axes to null (OFF) on an absent row (fn-1252 task .3)", () => {
+  expect(resolveDriftThresholds(undefined)).toEqual({
+    behindThreshold: null,
+    ageThresholdDays: null,
+  });
+});
+
+test("resolveDriftThresholds resolves a configured positive-integer pair (fn-1252 task .3)", () => {
+  expect(
+    resolveDriftThresholds({
+      drift_behind_threshold: 15,
+      drift_age_threshold_days: 5,
+    }),
+  ).toEqual({ behindThreshold: 15, ageThresholdDays: 5 });
+});
+
+test("resolveDriftThresholds resolves each axis independently (one set, one absent)", () => {
+  expect(resolveDriftThresholds({ drift_behind_threshold: 15 })).toEqual({
+    behindThreshold: 15,
+    ageThresholdDays: null,
+  });
+  expect(resolveDriftThresholds({ drift_age_threshold_days: 5 })).toEqual({
+    behindThreshold: null,
+    ageThresholdDays: 5,
+  });
+});
+
+test("resolveDriftThresholds coerces NULL/0/non-positive/non-integer to null (OFF) (fn-1252 task .3)", () => {
+  for (const bad of [null, 0, -2, 2.5, "15"]) {
+    expect(
+      resolveDriftThresholds({
+        drift_behind_threshold: bad,
+        drift_age_threshold_days: bad,
+      }),
+    ).toEqual({ behindThreshold: null, ageThresholdDays: null });
+  }
+});
+
+test("resolveDriftThresholds round-trips through a real loadReconcileSnapshot-fed row (fn-1252 task .3)", async () => {
+  await withSeededDb(async (db) => {
+    // End-to-end: a runtime-set pair in the projection reads back through the
+    // SAME `autopilot_state` row loadReconcileSnapshot consumes for
+    // worktreeMode/worktreeMultiRepo, confirming the resolver reads the exact
+    // column shape a real boot produces.
+    db.run(
+      `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, drift_behind_threshold, drift_age_threshold_days)
+       VALUES (1, 1, 1, 0, 0, 15, 5)`,
+    );
+    const snap = await loadReconcileSnapshot(db);
+    // loadReconcileSnapshot itself does not thread the drift columns onto the
+    // snapshot (that lands with `.2`'s drift probe); read the raw row the same
+    // way loadReconcileSnapshot reads `autopilot_state` to prove the resolver
+    // agrees with the live schema.
+    const row = db
+      .query("SELECT * FROM autopilot_state WHERE id = 1")
+      .get() as Record<string, unknown>;
+    expect(resolveDriftThresholds(row)).toEqual({
+      behindThreshold: 15,
+      ageThresholdDays: 5,
+    });
+    // Sibling worktreeMode resolution is unaffected by the drift columns.
+    expect(snap.worktreeMode).toBe(false);
   });
 });
 

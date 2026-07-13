@@ -364,6 +364,13 @@ export interface SetAutopilotConfigParams {
    *  cell-bearing work dispatches only. The deprecated `"codex"` input alias is
    *  accepted on write and normalized to `"gpt"`, so the echoed patch is canonical. */
   worker_provider?: "claude" | "gpt" | null;
+  /** The durable base-drift behind-count threshold — a positive integer, or
+   *  `null` to disable that axis (the byte-identical default). */
+  drift_behind_threshold?: number | null;
+  /** The durable base-drift merge-base-age threshold in days — a positive
+   *  integer, or `null` to disable that axis (the byte-identical default).
+   *  Both drift thresholds `null` is the base-freshness gate's OFF state. */
+  drift_age_threshold_days?: number | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch.
@@ -395,6 +402,8 @@ function validateSetAutopilotConfigParams(
     "worktree_multi_repo",
     "codex_adoption",
     "worker_provider",
+    "drift_behind_threshold",
+    "drift_age_threshold_days",
   ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
@@ -481,6 +490,34 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`worker_provider\` must be one of "claude" | "gpt" | null (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("drift_behind_threshold" in obj) {
+    const raw = obj.drift_behind_threshold;
+    // null = disable this axis; otherwise a POSITIVE INTEGER only — mirrors
+    // max_concurrent_per_root's null-or-positive-int shape.
+    if (raw === null) {
+      patch.drift_behind_threshold = null;
+    } else if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+      patch.drift_behind_threshold = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`drift_behind_threshold\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
+      );
+    }
+  }
+  if ("drift_age_threshold_days" in obj) {
+    const raw = obj.drift_age_threshold_days;
+    // null = disable this axis; otherwise a POSITIVE INTEGER only — mirrors
+    // drift_behind_threshold's shape.
+    if (raw === null) {
+      patch.drift_age_threshold_days = null;
+    } else if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+      patch.drift_age_threshold_days = raw;
+    } else {
+      throw new BadParamsError(
+        `set_autopilot_config: \`drift_age_threshold_days\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
       );
     }
   }

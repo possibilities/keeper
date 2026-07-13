@@ -646,6 +646,44 @@ test("openDb adds nullable adopted to BOTH events and jobs + codex_adoption to a
   db.close();
 });
 
+test("openDb adds nullable drift_behind_threshold + drift_age_threshold_days to autopilot_state (fn-1252 task .3)", () => {
+  // The v118->v119 step adds the two durable base-drift threshold config
+  // columns — both INTEGER, nullable, NO default (the NULL=absent + re-fold
+  // byte-identity invariant, mirroring codex_adoption). A bare-inserted row
+  // reads NULL for both (the OFF/no-detection default).
+  const { db } = openDb(":memory:");
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  for (const name of [
+    "drift_behind_threshold",
+    "drift_age_threshold_days",
+  ] as const) {
+    const col = stateCols.find((c) => c.name === name);
+    expect(col).toBeDefined();
+    expect(col?.type).toBe("INTEGER");
+    expect(col?.notnull).toBe(0);
+    expect(col?.dflt_value).toBeNull();
+  }
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const s = db
+    .prepare(
+      "SELECT drift_behind_threshold, drift_age_threshold_days FROM autopilot_state WHERE id = 1",
+    )
+    .get() as {
+    drift_behind_threshold: number | null;
+    drift_age_threshold_days: number | null;
+  };
+  expect(s.drift_behind_threshold).toBeNull();
+  expect(s.drift_age_threshold_days).toBeNull();
+  db.close();
+});
+
 test("a from-scratch re-fold over zero handoff events leaves handoffs empty (fn-946)", () => {
   // The schema default matches the zero-event projection: a fresh DB with no
   // `HandoffRequested` events drains to an empty `handoffs` table. (Folds land
@@ -3007,7 +3045,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(122);
+  expect(SCHEMA_VERSION).toBe(123);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

@@ -208,6 +208,8 @@ function autopilotStubBridge(opts: {
       worktree_multi_repo?: boolean;
       codex_adoption?: boolean;
       worker_provider?: "claude" | "gpt" | null;
+      drift_behind_threshold?: number | null;
+      drift_age_threshold_days?: number | null;
     }>;
     setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
     requestHandoffCalls: Array<{
@@ -1033,4 +1035,97 @@ test("retry_dispatch surfaces bridge ok:false as a thrown error (rpc_failed fram
   expect(
     retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge),
   ).rejects.toThrow(/insertEvent failed/);
+});
+
+test("set_autopilot_config forwards a drift_behind_threshold patch (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { drift_behind_threshold: 15 },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { drift_behind_threshold: 15 },
+  });
+  expect(state.setConfigCalls).toEqual([{ drift_behind_threshold: 15 }]);
+});
+
+test("set_autopilot_config accepts an explicit null drift_behind_threshold (= OFF) (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { drift_behind_threshold: null },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { drift_behind_threshold: null },
+  });
+  expect(state.setConfigCalls).toEqual([{ drift_behind_threshold: null }]);
+});
+
+test("set_autopilot_config rejects a non-positive / non-integer drift_behind_threshold (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { drift_behind_threshold: 0 },
+    { drift_behind_threshold: -2 },
+    { drift_behind_threshold: 2.5 },
+    { drift_behind_threshold: "15" },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config forwards a drift_age_threshold_days patch (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { drift_age_threshold_days: 5 },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { drift_age_threshold_days: 5 },
+  });
+  expect(state.setConfigCalls).toEqual([{ drift_age_threshold_days: 5 }]);
+});
+
+test("set_autopilot_config accepts an explicit null drift_age_threshold_days (= OFF) (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotConfigHandler(
+    { drift_age_threshold_days: null },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    patch: { drift_age_threshold_days: null },
+  });
+  expect(state.setConfigCalls).toEqual([{ drift_age_threshold_days: null }]);
+});
+
+test("set_autopilot_config rejects a non-positive / non-integer drift_age_threshold_days (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { drift_age_threshold_days: 0 },
+    { drift_age_threshold_days: -2 },
+    { drift_age_threshold_days: 2.5 },
+    { drift_age_threshold_days: "5" },
+  ]) {
+    expect(setAutopilotConfigHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
+test("set_autopilot_config rejects an unknown key even alongside a valid drift threshold (fn-1252 task .3)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  expect(
+    setAutopilotConfigHandler(
+      { drift_behind_threshold: 15, bogus_key: 1 },
+      bridge,
+    ),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(state.setConfigCalls).toEqual([]);
 });

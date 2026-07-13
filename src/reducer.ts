@@ -5063,6 +5063,8 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   worktree_multi_repo: "worktree_multi_repo",
   codex_adoption: "codex_adoption",
   worker_provider: "worker_provider",
+  drift_behind_threshold: "drift_behind_threshold",
+  drift_age_threshold_days: "drift_age_threshold_days",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -5120,6 +5122,17 @@ interface AutopilotConfigSetPayload {
    *  rejects a bad value loud before it ever reaches here; this is a defensive
    *  backstop, never a throw. */
   worker_provider?: "claude" | "gpt" | null;
+  /** The durable base-drift behind-count threshold — a positive integer, or
+   *  `null` to disable that axis. Same coercion discipline as
+   *  `max_concurrent_per_root`: `null` / non-positive / non-integer all
+   *  resolve to `null` (the sentinel/0-disables OFF default); a positive int
+   *  sets the threshold. Present iff the patch touches it. */
+  drift_behind_threshold?: number | null;
+  /** The durable base-drift merge-base-age threshold, in days — same shape and
+   *  coercion as {@link drift_behind_threshold}. Present iff the patch touches
+   *  it. Both drift thresholds resolving `null` is the OFF default: `.2`'s
+   *  drift probe and `.4`'s refresh pass both stay inert. */
+  drift_age_threshold_days?: number | null;
 }
 
 /**
@@ -5205,6 +5218,24 @@ function extractAutopilotConfigSetPayload(
       } else if (raw === "codex") {
         patch.worker_provider = "gpt";
       }
+    }
+    if ("drift_behind_threshold" in parsed) {
+      const raw = parsed.drift_behind_threshold;
+      // null/non-positive/non-integer → NULL (OFF for this axis, the
+      // sentinel/0-disables discipline); a positive int sets the threshold.
+      patch.drift_behind_threshold =
+        typeof raw === "number" && Number.isInteger(raw) && raw > 0
+          ? raw
+          : null;
+    }
+    if ("drift_age_threshold_days" in parsed) {
+      const raw = parsed.drift_age_threshold_days;
+      // Same coercion as drift_behind_threshold — null/non-positive/non-integer
+      // → NULL (OFF for this axis).
+      patch.drift_age_threshold_days =
+        typeof raw === "number" && Number.isInteger(raw) && raw > 0
+          ? raw
+          : null;
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;
