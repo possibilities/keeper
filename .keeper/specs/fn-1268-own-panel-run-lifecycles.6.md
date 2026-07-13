@@ -58,5 +58,5 @@ After landing, run the fake gate, one small real panel, and one operator abort. 
 - [ ] Operator docs state retry safety, cleanup-failed handling, Pi compatibility requirements, and the gate for resuming the original design inquiry.
 
 ## Done summary
-
+Added a fake incident regression proving one-run/one-fan-out ownership across recursive text and no_message legs, fast-tier coverage for failed quorum, timeout, partial launch, cancellation, output failure and cleanup escalation, slow fake-harness coverage proving exact wrapper/tmux teardown on both terminal and aborted runs, a bounded operator smoke script (scripts/panel-smoke.ts) with unique identity, hard timeout, explicit abort and exact survivor reporting, and consolidated README/install/problem-codes docs on retry safety, cleanup-failed handling, Pi compatibility, and the CodexBar retry-gate checklist.
 ## Evidence
