@@ -1389,6 +1389,166 @@ export interface SharedCheckoutDirtyTracker {
  * keyed on {@link sharedDirtyDistressId} + the dirt reason, so the mid-merge path
  * stays byte-untouched and the two distress surfaces never share a row.
  */
+export const SHARED_CHECKOUT_WRITER_GRACE_SEC = SHARED_CHECKOUT_DIRTY_GRACE_SEC;
+
+export interface SharedCheckoutWriter {
+  job_id: string;
+  state: string;
+  pid: number | null;
+  start_time: string | null;
+  updated_at: number;
+}
+
+export type WriterIdentityLiveness = "dead" | "live" | "inconclusive";
+
+export interface DeadWriterCheckoutRow {
+  id: string;
+  dir: string;
+}
+
+export type DeadWriterCheckoutSweepOutcome =
+  | { id: string; dir: string; kind: "cleaned"; snapshotDir: string }
+  | { id: string; dir: string; kind: "refused"; detail: string }
+  | { id: string; dir: string; kind: "failed"; detail: string };
+
+export interface DeadWriterCheckoutSweepDeps {
+  rows: readonly DeadWriterCheckoutRow[];
+  nowSec: () => number;
+  graceSec?: number;
+  selectWriters: (
+    dir: string,
+  ) =>
+    | readonly SharedCheckoutWriter[]
+    | Promise<readonly SharedCheckoutWriter[]>;
+  identityLiveness: (
+    writer: SharedCheckoutWriter,
+  ) => WriterIdentityLiveness | Promise<WriterIdentityLiveness>;
+  probeMergeHead: (
+    dir: string,
+  ) =>
+    | "absent"
+    | "present"
+    | "inconclusive"
+    | Promise<"absent" | "present" | "inconclusive">;
+  backupThenClean: (
+    dir: string,
+  ) => Promise<
+    | { kind: "cleaned"; snapshotDir: string }
+    | { kind: "backup-failed" | "clean-failed"; detail: string }
+  >;
+  noteLine?: (line: string) => void;
+}
+
+export async function runDeadWriterCheckoutSweep(
+  deps: DeadWriterCheckoutSweepDeps,
+): Promise<DeadWriterCheckoutSweepOutcome[]> {
+  const outcomes: DeadWriterCheckoutSweepOutcome[] = [];
+  const graceSec = deps.graceSec ?? SHARED_CHECKOUT_WRITER_GRACE_SEC;
+  const nowSec = deps.nowSec();
+  const note = deps.noteLine ?? (() => {});
+  const refuse = (row: DeadWriterCheckoutRow, detail: string): void => {
+    outcomes.push({ ...row, kind: "refused", detail });
+    note(`# shared-checkout clean refused for ${row.dir}: ${detail}`);
+  };
+
+  for (const row of deps.rows) {
+    if (row.dir === "") {
+      refuse(row, "checkout dir is missing");
+      continue;
+    }
+    let writers: readonly SharedCheckoutWriter[];
+    try {
+      writers = await deps.selectWriters(row.dir);
+    } catch (err) {
+      refuse(
+        row,
+        `writer enumeration was inconclusive: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    if (writers.length === 0) {
+      refuse(row, "no cwd-matched writer identity exists");
+      continue;
+    }
+    if (writers.some((writer) => writer.state === "working")) {
+      refuse(row, "a cwd-matched writer is working");
+      continue;
+    }
+    if (
+      writers.some(
+        (writer) =>
+          !Number.isFinite(writer.updated_at) ||
+          nowSec - writer.updated_at < graceSec,
+      )
+    ) {
+      refuse(row, "a cwd-matched writer is not grace-stale");
+      continue;
+    }
+
+    let writerRefusal: string | null = null;
+    for (const writer of writers) {
+      if (writer.pid == null || writer.start_time == null) {
+        writerRefusal = `writer ${writer.job_id} has no provable process identity`;
+        break;
+      }
+      let liveness: WriterIdentityLiveness;
+      try {
+        liveness = await deps.identityLiveness(writer);
+      } catch {
+        liveness = "inconclusive";
+      }
+      if (liveness !== "dead") {
+        writerRefusal =
+          liveness === "live"
+            ? `writer ${writer.job_id} is live`
+            : `writer ${writer.job_id} liveness is inconclusive`;
+        break;
+      }
+    }
+    if (writerRefusal !== null) {
+      refuse(row, writerRefusal);
+      continue;
+    }
+
+    let mergeHead: "absent" | "present" | "inconclusive";
+    try {
+      mergeHead = await deps.probeMergeHead(row.dir);
+    } catch {
+      mergeHead = "inconclusive";
+    }
+    if (mergeHead !== "absent") {
+      refuse(
+        row,
+        mergeHead === "present"
+          ? "MERGE_HEAD is present"
+          : "MERGE_HEAD probe was inconclusive",
+      );
+      continue;
+    }
+
+    try {
+      const cleaned = await deps.backupThenClean(row.dir);
+      if (cleaned.kind === "cleaned") {
+        outcomes.push({
+          ...row,
+          kind: "cleaned",
+          snapshotDir: cleaned.snapshotDir,
+        });
+      } else {
+        outcomes.push({ ...row, kind: "failed", detail: cleaned.detail });
+        note(
+          `# shared-checkout clean failed for ${row.dir}: ${cleaned.detail}`,
+        );
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      outcomes.push({ ...row, kind: "failed", detail });
+      note(`# shared-checkout clean failed for ${row.dir}: ${detail}`);
+    }
+  }
+  return outcomes;
+}
+
 export function createSharedCheckoutDirtyTracker(
   graceSec: number = SHARED_CHECKOUT_DIRTY_GRACE_SEC,
 ): SharedCheckoutDirtyTracker {

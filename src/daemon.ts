@@ -62,6 +62,8 @@ import type {
 import {
   classifyResolverOutcome,
   createSharedCheckoutDirtyTracker,
+  runDeadWriterCheckoutSweep,
+  type SharedCheckoutWriter,
   WORKER_EFFORT,
   WORKER_MODEL,
 } from "./autopilot-worker";
@@ -236,26 +238,27 @@ import type {
 } from "./restore-worker";
 import { nodeResumeResolveFs } from "./resume-resolve";
 import { perRootStoredWhileOffNote } from "./rpc-handlers";
-import { seedKilledSweep } from "./seed-sweep";
-import type {
-  BootCompleteMessage,
-  KickMessage,
-  ReplayRequestMessage,
-  ReplayResultMessage,
-  RequestHandoffRequestMessage,
-  RequestHandoffResultMessage,
-  RetryDispatchRequestMessage,
-  RetryDispatchResultMessage,
-  ServeHealthMessage,
-  ServerWorkerData,
-  SetAutopilotConfigRequestMessage,
-  SetAutopilotConfigResultMessage,
-  SetAutopilotModeRequestMessage,
-  SetAutopilotModeResultMessage,
-  SetAutopilotPausedRequestMessage,
-  SetAutopilotPausedResultMessage,
-  SetEpicArmedRequestMessage,
-  SetEpicArmedResultMessage,
+import { readOsStartTime, seedKilledSweep } from "./seed-sweep";
+import {
+  type BootCompleteMessage,
+  isPidAlive,
+  type KickMessage,
+  type ReplayRequestMessage,
+  type ReplayResultMessage,
+  type RequestHandoffRequestMessage,
+  type RequestHandoffResultMessage,
+  type RetryDispatchRequestMessage,
+  type RetryDispatchResultMessage,
+  type ServeHealthMessage,
+  type ServerWorkerData,
+  type SetAutopilotConfigRequestMessage,
+  type SetAutopilotConfigResultMessage,
+  type SetAutopilotModeRequestMessage,
+  type SetAutopilotModeResultMessage,
+  type SetAutopilotPausedRequestMessage,
+  type SetAutopilotPausedResultMessage,
+  type SetEpicArmedRequestMessage,
+  type SetEpicArmedResultMessage,
 } from "./server-worker";
 import type { StatuslineWorkerData } from "./statusline-worker";
 import { type PiRepairJob, proposePiRepair } from "./tabs-core";
@@ -281,6 +284,10 @@ import type {
   WakeWorkerData,
   WakeWorkerOutbound,
 } from "./wake-worker";
+import {
+  backupThenCleanSharedCheckout,
+  probeLaneMergeHead,
+} from "./worktree-git";
 import { repoToken, worktreePathFor } from "./worktree-plan";
 
 /** Grace period for the worker to exit on shutdown before we close the db anyway. */
@@ -12249,6 +12256,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // per-repo `shared-checkout-dirty:<hash>` row, level-cleared on observed-clean. In
   // main memory only; a restart re-arms it (the projection-driven clear still fires).
   const sharedDirtyDistressTracker = createSharedCheckoutDirtyTracker();
+  const sharedDirtyCleanedAwaitingClear = new Set<string>();
 
   // The OPEN `shared-checkout-dirty` distress rows (per-repo `daemon`-verb) — the grace
   // tracker's clear surface + the id the repair-defer diagnostic names. A read failure
@@ -12277,24 +12285,56 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // — the page-once sweep's current-state working set. Both families share the daemon
   // distress verb; the two id prefixes are disjoint. A read failure degrades to an empty
   // set (the next tick re-reads).
-  function selectUnpagedSharedCheckoutRows(): SharedCheckoutPageRow[] {
+  function selectUnpagedSharedCheckoutRows(
+    excludeIds: ReadonlySet<string> = new Set(),
+  ): SharedCheckoutPageRow[] {
     try {
-      return db
-        .query(
-          `SELECT id, dir, reason FROM dispatch_failures
-             WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
-               AND human_notified_at IS NULL`,
-        )
-        .all(
-          SHARED_DIRTY_DISTRESS_VERB,
-          `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
-          `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
-          `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
-          `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
-        ) as SharedCheckoutPageRow[];
+      return (
+        db
+          .query(
+            `SELECT id, dir, reason FROM dispatch_failures
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+                 AND human_notified_at IS NULL`,
+          )
+          .all(
+            SHARED_DIRTY_DISTRESS_VERB,
+            `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
+            `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
+            `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
+            `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
+          ) as SharedCheckoutPageRow[]
+      ).filter((row) => !excludeIds.has(row.id));
     } catch {
       return [];
     }
+  }
+
+  function selectSharedCheckoutWriters(
+    checkoutDir: string,
+  ): SharedCheckoutWriter[] {
+    const canonical = (() => {
+      try {
+        return realpathSync(checkoutDir);
+      } catch {
+        return checkoutDir;
+      }
+    })();
+    return db
+      .query(
+        `SELECT job_id, state, pid, start_time, updated_at FROM jobs
+           WHERE cwd = ? OR cwd = ?`,
+      )
+      .all(checkoutDir, canonical) as SharedCheckoutWriter[];
+  }
+
+  function sharedCheckoutWriterLiveness(
+    writer: SharedCheckoutWriter,
+  ): "dead" | "live" | "inconclusive" {
+    if (writer.pid == null || writer.start_time == null) return "inconclusive";
+    if (!isPidAlive(writer.pid)) return "dead";
+    const liveStartTime = readOsStartTime(writer.pid);
+    if (liveStartTime == null) return "inconclusive";
+    return liveStartTime === writer.start_time ? "live" : "dead";
   }
 
   // Send the ONE botctl page about a live shared-checkout dirty/desync distress row.
@@ -12493,7 +12533,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     const candidatesAll = [...candidates, ...baselineCandidates];
     const openDirty = selectOpenSharedDirtyRows();
+    const openDirtyIds = new Set(openDirty.map((row) => row.id));
+    for (const id of sharedDirtyCleanedAwaitingClear) {
+      if (!openDirtyIds.has(id)) sharedDirtyCleanedAwaitingClear.delete(id);
+    }
     const openDirtyById = new Map(openDirty.map((r) => [r.dir, r.id]));
+    const deadWriterOutcomes = await runDeadWriterCheckoutSweep({
+      rows: openDirty.filter(
+        (row) => !sharedDirtyCleanedAwaitingClear.has(row.id),
+      ),
+      nowSec: () => Date.now() / 1000,
+      selectWriters: (dir) => selectSharedCheckoutWriters(dir),
+      identityLiveness: (writer) => sharedCheckoutWriterLiveness(writer),
+      probeMergeHead: (dir) => probeLaneMergeHead(dir),
+      backupThenClean: (dir) => backupThenCleanSharedCheckout(dir),
+      noteLine: note,
+    });
+    const cleanedDirtyIds = new Set(
+      deadWriterOutcomes
+        .filter((outcome) => outcome.kind === "cleaned")
+        .map((outcome) => outcome.id),
+    );
+    for (const id of cleanedDirtyIds) sharedDirtyCleanedAwaitingClear.add(id);
 
     await runRepairEscalationSweep({
       selectCandidates: () => candidatesAll,
@@ -12574,7 +12635,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // dropped out of `human_notified_at IS NULL` selection. Inherits this tick's
     // not-paused / not-shutting-down gating; a paused board defers the page until play.
     await runSharedCheckoutPageSweep({
-      selectUnpaged: () => selectUnpagedSharedCheckoutRows(),
+      selectUnpaged: () => selectUnpagedSharedCheckoutRows(cleanedDirtyIds),
       notifyHuman: (row) => notifyHumanOfSharedCheckout(row),
       mintNotified: (id, outcome) =>
         mintSharedCheckoutHumanNotifiedEvent(id, outcome),
