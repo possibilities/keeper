@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-13T07:59:47.438000Z",
   "depends_on": [
@@ -6,11 +7,11 @@
   ],
   "epic": "fn-1271-worktree-lane-hygiene-hardening",
   "id": "fn-1271-worktree-lane-hygiene-hardening.4",
-  "model": "opus",
+  "model": "gpt-5.5",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Epic rm lane teardown",
-  "updated_at": "2026-07-13T07:59:47.438000Z"
+  "updated_at": "2026-07-13T08:00:51.152000Z"
 }

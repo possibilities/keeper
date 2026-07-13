@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Merge-time schema-ladder identity keying is a subtle correctness invariant where silent dedup creep or a mis-repinned fingerprint corrupts migrations, a nameable intelligence-bound opus gate.",
+      "task_id": "fn-1271-worktree-lane-hygiene-hardening.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Safety-critical cross-cutting worktree destruction where TOCTOU/occupancy gates guard against Phantom-working and a new page-once distress class must mirror sticky-row discipline exactly, a correctness-invariant opus reason.",
+      "task_id": "fn-1271-worktree-lane-hygiene-hardening.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Bounded single-surface provision-time symlink with a fully-named acceptance and enumerated test cases, well-specified GPT-first work needing only modest care on the husk-sweep interaction.",
+      "task_id": "fn-1271-worktree-lane-hygiene-hardening.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Substantial well-specified multi-file plan-side work that replicates the sibling task's already-designed teardown convention under plugin isolation, a GPT-workhorse fit with the hard judgment already spent upstream.",
+      "task_id": "fn-1271-worktree-lane-hygiene-hardening.4",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T08:00:51.152000Z",
+  "epic_id": "fn-1271-worktree-lane-hygiene-hardening",
+  "input_hash": "5286acfb97249e64fb518cd7921642210dbc5830636025113b822d71eeb5374e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1384557819,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1271-worktree-lane-hygiene-hardening.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Merge-time schema-ladder identity keying is a subtle correctness invariant where silent dedup creep or a mis-repinned fingerprint corrupts migrations, a nameable intelligence-bound opus gate.\",\"confidence\":0.83},{\"task_id\":\"fn-1271-worktree-lane-hygiene-hardening.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Safety-critical cross-cutting worktree destruction where TOCTOU/occupancy gates guard against Phantom-working and a new page-once distress class must mirror sticky-row discipline exactly, a correctness-invariant opus reason.\",\"confidence\":0.82},{\"task_id\":\"fn-1271-worktree-lane-hygiene-hardening.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Bounded single-surface provision-time symlink with a fully-named acceptance and enumerated test cases, well-specified GPT-first work needing only modest care on the husk-sweep interaction.\",\"confidence\":0.74},{\"task_id\":\"fn-1271-worktree-lane-hygiene-hardening.4\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Substantial well-specified multi-file plan-side work that replicates the sibling task's already-designed teardown convention under plugin isolation, a GPT-workhorse fit with the hard judgment already spent upstream.\",\"confidence\":0.72}]}\n"
+}
