@@ -659,6 +659,13 @@ function boundTurnText(text: string): { text: string; truncated: boolean } {
     : { text: text.slice(0, TURN_TEXT_CAP), truncated: true };
 }
 
+/** Remove Pi's complete expanded skill envelopes before a consumer-specific
+ *  Latest-turn cap can cut away their closing tags. The ordinary transcript
+ *  contract stays byte-faithful unless the caller explicitly opts in. */
+export function stripPiSkillBlocks(text: string): string {
+  return text.replace(/<skill(?:\s[^>]*)?>[\s\S]*?<\/skill>/g, "");
+}
+
 /** Extract only `type: "text"` blocks (string content is returned whole);
  *  thinking, toolCall, and image blocks contribute no text — an image-only
  *  user message or a thinking-only assistant message reduces to "". */
@@ -770,7 +777,10 @@ function walkPiPath(
  *  successful stop. Thinking, tool calls/results, images, custom entries,
  *  and compaction summaries never reach either field — they are simply not
  *  `type: "message"` (or not a `"text"` content block) and fall through. */
-function reducePiTurn(path: readonly PiTurnEntry[]): LatestTurn | null {
+function reducePiTurn(
+  path: readonly PiTurnEntry[],
+  stripSkills: boolean,
+): LatestTurn | null {
   let latestUserIndex = -1;
   let latestUserText = "";
   for (let i = 0; i < path.length; i++) {
@@ -813,7 +823,13 @@ function reducePiTurn(path: readonly PiTurnEntry[]): LatestTurn | null {
     lastStopReason = stringOrNull(message.stopReason);
   }
 
-  const prompt = boundTurnText(latestUserText);
+  const promptText = stripSkills
+    ? stripPiSkillBlocks(latestUserText).trim()
+    : latestUserText;
+  if (promptText.length === 0) {
+    return null;
+  }
+  const prompt = boundTurnText(promptText);
   if (!sawAssistant || lastStopReason !== TURN_TERMINAL_STOP_REASON) {
     return {
       prompt: prompt.text,
@@ -837,6 +853,8 @@ export interface PiTurnQuery {
   project: string | null;
   /** An entry id, or the literal "root" — the empty branch before any entry. */
   leaf: string;
+  /** Remove complete expanded skill envelopes before bounding prompt text. */
+  stripSkills?: boolean;
 }
 
 export type PiTurnOutcome =
@@ -883,6 +901,6 @@ export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
   return {
     kind: "ok",
     selectedLeaf: query.leaf,
-    turn: reducePiTurn(walked.path),
+    turn: reducePiTurn(walked.path, query.stripSkills === true),
   };
 }

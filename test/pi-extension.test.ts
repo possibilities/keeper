@@ -768,6 +768,7 @@ describe("/rename — buildPiTurnArgv", () => {
       "root",
       "--project",
       "/work/repo",
+      "--strip-skills",
       "--format",
       "json",
     ]);

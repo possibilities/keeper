@@ -152,6 +152,7 @@ export function buildPiTurnArgv(
     leaf,
     "--project",
     project,
+    "--strip-skills",
     "--format",
     "json",
   ];

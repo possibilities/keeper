@@ -580,6 +580,18 @@ describe("keeper transcript pi turn", () => {
       assistantMsg("a_big", "u_big", "stop", [
         { type: "text", text: OVERSIZED },
       ]),
+      // A skill body longer than the ordinary prompt cap. Rename's opt-in
+      // strips the complete envelope while it is still intact, preserving the
+      // actual request that follows it.
+      userMsg("u_skill", "si1", [
+        {
+          type: "text",
+          text: `<skill name="hack">${OVERSIZED}</skill>\n\nFix wrapped dispatch`,
+        },
+      ]),
+      userMsg("u_skill_only", "si1", [
+        { type: "text", text: `<skill name="hack">${OVERSIZED}</skill>` },
+      ]),
       // A dangling parent link: never resolvable, regardless of file order.
       userMsg("dangling", "does-not-exist", [
         { type: "text", text: "Dangling" },
@@ -682,6 +694,30 @@ describe("keeper transcript pi turn", () => {
     expect(parsed.data.turn.promptTruncated).toBe(true);
     expect(parsed.data.turn.response.length).toBe(TURN_TEXT_CAP);
     expect(parsed.data.turn.responseTruncated).toBe(true);
+  });
+
+  test("--strip-skills removes an oversized skill before the prompt cap", () => {
+    const raw = JSON.parse(runTurn("u_skill").stdout);
+    expect(raw.data.turn.promptTruncated).toBe(true);
+    expect(raw.data.turn.prompt).toContain('<skill name="hack">');
+    expect(raw.data.turn.prompt).not.toContain("Fix wrapped dispatch");
+
+    const stripped = JSON.parse(
+      runTurn("u_skill", ["--strip-skills"]).stdout,
+    );
+    expect(stripped.data.turn).toEqual({
+      prompt: "Fix wrapped dispatch",
+      promptTruncated: false,
+      response: null,
+      responseTruncated: false,
+    });
+  });
+
+  test("--strip-skills reduces a skill-only prompt to an empty turn", () => {
+    const parsed = JSON.parse(
+      runTurn("u_skill_only", ["--strip-skills"]).stdout,
+    );
+    expect(parsed.data.turn).toBeNull();
   });
 
   test("an abandoned branch written later in the file never influences an earlier leaf's result", () => {

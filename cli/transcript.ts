@@ -139,6 +139,7 @@ envelope, never a null turn.
 Options:
   --leaf <entry-id|root> Required. The tree leaf to resolve the turn from.
   --project <path>       Disambiguate a duplicated session id by project
+  --strip-skills         Remove expanded skills before bounding prompt text
   --format json          Output format (default and only mode: json)
   --json                 Alias of --format json
   --help, -h             Show this help
@@ -833,6 +834,7 @@ function parseTurn(
     sessionId,
     project,
     leaf,
+    stripSkills: parsed.values["strip-skills"] === true,
   });
   if (outcome.kind === "no_roots") {
     return jsonFailure(

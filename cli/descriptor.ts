@@ -1175,6 +1175,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             type: "string",
             summary: "Project path used to disambiguate the session",
           },
+          {
+            name: "strip-skills",
+            type: "boolean",
+            summary: "Remove expanded skill envelopes before bounding prompt text",
+          },
           FLAG_FORMAT,
           FLAG_JSON_ALIAS,
         ],
