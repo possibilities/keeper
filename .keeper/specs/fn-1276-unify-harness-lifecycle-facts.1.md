@@ -64,5 +64,5 @@ Land the new derivation behind existing input shapes and retain reason-compatibl
 - [ ] Focused readiness, deriver, transcript, and reducer suites pass without daemon, subprocess, tmux, socket, or live-transcript access.
 
 ## Done summary
-
+Added a canonical reason-carrying Harness-activity derivation (active|quiescent|unknown) over parent, subagent, and background-task evidence, split from Dispatch reservations. Transcript cut/clean settlement is now invocation-correlated and provisional, so an intermediate cut can no longer stop a still-working parent while a settled cut still recovers it exactly once; terminal parents override orphan open-child rows.
 ## Evidence
