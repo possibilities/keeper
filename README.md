@@ -19,6 +19,10 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Agent Bus** — `keeper bus chat send <target> "message"` stores new content in a
   Bus message artifact; receivers explicitly read its confined path from the
   metadata-only notification. See the [bus skill](./plugins/keeper/skills/bus/SKILL.md).
+- **Owned panels** — each request admits one bounded fan-out and one generic Task-owned judge;
+  retries join the durable request and cancellation settles its exact registered children. See
+  [installation and smoke checks](./docs/install.md#pi-task-and-panel-operations) and
+  [machine-visible failures](./docs/problem-codes.md#panel-run-lifecycle).
 
 Install & uninstall: [docs/install.md](./docs/install.md) · Guardrails:
 [CLAUDE.md](./CLAUDE.md) · Vocabulary: [CONTEXT.md](./CONTEXT.md) · Decisions:

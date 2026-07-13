@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -28,6 +29,69 @@ function bodyOf(markdown: string): string {
     throw new Error("bad fixture");
   return markdown.slice(close + "\n---\n".length);
 }
+
+describe("Pi panel agent compatibility", () => {
+  test("preserves shared bodies while keeping runner and judge delegation restrictions", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-panel-fixture-"));
+    try {
+      const sourceDir = join(root, "plan", "agents");
+      const extensionDir = join(root, "keeper", "pi-extension");
+      mkdirSync(sourceDir, { recursive: true });
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "task-facade.ts"),
+        "export default () => {};\n",
+      );
+      const sharedBody = [
+        "Use Task(subagent_type, description, prompt) exactly once.",
+        "Return only the named child's final text.",
+        "",
+      ].join("\n");
+      const runnerPath = join(sourceDir, "panel-runner.md");
+      const judgePath = join(sourceDir, "panel-judge.md");
+      writeFileSync(
+        runnerPath,
+        `---\ndescription: runner\neffort: high\ndisallowedTools: Monitor, Edit, Write\n---\n${sharedBody}`,
+      );
+      writeFileSync(
+        judgePath,
+        `---\ndescription: judge\neffort: xhigh\ndisallowedTools: Task, Monitor, Edit, Write\n---\n${sharedBody}`,
+      );
+
+      const runner = renderPiPlanAgent(runnerPath).content;
+      const judge = renderPiPlanAgent(judgePath).content;
+      expect(bodyOf(runner)).toBe(sharedBody);
+      expect(bodyOf(judge)).toBe(sharedBody);
+      const runnerHeader = runner.slice(0, runner.indexOf("\n---\n", 4));
+      const judgeHeader = judge.slice(0, judge.indexOf("\n---\n", 4));
+      expect(runnerHeader).toContain(
+        `extensions: ${JSON.stringify(`*, ${join(extensionDir, "task-facade.ts")}`)}`,
+      );
+      expect(runnerHeader).toContain('tools: "all, ext:task-facade/Task"');
+      expect(runnerHeader).not.toContain("Task, Agent");
+      expect(judgeHeader).toContain("Task, Agent");
+      expect(judgeHeader).not.toContain("extensions:");
+      expect(sharedBody).not.toMatch(/subagents:rpc|agent.?id|owner.?handle/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("installer verifies nested context and owner-scoped cancellation markers", () => {
+    const installScript = readFileSync(
+      join(import.meta.dir, "..", "scripts", "install.sh"),
+      "utf8",
+    );
+    expect(installScript).toContain("getActiveScopeContext");
+    expect(installScript).toContain(
+      "PROTOCOL_VERSION[[:space:]]*=[[:space:]]*3",
+    );
+    expect(installScript).toContain("manager.cancelScope(handle");
+    expect(installScript).toContain(
+      "nested Task context + scoped cancellation",
+    );
+  });
+});
 
 describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
   const temps: string[] = [];

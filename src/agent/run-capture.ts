@@ -35,6 +35,162 @@ import type {
  */
 export const RUN_CAPTURE_SCHEMA_VERSION = 1;
 
+/** Durable ownership record written beside a launched run's existing artifacts. */
+export const RUN_CONTROL_SCHEMA_VERSION = 1;
+
+export type RunControlStatus = "running" | "cancelling" | "terminal";
+
+/**
+ * The deliberately narrow control surface for one launched run. The tmux argv is
+ * copied byte-for-byte from the launch result; consumers must never derive a
+ * target from a display name or pid.
+ */
+export interface RunControlArtifact {
+  schema_version: number;
+  run_id: string;
+  agent: AgentKind;
+  started_at_ms: number;
+  kill_window_command: string[];
+  status: RunControlStatus;
+}
+
+export interface RunControlIdentity {
+  run_id: string;
+  agent: AgentKind;
+  kill_window_command: string[];
+}
+
+export interface TmuxTeardownCommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export type ExactTeardownResult =
+  | { kind: "torn_down" }
+  | { kind: "already_gone" }
+  | { kind: "unresolved_teardown_error"; error: string };
+
+export type CancelRunResult =
+  | { kind: "cancelled" }
+  | { kind: "already_gone" }
+  | { kind: "already_terminal" }
+  | { kind: "identity_mismatch" }
+  | { kind: "unresolved_teardown_error"; error: string };
+
+/** Build the running-state record immediately available after a tmux launch. */
+export function buildRunControlArtifact(args: {
+  runId: string;
+  agent: AgentKind;
+  startedAtMs: number;
+  killWindowCommand: string[];
+}): RunControlArtifact {
+  return {
+    schema_version: RUN_CONTROL_SCHEMA_VERSION,
+    run_id: args.runId,
+    agent: args.agent,
+    started_at_ms: args.startedAtMs,
+    kill_window_command: [...args.killWindowCommand],
+    status: "running",
+  };
+}
+
+function alreadyGoneTmuxError(stderr: string): boolean {
+  return /(?:can't find (?:window|session)|no server running|no sessions|session not found|window not found)/i.test(
+    stderr,
+  );
+}
+
+/**
+ * Make exact tmux teardown single-shot. The first resolved result is cached, so
+ * converging completion/cancellation paths can safely invoke the same closure.
+ */
+export function createExactRunTeardown(
+  killWindowCommand: readonly string[],
+  runTmuxCommand: (
+    command: string[],
+    timeoutMs?: number,
+  ) => TmuxTeardownCommandResult,
+  timeoutMs = 5_000,
+): () => ExactTeardownResult {
+  let resolved: ExactTeardownResult | null = null;
+  return () => {
+    if (resolved !== null) {
+      return resolved;
+    }
+    try {
+      const result = runTmuxCommand([...killWindowCommand], timeoutMs);
+      resolved =
+        result.exitCode === 0
+          ? { kind: "torn_down" }
+          : alreadyGoneTmuxError(result.stderr)
+            ? { kind: "already_gone" }
+            : {
+                kind: "unresolved_teardown_error",
+                error: `tmux kill-window exited ${result.exitCode}: ${result.stderr.trim()}`,
+              };
+    } catch (err) {
+      resolved = {
+        kind: "unresolved_teardown_error",
+        error: (err as Error).message,
+      };
+    }
+    return resolved;
+  };
+}
+
+function sameControlIdentity(
+  artifact: RunControlArtifact,
+  claimed: RunControlIdentity,
+): boolean {
+  return (
+    artifact.run_id === claimed.run_id &&
+    artifact.agent === claimed.agent &&
+    artifact.kill_window_command.length ===
+      claimed.kill_window_command.length &&
+    artifact.kill_window_command.every(
+      (token, index) => token === claimed.kill_window_command[index],
+    )
+  );
+}
+
+/**
+ * Cancellation entry seam. Storage and tmux are injected so callers can use the
+ * same atomic writer and bounded exact teardown as terminal finalization.
+ */
+export function cancelRunFromControlArtifact(args: {
+  path: string;
+  claimedIdentity: RunControlIdentity;
+  readArtifact: (path: string) => RunControlArtifact;
+  writeArtifact: (path: string, artifact: RunControlArtifact) => void;
+  runTmuxCommand: (
+    command: string[],
+    timeoutMs?: number,
+  ) => TmuxTeardownCommandResult;
+  timeoutMs?: number;
+}): CancelRunResult {
+  const artifact = args.readArtifact(args.path);
+  if (!sameControlIdentity(artifact, args.claimedIdentity)) {
+    return { kind: "identity_mismatch" };
+  }
+  if (artifact.status === "terminal") {
+    return { kind: "already_terminal" };
+  }
+  args.writeArtifact(args.path, { ...artifact, status: "cancelling" });
+  const teardown = createExactRunTeardown(
+    artifact.kill_window_command,
+    args.runTmuxCommand,
+    args.timeoutMs,
+  )();
+  if (teardown.kind === "unresolved_teardown_error") {
+    return teardown;
+  }
+  args.writeArtifact(args.path, { ...artifact, status: "terminal" });
+  return teardown.kind === "already_gone"
+    ? { kind: "already_gone" }
+    : { kind: "cancelled" };
+}
+
 /**
  * The closed set of terminal outcomes. Each maps to a process exit code via
  * {@link runCaptureExitCode}: completed/no_message succeed (0), timed_out/
@@ -446,10 +602,9 @@ export type RunLaunchResult =
       ok: true;
       handle: ResolvedHandle;
       runId: string;
-      /** The socket-correct `tmux kill-window` argv for the window this launch
-       *  opened — the handler runs it on the reap-on-terminal posture, AFTER the
-       *  result file lands. Absent when the launch path exposes no window. */
-      killWindowCommand?: string[];
+      /** The socket-correct `tmux kill-window` argv for the window this detached
+       *  launch opened. It is mandatory ownership identity, never reconstructed. */
+      killWindowCommand: string[];
     }
   | { ok: false; error: string };
 
@@ -594,7 +749,11 @@ export async function captureFromHandle(
  * the launch so `elapsed_seconds` spans the whole run.
  */
 export async function composeRunCapture(
-  deps: RunCaptureDeps & { launch: () => RunLaunchResult },
+  deps: RunCaptureDeps & {
+    launch: () => RunLaunchResult;
+    /** Runs synchronously after launch success and before capture can wait. */
+    onLaunched?: (launched: Extract<RunLaunchResult, { ok: true }>) => void;
+  },
   verbDeps: VerbDeps,
   agent: AgentKind,
 ): Promise<RunCaptureResult> {
@@ -603,6 +762,7 @@ export async function composeRunCapture(
   if (!launched.ok) {
     return buildRunCaptureEnvelope({ outcome: "launch_failed", agent });
   }
+  deps.onLaunched?.(launched);
   return captureFromHandle(deps, verbDeps, {
     handle: launched.handle,
     handleId: launched.runId,

@@ -13,7 +13,7 @@
  *    and `agent wait`, asserting a single JSON line + the mapped exit code.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PresetCatalog } from "../src/agent/config";
 import { splitSubcommand } from "../src/agent/dispatch";
+import { launchToResolvedHandle } from "../src/agent/launch-handle";
 import { main } from "../src/agent/main";
 import type {
   ResolvedHandle,
@@ -36,14 +37,19 @@ import type {
 import type { ResumeDecision } from "../src/agent/resume-policy";
 import {
   buildRunCaptureEnvelope,
+  buildRunControlArtifact,
+  cancelRunFromControlArtifact,
   captureFromHandle,
   composeRunCapture,
+  createExactRunTeardown,
   parseRunArgs,
   RUN_CAPTURE_SCHEMA_VERSION,
   type RunCaptureDeps,
+  type RunControlArtifact,
   type RunLaunchResult,
   runCaptureExitCode,
 } from "../src/agent/run-capture";
+import * as tmuxLaunch from "../src/agent/tmux-launch";
 import {
   waitForTranscriptPath,
   waitForTranscriptStop,
@@ -738,6 +744,60 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
   });
 });
 
+describe("launchToResolvedHandle — teardown target", () => {
+  test("null killWindowCommand → ok:false via TmuxLaunchError", () => {
+    const launchSpy = spyOn(
+      tmuxLaunch,
+      "launchKeeperAgentInTmux",
+    ).mockReturnValue({
+      id: "tmux-no-target",
+      runDir: null,
+      session: "keeper-agent",
+      windowId: "@1",
+      paneId: "%1",
+      launchScript: null,
+      attachCommand: ["/fake/tmux", "attach-session", "-t", "keeper-agent"],
+      killWindowCommand: null,
+      message: null,
+    });
+    const errs: string[] = [];
+
+    try {
+      const result = launchToResolvedHandle({
+        deps: {
+          env: {},
+          cwd: "/work/proj",
+          tmuxBin: "/fake/tmux",
+          launcherStateDir: tempDir(),
+          launcherArgvPrefix: ["/fake/bun", "/fake/keeper.ts", "agent"],
+          randomUuid: () => "11111111-1111-1111-1111-111111111111",
+          runTmuxCommand: () => {
+            throw new Error("fake launch must not execute tmux");
+          },
+          ensureCodexDirTrust: () => "already-trusted",
+          ensureHermesShimTrust: () => "already-seeded",
+          now: () => 123,
+          writeErr: (message) => errs.push(message),
+        },
+        agent: "claude",
+        prompt: "say hi",
+        posture: {},
+        stopTimeoutMs: null,
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        error: "detached tmux launch returned no exact teardown target",
+      });
+      expect(errs).toEqual([
+        "Error: detached tmux launch returned no exact teardown target\n",
+      ]);
+    } finally {
+      launchSpy.mockRestore();
+    }
+  });
+});
+
 describe("composeRunCapture — launch seam", () => {
   function clock(values: number[]): () => number {
     let i = 0;
@@ -774,6 +834,48 @@ describe("composeRunCapture — launch seam", () => {
     expect(captured).toBe(false);
   });
 
+  test("post-launch control hook completes before capture waiting begins", async () => {
+    const events: string[] = [];
+    await composeRunCapture(
+      {
+        waitForStop: async () => {
+          events.push("wait");
+          return { ok: true, transcriptPath: "/t.jsonl", stop: STOP };
+        },
+        showLastMessage: async () => ({
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "answer",
+          found: true,
+        }),
+        now: () => 1_000,
+        launch: (): RunLaunchResult => {
+          events.push("launch");
+          return {
+            ok: true,
+            handle: handle("sess-control"),
+            runId: "tmux-control-1",
+            killWindowCommand: [
+              "/opt/tmux",
+              "-S",
+              "/tmp/exact.sock",
+              "kill-window",
+              "-t",
+              "@41",
+            ],
+          };
+        },
+        onLaunched: () => {
+          events.push("control");
+        },
+      },
+      VERB_DEPS,
+      "claude",
+    );
+
+    expect(events).toEqual(["launch", "control", "wait"]);
+  });
+
   test("launch success → capture runs, handle + elapsed from the launch", async () => {
     const { envelope, exitCode } = await composeRunCapture(
       {
@@ -793,6 +895,7 @@ describe("composeRunCapture — launch seam", () => {
           ok: true,
           handle: handle("sess-run"),
           runId: "tmux-run-1",
+          killWindowCommand: ["tmux", "kill-window", "-t", "@1"],
         }),
       },
       VERB_DEPS,
@@ -806,6 +909,105 @@ describe("composeRunCapture — launch seam", () => {
       elapsed_seconds: 3,
     });
     expect(exitCode).toBe(0);
+  });
+});
+
+describe("run control — exact, idempotent cancellation", () => {
+  const EXACT_KILL = [
+    "/opt/tmux",
+    "-S",
+    "/tmp/keeper-owned.sock",
+    "kill-window",
+    "-t",
+    "@77",
+  ];
+
+  function control(status: RunControlArtifact["status"] = "running") {
+    return {
+      ...buildRunControlArtifact({
+        runId: "tmux-owned-77",
+        agent: "claude",
+        startedAtMs: 12_345,
+        killWindowCommand: EXACT_KILL,
+      }),
+      status,
+    };
+  }
+
+  test("exact teardown is single-shot and preserves the socket-qualified target", () => {
+    const calls: string[][] = [];
+    const teardown = createExactRunTeardown(EXACT_KILL, (command) => {
+      calls.push(command);
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    expect(teardown()).toEqual({ kind: "torn_down" });
+    expect(teardown()).toEqual({ kind: "torn_down" });
+    expect(calls).toEqual([EXACT_KILL]);
+  });
+
+  test("already-gone, identity mismatch, terminal, and unresolved errors stay distinct", () => {
+    let artifact = control();
+    const base = {
+      path: "/fake/control.json",
+      claimedIdentity: {
+        run_id: "tmux-owned-77",
+        agent: "claude" as const,
+        kill_window_command: EXACT_KILL,
+      },
+      readArtifact: () => artifact,
+      writeArtifact: (_path: string, next: RunControlArtifact) => {
+        artifact = next;
+      },
+    };
+
+    const mismatch = cancelRunFromControlArtifact({
+      ...base,
+      claimedIdentity: { ...base.claimedIdentity, run_id: "tmux-foreign" },
+      runTmuxCommand: () => {
+        throw new Error("must not run");
+      },
+    });
+    expect(mismatch).toEqual({ kind: "identity_mismatch" });
+
+    artifact = control("terminal");
+    expect(
+      cancelRunFromControlArtifact({
+        ...base,
+        runTmuxCommand: () => {
+          throw new Error("must not run");
+        },
+      }),
+    ).toEqual({ kind: "already_terminal" });
+
+    artifact = control();
+    expect(
+      cancelRunFromControlArtifact({
+        ...base,
+        runTmuxCommand: () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: "can't find window: @77",
+        }),
+      }),
+    ).toEqual({ kind: "already_gone" });
+    expect(artifact.status).toBe("terminal");
+
+    artifact = control();
+    expect(
+      cancelRunFromControlArtifact({
+        ...base,
+        runTmuxCommand: () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: "permission denied",
+        }),
+      }),
+    ).toEqual({
+      kind: "unresolved_teardown_error",
+      error: "tmux kill-window exited 1: permission denied",
+    });
+    expect(artifact.status).toBe("cancelling");
   });
 });
 
@@ -924,6 +1126,43 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
     // No spawn fired in-process — the launch is the detached tmux pane only.
     expect(h.spawned.length).toBe(0);
+  });
+
+  test("publishes exact atomic control beside the run before capture completes", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/control-proj";
+    const sessionId = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    writeClaudeTranscript(home, cwd, sessionId, "controlled answer");
+    const h = makeHarness({
+      argv: ["run", "claude", "control me"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      now: () => 12_345,
+      tmuxCommand: fakeTmux,
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+
+    const runsDir = join(stateDir, "tmux-runs");
+    const runIds = readdirSync(runsDir);
+    expect(runIds).toEqual([`tmux-${sessionId}`]);
+    const runFiles = readdirSync(join(runsDir, runIds[0] as string)).sort();
+    expect(runFiles).toEqual(["control.json", "launch.sh", "run.json"]);
+    const artifact = JSON.parse(
+      readFileSync(join(runsDir, runIds[0] as string, "control.json"), "utf8"),
+    );
+    expect(artifact).toEqual({
+      schema_version: 1,
+      run_id: `tmux-${sessionId}`,
+      agent: "claude",
+      started_at_ms: 12_345,
+      kill_window_command: ["tmux", "kill-window", "-t", "@1"],
+      status: "terminal",
+    });
   });
 
   test("an unknown <cli> exits bad_args (2) with the uniform envelope", async () => {
@@ -1072,6 +1311,50 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     expect(fileEnvelope).toMatchObject({ outcome: "completed" });
     // The stdout sink carries the SAME envelope the created file holds.
     expect(fileEnvelope).toEqual(parseEnvelope(h.out));
+  });
+
+  test("reap observes the durable result first and uses the exact launched target once", async () => {
+    const outPath = join(tempDir(), "leg.json");
+    const observations: string[] = [];
+    const { h } = completedRunHarness([
+      "--output",
+      outPath,
+      "--reap-window-on-terminal",
+    ]);
+    h.deps.runTmuxCommandFn = (command) => {
+      h.tmuxCommands.push(command);
+      if (command.includes("kill-window")) {
+        const saved = JSON.parse(readFileSync(outPath, "utf8")) as {
+          outcome: string;
+        };
+        observations.push(saved.outcome);
+      }
+      return fakeTmux(command);
+    };
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(observations).toEqual(["completed"]);
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+  });
+
+  test("an --output persistence failure still reaps the exact window once", async () => {
+    const dir = tempDir();
+    const occupied = join(dir, "occupied");
+    writeFileSync(occupied, "not a directory\n");
+    const outPath = join(occupied, "leg.json");
+    const { h } = completedRunHarness([
+      "--output",
+      outPath,
+      "--reap-window-on-terminal",
+    ]);
+
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
   });
 
   test("--output onto a genuinely unwritable path (a file in the parent chain) is the path's own bad_args (exit 2)", async () => {

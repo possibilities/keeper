@@ -13,17 +13,26 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createExactRunTeardown } from "../src/agent/run-capture";
 import {
   buildDetachWrapperArgv,
   buildPanelDeps,
   type PanelDeps,
   type PanelManifest,
   type PanelVerdict,
+  panelCancel,
   panelWait,
 } from "../src/pair/panel";
+import { retryUntil } from "./helpers/retry-until";
 
 const SLOW_ENABLED = process.env.KEEPER_RUN_SLOW !== undefined;
 
@@ -118,5 +127,102 @@ describe.skipIf(!SLOW_ENABLED)("pair panel — real detached spawn", () => {
     expect(v.members[0]?.reason).toContain(
       "exited before producing a result file",
     );
+  });
+
+  test("terminal fake harness leaves no registered wrapper surviving", async () => {
+    const run = spawnDetachedLeg(
+      "terminal",
+      'printf "%s\\n" "$RESULT" > "$1.tmp"; mv "$1.tmp" "$1"',
+    );
+    const { deps } = waitDeps();
+    expect(await panelWait({ dir, chunkSeconds: 10 }, deps)).toBe(0);
+    const pid = Number.parseInt(
+      await Bun.file(run.members[0]?.pidfile as string).text(),
+      10,
+    );
+    const gone = await retryUntil(() => {
+      try {
+        process.kill(pid, 0);
+        return null;
+      } catch {
+        return true;
+      }
+    }, 5_000);
+    expect(gone).toBe(true);
+  });
+
+  test("aborted fake harness reaps the exact wrapper and exact fake tmux target", async () => {
+    const run = spawnDetachedLeg(
+      "aborted",
+      "trap 'exit 0' TERM INT; while :; do sleep 1; done",
+    );
+    run.request_id = "slow-abort-request";
+    run.state = "running";
+    const member = run.members[0] as NonNullable<
+      PanelManifest["members"][number]
+    >;
+    member.launched_at = Date.now();
+    member.attempts = [
+      {
+        attempt: 1,
+        yaml: member.yaml,
+        pidfile: member.pidfile,
+        startfile: join(dir, "aborted.starttime"),
+        launched_at: member.launched_at,
+        state: "running",
+      },
+    ];
+    member.startfile = join(dir, "aborted.starttime");
+    writeFileSync(join(dir, "manifest.json"), JSON.stringify(run));
+
+    const wrapperPidText = await retryUntil(() => {
+      const path = member.pidfile as string;
+      if (!existsSync(path)) return null;
+      const text = readFileSync(path, "utf8").trim();
+      return text === "" ? null : text;
+    });
+    expect(wrapperPidText).not.toBeNull();
+    const wrapperPid = Number.parseInt(wrapperPidText as string, 10);
+
+    const tmuxTarget = Bun.spawn(
+      ["sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 1; done"],
+      { cwd: dir, stdin: "ignore", stdout: "ignore", stderr: "ignore" },
+    );
+    const exactTarget = `fake-tmux:@${tmuxTarget.pid}`;
+    const reap = createExactRunTeardown(
+      ["fake-tmux", "kill-window", "-t", exactTarget],
+      (command) => {
+        expect(command.at(-1)).toBe(exactTarget);
+        process.kill(tmuxTarget.pid, "SIGTERM");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    const deps = {
+      ...buildPanelDeps(),
+      pollIntervalMs: 25,
+      write: () => {},
+      writeErr: () => {},
+    };
+    expect(await panelCancel({ dir, cleanupMs: 5_000 }, deps)).toBe(0);
+    expect(reap()).toEqual({ kind: "torn_down" });
+    await tmuxTarget.exited;
+
+    const wrapperGone = await retryUntil(() => {
+      try {
+        process.kill(wrapperPid, 0);
+        return null;
+      } catch {
+        return true;
+      }
+    }, 5_000);
+    expect(wrapperGone).toBe(true);
+    expect(tmuxTarget.exitCode).not.toBeNull();
+    expect(
+      JSON.parse(await Bun.file(join(dir, "manifest.json")).text()),
+    ).toMatchObject({
+      state: "cancelled",
+      unresolved_cleanup: [],
+    });
   });
 });

@@ -147,13 +147,17 @@ import {
 } from "./run";
 import {
   buildRunCaptureEnvelope,
+  buildRunControlArtifact,
   captureFromHandle,
   composeRunCapture,
+  createExactRunTeardown,
+  type ExactTeardownResult,
   type ParseRunArgsResult,
   parseRunArgs,
   type RunCaptureDeps,
   type RunCaptureEnvelope,
   type RunCaptureResult,
+  type RunControlArtifact,
 } from "./run-capture";
 import { extractPromptText, resolveSessionSlug } from "./session-name";
 import {
@@ -1220,8 +1224,10 @@ function emitRunCapture(
   deps: MainDeps,
   result: RunCaptureResult,
   outputPath: string | null = null,
-  reap?: () => void,
+  reap?: () => ExactTeardownResult,
+  control?: { path: string; artifact: RunControlArtifact },
 ): never {
+  let emitted = result;
   if (outputPath !== null) {
     try {
       writeEnvelopeAtomic(outputPath, result.envelope);
@@ -1229,25 +1235,54 @@ function emitRunCapture(
       deps.writeErr(
         `agent: cannot write --output ${outputPath}: ${(err as Error).message}\n`,
       );
-      const bad = buildRunCaptureEnvelope({ outcome: "bad_args" });
-      deps.write(`${JSON.stringify(bad.envelope)}\n`);
-      return deps.exit(bad.exitCode);
+      emitted = buildRunCaptureEnvelope({ outcome: "bad_args" });
     }
   }
-  // Reap AFTER the result file landed and BEFORE the exit: the answer's
-  // durability never depends on the teardown, and a reap failure downgrades to
-  // a stderr note — it must never rewrite a captured result as a failed leg.
+
+  // The answer is observable before teardown on every path, including a failed
+  // --output write. Teardown can never rewrite a viable captured answer.
+  deps.write(`${JSON.stringify(emitted.envelope)}\n`);
+
+  let teardown: ExactTeardownResult | null = null;
   if (reap !== undefined) {
-    try {
-      reap();
-    } catch (err) {
+    if (control !== undefined) {
+      try {
+        writeControlAtomic(control.path, {
+          ...control.artifact,
+          status: "cancelling",
+        });
+      } catch (err) {
+        deps.writeErr(
+          `agent: cannot update run control before reap: ${(err as Error).message}\n`,
+        );
+      }
+    }
+    teardown = reap();
+    if (teardown.kind === "unresolved_teardown_error") {
       deps.writeErr(
-        `agent: reap-window-on-terminal failed (window left resident): ${(err as Error).message}\n`,
+        `agent: reap-window-on-terminal failed (window left resident): ${teardown.error}\n`,
       );
     }
   }
-  deps.write(`${JSON.stringify(result.envelope)}\n`);
-  return deps.exit(result.exitCode);
+
+  // A failed reap deliberately remains `cancelling`: the exact target stays
+  // inspectable and a later owner can distinguish/retry unresolved teardown.
+  if (
+    control !== undefined &&
+    (reap === undefined || teardown?.kind !== "unresolved_teardown_error")
+  ) {
+    try {
+      writeControlAtomic(control.path, {
+        ...control.artifact,
+        status: "terminal",
+      });
+    } catch (err) {
+      deps.writeErr(
+        `agent: cannot mark run control terminal: ${(err as Error).message}\n`,
+      );
+    }
+  }
+  return deps.exit(emitted.exitCode);
 }
 
 /**
@@ -1261,18 +1296,11 @@ function reapThunk(
   deps: MainDeps,
   requested: boolean,
   killWindowCommand: string[] | null,
-): (() => void) | undefined {
+): (() => ExactTeardownResult) | undefined {
   if (!requested || killWindowCommand === null) {
     return undefined;
   }
-  return () => {
-    const result = deps.runTmuxCommandFn(killWindowCommand);
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `tmux kill-window exited ${result.exitCode}: ${result.stderr.trim()}`,
-      );
-    }
-  };
+  return createExactRunTeardown(killWindowCommand, deps.runTmuxCommandFn);
 }
 
 /**
@@ -1294,6 +1322,24 @@ function writeEnvelopeAtomic(
   );
   writeFileSync(tmp, `${JSON.stringify(envelope)}\n`);
   renameSync(tmp, target);
+}
+
+/** Persist the narrow ownership record with the same-directory atomicity. */
+function writeControlAtomic(
+  target: string,
+  artifact: RunControlArtifact,
+): void {
+  mkdirSync(dirname(target), { recursive: true });
+  const tmp = join(
+    dirname(target),
+    `.keeper-agent-control-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  writeFileSync(tmp, `${JSON.stringify(artifact)}\n`);
+  renameSync(tmp, target);
+}
+
+function controlPath(stateDir: string, runId: string): string {
+  return join(stateDir, "tmux-runs", runId, "control.json");
 }
 
 /**
@@ -1421,37 +1467,67 @@ async function runRunCaptureSubcommand(
   }
   const prompt = composed.prompt;
   let killWindowCommand: string[] | null = null;
-  const result = await composeRunCapture(
-    {
-      ...runCaptureSeams(deps),
-      launch: () => {
-        const launched = launchToResolvedHandle({
-          deps: launchHandleDeps(deps),
-          agent,
-          prompt,
-          posture: {
-            preset: parsed.preset ?? undefined,
-            model: parsed.model ?? undefined,
-            effort: parsed.effort ?? undefined,
-            session: parsed.session ?? undefined,
-            name: parsed.name ?? undefined,
-          },
-          stopTimeoutMs: parsed.stopTimeoutMs,
-        });
-        if (launched.ok) {
-          killWindowCommand = launched.killWindowCommand ?? null;
-        }
-        return launched;
+  let control: { path: string; artifact: RunControlArtifact } | undefined;
+  let controlWriteFailed = false;
+  let result: RunCaptureResult;
+  try {
+    result = await composeRunCapture(
+      {
+        ...runCaptureSeams(deps),
+        launch: () => {
+          const launched = launchToResolvedHandle({
+            deps: launchHandleDeps(deps),
+            agent,
+            prompt,
+            posture: {
+              preset: parsed.preset ?? undefined,
+              model: parsed.model ?? undefined,
+              effort: parsed.effort ?? undefined,
+              session: parsed.session ?? undefined,
+              name: parsed.name ?? undefined,
+            },
+            stopTimeoutMs: parsed.stopTimeoutMs,
+          });
+          return launched;
+        },
+        onLaunched: (launched) => {
+          killWindowCommand = launched.killWindowCommand;
+          control = {
+            path: controlPath(deps.launcherStateDir, launched.runId),
+            artifact: buildRunControlArtifact({
+              runId: launched.runId,
+              agent,
+              startedAtMs: launched.handle.startedAtMs,
+              killWindowCommand: launched.killWindowCommand,
+            }),
+          };
+          try {
+            writeControlAtomic(control.path, control.artifact);
+          } catch (err) {
+            controlWriteFailed = true;
+            throw err;
+          }
+        },
       },
-    },
-    verbDeps,
-    agent,
-  );
+      verbDeps,
+      agent,
+    );
+  } catch (err) {
+    deps.writeErr(
+      `agent: cannot persist run control: ${(err as Error).message}\n`,
+    );
+    result = buildRunCaptureEnvelope({ outcome: "launch_failed", agent });
+  }
   return emitRunCapture(
     deps,
     result,
     parsed.output,
-    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+    reapThunk(
+      deps,
+      parsed.reapWindowOnTerminal || controlWriteFailed,
+      killWindowCommand,
+    ),
+    control,
   );
 }
 
@@ -1634,37 +1710,67 @@ async function runResumeCaptureSubcommand(
         : decision.resume_target;
 
   let killWindowCommand: string[] | null = null;
-  const result = await composeRunCapture(
-    {
-      ...runCaptureSeams(deps),
-      launch: () => {
-        const launched = launchToResolvedHandle({
-          deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
-          agent,
-          prompt: composed.prompt,
-          // The resumed session owns its config — no posture overlay.
-          posture: {},
-          stopTimeoutMs: parsed.stopTimeoutMs,
-          resume: {
-            target: decision.resume_target,
-            childSessionId,
-            sessionId: discoverySessionId,
-          },
-        });
-        if (launched.ok) {
-          killWindowCommand = launched.killWindowCommand ?? null;
-        }
-        return launched;
+  let control: { path: string; artifact: RunControlArtifact } | undefined;
+  let controlWriteFailed = false;
+  let result: RunCaptureResult;
+  try {
+    result = await composeRunCapture(
+      {
+        ...runCaptureSeams(deps),
+        launch: () => {
+          const launched = launchToResolvedHandle({
+            deps: { ...launchHandleDeps(deps), cwd: resumeCwd },
+            agent,
+            prompt: composed.prompt,
+            // The resumed session owns its config — no posture overlay.
+            posture: {},
+            stopTimeoutMs: parsed.stopTimeoutMs,
+            resume: {
+              target: decision.resume_target,
+              childSessionId,
+              sessionId: discoverySessionId,
+            },
+          });
+          return launched;
+        },
+        onLaunched: (launched) => {
+          killWindowCommand = launched.killWindowCommand;
+          control = {
+            path: controlPath(deps.launcherStateDir, launched.runId),
+            artifact: buildRunControlArtifact({
+              runId: launched.runId,
+              agent,
+              startedAtMs: launched.handle.startedAtMs,
+              killWindowCommand: launched.killWindowCommand,
+            }),
+          };
+          try {
+            writeControlAtomic(control.path, control.artifact);
+          } catch (err) {
+            controlWriteFailed = true;
+            throw err;
+          }
+        },
       },
-    },
-    verbDeps,
-    agent,
-  );
+      verbDeps,
+      agent,
+    );
+  } catch (err) {
+    deps.writeErr(
+      `agent: cannot persist run control: ${(err as Error).message}\n`,
+    );
+    result = buildRunCaptureEnvelope({ outcome: "launch_failed", agent });
+  }
   return emitRunCapture(
     deps,
     result,
     parsed.output,
-    reapThunk(deps, parsed.reapWindowOnTerminal, killWindowCommand),
+    reapThunk(
+      deps,
+      parsed.reapWindowOnTerminal || controlWriteFailed,
+      killWindowCommand,
+    ),
+    control,
   );
 }
 

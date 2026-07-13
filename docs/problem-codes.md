@@ -133,6 +133,26 @@ Exit codes (distinct from the shared 0/1/2 core, published in `keeper --help --j
 | 1    | `agent providers check`   | Tool fault — the matrix is malformed (ConfigError naming the offense on stderr), OR a host launch triple is malformed (the grammar rejects a `<harness>_default` / `dispatch:` verb row / panel member); each malformed triple prints one line. |
 | 9    | `agent providers check`   | One or more roster/host-triple/reachability drift findings (an unreachable provider binary, or a well-formed host launch triple outside the enumerable cube); each finding prints one line. |
 
+## Panel-run lifecycle
+
+`keeper agent panel` uses a durable run manifest rather than the shared CLI envelope. The manifest's
+`request_id` is the ownership key; reissuing `start` with the same run directory and byte-identical
+arguments joins the reservation without another fan-out. A digest mismatch, cancellation tombstone,
+or member attempt beyond the explicit resume cap is not retryable under a fresh identity. `resume` is
+the only bounded recovery operation and applies only to positively dead, nonterminal attempts.
+
+The panel runner emits one of two first-line sentinels: `PANEL_ANSWER` or `PANEL_RUN_FAILED`. A failed
+quorum, exhausted wait backstop, unusable judge return, or judge cancellation is
+`PANEL_RUN_FAILED`; neither the member fan-out nor the judge is automatically retried. `wait` exit 124
+means only that its polling chunk elapsed and is safe to repeat against the same `run_dir`.
+
+| state / token | meaning | recovery | retry-safe |
+| ------------- | ------- | -------- | ---------- |
+| `cancelled` | The cancellation tombstone was persisted and every registered member identity settled. | Inspect retained outputs if needed; start a deliberately new request only for a new invocation. | no (the request is terminal) |
+| `cleanup_failed` | Bounded cancellation could not prove one or more exact `member#attempt` identities dead; `unresolved_cleanup` lists them. Success is withheld. | Inspect the listed run-directory identities and their per-run control artifacts; reap only their recorded PID/start-time and socket-qualified tmux target, then retain the run for forensics. Never use broad process matching. | no automatic retry |
+| `no_message` | A member terminated without a usable answer. It counts as a failed leg for quorum. | Let the content-blind quorum decide the request; do not relaunch the leg implicitly. | no automatic retry |
+| `PANEL_RUN_FAILED` | The owned runner reached a terminal failure and produced no panel answer. | Use its one-line reason and run directory to inspect the reservation. A later intentional inquiry needs a new request identity. | no automatic retry |
+
 ## Worker-cell launch rejects (`keeper dispatch`, autopilot)
 
 The launcher-owned worker-cell seam (`src/worker-cell.ts`) rejects a doomed
