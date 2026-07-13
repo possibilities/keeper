@@ -7,7 +7,7 @@
     "fn-1276-unify-harness-lifecycle-facts"
   ],
   "id": "fn-1279-backstop-wedged-dispatch-slot-occupants",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-13T16:07:32.309000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T16:07:31.427000Z"
+  "updated_at": "2026-07-13T16:07:32.309000Z"
 }
