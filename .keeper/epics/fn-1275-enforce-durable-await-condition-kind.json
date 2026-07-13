@@ -7,7 +7,7 @@
     "fn-1274-cover-durable-await-server-side"
   ],
   "id": "fn-1275-enforce-durable-await-condition-kind",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-13T11:30:25.536000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T11:30:25.262000Z"
+  "updated_at": "2026-07-13T11:30:25.536000Z"
 }
