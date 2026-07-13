@@ -33,5 +33,5 @@ Add a test asserting stable page order across two refetches for two rows sharing
 - [ ] `bun test` (fast tier) is green.
 
 ## Done summary
-
+Replaced the subscribe page ORDER BY tie-break's bare descriptor.pk with liveKeyExpr(descriptor), giving a total stable order for composite-PK collections and dispatch_failures; added coverage across all four collections for stable tied-order across refetches.
 ## Evidence

@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Stabilize subscribe page tie-break via composite key",
-  "updated_at": "2026-07-12T14:07:24.224000Z"
+  "updated_at": "2026-07-13T01:34:45.710000Z",
+  "worker_done_at": "2026-07-13T01:34:45.710000Z"
 }
