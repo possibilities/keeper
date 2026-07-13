@@ -8,7 +8,7 @@
     "fn-1283-prune-stale-monitor-slot-backstop"
   ],
   "id": "fn-1286-daemon-rides-through-subsystem-failure",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-13T21:49:20.419000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-13T21:49:11.258000Z"
+  "updated_at": "2026-07-13T21:49:20.419000Z"
 }
