@@ -317,11 +317,16 @@ export function launchToResolvedHandle(
       stopTimeoutMs,
       isResume: resume !== undefined,
     };
+    if (result.killWindowCommand === null) {
+      throw new TmuxLaunchError(
+        "detached tmux launch returned no exact teardown target",
+      );
+    }
     return {
       ok: true,
       handle,
       runId: result.id,
-      killWindowCommand: result.killWindowCommand ?? undefined,
+      killWindowCommand: result.killWindowCommand,
     };
   } catch (exc) {
     if (exc instanceof TmuxLaunchError) {
