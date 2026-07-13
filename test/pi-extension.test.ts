@@ -1328,9 +1328,7 @@ describe("createRenameCommandHandler", () => {
     );
     await handler("", ctx);
     expect(calls).toEqual(["add-dark-mode"]);
-    expect(ui.calls[0]?.message).toBe(
-      "/rename: generating a session title…",
-    );
+    expect(ui.calls[0]?.message).toBe("/rename: generating a session title…");
     expect(ui.calls.at(-1)?.message).toBe("Session renamed: add-dark-mode");
   });
 
@@ -1531,9 +1529,7 @@ describe("registerRenameCommand", () => {
     const deps = fakeRenameDeps({
       runTurnCli: async () => ({
         stdout: turnEnvelopeStdout(
-          hasTurn
-            ? { prompt: "add durable retries", response: "done" }
-            : null,
+          hasTurn ? { prompt: "add durable retries", response: "done" } : null,
         ),
         stderr: "",
       }),
