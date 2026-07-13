@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T05:43:50.365000Z",
+  "depends_on": [],
+  "epic": "fn-1270-dispatch-reaper-reliability-hardening",
+  "id": "fn-1270-dispatch-reaper-reliability-hardening.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Degraded readiness reads defer",
+  "updated_at": "2026-07-13T05:43:50.365000Z"
+}

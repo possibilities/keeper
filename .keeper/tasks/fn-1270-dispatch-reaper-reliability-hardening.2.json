@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T05:43:50.365000Z",
+  "depends_on": [
+    "fn-1270-dispatch-reaper-reliability-hardening.1"
+  ],
+  "epic": "fn-1270-dispatch-reaper-reliability-hardening",
+  "id": "fn-1270-dispatch-reaper-reliability-hardening.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Idle-slot reclaim dead-arm",
+  "updated_at": "2026-07-13T05:43:50.365000Z"
+}
