@@ -268,6 +268,11 @@ import {
   type SetEpicArmedRequestMessage,
   type SetEpicArmedResultMessage,
 } from "./server-worker";
+import {
+  deriveHarnessActivities,
+  deriveHarnessActivity,
+  type HarnessActivity,
+} from "./session-activity";
 import type { StatuslineWorkerData } from "./statusline-worker";
 import { type PiRepairJob, proposePiRepair } from "./tabs-core";
 import { seedTmuxProjection } from "./tmux-boot-seed";
@@ -968,16 +973,26 @@ export function probeAuditOrchestrator(
   jobs: readonly Job[],
   epicId: string,
   taskId: string,
+  activityByJobId: ReadonlyMap<string, HarnessActivity> = new Map(),
 ): AuditOrchestratorLiveness {
   let latestDeadMs: number | null = null;
   for (const job of jobs) {
     if (job.plan_verb !== "work" && job.plan_verb !== "close") continue;
     if (job.plan_ref !== taskId && job.plan_ref !== epicId) continue;
-    if (
-      job.state === "working" ||
-      (job.state === "stopped" && isStoppedJobLive(job, null))
-    ) {
-      return { state: "live" };
+    if (activityByJobId.size === 0) {
+      if (
+        job.state === "working" ||
+        (job.state === "stopped" && isStoppedJobLive(job, null))
+      ) {
+        return { state: "live" };
+      }
+    } else {
+      const activity =
+        activityByJobId.get(job.job_id) ??
+        deriveHarnessActivity({ parent: job });
+      if (activity.status !== "quiescent") {
+        return { state: "live" };
+      }
     }
     const ms = (job.updated_at ?? 0) * 1000;
     if (latestDeadMs == null || ms > latestDeadMs) latestDeadMs = ms;
@@ -11563,7 +11578,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     try {
       return db
         .query(
-          "SELECT job_id, plan_verb, plan_ref, state, backend_exec_pane_id, updated_at FROM jobs WHERE plan_verb IN ('work', 'close') AND plan_ref IN (?, ?)",
+          "SELECT * FROM jobs WHERE plan_verb IN ('work', 'close') AND plan_ref IN (?, ?)",
         )
         .all(taskId, epicId) as unknown as Job[];
     } catch {
@@ -12287,12 +12302,33 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         ),
       dispatchUnblock: (row) => dispatchUnblock(row),
       isEpicUnblockLive: (epicId) => epicUnblockLive(epicId),
-      auditOrchestratorLiveness: (row) =>
-        probeAuditOrchestrator(
-          readAuditOrchestratorJobs(row.epic_id, row.task_id),
+      auditOrchestratorLiveness: (row) => {
+        const jobs = readAuditOrchestratorJobs(row.epic_id, row.task_id);
+        const ids = jobs.map((job) => job.job_id);
+        let children: Array<Record<string, unknown>> = [];
+        if (ids.length > 0) {
+          try {
+            const placeholders = ids.map(() => "?").join(",");
+            children = db
+              .query(
+                `SELECT * FROM subagent_invocations WHERE job_id IN (${placeholders})`,
+              )
+              .all(...ids) as Array<Record<string, unknown>>;
+          } catch {
+            children = ids.map((job_id) => ({ job_id }));
+          }
+        }
+        return probeAuditOrchestrator(
+          jobs,
           row.epic_id,
           row.task_id,
-        ),
+          deriveHarnessActivities(
+            jobs,
+            children,
+            Math.floor(Date.now() / 1000),
+          ),
+        );
+      },
       now: () => Date.now(),
       hasOpenWorkFailure: (taskId) => {
         try {

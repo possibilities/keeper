@@ -100,6 +100,10 @@ import {
 // keeps the dependency one-directional.
 import type { NeedsHumanProjection } from "./needs-human";
 import type { BlockReason, ReadinessSnapshot, Verdict } from "./readiness";
+import {
+  deriveHarnessActivity,
+  type HarnessActivity,
+} from "./session-activity";
 import type { Epic, GitStatus, Job, Task } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -1142,10 +1146,13 @@ export function agentsIdleState(
   gitRoot: string,
   ownSessionId: string | null,
   jobsRows: Iterable<Job>,
+  activityByJobId: ReadonlyMap<string, HarnessActivity> = new Map(),
 ): AwaitState {
   let busy = 0;
   for (const job of jobsRows) {
-    if (job.state !== "working") {
+    const activity =
+      activityByJobId.get(job.job_id) ?? deriveHarnessActivity({ parent: job });
+    if (activity.status === "quiescent") {
       continue;
     }
     if (ownSessionId !== null && job.job_id === ownSessionId) {
@@ -1395,8 +1402,8 @@ export function boardWorkIdleState(
 }
 
 /**
- * One `state==='working'` job the {@link drainedState} predicate weighs. The CLI
- * projects each working `jobs` row into this; the pure predicate applies the
+ * One active-or-unknown Harness session the {@link drainedState} predicate weighs.
+ * The caller projects canonical Harness activity into this; the pure predicate applies the
  * scope's provenance + self-exclusion filter (never the CLI — the scope
  * semantics live here so the fixture corpus pins them).
  */

@@ -228,6 +228,10 @@ import {
   loadReadinessInputs,
   type ReadinessQuery,
 } from "../src/readiness-inputs";
+import {
+  dispatchClaimBlocksReplacement,
+  dispatchTargetHasActivityCollision,
+} from "../src/reconcile-core";
 import { drain } from "../src/reducer";
 import { readBootStatus, runQuery } from "../src/server-worker";
 import type {
@@ -632,6 +636,77 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Harness activity + Dispatch claim ownership
+// ---------------------------------------------------------------------------
+
+test("parked exact claim owns its target without consuming activity; active and unknown collide", () => {
+  const claim = {
+    verb: "work",
+    id: "fn-1-a.1",
+    attempt_id: 41,
+    state: "bound",
+    session_id: "s1",
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: 2,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 2,
+    updated_at: 2,
+  };
+  expect(dispatchClaimBlocksReplacement(claim)).toBe(true);
+  expect(dispatchClaimBlocksReplacement({ ...claim, state: "released" })).toBe(
+    false,
+  );
+  const jobs = new Map([
+    [
+      "s1",
+      {
+        job_id: "s1",
+        plan_verb: "work",
+        plan_ref: "fn-1-a.1",
+        state: "stopped",
+      },
+    ],
+  ]) as unknown as Map<string, Job>;
+  expect(
+    dispatchTargetHasActivityCollision(
+      jobs,
+      new Map([
+        [
+          "s1",
+          {
+            status: "quiescent",
+            reason: "ambient-resource",
+            reservation: null,
+          },
+        ],
+      ]),
+      "work",
+      "fn-1-a.1",
+    ),
+  ).toBe(false);
+  expect(
+    dispatchTargetHasActivityCollision(
+      jobs,
+      new Map([
+        [
+          "s1",
+          {
+            status: "unknown",
+            reason: "child-evidence-stale",
+            reservation: null,
+          },
+        ],
+      ]),
+      "work",
+      "fn-1-a.1",
+    ),
+  ).toBe(true);
+});
 
 // ---------------------------------------------------------------------------
 // verbForVerdict

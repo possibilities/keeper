@@ -2715,6 +2715,24 @@ test("Dispatch claim exact lifecycle is attempt-fenced and idempotent", () => {
     last_event_id: bound,
   });
 
+  dispatchClaimEvent("DispatchClaimResumeRequested", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 9,
+    session_id: "session-10",
+  });
+  const requested = dispatchClaimEvent("DispatchClaimResumeRequested", {
+    verb: "work",
+    id: "fn-claim.1",
+    expected_attempt_id: 10,
+    session_id: "session-10",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-claim.1")).toMatchObject({
+    state: "resume_requested",
+    last_event_id: requested,
+  });
+
   const acknowledged = dispatchClaimEvent("DispatchClaimResumeAcknowledged", {
     verb: "work",
     id: "fn-claim.1",
@@ -2727,6 +2745,7 @@ test("Dispatch claim exact lifecycle is attempt-fenced and idempotent", () => {
     "fn-claim.1",
   )?.resume_acknowledged_at;
   expect(acknowledgementAt).not.toBeNull();
+  expect(getDispatchClaim("work", "fn-claim.1")?.state).toBe("bound");
   expect(getDispatchClaim("work", "fn-claim.1")?.last_event_id).toBe(
     acknowledged,
   );

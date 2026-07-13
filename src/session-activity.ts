@@ -21,7 +21,7 @@ export type HarnessActivityReason =
   | "resource-evidence-incomplete"
   | "resource-evidence-stale";
 
-export type DispatchReservation = "launch" | "bound" | null;
+export type DispatchReservation = "launch" | "bound" | "resume" | null;
 
 export type HarnessActivity =
   | {
@@ -235,4 +235,46 @@ export function deriveHarnessActivity(
     { status: "quiescent", reason: "parent-quiescent" },
     reservation,
   );
+}
+
+export function deriveHarnessActivities<
+  P extends HarnessParentEvidence,
+  C extends HarnessChildEvidence,
+>(
+  parents: Iterable<P>,
+  children: readonly C[],
+  now: number,
+  reservationByJobId: ReadonlyMap<
+    string,
+    Exclude<DispatchReservation, null>
+  > = new Map(),
+): Map<string, HarnessActivity> {
+  const childrenByJobId = new Map<string, C[]>();
+  for (const child of children) {
+    if (typeof child.job_id !== "string" || child.job_id.length === 0) continue;
+    const group = childrenByJobId.get(child.job_id);
+    if (group === undefined) childrenByJobId.set(child.job_id, [child]);
+    else group.push(child);
+  }
+  const activities = new Map<string, HarnessActivity>();
+  for (const parent of parents) {
+    if (typeof parent.job_id !== "string" || parent.job_id.length === 0)
+      continue;
+    activities.set(
+      parent.job_id,
+      deriveHarnessActivity({
+        parent,
+        children: childrenByJobId.get(parent.job_id),
+        now,
+        reservation: reservationByJobId.get(parent.job_id) ?? null,
+      }),
+    );
+  }
+  return activities;
+}
+
+export function harnessActivityHoldsCapacity(
+  activity: HarnessActivity,
+): boolean {
+  return activity.status !== "quiescent" || activity.reservation !== null;
 }

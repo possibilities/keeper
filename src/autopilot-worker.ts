@@ -8186,6 +8186,8 @@ export async function loadReconcileSnapshot(
     subagentInvocations,
     gitStatusByProjectDir,
     pendingDispatches,
+    dispatchClaims,
+    harnessActivityByJobId,
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery);
@@ -8360,6 +8362,13 @@ export async function loadReconcileSnapshot(
       liveTabKeys.add(dispatchKey(verb as Verb, id));
     }
   }
+
+  const dispatchClaimsByKey = new Map(
+    dispatchClaims.map((claim) => [
+      dispatchKey(claim.verb as Verb, claim.id),
+      claim,
+    ]),
+  );
 
   // Read the autopilot `mode` and the armed id set — PROJECTION-PULL only (no
   // `workerData`, no cache) so the gate survives a restart with one source of
@@ -8665,6 +8674,8 @@ export async function loadReconcileSnapshot(
     staleBaseDistressIds,
     dupEpicNumberDistressIds,
     liveTabKeys,
+    dispatchClaims: dispatchClaimsByKey,
+    harnessActivityByJobId,
     livePaneIds,
     paneCommandById,
     provenDeadJobIds,

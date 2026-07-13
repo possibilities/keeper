@@ -3943,6 +3943,12 @@ function foldDispatchCleared(db: Database, event: Event): void {
     payload.verb,
     payload.id,
   ]);
+  db.run(
+    `UPDATE dispatch_claims
+        SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
+      WHERE verb = ? AND id = ? AND state != 'released'`,
+    [event.ts, event.id, event.ts, payload.verb, payload.id],
+  );
 }
 
 /**
@@ -4288,6 +4294,37 @@ function foldDispatchClaimBound(db: Database, event: Event): void {
   }
 }
 
+function foldDispatchClaimResumeRequested(db: Database, event: Event): void {
+  const payload = extractDispatchClaimMutationPayload(event);
+  if (payload == null || payload.sessionId == null) return;
+  if (payload.expectedAttemptId == null) {
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'legacy_unfenced', resume_acknowledged_at = NULL,
+              last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL
+          AND legacy_unfenced = 1 AND session_id = ? AND state != 'released'`,
+      [event.id, event.ts, payload.verb, payload.id, payload.sessionId],
+    );
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_claims
+        SET state = 'resume_requested', resume_acknowledged_at = NULL,
+            last_event_id = ?, updated_at = ?
+      WHERE verb = ? AND id = ? AND attempt_id = ?
+        AND legacy_unfenced = 0 AND session_id = ? AND state = 'bound'`,
+    [
+      event.id,
+      event.ts,
+      payload.verb,
+      payload.id,
+      payload.expectedAttemptId,
+      payload.sessionId,
+    ],
+  );
+}
+
 function foldDispatchClaimResumeAcknowledged(db: Database, event: Event): void {
   const payload = extractDispatchClaimMutationPayload(event);
   if (payload == null || payload.sessionId == null) {
@@ -4312,9 +4349,10 @@ function foldDispatchClaimResumeAcknowledged(db: Database, event: Event): void {
   } else {
     db.run(
       `UPDATE dispatch_claims
-          SET resume_acknowledged_at = ?, last_event_id = ?, updated_at = ?
+          SET state = 'bound', resume_acknowledged_at = ?, last_event_id = ?, updated_at = ?
         WHERE verb = ? AND id = ? AND attempt_id = ?
-          AND legacy_unfenced = 0 AND state = 'bound' AND session_id = ?
+          AND legacy_unfenced = 0
+          AND state IN ('bound', 'resume_requested') AND session_id = ?
           AND resume_acknowledged_at IS NULL`,
       [
         event.ts,
@@ -9027,6 +9065,7 @@ function projectJobsRow(db: Database, event: Event): void {
                 "UPDATE jobs SET dispatch_origin = 'autopilot' WHERE job_id = ?",
                 [jobId],
               );
+              syncIfPlanRef(db, jobId, event.id, ts);
             }
             db.run(
               "DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?",
@@ -9034,6 +9073,31 @@ function projectJobsRow(db: Database, event: Event): void {
             );
           }
         }
+        if (
+          !isSpawnInsert &&
+          priorJob.plan_verb != null &&
+          priorJob.plan_ref != null &&
+          dispatchAttemptId != null
+        ) {
+          db.run(
+            `UPDATE dispatch_claims
+                SET state = 'bound', resume_acknowledged_at = ?,
+                    last_event_id = ?, updated_at = ?
+              WHERE verb = ? AND id = ? AND attempt_id = ?
+                AND legacy_unfenced = 0 AND session_id = ?
+                AND state IN ('bound', 'resume_requested')`,
+            [
+              event.ts,
+              event.id,
+              event.ts,
+              priorJob.plan_verb,
+              priorJob.plan_ref,
+              dispatchAttemptId,
+              jobId,
+            ],
+          );
+        }
+
         // Escalation-instance binding: an `unblock::<task>` / `deconflict::<epic>`
         // / `resolve::<epic>` session is a first-class dispatch key
         // (`planVerbRefFromSpawnName` returns its verb), but it is dispatched by a
@@ -10413,6 +10477,8 @@ export function applyEvent(
       foldDispatchClaimAcquired(db, event);
     } else if (event.hook_event === "DispatchClaimBound") {
       foldDispatchClaimBound(db, event);
+    } else if (event.hook_event === "DispatchClaimResumeRequested") {
+      foldDispatchClaimResumeRequested(db, event);
     } else if (event.hook_event === "DispatchClaimResumeAcknowledged") {
       foldDispatchClaimResumeAcknowledged(db, event);
     } else if (event.hook_event === "DispatchClaimReleased") {

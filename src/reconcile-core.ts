@@ -54,6 +54,11 @@ import {
   type PendingDispatch,
   type Verdict,
 } from "./readiness";
+import type { DispatchClaim } from "./readiness-inputs";
+import {
+  deriveHarnessActivity,
+  type HarnessActivity,
+} from "./session-activity";
 import type { Epic, Job, SubagentInvocation, Task } from "./types";
 import {
   CLOSE_SINK_ID,
@@ -742,6 +747,10 @@ export interface ReconcileSnapshot {
    * (same-key dedup vs cross-sibling demotion — both needed).
    */
   liveTabKeys: Set<DispatchKey>;
+  /** Durable current Dispatch claim keyed by `verb::id`, including released fences. */
+  dispatchClaims?: ReadonlyMap<DispatchKey, DispatchClaim>;
+  /** Canonical Harness activity keyed by Harness session id. */
+  harnessActivityByJobId?: ReadonlyMap<string, HarnessActivity>;
   /**
    * The LIVE backend pane ids from the read-time `listPanes()` probe, used to
    * gate the `stopped` arm of {@link isOccupyingJob}: a stopped job whose
@@ -1553,6 +1562,54 @@ export function verbForVerdict(
  * predicate never probes the backend itself (and folds never read liveness —
  * re-fold determinism is sacrosanct). Returns on first match.
  */
+export function dispatchClaimBlocksReplacement(
+  claim: DispatchClaim | undefined,
+): boolean {
+  return claim !== undefined && claim.state !== "released";
+}
+
+export function dispatchTargetHasActivityCollision(
+  jobs: Map<string, Job>,
+  activityByJobId: ReadonlyMap<string, HarnessActivity>,
+  verb: Verb | "resolve",
+  id: string,
+): boolean {
+  for (const job of jobs.values()) {
+    if (job.plan_verb !== verb || job.plan_ref !== id) continue;
+    const activity =
+      activityByJobId.get(job.job_id) ?? deriveHarnessActivity({ parent: job });
+    if (activity.status !== "quiescent") return true;
+  }
+  return false;
+}
+
+export function dispatchTargetIsOwned(
+  snapshot: Pick<
+    ReconcileSnapshot,
+    "jobs" | "dispatchClaims" | "harnessActivityByJobId" | "livePaneIds"
+  >,
+  verb: Verb | "resolve",
+  id: string,
+): boolean {
+  if (
+    snapshot.dispatchClaims === undefined &&
+    snapshot.harnessActivityByJobId === undefined
+  ) {
+    return isOccupyingJob(snapshot.jobs, verb, id, snapshot.livePaneIds);
+  }
+  return (
+    dispatchClaimBlocksReplacement(
+      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
+    ) ||
+    dispatchTargetHasActivityCollision(
+      snapshot.jobs,
+      snapshot.harnessActivityByJobId ?? new Map(),
+      verb,
+      id,
+    )
+  );
+}
+
 export function isOccupyingJob(
   jobs: Map<string, Job>,
   // `Verb | "resolve"`: the reconciler's own dispatch verbs PLUS the daemon's
@@ -1972,16 +2029,38 @@ export function isEpicInFlight(
   jobs: Map<string, Job>,
   liveTabKeys: Set<DispatchKey>,
   livePaneIds: ReadonlySet<string> | null,
+  dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> = new Map(),
+  harnessActivityByJobId: ReadonlyMap<string, HarnessActivity> = new Map(),
 ): boolean {
   if (
-    isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds) ||
+    (dispatchClaims.size === 0 && harnessActivityByJobId.size === 0
+      ? isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds)
+      : dispatchClaimBlocksReplacement(
+          dispatchClaims.get(dispatchKey("close", epic.epic_id)),
+        ) ||
+        dispatchTargetHasActivityCollision(
+          jobs,
+          harnessActivityByJobId,
+          "close",
+          epic.epic_id,
+        )) ||
     liveTabKeys.has(dispatchKey("close", epic.epic_id))
   ) {
     return true;
   }
   for (const task of epic.tasks) {
     if (
-      isOccupyingJob(jobs, "work", task.task_id, livePaneIds) ||
+      (dispatchClaims.size === 0 && harnessActivityByJobId.size === 0
+        ? isOccupyingJob(jobs, "work", task.task_id, livePaneIds)
+        : dispatchClaimBlocksReplacement(
+            dispatchClaims.get(dispatchKey("work", task.task_id)),
+          ) ||
+          dispatchTargetHasActivityCollision(
+            jobs,
+            harnessActivityByJobId,
+            "work",
+            task.task_id,
+          )) ||
       liveTabKeys.has(dispatchKey("work", task.task_id))
     ) {
       return true;
@@ -2178,17 +2257,29 @@ export function reconcile(
   // drift. `budget` is the remaining admittance for NEWLY-planned launches; a
   // `null` cap is a fast-path bypass. Strict `budget > 0`: cap=1 occupied=1 →
   // admit nothing.
-  let occupied = 0;
-  for (const verdict of readiness.perTask.values()) {
+  const occupiedKeys = new Set<DispatchKey>();
+  for (const [id, verdict] of readiness.perTask) {
     if (isRootOccupant(verdict)) {
-      occupied++;
+      occupiedKeys.add(dispatchKey("work", id));
     }
   }
-  for (const verdict of readiness.perCloseRow.values()) {
+  for (const [id, verdict] of readiness.perCloseRow) {
     if (isRootOccupant(verdict)) {
-      occupied++;
+      occupiedKeys.add(dispatchKey("close", id));
     }
   }
+  for (const job of snapshot.jobs.values()) {
+    if (job.plan_verb !== "work" && job.plan_verb !== "close") continue;
+    if (job.plan_ref == null || job.plan_ref === "") continue;
+    const activity = snapshot.harnessActivityByJobId?.get(job.job_id);
+    if (
+      activity !== undefined &&
+      (activity.status !== "quiescent" || activity.reservation !== null)
+    ) {
+      occupiedKeys.add(dispatchKey(job.plan_verb, job.plan_ref));
+    }
+  }
+  const occupied = occupiedKeys.size;
   const cap = state.maxConcurrentJobs;
   let budget =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - occupied);
@@ -2247,7 +2338,7 @@ export function reconcile(
       if (snapshot.failedKeys.has(key)) {
         continue;
       }
-      if (isOccupyingJob(snapshot.jobs, verb, taskId, snapshot.livePaneIds)) {
+      if (dispatchTargetIsOwned(snapshot, verb, taskId)) {
         continue;
       }
       if (snapshot.liveTabKeys.has(key)) {
@@ -2415,12 +2506,7 @@ export function reconcile(
         !state.paused &&
         !state.inFlight.has(closeKey) &&
         !snapshot.failedKeys.has(closeKey) &&
-        !isOccupyingJob(
-          snapshot.jobs,
-          closeVerb,
-          epicId,
-          snapshot.livePaneIds,
-        ) &&
+        !dispatchTargetIsOwned(snapshot, closeVerb, epicId) &&
         // Standing dedup arm: a live `close::<epic>` tab proves a launched closer
         // occupies the slot before its SessionStart binds.
         !snapshot.liveTabKeys.has(closeKey) &&
@@ -2449,6 +2535,8 @@ export function reconcile(
             snapshot.jobs,
             snapshot.liveTabKeys,
             snapshot.livePaneIds,
+            snapshot.dispatchClaims ?? new Map(),
+            snapshot.harnessActivityByJobId ?? new Map(),
           )
         ) &&
         // Cross-epic merge-gate: suppress the single plan-close while ANY of the

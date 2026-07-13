@@ -1760,6 +1760,49 @@ test("agents-idle: non-working job in root → met (only working counts)", () =>
   expect(agentsIdleState("/repo", "me", jobs).kind).toBe("met");
 });
 
+test("agents-idle: canonical quiescent releases while unknown holds", () => {
+  const parked = makeJob({ job_id: "parked", state: "stopped", cwd: "/repo" });
+  const unknown = makeJob({
+    job_id: "unknown",
+    state: "stopped",
+    cwd: "/repo",
+  });
+  expect(
+    agentsIdleState(
+      "/repo",
+      null,
+      [parked],
+      new Map([
+        [
+          "parked",
+          {
+            status: "quiescent",
+            reason: "ambient-resource",
+            reservation: null,
+          },
+        ],
+      ]),
+    ).kind,
+  ).toBe("met");
+  expect(
+    agentsIdleState(
+      "/repo",
+      null,
+      [unknown],
+      new Map([
+        [
+          "unknown",
+          {
+            status: "unknown",
+            reason: "child-evidence-stale",
+            reservation: null,
+          },
+        ],
+      ]),
+    ).kind,
+  ).toBe("waiting");
+});
+
 test("agents-idle: cwd inside root (prefix descendant) → waiting", () => {
   const jobs = [
     makeJob({ job_id: "other", state: "working", cwd: "/repo/sub/dir" }),

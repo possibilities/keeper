@@ -25,6 +25,15 @@ import {
 } from "../src/bus-wake";
 import type { LaunchResult } from "../src/exec-backend";
 
+const exactClaim = {
+  verb: "work",
+  id: "fn-1-a.1",
+  attempt_id: 41,
+  state: "bound",
+  session_id: "s1",
+  legacy_unfenced: 0,
+};
+
 function creator(overrides: Partial<WakeCreator> = {}): WakeCreator {
   return {
     job_id: "sess-creator",
@@ -83,6 +92,15 @@ function makeDeps(
     launch:
       overrides.launch ??
       (async () => overrides.launchResult ?? ({ ok: true } as LaunchResult)),
+    ...(overrides.requestResume === undefined
+      ? {}
+      : { requestResume: overrides.requestResume }),
+    ...(overrides.awaitResumeAccepted === undefined
+      ? {}
+      : { awaitResumeAccepted: overrides.awaitResumeAccepted }),
+    ...(overrides.revokeAttempt === undefined
+      ? {}
+      : { revokeAttempt: overrides.revokeAttempt }),
     now: overrides.now ?? (() => overrides.nowMs ?? 1_000_000),
     noteLine: overrides.noteLine ?? (() => {}),
   };
@@ -242,6 +260,58 @@ test("runWake: a stopped creator with no live pane and off the bus still wakes",
   );
   expect(res.outcome).toBe("launched");
   expect(launched).toBe(true);
+});
+
+test("runWake: an exact parked claim resumes despite a live shell pane and carries its attempt", async () => {
+  const attempts: Array<number | undefined> = [];
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({
+          job_id: "s1",
+          state: "stopped",
+          backend_exec_pane_id: "%7",
+          monitors: JSON.stringify([{ id: "bus", kind: "ambient" }]),
+          dispatchClaim: exactClaim,
+        }),
+      ],
+      live: new Set(["s1"]),
+      livePanes: new Set(["%7"]),
+      requestResume: () => true,
+      awaitResumeAccepted: async () => true,
+      launch: async (_session, _target, _cwd, _harness, attemptId) => {
+        attempts.push(attemptId);
+        return { ok: true };
+      },
+    }),
+  );
+  expect(res.outcome).toBe("launched");
+  expect(attempts).toEqual([41]);
+});
+
+test("runWake: missed exact-attempt acknowledgement requests revocation and never authorizes replacement", async () => {
+  const revoked: number[] = [];
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({
+          job_id: "s1",
+          state: "stopped",
+          dispatchClaim: exactClaim,
+        }),
+      ],
+      requestResume: () => true,
+      awaitResumeAccepted: async () => false,
+      revokeAttempt: (claim) => {
+        revoked.push(claim.attempt_id as number);
+        return false;
+      },
+    }),
+  );
+  expect(res.outcome).toBe("acknowledgement_missed");
+  expect(revoked).toEqual([41]);
 });
 
 test("runWake: in_flight when the per-session lock is held by another wake", async () => {
