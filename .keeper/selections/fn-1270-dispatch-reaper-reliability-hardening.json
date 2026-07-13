@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant on the shared dispatch/reap input seam where mis-classifying error-vs-empty either freezes a fresh board or mass-reaps, but the slice is small and mirrors the existing DEFER idiom, so high band.",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Destructive pane reaping with a TOCTOU/PID-reuse (CWE-367) kill-time re-verification invariant and a shared, unforked occupancy predicate feeding board/escalation/autoclose \u2014 a hard opus gate at contract-touching xhigh.",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified allocator branch flip with a nameable acceptance (honor stored cap under worktree, floor to one off, group by root) and a guard test catching the per-lane mis-fix \u2014 substantial bounded GPT-first work.",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Audit-bypass-creep and ADR-0031 stamp-under-live-closer hazards, a positive-ancestor-evidence invariant, a new daemon-to-plan-CLI coupling, and a pure-core import boundary make this an intelligence-bound contract-shaped change.",
+      "task_id": "fn-1270-dispatch-reaper-reliability-hardening.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T05:45:18.958000Z",
+  "epic_id": "fn-1270-dispatch-reaper-reliability-hardening",
+  "input_hash": "74d12ceea12c0ebc2dadbb7432761fcb7819f7fd37a0f2256e3051f1eae4141b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1959865582,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1270-dispatch-reaper-reliability-hardening.1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant on the shared dispatch/reap input seam where mis-classifying error-vs-empty either freezes a fresh board or mass-reaps, but the slice is small and mirrors the existing DEFER idiom, so high band.\",\"confidence\":0.72},{\"task_id\":\"fn-1270-dispatch-reaper-reliability-hardening.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Destructive pane reaping with a TOCTOU/PID-reuse (CWE-367) kill-time re-verification invariant and a shared, unforked occupancy predicate feeding board/escalation/autoclose \u2014 a hard opus gate at contract-touching xhigh.\",\"confidence\":0.8},{\"task_id\":\"fn-1270-dispatch-reaper-reliability-hardening.3\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified allocator branch flip with a nameable acceptance (honor stored cap under worktree, floor to one off, group by root) and a guard test catching the per-lane mis-fix \u2014 substantial bounded GPT-first work.\",\"confidence\":0.7},{\"task_id\":\"fn-1270-dispatch-reaper-reliability-hardening.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Audit-bypass-creep and ADR-0031 stamp-under-live-closer hazards, a positive-ancestor-evidence invariant, a new daemon-to-plan-CLI coupling, and a pure-core import boundary make this an intelligence-bound contract-shaped change.\",\"confidence\":0.79}]}\n"
+}
