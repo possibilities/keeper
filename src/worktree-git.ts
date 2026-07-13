@@ -37,7 +37,7 @@
  * the worktree/merge lifecycle are covered by the real-git `*.slow.test.ts`.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
   appendFile,
   copyFile,
@@ -1913,6 +1913,10 @@ export async function probeLaneMergeHead(
 
 export const LANE_DIRT_INDEX_MAX_BYTES = 4096;
 
+export function laneDirtSnapshotId(lanePath: string): string {
+  return `lane-${createHash("sha256").update(lanePath).digest("hex")}`;
+}
+
 /** Resolve the operator-managed lane dirt spool. Pure; performs no I/O. */
 export function resolveLaneDirtSpoolDir(): string {
   const override = process.env.KEEPER_LANE_DIRT_SPOOL_DIR;
@@ -1944,62 +1948,85 @@ export async function backupThenForceRemoveWorktree(
 ): Promise<BackupForceRemoveResult> {
   const spoolDir = options.spoolDir ?? resolveLaneDirtSpoolDir();
   const nowMs = options.nowMs?.() ?? Date.now();
-  const snapshotId =
-    options.snapshotId?.() ?? `${nowMs}-${randomUUID().replaceAll("-", "")}`;
+  const snapshotId = options.snapshotId?.() ?? laneDirtSnapshotId(entry.path);
   if (!/^[A-Za-z0-9._-]+$/.test(snapshotId) || snapshotId.includes("..")) {
     return { kind: "backup-failed", detail: "invalid snapshot id" };
   }
   const snapshotDir = resolve(spoolDir, snapshotId);
+  let createdSnapshot = false;
   try {
-    const [staged, unstaged, untracked] = await Promise.all([
-      run(["diff", "--cached", "--binary", "--no-ext-diff"], {
-        cwd: entry.path,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      }),
-      run(["diff", "--binary", "--no-ext-diff"], {
-        cwd: entry.path,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      }),
-      run(["ls-files", "--others", "--exclude-standard", "-z"], {
-        cwd: entry.path,
-        timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-      }),
-    ]);
-    if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
-      return { kind: "backup-failed", detail: "git dirt probe failed" };
-    }
-    const untrackedPaths = untracked.stdout
-      .split("\0")
-      .filter((p) => p.length > 0);
-    for (const relativePath of untrackedPaths) {
-      if (!isSafeLaneRelativePath(relativePath)) {
-        return {
-          kind: "backup-failed",
-          detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
-        };
+    let existingSnapshot: Awaited<ReturnType<typeof lstat>> | undefined;
+    try {
+      existingSnapshot = await lstat(snapshotDir);
+    } catch (err) {
+      if (
+        !(err instanceof Error) ||
+        (err as NodeJS.ErrnoException).code !== "ENOENT"
+      ) {
+        throw err;
       }
     }
-    await mkdir(spoolDir, { recursive: true });
-    await mkdir(snapshotDir, { recursive: false });
-    await writeFile(resolve(snapshotDir, "staged.patch"), staged.stdout);
-    await writeFile(resolve(snapshotDir, "unstaged.patch"), unstaged.stdout);
-    for (const relativePath of untrackedPaths) {
-      await snapshotUntrackedNode(
-        resolve(entry.path, relativePath),
-        resolve(snapshotDir, "untracked", relativePath),
-      );
+    if (existingSnapshot !== undefined) {
+      if (!existingSnapshot.isDirectory()) {
+        return {
+          kind: "backup-failed",
+          detail: "snapshot path is not a directory",
+        };
+      }
+    } else {
+      const [staged, unstaged, untracked] = await Promise.all([
+        run(["diff", "--cached", "--binary", "--no-ext-diff"], {
+          cwd: entry.path,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        }),
+        run(["diff", "--binary", "--no-ext-diff"], {
+          cwd: entry.path,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        }),
+        run(["ls-files", "--others", "--exclude-standard", "-z"], {
+          cwd: entry.path,
+          timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+        }),
+      ]);
+      if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
+        return { kind: "backup-failed", detail: "git dirt probe failed" };
+      }
+      const untrackedPaths = untracked.stdout
+        .split("\0")
+        .filter((p) => p.length > 0);
+      for (const relativePath of untrackedPaths) {
+        if (!isSafeLaneRelativePath(relativePath)) {
+          return {
+            kind: "backup-failed",
+            detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
+          };
+        }
+      }
+      await mkdir(spoolDir, { recursive: true });
+      await mkdir(snapshotDir, { recursive: false });
+      createdSnapshot = true;
+      await writeFile(resolve(snapshotDir, "staged.patch"), staged.stdout);
+      await writeFile(resolve(snapshotDir, "unstaged.patch"), unstaged.stdout);
+      for (const relativePath of untrackedPaths) {
+        await snapshotUntrackedNode(
+          resolve(entry.path, relativePath),
+          resolve(snapshotDir, "untracked", relativePath),
+        );
+      }
+      const indexLine = serializeLaneDirtIndex({
+        snapshotId,
+        createdAtMs: nowMs,
+        repoCwd,
+        lanePath: entry.path,
+        branch: entry.branch ?? "",
+        untrackedPaths,
+      });
+      await appendFile(resolve(spoolDir, "index.ndjson"), indexLine);
     }
-    const indexLine = serializeLaneDirtIndex({
-      snapshotId,
-      createdAtMs: nowMs,
-      repoCwd,
-      lanePath: entry.path,
-      branch: entry.branch ?? "",
-      untrackedPaths,
-    });
-    await appendFile(resolve(spoolDir, "index.ndjson"), indexLine);
   } catch (err) {
-    await rm(snapshotDir, { recursive: true, force: true }).catch(() => {});
+    if (createdSnapshot) {
+      await rm(snapshotDir, { recursive: true, force: true }).catch(() => {});
+    }
     return {
       kind: "backup-failed",
       detail: err instanceof Error ? err.message : String(err),

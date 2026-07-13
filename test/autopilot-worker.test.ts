@@ -36,6 +36,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -10406,6 +10407,7 @@ function makeRecoveryGit(state: {
   pushTimeout?: boolean; // the push spawn times out (GNU-timeout sentinel)
   pushUnconfirmed?: boolean; // push exits 0 but origin/<default> never advances ("up-to-date" on the wrong ref)
   dirtyRemoveAt?: Set<string>; // worktree paths whose `worktree remove` refuses (dirty)
+  forceRemoveFailsAt?: Set<string>; // worktree paths whose forced teardown remains wedged
   linkedWorktreeAt?: Set<string>; // cwds whose git-dir ≠ common-dir → a linked lane (skipped by the sweep filter)
   probeErrorAt?: Set<string>; // cwds whose git-dir/common-dir probe exits nonzero → defer the repo this cycle
   stagedPaths?: Map<string, string[]>; // cwd → `git diff --cached --name-only -z` paths (mid-merge staged set the abort would touch)
@@ -10513,8 +10515,10 @@ function makeRecoveryGit(state: {
       return { code: 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("worktree remove ")) {
-      const path = args[2] ?? "";
-      return state.dirtyRemoveAt?.has(path)
+      const forced = args[2] === "--force";
+      const path = args[forced ? 3 : 2] ?? "";
+      return (!forced && state.dirtyRemoveAt?.has(path)) ||
+        (forced && state.forceRemoveFailsAt?.has(path))
         ? {
             code: 1,
             stdout: "",
@@ -11939,6 +11943,65 @@ test("recoverWorktrees: a merged dirty closed lane snapshots then force-removes 
       (name) => name !== "index.ndjson",
     );
     expect(snapshots).toHaveLength(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("recoverWorktrees: repeated force-remove failures keep one lane dirt snapshot", async () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "kpr-lane-spool-bound-")),
+  );
+  const lanePath = join(root, "lane");
+  const spoolDir = join(root, "spool");
+  const base = "keeper/epic/fn-1-foo";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${lanePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    repoHead: "main",
+    dirtyRemoveAt: new Set([lanePath]),
+    forceRemoveFailsAt: new Set([lanePath]),
+  });
+  const tracker = createLaneTeardownGraceTracker(0);
+  try {
+    mkdirSync(lanePath, { recursive: true });
+    const outcomes = [];
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      outcomes.push(
+        await recoverWorktrees(
+          ["/repo"],
+          async () => "done",
+          run,
+          undefined,
+          async () => false,
+          () => false,
+          undefined,
+          () => false,
+          { tracker, nowSec: 100 + cycle, spoolDir },
+        ),
+      );
+    }
+    expect(
+      calls.filter(
+        (call) => call.args === `worktree remove --force ${lanePath}`,
+      ),
+    ).toHaveLength(3);
+    expect(
+      readdirSync(spoolDir).filter((name) => name !== "index.ndjson"),
+    ).toHaveLength(1);
+    expect(
+      readFileSync(join(spoolDir, "index.ndjson"), "utf8").trim().split("\n"),
+    ).toHaveLength(1);
+    expect(
+      outcomes
+        .flatMap((outcome) => outcome.laneTeardownDistress)
+        .filter((action) => action?.action === "mint"),
+    ).toHaveLength(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
