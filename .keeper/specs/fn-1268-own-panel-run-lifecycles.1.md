@@ -56,5 +56,5 @@ Keep the existing `--reap-window-on-terminal` behavior compatible while the pane
 - [ ] Fast tests prove ordering and cardinality entirely through injected effects.
 
 ## Done summary
-
+Added an atomic tmux-runs/<run-id>/control.json ownership record published right after tmux launch succeeds and before capture waiting, carrying the exact socket-qualified kill-window target; unified terminal-outcome and output-write-failure emission behind one idempotent finalizer that always attempts exact teardown; and added an identity-checked cancellation seam distinguishing already-gone, already-terminal, identity-mismatch, and unresolved-teardown outcomes, covered entirely by injected-effects tests.
 ## Evidence
