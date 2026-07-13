@@ -1,0 +1,77 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Canonical harness narrowing causes a cross-cutting architectural cascade with a subtle process-creation invariant while preserving Pi Codex-named ids.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "The explicit lifecycle-removal plan is substantial well-specified multi-file work spanning daemon, RPC, collections, and retained Pi behavior.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Table reconstruction and byte-for-byte preservation of surviving state form a subtle correctness-critical schema migration invariant.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.91,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The destructive repository and host-state purge requires subtle boundary judgment to remove Hermes without damaging unrelated state or supported harnesses.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Multiple execution paths share a security-shaped invariant that unknown harness values must never reach process creation while narrow Claude compatibility remains.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.4-mini",
+      "rationale": "Deleting one registered reader and updating bounded tests is a fully specified mechanical change with modest reasoning demand.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.6",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.91,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Broad user-facing contract pruning needs wording and namespace judgment plus careful generated-artifact parity, but no novel architecture.",
+      "task_id": "fn-1282-retire-hermes-codex-harnesses.7",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-13T17:20:39.533000Z",
+  "epic_id": "fn-1282-retire-hermes-codex-harnesses",
+  "input_hash": "7303dfbc33cfaceee43da3fb50d543b91305d8886a53a338a7bc2bf222e3913b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1929633724,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Canonical harness narrowing causes a cross-cutting architectural cascade with a subtle process-creation invariant while preserving Pi Codex-named ids.\",\"confidence\":0.94},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"The explicit lifecycle-removal plan is substantial well-specified multi-file work spanning daemon, RPC, collections, and retained Pi behavior.\",\"confidence\":0.86},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Table reconstruction and byte-for-byte preservation of surviving state form a subtle correctness-critical schema migration invariant.\",\"confidence\":0.95},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The destructive repository and host-state purge requires subtle boundary judgment to remove Hermes without damaging unrelated state or supported harnesses.\",\"confidence\":0.91},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Multiple execution paths share a security-shaped invariant that unknown harness values must never reach process creation while narrow Claude compatibility remains.\",\"confidence\":0.96},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.6\",\"tier\":\"medium\",\"model\":\"gpt-5.4-mini\",\"rationale\":\"Deleting one registered reader and updating bounded tests is a fully specified mechanical change with modest reasoning demand.\",\"confidence\":0.96},{\"task_id\":\"fn-1282-retire-hermes-codex-harnesses.7\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Broad user-facing contract pruning needs wording and namespace judgment plus careful generated-artifact parity, but no novel architecture.\",\"confidence\":0.91}]}\n"
+}
