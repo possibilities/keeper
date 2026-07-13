@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-13T12:31:14.779000Z",
+  "depends_on": [
+    "fn-1276-unify-harness-lifecycle-facts.2"
+  ],
+  "epic": "fn-1276-unify-harness-lifecycle-facts",
+  "id": "fn-1276-unify-harness-lifecycle-facts.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Bind attempts across harness starts",
+  "updated_at": "2026-07-13T12:31:14.779000Z"
+}
