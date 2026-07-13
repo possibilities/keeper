@@ -65,5 +65,5 @@ New turns use bare task-ID titles immediately. Resume lookup remains compatible 
 - [ ] Current operational and plugin-composition docs describe the shared-session, resume, title, and autoclose contract without historical narration.
 
 ## Done summary
-
+Threaded --session/--name presentation through keeper agent run --resume launch posture (model/effort/preset still rejected), rewrote the wrapped-worker template to bare task-ID titles keyed by run handle and Harness resume target with no wrapped::<task-id> or one-shot reap, added Pi/Codex resume argv golden coverage plus rendered-template parity assertions, and consolidated docs/install.md + docs/plugin-composition-map.md around the shared-session/autoclose contract.
 ## Evidence
