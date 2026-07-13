@@ -3381,10 +3381,9 @@ test("subscribeReadiness: snapshot un-drops autopilot mode/caps/worktree + armed
   expect(snap?.maxConcurrentJobs).toBe(8);
   // The EFFECTIVE cap derives off the folded stored intent (99) + worktree mode
   // (on) through effectivePerRootCap — NOT the boot header (3), which is ignored.
-  expect(snap?.maxConcurrentPerRoot).toBe(99);
-  // The STORED intent is the raw column (99), projected off the same rows. With
-  // worktree ON it equals the effective cap; it diverges (and stays distinctly
-  // readable) only while worktree is off, where effective floors to 1.
+  expect(snap?.maxConcurrentPerRoot).toBe(effectivePerRootCap(99, true));
+  // The STORED intent is the raw column (99), projected off the same rows. It can
+  // diverge from the effective cap when worktree is off or the sanity clamp applies.
   expect(snap?.maxConcurrentPerRootStored).toBe(99);
   expect(snap?.worktreeMode).toBe(true);
   expect(snap?.autopilotEligibleEpicIds).toEqual(["fn-1-foo", "fn-2-bar"]);

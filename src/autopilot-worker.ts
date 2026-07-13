@@ -127,11 +127,12 @@ import {
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
-import { loadReadinessInputs } from "./readiness-inputs";
+import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
 import {
   type BaseDriftEntry,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
+  closerJobFinished,
   type DispatchKey,
   dispatchKey,
   type EpicRecoverVerdict,
@@ -310,6 +311,7 @@ export {
   reconcile,
   recoverFailureDispatchId,
   SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   verbForVerdict,
   WORKER_EFFORT,
   WORKER_MODEL,
@@ -623,6 +625,14 @@ export interface LiveDispatch {
  * the core stays pure (the test suite drives the same paths with fakes
  * — no real worker spawn).
  */
+export const CLOSE_RECOVERY_MARKER =
+  "autopilot-close-recovery: prior closer finished after lane merged";
+export const CLOSE_RECOVERY_TIMEOUT_MS = 60_000;
+
+export type CloseRecoveryStampResult =
+  | { ok: true; alreadyClosed: boolean }
+  | { ok: false; detail: string };
+
 export interface ConfirmRunningDeps {
   /** Spawn the worker in a managed window keyed by `name`. keeper agent is the sole
    *  launch transport: it builds its invocation from `spec` (the unwrapped
@@ -809,6 +819,15 @@ export interface ConfirmRunningDeps {
    * Mirrors the same probe the recover glue passes into `worktree.recover`.
    */
   isEpicDone(epicId: string): Promise<boolean>;
+  /**
+   * Land the recovery-only terminal epic stamp through the plan CLI. The pure
+   * decision emits this action only after a positive lane-ancestry fact and prior
+   * finished closer; failures remain level-triggered and retry next cycle.
+   */
+  stampEpicCloseRecovery?(
+    epicId: string,
+    projectDir: string,
+  ): Promise<CloseRecoveryStampResult>;
   /**
    * The merge-suite gate probe threaded into `worktree.finalizeEpic` (the {@link
    * isEpicDone} precedent): given a PROSPECTIVE lane→default merged commit, run the
@@ -2941,6 +2960,75 @@ export async function computeMergedLaneEntries(
   return out;
 }
 
+/**
+ * Prove the narrow close-recovery condition from live producer observations.
+ * A candidate must still be open, have every task administratively done, have a
+ * finished prior closer, and have every lane-cutting repo positively report the
+ * still-present epic branch as an ancestor of local default. A missing branch,
+ * failed default lookup, ancestry error, or throwing probe yields no fact.
+ */
+export async function computeCloseRecoveryEligibleIds(
+  epics: readonly Epic[],
+  jobs: Map<string, Job>,
+  livePaneIds: ReadonlySet<string> | null,
+  worktreeRepoByEpicId: ReadonlyMap<string, WorktreeRepoResolution>,
+  run: WorktreeGitRunner = gitExec,
+): Promise<Set<string>> {
+  const eligible = new Set<string>();
+  const defaultBranchByRepo = new Map<string, string | null>();
+  const localDefault = async (repoDir: string): Promise<string | null> => {
+    if (defaultBranchByRepo.has(repoDir)) {
+      return defaultBranchByRepo.get(repoDir) ?? null;
+    }
+    let branch: string | null;
+    try {
+      branch = await gitResolveDefaultBranch(repoDir, run);
+    } catch {
+      branch = null;
+    }
+    defaultBranchByRepo.set(repoDir, branch);
+    return branch;
+  };
+
+  for (const epic of epics) {
+    if (
+      epic.status === "done" ||
+      !epic.tasks.every((task) => task.worker_phase === "done") ||
+      !closerJobFinished(jobs, epic.epic_id, livePaneIds)
+    ) {
+      continue;
+    }
+    const resolution = worktreeRepoByEpicId.get(epic.epic_id);
+    if (resolution === undefined) {
+      continue;
+    }
+    const repos = worktreeLaneRepoDirs(resolution);
+    if (repos.length === 0) {
+      continue;
+    }
+    const lane = baseBranchFor(epic.epic_id);
+    let allMerged = true;
+    try {
+      for (const repoDir of repos) {
+        const defaultBranch = await localDefault(repoDir);
+        if (
+          defaultBranch === null ||
+          !(await gitIsAncestorOf(repoDir, lane, defaultBranch, run))
+        ) {
+          allMerged = false;
+          break;
+        }
+      }
+    } catch {
+      allMerged = false;
+    }
+    if (allMerged) {
+      eligible.add(epic.epic_id);
+    }
+  }
+  return eligible;
+}
+
 /** Defaults until durable autopilot config supplies these producer inputs. */
 export const DEFAULT_BASE_DRIFT_THRESHOLDS = {
   behindCount: 15,
@@ -3713,6 +3801,114 @@ function normalizeWorktreeAttributionKey(p: string): string {
  */
 export const BASE_REFRESH_COOLDOWN_SEC = 15 * 60;
 
+async function readBoundedProcessText(
+  stream: ReadableStream<Uint8Array> | null,
+  maxBytes = 16 * 1024,
+): Promise<string> {
+  if (stream === null) return "";
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const room = maxBytes - size;
+      const chunk = value.byteLength <= room ? value : value.subarray(0, room);
+      chunks.push(chunk);
+      size += chunk.byteLength;
+    }
+  } finally {
+    if (size >= maxBytes) {
+      await reader.cancel().catch(() => {});
+    }
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+export function buildCloseRecoveryStampArgv(
+  epicId: string,
+  projectDir: string,
+  execPath = process.execPath,
+  keeperRoot = KEEPER_ROOT,
+): string[] {
+  return [
+    execPath,
+    join(keeperRoot, "cli", "keeper.ts"),
+    "plan",
+    "epic",
+    "close",
+    epicId,
+    "--reason",
+    CLOSE_RECOVERY_MARKER,
+    "--project",
+    projectDir,
+  ];
+}
+
+export function classifyCloseRecoveryStampExit(
+  epicId: string,
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+): CloseRecoveryStampResult {
+  if (exitCode === 0) return { ok: true, alreadyClosed: false };
+  const output = `${stdout}\n${stderr}`;
+  if (output.includes(`Epic ${epicId} is already done`)) {
+    return { ok: true, alreadyClosed: true };
+  }
+  return {
+    ok: false,
+    detail: `exit ${exitCode}: ${output.trim().slice(0, 2_000) || "no output"}`,
+  };
+}
+
+/** Run the plan-owned epic-close mutation with an exact argv and hard deadline. */
+export async function stampEpicCloseRecovery(
+  epicId: string,
+  projectDir: string,
+  timeoutMs = CLOSE_RECOVERY_TIMEOUT_MS,
+): Promise<CloseRecoveryStampResult> {
+  try {
+    const proc = Bun.spawn(buildCloseRecoveryStampArgv(epicId, projectDir), {
+      cwd: projectDir,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = readBoundedProcessText(proc.stdout);
+    const stderr = readBoundedProcessText(proc.stderr);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = Symbol("close-recovery-timeout");
+    const deadline = new Promise<typeof timedOut>((resolve) => {
+      timer = setTimeout(() => resolve(timedOut), timeoutMs);
+    });
+    const exit = await Promise.race([proc.exited, deadline]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (exit === timedOut) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // The process may have exited at the deadline edge.
+      }
+      await proc.exited.catch(() => {});
+      await Promise.all([stdout, stderr]);
+      return { ok: false, detail: `timed out after ${timeoutMs}ms` };
+    }
+    const [out, err] = await Promise.all([stdout, stderr]);
+    return classifyCloseRecoveryStampExit(epicId, exit, out, err);
+  } catch (err) {
+    return { ok: false, detail: errMsg(err) };
+  }
+}
+
 export async function runReconcileCycle(
   decision: ReconcileDecision,
   state: ReconcileState,
@@ -3836,6 +4032,42 @@ export async function runReconcileCycle(
       }
     }
   }
+  // Start the bounded plan mutation without holding the reconcile cycle open.
+  // The shared close key remains in-flight until settlement, so a later cycle
+  // cannot launch a closer or a second stamp over the same epic.
+  for (const stamp of decision.closeRecoveryStamps) {
+    if (signal.aborted) return;
+    if (state.inFlight.has(stamp.key)) continue;
+    state.inFlight.add(stamp.key);
+    const attempt = deps.stampEpicCloseRecovery
+      ? deps.stampEpicCloseRecovery(stamp.epicId, stamp.projectDir)
+      : Promise.resolve({
+          ok: false as const,
+          detail: "close recovery stamp dependency absent",
+        });
+    void attempt
+      .then((result) => {
+        if (result.ok) {
+          const stampedAt = deps.now();
+          state.redispatchCooldown.set(stamp.key, stampedAt);
+          state.finalizerGuard.set(stamp.epicId, stampedAt);
+        } else {
+          console.error(
+            `[autopilot-worker] close recovery stamp ${stamp.epicId}: ${result.detail}`,
+          );
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[autopilot-worker] close recovery stamp ${stamp.epicId} threw (retrying next cycle):`,
+          err,
+        );
+      })
+      .finally(() => {
+        state.inFlight.delete(stamp.key);
+      });
+  }
+
   // One-at-a-time: each await covers the full confirm window for that dispatch
   // before the next launch starts (which IS the stagger).
   for (const plan of decision.launches) {
@@ -7444,6 +7676,7 @@ export async function loadReconcileSnapshot(
   // pane shows a lingering wrapper/launcher command. Injectable so tests drive the
   // dead/live matrix without a real process; defaults to {@link isPidAlive}.
   pidAlive: (pid: number) => boolean = isPidAlive,
+  readinessQuery: ReadinessQuery = runQuery,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -7464,6 +7697,7 @@ export async function loadReconcileSnapshot(
   // MOVED (not copied) — the epics merge/dedup, the pending-dispatch builder, and
   // the git-seed gate all live in that ONE place now.
   const {
+    readinessDegraded,
     epics,
     jobs,
     subagentInvocations,
@@ -7471,7 +7705,7 @@ export async function loadReconcileSnapshot(
     pendingDispatches,
     unseededRoots,
     maxConcurrentPerRoot,
-  } = loadReadinessInputs(db);
+  } = loadReadinessInputs(db, readinessQuery);
 
   const failedKeys = new Set<DispatchKey>();
   const recoverFailureIds = new Set<string>();
@@ -7871,6 +8105,15 @@ export async function loadReconcileSnapshot(
     ? await computeMergedLaneEntries(epics, worktreeRepoByEpicId)
     : [];
 
+  const closeRecoveryEligibleIds = worktreeMode
+    ? await computeCloseRecoveryEligibleIds(
+        epics,
+        jobs,
+        livePaneIds,
+        worktreeRepoByEpicId,
+      )
+    : new Set<string>();
+
   // Base drift is a separate producer observation. It reuses the resolved lane
   // repos, resolves each local default once, and remains inert (including all git
   // reads) while worktree mode is OFF.
@@ -7908,6 +8151,7 @@ export async function loadReconcileSnapshot(
   const worktreesRoot = worktreeMode ? `${homedir()}/worktrees` : undefined;
 
   return {
+    readinessDegraded,
     epics,
     jobs,
     subagentInvocations,
@@ -7945,6 +8189,7 @@ export async function loadReconcileSnapshot(
     worktreeKnownRoots,
     deferredEpicIds,
     landedLaneEntries,
+    closeRecoveryEligibleIds,
     baseDriftEntries,
     staleBaseLaneEntries,
     liveAttributedDirtyByWorktree,
@@ -8385,6 +8630,8 @@ function main(): void {
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.
     isEpicDone: (epicId) => isEpicDoneById(db, epicId),
+    stampEpicCloseRecovery: (epicId, projectDir) =>
+      stampEpicCloseRecovery(epicId, projectDir),
     // The merge-suite gate probe: before local default advances, finalize runs the
     // fast suite against the prospective merged commit on a detached scratch worktree.
     // Real git + a real suite run (a producer side effect, never a fold).
@@ -8436,6 +8683,9 @@ function main(): void {
         const snapshot = await loadReconcileSnapshot(db, () =>
           paneOps.listPanes(),
         );
+        if (snapshot.readinessDegraded) {
+          continue;
+        }
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
         // operator projection. Once per cycle, regardless of paused/playing (the
         // verdict is observational, not a dispatch action); the dep dedupes so a

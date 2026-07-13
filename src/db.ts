@@ -4504,16 +4504,15 @@ export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
 /**
  * The IN-MEMORY default for the runtime-settable PER-ROOT dispatch concurrency
  * count — used until a `set_autopilot_config` sets
- * `autopilot_state.max_concurrent_per_root`. `1` = today's hardcoded
- * one-task-per-root mutex (N=1 is byte-identical to the pre-feature board);
- * a positive integer N grants up to N concurrent tasks per root, distributed
- * fairly across the root's epics (the allocator lands in task .2). Unlike the
- * global cap, this has NO unlimited sentinel — the stored column is durable
- * intent, and the EFFECTIVE cap consumers dispatch against is derived through
- * {@link effectivePerRootCap} (worktree off ⇒ 1; worktree on ⇒ the stored
- * positive integer, else this default).
+ * `autopilot_state.max_concurrent_per_root`. `1` = one-task-per-root; a positive
+ * integer N grants up to N concurrent tasks per root, distributed fairly across
+ * the root's epics. Unlike the global cap, this has NO unlimited sentinel — the
+ * stored column is durable intent, and the EFFECTIVE cap consumers dispatch
+ * against is derived through {@link effectivePerRootCap} (worktree off ⇒ 1;
+ * worktree on ⇒ the stored positive integer, capped, else this default).
  */
 export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
+export const MAX_EFFECTIVE_CONCURRENT_PER_ROOT = 8;
 
 /**
  * Derive the EFFECTIVE per-root dispatch concurrency cap from the durable STORED
@@ -4523,11 +4522,11 @@ export const DEFAULT_MAX_CONCURRENT_PER_ROOT = 1;
  * boundary: with it OFF every worker of a root shares the one main checkout, so
  * the effective cap is ALWAYS 1 (concurrent same-checkout workers would corrupt
  * each other's working tree + index); with it ON each task forks its own lane, so
- * the stored intent is honored. The stored value is durable — it survives a
- * worktree toggle untouched, so an OFF→ON flip restores the prior cap with no
- * re-set. Fails closed: a missing / null / non-integer / non-positive stored
- * value derives to 1, never permissive. No upper clamp — the ceiling is
- * unbounded. Pure.
+ * the stored intent is honored up to the sanity ceiling. The stored value is
+ * durable — it survives a worktree toggle untouched, so an OFF→ON flip restores
+ * the prior cap with no re-set. Fails closed: a missing / null / non-integer /
+ * non-positive stored value derives to 1, never permissive. A sanity ceiling
+ * keeps a fat-fingered stored value from flooding dispatch. Pure.
  */
 export function effectivePerRootCap(
   stored: unknown,
@@ -4537,7 +4536,7 @@ export function effectivePerRootCap(
     return DEFAULT_MAX_CONCURRENT_PER_ROOT;
   }
   return typeof stored === "number" && Number.isInteger(stored) && stored > 0
-    ? stored
+    ? Math.min(stored, MAX_EFFECTIVE_CONCURRENT_PER_ROOT)
     : DEFAULT_MAX_CONCURRENT_PER_ROOT;
 }
 

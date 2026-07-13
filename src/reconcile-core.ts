@@ -616,6 +616,9 @@ export function isInCooldown(
  * decides "did anything actually change this wake".
  */
 export interface ReconcileSnapshot {
+  /** The shared readiness-input read returned an ERROR frame. This is an
+   *  absence of observation, so dispatch and reap decisions defer this cycle. */
+  readinessDegraded: boolean;
   epics: Epic[];
   jobs: Map<string, Job>;
   subagentInvocations: SubagentInvocation[];
@@ -843,14 +846,10 @@ export interface ReconcileSnapshot {
   maxConcurrentJobs: number | null;
   /**
    * The PER-ROOT dispatch concurrency count N, read FRESH from the
-   * `autopilot_state` singleton's `max_concurrent_per_root` column each cycle
-   * (resolved `column ?? DEFAULT_MAX_CONCURRENT_PER_ROOT` = 1 — an absent/never-set
-   * row, NULL, or a non-positive value = the in-memory default, byte-identical to
-   * today's one-task-per-root mutex). Projection-pull only (no `workerData`, no
-   * config) so a runtime `set_autopilot_config` lands the next cycle and N survives
-   * a restart. Refreshed onto {@link ReconcileState.maxConcurrentPerRoot} in the
-   * cycle glue. RESERVED for task .2's round-robin allocator; until .2 lands it is
-   * carried but unconsumed (the hardcoded N=1 mutex still runs).
+   * `autopilot_state` singleton's effective per-root cap each cycle. Projection-pull
+   * only (no `workerData`, no config) so a runtime `set_autopilot_config` lands
+   * the next cycle and N survives a restart. Refreshed onto
+   * {@link ReconcileState.maxConcurrentPerRoot} in the cycle glue.
    */
   maxConcurrentPerRoot: number;
   /**
@@ -859,8 +858,7 @@ export interface ReconcileSnapshot {
    * absent/never-set row, NULL, or 0 = OFF, the byte-identical no-worktree
    * dispatch; only a stored `1` = ON). Projection-pull only (no `workerData`, no
    * config) so a runtime `set_autopilot_config` lands the very next cycle and the
-   * toggle survives a restart for free. RESERVED for the downstream worktree tasks
-   * (.2+); until they land it is carried but unconsumed (dispatch is unchanged).
+   * toggle survives a restart for free.
    */
   worktreeMode: boolean;
   /**
@@ -919,6 +917,13 @@ export interface ReconcileSnapshot {
    * consumer degrades `landed` to `done`). Optional so a test snapshot may omit it.
    */
   landedLaneEntries?: readonly LaneMergedEntry[];
+  /**
+   * Epic ids whose producer-side live-git probe proved the recovery-only close
+   * conditions: every task is done, the still-present epic lane is an ancestor of
+   * local default, and a prior closer finished while the epic remains open. The
+   * pure reconciler reads only this plain fact; it never probes git itself.
+   */
+  closeRecoveryEligibleIds?: ReadonlySet<string>;
   /**
    * The STALE-BASE lane set (fn-1127) — every epic whose already-cut worktree lane
    * `keeper/epic/<id>` was forked off a base DEFINITIVELY MISSING a satisfied
@@ -1127,12 +1132,10 @@ export interface ReconcileState {
   maxConcurrentJobs: number | null;
   /**
    * Per-root dispatch concurrency count N this reconciler grants per root.
-   * REFRESHED each cycle from {@link ReconcileSnapshot.maxConcurrentPerRoot}
-   * (`autopilot_state.max_concurrent_per_root ?? DEFAULT` = 1) in the cycle glue
-   * BEFORE `reconcile()` reads it — so a runtime `set_autopilot_config` lands on
-   * the next cycle. Held on `state` (not read straight off the snapshot) for the
-   * same reason as `maxConcurrentJobs`. RESERVED for task .2's round-robin
-   * allocator; until .2 lands the hardcoded N=1 mutex still runs.
+   * REFRESHED each cycle from {@link ReconcileSnapshot.maxConcurrentPerRoot} in
+   * the cycle glue BEFORE `reconcile()` reads it — so a runtime
+   * `set_autopilot_config` lands on the next cycle. Held on `state` (not read
+   * straight off the snapshot) for the same reason as `maxConcurrentJobs`.
    */
   maxConcurrentPerRoot: number;
 }
@@ -1337,8 +1340,15 @@ export interface WorktreeReject {
  * must NOT recompute readiness) and holds task ids + epic ids; the completion-reap
  * predicate keys off `<id>` only.
  */
+export interface CloseRecoveryStamp {
+  epicId: string;
+  key: DispatchKey;
+  projectDir: string;
+}
+
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
+  closeRecoveryStamps: CloseRecoveryStamp[];
   completedRowIds: Set<string>;
   /** Plain producer-probed base-drift data, carried without any git/clock reads. */
   baseDriftEntries: readonly BaseDriftEntry[];
@@ -1683,6 +1693,17 @@ export function isStoppedJobLive(
 export const SLOT_RECLAIM_GRACE_SEC = 120;
 
 /**
+ * Blast-radius bound on pane KILLS a single occupancy sweep may issue — mirrors
+ * autoclose's {@link AUTOCLOSE_MAX_KILLS_PER_PULSE} so one bad projection frame
+ * cannot cascade into a mass window close. Over-cap dead candidates DOWNGRADE to
+ * visibility-only `slot-occupied` (never dropped) and are reconsidered next cycle,
+ * since their `updated_at`/`state` persist — no local grace map is needed. The
+ * kept set is chosen deterministically (lowest `(verb, id)` slot key wins) so it is
+ * stable across cycles, never flaky.
+ */
+export const SLOT_RECLAIM_MAX_PER_SWEEP = 5;
+
+/**
  * The idle-shell foreground command names the launch wrapper's trailing
  * `exec $SHELL -l -i` tail reports via tmux `pane_current_command` once the hosted
  * claude exits. CONSERVATIVE by construction — every entry is unambiguously a shell,
@@ -1767,19 +1788,28 @@ export interface SlotOccupancyDecision {
 const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
 
 /**
- * Surface — and, when provably dead, reclaim — a slot held by a stopped-but-LIVE
- * session, so a wedged dispatch slot is never silent. For each `stopped` job whose
- * pane is still live AND whose key `reconcile` still wants to dispatch (the mint is
- * blocked): a bare-shell pane past its grace is DEAD → kill it and mint
- * `slot-reclaimed`; anything else (a live/parked `claude`, or a bare shell still in
- * grace) is `slot-occupied` visibility-only. Every OPEN slot row whose key got no
- * fresh signal (occupant gone / resumed to `working` / verdict completed) is cleared.
+ * Surface — and, when dead, reclaim — a slot held by a stopped-but-LIVE session, so
+ * a wedged dispatch slot is never silent. For each `stopped` job whose pane is still
+ * live AND whose key `reconcile` still wants to dispatch (the mint is blocked), a
+ * pane past its grace is DEAD → kill it and mint `slot-reclaimed` when ANY of three
+ * proofs hold: the daemon's proven-dead pid verdict, a bare-shell tail command, or
+ * DERIVED IDLE — a session that went `working` (`active_since` non-null) and ended
+ * its turn but stays resident. A NEVER-started row (`active_since` null) is not
+ * derived-idle: it never ran a turn, so the derived arm never reclaims it (the
+ * proven-dead / bare-shell arms still fire on their own evidence). Anything else (a
+ * live/parked `claude` still mid-turn, or any candidate still in grace) is
+ * `slot-occupied` visibility-only. Every OPEN slot row whose key got no fresh signal
+ * (occupant gone / resumed to `working` / verdict completed) is cleared.
+ *
+ * Reclaims are blast-capped at {@link SLOT_RECLAIM_MAX_PER_SWEEP} per sweep, chosen
+ * by lowest `(verb, id)` key; over-cap dead candidates downgrade to `slot-occupied`
+ * (never dropped) and are reconsidered next cycle.
  *
  * Pure + re-fold-safe: reads only the snapshot's liveness fields and the readiness-
  * derived `wantsDispatch` gate. INERT (empty) when paused or the probe is degraded
  * (`livePaneIds`/`paneCommandById` null) — the conservative silent-occupy fallback.
- * A killed resumable session is the catastrophic failure, so the DEAD criterion is
- * strictly the bare-shell-past-grace conjunction; when in doubt it surfaces only.
+ * A killed session mid-turn is the catastrophic failure, so a `working` row is never
+ * a candidate and every DEAD criterion is grace-aged; when in doubt it surfaces only.
  */
 export function computeSlotOccupancy(
   input: SlotOccupancyInput,
@@ -1793,6 +1823,17 @@ export function computeSlotOccupancy(
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
   const activeKeys = new Set<string>();
+  // Per-key candidates collected before any signal is pushed, so the reclaim blast
+  // cap selects deterministically across the WHOLE sweep, not per iteration.
+  const candidates: {
+    key: string;
+    verb: Verb;
+    id: string;
+    paneId: string;
+    command: string | undefined;
+    dir: string | null;
+    dead: boolean;
+  }[] = [];
   for (const job of input.jobs.values()) {
     if (job.state !== "stopped") {
       continue;
@@ -1825,30 +1866,55 @@ export function computeSlotOccupancy(
     // whatever its pane's foreground command shows — a lingering launch-wrapper
     // shell or launcher process holding the pane never masks the verdict. The
     // bare-shell tail stays a SECONDARY proof for the degraded-probe cycle that
-    // carries no pid verdict. Grace-aged either way (never immediate): the kill
+    // carries no pid verdict. Grace-aged every way (never immediate): the kill
     // waits `graceSec` past the last fold so a transient teardown frame is never
     // reaped, and the `wantsDispatch` gate already scopes it to a slot in demand.
     const provenDead = input.provenDeadJobIds?.has(job.job_id) ?? false;
     const graceElapsed = input.now - job.updated_at >= graceSec;
-    const dead = graceElapsed && (provenDead || isBareShellCommand(command));
+    // Derived idle: a session that went `working` (`active_since` non-null) and
+    // ended its turn but stays resident — the residual, once the pid verdict and
+    // bare-shell tail are excluded. A NEVER-started row (`active_since` null) never
+    // ran a turn (a still-binding launch, not a finished one), so it is NOT
+    // derived-idle; only the pid/bare-shell arms may reclaim it. `active_since` is
+    // held across turn end (never cleared / backfilled), so it reads solely as a
+    // never-started gate here, never as a turn-activity signal.
+    const neverStarted = job.active_since == null;
+    const derivedIdle =
+      !neverStarted && !provenDead && !isBareShellCommand(command);
+    const dead =
+      graceElapsed &&
+      (provenDead || isBareShellCommand(command) || derivedIdle);
+    candidates.push({ key, verb, id, paneId, command, dir: job.cwd, dead });
+  }
+  // Blast cap: at most SLOT_RECLAIM_MAX_PER_SWEEP dead candidates become real kills
+  // this sweep (lowest `(verb, id)` key wins, deterministic); the rest downgrade to
+  // visibility-only `slot-occupied`, retried next cycle.
+  const reclaimKeys = new Set(
+    candidates
+      .filter((c) => c.dead)
+      .map((c) => c.key)
+      .sort()
+      .slice(0, SLOT_RECLAIM_MAX_PER_SWEEP),
+  );
+  for (const c of candidates) {
     // Reason text is STABLE across cycles (pane id + command only, never the growing
     // idle age) so the producer change-gate suppresses re-emits — one event per
     // condition, not one per cycle. The row's `ts` carries the age. The
     // occupied→dead transition IS a reason change, so it re-emits (actionable).
-    if (dead) {
+    if (c.dead && reclaimKeys.has(c.key)) {
       failures.push({
-        verb,
-        id,
-        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${verb} session (pane ${paneId} ${command ?? "?"})`,
-        dir: job.cwd,
-        reclaimPaneId: paneId,
+        verb: c.verb,
+        id: c.id,
+        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${c.verb} session (pane ${c.paneId} ${c.command ?? "?"})`,
+        dir: c.dir,
+        reclaimPaneId: c.paneId,
       });
     } else {
       failures.push({
-        verb,
-        id,
-        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${verb} session holds the slot (pane ${paneId} ${command ?? "?"})`,
-        dir: job.cwd,
+        verb: c.verb,
+        id: c.id,
+        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${c.verb} session holds the slot (pane ${c.paneId} ${c.command ?? "?"})`,
+        dir: c.dir,
         reclaimPaneId: null,
       });
     }
@@ -1953,7 +2019,22 @@ export function reconcile(
   state: ReconcileState,
   now: number,
 ): ReconcileDecision {
+  if (snapshot.readinessDegraded) {
+    return {
+      launches: [],
+      closeRecoveryStamps: [],
+      completedRowIds: new Set(),
+      baseDriftEntries: [],
+      worktreeFinalize: [],
+      worktreeSinkProvision: [],
+      finalizeFailureIds: new Set(),
+      slotOccupancy: [],
+      slotOccupancyClears: [],
+    };
+  }
+
   const launches: PlannedLaunch[] = [];
+  const closeRecoveryStamps: CloseRecoveryStamp[] = [];
 
   // The EPHEMERAL cross-epic merge-gate defer map (epic id → its deferred lane
   // repos), probed git-side ONCE per cycle in `loadReconcileSnapshot` and read here
@@ -1992,8 +2073,8 @@ export function reconcile(
   // (the default) whenever worktree mode is OFF — then `computeReadiness` keys on
   // `effectiveRoot`, byte-identical to today. ON: `laneKeyById` re-keys each row on
   // its derived lane worktree path so every worktree is a CAP-1 lane (two agents in
-  // one index = corruption) while parallel sibling lanes run concurrently, and
-  // `byEpicId` feeds the dispatch-side `attachWorktreeGeometry` post-pass — both
+  // one index = corruption); the allocator then applies the per-root cap over true
+  // roots. `byEpicId` feeds the dispatch-side `attachWorktreeGeometry` post-pass — both
   // consuming the SAME plan, so the gate and dispatch never diverge.
   const worktreeGeometry: PreparedWorktreeGeometry = snapshot.worktreeMode
     ? prepareWorktreeGeometry(
@@ -2035,9 +2116,9 @@ export function reconcile(
     // across its epics. The board latches the SAME N off `BootStatus`, so both
     // consumers compute identical demotions. Default 1 = one-task-per-root.
     state.maxConcurrentPerRoot,
-    // The worktree-mode lane re-key (empty when OFF). Re-keys the allocator
-    // onto lane paths (cap-1 per lane) without diverging from the dispatch-side
-    // worktree geometry, which derives the SAME plan in `attachWorktreeGeometry`.
+    // The worktree-mode lane re-key (empty when OFF). Enforces cap-1 per lane
+    // before the per-root fill without diverging from the dispatch-side worktree
+    // geometry, which derives the SAME plan in `attachWorktreeGeometry`.
     laneKeyById,
     // The proven-dead owning-worker set (recorded pid re-proved gone at snapshot
     // load — the SAME lifecycle verdict `computeSlotOccupancy` reclaims a slot
@@ -2353,30 +2434,42 @@ export function reconcile(
         // task push, so a closer can't blow the cap.
         budget > 0;
       if (okToPlan && projectDir !== "") {
-        launches.push({
-          verb: closeVerb,
-          id: epicId,
-          key: closeKey,
-          cwd: projectDir,
-          workerCommand: buildWorkerCommand(
-            closeVerb,
-            epicId,
-            projectDir,
-            snapshot.closeModel,
-            snapshot.closeEffort,
-          ),
-          model: snapshot.closeModel,
-          effort: snapshot.closeEffort,
-          tier: null,
-          // A `close` row is cell-less — it loads no per-cell worker plugin, and
-          // names no capability model.
-          cellModel: null,
-          pluginDir: null,
-          // Every close-row launch is an epic finalizer (`close`);
-          // the cycle glue stamps the per-epic guard for these.
-          isEpicFinalizer: true,
-        });
-        budget--;
+        const recoverDirectly =
+          snapshot.worktreeMode &&
+          snapshot.closeRecoveryEligibleIds?.has(epicId) === true &&
+          epic.tasks.every((task) => task.worker_phase === "done") &&
+          closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds);
+        if (recoverDirectly) {
+          if (!epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)) {
+            closeRecoveryStamps.push({ epicId, key: closeKey, projectDir });
+            budget--;
+          }
+        } else {
+          launches.push({
+            verb: closeVerb,
+            id: epicId,
+            key: closeKey,
+            cwd: projectDir,
+            workerCommand: buildWorkerCommand(
+              closeVerb,
+              epicId,
+              projectDir,
+              snapshot.closeModel,
+              snapshot.closeEffort,
+            ),
+            model: snapshot.closeModel,
+            effort: snapshot.closeEffort,
+            tier: null,
+            // A `close` row is cell-less — it loads no per-cell worker plugin, and
+            // names no capability model.
+            cellModel: null,
+            pluginDir: null,
+            // Every close-row launch is an epic finalizer (`close`);
+            // the cycle glue stamps the per-epic guard for these.
+            isEpicFinalizer: true,
+          });
+          budget--;
+        }
       }
     }
   }
@@ -2466,6 +2559,7 @@ export function reconcile(
 
   return {
     launches,
+    closeRecoveryStamps,
     completedRowIds,
     baseDriftEntries,
     worktreeFinalize,
@@ -2560,10 +2654,9 @@ export function prepareWorktreeGeometry(
     if (resolution !== undefined && resolution.kind === "disabled") {
       // A worktree-DISABLED repo: dispatch SEQUENTIALLY on the shared checkout,
       // never a lane. Key EVERY task id AND the epic id (close row) to the bare
-      // resolved toplevel (NOT a per-lane path) so the allocator's lane-keyed cap-1
-      // mutex serializes one worker per repo — the load-bearing safety invariant
-      // (a non-empty `laneKeyById` is what forces cap-1 even under
-      // `max_concurrent_per_root>1`). Record the `disabled` geometry, NOT a reject.
+      // resolved toplevel (NOT a per-lane path) so the allocator's lane-keyed
+      // cap-1 pass serializes one worker per repo before the root-cap fill. Record
+      // the `disabled` geometry, NOT a reject.
       const repoDir = resolution.repoDir;
       byEpicId.set(epic.epic_id, {
         kind: "disabled",

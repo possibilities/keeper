@@ -19,6 +19,8 @@ import {
 } from "../src/autoclose-worker";
 import type { LaunchResult, PaneInfo } from "../src/exec-backend";
 import type { ReadinessSnapshot, Verdict } from "../src/readiness";
+import type { ReadinessQuery } from "../src/readiness-inputs";
+import { runQuery } from "../src/server-worker";
 import { freshMemDb } from "./helpers/template-db";
 
 // ---------------------------------------------------------------------------
@@ -854,6 +856,71 @@ const escalationBackend = (killed: string[], windowName: string) => ({
     killed.push(paneId);
     return { ok: true };
   },
+});
+
+const jobsReadError: ReadinessQuery = (db, worldRev, frame, out, nowSec) => {
+  if (frame.collection === "jobs") {
+    return {
+      type: "error",
+      id: frame.id,
+      collection: "jobs",
+      rev: worldRev,
+      code: "read_failed",
+      message: "jobs unavailable",
+    };
+  }
+  return runQuery(db, worldRev, frame, out, nowSec);
+};
+
+test("autoclosePulse: an errored jobs read defers reaping and preserves grace", async () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at, pid, start_time)
+     VALUES
+       ('paneljob', 1, 1, 'stopped', 'panel::claude::q1', NULL, NULL,
+        NULL, 'tmux', '%9', 'panels', 'gen-9', NULL, NULL, 4242, '55')`,
+  );
+
+  const killed: string[] = [];
+  const intents: AutocloseIntentMessage[] = [];
+  const state: AutoclosePulseState = {
+    graceMap: new Map([["paneljob", 1]]),
+  };
+  await autoclosePulse(
+    db,
+    {
+      listPanes: async () => [
+        pane({
+          tmuxGenerationId: "gen-9",
+          paneId: "%9",
+          windowId: "@9",
+          sessionName: "panels",
+          windowName: "panel::claude::q1",
+        }),
+      ],
+      killWindow: async (paneId: string) => {
+        killed.push(paneId);
+        return { ok: true };
+      },
+    },
+    state,
+    {
+      resolveConfig: () => CONFIG,
+      now: () => 1_000,
+      postIntent: (intent) => intents.push(intent),
+      noteLine: () => {},
+      readinessQuery: jobsReadError,
+    },
+  );
+
+  expect(killed).toEqual([]);
+  expect(intents).toEqual([]);
+  expect(state.graceMap.get("paneljob")).toBe(1);
+  db.close();
 });
 
 test("autoclosePulse: a due unblock session whose block instance is resolved is reaped", async () => {

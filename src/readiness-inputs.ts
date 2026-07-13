@@ -37,12 +37,17 @@ import {
 import { runQuery } from "./server-worker";
 import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 
+export type ReadinessQuery = typeof runQuery;
+
 /**
  * The DB-sourced argument set both readiness consumers feed to
  * {@link computeReadiness} identically. Field names/shapes mirror the
  * `computeReadiness` parameters one-for-one.
  */
 export interface ReadinessInputs {
+  /** A collection read returned an ERROR frame, so this input set is not a
+   *  complete observation and consumers must defer the tick. */
+  readinessDegraded: boolean;
   /** Open scope merged with the recently-done window, deduped (open wins),
    *  ordered through the single scheduling seam. */
   epics: Epic[];
@@ -75,7 +80,11 @@ export interface ReadinessInputs {
  * Deterministic given the projection state (same reads, same ordering seam as
  * the reconciler), so two callers over the same seeded db get identical inputs.
  */
-export function loadReadinessInputs(db: Database): ReadinessInputs {
+export function loadReadinessInputs(
+  db: Database,
+  query: ReadinessQuery = runQuery,
+): ReadinessInputs {
+  let readinessDegraded = false;
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
       type: "query" as const,
@@ -83,8 +92,12 @@ export function loadReadinessInputs(db: Database): ReadinessInputs {
       id: `readiness-inputs-${collection}`,
       limit: 0,
     };
-    const res = runQuery(db, 0, frame);
-    return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
+    const res = query(db, 0, frame);
+    if (res.type === "result") {
+      return res.rows as Record<string, unknown>[];
+    }
+    readinessDegraded = true;
+    return [];
   };
 
   // The default-scope (open) epics — the live work set — MERGED with the
@@ -154,6 +167,7 @@ export function loadReadinessInputs(db: Database): ReadinessInputs {
     : new Set<string>();
 
   return {
+    readinessDegraded,
     epics,
     jobs,
     subagentInvocations,

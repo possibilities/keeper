@@ -45,16 +45,21 @@ import { computeEligibleEpics } from "../src/armed-closure";
 import {
   BASE_REFRESH_COOLDOWN_SEC,
   type BaseDriftEntry,
+  buildCloseRecoveryStampArgv,
   buildLaunchArgv,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
   buildWorktreeStatusEntries,
   type CheckoutDesyncProbe,
+  CLOSE_RECOVERY_MARKER,
+  type CloseRecoveryStampResult,
   type ConfirmRunningDeps,
+  classifyCloseRecoveryStampExit,
   classifyResolverOutcome,
   classifyWorktreeRepos,
   closerJobFinished,
   computeBaseDriftEntries,
+  computeCloseRecoveryEligibleIds,
   computeDeferredEpicIds,
   computeDuplicateEpicNumberGroups,
   computeMergedLaneEntries,
@@ -144,6 +149,7 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_REASON,
   SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   type SlotOccupancySignal,
   STALE_BASE_DISTRESS_REASON,
   STALE_BASE_LANE_GRACE_SEC,
@@ -208,9 +214,12 @@ import {
   computeLandedEpicIds,
   projectPendingDispatches,
 } from "../src/readiness-client";
-import { loadReadinessInputs } from "../src/readiness-inputs";
+import {
+  loadReadinessInputs,
+  type ReadinessQuery,
+} from "../src/readiness-inputs";
 import { drain } from "../src/reducer";
-import { readBootStatus } from "../src/server-worker";
+import { readBootStatus, runQuery } from "../src/server-worker";
 import type {
   EmbeddedJob,
   Epic,
@@ -300,6 +309,7 @@ function makeJob(overrides: Partial<Job>): Job {
     start_time: null,
     plan_verb: null,
     plan_ref: null,
+    active_since: null,
     epic_links: [],
     last_api_error_at: null,
     last_api_error_kind: null,
@@ -317,6 +327,7 @@ function makeSnapshot(
   overrides: Partial<ReconcileSnapshot>,
 ): ReconcileSnapshot {
   const snapshot: ReconcileSnapshot = {
+    readinessDegraded: false,
     epics: [],
     jobs: new Map(),
     subagentInvocations: [],
@@ -438,6 +449,7 @@ interface FakeDepsLog {
   // pre-ceiling confirm posts `{rescued:false, stalenessMs:null}`, a
   // ceiling-hit posts `{rescued:true, stalenessMs:<elapsedMs>}`.
   timeoutBackstops: Array<{ rescued: boolean; stalenessMs: number | null }>;
+  closeRecoveryStamps: Array<{ epicId: string; projectDir: string }>;
 }
 
 interface FakeDepsOptions {
@@ -498,6 +510,7 @@ interface FakeDepsOptions {
    * manifest path to drive the `work-plugin-shadowed` DispatchFailed branch.
    */
   probeShadowingWorkManifest?: () => string | null;
+  stampEpicCloseRecovery?: ConfirmRunningDeps["stampEpicCloseRecovery"];
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -514,6 +527,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     findJobCalls: [],
     maxEventIdCalls: 0,
     timeoutBackstops: [],
+    closeRecoveryStamps: [],
   };
   let maxEventId = opts.maxEventId ?? 100;
   const jobsByKey = new Map<string, FoundJob>(opts.jobsByKey ?? []);
@@ -586,6 +600,12 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     realpath: opts.realpath ?? ((p: string) => p),
     probeShadowingWorkManifest: opts.probeShadowingWorkManifest ?? (() => null),
     isEpicDone: opts.isEpicDone ?? (async () => true),
+    async stampEpicCloseRecovery(epicId, projectDir) {
+      log.closeRecoveryStamps.push({ epicId, projectDir });
+      return opts.stampEpicCloseRecovery
+        ? opts.stampEpicCloseRecovery(epicId, projectDir)
+        : { ok: true, alreadyClosed: false };
+    },
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     ceilingMs: opts.ceilingMs ?? 50,
   };
@@ -1065,6 +1085,7 @@ function oneOccupant(over: {
   pane?: string;
   command?: string;
   updated_at?: number;
+  active_since?: number | null;
 }): {
   jobs: Map<string, Job>;
   livePaneIds: Set<string>;
@@ -1081,6 +1102,7 @@ function oneOccupant(over: {
         state: over.state ?? "stopped",
         backend_exec_pane_id: pane,
         updated_at: over.updated_at ?? 800,
+        active_since: over.active_since ?? null,
       }),
     ],
   ]);
@@ -1131,13 +1153,103 @@ test("computeSlotOccupancy: bare shell but WITHIN grace → slot-occupied, NO ki
 });
 
 test("computeSlotOccupancy: a live/parked claude pane → slot-occupied, NEVER killed (even past grace)", () => {
-  // The resumable session: its pane still runs `claude`, so it is NOT provably dead
-  // regardless of age — killing it would be the catastrophic failure.
+  // NEVER-started: `oneOccupant`'s default `active_since` is null, so this row never
+  // ran a turn — the derived-idle arm skips it (it is a still-binding launch, not a
+  // finished session), and its `claude` foreground command is neither a bare shell
+  // nor a proven-dead verdict. Surfaced only, never killed.
   const occ = oneOccupant({ command: "claude", updated_at: 0 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
   expect(out.failures[0].reclaimPaneId).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim + slot-reclaimed", () => {
+  // ADR 0052 core case: a session that WENT working (`active_since` set) then ended
+  // its turn but stays resident holding a wanted slot. Its pane still reads `claude`
+  // (not a bare shell, no proven-dead verdict), yet past grace it is derived-idle →
+  // reclaimed, unlike the never-started row above.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 800,
+    active_since: 500,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  const sig: SlotOccupancySignal = out.failures[0];
+  expect(sig.reclaimPaneId).toBe("%7");
+  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupied, NO kill", () => {
+  // idle 50s < 120s grace: a just-ended turn could be a transient frame, so the
+  // derived-idle arm waits out the grace exactly like the bare-shell arm.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 950,
+    active_since: 500,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: never-started (active_since null) + idle pane past grace → derived-idle arm NEVER reclaims", () => {
+  // The startup-grace guard for the derived-idle arm specifically: a row that never
+  // went `working` is a still-binding launch, not a finished turn — killing it would
+  // race a booting session. Only the proven-dead / bare-shell arms may reclaim it.
+  const occ = oneOccupant({
+    command: "claude",
+    updated_at: 800,
+    active_since: null,
+  });
+  const out = computeSlotOccupancy(slotInput(occ));
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+});
+
+test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgrades to visibility-only", () => {
+  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct started + derived-idle + wanted zombies
+  // past grace. At most the cap are real kills (lowest `(verb, id)` key wins,
+  // deterministic); the rest surface as slot-occupied — never dropped from failures.
+  const n = SLOT_RECLAIM_MAX_PER_SWEEP + 3;
+  const jobs = new Map<string, Job>();
+  const livePaneIds = new Set<string>();
+  const paneCommandById = new Map<string, string>();
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const id = `fn-1-foo.${String(i).padStart(2, "0")}`;
+    const pane = `%${100 + i}`;
+    ids.push(id);
+    jobs.set(
+      `j-${i}`,
+      makeJob({
+        job_id: `j-${i}`,
+        plan_verb: "work",
+        plan_ref: id,
+        state: "stopped",
+        backend_exec_pane_id: pane,
+        updated_at: 800,
+        active_since: 500,
+      }),
+    );
+    livePaneIds.add(pane);
+    paneCommandById.set(pane, "claude");
+  }
+  const out = computeSlotOccupancy(
+    slotInput({ jobs, livePaneIds, paneCommandById }),
+  );
+  // Every candidate is surfaced — nothing silently dropped.
+  expect(out.failures).toHaveLength(n);
+  const reclaimed = out.failures.filter((f) => f.reclaimPaneId !== null);
+  const occupied = out.failures.filter((f) => f.reclaimPaneId === null);
+  expect(reclaimed).toHaveLength(SLOT_RECLAIM_MAX_PER_SWEEP);
+  expect(occupied).toHaveLength(n - SLOT_RECLAIM_MAX_PER_SWEEP);
+  // Deterministic selection: the lowest `(verb, id)` keys are the real reclaims.
+  const reclaimedIds = reclaimed.map((f) => f.id).sort();
+  expect(reclaimedIds).toEqual(ids.slice(0, SLOT_RECLAIM_MAX_PER_SWEEP));
 });
 
 test("computeSlotOccupancy: login `-zsh` past grace is still reclaimed (dash stripped)", () => {
@@ -1542,6 +1654,179 @@ test("reconcile: ready close row → planned `close` launch", () => {
   expect(closePlan).not.toBeUndefined();
   expect(closePlan?.id).toBe("fn-1-foo");
   expect(closePlan?.cwd).toBe("/repo");
+});
+
+test("close recovery: eligible merged epic plans a direct stamp instead of another closer", () => {
+  const epicId = "fn-1-foo";
+  const epic = makeEpic({
+    epic_id: epicId,
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const closer = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map([[closer.job_id, closer]]),
+      livePaneIds: new Set(),
+      worktreeMode: true,
+      closeRecoveryEligibleIds: new Set([epicId]),
+    }),
+    makeState(),
+    0,
+  );
+
+  expect(decision.closeRecoveryStamps).toEqual([
+    { epicId, key: `close::${epicId}`, projectDir: "/repo" },
+  ]);
+  expect(decision.launches.filter((plan) => plan.verb === "close")).toEqual([]);
+});
+
+test("close recovery remains narrow: each missing leg uses the ordinary close decision", () => {
+  const epicId = "fn-1-foo";
+  const doneTask = makeTask({
+    task_id: `${epicId}.1`,
+    epic_id: epicId,
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic = makeEpic({ epic_id: epicId, tasks: [doneTask] });
+  const finishedCloser = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const decide = (overrides: Partial<ReconcileSnapshot>) =>
+    reconcile(
+      makeSnapshot({
+        epics: [epic],
+        jobs: new Map([[finishedCloser.job_id, finishedCloser]]),
+        livePaneIds: new Set(),
+        worktreeMode: true,
+        closeRecoveryEligibleIds: new Set([epicId]),
+        ...overrides,
+      }),
+      makeState(),
+      0,
+    );
+  const expectNormalClose = (decision: ReturnType<typeof reconcile>) => {
+    expect(decision.closeRecoveryStamps).toEqual([]);
+    expect(decision.launches.map((plan) => plan.key)).toContain(
+      `close::${epicId}`,
+    );
+  };
+
+  expectNormalClose(decide({ closeRecoveryEligibleIds: new Set() }));
+  expectNormalClose(decide({ jobs: new Map() }));
+  expectNormalClose(decide({ worktreeMode: false }));
+
+  const unfinished = makeEpic({
+    epic_id: epicId,
+    tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+  });
+  const unfinishedDecision = decide({ epics: [unfinished] });
+  expect(unfinishedDecision.closeRecoveryStamps).toEqual([]);
+  expect(
+    unfinishedDecision.launches.some((plan) => plan.key === `close::${epicId}`),
+  ).toBe(false);
+
+  const occupyingCloser = makeJob({
+    ...finishedCloser,
+    state: "working",
+  });
+  const occupied = decide({
+    jobs: new Map([[occupyingCloser.job_id, occupyingCloser]]),
+  });
+  expect(occupied.closeRecoveryStamps).toEqual([]);
+  expect(
+    occupied.launches.some((plan) => plan.key === `close::${epicId}`),
+  ).toBe(false);
+});
+
+test("close recovery is single-flight and already-closed epics are inert", () => {
+  const epicId = "fn-1-foo";
+  const task = makeTask({
+    task_id: `${epicId}.1`,
+    epic_id: epicId,
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const closer = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const snapshot = makeSnapshot({
+    epics: [makeEpic({ epic_id: epicId, tasks: [task] })],
+    jobs: new Map([[closer.job_id, closer]]),
+    livePaneIds: new Set(),
+    worktreeMode: true,
+    closeRecoveryEligibleIds: new Set([epicId]),
+  });
+  expect(
+    reconcile(
+      snapshot,
+      makeState({ inFlight: new Set([`close::${epicId}`]) }),
+      0,
+    ).closeRecoveryStamps,
+  ).toEqual([]);
+  expect(
+    reconcile(
+      makeSnapshot({
+        ...snapshot,
+        epics: [makeEpic({ status: "done", tasks: [task] })],
+      }),
+      makeState(),
+      0,
+    ).closeRecoveryStamps,
+  ).toEqual([]);
+});
+
+test("close recovery argv records the explicit marker through plan epic close", () => {
+  expect(
+    buildCloseRecoveryStampArgv("fn-7-recover", "/project", "/bun", "/keeper"),
+  ).toEqual([
+    "/bun",
+    "/keeper/cli/keeper.ts",
+    "plan",
+    "epic",
+    "close",
+    "fn-7-recover",
+    "--reason",
+    "autopilot-close-recovery: prior closer finished after lane merged",
+    "--project",
+    "/project",
+  ]);
+  expect(CLOSE_RECOVERY_MARKER).toBe(
+    "autopilot-close-recovery: prior closer finished after lane merged",
+  );
+});
+
+test("close recovery treats the plan CLI's already-done response as idempotent success", () => {
+  expect(
+    classifyCloseRecoveryStampExit(
+      "fn-7-recover",
+      1,
+      "",
+      "Epic fn-7-recover is already done",
+    ),
+  ).toEqual({ ok: true, alreadyClosed: true });
+  expect(
+    classifyCloseRecoveryStampExit("fn-7-recover", 1, "", "plan lock busy"),
+  ).toEqual({ ok: false, detail: "exit 1: plan lock busy" });
 });
 
 test("reconcile: task target_repo override wins over epic project_dir for cwd", () => {
@@ -4632,6 +4917,7 @@ function seedEpicRow(
     status: string;
     updated_at?: number;
     last_validated_at?: string | null;
+    tasks?: Task[];
     /** Epic-level (close-scope) embedded jobs, JSON-serialized. */
     jobs?: EmbeddedJob[];
   },
@@ -4647,7 +4933,7 @@ function seedEpicRow(
     opts.status,
     0,
     opts.updated_at ?? Math.floor(Date.now() / 1000),
-    "[]",
+    JSON.stringify(opts.tasks ?? []),
     "[]",
     JSON.stringify(opts.jobs ?? []),
     "[]",
@@ -4679,6 +4965,22 @@ async function withSeededDb(
   }
 }
 
+function errorReadinessQuery(collection: string): ReadinessQuery {
+  return (db, worldRev, frame, out, nowSec) => {
+    if (frame.collection === collection) {
+      return {
+        type: "error",
+        id: frame.id,
+        collection,
+        rev: worldRev,
+        code: "read_failed",
+        message: `${collection} unavailable`,
+      };
+    }
+    return runQuery(db, worldRev, frame, out, nowSec);
+  };
+}
+
 /** Fold one emitted failure, then prove its structured conflict list re-folds. */
 async function expectConflictedFilesRefold(
   payload: DispatchFailedPayload,
@@ -4708,6 +5010,79 @@ async function expectConflictedFilesRefold(
     expect(select()).toEqual(before);
   });
 }
+
+for (const collection of ["jobs", "epics"]) {
+  test(`loadReadinessInputs marks an ERROR frame for ${collection} as degraded`, async () => {
+    await withSeededDb((db) => {
+      const inputs = loadReadinessInputs(db, errorReadinessQuery(collection));
+      expect(inputs.readinessDegraded).toBe(true);
+    });
+  });
+}
+
+test("an errored jobs read defers dispatch and slot-reclaim classification", async () => {
+  await withSeededDb(async (db) => {
+    const epicId = "fn-20-ready";
+    seedEpicRow(db, epicId, {
+      epic_number: 20,
+      status: "open",
+      tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+    });
+    const snap = await loadReconcileSnapshot(
+      db,
+      undefined,
+      undefined,
+      errorReadinessQuery("jobs"),
+    );
+    expect(snap.readinessDegraded).toBe(true);
+
+    const decision = reconcile(snap, makeState(), 1_000);
+    expect(decision.launches).toEqual([]);
+    expect(decision.slotOccupancy).toEqual([]);
+    expect(decision.slotOccupancyClears).toEqual([]);
+  });
+});
+
+test("a degraded readiness snapshot preserves an open occupancy row", () => {
+  const occupant = oneOccupant({
+    id: "fn-21-ready",
+    command: "zsh",
+    updated_at: 1,
+  });
+  const snap = makeSnapshot({
+    readinessDegraded: true,
+    epics: [readyEpic("fn-21-ready", "/repo-21")],
+    jobs: occupant.jobs,
+    livePaneIds: occupant.livePaneIds,
+    paneCommandById: occupant.paneCommandById,
+    slotOccupancyFailures: [{ verb: "close", id: "fn-21-ready" }],
+    worktreeMode: true,
+    closeRecoveryEligibleIds: new Set(["fn-21-ready"]),
+  });
+
+  const decision = reconcile(snap, makeState(), 1_000);
+  expect(decision.closeRecoveryStamps).toEqual([]);
+  expect(decision.slotOccupancy).toEqual([]);
+  expect(decision.slotOccupancyClears).toEqual([]);
+});
+
+test("a genuinely empty jobs result still dispatches ready work", async () => {
+  await withSeededDb(async (db) => {
+    const epicId = "fn-22-fresh";
+    seedEpicRow(db, epicId, {
+      epic_number: 22,
+      status: "open",
+      tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+    });
+
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.readinessDegraded).toBe(false);
+    expect(snap.jobs.size).toBe(0);
+    expect(
+      reconcile(snap, makeState(), 1_000).launches.map((p) => p.key),
+    ).toEqual([`work::${epicId}.1`]);
+  });
+});
 
 test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcileSnapshot path", async () => {
   await withSeededDb(async (db) => {
@@ -7992,6 +8367,110 @@ test("base refresh driver: cooldown skips churn; after expiry merges local defau
   ).toEqual({ ok: true });
   const merges = expired.commands.filter((args) => args[0] === "merge");
   expect(merges).toEqual([["merge", "--no-edit", "main"]]);
+});
+
+test("close recovery producer retries a failed stamp next cycle and guards a success", async () => {
+  const epicId = "fn-1-foo";
+  const epic = makeEpic({
+    epic_id: epicId,
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const closer = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const snapshot = makeSnapshot({
+    epics: [epic],
+    jobs: new Map([[closer.job_id, closer]]),
+    livePaneIds: new Set(),
+    worktreeMode: true,
+    closeRecoveryEligibleIds: new Set([epicId]),
+  });
+  const decision = reconcile(snapshot, makeState(), 0);
+  expect(decision.launches).toEqual([]);
+  let finishFirst!: (result: CloseRecoveryStampResult) => void;
+  const firstAttempt = new Promise<CloseRecoveryStampResult>((resolve) => {
+    finishFirst = resolve;
+  });
+  let attempts = 0;
+  const { deps, log } = makeFakeDeps({
+    now: 100,
+    stampEpicCloseRecovery: async () => {
+      attempts += 1;
+      return attempts === 1 ? firstAttempt : { ok: true, alreadyClosed: false };
+    },
+  });
+  const state = makeState();
+  const signal = new AbortController().signal;
+  const flushAttempt = async (): Promise<void> => {
+    for (let i = 0; i < 20 && state.inFlight.size > 0; i += 1) {
+      await Promise.resolve();
+    }
+  };
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await runReconcileCycle(
+      decision,
+      state,
+      new Map(),
+      "/bin/zsh",
+      signal,
+      deps,
+    );
+    expect(attempts).toBe(1);
+    expect(state.inFlight.has(`close::${epicId}`)).toBe(true);
+    expect(state.redispatchCooldown.has(`close::${epicId}`)).toBe(false);
+
+    await runReconcileCycle(
+      decision,
+      state,
+      new Map(),
+      "/bin/zsh",
+      signal,
+      deps,
+    );
+    expect(attempts).toBe(1);
+
+    finishFirst({ ok: false, detail: "temporary plan lock" });
+    await flushAttempt();
+    expect(state.inFlight.has(`close::${epicId}`)).toBe(false);
+    expect(state.finalizerGuard.has(epicId)).toBe(false);
+    expect(state.redispatchCooldown.has(`close::${epicId}`)).toBe(false);
+
+    await runReconcileCycle(
+      decision,
+      state,
+      new Map(),
+      "/bin/zsh",
+      signal,
+      deps,
+    );
+    await flushAttempt();
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(attempts).toBe(2);
+  expect(log.closeRecoveryStamps).toEqual([
+    { epicId, projectDir: "/repo" },
+    { epicId, projectDir: "/repo" },
+  ]);
+  expect(state.finalizerGuard.get(epicId)).toBe(100);
+  expect(state.redispatchCooldown.get(`close::${epicId}`)).toBe(100);
+  expect(state.inFlight.size).toBe(0);
+  expect(log.emissions).toEqual([]);
+  expect(log.launches).toEqual([]);
 });
 
 test("fn-959 runReconcileCycle: closer-done epic → finalizeEpic runs AFTER the launch loop, merges base into default", async () => {
@@ -14374,6 +14853,62 @@ test("logMergeGateDeferral: an unseen key always logs on first call, even agains
 // `ok` epic's OWN lane probed merged-into-default → an entry; reuses the SAME
 // per-repo lane-enumeration + ancestry probes as the merge-gate.
 // ---------------------------------------------------------------------------
+
+test("close recovery producer requires done tasks, finished closer, and positive ancestry", async () => {
+  const epicId = "fn-1-a";
+  const epic = makeEpic({
+    epic_id: epicId,
+    project_dir: "/repo",
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const closer = makeJob({
+    job_id: "j-close",
+    plan_verb: "close",
+    plan_ref: epicId,
+    state: "stopped",
+  });
+  const jobs = new Map([[closer.job_id, closer]]);
+  const positive = gateGit({
+    lanes: [`keeper/epic/${epicId}`],
+    ancestors: [`keeper/epic/${epicId}`],
+  });
+  expect(
+    await computeCloseRecoveryEligibleIds(
+      [epic],
+      jobs,
+      new Set(),
+      classifyIdentity([epic]),
+      positive.run,
+    ),
+  ).toEqual(new Set([epicId]));
+
+  const absent = gateGit({ lanes: [], ancestors: [] });
+  expect(
+    await computeCloseRecoveryEligibleIds(
+      [epic],
+      jobs,
+      new Set(),
+      classifyIdentity([epic]),
+      absent.run,
+    ),
+  ).toEqual(new Set());
+  expect(
+    await computeCloseRecoveryEligibleIds(
+      [epic],
+      new Map(),
+      new Set(),
+      classifyIdentity([epic]),
+      positive.run,
+    ),
+  ).toEqual(new Set());
+});
 
 test("fn-1016 computeMergedLaneEntries: a lane PRESENT ∧ ancestor of local default → MERGED", async () => {
   const a = makeEpic({ epic_id: "fn-1-a", project_dir: "/repo" });
