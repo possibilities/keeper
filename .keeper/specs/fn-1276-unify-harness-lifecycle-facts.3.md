@@ -64,5 +64,5 @@ Dual-read legacy/unfenced behavior remains until pre-change sessions end. The pr
 - [ ] Dispatch, birth-ingest, reducer, and Pi golden suites pass in process isolation.
 
 ## Done summary
-
+Minted an opaque Dispatch-attempt identity at admission and carried it through the generic backend envelope into Claude SessionStart and Pi birth ingestion, exact-binding a Harness session to its current claim while keeping stale/duplicate/missing/malformed/manual starts on the existing idempotent or unfenced paths; verb prompts, cell selection, titles, and Codex/Hermes behavior are unchanged.
 ## Evidence
