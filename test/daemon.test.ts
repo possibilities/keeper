@@ -211,6 +211,7 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
+import { HANDOFF_DOC_MAX_BYTES } from "../src/handoff-contract";
 import { MAX_LINE_LENGTH } from "../src/protocol";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
@@ -9617,6 +9618,129 @@ function spawnedWorkerNames(opts?: {
   void handle;
   return captured;
 }
+
+test("request-await rejects unsafe spill files without minting AwaitRequested", async () => {
+  const awaitSpillDir = join(tmpDir, "await-spill");
+  mkdirSync(awaitSpillDir, { recursive: true });
+  const outsidePath = join(tmpDir, "escape.md");
+  const escapingPath = join(awaitSpillDir, "..", "escape.md");
+  const emptyPath = join(awaitSpillDir, "empty.md");
+  const oversizedPath = join(awaitSpillDir, "oversized.md");
+  writeFileSync(outsidePath, "outside");
+  writeFileSync(emptyPath, "");
+  writeFileSync(oversizedPath, "x".repeat(HANDOFF_DOC_MAX_BYTES + 1));
+
+  type CapturedWorker = {
+    onmessage: ((ev: { data: unknown }) => void) | null;
+    postMessage: (msg: unknown) => void;
+    addEventListener: () => void;
+    terminate: () => void;
+  };
+  let server: CapturedWorker | null = null;
+  const replies: unknown[] = [];
+
+  class WorkerSpy implements CapturedWorker {
+    onmessage: ((ev: { data: unknown }) => void) | null = null;
+    constructor(url: string | URL) {
+      const href = typeof url === "string" ? url : url.href;
+      if ((href.split("/").pop() ?? href) === "server-worker.ts") {
+        server = this;
+      }
+    }
+    addEventListener(): void {}
+    postMessage(msg: unknown): void {
+      if (
+        typeof msg === "object" &&
+        msg !== null &&
+        (msg as { type?: unknown }).type === "request-await-result"
+      ) {
+        replies.push(msg);
+      }
+    }
+    terminate(): void {}
+  }
+
+  const realWorker = globalThis.Worker;
+  const sandbox: Record<string, string> = {
+    KEEPER_DB: dbPath,
+    KEEPER_CONFIG: join(tmpDir, "keeper-config.yaml"),
+    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
+    KEEPER_EVENTS_LOG: join(tmpDir, "events-log"),
+    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
+    KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
+    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
+    KEEPER_RESTART_LEDGER: join(tmpDir, "restart-ledger.json"),
+    KEEPER_SOCK: join(tmpDir, "keeperd.sock"),
+    KEEPER_AWAIT_SPILL_DIR: awaitSpillDir,
+  };
+  writeFileSync(sandbox.KEEPER_CONFIG, "");
+  const prior: Record<string, string | undefined> = {};
+  for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
+
+  let handle: DaemonHandle | null = null;
+  try {
+    (globalThis as { Worker: unknown }).Worker = WorkerSpy;
+    for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
+    handle = startDaemon({
+      workers: ["server"],
+      disableSingleInstanceLock: true,
+    });
+  } finally {
+    (globalThis as { Worker: unknown }).Worker = realWorker;
+    for (const k of Object.keys(sandbox)) {
+      const v = prior[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  try {
+    expect(server).not.toBeNull();
+    const send = (id: string, docPath: string): void => {
+      server?.onmessage?.({
+        data: {
+          kind: "request-await-request",
+          id,
+          request: {
+            op: "request",
+            await_id: `await-${id}`,
+            condition_spec: [{ condition: "drained" }],
+            doc_path: docPath,
+            target_session: "target-session",
+            target_dir: null,
+            timeout_ms: null,
+          },
+        },
+      });
+    };
+
+    send("escape", escapingPath);
+    send("empty", emptyPath);
+    send("oversized", oversizedPath);
+  } finally {
+    await handle?.stop();
+  }
+
+  expect(replies).toHaveLength(3);
+  for (const reply of replies) {
+    expect(reply).toMatchObject({ type: "request-await-result", ok: false });
+  }
+  expect(replies[0]).toMatchObject({ id: "escape" });
+  expect(replies[1]).toMatchObject({ id: "empty" });
+  expect(replies[2]).toMatchObject({ id: "oversized" });
+
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    const row = db
+      .query(
+        "SELECT COUNT(*) AS count FROM events WHERE hook_event = 'AwaitRequested'",
+      )
+      .get() as { count: number };
+    expect(row.count).toBe(0);
+  } finally {
+    db.close();
+  }
+});
 
 test("the production boot spawns the complete worker set", () => {
   // A boot with no selector must spawn exactly ALL_WORKERS, in order. The
