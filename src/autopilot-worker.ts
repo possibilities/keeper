@@ -203,6 +203,7 @@ import {
   ensureWorktree as gitEnsureWorktree,
   enumerateEpicLaneBranches as gitEnumerateEpicLaneBranches,
   isAncestorOf as gitIsAncestorOf,
+  laneDirtSnapshotId as gitLaneDirtSnapshotId,
   listEpicBaseBranches as gitListEpicBaseBranches,
   listEpicLaneBranches as gitListEpicLaneBranches,
   listWorktrees as gitListWorktrees,
@@ -7172,9 +7173,12 @@ export async function recoverWorktrees(
               repo,
               fresh,
               run,
-              laneTeardown?.spoolDir
-                ? { spoolDir: laneTeardown.spoolDir }
-                : undefined,
+              {
+                snapshotId: () => gitLaneDirtSnapshotId(wtKey),
+                ...(laneTeardown?.spoolDir
+                  ? { spoolDir: laneTeardown.spoolDir }
+                  : {}),
+              },
             );
             if (forced.kind === "backup-failed") {
               backupFailedPaths.add(wtKey);
