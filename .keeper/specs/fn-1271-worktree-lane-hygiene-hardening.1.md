@@ -53,5 +53,5 @@ with fingerprint + test-assertion rewrite verified.
 - [ ] Regression fixtures cover all the above in the fast suite
 
 ## Done summary
-
+Rekeyed the merge-time schema-ladder alignment on step identity (version + canonicalized body signature) instead of version-number lookup, so a branch-local additive step is detected by body identity regardless of file position, the recorded union-shape repro renumbers mechanically without a false identical-content refusal, same-body-at-a-different-version and every destructive class still refuse, and regression fixtures cover all of it in the fast suite.
 ## Evidence
