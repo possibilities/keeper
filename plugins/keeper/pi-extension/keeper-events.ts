@@ -60,6 +60,7 @@ import {
 } from "./bus-inbox.ts";
 import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
+import { installPiEditorBorder } from "./editor-border.ts";
 import {
   installPiStatusFooter,
   type PiFooterApi,
@@ -101,6 +102,7 @@ export interface PiExtensionApi {
   ): void;
   events?: PiTaskEventBus;
   getThinkingLevel?(): string;
+  getSessionName?(): string | undefined;
   registerTool?(tool: PiToolDefinition<unknown>): void;
   /** Presence-gated: `/rename` registers only when both this and
    *  `setSessionName` exist (see the `registerRenameCommand` call site). The
@@ -867,9 +869,11 @@ export default function keeperEvents(pi: PiExtensionApi): void {
             context,
             jobId,
           );
+
+          void installPiEditorBorder(pi, context);
         }
       } catch {
-        // A cosmetic footer failure must never break Pi startup.
+        // A cosmetic footer/editor failure must never break Pi startup.
       }
     });
     for (const kind of ["turn_end", "model_select", "thinking_level_select"]) {
