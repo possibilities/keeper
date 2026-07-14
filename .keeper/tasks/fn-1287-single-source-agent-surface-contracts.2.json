@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-14T00:14:53.893000Z",
   "depends_on": [],
   "epic": "fn-1287-single-source-agent-surface-contracts",
   "id": "fn-1287-single-source-agent-surface-contracts.2",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Add agent interaction glossary terms",
-  "updated_at": "2026-07-14T00:14:53.893000Z"
+  "updated_at": "2026-07-14T00:18:42.452000Z"
 }
