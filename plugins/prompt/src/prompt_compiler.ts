@@ -80,6 +80,8 @@ export interface PromptCompileLaunchCell extends PromptCompileCell {
   readonly provider: "pi";
 }
 
+export type PromptCompilePiThinking = "low" | "medium" | "high" | "xhigh";
+
 export interface PromptCompileRoleResult {
   readonly role: string;
   readonly output: string;
@@ -87,6 +89,8 @@ export interface PromptCompileRoleResult {
   readonly assigned_cell: PromptCompileCell;
   readonly effective_cell: PromptCompileCell;
   readonly launch_cell: PromptCompileLaunchCell;
+  readonly thinking: PromptCompilePiThinking;
+  readonly max_turns: number;
   readonly changed: boolean;
   readonly sidecar_changed: boolean;
 }
@@ -173,7 +177,7 @@ function translatedDeniedTools(value: unknown): string[] {
   return translated;
 }
 
-function piThinking(effort: string): "low" | "medium" | "high" | "xhigh" {
+function piThinking(effort: string): PromptCompilePiThinking {
   if (
     effort === "low" ||
     effort === "medium" ||
@@ -186,8 +190,15 @@ function piThinking(effort: string): "low" | "medium" | "high" | "xhigh" {
   throw new Error(`unsupported Pi thinking effort ${JSON.stringify(effort)}`);
 }
 
-function maxTurns(thinking: "low" | "medium" | "high" | "xhigh"): number {
-  return { low: 25, medium: 40, high: 60, xhigh: 75 }[thinking];
+function piRenderValues(effort: string): {
+  thinking: PromptCompilePiThinking;
+  max_turns: number;
+} {
+  const thinking = piThinking(effort);
+  return {
+    thinking,
+    max_turns: { low: 25, medium: 40, high: 60, xhigh: 75 }[thinking],
+  };
 }
 
 function splitRenderedClaudeAgent(
@@ -239,15 +250,15 @@ export function translateClaudeAgentToPi(input: {
   if (typeof description !== "string" || description.trim() === "") {
     throw new Error(`${input.sourcePath}: description is required`);
   }
-  const thinking = piThinking(input.launchEffort);
+  const renderValues = piRenderValues(input.launchEffort);
   const denied = translatedDeniedTools(source.frontmatter.disallowedTools);
   const lines = ["---", `description: ${JSON.stringify(description)}`];
   if (input.emitModel ?? true) {
     lines.push(`model: ${JSON.stringify(input.launchModel)}`);
   }
   lines.push(
-    `thinking: ${thinking}`,
-    `max_turns: ${maxTurns(thinking)}`,
+    `thinking: ${renderValues.thinking}`,
+    `max_turns: ${renderValues.max_turns}`,
     "prompt_mode: replace",
   );
   if (input.role === "plan:panel-runner") {
@@ -713,6 +724,7 @@ function roleResults(
     assigned_cell: item.assigned,
     effective_cell: item.effective,
     launch_cell: item.launch,
+    ...piRenderValues(item.launch.effort),
     changed: outputChanged.get(item.output) ?? false,
     sidecar_changed: sidecarChanged.get(item.sidecar) ?? false,
   }));

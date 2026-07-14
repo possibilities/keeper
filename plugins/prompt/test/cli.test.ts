@@ -281,10 +281,19 @@ describe("keeper prompt dispatcher contract", () => {
       expect(r.ret).toBe(0);
       expect(r.code).toBeUndefined();
       expect(r.stderr).toBe("");
-      expect(JSON.parse(r.stdout)).toMatchObject({
+      const parsed = JSON.parse(r.stdout) as {
+        outputs: Array<Record<string, unknown>>;
+      };
+      expect(parsed).toMatchObject({
         target: "pi",
         ok: true,
         request: { kind: "bundle", name: "plan:static" },
+      });
+      expect(
+        parsed.outputs.find((row) => row.role === "plan:repo-scout"),
+      ).toMatchObject({
+        thinking: "high",
+        max_turns: 60,
       });
       expect(
         statSync(join(agentDir, "agents", ".keeper-plan-agents.json")).isFile(),

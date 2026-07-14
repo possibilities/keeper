@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 export interface PiTaskParams {
@@ -64,6 +65,8 @@ const RPC_TIMEOUT_MS = 2_000;
 // The owner finalizer has its own five-second bound. Leave enough transport
 // headroom for it to report either terminal cleanup or exact failures.
 const STOP_RPC_TIMEOUT_MS = 7_000;
+const PROMPT_COMPILE_TIMEOUT_MS = 15_000;
+const PROMPT_COMPILE_MAX_BUFFER = 64 * 1024;
 const PACKAGE_NAME = "@tintinweb/pi-subagents@0.14.0";
 
 export interface RpcDeadline {
@@ -71,16 +74,72 @@ export interface RpcDeadline {
   cancel(handle: unknown): void;
 }
 
+export interface PromptCompilerExecOptions {
+  readonly encoding: "utf8";
+  readonly env: NodeJS.ProcessEnv;
+  readonly timeout: number;
+  readonly maxBuffer: number;
+  readonly shell: false;
+  readonly signal?: AbortSignal;
+}
+
+export interface PromptCompilerExecResult {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export type PromptCompilerRunner = (
+  executable: string,
+  args: readonly string[],
+  options: PromptCompilerExecOptions,
+) => Promise<PromptCompilerExecResult>;
+
 export interface TaskFacadeOptions {
   rpcTimeoutMs?: number;
   stopRpcTimeoutMs?: number;
   deadline?: RpcDeadline;
+  compilerRunner?: PromptCompilerRunner;
+}
+
+interface ResolvedTaskFacadeOptions {
+  rpcTimeoutMs: number;
+  stopRpcTimeoutMs: number;
+  deadline: RpcDeadline;
+  compilerRunner: PromptCompilerRunner;
 }
 
 const systemDeadline: RpcDeadline = {
   schedule: (callback, timeoutMs) => setTimeout(callback, timeoutMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
+
+const systemCompilerRunner: PromptCompilerRunner = (
+  executable,
+  args,
+  options,
+) =>
+  new Promise((resolve, reject) => {
+    try {
+      execFile(executable, [...args], options, (error, stdout, stderr) => {
+        if (error !== null) {
+          if (options.signal?.aborted) {
+            reject(cancellationReason(options.signal));
+            return;
+          }
+          const detail = stderr.trim();
+          reject(
+            new Error(
+              `keeper prompt compile failed: ${detail || error.message}`,
+            ),
+          );
+          return;
+        }
+        resolve({ stdout, stderr });
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
 
 const TASK_PARAMETERS: Record<string, unknown> = {
   type: "object",
@@ -200,7 +259,7 @@ function rpcCall(
 
 async function requireProtocol(
   events: PiTaskEventBus,
-  options: Required<TaskFacadeOptions>,
+  options: ResolvedTaskFacadeOptions,
 ): Promise<void> {
   const reply = await rpcCall(
     events,
@@ -228,6 +287,163 @@ function validateParams(params: PiTaskParams): void {
   }
 }
 
+const PLAN_ROLE_RE = /^plan:[a-z0-9][a-z0-9._-]*$/;
+const LAUNCH_MODEL_SEGMENT_RE = /^[a-z0-9._-]+$/;
+const THINKING_MAX_TURNS = {
+  low: 25,
+  medium: 40,
+  high: 60,
+  xhigh: 75,
+} as const;
+
+type PiThinkingLevel = keyof typeof THINKING_MAX_TURNS;
+
+interface CompiledLaunchOptions {
+  model: string;
+  thinkingLevel: PiThinkingLevel;
+  maxTurns: number;
+}
+
+function isLaunchModel(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value
+      .split("/")
+      .every(
+        (segment) =>
+          LAUNCH_MODEL_SEGMENT_RE.test(segment) && !segment.startsWith("."),
+      )
+  );
+}
+
+function isThinkingLevel(value: unknown): value is PiThinkingLevel {
+  return (
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+  );
+}
+
+function isCanonicalPlanRole(type: string): boolean {
+  if (!type.startsWith("plan:")) return false;
+  if (!PLAN_ROLE_RE.test(type)) {
+    throw new Error(
+      "Task plan subagent_type must be a fully-qualified plan:name token",
+    );
+  }
+  return true;
+}
+
+function parseCompiledLaunch(
+  stdout: string,
+  role: string,
+): CompiledLaunchOptions {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `keeper prompt compile for ${role} returned malformed or multi-document JSON`,
+    );
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`keeper prompt compile for ${role} returned a non-object`);
+  }
+  if (parsed.ok === false) {
+    throw new Error(`keeper prompt compile for ${role} reported ok:false`);
+  }
+  if (
+    parsed.schema_version !== 1 ||
+    parsed.target !== "pi" ||
+    parsed.ok !== true ||
+    (parsed.outcome !== "hit" &&
+      parsed.outcome !== "compiled" &&
+      parsed.outcome !== "repaired") ||
+    !isRecord(parsed.request) ||
+    parsed.request.kind !== "role" ||
+    parsed.request.name !== role ||
+    !Array.isArray(parsed.outputs)
+  ) {
+    throw new Error(
+      `keeper prompt compile for ${role} returned a malformed result envelope`,
+    );
+  }
+
+  const outputs: Record<string, unknown>[] = [];
+  for (const output of parsed.outputs) {
+    if (!isRecord(output) || typeof output.role !== "string") {
+      throw new Error(
+        `keeper prompt compile for ${role} returned a malformed output row`,
+      );
+    }
+    if (output.role === role) outputs.push(output);
+  }
+  if (outputs.length !== 1) {
+    throw new Error(
+      `keeper prompt compile for ${role} returned ${outputs.length} matching output rows`,
+    );
+  }
+
+  const output = outputs[0] as Record<string, unknown>;
+  if (!isRecord(output.launch_cell) || output.launch_cell.provider !== "pi") {
+    throw new Error(
+      `keeper prompt compile for ${role} returned an invalid launch cell`,
+    );
+  }
+  const model = output.launch_cell.model;
+  if (!isLaunchModel(model)) {
+    throw new Error(
+      `keeper prompt compile for ${role} returned an invalid launch model`,
+    );
+  }
+  const effort = output.launch_cell.effort;
+  const expectedThinking = effort === "max" ? "xhigh" : effort;
+  if (
+    !isThinkingLevel(output.thinking) ||
+    output.thinking !== expectedThinking
+  ) {
+    throw new Error(
+      `keeper prompt compile for ${role} returned invalid Pi thinking`,
+    );
+  }
+  if (
+    !Number.isInteger(output.max_turns) ||
+    output.max_turns !== THINKING_MAX_TURNS[output.thinking]
+  ) {
+    throw new Error(
+      `keeper prompt compile for ${role} returned invalid Pi max_turns`,
+    );
+  }
+  return {
+    model,
+    thinkingLevel: output.thinking,
+    maxTurns: output.max_turns as number,
+  };
+}
+
+async function compilePlanRole(
+  role: string,
+  signal: AbortSignal | undefined,
+  runner: PromptCompilerRunner,
+): Promise<CompiledLaunchOptions | null> {
+  if (!isCanonicalPlanRole(role)) return null;
+  const args = ["prompt", "compile", "--role", role, "--target", "pi"];
+  const result = await runner("keeper", args, {
+    encoding: "utf8",
+    env: process.env,
+    timeout: PROMPT_COMPILE_TIMEOUT_MS,
+    maxBuffer: PROMPT_COMPILE_MAX_BUFFER,
+    shell: false,
+    ...(signal === undefined ? {} : { signal }),
+  });
+  if (!isRecord(result) || typeof result.stdout !== "string") {
+    throw new Error(`keeper prompt compile for ${role} returned no stdout`);
+  }
+  return parseCompiledLaunch(result.stdout, role);
+}
+
 function beforeSpawnOrAbort<T>(
   operation: Promise<T>,
   signal?: AbortSignal,
@@ -247,11 +463,16 @@ async function executeTask(
   events: PiTaskEventBus,
   params: PiTaskParams,
   signal: AbortSignal | undefined,
-  options: Required<TaskFacadeOptions>,
+  options: ResolvedTaskFacadeOptions,
 ): Promise<PiTaskToolResult> {
   validateParams(params);
   if (signal?.aborted) throw cancellationReason(signal);
   await beforeSpawnOrAbort(requireProtocol(events, options), signal);
+  if (signal?.aborted) throw cancellationReason(signal);
+  const compiledLaunch = await beforeSpawnOrAbort(
+    compilePlanRole(params.subagent_type, signal, options.compilerRunner),
+    signal,
+  );
   if (signal?.aborted) throw cancellationReason(signal);
 
   let agentId: string | null = null;
@@ -338,6 +559,7 @@ async function executeTask(
         options: {
           description: params.description,
           isBackground: false,
+          ...(compiledLaunch ?? {}),
           ...(signal === undefined ? {} : { signal }),
         },
       },
@@ -428,10 +650,11 @@ export function createTaskFacadeTool(
   events: PiTaskEventBus,
   overrides: TaskFacadeOptions = {},
 ): PiTaskToolDefinition {
-  const options: Required<TaskFacadeOptions> = {
+  const options: ResolvedTaskFacadeOptions = {
     rpcTimeoutMs: overrides.rpcTimeoutMs ?? RPC_TIMEOUT_MS,
     stopRpcTimeoutMs: overrides.stopRpcTimeoutMs ?? STOP_RPC_TIMEOUT_MS,
     deadline: overrides.deadline ?? systemDeadline,
+    compilerRunner: overrides.compilerRunner ?? systemCompilerRunner,
   };
   return {
     name: "Task",

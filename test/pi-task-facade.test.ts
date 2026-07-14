@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import taskFacadeExtension, {
-  createTaskFacadeTool,
+  createTaskFacadeTool as createRawTaskFacadeTool,
   type PiTaskEventBus,
   type PiTaskToolDefinition,
+  type PromptCompilerRunner,
+  type TaskFacadeOptions,
 } from "../plugins/keeper/pi-extension/task-facade";
 
 class FakeBus implements PiTaskEventBus {
@@ -32,6 +34,67 @@ const immediateDeadline = {
   },
   cancel(): void {},
 };
+
+const THINKING_TURNS = { low: 25, medium: 40, high: 60, xhigh: 75 } as const;
+type TestThinking = keyof typeof THINKING_TURNS;
+
+function compiledResult(
+  role: string,
+  options: {
+    outcome?: "hit" | "compiled" | "repaired";
+    model?: unknown;
+    effort?: unknown;
+    thinking?: unknown;
+    maxTurns?: unknown;
+    outputs?: unknown[];
+  } = {},
+): string {
+  const effort = options.effort ?? "high";
+  const thinking = options.thinking ?? (effort === "max" ? "xhigh" : effort);
+  const maxTurns =
+    options.maxTurns ??
+    (typeof thinking === "string" && thinking in THINKING_TURNS
+      ? THINKING_TURNS[thinking as TestThinking]
+      : 60);
+  return JSON.stringify({
+    schema_version: 1,
+    target: "pi",
+    request: { kind: "role", name: role },
+    outcome: options.outcome ?? "hit",
+    ok: true,
+    outputs: options.outputs ?? [
+      {
+        role,
+        launch_cell: {
+          provider: "pi",
+          model: options.model ?? "openai-codex/gpt-5.6-sol",
+          effort,
+        },
+        thinking,
+        max_turns: maxTurns,
+      },
+    ],
+  });
+}
+
+const successfulCompilerRunner: PromptCompilerRunner = async (
+  _executable,
+  args,
+) => {
+  const role = args[3];
+  if (role === undefined) throw new Error("test compiler received no role");
+  return { stdout: compiledResult(role), stderr: "" };
+};
+
+function createTaskFacadeTool(
+  events: PiTaskEventBus,
+  overrides: TaskFacadeOptions = {},
+): PiTaskToolDefinition {
+  return createRawTaskFacadeTool(events, {
+    compilerRunner: successfulCompilerRunner,
+    ...overrides,
+  });
+}
 
 function withKeeperJobId(value: string | undefined, run: () => void): void {
   const saved = process.env.KEEPER_JOB_ID;
@@ -193,6 +256,382 @@ describe("Pi Task facade", () => {
       rpc_protocol: 3,
       tool_uses: 3,
     });
+  });
+
+  test("compiles the exact role argv and binds explicit Pi launch options", async () => {
+    const { bus, spawns } = rpcBus();
+    const calls: Array<{
+      executable: string;
+      args: readonly string[];
+      options: Parameters<PromptCompilerRunner>[2];
+    }> = [];
+    const compilerRunner: PromptCompilerRunner = async (
+      executable,
+      args,
+      options,
+    ) => {
+      calls.push({ executable, args, options });
+      return {
+        stdout: compiledResult("plan:repo-scout", {
+          outcome: "compiled",
+          model: "openai/gpt-5.6-terra",
+          effort: "medium",
+        }),
+        stderr: "",
+      };
+    };
+    const pending = createTaskFacadeTool(bus, { compilerRunner }).execute(
+      "call",
+      {
+        subagent_type: "plan:repo-scout",
+        description: "scan repo",
+        prompt: "scan",
+      },
+    );
+    await flushMicrotasks();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.executable).toBe("keeper");
+    expect(calls[0]?.args).toEqual([
+      "prompt",
+      "compile",
+      "--role",
+      "plan:repo-scout",
+      "--target",
+      "pi",
+    ]);
+    expect(calls[0]?.options).toMatchObject({
+      encoding: "utf8",
+      env: process.env,
+      timeout: 15_000,
+      maxBuffer: 64 * 1024,
+      shell: false,
+    });
+    expect(calls[0]?.options).not.toHaveProperty("signal");
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]?.options).toEqual({
+      description: "scan repo",
+      isBackground: false,
+      model: "openai/gpt-5.6-terra",
+      thinkingLevel: "medium",
+      maxTurns: 40,
+    });
+
+    bus.emit("subagents:completed", {
+      id: "agent-1",
+      status: "completed",
+      result: "done",
+    });
+    await pending;
+  });
+
+  test("binds each role's distinct effort, including max compatibility", async () => {
+    const { bus, spawns } = rpcBus();
+    const compilerRunner: PromptCompilerRunner = async (_file, args) => {
+      const role = args[3] as string;
+      if (role === "plan:docs-gap-scout") {
+        return {
+          stdout: compiledResult(role, {
+            model: "openai/gpt-5.6-sol",
+            effort: "low",
+          }),
+          stderr: "",
+        };
+      }
+      return {
+        stdout: compiledResult(role, {
+          model: "openai/gpt-5.6-terra",
+          effort: "max",
+        }),
+        stderr: "",
+      };
+    };
+    const tool = createTaskFacadeTool(bus, { compilerRunner });
+    const low = tool.execute("low", {
+      subagent_type: "plan:docs-gap-scout",
+      description: "docs",
+      prompt: "scan docs",
+    });
+    const max = tool.execute("max", {
+      subagent_type: "plan:panel-judge",
+      description: "judge",
+      prompt: "judge panel",
+    });
+    await flushMicrotasks();
+
+    expect(spawns.map(({ type, options }) => ({ type, options }))).toEqual([
+      {
+        type: "plan:docs-gap-scout",
+        options: {
+          description: "docs",
+          isBackground: false,
+          model: "openai/gpt-5.6-sol",
+          thinkingLevel: "low",
+          maxTurns: 25,
+        },
+      },
+      {
+        type: "plan:panel-judge",
+        options: {
+          description: "judge",
+          isBackground: false,
+          model: "openai/gpt-5.6-terra",
+          thinkingLevel: "xhigh",
+          maxTurns: 75,
+        },
+      },
+    ]);
+    bus.emit("subagents:completed", {
+      id: "agent-1",
+      status: "completed",
+      result: "low",
+    });
+    bus.emit("subagents:completed", {
+      id: "agent-2",
+      status: "completed",
+      result: "max",
+    });
+    await Promise.all([low, max]);
+  });
+
+  test("compiler hit and compiled outcomes produce equivalent RPC binding", async () => {
+    const { bus, spawns } = rpcBus();
+    let invocation = 0;
+    const compilerRunner: PromptCompilerRunner = async (_file, args) => {
+      const outcome = invocation++ === 0 ? "compiled" : "hit";
+      return {
+        stdout: compiledResult(args[3] as string, { outcome }),
+        stderr: "",
+      };
+    };
+    const tool = createTaskFacadeTool(bus, { compilerRunner });
+    const first = tool.execute("first", {
+      subagent_type: "plan:repo-scout",
+      description: "first",
+      prompt: "one",
+    });
+    await flushMicrotasks();
+    bus.emit("subagents:completed", {
+      id: "agent-1",
+      status: "completed",
+      result: "one",
+    });
+    await first;
+    const second = tool.execute("second", {
+      subagent_type: "plan:repo-scout",
+      description: "second",
+      prompt: "two",
+    });
+    await flushMicrotasks();
+
+    expect(spawns).toHaveLength(2);
+    expect(spawns[0]?.options).toMatchObject({
+      model: "openai-codex/gpt-5.6-sol",
+      thinkingLevel: "high",
+      maxTurns: 60,
+    });
+    expect(spawns[1]?.options).toMatchObject({
+      model: spawns[0]?.options.model,
+      thinkingLevel: spawns[0]?.options.thinkingLevel,
+      maxTurns: spawns[0]?.options.maxTurns,
+    });
+    bus.emit("subagents:completed", {
+      id: "agent-2",
+      status: "completed",
+      result: "two",
+    });
+    await second;
+  });
+
+  test.each([
+    ["malformed JSON", "not-json", /malformed/],
+    ["multiple JSON documents", "{}\n{}", /multi-document/],
+    ["ok false", JSON.stringify({ ok: false }), /ok:false/],
+    [
+      "missing role",
+      compiledResult("plan:repo-scout", {
+        outputs: [
+          {
+            role: "plan:other",
+            launch_cell: {
+              provider: "pi",
+              model: "openai/gpt-5.6-sol",
+              effort: "high",
+            },
+            thinking: "high",
+            max_turns: 60,
+          },
+        ],
+      }),
+      /0 matching output rows/,
+    ],
+    [
+      "duplicate role",
+      compiledResult("plan:repo-scout", {
+        outputs: [
+          {
+            role: "plan:repo-scout",
+            launch_cell: {
+              provider: "pi",
+              model: "openai/gpt-5.6-sol",
+              effort: "high",
+            },
+            thinking: "high",
+            max_turns: 60,
+          },
+          {
+            role: "plan:repo-scout",
+            launch_cell: {
+              provider: "pi",
+              model: "openai/gpt-5.6-terra",
+              effort: "high",
+            },
+            thinking: "high",
+            max_turns: 60,
+          },
+        ],
+      }),
+      /2 matching output rows/,
+    ],
+  ])("fails before spawn on compiler %s", async (_name, stdout, message) => {
+    const { bus, spawns } = rpcBus();
+    const compilerRunner: PromptCompilerRunner = async () => ({
+      stdout: stdout as string,
+      stderr: "",
+    });
+    await expect(
+      createTaskFacadeTool(bus, { compilerRunner }).execute("call", {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow(message as RegExp);
+    expect(spawns).toHaveLength(0);
+  });
+
+  test("fails before spawn when the compiler process fails", async () => {
+    const { bus, spawns } = rpcBus();
+    const compilerRunner: PromptCompilerRunner = async () => {
+      throw new Error("keeper prompt compile exited 1: matrix invalid");
+    };
+    await expect(
+      createTaskFacadeTool(bus, { compilerRunner }).execute("call", {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow("matrix invalid");
+    expect(spawns).toHaveLength(0);
+  });
+
+  test.each([
+    ["launch model", { model: "../escape" }, /launch model/],
+    ["thinking", { effort: "max", thinking: "max", maxTurns: 75 }, /thinking/],
+    ["max turns", { maxTurns: 0 }, /max_turns/],
+  ])("rejects invalid compiler %s", async (_name, values, message) => {
+    const { bus, spawns } = rpcBus();
+    const compilerRunner: PromptCompilerRunner = async () => ({
+      stdout: compiledResult("plan:repo-scout", values),
+      stderr: "",
+    });
+    await expect(
+      createTaskFacadeTool(bus, { compilerRunner }).execute("call", {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow(message as RegExp);
+    expect(spawns).toHaveLength(0);
+  });
+
+  test("custom agents and work:worker bypass prompt compilation", async () => {
+    const { bus, spawns } = rpcBus();
+    let compilerCalls = 0;
+    const compilerRunner: PromptCompilerRunner = async () => {
+      compilerCalls += 1;
+      throw new Error("compiler must not run");
+    };
+    const tool = createTaskFacadeTool(bus, { compilerRunner });
+    const custom = tool.execute("custom", {
+      subagent_type: "my-custom-agent",
+      description: "custom",
+      prompt: "custom work",
+    });
+    const worker = tool.execute("worker", {
+      subagent_type: "work:worker",
+      description: "work",
+      prompt: "worker work",
+    });
+    await flushMicrotasks();
+
+    expect(compilerCalls).toBe(0);
+    expect(spawns.map((spawn) => spawn.type)).toEqual([
+      "my-custom-agent",
+      "work:worker",
+    ]);
+    expect(spawns.every((spawn) => !("model" in spawn.options))).toBe(true);
+    bus.emit("subagents:completed", {
+      id: "agent-1",
+      status: "completed",
+      result: "custom",
+    });
+    bus.emit("subagents:completed", {
+      id: "agent-2",
+      status: "completed",
+      result: "worker",
+    });
+    await Promise.all([custom, worker]);
+  });
+
+  test("abort during compilation preserves the reason and spawns nothing", async () => {
+    const { bus, spawns } = rpcBus();
+    let compilerSignal: AbortSignal | undefined;
+    let compilerCalls = 0;
+    const compilerRunner: PromptCompilerRunner = async (
+      _file,
+      _args,
+      options,
+    ) => {
+      compilerCalls += 1;
+      compilerSignal = options.signal;
+      return await new Promise<never>(() => {});
+    };
+    const controller = new AbortController();
+    const reason = new DOMException("cancel compile", "AbortError");
+    const pending = createTaskFacadeTool(bus, { compilerRunner }).execute(
+      "call",
+      {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      },
+      controller.signal,
+    );
+    await flushMicrotasks();
+    expect(compilerCalls).toBe(1);
+    expect(compilerSignal).toBe(controller.signal);
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(spawns).toHaveLength(0);
+  });
+
+  test("rejects a shell-shaped plan role before constructing compiler argv", async () => {
+    const { bus, spawns } = rpcBus();
+    let compilerCalls = 0;
+    const compilerRunner: PromptCompilerRunner = async () => {
+      compilerCalls += 1;
+      throw new Error("must not run");
+    };
+    await expect(
+      createTaskFacadeTool(bus, { compilerRunner }).execute("call", {
+        subagent_type: "plan:repo-scout;touch-pwned",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow("fully-qualified plan:name token");
+    expect(compilerCalls).toBe(0);
+    expect(spawns).toHaveLength(0);
   });
 
   test("an empty completed result is a loud Task failure, never 'No output'", async () => {

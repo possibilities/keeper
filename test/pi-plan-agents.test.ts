@@ -172,6 +172,8 @@ describe("role-scoped Pi prompt compiler", () => {
         model: "openai-codex/gpt-5.6-sol",
         effort: "high",
       },
+      thinking: "high",
+      max_turns: 60,
     });
     const scoutOutput = readFileSync(
       join(fx.targetDir, "plan:repo-scout.md"),
@@ -203,6 +205,13 @@ describe("role-scoped Pi prompt compiler", () => {
       "utf8",
     );
     expect(maxOutput).toContain("thinking: xhigh\nmax_turns: 75\n");
+    expect(
+      result.outputs.find((item) => item.role === "plan:panel-judge"),
+    ).toMatchObject({
+      launch_cell: { effort: "max" },
+      thinking: "xhigh",
+      max_turns: 75,
+    });
     const runner = readFileSync(
       join(fx.targetDir, "plan:panel-runner.md"),
       "utf8",
