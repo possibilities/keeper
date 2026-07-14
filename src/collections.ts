@@ -322,10 +322,9 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
  * `{tag:"completed"}` verdict — a DURATION requirement (keep it visible through
  * its done→idle close-row wind-down), not a count. The window must exceed a
  * healthy close-row wind-down with headroom over (fold-lag + reconcile cadence +
- * wind-down); 1800s tracks `MONITOR_RELEASE_SEC` (the hard closer-release
- * ceiling) and is ~10-30x a healthy wind-down. Over-observing is free (the reap
- * is idempotent); only UNDER-observing leaks, so the bound has headroom. A
- * closer wedged PAST the window is caught by the exit-watcher dead-pid reprobe,
+ * wind-down); over-observing is free (the reap is idempotent), so 1800s stays a
+ * bounded backstop. Only under-observing leaks, so the bound has headroom. A closer wedged PAST the
+ * window is caught by the exit-watcher dead-pid reprobe,
  * not this window — the window is a backstop, not the sole safeguard.
  */
 export const DONE_EPICS_REAP_WINDOW_SEC = 1800;
