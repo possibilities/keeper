@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 2,
+        "insertions": 7
+      },
+      "done_summary": "Rewrote the DONE_EPICS_REAP_WINDOW_SEC doc-comment to stop citing the deleted MONITOR_RELEASE_SEC symbol and to drop a false 1800s-vs-MONITOR_SLOT_WEDGE_PAGE_SEC inequality, and corrected the provenDeadJobIds comment to reflect that the backstop occupant loop can populate it under a degraded pane probe even though computeSlotOccupancy never consumes it then. Comment-only; no non-comment lines changed.",
+      "input_hash": "88df7309d79a198014221a64b84d85bdea917b6f50c14baea2e3cacf41c2a9ad",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1976,
+      "spec_md": "## Description\n\nTwo comments left inaccurate by fn-1279's symbol churn (both keeper repo):\n\n- F2 (`src/collections.ts:325`): the `DONE_EPICS_REAP_WINDOW_SEC` doc-comment\n  says \"1800s tracks `MONITOR_RELEASE_SEC` (the hard closer-release ceiling)\",\n  but fn-1279 deleted `MONITOR_RELEASE_SEC` from `readiness.ts` \u2014 this is now\n  the only surviving reference in `src/`. Rewrite the sentence to justify the\n  1800s window on its own terms (or against a surviving constant such as\n  `MONITOR_SLOT_WEDGE_PAGE_SEC`); do not resurrect the deleted symbol.\n- F3 (`src/autopilot-worker.ts:8728-8730`): the `provenDeadJobIds` comment\n  claims the set is \"Empty whenever the pane probe is degraded\n  (`livePaneIds === null`)\", but the new backstop occupant loop (~8766-8781)\n  is NOT gated on `livePaneIds !== null` and can add a dead-pid job under a\n  degraded probe. Correct the comment to say the set may be non-empty under a\n  degraded probe but is never consumed then (the consumer `computeSlotOccupancy`\n  returns early on `livePaneIds === null`).\n\nEvidence path: `git show 4989c025:src/readiness.ts` confirms the\n`MONITOR_RELEASE_SEC` deletion; grep confirms collections.ts:325 is the sole\nremaining reference; autopilot-worker.ts:8748-8781 shows the ungated new loop.\n\nFiles:\n- `src/collections.ts`\n- `src/autopilot-worker.ts`\n\n## Acceptance\n\n- [ ] `grep MONITOR_RELEASE_SEC src/` returns nothing\n- [ ] The `provenDeadJobIds` comment matches the degraded-probe behavior of the new loop\n- [ ] No non-comment lines changed; `bun test` stays green\n\n## Done summary\nRewrote the DONE_EPICS_REAP_WINDOW_SEC doc-comment to stop citing the deleted MONITOR_RELEASE_SEC symbol and to drop a false 1800s-vs-MONITOR_SLOT_WEDGE_PAGE_SEC inequality, and corrected the provenDeadJobIds comment to reflect that the backstop occupant loop can populate it under a degraded pane probe even though computeSlotOccupancy never consumes it then. Comment-only; no non-comment lines changed.\n## Evidence\n",
+      "task_id": "fn-1283-prune-stale-monitor-slot-backstop.1",
+      "tier": "medium",
+      "title": "Correct stale monitor-slot comments"
+    }
+  ],
+  "created_at": "2026-07-14T02:13:55.230000Z",
+  "epic_id": "fn-1283-prune-stale-monitor-slot-backstop",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "88df7309d79a198014221a64b84d85bdea917b6f50c14baea2e3cacf41c2a9ad",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
