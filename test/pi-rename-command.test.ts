@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildRenameConversationInput,
+  createRenameCommandHandler,
   createRenameInvocationState,
+  isValidRenameSlug,
   type RenameCommandContext,
   type RenameCommandDeps,
   runRenameInvocation,
@@ -74,6 +76,151 @@ describe("/rename conversation input", () => {
 
     expect(Buffer.byteLength(input ?? "", "utf8")).toBeLessThanOrEqual(11);
     expect(input).toBe("User: 😀");
+  });
+});
+
+describe("/rename explicit slug", () => {
+  test("accepts only exact canonical slugs", () => {
+    expect(isValidRenameSlug("project-search-ranking")).toBe(true);
+    for (const invalid of [
+      "Project-Search",
+      "project search",
+      "project--search",
+      "-project-search",
+      "project-search-",
+      "project_search",
+      "a".repeat(65),
+      "",
+    ]) {
+      expect(isValidRenameSlug(invalid)).toBe(false);
+    }
+  });
+
+  test("sets a valid slug immediately without reading or inferring", async () => {
+    const names: string[] = [];
+    const notices: Array<{ message: string; level?: string }> = [];
+    let turnReads = 0;
+    const deps: RenameCommandDeps = {
+      runTurnCli: async () => {
+        turnReads += 1;
+        return { stdout: "", stderr: "" };
+      },
+      resolveModel: () => undefined,
+      getAuth: async () => ({ ok: false, error: "unused" }),
+      runCompletion: async () => {
+        throw new Error("unused");
+      },
+    };
+    const ctx: RenameCommandContext = {
+      cwd: "/work/repo",
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getLeafId: () => "leaf-1",
+        getSessionName: () => undefined,
+      },
+      modelRegistry: {
+        find: () => undefined,
+        getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
+      },
+      ui: {
+        notify: (message, level) => notices.push({ message, level }),
+      },
+    };
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => names.push(name) },
+      deps,
+      createRenameInvocationState(),
+    );
+
+    await handler("project-search-ranking", ctx);
+
+    expect(names).toEqual(["project-search-ranking"]);
+    expect(turnReads).toBe(0);
+    expect(notices).toEqual([
+      { message: "Session renamed: project-search-ranking", level: "info" },
+    ]);
+  });
+
+  test("returns an error for a non-slug without mutating the title", async () => {
+    const names: string[] = [];
+    const notices: Array<{ message: string; level?: string }> = [];
+    const deps: RenameCommandDeps = {
+      runTurnCli: async () => ({ stdout: "", stderr: "" }),
+      resolveModel: () => undefined,
+      getAuth: async () => ({ ok: false, error: "unused" }),
+      runCompletion: async () => {
+        throw new Error("unused");
+      },
+    };
+    const ctx: RenameCommandContext = {
+      cwd: "/work/repo",
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getLeafId: () => "leaf-1",
+        getSessionName: () => undefined,
+      },
+      modelRegistry: {
+        find: () => undefined,
+        getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
+      },
+      ui: {
+        notify: (message, level) => notices.push({ message, level }),
+      },
+    };
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => names.push(name) },
+      deps,
+      createRenameInvocationState(),
+    );
+
+    await handler("Not A Slug", ctx);
+
+    expect(names).toEqual([]);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.level).toBe("error");
+    expect(notices[0]?.message).toContain("argument must be a lowercase slug");
+  });
+
+  test("a valid explicit slug cancels a pending inferred rename", async () => {
+    const names: string[] = [];
+    const state = createRenameInvocationState();
+    const deps: RenameCommandDeps = {
+      runTurnCli: async () => ({
+        stdout: JSON.stringify({ ok: true, data: { turn: null } }),
+        stderr: "",
+      }),
+      resolveModel: () => undefined,
+      getAuth: async () => ({ ok: false, error: "unused" }),
+      runCompletion: async () => {
+        throw new Error("unused");
+      },
+    };
+    const ctx: RenameCommandContext = {
+      cwd: "/work/repo",
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getLeafId: () => "leaf-1",
+        getSessionName: () => undefined,
+      },
+      modelRegistry: {
+        find: () => undefined,
+        getApiKeyAndHeaders: async () => ({ ok: false, error: "unused" }),
+      },
+      ui: { notify() {} },
+      isIdle: () => true,
+    };
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => names.push(name) },
+      deps,
+      state,
+    );
+
+    await handler("", ctx);
+    expect(state.pending).not.toBeNull();
+    await handler("manual-title", ctx);
+
+    expect(state.pending).toBeNull();
+    expect(names).toEqual(["manual-title"]);
   });
 });
 

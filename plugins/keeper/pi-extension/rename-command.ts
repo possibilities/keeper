@@ -100,6 +100,12 @@ export function renameSlugify(text: string): string | null {
   return s === "" ? null : s;
 }
 
+/** Accept only the exact canonical slug form; explicit `/rename` arguments
+ *  are validated, never silently normalized or truncated. PURE. */
+export function isValidRenameSlug(text: string): boolean {
+  return renameSlugify(text) === text;
+}
+
 /**
  * Remove Pi's expanded skill envelopes from model input. Skill bodies are
  * instructions for the live agent, not session-title subject matter. PURE.
@@ -964,7 +970,29 @@ export function createRenameCommandHandler(
   deps: RenameCommandDeps,
   state: RenameInvocationState,
 ): (args: string, ctx: RenameCommandContext) => Promise<void> {
-  return async (_args, ctx) => {
+  return async (args, ctx) => {
+    const explicitTitle = args.trim();
+    if (explicitTitle.length > 0) {
+      if (!isValidRenameSlug(explicitTitle)) {
+        ctx.ui.notify(
+          "/rename: argument must be a lowercase slug using letters, numbers, and single hyphens (max 64 characters)",
+          "error",
+        );
+        return;
+      }
+      state.generation += 1;
+      clearPendingRename(state);
+      try {
+        pi.setSessionName(explicitTitle);
+      } catch {
+        ctx.ui.notify("/rename: could not set session title", "error");
+        return;
+      }
+      const fb = renameFeedback("success", explicitTitle);
+      ctx.ui.notify(fb.message, fb.level);
+      return;
+    }
+
     const request = beginRenameRequest(ctx, state);
     ctx.ui.notify("/rename: generating a session title…", "info");
     try {
@@ -1030,7 +1058,7 @@ export function registerRenameCommand(
   const deps = opts.deps ?? defaultRenameCommandDeps();
   const state = createRenameInvocationState();
   pi.registerCommand("rename", {
-    description: "Derive a short Session title from the conversation",
+    description: "Derive a Session title, or set it from a supplied slug",
     handler: createRenameCommandHandler(pi, deps, state),
   });
   pi.on("session_info_changed", (event) => {
