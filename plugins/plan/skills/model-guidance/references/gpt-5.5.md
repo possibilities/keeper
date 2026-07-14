@@ -2,8 +2,8 @@
 
 <!--
 provenance:
-  model_id: gpt-5.5              # host-roster capability model (matrix.yaml alias target), NOT an embedded subagents.yaml axis value
-  resolves_to: gpt-5.5          # bare capability id; OpenAI's `gpt-5.5` alias currently resolves to the dated upstream snapshot gpt-5.5-2026-04-23 (frontier model released 2026-04-23, Dec 1 2025 knowledge cutoff). Served through the codex harness as a wrapped cell.
+  model_id: gpt-5.5              # host-roster capability token, NOT an embedded subagents.yaml axis value
+  resolves_to: openai-codex/gpt-5.5  # Pi-hosted launch id; OpenAI's `gpt-5.5` alias currently resolves to the dated upstream snapshot gpt-5.5-2026-04-23 (frontier model released 2026-04-23, Dec 1 2025 knowledge cutoff).
   researched: 2026-07-10
   status: researched             # provenance state: this cache reflects a real vendor-source capability-review pass
   method: model-capability review of OpenAI's own model docs (developers.openai.com model page + latest-model guidance) and the GPT-5.5 System Card PDF; no in-repo live probe this pass
@@ -39,8 +39,8 @@ it's done." A `gpt-5.5 Pro` variant is the same underlying model with parallel t
 On keeper's board it is NOT the fleet flagship: OpenAI's current models index promotes the GPT-5.6
 family (Sol flagship / Terra balanced / Luna cost-sensitive) above it, with gpt-5.4 / gpt-5.4-mini
 below — so gpt-5.5 is a recent, high-capability tier a half-step under the current frontier. keeper
-does not serve it natively; like the other codex-provider tiers it runs as a **wrapped cell**
-through the codex harness (a claude wrapper delegates implementation, then re-owns tests + the
+does not serve it natively; like the other Pi-hosted tiers it runs as a **wrapped cell**
+through the Pi harness (a Claude wrapper delegates implementation, then re-owns tests + the
 single sanitized trailer commit). On the plan board it routes per the binding `hand_tuned` GPT-first
 policy — GPT tiers take well-specified work whose quality bar is correctness against a nameable
 acceptance, while Claude tiers keep judgment-heavy, taste-, or intelligence-bound work — and

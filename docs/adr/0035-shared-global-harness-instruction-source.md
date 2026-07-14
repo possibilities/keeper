@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. The Codex instruction-source path below is historical; the retained
+shared-instruction contract covers Claude and Pi.
 
 ## Context
 

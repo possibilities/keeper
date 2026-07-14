@@ -189,8 +189,8 @@ For each model in scope on the host matrix's `subagent_models:` axis:
      `efforts_provenance.status`.
 5. **Author/refresh equivalence entries** in `provider-equivalence.yaml`, in BOTH directions, for
    every `{model, effort}` cell just distilled: a claude-native model gains or refreshes its
-   `claude_to_codex` entries (one per effort, each targeting its most-equivalent codex-served cell),
-   a codex-served model its `codex_to_claude` entries (targeting the most-equivalent claude-native
+   `claude_to_gpt` entries (one per effort, each targeting its most-equivalent Pi-hosted GPT cell),
+   a Pi-hosted GPT model its `gpt_to_claude` entries (targeting the most-equivalent Claude-native
    cell) — targets are restricted to the worker-cell eligibility list, and a target must never be
    same-family with its source. Base the call on the freshly distilled behavioral blocks for both
    sides of the pairing, not on names or price. When a cell has several defensible targets and no

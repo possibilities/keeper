@@ -2,11 +2,11 @@
 
 <!--
 provenance:
-  model_id: gpt-5.4-mini         # host-roster capability model (matrix.yaml alias target), served through the codex harness as a wrapped cell
-  resolves_to: gpt-5.4-mini      # bare capability id; the vendor `gpt-5.4-mini` alias currently pins the dated upstream snapshot gpt-5.4-mini-2026-03-17
+  model_id: gpt-5.4-mini         # host-roster capability token, served through Pi as a wrapped cell
+  resolves_to: openai-codex/gpt-5.4-mini  # Pi-hosted launch id; the vendor `gpt-5.4-mini` alias currently pins the dated upstream snapshot gpt-5.4-mini-2026-03-17
   researched: 2026-07-10
   status: researched             # provenance state: this cache reflects a real web-sourced capability-review pass
-  method: web-sourced capability review of OpenAI's own gpt-5.4-mini API model page, the GPT-5.4 model-guidance page, and the GPT-5.4 mini appendix (§6) of the GPT-5.4 Thinking System Card (added March 17, 2026). No in-repo codex live probe — capability judgment is drawn from vendor docs + the cached card, not a wrapped-cell run
+  method: web-sourced capability review of OpenAI's own gpt-5.4-mini API model page, the GPT-5.4 model-guidance page, and the GPT-5.4 mini appendix (§6) of the GPT-5.4 Thinking System Card (added March 17, 2026). No in-repo Pi live probe — capability judgment is drawn from vendor docs + the cached card, not a wrapped-cell run
   sources:
     - OpenAI API model page (developers.openai.com/api/docs/models/gpt-5.4-mini) — "Our strongest mini model yet for coding, computer use, and subagents"; 400,000-token context window, 128,000 max output tokens, Aug 31 2025 knowledge cutoff, $0.75 / $4.50 per 1M input/output ($0.075 cached input), reasoning.effort none|low|medium|high|xhigh (none = default), text+image in / text out
     - OpenAI GPT-5.4 model guidance (developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4): mini positioned for "high-volume coding, computer use, and agent workflows that still need strong reasoning" — a faster, more efficient variant of gpt-5.4 above gpt-5.4-nano
@@ -25,8 +25,8 @@ re-grades its routing fit.
 
 ## What `gpt-5.4-mini` is
 
-`gpt-5.4-mini` is a **wrapped cell** capability: keeper does not serve it natively, so a claude
-wrapper delegates implementation to the model's serving provider (the `codex` harness in the host
+`gpt-5.4-mini` is a **wrapped cell** capability: keeper does not serve it natively, so a Claude
+wrapper delegates implementation to the model's serving provider (the `pi` harness in the host
 matrix) and re-owns the keeper close-out (tests, soft-reset of foreign commits, the single sanitized
 trailer commit). Upstream it is OpenAI's **fast, efficient mini variant of GPT-5.4** — "our strongest
 mini model yet for coding, computer use, and subagents," bringing the flagship's strengths to a
@@ -60,7 +60,7 @@ grade fit through the wrapped-cell path, re-tuning this guidance as evidence acc
   ambiguous acceptance under-resolve here relative to full gpt-5.4 or sonnet; give it the choice
   pre-made, not discovered.
 - **Unproven through the wrapped-cell path.** Capability is vendor-documented, not yet cohort-graded
-  in keeper's codex harness — integration evidence, not raw strength, is the open question.
+  through Keeper's Pi harness — integration evidence, not raw strength, is the open question.
 - **`none`-default reasoning under-thinks if unguided.** Its lowest effort is the default; work that
   needs deliberation must be dispatched at a raised effort or it answers too shallowly.
 - **Contract-shaped blast radius.** Higher risk on contract-, schema-, or wire-shaped changes where a

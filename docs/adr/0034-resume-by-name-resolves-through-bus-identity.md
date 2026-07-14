@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. The Codex resume behavior below is historical; resume-by-name now
+supports the Claude and Pi harnesses.
 
 ## Context
 

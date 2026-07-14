@@ -238,43 +238,43 @@ research:
       sha256: 5b7494c21726a3bd74fa10b5aa7d09c78cc903b66da515b7d26c1b73e529292a
   gpt-5.3-codex-spark:
     reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
-    sha256: 6a9833d3a9199887b725bbb36dddd4a9f394a6cd162b326f5d0215f9c7f1c28c
+    sha256: 8d96568042e989b09297cc4ab91040a92643c5a7b01a6cd69e974716b39b98cc
     card:
       reference: skills/model-guidance/references/cards/gpt-5.3-codex-spark.md
       sha256: b2d909a0616523cbc0ec4ef47e9bbc6c039bf72fbfc4bcacdcee6c632b4a8f32
   gpt-5.4:
     reference: skills/model-guidance/references/gpt-5.4.md
-    sha256: b3b80dbac5f34fd5dceeb48914c1fc987f6df3e4301c55a1f6127eca788654e4
+    sha256: 0783b158a9424b0c74072273a90496ab52c05a3ea574bf23ab6076626f3ac72d
     card:
       reference: skills/model-guidance/references/cards/gpt-5.4.md
       sha256: 0f0ce4f969176e21c00169c18ca8c38d802c9b9fdbe13c7e7e86fd687c11223c
   gpt-5.4-mini:
     reference: skills/model-guidance/references/gpt-5.4-mini.md
-    sha256: a9e35cda918b8fd47b16b7d5e5e5850d516fa951d02a48685824b613e9491a21
+    sha256: ecdfdd74b8f866cb9fb547e08fd179f9a4fd638dcc1ef12df426e7670fb04a61
     card:
       reference: skills/model-guidance/references/cards/gpt-5.4-mini.md
       sha256: d6685f7cccfc8e3d8c66229e35b8db6faad22f2a24c27e26c747fd1e2dabf646
   gpt-5.5:
     reference: skills/model-guidance/references/gpt-5.5.md
-    sha256: 381f6ec7b9b5f2f8afd3cd5ee794ea0ffb43d9a3e0c025979b2ebf045b88e7a8
+    sha256: 583c622ac26aa6a2820b29bf1c640f2ed515d53ac55058538b06c583dbee6dab
     card:
       reference: skills/model-guidance/references/cards/gpt-5.5.md
       sha256: bbf8887d08564ffe7d58d28b2bd771a8892828a05b6f489de126654b1baa11f0
   gpt-5.6-sol:
     reference: skills/model-guidance/references/gpt-5.6-sol.md
-    sha256: f8c203137e4f592a1b470b54707968cf1b2184e4ba6da288b46c863e5747c8ae
+    sha256: 25dfdacc3b59a0bfc00c914ad88e720297b662c86d14556fdd555cf45d72ff52
     card:
       reference: skills/model-guidance/references/cards/gpt-5.6-sol.md
       sha256: 135bd1927d665e481718e1639b5a512c8bb777a3016b0e4c070feefe554175ed
   gpt-5.6-terra:
     reference: skills/model-guidance/references/gpt-5.6-terra.md
-    sha256: 184cd8988fb9dc92f16b23697dbda577cd050adf255b2ca2c83e5c4b6920a754
+    sha256: 843871d6a0814ace975b86cc27c5139efc5d4cbde38c07695fb9157b01efe753
     card:
       reference: skills/model-guidance/references/cards/gpt-5.6-terra.md
       sha256: 57b0f72b7a45c83107cc3f604bb1e9ec49313a1840cdb4d64a980b7248c899ce
   gpt-5.6-luna:
     reference: skills/model-guidance/references/gpt-5.6-luna.md
-    sha256: c2272ed98a58ea9af9bb7dcd2eeaa2427137befd9c08f0cabdf663a550a42e89
+    sha256: e892e55400b8c31e5c6e3adb3869eb0c43593bc4d80bc29c4a1515ef956fbad0
     card:
       reference: skills/model-guidance/references/cards/gpt-5.6-luna.md
       sha256: 19e48de300e9170699f4118191e357d33f9561eab82c88e321abe0101b55e330

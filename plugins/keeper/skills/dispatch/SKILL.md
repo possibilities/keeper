@@ -76,7 +76,7 @@ Optional flags (both forms unless noted):
 | `--dry-run` | Print the resolved launch plan (`session` / `cwd` / `key` / `prompt-from` / `argv`) and launch NOTHING. Run this first to preview. |
 | `--session <s>` | Target tmux session (overrides every fallback). Default precedence: `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX` current > `work`. |
 | `--cwd <dir>` | Free form only: working dir (defaults to `process.cwd()`). Plan form resolves cwd from the board. |
-| `--preset <triple>` | A launch triple `<harness>::<model>::<effort>` (claude-only — a codex/pi triple is an arg fault). Must be well-formed (exit 2 otherwise; run `keeper agent presets list` to see the enumerable cube). Supplies `--model`/`--effort`. Plan form defaults to the SAME `worker` triple the autopilot resolves, so a hand-fired plan worker is byte-identical to an automated one; `--model`/`--effort` override per field. |
+| `--preset <triple>` | A launch triple `<harness>::<model>::<effort>` (claude-only — a Pi triple is an arg fault). Must be well-formed (exit 2 otherwise; run `keeper agent presets list` to see the enumerable cube). Supplies `--model`/`--effort`. Plan form defaults to the SAME `worker` triple the autopilot resolves, so a hand-fired plan worker is byte-identical to an automated one; `--model`/`--effort` override per field. |
 | `--model <m>` | Pass `--model` through to claude (overrides the triple). |
 | `--effort <e>` | Pass `--effort` through to claude (overrides the triple). |
 | `--name <n>` | Free form only: a PURE claude pass-through, NOT a keeper label (see *What NOT to do*). Plan form bakes `--name <verb>::<id>` automatically — never set it there. |

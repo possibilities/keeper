@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. The Codex and Hermes capture references below describe retired harnesses;
+the live capture contract applies to Claude and Pi.
 
 ## Context
 

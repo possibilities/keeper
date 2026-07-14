@@ -2,8 +2,8 @@
 
 <!--
 provenance:
-  model_id: gpt-5.6-terra      # host-roster capability model (matrix.yaml alias target), NOT an embedded subagents.yaml axis value
-  resolves_to: gpt-5.6-terra   # bare capability id served through the codex harness. General GPT-5.6-family model, NOT a `-codex`-tuned variant
+  model_id: gpt-5.6-terra      # host-roster capability token, NOT an embedded subagents.yaml axis value
+  resolves_to: openai-codex/gpt-5.6-terra  # Pi-hosted launch id. General GPT-5.6-family model, NOT a `-codex`-tuned variant
   upstream_snapshot: GA 2026-07-09; knowledge cutoff Feb 16, 2026  # dated vendor facts, not a keeper alias
   researched: 2026-07-10
   status: researched           # provenance state: this cache reflects a real capability-review pass against vendor sources
@@ -37,9 +37,9 @@ GA 2026-07-09. OpenAI positions it as the balanced everyday default, and its lau
 performance as GPT-5.5-competitive at roughly half the cost (a directional vendor claim, not a
 benchmark reproduced here).
 
-In keeper it is a **wrapped cell**: keeper does not serve it natively, so a claude wrapper delegates
-implementation to the model's serving provider (the `codex` harness in the host matrix — the same
-harness OpenAI's Codex product runs these models through) and re-owns the keeper close-out (tests,
+In keeper it is a **wrapped cell**: keeper does not serve it natively, so a Claude wrapper delegates
+implementation to the model's serving provider (the `pi` harness in the host matrix) and re-owns the
+keeper close-out (tests,
 soft-reset of foreign commits, the single sanitized trailer commit). On the plan board it routes
 per the binding `hand_tuned` GPT-first policy — GPT tiers take well-specified work whose quality
 bar is correctness against a nameable acceptance, while Claude tiers keep judgment-heavy, taste-,
