@@ -862,6 +862,65 @@ describe("commit-work real-git atomic plumbing publication", () => {
     }
   });
 
+  test("a signer changing raw private-index flags cannot publish", async () => {
+    const { repo, expected } = await repoWithBase();
+    writeFileSync(
+      join(repo, "selected.txt"),
+      "private index signer mutation\n",
+    );
+    let unreachable = "";
+    const run: GitRunner = async (args, options) => {
+      if (
+        args[0] === "config" &&
+        args.includes("--get") &&
+        args.includes("commit.gpgSign")
+      ) {
+        return { code: 0, stdout: "true\n", stderr: "" };
+      }
+      if (args[0] === "commit-tree") {
+        const result = await gitExec(
+          args.filter((arg) => arg !== "-S"),
+          options,
+        );
+        unreachable = result.stdout.trim();
+        const mutation = await gitExec(
+          ["update-index", "--assume-unchanged", "--", "selected.txt"],
+          { cwd: repo, env: options?.env },
+        );
+        expect(mutation.code).toBe(0);
+        return result;
+      }
+      return gitExec(args, options);
+    };
+    const privateIndex = await frozen(repo, ["selected.txt"], run);
+    try {
+      await expect(
+        commitFrozenPrivateIndex(
+          privateIndex,
+          "test: private index signer mutation",
+          repo,
+          run,
+        ),
+      ).rejects.toMatchObject({
+        code: "commit_hook_mutated",
+        commitSha: expect.any(String),
+        committed: false,
+      });
+      expect(unreachable).toMatch(/^[0-9a-f]{40,64}$/);
+      expect(await git(repo, ["cat-file", "-t", unreachable])).toBe("commit");
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
+      expect(
+        await git(
+          repo,
+          ["--no-optional-locks", "ls-files", "-v", "--", "selected.txt"],
+          { env: { GIT_INDEX_FILE: privateIndex.indexPath } },
+        ),
+      ).toBe("h selected.txt");
+    } finally {
+      cleanupPrivateIndex(privateIndex);
+    }
+  });
+
   test("a signing failure is typed and leaves the target ref untouched", async () => {
     const { repo, expected } = await repoWithBase();
     writeFileSync(join(repo, "selected.txt"), "unsigned candidate\n");

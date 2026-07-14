@@ -704,12 +704,11 @@ function sameEntries(a: GitPathEntry[], b: GitPathEntry[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** Re-hash live exact paths and require byte/mode/tree/index identity stability. */
-export async function verifyFrozenSurface(
+async function verifyFrozenSelectedSurface(
   frozen: FrozenPrivateIndex,
   worktree: string,
   git: GitRunner,
-  fs: PrivateIndexFs = {},
+  fs: PrivateIndexFs,
 ): Promise<void> {
   const base = await baseEntriesByPath(
     frozen.paths,
@@ -718,6 +717,19 @@ export async function verifyFrozenSurface(
     git,
   );
   const entries = await buildLiveEntries(frozen.paths, base, worktree, git, fs);
+  if (!sameEntries(entries, frozen.entries)) {
+    throw new PrivateIndexError("surface_changed");
+  }
+}
+
+/** Re-hash live exact paths and require byte/mode/tree/index identity stability. */
+export async function verifyFrozenSurface(
+  frozen: FrozenPrivateIndex,
+  worktree: string,
+  git: GitRunner,
+  fs: PrivateIndexFs = {},
+): Promise<void> {
+  await verifyFrozenSelectedSurface(frozen, worktree, git, fs);
   const privateGit = privateRunner(git, frozen.indexPath, worktree);
   const tree = await writeTree(worktree, privateGit);
   await requireExactStagedSet(
@@ -726,7 +738,7 @@ export async function verifyFrozenSurface(
     worktree,
     privateGit,
   );
-  if (tree !== frozen.tree || !sameEntries(entries, frozen.entries)) {
+  if (tree !== frozen.tree) {
     throw new PrivateIndexError("surface_changed");
   }
 }
@@ -1357,6 +1369,15 @@ export async function commitFrozenPrivateIndex(
     await verifyFrozenSurface(frozen, worktree, git, fs);
     finalMessage = readFileSync(messagePath, "utf8");
     assertMessageIntegrity(finalMessage, marker, guards.jobId, expectedTasks);
+    let privateIndexBaseline: string;
+    try {
+      privateIndexBaseline = fingerprintIndexFile(frozen.indexPath, fs);
+    } catch (error) {
+      throw new PrivateIndexError(
+        "commit_failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
 
     const commit = await git(
       [
@@ -1408,7 +1429,8 @@ export async function commitFrozenPrivateIndex(
 
     // A configured signer is executable and may mutate every caller-owned
     // surface. Re-run the operation, ownership, branch, selected-surface, and
-    // raw target-index checks after commit-tree and immediately before CAS.
+    // complete raw private/target-index checks after commit-tree and immediately
+    // before CAS.
     const postCommitOperation = await guards.beforeCommit?.();
     if (postCommitOperation) {
       throw new PrivateIndexError("operation_in_progress", "", {
@@ -1431,7 +1453,20 @@ export async function commitFrozenPrivateIndex(
         { commitSha: sha },
       );
     }
-    await verifyFrozenSurface(frozen, worktree, git, fs);
+    // The full private-index fingerprint below supersedes tree/index plumbing
+    // here; avoid a post-signer write-tree that can refresh cache extensions.
+    await verifyFrozenSelectedSurface(frozen, worktree, git, fs);
+    try {
+      if (fingerprintIndexFile(frozen.indexPath, fs) !== privateIndexBaseline) {
+        throw new Error("private index changed before publication");
+      }
+    } catch (error) {
+      throw new PrivateIndexError(
+        "commit_hook_mutated",
+        error instanceof Error ? error.message : String(error),
+        { commitSha: sha },
+      );
+    }
     try {
       if (fingerprintIndexFile(targetIndexPath, fs) !== targetIndexBaseline) {
         throw new Error("target worktree index changed before publication");
