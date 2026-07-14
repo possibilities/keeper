@@ -65,7 +65,7 @@ describe("Pi panel agent compatibility", () => {
       const runnerHeader = runner.slice(0, runner.indexOf("\n---\n", 4));
       const judgeHeader = judge.slice(0, judge.indexOf("\n---\n", 4));
       expect(runnerHeader).toContain(
-        `extensions: ${JSON.stringify(`*, ${join(extensionDir, "task-facade.ts")}`)}`,
+        `extensions: ${JSON.stringify(`pi-subagents, ${join(extensionDir, "task-facade.ts")}`)}`,
       );
       expect(runnerHeader).toContain('tools: "all, ext:task-facade/Task"');
       expect(runnerHeader).not.toContain("Task, Agent");
@@ -131,12 +131,12 @@ describe.skipIf(!AGENTS_RENDERED)("Pi plan agent renderer", () => {
     // pi-subagents must LOAD in the runner's child session (extensions: is the
     // sole loading authority — an allowlist omitting it leaves only factory
     // side effects, and the judge spawn dies with "No active session"). It
-    // cannot be allowlisted by name (its `./src/index.ts` entry canonicalizes
-    // to "src"), so the wildcard keeps all defaults loaded while the ext:
-    // allowlist keeps their tools hidden.
+    // is allowlisted by its package short name (matched via the nearest
+    // package.json whose pi.extensions declares the entry), while the ext:
+    // allowlist keeps extension tools hidden.
     expect(runnerHeader).toContain(
       `extensions: ${JSON.stringify(
-        `*, ${join(
+        `pi-subagents, ${join(
           import.meta.dir,
           "..",
           "plugins",
