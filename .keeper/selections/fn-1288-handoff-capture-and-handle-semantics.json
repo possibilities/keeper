@@ -9,7 +9,7 @@
       "confidence": 0.68,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Contract-shaped schema/RPC/wire extension gated on the sacred re-fold-determinism and fold-never-throws correctness invariants \u2014 a hard opus gate despite the named target_dir template.",
+      "rationale": "Contract-shaped schema/RPC/wire extension gated on the sacred re-fold-determinism and fold-never-throws correctness invariants; a hard opus gate despite the named target_dir template.",
       "task_id": "fn-1288-handoff-capture-and-handle-semantics.1",
       "tier": "xhigh"
     },
@@ -17,7 +17,7 @@
       "confidence": 0.78,
       "label_source": "heuristic-guided",
       "model": "gpt-5.6-terra",
-      "rationale": "Bounded single-surface CLI flag/validation/help work mirroring the dispatch flag shape with a nameable acceptance and RPC as the correctness backstop \u2014 GPT-first everyday tier.",
+      "rationale": "Bounded single-surface CLI flag/validation/help work mirroring the dispatch flag shape with a nameable acceptance and RPC as the correctness backstop; GPT-first everyday tier.",
       "task_id": "fn-1288-handoff-capture-and-handle-semantics.2",
       "tier": "medium"
     },
@@ -39,7 +39,7 @@
     }
   ],
   "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
-  "created_at": "2026-07-14T00:19:08.438000Z",
+  "created_at": "2026-07-14T00:21:20.669000Z",
   "epic_id": "fn-1288-handoff-capture-and-handle-semantics",
   "input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
   "outcome": "completed",
@@ -49,5 +49,5 @@
     "model": "plan:model-selector"
   },
   "shuffle_seed": 3137945163,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1288-handoff-capture-and-handle-semantics.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped schema/RPC/wire extension gated on the sacred re-fold-determinism and fold-never-throws correctness invariants \u2014 a hard opus gate despite the named target_dir template.\",\"confidence\":0.68},{\"task_id\":\"fn-1288-handoff-capture-and-handle-semantics.2\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Bounded single-surface CLI flag/validation/help work mirroring the dispatch flag shape with a nameable acceptance and RPC as the correctness backstop \u2014 GPT-first everyday tier.\",\"confidence\":0.78},{\"task_id\":\"fn-1288-handoff-capture-and-handle-semantics.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Contract-touching worker launch path (env-carrier + exact run-capture schema match + sole-writer invariant) plus authoring an autonomous prompt-framing constant that needs taste and delicate idiom matching to the wrapped-envelope precedent.\",\"confidence\":0.66},{\"task_id\":\"fn-1288-handoff-capture-and-handle-semantics.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Under-specified cross-document prose alignment demanding consistent handle-vocabulary judgment, user-facing wording, and care not to drift into behavior change or contradict the fn-1287 glossary.\",\"confidence\":0.72}]}"
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1288-handoff-capture-and-handle-semantics.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Contract-shaped schema/RPC/wire extension gated on the sacred re-fold-determinism and fold-never-throws correctness invariants; a hard opus gate despite the named target_dir template.\", \"confidence\": 0.68}, {\"task_id\": \"fn-1288-handoff-capture-and-handle-semantics.2\", \"tier\": \"medium\", \"model\": \"gpt-5.6-terra\", \"rationale\": \"Bounded single-surface CLI flag/validation/help work mirroring the dispatch flag shape with a nameable acceptance and RPC as the correctness backstop; GPT-first everyday tier.\", \"confidence\": 0.78}, {\"task_id\": \"fn-1288-handoff-capture-and-handle-semantics.3\", \"tier\": \"xhigh\", \"model\": \"sonnet\", \"rationale\": \"Contract-touching worker launch path (env-carrier + exact run-capture schema match + sole-writer invariant) plus authoring an autonomous prompt-framing constant that needs taste and delicate idiom matching to the wrapped-envelope precedent.\", \"confidence\": 0.66}, {\"task_id\": \"fn-1288-handoff-capture-and-handle-semantics.4\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Under-specified cross-document prose alignment demanding consistent handle-vocabulary judgment, user-facing wording, and care not to drift into behavior change or contradict the fn-1287 glossary.\", \"confidence\": 0.72}]}\n"
 }
