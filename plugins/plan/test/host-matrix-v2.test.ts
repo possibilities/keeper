@@ -244,6 +244,17 @@ function projectLauncher(m: MatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    providerRoutes: m.providers.flatMap((provider) =>
+      [...provider.models].map(([capability, launchId]) => ({
+        provider: provider.name,
+        capability,
+        launchId,
+        efforts:
+          provider.modelEfforts.get(capability) ??
+          provider.efforts ??
+          m.efforts,
+      })),
+    ),
     agentPins: Object.fromEntries(m.agentPins),
   };
 }
@@ -263,6 +274,14 @@ function projectPlan(h: HostMatrixV2) {
       launchId: s.launchId,
       winner: s.winner,
     })),
+    providerRoutes: [...h.providerRoutes.values()].flatMap((routes) =>
+      [...routes.values()].map((route) => ({
+        provider: route.provider,
+        capability: route.capability,
+        launchId: route.launchId,
+        efforts: route.efforts,
+      })),
+    ),
     agentPins: Object.fromEntries(h.agentPins),
   };
 }

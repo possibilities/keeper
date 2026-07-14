@@ -332,6 +332,15 @@ export function loadHostMatrixV2(
       `matrix.yaml could not be read: ${(err as Error).message}`,
     );
   }
+  return parseHostMatrixV2Bytes(raw, path);
+}
+
+/** Parse one already-read matrix snapshot. The compiler uses this seam so
+ * parsing, route resolution, and fingerprinting all consume identical bytes. */
+export function parseHostMatrixV2Bytes(
+  raw: Buffer,
+  path: string,
+): HostMatrixV2 {
   let parsed: unknown;
   try {
     parsed = parseYamlInput(raw, path);

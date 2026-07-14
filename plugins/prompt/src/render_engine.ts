@@ -58,11 +58,33 @@ export function renderTemplate(
   templatePath: string,
   extraVars: Record<string, string> | null = null,
 ): RenderResult {
+  return renderTemplateSource(
+    templatePath,
+    readFileSync(templatePath, "utf-8"),
+    extraVars,
+  );
+}
+
+export interface RenderTemplateSourceOptions {
+  /** Optional pure shell replacement. Supplying it guarantees this render does
+   * not spawn commands; the caller owns every returned byte. */
+  readonly shell?: (command: string) => string;
+}
+
+/** Render caller-supplied template bytes. Includes still resolve through the
+ * canonical loader roots, but the primary source is never re-read. */
+export function renderTemplateSource(
+  templatePath: string,
+  source: string,
+  extraVars: Record<string, string> | null = null,
+  options: RenderTemplateSourceOptions = {},
+): RenderResult {
   const cwd = dirname(templatePath);
   const projectRoot = findGitRoot(cwd);
   let hadErrors = false;
 
   const shell = (cmd: string): string => {
+    if (options.shell !== undefined) return options.shell(cmd);
     const result = spawnSync("/bin/sh", ["-c", cmd], {
       cwd,
       encoding: "utf-8",
@@ -109,7 +131,6 @@ export function renderTemplate(
   });
   engine.registerFilter("shell", (cmd: unknown) => shell(String(cmd)));
 
-  const source = readFileSync(templatePath, "utf-8");
   const text = engine.parseAndRenderSync(rewriteShellCalls(source), {
     ...(extraVars ?? {}),
   }) as string;

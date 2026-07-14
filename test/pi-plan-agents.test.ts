@@ -15,6 +15,10 @@ import {
   compilePromptArtifacts,
   PI_PROMPT_MANIFEST,
 } from "../plugins/prompt/src/prompt_compiler.ts";
+import {
+  installPiPlanAgents,
+  renderPiPlanAgent,
+} from "../src/agent/pi-plan-agents.ts";
 
 const LIVE_ROOT = resolve(import.meta.dir, "..");
 const PIN_ROWS = [
@@ -105,10 +109,11 @@ function fixture(piModels?: string[]): Fixture {
 }
 
 function renderCanonical(
-  sourcePath: string,
+  _sourcePath: string,
   variables: Readonly<Record<string, string>>,
+  snapshottedSource: string,
 ): string {
-  const source = readFileSync(sourcePath, "utf8")
+  const source = snapshottedSource
     .replaceAll("{{ agent_model }}", variables.agent_model ?? "")
     .replaceAll("{{ agent_effort }}", variables.agent_effort ?? "")
     .replace(/\{\{\s*shell\("(?:\\.|[^"])*"\)\s*\}\}/g, "TEST SHELL OUTPUT");
@@ -172,15 +177,24 @@ describe("role-scoped Pi prompt compiler", () => {
       join(fx.targetDir, "plan:repo-scout.md"),
       "utf8",
     );
-    expect(scoutOutput).toContain("model: openai-codex/gpt-5.6-sol\n");
+    expect(scoutOutput).toContain(
+      `model: ${JSON.stringify("openai-codex/gpt-5.6-sol")}\n`,
+    );
     expect(scoutOutput).toContain("thinking: high\nmax_turns: 60\n");
     expect(scoutOutput).toContain(
       'disallowed_tools: "edit, write, Task, Agent"',
     );
     expect(scoutOutput).not.toContain("STALE INTERMEDIATE");
+    const canonicalPath = join(
+      fx.planRoot,
+      "template",
+      "agents",
+      "repo-scout.md.tmpl",
+    );
     const canonical = renderCanonical(
-      join(fx.planRoot, "template", "agents", "repo-scout.md.tmpl"),
+      canonicalPath,
       { agent_model: "opus", agent_effort: "high" },
+      readFileSync(canonicalPath, "utf8"),
     );
     expect(bodyOf(scoutOutput)).toBe(bodyOf(canonical));
 
@@ -267,6 +281,111 @@ describe("role-scoped Pi prompt compiler", () => {
     });
   });
 
+  test("returns on the verified fingerprint fast path before rendering", () => {
+    const fx = fixture();
+    let renders = 0;
+    const render = (
+      path: string,
+      variables: Readonly<Record<string, string>>,
+      source: string,
+    ): string => {
+      renders += 1;
+      return renderCanonical(path, variables, source);
+    };
+    const options = {
+      request: { target: "pi" as const, bundle: "plan:static" },
+      repoRoot: fx.repoRoot,
+      planRoot: fx.planRoot,
+      matrixPath: fx.matrixPath,
+      equivalencePath: fx.equivalencePath,
+      targetDir: fx.targetDir,
+      taskFacadePath: fx.taskFacadePath,
+      renderCanonical: render,
+    };
+    compilePromptArtifacts(options);
+    expect(renders).toBe(11);
+    expect(compilePromptArtifacts(options).outcome).toBe("hit");
+    expect(renders).toBe(11);
+  });
+
+  test("renders and fingerprints one immutable canonical source snapshot", () => {
+    const fx = fixture();
+    const sourcePath = join(
+      fx.planRoot,
+      "template",
+      "agents",
+      "repo-scout.md.tmpl",
+    );
+    let mutated = false;
+    const first = compilePromptArtifacts({
+      request: { target: "pi", bundle: "plan:static" },
+      repoRoot: fx.repoRoot,
+      planRoot: fx.planRoot,
+      matrixPath: fx.matrixPath,
+      equivalencePath: fx.equivalencePath,
+      targetDir: fx.targetDir,
+      taskFacadePath: fx.taskFacadePath,
+      renderCanonical: (path, variables, source) => {
+        if (!mutated) {
+          mutated = true;
+          writeFileSync(
+            sourcePath,
+            `${readFileSync(sourcePath, "utf8")}RACE\n`,
+          );
+        }
+        return renderCanonical(path, variables, source);
+      },
+    });
+    const published = readFileSync(
+      join(fx.targetDir, "plan:repo-scout.md"),
+      "utf8",
+    );
+    expect(published).not.toContain("RACE");
+    const manifest = JSON.parse(
+      readFileSync(join(fx.targetDir, PI_PROMPT_MANIFEST), "utf8"),
+    ) as { fingerprint: string; files: Record<string, string> };
+    expect(manifest.fingerprint).toBe(first.fingerprint);
+    expect(manifest.files["plan:repo-scout.md"]).toBe(
+      new Bun.CryptoHasher("sha256").update(published).digest("hex"),
+    );
+    const second = compile(fx);
+    expect(second.fingerprint).not.toBe(first.fingerprint);
+    expect(
+      readFileSync(join(fx.targetDir, "plan:repo-scout.md"), "utf8"),
+    ).toContain("RACE");
+  });
+
+  test("uses explicit snapshotted practice-scout values without shell rendering", () => {
+    const fx = fixture();
+    const run = (currentYear: string) =>
+      compilePromptArtifacts({
+        request: { target: "pi", bundle: "plan:static" },
+        repoRoot: fx.repoRoot,
+        planRoot: fx.planRoot,
+        matrixPath: fx.matrixPath,
+        equivalencePath: fx.equivalencePath,
+        targetDir: fx.targetDir,
+        taskFacadePath: fx.taskFacadePath,
+        renderInputs: {
+          currentYear,
+          knowctlAgentTeaser: "SNAPSHOT TEASER",
+          knowctlTopicCount: "2 topics:",
+          knowctlTopics: "alpha, beta",
+        },
+      });
+    const first = run("2042");
+    const practice = readFileSync(
+      join(fx.targetDir, "plan:practice-scout.md"),
+      "utf8",
+    );
+    expect(practice).toContain("The current year is 2042");
+    expect(practice).toContain("SNAPSHOT TEASER");
+    expect(practice).toContain("2 topics: alpha, beta");
+    expect(run("2042").outcome).toBe("hit");
+    const next = run("2043");
+    expect(next.fingerprint).not.toBe(first.fingerprint);
+  });
+
   test("recovers compiler-owned outputs when a manifest-last publication was interrupted", () => {
     const fx = fixture();
     compile(fx);
@@ -346,6 +465,18 @@ describe("role-scoped Pi prompt compiler", () => {
     );
   });
 
+  test("refuses an unrecognized sidecar even when its primary is absent", () => {
+    const fx = fixture();
+    mkdirSync(fx.targetDir, { recursive: true });
+    writeFileSync(
+      join(fx.targetDir, "plan:repo-scout.md.managed-file-dont-edit"),
+      "Generated by somebody else.\n",
+    );
+    expect(() => compile(fx)).toThrow(
+      "refusing to overwrite an unmanaged sidecar",
+    );
+  });
+
   test("fails loud on missing or malformed equivalence maps", () => {
     const fx = fixture();
     expect(() =>
@@ -418,6 +549,86 @@ describe("role-scoped Pi prompt compiler", () => {
     expect(
       JSON.parse(readFileSync(manifestPath, "utf8")).files[orphan],
     ).toBeUndefined();
+  });
+
+  test("compiles the committed copyable example matrix through Pi routes", () => {
+    const fx = fixture();
+    writeFileSync(
+      fx.matrixPath,
+      readFileSync(
+        join(LIVE_ROOT, "docs", "examples", "matrix.example.yaml"),
+        "utf8",
+      ),
+    );
+    const result = compilePromptArtifacts({
+      request: { target: "pi", bundle: "plan:static" },
+      repoRoot: fx.repoRoot,
+      planRoot: fx.planRoot,
+      matrixPath: fx.matrixPath,
+      equivalencePath: fx.equivalencePath,
+      targetDir: fx.targetDir,
+      taskFacadePath: fx.taskFacadePath,
+      renderInputs: { currentYear: "2042" },
+    });
+    expect(result.ok).toBe(true);
+    expect(
+      result.outputs.find((item) => item.role === "plan:repo-scout")
+        ?.launch_cell,
+    ).toEqual({
+      provider: "pi",
+      model: "openai/gpt-5.6-sol",
+      effort: "high",
+    });
+  });
+
+  test("retains the deprecated one-file renderer behavior", () => {
+    const fx = fixture();
+    const sourceDir = join(fx.planRoot, "agents");
+    mkdirSync(sourceDir, { recursive: true });
+    const sourcePath = join(sourceDir, "repo-scout.md");
+    const body = "Body bytes stay exact.\n";
+    writeFileSync(
+      sourcePath,
+      `---\ndescription: scout\nmodel: opus\neffort: high\ndisallowedTools: Edit, Write, Task\n---\n${body}`,
+    );
+    const rendered = renderPiPlanAgent(sourcePath);
+    expect(rendered.filename).toBe("plan:repo-scout.md");
+    expect(rendered.body).toBe(body);
+    expect(headerOf(rendered.content)).not.toContain("model:");
+    expect(headerOf(rendered.content)).toContain("thinking: high");
+    expect(headerOf(rendered.content)).toContain("Task, Agent");
+  });
+
+  test("compatibility check errors name sidecar-only and manifest-only drift", () => {
+    const fx = fixture();
+    const sourceDir = join(fx.planRoot, "agents");
+    mkdirSync(sourceDir, { recursive: true });
+    const options = {
+      sourceDir,
+      targetDir: fx.targetDir,
+      matrixPath: fx.matrixPath,
+      equivalencePath: fx.equivalencePath,
+      catalogPath: join(fx.planRoot, "prompt-artifacts.yaml"),
+    };
+    installPiPlanAgents(options);
+    const sidecar = join(
+      fx.targetDir,
+      "plan:repo-scout.md.managed-file-dont-edit",
+    );
+    writeFileSync(sidecar, `${readFileSync(sidecar, "utf8")}drift\n`);
+    expect(() => installPiPlanAgents({ ...options, check: true })).toThrow(
+      "plan:repo-scout.md.managed-file-dont-edit",
+    );
+
+    installPiPlanAgents(options);
+    const manifest = join(fx.targetDir, PI_PROMPT_MANIFEST);
+    writeFileSync(
+      manifest,
+      JSON.stringify(JSON.parse(readFileSync(manifest, "utf8"))),
+    );
+    expect(() => installPiPlanAgents({ ...options, check: true })).toThrow(
+      PI_PROMPT_MANIFEST,
+    );
   });
 
   test("the install paths retain Pi's nested Task compatibility and invoke the compiler seam", () => {

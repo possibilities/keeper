@@ -110,6 +110,21 @@ export function readYamlBytes(fileArg: string): Buffer {
  * Throws YamlInputError(bad_yaml) on invalid UTF-8 or a YAML syntax error;
  * returns the parsed document (any JS value, or undefined for an empty doc). */
 export function parseYamlInput(raw: Buffer, fileLabel: string): unknown {
+  return parseYamlBytes(raw, fileLabel, false);
+}
+
+/** Parse compiler control data with the same YAML 1.1 scalar semantics as the
+ * shared plan loader while rejecting duplicate mapping keys. This is an opt-in
+ * seam: plan creation inputs deliberately retain their last-key-wins behavior. */
+export function parseStrictYamlInput(raw: Buffer, fileLabel: string): unknown {
+  return parseYamlBytes(raw, fileLabel, true);
+}
+
+function parseYamlBytes(
+  raw: Buffer,
+  fileLabel: string,
+  uniqueKeys: boolean,
+): unknown {
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
@@ -122,7 +137,7 @@ export function parseYamlInput(raw: Buffer, fileLabel: string): unknown {
   }
 
   try {
-    return parseYaml(text, { version: "1.1", uniqueKeys: false });
+    return parseYaml(text, { version: "1.1", uniqueKeys });
   } catch (exc) {
     throw new YamlInputError(
       "bad_yaml",

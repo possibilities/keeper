@@ -22,6 +22,7 @@ import {
   lookupProviderEquivalence,
   type ProviderEquivalenceConfig,
   ProviderEquivalenceConfigError,
+  parseProviderEquivalenceConfigBytes,
 } from "../src/provider_equivalence.ts";
 import { parseYamlInput } from "../src/yaml_input.ts";
 
@@ -146,6 +147,24 @@ describe("coerceProviderEquivalenceConfig", () => {
       },
     };
   }
+
+  test("the strict loader rejects duplicate cell mapping keys", () => {
+    const body = [
+      "schema_version: 1",
+      "mappings:",
+      "  claude_to_gpt:",
+      "    - source: { model: opus, model: sonnet, effort: low }",
+      "      target: { model: gpt-5.6-sol, effort: low }",
+      "  gpt_to_claude: []",
+      "",
+    ].join("\n");
+    expect(() =>
+      parseProviderEquivalenceConfigBytes(
+        Buffer.from(body),
+        "duplicate-cell.yaml",
+      ),
+    ).toThrow(/Map keys must be unique|duplicate/i);
+  });
 
   test("a well-formed minimal document coerces", () => {
     const config = coerceProviderEquivalenceConfig(validDoc());

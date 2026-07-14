@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { main, positional } from "../src/cli.ts";
 import { PROMPT_COMMANDS } from "../src/descriptor.ts";
 
@@ -177,6 +177,123 @@ describe("keeper prompt dispatcher contract", () => {
     const r = run(["--format", "xml", "render", "foo"]);
     expect(r.code).toBe(2);
     expect(r.stderr).toContain("Invalid value for '--format'");
+  });
+
+  test.each([
+    {
+      name: "unknown flag",
+      argv: ["compile", "--bundle", "plan:static", "--target", "pi", "--nope"],
+      message: "No such option for compile: --nope",
+    },
+    {
+      name: "positional",
+      argv: ["compile", "plan:static", "--target", "pi"],
+      message: "does not accept positional argument",
+    },
+    {
+      name: "terminal agent-dir",
+      argv: [
+        "compile",
+        "--bundle",
+        "plan:static",
+        "--target",
+        "pi",
+        "--agent-dir",
+      ],
+      message: "--agent-dir requires a non-empty value",
+    },
+    {
+      name: "empty agent-dir",
+      argv: [
+        "compile",
+        "--bundle",
+        "plan:static",
+        "--target",
+        "pi",
+        "--agent-dir=",
+      ],
+      message: "--agent-dir requires a non-empty value",
+    },
+    {
+      name: "empty scope",
+      argv: ["compile", "--bundle=", "--target", "pi"],
+      message: "--bundle requires a non-empty value",
+    },
+    {
+      name: "conflicting scopes",
+      argv: [
+        "compile",
+        "--bundle",
+        "plan:static",
+        "--role",
+        "plan:repo-scout",
+        "--target",
+        "pi",
+      ],
+      message: "exactly one of --bundle or --role",
+    },
+    {
+      name: "missing scope",
+      argv: ["compile", "--target", "pi"],
+      message: "exactly one of --bundle or --role",
+    },
+    {
+      name: "missing target",
+      argv: ["compile", "--bundle", "plan:static"],
+      message: "requires --target",
+    },
+    {
+      name: "unsupported target",
+      argv: ["compile", "--bundle", "plan:static", "--target", "claude"],
+      message: "does not support target 'claude'",
+    },
+  ])("compile rejects $name", ({ argv, message }) => {
+    const r = run([...argv]);
+    expect(r.code).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain(message);
+  });
+
+  test("compile accepts exactly its advertised flags and publishes through the real CLI", () => {
+    const repoRoot = resolve(import.meta.dir, "../../..");
+    const root = mkdtempSync(join(tmpdir(), "kp-cli-compile-"));
+    const config = join(root, "config");
+    const agentDir = join(root, "pi-agent");
+    mkdirSync(config, { recursive: true });
+    writeFileSync(
+      join(config, "matrix.yaml"),
+      readFileSync(join(repoRoot, "docs", "examples", "matrix.example.yaml")),
+    );
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = config;
+    try {
+      const r = run([
+        "compile",
+        "--bundle",
+        "plan:static",
+        "--target",
+        "pi",
+        "--project-root",
+        repoRoot,
+        "--agent-dir",
+        agentDir,
+      ]);
+      expect(r.ret).toBe(0);
+      expect(r.code).toBeUndefined();
+      expect(r.stderr).toBe("");
+      expect(JSON.parse(r.stdout)).toMatchObject({
+        target: "pi",
+        ok: true,
+        request: { kind: "bundle", name: "plan:static" },
+      });
+      expect(
+        statSync(join(agentDir, "agents", ".keeper-plan-agents.json")).isFile(),
+      ).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.KEEPER_CONFIG_DIR;
+      else process.env.KEEPER_CONFIG_DIR = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   for (const verb of STUB_VERBS) {

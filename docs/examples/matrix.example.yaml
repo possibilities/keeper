@@ -72,6 +72,13 @@ providers:
       - id: gpt-5.3-spark-preview
         efforts:
           - medium
+      # Launch-only route used when static opus pins adapt through the committed
+      # provider-equivalence map. It stays outside the worker cell axis.
+      - id: openai/gpt-5.6-sol
+        efforts:
+          - medium
+          - high
+          - xhigh
 
 # The fixed claude model-and-effort every wrapped cell's wrapper runs at.
 wrapper_driver:

@@ -8,11 +8,10 @@
 // The parser is DELIBERATELY strict (not the permissive coercer pattern used
 // elsewhere): it rejects an unknown key at every level, a non-canonical
 // effort, and a malformed target shape, so a typo in the committed map fails
-// loud rather than silently mistranslating a dispatch. Each direction is a
-// LIST of `{source, target}` entries rather than a nested map — YAML's
-// duplicate-key handling (`parseYamlInput`'s `uniqueKeys: false`) silently
-// last-wins a nested map, which would make a duplicate source cell
-// undetectable; a list lets `checkProviderEquivalence` catch it structurally.
+// loud rather than silently mistranslating a dispatch. The loader rejects YAML
+// duplicate mapping keys. Each direction remains a LIST of `{source, target}`
+// entries so semantically duplicate source cells stay visible to
+// `checkProviderEquivalence` as a separate control-data invariant.
 //
 // `checkProviderEquivalence` is HOST-BLIND (no host matrix read): it validates
 // the map's own internal shape — no same-family target, every target model a
@@ -30,7 +29,7 @@ import {
   type EffectiveMatrix,
   effectiveMatrix,
 } from "./host_matrix.ts";
-import { loadYamlInput } from "./yaml_input.ts";
+import { parseStrictYamlInput, readYamlBytes } from "./yaml_input.ts";
 
 /** Plan plugin root — provider-equivalence.yaml sits here. */
 export const PLAN_ROOT = resolve(import.meta.dir, "..");
@@ -141,10 +140,8 @@ function coerceEntry(raw: unknown, label: string): EquivalenceEntry {
   };
 }
 
-/** Coerce one direction's entry list. A direction is a LIST (not a nested map)
- * precisely so a duplicate source cell stays structurally detectable —
- * `parseYamlInput` disables duplicate-key rejection, so a nested map would
- * silently last-win a repeated key before this parser ever saw it. */
+/** Coerce one direction's entry list. A LIST keeps a repeated source cell
+ * structurally detectable even when every individual YAML mapping key is unique. */
 function coerceDirection(raw: unknown, label: string): EquivalenceEntry[] {
   if (!Array.isArray(raw)) {
     throw new ProviderEquivalenceConfigError(
@@ -193,11 +190,20 @@ export function coerceProviderEquivalenceConfig(
   };
 }
 
-/** Read + parse the config off disk through the shared YAML 1.1 loader. */
+/** Parse one already-read control-data snapshot with duplicate mapping keys
+ * rejected. Shared plan creation inputs keep their separate permissive seam. */
+export function parseProviderEquivalenceConfigBytes(
+  raw: Buffer,
+  path: string,
+): ProviderEquivalenceConfig {
+  return coerceProviderEquivalenceConfig(parseStrictYamlInput(raw, path));
+}
+
+/** Read + strictly parse the committed control-data map. */
 export function loadProviderEquivalenceConfig(
   path: string,
 ): ProviderEquivalenceConfig {
-  return coerceProviderEquivalenceConfig(loadYamlInput(path));
+  return parseProviderEquivalenceConfigBytes(readYamlBytes(path), path);
 }
 
 /** report-or-exit result, matching model-guidance-check's GuidanceCheckResult. */

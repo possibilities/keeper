@@ -193,6 +193,58 @@ function printLeafHelp(spec: PromptCommandDescriptor): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+interface StrictLeafOptions {
+  readonly strings: ReadonlyMap<string, string>;
+  readonly booleans: ReadonlySet<string>;
+}
+
+/** Strict descriptor-driven option parser for compiler publication. No hidden
+ * flags, positionals, empty values, or value-bearing booleans are accepted. */
+function parseStrictLeafOptions(
+  spec: PromptCommandDescriptor,
+  args: readonly string[],
+): StrictLeafOptions {
+  const advertised = new Map(spec.flags.map((flag) => [flag.name, flag]));
+  const strings = new Map<string, string>();
+  const booleans = new Set<string>();
+  const seen = new Set<string>();
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] as string;
+    if (!arg.startsWith("--")) {
+      usageError(`${spec.name} does not accept positional argument '${arg}'`);
+    }
+    const equals = arg.indexOf("=");
+    const name = arg.slice(2, equals < 0 ? undefined : equals);
+    const flag = advertised.get(name);
+    if (flag === undefined) {
+      usageError(`No such option for ${spec.name}: --${name}`);
+    }
+    if (seen.has(name)) {
+      usageError(`${spec.name} option --${name} may be specified only once`);
+    }
+    seen.add(name);
+    if (flag.type === "boolean") {
+      if (equals >= 0) {
+        usageError(`${spec.name} option --${name} does not take a value`);
+      }
+      booleans.add(name);
+      continue;
+    }
+    let value: string | undefined;
+    if (equals >= 0) {
+      value = arg.slice(equals + 1);
+    } else {
+      index += 1;
+      value = args[index];
+    }
+    if (value === undefined || value === "" || value.startsWith("--")) {
+      usageError(`${spec.name} option --${name} requires a non-empty value`);
+    }
+    strings.set(name, value);
+  }
+  return { strings, booleans };
+}
+
 function dispatch(parsed: ParsedArgs): number {
   const { command, format } = parsed;
   if (command === null) {
@@ -215,24 +267,28 @@ function dispatch(parsed: ParsedArgs): number {
 
   switch (command) {
     case "compile": {
-      const bundle = readOption(parsed.rest, "--bundle");
-      const role = readOption(parsed.rest, "--role");
-      const target = readOption(parsed.rest, "--target");
+      const options = parseStrictLeafOptions(spec, parsed.rest);
+      const bundle = options.strings.get("bundle");
+      const role = options.strings.get("role");
+      const target = options.strings.get("target");
       if ((bundle === undefined) === (role === undefined)) {
         usageError("compile requires exactly one of --bundle or --role");
       }
-      if (target !== "pi") {
-        usageError("compile --target must be 'pi'");
+      if (target === undefined) {
+        usageError("compile requires --target");
       }
-      const projectRoot = readOption(parsed.rest, "--project-root");
-      const agentDir = readOption(parsed.rest, "--agent-dir");
+      if (target !== "pi") {
+        usageError(`compile does not support target '${target}'`);
+      }
+      const projectRoot = options.strings.get("project-root");
+      const agentDir = options.strings.get("agent-dir");
       try {
         const result = compilePromptArtifacts({
           request: {
             target: "pi",
             ...(bundle === undefined ? { role } : { bundle }),
           },
-          check: parsed.rest.includes("--check"),
+          check: options.booleans.has("check"),
           repoRoot:
             projectRoot === undefined ? undefined : resolve(projectRoot),
           targetDir:

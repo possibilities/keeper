@@ -1,7 +1,10 @@
 import { readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import { loadYamlInput } from "../../plan/src/yaml_input.ts";
+import {
+  parseStrictYamlInput,
+  readYamlBytes,
+} from "../../plan/src/yaml_input.ts";
 
 export type PromptArtifactBinding = "static" | "cell-bound";
 export type PromptArtifactAdaptation = "equivalent" | "wrapped";
@@ -266,9 +269,26 @@ export function parsePromptArtifactCatalog(
   };
 }
 
+/** Parse one already-read catalog snapshot. Duplicate mapping keys are rejected
+ * here without changing the shared plan-input loader's last-key-wins contract. */
+export function parsePromptArtifactCatalogBytes(
+  raw: Buffer,
+  catalogPath: string,
+  planRoot: string,
+): PromptArtifactCatalog {
+  return parsePromptArtifactCatalog(
+    parseStrictYamlInput(raw, catalogPath),
+    planRoot,
+  );
+}
+
 export function loadPromptArtifactCatalog(
   catalogPath: string,
   planRoot: string,
 ): PromptArtifactCatalog {
-  return parsePromptArtifactCatalog(loadYamlInput(catalogPath), planRoot);
+  return parsePromptArtifactCatalogBytes(
+    readYamlBytes(catalogPath),
+    catalogPath,
+    planRoot,
+  );
 }

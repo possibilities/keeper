@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 
 import {
   loadPromptArtifactCatalog,
@@ -80,6 +80,20 @@ describe("strict prompt artifact catalog", () => {
     for (const bundle of ["plan:plan", "plan:close", "plan:work"]) {
       expect(catalog.bundleByName.get(bundle)?.roles.length).toBeGreaterThan(1);
     }
+  });
+
+  test("rejects duplicate YAML mapping keys before schema coercion", () => {
+    const root = planRoot();
+    const path = join(root, "prompt-artifacts.yaml");
+    const body = stringify(validDoc()).replace(
+      "role: plan:one",
+      "role: plan:one\n    role: plan:two",
+    );
+    expect(body).toContain("role: plan:two\n    source:");
+    writeFileSync(path, body);
+    expect(() => loadPromptArtifactCatalog(path, root)).toThrow(
+      /Map keys must be unique|duplicate/i,
+    );
   });
 
   test("rejects unknown keys and duplicate logical roles", () => {

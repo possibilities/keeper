@@ -1152,8 +1152,14 @@ describe("committed example matrix (anti-rot, v2)", () => {
         .find((p) => p.name === "pi")
         ?.models.get("gpt-5.3-codex-spark"),
     ).toBe("openai-codex/gpt-5.3-codex-spark");
-    // {id, efforts} band (pi) → launch-only capability with its own effort list
+    // {id, efforts} bands (pi) → launch-only capabilities with exact effort lists
     expect(m.effortsByModel.get("gpt-5.3-spark-preview")).toEqual(["medium"]);
+    expect(
+      m.providers.find((p) => p.name === "pi")?.models.get("gpt-5.6-sol"),
+    ).toBe("openai/gpt-5.6-sol");
+    expect(
+      m.providers.find((p) => p.name === "pi")?.modelEfforts.get("gpt-5.6-sol"),
+    ).toEqual(["medium", "high", "xhigh"]);
     // driver-tagged cell axis
     expect(matrixV2Cells(m)).toEqual([
       { model: "opus", driver: "native" },

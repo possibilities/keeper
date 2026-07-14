@@ -11,30 +11,30 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import yaml from "js-yaml";
-
+import { FileLock } from "../../../src/file-lock.ts";
 import {
   type AgentPin,
   type HostMatrixV2,
   hostMatrixV2ProviderRoute,
-  loadHostMatrixV2,
+  parseHostMatrixV2Bytes,
 } from "../../plan/src/host_matrix.ts";
 import {
   checkProviderEquivalence,
   type EquivalenceCell,
-  loadProviderEquivalenceConfig,
   lookupProviderEquivalence,
   type ProviderEquivalenceConfig,
+  parseProviderEquivalenceConfigBytes,
 } from "../../plan/src/provider_equivalence.ts";
 import {
-  loadPromptArtifactCatalog,
   type PromptArtifactCatalog,
   type PromptArtifactRole,
+  parsePromptArtifactCatalogBytes,
 } from "./artifact_catalog.ts";
-import { renderTemplate } from "./render_engine.ts";
+import { renderTemplateSource } from "./render_engine.ts";
 
 export const PI_PROMPT_MANIFEST = ".keeper-plan-agents.json";
 const SIDECAR_SUFFIX = ".managed-file-dont-edit";
-const COMPILER_REVISION = "keeper-prompt-pi-static-v1";
+const COMPILER_REVISION = "keeper-prompt-pi-static-v2";
 
 export interface PromptCompileRequest {
   readonly target: "pi";
@@ -53,11 +53,22 @@ export interface PromptCompileOptions {
   /** Pi definitions directory. Defaults to $PI_CODING_AGENT_DIR/agents. */
   readonly targetDir?: string;
   readonly taskFacadePath?: string;
-  /** Deterministic test seam; returns the complete canonical rendered markdown. */
+  /** Explicit deterministic values for canonical shell expressions. Every value
+   * is snapshotted into the input fingerprint; the compiler never runs a shell. */
+  readonly renderInputs?: Partial<PromptCompilerRenderInputs>;
+  /** Deterministic test seam; receives the snapshotted canonical source bytes. */
   readonly renderCanonical?: (
     sourcePath: string,
     variables: Readonly<Record<string, string>>,
+    source: string,
   ) => string;
+}
+
+export interface PromptCompilerRenderInputs {
+  readonly currentYear: string;
+  readonly knowctlAgentTeaser: string;
+  readonly knowctlTopicCount: string;
+  readonly knowctlTopics: string;
 }
 
 export interface PromptCompileCell {
@@ -77,6 +88,7 @@ export interface PromptCompileRoleResult {
   readonly effective_cell: PromptCompileCell;
   readonly launch_cell: PromptCompileLaunchCell;
   readonly changed: boolean;
+  readonly sidecar_changed: boolean;
 }
 
 export interface PromptCompileResult {
@@ -87,21 +99,25 @@ export interface PromptCompileResult {
   readonly fingerprint: string;
   readonly outputs: readonly PromptCompileRoleResult[];
   readonly removed: readonly string[];
+  readonly drifted: readonly string[];
   readonly check: boolean;
   readonly ok: boolean;
 }
 
-interface CompiledRole {
+interface PlannedRole {
   role: PromptArtifactRole;
   output: string;
-  content: string;
-  hash: string;
   sidecar: string;
   sidecarContent: string;
   sidecarHash: string;
   assigned: PromptCompileCell;
   effective: PromptCompileCell;
   launch: PromptCompileLaunchCell;
+}
+
+interface CompiledRole extends PlannedRole {
+  content: string;
+  hash: string;
 }
 
 interface ManagedManifestV2 {
@@ -215,6 +231,8 @@ export function translateClaudeAgentToPi(input: {
   readonly launchModel: string;
   readonly launchEffort: string;
   readonly taskFacadePath: string;
+  /** Compatibility facades can emit the model-free one-file header contract. */
+  readonly emitModel?: boolean;
 }): { readonly content: string; readonly body: string } {
   const source = splitRenderedClaudeAgent(input.rendered, input.sourcePath);
   const description = source.frontmatter.description;
@@ -223,14 +241,15 @@ export function translateClaudeAgentToPi(input: {
   }
   const thinking = piThinking(input.launchEffort);
   const denied = translatedDeniedTools(source.frontmatter.disallowedTools);
-  const lines = [
-    "---",
-    `description: ${JSON.stringify(description)}`,
-    `model: ${input.launchModel}`,
+  const lines = ["---", `description: ${JSON.stringify(description)}`];
+  if (input.emitModel ?? true) {
+    lines.push(`model: ${JSON.stringify(input.launchModel)}`);
+  }
+  lines.push(
     `thinking: ${thinking}`,
     `max_turns: ${maxTurns(thinking)}`,
     "prompt_mode: replace",
-  ];
+  );
   if (input.role === "plan:panel-runner") {
     if (!existsSync(input.taskFacadePath)) {
       throw new Error(
@@ -347,10 +366,89 @@ function validateRequest(
   return { kind: "bundle", name: bundle.bundle };
 }
 
-function fingerprintInputs(input: {
+interface PromptCompilerSnapshot {
+  readonly catalog: Buffer;
+  readonly matrix: Buffer;
+  readonly equivalence: Buffer;
+  readonly sources: ReadonlyMap<string, string>;
+  readonly renderInputs: PromptCompilerRenderInputs;
+}
+
+function renderInputs(
+  provided: Partial<PromptCompilerRenderInputs> | undefined,
+): PromptCompilerRenderInputs {
+  const values = {
+    currentYear: String(new Date().getUTCFullYear()),
+    knowctlAgentTeaser: "",
+    knowctlTopicCount: "",
+    knowctlTopics: "",
+    ...provided,
+  };
+  if (!/^\d{4}$/.test(values.currentYear)) {
+    throw new Error(
+      "prompt compiler renderInputs.currentYear must be four digits",
+    );
+  }
+  for (const [name, value] of Object.entries(values)) {
+    if (typeof value !== "string" || value.includes("\0")) {
+      throw new Error(
+        `prompt compiler renderInputs.${name} must be a NUL-free string`,
+      );
+    }
+  }
+  return values;
+}
+
+function snapshotInputs(input: {
   catalogPath: string;
   matrixPath: string;
   equivalencePath: string;
+  planRoot: string;
+  renderInputs: PromptCompilerRenderInputs;
+}): {
+  snapshot: PromptCompilerSnapshot;
+  catalog: PromptArtifactCatalog;
+  matrix: HostMatrixV2;
+  equivalence: ProviderEquivalenceConfig;
+  roles: PromptArtifactRole[];
+} {
+  const catalogBytes = readFileSync(input.catalogPath);
+  const matrixBytes = readFileSync(input.matrixPath);
+  const equivalenceBytes = readFileSync(input.equivalencePath);
+  const catalog = parsePromptArtifactCatalogBytes(
+    catalogBytes,
+    input.catalogPath,
+    input.planRoot,
+  );
+  const matrix = parseHostMatrixV2Bytes(matrixBytes, input.matrixPath);
+  const equivalence = parseProviderEquivalenceConfigBytes(
+    equivalenceBytes,
+    input.equivalencePath,
+  );
+  const roles = catalog.roles
+    .filter((role) => role.binding === "static")
+    .sort((a, b) => a.role.localeCompare(b.role));
+  const sources = new Map<string, string>();
+  for (const role of roles) {
+    sources.set(role.role, readFileSync(role.sourcePath, "utf8"));
+  }
+  return {
+    snapshot: {
+      catalog: Buffer.from(catalogBytes),
+      matrix: Buffer.from(matrixBytes),
+      equivalence: Buffer.from(equivalenceBytes),
+      sources,
+      renderInputs: input.renderInputs,
+    },
+    catalog,
+    matrix,
+    equivalence,
+    roles,
+  };
+}
+
+function fingerprintInputs(input: {
+  snapshot: PromptCompilerSnapshot;
   roles: readonly PromptArtifactRole[];
   taskFacadePath: string;
 }): string {
@@ -363,17 +461,16 @@ function fingerprintInputs(input: {
   add("compiler", COMPILER_REVISION);
   add("target", "pi");
   add("task-facade-path", input.taskFacadePath);
-  for (const [label, path] of [
-    ["catalog", input.catalogPath],
-    ["matrix", input.matrixPath],
-    ["equivalence", input.equivalencePath],
-  ] as const) {
-    add(label, readFileSync(path));
-  }
-  for (const role of [...input.roles].sort((a, b) =>
-    a.role.localeCompare(b.role),
-  )) {
-    add(`source:${role.role}:${role.source}`, readFileSync(role.sourcePath));
+  add("render-inputs", JSON.stringify(input.snapshot.renderInputs));
+  add("catalog", input.snapshot.catalog);
+  add("matrix", input.snapshot.matrix);
+  add("equivalence", input.snapshot.equivalence);
+  for (const role of input.roles) {
+    const source = input.snapshot.sources.get(role.role);
+    if (source === undefined) {
+      throw new Error(`${role.role}: canonical template snapshot is missing`);
+    }
+    add(`source:${role.role}:${role.source}`, source);
   }
   return hash.digest("hex");
 }
@@ -455,31 +552,82 @@ function fileMatches(path: string, hash: string): boolean {
   return existsSync(path) && sha256(readFileSync(path)) === hash;
 }
 
-function hasManagedSidecar(path: string): boolean {
+function hasValidatedManagedSidecar(
+  path: string,
+  role: PromptArtifactRole,
+  planRoot: string,
+): boolean {
   if (!existsSync(path)) return false;
   const content = readFileSync(path, "utf8");
+  const legacy = [
+    "Generated by Keeper for Pi. Do not edit this file directly.",
+    `Source: ${localName(role.role)}.md`,
+    "Regenerate with: bun scripts/install-pi-plan-agents.ts",
+    "",
+  ].join("\n");
+  if (content === legacy) return true;
+  const lines = content.split("\n");
   return (
-    content.startsWith("Generated by keeper prompt compile.") ||
-    content.startsWith("Generated by Keeper for Pi.")
+    lines.length === 6 &&
+    lines[0] ===
+      "Generated by keeper prompt compile. Do not edit this file directly." &&
+    lines[1] === `Role: ${role.role}` &&
+    lines[2] === `Source: ${relative(planRoot, role.sourcePath)}` &&
+    /^Fingerprint: [a-f0-9]{64}$/.test(lines[3] ?? "") &&
+    lines[4] ===
+      "Regenerate with: keeper prompt compile --bundle plan:static --target pi" &&
+    lines[5] === ""
   );
 }
 
 function atomicWrite(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
-  writeFileSync(temp, content, { mode: 0o644 });
-  chmodSync(temp, 0o644);
-  renameSync(temp, path);
+  try {
+    writeFileSync(temp, content, { mode: 0o644 });
+    chmodSync(temp, 0o644);
+    renameSync(temp, path);
+  } finally {
+    rmSync(temp, { force: true });
+  }
 }
 
-function manifestBody(
+function compilerShell(
+  inputs: PromptCompilerRenderInputs,
+): (command: string) => string {
+  return (command) => {
+    if (command === "date +%Y") return inputs.currentYear;
+    if (command.includes("knowctl --agent-teaser")) {
+      return inputs.knowctlAgentTeaser;
+    }
+    if (command.includes("knowctl list-topics") && command.includes("wc -l")) {
+      return inputs.knowctlTopicCount;
+    }
+    if (
+      command.includes("knowctl list-topics") &&
+      command.includes("paste -sd")
+    ) {
+      return inputs.knowctlTopics;
+    }
+    throw new Error(
+      `prompt compiler template uses unsnapshotted shell command ${JSON.stringify(command)}`,
+    );
+  };
+}
+
+function manifestBodyFromHashes(
   fingerprint: string,
-  compiled: readonly CompiledRole[],
+  planned: readonly PlannedRole[],
+  fileHashes: ReadonlyMap<string, string>,
 ): string {
   const files: Record<string, string> = {};
   const sidecars: Record<string, string> = {};
-  for (const item of compiled) {
-    files[item.output] = item.hash;
+  for (const item of planned) {
+    const hash = fileHashes.get(item.output);
+    if (hash === undefined) {
+      throw new Error(`missing compiled hash for ${item.output}`);
+    }
+    files[item.output] = hash;
     sidecars[item.sidecar] = item.sidecarHash;
   }
   const manifest: ManagedManifestV2 = {
@@ -490,6 +638,84 @@ function manifestBody(
     sidecars,
   };
   return `${JSON.stringify(manifest, null, 2)}\n`;
+}
+
+function planRoles(
+  roles: readonly PromptArtifactRole[],
+  matrix: HostMatrixV2,
+  equivalence: ProviderEquivalenceConfig,
+  planRoot: string,
+  fingerprint: string,
+): PlannedRole[] {
+  return roles.map((role) => {
+    const pin = matrix.agentPins.get(localName(role.role));
+    if (pin === undefined) {
+      throw new Error(
+        `${role.role}: no agent_pins entry for '${localName(role.role)}'`,
+      );
+    }
+    const cells = resolveCell(role, pin, matrix, equivalence);
+    const output = `${role.role}.md`;
+    const sidecar = `${output}${SIDECAR_SUFFIX}`;
+    const marker = sidecarContent(role, planRoot, fingerprint);
+    return {
+      role,
+      output,
+      sidecar,
+      sidecarContent: marker,
+      sidecarHash: sha256(marker),
+      ...cells,
+    };
+  });
+}
+
+function fastPathMatches(
+  previous: PreviousManifest,
+  fingerprint: string,
+  planned: readonly PlannedRole[],
+  targetDir: string,
+  manifestPath: string,
+): boolean {
+  if (
+    previous.fingerprint !== fingerprint ||
+    previous.files.size !== planned.length ||
+    previous.sidecars.size !== planned.length
+  ) {
+    return false;
+  }
+  for (const item of planned) {
+    const outputHash = previous.files.get(item.output);
+    if (
+      outputHash === undefined ||
+      previous.sidecars.get(item.sidecar) !== item.sidecarHash ||
+      !fileMatches(join(targetDir, item.output), outputHash) ||
+      !fileMatches(join(targetDir, item.sidecar), item.sidecarHash)
+    ) {
+      return false;
+    }
+  }
+  return (
+    readFileSync(manifestPath, "utf8") ===
+    manifestBodyFromHashes(fingerprint, planned, previous.files)
+  );
+}
+
+function roleResults(
+  planned: readonly PlannedRole[],
+  hashes: ReadonlyMap<string, string>,
+  outputChanged: ReadonlyMap<string, boolean>,
+  sidecarChanged: ReadonlyMap<string, boolean>,
+): PromptCompileRoleResult[] {
+  return planned.map((item) => ({
+    role: item.role.role,
+    output: item.output,
+    sha256: hashes.get(item.output) as string,
+    assigned_cell: item.assigned,
+    effective_cell: item.effective,
+    launch_cell: item.launch,
+    changed: outputChanged.get(item.output) ?? false,
+    sidecar_changed: sidecarChanged.get(item.sidecar) ?? false,
+  }));
 }
 
 /** Compile and publish the complete static plan-role set. A role/bundle request
@@ -518,80 +744,165 @@ export function compilePromptArtifacts(
   );
   const check = options.check ?? false;
 
-  const catalog = loadPromptArtifactCatalog(catalogPath, planRoot);
-  const request = validateRequest(options.request, catalog);
-  const matrix = loadHostMatrixV2(matrixPath);
-  const equivalence = loadProviderEquivalenceConfig(equivalencePath);
-  const equivalenceCheck = checkProviderEquivalence(equivalence);
+  const snapshotted = snapshotInputs({
+    catalogPath,
+    matrixPath,
+    equivalencePath,
+    planRoot,
+    renderInputs: renderInputs(options.renderInputs),
+  });
+  const request = validateRequest(options.request, snapshotted.catalog);
+  const equivalenceCheck = checkProviderEquivalence(snapshotted.equivalence);
   if (!equivalenceCheck.ok) {
     throw new Error(
       `provider equivalence map is invalid: ${equivalenceCheck.errors.join("; ")}`,
     );
   }
-  const staticRoles = catalog.roles
-    .filter((role) => role.binding === "static")
-    .sort((a, b) => a.role.localeCompare(b.role));
-  if (staticRoles.length === 0) {
+  if (snapshotted.roles.length === 0) {
     throw new Error("prompt artifact catalog has no static roles");
   }
   const fingerprint = fingerprintInputs({
-    catalogPath,
-    matrixPath,
-    equivalencePath,
-    roles: staticRoles,
+    snapshot: snapshotted.snapshot,
+    roles: snapshotted.roles,
     taskFacadePath,
   });
+  const planned = planRoles(
+    snapshotted.roles,
+    snapshotted.matrix,
+    snapshotted.equivalence,
+    planRoot,
+    fingerprint,
+  );
+  if (
+    planned.some((item) => item.role.role === "plan:panel-runner") &&
+    !existsSync(taskFacadePath)
+  ) {
+    throw new Error(`Pi Task extension not found at ${taskFacadePath}`);
+  }
 
-  const compiled: CompiledRole[] = staticRoles.map((role) => {
-    const pin = matrix.agentPins.get(localName(role.role));
-    if (pin === undefined) {
+  const lockPath = `${targetDir}.keeper-prompt-compile.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const lock = FileLock.acquire(lockPath);
+  try {
+    return compileUnderPublicationLock({
+      options,
+      request,
+      check,
+      planRoot,
+      targetDir,
+      taskFacadePath,
+      fingerprint,
+      snapshot: snapshotted.snapshot,
+      planned,
+    });
+  } finally {
+    lock.release();
+  }
+}
+
+function compileUnderPublicationLock(input: {
+  options: PromptCompileOptions;
+  request: PromptCompileResult["request"];
+  check: boolean;
+  planRoot: string;
+  targetDir: string;
+  taskFacadePath: string;
+  fingerprint: string;
+  snapshot: PromptCompilerSnapshot;
+  planned: readonly PlannedRole[];
+}): PromptCompileResult {
+  const manifestPath = join(input.targetDir, PI_PROMPT_MANIFEST);
+  const previous = readManifest(manifestPath);
+
+  if (
+    fastPathMatches(
+      previous,
+      input.fingerprint,
+      input.planned,
+      input.targetDir,
+      manifestPath,
+    )
+  ) {
+    const unchanged = new Map<string, boolean>();
+    return {
+      schema_version: 1,
+      target: "pi",
+      request: input.request,
+      outcome: "hit",
+      fingerprint: input.fingerprint,
+      outputs: roleResults(input.planned, previous.files, unchanged, unchanged),
+      removed: [],
+      drifted: [],
+      check: input.check,
+      ok: true,
+    };
+  }
+
+  for (const item of input.planned) {
+    const outputPath = join(input.targetDir, item.output);
+    const sidecarPath = join(input.targetDir, item.sidecar);
+    const markerOwned = hasValidatedManagedSidecar(
+      sidecarPath,
+      item.role,
+      input.planRoot,
+    );
+    if (
+      existsSync(sidecarPath) &&
+      !previous.sidecars.has(item.sidecar) &&
+      !markerOwned
+    ) {
       throw new Error(
-        `${role.role}: no agent_pins entry for '${localName(role.role)}'`,
+        `${sidecarPath}: refusing to overwrite an unmanaged sidecar`,
       );
     }
-    const cells = resolveCell(role, pin, matrix, equivalence);
-    const variables = {
-      agent_model: pin.model,
-      agent_effort: pin.effort,
-    };
-    const canonical =
-      options.renderCanonical?.(role.sourcePath, variables) ??
-      `${renderTemplate(role.sourcePath, variables).text}\n`;
-    const translated = translateClaudeAgentToPi({
-      role: role.role,
-      sourcePath: role.sourcePath,
-      rendered: canonical,
-      launchModel: cells.launch.model,
-      launchEffort: cells.launch.effort,
-      taskFacadePath,
-    });
-    const output = `${role.role}.md`;
-    const sidecar = `${output}${SIDECAR_SUFFIX}`;
-    const marker = sidecarContent(role, planRoot, fingerprint);
-    return {
-      role,
-      output,
-      content: translated.content,
-      hash: sha256(translated.content),
-      sidecar,
-      sidecarContent: marker,
-      sidecarHash: sha256(marker),
-      ...cells,
-    };
-  });
-
-  const manifestPath = join(targetDir, PI_PROMPT_MANIFEST);
-  const previous = readManifest(manifestPath);
-  for (const item of compiled) {
-    const path = join(targetDir, item.output);
-    const owned =
-      previous.files.has(item.output) ||
-      hasManagedSidecar(join(targetDir, item.sidecar));
-    if (existsSync(path) && !owned) {
-      throw new Error(`${path}: refusing to overwrite an unmanaged plan agent`);
+    if (
+      existsSync(outputPath) &&
+      !previous.files.has(item.output) &&
+      !markerOwned
+    ) {
+      throw new Error(
+        `${outputPath}: refusing to overwrite an unmanaged plan agent`,
+      );
     }
   }
 
+  const compiled: CompiledRole[] = input.planned.map((item) => {
+    const source = input.snapshot.sources.get(item.role.role);
+    if (source === undefined) {
+      throw new Error(
+        `${item.role.role}: canonical template snapshot is missing`,
+      );
+    }
+    const variables = {
+      agent_model: item.assigned.model,
+      agent_effort: item.assigned.effort,
+    };
+    const canonical =
+      input.options.renderCanonical?.(
+        item.role.sourcePath,
+        variables,
+        source,
+      ) ??
+      `${
+        renderTemplateSource(item.role.sourcePath, source, variables, {
+          shell: compilerShell(input.snapshot.renderInputs),
+        }).text
+      }\n`;
+    const translated = translateClaudeAgentToPi({
+      role: item.role.role,
+      sourcePath: item.role.sourcePath,
+      rendered: canonical,
+      launchModel: item.launch.model,
+      launchEffort: item.launch.effort,
+      taskFacadePath: input.taskFacadePath,
+    });
+    return {
+      ...item,
+      content: translated.content,
+      hash: sha256(translated.content),
+    };
+  });
+  const hashes = new Map(compiled.map((item) => [item.output, item.hash]));
   const expectedFiles = new Set(compiled.map((item) => item.output));
   const expectedSidecars = new Set(compiled.map((item) => item.sidecar));
   const stale = [...previous.files.keys()]
@@ -601,37 +912,44 @@ export function compilePromptArtifacts(
     [...previous.sidecars.keys()].filter((name) => !expectedSidecars.has(name)),
   );
   for (const name of stale) staleSidecars.add(`${name}${SIDECAR_SUFFIX}`);
+  const removed = [...new Set([...stale, ...staleSidecars])].sort();
 
   const outputChanged = new Map<string, boolean>();
-  let artifactDrift = stale.length > 0 || staleSidecars.size > 0;
+  const sidecarChanged = new Map<string, boolean>();
+  const drifted = new Set<string>(removed);
   for (const item of compiled) {
-    const changed = !fileMatches(join(targetDir, item.output), item.hash);
-    const sidecarChanged = !fileMatches(
-      join(targetDir, item.sidecar),
+    const changed = !fileMatches(join(input.targetDir, item.output), item.hash);
+    const markerChanged = !fileMatches(
+      join(input.targetDir, item.sidecar),
       item.sidecarHash,
     );
     outputChanged.set(item.output, changed);
-    artifactDrift ||= changed || sidecarChanged;
+    sidecarChanged.set(item.sidecar, markerChanged);
+    if (changed) drifted.add(item.output);
+    if (markerChanged) drifted.add(item.sidecar);
   }
-  const nextManifest = manifestBody(fingerprint, compiled);
+  const nextManifest = manifestBodyFromHashes(
+    input.fingerprint,
+    compiled,
+    hashes,
+  );
   const manifestMatches =
     existsSync(manifestPath) &&
     readFileSync(manifestPath, "utf8") === nextManifest;
-  const drift = artifactDrift || !manifestMatches;
-  const inputsMatch = previous.fingerprint === fingerprint;
-  const outcome: PromptCompileResult["outcome"] = !drift
-    ? "hit"
-    : previous.exists && inputsMatch
+  if (!manifestMatches) drifted.add(PI_PROMPT_MANIFEST);
+  const drift = drifted.size > 0;
+  const outcome: PromptCompileResult["outcome"] =
+    previous.exists && previous.fingerprint === input.fingerprint
       ? "repaired"
       : "compiled";
 
-  if (!check && drift) {
-    mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  if (!input.check && drift) {
+    mkdirSync(input.targetDir, { recursive: true, mode: 0o700 });
     for (const item of compiled) {
-      const outputPath = join(targetDir, item.output);
-      const sidecarPath = join(targetDir, item.sidecar);
-      // The marker lands first so a crash before the manifest-last rename leaves
-      // a recoverable ownership proof rather than an apparently unmanaged file.
+      const outputPath = join(input.targetDir, item.output);
+      const sidecarPath = join(input.targetDir, item.sidecar);
+      // Marker first: an interrupted manifest-last publication leaves a
+      // validated ownership proof, never an apparently unmanaged primary.
       if (!fileMatches(sidecarPath, item.sidecarHash)) {
         atomicWrite(sidecarPath, item.sidecarContent);
       }
@@ -639,33 +957,41 @@ export function compilePromptArtifacts(
         atomicWrite(outputPath, item.content);
       }
     }
-    for (const name of stale) rmSync(join(targetDir, name), { force: true });
-    for (const name of [...staleSidecars].sort()) {
-      rmSync(join(targetDir, name), { force: true });
+    for (const name of stale) {
+      rmSync(join(input.targetDir, name), { force: true });
     }
-    // Publication authority lands last: readers never observe a new manifest
-    // that claims output bytes which have not yet been renamed into place.
+    for (const name of [...staleSidecars].sort()) {
+      rmSync(join(input.targetDir, name), { force: true });
+    }
+
+    // Reverify every claimed byte under the target-scoped lock immediately
+    // before the manifest-last publication authority is renamed into place.
+    for (const item of compiled) {
+      if (!fileMatches(join(input.targetDir, item.output), item.hash)) {
+        throw new Error(
+          `${join(input.targetDir, item.output)}: changed before manifest publication`,
+        );
+      }
+      if (!fileMatches(join(input.targetDir, item.sidecar), item.sidecarHash)) {
+        throw new Error(
+          `${join(input.targetDir, item.sidecar)}: changed before manifest publication`,
+        );
+      }
+    }
     if (!manifestMatches) atomicWrite(manifestPath, nextManifest);
   }
 
   return {
     schema_version: 1,
     target: "pi",
-    request,
+    request: input.request,
     outcome,
-    fingerprint,
-    outputs: compiled.map((item) => ({
-      role: item.role.role,
-      output: item.output,
-      sha256: item.hash,
-      assigned_cell: item.assigned,
-      effective_cell: item.effective,
-      launch_cell: item.launch,
-      changed: outputChanged.get(item.output) ?? false,
-    })),
-    removed: [...stale, ...[...staleSidecars].sort()],
-    check,
-    ok: !(check && drift),
+    fingerprint: input.fingerprint,
+    outputs: roleResults(compiled, hashes, outputChanged, sidecarChanged),
+    removed,
+    drifted: [...drifted].sort(),
+    check: input.check,
+    ok: !(input.check && drift),
   };
 }
 
