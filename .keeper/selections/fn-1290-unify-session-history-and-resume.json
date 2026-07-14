@@ -1,0 +1,88 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [
+      "fn-1290-unify-session-history-and-resume.2",
+      "fn-1290-unify-session-history-and-resume.6"
+    ],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-harness identity association and ambiguity preservation form a subtle correctness invariant across several architectural seams.",
+      "task_id": "fn-1290-unify-session-history-and-resume.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Concurrent incremental ingestion, atomic publication, torn-tail handling, and private-file permissions create intertwined correctness and security invariants.",
+      "task_id": "fn-1290-unify-session-history-and-resume.2",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Evidence grading must preserve subtle provenance and confidence invariants while combining FTS ranking, path semantics, and partial failures.",
+      "task_id": "fn-1290-unify-session-history-and-resume.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.89,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is substantial but well-specified multi-file CLI integration with explicit contracts, fixtures, and established routing patterns.",
+      "task_id": "fn-1290-unify-session-history-and-resume.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Migrating many readers through one resolver without widening capability boundaries is a cross-cutting architectural cascade with ambiguity invariants.",
+      "task_id": "fn-1290-unify-session-history-and-resume.5",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.98,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Wrong-session prevention, shell safety, liveness checks, and exact foreground process semantics make this security- and correctness-critical.",
+      "task_id": "fn-1290-unify-session-history-and-resume.6",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.92,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "The edit is bounded, but concise agent-facing guidance and truthful capability wording benefit from judgment and prose taste.",
+      "task_id": "fn-1290-unify-session-history-and-resume.7",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "The atomic repository-wide cutover combines broad mechanical migration with delicate documentation, guidance, and in-repo idiom matching.",
+      "task_id": "fn-1290-unify-session-history-and-resume.8",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-14T20:27:07.087000Z",
+  "epic_id": "fn-1290-unify-session-history-and-resume",
+  "input_hash": "de86c50b327423dad33aebd8632f2aecd201704b1c98270efcd7dabbf0a5aacf",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3733374219,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1290-unify-session-history-and-resume.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-harness identity association and ambiguity preservation form a subtle correctness invariant across several architectural seams.\",\"confidence\":0.94},{\"task_id\":\"fn-1290-unify-session-history-and-resume.2\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Concurrent incremental ingestion, atomic publication, torn-tail handling, and private-file permissions create intertwined correctness and security invariants.\",\"confidence\":0.97},{\"task_id\":\"fn-1290-unify-session-history-and-resume.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Evidence grading must preserve subtle provenance and confidence invariants while combining FTS ranking, path semantics, and partial failures.\",\"confidence\":0.94},{\"task_id\":\"fn-1290-unify-session-history-and-resume.4\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"This is substantial but well-specified multi-file CLI integration with explicit contracts, fixtures, and established routing patterns.\",\"confidence\":0.89},{\"task_id\":\"fn-1290-unify-session-history-and-resume.5\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Migrating many readers through one resolver without widening capability boundaries is a cross-cutting architectural cascade with ambiguity invariants.\",\"confidence\":0.95},{\"task_id\":\"fn-1290-unify-session-history-and-resume.6\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Wrong-session prevention, shell safety, liveness checks, and exact foreground process semantics make this security- and correctness-critical.\",\"confidence\":0.98},{\"task_id\":\"fn-1290-unify-session-history-and-resume.7\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"The edit is bounded, but concise agent-facing guidance and truthful capability wording benefit from judgment and prose taste.\",\"confidence\":0.92},{\"task_id\":\"fn-1290-unify-session-history-and-resume.8\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"The atomic repository-wide cutover combines broad mechanical migration with delicate documentation, guidance, and in-repo idiom matching.\",\"confidence\":0.9}]}"
+}
