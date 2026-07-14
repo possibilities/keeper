@@ -58,13 +58,13 @@ describe("Pi editor border", () => {
     expect(editor).toBeDefined();
     const first = editor!.render(30);
     expect(first[0]).toEndWith(
-      orangeEditorLabel(" keeper-pi ") + orangeEditorText("─"),
+      orangeEditorLabel(" keeper-pi ") + orangeEditorText("──"),
     );
     expect(first[2]).toBe(orangeEditorText("─".repeat(30)));
 
     name = "renamed";
     expect(editor!.render(30)[0]).toEndWith(
-      orangeEditorLabel(" renamed ") + orangeEditorText("─"),
+      orangeEditorLabel(" renamed ") + orangeEditorText("──"),
     );
   });
 

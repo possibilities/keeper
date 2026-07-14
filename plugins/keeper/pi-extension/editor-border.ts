@@ -96,12 +96,18 @@ export async function installPiEditorBorder(
         if (!sessionName) return lines;
         const label = ` ${sessionName} `;
         const labelWidth = visibleWidth(label);
-        if (labelWidth + 1 >= width) return lines;
+        const trailingBorder = "──";
+        const trailingWidth = visibleWidth(trailingBorder);
+        if (labelWidth + trailingWidth >= width) return lines;
 
         lines[0] =
-          truncateToWidth(lines[0] ?? "", width - labelWidth - 1, "") +
+          truncateToWidth(
+            lines[0] ?? "",
+            width - labelWidth - trailingWidth,
+            "",
+          ) +
           orangeEditorLabel(label) +
-          orangeEditorText("─");
+          orangeEditorText(trailingBorder);
         return lines;
       }
     }
