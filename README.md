@@ -25,6 +25,6 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   [installation and smoke checks](./docs/install.md#pi-task-and-panel-operations) and
   [machine-visible failures](./docs/problem-codes.md#panel-run-lifecycle).
 
-Install, lifecycle audit, and uninstall: [docs/install.md](./docs/install.md) · Guardrails:
-[CLAUDE.md](./CLAUDE.md) · Vocabulary: [CONTEXT.md](./CONTEXT.md) · Decisions:
-[docs/adr/](./docs/adr/)
+Install, lifecycle audit, and uninstall: [docs/install.md](./docs/install.md) · Testing:
+[docs/testing.md](./docs/testing.md) · Guardrails: [CLAUDE.md](./CLAUDE.md) · Vocabulary:
+[CONTEXT.md](./CONTEXT.md) · Decisions: [docs/adr/](./docs/adr/)
