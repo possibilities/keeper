@@ -200,7 +200,14 @@ const FIND_EXEC_PRIMARIES = new Set([
   "-fprint",
   "-fprint0",
   "-fprintf",
+  "-fls",
 ]);
+
+/** Ripgrep flags that run a caller-named command. This per-tool blocklist accepts
+ *  the same future-exec-flag residual as the git grep `-O` arm: a newly added rg
+ *  exec flag passes until this list is updated. `--search-zip` / `-z` is deferred
+ *  because it selects fixed decompressors rather than a caller-named command. */
+const RG_EXEC_FLAGS = new Set(["--pre", "--pre-glob", "--hostname-bin"]);
 
 /** bun flags/subcommands that evaluate inline code — denied for every role. */
 const BUN_EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
@@ -636,6 +643,12 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
   if (exe === "keeper") {
     const sub = tokens[1];
     if (sub === undefined) return "bare `keeper` with no subcommand";
+    if (
+      sub === "dispatch" &&
+      tokens.slice(2).some((arg) => arg.startsWith("--prompt"))
+    ) {
+      return "`keeper dispatch --prompt` launches a free-form worker, which is never permitted for an escalation session";
+    }
     if (sub === "commit-work") {
       return cfg.writeCapable
         ? null
@@ -675,6 +688,8 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
     return `git '${sub.name}' is a mutating/off-list git subcommand, denied for the diagnosis role '${cfg.role}'`;
   }
 
+  // `botctl` is external; its only observed call shape is `send-message --topic`,
+  // and no exec or file-write flag is known to exist on it.
   if (exe === "botctl") return null;
 
   if (exe === "bun") {
@@ -702,6 +717,17 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
     const bad = tokens.find((t) => FIND_EXEC_PRIMARIES.has(t));
     if (bad !== undefined)
       return `\`find ${bad}\` (a command runner / file deleter)`;
+    return null;
+  }
+
+  if (exe === "rg") {
+    for (const arg of tokens.slice(1)) {
+      if (arg === "--") break;
+      const flag = arg.split("=", 1)[0] as string;
+      if (RG_EXEC_FLAGS.has(flag)) {
+        return `\`rg ${flag}\` runs a caller-named command (arbitrary program execution from an allowlisted read utility)`;
+      }
+    }
     return null;
   }
 

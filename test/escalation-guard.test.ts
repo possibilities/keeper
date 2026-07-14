@@ -67,6 +67,7 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git branch --merged main",
     // read utilities
     "rg pattern src/",
+    "rg -n --json foo",
     "grep -rn foo .",
     "find . -name '*.ts'",
     "cat package.json",
@@ -219,6 +220,11 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "git branch newbranch origin/main",
     // write-capable-only families are off-list for diagnosis
     "keeper commit-work 'msg'",
+    // free-form dispatch is denied for every escalation role
+    "keeper dispatch --prompt x",
+    "keeper dispatch --prompt=x",
+    "keeper dispatch --prompt-file /tmp/x",
+    "keeper dispatch --prompt-file=/tmp/x",
     "uv run pytest",
     "uv run python3 -c 'x'",
     "cargo build",
@@ -228,9 +234,15 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     // autopilot verbs other than retry
     "keeper autopilot pause",
     "keeper autopilot play",
-    // find -exec / -delete command-runner forms
+    // rg caller-named command flags
+    "rg --pre x .",
+    "rg --pre=x .",
+    "rg --pre-glob x .",
+    "rg --hostname-bin y .",
+    // find command-runner / delete / caller-named output forms
     "find . -type f -exec cat {} +",
     "find . -name x -delete",
+    "find . -fls /tmp/x",
     // xargs with flags
     "xargs -I{} rm {}",
     // the observed compound: a legit prefix AND-chained with the bypass
@@ -305,6 +317,7 @@ describe("evaluateEscalationCommand — write-capable role (deconflict/repair)",
     "echo `whoami`",
     "FOO=1 git commit -m x",
     "keeper commit-work 'x' > out",
+    "keeper dispatch --prompt x",
     "tee out.txt",
   ];
   for (const cmd of deny) {
@@ -336,6 +349,12 @@ test("evaluateEscalationCommand: the deny reason NAMES the offending command / c
   expect(
     evaluateEscalationCommand("git branch -D feature", DIAGNOSIS),
   ).toContain("mutates refs");
+  expect(evaluateEscalationCommand("rg --pre x .", DIAGNOSIS)).toContain(
+    "pre",
+  );
+  expect(
+    evaluateEscalationCommand("keeper dispatch --prompt x", DIAGNOSIS),
+  ).toContain("prompt");
 });
 
 // ---------------------------------------------------------------------------
