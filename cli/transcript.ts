@@ -546,7 +546,11 @@ function parseList(
       total: outcome.total,
       next_offset: outcome.nextOffset,
     },
-    sessions: outcome.items,
+    // Title history is an internal catalog input in this slice; keep the
+    // public transcript-list envelope byte-compatible until history is exposed.
+    sessions: outcome.items.map(
+      ({ titleHistory: _titleHistory, ...item }) => item,
+    ),
   };
   return format.value === "json"
     ? ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)))
@@ -754,7 +758,11 @@ function parseShow(
   });
   const data = {
     harness: reader.harness,
-    session: session.main.metadata,
+    // Keep the public transcript JSON shape while the internal normalizer
+    // retains native title history for the unified Session catalog.
+    session: (({ titleHistory: _titleHistory, ...metadata }) => metadata)(
+      session.main.metadata,
+    ),
     selected_source: session.selectedSource,
     subagents: session.subagents,
     page: {

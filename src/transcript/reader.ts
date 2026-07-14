@@ -6,7 +6,14 @@
  * a harness joins the CLI grammar solely by registering here.
  */
 
-import type { TranscriptListItem, TranscriptSession } from "./model";
+import type {
+  TranscriptEntry,
+  TranscriptListItem,
+  TranscriptMetadata,
+  TranscriptSession,
+  TranscriptSource,
+  TranscriptUnknownRecord,
+} from "./model";
 
 /** Inputs the CLI passes verbatim; a reader resolves its OWN root set from
  *  these. `configDirs`, when present, is claude's `--config-dir` repeatable
@@ -46,6 +53,16 @@ export type TranscriptListOutcome =
 export interface TranscriptSessionHandle {
   sessionId: string;
   path: string;
+}
+
+/** Bounded line-at-a-time normalizer used by the disposable History index. */
+export interface TranscriptLineNormalizer {
+  readonly source: TranscriptSource;
+  feedLine(line: string): {
+    entries: TranscriptEntry[];
+    unknownRecords: TranscriptUnknownRecord[];
+  };
+  finish(): TranscriptMetadata;
 }
 
 export interface TranscriptFindQuery {

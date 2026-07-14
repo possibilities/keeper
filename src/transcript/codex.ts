@@ -471,6 +471,7 @@ export function parseCodexRolloutText(
     path: options.path,
     project: null,
     title: null,
+    titleHistory: [],
     agentName: null,
     model: null,
     version: null,
@@ -482,10 +483,13 @@ export function parseCodexRolloutText(
   const state: ParseState = {
     source: options.source ?? "main",
     entries: [],
+    unknownRecords: [],
     toolNames: new Map(),
     metadata,
     minTimestamp: null,
     maxTimestamp: null,
+    nextSourceOrdinal: 0,
+    nextRecordOrdinal: 0,
   };
   for (const line of text.split("\n")) {
     if (line.trim().length > 0) {
@@ -494,7 +498,12 @@ export function parseCodexRolloutText(
   }
   finalizeTimestamps(state);
   backfillToolNames(state);
-  return { metadata, source: state.source, entries: state.entries };
+  return {
+    metadata,
+    source: state.source,
+    entries: state.entries,
+    unknownRecords: state.unknownRecords,
+  };
 }
 
 export function readCodexTranscript(
@@ -696,6 +705,7 @@ export function listCodexSessions(options: CodexListOptions): CodexListResult {
         path: file.path,
         project: inspected.document.metadata.project,
         title: null,
+        titleHistory: [],
         startedAt: inspected.document.metadata.startedAt,
         updatedAt: new Date(file.modifiedMs).toISOString(),
         bytes: file.bytes,
