@@ -101,20 +101,30 @@ identity, is the sole jurisdiction the `wrapped-guard` `PreToolUse` hook keys it
 single-state total source-edit denial on — no envelope gate, fail-closed only when
 marked ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)). The host
 `~/.config/keeper/matrix.yaml` ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
-is the composition INPUT that makes any cell render at all — claude-native included, since there
-is no embedded fallback: `render-plugin-templates` fans `subagent_templates` out over
-`subagent_models × efforts` into the per-cell manifests under `plugins/plan/workers/`, and an
-absent, unparseable, schema-invalid, or empty matrix is a typed loud failure rather than a
-claude-only default. The same render also stamps the 11 static plan agents
-(`plugins/plan/agents/*.md` — close-planner, docs-gap-scout, epic-scout, gap-analyst,
-model-selector, panel-judge, panel-runner, practice-scout, quality-auditor, repo-scout,
-selection-auditor): every plain-render agent template (every `template/agents/*.md.tmpl` NOT
-in `subagent_templates`) draws its frontmatter `model`/`effort` from the matrix's
-`agent_pins:` map, keyed by agent name. A template with no matching pin fails the render
-loud, naming the agent. Every plain-render template ↔ `agent_pins` entry is meant to be a
-total, disjoint partition — a host-blind test suite gate (`plugins/prompt/test/`) renders
-into a temp dir and compares frontmatter against the pin, catching a template with no pin,
-a pin with no template, or a hand-edited rendered file diverging from its pin.
+is the composition input for runtime worker cells — claude-native included, since there is no
+embedded fallback. `render-plugin-templates` fans `subagent_templates` out over
+`subagent_models × efforts` into `plugins/plan/workers/`; an absent, unparseable,
+schema-invalid, or empty matrix is a typed loud failure rather than a claude-only default.
+That matrix-driven rendering remains the native/wrapped work-worker contract: a native cell
+runs its declared provider directly, while an unserved cell uses the wrapper described above.
+
+Static plan agents are a separate prompt-artifact surface. Their canonical identities — each
+`plan:<role>` and the named bundles that collect them — live in
+`plugins/plan/prompt-artifacts.yaml`; `plan:static` is precisely the static-role bundle and
+excludes the cell-bound `work:worker`. `keeper prompt compile --bundle plan:static --target pi`
+adapts those canonical templates directly for Pi, preserving the prompt body and translating
+only launch metadata. It resolves each role's exact `agent_pins` assignment. An assigned Opus
+cell that Pi does not serve is translated only through an explicit provider-equivalence entry
+to one exact Pi model ID and effort; there is no parent-model, fuzzy, or implicit-provider
+fallback. The compiler publishes and fingerprints the static artifact set, whereas runtime
+per-task worker-cell selection still derives from the matrix and produces the native or wrapped
+cell manifest.
+
+Before a Pi Task launch, the facade preflights the compiler and its absolute CLI paths, then
+compiles the requested canonical role for that Task. It binds only the exact `(provider, model
+ID)` object present both in Pi's registry lookup and available-model list; a missing route,
+compiled role, or exact registry binding fails loudly. The static compiler therefore never
+turns a runtime work-worker assignment into a generic Pi agent.
 
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
