@@ -132,6 +132,10 @@ import {
   resolveStartupThinkingOverride,
 } from "./passthrough";
 import { makePhaser } from "./phaser";
+import {
+  ensurePiPromptArtifacts,
+  PiPromptArtifactsError,
+} from "./pi-prompt-artifacts";
 import { discoverPlugins, PluginError } from "./plugins";
 // Type-only: resolveResumeDecision itself is NEVER imported here — it
 // transitively pulls src/db.ts (bun:sqlite) via server-worker.ts, a cost this
@@ -250,6 +254,12 @@ export interface MainDeps {
    * included — there is no Keeper-owned Pi profile farm.
    */
   ensurePiStateSharingFn: (actionLog: string[]) => void;
+  /**
+   * Compile Pi's static plan prompt artifacts through the keeper CLI subprocess.
+   * Runs once in the inner Pi launcher before Pi state discovery, including native
+   * passthrough commands. The subprocess inherits the launch environment intact.
+   */
+  ensurePiPromptArtifactsFn: (actionLog: string[]) => void;
   /**
    * Read the host provider matrix from `matrix.yaml` (v2, ADR 0036) — REQUIRED,
    * never null: an absent/unparseable/empty/schema-invalid file throws the typed
@@ -418,6 +428,8 @@ export function realDeps(): MainDeps {
         defaultSharedStowDir(),
         process.env,
       ),
+    ensurePiPromptArtifactsFn: (actionLog) =>
+      ensurePiPromptArtifacts(actionLog, { env: process.env }),
     loadMatrixFn: loadMatrixV2,
     loadHostTriplesFn: () =>
       extractHostTriples(
@@ -2861,15 +2873,18 @@ export async function main(deps: MainDeps): Promise<never> {
       throw exc;
     }
   } else if (agent === "pi") {
-    // The canonical ~/.pi/agent/AGENTS.md leaf is asserted on EVERY pi launch,
-    // passthrough default-account launches included — there is no Keeper-owned
-    // Pi profile farm to gate.
+    // Compile before touching Pi's state root or resolving Pi launch resources.
+    // This inner-only branch covers managed and passthrough launches; the outer
+    // tmux delegator returns above and the pane re-exec performs the preflight.
     try {
+      phase("ensure Pi prompt artifacts", () => {
+        deps.ensurePiPromptArtifactsFn(actionLog);
+      });
       phase("ensure shared Pi state", () => {
         deps.ensurePiStateSharingFn(actionLog);
       });
     } catch (exc) {
-      if (exc instanceof StateError) {
+      if (exc instanceof PiPromptArtifactsError || exc instanceof StateError) {
         deps.writeErr(`Error: ${exc.message}\n`);
         return deps.exit(1);
       }

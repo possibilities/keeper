@@ -97,6 +97,10 @@ export interface Harness {
    *  length) — the pi leaf-guard reaches every pi launch, passthrough included;
    *  there is no Keeper-owned Pi profile farm to gate it behind. */
   piStateSharingCalls: string[][];
+  /** Pi prompt-artifact preflight action logs, once per inner Pi launch. */
+  piPromptArtifactsCalls: string[][];
+  /** Pi preflight/state/spawn ordering recorder. */
+  piLaunchOrder: string[];
   /** Codex synthetic session-name indexer starts, in order. */
   codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
   /** Every birth record the launcher emitted (draft + child pid), in order. */
@@ -157,6 +161,8 @@ export interface HarnessOptions {
    *  argv byte-pins stay path-independent). Pass `["-e", "<fake>"]` to exercise
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
+  /** Pi prompt-artifact preflight seam; may throw a typed launcher failure. */
+  ensurePiPromptArtifacts?: (actionLog: string[]) => void;
   /** `resume` verb + `run --resume` decision seam (default: `{kind:"unknown",
    *  target}` — no fixture db, no real subprocess spawn). Pass a fixed
    *  `ResumeDecision` or a function of the target (and the optional
@@ -189,6 +195,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const err: string[] = [];
   const codexStateSharingCalls: string[][] = [];
   const piStateSharingCalls: string[][] = [];
+  const piPromptArtifactsCalls: string[][] = [];
+  const piLaunchOrder: string[] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
@@ -212,6 +220,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     opts.spawn ??
     ((cmd: string[]): SpawnedChild => {
       spawned.push(cmd);
+      piLaunchOrder.push("spawn");
       return okChild();
     });
 
@@ -244,6 +253,12 @@ export function makeHarness(opts: HarnessOptions): Harness {
     },
     ensurePiStateSharingFn: (actionLog: string[]) => {
       piStateSharingCalls.push(actionLog);
+      piLaunchOrder.push("state");
+    },
+    ensurePiPromptArtifactsFn: (actionLog: string[]) => {
+      piPromptArtifactsCalls.push(actionLog);
+      piLaunchOrder.push("preflight");
+      opts.ensurePiPromptArtifacts?.(actionLog);
     },
     loadMatrixFn: () => {
       if (opts.matrix === undefined || opts.matrix === null) {
@@ -319,6 +334,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
     err,
     codexStateSharingCalls,
     piStateSharingCalls,
+    piPromptArtifactsCalls,
+    piLaunchOrder,
     codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,

@@ -5,11 +5,16 @@
  * `--name`, and package/metadata commands pass through cleanly.
  */
 
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { parseArgsForAgent } from "../src/agent/args";
+import { PiPromptArtifactsError } from "../src/agent/pi-prompt-artifacts";
 import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
 import {
+  expectExit,
   flagValues,
   makeHarness,
   runAndCapture,
@@ -104,14 +109,18 @@ describe("Pi command assembly", () => {
   });
 
   test("--fork gets a fresh display name but not a wrapper session id", async () => {
-    const h = piHarness(["--fork", "abc"]);
+    const h = piHarness(["--fork", "abc"], {
+      env: { PWD: "/Users/mike/code/keeper" },
+    });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--session-id")).toEqual([]);
     expect(flagValues(cmd, "--name")).toEqual(["proj-001"]);
   });
 
   test("--no-session suppresses wrapper session id and name", async () => {
-    const h = piHarness(["--no-session", "hello"]);
+    const h = piHarness(["--no-session", "hello"], {
+      env: { PWD: "/Users/mike/code/keeper" },
+    });
     const cmd = await runAndCapture(h, main);
     expect(flagValues(cmd, "--session-id")).toEqual([]);
     expect(flagValues(cmd, "--name")).toEqual([]);
@@ -133,6 +142,56 @@ describe("Pi command assembly", () => {
   });
 });
 
+describe("Pi prompt-artifact preflight", () => {
+  test("managed Pi launches preflight before state discovery and spawn", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"]);
+
+    await runAndCapture(h, main);
+
+    expect(h.piPromptArtifactsCalls).toHaveLength(1);
+    expect(h.piStateSharingCalls).toHaveLength(1);
+    expect(h.piLaunchOrder).toEqual(["preflight", "state", "spawn"]);
+  });
+
+  test("a preflight failure exits before Pi state discovery or spawn", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      ensurePiPromptArtifacts: () => {
+        throw new PiPromptArtifactsError("prompt artifacts are unavailable");
+      },
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(1);
+    expect(h.err.join("")).toContain("prompt artifacts are unavailable");
+    expect(h.piLaunchOrder).toEqual(["preflight"]);
+    expect(h.piStateSharingCalls).toEqual([]);
+    expect(h.spawned).toEqual([]);
+  });
+
+  test("the outer tmux delegator skips preflight and the inner Pi launch runs it once", async () => {
+    const outer = piHarness(
+      ["--x-tmux", "--x-tmux-detached", "--x-no-confirm", "hello"],
+      {
+        launcherStateDir: mkdtempSync(join(tmpdir(), "keeper-pi-tmux-")),
+        tmuxCommand: (cmd) =>
+          cmd.includes("new-window")
+            ? { exitCode: 0, stdout: "agent\x01@1\x01%1\n", stderr: "" }
+            : { exitCode: 0, stdout: "", stderr: "" },
+      },
+    );
+
+    expect(await expectExit(main(outer.deps))).toBe(0);
+    expect(outer.piPromptArtifactsCalls).toEqual([]);
+    expect(outer.piStateSharingCalls).toEqual([]);
+
+    const inner = piHarness(["--x-no-confirm", "hello"]);
+    await runAndCapture(inner, main);
+    expect(inner.piPromptArtifactsCalls).toHaveLength(1);
+    expect(
+      outer.piPromptArtifactsCalls.length + inner.piPromptArtifactsCalls.length,
+    ).toBe(1);
+  });
+});
+
 describe("Pi passthrough commands", () => {
   test("package commands pass through without model or session defaults", async () => {
     const h = piHarness(["list"], {
@@ -140,6 +199,7 @@ describe("Pi passthrough commands", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "list"]);
+    expect(h.piLaunchOrder).toEqual(["preflight", "state", "spawn"]);
   });
 
   test("metadata flags pass through without model or session defaults", async () => {
