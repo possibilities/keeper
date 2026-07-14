@@ -6,10 +6,18 @@ import {
   isValidRenameSlug,
   type RenameCommandContext,
   type RenameCommandDeps,
-  runRenameInvocation,
 } from "../plugins/keeper/pi-extension/rename-command";
 
 describe("/rename conversation input", () => {
+  test("a single user message is sufficient input", () => {
+    expect(
+      buildRenameConversationInput(
+        [{ role: "user", content: "Build project search" }],
+        1_000,
+      ),
+    ).toBe("User: Build project search");
+  });
+
   test("includes the active conversation in chronological order", () => {
     const input = buildRenameConversationInput(
       [
@@ -225,8 +233,9 @@ describe("/rename explicit slug", () => {
 });
 
 describe("/rename conversation orchestration", () => {
-  test("prefers Pi's full active context over the Latest-turn fallback", async () => {
+  test("uses the full context immediately while the assistant is active", async () => {
     let completionInput = "";
+    let turnReads = 0;
     const ctx: RenameCommandContext = {
       cwd: "/work/repo",
       sessionManager: {
@@ -246,16 +255,13 @@ describe("/rename conversation orchestration", () => {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test" }),
       },
       ui: { notify() {} },
-      isIdle: () => true,
+      isIdle: () => false,
     };
     const deps: RenameCommandDeps = {
-      runTurnCli: async () => ({
-        stdout: JSON.stringify({
-          ok: true,
-          data: { turn: { prompt: "Now add ranking", response: "Done" } },
-        }),
-        stderr: "",
-      }),
+      runTurnCli: async () => {
+        turnReads += 1;
+        return { stdout: "", stderr: "" };
+      },
       resolveModel: (registry, provider, modelId) =>
         registry.find(provider, modelId),
       getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
@@ -268,18 +274,68 @@ describe("/rename conversation orchestration", () => {
       },
     };
 
-    const result = await runRenameInvocation(
-      ctx,
+    const names: string[] = [];
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => names.push(name) },
       deps,
       createRenameInvocationState(),
     );
 
-    expect(result).toEqual({
-      outcome: "success",
-      title: "project-search-ranking",
-    });
+    await handler("", ctx);
+
+    expect(names).toEqual(["project-search-ranking"]);
+    expect(turnReads).toBe(0);
     expect(completionInput).toContain("User: Build project search");
     expect(completionInput).toContain("Assistant: Implemented indexing");
     expect(completionInput).toContain("User: Now add ranking");
+  });
+
+  test("the command waits only when live context has no messages", async () => {
+    const names: string[] = [];
+    const notices: string[] = [];
+    let completionCalls = 0;
+    const state = createRenameInvocationState();
+    const ctx: RenameCommandContext = {
+      cwd: "/work/repo",
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getLeafId: () => "root",
+        getSessionName: () => undefined,
+        buildSessionContext: () => ({ messages: [] }),
+      },
+      modelRegistry: {
+        find: () => ({ provider: "openai-codex" }),
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test" }),
+      },
+      ui: { notify: (message) => notices.push(message) },
+      isIdle: () => false,
+    };
+    const deps: RenameCommandDeps = {
+      runTurnCli: async () => {
+        throw new Error("live context must not use the fallback");
+      },
+      resolveModel: (registry, provider, modelId) =>
+        registry.find(provider, modelId),
+      getAuth: (registry, model) => registry.getApiKeyAndHeaders(model),
+      runCompletion: async () => {
+        completionCalls += 1;
+        return {
+          stopReason: "stop",
+          content: [{ type: "text", text: "unused" }],
+        };
+      },
+    };
+    const handler = createRenameCommandHandler(
+      { setSessionName: (name) => names.push(name) },
+      deps,
+      state,
+    );
+
+    await handler("", ctx);
+
+    expect(state.pending).not.toBeNull();
+    expect(completionCalls).toBe(0);
+    expect(names).toEqual([]);
+    expect(notices).toEqual(["/rename: generating a session title…"]);
   });
 });

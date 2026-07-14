@@ -177,11 +177,13 @@ Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which 
 a short Session title from the active branch's bounded, compaction-aware conversation context,
 with extra weight on user requests, and applies it through Pi's own `setSessionName()`. Passing a
 canonical lowercase slug sets it directly (`/rename project-search-ranking`); any non-slug argument
-returns an error without changing the title. Inference requires Pi's own OAuth login to serve the
-one fixed cheap
-`openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate keeper credential. Absent
-that OAuth, an unresolvable model, an empty turn, or a malformed model response, `/rename` no-ops
-with an in-Pi notification and leaves the existing title unchanged; a successful rename reaches
+returns an error without changing the title. Bare `/rename` starts inference as soon as the active
+context contains one user or assistant message, including while the assistant is still responding;
+it remains pending only when no such message exists yet. Inference requires Pi's own OAuth login to
+serve the one fixed cheap `openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate
+keeper credential. Absent that OAuth, an unresolvable model, or a malformed model response,
+`/rename` no-ops with an in-Pi notification and leaves the existing title unchanged; a successful
+rename reaches
 Keeper's title projection and the tmux renamer asynchronously through the existing `TranscriptTitle`
 event, never a direct DB/tmux write.
 

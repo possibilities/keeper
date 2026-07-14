@@ -2,7 +2,7 @@
  * keeper's `/rename` Pi command — derives a short Session title from Pi's
  * active, compaction-aware conversation context and applies it through Pi's
  * own `setSessionName()`, never Keeper's DB or tmux directly. The branch-aware
- * Latest-turn CLI contract gates settled reads and serves older Pi hosts.
+ * Latest-turn CLI contract serves hosts without Pi's model-context API.
  *
  * SELF-CONTAINED ISLAND, same discipline as `keeper-events.ts`: this file
  * ships no static import of any `@earendil-works/*` package (that package is
@@ -685,25 +685,47 @@ async function runRenameAttempt(
   if (!requestIsCurrent(ctx, state, request)) {
     return { outcome: "stale", staleReason: "cancelled" };
   }
-  const leaf = ctx.sessionManager.getLeafId() ?? "root";
-  const cliExit = await deps.runTurnCli(
-    buildPiTurnArgv(request.sessionId, leaf, ctx.cwd),
-  );
-  const turnOutcome = parseTurnCliOutput(cliExit);
-  if (!requestIsCurrent(ctx, state, request)) {
-    return { outcome: "stale", staleReason: "cancelled" };
-  }
-  if (
-    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
-    !(ctx.isIdle?.() ?? true)
-  ) {
-    return { outcome: "stale", staleReason: "retryable" };
-  }
-  if (turnOutcome.kind === "error") {
-    return { outcome: "read_failed" };
-  }
-  if (turnOutcome.kind === "empty") {
-    return { outcome: "empty" };
+
+  const buildSessionContext = ctx.sessionManager.buildSessionContext;
+  const usesLiveContext = buildSessionContext !== undefined;
+  let fallbackLeaf: string | null = null;
+  let inputText: string | null;
+  if (usesLiveContext) {
+    try {
+      inputText = buildRenameConversationInput(
+        buildSessionContext.call(ctx.sessionManager).messages,
+        RENAME_MAX_TRANSCRIPT_BYTES,
+      );
+    } catch {
+      return { outcome: "read_failed" };
+    }
+    if (inputText === null) return { outcome: "empty" };
+  } else {
+    fallbackLeaf = ctx.sessionManager.getLeafId() ?? "root";
+    const cliExit = await deps.runTurnCli(
+      buildPiTurnArgv(request.sessionId, fallbackLeaf, ctx.cwd),
+    );
+    const turnOutcome = parseTurnCliOutput(cliExit);
+    if (!requestIsCurrent(ctx, state, request)) {
+      return { outcome: "stale", staleReason: "cancelled" };
+    }
+    if (
+      (ctx.sessionManager.getLeafId() ?? "root") !== fallbackLeaf ||
+      !(ctx.isIdle?.() ?? true)
+    ) {
+      return { outcome: "stale", staleReason: "retryable" };
+    }
+    if (turnOutcome.kind === "error") {
+      return { outcome: "read_failed" };
+    }
+    if (turnOutcome.kind === "empty") {
+      return { outcome: "empty" };
+    }
+    inputText = buildRenameInputText(
+      turnOutcome.prompt,
+      turnOutcome.response,
+      RENAME_MAX_TRANSCRIPT_BYTES,
+    );
   }
 
   const model = deps.resolveModel(
@@ -723,29 +745,12 @@ async function runRenameAttempt(
     return { outcome: "stale", staleReason: "cancelled" };
   }
   if (
-    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
-    !(ctx.isIdle?.() ?? true)
+    !usesLiveContext &&
+    ((ctx.sessionManager.getLeafId() ?? "root") !== fallbackLeaf ||
+      !(ctx.isIdle?.() ?? true))
   ) {
     return { outcome: "stale", staleReason: "retryable" };
   }
-
-  let inputText: string | null = null;
-  try {
-    const sessionContext = ctx.sessionManager.buildSessionContext?.();
-    if (sessionContext !== undefined) {
-      inputText = buildRenameConversationInput(
-        sessionContext.messages,
-        RENAME_MAX_TRANSCRIPT_BYTES,
-      );
-    }
-  } catch {
-    // Host context drift degrades to the stable Latest-turn CLI contract.
-  }
-  inputText ??= buildRenameInputText(
-    turnOutcome.prompt,
-    turnOutcome.response,
-    RENAME_MAX_TRANSCRIPT_BYTES,
-  );
 
   request.completionAttempts += 1;
   const controller = new AbortController();
@@ -808,8 +813,9 @@ async function runRenameAttempt(
     return { outcome: "stale", staleReason: "cancelled" };
   }
   if (
-    (ctx.sessionManager.getLeafId() ?? "root") !== leaf ||
-    !(ctx.isIdle?.() ?? true)
+    !usesLiveContext &&
+    ((ctx.sessionManager.getLeafId() ?? "root") !== fallbackLeaf ||
+      !(ctx.isIdle?.() ?? true))
   ) {
     return { outcome: "stale", staleReason: "retryable" };
   }
@@ -881,8 +887,9 @@ function clearPendingRename(
   state.activeAbort = null;
 }
 
-/** Drive one pending request while the session is settled. Calls coalesce so
- *  an `agent_settled` arriving during inference becomes one later wake. */
+/** Drive one pending request as soon as conversation context exists. Calls
+ *  coalesce so an `agent_settled` arriving during inference becomes one later
+ *  wake; hosts without live context retain the settled-turn fallback. */
 async function drivePendingRename(
   pi: { setSessionName(name: string): void },
   deps: RenameCommandDeps,
@@ -896,11 +903,16 @@ async function drivePendingRename(
     state.wakeContext = ctx;
     return;
   }
-  if (!(ctx.isIdle?.() ?? true)) return;
+  const usesLiveContext =
+    ctx.sessionManager.buildSessionContext !== undefined;
+  if (!usesLiveContext && !(ctx.isIdle?.() ?? true)) return;
 
   state.running = true;
   try {
-    while (state.pending === request && (ctx.isIdle?.() ?? true)) {
+    while (
+      state.pending === request &&
+      (usesLiveContext || (ctx.isIdle?.() ?? true))
+    ) {
       let result: RenameOutcome;
       try {
         result = await runRenameAttempt(ctx, deps, state, request);
@@ -918,7 +930,7 @@ async function drivePendingRename(
         result.staleReason === "retryable"
       ) {
         if (request.completionAttempts < RENAME_MAX_COMPLETION_ATTEMPTS) {
-          if (ctx.isIdle?.() ?? true) continue;
+          if (usesLiveContext || (ctx.isIdle?.() ?? true)) continue;
           return;
         }
         clearPendingRename(state, request);
@@ -964,7 +976,8 @@ async function drivePendingRename(
 }
 
 /** Build `/rename`: arm one eventual title, acknowledge immediately, then
- *  either attempt now or let `agent_settled` wake it. */
+ *  infer from any available conversation or let `agent_settled` retry an
+ *  initially empty context. */
 export function createRenameCommandHandler(
   pi: { setSessionName(name: string): void },
   deps: RenameCommandDeps,
