@@ -208,6 +208,45 @@ describe("decideBranchGuard ladder", () => {
     expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 
+  const spaceFormGlobalDenies = [
+    "git --git-dir /tmp/x checkout -b evil",
+    'git --git-dir "/my space dir/.git" switch -c evil',
+    "git --work-tree /x worktree add /y",
+    "git --work-tree '/my space tree' worktree add /y",
+    "git --namespace ns checkout -b evil",
+    "git --super-prefix prefix/ checkout -b evil",
+    "git --config-env core.foo=GIT_CORE_FOO checkout -b evil",
+    "git --attr-source HEAD checkout -b evil",
+  ];
+  for (const command of spaceFormGlobalDenies) {
+    test(`denies a branch mutation behind a space-form global for a subagent: ${command}`, () => {
+      const decision = decideBranchGuard(
+        bashPayload({ agent_id: "agent-7", tool_input: { command } }),
+      );
+      expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    });
+  }
+
+  const spaceFormGlobalAllows = [
+    "git --git-dir /tmp/x log",
+    'git --git-dir "/my space dir/.git" status',
+    "git --work-tree /x status",
+    "git --work-tree '/my space tree' log",
+    "git --namespace ns log",
+    "git --super-prefix prefix/ status",
+    "git --config-env core.foo=GIT_CORE_FOO log",
+    "git --attr-source HEAD status",
+  ];
+  for (const command of spaceFormGlobalAllows) {
+    test(`allows a read behind a space-form global for a subagent: ${command}`, () => {
+      expect(
+        decideBranchGuard(
+          bashPayload({ agent_id: "agent-7", tool_input: { command } }),
+        ),
+      ).toBeNull();
+    });
+  }
+
   test("denies a subagent `git stash pop`; reason names the shared stash stack and `git restore`", () => {
     const decision = decideBranchGuard(
       bashPayload({

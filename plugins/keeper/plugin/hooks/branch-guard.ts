@@ -21,23 +21,28 @@
 const GIT_INVOCATION =
   /(?:^|[;&|\n(`]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env)[ \t]+)*git\b([^;&|\n)`]*)/g;
 
-/** Strip git global flags that may precede the subcommand: `-C <dir>`,
- * `--git-dir=…`, `--work-tree=…`, `-c <cfg>`, `-c<cfg>`, `--namespace=…`, and
- * the bare boolean globals (`-p`/`--paginate`, `--no-pager`, `--bare`, etc.)
- * so the FIRST remaining token is the subcommand. */
+/** Strip git global flags that may precede the subcommand: space-form
+ * valued globals (`-C <dir>`, `-c <cfg>`, `--git-dir <path>`, `--work-tree
+ * <path>`, `--namespace <value>`, `--super-prefix <value>`, `--config-env
+ * <value>`, and `--attr-source <value>`), their glued/equals forms, and the
+ * bare boolean globals (`-p`/`--paginate`, `--no-pager`, `--bare`, etc.) so the
+ * FIRST remaining token is the subcommand. Quote-wrapped values are consumed
+ * whole, including internal spaces. */
 function stripGlobalFlags(args: string): string {
   let rest = args.trim();
   for (;;) {
-    // `-C <dir>` / `-c <cfg>` consume a following value token.
-    let m = rest.match(/^(?:-C|-c)[ \t]+\S+[ \t]*/);
+    // Space-form valued globals consume one quote-aware value token.
+    let m = rest.match(
+      /^(?:-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--attr-source)[ \t]+(?:"(?:\\.|[^"\\])*"|'[^']*'|[^ \t]+)[ \t]*/,
+    );
     if (m) {
       rest = rest.slice(m[0].length);
       continue;
     }
-    // `--git-dir=…`, `--work-tree=…`, `--namespace=…`, `-c<cfg>`, and the bare
-    // boolean globals — single token, no value to consume.
+    // Equals-form valued globals, `-c<cfg>`, and the bare boolean globals are
+    // each one token, with no separate value to consume.
     m = rest.match(
-      /^(?:--git-dir=\S*|--work-tree=\S*|--namespace=\S*|-c\S+|-p|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--icase-pathspecs)[ \t]+/,
+      /^(?:--(?:git-dir|work-tree|namespace|super-prefix|config-env|attr-source)=(?:"(?:\\.|[^"\\])*"|'[^']*'|[^ \t]*)|-c\S+|-p|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--icase-pathspecs)[ \t]+/,
     );
     if (m) {
       rest = rest.slice(m[0].length);
