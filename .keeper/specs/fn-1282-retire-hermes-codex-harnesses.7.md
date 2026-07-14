@@ -59,5 +59,5 @@ Reinstall completions/templates; record final grep survivors by namespace in evi
 - [ ] No unintended support remains and `bun run test:full` passes.
 
 ## Done summary
-
+Pruned every remaining doc, guardrail, skill, and template contract still presenting Hermes/Codex as a supported harness, retargeted GPT model guidance to Pi-hosted launch ids with re-pinned hashes, and regenerated template fixtures — preserving Pi openai-codex model ids, CodexBar routing, and ADR/migration history. Root and prompt suites are fully green; the plan suite's sole failure is a pre-existing environmental KEEPER_PLAN_WORKTREE leak in this worktree session, confirmed unrelated via source inspection and a green keeper baseline at the base sha.
 ## Evidence
