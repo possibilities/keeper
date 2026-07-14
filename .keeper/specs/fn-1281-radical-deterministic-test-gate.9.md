@@ -58,5 +58,5 @@ Land after task 8 fixes the final live command surface so docs describe shipped 
 - [ ] Repository guidance contains no recommendation to use bare aggregate `bun test`.
 
 ## Done summary
-
+Centralized deterministic test-gate contributor docs in docs/testing.md, trimmed CLAUDE.md and plugins/plan/CLAUDE.md test prose to imperative rules, and pointed README.md/docs/install.md at the new guide.
 ## Evidence
