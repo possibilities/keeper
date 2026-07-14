@@ -6,7 +6,7 @@
     "fn-1282-retire-hermes-codex-harnesses"
   ],
   "id": "fn-1287-single-source-agent-surface-contracts",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-14T00:20:58.003000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T00:20:48.578000Z"
+  "updated_at": "2026-07-14T00:20:58.003000Z"
 }
