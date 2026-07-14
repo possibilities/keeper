@@ -7,7 +7,7 @@
     "fn-1288-handoff-capture-and-handle-semantics"
   ],
   "id": "fn-1290-unify-session-history-and-resume",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-14T20:27:10.488000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T20:27:07.117000Z"
+  "updated_at": "2026-07-14T20:27:10.488000Z"
 }
