@@ -9,6 +9,8 @@
  * not used — the HOME-coupled config readers and state collaborators are stubs.
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   RouteSelection,
   RoutingInspection,
@@ -217,7 +219,12 @@ export function makeHarness(opts: HarnessOptions): Harness {
       reason: "harness-native",
     }));
 
-  const env = opts.env ?? {};
+  // Keep the cwd-confirm gate deterministic in temp-backed isolated worktrees.
+  // Explicit callers can still override the logical shell path.
+  const env = {
+    PWD: join(homedir(), "code", "fixture-project"),
+    ...(opts.env ?? {}),
+  };
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";

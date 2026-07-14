@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
+  closeSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -98,11 +102,15 @@ export interface PrivateIndexFs {
   inspectPath?: (absolutePath: string) => PrivatePathInfo;
   /** Raw symlink-target seam; targets are blob bytes, never followed paths. */
   readLink?: (absolutePath: string) => Uint8Array;
+  /** Complete private-index fingerprint seam for plumbing-only unit fixtures. */
+  fingerprintIndex?: (indexPath: string) => string;
 }
 
 export interface PrivateCommitGuards {
-  /** Last original-worktree operation probe before hooks and commit plumbing. */
+  /** Original-worktree operation probe, run both before and after commit hooks. */
   beforeCommit?: () => Promise<string | null>;
+  /** Caller-owned evidence validation, run after every commit hook. */
+  validateOwnership?: () => Promise<void>;
   /** Validated invocation UUID to add as the internal Job-Id trailer. */
   jobId?: string | null;
 }
@@ -1038,39 +1046,63 @@ async function verifyHookBoundary(
   }
 }
 
-async function hookEnvironment(
+function targetGitEnvironment(
   frozen: FrozenPrivateIndex,
-  worktree: string,
-  git: GitRunner,
-  hookDir: string,
-): Promise<Record<string, string>> {
-  const env: Record<string, string> = {
+): Record<string, string> {
+  // Keep cwd-based discovery in the original target worktree. In particular,
+  // worktree-scoped config, hooks, identity, and signing must not be redirected
+  // through a synthetic administrative directory.
+  return {
     GIT_INDEX_FILE: frozen.indexPath,
     GIT_NO_REPLACE_OBJECTS: "1",
   };
-  const common = await git(
-    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    { cwd: worktree },
-  );
-  const commonDir = common.stdout.trim();
-  if (common.code !== 0 || commonDir.length === 0) {
-    throw new PrivateIndexError("commit_failed", common.stderr);
-  }
+}
 
-  // This is an unregistered, read-only ref context, not a Git worktree. Its
-  // private HEAD keeps hooks on the captured target branch even if the original
-  // checkout switches branches; objects/config/hooks remain in the common dir.
-  mkdirSync(hookDir, { recursive: true });
-  writeFileSync(join(hookDir, "HEAD"), `ref: ${frozen.branchRef}\n`, {
-    mode: 0o600,
-  });
-  writeFileSync(join(hookDir, "commondir"), `${commonDir}\n`, { mode: 0o600 });
-  return {
-    ...env,
-    GIT_DIR: hookDir,
-    GIT_COMMON_DIR: commonDir,
-    GIT_WORK_TREE: worktree,
-  };
+function stableIndexMetadata(stat: BigIntStats): string {
+  return [
+    stat.dev,
+    stat.ino,
+    stat.mode,
+    stat.nlink,
+    stat.uid,
+    stat.gid,
+    stat.rdev,
+    stat.size,
+    stat.blksize,
+    stat.blocks,
+    stat.mtimeNs,
+    stat.ctimeNs,
+    stat.birthtimeNs,
+  ]
+    .map(String)
+    .join(":");
+}
+
+function fingerprintPrivateIndex(
+  indexPath: string,
+  fs: PrivateIndexFs,
+): string {
+  if (fs.fingerprintIndex) return fs.fingerprintIndex(indexPath);
+
+  const fd = openSync(indexPath, "r");
+  try {
+    const before = fstatSync(fd, { bigint: true });
+    if (!before.isFile()) throw new Error("private index is not a file");
+    const bytes = readFileSync(fd);
+    const after = fstatSync(fd, { bigint: true });
+    const pathStat = lstatSync(indexPath, { bigint: true });
+    const beforeMetadata = stableIndexMetadata(before);
+    const afterMetadata = stableIndexMetadata(after);
+    if (
+      beforeMetadata !== afterMetadata ||
+      afterMetadata !== stableIndexMetadata(pathStat)
+    ) {
+      throw new Error("private index changed while it was fingerprinted");
+    }
+    return `${afterMetadata}\0${bytes.toString("base64")}`;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function signingArgs(
@@ -1102,6 +1134,16 @@ async function runCommitHook(
   git: GitRunner,
   fs: PrivateIndexFs,
 ): Promise<void> {
+  let indexBefore: string;
+  try {
+    indexBefore = fingerprintPrivateIndex(frozen.indexPath, fs);
+  } catch (error) {
+    throw new PrivateIndexError(
+      "commit_failed",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
   const hook = await git(
     [
       "hook",
@@ -1116,6 +1158,25 @@ async function runCommitHook(
       timeoutMs: GIT_LOCAL_TIMEOUT_MS,
     },
   );
+  // Inspect the exact file before any later Git command can normalize index
+  // flags or extensions. Byte-identical trees do not cover skip-worktree,
+  // assume-unchanged, split-index state, or arbitrary index extensions.
+  let indexAfter: string;
+  try {
+    indexAfter = fingerprintPrivateIndex(frozen.indexPath, fs);
+  } catch (error) {
+    throw new PrivateIndexError(
+      "commit_hook_mutated",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  if (indexAfter !== indexBefore) {
+    throw new PrivateIndexError(
+      "commit_hook_mutated",
+      "commit hook changed the private index file",
+    );
+  }
+
   // Mutation wins over a hook's exit code: publication must never happen when a
   // failing hook also changed the frozen index, live worktree, or target context.
   await verifyHookBoundary(frozen, baseline, worktree, git, fs);
@@ -1174,11 +1235,10 @@ export async function commitFrozenPrivateIndex(
   mkdirSync(frozen.dir, { recursive: true });
   const nonce = randomUUID();
   const messagePath = join(frozen.dir, `message-${nonce}`);
-  const hookDir = join(frozen.dir, `hook-git-${nonce}`);
   writeFileSync(messagePath, completeMessage, { mode: 0o600 });
 
   try {
-    const hookEnv = await hookEnvironment(frozen, worktree, git, hookDir);
+    const hookEnv = targetGitEnvironment(frozen);
     const baseline = await worktreeSnapshot(frozen, worktree, git, fs);
 
     await runCommitHook(
@@ -1219,6 +1279,34 @@ export async function commitFrozenPrivateIndex(
     assertMessageIntegrity(finalMessage, marker, guards.jobId, expectedTasks);
 
     const signing = await signingArgs(worktree, git, hookEnv);
+    const finalOperation = await guards.beforeCommit?.();
+    if (finalOperation) {
+      throw new PrivateIndexError("operation_in_progress", "", {
+        operation: finalOperation,
+      });
+    }
+    await guards.validateOwnership?.();
+
+    // Ownership validation is the final non-local boundary. From here through
+    // compare-and-swap, perform only private filesystem reads and local Git
+    // plumbing against the original target worktree context.
+    const finalTarget = await git(["symbolic-ref", "-q", "HEAD"], {
+      cwd: worktree,
+      env: hookEnv,
+    });
+    if (
+      finalTarget.code !== 0 ||
+      finalTarget.stdout.trim() !== frozen.branchRef
+    ) {
+      throw new PrivateIndexError(
+        "commit_hook_mutated",
+        "target worktree changed the captured branch context",
+      );
+    }
+    await verifyFrozenSurface(frozen, worktree, git, fs);
+    finalMessage = readFileSync(messagePath, "utf8");
+    assertMessageIntegrity(finalMessage, marker, guards.jobId, expectedTasks);
+
     const commit = await git(
       [
         "commit-tree",
@@ -1313,15 +1401,10 @@ export async function commitFrozenPrivateIndex(
       ...(postCommitHookWarning ? { postCommitHookWarning } : {}),
     };
   } finally {
-    // Message and synthetic hook context are private invocation state. The
-    // isolated index remains until the caller's outer cleanup/reconciliation.
+    // The message is private invocation state. The isolated index remains until
+    // the caller's outer cleanup/reconciliation.
     try {
       rmSync(messagePath, { force: true });
-    } catch {
-      // Preserve the commit outcome.
-    }
-    try {
-      rmSync(hookDir, { recursive: true, force: true });
     } catch {
       // Preserve the commit outcome.
     }

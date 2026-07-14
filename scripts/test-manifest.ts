@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 export type FastPhase = "root" | "plan" | "prompt";
-export type TestClass = FastPhase | "opentui";
+export type GatePhase = FastPhase | "slow-git";
+export type TestClass = GatePhase | "opentui";
 
 export type PackageSpec = {
   phase: FastPhase;
@@ -17,6 +18,7 @@ export type PackageSpec = {
 export type TestManifest = {
   packages: readonly PackageSpec[];
   openTuiFiles: readonly string[];
+  slowGitFiles: readonly string[];
 };
 
 export const OPEN_TUI_FILES = [
@@ -24,6 +26,10 @@ export const OPEN_TUI_FILES = [
   "test/live-shell.test.ts",
   "test/dash-app.test.ts",
   "test/dash-shell.test.ts",
+] as const;
+
+export const SLOW_GIT_FILES = [
+  "test/slow/commit-work-publication-realgit.test.ts",
 ] as const;
 
 export const TEST_PACKAGES: readonly PackageSpec[] = [
@@ -53,6 +59,7 @@ export const TEST_PACKAGES: readonly PackageSpec[] = [
 export const TEST_MANIFEST: TestManifest = {
   packages: TEST_PACKAGES,
   openTuiFiles: OPEN_TUI_FILES,
+  slowGitFiles: SLOW_GIT_FILES,
 };
 
 export type ManifestAudit = {
@@ -113,6 +120,7 @@ export function classifyTestFile(
   const normalized = posix(path);
   const classes: TestClass[] = [];
   if (manifest.openTuiFiles.includes(normalized)) classes.push("opentui");
+  if (manifest.slowGitFiles.includes(normalized)) classes.push("slow-git");
   for (const pkg of manifest.packages) {
     const prefix = `${posix(pkg.testDir).replace(/\/$/, "")}/`;
     if (normalized.startsWith(prefix)) classes.push(pkg.phase);
@@ -127,23 +135,44 @@ export function auditTestManifest(
 ): ManifestAudit {
   if (discovered.length === 0)
     throw new ManifestError("zero test files discovered");
-  const requiredPhases: TestClass[] = ["root", "plan", "prompt", "opentui"];
+  const requiredPhases: TestClass[] = [
+    "root",
+    "plan",
+    "prompt",
+    "opentui",
+    "slow-git",
+  ];
   const files: Record<TestClass, string[]> = {
     root: [],
     plan: [],
     prompt: [],
     opentui: [],
+    "slow-git": [],
   };
-  const openTui = new Set(manifest.openTuiFiles);
-  for (const expected of openTui) {
-    if (!fileExists(expected) || !discovered.includes(expected)) {
-      throw new ManifestError(`required OpenTUI file is missing: ${expected}`);
+  const requiredFiles: Array<{
+    label: string;
+    paths: readonly string[];
+  }> = [
+    { label: "OpenTUI", paths: manifest.openTuiFiles },
+    { label: "slow Git", paths: manifest.slowGitFiles },
+  ];
+  for (const required of requiredFiles) {
+    for (const expected of required.paths) {
+      if (!fileExists(expected) || !discovered.includes(expected)) {
+        throw new ManifestError(
+          `required ${required.label} file is missing: ${expected}`,
+        );
+      }
     }
   }
   for (const path of [...discovered].sort()) {
     let classes = classifyTestFile(path, manifest);
-    if (classes.includes("opentui"))
-      classes = classes.filter((c) => c === "opentui");
+    if (classes.includes("opentui") || classes.includes("slow-git")) {
+      classes = classes.filter(
+        (classification) =>
+          classification === "opentui" || classification === "slow-git",
+      );
+    }
     if (classes.length === 0)
       throw new ManifestError(`unclassified test file: ${path}`);
     if (classes.length !== 1) {

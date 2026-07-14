@@ -194,6 +194,7 @@ interface RefFixtureOptions {
   tree?: string;
   casFails?: boolean;
   commitFails?: boolean;
+  onHook?: (name: string) => void;
 }
 
 const BASE_TREE = "1111111111111111111111111111111111111111";
@@ -288,6 +289,7 @@ function refFixture(options: RefFixtureOptions = {}) {
     }
     if (args[0] === "hook" && args[1] === "run") {
       hookRan = true;
+      options.onHook?.(args[3] ?? "");
       return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "commit-tree") {
@@ -328,6 +330,7 @@ function refFixture(options: RefFixtureOptions = {}) {
     },
     commitMarker: () => "audit-marker",
     inspectPath: () => ({ kind: "file" as const, executable: false }),
+    fingerprintIndex: () => "stable-private-index",
   };
   return {
     run,
@@ -692,8 +695,113 @@ describe("commit-work wait and frozen claim binding", () => {
     expect(fixture.calls.some((call) => call.args[0] === "commit")).toBe(false);
   });
 
-  test("a sequencer appearing in the final pre-commit probe aborts publication", async () => {
-    const fixture = refFixture();
+  test("a same-OID foreign claim appearing during hooks blocks publication", async () => {
+    let hookRan = false;
+    const fixture = refFixture({
+      onHook: () => {
+        hookRan = true;
+      },
+    });
+    let reads = 0;
+    const mine = {
+      path: "a.txt",
+      sessionId: ID,
+      liveness: "live" as const,
+      oid: BLOB,
+      mode: "100644",
+    };
+    const output = await runForTest(["message", "--session-id", ID], {
+      cwd: "/repo",
+      env: {},
+      gitRunner: pipelineRun(fixture),
+      directEvidence: () => ({ complete: true }),
+      readClaims: () => {
+        reads += 1;
+        return !hookRan
+          ? [mine]
+          : [
+              mine,
+              {
+                path: "a.txt",
+                sessionId: OTHER,
+                liveness: "unknown" as const,
+                oid: BLOB,
+                mode: "100644",
+              },
+            ];
+      },
+      detectInProgress: async () => null,
+      checkSharedCheckoutJam: () => false,
+      acquireLock: () => ({ release: () => {} }),
+      runLint: async () => {},
+      privateIndexFs: fixture.fs,
+    });
+    expect(reads).toBe(4);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      outcome: "ownership_conflict",
+      reason: "foreign_claim_before_publication",
+    });
+    expect(
+      fixture.calls.filter(
+        (call) => call.args[0] === "hook" && call.args[1] === "run",
+      ),
+    ).toHaveLength(3);
+    expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+      false,
+    );
+    expect(fixture.calls.some((call) => call.args[0] === "update-ref")).toBe(
+      false,
+    );
+  });
+
+  test("claim OID and mode drift appearing during hooks blocks publication", async () => {
+    for (const changed of [
+      { oid: FOREIGN, mode: "100644" },
+      { oid: BLOB, mode: "100755" },
+    ]) {
+      let hookRan = false;
+      const fixture = refFixture({
+        onHook: () => {
+          hookRan = true;
+        },
+      });
+      const output = await runForTest(["message", "--session-id", ID], {
+        cwd: "/repo",
+        env: {},
+        gitRunner: pipelineRun(fixture),
+        directEvidence: () => ({ complete: true }),
+        readClaims: () => [
+          {
+            path: "a.txt",
+            sessionId: ID,
+            liveness: "live" as const,
+            oid: hookRan ? changed.oid : BLOB,
+            mode: hookRan ? changed.mode : "100644",
+          },
+        ],
+        detectInProgress: async () => null,
+        checkSharedCheckoutJam: () => false,
+        acquireLock: () => ({ release: () => {} }),
+        runLint: async () => {},
+        privateIndexFs: fixture.fs,
+      });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        outcome: "surface_changed",
+        reason: "claim_identity_changed_before_publication",
+      });
+      expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+        false,
+      );
+    }
+  });
+
+  test("an operation starting during hooks aborts publication", async () => {
+    let operationStarted = false;
+    const fixture = refFixture({
+      onHook: () => {
+        operationStarted = true;
+      },
+    });
     let probes = 0;
     const output = await runForTest(["message", "--session-id", ID], {
       cwd: "/repo",
@@ -706,19 +814,29 @@ describe("commit-work wait and frozen claim binding", () => {
       readClaims: () => [],
       detectInProgress: async () => {
         probes += 1;
-        return probes === 3 ? "rebase" : null;
+        return operationStarted ? "rebase" : null;
       },
       checkSharedCheckoutJam: () => false,
       acquireLock: () => ({ release: () => {} }),
       runLint: async () => {},
       privateIndexFs: fixture.fs,
     });
-    expect(probes).toBe(3);
+    expect(probes).toBe(4);
     expect(JSON.parse(output.stdout)).toMatchObject({
       outcome: "operation_in_progress",
       operation: "rebase",
     });
-    expect(fixture.calls.some((call) => call.args[0] === "commit")).toBe(false);
+    expect(
+      fixture.calls.filter(
+        (call) => call.args[0] === "hook" && call.args[1] === "run",
+      ),
+    ).toHaveLength(3);
+    expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+      false,
+    );
+    expect(fixture.calls.some((call) => call.args[0] === "update-ref")).toBe(
+      false,
+    );
   });
 
   test("publication and push remain bound to the captured branch and commit", async () => {
@@ -752,11 +870,11 @@ describe("commit-work wait and frozen claim binding", () => {
     expect(pushed).toEqual([
       ["/repo", COMMIT, "refs/heads/main", expect.any(Function)],
     ]);
-    // Capture, three hook-boundary context checks, and guarded ambient
-    // reconciliation; none chooses the push source or destination.
+    // Capture, three hook boundaries, final target validation, and guarded
+    // ambient reconciliation; none chooses the push source or destination.
     expect(
       fixture.calls.filter((call) => call.args[0] === "symbolic-ref"),
-    ).toHaveLength(5);
+    ).toHaveLength(6);
   });
 
   test("ambient reconciliation uses one exact index-info update and never reset", async () => {

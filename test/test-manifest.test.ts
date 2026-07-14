@@ -19,6 +19,7 @@ const FILES = [
   "test/live-shell.test.ts",
   "test/dash-app.test.ts",
   "test/dash-shell.test.ts",
+  "test/slow/commit-work-publication-realgit.test.ts",
   "plugins/plan/test/a.test.ts",
   "plugins/prompt/test/a.test.ts",
 ];
@@ -28,6 +29,9 @@ describe("test manifest classification", () => {
     const audit = auditTestManifest(FILES, TEST_MANIFEST, () => true);
     expect(audit.files.root).toEqual(["test/a.test.ts"]);
     expect(audit.files.opentui).toHaveLength(4);
+    expect(audit.files["slow-git"]).toEqual([
+      "test/slow/commit-work-publication-realgit.test.ts",
+    ]);
     expect(audit.files.plan).toEqual(["plugins/plan/test/a.test.ts"]);
     expect(audit.files.prompt).toEqual(["plugins/prompt/test/a.test.ts"]);
   });
@@ -48,6 +52,13 @@ describe("test manifest classification", () => {
         (path) => path !== "test/live-shell.test.ts",
       ),
     ).toThrow("required OpenTUI file is missing");
+    expect(() =>
+      auditTestManifest(
+        FILES,
+        TEST_MANIFEST,
+        (path) => path !== "test/slow/commit-work-publication-realgit.test.ts",
+      ),
+    ).toThrow("required slow Git file is missing");
     expect(() =>
       auditTestManifest(
         FILES.filter((path) => !path.startsWith("plugins/prompt/")),

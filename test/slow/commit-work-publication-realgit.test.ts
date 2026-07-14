@@ -19,17 +19,16 @@ import {
   type GitExecOptions,
   type GitRunner,
   gitExec,
-} from "../src/commit-work/git-exec";
+} from "../../src/commit-work/git-exec";
 import {
   cleanupPrivateIndex,
   commitFrozenPrivateIndex,
   createFrozenPrivateIndex,
   type FrozenPrivateIndex,
   type PrivateIndexError,
-  reconcileAmbientAfterPublication,
   reconcileAmbientIndexEntries,
-} from "../src/commit-work/private-index";
-import { pushExactCommit } from "../src/commit-work/push";
+} from "../../src/commit-work/private-index";
+import { pushExactCommit } from "../../src/commit-work/push";
 
 const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const roots: string[] = [];
@@ -102,10 +101,15 @@ async function worktreePaths(repo: string): Promise<string[]> {
     .map((record) => record.slice("worktree ".length));
 }
 
-function installHook(repo: string, name: string, body: string): void {
-  const hook = join(repo, ".git", "hooks", name);
+function installHookAt(hooksDir: string, name: string, body: string): void {
+  mkdirSync(hooksDir, { recursive: true });
+  const hook = join(hooksDir, name);
   writeFileSync(hook, `#!/bin/sh\nset -eu\n${body}\n`);
   chmodSync(hook, 0o755);
+}
+
+function installHook(repo: string, name: string, body: string): void {
+  installHookAt(join(repo, ".git", "hooks"), name, body);
 }
 
 function shellQuote(value: string): string {
@@ -343,73 +347,77 @@ describe("commit-work real-git atomic plumbing publication", () => {
     }
   });
 
-  test("an original MERGE_HEAD appearing after the gate cannot add a parent", async () => {
+  test("an operation starting during a hook aborts before commit creation", async () => {
     const { repo, expected } = await repoWithBase();
     writeFileSync(join(repo, "selected.txt"), "merge-race change\n");
-    const privateIndex = await frozen(repo, ["selected.txt"]);
+    installHook(
+      repo,
+      "pre-commit",
+      `printf '%s\\n' ${shellQuote(expected)} > .git/MERGE_HEAD`,
+    );
+    const recording = recordingRunner();
+    const privateIndex = await frozen(repo, ["selected.txt"], recording.run);
+    let probes = 0;
     try {
-      const committed = await commitFrozenPrivateIndex(
-        privateIndex,
-        "feat: isolated from merge race",
-        repo,
-        gitExec,
-        {},
-        {
-          beforeCommit: async () => {
-            writeFileSync(join(repo, ".git", "MERGE_HEAD"), `${expected}\n`);
-            return null;
+      await expect(
+        commitFrozenPrivateIndex(
+          privateIndex,
+          "feat: reject merge race",
+          repo,
+          recording.run,
+          {},
+          {
+            beforeCommit: async () => {
+              probes += 1;
+              return existsSync(join(repo, ".git", "MERGE_HEAD"))
+                ? "merge"
+                : null;
+            },
           },
-        },
-      );
-      expect(
-        (await git(repo, ["show", "-s", "--format=%P", committed.sha])).split(
-          " ",
         ),
-      ).toEqual([expected]);
-      expect(existsSync(join(repo, ".git", "MERGE_HEAD"))).toBe(true);
+      ).rejects.toMatchObject({
+        code: "operation_in_progress",
+        operation: "merge",
+      });
+      expect(probes).toBe(2);
+      expect(
+        recording.calls.some((call) => call.args[0] === "commit-tree"),
+      ).toBe(false);
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
     } finally {
       cleanupPrivateIndex(privateIndex);
     }
   });
 
-  test("switching the original symbolic HEAD does not redirect publication", async () => {
+  test("switching the original symbolic HEAD aborts before publication", async () => {
     const { repo, expected } = await repoWithBase();
     await git(repo, ["branch", "other", expected]);
     writeFileSync(join(repo, "selected.txt"), "branch-race change\n");
     const privateIndex = await frozen(repo, ["selected.txt"]);
+    let switched = false;
     try {
-      const committed = await commitFrozenPrivateIndex(
-        privateIndex,
-        "feat: captured branch",
-        repo,
-        gitExec,
-        {},
-        {
-          beforeCommit: async () => {
-            await git(repo, ["switch", "other"]);
-            return null;
-          },
-        },
-      );
-      const indexBefore = await git(repo, ["ls-files", "-s", "-z"]);
       await expect(
-        reconcileAmbientAfterPublication(
+        commitFrozenPrivateIndex(
           privateIndex,
-          committed.sha,
+          "feat: captured branch",
           repo,
           gitExec,
+          {},
+          {
+            beforeCommit: async () => {
+              if (!switched) {
+                switched = true;
+                await git(repo, ["switch", "other"]);
+              }
+              return null;
+            },
+          },
         ),
-      ).resolves.toMatchObject({
-        reconciled: false,
-        warning: { code: "checkout_changed" },
-      });
-      expect(await git(repo, ["ls-files", "-s", "-z"])).toBe(indexBefore);
+      ).rejects.toMatchObject({ code: "commit_hook_mutated" });
       expect(await git(repo, ["symbolic-ref", "HEAD"])).toBe(
         "refs/heads/other",
       );
-      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
-        committed.sha,
-      );
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
       expect(await git(repo, ["rev-parse", "refs/heads/other"])).toBe(expected);
     } finally {
       cleanupPrivateIndex(privateIndex);
@@ -439,12 +447,16 @@ describe("commit-work real-git atomic plumbing publication", () => {
           {},
           {
             beforeCommit: async () => {
-              await git(repo, [
-                "update-ref",
-                "refs/heads/main",
-                competitor,
-                expected,
-              ]);
+              if (
+                (await git(repo, ["rev-parse", "refs/heads/main"])) === expected
+              ) {
+                await git(repo, [
+                  "update-ref",
+                  "refs/heads/main",
+                  competitor,
+                  expected,
+                ]);
+              }
               return null;
             },
           },
@@ -469,7 +481,7 @@ describe("commit-work real-git atomic plumbing publication", () => {
     }
   });
 
-  test("hooks observe the captured target branch after the original checkout switches", async () => {
+  test("hooks remain in the original target worktree context", async () => {
     const { root, repo, expected } = await repoWithBase();
     await git(repo, ["branch", "other", expected]);
     const observed = join(root, "observed-hook-branch");
@@ -480,27 +492,122 @@ describe("commit-work real-git atomic plumbing publication", () => {
     );
     writeFileSync(join(repo, "selected.txt"), "target-context change\n");
     const privateIndex = await frozen(repo, ["selected.txt"]);
+    let switched = false;
     try {
-      const committed = await commitFrozenPrivateIndex(
-        privateIndex,
-        "test: hook target context",
-        repo,
-        gitExec,
-        {},
-        {
-          beforeCommit: async () => {
-            await git(repo, ["switch", "other"]);
-            return null;
+      await expect(
+        commitFrozenPrivateIndex(
+          privateIndex,
+          "test: hook target context",
+          repo,
+          gitExec,
+          {},
+          {
+            beforeCommit: async () => {
+              if (!switched) {
+                switched = true;
+                await git(repo, ["switch", "other"]);
+              }
+              return null;
+            },
           },
-        },
-      );
-      expect(readFileSync(observed, "utf8").trim()).toBe("main");
+        ),
+      ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+      expect(readFileSync(observed, "utf8").trim()).toBe("other");
       expect(await git(repo, ["symbolic-ref", "--short", "HEAD"])).toBe(
         "other",
       );
-      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
-        committed.sha,
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
+    } finally {
+      cleanupPrivateIndex(privateIndex);
+    }
+  });
+
+  test("linked target worktree config controls hooks, identity, and signing", async () => {
+    const { root, repo } = await repoWithBase();
+    await git(repo, ["config", "extensions.worktreeConfig", "true"]);
+    await git(repo, ["config", "user.name", "Common Identity"]);
+    await git(repo, ["config", "user.email", "common@example.test"]);
+
+    const targetPath = join(root, "target");
+    await git(repo, ["worktree", "add", "-b", "target", targetPath, "main"]);
+    const target = realpathSync(targetPath);
+    const targetHooks = join(root, "target-hooks");
+    const observed = join(root, "target-hooks-observed");
+    await git(target, ["config", "--worktree", "core.hooksPath", targetHooks]);
+    await git(target, ["config", "--worktree", "user.name", "Target Identity"]);
+    await git(target, [
+      "config",
+      "--worktree",
+      "user.email",
+      "target@example.test",
+    ]);
+    await git(target, ["config", "--worktree", "commit.gpgSign", "true"]);
+
+    installHook(repo, "pre-commit", "exit 97");
+    installHookAt(
+      targetHooks,
+      "pre-commit",
+      `printf 'pre:%s:%s\\n' "$(git config --get user.email)" "$(git symbolic-ref --short HEAD)" >> ${shellQuote(observed)}`,
+    );
+    installHookAt(
+      targetHooks,
+      "post-commit",
+      `printf 'post:%s:%s\\n' "$(git config --get user.email)" "$(git rev-parse HEAD)" >> ${shellQuote(observed)}`,
+    );
+
+    writeFileSync(join(target, "selected.txt"), "target-local config\n");
+    let signingSeen = false;
+    const calls: Array<{ args: string[]; options: GitExecOptions }> = [];
+    const run: GitRunner = async (args, options = {}) => {
+      calls.push({ args: [...args], options: { ...options } });
+      if (args[0] === "commit-tree" && args.includes("-S")) {
+        signingSeen = true;
+        return gitExec(
+          args.filter((arg) => arg !== "-S"),
+          options,
+        );
+      }
+      return gitExec(args, options);
+    };
+
+    const privateIndex = await frozen(target, ["selected.txt"], run);
+    try {
+      const committed = await commitFrozenPrivateIndex(
+        privateIndex,
+        "test: target worktree config",
+        target,
+        run,
       );
+      expect(signingSeen).toBe(true);
+      expect(
+        (
+          await git(target, [
+            "show",
+            "-s",
+            "--format=%an%x00%ae",
+            committed.sha,
+          ])
+        ).split("\0"),
+      ).toEqual(["Target Identity", "target@example.test"]);
+      expect(readFileSync(observed, "utf8").trim().split("\n")).toEqual([
+        "pre:target@example.test:target",
+        `post:target@example.test:${committed.sha}`,
+      ]);
+
+      const contextual = calls.filter(
+        (call) =>
+          call.args[0] === "hook" ||
+          call.args[0] === "commit-tree" ||
+          (call.args[0] === "config" && call.args.includes("commit.gpgSign")),
+      );
+      expect(contextual.length).toBeGreaterThanOrEqual(6);
+      for (const call of contextual) {
+        expect(call.options.cwd).toBe(target);
+        expect(call.options.env?.GIT_INDEX_FILE).toBe(privateIndex.indexPath);
+        expect(call.options.env?.GIT_DIR).toBeUndefined();
+        expect(call.options.env?.GIT_COMMON_DIR).toBeUndefined();
+        expect(call.options.env?.GIT_WORK_TREE).toBeUndefined();
+      }
     } finally {
       cleanupPrivateIndex(privateIndex);
     }
@@ -530,6 +637,38 @@ describe("commit-work real-git atomic plumbing publication", () => {
           ),
         ).rejects.toMatchObject({
           code: "commit_hook_mutated",
+          committed: false,
+        });
+        expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
+          expected,
+        );
+      } finally {
+        cleanupPrivateIndex(privateIndex);
+      }
+    });
+  }
+
+  for (const mutation of ["--skip-worktree", "--assume-unchanged"] as const) {
+    test(`a hook setting ${mutation} aborts despite an unchanged tree`, async () => {
+      const { repo, expected } = await repoWithBase();
+      writeFileSync(join(repo, "selected.txt"), "flag-only hook candidate\n");
+      installHook(
+        repo,
+        "pre-commit",
+        `git update-index ${mutation} -- selected.txt`,
+      );
+      const privateIndex = await frozen(repo, ["selected.txt"]);
+      try {
+        await expect(
+          commitFrozenPrivateIndex(
+            privateIndex,
+            `test: reject ${mutation}`,
+            repo,
+            gitExec,
+          ),
+        ).rejects.toMatchObject({
+          code: "commit_hook_mutated",
+          stderr: "commit hook changed the private index file",
           committed: false,
         });
         expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
@@ -692,7 +831,7 @@ describe("commit-work real-git atomic plumbing publication", () => {
     }
   });
 
-  test("private message and hook-context files are removed after publication", async () => {
+  test("private message files are removed after publication", async () => {
     const { repo } = await repoWithBase();
     writeFileSync(join(repo, "selected.txt"), "cleanup candidate\n");
     const privateIndex = await frozen(repo, ["selected.txt"]);
@@ -704,8 +843,8 @@ describe("commit-work real-git atomic plumbing publication", () => {
         gitExec,
       );
       expect(
-        readdirSync(privateIndex.dir).filter(
-          (name) => name.startsWith("message-") || name.startsWith("hook-git-"),
+        readdirSync(privateIndex.dir).filter((name) =>
+          name.startsWith("message-"),
         ),
       ).toEqual([]);
     } finally {

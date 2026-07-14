@@ -8,7 +8,7 @@ import { classifyVerdict, runProcessGroup, type SuiteSpec } from "./test-full";
 import {
   buildTimingReport,
   emitTimingArtifacts,
-  type FastPhase,
+  type GatePhase,
   loadTestManifest,
   qualifyReferenceHost,
   repoRootFromScripts,
@@ -123,10 +123,10 @@ export function buildBunTestEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 export function parseGateArgs(argv: readonly string[]): {
-  phase: FastPhase;
+  phase: GatePhase;
   forwarded: string[];
 } {
-  let phase: FastPhase = "root";
+  let phase: GatePhase = "root";
   const forwarded: string[] = [];
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
@@ -136,8 +136,14 @@ export function parseGateArgs(argv: readonly string[]): {
         ? argv[++index]
         : undefined;
     if (value !== undefined) {
-      if (value !== "root" && value !== "plan" && value !== "prompt")
+      if (
+        value !== "root" &&
+        value !== "plan" &&
+        value !== "prompt" &&
+        value !== "slow-git"
+      ) {
         throw new Error(`unknown test phase: ${value}`);
+      }
       phase = value;
     } else forwarded.push(arg);
   }
@@ -145,15 +151,16 @@ export function parseGateArgs(argv: readonly string[]): {
 }
 
 export function phaseTargets(
-  phase: FastPhase,
+  phase: GatePhase,
   repoRoot: string,
 ): { cwd: string; files: string[] } {
   const audit = loadTestManifest(repoRoot);
-  const cwd = phase === "root" ? "." : `plugins/${phase}`;
+  const cwd =
+    phase === "root" || phase === "slow-git" ? "." : `plugins/${phase}`;
   return {
     cwd,
     files: audit.files[phase].map((file) =>
-      phase === "root" ? `./${file}` : `./${relative(cwd, file)}`,
+      cwd === "." ? `./${file}` : `./${relative(cwd, file)}`,
     ),
   };
 }

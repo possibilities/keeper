@@ -454,6 +454,74 @@ function surfaceFailure(
   return null;
 }
 
+class PublicationValidationError extends Error {
+  readonly result: CommitWorkResult;
+
+  constructor(failure: CommitWorkResult) {
+    super(failure.outcome);
+    this.name = "PublicationValidationError";
+    this.result = failure;
+  }
+}
+
+function finalOwnershipFailure(
+  initial: SurfaceDiscoveryResult,
+  current: SurfaceDiscoveryResult,
+  frozen: FrozenPrivateIndex,
+  identity: string | null,
+): CommitWorkResult | null {
+  const invalid = surfaceFailure(current, identity);
+  if (invalid) return invalid;
+
+  const foreign = selectedForeignConflicts(current, frozen.paths, identity);
+  if (foreign.length > 0) {
+    return result("commit-work-result", "ownership_conflict", false, {
+      identity,
+      reason: "foreign_claim_before_publication",
+      count: foreign.length,
+      sample: foreign.slice(0, SAMPLE_LIMIT),
+      files: frozen.paths,
+      selection: selectionEnvelope(current, identity),
+      surface: current.summary,
+    });
+  }
+
+  const automaticLost = initial.automatic.filter(
+    (path) => !current.automatic.includes(path),
+  );
+  if (automaticLost.length > 0) {
+    return result("commit-work-result", "ownership_ambiguous", false, {
+      identity,
+      reason: "automatic_ownership_changed_before_publication",
+      count: automaticLost.length,
+      sample: pathSample(automaticLost),
+      files: frozen.paths,
+      selection: selectionEnvelope(current, identity),
+      surface: current.summary,
+    });
+  }
+
+  const claimDrift = automaticClaimIdentityDrift(
+    current,
+    frozen,
+    identity,
+    frozen.paths,
+  );
+  if (claimDrift.length > 0) {
+    return result("commit-work-result", "surface_changed", false, {
+      identity,
+      reason: "claim_identity_changed_before_publication",
+      count: claimDrift.length,
+      sample: pathSample(claimDrift),
+      files: frozen.paths,
+      selection: selectionEnvelope(current, identity),
+      surface: current.summary,
+    });
+  }
+
+  return null;
+}
+
 async function runAttempt(
   args: ParsedArgs,
   deps: CommitWorkDeps,
@@ -1016,20 +1084,34 @@ async function runAttempt(
       };
     }
 
+    const publicationFrozen = frozen;
     let committed: Awaited<ReturnType<typeof commitFrozenPrivateIndex>>;
     try {
       committed = await commitFrozenPrivateIndex(
-        frozen,
+        publicationFrozen,
         args.msg,
         worktree,
         git,
         deps.privateIndexFs,
         {
           beforeCommit: async () => await detect(worktree, git),
+          validateOwnership: async () => {
+            const current = await discover(args, identity, worktree, git, deps);
+            const failure = finalOwnershipFailure(
+              surface,
+              current,
+              publicationFrozen,
+              identity,
+            );
+            if (failure) throw new PublicationValidationError(failure);
+          },
           jobId: identity,
         },
       );
     } catch (error) {
+      if (error instanceof PublicationValidationError) {
+        return { code: 1, identity, result: error.result };
+      }
       const typed = error instanceof PrivateIndexError ? error : null;
       const code = typed?.code ?? "commit_failed";
       return {

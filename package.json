@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit",
     "test:opentui": "bun test ./test/ansi-to-styled.test.ts ./test/live-shell.test.ts ./test/dash-app.test.ts ./test/dash-shell.test.ts",
     "test:gate": "bun scripts/test-gate.ts --phase=root --timeout=10000",
+    "test:slow-git": "bun scripts/test-gate.ts --phase=slow-git --timeout=60000",
     "test": "bun scripts/test-default.ts",
     "test:full": "bun scripts/test-full.ts"
   },

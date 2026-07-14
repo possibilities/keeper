@@ -261,6 +261,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
           removeTempDir: () => {},
           commitMarker: () => "worktree-test",
           inspectPath: () => ({ kind: "file", executable: false }),
+          fingerprintIndex: () => "stable-private-index",
         },
       },
     );

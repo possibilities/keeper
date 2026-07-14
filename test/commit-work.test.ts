@@ -341,6 +341,7 @@ function deps(opts: {
           : "file",
         executable: false,
       }),
+      fingerprintIndex: () => "stable-private-index",
     },
     detectInProgress: opts.detectInProgress ?? (async () => null),
     checkSharedCheckoutJam: opts.checkSharedCheckoutJam ?? (() => false),
