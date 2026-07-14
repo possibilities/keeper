@@ -1,49 +1,28 @@
 #!/usr/bin/env bun
-/**
- * `keeper commit-work` — stage session-attributed dirty files, run the polyglot
- * lint matrix, commit with a `Job-Id:` trailer, and push. The native port of
- * jobctl's `run_commit_work.py` (epic fn-715).
- *
- * Pipeline (parity with the Python `run()`):
- *   resolve session-id (fail+exit 1, never a silent no-op)
- *     → discover session-attributed dirty files (src/commit-work/attribution)
- *     → gitignore-filter (`git check-ignore -z --stdin`, fail-open ≥128)
- *     → `--max-files` guard on the POST-filter count (default 500, 0 disables)
- *     → `--preview-files` branch (pretty envelope, NO lock, NO commit)
- *     → require message · sanitize (`_FORBIDDEN_TRAILER_RE`, multi-line only)
- *     → no-files branch (pretty `committed:false`)
- *     → acquire flock (<per-worktree --git-dir>/keeper-commit-work.lock)
- *       → `git add -A -- <pathspecs>` (pathspec-scoped; deletions stage as removals)
- *       → index-purity gate: staged content outside the attributed set fails
- *         loud (`stale_index_carryover`) unless `--allow-stale-unstage` unstages it
- *       → lint matrix (src/commit-work/lint-matrix) — fail → release + emit
- *       → sanitize-safe `git commit -F - -- <attributed pathspec>` (GIT_LITERAL_PATHSPECS=1),
- *         appended `Job-Id:` trailer — poisoned index cannot leak into the tree
- *       → NDJSON line 1 (COMPACT `{success,commit_sha,files}`)
- *       → push (src/commit-work/push) → NDJSON line 2 (compact push envelope)
- *     → release flock (every path, no double-release)
- *
- * **Byte-parity envelopes.** Python emits two distinct JSON shapes:
- *   - bare `print(json.dumps(...))` — COMPACT, single line, Python's default
- *     `", "`/`": "` separators, `ensure_ascii=True`, plus a trailing `\n`. Used
- *     for the two NDJSON lines and EVERY error envelope. {@link printCompact}.
- *   - `format_output(...)` → `json_dumps` — pretty `indent=2`,
- *     `ensure_ascii=False`, trailing `\n`. Used for `--preview-files` and the
- *     no-files `committed:false` envelope. {@link printPretty}.
- * Line-oriented consumers (keeper plan, the worker dispatch) depend on the compact
- * two-line form — these serializers reproduce Python's exact bytes.
- */
 
-import { existsSync } from "node:fs";
-import {
-  discoverSessionFiles,
-  resolveCwdRepo,
-  waitForAttributionCaughtUp,
-} from "../src/commit-work/attribution";
+import { waitForAttributionCaughtUp } from "../src/commit-work/attribution";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
+import {
+  IdentityConflictError,
+  InvalidIdentityError,
+  resolveInvocationIdentity,
+} from "../src/commit-work/identity";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
-import { pushCommitted } from "../src/commit-work/push";
+import {
+  cleanupPrivateIndex,
+  commitFrozenPrivateIndex,
+  createFrozenPrivateIndex,
+  exactEntriesFromTree,
+  type FrozenPrivateIndex,
+  PrivateIndexError,
+  type PrivateIndexFs,
+  privateIndexGit,
+  reconcileAmbientAfterPublication,
+  reconcileAmbientIndexEntries,
+  verifyFrozenSurface,
+} from "../src/commit-work/private-index";
+import { pushExactCommit } from "../src/commit-work/push";
 import {
   analyzeReversionSweep,
   detectInProgressOperation,
@@ -51,251 +30,58 @@ import {
   isMassReversion,
   sharedCheckoutJamActive,
 } from "../src/commit-work/repo-state";
-import { resolveSessionId } from "../src/commit-work/session-id";
+import {
+  type ClaimLiveness,
+  type CommitWorkSurfaceSummary,
+  type DirectSurfaceEvidence,
+  discoverCommitWorkSurface,
+  type OwnershipClaim,
+  type SurfaceDiscoveryDeps,
+  type SurfaceDiscoveryResult,
+} from "../src/commit-work/surface";
+import { emitCommitWorkOutcome } from "../src/commit-work/telemetry";
 
 const HELP = `keeper commit-work [MSG] [options]
 
-Stage session-touched work files, run the lint matrix, commit, and push.
-Always run \`--preview-files\` first to inspect the file list. .keeper/**
-board files are excluded (they commit via the plan-commit hook). Untracked
-gitignored files are filtered before staging; a runaway file list
-(> --max-files, default 500) aborts with a file_list_too_large envelope.
-
-The commit is scoped to the session-attributed set. Staged content outside
-that set (a dead worker's residue, a shared checkout that trails landed
-history, or a git-apply/codegen write the attribution hooks never saw) aborts
-with a stale_index_carryover envelope, and the commit itself is pathspec-
-limited so nothing outside the attributed set can enter the tree.
-
-Three repo-state gates guard the commit: it refuses while a merge/cherry-pick/
-revert/rebase/bisect is in progress (operation_in_progress, no override), while
-a live shared-checkout dirty/desync jam names this repo (shared_checkout_jam,
---override-jam), and when the staged set mass-reverts landed work to ancestor
-content (mass_reversion, --allow-mass-reversion).
-
-Arguments:
-  MSG                  Commit message (required unless --preview-files)
+Commit only work owned by this invocation through an isolated Git index.
+Preview explains the complete dirty surface. Attribution gaps are covered with
+explicit, invocation-local adoption; adoption never creates a durable claim.
 
 Options:
-  --session-id <id>    Tracked agent session id (auto-resolved if omitted)
-  --preview-files      List files that would be committed; no commit is made
-  --max-files <n>      Abort when the post-filter file count exceeds <n>
-                       (default 500; pass 0 to disable)
+  --session-id <uuid>  Invocation identity (must agree with non-empty env carriers)
+  --adopt <path>       Adopt one exact dirty path; repeat for multiple paths
+  --preview-files      Emit an advisory surface envelope; make no commit
+  --max-files <n>      Refuse a selected set larger than n (default 500; 0 disables)
   --allow-stale-unstage
-                       On a stale_index_carryover abort, unstage the extra
-                       paths and commit the attributed set only. Recovery
-                       opt-in, not a default; if the extra paths are yours,
-                       prefer plain git with explicit paths instead.
-  --override-jam       Proceed past a shared_checkout_jam refusal. Only when
-                       you are certain the staged set is correct and current.
+                       Unstage ambient paths outside the selected set
+  --override-jam       Proceed past a shared-checkout jam
   --allow-mass-reversion
-                       Proceed past a mass_reversion abort — for a genuine
-                       bulk revert you intend.
+                       Proceed past an intentional bulk reversion
   --help, -h           Show this help
 
-Escape hatch: plain-git-with-explicit-paths is the ONE documented path for a
-commit these gates block deliberately — \`git add <explicit paths>\` (never -A /
-.) then \`git commit\` and \`git push\`. That is the mixed/stale-index exception
-the gates exist to make visible; the commit itself stays pathspec-limited.
-
-Run \`keeper commit-work --agent-help\` for the terse operator runbook.
+A coverage gap is resolved by re-running with --adopt <path>. Lint failures are
+fixed in the live worktree and retried through keeper commit-work; never bypass
+hooks or use --no-verify.
 `;
 
-/** Terse operator runbook (agent-facing), distinct from the full `--help`. */
-const AGENT_HELP = `keeper commit-work — operator runbook (agent-facing)
+const AGENT_HELP = `keeper commit-work — operator runbook
 
-Stage session-touched files, run the lint matrix, commit, and push. .keeper/**
-board files are excluded (the plan-commit hook owns them).
-
-  keeper commit-work --preview-files          # inspect the scoped file list first
-  keeper commit-work "<type>(<scope>): <summary>
-
-  Task: fn-N.M"                               # source commit carries the Task: trailer
-
-On a {"error":"lint_failed"} envelope: read the named files, fix per stderr,
-\`git add\` the fixes, then re-invoke the SAME message — never --no-verify. A
-runaway list (> --max-files, default 500) aborts with file_list_too_large. Every
-verb envelope is exit 1; an arg fault is exit 2. Escape hatch: if it won't stage
-a file you need, \`git add <explicit paths>\` then plain git commit/push.
-
-On a {"error":"stale_index_carryover"} envelope: the index carries staged paths
-outside your session's attributed set (a dead worker's residue or a desynced
-checkout). Do NOT reflexively override. Either \`git add <explicit paths>\` +
-plain git commit if those paths are genuinely yours, or --allow-stale-unstage to
-unstage the extras and commit the attributed set only. The commit is always
-pathspec-limited to the attributed set, so nothing else can enter the tree.
-
-Repo-state refusals: {"error":"operation_in_progress"} — conclude or abort the
-named git operation, then retry (no override; a mid-op commit is never correct).
-{"error":"shared_checkout_jam"} — a live dirty/desync distress row names this
-repo; let the daemon's recovery clear it, or --override-jam if the staged set is
-truly correct. {"error":"mass_reversion"} — the staged set bulk-reverts landed
-work to ancestor content (a desynced checkout; suites cannot catch it); inspect
-the flagged paths, then --allow-mass-reversion only for an intended bulk revert.
-Across every gate, plain-git-with-explicit-paths remains the ONE documented
-mixed-commit path — the deliberate exception the gates exist to make visible.
+Run --preview-files first. Automatic selection is attribution-backed; add an
+exact missing dirty path with repeatable --adopt <path>. Adoption is local to
+this invocation and refuses a live foreign owner. Fix lint failures in the live
+worktree and re-run the same command. Commit hooks and signing remain on.
 `;
 
-// Trailer patterns forbidden in a multi-line commit message body. Forged
-// trailers could confuse downstream hooks that parse commit metadata. Mirrors
-// the Python `_FORBIDDEN_TRAILER_RE` exactly (MULTILINE; the catch-all
-// `Planctl-[A-Za-z]+:` makes the explicit Planctl-* alternatives redundant but
-// they are kept verbatim for parity).
 const FORBIDDEN_TRAILER_RE =
-  /^(Job-Id:|Session-Id:|Signed-off-by:|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[A-Za-z]+:)/m;
-
-const FORBIDDEN_TRAILER_ERROR =
-  "commit message contains a forbidden trailer pattern (Job-Id:, " +
-  "Session-Id:, Signed-off-by:, Planctl-*:); rewrite the message and retry";
-
+  /^(Job-Id:|Keeper-Commit-Id:|Session-Id:|Signed-off-by:|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[A-Za-z]+:)/im;
 const DEFAULT_MAX_FILES = 500;
+const SAMPLE_LIMIT = 20;
+const STDERR_LIMIT = 4000;
 
-// Recovery contract carried in the lint_failed envelope, injected at the agent's
-// decision point. A lint failure is never a staging-coverage gap, so the only
-// permitted recovery loops back through commit-work — never a bare-git bypass.
-const LINT_FAILED_RECOVERY =
-  "Fix the reported lint errors in the files listed, re-stage them with " +
-  "`git add <files>`, then re-invoke `keeper commit-work` with the same " +
-  "message. Do NOT fall back to bare `git commit` or use `--no-verify` — a " +
-  "lint failure is not a coverage gap.";
-
-// Carried in the stale_index_carryover envelope. The attributed set derives
-// ONLY from Write/Edit-class PostToolUse hooks, so a git-apply / codegen /
-// script-written file is invisible to it and would otherwise DROP silently —
-// and a desynced shared checkout surfaces as exactly this stale set. Both must
-// be loud, so the default is to refuse rather than silently unstage.
-const STALE_INDEX_CARRYOVER_HINT =
-  "The index has staged content outside this session's attributed file set — " +
-  "stale carryover from a prior worker that died mid-commit, a shared checkout " +
-  "trailing landed history, or a git-apply/codegen/script write the attribution " +
-  "hooks never saw. Committing it would sweep unrelated (possibly stale) paths " +
-  "into your commit.";
-
-// Recovery contract naming BOTH paths forward, so the operator chooses without
-// running another git command. `--allow-stale-unstage` is the explicit opt-in
-// for the old silent behavior; plain git is the path when the extras are yours.
-const STALE_INDEX_CARRYOVER_RECOVERY =
-  "Two ways forward: (1) if the extra paths are genuinely yours, commit the " +
-  "mixed set with plain git and explicit paths — `git add <path> …` (never -A " +
-  "/ .) then `git commit`; or (2) re-run `keeper commit-work --allow-stale-" +
-  "unstage` to unstage the extras and commit ONLY your attributed files.";
-
-// Carried in the operation_in_progress refusal (gate 1, pre-lock, no override).
-// A full `git commit` on top of a live merge/sequencer op silently creates a
-// two-parent merge commit — the shape that propagated the incident's stale blobs
-// through an auto-merge. Retry-safe once the operator concludes or aborts the op.
-const OPERATION_IN_PROGRESS_RECOVERY =
-  "Conclude the operation (finish the merge/rebase/cherry-pick/revert, or " +
-  "`git bisect reset`), or abort it (`git merge --abort`, `git rebase --abort`, " +
-  "`git cherry-pick --abort`, `git revert --abort`), then re-run keeper " +
-  "commit-work. No override — a partial commit mid-operation is never correct.";
-
-// Carried in the shared_checkout_jam refusal (gate 2, pre-lock, --override-jam).
-// A live dirty/desync distress row means the shared checkout's working tree may
-// trail landed history, so a commit here risks sweeping stale content.
-const SHARED_CHECKOUT_JAM_HINT =
-  "A live shared-checkout dirty/desync distress row matches this repo — the " +
-  "working tree may trail landed history, so committing risks sweeping stale " +
-  "content back over landed work (the incident this gate exists to prevent).";
-
-const SHARED_CHECKOUT_JAM_RECOVERY =
-  "Let the daemon's repair/desync recovery clear the jam (inspect it with " +
-  "`keeper query dispatch_failures`), or — if you are certain the staged set is " +
-  "correct and current — re-run with `--override-jam` to proceed anyway.";
-
-// Carried in the mass_reversion abort (gate 3, in-lock, --allow-mass-reversion).
-// The staged set mass-matches ancestor blobs while differing from HEAD — the
-// desynced-checkout reversion signature (green suites cannot catch it because the
-// tests revert in the same sweep).
-const MASS_REVERSION_HINT =
-  "The staged set mass-matches ANCESTOR blobs while differing from HEAD — the " +
-  "signature of a desynced checkout reverting landed work in bulk. Green suites " +
-  "cannot catch this: the tests revert in the same sweep.";
-
-const MASS_REVERSION_RECOVERY =
-  "Inspect the flagged paths against landed history (`git log -p -- <path>`). If " +
-  "this is a genuine bulk revert you intend, re-run with `--allow-mass-reversion`; " +
-  "otherwise your checkout is stale — reconcile it with landed history first.";
-
-// Carried in the unmerged_paths refusal (gate 3). An index with stage 1/2/3
-// entries is mid-conflict-resolution; committing it is never a clean source commit.
-const UNMERGED_PATHS_RECOVERY =
-  "Resolve the conflicted paths (`git add` each once fixed) or abort the " +
-  "in-progress operation, then re-run keeper commit-work.";
-
-// ---------------------------------------------------------------------------
-// Python-byte-parity JSON serializers
-// ---------------------------------------------------------------------------
-
-/**
- * Serialize a single string with Python `json.dumps(ensure_ascii=True)` bytes:
- * `JSON.stringify` handles the control-char + quote/backslash escapes (its
- * table matches Python's for `\b \t \n \f \r " \\` and `\uXXXX` for other
- * `< 0x20`), then every char `>= 0x7f` is escaped to `\uXXXX` to match
- * `ensure_ascii`. Verified byte-identical against CPython.
- */
-function pyStr(s: string): string {
-  return JSON.stringify(s).replace(
-    /[-￿]/g,
-    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
-}
-
-/**
- * Compact JSON matching Python's `json.dumps()` DEFAULT output: `", "` between
- * items, `": "` after keys, single line, `ensure_ascii=True`. This is the byte
- * shape line-oriented consumers parse.
- */
-function pyCompact(value: unknown): string {
-  if (value === null || value === undefined) return "null";
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (typeof value === "number") return String(value);
-  if (typeof value === "string") return pyStr(value);
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => pyCompact(v)).join(", ")}]`;
-  }
-  if (typeof value === "object") {
-    const pairs = Object.entries(value as Record<string, unknown>).map(
-      ([k, v]) => `${pyStr(k)}: ${pyCompact(v)}`,
-    );
-    return `{${pairs.join(", ")}}`;
-  }
-  return "null";
-}
-
-/**
- * The stdout sink for every envelope. Defaults to `process.stdout.write`; the
- * test suite swaps it for an in-memory buffer so it can assert the exact compact
- * NDJSON / pretty bytes WITHOUT spawning the CLI binary. A single module-level
- * seam keeps the byte-parity serializers (`printCompact`/`printPretty`) intact.
- */
-let writeOut: (chunk: string) => void = (chunk) => {
-  process.stdout.write(chunk);
-};
-
-/** Emit a compact envelope (Python `print(json.dumps(...))` — adds `\n`). */
-function printCompact(value: unknown): void {
-  writeOut(`${pyCompact(value)}\n`);
-}
-
-/**
- * Emit a pretty envelope matching `format_output` → `json_dumps`: `indent=2`,
- * `ensure_ascii=False`, trailing `\n`. JS `JSON.stringify(obj, null, 2)`
- * reproduces Python's `indent=2` framing byte-for-byte (including `[]` and
- * nested-array indentation); the payloads here are ASCII-only so the
- * ensure_ascii=False distinction never bites.
- */
-function printPretty(value: unknown): void {
-  writeOut(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-// ---------------------------------------------------------------------------
-// arg parsing
-// ---------------------------------------------------------------------------
-
-interface ParsedArgs {
+export interface ParsedArgs {
   msg: string | null;
   sessionId: string | null;
+  adopt: string[];
   previewFiles: boolean;
   allowStaleUnstage: boolean;
   overrideJam: boolean;
@@ -305,16 +91,32 @@ interface ParsedArgs {
   agentHelp: boolean;
 }
 
-/**
- * Parse the commit-work argv. Mirrors the Click surface: one optional
- * positional MSG, `--session-id`, `--preview-files` flag, `--max-files` int
- * (min 0). An unparseable `--max-files` mirrors Click's IntRange rejection
- * (exit 2 with a stderr message); the verb's own envelopes are all exit 1.
- */
-function parseArgs(argv: string[]): ParsedArgs {
+class UsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
+
+function valueAfter(argv: string[], index: number, flag: string): string {
+  const value = argv[index + 1];
+  if (value === undefined) throw new UsageError(`${flag} requires a value`);
+  return value;
+}
+
+function parseMaxFiles(raw: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new UsageError(`--max-files must be an integer >= 0 (got '${raw}')`);
+  }
+  return value;
+}
+
+export function parseArgs(argv: string[]): ParsedArgs {
   const parsed: ParsedArgs = {
     msg: null,
     sessionId: null,
+    adopt: [],
     previewFiles: false,
     allowStaleUnstage: false,
     overrideJam: false,
@@ -323,625 +125,1111 @@ function parseArgs(argv: string[]): ParsedArgs {
     help: false,
     agentHelp: false,
   };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--help" || a === "-h") {
-      parsed.help = true;
-    } else if (a === "--agent-help") {
-      parsed.agentHelp = true;
-    } else if (a === "--preview-files") {
-      parsed.previewFiles = true;
-    } else if (a === "--allow-stale-unstage") {
-      parsed.allowStaleUnstage = true;
-    } else if (a === "--override-jam") {
-      parsed.overrideJam = true;
-    } else if (a === "--allow-mass-reversion") {
-      parsed.allowMassReversion = true;
-    } else if (a === "--session-id") {
-      parsed.sessionId = argv[++i] ?? null;
-    } else if (a.startsWith("--session-id=")) {
-      parsed.sessionId = a.slice("--session-id=".length);
-    } else if (a === "--max-files") {
-      parsed.maxFiles = parseMaxFiles(argv[++i]);
-    } else if (a.startsWith("--max-files=")) {
-      parsed.maxFiles = parseMaxFiles(a.slice("--max-files=".length));
-    } else if (a === "--") {
-      // Everything after `--` is the positional message.
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--help" || arg === "-h") parsed.help = true;
+    else if (arg === "--agent-help") parsed.agentHelp = true;
+    else if (arg === "--preview-files") parsed.previewFiles = true;
+    else if (arg === "--allow-stale-unstage") parsed.allowStaleUnstage = true;
+    else if (arg === "--override-jam") parsed.overrideJam = true;
+    else if (arg === "--allow-mass-reversion") parsed.allowMassReversion = true;
+    else if (arg === "--session-id") {
+      parsed.sessionId = valueAfter(argv, i, arg);
+      i += 1;
+    } else if (arg.startsWith("--session-id=")) {
+      parsed.sessionId = arg.slice("--session-id=".length);
+    } else if (arg === "--adopt") {
+      parsed.adopt.push(valueAfter(argv, i, arg));
+      i += 1;
+    } else if (arg.startsWith("--adopt=")) {
+      parsed.adopt.push(arg.slice("--adopt=".length));
+    } else if (arg === "--max-files") {
+      parsed.maxFiles = parseMaxFiles(valueAfter(argv, i, arg));
+      i += 1;
+    } else if (arg.startsWith("--max-files=")) {
+      parsed.maxFiles = parseMaxFiles(arg.slice("--max-files=".length));
+    } else if (arg === "--") {
       if (i + 1 < argv.length) parsed.msg = argv[i + 1];
+      if (i + 2 < argv.length)
+        throw new UsageError("too many positional arguments");
       break;
-    } else if (!a.startsWith("-") && parsed.msg === null) {
-      parsed.msg = a;
-    } else {
-      process.stderr.write(`keeper commit-work: unexpected argument '${a}'\n`);
-      process.exit(2);
-    }
+    } else if (!arg.startsWith("-") && parsed.msg === null) parsed.msg = arg;
+    else throw new UsageError(`unexpected argument '${arg}'`);
   }
   return parsed;
 }
 
-/** Parse `--max-files` as a non-negative int (Click `IntRange(min=0)` parity). */
-function parseMaxFiles(raw: string | undefined): number {
-  if (raw === undefined) {
-    process.stderr.write("keeper commit-work: --max-files requires a value\n");
-    process.exit(2);
-  }
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 0) {
-    process.stderr.write(
-      `keeper commit-work: --max-files must be an integer >= 0 (got '${raw}')\n`,
-    );
-    process.exit(2);
-  }
-  return n;
+export type CommitWorkOutcome =
+  | "preview"
+  | "committed_pushed"
+  | "committed_push_skipped"
+  | "nothing_to_commit"
+  | "argument_error"
+  | "identity_conflict"
+  | "invalid_identity"
+  | "no_session_id"
+  | "surface_unavailable"
+  | "ownership_conflict"
+  | "ownership_ambiguous"
+  | "adoption_rejected"
+  | "message_required"
+  | "forbidden_trailer"
+  | "operation_in_progress"
+  | "shared_checkout_jam"
+  | "initial_commit_unsupported"
+  | "lock_timeout"
+  | "file_list_too_large"
+  | "stale_index_carryover"
+  | "unmerged_paths"
+  | "detached_head"
+  | "head_read_failed"
+  | "index_seed_failed"
+  | "stage_failed"
+  | "directory_file_conflict"
+  | "tree_write_failed"
+  | "mass_reversion"
+  | "lint_failed"
+  | "surface_changed"
+  | "ref_conflict"
+  | "commit_failed"
+  | "commit_signing_failed"
+  | "commit_hook_mutated"
+  | "post_commit_hook_failed"
+  | "ambient_reconcile_failed"
+  | "push_failed"
+  | "internal_error";
+
+export interface CommitWorkResult {
+  schema_version: 1;
+  kind: "commit-work-preview" | "commit-work-result";
+  outcome: CommitWorkOutcome;
+  success: boolean;
+  identity?: string | null;
+  selection?: Record<string, unknown>;
+  surface?: CommitWorkSurfaceSummary;
+  commit?: Record<string, unknown>;
+  push?: Record<string, unknown>;
+  error?: string;
+  [key: string]: unknown;
 }
 
-// ---------------------------------------------------------------------------
-// gitignore filter + git pipeline helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Strip untracked-gitignored paths (order-preserving) — the port of jobctl's
- * `filter_gitignored`. Shells `git check-ignore -z --stdin` with NUL-framed
- * input so odd-encoded paths round-trip and we sidestep ARG_MAX. `--no-index`
- * is deliberately NOT used (it would mis-report tracked files as ignored).
- * Exit codes: 0 = some ignored, 1 = none ignored (normal), >=128 = fatal →
- * fail-open (return `files` unchanged rather than dropping everything).
- */
-async function filterGitignored(
-  files: string[],
-  cwd: string,
-  run: GitRunner,
-): Promise<string[]> {
-  if (files.length === 0) return [];
-  const stdin = new TextEncoder().encode(`${files.join("\0")}\0`);
-  const res = await run(["check-ignore", "-z", "--stdin"], { cwd, stdin });
-  if (res.code >= 128) return files;
-  const raw = res.stdout.replace(/\0+$/, "");
-  if (raw.length === 0) return [...files];
-  const ignored = new Set(raw.split("\0").filter((c) => c.length > 0));
-  return files.filter((p) => !ignored.has(p));
+function result(
+  kind: CommitWorkResult["kind"],
+  outcome: CommitWorkOutcome,
+  success: boolean,
+  extra: Record<string, unknown> = {},
+): CommitWorkResult {
+  return {
+    schema_version: 1,
+    kind,
+    outcome,
+    success,
+    ...(success ? {} : { error: outcome }),
+    ...extra,
+  };
 }
 
-/**
- * Resolve the worktree root for `cwd` via `git -C <cwd> rev-parse --show-toplevel`.
- * Every subsequent git op runs with `cwd: <this>`, so the whole pipeline is PINNED
- * to one canonical (git-realpath'd) worktree path — robust to a symlinked cwd and
- * to a concurrent producer perturbing ambient git-dir discovery mid-sequence. A
- * non-repo cwd (or any git error) falls back to `cwd` unchanged.
- */
+function capStderr(stderr: string | undefined): string | undefined {
+  if (!stderr) return undefined;
+  return stderr.slice(0, STDERR_LIMIT);
+}
+
+function pathSample(paths: string[]): string[] {
+  return paths.slice(0, SAMPLE_LIMIT).map((path) => path.slice(0, 1024));
+}
+
+function pushAliases(push: Record<string, unknown>): Record<string, unknown> {
+  return {
+    pushed: push.pushed,
+    ...(push.remote === undefined ? {} : { remote: push.remote }),
+    ...(push.branch === undefined ? {} : { branch: push.branch }),
+    ...(push.skipped === undefined ? {} : { skipped: push.skipped }),
+    ...(push.push_error === undefined ? {} : { push_error: push.push_error }),
+    ...(push.push_error_class === undefined
+      ? {}
+      : { push_error_class: push.push_error_class }),
+    ...(push.tracking_warning === undefined
+      ? {}
+      : { tracking_warning: push.tracking_warning }),
+    ...(push.tracking_warning_class === undefined
+      ? {}
+      : { tracking_warning_class: push.tracking_warning_class }),
+  };
+}
+
+function selectionEnvelope(
+  surface: SurfaceDiscoveryResult,
+  identity: string | null,
+): Record<string, unknown> {
+  return {
+    identity,
+    total: surface.selected.length,
+    sample: pathSample(surface.selected),
+    automatic_total: surface.automatic.length,
+    automatic_sample: pathSample(surface.automatic),
+    adopted_total: surface.adopted.length,
+    adopted_sample: pathSample(surface.adopted),
+    rejections: surface.rejections.slice(0, SAMPLE_LIMIT).map((rejection) => ({
+      ...rejection,
+      input: rejection.input.slice(0, 1024),
+      path: rejection.path?.slice(0, 1024),
+      conflicting_sessions: rejection.conflicting_sessions?.map((session) =>
+        session.slice(0, 256),
+      ),
+    })),
+    rejection_total: surface.rejections.length,
+  };
+}
+
 async function resolveWorktreeRoot(
   cwd: string,
-  run: GitRunner,
+  git: GitRunner,
 ): Promise<string> {
-  const res = await run(["rev-parse", "--show-toplevel"], { cwd });
-  const top = res.stdout.trim();
-  return res.code === 0 && top.length > 0 ? top : cwd;
+  const root = await git(["rev-parse", "--show-toplevel"], { cwd });
+  return root.code === 0 && root.stdout.trim() ? root.stdout.trim() : cwd;
 }
 
-/**
- * Stage `files` with `git add -A -- <files>`. The `-A` is PATHSPEC-SCOPED, so
- * deleted paths stage as removals instead of erroring "did not match any
- * files"; it is NOT a tree-wide `git add -A`. Returns a failure envelope-like
- * string on error, or `null` on success.
- */
-async function gitStage(
-  files: string[],
+async function stagedFileNames(
   cwd: string,
-  run: GitRunner,
-): Promise<string | null> {
-  const res = await run(["add", "-A", "--", ...files], { cwd });
-  if (res.code !== 0) return res.stderr.trim();
-  return null;
-}
-
-/**
- * Repo-relative names currently staged (incl. deletions, so deleted-file
- * session entries are not dropped from the purity gate or the commit pathspec).
- *
- * `--no-renames` is load-bearing: with rename detection a rename reports ONLY
- * the new path, so the old path would neither land in the attributed pathspec
- * (leaving half a rename → a broken tree) nor surface in the stale set. Forcing
- * no-renames splits a rename into its A (new) and D (old) halves, so both ride
- * the pathspec when attributed, and a rename with one un-attributed half falls
- * into the stale set (the gate fires — all-or-nothing).
- *
- * Uses `-z` (NUL-delimited): without it git QUOTES non-ASCII paths
- * (`"caf\303\251.txt"`), which would never intersect the raw-UTF-8
- * `callerFiles` set (sourced from the porcelain-v2 `-z` attribution reader),
- * silently dropping a unicode-named file from BOTH the commit `files` list and
- * the stale set. For ASCII paths `-z` is byte-identical to the line-delimited
- * form, so the common-case envelope is unchanged.
- */
-async function stagedFileNames(cwd: string, run: GitRunner): Promise<string[]> {
-  const res = await run(
+  git: GitRunner,
+): Promise<string[] | null> {
+  const staged = await git(
     [
       "diff",
       "--cached",
       "--name-only",
       "-z",
       "--no-renames",
-      "--diff-filter=ACMRD",
+      "--diff-filter=ACDMRT",
     ],
     { cwd },
   );
-  if (res.code !== 0) return [];
-  return res.stdout.split("\0").filter((l) => l.length > 0);
+  if (staged.code !== 0) return null;
+  return staged.stdout.split("\0").filter(Boolean).sort();
 }
 
-/**
- * Resolve the `Job-Id:` trailer value, or `null`. Mirrors the Python's
- * `current_job_id()`: `JOBCTL_JOB_ID` override first, then the resolved session
- * id (the keeper invariant is `job_id === session_id`). The psutil ancestor-pid
- * walk is dropped because tracked harnesses carry an explicit session identity
- * (same rationale as session-id.ts).
- */
-function resolveJobId(): string | null {
-  const envJob = process.env.JOBCTL_JOB_ID;
-  if (envJob) return envJob;
-  return resolveSessionId(null);
-}
-
-/**
- * Append a `Job-Id: <id>` trailer to `msg` when resolvable, via
- * `git interpret-trailers --if-exists doNothing` (idempotent on re-runs of the
- * same prepared message). Returns `msg` unchanged when no job id resolves or
- * the git call fails. Runs AFTER sanitize — a user-supplied `Job-Id:` line is
- * already rejected by {@link FORBIDDEN_TRAILER_RE}; this is the one legitimate
- * injection path.
- */
-async function appendJobIdTrailer(
-  msg: string,
+async function unmergedFileNames(
   cwd: string,
-  run: GitRunner,
-): Promise<string> {
-  const jobId = resolveJobId();
-  if (!jobId) return msg;
-  const res = await run(
-    [
-      "-c",
-      "trailer.job-id.ifExists=doNothing",
-      "interpret-trailers",
-      "--trailer",
-      `Job-Id=${jobId}`,
-    ],
-    { cwd, stdin: new TextEncoder().encode(msg) },
-  );
-  if (res.code !== 0) return msg;
-  return res.stdout;
-}
-
-/**
- * Commit the attributed staged set with `msg` (passed via `-F -` stdin so the
- * message cannot be argv-injected). PATHSPEC-LIMITED: `git commit -- <pathspec>`
- * uses git's `--only` mode, building the commit tree from HEAD plus the worktree
- * content of ONLY the named paths — staged entries OUTSIDE the pathspec are
- * physically held back, so a poisoned index cannot leak into the tree even if
- * the purity gate was overridden. `GIT_LITERAL_PATHSPECS=1` + the `--` separator
- * defeat leading-dash options and pathspec magic on attacker-influenced paths.
- * `pathspec` is the rename-complete staged-name set (deletions included), never
- * the lint list (which drops deleted paths). Returns the short SHA, or git's
- * verbatim stderr on commit failure (e.g. a mid-merge partial-commit refusal).
- */
-async function gitCommitStaged(
-  msg: string,
-  pathspec: string[],
-  cwd: string,
-  run: GitRunner,
-): Promise<{ sha: string } | { error: string }> {
-  const withTrailer = await appendJobIdTrailer(msg, cwd, run);
-  const commit = await run(["commit", "-F", "-", "--", ...pathspec], {
+  git: GitRunner,
+): Promise<string[] | null> {
+  const unmerged = await git(["diff", "--name-only", "-z", "--diff-filter=U"], {
     cwd,
-    stdin: new TextEncoder().encode(withTrailer),
-    env: { GIT_LITERAL_PATHSPECS: "1" },
   });
-  if (commit.code !== 0) {
-    return { error: commit.stderr.trim() };
-  }
-  const sha = await run(["rev-parse", "--short", "HEAD"], { cwd });
-  return { sha: sha.stdout.trim() };
+  if (unmerged.code !== 0) return null;
+  return unmerged.stdout.split("\0").filter(Boolean).sort();
 }
 
-/**
- * Default read-side wait: resolve the cwd's git toplevel, then block (bounded +
- * fail-open) until the session's attribution is caught up with its latest edits
- * in that repo. A non-repo cwd has nothing to wait on, so this is a no-op there.
- * Never throws — the bounded wait fails open on a slow/wedged producer, and a
- * resolution miss simply skips the wait, preserving the pre-`.1` read behavior.
- */
-async function defaultWaitCaughtUp(
-  sessionId: string,
-  cwd: string,
-): Promise<void> {
-  const cwdRepo = resolveCwdRepo(cwd);
-  if (!cwdRepo) return;
-  await waitForAttributionCaughtUp(sessionId, cwdRepo);
-}
-
-// ---------------------------------------------------------------------------
-// orchestration
-// ---------------------------------------------------------------------------
-
-/**
- * Sentinel thrown by {@link fail} to unwind to the {@link run} boundary with a
- * fixed exit code, in place of an inline `process.exit`. `run` catches it and
- * returns the code so the in-process test path never kills the test process and
- * the production path still surfaces the same exit 1.
- */
-class ExitError extends Error {
-  readonly code: number;
-  constructor(code: number) {
-    super(`exit ${code}`);
-    this.name = "ExitError";
-    this.code = code;
-  }
-}
-
-/** Print a compact failure envelope and unwind to {@link run} with exit 1. */
-function fail(payload: Record<string, unknown>): never {
-  printCompact(payload);
-  throw new ExitError(1);
-}
-
-/**
- * Injectable seams for {@link run}. Every field defaults to the real production
- * implementation; the test suite overrides them to exercise the commit-work
- * DECISIONS (file discovery → gitignore filter → stage → lint gate → commit →
- * push) IN-PROCESS with zero real git, no real linters, and no compiled binary
- * spawn. Plain function params — no DI framework.
- */
 export interface CommitWorkDeps {
-  /**
-   * Starting working directory, resolved to the worktree root before any git op
-   * (default: `process.cwd()`). A test seam: the real-git suite points the
-   * pipeline at a linked worktree path without a global `process.chdir`.
-   */
   cwd?: string;
-  /** Git runner threaded to every git boundary (default: real {@link gitExec}). */
+  env?: Record<string, string | undefined>;
   gitRunner?: GitRunner;
-  /** Session-attributed dirty file discovery (default: real attribution read). */
-  discoverFiles?: (sessionId: string, cwd: string) => string[];
-  /**
-   * Read-side wait that lets the `.1` poll-only git producer catch up so a file
-   * edited immediately before commit-work is attributed before the read. Bounded
-   * + fail-open by contract (default: real {@link waitForAttributionCaughtUp}).
-   */
-  waitCaughtUp?: (sessionId: string, cwd: string) => Promise<void>;
-  /** Lint matrix; throws {@link LintFailure} on a violation (default: real). */
-  runLint?: (stagedFiles: string[], cwd: string) => Promise<void>;
-  /** Commit-work flock acquire (default: real {@link CommitWorkLock.acquire}). */
-  acquireLock?: (lockPath: string) => { release: () => void };
-  /**
-   * In-progress merge/sequencer operation probe (gate 1, pre-lock). Defaults to
-   * the real {@link detectInProgressOperation}; tests inject a canned state so
-   * the pipeline refusal is driven without a real repo mid-operation.
-   */
+  directEvidence?: (
+    identity: string | null,
+    worktree: string,
+  ) => DirectSurfaceEvidence | undefined;
+  waitForAttribution?: (identity: string, worktree: string) => Promise<boolean>;
+  readClaims?: (worktree: string) => OwnershipClaim[] | null;
+  classifyClaim?: (claim: OwnershipClaim) => ClaimLiveness;
+  runLint?: (files: string[], cwd: string) => Promise<void>;
+  acquireLock?: (
+    lockPath: string,
+  ) => { release: () => void } | null | Promise<{ release: () => void } | null>;
   detectInProgress?: (
     worktree: string,
     git: GitRunner,
   ) => Promise<InProgressOperation | null>;
-  /**
-   * Live shared-checkout jam probe (gate 2, pre-lock). Defaults to the real
-   * {@link sharedCheckoutJamActive} (a read-only keeper.db read). Keeps the fast
-   * suite DB-free; the call site fails open if an injected probe throws.
-   */
   checkSharedCheckoutJam?: (worktree: string) => boolean;
+  push?: typeof pushExactCommit;
+  privateIndexFs?: PrivateIndexFs;
+  emitOutcome?: (result: CommitWorkResult, identity: string | null) => void;
 }
 
-/**
- * Run the commit-work pipeline. Returns the process exit code (0 success, 1
- * failure); never calls `process.exit` itself inside the lock window so the
- * `finally` lock-release always runs (Bun's `process.exit` skips `finally`).
- * Catches the {@link ExitError} that the early-validation {@link fail} throws and
- * returns its code — no `process.exit` ever fires inside the pipeline.
- *
- * `deps` injects the git runner, file discovery, lint matrix, and lock so the
- * suite can drive the full decision pipeline with no real git / lint / binary.
- */
-async function run(
+async function discover(
   args: ParsedArgs,
-  deps: CommitWorkDeps = {},
-): Promise<number> {
-  try {
-    return await runInner(args, deps);
-  } catch (err) {
-    if (err instanceof ExitError) return err.code;
-    throw err;
-  }
+  identity: string | null,
+  worktree: string,
+  git: GitRunner,
+  deps: CommitWorkDeps,
+): Promise<SurfaceDiscoveryResult> {
+  const surfaceDeps: SurfaceDiscoveryDeps = {
+    readClaims: deps.readClaims,
+    classifyClaim: deps.classifyClaim,
+  };
+  const supplied = deps.directEvidence?.(identity, worktree);
+  return discoverCommitWorkSurface({
+    worktree,
+    identity,
+    adoptedPaths: args.adopt,
+    git,
+    directEvidence: supplied,
+    sampleLimit: SAMPLE_LIMIT,
+    deps: surfaceDeps,
+  });
 }
 
-async function runInner(
+function automaticClaimIdentityDrift(
+  surface: SurfaceDiscoveryResult,
+  frozen: FrozenPrivateIndex,
+  identity: string | null,
+  automaticPaths: string[] = surface.automatic,
+): string[] {
+  if (identity === null) return [];
+  const byPath = new Map(frozen.entries.map((entry) => [entry.path, entry]));
+  const drifted: string[] = [];
+  for (const path of automaticPaths) {
+    const entry = byPath.get(path);
+    if (!entry) {
+      drifted.push(path);
+      continue;
+    }
+    const mine = (surface.claimsByPath.get(path) ?? []).filter(
+      (claim) => claim.sessionId === identity,
+    );
+    const frozenMode = entry.kind === "absent" ? "000000" : entry.mode;
+    if (
+      mine.some(
+        (claim) =>
+          (claim.oid !== null &&
+            claim.oid !== undefined &&
+            claim.oid !== entry.oid) ||
+          (claim.mode !== null &&
+            claim.mode !== undefined &&
+            claim.mode !== frozenMode),
+      )
+    ) {
+      drifted.push(path);
+    }
+  }
+  return drifted.sort();
+}
+
+function selectedForeignConflicts(
+  surface: SurfaceDiscoveryResult,
+  selected: string[],
+  identity: string | null,
+): Array<{ path: string; sessions: string[] }> {
+  const conflicts: Array<{ path: string; sessions: string[] }> = [];
+  for (const path of selected) {
+    const sessions = [
+      ...new Set(
+        (surface.claimsByPath.get(path) ?? [])
+          .filter(
+            (claim) =>
+              claim.sessionId !== identity && claim.liveness !== "terminal",
+          )
+          .map((claim) => claim.sessionId),
+      ),
+    ].sort();
+    if (sessions.length > 0) conflicts.push({ path, sessions });
+  }
+  return conflicts;
+}
+
+function surfaceFailure(
+  surface: SurfaceDiscoveryResult,
+  identity: string | null,
+): CommitWorkResult | null {
+  if (!surface.dirtyAvailable) {
+    return result("commit-work-result", "surface_unavailable", false, {
+      identity,
+      selection: selectionEnvelope(surface, identity),
+      surface: surface.summary,
+    });
+  }
+  const conflict = surface.rejections.some(
+    (rejection) => rejection.code === "ownership_conflict",
+  );
+  if (surface.rejections.length > 0) {
+    return result(
+      "commit-work-result",
+      conflict ? "ownership_conflict" : "adoption_rejected",
+      false,
+      {
+        identity,
+        selection: selectionEnvelope(surface, identity),
+        surface: surface.summary,
+      },
+    );
+  }
+  return null;
+}
+
+async function runAttempt(
   args: ParsedArgs,
   deps: CommitWorkDeps,
-): Promise<number> {
-  const startCwd = deps.cwd ?? process.cwd();
-  const git = deps.gitRunner ?? gitExec;
-  const discoverFiles = deps.discoverFiles ?? discoverSessionFiles;
-  const waitCaughtUp = deps.waitCaughtUp ?? defaultWaitCaughtUp;
-  const runLint = deps.runLint ?? runScopedLint;
-  const acquireLock = deps.acquireLock ?? CommitWorkLock.acquire;
-  const detectInProgress = deps.detectInProgress ?? detectInProgressOperation;
-  const checkSharedCheckoutJam =
-    deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive;
-
-  const sessionId = resolveSessionId(args.sessionId);
-  if (sessionId === null) {
-    fail({
-      success: false,
-      error: "no_session_id",
-      hint:
-        "commit-work attributes files by tracked agent session id, which isn't " +
-        "set here. Commit with git directly instead: stage ONLY the files you " +
-        "changed, by explicit path (git add <path> … — never -A or .), then " +
-        "git commit and git push.",
-    });
+): Promise<{
+  code: number;
+  result: CommitWorkResult;
+  identity: string | null;
+}> {
+  const invocationKind = args.previewFiles
+    ? "commit-work-preview"
+    : "commit-work-result";
+  let identity: string | null = null;
+  try {
+    const resolved = resolveInvocationIdentity(
+      args.sessionId,
+      deps.env ?? process.env,
+    );
+    identity = resolved.value;
+  } catch (error) {
+    if (error instanceof IdentityConflictError) {
+      return {
+        code: 1,
+        identity: null,
+        result: result(invocationKind, "identity_conflict", false, {
+          identity: null,
+          identity_sources: Object.keys(error.carriers),
+        }),
+      };
+    }
+    if (error instanceof InvalidIdentityError) {
+      return {
+        code: 1,
+        identity: null,
+        result: result(invocationKind, "invalid_identity", false, {
+          identity: null,
+          identity_sources: error.sources,
+        }),
+      };
+    }
+    throw error;
   }
 
-  // Pin the whole pipeline to the resolved worktree root: every git op below runs
-  // with `cwd: worktree`, so a concurrent producer perturbing ambient git-dir
-  // discovery cannot make a commit land on the wrong branch (the env strip in
-  // git-exec closes the GIT_DIR/GIT_WORK_TREE side of the same hazard).
-  const worktree = await resolveWorktreeRoot(startCwd, git);
+  if (identity === null && args.adopt.length === 0) {
+    return {
+      code: 1,
+      identity,
+      result: result(invocationKind, "no_session_id", false, {
+        identity,
+        hint: "Pass --session-id <uuid> or run from a git worktree tracked by Keeper.",
+      }),
+    };
+  }
 
-  // Read-side wait (fn-921.4): let the `.1` poll-only git producer fold a
-  // GitSnapshot covering any just-landed edit so its attribution is charged
-  // before we read. Bounded + fail-open — a wedged/slow producer never blocks
-  // the commit; on timeout we fall back to the on-hook ∩ live read below.
-  await waitCaughtUp(sessionId, worktree);
+  const git = deps.gitRunner ?? gitExec;
+  const worktree = await resolveWorktreeRoot(deps.cwd ?? process.cwd(), git);
+  // Receipt evidence is an injectable extension seam, not a wired production
+  // source yet. Keep the established 1.5s bounded fold-lag wait in production
+  // until such a source is actually supplied.
+  if (identity !== null && deps.directEvidence === undefined) {
+    try {
+      await (deps.waitForAttribution ?? waitForAttributionCaughtUp)(
+        identity,
+        worktree,
+      );
+    } catch {
+      // Attribution waiting is bounded and fail-open; an unavailable DB must
+      // not turn into an unbounded commit-work failure.
+    }
+  }
+  const advisory = await discover(args, identity, worktree, git, deps);
+  const ambient = await stagedFileNames(worktree, git);
+  if (ambient !== null) {
+    advisory.summary.ambient_staged_carryover = {
+      total: ambient.length,
+      sample: pathSample(ambient),
+    };
+  }
 
-  // Discover + gitignore-filter OUTSIDE the lock (pure reads, no mutation).
-  let files = discoverFiles(sessionId, worktree);
-  files = await filterGitignored(files, worktree, git);
-
-  // Hard-stop on a runaway POST-filter file list (the fn-684 incident shape).
-  // `--max-files 0` disables the guard.
-  if (args.maxFiles && files.length > args.maxFiles) {
-    fail({
-      success: false,
-      error: "file_list_too_large",
-      count: files.length,
-      limit: args.maxFiles,
-      sample: [...files].sort().slice(0, 20),
-      hint:
-        "Add a .gitignore rule for the runaway tree, then re-run; or pass " +
-        "--max-files N to raise the cap (0 disables).",
-    });
+  if (args.maxFiles > 0 && advisory.selected.length > args.maxFiles) {
+    return {
+      code: 1,
+      identity,
+      result: result(invocationKind, "file_list_too_large", false, {
+        identity,
+        files: advisory.selected,
+        count: advisory.selected.length,
+        limit: args.maxFiles,
+        sample: pathSample(advisory.selected),
+        selection: selectionEnvelope(advisory, identity),
+        surface: advisory.summary,
+      }),
+    };
   }
 
   if (args.previewFiles) {
-    printPretty({ success: true, files });
-    return 0;
+    return {
+      code: 0,
+      identity,
+      result: result("commit-work-preview", "preview", true, {
+        identity,
+        files: advisory.selected,
+        selection: selectionEnvelope(advisory, identity),
+        surface: advisory.summary,
+      }),
+    };
   }
 
   if (!args.msg) {
-    fail({
-      success: false,
-      error:
-        "commit message is required (pass a message as the positional argument)",
-    });
+    return {
+      code: 1,
+      identity,
+      result: result("commit-work-result", "message_required", false, {
+        identity,
+        selection: selectionEnvelope(advisory, identity),
+        surface: advisory.summary,
+      }),
+    };
   }
-  const msg = args.msg;
-
-  // Forbidden-trailer gate fires ONLY when the message is multi-line.
-  if (msg.includes("\n") && FORBIDDEN_TRAILER_RE.test(msg)) {
-    fail({ success: false, error: FORBIDDEN_TRAILER_ERROR });
+  if (FORBIDDEN_TRAILER_RE.test(args.msg)) {
+    return {
+      code: 1,
+      identity,
+      result: result("commit-work-result", "forbidden_trailer", false, {
+        identity,
+        selection: selectionEnvelope(advisory, identity),
+        surface: advisory.summary,
+      }),
+    };
   }
 
-  if (files.length === 0) {
-    printPretty({ success: true, committed: false, files: [] });
-    return 0;
-  }
-
-  // Gate 1 — in-progress merge/sequencer refusal (pre-lock, always-on, NO
-  // override). A full `git commit` on top of a live merge silently creates a
-  // two-parent merge commit — the shape that propagated the incident's stale
-  // blobs through an auto-merge. Worktree-portable, retry-safe once the operator
-  // concludes or aborts the operation. Pre-lock, so the throwing `fail()` is safe.
-  const inProgress = await detectInProgress(worktree, git);
+  const detect = deps.detectInProgress ?? detectInProgressOperation;
+  const inProgress = await detect(worktree, git);
   if (inProgress !== null) {
-    fail({
-      success: false,
-      error: "operation_in_progress",
-      operation: inProgress,
-      hint:
-        `A git ${inProgress} is in progress in this repo — committing now would ` +
-        "fold your work into that operation (a mid-merge commit becomes a " +
-        "two-parent merge commit), the shape that spread stale blobs through an " +
-        "auto-merge.",
-      recovery: OPERATION_IN_PROGRESS_RECOVERY,
-    });
+    return {
+      code: 1,
+      identity,
+      result: result("commit-work-result", "operation_in_progress", false, {
+        identity,
+        operation: inProgress,
+        recovery: `Finish or abort the in-progress ${inProgress} operation, then re-run keeper commit-work.`,
+        selection: selectionEnvelope(advisory, identity),
+        surface: advisory.summary,
+      }),
+    };
   }
-
-  // Gate 2 — shared-checkout jam refusal (pre-lock, `--override-jam` escape). A
-  // live dirty/desync distress row for this repo means the working tree may trail
-  // landed history. FAIL-OPEN around the whole probe: an injected probe that
-  // throws (or the default's own internal miss) proceeds WITHOUT the gate, so
-  // commit-work keeps working in a repo with no keeper state.
   if (!args.overrideJam) {
     let jam = false;
     try {
-      jam = checkSharedCheckoutJam(worktree);
+      jam = (deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive)(worktree);
     } catch {
       jam = false;
     }
     if (jam) {
-      fail({
-        success: false,
-        error: "shared_checkout_jam",
-        dir: worktree,
-        hint: SHARED_CHECKOUT_JAM_HINT,
-        recovery: SHARED_CHECKOUT_JAM_RECOVERY,
-      });
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "shared_checkout_jam", false, {
+          identity,
+          recovery:
+            "Resolve the shared-checkout jam, or use --override-jam only after inspecting it.",
+          selection: selectionEnvelope(advisory, identity),
+          surface: advisory.summary,
+        }),
+      };
     }
   }
 
-  // Acquire the per-worktree commit lock for the full stage → lint → commit →
-  // push window, keyed on the worktree's OWN git dir (`--git-dir`). The git index,
-  // index.lock, and HEAD are per-worktree, so a commit-work serializes only against
-  // another commit-work in the SAME worktree; disjoint linked worktrees share no
-  // staging state and take distinct locks. Argv-identical to `commitWorkLockPath`
-  // in src/worktree-git.ts, so a lane's commit-work and its fan-in lane merge
-  // (`mergeBranchInto`, same `--git-dir`) still collide in that lane.
-  //
-  // The autopilot base→default merge is the DELIBERATE exception: it keys its lock
-  // on `--git-common-dir` (`baseMergeLockPath`), because it advances the SHARED
-  // `refs/heads/<default>` rather than a per-worktree branch. In the MAIN checkout
-  // `--git-dir` == `--git-common-dir`, so a main-checkout commit-work still
-  // serializes against the base merge; a linked lane's commit-work (its own
-  // `--git-dir`) does not (correctly — the base merge never runs in a lane).
-  const gitDirRes = await git(
+  const gitDirResult = await git(
     ["rev-parse", "--path-format=absolute", "--git-dir"],
     { cwd: worktree },
   );
-  const gitDir = gitDirRes.stdout.trim();
-  // Fallback (git error / empty stdout): the worktree-anchored absolute `.git` —
-  // never a bare relative `.git` (it would resolve against the daemon's ambient
-  // cwd, not the pinned worktree) and never `/keeper-commit-work.lock` (root).
   const lockDir =
-    gitDirRes.code === 0 && gitDir.length > 0 ? gitDir : `${worktree}/.git`;
-  const lockPath = `${lockDir}/keeper-commit-work.lock`;
-
-  const lock = acquireLock(lockPath);
-  let exitCode = 0;
+    gitDirResult.code === 0 && gitDirResult.stdout.trim()
+      ? gitDirResult.stdout.trim()
+      : `${worktree}/.git`;
+  const acquire =
+    deps.acquireLock ?? ((path: string) => CommitWorkLock.acquire(path));
+  let lock: { release: () => void } | null;
   try {
-    const stageErr = await gitStage(files, worktree, git);
-    if (stageErr !== null) {
-      printCompact({ success: false, error: `git add failed: ${stageErr}` });
-      return 1;
-    }
+    lock = await acquire(`${lockDir}/keeper-commit-work.lock`);
+  } catch (error) {
+    return {
+      code: 1,
+      identity,
+      result: result("commit-work-result", "lock_timeout", false, {
+        identity,
+        detail: error instanceof Error ? error.name : "lock_error",
+      }),
+    };
+  }
+  if (lock === null) {
+    return {
+      code: 1,
+      identity,
+      result: result("commit-work-result", "lock_timeout", false, { identity }),
+    };
+  }
 
-    // Index-purity gate. Any staged path outside the session-attributed set is
-    // stale carryover — a prior worker that died between stage and commit, a
-    // shared checkout trailing landed history, or a git-apply/codegen write the
-    // attribution hooks never saw. All of those must be LOUD, not silently
-    // dropped, so the default refuses and `--allow-stale-unstage` is the explicit
-    // opt-in for the old unstage-and-proceed behavior. `--no-renames` in
-    // `stagedFileNames` splits a rename into both halves, so a rename with one
-    // un-attributed half lands in `stale` and the gate fires all-or-nothing.
-    const allStaged = new Set(await stagedFileNames(worktree, git));
-    const callerFiles = new Set(files);
-    const stale = [...allStaged].filter((f) => !callerFiles.has(f)).sort();
-    if (stale.length > 0) {
-      if (args.allowStaleUnstage) {
-        await git(["reset", "HEAD", "--", ...stale], { cwd: worktree });
-      } else {
-        printCompact({
-          success: false,
-          error: "stale_index_carryover",
-          count: stale.length,
-          sample: stale.slice(0, 20),
-          hint: STALE_INDEX_CARRYOVER_HINT,
-          recovery: STALE_INDEX_CARRYOVER_RECOVERY,
-        });
-        return 1;
+  let frozen: FrozenPrivateIndex | null = null;
+  try {
+    // The advisory wait does not cover time spent contending for the lock. Keep
+    // the bounded wait inside the lock until direct receipts are production-wired.
+    if (identity !== null && deps.directEvidence === undefined) {
+      try {
+        await (deps.waitForAttribution ?? waitForAttributionCaughtUp)(
+          identity,
+          worktree,
+        );
+      } catch {
+        // Bounded attribution waiting remains fail-open.
       }
     }
 
-    // The pathspec the commit is scoped to: the attributed ∩ staged set,
-    // rename-complete and deletion-inclusive (built from staged NAMES, never the
-    // lint list, which filters to paths still on disk).
-    const stagedNames = [...allStaged].filter((f) => callerFiles.has(f)).sort();
-
-    // Empty resolved pathspec: files were discovered + staged, but none of them
-    // carry an actual index change (already committed, or reverted). Skip commit
-    // and push rather than issue an empty-tree commit.
-    if (stagedNames.length === 0) {
-      printCompact({
-        success: false,
-        error: "nothing_to_commit",
-        hint:
-          "The session-attributed files produced no staged change (already " +
-          "committed, or their edits were reverted). Nothing to commit.",
-      });
-      return 1;
+    const underLockOperation = await detect(worktree, git);
+    if (underLockOperation !== null) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "operation_in_progress", false, {
+          identity,
+          operation: underLockOperation,
+          recovery: `Finish or abort the in-progress ${underLockOperation} operation, then re-run keeper commit-work.`,
+        }),
+      };
+    }
+    if (!args.overrideJam) {
+      let underLockJam = false;
+      try {
+        underLockJam = (deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive)(
+          worktree,
+        );
+      } catch {
+        underLockJam = false;
+      }
+      if (underLockJam) {
+        return {
+          code: 1,
+          identity,
+          result: result("commit-work-result", "shared_checkout_jam", false, {
+            identity,
+            recovery:
+              "Resolve the shared-checkout jam, or use --override-jam only after inspecting it.",
+          }),
+        };
+      }
     }
 
-    // Gate 3 — mass-reversion tripwire (in-lock, post-stage, `--allow-mass-
-    // reversion` escape). An unmerged (stage 1/2/3) index refuses outright; a
-    // staged set that mass-matches ANCESTOR blobs while differing from HEAD is the
-    // desynced-checkout reversion signature (green suites cannot catch it — the
-    // tests revert in the same sweep). In-lock emission: `printCompact` + return,
-    // the flock released by the outer finally.
-    const sweep = await analyzeReversionSweep(stagedNames, worktree, git);
+    // Preview is advisory. Definitive ownership discovery follows both the lock
+    // and its attribution wait, then binds exact live identities.
+    const surface = await discover(args, identity, worktree, git, deps);
+    const ambientNow = await stagedFileNames(worktree, git);
+    if (ambientNow === null) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "stage_failed", false, {
+          identity,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+    surface.summary.ambient_staged_carryover = {
+      total: ambientNow.length,
+      sample: pathSample(ambientNow),
+    };
+    const invalid = surfaceFailure(surface, identity);
+    if (invalid) return { code: 1, identity, result: invalid };
+
+    if (args.maxFiles > 0 && surface.selected.length > args.maxFiles) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "file_list_too_large", false, {
+          identity,
+          files: surface.selected,
+          count: surface.selected.length,
+          limit: args.maxFiles,
+          sample: pathSample(surface.selected),
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+    if (
+      surface.selected.length === 0 &&
+      surface.summary.multi_ambiguous.total > 0
+    ) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "ownership_ambiguous", false, {
+          identity,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+    if (surface.selected.length === 0) {
+      return {
+        code: 0,
+        identity,
+        result: result("commit-work-result", "nothing_to_commit", true, {
+          identity,
+          files: [],
+          committed: false,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+
+    const selectedSet = new Set(surface.selected);
+    const stale = ambientNow.filter((path) => !selectedSet.has(path));
+    if (stale.length > 0 && !args.allowStaleUnstage) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "stale_index_carryover", false, {
+          identity,
+          count: stale.length,
+          sample: pathSample(stale),
+          hint: "Ambient staged paths are outside this invocation's selected surface.",
+          recovery:
+            "Commit the ambient paths separately, restore them with git add, or explicitly use --allow-stale-unstage.",
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+
+    const unmerged = await unmergedFileNames(worktree, git);
+    if (unmerged === null) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "stage_failed", false, {
+          identity,
+        }),
+      };
+    }
+    if (unmerged.length > 0) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "unmerged_paths", false, {
+          identity,
+          count: unmerged.length,
+          sample: pathSample(unmerged),
+        }),
+      };
+    }
+
+    try {
+      frozen = await createFrozenPrivateIndex(
+        worktree,
+        surface.selected,
+        git,
+        deps.privateIndexFs,
+      );
+      if (stale.length > 0) {
+        const baseEntries = await exactEntriesFromTree(
+          stale,
+          frozen.expectedHead,
+          worktree,
+          git,
+        );
+        await reconcileAmbientIndexEntries(
+          baseEntries,
+          frozen.expectedHead,
+          worktree,
+          git,
+        );
+      }
+      // The first verification makes the binding explicit before lint starts.
+      await verifyFrozenSurface(frozen, worktree, git, deps.privateIndexFs);
+    } catch (error) {
+      const typed = error instanceof PrivateIndexError ? error : null;
+      return {
+        code: 1,
+        identity,
+        result: result(
+          "commit-work-result",
+          typed?.code ?? "stage_failed",
+          false,
+          {
+            identity,
+            stderr_sample: capStderr(typed?.stderr),
+            affected_total: typed?.paths?.length,
+            affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
+            selection: selectionEnvelope(surface, identity),
+            surface: surface.summary,
+          },
+        ),
+      };
+    }
+
+    const claimDrift = automaticClaimIdentityDrift(surface, frozen, identity);
+    if (claimDrift.length > 0) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "surface_changed", false, {
+          identity,
+          reason: "automatic_claim_identity_changed",
+          count: claimDrift.length,
+          sample: pathSample(claimDrift),
+          files: surface.selected,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+
+    const privateGit = privateIndexGit(frozen, worktree, git);
+    const sweep = await analyzeReversionSweep(
+      surface.selected,
+      worktree,
+      privateGit,
+    );
     if (sweep.unmergedPaths.length > 0) {
-      printCompact({
-        success: false,
-        error: "unmerged_paths",
-        count: sweep.unmergedPaths.length,
-        sample: sweep.unmergedPaths.slice(0, 20),
-        hint:
-          "The index carries unmerged (conflicted) paths — a commit now would " +
-          "record a half-resolved conflict.",
-        recovery: UNMERGED_PATHS_RECOVERY,
-      });
-      return 1;
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "unmerged_paths", false, {
+          identity,
+          count: sweep.unmergedPaths.length,
+          sample: pathSample(sweep.unmergedPaths),
+        }),
+      };
     }
     if (
       !args.allowMassReversion &&
       isMassReversion(sweep.reversionCandidates.length, sweep.stagedCount)
     ) {
-      printCompact({
-        success: false,
-        error: "mass_reversion",
-        count: sweep.reversionCandidates.length,
-        staged: sweep.stagedCount,
-        sample: sweep.reversionCandidates.slice(0, 20),
-        hint: MASS_REVERSION_HINT,
-        recovery: MASS_REVERSION_RECOVERY,
-      });
-      return 1;
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "mass_reversion", false, {
+          identity,
+          count: sweep.reversionCandidates.length,
+          staged: sweep.stagedCount,
+          sample: pathSample(sweep.reversionCandidates),
+        }),
+      };
     }
 
-    // Linters operate on file CONTENTS — skip paths deleted in this commit.
-    const lintNames = stagedNames.filter((n) => existsSync(`${worktree}/${n}`));
+    const lintFiles = frozen.entries
+      .filter((entry) => entry.kind !== "absent")
+      .map((entry) => entry.path);
     try {
-      await runLint(lintNames, worktree);
-    } catch (err) {
-      if (err instanceof LintFailure) {
-        // Release the lock BEFORE printing (mirrors the Python finally-guard
-        // that nulls the fd on the lint-fail path). The lock's release() is
-        // idempotent, so the outer finally is a harmless no-op afterward.
-        lock.release();
-        printCompact({
-          success: false,
-          error: "lint_failed",
-          linter: err.linter,
-          files: err.files,
-          stderr: err.stderr,
-          recovery: LINT_FAILED_RECOVERY,
-        });
-        return 1;
+      await (deps.runLint ?? runScopedLint)(lintFiles, worktree);
+    } catch (error) {
+      if (error instanceof LintFailure) {
+        return {
+          code: 1,
+          identity,
+          result: result("commit-work-result", "lint_failed", false, {
+            identity,
+            linter: error.linter,
+            file_total: error.files.length,
+            files: pathSample(error.files),
+            stderr: capStderr(error.stderr),
+            stderr_sample: capStderr(error.stderr),
+            recovery:
+              "Fix the reported files in the live worktree, restage as needed, then re-invoke `keeper commit-work` with the same message. A lint failure is not a coverage gap; use --adopt only for missing attribution.",
+          }),
+        };
       }
-      throw err;
+      throw error;
     }
 
-    const committed = await gitCommitStaged(msg, stagedNames, worktree, git);
-    if ("error" in committed) {
-      printCompact({
-        success: false,
-        error: `git commit failed: ${committed.error}`,
-      });
-      return 1;
+    // Lint can run arbitrary tools and lasts long enough for ownership to
+    // change. Re-read durable and direct evidence before trusting identical
+    // bytes: a new live/unknown foreign claimant always blocks adoption.
+    const postLintSurface = await discover(args, identity, worktree, git, deps);
+    const postLintInvalid = surfaceFailure(postLintSurface, identity);
+    if (postLintInvalid) return { code: 1, identity, result: postLintInvalid };
+
+    const foreignAfterLint = selectedForeignConflicts(
+      postLintSurface,
+      surface.selected,
+      identity,
+    );
+    if (foreignAfterLint.length > 0) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "ownership_conflict", false, {
+          identity,
+          reason: "foreign_claim_after_lint",
+          count: foreignAfterLint.length,
+          sample: foreignAfterLint.slice(0, SAMPLE_LIMIT),
+          files: surface.selected,
+          selection: selectionEnvelope(postLintSurface, identity),
+          surface: postLintSurface.summary,
+        }),
+      };
     }
 
-    // NDJSON line 1 — commit envelope (COMPACT).
-    printCompact({
-      success: true,
-      commit_sha: committed.sha,
-      files: stagedNames,
-    });
+    const automaticLost = surface.automatic.filter(
+      (path) => !postLintSurface.automatic.includes(path),
+    );
+    if (automaticLost.length > 0) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "ownership_ambiguous", false, {
+          identity,
+          reason: "automatic_ownership_changed_after_lint",
+          count: automaticLost.length,
+          sample: pathSample(automaticLost),
+          files: surface.selected,
+          selection: selectionEnvelope(postLintSurface, identity),
+          surface: postLintSurface.summary,
+        }),
+      };
+    }
 
-    // NDJSON line 2 — push envelope (COMPACT). Lock held through the push.
-    const pushResult = await pushCommitted(worktree, git);
-    printCompact(pushResult);
-    if (!pushResult.success) exitCode = 1;
+    const postLintClaimDrift = automaticClaimIdentityDrift(
+      postLintSurface,
+      frozen,
+      identity,
+      surface.automatic,
+    );
+    if (postLintClaimDrift.length > 0) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "surface_changed", false, {
+          identity,
+          reason: "automatic_claim_identity_changed_after_lint",
+          count: postLintClaimDrift.length,
+          sample: pathSample(postLintClaimDrift),
+          files: surface.selected,
+          selection: selectionEnvelope(postLintSurface, identity),
+          surface: postLintSurface.summary,
+        }),
+      };
+    }
+
+    try {
+      // Re-hash and compare the same selected OIDs, modes, and whole tree only
+      // after the post-lint ownership read has accepted the claim set.
+      await verifyFrozenSurface(frozen, worktree, git, deps.privateIndexFs);
+    } catch (error) {
+      const typed = error instanceof PrivateIndexError ? error : null;
+      return {
+        code: 1,
+        identity,
+        result: result(
+          "commit-work-result",
+          typed?.code ?? "surface_changed",
+          false,
+          {
+            identity,
+            stderr_sample: capStderr(typed?.stderr),
+          },
+        ),
+      };
+    }
+
+    let committed: Awaited<ReturnType<typeof commitFrozenPrivateIndex>>;
+    try {
+      committed = await commitFrozenPrivateIndex(
+        frozen,
+        args.msg,
+        worktree,
+        git,
+        deps.privateIndexFs,
+        {
+          beforeCommit: async () => await detect(worktree, git),
+          jobId: identity,
+        },
+      );
+    } catch (error) {
+      const typed = error instanceof PrivateIndexError ? error : null;
+      const code = typed?.code ?? "commit_failed";
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", code, false, {
+          identity,
+          stderr: capStderr(typed?.stderr),
+          stderr_sample: capStderr(typed?.stderr),
+          commit_sha: typed?.commitSha,
+          files: surface.selected,
+          affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
+          commit: typed?.commitSha ? { sha: typed.commitSha } : undefined,
+          committed: typed?.committed || undefined,
+          indeterminate: typed?.indeterminate || undefined,
+          operation: typed?.operation,
+          recovery:
+            code === "operation_in_progress" && typed?.operation
+              ? `Finish or abort the in-progress ${typed.operation} operation, then re-run keeper commit-work.`
+              : undefined,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+        }),
+      };
+    }
+
+    const ambient = await reconcileAmbientAfterPublication(
+      frozen,
+      committed.sha,
+      worktree,
+      git,
+    );
+    const ambientWarning =
+      "warning" in ambient
+        ? {
+            ...ambient.warning,
+            detail: ambient.warning.detail?.slice(0, STDERR_LIMIT),
+          }
+        : undefined;
+    const commitEnvelope = {
+      sha: committed.sha,
+      tree: committed.tree,
+      files: {
+        total: surface.selected.length,
+        sample: pathSample(surface.selected),
+      },
+      identities: frozen.entries.slice(0, SAMPLE_LIMIT).map((entry) => ({
+        ...entry,
+        path: entry.path.slice(0, 1024),
+      })),
+      identity_total: frozen.entries.length,
+      ...(ambientWarning
+        ? { ambient_reconciliation_warning: ambientWarning }
+        : {}),
+    };
+
+    // The ref is already published. A post-commit hook failure is therefore a
+    // typed committed-local result; it never rewinds and never claims a push.
+    if (committed.postCommitHookWarning) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "post_commit_hook_failed", false, {
+          identity,
+          commit_sha: committed.sha,
+          files: surface.selected,
+          committed: true,
+          pushed: false,
+          stderr: capStderr(committed.postCommitHookWarning.stderr),
+          stderr_sample: capStderr(committed.postCommitHookWarning.stderr),
+          ambient_reconciliation_warning: ambientWarning,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+          commit: commitEnvelope,
+        }),
+      };
+    }
+
+    const pushed = await (deps.push ?? pushExactCommit)(
+      worktree,
+      committed.sha,
+      frozen.branchRef,
+      git,
+    );
+    const pushEnvelope = pushed.success
+      ? {
+          ...pushed,
+          branch: pushed.branch.slice(0, 1024),
+          ...(!("tracking_warning" in pushed) ||
+          pushed.tracking_warning === undefined
+            ? {}
+            : {
+                tracking_warning: pushed.tracking_warning.slice(
+                  0,
+                  STDERR_LIMIT,
+                ),
+              }),
+        }
+      : {
+          ...pushed,
+          push_error:
+            "push_error" in pushed
+              ? pushed.push_error.slice(0, STDERR_LIMIT)
+              : "unknown push failure",
+        };
+    if (!pushed.success) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "push_failed", false, {
+          identity,
+          commit_sha: committed.sha,
+          files: surface.selected,
+          committed: true,
+          ...pushAliases(pushEnvelope),
+          ambient_reconciliation_warning: ambientWarning,
+          selection: selectionEnvelope(surface, identity),
+          surface: surface.summary,
+          commit: commitEnvelope,
+          push: pushEnvelope,
+        }),
+      };
+    }
+    const pushOutcome = pushed.pushed
+      ? "committed_pushed"
+      : "committed_push_skipped";
+    return {
+      code: 0,
+      identity,
+      result: result("commit-work-result", pushOutcome, true, {
+        identity,
+        commit_sha: committed.sha,
+        files: surface.selected,
+        committed: true,
+        ...pushAliases(pushEnvelope),
+        ambient_reconciliation_warning: ambientWarning,
+        selection: selectionEnvelope(surface, identity),
+        surface: surface.summary,
+        commit: commitEnvelope,
+        push: pushEnvelope,
+      }),
+    };
   } finally {
+    if (frozen !== null) cleanupPrivateIndex(frozen, deps.privateIndexFs);
     lock.release();
   }
-  return exitCode;
+}
+
+let writeOut: (chunk: string) => void = (chunk) => process.stdout.write(chunk);
+
+async function runParsed(
+  args: ParsedArgs,
+  deps: CommitWorkDeps,
+): Promise<{ code: number; result: CommitWorkResult }> {
+  let attempt: {
+    code: number;
+    result: CommitWorkResult;
+    identity: string | null;
+  };
+  try {
+    attempt = await runAttempt(args, deps);
+  } catch (error) {
+    attempt = {
+      code: 1,
+      identity: null,
+      result: result(
+        args.previewFiles ? "commit-work-preview" : "commit-work-result",
+        "internal_error",
+        false,
+        { detail: error instanceof Error ? error.name : "unknown" },
+      ),
+    };
+  }
+  writeOut(`${JSON.stringify(attempt.result)}\n`);
+  if (!args.previewFiles) {
+    try {
+      (deps.emitOutcome ?? emitCommitWorkOutcome)(
+        attempt.result,
+        attempt.identity,
+      );
+    } catch {
+      // The injectable seam obeys the same fail-open contract as production.
+    }
+  }
+  return { code: attempt.code, result: attempt.result };
 }
 
 export async function main(argv: string[]): Promise<void> {
-  const args = parseArgs(argv);
+  let args: ParsedArgs;
+  try {
+    args = parseArgs(argv);
+  } catch (error) {
+    const envelope = result("commit-work-result", "argument_error", false, {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    process.stdout.write(`${JSON.stringify(envelope)}\n`);
+    emitCommitWorkOutcome(envelope, null);
+    process.exitCode = 2;
+    return;
+  }
   if (args.help) {
     process.stdout.write(HELP);
     return;
@@ -950,35 +1238,37 @@ export async function main(argv: string[]): Promise<void> {
     process.stdout.write(AGENT_HELP);
     return;
   }
-  const code = await run(args);
-  if (code !== 0) process.exit(code);
+  const { code } = await runParsed(args, {});
+  if (code !== 0) process.exitCode = code;
 }
 
-/**
- * In-process test entry — parse `argv`, run the pipeline with injected `deps`,
- * and return the captured stdout + exit code WITHOUT spawning the CLI binary,
- * touching real git, or calling `process.exit`. Routes every envelope through an
- * in-memory `writeOut` so the byte-parity serializers are still under test. The
- * help path is exercised separately; this asserts the verb's decisions.
- */
 export async function runForTest(
   argv: string[],
   deps: CommitWorkDeps = {},
 ): Promise<{ code: number; stdout: string }> {
-  const args = parseArgs(argv);
-  const prevWrite = writeOut;
-  let buf = "";
+  let args: ParsedArgs;
+  try {
+    args = parseArgs(argv);
+  } catch (error) {
+    const envelope = result("commit-work-result", "argument_error", false, {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { code: 2, stdout: `${JSON.stringify(envelope)}\n` };
+  }
+  const previous = writeOut;
+  let stdout = "";
   writeOut = (chunk) => {
-    buf += chunk;
+    stdout += chunk;
   };
   try {
-    const code = await run(args, deps);
-    return { code, stdout: buf };
+    const { code } = await runParsed(args, {
+      ...deps,
+      emitOutcome: deps.emitOutcome ?? (() => {}),
+    });
+    return { code, stdout };
   } finally {
-    writeOut = prevWrite;
+    writeOut = previous;
   }
 }
 
-if (import.meta.main) {
-  void main(Bun.argv.slice(3));
-}
+if (import.meta.main) void main(Bun.argv.slice(3));

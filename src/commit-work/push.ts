@@ -6,14 +6,19 @@
  * `pushCommitted()` returns a discriminated {@link PushEnvelope} rather than
  * printing — the caller (`cli/commit-work.ts`) owns ALL stdout so it can emit
  * the compact NDJSON line 2 with the exact Python byte shape and release the
- * commit-work flock on every path. The 6 push-error classes are a CONSUMER
+ * commit-work flock on every path. The push-error classes are a CONSUMER
  * contract (the autopilot worker keys dispatch retries on them), so the stderr
  * substrings are replicated byte-for-byte; `auth`/`network` lowercase the
  * combined output before matching, exactly as the Python does.
  */
 
 import { resolveDefaultBranch } from "../worktree-git";
-import { GIT_PUSH_TIMEOUT_MS, type GitRunner, gitExec } from "./git-exec";
+import {
+  GIT_PUSH_TIMEOUT_MS,
+  GIT_SPAWN_TIMEOUT_CODE,
+  type GitRunner,
+  gitExec,
+} from "./git-exec";
 
 /**
  * A push-error class. Unmatched git stderr falls back to `"other"`;
@@ -28,6 +33,7 @@ export type PushErrorClass =
   | "network"
   | "no_upstream"
   | "protected_branch"
+  | "timeout"
   | "other";
 
 /** Push succeeded — line 2 of the success NDJSON. */
@@ -36,6 +42,9 @@ export interface PushSuccess {
   pushed: true;
   remote: "origin";
   branch: string;
+  /** Remote publication succeeded; only local upstream bookkeeping failed. */
+  tracking_warning?: string;
+  tracking_warning_class?: "tracking_setup_failed";
 }
 
 /**
@@ -189,7 +198,10 @@ export async function remotePushTurnKey(
       ready: false,
       reason: {
         kind: "dry-run-rejected",
-        pushErrorClass: classifyPushError(detail),
+        pushErrorClass:
+          dry.code === GIT_SPAWN_TIMEOUT_CODE
+            ? "timeout"
+            : classifyPushError(detail),
         detail,
       },
     };
@@ -271,6 +283,102 @@ function protectedBranchAbort(branch: string, worktree: string): PushFailure {
   };
 }
 
+function pushFailure(result: {
+  code: number;
+  stdout: string;
+  stderr: string;
+}): PushFailure {
+  const combined = (result.stdout + result.stderr).trim();
+  return {
+    success: false,
+    pushed: false,
+    push_error_class:
+      result.code === GIT_SPAWN_TIMEOUT_CODE
+        ? "timeout"
+        : classifyPushError(combined),
+    push_error: combined,
+  };
+}
+
+/**
+ * Push one immutable commit to one captured local branch destination. Every
+ * network write uses `<commit>:<refs/heads/...>` with no force marker, so a
+ * later symbolic-HEAD switch or local branch advance cannot change the source
+ * object and a remote non-fast-forward remains a normal refusal.
+ */
+export async function pushExactCommit(
+  worktree: string,
+  commitSha: string,
+  branchRef: string,
+  run: GitRunner = gitExec,
+): Promise<PushEnvelope> {
+  const env = { GIT_TERMINAL_PROMPT: "0" };
+  const prefix = "refs/heads/";
+  const branch = branchRef.startsWith(prefix)
+    ? branchRef.slice(prefix.length)
+    : branchRef;
+  const refspec = `${commitSha}:${branchRef}`;
+
+  if (await inLinkedWorktree(worktree, run)) {
+    return { success: true, pushed: false, skipped: "worktree", branch };
+  }
+
+  // Re-probe immediately before any network write. A linkage race always
+  // suppresses the push, regardless of destination; exact publication must
+  // never leak a linked-worktree branch to origin on either probe.
+  if (await inLinkedWorktree(worktree, run)) {
+    return { success: true, pushed: false, skipped: "worktree", branch };
+  }
+
+  const upstream = await run(
+    [
+      "rev-parse",
+      "--abbrev-ref",
+      "--symbolic-full-name",
+      `${branch}@{upstream}`,
+    ],
+    { cwd: worktree, env },
+  );
+  if (upstream.code === 128) {
+    // The object-id source keeps the network write independent of mutable HEAD.
+    // Git cannot attach branch tracking to an object id, so configure it only
+    // after the exact remote update has succeeded.
+    const first = await run(
+      ["push", "--no-progress", "-u", "origin", refspec],
+      {
+        cwd: worktree,
+        env,
+        timeoutMs: GIT_PUSH_TIMEOUT_MS,
+      },
+    );
+    if (first.code !== 0) return pushFailure(first);
+    const track = await run(
+      ["branch", `--set-upstream-to=origin/${branch}`, branch],
+      { cwd: worktree, env },
+    );
+    if (track.code !== 0) {
+      return {
+        success: true,
+        pushed: true,
+        remote: "origin",
+        branch,
+        tracking_warning: (track.stdout + track.stderr).trim(),
+        tracking_warning_class: "tracking_setup_failed",
+      };
+    }
+    return { success: true, pushed: true, remote: "origin", branch };
+  }
+  if (upstream.code !== 0) return pushFailure(upstream);
+
+  const push = await run(["push", "--no-progress", "origin", refspec], {
+    cwd: worktree,
+    env,
+    timeoutMs: GIT_PUSH_TIMEOUT_MS,
+  });
+  if (push.code !== 0) return pushFailure(push);
+  return { success: true, pushed: true, remote: "origin", branch };
+}
+
 /**
  * Push the just-landed commit to `origin`, auto-setting upstream on first push.
  * `worktree` is the resolved, worktree-PINNED path the caller threads through
@@ -338,28 +446,12 @@ export async function pushCommitted(
       cwd: worktree,
       env,
     });
-    if (pushU.code !== 0) {
-      const combined = (pushU.stdout + pushU.stderr).trim();
-      return {
-        success: false,
-        pushed: false,
-        push_error_class: classifyPushError(combined),
-        push_error: combined,
-      };
-    }
+    if (pushU.code !== 0) return pushFailure(pushU);
     return { success: true, pushed: true, remote: "origin", branch };
   }
 
   // 2. Upstream configured — regular push.
   const push = await run(["push", "--no-progress"], { cwd: worktree, env });
-  if (push.code !== 0) {
-    const combined = (push.stdout + push.stderr).trim();
-    return {
-      success: false,
-      pushed: false,
-      push_error_class: classifyPushError(combined),
-      push_error: combined,
-    };
-  }
+  if (push.code !== 0) return pushFailure(push);
   return { success: true, pushed: true, remote: "origin", branch };
 }

@@ -6,8 +6,8 @@
  * push — against injected seams: a recording fake git runner returning canned
  * outputs / captured-from-real-git push stderr goldens, a fake attribution
  * discovery, a fake lint matrix, and a no-op flock. The byte-parity serializers
- * still run (output routes through the in-memory `writeOut` seam), so the compact
- * two-line NDJSON / pretty envelope SHAPES stay under test.
+ * still run (output routes through the in-memory `writeOut` seam), so the one
+ * compact versioned result envelope stays under test.
  *
  * The assertions are keeper's DECISIONS, not git's effect: the staged pathspec,
  * the committed message + Job-Id trailer, the push skip/classify, the
@@ -19,7 +19,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CommitWorkDeps, runForTest } from "../cli/commit-work";
+import {
+  type CommitWorkDeps,
+  runForTest as runCommitWorkForTest,
+} from "../cli/commit-work";
 import { LintFailure } from "../src/commit-work/lint-matrix";
 import {
   describePushNotReady,
@@ -45,28 +48,18 @@ import {
 } from "./helpers/fake-git.ts";
 import { freshDbFile } from "./helpers/template-db.ts";
 
-// The verb resolves a session id from the ambient env when no --session-id is
-// passed; clear the harness ids so the no-session-id path is reachable and the
-// Job-Id trailer is fully test-controlled.
-let savedEnv: Record<string, string | undefined>;
-beforeEach(() => {
-  savedEnv = {
-    CLAUDE_CODE_SESSION_ID: process.env.CLAUDE_CODE_SESSION_ID,
-    JOBCTL_SESSION_ID: process.env.JOBCTL_SESSION_ID,
-    JOBCTL_JOB_ID: process.env.JOBCTL_JOB_ID,
-    KEEPER_JOB_ID: process.env.KEEPER_JOB_ID,
-  };
-  delete process.env.CLAUDE_CODE_SESSION_ID;
-  delete process.env.JOBCTL_SESSION_ID;
-  delete process.env.JOBCTL_JOB_ID;
-  delete process.env.KEEPER_JOB_ID;
-});
-afterEach(() => {
-  for (const [k, v] of Object.entries(savedEnv)) {
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  }
-});
+// Every pipeline fixture supplies `deps.env`, so identity tests never mutate or
+// depend on the process-wide harness environment.
+const TEST_ID = "11111111-1111-4111-8111-111111111111";
+const FAKE_COMMIT = "abcdef0123456789abcdef0123456789abcdef01";
+
+/** Keep the broad legacy scenarios readable while exercising UUID-only input. */
+function runForTest(argv: string[], deps: CommitWorkDeps = {}) {
+  return runCommitWorkForTest(
+    argv.map((arg) => (arg === "s1" ? TEST_ID : arg)),
+    deps,
+  );
+}
 
 /**
  * The standard git rule set for a clean repo with `n` staged files. Models every
@@ -125,12 +118,12 @@ function successRules(opts: {
       result: { exitCode: 0, stdout: "" },
     },
     {
-      when: (a) => argvStartsWith(a, "commit", "-F", "-"),
-      result: { exitCode: 0 },
+      when: (a) => argvStartsWith(a, "commit-tree"),
+      result: { exitCode: 0, stdout: `${FAKE_COMMIT}\n` },
     },
     {
       when: (a) => argvStartsWith(a, "rev-parse", "--short", "HEAD"),
-      result: { exitCode: 0, stdout: "abc1234\n" },
+      result: { exitCode: 0, stdout: `${FAKE_COMMIT}\n` },
     },
     {
       when: (a) => argvStartsWith(a, "rev-parse", "--abbrev-ref", "HEAD"),
@@ -139,7 +132,7 @@ function successRules(opts: {
   ];
   // @{u} probe: exit 128 → no upstream (first push sets it); exit 0 → configured.
   rules.push({
-    when: (a) => a.includes("@{u}"),
+    when: (a) => a.some((arg) => arg === "@{u}" || arg.endsWith("@{upstream}")),
     result:
       upstream === "none"
         ? { exitCode: 128 }
@@ -153,43 +146,202 @@ function successRules(opts: {
   return rules;
 }
 
-/** Build deps from rules + a discovered file set. The git runner echoes the
- * commit message through `interpret-trailers`, appending `Job-Id: <jobId>` when
- * given — modeling git's trailer machinery so the commit message under test
- * carries (or omits) the trailer exactly as production would. */
+/** Build deps from rules + a discovered file set while modeling the exact
+ * private-index, detached-admin, CAS-publish pipeline. */
 function deps(opts: {
   files: string[];
   rules: FakeGitRule[];
-  jobId?: string;
+  absentFiles?: string[];
+  privateStagedNames?: string[];
   runLint?: (files: string[], cwd: string) => Promise<void>;
   detectInProgress?: CommitWorkDeps["detectInProgress"];
   checkSharedCheckoutJam?: CommitWorkDeps["checkSharedCheckoutJam"];
 }): { d: CommitWorkDeps; calls: ReturnType<typeof fakeAsyncGit>["calls"] } {
   const fake = fakeAsyncGit(opts.rules);
   const baseRun = fake.run;
+  let privateUpdated = false;
+  let published = false;
+  const selected = [...opts.files].sort();
   const run: typeof baseRun = async (args, options) => {
-    if (args.includes("interpret-trailers")) {
-      const msg = options?.stdin ? new TextDecoder().decode(options.stdin) : "";
-      // Record the call (so it's in `calls`) then synthesize the trailer append.
+    if (
+      argvStartsWith(args, "diff", "--cached", "--name-only", "-z") &&
+      options?.env?.GIT_INDEX_FILE
+    ) {
       await baseRun(args, options);
-      const out = opts.jobId ? `${msg}\nJob-Id: ${opts.jobId}\n` : msg;
-      return { code: 0, stdout: out, stderr: "" };
+      return {
+        code: 0,
+        stdout: (opts.privateStagedNames ?? selected).join("\0"),
+        stderr: "",
+      };
+    }
+    if (args[0] === "interpret-trailers") {
+      const base = await baseRun(args, options);
+      if (base.code !== 0) return base;
+      const msg = options?.stdin ? new TextDecoder().decode(options.stdin) : "";
+      const trailers = args
+        .flatMap((arg, index) => (arg === "--trailer" ? [args[index + 1]] : []))
+        .filter((value): value is string => value !== undefined);
+      return {
+        code: 0,
+        stdout: `${msg.trimEnd()}\n\n${trailers.join("\n")}\n`,
+        stderr: "",
+      };
+    }
+    if (argvStartsWith(args, "rev-parse", "--show-toplevel")) {
+      await baseRun(args, options);
+      return { code: 0, stdout: "/repo\n", stderr: "" };
+    }
+    if (args[0] === "status") {
+      await baseRun(args, options);
+      const ignored = await baseRun(["check-ignore", "-z", "--stdin"], {
+        cwd: options?.cwd,
+        stdin: new TextEncoder().encode(`${opts.files.join("\0")}\0`),
+      });
+      const ignoredSet = new Set(ignored.stdout.split("\0").filter(Boolean));
+      const dirty = opts.files.filter((path) => !ignoredSet.has(path));
+      return {
+        code: 0,
+        stdout: `${dirty.map((path) => `? ${path}`).join("\0")}\0`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "symbolic-ref" && args[1] === "-q") {
+      await baseRun(args, options);
+      return { code: 0, stdout: "refs/heads/main\n", stderr: "" };
+    }
+    if (
+      args[0] === "rev-parse" &&
+      args[1] === "--verify" &&
+      args[2] === "refs/heads/main^{commit}"
+    ) {
+      await baseRun(args, options);
+      return {
+        code: 0,
+        stdout: published ? `${FAKE_COMMIT}\n` : "parent\n",
+        stderr: "",
+      };
+    }
+    if (
+      args[0] === "rev-parse" &&
+      args[1] === "--verify" &&
+      args[2] === "HEAD^{commit}"
+    ) {
+      await baseRun(args, options);
+      return { code: 0, stdout: `${FAKE_COMMIT}\n`, stderr: "" };
+    }
+    if (args[0] === "read-tree") {
+      return baseRun(args, options);
+    }
+    if (args[0] === "ls-tree") {
+      const base = await baseRun(args, options);
+      return base.stdout || base.code !== 0
+        ? base
+        : { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "hash-object") {
+      const base = await baseRun(args, options);
+      if (base.code !== 0 || base.stdout) return base;
+      const path = args.at(-1) ?? "";
+      const index = Math.max(0, selected.indexOf(path));
+      return {
+        code: 0,
+        stdout: `${(index + 1).toString(16).padStart(40, "0")}\n`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "config" && args.includes("core.filemode")) {
+      await baseRun(args, options);
+      return { code: 0, stdout: "true\n", stderr: "" };
+    }
+    if (args[0] === "update-index") {
+      const base = await baseRun(args, options);
+      if (base.code === 0 && options?.env?.GIT_INDEX_FILE) {
+        privateUpdated = true;
+      }
+      return base;
+    }
+    if (args[0] === "ls-files" && options?.env?.GIT_INDEX_FILE) {
+      const base = await baseRun(args, options);
+      if (base.code !== 0 || base.stdout) return base;
+      return {
+        code: 0,
+        stdout: `${selected
+          .map((path, index) => `100644 blob${index} 0\t${path}\0`)
+          .join("")}`,
+        stderr: "",
+      };
+    }
+    if (args[0] === "write-tree" && options?.env?.GIT_INDEX_FILE) {
+      const base = await baseRun(args, options);
+      if (base.code !== 0) return base;
+      return {
+        code: 0,
+        stdout: privateUpdated ? "tree\n" : "base-tree\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "worktree" && args[1] === "add") {
+      return baseRun(args, options);
+    }
+    if (
+      argvStartsWith(
+        args,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+      ) &&
+      options?.cwd?.endsWith("/admin-worktree")
+    ) {
+      await baseRun(args, options);
+      return {
+        code: 0,
+        stdout: "/repo/.git/worktrees/admin-worktree\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "commit" && options?.env?.GIT_INDEX_FILE) {
+      return baseRun(args, options);
+    }
+    if (args[0] === "cat-file" && args[1] === "commit") {
+      await baseRun(args, options);
+      return {
+        code: 0,
+        stdout:
+          "tree tree\nparent parent\nauthor Test <t@example.com> 1 +0000\n" +
+          "committer Test <t@example.com> 1 +0000\n\nmessage\n",
+        stderr: "",
+      };
+    }
+    if (args[0] === "update-ref") {
+      const base = await baseRun(args, options);
+      if (base.code === 0) published = true;
+      return base;
     }
     return baseRun(args, options);
   };
+  const absent = new Set(opts.absentFiles ?? []);
   const d: CommitWorkDeps = {
+    env: {},
+    cwd: "/repo",
     gitRunner: run,
-    discoverFiles: () => opts.files,
-    // No-op the read-side attribution wait: this suite injects the file set
-    // directly, so there is nothing to wait for, and the default wait would
-    // spawn real git + read the production DB — both banned here.
-    waitCaughtUp: async () => {},
+    directEvidence: () => ({
+      currentSessionPaths: opts.files,
+      complete: true,
+    }),
+    readClaims: () => [],
     runLint: opts.runLint ?? (async () => {}),
     acquireLock: () => ({ release: () => {} }),
-    // Repo-state gates default to quiescent so the file-set-driven cases run
-    // unblocked; individual gate tests override these. The reversion tripwire
-    // (gate 3) runs through the injected git runner, whose default empty
-    // `ls-files` output yields no candidates.
+    privateIndexFs: {
+      makeTempDir: () => "/tmp/keeper-commit-work-broad-test",
+      removeTempDir: () => {},
+      commitMarker: () => "broad-test",
+      inspectPath: (absolutePath) => ({
+        kind: [...absent].some((path) => absolutePath.endsWith(`/${path}`))
+          ? "absent"
+          : "file",
+        executable: false,
+      }),
+    },
     detectInProgress: opts.detectInProgress ?? (async () => null),
     checkSharedCheckoutJam: opts.checkSharedCheckoutJam ?? (() => false),
   };
@@ -219,7 +371,7 @@ describe("commit-work: session id", () => {
 // ---------------------------------------------------------------------------
 
 describe("commit-work: --preview-files", () => {
-  test("lists session-attributed files (pretty), gitignore-filtered, no commit", async () => {
+  test("lists session-attributed files, gitignore-filtered, with no commit", async () => {
     // discovery returns three; check-ignore drops the *.log.
     const rules: FakeGitRule[] = [
       {
@@ -236,14 +388,14 @@ describe("commit-work: --preview-files", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(JSON.parse(stdout)).toEqual({
+    expect(JSON.parse(stdout)).toMatchObject({
+      schema_version: 1,
+      kind: "commit-work-preview",
+      outcome: "preview",
       success: true,
       files: ["a.txt", "b.txt"],
     });
-    // Pretty indent=2 shape.
-    expect(stdout).toBe(
-      `${JSON.stringify({ success: true, files: ["a.txt", "b.txt"] }, null, 2)}\n`,
-    );
+    expect(stdout.trimEnd()).not.toContain("\n");
     // No commit issued in preview mode.
     expect(calls.some((c) => argvStartsWith(c.args, "commit"))).toBe(false);
   });
@@ -312,7 +464,7 @@ describe("commit-work: message validation", () => {
     });
     const { code, stdout } = await runForTest(["--session-id", "s1"], d);
     expect(code).toBe(1);
-    expect(JSON.parse(stdout).error).toContain("commit message is required");
+    expect(JSON.parse(stdout).outcome).toBe("message_required");
   });
 
   test("rejects a multi-line message carrying a forbidden trailer", async () => {
@@ -330,22 +482,25 @@ describe("commit-work: message validation", () => {
       d,
     );
     expect(code).toBe(1);
-    expect(JSON.parse(stdout).error).toContain("forbidden trailer pattern");
+    expect(JSON.parse(stdout).outcome).toBe("forbidden_trailer");
   });
 
-  test("a single-line trailer-looking subject is allowed (gate is multi-line only)", async () => {
-    const { d } = deps({
-      files: ["a.txt"],
-      rules: successRules({ stagedNames: ["a.txt"] }),
-    });
-    const { code, stdout } = await runForTest(
-      ["Job-Id: not-really", "--session-id", "s1"],
-      d,
-    );
-    const line1 = JSON.parse(stdout.split("\n")[0]);
-    expect(code).toBe(0);
-    expect(line1.success).toBe(true);
-    expect(line1.commit_sha).toBe("abc1234");
+  test("forbidden trailer keys are rejected even as a single-line subject", async () => {
+    for (const message of [
+      "Job-Id: not-really",
+      "Keeper-Commit-Id: user-forged",
+    ]) {
+      const { d } = deps({
+        files: ["a.txt"],
+        rules: successRules({ stagedNames: ["a.txt"] }),
+      });
+      const { code, stdout } = await runForTest(
+        [message, "--session-id", "s1"],
+        d,
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout).outcome).toBe("forbidden_trailer");
+    }
   });
 });
 
@@ -354,7 +509,7 @@ describe("commit-work: message validation", () => {
 // ---------------------------------------------------------------------------
 
 describe("commit-work: empty file set", () => {
-  test("emits committed:false (pretty) when nothing is on the hook", async () => {
+  test("emits committed:false when nothing is on the hook", async () => {
     const { d } = deps({
       files: [],
       rules: [
@@ -369,23 +524,23 @@ describe("commit-work: empty file set", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(JSON.parse(stdout)).toEqual({
+    expect(JSON.parse(stdout)).toMatchObject({
+      schema_version: 1,
+      outcome: "nothing_to_commit",
       success: true,
       committed: false,
       files: [],
     });
-    expect(stdout).toBe(
-      `${JSON.stringify({ success: true, committed: false, files: [] }, null, 2)}\n`,
-    );
+    expect(stdout.trimEnd()).not.toContain("\n");
   });
 });
 
 // ---------------------------------------------------------------------------
-// success path — two-line compact NDJSON
+// success path — one compact versioned envelope
 // ---------------------------------------------------------------------------
 
 describe("commit-work: success path", () => {
-  test("two-line compact NDJSON; both parse; stage + commit + push issued", async () => {
+  test("one compact envelope carries commit + push; both operations issue", async () => {
     const { d, calls } = deps({
       files: ["a.txt", "b.txt"],
       rules: successRules({ stagedNames: ["a.txt", "b.txt"] }),
@@ -397,37 +552,35 @@ describe("commit-work: success path", () => {
     expect(code).toBe(0);
 
     const lines = stdout.split("\n").filter((l) => l.length > 0);
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(1);
 
-    // Line 1 — commit envelope (compact, sorted files).
-    const line1 = JSON.parse(lines[0]);
-    expect(line1.success).toBe(true);
-    expect(line1.commit_sha).toBe("abc1234");
-    expect(line1.files).toEqual(["a.txt", "b.txt"]);
-    expect(lines[0]).not.toMatch(/^\s/); // compact
-
-    // Line 2 — push envelope.
-    expect(JSON.parse(lines[1])).toEqual({
+    const envelope = JSON.parse(lines[0]);
+    expect(envelope).toMatchObject({
+      schema_version: 1,
       success: true,
+      commit_sha: FAKE_COMMIT,
+      files: ["a.txt", "b.txt"],
       pushed: true,
       remote: "origin",
       branch: "main",
     });
+    expect(lines[0]).not.toMatch(/^\s/);
 
-    // Decisions: staged the discovered files pathspec-scoped, then committed.
-    const add = calls.find((c) => argvStartsWith(c.args, "add", "-A", "--"));
-    expect(add?.args).toEqual(["add", "-A", "--", "a.txt", "b.txt"]);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
+    // Decisions: populated only the two exact private-index entries, then committed.
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
     );
+    expect(exact?.args).toEqual(["update-index", "-z", "--index-info"]);
+    expect(exact?.stdin).toContain("\ta.txt\0");
+    expect(exact?.stdin).toContain("\tb.txt\0");
+    expect(calls.some((c) => c.args[0] === "add")).toBe(false);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
     expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(true);
   });
 
-  test("appends the Job-Id trailer from JOBCTL_JOB_ID", async () => {
-    process.env.JOBCTL_JOB_ID = "job-abc";
+  test("appends the Job-Id trailer from explicit --session-id", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
-      jobId: "job-abc",
       rules: successRules({ stagedNames: ["a.txt"] }),
     });
     const { code } = await runForTest(
@@ -435,29 +588,26 @@ describe("commit-work: success path", () => {
       d,
     );
     expect(code).toBe(0);
-    // The committed message (fed via commit -F - stdin) carries the trailer.
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const trailers = calls.find((c) =>
+      argvStartsWith(c.args, "interpret-trailers"),
     );
-    expect(commit?.stdin).toContain("Job-Id: job-abc");
+    expect(trailers?.args).toContain(`Job-Id: ${TEST_ID}`);
   });
 
-  test("no Job-Id trailer when no job id is resolvable", async () => {
-    // --session-id feeds attribution but NOT the trailer (env only). No
-    // JOBCTL_JOB_ID + cleared CLAUDE_CODE_SESSION_ID → no trailer.
+  test("an identity-free exact adoption carries no Job-Id trailer", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: ["a.txt"] }),
     });
     const { code } = await runForTest(
-      ["feat: no trailer", "--session-id", "s1"],
+      ["feat: no trailer", "--adopt", "a.txt"],
       d,
     );
     expect(code).toBe(0);
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const trailers = calls.find((c) =>
+      argvStartsWith(c.args, "interpret-trailers"),
     );
-    expect(commit?.stdin).not.toContain("Job-Id:");
+    expect(trailers?.args.some((arg) => arg.startsWith("Job-Id:"))).toBe(false);
   });
 });
 
@@ -466,7 +616,7 @@ describe("commit-work: success path", () => {
 // ---------------------------------------------------------------------------
 
 describe("commit-work: no upstream", () => {
-  test("sets upstream on first push (@{u} probe exits 128 → push -u origin HEAD)", async () => {
+  test("sets upstream on first exact-SHA push when the captured branch has none", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: ["a.txt"], upstream: "none" }),
@@ -476,18 +626,30 @@ describe("commit-work: no upstream", () => {
       d,
     );
     expect(code).toBe(0);
-    const lines = stdout.split("\n").filter((l) => l.length > 0);
-    expect(JSON.parse(lines[1])).toEqual({
+    expect(JSON.parse(stdout)).toMatchObject({
       success: true,
       pushed: true,
       remote: "origin",
       branch: "main",
     });
-    // The decision: push WITH -u origin HEAD to set the missing upstream.
     const push = calls.find((c) => argvStartsWith(c.args, "push"));
-    expect(push?.args).toContain("-u");
-    expect(push?.args).toContain("origin");
-    expect(push?.args).toContain("HEAD");
+    expect(push?.args).toEqual([
+      "push",
+      "--no-progress",
+      "-u",
+      "origin",
+      `${FAKE_COMMIT}:refs/heads/main`,
+    ]);
+    expect(
+      calls.some((c) =>
+        argvStartsWith(
+          c.args,
+          "branch",
+          "--set-upstream-to=origin/main",
+          "main",
+        ),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -497,7 +659,7 @@ describe("commit-work: no upstream", () => {
 
 describe("commit-work: push failure", () => {
   test("a non-fast-forward push → exit 1, classified push envelope (compact)", async () => {
-    const { d } = deps({
+    const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({
         stagedNames: ["a.txt"],
@@ -509,12 +671,16 @@ describe("commit-work: push failure", () => {
       d,
     );
     expect(code).toBe(1);
-    const lines = stdout.split("\n").filter((l) => l.length > 0);
-    // Line 1 commit succeeded; line 2 is the classified failure.
-    const line2 = JSON.parse(lines[1]);
-    expect(line2.success).toBe(false);
-    expect(line2.pushed).toBe(false);
-    expect(line2.push_error_class).toBe("non_fast_forward");
+    const envelope = JSON.parse(stdout);
+    expect(envelope.success).toBe(false);
+    expect(envelope.commit_sha).toBe(FAKE_COMMIT);
+    expect(envelope.pushed).toBe(false);
+    expect(envelope.push_error_class).toBe("non_fast_forward");
+    const push = calls.find((call) => call.args[0] === "push");
+    expect(push?.args).toContain(`${FAKE_COMMIT}:refs/heads/main`);
+    expect(
+      push?.args.some((arg) => arg === "--force" || arg.startsWith("+")),
+    ).toBe(false);
   });
 });
 
@@ -578,22 +744,17 @@ describe("commit-work: linked-worktree push skip", () => {
     expect(code).toBe(0);
 
     const lines = stdout.split("\n").filter((l) => l.length > 0);
-    expect(lines.length).toBe(2);
-    // Line 1 — the commit still landed.
-    expect(JSON.parse(lines[0]).success).toBe(true);
-    // Line 2 — the distinct skipped envelope (compact).
-    expect(JSON.parse(lines[1])).toEqual({
+    expect(lines.length).toBe(1);
+    expect(JSON.parse(lines[0])).toMatchObject({
       success: true,
       pushed: false,
       skipped: "worktree",
       branch: "main",
     });
-    expect(lines[1]).not.toMatch(/^\s/); // compact
+    expect(lines[0]).not.toMatch(/^\s/);
 
     // The DECISION: committed, never pushed.
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
     expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
 
@@ -610,8 +771,7 @@ describe("commit-work: linked-worktree push skip", () => {
       d,
     );
     expect(code).toBe(0);
-    const lines = stdout.split("\n").filter((l) => l.length > 0);
-    expect(JSON.parse(lines[1])).toEqual({
+    expect(JSON.parse(stdout)).toMatchObject({
       success: true,
       pushed: true,
       remote: "origin",
@@ -633,9 +793,8 @@ describe("commit-work: linked-worktree push skip", () => {
       d,
     );
     expect(code).toBe(0);
-    const lines = stdout.split("\n").filter((l) => l.length > 0);
     // Despite git-dir != common-dir, the superproject guard vetoes the skip.
-    expect(JSON.parse(lines[1])).toEqual({
+    expect(JSON.parse(stdout)).toMatchObject({
       success: true,
       pushed: true,
       remote: "origin",
@@ -651,9 +810,9 @@ describe("commit-work: linked-worktree push skip", () => {
 
 describe("commit-work: deletion staging", () => {
   test("a session-deleted tracked file stages + commits as a removal", async () => {
-    // `add -A -- doomed.txt` records the removal; the staged-name read reports it.
     const { d, calls } = deps({
       files: ["doomed.txt"],
+      absentFiles: ["doomed.txt"],
       rules: successRules({ stagedNames: ["doomed.txt"] }),
     });
     const { code, stdout } = await runForTest(
@@ -664,9 +823,12 @@ describe("commit-work: deletion staging", () => {
     const line1 = JSON.parse(stdout.split("\n")[0]);
     expect(line1.success).toBe(true);
     expect(line1.files).toEqual(["doomed.txt"]);
-    // The deletion is staged via the -A pathspec form.
-    const add = calls.find((c) => argvStartsWith(c.args, "add", "-A", "--"));
-    expect(add?.args).toEqual(["add", "-A", "--", "doomed.txt"]);
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
+    );
+    expect(exact?.args).toEqual(["update-index", "-z", "--index-info"]);
+    expect(exact?.stdin).toMatch(/^0 0{40} 0\tdoomed\.txt\0$/);
+    expect(calls.some((c) => c.args[0] === "add")).toBe(false);
   });
 });
 
@@ -710,7 +872,7 @@ describe("commit-work: lint_failed", () => {
 });
 
 // ---------------------------------------------------------------------------
-// index-purity gate (stale_index_carryover) + pathspec-limited commit
+// index-purity gate (stale_index_carryover) + isolated-index commit
 // ---------------------------------------------------------------------------
 
 /** A flock stand-in that COUNTS release() calls, so a test can assert every
@@ -768,6 +930,28 @@ describe("commit-work: index-purity gate", () => {
     );
   });
 
+  test("ambient staged-name discovery includes type changes", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt", "type-changed"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: only a", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "stale_index_carryover",
+      sample: ["type-changed"],
+    });
+    const scan = calls.find(
+      (call) =>
+        argvStartsWith(call.args, "diff", "--cached", "--name-only", "-z") &&
+        !call.env?.GIT_INDEX_FILE,
+    );
+    expect(scan?.args).toContain("--diff-filter=ACDMRT");
+  });
+
   test("sample is capped at 20 while count carries the full total", async () => {
     // 25 stale paths, zero-padded so lexical sort is numeric-stable.
     const stale = Array.from(
@@ -790,7 +974,7 @@ describe("commit-work: index-purity gate", () => {
     expect(parsed.sample).toEqual(stale.slice(0, 20));
   });
 
-  test("--allow-stale-unstage restores the reset argv and commits attributed-only", async () => {
+  test("--allow-stale-unstage restores exact base entries and commits attributed-only", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: ["a.txt", "stale.txt"] }),
@@ -800,20 +984,32 @@ describe("commit-work: index-purity gate", () => {
       d,
     );
     expect(code).toBe(0);
-    // The stale path was unstaged via `reset HEAD -- stale.txt`.
-    const reset = calls.find((c) => argvStartsWith(c.args, "reset", "HEAD"));
-    expect(reset?.args).toEqual(["reset", "HEAD", "--", "stale.txt"]);
-    // Then the commit proceeded, pathspec-limited to the attributed set only.
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const ambient = calls.filter(
+      (c) => c.args[0] === "update-index" && !c.env?.GIT_INDEX_FILE,
     );
-    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "a.txt"]);
+    expect(ambient[0]).toMatchObject({
+      args: ["update-index", "-z", "--index-info"],
+    });
+    expect(ambient[0]?.stdin).toMatch(/^0 0{40} 0\tstale\.txt\0$/);
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
+    );
+    expect(exact?.stdin).toContain("\ta.txt\0");
+    expect(calls.some((c) => c.args[0] === "reset")).toBe(false);
+    const commit = calls.find((c) => argvStartsWith(c.args, "commit-tree"));
+    expect(commit?.args.slice(0, 5)).toEqual([
+      "commit-tree",
+      "tree",
+      "-p",
+      "parent",
+      "-F",
+    ]);
     // Line 1 reports the attributed file only.
     expect(JSON.parse(stdout.split("\n")[0]).files).toEqual(["a.txt"]);
   });
 
-  test("empty resolved pathspec yields nothing_to_commit; no commit/push", async () => {
-    // Files discovered + staged, but nothing actually lands in the index.
+  test("an empty ambient staged read does not suppress private-index content", async () => {
+    // Ambient staged names do not define the isolated index's selected content.
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: [] }),
@@ -822,33 +1018,39 @@ describe("commit-work: index-purity gate", () => {
       ["feat: no-op", "--session-id", "s1"],
       d,
     );
-    expect(code).toBe(1);
+    expect(code).toBe(0);
     const parsed = JSON.parse(stdout);
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toBe("nothing_to_commit");
-    expect(typeof parsed.hint).toBe("string");
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      false,
-    );
-    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
+    expect(parsed.success).toBe(true);
+    expect(parsed.files).toEqual(["a.txt"]);
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
+    expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(true);
   });
 });
 
-describe("commit-work: pathspec-limited commit", () => {
-  test("commit argv carries the sorted pathspec after `--` + the literal-pathspecs env; staged read is --no-renames", async () => {
+describe("commit-work: isolated-index commit", () => {
+  test("private index-info carries sorted exact entries into commit-tree", async () => {
     const { d, calls } = deps({
       files: ["b.txt", "a.txt"],
       rules: successRules({ stagedNames: ["a.txt", "b.txt"] }),
     });
     const { code } = await runForTest(["feat: two", "--session-id", "s1"], d);
     expect(code).toBe(0);
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
     );
-    // `--only` mode: message flags, then `--`, then the exact attributed pathspec.
-    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "a.txt", "b.txt"]);
-    // Pathspec magic disabled so poisoned-index paths can't smuggle options.
-    expect(commit?.env?.GIT_LITERAL_PATHSPECS).toBe("1");
+    expect(exact?.args).toEqual(["update-index", "-z", "--index-info"]);
+    expect(exact?.stdin?.indexOf("\ta.txt\0")).toBeLessThan(
+      exact?.stdin?.indexOf("\tb.txt\0") ?? -1,
+    );
+    expect(calls.some((c) => c.args[0] === "add")).toBe(false);
+    const commit = calls.find((c) => argvStartsWith(c.args, "commit-tree"));
+    expect(commit?.args.slice(0, 5)).toEqual([
+      "commit-tree",
+      "tree",
+      "-p",
+      "parent",
+      "-F",
+    ]);
     // The staged-name read forces --no-renames so a rename splits into both halves.
     const diff = calls.find((c) =>
       argvStartsWith(c.args, "diff", "--cached", "--name-only", "-z"),
@@ -856,9 +1058,32 @@ describe("commit-work: pathspec-limited commit", () => {
     expect(diff?.args).toContain("--no-renames");
   });
 
-  test("a rename's A and D halves both ride the pathspec when both are attributed", async () => {
-    // With --no-renames a rename reports the new path (A) and old path (D); when
-    // both are attributed the pathspec is rename-complete.
+  test("a private staged-name expansion outside selection refuses before lint", async () => {
+    let linted = false;
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      privateStagedNames: ["a.txt", "implicit.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+      runLint: async () => {
+        linted = true;
+      },
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: exact only", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "stage_failed",
+      stderr_sample: expect.stringContaining("extras: implicit.txt"),
+    });
+    expect(linted).toBe(false);
+    expect(calls.some((call) => call.args[0] === "commit-tree")).toBe(false);
+  });
+
+  test("a rename's A and D halves both become exact entries when attributed", async () => {
+    // With --no-renames discovery reports both halves; exact index-info then
+    // writes only those two stage-0 identities.
     const { d, calls } = deps({
       files: ["dir/new.txt", "dir/old.txt"],
       rules: successRules({ stagedNames: ["dir/new.txt", "dir/old.txt"] }),
@@ -868,17 +1093,12 @@ describe("commit-work: pathspec-limited commit", () => {
       d,
     );
     expect(code).toBe(0);
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
     );
-    expect(commit?.args).toEqual([
-      "commit",
-      "-F",
-      "-",
-      "--",
-      "dir/new.txt",
-      "dir/old.txt",
-    ]);
+    expect(exact?.stdin).toContain("\tdir/new.txt\0");
+    expect(exact?.stdin).toContain("\tdir/old.txt\0");
+    expect(calls.some((c) => c.args[0] === "add")).toBe(false);
   });
 
   test("a rename with one unattributed half fires the gate (all-or-nothing)", async () => {
@@ -900,11 +1120,10 @@ describe("commit-work: pathspec-limited commit", () => {
     );
   });
 
-  test("a deletion rides the pathspec even though it is skipped by lint", async () => {
-    // doomed.txt is staged as a removal (not on disk) — it must appear in the
-    // commit pathspec, which is built from staged NAMES not the lint list.
+  test("a deletion emits an exact removal and is skipped by lint", async () => {
     const { d, calls } = deps({
       files: ["doomed.txt"],
+      absentFiles: ["doomed.txt"],
       rules: successRules({ stagedNames: ["doomed.txt"] }),
     });
     const { code } = await runForTest(
@@ -912,20 +1131,56 @@ describe("commit-work: pathspec-limited commit", () => {
       d,
     );
     expect(code).toBe(0);
-    const commit = calls.find((c) =>
-      argvStartsWith(c.args, "commit", "-F", "-"),
+    const exact = calls.find(
+      (c) => c.args[0] === "update-index" && c.env?.GIT_INDEX_FILE,
     );
-    expect(commit?.args).toEqual(["commit", "-F", "-", "--", "doomed.txt"]);
+    expect(exact?.stdin).toMatch(/^0 0{40} 0\tdoomed\.txt\0$/);
   });
 
-  test("git commit non-zero maps to a commit-failure envelope preserving git's stderr", async () => {
-    // Mid-merge partial-commit refusal is the live specimen.
-    const mergeRefusal = "fatal: cannot do a partial commit during a merge";
+  test("post-commit failure reports a committed-local result and never pushes", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: [
         {
-          when: (a) => argvStartsWith(a, "commit", "-F", "-"),
+          when: (args) =>
+            argvStartsWith(
+              args,
+              "hook",
+              "run",
+              "--ignore-missing",
+              "post-commit",
+            ),
+          result: { exitCode: 1, stderr: "post hook failed" },
+        },
+        ...successRules({ stagedNames: ["a.txt"] }),
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: committed local", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "post_commit_hook_failed",
+      success: false,
+      committed: true,
+      pushed: false,
+      commit_sha: FAKE_COMMIT,
+      stderr: "post hook failed",
+    });
+    expect(calls.filter((call) => call.args[0] === "update-ref")).toHaveLength(
+      1,
+    );
+    expect(calls.some((call) => call.args[0] === "push")).toBe(false);
+  });
+
+  test("git commit-tree non-zero maps to a commit-failure envelope preserving git's stderr", async () => {
+    const mergeRefusal = "fatal: commit creation declined";
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: [
+        {
+          when: (a) => argvStartsWith(a, "commit-tree"),
           result: { exitCode: 1, stderr: mergeRefusal },
         },
         ...successRules({ stagedNames: ["a.txt"] }),
@@ -938,7 +1193,8 @@ describe("commit-work: pathspec-limited commit", () => {
     expect(code).toBe(1);
     const parsed = JSON.parse(stdout);
     expect(parsed.success).toBe(false);
-    expect(parsed.error).toBe(`git commit failed: ${mergeRefusal}`);
+    expect(parsed.outcome).toBe("commit_failed");
+    expect(parsed.stderr).toBe(mergeRefusal);
     // Commit failed → push never runs.
     expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(false);
   });
@@ -960,7 +1216,7 @@ describe("commit-work: flock released on every in-lock failure path", () => {
     {
       name: "nothing_to_commit",
       argv: ["feat: no-op", "--session-id", "s1"],
-      files: ["a.txt"],
+      files: [],
       rules: successRules({ stagedNames: [] }),
     },
     {
@@ -969,7 +1225,7 @@ describe("commit-work: flock released on every in-lock failure path", () => {
       files: ["a.txt"],
       rules: [
         {
-          when: (a: string[]) => argvStartsWith(a, "commit", "-F", "-"),
+          when: (a: string[]) => argvStartsWith(a, "commit-tree"),
           result: { exitCode: 1, stderr: "fatal: nope" },
         },
         ...successRules({ stagedNames: ["a.txt"] }),
@@ -982,7 +1238,7 @@ describe("commit-work: flock released on every in-lock failure path", () => {
       const lock = recordingLock();
       d.acquireLock = lock.acquire;
       const { code } = await runForTest(s.argv, d);
-      expect(code).toBe(1);
+      expect(code).toBe(s.name === "nothing_to_commit" ? 0 : 1);
       expect(lock.count()).toBeGreaterThanOrEqual(1);
     });
   }
@@ -1308,6 +1564,26 @@ describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
     );
   });
 
+  test("a jam appearing while waiting for the lock is rechecked before build", async () => {
+    let probes = 0;
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+      checkSharedCheckoutJam: () => {
+        probes += 1;
+        return probes === 2;
+      },
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: raced jam", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(probes).toBe(2);
+    expect(JSON.parse(stdout).outcome).toBe("shared_checkout_jam");
+    expect(calls.some((call) => call.args[0] === "hash-object")).toBe(false);
+  });
+
   test("--override-jam proceeds past a live jam row and commits", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
@@ -1319,9 +1595,7 @@ describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("a throwing jam probe fails open — the commit proceeds", async () => {
@@ -1337,9 +1611,7 @@ describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 });
 
@@ -1537,9 +1809,7 @@ describe("commit-work: mass_reversion tripwire", () => {
     });
     const { code } = await runForTest(["feat: minor", "--session-id", "s1"], d);
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("fraction denominator: 5 reversions in a 20-path set (< 30%) does NOT trip", async () => {
@@ -1565,9 +1835,7 @@ describe("commit-work: mass_reversion tripwire", () => {
     );
     // 5 >= 5 but 5 < 0.30 * 20 (= 6) → no trip.
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("a gitlink (mode 160000) is excluded from the numerator", async () => {
@@ -1597,9 +1865,7 @@ describe("commit-work: mass_reversion tripwire", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("an excluded-glob surface (corpus) is skipped from the numerator", async () => {
@@ -1621,9 +1887,7 @@ describe("commit-work: mass_reversion tripwire", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("short history (all ancestors missing) degrades to no signal", async () => {
@@ -1648,9 +1912,7 @@ describe("commit-work: mass_reversion tripwire", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("a missing HEAD blob (re-added deleted file) still counts as a reversion", async () => {
@@ -1701,9 +1963,7 @@ describe("commit-work: mass_reversion tripwire", () => {
       d,
     );
     expect(code).toBe(0);
-    expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
-      true,
-    );
+    expect(calls.some((c) => argvStartsWith(c.args, "commit-tree"))).toBe(true);
   });
 
   test("an unmerged (stage>0) index entry refuses with unmerged_paths", async () => {
