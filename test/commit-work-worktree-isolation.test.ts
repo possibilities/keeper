@@ -262,6 +262,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
           commitMarker: () => "worktree-test",
           inspectPath: () => ({ kind: "file", executable: false }),
           fingerprintIndex: () => "stable-private-index",
+          targetIndexPath: () => "/repo/.git/index",
         },
       },
     );

@@ -9,6 +9,7 @@ import {
   openSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -102,8 +103,10 @@ export interface PrivateIndexFs {
   inspectPath?: (absolutePath: string) => PrivatePathInfo;
   /** Raw symlink-target seam; targets are blob bytes, never followed paths. */
   readLink?: (absolutePath: string) => Uint8Array;
-  /** Complete private-index fingerprint seam for plumbing-only unit fixtures. */
+  /** Complete index fingerprint seam for plumbing-only unit fixtures. */
   fingerprintIndex?: (indexPath: string) => string;
+  /** Canonical target-worktree index path seam for plumbing-only fixtures. */
+  targetIndexPath?: (worktree: string) => string;
 }
 
 export interface PrivateCommitGuards {
@@ -1078,10 +1081,7 @@ function stableIndexMetadata(stat: BigIntStats): string {
     .join(":");
 }
 
-function fingerprintPrivateIndex(
-  indexPath: string,
-  fs: PrivateIndexFs,
-): string {
+function fingerprintIndexFile(indexPath: string, fs: PrivateIndexFs): string {
   if (fs.fingerprintIndex) return fs.fingerprintIndex(indexPath);
 
   const fd = openSync(indexPath, "r");
@@ -1102,6 +1102,29 @@ function fingerprintPrivateIndex(
     return `${afterMetadata}\0${bytes.toString("base64")}`;
   } finally {
     closeSync(fd);
+  }
+}
+
+async function targetWorktreeIndexPath(
+  worktree: string,
+  git: GitRunner,
+  fs: PrivateIndexFs,
+): Promise<string> {
+  if (fs.targetIndexPath) return fs.targetIndexPath(worktree);
+  const found = await git(["rev-parse", "--git-path", "index"], {
+    cwd: worktree,
+    env: { GIT_NO_REPLACE_OBJECTS: "1" },
+  });
+  if (found.code !== 0 || found.stdout.trim() === "") {
+    throw new PrivateIndexError("commit_failed", found.stderr);
+  }
+  try {
+    return realpathSync(resolve(worktree, found.stdout.trim()));
+  } catch (error) {
+    throw new PrivateIndexError(
+      "commit_failed",
+      error instanceof Error ? error.message : String(error),
+    );
   }
 }
 
@@ -1133,10 +1156,12 @@ async function runCommitHook(
   worktree: string,
   git: GitRunner,
   fs: PrivateIndexFs,
+  targetIndexPath: string,
+  targetIndexBaseline: string,
 ): Promise<void> {
   let indexBefore: string;
   try {
-    indexBefore = fingerprintPrivateIndex(frozen.indexPath, fs);
+    indexBefore = fingerprintIndexFile(frozen.indexPath, fs);
   } catch (error) {
     throw new PrivateIndexError(
       "commit_failed",
@@ -1163,7 +1188,7 @@ async function runCommitHook(
   // assume-unchanged, split-index state, or arbitrary index extensions.
   let indexAfter: string;
   try {
-    indexAfter = fingerprintPrivateIndex(frozen.indexPath, fs);
+    indexAfter = fingerprintIndexFile(frozen.indexPath, fs);
   } catch (error) {
     throw new PrivateIndexError(
       "commit_hook_mutated",
@@ -1174,6 +1199,16 @@ async function runCommitHook(
     throw new PrivateIndexError(
       "commit_hook_mutated",
       "commit hook changed the private index file",
+    );
+  }
+  try {
+    if (fingerprintIndexFile(targetIndexPath, fs) !== targetIndexBaseline) {
+      throw new Error("commit hook changed the target worktree index file");
+    }
+  } catch (error) {
+    throw new PrivateIndexError(
+      "commit_hook_mutated",
+      error instanceof Error ? error.message : String(error),
     );
   }
 
@@ -1240,6 +1275,16 @@ export async function commitFrozenPrivateIndex(
   try {
     const hookEnv = targetGitEnvironment(frozen);
     const baseline = await worktreeSnapshot(frozen, worktree, git, fs);
+    const targetIndexPath = await targetWorktreeIndexPath(worktree, git, fs);
+    let targetIndexBaseline: string;
+    try {
+      targetIndexBaseline = fingerprintIndexFile(targetIndexPath, fs);
+    } catch (error) {
+      throw new PrivateIndexError(
+        "commit_failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
 
     await runCommitHook(
       "pre-commit",
@@ -1250,6 +1295,8 @@ export async function commitFrozenPrivateIndex(
       worktree,
       git,
       fs,
+      targetIndexPath,
+      targetIndexBaseline,
     );
 
     await runCommitHook(
@@ -1261,6 +1308,8 @@ export async function commitFrozenPrivateIndex(
       worktree,
       git,
       fs,
+      targetIndexPath,
+      targetIndexBaseline,
     );
     let finalMessage = readFileSync(messagePath, "utf8");
     assertMessageIntegrity(finalMessage, marker, guards.jobId, expectedTasks);
@@ -1274,6 +1323,8 @@ export async function commitFrozenPrivateIndex(
       worktree,
       git,
       fs,
+      targetIndexPath,
+      targetIndexBaseline,
     );
     finalMessage = readFileSync(messagePath, "utf8");
     assertMessageIntegrity(finalMessage, marker, guards.jobId, expectedTasks);
@@ -1352,6 +1403,44 @@ export async function commitFrozenPrivateIndex(
         {
           commitSha: sha,
         },
+      );
+    }
+
+    // A configured signer is executable and may mutate every caller-owned
+    // surface. Re-run the operation, ownership, branch, selected-surface, and
+    // raw target-index checks after commit-tree and immediately before CAS.
+    const postCommitOperation = await guards.beforeCommit?.();
+    if (postCommitOperation) {
+      throw new PrivateIndexError("operation_in_progress", "", {
+        operation: postCommitOperation,
+        commitSha: sha,
+      });
+    }
+    await guards.validateOwnership?.();
+    const postCommitTarget = await git(["symbolic-ref", "-q", "HEAD"], {
+      cwd: worktree,
+      env: hookEnv,
+    });
+    if (
+      postCommitTarget.code !== 0 ||
+      postCommitTarget.stdout.trim() !== frozen.branchRef
+    ) {
+      throw new PrivateIndexError(
+        "commit_hook_mutated",
+        "target worktree changed the captured branch context",
+        { commitSha: sha },
+      );
+    }
+    await verifyFrozenSurface(frozen, worktree, git, fs);
+    try {
+      if (fingerprintIndexFile(targetIndexPath, fs) !== targetIndexBaseline) {
+        throw new Error("target worktree index changed before publication");
+      }
+    } catch (error) {
+      throw new PrivateIndexError(
+        "commit_hook_mutated",
+        error instanceof Error ? error.message : String(error),
+        { commitSha: sha },
       );
     }
 

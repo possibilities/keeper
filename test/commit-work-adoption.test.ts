@@ -331,6 +331,7 @@ function refFixture(options: RefFixtureOptions = {}) {
     commitMarker: () => "audit-marker",
     inspectPath: () => ({ kind: "file" as const, executable: false }),
     fingerprintIndex: () => "stable-private-index",
+    targetIndexPath: () => "/repo/.git/index",
   };
   return {
     run,
@@ -870,11 +871,11 @@ describe("commit-work wait and frozen claim binding", () => {
     expect(pushed).toEqual([
       ["/repo", COMMIT, "refs/heads/main", expect.any(Function)],
     ]);
-    // Capture, three hook boundaries, final target validation, and guarded
-    // ambient reconciliation; none chooses the push source or destination.
+    // Capture, three hook boundaries, pre/post-commit target validation, and
+    // guarded ambient reconciliation; none chooses push source or destination.
     expect(
       fixture.calls.filter((call) => call.args[0] === "symbolic-ref"),
-    ).toHaveLength(6);
+    ).toHaveLength(7);
   });
 
   test("ambient reconciliation uses one exact index-info update and never reset", async () => {

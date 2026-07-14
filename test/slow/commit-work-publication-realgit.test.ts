@@ -680,6 +680,44 @@ describe("commit-work real-git atomic plumbing publication", () => {
     });
   }
 
+  for (const [mutation, flag] of [
+    ["--assume-unchanged", "h"],
+    ["--skip-worktree", "S"],
+  ] as const) {
+    test(`an ambient ${mutation} hook mutation is reported and preserved`, async () => {
+      const { repo, expected } = await repoWithBase();
+      writeFileSync(join(repo, "selected.txt"), "ambient flag candidate\n");
+      installHook(
+        repo,
+        "pre-commit",
+        `unset GIT_INDEX_FILE GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE\ngit update-index ${mutation} -- selected.txt`,
+      );
+      const privateIndex = await frozen(repo, ["selected.txt"]);
+      try {
+        await expect(
+          commitFrozenPrivateIndex(
+            privateIndex,
+            `test: ambient ${mutation}`,
+            repo,
+            gitExec,
+          ),
+        ).rejects.toMatchObject({
+          code: "commit_hook_mutated",
+          stderr: "commit hook changed the target worktree index file",
+          committed: false,
+        });
+        expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
+          expected,
+        );
+        expect(await git(repo, ["ls-files", "-v", "--", "selected.txt"])).toBe(
+          `${flag} selected.txt`,
+        );
+      } finally {
+        cleanupPrivateIndex(privateIndex);
+      }
+    });
+  }
+
   test("a hook mutating the real ambient index also aborts before publication", async () => {
     const { repo, expected } = await repoWithBase();
     writeFileSync(join(repo, "selected.txt"), "ambient index candidate\n");
@@ -766,6 +804,59 @@ describe("commit-work real-git atomic plumbing publication", () => {
         "-p",
         expected,
       ]);
+    } finally {
+      cleanupPrivateIndex(privateIndex);
+    }
+  });
+
+  test("signer mutation is revalidated after commit-tree and before CAS", async () => {
+    const { repo, expected } = await repoWithBase();
+    writeFileSync(join(repo, "selected.txt"), "signer mutation candidate\n");
+    let unreachable = "";
+    const run: GitRunner = async (args, options) => {
+      if (
+        args[0] === "config" &&
+        args.includes("--get") &&
+        args.includes("commit.gpgSign")
+      ) {
+        return { code: 0, stdout: "true\n", stderr: "" };
+      }
+      if (args[0] === "commit-tree") {
+        const result = await gitExec(
+          args.filter((arg) => arg !== "-S"),
+          options,
+        );
+        unreachable = result.stdout.trim();
+        await gitExec(
+          ["update-index", "--assume-unchanged", "--", "selected.txt"],
+          {
+            cwd: repo,
+          },
+        );
+        return result;
+      }
+      return gitExec(args, options);
+    };
+    const privateIndex = await frozen(repo, ["selected.txt"], run);
+    try {
+      await expect(
+        commitFrozenPrivateIndex(
+          privateIndex,
+          "test: signer mutation",
+          repo,
+          run,
+        ),
+      ).rejects.toMatchObject({
+        code: "commit_hook_mutated",
+        commitSha: expect.any(String),
+        committed: false,
+      });
+      expect(unreachable).toMatch(/^[0-9a-f]{40,64}$/);
+      expect(await git(repo, ["cat-file", "-t", unreachable])).toBe("commit");
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
+      expect(await git(repo, ["ls-files", "-v", "--", "selected.txt"])).toBe(
+        "h selected.txt",
+      );
     } finally {
       cleanupPrivateIndex(privateIndex);
     }

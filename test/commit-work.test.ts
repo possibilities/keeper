@@ -342,6 +342,7 @@ function deps(opts: {
         executable: false,
       }),
       fingerprintIndex: () => "stable-private-index",
+      targetIndexPath: () => "/repo/.git/index",
     },
     detectInProgress: opts.detectInProgress ?? (async () => null),
     checkSharedCheckoutJam: opts.checkSharedCheckoutJam ?? (() => false),
