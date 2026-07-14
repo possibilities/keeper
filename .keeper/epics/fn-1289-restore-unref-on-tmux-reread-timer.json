@@ -7,7 +7,7 @@
     "fn-1281-radical-deterministic-test-gate"
   ],
   "id": "fn-1289-restore-unref-on-tmux-reread-timer",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-14T00:56:38.459000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T00:56:38.272000Z"
+  "updated_at": "2026-07-14T00:56:38.459000Z"
 }
