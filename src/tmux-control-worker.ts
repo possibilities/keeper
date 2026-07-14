@@ -36,8 +36,7 @@
  *
  * The PURE pieces below (`buildAttachArgs`, `pickAnchorSession`, `focusDedupKey`,
  * `decideReconnect`, `isStructuralNotification`) carry no I/O so the fast tier
- * drives them against golden inputs; the live `tmux -C` attach is exercised only
- * in `tmux-control-worker.slow.test.ts` (allowlisted).
+ * drives them against golden inputs; the live `tmux -C` attach is a manual diagnostic.
  */
 
 import type { Database } from "bun:sqlite";

@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check --no-errors-on-unmatched src test",
-    "test:gate": "bun ../../scripts/test-gate.ts --timeout 30000 ./test",
+    "test:gate": "bun ../../scripts/test-gate.ts --phase=prompt --timeout 30000",
     "test": "bun run test:gate",
     "capture-oracle": "bun test/oracle/capture.ts"
   },

@@ -14,8 +14,6 @@ import {
 
 export function buildDefaultPlan(): SuiteSpec[] {
   const envPatch = {
-    KEEPER_RUN_SLOW: undefined,
-    KEEPER_PLAN_RUN_SLOW: undefined,
     KEEPER_TEST_ENFORCE_BUDGET: undefined,
     KEEPER_TEST_TIMING_DIR: undefined,
   };

@@ -21,17 +21,15 @@ const FILES = [
   "test/dash-shell.test.ts",
   "plugins/plan/test/a.test.ts",
   "plugins/prompt/test/a.test.ts",
-  "test/operator.slow.test.ts",
 ];
 
 describe("test manifest classification", () => {
-  test("maps every discovered file to one required phase or diagnostic class", () => {
+  test("maps every discovered file to one required phase", () => {
     const audit = auditTestManifest(FILES, TEST_MANIFEST, () => true);
     expect(audit.files.root).toEqual(["test/a.test.ts"]);
     expect(audit.files.opentui).toHaveLength(4);
     expect(audit.files.plan).toEqual(["plugins/plan/test/a.test.ts"]);
     expect(audit.files.prompt).toEqual(["plugins/prompt/test/a.test.ts"]);
-    expect(audit.files.diagnostic).toEqual(["test/operator.slow.test.ts"]);
   });
 
   test("fails closed on zero discovery, omission, missing required file, and zero phase", () => {

@@ -30,8 +30,6 @@ export type ProcessResult = {
 export type Verdict = { ok: boolean; reason: string };
 
 const SCRUBBED_CHILD_ENV: Record<string, undefined> = {
-  KEEPER_RUN_SLOW: undefined,
-  KEEPER_PLAN_RUN_SLOW: undefined,
   KEEPER_TEST_ENFORCE_BUDGET: undefined,
   KEEPER_TEST_TIMING_DIR: undefined,
 };

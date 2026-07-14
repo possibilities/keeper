@@ -38,11 +38,9 @@ describe("default and full package plans", () => {
     ]);
   });
 
-  test("all children scrub obsolete slow tiers and nested budget/artifact ownership", () => {
+  test("all children isolate nested budget and artifact ownership", () => {
     for (const stage of buildSuitePlan()) {
       expect(stage.envPatch).toEqual({
-        KEEPER_RUN_SLOW: undefined,
-        KEEPER_PLAN_RUN_SLOW: undefined,
         KEEPER_TEST_ENFORCE_BUDGET: undefined,
         KEEPER_TEST_TIMING_DIR: undefined,
       });
@@ -130,8 +128,8 @@ describe("process verdicts and env", () => {
   test("env patches delete ambient ownership switches", () => {
     expect(
       buildChildEnv(
-        { KEEP: "yes", KEEPER_RUN_SLOW: "1" },
-        { KEEPER_RUN_SLOW: undefined },
+        { KEEP: "yes", KEEPER_TEST_TIMING_DIR: "/tmp/timing" },
+        { KEEPER_TEST_TIMING_DIR: undefined },
       ),
     ).toEqual({ KEEP: "yes" });
   });

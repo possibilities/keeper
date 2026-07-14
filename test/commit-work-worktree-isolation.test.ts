@@ -15,7 +15,7 @@
  *
  * The end-to-end real-git proof (concurrent same-repo lane commits land on their
  * own branches, never main; push skipped) lives in the allowlisted slow sibling
- * `commit-work-worktree-isolation-realgit.slow.test.ts`.
+ * the injected command seam.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";

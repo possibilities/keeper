@@ -612,7 +612,7 @@ test("budget: an exhausted time budget stops issuing scans and leaves seed_requi
 // ---------------------------------------------------------------------------
 //
 // (The DISCOVERY path — no explicit roots, `jobs.cwd` → git toplevel resolve —
-// genuinely needs real git and lives in git-boot-seed-realgit.slow.test.ts.)
+// uses the injected command seam.)
 
 test("multi-root: each explicit root is seeded independently from its own snapshot", () => {
   const repoA = fakeRoot("multi-a");

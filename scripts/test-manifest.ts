@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 export type FastPhase = "root" | "plan" | "prompt";
-export type TestClass = FastPhase | "opentui" | "diagnostic";
+export type TestClass = FastPhase | "opentui";
 
 export type PackageSpec = {
   phase: FastPhase;
@@ -17,7 +17,6 @@ export type PackageSpec = {
 export type TestManifest = {
   packages: readonly PackageSpec[];
   openTuiFiles: readonly string[];
-  diagnosticFilePatterns: readonly RegExp[];
 };
 
 export const OPEN_TUI_FILES = [
@@ -54,9 +53,6 @@ export const TEST_PACKAGES: readonly PackageSpec[] = [
 export const TEST_MANIFEST: TestManifest = {
   packages: TEST_PACKAGES,
   openTuiFiles: OPEN_TUI_FILES,
-  // Matching files are opt-in operator diagnostics, not correctness phases;
-  // named gates never enable their environment switches.
-  diagnosticFilePatterns: [/\.slow\.test\.tsx?$/],
 };
 
 export type ManifestAudit = {
@@ -76,7 +72,7 @@ function posix(path: string): string {
 }
 
 export function isTestFile(path: string): boolean {
-  return /(?:\.slow)?\.(?:test|spec)\.tsx?$/.test(path);
+  return /\.(?:test|spec)\.tsx?$/.test(path);
 }
 
 export function discoverTests(
@@ -117,11 +113,6 @@ export function classifyTestFile(
   const normalized = posix(path);
   const classes: TestClass[] = [];
   if (manifest.openTuiFiles.includes(normalized)) classes.push("opentui");
-  if (
-    manifest.diagnosticFilePatterns.some((pattern) => pattern.test(normalized))
-  ) {
-    classes.push("diagnostic");
-  }
   for (const pkg of manifest.packages) {
     const prefix = `${posix(pkg.testDir).replace(/\/$/, "")}/`;
     if (normalized.startsWith(prefix)) classes.push(pkg.phase);
@@ -142,7 +133,6 @@ export function auditTestManifest(
     plan: [],
     prompt: [],
     opentui: [],
-    diagnostic: [],
   };
   const openTui = new Set(manifest.openTuiFiles);
   for (const expected of openTui) {
@@ -152,11 +142,8 @@ export function auditTestManifest(
   }
   for (const path of [...discovered].sort()) {
     let classes = classifyTestFile(path, manifest);
-    // OpenTUI and diagnostics replace their package's ordinary fast membership.
     if (classes.includes("opentui"))
       classes = classes.filter((c) => c === "opentui");
-    else if (classes.includes("diagnostic"))
-      classes = classes.filter((c) => c === "diagnostic");
     if (classes.length === 0)
       throw new ManifestError(`unclassified test file: ${path}`);
     if (classes.length !== 1) {

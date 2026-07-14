@@ -179,10 +179,7 @@ async function main(): Promise<number> {
     name: phase,
     cmd: ["bun", ...args],
     cwd: target.cwd,
-    envPatch: buildBunTestEnv({
-      KEEPER_RUN_SLOW: undefined,
-      KEEPER_PLAN_RUN_SLOW: undefined,
-    }),
+    envPatch: buildBunTestEnv({}),
     timeoutMs: TEST_BUDGETS.gate.hangDeadlineMs,
   };
   const stageStartedMs = performance.now();

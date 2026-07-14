@@ -734,7 +734,7 @@ describe("resolveTmuxBin", () => {
 
 // The `defaultTmuxCommandRunner` real-process timeout-classification scenario
 // (`sleep 30` against the 5s spawn floor) is too heavy for the fast tier and has
-// no automated slow-tier sibling; it is left to manual verification.
+// manual verification remains available.
 
 describe("parseKeeperAgentTmuxArgs --x-tmux-env", () => {
   test("split and joined forms both parse; repeatable; last-wins per KEY", () => {

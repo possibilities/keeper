@@ -23,7 +23,6 @@ import {
   gitLogCount,
   parseCliOutput,
   runCli,
-  SLOW_ENABLED,
   seedState,
   setRoots,
   taskSpec,
@@ -322,21 +321,6 @@ describe("git assertion helpers + withProject", () => {
     expect(res.code).toBe(0);
     const payload = parseCliOutput(res.output) as { success: boolean };
     expect(payload.success).toBe(true);
-  });
-});
-
-// ===========================================================================
-// Slow-bucket gate visibility — asserted via the run summary skip counts.
-// ===========================================================================
-
-describe("slow-bucket gate", () => {
-  // SLOW_ENABLED gates the real-git src-commit.test.ts bucket, run by the wired
-  // `bun run test:slow` (KEEPER_PLAN_RUN_SLOW=1). This pins the constant to its
-  // env source so the gate stays honest.
-  test("SLOW_ENABLED reflects the KEEPER_PLAN_RUN_SLOW env exactly", () => {
-    const v = process.env.KEEPER_PLAN_RUN_SLOW;
-    const expected = v !== undefined && v !== "" && v !== "0";
-    expect(SLOW_ENABLED).toBe(expected);
   });
 });
 

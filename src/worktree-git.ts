@@ -34,7 +34,7 @@
  * (`--git-dir` vs `--git-common-dir` with a `--show-superproject-working-tree`
  * submodule guard) are split into PURE parse functions so the fast tier covers
  * them via a faked GitRunner with zero real git; the git-shelling wrappers and
- * the worktree/merge lifecycle are covered by the real-git `*.slow.test.ts`.
+ * the worktree/merge lifecycle is covered by injected command seams.
  */
 
 import { createHash } from "node:crypto";

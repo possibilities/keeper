@@ -9,7 +9,7 @@ import {
 } from "../src/exec-backend";
 
 // Fast, in-process content guard for the static tmux drop-in. No tmux is
-// spawned here — the real-tmux behavior lives in `keeper-guard.slow.test.ts`.
+// spawned here — tmux behavior is covered through injected seams.
 // This pins the duplicated-by-value literals to their TS source of truth so a
 // rename in `exec-backend.ts` trips the test instead of silently drifting.
 

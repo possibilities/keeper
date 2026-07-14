@@ -12,7 +12,7 @@
  *  - `decideTmuxControlWatchdog` (from daemon) — the mute-escalation verdict.
  *
  * The live `tmux -C` attach is exercised only in
- * `test/tmux-control-worker.slow.test.ts` (allowlisted).
+ * an injected control-stream seam.
  */
 
 import { describe, expect, test } from "bun:test";

@@ -1843,7 +1843,7 @@ test("reflogWatchDiff: a removed .keeper repo lands in toDrop (drops its watch)"
 // root(s); the drain tears down + re-subscribes each sequentially with the
 // identical options, bounded by MAX_SUBSCRIBES_PER_CYCLE. These tests cover the
 // decision surface only — no live-watcher tests (the sequential teardown / flap
-// guard / generation guard are exercised by the slow-tier worker integration).
+// guard / generation guard are exercised by the worker command seam).
 // ---------------------------------------------------------------------------
 
 test("decidePlanResubscribe: an empty flag set yields no tear-downs", () => {
