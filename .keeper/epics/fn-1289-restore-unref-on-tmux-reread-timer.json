@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-14T00:56:38.272000Z",
+  "created_by_close_of": "fn-1281-radical-deterministic-test-gate",
+  "depends_on_epics": [
+    "fn-1281-radical-deterministic-test-gate"
+  ],
+  "id": "fn-1289-restore-unref-on-tmux-reread-timer",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Restore unref on tmux reread timer",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-14T00:56:38.272000Z"
+}

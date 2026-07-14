@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-14T00:56:38.272000Z",
+  "depends_on": [],
+  "epic": "fn-1289-restore-unref-on-tmux-reread-timer",
+  "id": "fn-1289-restore-unref-on-tmux-reread-timer.1",
+  "model": "gpt-5.3-codex-spark",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "low",
+  "title": "Restore reread-timer unref",
+  "updated_at": "2026-07-14T00:56:38.272000Z"
+}
