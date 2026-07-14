@@ -31,5 +31,5 @@ Files:
 - [ ] No non-comment lines changed; `bun test` stays green
 
 ## Done summary
-
+Rewrote the DONE_EPICS_REAP_WINDOW_SEC doc-comment to stop citing the deleted MONITOR_RELEASE_SEC symbol and to drop a false 1800s-vs-MONITOR_SLOT_WEDGE_PAGE_SEC inequality, and corrected the provenDeadJobIds comment to reflect that the backstop occupant loop can populate it under a degraded pane probe even though computeSlotOccupancy never consumes it then. Comment-only; no non-comment lines changed.
 ## Evidence
