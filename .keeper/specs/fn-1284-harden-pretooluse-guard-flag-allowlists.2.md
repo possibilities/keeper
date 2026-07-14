@@ -32,5 +32,5 @@ Deny (as a subagent): `git --git-dir /tmp/x checkout -b evil`, `git --git-dir "/
 - [ ] `bun test test/branch-guard.test.ts` is green.
 
 ## Done summary
-
+Extended branch-guard's stripGlobalFlags to close the space-form valued git global escape (--git-dir/--work-tree/--namespace/--super-prefix/--config-env/--attr-source), quote-aware for spaced values; added deny/allow regression coverage in test/branch-guard.test.ts.
 ## Evidence
