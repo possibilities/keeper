@@ -63,5 +63,5 @@ Delete only after tasks 4–7 land their narrow survivors. Promotion keeps lint/
 - [ ] No deleted slow/journey assertion remains unique without an explicit focused survivor or recorded retirement.
 
 ## Done summary
-
+Removed root and plugin/plan slow-tier correctness tests (KEEPER_RUN_SLOW/KEEPER_PLAN_RUN_SLOW, .slow.test.ts files, test:slow scripts, promote.sh real-git gate); restored equivalent deterministic in-process coverage for host-matrix-v2-driven worker-cell rendering and the wrapped-cell body contract in a new plugins/prompt/test/render_plugin_templates.test.ts. Full gate coverage stays root + OpenTUI + plan + prompt.
 ## Evidence
