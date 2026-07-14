@@ -22,6 +22,7 @@ import keeperEvents, {
   type PiEventBindings,
   type PiExtensionApi,
   type PiObservedEvent,
+  type PiSessionContext,
   type PiTranslateMeta,
   piDispatchAttemptFromEnv,
   piEventBindings,
@@ -475,12 +476,17 @@ describe("pi extension — factory arming + fail-open", () => {
   let logDir: string;
 
   function fakePi() {
-    const handlers = new Map<string, ((e: PiObservedEvent) => void)[]>();
+    const handlers = new Map<
+      string,
+      ((e: PiObservedEvent, context?: PiSessionContext) => void)[]
+    >();
     const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
     const tools = new Map<string, unknown>();
+    const commands: Array<{ name: string; source: string }> = [];
     return {
       handlers,
       tools,
+      commands,
       events: {
         on(event: string, handler: (data: unknown) => void) {
           const set = eventHandlers.get(event) ?? new Set();
@@ -494,15 +500,21 @@ describe("pi extension — factory arming + fail-open", () => {
           }
         },
       },
-      on(kind: string, h: (e: PiObservedEvent) => void) {
+      on(
+        kind: string,
+        h: (e: PiObservedEvent, context?: PiSessionContext) => void,
+      ) {
         const list = handlers.get(kind) ?? [];
         list.push(h);
         handlers.set(kind, list);
       },
-      fire(kind: string, e: PiObservedEvent) {
+      fire(kind: string, e: PiObservedEvent, context?: PiSessionContext) {
         for (const h of handlers.get(kind) ?? []) {
-          h(e);
+          h(e, context);
         }
+      },
+      getCommands() {
+        return commands;
       },
       registerTool(tool: unknown) {
         const name = (tool as { name?: unknown }).name;
@@ -561,6 +573,70 @@ describe("pi extension — factory arming + fail-open", () => {
       "turn_end",
     ]);
     expect([...pi.tools.keys()]).toEqual(["keeper_transcript", "Task"]);
+  });
+
+  test("session start hides skill commands shadowed by extension aliases", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    const pi = fakePi();
+    pi.commands.push(
+      { name: "hack", source: "extension" },
+      { name: "skill:hack", source: "skill" },
+    );
+    let installed = false;
+    keeperEvents(pi);
+    pi.fire(
+      "session_start",
+      { type: "session_start" },
+      {
+        cwd: "/work/repo",
+        ui: {
+          addAutocompleteProvider() {
+            installed = true;
+          },
+        },
+      },
+    );
+    expect(installed).toBe(true);
+  });
+
+  test("autocomplete failures never escape session start", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    const commandFailure = fakePi();
+    commandFailure.getCommands = () => {
+      throw new Error("command discovery failed");
+    };
+    keeperEvents(commandFailure);
+    expect(() =>
+      commandFailure.fire(
+        "session_start",
+        { type: "session_start" },
+        {
+          cwd: "/work/repo",
+          ui: { addAutocompleteProvider() {} },
+        },
+      ),
+    ).not.toThrow();
+
+    const uiFailure = fakePi();
+    uiFailure.commands.push(
+      { name: "hack", source: "extension" },
+      { name: "skill:hack", source: "skill" },
+    );
+    keeperEvents(uiFailure);
+    expect(() =>
+      uiFailure.fire(
+        "session_start",
+        { type: "session_start" },
+        {
+          cwd: "/work/repo",
+          ui: {
+            addAutocompleteProvider() {
+              throw new Error("autocomplete UI failed");
+            },
+          },
+        },
+      ),
+    ).not.toThrow();
   });
 
   test("a fired event appends the translated line to the per-pid file", () => {

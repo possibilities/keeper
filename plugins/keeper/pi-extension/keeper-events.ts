@@ -58,14 +58,22 @@ import {
   PiBusInboxController,
   releaseBusInboxOwnership,
 } from "./bus-inbox.ts";
+import {
+  installPiEditorBorder,
+  type PiEditorBorderContext,
+} from "./editor-border.ts";
 import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
-import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
-import { installPiEditorBorder } from "./editor-border.ts";
+import {
+  installShadowedSkillAutocomplete,
+  type PiSkillAutocompleteApi,
+  type PiSkillAutocompleteContext,
+} from "./skill-autocomplete.ts";
 import {
   installPiStatusFooter,
   type PiFooterApi,
   type PiFooterContext,
 } from "./status-footer.ts";
+import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
 
 // ---------------------------------------------------------------------------
 // pi event shapes (minimal structural subset)
@@ -92,12 +100,16 @@ export interface PiObservedEvent {
 
 /** The minimal surface of pi's `ExtensionAPI` this extension calls. Structural so
  *  the file needs no import from the pi package; pi passes an object with `.on`. */
-export interface PiExtensionApi {
+export type PiSessionContext = PiFooterContext &
+  PiEditorBorderContext &
+  PiSkillAutocompleteContext;
+
+export interface PiExtensionApi extends PiSkillAutocompleteApi {
   on(
     event: string,
     handler: (
       event: PiObservedEvent,
-      context?: PiFooterContext,
+      context?: PiSessionContext,
     ) => void | Promise<void>,
   ): void;
   events?: PiTaskEventBus;
@@ -874,6 +886,13 @@ export default function keeperEvents(pi: PiExtensionApi): void {
         }
       } catch {
         // A cosmetic footer/editor failure must never break Pi startup.
+      }
+      try {
+        if (context !== undefined) {
+          installShadowedSkillAutocomplete(pi, context);
+        }
+      } catch {
+        // Autocomplete is advisory and must never break Pi startup.
       }
     });
     for (const kind of ["turn_end", "model_select", "thinking_level_select"]) {
