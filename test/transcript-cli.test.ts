@@ -759,6 +759,13 @@ describe("keeper transcript harness-first grammar", () => {
     expect(result.stdout).toContain("keeper transcript <harness>");
   });
 
+  test("codex is unsupported like hermes", () => {
+    const result = runTranscriptCli(["codex", "list"], deps);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("codex");
+    expect(result.stderr).toContain("claude");
+  });
+
   test("an unknown position-0 token exits non-zero the same way", () => {
     const result = runTranscriptCli(["bogus", "list"], deps);
     expect(result.code).not.toBe(0);

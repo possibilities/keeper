@@ -7,14 +7,12 @@
  */
 
 import { claudeTranscriptReader } from "./claude";
-import { codexTranscriptReader } from "./codex";
 import { piTranscriptReader } from "./pi";
 import type { TranscriptReader } from "./reader";
 
 const READERS: Readonly<Record<string, TranscriptReader>> = {
   claude: claudeTranscriptReader,
   pi: piTranscriptReader,
-  codex: codexTranscriptReader,
 };
 
 /** The registered harness tokens, in registration order. */
