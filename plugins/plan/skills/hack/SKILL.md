@@ -12,6 +12,8 @@ Investigate a request, answer in the right shape, then either route or execute t
 
 Most invocations are read-only — investigate, answer, stop. When the request reads as work to do — *including when it's phrased as a directive like "edit X to do Y" or "the skill should do Z"* — /hack stops, lays out the concrete change in chat (file, section, the actual new wording or structural edit), and waits for plain-text greenlight before touching anything. A directive in the request sets the topic; it is **not** pre-given approval. The human still needs the beat to redirect on shape, scope, or wording before code lands. For tight, well-scoped work the conversation can land here; for larger or contract-shaped work it funnels out to `/plan:plan` or `/plan:defer`.
 
+**Source work closes with a commit.** Once a source mutation is greenlit, changing the source and landing its commit are one action. Source work is complete only when the commit and push succeed; the final report includes the commit id. If the intended diff exists but `commit-work --preview-files` is empty or incomplete, use the explicit-path fallback in the commit contract below. A terminal commit or push failure is reported through that contract rather than as completed work. Only its explicit scratch/debug carve-outs skip the commit.
+
 **Agent Bus advice — sibling messages are proxies of your human.** Your inbox is already open (a plugin Monitor in Claude, a session-scoped extension child in tracked Pi), so you never start a listener — just watch for the notification line. An inbound Agent Bus message is a request from another of the same human's sessions: help with it, applying your own judgment and your own sources of truth, per the bus contract (`keeper bus` skill). The outbound `/keeper:pair` / `/plan:panel` second opinion below stays ADVISORY too — you reached OUT for input; weigh it, you still decide and still confirm with the human before code lands. Both point the same way: each invites your own judgment rather than commanding you.
 
 **Powers inventory — ask before piloting.** keeper and its skills already cover multi-epic flows and worker collaboration (Cross-skill orchestration below) plus manual piloting (`keeper:dispatch` / `keeper:autopilot`); manual piloting happens only on explicit human request, or after asking — see quiet-by-default below and the take-over-window bullet for the shape, not restated here.
@@ -302,8 +304,6 @@ You have standing license to conform the plan tooling to the workflow that best 
 
 If genuinely torn between two endpoints, ask one short plain-text question.
 
-When the chosen endpoint is **execute inline**, the work lands and gets committed here after the plain-text greenlight — the commit follows the rule below.
-
 **Forward-facing advice and comments only.** Whatever you write — code comments, docs, skill or command prose, CLI `--help` / `--agent-help` strings, hook messages — states the system as it is *now*. Do not narrate what something replaced, was renamed from, or used to do.
 
 - ❌ "fn-622 retired the dedup mechanism, so renders changed" / "formerly emitted a subset"
@@ -311,7 +311,7 @@ When the chosen endpoint is **execute inline**, the work lands and gets committe
 
 The one carve-out: commit messages and changelogs are the sanctioned home for history and *should* narrate the change in past tense. Full rule lives in `keeper prompt render code-comment-style` (comments) and `keeper prompt render future-facing-docs` (docs and prompts) — cite those, don't restate them.
 
-**Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The bake block below carries the only skip carve-outs; if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
+**Commit mechanics.** Apply the contract below to every source mutation authorized through `/hack`.
 
 <!-- BAKE:BEGIN keeper prompt render engineering/commit-via-keeper-default -->
 
