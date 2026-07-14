@@ -8,7 +8,7 @@
     "fn-1285-reconcile-panel-cancellation-cleanup"
   ],
   "id": "fn-1288-handoff-capture-and-handle-semantics",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-14T00:21:28.374000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T00:21:20.769000Z"
+  "updated_at": "2026-07-14T00:21:28.374000Z"
 }
