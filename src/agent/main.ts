@@ -135,6 +135,7 @@ import { makePhaser } from "./phaser";
 import {
   ensurePiPromptArtifacts,
   PiPromptArtifactsError,
+  stampPiPromptCompilerEnv,
 } from "./pi-prompt-artifacts";
 import { discoverPlugins, PluginError } from "./plugins";
 // Type-only: resolveResumeDecision itself is NEVER imported here — it
@@ -257,7 +258,7 @@ export interface MainDeps {
   /**
    * Compile Pi's static plan prompt artifacts through the keeper CLI subprocess.
    * Runs once in the inner Pi launcher before Pi state discovery, including native
-   * passthrough commands. The subprocess inherits the launch environment intact.
+   * passthrough commands. The subprocess inherits the stamped launch environment.
    */
   ensurePiPromptArtifactsFn: (actionLog: string[]) => void;
   /**
@@ -387,6 +388,14 @@ export function realDeps(): MainDeps {
     pi: "pi",
     hermes: resolveHermesBin(),
   };
+  const launcherArgvPrefix = buildLauncherArgvPrefix(
+    process.execPath,
+    resolveKeeperAgentPathDepFree(),
+  );
+  const piPromptCompilerPaths = {
+    executablePath: launcherArgvPrefix[0] ?? "",
+    keeperCliPath: launcherArgvPrefix[1] ?? "",
+  };
   return {
     argv: process.argv.slice(2),
     env: process.env,
@@ -429,7 +438,10 @@ export function realDeps(): MainDeps {
         process.env,
       ),
     ensurePiPromptArtifactsFn: (actionLog) =>
-      ensurePiPromptArtifacts(actionLog, { env: process.env }),
+      ensurePiPromptArtifacts(actionLog, {
+        ...piPromptCompilerPaths,
+        env: process.env,
+      }),
     loadMatrixFn: loadMatrixV2,
     loadHostTriplesFn: () =>
       extractHostTriples(
@@ -440,10 +452,7 @@ export function realDeps(): MainDeps {
     startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
     tmuxBin: resolveTmuxBin(process.env),
-    launcherArgvPrefix: buildLauncherArgvPrefix(
-      process.execPath,
-      resolveKeeperAgentPathDepFree(),
-    ),
+    launcherArgvPrefix,
     launcherStateDir: defaultKeeperAgentStateDir(process.env),
     transcriptHomeDir: homedir(),
     runTmuxCommandFn: defaultTmuxCommandRunner,
@@ -2427,6 +2436,21 @@ function runResumeSubcommand(
   const resumeSessionId =
     decision.harness === "claude" ? deps.randomUuid() : undefined;
 
+  if (decision.harness === "pi") {
+    try {
+      stampPiPromptCompilerEnv(deps.env, {
+        executablePath: deps.launcherArgvPrefix[0] ?? "",
+        keeperCliPath: deps.launcherArgvPrefix[1] ?? "",
+      });
+    } catch (exc) {
+      if (exc instanceof PiPromptArtifactsError) {
+        deps.writeErr(`Error: ${exc.message}\n`);
+        return deps.exit(1);
+      }
+      throw exc;
+    }
+  }
+
   let launchArgv: string[];
   try {
     launchArgv = buildAgentLaunchArgv({
@@ -2625,6 +2649,24 @@ export async function main(deps: MainDeps): Promise<never> {
   if (hasKeeperAgentHelpFlag(argv)) {
     deps.write(KEEPER_AGENT_HELP);
     return deps.exit(0);
+  }
+
+  // Bind every Pi descendant to this launcher's already-resolved compiler
+  // prefix. Stamp before the tmux split so an outer delegator forwards the same
+  // executable + checkout to the inner launcher, which then preflights once.
+  if (agent === "pi") {
+    try {
+      stampPiPromptCompilerEnv(deps.env, {
+        executablePath: deps.launcherArgvPrefix[0] ?? "",
+        keeperCliPath: deps.launcherArgvPrefix[1] ?? "",
+      });
+    } catch (exc) {
+      if (exc instanceof PiPromptArtifactsError) {
+        deps.writeErr(`Error: ${exc.message}\n`);
+        return deps.exit(1);
+      }
+      throw exc;
+    }
   }
 
   const tmuxLaunch = parseKeeperAgentTmuxArgs(argv);

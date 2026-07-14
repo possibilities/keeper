@@ -5,14 +5,18 @@
  * `--name`, and package/metadata commands pass through cleanly.
  */
 
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
 import { parseArgsForAgent } from "../src/agent/args";
-import { PiPromptArtifactsError } from "../src/agent/pi-prompt-artifacts";
 import type { PresetCatalog } from "../src/agent/config";
 import { main } from "../src/agent/main";
+import {
+  KEEPER_AGENT_PI_PROMPT_CLI_ENV,
+  KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV,
+  PiPromptArtifactsError,
+} from "../src/agent/pi-prompt-artifacts";
 import {
   expectExit,
   flagValues,
@@ -143,6 +147,31 @@ describe("Pi command assembly", () => {
 });
 
 describe("Pi prompt-artifact preflight", () => {
+  test("managed Pi launches overwrite spoofed compiler stamps before preflight", async () => {
+    const launcherArgvPrefix = [
+      "/trusted/bin/bun",
+      "/trusted/keeper/cli/keeper.ts",
+      "agent",
+    ];
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      launcherArgvPrefix,
+      env: {
+        PI_CODING_AGENT_DIR: "/tmp/pi-override",
+        [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: "/spoof/bun",
+        [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: "/spoof/keeper.ts",
+      },
+    });
+
+    await runAndCapture(h, main);
+
+    expect(h.piPromptArtifactEnvSnapshots).toHaveLength(1);
+    expect(h.piPromptArtifactEnvSnapshots[0]).toMatchObject({
+      PI_CODING_AGENT_DIR: "/tmp/pi-override",
+      [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: launcherArgvPrefix[0],
+      [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: launcherArgvPrefix[1],
+    });
+  });
+
   test("managed Pi launches preflight before state discovery and spawn", async () => {
     const h = piHarness(["--x-no-confirm", "hello"]);
 
@@ -182,10 +211,24 @@ describe("Pi prompt-artifact preflight", () => {
     expect(await expectExit(main(outer.deps))).toBe(0);
     expect(outer.piPromptArtifactsCalls).toEqual([]);
     expect(outer.piStateSharingCalls).toEqual([]);
+    const outerMetadata = JSON.parse(outer.out.join("")) as {
+      launchScript: string;
+    };
+    const launchScript = readFileSync(outerMetadata.launchScript, "utf8");
+    expect(launchScript).toContain(
+      `export ${KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV}='/fake-home/.bun/bin/bun'`,
+    );
+    expect(launchScript).toContain(
+      `export ${KEEPER_AGENT_PI_PROMPT_CLI_ENV}='/fake-home/code/keeper/cli/keeper.ts'`,
+    );
 
     const inner = piHarness(["--x-no-confirm", "hello"]);
     await runAndCapture(inner, main);
     expect(inner.piPromptArtifactsCalls).toHaveLength(1);
+    expect(inner.piPromptArtifactEnvSnapshots[0]).toMatchObject({
+      [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: "/fake-home/.bun/bin/bun",
+      [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: "/fake-home/code/keeper/cli/keeper.ts",
+    });
     expect(
       outer.piPromptArtifactsCalls.length + inner.piPromptArtifactsCalls.length,
     ).toBe(1);

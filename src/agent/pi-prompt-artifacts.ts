@@ -4,11 +4,20 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { isAbsolute } from "node:path";
 
-const COMMAND = "keeper";
 const ARGV = ["prompt", "compile", "--bundle", "plan:static", "--target", "pi"];
 const TIMEOUT_MS = 30_000;
 const MAX_BUFFER_BYTES = 1024 * 1024;
+
+export const KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV =
+  "KEEPER_AGENT_PI_PROMPT_EXECUTABLE";
+export const KEEPER_AGENT_PI_PROMPT_CLI_ENV = "KEEPER_AGENT_PI_PROMPT_CLI";
+
+export interface PiPromptCompilerPaths {
+  readonly executablePath: string;
+  readonly keeperCliPath: string;
+}
 
 export interface PiPromptArtifactsSpawnResult {
   readonly status: number | null;
@@ -30,7 +39,7 @@ export type PiPromptArtifactsSpawnSync = (
   options: PiPromptArtifactsSpawnOptions,
 ) => PiPromptArtifactsSpawnResult;
 
-export interface EnsurePiPromptArtifactsOptions {
+export interface EnsurePiPromptArtifactsOptions extends PiPromptCompilerPaths {
   readonly env?: NodeJS.ProcessEnv;
   readonly spawnSyncFn?: PiPromptArtifactsSpawnSync;
 }
@@ -41,6 +50,44 @@ export class PiPromptArtifactsError extends Error {
     super(message);
     this.name = "PiPromptArtifactsError";
   }
+}
+
+function hasControlCharacters(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+}
+
+function requireAbsolutePath(value: string, label: string): string {
+  if (
+    value === "" ||
+    value !== value.trim() ||
+    hasControlCharacters(value) ||
+    !isAbsolute(value)
+  ) {
+    throw new PiPromptArtifactsError(
+      `Pi prompt-artifact preflight requires an absolute ${label}`,
+    );
+  }
+  return value;
+}
+
+/** Stamp the exact compiler prefix onto the Pi process environment. The
+ * KEEPER_AGENT_ namespace is forwarded by detached launcher re-execs, so nested
+ * Task sessions inherit the same checkout without consulting PATH. */
+export function stampPiPromptCompilerEnv(
+  env: NodeJS.ProcessEnv,
+  paths: PiPromptCompilerPaths,
+): void {
+  env[KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV] = requireAbsolutePath(
+    paths.executablePath,
+    "compiler executable path",
+  );
+  env[KEEPER_AGENT_PI_PROMPT_CLI_ENV] = requireAbsolutePath(
+    paths.keeperCliPath,
+    "keeper CLI path",
+  );
 }
 
 interface PiCompileEnvelope {
@@ -100,9 +147,9 @@ function parseEnvelope(stdout: string): PiCompileEnvelope {
   }
   if (
     result.target !== "pi" ||
-    result.outcome !== "hit" &&
+    (result.outcome !== "hit" &&
       result.outcome !== "compiled" &&
-      result.outcome !== "repaired" ||
+      result.outcome !== "repaired") ||
     typeof result.fingerprint !== "string" ||
     !/^[a-f0-9]{64}$/.test(result.fingerprint) ||
     result.request === null ||
@@ -120,17 +167,26 @@ function parseEnvelope(stdout: string): PiCompileEnvelope {
 /**
  * Compile Pi's static plan artifacts before a Pi launch. `env` is passed to the
  * compiler unchanged so PI_CODING_AGENT_DIR selects the same artifact root Pi
- * will use.
+ * will use. The executable and keeper CLI are an injected absolute prefix from
+ * the launcher; this preflight never resolves a bare command through PATH.
  */
 export function ensurePiPromptArtifacts(
   actionLog: string[],
-  options: EnsurePiPromptArtifactsOptions = {},
+  options: EnsurePiPromptArtifactsOptions,
 ): void {
   const env = options.env ?? process.env;
   const run = options.spawnSyncFn ?? defaultSpawnSync;
+  const executable = requireAbsolutePath(
+    options.executablePath,
+    "compiler executable path",
+  );
+  const keeperCli = requireAbsolutePath(
+    options.keeperCliPath,
+    "keeper CLI path",
+  );
   let result: PiPromptArtifactsSpawnResult;
   try {
-    result = run(COMMAND, ARGV, {
+    result = run(executable, [keeperCli, ...ARGV], {
       env,
       encoding: "utf8",
       timeout: TIMEOUT_MS,

@@ -73,7 +73,11 @@ import {
   type PiFooterApi,
   type PiFooterContext,
 } from "./status-footer.ts";
-import { createTaskFacadeTool, type PiTaskEventBus } from "./task-facade.ts";
+import {
+  createTaskFacadeTool,
+  type PiTaskEventBus,
+  type PiTaskToolDefinition,
+} from "./task-facade.ts";
 
 // ---------------------------------------------------------------------------
 // pi event shapes (minimal structural subset)
@@ -115,7 +119,7 @@ export interface PiExtensionApi extends PiSkillAutocompleteApi {
   events?: PiTaskEventBus;
   getThinkingLevel?(): string;
   getSessionName?(): string | undefined;
-  registerTool?(tool: PiToolDefinition<unknown>): void;
+  registerTool?(tool: PiToolDefinition<unknown> | PiTaskToolDefinition): void;
   /** Presence-gated: `/rename` registers only when both this and
    *  `setSessionName` exist (see the `registerRenameCommand` call site). The
    *  real options/handler shape lives in `rename-command.ts`'s `PiRenameApi`

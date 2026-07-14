@@ -99,6 +99,8 @@ export interface Harness {
   piStateSharingCalls: string[][];
   /** Pi prompt-artifact preflight action logs, once per inner Pi launch. */
   piPromptArtifactsCalls: string[][];
+  /** Environment snapshots at each Pi preflight boundary. */
+  piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[];
   /** Pi preflight/state/spawn ordering recorder. */
   piLaunchOrder: string[];
   /** Codex synthetic session-name indexer starts, in order. */
@@ -196,6 +198,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const codexStateSharingCalls: string[][] = [];
   const piStateSharingCalls: string[][] = [];
   const piPromptArtifactsCalls: string[][] = [];
+  const piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[] = [];
   const piLaunchOrder: string[] = [];
   const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
@@ -211,6 +214,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
       reason: "harness-native",
     }));
 
+  const env = opts.env ?? {};
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
   const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
@@ -226,7 +230,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
 
   const deps: MainDeps = {
     argv: opts.rawArgv ? opts.argv : [opts.agent ?? "claude", ...opts.argv],
-    env: opts.env ?? {},
+    env,
     cwd: opts.cwd ?? "/fake-home/code/proj",
     spawn,
     readChar: () => "n",
@@ -257,6 +261,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     },
     ensurePiPromptArtifactsFn: (actionLog: string[]) => {
       piPromptArtifactsCalls.push(actionLog);
+      piPromptArtifactEnvSnapshots.push({ ...env });
       piLaunchOrder.push("preflight");
       opts.ensurePiPromptArtifacts?.(actionLog);
     },
@@ -335,6 +340,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     codexStateSharingCalls,
     piStateSharingCalls,
     piPromptArtifactsCalls,
+    piPromptArtifactEnvSnapshots,
     piLaunchOrder,
     codexSessionNameIndexers,
     birthRecords,

@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 export interface PiTaskParams {
   subagent_type: string;
@@ -17,6 +18,22 @@ export interface PiTaskToolResult {
   details: Record<string, unknown>;
 }
 
+/** Minimal local shapes from Pi's custom-tool execution context. Keeping these
+ * structural avoids coupling this isolated extension to prompt/plan packages. */
+export interface PiTaskModel {
+  readonly provider: string;
+  readonly id: string;
+}
+
+export interface PiTaskModelRegistry {
+  find(provider: string, modelId: string): PiTaskModel | undefined;
+  getAvailable(): PiTaskModel[];
+}
+
+export interface PiTaskExecutionContext {
+  readonly modelRegistry: PiTaskModelRegistry;
+}
+
 export interface PiTaskToolDefinition {
   name: "Task";
   label: string;
@@ -26,7 +43,9 @@ export interface PiTaskToolDefinition {
   execute(
     toolCallId: string,
     params: PiTaskParams,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    onUpdate: ((result: PiTaskToolResult) => void) | undefined,
+    ctx: PiTaskExecutionContext,
   ): Promise<PiTaskToolResult>;
 }
 
@@ -68,6 +87,9 @@ const STOP_RPC_TIMEOUT_MS = 7_000;
 const PROMPT_COMPILE_TIMEOUT_MS = 15_000;
 const PROMPT_COMPILE_MAX_BUFFER = 64 * 1024;
 const PACKAGE_NAME = "@tintinweb/pi-subagents@0.14.0";
+export const KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV =
+  "KEEPER_AGENT_PI_PROMPT_EXECUTABLE";
+export const KEEPER_AGENT_PI_PROMPT_CLI_ENV = "KEEPER_AGENT_PI_PROMPT_CLI";
 
 export interface RpcDeadline {
   schedule(callback: () => void, timeoutMs: number): unknown;
@@ -99,6 +121,8 @@ export interface TaskFacadeOptions {
   stopRpcTimeoutMs?: number;
   deadline?: RpcDeadline;
   compilerRunner?: PromptCompilerRunner;
+  /** Test seam; production reads the launcher's stamped process environment. */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface ResolvedTaskFacadeOptions {
@@ -106,6 +130,7 @@ interface ResolvedTaskFacadeOptions {
   stopRpcTimeoutMs: number;
   deadline: RpcDeadline;
   compilerRunner: PromptCompilerRunner;
+  env: NodeJS.ProcessEnv;
 }
 
 const systemDeadline: RpcDeadline = {
@@ -298,23 +323,33 @@ const THINKING_MAX_TURNS = {
 
 type PiThinkingLevel = keyof typeof THINKING_MAX_TURNS;
 
-interface CompiledLaunchOptions {
-  model: string;
+interface ParsedCompiledLaunchOptions {
+  modelProvider: string;
+  modelId: string;
   thinkingLevel: PiThinkingLevel;
   maxTurns: number;
 }
 
-function isLaunchModel(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value
-      .split("/")
-      .every(
-        (segment) =>
-          LAUNCH_MODEL_SEGMENT_RE.test(segment) && !segment.startsWith("."),
-      )
-  );
+interface CompiledLaunchOptions {
+  model: PiTaskModel;
+  thinkingLevel: PiThinkingLevel;
+  maxTurns: number;
+}
+
+function splitLaunchModel(
+  value: unknown,
+): { provider: string; modelId: string } | null {
+  if (typeof value !== "string") return null;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1) return null;
+  const provider = value.slice(0, slash);
+  const modelId = value.slice(slash + 1);
+  const validSegment = (segment: string): boolean =>
+    LAUNCH_MODEL_SEGMENT_RE.test(segment) && !segment.startsWith(".");
+  if (!validSegment(provider) || !modelId.split("/").every(validSegment)) {
+    return null;
+  }
+  return { provider, modelId };
 }
 
 function isThinkingLevel(value: unknown): value is PiThinkingLevel {
@@ -339,7 +374,7 @@ function isCanonicalPlanRole(type: string): boolean {
 function parseCompiledLaunch(
   stdout: string,
   role: string,
-): CompiledLaunchOptions {
+): ParsedCompiledLaunchOptions {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -392,8 +427,8 @@ function parseCompiledLaunch(
       `keeper prompt compile for ${role} returned an invalid launch cell`,
     );
   }
-  const model = output.launch_cell.model;
-  if (!isLaunchModel(model)) {
+  const model = splitLaunchModel(output.launch_cell.model);
+  if (model === null) {
     throw new Error(
       `keeper prompt compile for ${role} returned an invalid launch model`,
     );
@@ -417,9 +452,81 @@ function parseCompiledLaunch(
     );
   }
   return {
-    model,
+    modelProvider: model.provider,
+    modelId: model.modelId,
     thinkingLevel: output.thinking,
     maxTurns: output.max_turns as number,
+  };
+}
+
+function hasControlCharacters(value: string): boolean {
+  return [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  });
+}
+
+function stampedAbsolutePath(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  role: string,
+): string {
+  const value = env[key];
+  if (
+    typeof value !== "string" ||
+    value === "" ||
+    value !== value.trim() ||
+    hasControlCharacters(value) ||
+    !isAbsolute(value)
+  ) {
+    throw new Error(
+      `canonical Task role ${role} requires launcher-stamped absolute ${key}`,
+    );
+  }
+  return value;
+}
+
+function resolveCompiledLaunch(
+  parsed: ParsedCompiledLaunchOptions,
+  role: string,
+  ctx: PiTaskExecutionContext,
+): CompiledLaunchOptions {
+  const registry = ctx?.modelRegistry;
+  if (
+    registry === undefined ||
+    typeof registry.find !== "function" ||
+    typeof registry.getAvailable !== "function"
+  ) {
+    throw new Error(`canonical Task role ${role} has no Pi model registry`);
+  }
+
+  const model = registry.find(parsed.modelProvider, parsed.modelId);
+  if (
+    model === undefined ||
+    model.provider !== parsed.modelProvider ||
+    model.id !== parsed.modelId
+  ) {
+    throw new Error(
+      `compiled Pi model ${parsed.modelProvider}/${parsed.modelId} for ${role} is not registered exactly`,
+    );
+  }
+  const available = registry.getAvailable();
+  if (
+    !Array.isArray(available) ||
+    !available.some(
+      (candidate) =>
+        candidate?.provider === parsed.modelProvider &&
+        candidate.id === parsed.modelId,
+    )
+  ) {
+    throw new Error(
+      `compiled Pi model ${parsed.modelProvider}/${parsed.modelId} for ${role} is unavailable`,
+    );
+  }
+  return {
+    model,
+    thinkingLevel: parsed.thinkingLevel,
+    maxTurns: parsed.maxTurns,
   };
 }
 
@@ -427,12 +534,32 @@ async function compilePlanRole(
   role: string,
   signal: AbortSignal | undefined,
   runner: PromptCompilerRunner,
+  env: NodeJS.ProcessEnv,
+  ctx: PiTaskExecutionContext,
 ): Promise<CompiledLaunchOptions | null> {
   if (!isCanonicalPlanRole(role)) return null;
-  const args = ["prompt", "compile", "--role", role, "--target", "pi"];
-  const result = await runner("keeper", args, {
+  const executable = stampedAbsolutePath(
+    env,
+    KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV,
+    role,
+  );
+  const keeperCli = stampedAbsolutePath(
+    env,
+    KEEPER_AGENT_PI_PROMPT_CLI_ENV,
+    role,
+  );
+  const args = [
+    keeperCli,
+    "prompt",
+    "compile",
+    "--role",
+    role,
+    "--target",
+    "pi",
+  ];
+  const result = await runner(executable, args, {
     encoding: "utf8",
-    env: process.env,
+    env,
     timeout: PROMPT_COMPILE_TIMEOUT_MS,
     maxBuffer: PROMPT_COMPILE_MAX_BUFFER,
     shell: false,
@@ -441,7 +568,8 @@ async function compilePlanRole(
   if (!isRecord(result) || typeof result.stdout !== "string") {
     throw new Error(`keeper prompt compile for ${role} returned no stdout`);
   }
-  return parseCompiledLaunch(result.stdout, role);
+  const parsed = parseCompiledLaunch(result.stdout, role);
+  return resolveCompiledLaunch(parsed, role, ctx);
 }
 
 function beforeSpawnOrAbort<T>(
@@ -463,6 +591,7 @@ async function executeTask(
   events: PiTaskEventBus,
   params: PiTaskParams,
   signal: AbortSignal | undefined,
+  ctx: PiTaskExecutionContext,
   options: ResolvedTaskFacadeOptions,
 ): Promise<PiTaskToolResult> {
   validateParams(params);
@@ -470,7 +599,13 @@ async function executeTask(
   await beforeSpawnOrAbort(requireProtocol(events, options), signal);
   if (signal?.aborted) throw cancellationReason(signal);
   const compiledLaunch = await beforeSpawnOrAbort(
-    compilePlanRole(params.subagent_type, signal, options.compilerRunner),
+    compilePlanRole(
+      params.subagent_type,
+      signal,
+      options.compilerRunner,
+      options.env,
+      ctx,
+    ),
     signal,
   );
   if (signal?.aborted) throw cancellationReason(signal);
@@ -655,6 +790,7 @@ export function createTaskFacadeTool(
     stopRpcTimeoutMs: overrides.stopRpcTimeoutMs ?? STOP_RPC_TIMEOUT_MS,
     deadline: overrides.deadline ?? systemDeadline,
     compilerRunner: overrides.compilerRunner ?? systemCompilerRunner,
+    env: overrides.env ?? process.env,
   };
   return {
     name: "Task",
@@ -663,9 +799,9 @@ export function createTaskFacadeTool(
       "Run a named Pi subagent in an isolated foreground session and return only its final result. Multiple Task calls in one assistant message run concurrently.",
     executionMode: "parallel",
     parameters: TASK_PARAMETERS,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        return await executeTask(events, params, signal, options);
+        return await executeTask(events, params, signal, ctx, options);
       } catch (error) {
         // Pi passes the caller's AbortSignal through the tool boundary. Keep
         // its native reason object and AbortError typing instead of converting

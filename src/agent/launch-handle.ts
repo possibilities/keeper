@@ -32,6 +32,10 @@ import type { AgentKind } from "./dispatch";
 import { HARNESS_DESCRIPTORS, ResumeLaunchUnsupportedError } from "./harness";
 import { buildAgentLaunchArgv, stripClaudeEnv } from "./launch-config";
 import type { ResolvedHandle } from "./pair-subcommands";
+import {
+  PiPromptArtifactsError,
+  stampPiPromptCompilerEnv,
+} from "./pi-prompt-artifacts";
 import type { RunLaunchResult } from "./run-capture";
 import {
   launchKeeperAgentInTmux,
@@ -227,6 +231,20 @@ export function launchToResolvedHandle(
   args: LaunchHandleArgs,
 ): RunLaunchResult {
   const { deps, agent, prompt, posture, stopTimeoutMs, resume } = args;
+  if (agent === "pi") {
+    try {
+      stampPiPromptCompilerEnv(deps.env, {
+        executablePath: deps.launcherArgvPrefix[0] ?? "",
+        keeperCliPath: deps.launcherArgvPrefix[1] ?? "",
+      });
+    } catch (exc) {
+      if (exc instanceof PiPromptArtifactsError) {
+        deps.writeErr(`agent: ${exc.message}\n`);
+        return { ok: false, error: exc.message };
+      }
+      throw exc;
+    }
+  }
   // Build with an EMPTY launcherArgvPrefix so the cli token sits first; `.slice(1)`
   // then drops it, leaving the inner args. The REAL prefix rides on the launch
   // request below, where the detached pane re-execs through it. A resume launch

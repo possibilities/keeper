@@ -6,6 +6,12 @@ import {
 } from "../src/agent/pi-prompt-artifacts";
 
 const FINGERPRINT = "a".repeat(64);
+const EXECUTABLE_PATH = "/opt/keeper/bin/bun";
+const KEEPER_CLI_PATH = "/checkout/keeper/cli/keeper.ts";
+const COMPILER_PATHS = {
+  executablePath: EXECUTABLE_PATH,
+  keeperCliPath: KEEPER_CLI_PATH,
+} as const;
 
 function successfulResult(
   overrides: Partial<PiPromptArtifactsSpawnResult> = {},
@@ -25,16 +31,21 @@ function successfulResult(
 }
 
 describe("ensurePiPromptArtifacts", () => {
-  test("runs the fixed compiler command with the unmodified Pi environment", () => {
-    const env = { PI_CODING_AGENT_DIR: "/tmp/pi-override", PATH: "/bin" };
+  test("runs the absolute compiler prefix with the unmodified Pi environment", () => {
+    const env = {
+      PI_CODING_AGENT_DIR: "/tmp/pi-override",
+      PATH: "/path-spoof/keeper-only",
+    };
     const actionLog: string[] = [];
     let receivedEnv: NodeJS.ProcessEnv | undefined;
 
     ensurePiPromptArtifacts(actionLog, {
+      ...COMPILER_PATHS,
       env,
       spawnSyncFn: (command, argv, options) => {
-        expect(command).toBe("keeper");
+        expect(command).toBe(EXECUTABLE_PATH);
         expect(argv).toEqual([
+          KEEPER_CLI_PATH,
           "prompt",
           "compile",
           "--bundle",
@@ -71,7 +82,10 @@ describe("ensurePiPromptArtifacts", () => {
   ])("throws an actionable typed failure for $0 output", (_name, result) => {
     let failure: unknown;
     try {
-      ensurePiPromptArtifacts([], { spawnSyncFn: () => result });
+      ensurePiPromptArtifacts([], {
+        ...COMPILER_PATHS,
+        spawnSyncFn: () => result,
+      });
     } catch (error) {
       failure = error;
     }
@@ -79,5 +93,25 @@ describe("ensurePiPromptArtifacts", () => {
     expect((failure as Error).message).toContain(
       "keeper prompt compile --bundle plan:static --target pi",
     );
+  });
+
+  test.each([
+    ["executable", { executablePath: "bun", keeperCliPath: KEEPER_CLI_PATH }],
+    [
+      "CLI",
+      { executablePath: EXECUTABLE_PATH, keeperCliPath: "cli/keeper.ts" },
+    ],
+  ])("rejects a relative $0 path before spawn", (_name, paths) => {
+    let spawnCalls = 0;
+    expect(() =>
+      ensurePiPromptArtifacts([], {
+        ...paths,
+        spawnSyncFn: () => {
+          spawnCalls += 1;
+          return successfulResult();
+        },
+      }),
+    ).toThrow(/requires an absolute/);
+    expect(spawnCalls).toBe(0);
   });
 });

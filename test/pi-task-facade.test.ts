@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import taskFacadeExtension, {
   createTaskFacadeTool as createRawTaskFacadeTool,
+  KEEPER_AGENT_PI_PROMPT_CLI_ENV,
+  KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV,
   type PiTaskEventBus,
+  type PiTaskExecutionContext,
+  type PiTaskModel,
+  type PiTaskParams,
   type PiTaskToolDefinition,
+  type PiTaskToolResult,
   type PromptCompilerRunner,
   type TaskFacadeOptions,
 } from "../plugins/keeper/pi-extension/task-facade";
@@ -37,6 +43,51 @@ const immediateDeadline = {
 
 const THINKING_TURNS = { low: 25, medium: 40, high: 60, xhigh: 75 } as const;
 type TestThinking = keyof typeof THINKING_TURNS;
+
+const COMPILER_EXECUTABLE = "/opt/keeper/bin/bun";
+const KEEPER_CLI = "/checkout/keeper/cli/keeper.ts";
+const TASK_ENV: NodeJS.ProcessEnv = {
+  PATH: "/path-spoof/keeper-only",
+  PI_CODING_AGENT_DIR: "/tmp/pi-agent",
+  [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: COMPILER_EXECUTABLE,
+  [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: KEEPER_CLI,
+};
+
+const DEFAULT_MODELS = [
+  {
+    provider: "openai-codex",
+    id: "gpt-5.6-sol",
+    exactObject: "codex-sol",
+  },
+  { provider: "openai", id: "gpt-5.6-sol", exactObject: "openai-sol" },
+  { provider: "openai", id: "gpt-5.6-terra", exactObject: "openai-terra" },
+] as const;
+
+function modelContext(
+  models: readonly PiTaskModel[] = DEFAULT_MODELS,
+  available: readonly PiTaskModel[] = models,
+): PiTaskExecutionContext {
+  return {
+    modelRegistry: {
+      find: (provider, modelId) =>
+        models.find(
+          (model) => model.provider === provider && model.id === modelId,
+        ),
+      getAvailable: () => [...available],
+    },
+  };
+}
+
+const DEFAULT_CONTEXT = modelContext();
+
+function exactModel(provider: string, id: string): PiTaskModel {
+  const model = DEFAULT_MODELS.find(
+    (candidate) => candidate.provider === provider && candidate.id === id,
+  );
+  if (model === undefined)
+    throw new Error(`missing test model ${provider}/${id}`);
+  return model;
+}
 
 function compiledResult(
   role: string,
@@ -81,19 +132,34 @@ const successfulCompilerRunner: PromptCompilerRunner = async (
   _executable,
   args,
 ) => {
-  const role = args[3];
+  const role = args[4];
   if (role === undefined) throw new Error("test compiler received no role");
   return { stdout: compiledResult(role), stderr: "" };
+};
+
+type TestTaskTool = Omit<PiTaskToolDefinition, "execute"> & {
+  execute(
+    toolCallId: string,
+    params: PiTaskParams,
+    signal?: AbortSignal,
+  ): Promise<PiTaskToolResult>;
 };
 
 function createTaskFacadeTool(
   events: PiTaskEventBus,
   overrides: TaskFacadeOptions = {},
-): PiTaskToolDefinition {
-  return createRawTaskFacadeTool(events, {
+  ctx: PiTaskExecutionContext = DEFAULT_CONTEXT,
+): TestTaskTool {
+  const raw = createRawTaskFacadeTool(events, {
     compilerRunner: successfulCompilerRunner,
+    env: TASK_ENV,
     ...overrides,
   });
+  return {
+    ...raw,
+    execute: (toolCallId, params, signal) =>
+      raw.execute(toolCallId, params, signal, undefined, ctx),
+  };
 }
 
 function withKeeperJobId(value: string | undefined, run: () => void): void {
@@ -291,8 +357,9 @@ describe("Pi Task facade", () => {
     await flushMicrotasks();
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.executable).toBe("keeper");
+    expect(calls[0]?.executable).toBe(COMPILER_EXECUTABLE);
     expect(calls[0]?.args).toEqual([
+      KEEPER_CLI,
       "prompt",
       "compile",
       "--role",
@@ -302,7 +369,7 @@ describe("Pi Task facade", () => {
     ]);
     expect(calls[0]?.options).toMatchObject({
       encoding: "utf8",
-      env: process.env,
+      env: TASK_ENV,
       timeout: 15_000,
       maxBuffer: 64 * 1024,
       shell: false,
@@ -312,10 +379,13 @@ describe("Pi Task facade", () => {
     expect(spawns[0]?.options).toEqual({
       description: "scan repo",
       isBackground: false,
-      model: "openai/gpt-5.6-terra",
+      model: exactModel("openai", "gpt-5.6-terra"),
       thinkingLevel: "medium",
       maxTurns: 40,
     });
+    expect(spawns[0]?.options.model).toBe(
+      exactModel("openai", "gpt-5.6-terra"),
+    );
 
     bus.emit("subagents:completed", {
       id: "agent-1",
@@ -328,7 +398,7 @@ describe("Pi Task facade", () => {
   test("binds each role's distinct effort, including max compatibility", async () => {
     const { bus, spawns } = rpcBus();
     const compilerRunner: PromptCompilerRunner = async (_file, args) => {
-      const role = args[3] as string;
+      const role = args[4] as string;
       if (role === "plan:docs-gap-scout") {
         return {
           stdout: compiledResult(role, {
@@ -365,7 +435,7 @@ describe("Pi Task facade", () => {
         options: {
           description: "docs",
           isBackground: false,
-          model: "openai/gpt-5.6-sol",
+          model: exactModel("openai", "gpt-5.6-sol"),
           thinkingLevel: "low",
           maxTurns: 25,
         },
@@ -375,7 +445,7 @@ describe("Pi Task facade", () => {
         options: {
           description: "judge",
           isBackground: false,
-          model: "openai/gpt-5.6-terra",
+          model: exactModel("openai", "gpt-5.6-terra"),
           thinkingLevel: "xhigh",
           maxTurns: 75,
         },
@@ -400,7 +470,7 @@ describe("Pi Task facade", () => {
     const compilerRunner: PromptCompilerRunner = async (_file, args) => {
       const outcome = invocation++ === 0 ? "compiled" : "hit";
       return {
-        stdout: compiledResult(args[3] as string, { outcome }),
+        stdout: compiledResult(args[4] as string, { outcome }),
         stderr: "",
       };
     };
@@ -426,7 +496,7 @@ describe("Pi Task facade", () => {
 
     expect(spawns).toHaveLength(2);
     expect(spawns[0]?.options).toMatchObject({
-      model: "openai-codex/gpt-5.6-sol",
+      model: exactModel("openai-codex", "gpt-5.6-sol"),
       thinkingLevel: "high",
       maxTurns: 60,
     });
@@ -524,6 +594,75 @@ describe("Pi Task facade", () => {
     expect(spawns).toHaveLength(0);
   });
 
+  test("an unavailable exact model cannot fuzzily fall back", async () => {
+    const { bus, spawns } = rpcBus();
+    const exact = {
+      provider: "openai",
+      id: "gpt-5.6-terra",
+      exactObject: "compiled-but-unavailable",
+    };
+    const fuzzyFallback = {
+      provider: "openai-codex",
+      id: "gpt-5.6-terra",
+      exactObject: "available-fuzzy-candidate",
+    };
+    const compilerRunner: PromptCompilerRunner = async () => ({
+      stdout: compiledResult("plan:repo-scout", {
+        model: "openai/gpt-5.6-terra",
+      }),
+      stderr: "",
+    });
+
+    await expect(
+      createTaskFacadeTool(
+        bus,
+        { compilerRunner },
+        modelContext([exact, fuzzyFallback], [fuzzyFallback]),
+      ).execute("call", {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow(
+      "compiled Pi model openai/gpt-5.6-terra for plan:repo-scout is unavailable",
+    );
+    expect(spawns).toHaveLength(0);
+  });
+
+  test.each([
+    ["missing stamps", {}],
+    [
+      "relative executable",
+      {
+        [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: "bun",
+        [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: KEEPER_CLI,
+      },
+    ],
+    [
+      "relative CLI",
+      {
+        [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: COMPILER_EXECUTABLE,
+        [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: "cli/keeper.ts",
+      },
+    ],
+  ])("rejects $0 before compiler or RPC spawn", async (_name, env) => {
+    const { bus, spawns } = rpcBus();
+    let compilerCalls = 0;
+    const compilerRunner: PromptCompilerRunner = async () => {
+      compilerCalls += 1;
+      throw new Error("compiler must not run");
+    };
+    await expect(
+      createTaskFacadeTool(bus, { compilerRunner, env }).execute("call", {
+        subagent_type: "plan:repo-scout",
+        description: "repo",
+        prompt: "scan",
+      }),
+    ).rejects.toThrow(/requires launcher-stamped absolute/);
+    expect(compilerCalls).toBe(0);
+    expect(spawns).toHaveLength(0);
+  });
+
   test.each([
     ["launch model", { model: "../escape" }, /launch model/],
     ["thinking", { effort: "max", thinking: "max", maxTurns: 75 }, /thinking/],
@@ -551,7 +690,10 @@ describe("Pi Task facade", () => {
       compilerCalls += 1;
       throw new Error("compiler must not run");
     };
-    const tool = createTaskFacadeTool(bus, { compilerRunner });
+    const tool = createTaskFacadeTool(bus, {
+      compilerRunner,
+      env: { PATH: "/path-only" },
+    });
     const custom = tool.execute("custom", {
       subagent_type: "my-custom-agent",
       description: "custom",
