@@ -59,6 +59,28 @@ describe("runWithJobControl", () => {
     }
   });
 
+  test("passes explicit env and cwd through the spawn seam", async () => {
+    const env = { PATH: "/fake/bin", KEEPER_JOB_ID: "job-1" };
+    const seen: unknown[] = [];
+    const spawn = (_cmd: string[], options?: unknown): SpawnedChild => {
+      seen.push(options);
+      return fakeChild({ exitCode: 0, signalCode: null });
+    };
+    await expect(
+      runWithJobControl(
+        ["pi", "--session", "native"],
+        spawn,
+        throwingExit,
+        undefined,
+        {
+          env,
+          cwd: "/repo/pi",
+        },
+      ),
+    ).rejects.toBeInstanceOf(ExitSignal);
+    expect(seen).toEqual([{ env, cwd: "/repo/pi" }]);
+  });
+
   test("a zero exit propagates 0", async () => {
     const spawn = (): SpawnedChild =>
       fakeChild({ exitCode: 0, signalCode: null });
@@ -80,6 +102,33 @@ describe("runWithJobControl", () => {
     }
     expect(process.listenerCount("SIGTERM")).toBe(before);
     expect(process.listenerCount("SIGINT")).toBe(0);
+  });
+
+  test("forwards wrapper SIGTERM and SIGHUP to the foreground child", async () => {
+    let release: (() => void) | undefined;
+    const exited = new Promise<number>((resolve) => {
+      release = () => resolve(0);
+    });
+    const signals: NodeJS.Signals[] = [];
+    const child: SpawnedChild = {
+      exited,
+      exitCode: 0,
+      signalCode: null,
+      kill(signal) {
+        signals.push(signal);
+      },
+    };
+    const running = runWithJobControl(
+      ["pi", "--session", "native-id"],
+      () => child,
+      throwingExit,
+    );
+
+    process.emit("SIGTERM", "SIGTERM");
+    process.emit("SIGHUP", "SIGHUP");
+    release?.();
+    await expect(running).rejects.toBeInstanceOf(ExitSignal);
+    expect(signals).toEqual(["SIGTERM", "SIGHUP"]);
   });
 });
 

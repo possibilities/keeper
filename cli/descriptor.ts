@@ -564,6 +564,21 @@ export const HISTORY_INDEX_FLAGS = [
   ...HISTORY_FORMAT_FLAGS,
 ] as const satisfies readonly FlagDescriptor[];
 
+export const RESUME_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "project",
+    type: "string",
+    summary: "Restrict resolution to one artifact-derived project",
+  },
+  {
+    name: "format",
+    type: "string",
+    summary: "Decision/error format: human|json (default human)",
+  },
+  FLAG_JSON_ALIAS,
+] as const satisfies readonly FlagDescriptor[];
+
 // ── native command tree ──────────────────────────────────────────────────────
 
 /**
@@ -1339,7 +1354,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         name: "files",
-        summary: "Refresh the private index and search provenance-graded file evidence",
+        summary:
+          "Refresh the private index and search provenance-graded file evidence",
         visibility: "public",
         mutates: true,
         requires_daemon: false,
@@ -1359,6 +1375,16 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: HISTORY_INDEX_FLAGS,
       },
     ],
+  },
+  {
+    name: "resume",
+    summary: "Resolve a Claude/Pi Session and continue it in the foreground",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    format_modes: ["human", "json"],
+    flags: RESUME_FLAGS,
   },
   {
     name: "search-history",

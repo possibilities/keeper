@@ -34,26 +34,37 @@ export interface SpawnedChild {
   kill(signal: NodeJS.Signals): void;
 }
 
+export interface SpawnOptions {
+  /** Materialized child environment. Defaults to the current process view. */
+  env?: NodeJS.ProcessEnv;
+  /** Child working directory. Defaults to Bun's inherited cwd. */
+  cwd?: string;
+}
+
 /** Injectable spawn seam — the DI point the test-port task records against. */
-export type SpawnFn = (cmd: string[]) => SpawnedChild;
+export type SpawnFn = (cmd: string[], options?: SpawnOptions) => SpawnedChild;
 
 /** Fired synchronously right after the child spawns, with its pid — the
  *  non-claude birth-record write hooks here (see `emitBirthRecord`). */
 export type ChildSpawnedFn = (pid: number) => void;
 
 /** Production spawn: Bun.spawn with all three stdio streams inherited. */
-export const defaultSpawn: SpawnFn = (cmd: string[]): SpawnedChild => {
-  // Pass env as an explicit spread of the (already-mutated) process.env, NOT
-  // inherit-mode. Bun's inherit spawn hands the child the original OS environ
-  // and ignores `delete process.env.X` performed earlier in this process — so
-  // the tmux strip in main.ts (delete TMUX/TMUX_PANE so Claude renders 24-bit
-  // truecolor) only reaches the child if we materialize the current view here.
-  // The spread also carries KEEPER_TMUX_PANE and preserves PATH/HOME/etc.
-  // Never switch this back to inherit-mode or the strip silently no-ops.
-  const proc = Bun.spawn(cmd, {
+export const defaultSpawn: SpawnFn = (
+  cmd: string[],
+  options: SpawnOptions = {},
+): SpawnedChild => {
+  // Pass env as an explicit spread of the launcher's already-mutated env view,
+  // NOT inherit-mode. Bun's inherit spawn can ignore deletes from that object
+  // (for example TMUX/TMUX_PANE stripping before Claude launch); materializing
+  // the map is the contract that carries additions and deletions exactly.
+  const spawnOptions: Parameters<typeof Bun.spawn>[1] = {
     stdio: ["inherit", "inherit", "inherit"],
-    env: { ...process.env },
-  });
+    env: { ...(options.env ?? process.env) },
+  };
+  if (options.cwd !== undefined && options.cwd !== "") {
+    spawnOptions.cwd = options.cwd;
+  }
+  const proc = Bun.spawn(cmd, spawnOptions);
   return {
     exited: proc.exited,
     pid: proc.pid,
@@ -79,8 +90,9 @@ export async function runWithJobControl(
   spawn: SpawnFn = defaultSpawn,
   exit: (code: number) => never = (code) => process.exit(code),
   onChildSpawned?: ChildSpawnedFn,
+  spawnOptions: SpawnOptions = {},
 ): Promise<never> {
-  const child = spawn(runCmd);
+  const child = spawn(runCmd, spawnOptions);
 
   // Birth-record seam: fire once, immediately post-spawn, so the recorded
   // start_time pairs with a still-fresh child pid. Defensive try/catch on top of
@@ -149,8 +161,9 @@ export async function runPassthrough(
   runCmd: string[],
   spawn: SpawnFn = defaultSpawn,
   exit: (code: number) => never = (code) => process.exit(code),
+  spawnOptions: SpawnOptions = {},
 ): Promise<never> {
-  const child = spawn(runCmd);
+  const child = spawn(runCmd, spawnOptions);
   const sigintNoop = (): void => {};
   process.on("SIGINT", sigintNoop);
   try {

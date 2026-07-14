@@ -90,6 +90,7 @@ function makeHarness(): Harness {
       session: mkHandler("session"),
       transcript: mkHandler("transcript"),
       history: mkHandler("history"),
+      resume: mkHandler("resume"),
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
       "show-job": mkHandler("show-job"),

@@ -1,21 +1,16 @@
 #!/usr/bin/env bun
 
 import type { Database } from "bun:sqlite";
-import { realpathSync, statSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
-import {
-  adaptKeeperJobRows,
-  discoverSessionCatalog,
-  type HistoryCatalogAdapter,
-} from "../src/history/catalog";
-import { readHistoryCatalogCache } from "../src/history/catalog-cache";
+import type { HistoryCatalogAdapter } from "../src/history/catalog";
 import { normalizeEvidencePath } from "../src/history/file-evidence";
 import {
-  HISTORY_FILES_DEFAULT_LIMIT,
   HISTORY_FILE_PROVENANCE_MAX,
+  HISTORY_FILES_DEFAULT_LIMIT,
   HISTORY_FILES_LIMIT_MAX,
   HISTORY_FILES_OFFSET_MAX,
   type HistoryFileEvidenceMatch,
@@ -33,17 +28,20 @@ import {
   rebuildHistoryIndex,
   refreshHistoryIndex,
 } from "../src/history/indexer";
-import { aggregateHistoryDiagnostics } from "../src/history/model";
+import { loadSessionCatalog } from "../src/history/load-catalog";
 import type {
   CatalogSession,
   HistoryDiagnostic,
   HistoryHarness,
   KeeperJobAlias,
-  KeeperJobRowLike,
   SessionCatalog,
   SessionResolution,
 } from "../src/history/model";
-import { HISTORY_HARNESSES, isHistoryHarness } from "../src/history/model";
+import {
+  aggregateHistoryDiagnostics,
+  HISTORY_HARNESSES,
+  isHistoryHarness,
+} from "../src/history/model";
 import { resolveSessionReference } from "../src/history/resolver";
 import {
   HISTORY_SEARCH_LIMIT_MAX,
@@ -378,67 +376,18 @@ function parseToolDetail(
       };
 }
 
-function readKeeperJobAliases(dbPath: string): {
-  jobs: KeeperJobAlias[];
-  diagnostics: HistoryDiagnostic[];
-} {
-  try {
-    if (!statSync(dbPath).isFile()) throw new Error("keeper database is not a file");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      return {
-        jobs: [],
-        diagnostics: [
-          { code: "keeper_jobs_unavailable", harness: null, scope: "job" },
-        ],
-      };
-    }
-    throw error;
-  }
-
-  // Once a database file exists, an open/query failure is not equivalent to
-  // absence. Propagate malformed, incompatible, busy, and short-schema images
-  // so callers return a read failure rather than silently dropping aliases.
-  const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
-  try {
-    const rows = db
-      .query(`SELECT job_id, harness, resume_target, transcript_path, cwd,
-                     title, name_history, state, created_at, updated_at,
-                     pid, start_time
-                FROM jobs`)
-      .all() as KeeperJobRowLike[];
-    return adaptKeeperJobRows(rows);
-  } finally {
-    db.close();
-  }
-}
-
 function loadCatalog(
   deps: HistoryCliDeps,
   options: { completeTitleHistory?: boolean } = {},
 ): SessionCatalog {
-  const loaded = deps.readKeeperJobs?.() ?? readKeeperJobAliases(deps.dbPath);
-  let titleCache: ReturnType<typeof readHistoryCatalogCache> | undefined;
-  try {
-    titleCache = readHistoryCatalogCache(resolveHistoryIndexPaths(deps.stateDir));
-  } catch {
-    // A cache miss or malformed disposable sidecar never masks native history.
-  }
-  const catalog = discoverSessionCatalog({
+  return loadSessionCatalog({
     root: { homeDir: deps.homeDir, env: deps.env },
-    jobs: loaded.jobs,
+    dbPath: deps.dbPath,
+    stateDir: deps.stateDir,
     adapters: deps.catalogAdapters,
-    titleCache,
     completeTitleHistory: options.completeTitleHistory,
+    readKeeperJobs: deps.readKeeperJobs,
   });
-  return {
-    ...catalog,
-    diagnostics: aggregateHistoryDiagnostics([
-      ...catalog.diagnostics,
-      ...loaded.diagnostics,
-    ]),
-  };
 }
 
 function catalogReadFailure(format: "human" | "json"): HistoryCliResult {
@@ -604,7 +553,10 @@ function compact(value: string | null, max = 120): string {
   return value === null ? "" : ellipsizeInline(value, max);
 }
 
-function boundedText(value: string | null, max = OUTPUT_TITLE_CHARS): string | null {
+function boundedText(
+  value: string | null,
+  max = OUTPUT_TITLE_CHARS,
+): string | null {
   if (value === null || value.length <= max) return value;
   return value.slice(0, max);
 }
@@ -684,10 +636,12 @@ function renderListHuman(data: {
   for (const session of data.sessions) {
     lines.push(
       `[${session.qualifiedNativeId}] ${session.updatedAt ?? "time-unknown"} ${session.currentTitle === null ? "" : JSON.stringify(compact(session.currentTitle))}`.trimEnd(),
-      `project=${session.project ?? "unknown"} artifact=${session.artifact === null ? "none" : "yes"} jobs=${session.jobs
-        .slice(0, OUTPUT_JOBS_MAX)
-        .map((job) => job.jobId)
-        .join(",") || "none"}${session.jobs.length > OUTPUT_JOBS_MAX ? `,+${session.jobs.length - OUTPUT_JOBS_MAX} more` : ""}`,
+      `project=${session.project ?? "unknown"} artifact=${session.artifact === null ? "none" : "yes"} jobs=${
+        session.jobs
+          .slice(0, OUTPUT_JOBS_MAX)
+          .map((job) => job.jobId)
+          .join(",") || "none"
+      }${session.jobs.length > OUTPUT_JOBS_MAX ? `,+${session.jobs.length - OUTPUT_JOBS_MAX} more` : ""}`,
       `show: ${commandText(baseShowArgv(session))}`,
       "",
     );
@@ -1422,9 +1376,7 @@ function readSidecarFileCandidates(
     matches.push(...page.matches);
     cursor += page.matches.length;
     if (cursor >= total || page.matches.length === 0) break;
-    if (
-      mergeFileMatches(matches).length >= options.needed
-    ) {
+    if (mergeFileMatches(matches).length >= options.needed) {
       break;
     }
   }
