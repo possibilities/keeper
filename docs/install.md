@@ -154,20 +154,24 @@ those identities and their exported `tmux-runs/<run-id>/control.json` commands i
 session-wide tmux cleanup or process-name matching. Detailed states are in
 [problem-codes.md](./problem-codes.md#panel-run-lifecycle).
 
-The post-install lifecycle gate uses a configured panel containing two or three inexpensive members and
-never reuses the production design inquiry:
+After installing agent-template or extension changes, run the repository correctness gate:
 
 ```sh
-bun test test/panel-lifecycle-integration.test.ts
-KEEPER_RUN_SLOW=1 bun test test/pair-panel.slow.test.ts
+bun run test:full
+```
+
+For a manual, non-blocking panel diagnostic, use a configured panel containing two or three
+inexpensive members and do not reuse the production design inquiry:
+
+```sh
 bun scripts/panel-smoke.ts --panel <small-panel> --outer-timeout 120
 bun scripts/panel-smoke.ts --panel <small-panel> --outer-timeout 120 --abort-after 5
 ```
 
-Both smoke reports must show `launch_count` equal to the configured member count exactly once,
-settled cancellation, and `exact_survivor_count: 0`. Keep the original design inquiry gated until both
-the terminal run and explicit-abort run satisfy those checks; do not retry that inquiry as validation.
-A `cleanup_failed` report keeps the gate closed until its listed exact identities are reconciled.
+Inspect each smoke report for `launch_count` equal to the configured member count exactly once,
+settled cancellation, and `exact_survivor_count: 0`. A `cleanup_failed` report names the exact
+identities for operator reconciliation. The canonical test commands and budget policy are in
+[docs/testing.md](./testing.md).
 
 Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which derives
 a short Session title from the current branch's Latest turn and applies it through Pi's own

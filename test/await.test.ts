@@ -36,6 +36,7 @@ import type {
   ReadinessSocket,
   SocketHandlers,
 } from "../src/readiness-client";
+import { drainMicrotasks } from "./helpers/retry-until";
 
 // ---------------------------------------------------------------------------
 // HELP text — drift guard for the two documented-vs-behavior fixes.
@@ -2167,9 +2168,7 @@ test("epic complete: present-then-drop + re-query CAP-REJECT → indeterminate (
   reSock.deliver([errorFrame("max_connections", "server full", 0)]);
   clock = 7000; // > REQUERY_GIVE_UP_MS (6000)
   reSock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
-  await Promise.resolve();
-  await Promise.resolve();
+  await drainMicrotasks();
 
   // NO `deleted` committed: exit code stays null (still armed), no failed line.
   expect(h.exitCode).toBeNull();
@@ -2230,21 +2229,14 @@ test("reconnect blip: post-reconnect first-paint absence is swallowed (no delete
   // No new snapshot frame on stdout yet.
   expect(h.stdout).toHaveLength(1);
 
-  // The helper will attempt reconnect via the factory; that fires a
-  // NEW socket. Drive it with the all-empty post-reconnect first
-  // paint. We need to wait microtasks for the reconnect to land.
-  await Promise.resolve();
-  await Promise.resolve();
-  await new Promise((r) => setTimeout(r, 20));
+  await drainMicrotasks();
+  const reSock = socketRef.current;
+  if (!reSock || reSock === sock) {
+    throw new Error("reconnect socket not installed");
+  }
+  reSock.takeOutbound();
+  deliverFiveEmpty(reSock, idPrefix);
 
-  // The helper may have scheduled a backoff timer (real setTimeout).
-  // Wait a bit longer.
-  await new Promise((r) => setTimeout(r, 200));
-
-  // If the reconnect socket is up, deliver the all-empty paint to
-  // exercise the blip path. If reconnect hasn't happened in 200ms,
-  // skip this assertion — the test still proves no `deleted` fired
-  // before reconnect (which is the property under test).
   expect(h.exitCode).toBeNull();
   expect(
     h.stdout.filter((l) => l.includes("[keeper-await] failed")),
@@ -2372,8 +2364,7 @@ test("unreachable: --connect-timeout give-up → failed reason=unreachable + adv
   // the connection so `connectWithRetry` re-iterates and checks the deadline.
   clock = 31_000;
   sock.closeFromServer();
-  // Let the reconnect microtask settle so the loop-top checkGiveUp runs.
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
@@ -2413,7 +2404,7 @@ test("unreachable: post-paint-drop past --connect-timeout → reason=unreachable
   // First drop (at clock=0) re-arms the unpainted anchor fresh (post-paint
   // case). No terminal yet — the window has just started.
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
   expect(h.exitCode).toBeNull();
 
   // Advance past the re-armed deadline, then bounce again so the reconnect
@@ -2424,7 +2415,7 @@ test("unreachable: post-paint-drop past --connect-timeout → reason=unreachable
     throw new Error("reconnect socket never installed");
   }
   reSock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
@@ -2455,10 +2446,10 @@ test("unreachable: emitted once across handles (terminating latch dedups)", asyn
 
   clock = 31_000;
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
   // A second bounce after we've already given up must not re-emit.
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failedLines = h.stdout.filter((l) =>
     l.includes("[keeper-await] failed"),
@@ -2496,8 +2487,7 @@ test("default path: no --connect-timeout reconnects forever; bounce past 30s yie
   // reconnect forever = NO terminal.
   clock = 120_000;
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
-  await new Promise<void>((r) => setTimeout(r, 200));
+  await drainMicrotasks();
 
   expect(h.exitCode).toBeNull();
   expect(
@@ -3550,7 +3540,7 @@ test("--heartbeat: while reconnecting, names the reconnecting state rather than 
 
   // Drop the connection — mid-reconnect, no fresh snapshot has landed yet.
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   h.fireDeadline();
   expect(h.stderr).toHaveLength(1);
@@ -3838,7 +3828,7 @@ test("--probe: unreachable daemon terminates within the bounded default deadline
 
   clock = 6_000;
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
@@ -3868,7 +3858,7 @@ test("--probe: an explicit --connect-timeout still wins over the probe default",
   // Past the probe default (5s) but well under the explicit 30s → no terminal.
   clock = 6_000;
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
   expect(h.exitCode).toBeNull();
 
   clock = 31_000;
@@ -3877,7 +3867,7 @@ test("--probe: an explicit --connect-timeout still wins over the probe default",
     throw new Error("reconnect socket never installed");
   }
   reSock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
@@ -3904,7 +3894,7 @@ test("--probe server-up: an ordinary bounded reachability check (not reconnect-f
 
   clock = 6_000;
   sock.closeFromServer();
-  await new Promise<void>((r) => setTimeout(r, 0));
+  await drainMicrotasks();
 
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();

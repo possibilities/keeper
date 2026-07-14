@@ -6,7 +6,7 @@
  * rather than only end-to-end.
  *
  * The view-shell / CLI process path (mode resolution, dispose-then-exit,
- * trailer shape) is shared with `cli/git.ts` and exercised slow-tier in
+ * trailer shape) is shared with `cli/git.ts` and exercised through injected seams in
  * `test/git.test.ts`; the dispatch route for `keeper builds` is covered in
  * `test/keeper-cli.test.ts`. This file owns the pure renderers only.
  *

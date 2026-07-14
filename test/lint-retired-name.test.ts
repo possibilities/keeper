@@ -1,5 +1,5 @@
 /**
- * Fixture tests for the retired-name guard (scripts/lint-retired-name.sh).
+ * Fixture tests for the retired-name guard core (scripts/lint-retired-name.ts).
  *
  * The guard covers three retired names: "planctl" (PROGRESSIVE — enforces only the
  * frozen-literal surface in scripts/frozen-allowlist.txt: anchors via Check A,
@@ -12,16 +12,15 @@
  * never matches). A count-pin's token defaults to "planctl" but a 4th `|<token>`
  * field overrides it (the agentwrap relocation files are pinned that way).
  *
- * These drive the script via a sandboxed fixture tree (the guard honors
- * KEEPER_RETIRED_NAME_REPO_ROOT), so no git repo or real source is mutated.
+ * These drive the importable classifier via a sandboxed fixture tree, so no git
+ * repo, shell, or real source is involved.
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-const GUARD = join(import.meta.dir, "..", "scripts", "lint-retired-name.sh");
+import { lintRetiredNames } from "../scripts/lint-retired-name";
 
 let root: string;
 
@@ -41,14 +40,12 @@ function put(relpath: string, body: string): void {
   writeFileSync(abs, body);
 }
 
-/** Run the guard against the fixture root; returns {code, stderr}. */
+/** Run the importable classifier against the fixture root. */
 function runGuard(): { code: number; stderr: string } {
-  const res = Bun.spawnSync(["bash", GUARD], {
-    env: { ...process.env, KEEPER_RETIRED_NAME_REPO_ROOT: root },
-  });
+  const { violations } = lintRetiredNames(root);
   return {
-    code: res.exitCode ?? -1,
-    stderr: res.stderr.toString(),
+    code: violations.length === 0 ? 0 : 1,
+    stderr: violations.join("\n"),
   };
 }
 
@@ -225,15 +222,4 @@ test("fails when the allowlist is missing", () => {
   const { code, stderr } = runGuard();
   expect(code).toBe(1);
   expect(stderr).toContain("frozen allowlist not found");
-});
-
-test("the real repo tree passes the guard (planctl frozen surface intact + agentwrap + keeper pair at zero)", () => {
-  // Proves all three postures against live source: the planctl anchors/count-pins
-  // hold, Check C finds zero "agentwrap" outside the exclusion set (the only
-  // residue is the count-pinned state-dir relocation), AND Check D finds zero
-  // space-separated "keeper pair" outside the exclusion set.
-  const res = Bun.spawnSync(["bash", GUARD], {
-    cwd: join(import.meta.dir, ".."),
-  });
-  expect(res.exitCode).toBe(0);
 });

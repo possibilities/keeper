@@ -44,9 +44,9 @@
  * `node:*` plus the dep-free `baseline-store` / `worktree-git` / `git-exec`
  * leaves. NEVER `bun:sqlite` / `src/db.ts`. The decision core (spool ordering,
  * dedupe, deadline→timeout, retry/flaky classification, boot-prune planning,
- * install-failure classification, gate-phase extraction, suite-output parsing) is
- * exported PURE and drives the whole test suite without a Worker, subprocess, or
- * git.
+ * install-failure classification, missing-gate classification, suite-output parsing)
+ * is exported PURE and drives the whole test suite without a Worker, subprocess,
+ * or git.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -183,14 +183,12 @@ export interface RawRun {
 
 // ── pure decision core (exported, unit-driven) ───────────────────────────────
 
-/**
- * Extract the gate-phase command from a package.json `test` script. The suite is
- * a two-phase `<gate> && <opentui>` script; the Baseline runs the GATE phase only,
- * so this returns the first `&&` segment. Null when the script is empty. PURE.
- */
-export function gatePhaseCommand(testScript: string): string | null {
-  const seg = testScript.split("&&")[0]?.trim() ?? "";
-  return seg.length > 0 ? seg : null;
+export function noTestGateOutcome(): BaselineOutcome {
+  return {
+    kind: "infra",
+    infra: "spawn",
+    message: "no test-gate script in package.json at sha",
+  };
 }
 
 /** Keep only the last `MESSAGE_TAIL_BYTES` chars — errors cluster at the end. */
@@ -609,13 +607,9 @@ async function computeBaseline(
       return leafWritten;
     }
 
-    const gateCmd = readGateCommand(scratchPath);
+    const gateCmd = readTestGateCommand(scratchPath);
     if (gateCmd === null) {
-      writeOutcome({
-        kind: "infra",
-        infra: "spawn",
-        message: "no test-gate script in package.json at sha",
-      });
+      writeOutcome(noTestGateOutcome());
       return leafWritten;
     }
 
@@ -689,15 +683,15 @@ async function computeBaseline(
   }
 }
 
-/** Read the gate-phase command from a scratch worktree's package.json, or null. */
-function readGateCommand(scratchPath: string): string | null {
+export function readTestGateCommand(pkgDir: string): string | null {
   try {
     const pkg = JSON.parse(
-      readFileSync(join(scratchPath, "package.json"), "utf8"),
-    ) as { scripts?: { test?: unknown } };
-    const testScript =
-      typeof pkg.scripts?.test === "string" ? pkg.scripts.test : "";
-    return gatePhaseCommand(testScript);
+      readFileSync(join(pkgDir, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> } | null;
+    const command = pkg?.scripts?.["test:gate"];
+    return typeof command === "string" && command.trim().length > 0
+      ? command
+      : null;
   } catch {
     return null;
   }

@@ -10,9 +10,7 @@
  * process.{exit,stdout,stderr} because `runPanel`
  * owns its own stdout + exit code via the process globals, not the injected
  * seams. Only the NON-spawning paths are exercised end-to-end (`wait` reads a
- * seeded manifest + result files; a bad-config `start` fails before any leg
- * spawns) — the real detached-leg launch is the slow-tier sibling
- * `test/pair-panel.slow.test.ts`, never the fast tier.
+ * seeded manifest + result files; a bad-config `start` fails before any leg spawns).
  *
  * The ad-hoc single-member (pairing = a panel of one) coverage sits here too:
  * `resolveAdHocMember`/`buildPanelLegArgv` are unit-tested pure, and `panelStart`

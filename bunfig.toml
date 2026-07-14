@@ -1,0 +1,5 @@
+[test]
+# Bare discovery runs only the fail-fast sentinel. Named gates pass the test
+# directory explicitly; targeted `./*.test.ts` paths remain directly runnable.
+root = "./scripts/test-entrypoint.ts"
+preload = ["./scripts/test-entrypoint.ts"]

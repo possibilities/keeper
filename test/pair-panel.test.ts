@@ -6,9 +6,7 @@
  * outcomes are simulated by seeding each leg's `--output` result file (a `keeper
  * agent run` JSON envelope carrying an `outcome`) plus its `.pidfile` into a real
  * scratch dir, so terminality + the verdict are exercised against real fs without
- * a single real process. The detached-survival case (the keystone proof that legs
- * outlive `start`'s exit and write their result file on macOS) is the REAL-spawn
- * sibling in `test/pair-panel.slow.test.ts` (skipped unless `KEEPER_RUN_SLOW`).
+ * a single real process. Detached-process behavior is a manual diagnostic; this suite covers the injected launch contract.
  *
  * Coverage: member resolution (panel hit / single preset / unknown fail-loud);
  * leg + detach-wrapper argv shape (zero setsid/timeout/gtimeout);

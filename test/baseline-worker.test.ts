@@ -12,7 +12,8 @@
 import { expect, test } from "bun:test";
 import type { ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type BaselineResult,
@@ -25,12 +26,13 @@ import {
   cleanupPlan,
   crashDetail,
   finalOutcome,
-  gatePhaseCommand,
   installFailureReason,
+  noTestGateOutcome,
   parseGateOutput,
   planBootPrune,
   planSpool,
   type RunClass,
+  readTestGateCommand,
   runDetached,
   type SpoolEntry,
   shouldRetry,
@@ -273,29 +275,48 @@ test("installFailureReason: clean exit is null; timeout + non-zero are distinct 
   );
 });
 
-// ── gate-phase extraction ────────────────────────────────────────────────────
+// ── named gate resolution ────────────────────────────────────────────────────
 
-test("gatePhaseCommand takes the first &&-segment (gate phase, not opentui)", () => {
-  const twoPhase =
-    "bun scripts/test-gate.ts --timeout=10000 && bun run test:opentui";
-  expect(gatePhaseCommand(twoPhase)).toBe(
-    "bun scripts/test-gate.ts --timeout=10000",
-  );
+test("readTestGateCommand returns the exact named script instead of scripts.test", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-baseline-gate-"));
+  const command = "bun scripts/test-gate.ts --timeout=10000 ./test";
+  try {
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({
+        scripts: { test: "do-not-read", "test:gate": command },
+      }),
+    );
+    expect(readTestGateCommand(dir)).toBe(command);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test("gatePhaseCommand returns null for an empty script", () => {
-  expect(gatePhaseCommand("")).toBeNull();
-  expect(gatePhaseCommand("   ")).toBeNull();
-});
+test("a missing or malformed test:gate resolves null and Baseline classifies it as infra", () => {
+  const noGateDir = mkdtempSync(join(tmpdir(), "keeper-baseline-no-gate-"));
+  const malformedDir = mkdtempSync(join(tmpdir(), "keeper-baseline-bad-gate-"));
+  try {
+    writeFileSync(
+      join(noGateDir, "package.json"),
+      JSON.stringify({ scripts: { test: "do-not-read" } }),
+    );
+    writeFileSync(join(malformedDir, "package.json"), "{not json");
+    expect(readTestGateCommand(noGateDir)).toBeNull();
+    expect(readTestGateCommand(malformedDir)).toBeNull();
 
-test("gatePhaseCommand extracts the real repo's gate phase without the opentui phase", () => {
-  const pkg = JSON.parse(
-    readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"),
-  ) as { scripts: { test: string } };
-  const gate = gatePhaseCommand(pkg.scripts.test);
-  expect(gate).not.toBeNull();
-  expect(gate).toContain("test-gate");
-  expect(gate).not.toContain("test:opentui");
+    const result = deriveResult({
+      ...DERIVE_BASE,
+      outcome: noTestGateOutcome(),
+    });
+    expect(result.status).toBe("infra-error");
+    if (result.status !== "infra-error") throw new Error("unreachable");
+    expect(result.kind).toBe("spawn");
+    expect(result.message).toContain("no test-gate script");
+  } finally {
+    rmSync(noGateDir, { recursive: true, force: true });
+    rmSync(malformedDir, { recursive: true, force: true });
+  }
 });
 
 // ── spool ordering + coalescing ──────────────────────────────────────────────

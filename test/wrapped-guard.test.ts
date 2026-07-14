@@ -61,12 +61,16 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "git commit --trailer 'Job-Id: job-1' -m msg",
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
     "git log -c --format=%H",
-    // the test runner
-    "bun test",
+    // explicit test files + stable named gates
     "bun test test/wrapped-guard.test.ts",
+    "bun test test/wrapped-guard.test.ts test/escalation-guard.test.ts",
+    "bun test --test-name-pattern allow test/wrapped-guard.test.ts",
+    "bun test --coverage test/wrapped-guard.test.ts",
+    "bun run test:gate",
     "bun run test:full",
     // a stripped benign wrapper in front of an allowed command
-    "timeout 300 bun test",
+    "timeout 300 bun test test/wrapped-guard.test.ts",
+    "nohup bun run test:gate",
     "nohup keeper agent wait leg-x",
     // pipes between two allowlisted commands
     "git log --oneline | git rev-parse HEAD",
@@ -92,6 +96,17 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "bun -e 'code'",
     "bun --eval 'code'",
     "bun -p 'code'",
+    // --- aggregate discovery must use the stable named package gate ---
+    "bun test",
+    "bun test .",
+    "bun test test",
+    "bun test 'test/*.test.*'",
+    "bun test --test-name-pattern allow",
+    "bun test -t fake.test.ts",
+    "bun test --watch",
+    "bun test --coverage",
+    "timeout 300 bun test",
+    "nohup bun test --coverage",
     // --- bun run demands a NAMED package script: a path-shaped target could run a
     //     just-written out-of-tree file, and a bare run has no script ---
     "bun run /scratch/gen.ts",
@@ -380,7 +395,8 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
       "git status",
       "git commit -m 'feat(x): y'",
       "git reset --soft HEAD~1",
-      "bun test",
+      "bun test test/wrapped-guard.test.ts",
+      "bun run test:gate",
     ]) {
       expect(decide(bashPayload(cmd))).toBeNull();
     }

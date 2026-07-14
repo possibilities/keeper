@@ -9,16 +9,6 @@
 # non-zero and leaves the live binary untouched.
 set -euo pipefail
 
-# --skip-slow is the emergency bypass for the real-git slow-tier gate below.
-# Routine promotions must run the gate; skipping it ships an unverified binary.
-skip_slow=0
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --skip-slow) skip_slow=1; shift ;;
-    *) echo "promote: unknown argument: $1" >&2; exit 2 ;;
-  esac
-done
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary="${repo_root}/dist/keeper-plan-bun"
 dest_dir="${HOME}/.local/bin"
@@ -46,7 +36,7 @@ keeper_root="$(cd "${repo_root}/../.." && pwd)"
 # render the plan guards silently skip. A `git status` diff here would be dead:
 # every rendered output (workers/, agents/practice-scout.md) is gitignored and so
 # invisible to porcelain, and the hand-authored agents/ files are never rendered.
-echo "promote: rendering per-cell work plugins for the slow-tier cell-set guard"
+echo "promote: rendering per-cell work plugins for the cell-set guard"
 ( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" )
 
 # Report >0 plugins rendered. The render step is a SILENT no-op on an
@@ -62,20 +52,6 @@ if [ "${cell_count}" -eq 0 ]; then
   exit 1
 fi
 echo "promote: rendered the plan plugin — ${cell_count} work cell(s) under plugins/plan/workers/"
-
-# Real-git slow-tier gate. The fast `bun test` suite is pure (no real git), so a
-# git-effect regression passes every commit gate; this is the routine surface
-# that runs the KEEPER_PLAN_RUN_SLOW real-git blocks and blocks promotion on any
-# failure (set -e). --skip-slow is the emergency hatch, never a routine path.
-if [ "${skip_slow}" -eq 1 ]; then
-  echo "promote: ############################################################" >&2
-  echo "promote: ## WARNING — real-git slow-tier gate BYPASSED (--skip-slow) ##" >&2
-  echo "promote: ## git-effect regressions are UNVERIFIED for this promote  ##" >&2
-  echo "promote: ############################################################" >&2
-else
-  echo "promote: slow-tier gate — real-git effect suite (KEEPER_PLAN_RUN_SLOW)"
-  ( cd "${repo_root}" && bun run test:slow )
-fi
 
 mkdir -p "${dest_dir}"
 

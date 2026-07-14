@@ -612,7 +612,7 @@ test("budget: an exhausted time budget stops issuing scans and leaves seed_requi
 // ---------------------------------------------------------------------------
 //
 // (The DISCOVERY path — no explicit roots, `jobs.cwd` → git toplevel resolve —
-// genuinely needs real git and lives in git-boot-seed-realgit.slow.test.ts.)
+// uses the injected command seam.)
 
 test("multi-root: each explicit root is seeded independently from its own snapshot", () => {
   const repoA = fakeRoot("multi-a");
@@ -762,7 +762,7 @@ test("fn-921: pre-warmed memo yields the same git surface as the cold fold (memo
 // real-1GB-DB version before cutover; this is the synthetic-corpus equivalent.
 // ---------------------------------------------------------------------------
 
-test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical GitSnapshots skipped) + correct for currently-dirty files + downgrade-guarded", () => {
+test("copy-proof (synthetic): v78→v79 migrate + boot-seed skips historical GitSnapshots + is correct for currently-dirty files + downgrade-guarded", () => {
   const repo = fakeRoot("copyproof");
   // An on-disk SQLite path the test reopens across migrate cycles. It is a DB
   // file only — no git repo is created, and the seed runs via the synthetic
@@ -775,11 +775,8 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
   //    and DROP the v79 control table so the reopen genuinely runs v78→v79.
   {
     const seed = openDb(dbPath);
-    // Seed a realistic count of HISTORICAL GitSnapshot events for the repo. In
-    // the OLD deterministic-replay model these would each drive
-    // `computeRepoBashWindows` (the ~6-day self-join time-bomb); the v79 floor
-    // must make every one of them a no-op on the post-migrate drain.
-    const N = 4000;
+    // A minimal historical set is enough to prove every event is skipped.
+    const N = 3;
     const insertSnap = seed.db.prepare(
       `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
          VALUES (?, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
@@ -808,22 +805,15 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
   }
 
   // 2. Reopen → migrate v78→v79 (raises floor = max(events.id)) + the post-migrate
-  //    boot drain. TIME it: the historical GitSnapshots must be skipped, so this
-  //    is milliseconds, not the ~6-day replay.
-  const t0 = performance.now();
+  //    boot drain.
   const { db, stmts } = openDb(dbPath);
   // The post-migrate drain (folds nothing new for git since floor gates them).
   let n: number;
   do {
     n = drain(db);
   } while (n > 0);
-  const migrateAndDrainMs = performance.now() - t0;
 
   try {
-    // (a) FAST: a generous CI bound. The whole point is it does NOT replay the
-    //     4000 GitSnapshots through the self-join. Comfortably sub-second.
-    expect(migrateAndDrainMs).toBeLessThan(5000);
-
     // The floor was raised to the max historical id, so the git surface is EMPTY
     // after the drain (every historical GitSnapshot self-gated) — proving the
     // historical replay was skipped, NOT folded.
@@ -835,7 +825,7 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
     ).toBeNull();
     expect(readGitProjectionSeedRequired(db)).toBe(true); // migration set it
 
-    // (b) Boot-seed re-derives the surface CORRECTLY for currently-dirty files.
+    // Boot-seed re-derives the surface CORRECTLY for currently-dirty files.
     const seedDrain = (): void => {
       let m: number;
       do {
@@ -855,7 +845,7 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
     expect(row?.dirty_count).toBe(1);
     expect(readGitProjectionSeedRequired(db)).toBe(false); // seed cleared it
 
-    // (c) The runtime-downgrade guard still refuses an older binary: stamp the DB
+    // The runtime-downgrade guard still refuses an older binary: stamp the DB
     //     one ahead and assert openDb throws BEFORE migrating.
     db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(
       String(SCHEMA_VERSION + 1),

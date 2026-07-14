@@ -28,7 +28,7 @@
  * No real tmux: a `TmuxClientFocusSnapshot` is a synthetic `events` row the
  * reducer folds — these tests drive the real fold + the real delete SQL over a
  * seeded in-memory log, never an attach. (The live `tmux -C` attach lives in the
- * worker's `*.slow.test.ts`.)
+ * worker command seam.)
  */
 
 import type { Database } from "bun:sqlite";

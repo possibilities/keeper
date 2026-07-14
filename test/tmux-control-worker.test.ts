@@ -12,7 +12,7 @@
  *  - `decideTmuxControlWatchdog` (from daemon) — the mute-escalation verdict.
  *
  * The live `tmux -C` attach is exercised only in
- * `test/tmux-control-worker.slow.test.ts` (allowlisted).
+ * an injected control-stream seam.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -28,6 +28,7 @@ import {
   isStructuralNotification,
   mapPaneRowsToTopology,
   pickAnchorSession,
+  type RereadScheduler,
   runConnection,
   type TmuxClientFocusSnapshotMessage,
   type TmuxTopologySnapshotMessage,
@@ -38,7 +39,11 @@ import {
   parsePaneLines,
 } from "../src/tmux-focus-derive";
 import type { Job } from "../src/types";
-import { retryUntil } from "./helpers/retry-until";
+import {
+  drainMicrotasks,
+  ManualScheduler,
+  retryUntil,
+} from "./helpers/retry-until";
 
 function fakeJob(opts: {
   job_id?: string;
@@ -505,11 +510,26 @@ function replyBlock(n: number, body: string[]): string {
   return [`%begin 0 ${n} 1`, ...body, `%end 0 ${n} 1`, ""].join("\n");
 }
 
+function rereadScheduler(clock: ManualScheduler): RereadScheduler {
+  return {
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  };
+}
+
+async function runScheduled(clock: ManualScheduler): Promise<void> {
+  await drainMicrotasks();
+  while (clock.pendingCount() > 0) {
+    await clock.runNext();
+  }
+}
+
 describe("runConnection — synthetic-child handshake drop + redirty re-read", () => {
   test("a handshake whose %end splits into a later read does not release the bootstrap early and never mis-correlates the first command reply", async () => {
     const posted: TmuxClientFocusSnapshotMessage[] = [];
     const commands: string[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
 
     // The real client on `main` window 3 pane %42; keeper's own control client
     // (controlMode=1) is dropped by the derivation. A non-trivial pane table so a
@@ -554,6 +574,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
       postTopology: () => {},
       postLiveness: () => {},
       readJobs: () => [],
+      rereadScheduler: rereadScheduler(clock),
     });
 
     // Emit the unsolicited attach handshake block with its `%end` SPLIT across two
@@ -562,13 +583,15 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     child.pushStdout(`%begin 0 0 1\n`);
     child.pushStdout(`%session-changed $1 main\n`); // body inside the open block
     // The handshake is still open — assert the bootstrap has NOT been released.
-    await Bun.sleep(20);
+    await drainMicrotasks();
     expect(commands.length).toBe(0);
+    expect(clock.pendingCount()).toBe(0);
 
     // The handshake's `%end` arrives in a LATER read — only now does the
     // connection-scoped parser complete the handshake reply, drop it (empty queue),
     // and release the bootstrap to send its first command.
     child.pushStdout(`%end 0 0 1\n`);
+    await runScheduled(clock);
 
     // The framed focus read must derive the CORRECT focus — a mis-correlation
     // (the handshake body matching the refresh-client resolver) would shift every
@@ -605,6 +628,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     const posted: TmuxClientFocusSnapshotMessage[] = [];
     const commands: string[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
 
     // Two distinct focus states so the redirty re-read produces a SECOND, different
     // post (window 3 → window 5). The first re-read reads state A; a structural
@@ -646,10 +670,12 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
       postTopology: () => {},
       postLiveness: () => {},
       readJobs: () => [],
+      rereadScheduler: rereadScheduler(clock),
     });
 
     // Settle the handshake (begin+end in one read this time) → bootstrap releases.
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
     // Expect exactly TWO posts: state A then the re-armed state B.
     const second = await retryUntil(
@@ -678,7 +704,7 @@ describe("runConnection — synthetic-child handshake drop + redirty re-read", (
     const paneReads = commands.filter((c) => c.startsWith("list-panes")).length;
     expect(paneReads).toBe(2);
     // No third re-read piles up after the re-arm drains.
-    await Bun.sleep(150);
+    expect(clock.pendingCount()).toBe(0);
     expect(commands.filter((c) => c.startsWith("list-panes")).length).toBe(2);
 
     stopping = true;
@@ -916,6 +942,7 @@ describe("runConnection — topology emit + skip-gates", () => {
   test("posts a topology snapshot with a live tmux job, byte-identical to the mapped shape", async () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     const child = scriptedReread({ generation: "48271:10", clients, panes });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
@@ -923,8 +950,10 @@ describe("runConnection — topology emit + skip-gates", () => {
       postTopology: (m) => topos.push(m),
       postLiveness: () => {},
       readJobs: () => liveTmuxJobs,
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
     const got = await retryUntil(
       () => (topos.length > 0 ? topos[0] : null),
@@ -953,6 +982,7 @@ describe("runConnection — topology emit + skip-gates", () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     const child = scriptedReread({ generation: "48271:10", clients, panes });
     const conn = runConnection(child.child, {
       isStopping: () => stopping,
@@ -960,12 +990,14 @@ describe("runConnection — topology emit + skip-gates", () => {
       postTopology: (m) => topos.push(m),
       postLiveness: () => {},
       readJobs: () => [], // no live tmux job → topology gated off
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
     // Focus still posts (its own contract); topology stays silent.
-    await retryUntil(() => (focus.length > 0 ? focus[0] : null), 5000);
-    await Bun.sleep(120);
+    expect(focus).toHaveLength(1);
+    expect(clock.pendingCount()).toBe(0);
     expect(topos).toHaveLength(0);
 
     stopping = true;
@@ -977,6 +1009,7 @@ describe("runConnection — topology emit + skip-gates", () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     // Panes empty (server up, no panes) — focus derives `none`, topology skips.
     const child = scriptedReread({
       generation: "48271:10",
@@ -989,11 +1022,13 @@ describe("runConnection — topology emit + skip-gates", () => {
       postTopology: (m) => topos.push(m),
       postLiveness: () => {},
       readJobs: () => liveTmuxJobs,
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
-    await retryUntil(() => (focus.length > 0 ? focus[0] : null), 5000);
-    await Bun.sleep(120);
+    expect(focus).toHaveLength(1);
+    expect(clock.pendingCount()).toBe(0);
     expect(topos).toHaveLength(0);
 
     stopping = true;
@@ -1005,6 +1040,7 @@ describe("runConnection — topology emit + skip-gates", () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     const focus: TmuxClientFocusSnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     // Empty reply → generationId stays null → topology gated off (focus too).
     const child = scriptedReread({ generation: "", clients, panes });
     const conn = runConnection(child.child, {
@@ -1013,12 +1049,13 @@ describe("runConnection — topology emit + skip-gates", () => {
       postTopology: (m) => topos.push(m),
       postLiveness: () => {},
       readJobs: () => liveTmuxJobs,
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
-    // Give the re-read time to run; a null generation suppresses BOTH posts'
-    // generation context — topology must stay empty.
-    await Bun.sleep(200);
+    // A null generation suppresses the topology post.
+    expect(clock.pendingCount()).toBe(0);
     expect(topos).toHaveLength(0);
 
     stopping = true;
@@ -1029,6 +1066,7 @@ describe("runConnection — topology emit + skip-gates", () => {
   test("a DB-only ownership claim re-posts steady topology; bursts coalesce and a true duplicate stays silent", async () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     let paneReads = 0;
     let cmdNum = 350;
     let requestDbRefresh: () => void = () => {
@@ -1078,8 +1116,10 @@ describe("runConnection — topology emit + skip-gates", () => {
       watchDbChanges: (onChange) => {
         requestDbRefresh = onChange;
       },
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
+    await runScheduled(clock);
 
     const repaired = await retryUntil(
       () => (topos.length >= 2 ? topos[1] : null),
@@ -1096,10 +1136,8 @@ describe("runConnection — topology emit + skip-gates", () => {
     // A later DB pulse rereads once, but unchanged ownership + physical topology
     // hashes identically and emits no third topology observation.
     requestDbRefresh();
-    await retryUntil(
-      () => (paneReads >= 3 && topos.length === 2 ? true : null),
-      5000,
-    );
+    expect(clock.pendingCount()).toBe(1);
+    await runScheduled(clock);
     expect(paneReads).toBe(3);
     expect(topos).toHaveLength(2);
 
@@ -1111,6 +1149,7 @@ describe("runConnection — topology emit + skip-gates", () => {
   test("dedup: a steady topology posts exactly once across two re-reads", async () => {
     const topos: TmuxTopologySnapshotMessage[] = [];
     let stopping = false;
+    const clock = new ManualScheduler();
     let paneReads = 0;
     let cmdNum = 400;
     let child!: ReturnType<typeof makeScriptedChild>;
@@ -1138,12 +1177,13 @@ describe("runConnection — topology emit + skip-gates", () => {
       postTopology: (m) => topos.push(m),
       postLiveness: () => {},
       readJobs: () => liveTmuxJobs,
+      rereadScheduler: rereadScheduler(clock),
     });
     child.pushStdout(`%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n`);
 
-    // Wait for both re-reads to run.
-    await retryUntil(() => (paneReads >= 2 ? true : null), 5000);
-    await Bun.sleep(120);
+    await runScheduled(clock);
+    expect(paneReads).toBe(2);
+    expect(clock.pendingCount()).toBe(0);
     // Two re-reads, ONE topology post (the second read's identical topology dedups).
     expect(topos).toHaveLength(1);
 

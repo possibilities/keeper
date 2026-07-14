@@ -40,7 +40,7 @@
  * state pause/play.
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -64,8 +64,8 @@ import {
 } from "./baseline-store";
 import {
   classifyRun,
-  gatePhaseCommand,
   parseGateOutput,
+  readTestGateCommand,
   runDetached,
   type SpawnFn,
 } from "./baseline-worker";
@@ -6138,21 +6138,6 @@ const MERGE_GATE_SUITE_DEADLINE_MS = 15 * 60_000;
 /** Cap on the failing-test names carried in a red verdict's detail. */
 const MERGE_GATE_MAX_FAILING_NAMES = 8;
 
-/** Read one package dir's gate-phase test command (the `<gate> && …` first segment),
- *  or null when it has no runnable `test` script. */
-export function readPkgGateCommand(pkgDir: string): string | null {
-  try {
-    const pkg = JSON.parse(
-      readFileSync(join(pkgDir, "package.json"), "utf8"),
-    ) as { scripts?: { test?: unknown } };
-    const testScript =
-      typeof pkg.scripts?.test === "string" ? pkg.scripts.test : "";
-    return gatePhaseCommand(testScript);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Run ONE package's fast gate suite in `pkgDir` (a scratch-worktree subdir): a
  * frozen-lockfile install, then the gate-phase command. Classifies via the SAME pure
@@ -6165,9 +6150,8 @@ export function readPkgGateCommand(pkgDir: string): string | null {
  *    the merged tree) → `red` — a broken merged build is a VISIBLE park an operator
  *    fixes, never a silent forever-retry.
  *
- * `opts.spawnFn` is the injectable seam (tests): overrides the underlying `spawn`
- * both the install and the gate-command run go through, so a fake suite runner can
- * exercise every verdict branch without a real subprocess.
+ * `opts.spawnFn` and `opts.killGraceMs` are injectable seams so tests can replace
+ * subprocesses and settle timeout paths without the production kill grace.
  */
 export async function runPackageSuiteGate(
   pkgDir: string,
@@ -6175,6 +6159,7 @@ export async function runPackageSuiteGate(
     installTimeoutMs: number;
     suiteDeadlineMs: number;
     spawnFn?: SpawnFn;
+    killGraceMs?: number;
   },
 ): Promise<MergeSuiteVerdict> {
   const install = await runDetached(
@@ -6182,7 +6167,7 @@ export async function runPackageSuiteGate(
     ["install", "--frozen-lockfile"],
     pkgDir,
     opts.installTimeoutMs,
-    { spawnFn: opts.spawnFn },
+    { spawnFn: opts.spawnFn, killGraceMs: opts.killGraceMs },
   );
   if (install.timedOut) {
     return {
@@ -6196,7 +6181,7 @@ export async function runPackageSuiteGate(
       detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
     };
   }
-  const gateCmd = readPkgGateCommand(pkgDir);
+  const gateCmd = readTestGateCommand(pkgDir);
   if (gateCmd === null) {
     return {
       kind: "cannot-run",
@@ -6208,7 +6193,7 @@ export async function runPackageSuiteGate(
     ["-c", gateCmd],
     pkgDir,
     opts.suiteDeadlineMs,
-    { spawnFn: opts.spawnFn },
+    { spawnFn: opts.spawnFn, killGraceMs: opts.killGraceMs },
   );
   if (raw.timedOut) {
     return { kind: "cannot-run", detail: `suite timed out in ${pkgDir}` };
@@ -6246,8 +6231,8 @@ export async function runPackageSuiteGate(
  * full rationale at the `runMergeSuite` dep wiring (the `ConfirmRunningDeps` object). The
  * scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
  * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`/
- * `spawnFn` are injectable seams; production passes `gitExec`, the default root,
- * and the real `spawn`.
+ * `spawnFn`/`killGraceMs` are injectable seams; production passes `gitExec`, the
+ * default root, the real `spawn`, and the bounded default kill grace.
  */
 export async function runMergeSuiteGate(
   args: { repoDir: string; mergedCommit: string; runsPlanSuite: boolean },
@@ -6257,6 +6242,7 @@ export async function runMergeSuiteGate(
     installTimeoutMs?: number;
     suiteDeadlineMs?: number;
     spawnFn?: SpawnFn;
+    killGraceMs?: number;
   } = {},
 ): Promise<MergeSuiteVerdict> {
   const run = opts.run ?? gitExec;
@@ -6285,6 +6271,7 @@ export async function runMergeSuiteGate(
       installTimeoutMs,
       suiteDeadlineMs,
       spawnFn: opts.spawnFn,
+      killGraceMs: opts.killGraceMs,
     });
     if (rootVerdict.kind !== "green" || !args.runsPlanSuite) {
       return rootVerdict;
@@ -6297,6 +6284,7 @@ export async function runMergeSuiteGate(
         installTimeoutMs,
         suiteDeadlineMs,
         spawnFn: opts.spawnFn,
+        killGraceMs: opts.killGraceMs,
       },
     );
   } catch (err) {

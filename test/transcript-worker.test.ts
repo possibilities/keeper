@@ -1660,7 +1660,7 @@ test("fn-720 transcript-heartbeat: cold-boot heartbeat (no fast path yet) report
 // drives the replace directly; `decideTranscriptResubscribe` is the verdict
 // that gates it. These cover the decision surface only — no live-watcher tests
 // (the sequential teardown / generation guard / flap window are exercised by
-// the slow-tier worker integration). The parity model is plan-worker's
+// the worker command seam). The parity model is plan-worker's
 // `decidePlanResubscribe`.
 // ---------------------------------------------------------------------------
 

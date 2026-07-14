@@ -7,7 +7,15 @@
  */
 
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,6 +50,7 @@ import {
 } from "../src/db";
 import { drain } from "../src/reducer";
 import type { Job } from "../src/types";
+import { freshMemDb } from "./helpers/template-db";
 
 /**
  * Boot drain helper for migration tests. Schema v11's rewind-and-redrain
@@ -3210,7 +3219,7 @@ test("Tier 2 (fn-628) idx_jobs_created_state serves the default jobs query as CO
   // shape was rejected during planning because SQLite cannot translate a
   // `NOT IN` predicate into a usable index-entry range on the leading
   // column.
-  const { db } = openDb(":memory:");
+  const { db } = freshMemDb();
   const states = ["running", "stopped", "ended", "killed", "spawned"];
   const insert = db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, state) VALUES (?, ?, ?, ?, ?)",
@@ -3323,110 +3332,111 @@ function seedPlanctlEventMix(db: Database): void {
   db.run("ANALYZE");
 }
 
-test("Tier 2 (fn-628.2) idx_events_plan_epic + idx_events_plan_target are present on fresh openDb", () => {
-  const { db } = openDb(":memory:");
-  const indexes = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
-    .all() as { name: string }[];
-  const names = new Set(indexes.map((i) => i.name));
-  expect(names.has("idx_events_plan_epic")).toBe(true);
-  expect(names.has("idx_events_plan_target")).toBe(true);
-  db.close();
-});
+describe("Tier 2 (fn-628.2) plan event indexes", () => {
+  let db: Database;
 
-test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH plan partial indexes (EXPLAIN QUERY PLAN)", () => {
-  // Mirrors the syncPlanLinks cross-session sweep at src/reducer.ts:~2371
-  // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
-  // branches each SEARCH a different new partial index — proving the
-  // optimizer can reach both indexes (the prior OR form could only reach one).
-  const { db } = openDb(":memory:");
-  seedPlanctlEventMix(db);
+  beforeAll(() => {
+    ({ db } = freshMemDb());
+    seedPlanctlEventMix(db);
+  });
 
-  const plan = db
-    .prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_epic_id IN ('fn-100-foo')
-        UNION
-       SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_target IN ('fn-100-foo')`,
-    )
-    .all() as { detail: string }[];
-  const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toMatch(/COMPOUND QUERY/);
-  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_epic/);
-  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_target/);
-  db.close();
-});
+  afterAll(() => {
+    db.close();
+  });
 
-test("Tier 2 (fn-628.2) per-session ordered plan load still uses idx_events_plan_session (regression guard)", () => {
-  // The per-session ordered load at src/reducer.ts:~2389-2395 must NOT be
-  // displaced by the new indexes — confirms the v14 session-leading index
-  // remains the planner's pick for `WHERE session_id = ? AND plan_op IS
-  // NOT NULL ORDER BY id ASC`.
-  const { db } = openDb(":memory:");
-  seedPlanctlEventMix(db);
+  test("Tier 2 (fn-628.2) idx_events_plan_epic + idx_events_plan_target are present on fresh openDb", () => {
+    const { db: fresh } = freshMemDb();
+    const indexes = fresh
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all() as { name: string }[];
+    const names = new Set(indexes.map((i) => i.name));
+    expect(names.has("idx_events_plan_epic")).toBe(true);
+    expect(names.has("idx_events_plan_target")).toBe(true);
+    fresh.close();
+  });
 
-  const plan = db
-    .prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT ts, plan_op, plan_target, plan_epic_id,
-              plan_subject_present
-         FROM events
-        WHERE session_id = ? AND plan_op IS NOT NULL
-        ORDER BY id ASC`,
-    )
-    .all("sess-both-0") as { detail: string }[];
-  const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_session/);
-  db.close();
-});
+  test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH plan partial indexes (EXPLAIN QUERY PLAN)", () => {
+    // Mirrors the syncPlanLinks cross-session sweep at src/reducer.ts:~2371
+    // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
+    // branches each SEARCH a different new partial index — proving the
+    // optimizer can reach both indexes (the prior OR form could only reach one).
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_epic_id IN ('fn-100-foo')
+          UNION
+         SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_target IN ('fn-100-foo')`,
+      )
+      .all() as { detail: string }[];
+    const detail = plan.map((r) => r.detail).join(" | ");
+    expect(detail).toMatch(/COMPOUND QUERY/);
+    expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_epic/);
+    expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_target/);
+  });
 
-test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR form (re-fold determinism guard)", () => {
-  // The reducer's `syncPlanLinks` cross-session sweep must produce
-  // byte-identical session_id sets after the rewrite. Both forms run against
-  // the same fixture; sorted+deduped session_id sets must deep-equal.
-  const { db } = openDb(":memory:");
-  seedPlanctlEventMix(db);
+  test("Tier 2 (fn-628.2) per-session ordered plan load still uses idx_events_plan_session (regression guard)", () => {
+    // The per-session ordered load at src/reducer.ts:~2389-2395 must NOT be
+    // displaced by the new indexes — confirms the v14 session-leading index
+    // remains the planner's pick for `WHERE session_id = ? AND plan_op IS
+    // NOT NULL ORDER BY id ASC`.
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT ts, plan_op, plan_target, plan_epic_id,
+                plan_subject_present
+           FROM events
+          WHERE session_id = ? AND plan_op IS NOT NULL
+          ORDER BY id ASC`,
+      )
+      .all("sess-both-0") as { detail: string }[];
+    const detail = plan.map((r) => r.detail).join(" | ");
+    expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_session/);
+  });
 
-  const orForm = db
-    .prepare(
-      `SELECT DISTINCT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND (plan_epic_id IN ('fn-100-foo') OR plan_target IN ('fn-100-foo'))`,
-    )
-    .all() as { session_id: string }[];
-  const unionForm = db
-    .prepare(
-      `SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_epic_id IN ('fn-100-foo')
-        UNION
-       SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_target IN ('fn-100-foo')`,
-    )
-    .all() as { session_id: string }[];
+  test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR form (re-fold determinism guard)", () => {
+    // The reducer's `syncPlanLinks` cross-session sweep must produce
+    // byte-identical session_id sets after the rewrite. Both forms run against
+    // the same fixture; sorted+deduped session_id sets must deep-equal.
+    const orForm = db
+      .prepare(
+        `SELECT DISTINCT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND (plan_epic_id IN ('fn-100-foo') OR plan_target IN ('fn-100-foo'))`,
+      )
+      .all() as { session_id: string }[];
+    const unionForm = db
+      .prepare(
+        `SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_epic_id IN ('fn-100-foo')
+          UNION
+         SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_target IN ('fn-100-foo')`,
+      )
+      .all() as { session_id: string }[];
 
-  const orSet = orForm.map((r) => r.session_id).sort();
-  const unionSet = unionForm.map((r) => r.session_id).sort();
-  // UNION dedups intrinsically; SELECT DISTINCT does too — both must
-  // produce the same set (and contain it without duplicates).
-  expect(new Set(orSet).size).toBe(orSet.length);
-  expect(new Set(unionSet).size).toBe(unionSet.length);
-  expect(unionSet).toEqual(orSet);
-  // Spot-check: the fixture has 20 epic-only + 20 target-only + 10 both =
-  // 50 distinct sessions that should match (the noise + non-planctl rows
-  // point at a different epic / carry NULL planctl columns).
-  expect(unionSet.length).toBe(50);
-  db.close();
+    const orSet = orForm.map((r) => r.session_id).sort();
+    const unionSet = unionForm.map((r) => r.session_id).sort();
+    // UNION dedups intrinsically; SELECT DISTINCT does too — both must
+    // produce the same set (and contain it without duplicates).
+    expect(new Set(orSet).size).toBe(orSet.length);
+    expect(new Set(unionSet).size).toBe(unionSet.length);
+    expect(unionSet).toEqual(orSet);
+    // Spot-check: the fixture has 20 epic-only + 20 target-only + 10 both =
+    // 50 distinct sessions that should match (the noise + non-planctl rows
+    // point at a different epic / carry NULL planctl columns).
+    expect(unionSet.length).toBe(50);
+  });
 });
 
 test("v9 DB migrates to v10: four columns added + three partial indexes + backfill, second open is idempotent", () => {
@@ -6468,13 +6478,13 @@ test("resolveSockPath does no I/O (does not create the parent dir)", () => {
 });
 
 test("selectWorldRev returns the seeded 0 on a fresh DB", () => {
-  const { db, stmts } = openDb(":memory:");
+  const { db, stmts } = freshMemDb();
   expect(selectWorldRev(stmts)).toBe(0);
   db.close();
 });
 
 test("selectWorldRev reflects advanceCursor", () => {
-  const { db, stmts } = openDb(":memory:");
+  const { db, stmts } = freshMemDb();
   db.prepare(
     "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
   ).run(7, 1);
@@ -6483,14 +6493,14 @@ test("selectWorldRev reflects advanceCursor", () => {
 });
 
 test("selectByIds returns [] for an empty id-set without querying", () => {
-  const { db } = openDb(":memory:");
+  const { db } = freshMemDb();
   // Sanity: even if we hadn't seeded anything, [] must short-circuit.
   expect(selectByIds(db, JOBS_DESCRIPTOR, [])).toEqual([]);
   db.close();
 });
 
 test("selectByIds returns matching rows for a multi-id set", () => {
-  const { db } = openDb(":memory:");
+  const { db } = freshMemDb();
   const ts = 1_700_000_000;
   const insert = db.prepare(
     "INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -6521,7 +6531,7 @@ test("selectByIds returns matching rows for a multi-id set", () => {
 });
 
 test("selectByIds serves title and no title_history key", () => {
-  const { db } = openDb(":memory:");
+  const { db } = freshMemDb();
   const ts = 1_700_000_000;
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title) VALUES (?, ?, ?, ?, ?)",
@@ -6542,7 +6552,7 @@ test("selectByIds serves title and no title_history key", () => {
 });
 
 test("selectByIds throws when id-set exceeds MAX_IN_PARAMS", () => {
-  const { db } = openDb(":memory:");
+  const { db } = freshMemDb();
   const ids = Array.from({ length: MAX_IN_PARAMS + 1 }, (_, i) => `id-${i}`);
   expect(() => selectByIds(db, JOBS_DESCRIPTOR, ids)).toThrow(
     /MAX_VARIABLE_NUMBER/,

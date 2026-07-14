@@ -36,8 +36,7 @@
  *
  * The PURE pieces below (`buildAttachArgs`, `pickAnchorSession`, `focusDedupKey`,
  * `decideReconnect`, `isStructuralNotification`) carry no I/O so the fast tier
- * drives them against golden inputs; the live `tmux -C` attach is exercised only
- * in `tmux-control-worker.slow.test.ts` (allowlisted).
+ * drives them against golden inputs; the live `tmux -C` attach is a manual diagnostic.
  */
 
 import type { Database } from "bun:sqlite";
@@ -398,6 +397,16 @@ const SHUTDOWN_DEADLINE_MS = 2_000;
  *  seam (a test substitutes a synthetic-transcript child with no real fork).
  *  Exported so the fast-tier synthetic-child test can feed a scripted transcript
  *  through {@link runConnection} with no real `tmux -C` fork. */
+export interface RereadScheduler {
+  setTimer: (callback: () => void, ms: number) => unknown;
+  clearTimer: (handle: unknown) => void;
+}
+
+const realRereadScheduler: RereadScheduler = {
+  setTimer: (callback, ms) => setTimeout(callback, ms),
+  clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 export interface ControlChild {
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stdin: { write(chunk: string): void; flush?(): void };
@@ -716,10 +725,12 @@ export async function runConnection(
       onChange: () => void,
       isDone: () => boolean,
     ) => Promise<void> | void;
+    rereadScheduler?: RereadScheduler;
   },
 ): Promise<boolean> {
   const decoder = new TextDecoder();
   const lineBuf = new LineBuffer();
+  const rereadScheduler = ctx.rereadScheduler ?? realRereadScheduler;
 
   // Framed-command correlation via a FIFO queue of pending replies. Commands are
   // issued STRICTLY SERIALLY (each `await sendCommand` resolves before the next is
@@ -788,7 +799,7 @@ export async function runConnection(
   let dirty = true; // bootstrap: read once on connect
   let rereadInFlight = false;
   let redirty = false;
-  let rereadTimer: ReturnType<typeof setTimeout> | null = null;
+  let rereadTimer: unknown | null = null;
 
   /** Send a framed command and resolve with its reply body lines (matched FIFO to
    *  the next reply). Rejects with {@link ChildGoneError} if the stdin write fails
@@ -872,11 +883,10 @@ export async function runConnection(
    *  one more re-read runs after. */
   function scheduleReread(): void {
     if (rereadTimer !== null) return;
-    rereadTimer = setTimeout(() => {
+    rereadTimer = rereadScheduler.setTimer(() => {
       rereadTimer = null;
       void runReread();
     }, REREAD_DEBOUNCE_MS);
-    rereadTimer.unref?.();
   }
 
   /** The single-in-flight framed re-read: read the server generation if unknown,
@@ -1049,7 +1059,7 @@ export async function runConnection(
     await ownershipWatch;
   }
   if (rereadTimer !== null) {
-    clearTimeout(rereadTimer);
+    rereadScheduler.clearTimer(rereadTimer);
     rereadTimer = null;
   }
   // Settle any in-flight commands so a `runReread` mid-flight unblocks.

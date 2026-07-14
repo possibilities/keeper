@@ -569,6 +569,61 @@ function classifyGitBranch(branchArgs: string[], role: string): string | null {
   return null;
 }
 
+const BUN_TEST_VALUE_FLAGS = new Set([
+  "--timeout",
+  "--rerun-each",
+  "--retry",
+  "--seed",
+  "--coverage-reporter",
+  "--coverage-dir",
+  "--test-name-pattern",
+  "-t",
+  "--reporter",
+  "--reporter-outfile",
+  "--max-concurrency",
+  "--path-ignore-patterns",
+  "--changed",
+  "--parallel",
+  "--parallel-delay",
+  "--shard",
+  "--preload",
+]);
+
+/** Direct Bun discovery is targeted only when it names a literal test file. */
+function classifyBunTest(tokens: string[]): string | null {
+  const args = tokens.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "--") {
+      return args
+        .slice(i + 1)
+        .some((value) => !value.startsWith("-") && value.endsWith(".test.ts"))
+        ? null
+        : "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
+    }
+    if (BUN_TEST_VALUE_FLAGS.has(arg)) {
+      i += 1;
+      continue;
+    }
+    if (!arg.startsWith("-") && arg.endsWith(".test.ts")) {
+      return null;
+    }
+  }
+  return "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
+}
+
+/** Diagnosis roles may invoke package scripts, never path/option-shaped run targets. */
+function isNamedBunScript(target: string | undefined): boolean {
+  return (
+    target !== undefined &&
+    target.length > 0 &&
+    !target.startsWith("-") &&
+    !target.includes(".") &&
+    !target.includes("/") &&
+    !target.includes("\\")
+  );
+}
+
 /** Classify one already-wrapper-stripped segment's executable against the role.
  *  Returns a deny reason, or null when the command is on the role's allowlist. */
 function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
@@ -630,9 +685,11 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
     ) {
       return "`bun` inline-eval (-e/--eval/-p/--print) is never permitted";
     }
-    if (cfg.writeCapable) return null; // any non-eval bun subcommand
-    if (sub === "test" || sub === "run") return null;
-    return `\`bun ${sub ?? ""}\` is not permitted for the diagnosis role '${cfg.role}' (only \`bun test\` / \`bun run\`)`;
+    // Aggregate discovery is denied for every role; use the stable named gate.
+    if (sub === "test") return classifyBunTest(tokens);
+    if (cfg.writeCapable) return null; // any other non-eval bun subcommand
+    if (sub === "run" && isNamedBunScript(tokens[2])) return null;
+    return `\`bun ${sub ?? ""}\` is not permitted for the diagnosis role '${cfg.role}' (only explicit \`bun test *.test.ts\` / \`bun run <named-package-script>\`)`;
   }
 
   if (BUILD_TOOL_FAMILIES.has(exe)) {
