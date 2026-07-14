@@ -46,5 +46,5 @@ Add allow AND deny table cases with reason-naming assertions: deny `rg --pre x .
 - [ ] `bun test test/escalation-guard.test.ts` is green.
 
 ## Done summary
-
+Extended classifyExecutable with an rg exec-flag arm (--pre/--pre-glob/--hostname-bin, exact match, no abbreviation), added -fls to FIND_EXEC_PRIMARIES, denied keeper dispatch --prompt/--prompt-file for every role while preserving the work::/close:: plan-form allow, and documented botctl's audited-empty flag surface. Added matching allow/deny table cases and a deny-reason assertion. bun test test/escalation-guard.test.ts: 214 pass, 0 fail.
 ## Evidence

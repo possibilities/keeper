@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Close escalation-guard exec/write flag escapes",
-  "updated_at": "2026-07-13T18:16:32.295000Z"
+  "updated_at": "2026-07-14T02:55:23.430000Z",
+  "worker_done_at": "2026-07-14T02:55:23.430000Z"
 }
