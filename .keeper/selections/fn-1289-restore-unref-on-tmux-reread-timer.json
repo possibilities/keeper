@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Fully-specified one-line single-file edit with the exact fix given (add .unref?.() to a timer) and no design choice, so route to the lightest GPT edit tier at the low band.",
+      "task_id": "fn-1289-restore-unref-on-tmux-reread-timer.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "created_at": "2026-07-14T00:56:38.382000Z",
+  "epic_id": "fn-1289-restore-unref-on-tmux-reread-timer",
+  "input_hash": "2f446dabc6ce2145ab86323247dc6d20bec96b0e173166749e9460ae76b2935d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 793013675,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Fully-specified one-line single-file edit with the exact fix given (add .unref?.() to a timer) and no design choice, so route to the lightest GPT edit tier at the low band.\",\"confidence\":0.9}]}\n"
+}
