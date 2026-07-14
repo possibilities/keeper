@@ -11,6 +11,8 @@
 // tasks fill in each `src/<verb>.ts` runner WITHOUT editing this dispatcher — the
 // dispatch table, arg parsing, help text, and exit-code contract land once.
 
+import { join, resolve } from "node:path";
+
 import { formatOutput, type OutputFormat } from "../../plan/src/format.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { run as runCheckGenerated } from "./check_generated.ts";
@@ -19,6 +21,7 @@ import { runFindSnippets } from "./find_snippets.ts";
 import { runListBundles } from "./list_bundles.ts";
 import { runListSnippets } from "./list_snippets.ts";
 import { resolveProjectRoot } from "./project_root.ts";
+import { compilePromptArtifacts } from "./prompt_compiler.ts";
 import { run as runRender } from "./render.ts";
 import { runRenderPluginTemplates } from "./render_plugin_templates.ts";
 import { runSaveBundle } from "./save_bundle.ts";
@@ -211,6 +214,41 @@ function dispatch(parsed: ParsedArgs): number {
   }
 
   switch (command) {
+    case "compile": {
+      const bundle = readOption(parsed.rest, "--bundle");
+      const role = readOption(parsed.rest, "--role");
+      const target = readOption(parsed.rest, "--target");
+      if ((bundle === undefined) === (role === undefined)) {
+        usageError("compile requires exactly one of --bundle or --role");
+      }
+      if (target !== "pi") {
+        usageError("compile --target must be 'pi'");
+      }
+      const projectRoot = readOption(parsed.rest, "--project-root");
+      const agentDir = readOption(parsed.rest, "--agent-dir");
+      try {
+        const result = compilePromptArtifacts({
+          request: {
+            target: "pi",
+            ...(bundle === undefined ? { role } : { bundle }),
+          },
+          check: parsed.rest.includes("--check"),
+          repoRoot:
+            projectRoot === undefined ? undefined : resolve(projectRoot),
+          targetDir:
+            agentDir === undefined
+              ? undefined
+              : join(resolve(agentDir), "agents"),
+        });
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+        return result.ok ? 0 : 1;
+      } catch (error) {
+        process.stderr.write(
+          `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        return 1;
+      }
+    }
     case "render": {
       const ref = positional(parsed.rest, ["--project-root"]);
       const explicit = readOption(parsed.rest, "--project-root") ?? null;

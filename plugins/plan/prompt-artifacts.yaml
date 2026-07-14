@@ -1,0 +1,95 @@
+# Canonical role-scoped prompt artifact catalog.
+#
+# Roles, not plugins, are the binding unit. Static roles draw their assigned
+# cell from matrix.yaml agent_pins and adapt through provider equivalence when a
+# publication target does not serve that cell. The work worker is cell-bound
+# and remains wrapped when unserved; Pi publication of that role is outside the
+# static compiler slice.
+
+schema_version: 1
+
+roles:
+  - role: "plan:close-planner"
+    source: template/agents/close-planner.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:docs-gap-scout"
+    source: template/agents/docs-gap-scout.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:epic-scout"
+    source: template/agents/epic-scout.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:gap-analyst"
+    source: template/agents/gap-analyst.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:model-selector"
+    source: template/agents/model-selector.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:panel-judge"
+    source: template/agents/panel-judge.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:panel-runner"
+    source: template/agents/panel-runner.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:practice-scout"
+    source: template/agents/practice-scout.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:quality-auditor"
+    source: template/agents/quality-auditor.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:repo-scout"
+    source: template/agents/repo-scout.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "plan:selection-auditor"
+    source: template/agents/selection-auditor.md.tmpl
+    binding: static
+    unserved: equivalent
+  - role: "work:worker"
+    source: template/agents/worker.md.tmpl
+    binding: cell-bound
+    unserved: wrapped
+
+bundles:
+  - bundle: "plan:plan"
+    roles:
+      - "plan:repo-scout"
+      - "plan:docs-gap-scout"
+      - "plan:practice-scout"
+      - "plan:epic-scout"
+      - "plan:gap-analyst"
+      - "plan:model-selector"
+  - bundle: "plan:close"
+    roles:
+      - "plan:quality-auditor"
+      - "plan:close-planner"
+      - "plan:selection-auditor"
+  - bundle: "plan:work"
+    roles:
+      - "work:worker"
+      - "plan:quality-auditor"
+  - bundle: "plan:panel"
+    roles:
+      - "plan:panel-runner"
+      - "plan:panel-judge"
+  - bundle: "plan:static"
+    roles:
+      - "plan:close-planner"
+      - "plan:docs-gap-scout"
+      - "plan:epic-scout"
+      - "plan:gap-analyst"
+      - "plan:model-selector"
+      - "plan:panel-judge"
+      - "plan:panel-runner"
+      - "plan:practice-scout"
+      - "plan:quality-auditor"
+      - "plan:repo-scout"
+      - "plan:selection-auditor"

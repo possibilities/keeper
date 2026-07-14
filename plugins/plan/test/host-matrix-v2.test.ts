@@ -22,6 +22,7 @@ import {
   HostMatrixConfigError,
   type HostMatrixV2,
   hostMatrixV2EffortsFor,
+  hostMatrixV2ProviderRoute,
   isValidTemplatePath,
   loadHostMatrixV2,
 } from "../src/host_matrix.ts";
@@ -69,6 +70,25 @@ describe("loadHostMatrixV2 — valid parse", () => {
     expect(isValidTemplatePath("template/agents/worker.md.tmpl")).toBe(true);
     expect(isValidTemplatePath("../x")).toBe(false);
     expect(isValidTemplatePath("/abs")).toBe(false);
+  });
+
+  test("named provider routes retain exact launch ids and allowed efforts, including shadows", () => {
+    const h = loadHostMatrixV2(writeMatrix(fx.MULTI_PROVIDER));
+    expect(hostMatrixV2ProviderRoute(h, "pi", "gpt-5.3-codex-spark")).toEqual({
+      provider: "pi",
+      capability: "gpt-5.3-codex-spark",
+      launchId: "openai-codex/gpt-5.3-codex-spark",
+      efforts: ["medium", "high"],
+    });
+    expect(hostMatrixV2ProviderRoute(h, "pi", "gpt-5.3-spark-preview")).toEqual(
+      {
+        provider: "pi",
+        capability: "gpt-5.3-spark-preview",
+        launchId: "gpt-5.3-spark-preview",
+        efforts: ["medium"],
+      },
+    );
+    expect(hostMatrixV2ProviderRoute(h, "pi", "opus")).toBeUndefined();
   });
 
   test("hostMatrixV2EffortsFor: per-capability list, else the top-level axis", () => {

@@ -210,6 +210,32 @@ function cellKey(cell: EquivalenceCell): string {
   return `${cell.model}::${cell.effort}`;
 }
 
+/** Provider family requested by a compiler or dispatcher adaptation. */
+export type ProviderFamily = "claude" | "gpt";
+
+/** Pure source-cell + target-family lookup. The directions are independently
+ * authored, so callers name the family they need rather than trying to invert a
+ * mapping. Returns undefined when the map has no exact source cell and rejects
+ * an ambiguous duplicate instead of silently taking declaration order. */
+export function lookupProviderEquivalence(
+  config: ProviderEquivalenceConfig,
+  source: EquivalenceCell,
+  targetFamily: ProviderFamily,
+): EquivalenceCell | undefined {
+  const direction: EquivalenceDirection =
+    targetFamily === "gpt" ? "claude_to_gpt" : "gpt_to_claude";
+  const matches = config.mappings[direction].filter(
+    (entry) => cellKey(entry.source) === cellKey(source),
+  );
+  if (matches.length > 1) {
+    throw new ProviderEquivalenceConfigError(
+      `${direction}: duplicate source cell {model: ${source.model}, effort: ${source.effort}}`,
+    );
+  }
+  const target = matches[0]?.target;
+  return target === undefined ? undefined : { ...target };
+}
+
 function otherDirection(direction: EquivalenceDirection): EquivalenceDirection {
   return direction === "claude_to_gpt" ? "gpt_to_claude" : "claude_to_gpt";
 }

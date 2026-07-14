@@ -19,6 +19,7 @@ import {
   coerceProviderEquivalenceConfig,
   type EquivalenceEntry,
   loadProviderEquivalenceConfig,
+  lookupProviderEquivalence,
   type ProviderEquivalenceConfig,
   ProviderEquivalenceConfigError,
 } from "../src/provider_equivalence.ts";
@@ -286,6 +287,31 @@ function totalConfig(): ProviderEquivalenceConfig {
 }
 
 describe("checkProviderEquivalence", () => {
+  test("pure lookup resolves an exact source cell toward the requested family", () => {
+    const config = totalConfig();
+    expect(
+      lookupProviderEquivalence(
+        config,
+        { model: "opus", effort: "high" },
+        "gpt",
+      ),
+    ).toEqual({ model: "gpt-5.6-sol", effort: "high" });
+    expect(
+      lookupProviderEquivalence(
+        config,
+        { model: "gpt-5.6-sol", effort: "max" },
+        "claude",
+      ),
+    ).toEqual({ model: "opus", effort: "max" });
+    expect(
+      lookupProviderEquivalence(
+        config,
+        { model: "sonnet", effort: "high" },
+        "gpt",
+      ),
+    ).toBeUndefined();
+  });
+
   test("a total, well-formed two-model map passes", () => {
     expect(checkProviderEquivalence(totalConfig())).toEqual({
       ok: true,

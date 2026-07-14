@@ -13,7 +13,8 @@
 // The plan island cannot import src/agent (the launcher island), so this is its
 // OWN small parser of the same matrix.yaml shape, extracting only what a plan
 // consumer needs: the effort axis, the model axis with each model's driver, the
-// template inventory, and the wrapper driver. Absence or malformedness is a
+// template inventory, wrapper driver, and exact named-provider routes. Absence
+// or malformedness is a
 // typed, four-state loud failure — see {@link HostMatrixConfigError}.
 
 import { readFileSync, statSync } from "node:fs";
@@ -198,8 +199,9 @@ export function effectiveMatrix(): EffectiveMatrix {
 //
 // The plan island's OWN small parser of the v2 matrix.yaml the launcher island
 // owns — extracting only what a plan consumer needs (the effort axis, the cell
-// axis with each cell's driver, the template inventory, the wrapper driver, the
-// per-cell effort lists, the dedup shadow log), pinned byte-for-byte against the
+// axis with each cell's driver, the template inventory, the wrapper driver, named
+// provider routes, per-cell effort lists, and the dedup shadow log), pinned
+// byte-for-byte against the
 // launcher island's twin (`src/agent/matrix.ts` `loadMatrixV2`) by the cross-island
 // parity test. A provider model entry is the launch id verbatim; the capability is
 // its basename. Absence/malformedness is a typed four-state loud error.
@@ -247,6 +249,16 @@ export interface AgentPin {
   effort: string;
 }
 
+/** One provider's exact native route for a capability. Unlike the deduplicated
+ * worker-cell projection, this preserves every named provider's launch id and
+ * effort allowlist so publication consumers can target a specific host. */
+export interface HostProviderRoute {
+  readonly provider: string;
+  readonly capability: string;
+  readonly launchId: string;
+  readonly efforts: readonly string[];
+}
+
 /** The v2 subset a plan consumer needs. `models` IS `subagent_models` (the cell
  *  axis); `effortsByModel` covers EVERY capability any provider serves. */
 export interface HostMatrixV2 {
@@ -257,6 +269,8 @@ export interface HostMatrixV2 {
   driverByModel: Map<string, Driver>;
   effortsByModel: Map<string, string[]>;
   shadowed: HostMatrixShadow[];
+  /** Exact routes by provider then capability, including cross-provider shadows. */
+  providerRoutes: Map<string, Map<string, HostProviderRoute>>;
   /** the `agent_pins:` map (static subagent name → its `{model, effort}` pin),
    *  in declaration order. Empty when the block is absent. */
   agentPins: Map<string, AgentPin>;
@@ -369,7 +383,7 @@ function parseHostMatrixV2(parsed: unknown, label: string): HostMatrixV2 {
   }
   const efforts = coerceEffortList(doc.efforts, "efforts", label);
   const subagentTemplates = coerceTemplateList(doc.subagent_templates, label);
-  const { effortsByModel, servedBy, claudeServes, shadowed } =
+  const { effortsByModel, servedBy, claudeServes, shadowed, providerRoutes } =
     coerceV2Providers(doc.providers, efforts, label);
   const models = coerceSubagentModels(doc.subagent_models, servedBy, label);
   const driverByModel = new Map<string, Driver>();
@@ -385,6 +399,7 @@ function parseHostMatrixV2(parsed: unknown, label: string): HostMatrixV2 {
     driverByModel,
     effortsByModel,
     shadowed,
+    providerRoutes,
     agentPins,
   };
 }
@@ -418,6 +433,7 @@ function coerceV2Providers(
   servedBy: Map<string, string>;
   claudeServes: Set<string>;
   shadowed: HostMatrixShadow[];
+  providerRoutes: Map<string, Map<string, HostProviderRoute>>;
 } {
   if (!Array.isArray(raw) || raw.length === 0) {
     throw new SubagentsConfigError(
@@ -430,6 +446,7 @@ function coerceV2Providers(
   // claudeServes tracks capabilities the claude provider serves → native.
   const claudeServes = new Set<string>();
   const shadowed: HostMatrixShadow[] = [];
+  const providerRoutes = new Map<string, Map<string, HostProviderRoute>>();
   const seenProvider = new Set<string>();
   for (const entry of raw) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
@@ -472,16 +489,22 @@ function coerceV2Providers(
         ? undefined
         : coerceEffortList(rec.efforts, `provider '${name}' efforts`, label);
     const caps = coerceV2ProviderModels(rec.models, name, label);
+    const routes = new Map<string, HostProviderRoute>();
+    providerRoutes.set(name, routes);
     for (const cap of caps.keys()) {
+      const effectiveEfforts = caps.get(cap) ?? providerEfforts ?? baseEfforts;
+      routes.set(cap, {
+        provider: name,
+        capability: cap,
+        launchId: caps.launchId(cap),
+        efforts: [...effectiveEfforts],
+      });
       if (name === "claude") {
         claudeServes.add(cap);
       }
       if (!servedBy.has(cap)) {
         servedBy.set(cap, name);
-        effortsByModel.set(
-          cap,
-          caps.get(cap) ?? providerEfforts ?? baseEfforts,
-        );
+        effortsByModel.set(cap, effectiveEfforts);
       } else {
         shadowed.push({
           provider: name,
@@ -492,7 +515,13 @@ function coerceV2Providers(
       }
     }
   }
-  return { effortsByModel, servedBy, claudeServes, shadowed };
+  return {
+    effortsByModel,
+    servedBy,
+    claudeServes,
+    shadowed,
+    providerRoutes,
+  };
 }
 
 /** The capabilities one provider serves plus per-model effort overrides and launch
@@ -682,6 +711,18 @@ function coerceAgentPins(
     pins.set(name, { model: rec.model, effort: rec.effort });
   }
   return pins;
+}
+
+/** Resolve whether a named provider serves a capability and, when it does,
+ * return the exact launch id plus that provider route's allowed efforts. */
+export function hostMatrixV2ProviderRoute(
+  host: HostMatrixV2,
+  provider: string,
+  capability: string,
+): HostProviderRoute | undefined {
+  const route = host.providerRoutes.get(provider)?.get(capability);
+  if (route === undefined) return undefined;
+  return { ...route, efforts: [...route.efforts] };
 }
 
 /** The effective effort list for a capability under the v2 host matrix — the

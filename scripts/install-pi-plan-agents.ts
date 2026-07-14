@@ -3,7 +3,7 @@
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { installPiPlanAgents } from "../src/agent/pi-plan-agents.ts";
+import { compilePromptArtifacts } from "../plugins/prompt/src/prompt_compiler.ts";
 
 function parseArgs(argv: string[]): { check: boolean; agentDir: string } {
   let check = false;
@@ -28,17 +28,14 @@ function parseArgs(argv: string[]): { check: boolean; agentDir: string } {
 export function main(argv = process.argv.slice(2)): void {
   const { check, agentDir } = parseArgs(argv);
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  const result = installPiPlanAgents({
-    sourceDir: join(repoRoot, "plugins", "plan", "agents"),
+  const result = compilePromptArtifacts({
+    request: { target: "pi", bundle: "plan:static" },
+    repoRoot,
     targetDir: join(agentDir, "agents"),
     check,
   });
-  const action = check ? "checked" : "installed";
-  process.stdout.write(
-    `Pi plan agents ${action}: ${result.checked.length} definitions` +
-      (result.changed.length > 0 ? ` (${result.changed.length} changed)` : "") +
-      "\n",
-  );
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (!result.ok) process.exitCode = 1;
 }
 
 if (import.meta.main) {

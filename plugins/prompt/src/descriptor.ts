@@ -96,6 +96,43 @@ export const PROMPT_COMMANDS: readonly PromptCommandDescriptor[] = [
     ],
   },
   {
+    name: "compile",
+    summary: "Compile a role or bundle into target-native agent definitions.",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    format_modes: ["json"],
+    flags: [
+      {
+        name: "bundle",
+        type: "string",
+        summary: "Fully-qualified catalog bundle to ensure",
+      },
+      {
+        name: "role",
+        type: "string",
+        summary: "Fully-qualified static role to ensure",
+      },
+      {
+        name: "target",
+        type: "string",
+        summary: "Publication target (this slice: pi)",
+      },
+      {
+        name: "agent-dir",
+        type: "string",
+        summary: "Pi agent root (default: $PI_CODING_AGENT_DIR or ~/.pi/agent)",
+      },
+      {
+        name: "check",
+        type: "boolean",
+        summary: "Verify outputs without writing; exit non-zero on drift",
+      },
+      FLAG_PROJECT_ROOT,
+    ],
+  },
+  {
     name: "find-snippets",
     summary: "BM25-rank snippets against a query, with excerpts.",
     visibility: "public",

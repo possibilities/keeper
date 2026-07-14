@@ -99,6 +99,7 @@ function run(argv: string[]): Run {
 const KEEP_VERBS = [
   "render",
   "check-generated",
+  "compile",
   "render-plugin-templates",
   "find-snippets",
   "build-snippets",
@@ -116,6 +117,7 @@ const KEEP_VERBS = [
 const PORTED_VERBS = new Set([
   "render",
   "check-generated",
+  "compile",
   "render-plugin-templates",
   "build-snippets",
   "find-snippets",
