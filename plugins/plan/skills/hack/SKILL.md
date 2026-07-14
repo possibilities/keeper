@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), WebSearch, WebFetch, Agent, Skill, Monitor
+allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(gh gist create:*), WebSearch, WebFetch, Agent, Skill, Monitor
 ---
 
 # Hack
@@ -165,6 +165,8 @@ A confident "I don't know yet, here's what I've ruled out" is more useful than a
 
 Output conventions, not a mode — they apply whenever a request produces a file artifact (most often a report or research writeup).
 
+Creating or opening a document is a direct output action, not a work-shaped source change: execute it without a sketch, greenlight, or approval. "Open this document," "open it," and "open that doc" mean first ensuring the Markdown and YAML sidecar are saved according to the convention below, then publishing both as a GitHub gist and opening the gist's web page in the browser. Never interpret "open" as opening the local file, an editor, Preview, or a `file://` URL.
+
 <!-- BAKE:BEGIN keeper prompt render source-dirs/docs-dir-and-gist-open -->
 
 When a request asks you to create a document — a writeup, report, brief, or research summary meant to persist as a file — write it under `~/docs/`. A single doc is `~/docs/<name>.md`; a related set gets its own `~/docs/<topic-slug>/` directory. Don't scatter docs into the repo or `/tmp` unless the human names another location.
@@ -233,10 +235,10 @@ Read follow-ups for decision content, not keywords. A short fragment that answer
 
 ### Hand off to /plan:plan warm, not cold
 
-When the route is `/plan:plan` — inferred, or because the human said "plan it" — don't fire the skill as the literal next action. The pre-plan beat is what makes the plan session worth running:
+When the route is `/plan:plan` — inferred, or because the human said "plan it" — don't fire the skill as the literal next action. The pre-plan beat is what makes the plan session worth running. "Plan it" authorizes planning from the conversation's established high-water mark: build the handoff from the conversation and research, resolve only genuine load-bearing unknowns, and invoke `/plan:plan` as soon as none remain.
 
 1. **Finish the exploration the sketch exposed.** Open the touchpoints you haven't read, run the command you were speculating about, delegate wide sweeps per the investigate rules. Scouts inside `/plan:plan` verify; they shouldn't discover.
-2. **Surface every open question and resolve it with the human** — one at a time, each with a short explainer (the tradeoff, why it matters, what each answer implies). Don't self-answer load-bearing unknowns. Update the sketch as answers land.
+2. **Surface only unresolved load-bearing questions that cannot be inferred from the conversation** — one at a time, each with a short explainer (the tradeoff, why it matters, what each answer implies). Don't turn the handoff summary or settled defaults into questions. Update the sketch as answers land.
 3. **When nothing load-bearing remains open, fire `/plan:plan`**, passing forward what the conversation established as its instructions: the conclusion the inquiry reached, the sketch (goal, direction, touchpoints), the resolved decisions, and key evidence with `path:line` cites — so the plan session starts from this conversation's high-water mark instead of rediscovering it. This is an internal skill-to-skill handoff: suppressing the panel's display to the human does not suppress the judged conclusion downstream — your panel-informed thinking carries forward as the session's own. The panel runs once, here at the inquiry stage; plan inherits its judgment through this handoff rather than re-invoking it.
 
 "Plan it" often arrives with this beat spelled out — "explore, resolve questions, then plan", "ask anything you need first, when ready /plan:plan". That phrasing sets the sequence, not just the destination; honor the sequence even when it's left implicit.
