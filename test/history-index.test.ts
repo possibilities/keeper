@@ -2,9 +2,11 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -12,10 +14,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSessionCatalog } from "../src/history/catalog";
+import { readHistoryCatalogCache } from "../src/history/catalog-cache";
 import {
   inspectHistoryIndex,
   openHistoryIndexReadOnly,
   publishHistoryIndexRebuild,
+  purgeHistoryIndex,
   resolveHistoryIndexPaths,
 } from "../src/history/index-db";
 import {
@@ -101,7 +105,7 @@ describe("private disposable History index", () => {
     expect(paths.database.endsWith("keeper.db")).toBe(false);
     expect(inspectHistoryIndex(paths)).toEqual({
       kind: "ready",
-      schemaVersion: 1,
+      schemaVersion: 3,
     });
     expect(statSync(paths.directory).mode & 0o777).toBe(0o700);
     expect(statSync(paths.database).mode & 0o777).toBe(0o600);
@@ -266,6 +270,106 @@ describe("private disposable History index", () => {
     expect(refreshed.rebuilt).toBe(true);
     expect(inspectHistoryIndex(paths).kind).toBe("ready");
     expect(bodies()).toEqual(["alpha original"]);
+  });
+
+  test("rebuilds a pre-file-evidence image and repopulates file evidence", () => {
+    piSession([user("u1", null, "please inspect src/evidence.ts")]);
+    const paths = resolveHistoryIndexPaths(join(root, "state"));
+    refreshHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 1,
+    });
+    const oldImage = new Database(paths.database);
+    oldImage.run("DROP TABLE file_evidence");
+    oldImage.run(
+      "UPDATE history_meta SET value = '1' WHERE key = 'schema_version'",
+    );
+    oldImage.run("PRAGMA user_version = 1");
+    oldImage.close();
+    expect(inspectHistoryIndex(paths).kind).toBe("incompatible");
+
+    const refreshed = refreshHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 2,
+    });
+    expect(refreshed.rebuilt).toBe(true);
+    const db = openHistoryIndexReadOnly(paths);
+    try {
+      const count = db
+        .query("SELECT count(*) AS count FROM file_evidence")
+        .get() as { count: number };
+      expect(count.count).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("publishes native title cache metadata keyed by the strong source fingerprint", () => {
+    const paths = resolveHistoryIndexPaths(join(root, "state"));
+    refreshHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 1,
+    });
+    const cache = readHistoryCatalogCache(paths);
+    const cached = cache.get(realpathSync(transcript));
+    expect(cached?.nativeId).toBe("pi-session");
+    expect(cached?.currentTitle).toBe("Index fixture");
+    expect(cached?.titleHistory).toEqual(["Index fixture"]);
+    expect(cached?.statFingerprint).toHaveLength(64);
+  });
+
+  test("atomic rebuild and purge preserve already-open reader snapshots and remove stale rebuild images", () => {
+    const paths = resolveHistoryIndexPaths(join(root, "state"));
+    refreshHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 1,
+    });
+    const reader = openHistoryIndexReadOnly(paths);
+    piSession([user("u1b", null, "incremental refresh with reader open")]);
+    const refreshed = refreshHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 2,
+    });
+    expect(refreshed.rebuilt).toBe(false);
+    expect(
+      (reader.query("SELECT body FROM entries").get() as { body: string }).body,
+    ).toBe("incremental refresh with reader open");
+
+    reader.run("BEGIN");
+    expect(
+      (reader.query("SELECT body FROM entries").get() as { body: string }).body,
+    ).toBe("incremental refresh with reader open");
+
+    piSession([user("u2", null, "replacement visible to new readers")]);
+    rebuildHistoryIndex({
+      paths,
+      catalog: buildSessionCatalog([artifact()]),
+      nowMs: 2,
+    });
+    expect(
+      (reader.query("SELECT body FROM entries").get() as { body: string }).body,
+    ).toBe("incremental refresh with reader open");
+    expect(bodies()).toEqual(["replacement visible to new readers"]);
+
+    const stale = `${paths.database}.rebuild-stale-sensitive-copy`;
+    writeFileSync(stale, "private transcript derivative");
+    writeFileSync(`${stale}-journal`, "journal");
+    purgeHistoryIndex(paths);
+    expect(inspectHistoryIndex(paths).kind).toBe("missing");
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(`${stale}-journal`)).toBe(false);
+    // Unix readers retain the complete old inode after unlink; purge never
+    // tears a live query between schema validation and open.
+    expect(
+      (reader.query("SELECT body FROM entries").get() as { body: string }).body,
+    ).toBe("incremental refresh with reader open");
+    reader.run("COMMIT");
+    reader.close();
   });
 
   test("publishes only a closed successful rebuild image", () => {

@@ -11,13 +11,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import {
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -95,6 +89,7 @@ function makeHarness(): Harness {
       tabs: mkHandler("tabs"),
       session: mkHandler("session"),
       transcript: mkHandler("transcript"),
+      history: mkHandler("history"),
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
       "show-job": mkHandler("show-job"),
@@ -236,6 +231,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("setup-tmux")).toBe(true);
     expect(isSubcommand("session")).toBe(true);
     expect(isSubcommand("transcript")).toBe(true);
+    expect(isSubcommand("history")).toBe(true);
     expect(isSubcommand("search-history")).toBe(true);
     expect(isSubcommand("find-file-history")).toBe(true);
     expect(isSubcommand("show-job")).toBe(true);
@@ -1555,6 +1551,25 @@ describe("keeper --help --json recursive descriptor tree", () => {
       "poll-interval",
     ]);
     expect(baseline?.exit_codes?.["3"]?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("history mutation metadata matches sidecar-refresh behavior", () => {
+    const history = buildHelpIndex().subcommands.find(
+      (command) => command.name === "history",
+    );
+    const verbs = new Map(
+      history?.verbs?.map((verb) => [verb.name, verb.mutates]) ?? [],
+    );
+    expect(history?.mutates).toBe(true);
+    expect(verbs).toEqual(
+      new Map([
+        ["list", false],
+        ["show", false],
+        ["search", true],
+        ["files", true],
+        ["index", true],
+      ]),
+    );
   });
 
   test("tabs node carries its verbs recursively with per-verb flags", () => {

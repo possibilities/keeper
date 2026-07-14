@@ -456,6 +456,114 @@ export const TABS_DUMP_FLAGS = [
   { name: "db", type: "string", summary: "keeper.db path override" },
 ] as const satisfies readonly FlagDescriptor[];
 
+const HISTORY_FORMAT_FLAGS = [
+  {
+    name: "format",
+    type: "string",
+    summary: "Output format: human|json (default human)",
+  },
+  FLAG_JSON_ALIAS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_LIST_FLAGS = [
+  FLAG_HELP,
+  { name: "project", type: "string", summary: "Restrict to one project path" },
+  { name: "harness", type: "string", summary: "claude|pi" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max sessions" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_SHOW_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "project",
+    type: "string",
+    summary: "Restrict resolution to one project path",
+  },
+  {
+    name: "artifact",
+    type: "string",
+    summary: "Pin one artifact when id/project are duplicated",
+  },
+  {
+    name: "subagent",
+    type: "string",
+    summary: "Claude subagent id/prefix, or all",
+  },
+  { name: "offset", type: "string", summary: "Filtered entry offset" },
+  {
+    name: "before",
+    type: "string",
+    summary: "Page backward before this offset",
+  },
+  { name: "limit", type: "string", summary: "Max entries" },
+  { name: "max-chars", type: "string", summary: "Total character budget" },
+  {
+    name: "max-entry-chars",
+    type: "string",
+    summary: "Per-entry character cap",
+  },
+  { name: "tools", type: "string", summary: "none|compact|full" },
+  {
+    name: "role",
+    type: "string",
+    multiple: true,
+    summary: "Repeatable role filter",
+  },
+  { name: "since", type: "string", summary: "Entry at/after time" },
+  { name: "until", type: "string", summary: "Entry at/before time" },
+  { name: "grep", type: "string", summary: "Content filter" },
+  {
+    name: "meta",
+    type: "boolean",
+    summary: "Include injected meta/system entries",
+  },
+  { name: "thinking", type: "boolean", summary: "Include thinking blocks" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_SEARCH_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Restrict to one Session reference",
+  },
+  { name: "project", type: "string", summary: "Restrict to one project path" },
+  { name: "harness", type: "string", summary: "claude|pi" },
+  {
+    name: "role",
+    type: "string",
+    multiple: true,
+    summary: "Repeatable role filter",
+  },
+  { name: "since", type: "string", summary: "Entry at/after time" },
+  { name: "until", type: "string", summary: "Entry at/before time" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max hits" },
+  { name: "syntax", type: "string", summary: "literal|fts (default literal)" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_FILES_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Restrict to one Session reference",
+  },
+  { name: "mentions", type: "boolean", summary: "Include textual mentions" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max matches" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_INDEX_FLAGS = [
+  FLAG_HELP,
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
 // ── native command tree ──────────────────────────────────────────────────────
 
 /**
@@ -1184,6 +1292,71 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           FLAG_FORMAT,
           FLAG_JSON_ALIAS,
         ],
+      },
+    ],
+  },
+  {
+    name: "history",
+    summary:
+      "Unified Claude/Pi session history: list, show, search, files, and index",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    format_modes: ["human", "json"],
+    flags: [FLAG_HELP],
+    verbs: [
+      {
+        name: "list",
+        summary: "List cataloged sessions globally by default",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_LIST_FLAGS,
+      },
+      {
+        name: "show",
+        summary:
+          "Resolve a Session reference and render a bounded transcript page",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_SHOW_FLAGS,
+      },
+      {
+        name: "search",
+        summary: "Refresh the private index and search transcript entries",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_SEARCH_FLAGS,
+      },
+      {
+        name: "files",
+        summary: "Refresh the private index and search provenance-graded file evidence",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_FILES_FLAGS,
+      },
+      {
+        name: "index",
+        summary:
+          "Inspect, refresh, rebuild, or purge the private history index",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_INDEX_FLAGS,
       },
     ],
   },

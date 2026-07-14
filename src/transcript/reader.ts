@@ -32,6 +32,9 @@ export interface TranscriptListQuery {
   untilMs: number | null;
   offset: number;
   limit: number;
+  /** Internal catalog scan: retain locator/project/time metadata without
+   * normalizing prompt or tool bodies for every historical artifact. */
+  metadataOnly?: boolean;
 }
 
 export type TranscriptListOutcome =

@@ -10,7 +10,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { scanTranscriptJsonlSync } from "./jsonl-scan";
+import {
+  readJsonlMetadataSpineSync,
+  scanTranscriptJsonlSync,
+} from "./jsonl-scan";
 import type {
   SubagentSummary,
   TranscriptDocument,
@@ -71,6 +74,7 @@ export interface ClaudeListOptions {
   untilMs: number | null;
   offset: number;
   limit: number;
+  metadataOnly?: boolean;
   /**
    * Extension seam invoked once per selected file, before it is inspected
    * (parsed). Lets a caller (tests, in practice) provoke a scan-to-parse
@@ -523,11 +527,15 @@ export function createClaudeLineNormalizer(options: {
 
 export function readClaudeTitleHistory(path: string): string[] {
   const titles: string[] = [];
-  scanTranscriptJsonlSync(path, (record) => {
-    if (record.type !== "custom-title") return;
-    const title = stringOrNull(record.customTitle);
-    if (title !== null) titles.push(title);
-  });
+  scanTranscriptJsonlSync(
+    path,
+    (record) => {
+      if (record.type !== "custom-title") return;
+      const title = stringOrNull(record.customTitle);
+      if (title !== null) titles.push(title);
+    },
+    "custom-title",
+  );
   return titles;
 }
 
@@ -683,6 +691,33 @@ export function listClaudeSessions(
   );
   const items = selected.map((file): TranscriptListItem => {
     options.onBeforeInspect?.(file);
+    if (options.metadataOnly === true) {
+      let spine: ReturnType<typeof readJsonlMetadataSpineSync> | null;
+      try {
+        spine = readJsonlMetadataSpineSync(file.path, file.bytes, {
+          marker: "custom-title",
+          read: (record) =>
+            record.type === "custom-title"
+              ? stringOrNull(record.customTitle)
+              : null,
+        });
+      } catch {
+        spine = null;
+      }
+      return {
+        sessionId: file.sessionId,
+        path: file.path,
+        project: spine?.project ?? null,
+        title: spine?.title ?? null,
+        titleHistory: spine?.titleHistory ?? [],
+        startedAt: spine?.startedAt ?? null,
+        updatedAt:
+          spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        bytes: file.bytes,
+        subagentCount: 0,
+        firstPrompt: null,
+      };
+    }
     // Read-and-catch, never existsSync-then-read: the transcript tree
     // mutates live under the reader (TOCTOU). A file that vanished between
     // scan and parse degrades this one row instead of failing the page.
@@ -882,6 +917,7 @@ function claudeList(query: TranscriptListQuery): TranscriptListOutcome {
       untilMs: query.untilMs,
       offset: query.offset,
       limit: query.limit,
+      metadataOnly: query.metadataOnly,
     });
     return {
       kind: "ok",

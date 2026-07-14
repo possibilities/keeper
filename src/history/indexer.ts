@@ -1,25 +1,26 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { createClaudeLineNormalizer } from "../transcript/claude";
 import type { TranscriptEntry, TranscriptSource } from "../transcript/model";
 import { TRANSCRIPT_LINE_BYTE_CAP } from "../transcript/parse-common";
 import { createPiLineNormalizer } from "../transcript/pi";
 import type { TranscriptLineNormalizer } from "../transcript/reader";
+import { deriveFileEvidence } from "./file-evidence";
 import {
-  ensureHistoryIndex,
   type HistoryIndexPaths,
-  inspectHistoryIndex,
   publishHistoryIndexRebuild,
-  withHistoryIndexWrite,
+  refreshHistoryIndexDatabase,
 } from "./index-db";
+import { aggregateHistoryDiagnostics } from "./model";
 import type {
   CatalogSession,
   HistoryDiagnostic,
   HistoryHarness,
   SessionCatalog,
 } from "./model";
+import { historySourceStat } from "./source-stat";
 
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_INDEX_BODY_CHARS = 1_048_576;
@@ -34,6 +35,9 @@ export interface HistoryPhysicalSource {
   project: string | null;
   title: string | null;
   titleHistory: string[];
+  artifactTitle: string | null;
+  artifactTitleHistory: string[];
+  artifactTitleHistoryComplete: boolean;
 }
 
 export interface HistorySourceEnumeration {
@@ -67,6 +71,13 @@ function physicalSource(
   path: string,
   source: TranscriptSource,
 ): HistoryPhysicalSource {
+  const artifactTitleRecords = session.titleRecords.filter(
+    (record) => record.source === "native",
+  );
+  const artifactTitle =
+    [...artifactTitleRecords].reverse().find((record) => record.current)?.title ??
+    artifactTitleRecords.at(-1)?.title ??
+    null;
   return {
     sourceKey: sourceKey(session, path, source),
     sessionKey: session.sessionKey,
@@ -77,6 +88,9 @@ function physicalSource(
     project: session.project,
     title: session.currentTitle,
     titleHistory: session.titleRecords.map((record) => record.title),
+    artifactTitle,
+    artifactTitleHistory: artifactTitleRecords.map((record) => record.title),
+    artifactTitleHistoryComplete: session.titleHistoryComplete,
   };
 }
 
@@ -137,36 +151,6 @@ export const DEFAULT_HISTORY_INDEX_ADAPTERS: readonly HistoryIndexAdapter[] = [
   },
 ];
 
-interface SourceStat {
-  statFingerprint: string;
-  size: number;
-  mtimeMs: number;
-}
-
-function sourceStat(path: string): SourceStat | null {
-  try {
-    const stat = statSync(path, { bigint: true });
-    if (!stat.isFile() || stat.size > BigInt(Number.MAX_SAFE_INTEGER))
-      return null;
-    const parts = [
-      stat.dev,
-      stat.ino,
-      stat.size,
-      stat.mtimeNs,
-      stat.ctimeNs,
-    ].map(String);
-    return {
-      statFingerprint: createHash("sha256")
-        .update(parts.join(":"))
-        .digest("hex"),
-      size: Number(stat.size),
-      mtimeMs: Number(stat.mtimeNs) / 1_000_000,
-    };
-  } catch {
-    return null;
-  }
-}
-
 function safeJson(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
@@ -193,6 +177,48 @@ function entryBody(entry: TranscriptEntry): string {
     : body.slice(0, MAX_INDEX_BODY_CHARS);
 }
 
+function insertFileEvidence(
+  db: Database,
+  source: HistoryPhysicalSource,
+  entries: readonly TranscriptEntry[],
+): number {
+  const evidence = deriveFileEvidence({
+    entries,
+    project: source.project,
+    contextForEntry: (entry) => ({
+      sessionKey: source.sessionKey,
+      sourceKey: source.sourceKey,
+      source: entry.source,
+      sourceOrdinal: entry.sourceOrdinal,
+      nativeEntryId: entry.nativeEntryId,
+      parentNativeEntryId: entry.parentNativeEntryId,
+    }),
+  });
+  const insert = db.prepare(`INSERT INTO file_evidence(
+      session_key, source_key, path, grade, provenance_source,
+      transcript_source, source_ordinal, native_entry_id, parent_native_entry_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  let rows = 0;
+  for (const item of evidence) {
+    for (const provenance of item.provenance) {
+      const context = provenance.context;
+      insert.run(
+        source.sessionKey,
+        source.sourceKey,
+        item.path,
+        item.grade,
+        provenance.source,
+        context?.source ?? source.source,
+        context?.sourceOrdinal ?? null,
+        context?.nativeEntryId ?? null,
+        context?.parentNativeEntryId ?? null,
+      );
+      rows++;
+    }
+  }
+  return rows;
+}
+
 interface StreamIndexResult {
   contentFingerprint: string;
   entries: number;
@@ -211,6 +237,7 @@ function streamSourceIntoIndex(
       $body, $tool_name, $native_entry_id, $parent_native_entry_id
     )`);
   let entryCount = 0;
+  const evidenceEntries: TranscriptEntry[] = [];
   const feed = (lineBuffer: Buffer): void => {
     const end =
       lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === 13
@@ -220,6 +247,7 @@ function streamSourceIntoIndex(
     if (line.trim().length === 0) return;
     const batch = normalizer.feedLine(line);
     for (const entry of batch.entries) {
+      evidenceEntries.push(entry);
       insert.run({
         source_key: source.sourceKey,
         source_ordinal: entry.sourceOrdinal,
@@ -286,6 +314,7 @@ function streamSourceIntoIndex(
     }
     if (!droppingOversizedLine && pending.length > 0) feed(pending);
     normalizer.finish();
+    insertFileEvidence(db, source, evidenceEntries);
     return { contentFingerprint: hash.digest("hex"), entries: entryCount };
   } finally {
     closeSync(fd);
@@ -363,7 +392,7 @@ function updateSource(
   nowMs: number,
   stats: HistoryIndexStats,
 ): void {
-  const before = sourceStat(source.path);
+  const before = historySourceStat(source.path);
   if (before === null) {
     stats.failedSources++;
     stats.diagnostics.push({
@@ -374,16 +403,27 @@ function updateSource(
     return;
   }
   const stored = db
-    .query("SELECT stat_fingerprint FROM sources WHERE source_key = ?")
-    .get(source.sourceKey) as { stat_fingerprint: string } | null;
-  if (stored?.stat_fingerprint === before.statFingerprint) {
+    .query("SELECT stat_fingerprint, project FROM sources WHERE source_key = ?")
+    .get(source.sourceKey) as {
+    stat_fingerprint: string;
+    project: string | null;
+  } | null;
+  if (
+    stored?.stat_fingerprint === before.statFingerprint &&
+    stored.project === source.project
+  ) {
     db.query(`UPDATE sources SET
-        session_key = ?, project = ?, title = ?, title_history = ?
+        session_key = ?, project = ?, title = ?, title_history = ?,
+        artifact_title = ?, artifact_title_history = ?,
+        artifact_title_history_complete = ?
       WHERE source_key = ?`).run(
       source.sessionKey,
       source.project,
       source.title,
       JSON.stringify(source.titleHistory),
+      source.artifactTitle,
+      JSON.stringify(source.artifactTitleHistory),
+      source.artifactTitleHistoryComplete ? 1 : 0,
       source.sourceKey,
     );
     stats.unchangedSources++;
@@ -397,9 +437,11 @@ function updateSource(
       );
       db.query(`INSERT INTO sources(
           source_key, session_key, harness, native_id, artifact_path,
-          transcript_source, project, title, title_history, stat_fingerprint,
-          content_fingerprint, source_size, source_mtime_ms, indexed_at_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`).run(
+          transcript_source, project, title, title_history, artifact_title,
+          artifact_title_history, artifact_title_history_complete,
+          stat_fingerprint, content_fingerprint, source_size, source_mtime_ms,
+          indexed_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)`).run(
         source.sourceKey,
         source.sessionKey,
         source.harness,
@@ -409,6 +451,9 @@ function updateSource(
         source.project,
         source.title,
         JSON.stringify(source.titleHistory),
+        source.artifactTitle,
+        JSON.stringify(source.artifactTitleHistory),
+        source.artifactTitleHistoryComplete ? 1 : 0,
         before.statFingerprint,
         before.size,
         before.mtimeMs,
@@ -419,7 +464,7 @@ function updateSource(
         source,
         adapter.createNormalizer(source),
       );
-      const after = sourceStat(source.path);
+      const after = historySourceStat(source.path);
       if (
         after === null ||
         after.statFingerprint !== before.statFingerprint ||
@@ -500,6 +545,7 @@ function populateIndex(
     enumerated.pruneHarnesses,
     stats,
   );
+  stats.diagnostics = aggregateHistoryDiagnostics(stats.diagnostics);
   return stats;
 }
 
@@ -526,13 +572,7 @@ export function refreshHistoryIndex(options: {
 }): HistoryIndexStats {
   const adapters = options.adapters ?? DEFAULT_HISTORY_INDEX_ADAPTERS;
   const nowMs = options.nowMs ?? Date.now();
-  if (inspectHistoryIndex(options.paths).kind !== "ready") {
-    return rebuildHistoryIndex({ ...options, adapters, nowMs });
-  }
-  // The status can become stale only through another history writer; ensure +
-  // withHistoryIndexWrite each take the same lock and converge fail-closed.
-  ensureHistoryIndex(options.paths);
-  return withHistoryIndexWrite(options.paths, (db) =>
-    populateIndex(db, options.catalog, adapters, nowMs, false),
+  return refreshHistoryIndexDatabase(options.paths, (db, rebuilt) =>
+    populateIndex(db, options.catalog, adapters, nowMs, rebuilt),
   );
 }

@@ -7,6 +7,7 @@ import {
   fsyncSync,
   mkdirSync,
   openSync,
+  readdirSync,
   renameSync,
   rmSync,
 } from "node:fs";
@@ -14,7 +15,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { FileLock } from "../file-lock";
 import { keeperStateDir } from "../keeper-state-dir";
 
-export const HISTORY_INDEX_SCHEMA_VERSION = 1;
+export const HISTORY_INDEX_SCHEMA_VERSION = 3;
 export const HISTORY_INDEX_APPLICATION_ID = 0x4b485354; // "KHST"
 
 export interface HistoryIndexPaths {
@@ -61,6 +62,9 @@ const HISTORY_INDEX_SCHEMA = `
     project TEXT,
     title TEXT,
     title_history TEXT NOT NULL,
+    artifact_title TEXT,
+    artifact_title_history TEXT NOT NULL,
+    artifact_title_history_complete INTEGER NOT NULL,
     stat_fingerprint TEXT NOT NULL,
     content_fingerprint TEXT NOT NULL,
     source_size INTEGER NOT NULL,
@@ -91,6 +95,26 @@ const HISTORY_INDEX_SCHEMA = `
     ON entries(source_key, source_ordinal, id);
   CREATE INDEX idx_entries_time ON entries(timestamp_ms, id);
   CREATE INDEX idx_entries_role ON entries(role, id);
+
+  CREATE TABLE file_evidence (
+    id INTEGER PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    source_key TEXT NOT NULL REFERENCES sources(source_key) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    provenance_source TEXT NOT NULL,
+    transcript_source TEXT NOT NULL,
+    source_ordinal INTEGER,
+    native_entry_id TEXT,
+    parent_native_entry_id TEXT
+  );
+
+  CREATE INDEX idx_file_evidence_path
+    ON file_evidence(path, grade, session_key, id);
+  CREATE INDEX idx_file_evidence_session
+    ON file_evidence(session_key, grade, path, id);
+  CREATE INDEX idx_file_evidence_source
+    ON file_evidence(source_key, source_ordinal, id);
 
   CREATE VIRTUAL TABLE entries_fts USING fts5(
     body,
@@ -176,6 +200,31 @@ function pragmaNumber(db: Database, name: string): number | null {
   return Number.isFinite(number) ? number : null;
 }
 
+function inspectOpenHistoryIndex(db: Database): HistoryIndexStatus {
+  const applicationId = pragmaNumber(db, "application_id");
+  const schemaVersion = pragmaNumber(db, "user_version");
+  if (
+    applicationId !== HISTORY_INDEX_APPLICATION_ID ||
+    schemaVersion !== HISTORY_INDEX_SCHEMA_VERSION
+  ) {
+    return { kind: "incompatible", schemaVersion };
+  }
+  const meta = db
+    .query("SELECT value FROM history_meta WHERE key = 'schema_version'")
+    .get() as { value: string } | null;
+  if (Number(meta?.value) !== HISTORY_INDEX_SCHEMA_VERSION) {
+    return { kind: "incompatible", schemaVersion };
+  }
+  // Prepare every public read surface so a partially published/corrupt image is
+  // never classified ready merely because its FTS root page survived.
+  db.query("SELECT rowid FROM entries_fts LIMIT 0").all();
+  db.query(
+    "SELECT source_key, artifact_title, artifact_title_history, artifact_title_history_complete FROM sources LIMIT 0",
+  ).all();
+  db.query("SELECT id FROM file_evidence LIMIT 0").all();
+  return { kind: "ready", schemaVersion };
+}
+
 export function inspectHistoryIndex(
   paths: HistoryIndexPaths,
 ): HistoryIndexStatus {
@@ -185,23 +234,7 @@ export function inspectHistoryIndex(
   try {
     db = new Database(paths.database, { readonly: true, strict: true });
     configureConnection(db);
-    const applicationId = pragmaNumber(db, "application_id");
-    const schemaVersion = pragmaNumber(db, "user_version");
-    if (
-      applicationId !== HISTORY_INDEX_APPLICATION_ID ||
-      schemaVersion !== HISTORY_INDEX_SCHEMA_VERSION
-    ) {
-      return { kind: "incompatible", schemaVersion };
-    }
-    const meta = db
-      .query("SELECT value FROM history_meta WHERE key = 'schema_version'")
-      .get() as { value: string } | null;
-    if (Number(meta?.value) !== HISTORY_INDEX_SCHEMA_VERSION) {
-      return { kind: "incompatible", schemaVersion };
-    }
-    // Preparing against the FTS table catches a partially published/corrupt image.
-    db.query("SELECT rowid FROM entries_fts LIMIT 0").all();
-    return { kind: "ready", schemaVersion };
+    return inspectOpenHistoryIndex(db);
   } catch {
     return { kind: "unreadable" };
   } finally {
@@ -315,13 +348,85 @@ export function withHistoryIndexWrite<T>(
   }
 }
 
+/** Recheck readiness under the writer lock and either update the published
+ * image or populate one closed replacement. Concurrent cold refreshes converge
+ * on one build instead of each rebuilding from a stale pre-lock observation. */
+export function refreshHistoryIndexDatabase<T>(
+  paths: HistoryIndexPaths,
+  operation: (db: Database, rebuilt: boolean) => T,
+): T {
+  const lock = acquireHistoryIndexLock(paths);
+  let db: Database | null = null;
+  try {
+    if (inspectHistoryIndex(paths).kind !== "ready") {
+      return publishHistoryIndexRebuildLocked(paths, (fresh) =>
+        operation(fresh, true),
+      );
+    }
+    db = new Database(paths.database, { strict: true });
+    configureConnection(db);
+    db.run("PRAGMA journal_mode = DELETE");
+    const result = operation(db, false);
+    chmodSync(paths.database, 0o600);
+    return result;
+  } finally {
+    db?.close();
+    lock.release();
+  }
+}
+
 export function openHistoryIndexReadOnly(paths: HistoryIndexPaths): Database {
   assertSeparateSidecar(paths.database);
-  const status = inspectHistoryIndex(paths);
-  if (status.kind !== "ready") {
-    throw new Error("history index is not ready");
+  let db: Database | null = null;
+  try {
+    // Validate the same handle that is returned. There is no inspect-then-open
+    // gap in which purge can remove the checked image; a racing reader opens
+    // either the old inode or the newly published one, both complete images.
+    db = new Database(paths.database, { readonly: true, strict: true });
+    configureConnection(db);
+    if (inspectOpenHistoryIndex(db).kind !== "ready") {
+      throw new Error("history index is not ready");
+    }
+    const opened = db;
+    db = null;
+    return opened;
+  } finally {
+    db?.close();
   }
-  const db = new Database(paths.database, { readonly: true, strict: true });
-  configureConnection(db);
-  return db;
+}
+
+/** Remove only the closed private history sidecar image family. The lock file
+ * remains as the serialization primitive and no path outside this sidecar's
+ * basename is touched. */
+export function purgeHistoryIndex(paths: HistoryIndexPaths): void {
+  const lock = acquireHistoryIndexLock(paths);
+  try {
+    assertSeparateSidecar(paths.database);
+    const rebuildPrefix = `${basename(paths.database)}.rebuild-`;
+    let staleRebuilds: string[] = [];
+    try {
+      staleRebuilds = readdirSync(paths.directory, { withFileTypes: true })
+        .filter(
+          (entry) =>
+            entry.name.startsWith(rebuildPrefix) &&
+            (entry.isFile() || entry.isSymbolicLink()),
+        )
+        .map((entry) => join(paths.directory, entry.name));
+    } catch {
+      // The directory was removed concurrently outside Keeper's lock. The fixed
+      // image-family removals below remain safe no-ops.
+    }
+    for (const path of [
+      paths.database,
+      `${paths.database}-wal`,
+      `${paths.database}-shm`,
+      `${paths.database}-journal`,
+      ...staleRebuilds,
+    ]) {
+      rmSync(path, { force: true });
+    }
+    if (existsSync(paths.directory)) fsyncPath(paths.directory);
+  } finally {
+    lock.release();
+  }
 }

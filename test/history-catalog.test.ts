@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -159,6 +160,67 @@ describe("Session catalog and resolver", () => {
       expect(listed.items.map((item) => item.sessionId)).toEqual([
         "pi-session",
       ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("canonicalizes symlinked artifact paths before joining duplicate native ids", () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-history-canonical-path-"));
+    try {
+      const first = join(root, "first", "duplicate.jsonl");
+      const second = join(root, "second", "duplicate.jsonl");
+      mkdirSync(join(root, "first"), { recursive: true });
+      mkdirSync(join(root, "second"), { recursive: true });
+      writeFileSync(first, "{}\n");
+      writeFileSync(second, "{}\n");
+      const alias = join(root, "second-alias.jsonl");
+      symlinkSync(second, alias);
+      const catalog = buildSessionCatalog(
+        [
+          artifact(
+            "claude",
+            "duplicate",
+            first,
+            "/same/project",
+            ["First"],
+            "2026-01-01T00:00:00.000Z",
+          ),
+          artifact(
+            "claude",
+            "duplicate",
+            second,
+            "/same/project",
+            ["Second"],
+            "2026-01-02T00:00:00.000Z",
+          ),
+          // A second adapter can discover the same physical file through an
+          // alias; catalog identity must collapse it before job association.
+          artifact(
+            "claude",
+            "duplicate",
+            alias,
+            "/same/project",
+            ["Second"],
+            "2026-01-02T00:00:00.000Z",
+          ),
+        ],
+        [
+          job({
+            transcriptPath: alias,
+            project: "/same/project",
+          }),
+        ],
+      );
+      expect(catalog.sessions).toHaveLength(2);
+      const joined = catalog.sessions.find((session) => session.jobs.length > 0);
+      expect(joined?.artifact?.path).toBe(realpathSync(second));
+      expect(joined?.jobs.map((item) => item.jobId)).toEqual(["job-a"]);
+      expect(
+        catalog.sessions.find(
+          (session) => session.artifact?.path === realpathSync(first),
+        )?.jobs,
+      ).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

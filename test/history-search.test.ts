@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   mkdirSync,
@@ -12,7 +13,10 @@ import { buildSessionCatalog } from "../src/history/catalog";
 import { resolveHistoryIndexPaths } from "../src/history/index-db";
 import { refreshHistoryIndex } from "../src/history/indexer";
 import type { NativeSessionArtifact } from "../src/history/model";
-import { searchHistoryIndex } from "../src/history/search";
+import {
+  searchHistoryDatabase,
+  searchHistoryIndex,
+} from "../src/history/search";
 
 let root: string;
 let paths: ReturnType<typeof resolveHistoryIndexPaths>;
@@ -91,7 +95,7 @@ beforeEach(() => {
       "pi2-u1",
       null,
       "user",
-      "alpha OR beta common",
+      "alpha OR beta common body:alpha foo*",
       "2026-01-02T01:00:00.000Z",
     ),
   ]);
@@ -157,6 +161,26 @@ describe("History full-text search", () => {
     });
     expect(advanced.kind).toBe("ok");
     if (advanced.kind === "ok") expect(advanced.total).toBe(3);
+  });
+
+  test("quotes punctuation and column/operator-looking tokens in literal mode", () => {
+    for (const [text, total] of [
+      ["body:alpha", 1],
+      ["foo*", 1],
+      ['"', 0],
+      ["NEAR(alpha beta)", 0],
+    ] as const) {
+      const result = searchHistoryIndex(paths, { text });
+      expect(result.kind).toBe("ok");
+      if (result.kind === "ok") expect(result.total).toBe(total);
+    }
+  });
+
+  test("distinguishes safe-query index failures from malformed advanced syntax", () => {
+    const broken = new Database(":memory:");
+    broken.run("CREATE VIRTUAL TABLE entries_fts USING fts5(body)");
+    expect(() => searchHistoryDatabase(broken, { text: "literal" })).toThrow();
+    broken.close();
   });
 
   test("applies structured session, project, role, source, and time filters", () => {

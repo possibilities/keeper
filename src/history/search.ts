@@ -20,7 +20,7 @@ export const HISTORY_SEARCH_OFFSET_MAX = 1_000_000;
 const HISTORY_SEARCH_DEFAULT_LIMIT = 20;
 const HISTORY_SEARCH_BODY_MAX_CHARS = 8192;
 
-function literalFtsQuery(text: string): string {
+export function literalFtsQuery(text: string): string {
   // Quote every whitespace-delimited term and supply the ANDs ourselves. FTS
   // operators, wildcards, parentheses, and column-looking tokens remain data,
   // while ordinary multi-word search need not be an exact adjacent phrase.
@@ -203,7 +203,24 @@ export function searchHistoryDatabase(
       offset,
       nextOffset: end < total ? end : null,
     };
-  } catch {
+  } catch (error) {
+    // Literal mode constructs the MATCH expression itself, so an execution
+    // failure there is an index/read fault, never a user-query fault. In
+    // advanced mode classify only SQLite's FTS parser diagnostics; schema,
+    // corruption, and I/O failures must propagate to the CLI read-failure arm.
+    const message =
+      error instanceof Error ? error.message.toLowerCase() : String(error);
+    const unknownQueryColumn =
+      message.includes("no such column:") &&
+      !message.includes("no such column: s.") &&
+      !message.includes("no such column: e.");
+    const ftsSyntaxFailure =
+      message.includes("fts5: syntax error") ||
+      message.includes("unterminated string") ||
+      message.includes("malformed match expression") ||
+      message.includes("unknown special query") ||
+      unknownQueryColumn;
+    if (mode !== "advanced" || !ftsSyntaxFailure) throw error;
     // Never echo the raw advanced query or a SQLite diagnostic containing it.
     return {
       kind: "invalid_query",

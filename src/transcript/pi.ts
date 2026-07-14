@@ -9,7 +9,10 @@ import {
   statSync,
 } from "node:fs";
 import { basename, join } from "node:path";
-import { scanTranscriptJsonlSync } from "./jsonl-scan";
+import {
+  readJsonlMetadataSpineSync,
+  scanTranscriptJsonlSync,
+} from "./jsonl-scan";
 import type {
   LatestTurn,
   TranscriptDocument,
@@ -509,11 +512,15 @@ export function createPiLineNormalizer(options: {
 
 export function readPiTitleHistory(path: string): string[] {
   const titles: string[] = [];
-  scanTranscriptJsonlSync(path, (record) => {
-    if (record.type !== "session_info") return;
-    const title = stringOrNull(record.name);
-    if (title !== null) titles.push(title);
-  });
+  scanTranscriptJsonlSync(
+    path,
+    (record) => {
+      if (record.type !== "session_info") return;
+      const title = stringOrNull(record.name);
+      if (title !== null) titles.push(title);
+    },
+    "session_info",
+  );
   return titles;
 }
 
@@ -582,6 +589,7 @@ export interface PiListOptions {
   untilMs: number | null;
   offset: number;
   limit: number;
+  metadataOnly?: boolean;
   /**
    * Extension seam invoked once per selected file, before it is inspected
    * (parsed). Lets a caller (tests, in practice) provoke a scan-to-parse
@@ -615,6 +623,31 @@ export function listPiSessions(options: PiListOptions): PiListResult {
   );
   const items = selected.map((file): TranscriptListItem => {
     options.onBeforeInspect?.(file);
+    if (options.metadataOnly === true) {
+      let spine: ReturnType<typeof readJsonlMetadataSpineSync> | null;
+      try {
+        spine = readJsonlMetadataSpineSync(file.path, file.bytes, {
+          marker: "session_info",
+          read: (record) =>
+            record.type === "session_info" ? stringOrNull(record.name) : null,
+        });
+      } catch {
+        spine = null;
+      }
+      return {
+        sessionId: file.sessionId,
+        path: file.path,
+        project: spine?.project ?? null,
+        title: spine?.title ?? null,
+        titleHistory: spine?.titleHistory ?? [],
+        startedAt: spine?.startedAt ?? null,
+        updatedAt:
+          spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        bytes: file.bytes,
+        subagentCount: 0,
+        firstPrompt: null,
+      };
+    }
     // Read-and-catch, never existsSync-then-read: the sessions tree mutates
     // live under the reader (TOCTOU). A file that vanished between scan and
     // parse degrades this one row instead of failing the page.
@@ -674,6 +707,7 @@ function piList(query: TranscriptListQuery): TranscriptListOutcome {
       untilMs: query.untilMs,
       offset: query.offset,
       limit: query.limit,
+      metadataOnly: query.metadataOnly,
     });
     return {
       kind: "ok",

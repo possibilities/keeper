@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   claudeTranscriptReader,
   readClaudeTitleHistory,
@@ -9,6 +11,7 @@ import type {
   TranscriptRootInputs,
 } from "../transcript/reader";
 import {
+  aggregateHistoryDiagnostics,
   type CatalogSession,
   HISTORY_HARNESSES,
   type HistoryDiagnostic,
@@ -20,8 +23,17 @@ import {
   type SessionCatalog,
   type SessionTitleRecord,
 } from "./model";
+import type { HistoryCatalogCacheEntry } from "./catalog-cache";
+import { historySourceStat } from "./source-stat";
 
-const DISCOVERY_PAGE_SIZE = 256;
+// Transcript readers already enumerate and sort the complete candidate set per
+// call. A large bounded page avoids re-walking every project directory for each
+// 256-row chunk while retaining a progress guard for truly enormous corpora.
+const DISCOVERY_PAGE_SIZE = 100_000;
+const JOB_ID_MAX_CHARS = 512;
+const JOB_PATH_MAX_CHARS = 4_096;
+const JOB_TITLE_MAX_CHARS = 16_384;
+const JOB_TITLE_HISTORY_MAX = 1_000;
 
 export interface HistoryCatalogDiscovery {
   artifacts: NativeSessionArtifact[];
@@ -32,7 +44,11 @@ export interface HistoryCatalogDiscovery {
 /** Catalog discovery is an adapter contract, not a launch-harness switch. */
 export interface HistoryCatalogAdapter {
   readonly harness: HistoryHarness;
-  discover(root: TranscriptRootInputs): HistoryCatalogDiscovery;
+  discover(
+    root: TranscriptRootInputs,
+    titleCache?: ReadonlyMap<string, HistoryCatalogCacheEntry>,
+    options?: { completeTitleHistory: boolean },
+  ): HistoryCatalogDiscovery;
 }
 
 function readerAdapter(
@@ -42,7 +58,7 @@ function readerAdapter(
 ): HistoryCatalogAdapter {
   return {
     harness,
-    discover(root) {
+    discover(root, titleCache, options) {
       const artifacts: NativeSessionArtifact[] = [];
       const diagnostics: HistoryDiagnostic[] = [];
       let offset = 0;
@@ -54,6 +70,7 @@ function readerAdapter(
           untilMs: null,
           offset,
           limit: DISCOVERY_PAGE_SIZE,
+          metadataOnly: true,
         });
         if (page.kind === "no_roots") {
           return {
@@ -74,25 +91,43 @@ function readerAdapter(
         }
         for (const item of page.items) {
           let titleHistory = item.titleHistory;
-          try {
-            // The list reader samples large files for display metadata. Catalog
-            // resolution needs every rename, so scan only title records with a
-            // bounded JSONL reader instead of loading transcript bodies.
-            titleHistory = readTitleHistory(item.path);
-          } catch {
-            diagnostics.push({
-              code: "artifact_read_failed",
-              harness,
-              scope: "artifact",
-            });
+          let currentTitle = item.title;
+          let titleHistoryComplete = false;
+          const cached = titleCache?.get(canonicalArtifactPath(item.path));
+          const stat = cached === undefined ? null : historySourceStat(item.path);
+          if (
+            cached !== undefined &&
+            cached.harness === harness &&
+            cached.nativeId === item.sessionId &&
+            stat?.statFingerprint === cached.statFingerprint
+          ) {
+            titleHistory = [...cached.titleHistory];
+            currentTitle = cached.currentTitle;
+            titleHistoryComplete = true;
+          } else if (options?.completeTitleHistory !== false) {
+            try {
+              // The list reader samples large files for display metadata.
+              // Catalog resolution needs every rename, so scan only title
+              // records. The title readers prefilter lines before JSON parsing.
+              titleHistory = readTitleHistory(item.path);
+              currentTitle = titleHistory.at(-1) ?? item.title;
+              titleHistoryComplete = true;
+            } catch {
+              diagnostics.push({
+                code: "artifact_read_failed",
+                harness,
+                scope: "artifact",
+              });
+            }
           }
           artifacts.push({
             harness,
             nativeId: item.sessionId,
             path: item.path,
             project: item.project,
-            currentTitle: titleHistory.at(-1) ?? item.title,
+            currentTitle: currentTitle ?? titleHistory.at(-1) ?? item.title,
             titleHistory: [...titleHistory],
+            titleHistoryComplete,
             startedAt: item.startedAt,
             updatedAt: item.updatedAt,
             bytes: item.bytes,
@@ -125,8 +160,18 @@ export const DEFAULT_HISTORY_CATALOG_ADAPTERS: readonly HistoryCatalogAdapter[] 
     readerAdapter("pi", piTranscriptReader, readPiTitleHistory),
   ];
 
+function canonicalArtifactPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 function artifactSessionKey(artifact: NativeSessionArtifact): string {
-  const pathHash = createHash("sha256").update(artifact.path).digest("hex");
+  const pathHash = createHash("sha256")
+    .update(canonicalArtifactPath(artifact.path))
+    .digest("hex");
   return `${artifact.harness}:${artifact.nativeId}@${pathHash}`;
 }
 
@@ -138,8 +183,15 @@ function qualifiedNativeId(harness: HistoryHarness, nativeId: string): string {
   return `${harness}:${nativeId}`;
 }
 
-function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
+function nonEmptyString(
+  value: unknown,
+  maxChars = Number.MAX_SAFE_INTEGER,
+): string | null {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= maxChars
+    ? value
+    : null;
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -158,8 +210,8 @@ function parseNameHistory(value: unknown): string[] {
     }
   }
   if (!Array.isArray(parsed)) return [];
-  return parsed.flatMap((item) => {
-    const title = nonEmptyString(item);
+  return parsed.slice(0, JOB_TITLE_HISTORY_MAX).flatMap((item) => {
+    const title = nonEmptyString(item, JOB_TITLE_MAX_CHARS);
     return title === null ? [] : [title];
   });
 }
@@ -175,7 +227,7 @@ export type KeeperJobRowAdaptation =
 export function keeperJobAliasFromRow(
   row: KeeperJobRowLike,
 ): KeeperJobRowAdaptation {
-  const jobId = nonEmptyString(row.job_id);
+  const jobId = nonEmptyString(row.job_id, JOB_ID_MAX_CHARS);
   const rawHarness = nonEmptyString(row.harness) ?? "claude";
   if (!isHistoryHarness(rawHarness)) {
     return {
@@ -198,7 +250,7 @@ export function keeperJobAliasFromRow(
     };
   }
   const nativeId =
-    nonEmptyString(row.resume_target) ??
+    nonEmptyString(row.resume_target, JOB_ID_MAX_CHARS) ??
     (rawHarness === "claude" ? jobId : null);
   if (nativeId === null) {
     return {
@@ -219,15 +271,15 @@ export function keeperJobAliasFromRow(
       jobId,
       harness: rawHarness,
       nativeId,
-      transcriptPath: nonEmptyString(row.transcript_path),
-      project: nonEmptyString(row.cwd),
-      currentTitle: nonEmptyString(row.title),
+      transcriptPath: nonEmptyString(row.transcript_path, JOB_PATH_MAX_CHARS),
+      project: nonEmptyString(row.cwd, JOB_PATH_MAX_CHARS),
+      currentTitle: nonEmptyString(row.title, JOB_TITLE_MAX_CHARS),
       titleHistory: parseNameHistory(row.name_history),
-      state: nonEmptyString(row.state),
+      state: nonEmptyString(row.state, 128),
       createdAtMs: createdSeconds === null ? null : createdSeconds * 1000,
       updatedAtMs: updatedSeconds === null ? null : updatedSeconds * 1000,
       pid: pid === null ? null : Math.trunc(pid),
-      startTime: nonEmptyString(row.start_time),
+      startTime: nonEmptyString(row.start_time, 512),
     },
   };
 }
@@ -243,7 +295,7 @@ export function adaptKeeperJobRows(rows: readonly KeeperJobRowLike[]): {
     if (adapted.kind === "ok") jobs.push(adapted.job);
     else diagnostics.push(adapted.diagnostic);
   }
-  return { jobs, diagnostics };
+  return { jobs, diagnostics: aggregateHistoryDiagnostics(diagnostics) };
 }
 
 interface MutableCatalogSession extends CatalogSession {
@@ -316,8 +368,20 @@ function finalizeSession(session: MutableCatalogSession): CatalogSession {
     session.currentTitle = latestJob?.currentTitle ?? null;
     session.startedAt = isoFromMs(latestJob?.createdAtMs ?? null);
     session.updatedAt = isoFromMs(latestJob?.updatedAtMs ?? null);
-  } else if (session.currentTitle === null) {
-    session.currentTitle = latestJob?.currentTitle ?? null;
+  } else {
+    if (session.project === null) session.project = latestJob?.project ?? null;
+    if (
+      session.currentTitle === null ||
+      (!session.titleHistoryComplete && latestJob?.currentTitle != null)
+    ) {
+      session.currentTitle = latestJob?.currentTitle ?? session.currentTitle;
+    }
+    if (session.startedAt === null) {
+      session.startedAt = isoFromMs(latestJob?.createdAtMs ?? null);
+    }
+    if (session.updatedAt === null) {
+      session.updatedAt = isoFromMs(latestJob?.updatedAtMs ?? null);
+    }
   }
   for (const job of session.jobs) {
     pushTitleHistory(
@@ -345,8 +409,11 @@ function selectJobArtifacts(
 ): MutableCatalogSession[] {
   if (candidates.length <= 1) return [...candidates];
   if (job.transcriptPath !== null) {
+    const jobPath = canonicalArtifactPath(job.transcriptPath);
     const byPath = candidates.filter(
-      (candidate) => candidate.artifact?.path === job.transcriptPath,
+      (candidate) =>
+        candidate.artifact !== null &&
+        canonicalArtifactPath(candidate.artifact.path) === jobPath,
     );
     if (byPath.length > 0) return byPath;
   }
@@ -379,10 +446,12 @@ export function buildSessionCatalog(
       a.nativeId.localeCompare(b.nativeId) ||
       a.path.localeCompare(b.path),
   )) {
-    const artifactDedupe = `${artifact.harness}\0${artifact.path}`;
+    const canonicalPath = canonicalArtifactPath(artifact.path);
+    const artifactDedupe = `${artifact.harness}\0${canonicalPath}`;
     if (seenArtifactPaths.has(artifactDedupe)) continue;
     seenArtifactPaths.add(artifactDedupe);
-    const sessionKey = artifactSessionKey(artifact);
+    const canonicalArtifact = { ...artifact, path: canonicalPath };
+    const sessionKey = artifactSessionKey(canonicalArtifact);
     const titleRecords: SessionTitleRecord[] = [];
     pushTitleHistory(
       titleRecords,
@@ -396,11 +465,12 @@ export function buildSessionCatalog(
       harness: artifact.harness,
       nativeId: artifact.nativeId,
       qualifiedNativeId: qualifiedNativeId(artifact.harness, artifact.nativeId),
-      artifact: { path: artifact.path, bytes: artifact.bytes },
+      artifact: { path: canonicalPath, bytes: artifact.bytes },
       project: artifact.project,
       currentTitle: artifact.currentTitle,
       titleRecords,
       titles: [],
+      titleHistoryComplete: artifact.titleHistoryComplete !== false,
       jobs: [],
       startedAt: artifact.startedAt,
       updatedAt: artifact.updatedAt,
@@ -433,6 +503,7 @@ export function buildSessionCatalog(
         currentTitle: null,
         titleRecords: [],
         titles: [],
+        titleHistoryComplete: false,
         jobs: [],
         startedAt: null,
         updatedAt: null,
@@ -451,7 +522,7 @@ export function buildSessionCatalog(
   });
   return {
     sessions: finalized,
-    diagnostics: [...(options.diagnostics ?? [])],
+    diagnostics: aggregateHistoryDiagnostics(options.diagnostics ?? []),
     authoritativeHarnesses: [
       ...(options.authoritativeHarnesses ?? HISTORY_HARNESSES),
     ].sort(),
@@ -462,13 +533,17 @@ export function discoverSessionCatalog(options: {
   root: TranscriptRootInputs;
   jobs?: readonly KeeperJobAlias[];
   adapters?: readonly HistoryCatalogAdapter[];
+  titleCache?: ReadonlyMap<string, HistoryCatalogCacheEntry>;
+  completeTitleHistory?: boolean;
 }): SessionCatalog {
   const artifacts: NativeSessionArtifact[] = [];
   const diagnostics: HistoryDiagnostic[] = [];
   const authoritativeHarnesses: HistoryHarness[] = [];
   for (const adapter of options.adapters ?? DEFAULT_HISTORY_CATALOG_ADAPTERS) {
     try {
-      const discovered = adapter.discover(options.root);
+      const discovered = adapter.discover(options.root, options.titleCache, {
+        completeTitleHistory: options.completeTitleHistory !== false,
+      });
       artifacts.push(...discovered.artifacts);
       diagnostics.push(...discovered.diagnostics);
       if (discovered.authoritative) {
@@ -483,7 +558,7 @@ export function discoverSessionCatalog(options: {
     }
   }
   return buildSessionCatalog(artifacts, options.jobs ?? [], {
-    diagnostics,
+    diagnostics: aggregateHistoryDiagnostics(diagnostics),
     authoritativeHarnesses,
   });
 }

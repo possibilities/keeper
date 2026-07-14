@@ -20,6 +20,9 @@ export interface NativeSessionArtifact {
   project: string | null;
   currentTitle: string | null;
   titleHistory: string[];
+  /** False only for a deliberately sampled plain-list scan. Resolvers and
+   * index refreshes request complete native title records. */
+  titleHistoryComplete?: boolean;
   startedAt: string | null;
   updatedAt: string | null;
   bytes: number;
@@ -86,6 +89,7 @@ export interface CatalogSession {
   titleRecords: SessionTitleRecord[];
   /** Exact aliases used by title resolution, in deterministic display order. */
   titles: string[];
+  titleHistoryComplete: boolean;
   jobs: KeeperJobAlias[];
   startedAt: string | null;
   updatedAt: string | null;
@@ -99,13 +103,71 @@ export type HistoryDiagnosticCode =
   | "job_missing_native_id"
   | "source_changed"
   | "source_read_failed"
-  | "source_removed";
+  | "source_removed"
+  | "keeper_jobs_unavailable"
+  | "keeper_mutations_unavailable"
+  | "diagnostics_truncated";
 
-/** Diagnostics deliberately carry no transcript body, exception text, or query. */
+export type HistoryDiagnosticScope =
+  | "root"
+  | "artifact"
+  | "job"
+  | "index"
+  | "mutation";
+
+/** Diagnostics deliberately carry no transcript body, exception text, or query.
+ * `count` aggregates identical facts so stale historical rows cannot make one
+ * bounded command emit thousands of duplicate diagnostics. */
 export interface HistoryDiagnostic {
   code: HistoryDiagnosticCode;
   harness: HistoryHarness | null;
-  scope: "root" | "artifact" | "job" | "index";
+  scope: HistoryDiagnosticScope;
+  count?: number;
+}
+
+export const HISTORY_DIAGNOSTIC_GROUP_MAX = 32;
+
+export function aggregateHistoryDiagnostics(
+  diagnostics: readonly HistoryDiagnostic[],
+  maxGroups = HISTORY_DIAGNOSTIC_GROUP_MAX,
+): HistoryDiagnostic[] {
+  const grouped = new Map<string, HistoryDiagnostic>();
+  for (const diagnostic of diagnostics) {
+    const harness =
+      diagnostic.harness === "claude" || diagnostic.harness === "pi"
+        ? diagnostic.harness
+        : null;
+    const count =
+      Number.isInteger(diagnostic.count) && (diagnostic.count ?? 0) > 0
+        ? (diagnostic.count as number)
+        : 1;
+    const key = `${diagnostic.code}\0${harness ?? ""}\0${diagnostic.scope}`;
+    const existing = grouped.get(key);
+    if (existing === undefined) {
+      grouped.set(key, { ...diagnostic, harness, count });
+    } else {
+      existing.count = (existing.count ?? 1) + count;
+    }
+  }
+  const ordered = [...grouped.values()].sort(
+    (a, b) =>
+      a.code.localeCompare(b.code) ||
+      (a.harness ?? "").localeCompare(b.harness ?? "") ||
+      a.scope.localeCompare(b.scope),
+  );
+  const cap = Math.max(1, Math.trunc(maxGroups));
+  if (ordered.length <= cap) return ordered;
+  const kept = ordered.slice(0, cap - 1);
+  const omitted = ordered
+    .slice(cap - 1)
+    .reduce((sum, diagnostic) => sum + (diagnostic.count ?? 1), 0);
+  kept.push({
+    code: "diagnostics_truncated",
+    harness: null,
+    scope: "index",
+    count: omitted,
+  });
+  return kept;
 }
 
 export interface SessionCatalog {
