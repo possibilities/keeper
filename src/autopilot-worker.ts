@@ -8713,8 +8713,10 @@ export async function loadReconcileSnapshot(
   // regardless of the (wrapper) foreground command. Scoped to the narrow
   // stopped-AND-live-pane candidate set (never every job) so the syscall cost stays
   // bounded; producer-side only (NEVER a fold input — re-fold stays deterministic).
-  // Empty whenever the pane probe is degraded (`livePaneIds === null`): with no
-  // live-pane set there is nothing to reclaim, so the slot pass stays inert.
+  // May be non-empty when the pane probe is degraded (`livePaneIds === null`):
+  // the backstop occupant loop can still add dead-pid job ids, but
+  // `computeSlotOccupancy` returns early on a degraded probe, so this set is
+  // never consumed in that case.
   const provenDeadJobIds = new Set<string>();
   const pidLivenessByJobId = new Map<string, boolean | null>();
   const probeJobPid = (job: Job): boolean | null => {
