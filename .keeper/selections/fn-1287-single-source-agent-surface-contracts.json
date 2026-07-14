@@ -9,7 +9,7 @@
       "confidence": 0.76,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Judgment-heavy prose condensation across six files with cite-don't-restate taste and a literal-token consistency gate to preserve \u2014 Claude wording judgment over multiple surfaces, no intelligence-bound reason for opus.",
+      "rationale": "Judgment-heavy prose condensation across six files with cite-don't-restate taste and a literal-token consistency gate to preserve; Claude wording judgment over multiple surfaces, no intelligence-bound reason for opus.",
       "task_id": "fn-1287-single-source-agent-surface-contracts.1",
       "tier": "high"
     },
@@ -17,7 +17,7 @@
       "confidence": 0.77,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Single-file glossary work whose definitions must match live behavior and house register \u2014 user-facing definitional taste routes to sonnet, bounded single surface caps effort at medium.",
+      "rationale": "Single-file glossary work whose definitions must match live behavior and house register; user-facing definitional taste routes to sonnet, bounded single surface caps effort at medium.",
       "task_id": "fn-1287-single-source-agent-surface-contracts.2",
       "tier": "medium"
     },
@@ -25,13 +25,13 @@
       "confidence": 0.75,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "One ADR of decision/non-goal prose following a spelled-out structure with adjacent cross-references \u2014 bounded single-file authoring needing wording judgment, not opus-level reasoning.",
+      "rationale": "One ADR of decision/non-goal prose following a spelled-out structure with adjacent cross-references; bounded single-file authoring needing wording judgment, not opus-level reasoning.",
       "task_id": "fn-1287-single-source-agent-surface-contracts.3",
       "tier": "medium"
     }
   ],
   "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
-  "created_at": "2026-07-14T00:18:42.452000Z",
+  "created_at": "2026-07-14T00:20:48.432000Z",
   "epic_id": "fn-1287-single-source-agent-surface-contracts",
   "input_hash": "f1789d2ecc6628a413ef887b634e593829a9b164ac63167feb10fd7b83c18028",
   "outcome": "completed",
@@ -41,5 +41,5 @@
     "model": "plan:model-selector"
   },
   "shuffle_seed": 4051213614,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1287-single-source-agent-surface-contracts.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy prose condensation across six files with cite-don't-restate taste and a literal-token consistency gate to preserve \u2014 Claude wording judgment over multiple surfaces, no intelligence-bound reason for opus.\",\"confidence\":0.76},{\"task_id\":\"fn-1287-single-source-agent-surface-contracts.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Single-file glossary work whose definitions must match live behavior and house register \u2014 user-facing definitional taste routes to sonnet, bounded single surface caps effort at medium.\",\"confidence\":0.77},{\"task_id\":\"fn-1287-single-source-agent-surface-contracts.3\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"One ADR of decision/non-goal prose following a spelled-out structure with adjacent cross-references \u2014 bounded single-file authoring needing wording judgment, not opus-level reasoning.\",\"confidence\":0.75}]}\n"
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1287-single-source-agent-surface-contracts.1\", \"tier\": \"high\", \"model\": \"sonnet\", \"rationale\": \"Judgment-heavy prose condensation across six files with cite-don't-restate taste and a literal-token consistency gate to preserve; Claude wording judgment over multiple surfaces, no intelligence-bound reason for opus.\", \"confidence\": 0.76}, {\"task_id\": \"fn-1287-single-source-agent-surface-contracts.2\", \"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"Single-file glossary work whose definitions must match live behavior and house register; user-facing definitional taste routes to sonnet, bounded single surface caps effort at medium.\", \"confidence\": 0.77}, {\"task_id\": \"fn-1287-single-source-agent-surface-contracts.3\", \"tier\": \"medium\", \"model\": \"sonnet\", \"rationale\": \"One ADR of decision/non-goal prose following a spelled-out structure with adjacent cross-references; bounded single-file authoring needing wording judgment, not opus-level reasoning.\", \"confidence\": 0.75}]}\n"
 }
