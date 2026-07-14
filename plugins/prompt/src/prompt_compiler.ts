@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -30,11 +31,14 @@ import {
   type PromptArtifactRole,
   parsePromptArtifactCatalogBytes,
 } from "./artifact_catalog.ts";
-import { renderTemplateSource } from "./render_engine.ts";
+import {
+  findUnsnapshottedRenderDependencies,
+  renderTemplateSource,
+} from "./render_engine.ts";
 
 export const PI_PROMPT_MANIFEST = ".keeper-plan-agents.json";
 const SIDECAR_SUFFIX = ".managed-file-dont-edit";
-const COMPILER_REVISION = "keeper-prompt-pi-static-v2";
+const COMPILER_REVISION = "keeper-prompt-pi-static-v3";
 
 export interface PromptCompileRequest {
   readonly target: "pi";
@@ -441,7 +445,16 @@ function snapshotInputs(input: {
     .sort((a, b) => a.role.localeCompare(b.role));
   const sources = new Map<string, string>();
   for (const role of roles) {
-    sources.set(role.role, readFileSync(role.sourcePath, "utf8"));
+    const source = readFileSync(role.sourcePath, "utf8");
+    const dependencies = findUnsnapshottedRenderDependencies(source);
+    if (dependencies.length > 0) {
+      throw new Error(
+        `${role.sourcePath}: static Pi template uses unsnapshotted render dependencies: ${dependencies.join(
+          ", ",
+        )}`,
+      );
+    }
+    sources.set(role.role, source);
   }
   return {
     snapshot: {
@@ -749,7 +762,9 @@ export function compilePromptArtifacts(
   const equivalencePath = resolve(
     options.equivalencePath ?? join(planRoot, "provider-equivalence.yaml"),
   );
-  const targetDir = resolve(options.targetDir ?? defaultPiAgentsDir());
+  const targetDir = canonicalizePromptTargetDir(
+    resolve(options.targetDir ?? defaultPiAgentsDir()),
+  );
   const taskFacadePath = resolve(
     options.taskFacadePath ??
       join(repoRoot, "plugins", "keeper", "pi-extension", "task-facade.ts"),
@@ -792,27 +807,30 @@ export function compilePromptArtifacts(
     throw new Error(`Pi Task extension not found at ${taskFacadePath}`);
   }
 
+  const compilation = {
+    options,
+    request,
+    check,
+    planRoot,
+    targetDir,
+    taskFacadePath,
+    fingerprint,
+    snapshot: snapshotted.snapshot,
+    planned,
+  };
+  if (check) return compileAgainstTarget(compilation);
+
   const lockPath = `${targetDir}.keeper-prompt-compile.lock`;
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const lock = FileLock.acquire(lockPath);
   try {
-    return compileUnderPublicationLock({
-      options,
-      request,
-      check,
-      planRoot,
-      targetDir,
-      taskFacadePath,
-      fingerprint,
-      snapshot: snapshotted.snapshot,
-      planned,
-    });
+    return compileAgainstTarget(compilation);
   } finally {
     lock.release();
   }
 }
 
-function compileUnderPublicationLock(input: {
+function compileAgainstTarget(input: {
   options: PromptCompileOptions;
   request: PromptCompileResult["request"];
   check: boolean;
@@ -898,6 +916,7 @@ function compileUnderPublicationLock(input: {
       `${
         renderTemplateSource(item.role.sourcePath, source, variables, {
           shell: compilerShell(input.snapshot.renderInputs),
+          allowFileSystemDependencies: false,
         }).text
       }\n`;
     const translated = translateClaudeAgentToPi({
@@ -1005,6 +1024,23 @@ function compileUnderPublicationLock(input: {
     check: input.check,
     ok: !(input.check && drift),
   };
+}
+
+/** Resolve an output path through its deepest existing ancestor. This gives
+ * aliases one physical publication/lock identity even when the output leaf has
+ * not been created yet. */
+export function canonicalizePromptTargetDir(targetDir: string): string {
+  let ancestor = resolve(targetDir);
+  const missing: string[] = [];
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor);
+    if (parent === ancestor) {
+      throw new Error(`${targetDir}: cannot resolve a physical output root`);
+    }
+    missing.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  return resolve(realpathSync(ancestor), ...missing);
 }
 
 function defaultPiAgentsDir(): string {

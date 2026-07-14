@@ -4,14 +4,17 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import {
+  canonicalizePromptTargetDir,
   compilePromptArtifacts,
   PI_PROMPT_MANIFEST,
 } from "../plugins/prompt/src/prompt_compiler.ts";
@@ -362,6 +365,82 @@ describe("role-scoped Pi prompt compiler", () => {
     expect(
       readFileSync(join(fx.targetDir, "plan:repo-scout.md"), "utf8"),
     ).toContain("RACE");
+  });
+
+  test("rejects disk-backed Liquid dependencies before publication", () => {
+    const cases = [
+      {
+        dependency: "include",
+        syntax: `{% include "_partials/unsnapshotted.md" %}`,
+      },
+      {
+        dependency: "snippets",
+        syntax: `{{ snippets(domain="plan") }}`,
+      },
+    ];
+    for (const item of cases) {
+      const fx = fixture();
+      const source = join(
+        fx.planRoot,
+        "template",
+        "agents",
+        "repo-scout.md.tmpl",
+      );
+      writeFileSync(
+        source,
+        `${readFileSync(source, "utf8")}\n${item.syntax}\n`,
+      );
+
+      expect(() => compile(fx)).toThrow(
+        `unsnapshotted render dependencies: ${item.dependency}`,
+      );
+      expect(existsSync(fx.targetDir)).toBe(false);
+      expect(existsSync(`${fx.targetDir}.keeper-prompt-compile.lock`)).toBe(
+        false,
+      );
+    }
+  });
+
+  test("canonicalizes a missing agents leaf below a symlinked Pi root", () => {
+    const fx = fixture();
+    const physicalPiRoot = join(fx.repoRoot, "physical-pi-agent");
+    const aliasPiRoot = join(fx.repoRoot, "pi-agent-alias");
+    mkdirSync(physicalPiRoot);
+    symlinkSync(physicalPiRoot, aliasPiRoot, "dir");
+    const physicalTarget = join(physicalPiRoot, "agents");
+    const aliasTarget = join(aliasPiRoot, "agents");
+    expect(existsSync(aliasTarget)).toBe(false);
+    const canonicalPhysicalTarget = canonicalizePromptTargetDir(physicalTarget);
+    expect(canonicalizePromptTargetDir(aliasTarget)).toBe(
+      canonicalPhysicalTarget,
+    );
+
+    const run = (targetDir: string, check = false) =>
+      compilePromptArtifacts({
+        request: { target: "pi", bundle: "plan:static" },
+        repoRoot: fx.repoRoot,
+        planRoot: fx.planRoot,
+        matrixPath: fx.matrixPath,
+        equivalencePath: fx.equivalencePath,
+        targetDir,
+        taskFacadePath: fx.taskFacadePath,
+        renderCanonical,
+        check,
+      });
+
+    expect(run(aliasTarget, true)).toMatchObject({ check: true, ok: false });
+    expect(readdirSync(physicalPiRoot)).toEqual([]);
+
+    const published = run(aliasTarget);
+    expect(published.outcome).toBe("compiled");
+    expect(existsSync(join(physicalTarget, PI_PROMPT_MANIFEST))).toBe(true);
+    const physicalAlias = run(physicalTarget);
+    expect(physicalAlias.outcome).toBe("hit");
+    expect(physicalAlias.fingerprint).toBe(published.fingerprint);
+    expect(readdirSync(physicalPiRoot).sort()).toEqual([
+      "agents",
+      "agents.keeper-prompt-compile.lock",
+    ]);
   });
 
   test("uses explicit snapshotted practice-scout values without shell rendering", () => {

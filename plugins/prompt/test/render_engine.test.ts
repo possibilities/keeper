@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { renderTemplate, rewriteShellCalls } from "../src/render_engine.ts";
+import {
+  findUnsnapshottedRenderDependencies,
+  renderTemplate,
+  rewriteShellCalls,
+} from "../src/render_engine.ts";
 import type { PluginTemplatesFixture } from "./oracle/fixture-types.ts";
 
 const HERE = dirname(new URL(import.meta.url).pathname);
@@ -62,5 +66,32 @@ describe("render engine", () => {
     expect(
       rewriteShellCalls(`{{ shell("echo (a)") }} | {{ current_variant }}\n`),
     ).toBe(`{{ "echo (a)" | shell }} | {{ current_variant }}\n`);
+  });
+
+  test("finds disk dependencies only in executable Liquid syntax", () => {
+    const inert = [
+      "Prose about include, snippet(), snippets(), all_snippets_in(), and file_exists().",
+      `{% assign example = "snippet('quoted')" %}`,
+      `{% comment %}{% include "commented.md" %}{{ file_exists("x") }}{% endcomment %}`,
+      `{% raw %}{% render "raw.md" %}{{ snippets() }}{% endraw %}`,
+    ].join("\n");
+    expect(findUnsnapshottedRenderDependencies(inert)).toEqual([]);
+
+    const active = [
+      `{% include "partial.md" %}`,
+      `{{ snippet("named") }}`,
+      `{% if file_exists("README.md") %}yes{% endif %}`,
+      `{% liquid`,
+      `render "other.md"`,
+      `assign paths = all_snippets_in("plan")`,
+      `%}`,
+    ].join("\n");
+    expect(findUnsnapshottedRenderDependencies(active)).toEqual([
+      "all_snippets_in",
+      "file_exists",
+      "include",
+      "render",
+      "snippet",
+    ]);
   });
 });

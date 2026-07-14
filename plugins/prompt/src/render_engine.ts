@@ -28,7 +28,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import yaml from "js-yaml";
-import { Liquid } from "liquidjs";
+import { Liquid, Tokenizer } from "liquidjs";
 import { findGitRoot } from "./project_root.ts";
 
 export interface RenderResult {
@@ -48,6 +48,13 @@ interface SnippetEntry {
 }
 
 const LIST_FIELDS = new Set(["tags", "scope", "phase", "topics", "audience"]);
+const DISK_HELPERS = new Set([
+  "all_snippets_in",
+  "file_exists",
+  "snippet",
+  "snippets",
+]);
+const PARTIAL_TAGS = new Set(["include", "layout", "render"]);
 
 /** Render the `.md.tmpl` at `templatePath` with the promptctl Jinja environment
  * reproduced in LiquidJS. `extraVars` binds template context (e.g.
@@ -69,10 +76,103 @@ export interface RenderTemplateSourceOptions {
   /** Optional pure shell replacement. Supplying it guarantees this render does
    * not spawn commands; the caller owns every returned byte. */
   readonly shell?: (command: string) => string;
+  /** Disable every disk-backed Liquid feature for immutable-source callers.
+   * Templates requesting one fail before rendering. */
+  readonly allowFileSystemDependencies?: boolean;
 }
 
-/** Render caller-supplied template bytes. Includes still resolve through the
- * canonical loader roots, but the primary source is never re-read. */
+/** Find disk-backed Liquid constructs in executable tags/outputs. The Liquid
+ * tokenizer keeps prose and raw blocks out of the scan; comment blocks and
+ * quoted examples are ignored explicitly. */
+export function findUnsnapshottedRenderDependencies(source: string): string[] {
+  const engine = new Liquid();
+  const tokens = new Tokenizer(source).readTopLevelTokens(engine.options);
+  const found = new Set<string>();
+  let commentDepth = 0;
+
+  for (const token of tokens) {
+    if ("name" in token) {
+      if (token.name === "comment") {
+        commentDepth += 1;
+        continue;
+      }
+      if (token.name === "endcomment") {
+        commentDepth = Math.max(0, commentDepth - 1);
+        continue;
+      }
+      if (commentDepth > 0 || token.name === "#") continue;
+      if (PARTIAL_TAGS.has(token.name)) found.add(token.name);
+      if (token.name === "liquid") {
+        findLiquidTagDependencies(token.args, found);
+      } else {
+        findHelperCalls(token.args, found);
+      }
+      continue;
+    }
+    if (commentDepth === 0 && token.getText().startsWith("{{")) {
+      findHelperCalls(token.getText(), found);
+    }
+  }
+
+  return [...found].sort();
+}
+
+function findLiquidTagDependencies(source: string, found: Set<string>): void {
+  let inComment = false;
+  for (const line of source.split("\n")) {
+    const name = /^\s*([^\s]+)/.exec(line)?.[1];
+    if (name === undefined || name === "#") continue;
+    if (name === "comment") {
+      inComment = true;
+      continue;
+    }
+    if (name === "endcomment") {
+      inComment = false;
+      continue;
+    }
+    if (inComment) continue;
+    if (PARTIAL_TAGS.has(name)) found.add(name);
+    findHelperCalls(line, found);
+  }
+}
+
+function findHelperCalls(source: string, found: Set<string>): void {
+  let i = 0;
+  while (i < source.length) {
+    const ch = source[i] as string;
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          i += 2;
+        } else if (source[i] === quote) {
+          i += 1;
+          break;
+        } else {
+          i += 1;
+        }
+      }
+      continue;
+    }
+    if (!/[A-Za-z_]/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    let end = i + 1;
+    while (end < source.length && /[A-Za-z0-9_-]/.test(source[end] ?? "")) {
+      end += 1;
+    }
+    const name = source.slice(i, end);
+    let call = end;
+    while (/\s/.test(source[call] ?? "")) call += 1;
+    if (source[call] === "(" && DISK_HELPERS.has(name)) found.add(name);
+    i = end;
+  }
+}
+
+/** Render caller-supplied template bytes. Includes resolve through the
+ * canonical loader roots by default, but the primary source is never re-read. */
 export function renderTemplateSource(
   templatePath: string,
   source: string,
@@ -80,7 +180,17 @@ export function renderTemplateSource(
   options: RenderTemplateSourceOptions = {},
 ): RenderResult {
   const cwd = dirname(templatePath);
-  const projectRoot = findGitRoot(cwd);
+  const allowFileSystemDependencies =
+    options.allowFileSystemDependencies ?? true;
+  const dependencies = findUnsnapshottedRenderDependencies(source);
+  if (!allowFileSystemDependencies && dependencies.length > 0) {
+    throw new Error(
+      `${templatePath}: unsnapshotted render dependencies: ${dependencies.join(
+        ", ",
+      )}`,
+    );
+  }
+  const projectRoot = allowFileSystemDependencies ? findGitRoot(cwd) : null;
   let hadErrors = false;
 
   const shell = (cmd: string): string => {
@@ -117,17 +227,21 @@ export function renderTemplateSource(
     return existsSync(join(projectRoot, path));
   };
 
-  const loaderDirs = resolveLoaderDirs(templatePath, projectRoot);
-  const snippetGlobals = buildSnippetHelpers(snippetRoot(loaderDirs));
+  const loaderDirs = allowFileSystemDependencies
+    ? resolveLoaderDirs(templatePath, projectRoot)
+    : [cwd];
+  const globals = allowFileSystemDependencies
+    ? {
+        file_exists: fileExists,
+        ...buildSnippetHelpers(snippetRoot(loaderDirs)),
+      }
+    : {};
 
   const engine = new Liquid({
     root: loaderDirs,
     extname: "",
     strictVariables: true,
-    globals: {
-      file_exists: fileExists,
-      ...snippetGlobals,
-    },
+    globals,
   });
   engine.registerFilter("shell", (cmd: unknown) => shell(String(cmd)));
 
