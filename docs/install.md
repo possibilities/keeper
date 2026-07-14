@@ -174,8 +174,9 @@ identities for operator reconciliation. The canonical test commands and budget p
 [docs/testing.md](./testing.md).
 
 Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which derives
-a short Session title from the current branch's Latest turn and applies it through Pi's own
-`setSessionName()`. It requires Pi's own OAuth login to serve the one fixed cheap
+a short Session title from the active branch's bounded, compaction-aware conversation context,
+with extra weight on user requests, and applies it through Pi's own `setSessionName()`. It
+requires Pi's own OAuth login to serve the one fixed cheap
 `openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate keeper credential. Absent
 that OAuth, an unresolvable model, an empty turn, or a malformed model response, `/rename` no-ops
 with an in-Pi notification and leaves the existing title unchanged; a successful rename reaches

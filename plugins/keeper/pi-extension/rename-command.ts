@@ -1,7 +1,8 @@
 /**
- * keeper's `/rename` Pi command — derives a short Session title from the
- * current branch's Latest turn (`keeper transcript pi turn`) and applies it
- * through Pi's own `setSessionName()`, never Keeper's DB or tmux directly.
+ * keeper's `/rename` Pi command — derives a short Session title from Pi's
+ * active, compaction-aware conversation context and applies it through Pi's
+ * own `setSessionName()`, never Keeper's DB or tmux directly. The branch-aware
+ * Latest-turn CLI contract gates settled reads and serves older Pi hosts.
  *
  * SELF-CONTAINED ISLAND, same discipline as `keeper-events.ts`: this file
  * ships no static import of any `@earendil-works/*` package (that package is
@@ -45,9 +46,10 @@ const RENAME_MAX_READ_FAILURES = 3;
 const RENAME_MAX_COMPLETION_ATTEMPTS = 3;
 
 const RENAME_SYSTEM_PROMPT =
-  "Generate a short session title (3-6 words) summarizing the user's most " +
-  "recent request below. Respond with ONLY the title text: no punctuation, " +
-  "no quotes, no preamble.";
+  "Generate a short session title (3-6 words) summarizing the overarching " +
+  "work in the conversation below. Prioritize the user's requests, goals, " +
+  "and repeated themes over assistant implementation detail. Respond with " +
+  "ONLY the title text: no punctuation, no quotes, no preamble.";
 
 /** Max slug length AFTER normalization. MUST match `SLUG_MAX_LEN` in
  *  `src/slug.ts` — copied because this file is isolated from keeper's `src/`
@@ -133,6 +135,167 @@ export function buildRenameInputText(
     sliceLen -= 1;
   }
   return combined.slice(0, sliceLen);
+}
+
+interface RenameContextMessage {
+  role?: unknown;
+  content?: unknown;
+  summary?: unknown;
+}
+
+interface RenameConversationSection {
+  label: "User" | "Assistant" | "Conversation summary";
+  text: string;
+  weight: number;
+}
+
+function contextText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      isRecord(block) &&
+      block.type === "text" &&
+      typeof block.text === "string"
+    ) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  let result = text.slice(0, low);
+  if (/^[\uD800-\uDBFF]$/.test(result.at(-1) ?? "")) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
+function allocateConversationBytes(
+  sections: readonly RenameConversationSection[],
+  budget: number,
+): number[] {
+  const allocations = sections.map(() => 0);
+  let remaining = budget;
+  let active = sections.map((_, index) => index);
+  while (active.length > 0 && remaining > 0) {
+    const totalWeight = active.reduce(
+      (sum, index) => sum + (sections[index]?.weight ?? 0),
+      0,
+    );
+    const unit = Math.floor(remaining / totalWeight);
+    const completed = active.filter((index) => {
+      const section = sections[index];
+      return (
+        section !== undefined &&
+        Buffer.byteLength(section.text, "utf8") <= unit * section.weight
+      );
+    });
+    if (completed.length === 0) {
+      let assigned = 0;
+      for (const index of active) {
+        const section = sections[index];
+        if (section === undefined) continue;
+        const share = Math.floor((remaining * section.weight) / totalWeight);
+        allocations[index] = share;
+        assigned += share;
+      }
+      for (const index of [...active].reverse()) {
+        if (assigned >= remaining) break;
+        allocations[index] = (allocations[index] ?? 0) + 1;
+        assigned += 1;
+      }
+      break;
+    }
+    const completedSet = new Set(completed);
+    for (const index of completed) {
+      const section = sections[index];
+      if (section === undefined) continue;
+      const bytes = Buffer.byteLength(section.text, "utf8");
+      allocations[index] = bytes;
+      remaining -= bytes;
+    }
+    active = active.filter((index) => !completedSet.has(index));
+  }
+  return allocations;
+}
+
+/** Build a bounded, chronological conversation excerpt from Pi's active,
+ *  compaction-aware model context. User text receives twice the truncation
+ *  weight of assistant detail; summaries remain available as context. PURE. */
+export function buildRenameConversationInput(
+  messages: readonly unknown[],
+  maxBytes: number,
+): string | null {
+  const sections: RenameConversationSection[] = [];
+  for (const raw of messages) {
+    if (!isRecord(raw)) continue;
+    const message = raw as RenameContextMessage;
+    let label: RenameConversationSection["label"];
+    let text: string;
+    let weight: number;
+    if (message.role === "user") {
+      label = "User";
+      text = contextText(message.content);
+      weight = 2;
+    } else if (message.role === "assistant") {
+      label = "Assistant";
+      text = contextText(message.content);
+      weight = 1;
+    } else if (
+      (message.role === "compactionSummary" ||
+        message.role === "branchSummary") &&
+      typeof message.summary === "string"
+    ) {
+      label = "Conversation summary";
+      text = message.summary;
+      weight = 1;
+    } else {
+      continue;
+    }
+    text = stripSkillBlocks(text).trim();
+    if (text.length > 0) sections.push({ label, text, weight });
+  }
+  if (sections.length === 0 || maxBytes <= 0) return null;
+
+  const separator = "\n\n";
+  const overhead = sections.reduce(
+    (bytes, section, index) =>
+      bytes +
+      Buffer.byteLength(`${section.label}: `, "utf8") +
+      (index === 0 ? 0 : Buffer.byteLength(separator, "utf8")),
+    0,
+  );
+  if (overhead >= maxBytes) {
+    return truncateUtf8(
+      sections
+        .map((section) => `${section.label}: ${section.text}`)
+        .join(separator),
+      maxBytes,
+    );
+  }
+
+  const allocations = allocateConversationBytes(sections, maxBytes - overhead);
+  return sections
+    .map(
+      (section, index) =>
+        `${section.label}: ${truncateUtf8(section.text, allocations[index] ?? 0)}`,
+    )
+    .join(separator);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +573,9 @@ export interface RenameSessionManager {
   getSessionId(): string;
   getLeafId(): string | null;
   getSessionName(): string | undefined;
+  /** Current Pi hosts expose their active, compaction-aware model context.
+   *  Optional so an older host keeps the Latest-turn compatibility path. */
+  buildSessionContext?(): { messages: unknown[] };
 }
 
 export interface RenameUi {
@@ -557,7 +723,19 @@ async function runRenameAttempt(
     return { outcome: "stale", staleReason: "retryable" };
   }
 
-  const inputText = buildRenameInputText(
+  let inputText: string | null = null;
+  try {
+    const sessionContext = ctx.sessionManager.buildSessionContext?.();
+    if (sessionContext !== undefined) {
+      inputText = buildRenameConversationInput(
+        sessionContext.messages,
+        RENAME_MAX_TRANSCRIPT_BYTES,
+      );
+    }
+  } catch {
+    // Host context drift degrades to the stable Latest-turn CLI contract.
+  }
+  inputText ??= buildRenameInputText(
     turnOutcome.prompt,
     turnOutcome.response,
     RENAME_MAX_TRANSCRIPT_BYTES,
@@ -852,7 +1030,7 @@ export function registerRenameCommand(
   const deps = opts.deps ?? defaultRenameCommandDeps();
   const state = createRenameInvocationState();
   pi.registerCommand("rename", {
-    description: "Derive a short Session title from the latest turn",
+    description: "Derive a short Session title from the conversation",
     handler: createRenameCommandHandler(pi, deps, state),
   });
   pi.on("session_info_changed", (event) => {
