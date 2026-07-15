@@ -123,6 +123,30 @@ describe("commit-work foreign claim adoption", () => {
     expect(terminal.adopted).toEqual(["a.txt"]);
   });
 
+  test("explicit adoption supersedes the caller's stale automatic identity", async () => {
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: ID,
+      adoptedPaths: ["a.txt"],
+      git: surfaceGit(),
+      deps: {
+        readClaims: () => [
+          {
+            path: "a.txt",
+            sessionId: ID,
+            liveness: "live",
+            source: "tool",
+            oid: "deadbeef",
+            mode: "100644",
+          },
+        ],
+      },
+    });
+    expect(surface.adopted).toEqual(["a.txt"]);
+    expect(surface.automatic).toEqual([]);
+    expect(surface.rejections).toEqual([]);
+  });
+
   test("unavailable overlap evidence blocks adoption unless direct evidence is complete", async () => {
     const unavailable = await discoverCommitWorkSurface({
       worktree: "/repo",
@@ -272,6 +296,9 @@ interface RefFixtureOptions {
   parents?: string[];
   tree?: string;
   casFails?: boolean;
+  casCode?: number;
+  casSignal?: NodeJS.Signals;
+  unborn?: boolean;
   commitFails?: boolean;
   signingConfigRace?: boolean;
   onHook?: (name: string) => void;
@@ -282,7 +309,7 @@ const BLOB = "1234567890123456789012345678901234567890";
 
 function refFixture(options: RefFixtureOptions = {}) {
   let branchReads = 0;
-  let branchTip = PARENT;
+  let branchTip: string | null = options.unborn ? null : PARENT;
   let privateUpdated = false;
   let hookRan = false;
   let removeCount = 0;
@@ -293,7 +320,7 @@ function refFixture(options: RefFixtureOptions = {}) {
     env?: Record<string, string>;
     stdin?: string;
   }> = [];
-  const parents = options.parents ?? [PARENT];
+  const parents = options.parents ?? (options.unborn ? [] : [PARENT]);
   const objectTree = options.tree ?? TREE;
   const run: GitRunner = async (args, opts = {}) => {
     const stdin = opts.stdin ? new TextDecoder().decode(opts.stdin) : undefined;
@@ -307,11 +334,21 @@ function refFixture(options: RefFixtureOptions = {}) {
       args[2] === "refs/heads/main^{commit}"
     ) {
       branchReads += 1;
+      if (branchTip === null) {
+        return { code: 128, stdout: "", stderr: "unborn branch" };
+      }
       const oid =
         branchReads === 2 && options.beforeCommit
           ? options.beforeCommit
           : branchTip;
       return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (args[0] === "show-ref" && args.includes("refs/heads/main")) {
+      return {
+        code: branchTip === null ? 1 : 0,
+        stdout: "",
+        stderr: "",
+      };
     }
     if (
       args[0] === "rev-parse" &&
@@ -399,11 +436,13 @@ function refFixture(options: RefFixtureOptions = {}) {
       };
     }
     if (args[0] === "update-ref") {
-      if (!options.casFails) branchTip = COMMIT;
+      const code = options.casCode ?? (options.casFails ? 1 : 0);
+      if (code === 0) branchTip = COMMIT;
       return {
-        code: options.casFails ? 1 : 0,
+        code,
         stdout: "",
-        stderr: options.casFails ? "compare-and-swap failed" : "",
+        stderr: code === 0 ? "" : "compare-and-swap failed",
+        signal: options.casSignal ?? null,
       };
     }
     return { code: 0, stdout: "", stderr: "" };
@@ -490,35 +529,23 @@ describe("commit-work atomic plumbing publication", () => {
     );
   });
 
-  test("an unborn branch is a typed refusal before commit creation", async () => {
-    const fixture = refFixture();
-    await expect(
-      commitFrozenPrivateIndex(
-        {
-          dir: "/tmp/keeper-private-audit",
-          indexPath: "/tmp/keeper-private-audit/index",
-          expectedHead: null,
-          branchRef: "refs/heads/main",
-          tree: TREE,
-          entries: [],
-          paths: [],
-          worktreeBaseline: "",
-          targetIndexPath: "",
-          targetIndexBaseline: "",
-          gitConfigBaseline: "",
-          hookSetBaseline: "",
-          signing: { args: [], enabled: false },
-        },
-        "initial",
-        "/repo",
-        fixture.run,
-      ),
-    ).rejects.toMatchObject({ code: "initial_commit_unsupported" });
-    expect(
-      fixture.calls.some(
-        (call) => call.args[0] === "worktree" && call.args[1] === "add",
-      ),
-    ).toBe(false);
+  test("an unborn branch publishes one parentless create-only CAS", async () => {
+    const fixture = refFixture({ unborn: true });
+    const frozen = await frozenFixture(fixture);
+    const committed = await commitFrozenPrivateIndex(
+      frozen,
+      "initial",
+      "/repo",
+      fixture.run,
+      fixture.fs,
+    );
+    expect(committed.sha).toBe(COMMIT);
+    const commitTree = fixture.calls.find(
+      (call) => call.args[0] === "commit-tree",
+    );
+    expect(commitTree?.args).not.toContain("-p");
+    const publish = fixture.calls.find((call) => call.args[0] === "update-ref");
+    expect(publish?.args.at(-1)).toBe("0".repeat(40));
   });
 
   test("commit-tree uses the captured tree and parent and publishes one exact CAS", async () => {
@@ -640,6 +667,34 @@ describe("commit-work atomic plumbing publication", () => {
       commitSha: COMMIT,
       committed: false,
       indeterminate: false,
+    });
+    expect(
+      fixture.calls.filter((call) => call.args[0] === "update-ref"),
+    ).toHaveLength(1);
+  });
+
+  test("an unknowable CAS timeout reports indeterminate and never retries", async () => {
+    const fixture = refFixture({ casCode: 124 });
+    const error = await capturePrivateError(fixture);
+    expect(error).toMatchObject({
+      code: "commit_state_indeterminate",
+      commitSha: COMMIT,
+      committed: false,
+      indeterminate: true,
+    });
+    expect(
+      fixture.calls.filter((call) => call.args[0] === "update-ref"),
+    ).toHaveLength(1);
+  });
+
+  test("a signaled CAS reports indeterminate and never retries", async () => {
+    const fixture = refFixture({ casCode: 137, casSignal: "SIGKILL" });
+    const error = await capturePrivateError(fixture);
+    expect(error).toMatchObject({
+      code: "commit_state_indeterminate",
+      commitSha: COMMIT,
+      committed: false,
+      indeterminate: true,
     });
     expect(
       fixture.calls.filter((call) => call.args[0] === "update-ref"),
@@ -1324,6 +1379,13 @@ describe("commit-work telemetry", () => {
       );
       const parsed = parseEventLogLine(line.trimEnd());
       expect(parsed?.bindings.hook_event).toBe("commit_work_outcome");
+      expect(
+        Object.values(parsed?.bindings ?? {}).every(
+          (value) =>
+            value === null ||
+            new Set(["string", "number", "boolean"]).has(typeof value),
+        ),
+      ).toBe(true);
       const data = JSON.parse(String(parsed?.bindings.data));
       expect(data.telemetry_truncated).toBe(true);
     } finally {

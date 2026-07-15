@@ -135,6 +135,10 @@ export interface OwnershipClaimsReadTestHooks {
   eventsLogDir?: string;
   /** Isolated dead-letter tree; production uses the fixed recovery directory. */
   deadLetterDir?: string;
+  /** Test-only seam for a dead-letter append at the final source handoff. */
+  afterDeadLetterRead?: () => void;
+  /** Test-only seam for a daemon import during a dead-letter disk scan. */
+  duringDeadLetterRead?: () => void;
 }
 
 const EXCLUDED_PREFIX = ".keeper/";
@@ -180,22 +184,33 @@ function canonicalMutationPath(
 function mutationPathFromReceipt(
   bindings: Record<string, string | number | boolean | null>,
 ): string | null {
+  let mutationPath: string | null = null;
   if (typeof bindings.mutation_path === "string") {
-    return bindings.mutation_path;
+    mutationPath = bindings.mutation_path;
+  } else if (typeof bindings.data === "string") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bindings.data);
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== "object" || parsed === null) return null;
+    mutationPath = extractMutationPath(
+      typeof bindings.hook_event === "string" ? bindings.hook_event : "",
+      typeof bindings.tool_name === "string" ? bindings.tool_name : null,
+      parsed as Record<string, unknown>,
+    );
   }
-  if (typeof bindings.data !== "string") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(bindings.data);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  return extractMutationPath(
-    typeof bindings.hook_event === "string" ? bindings.hook_event : "",
-    typeof bindings.tool_name === "string" ? bindings.tool_name : null,
-    parsed as Record<string, unknown>,
-  );
+  if (mutationPath === null || mutationPath.includes("\0")) return null;
+  if (isAbsolute(mutationPath)) return mutationPath;
+
+  // Legacy receipts predate the canonical `mutation_path` column. Their tool
+  // path is relative to the producer-recorded cwd, never implicitly to the
+  // repository root. Missing/relative cwd is unavailable evidence.
+  const cwd = bindings.cwd;
+  return typeof cwd === "string" && isAbsolute(cwd) && !cwd.includes("\0")
+    ? resolve(cwd, mutationPath)
+    : null;
 }
 
 /**
@@ -395,10 +410,57 @@ function readReceiptClaims(
   return stillStable() ? { claims, stillStable } : null;
 }
 
+interface DeadLetterImportState {
+  total: number;
+  waiting: number;
+  replayHead: number;
+}
+
+function deadLetterImportState(db: Database): DeadLetterImportState | null {
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0) AS waiting,
+              COALESCE(MAX(replayed_event_id), 0) AS replay_head
+         FROM dead_letters`,
+    )
+    .get() as { total: unknown; waiting: unknown; replay_head: unknown } | null;
+  if (
+    typeof row?.total !== "number" ||
+    !Number.isSafeInteger(row.total) ||
+    row.total < 0 ||
+    typeof row.waiting !== "number" ||
+    !Number.isSafeInteger(row.waiting) ||
+    row.waiting < 0 ||
+    typeof row.replay_head !== "number" ||
+    !Number.isSafeInteger(row.replay_head) ||
+    row.replay_head < 0
+  ) {
+    return null;
+  }
+  return {
+    total: row.total,
+    waiting: row.waiting,
+    replayHead: row.replay_head,
+  };
+}
+
+function sameDeadLetterImportState(
+  left: DeadLetterImportState,
+  right: DeadLetterImportState,
+): boolean {
+  return (
+    left.total === right.total &&
+    left.waiting === right.waiting &&
+    left.replayHead === right.replayHead
+  );
+}
+
 function unresolvedMutationDeadLetter(
   worktree: string,
   dbPath: string,
   dir: string,
+  duringRead?: () => void,
 ): boolean | null {
   const relevant = (
     bindings: Record<string, string | number | boolean | null>,
@@ -412,6 +474,8 @@ function unresolvedMutationDeadLetter(
   try {
     const { db } = openDb(dbPath, { readonly: true });
     try {
+      const importBefore = deadLetterImportState(db);
+      if (importBefore === null) return null;
       const unresolved = db
         .query(
           `SELECT bindings
@@ -443,13 +507,17 @@ function unresolvedMutationDeadLetter(
         }
       }
 
+      duringRead?.();
       let names: string[];
       try {
         names = readdirSync(dir)
           .filter((name) => name.endsWith(".ndjson"))
           .sort();
       } catch (error) {
-        return (error as NodeJS.ErrnoException).code === "ENOENT"
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+        const importAfter = deadLetterImportState(db);
+        return importAfter !== null &&
+          sameDeadLetterImportState(importBefore, importAfter)
           ? false
           : null;
       }
@@ -519,6 +587,17 @@ function unresolvedMutationDeadLetter(
           closeSync(fd);
         }
       }
+      // The daemon imports a disk record into SQLite before unlinking it. A
+      // stable monotonic import state between the first DB read and this point,
+      // followed by an unchanged directory pass, establishes one instant at
+      // which neither representation could have hidden the record.
+      const importMiddle = deadLetterImportState(db);
+      if (
+        importMiddle === null ||
+        !sameDeadLetterImportState(importBefore, importMiddle)
+      ) {
+        return null;
+      }
       const afterNames = readdirSync(dir)
         .filter((name) => name.endsWith(".ndjson"))
         .sort();
@@ -533,7 +612,11 @@ function unresolvedMutationDeadLetter(
           return null;
         }
       }
-      return false;
+      const importAfter = deadLetterImportState(db);
+      return importAfter !== null &&
+        sameDeadLetterImportState(importMiddle, importAfter)
+        ? false
+        : null;
     } finally {
       db.close();
     }
@@ -729,15 +812,34 @@ export function readOwnershipClaims(
         worktree,
         dbPath,
         testHooks.deadLetterDir ?? defaultDeadLetterDir(),
+        testHooks.duringDeadLetterRead,
       );
       if (deadLetterState !== false) return null;
+      testHooks.afterDeadLetterRead?.();
       const postDeadLetterHead =
         (
           db.query("SELECT MAX(id) AS max_id FROM events").get() as {
             max_id: unknown;
           } | null
         )?.max_id ?? 0;
-      if (postDeadLetterHead !== head || !receiptSnapshot.stillStable()) {
+      const finalDeadLetterState = unresolvedMutationDeadLetter(
+        worktree,
+        dbPath,
+        testHooks.deadLetterDir ?? defaultDeadLetterDir(),
+        testHooks.duringDeadLetterRead,
+      );
+      const finalEventHead =
+        (
+          db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+            max_id: unknown;
+          } | null
+        )?.max_id ?? 0;
+      if (
+        postDeadLetterHead !== head ||
+        finalEventHead !== head ||
+        !receiptSnapshot.stillStable() ||
+        finalDeadLetterState !== false
+      ) {
         return null;
       }
       return claims;
@@ -835,8 +937,17 @@ export async function readDirtySurface(
   const status = await git(
     ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
     // This reader may be the final ownership linearization immediately before
-    // ref CAS. Disable Git's optional index refresh so validation is read-only.
-    { cwd: worktree, env: { GIT_OPTIONAL_LOCKS: "0" } },
+    // ref CAS. Disable Git's optional index refresh and executable fsmonitor so
+    // validation is read-only before any owned-byte baseline exists.
+    {
+      cwd: worktree,
+      env: {
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.fsmonitor",
+        GIT_CONFIG_VALUE_0: "false",
+      },
+    },
   );
   if (status.code !== 0) return null;
   return parseDirtySurface(status.stdout);
@@ -1175,7 +1286,12 @@ export async function discoverCommitWorkSurface(
     }
   }
 
-  const resolvedAutomatic = [...automaticSet].sort();
+  // An explicit adoption intentionally binds current bytes instead of the
+  // caller's stale automatic OID/mode evidence; foreign conflicts still block
+  // above. Keep the path in adopted, not both decision classes.
+  const resolvedAutomatic = [...automaticSet]
+    .filter((path) => !adopted.has(path))
+    .sort();
   const selected = [...new Set([...resolvedAutomatic, ...adopted])].sort();
   // Selected adoption joins the caller-owned/selected explanation while its
   // original category remains as diagnostic provenance (notably a terminal

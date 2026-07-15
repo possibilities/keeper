@@ -2,7 +2,11 @@
 
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { CommitWorkLock } from "../src/commit-work/flock";
-import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
+import {
+  GIT_LOCAL_TIMEOUT_MS,
+  type GitRunner,
+  gitExec,
+} from "../src/commit-work/git-exec";
 import {
   IdentityConflictError,
   InvalidIdentityError,
@@ -420,7 +424,7 @@ export type CommitWorkOutcome =
   | "forbidden_trailer"
   | "operation_in_progress"
   | "shared_checkout_jam"
-  | "initial_commit_unsupported"
+  | "commit_state_indeterminate"
   | "lock_timeout"
   | "file_list_too_large"
   | "stale_index_carryover"
@@ -440,6 +444,7 @@ export type CommitWorkOutcome =
   | "commit_hook_mutated"
   | "post_commit_hook_failed"
   | "ambient_reconcile_failed"
+  | "push_state_indeterminate"
   | "push_failed"
   | "internal_error";
 
@@ -574,6 +579,20 @@ async function unmergedFileNames(
   });
   if (unmerged.code !== 0) return null;
   return unmerged.stdout.split("\0").filter(Boolean).sort();
+}
+
+/** Every local Git boundary in commit-work has a finite default. Callers may
+ * select another explicit positive bound (the push leg does), but omission can
+ * never turn config/FIFO/filesystem trouble into an unbounded publication. */
+export function boundedCommitWorkGit(run: GitRunner): GitRunner {
+  return (args, options = {}) =>
+    run(args, {
+      ...options,
+      timeoutMs:
+        options.timeoutMs !== undefined && options.timeoutMs > 0
+          ? options.timeoutMs
+          : GIT_LOCAL_TIMEOUT_MS,
+    });
 }
 
 export interface CommitWorkDeps {
@@ -1030,7 +1049,7 @@ async function runAttempt(
     };
   }
 
-  const git = deps.gitRunner ?? gitExec;
+  const git = boundedCommitWorkGit(deps.gitRunner ?? gitExec);
   const worktree = await resolveWorktreeRoot(deps.cwd ?? process.cwd(), git);
   // Ownership discovery is immediate: durable claims are used when available,
   // while fold-lagged or otherwise unattributed dirt is surfaced as explicitly
@@ -1686,18 +1705,23 @@ async function runAttempt(
       return {
         code: 1,
         identity,
-        result: result("commit-work-result", "push_failed", false, {
-          identity,
-          commit_sha: committed.sha,
-          ...resultFileFields(surface.selected),
-          committed: true,
-          ...pushAliases(pushEnvelope),
-          ambient_reconciliation_warning: ambientWarning,
-          selection: selectionEnvelope(surface, identity),
-          surface: surface.summary,
-          commit: commitEnvelope,
-          push: pushEnvelope,
-        }),
+        result: result(
+          "commit-work-result",
+          pushed.pushed === null ? "push_state_indeterminate" : "push_failed",
+          false,
+          {
+            identity,
+            commit_sha: committed.sha,
+            ...resultFileFields(surface.selected),
+            committed: true,
+            ...pushAliases(pushEnvelope),
+            ambient_reconciliation_warning: ambientWarning,
+            selection: selectionEnvelope(surface, identity),
+            surface: surface.summary,
+            commit: commitEnvelope,
+            push: pushEnvelope,
+          },
+        ),
       };
     }
     const pushOutcome = pushed.pushed

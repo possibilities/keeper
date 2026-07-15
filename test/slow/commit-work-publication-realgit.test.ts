@@ -428,6 +428,36 @@ test("worktree snapshot rejects a path created between status enumerations", asy
   );
 });
 
+test("an unborn SHA-1 branch publishes a parentless initial commit atomically", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-initial-commit-"));
+  roots.push(root);
+  const repo = join(root, "repo");
+  mkdirSync(repo);
+  await git(repo, ["init", "-b", "main"]);
+  await git(repo, ["config", "user.name", "Keeper Test"]);
+  await git(repo, ["config", "user.email", "keeper@example.test"]);
+  await git(repo, ["config", "commit.gpgSign", "false"]);
+  writeFileSync(join(repo, "selected.txt"), "initial\n");
+
+  const privateIndex = await frozen(repo, ["selected.txt"]);
+  try {
+    const committed = await commitFrozenPrivateIndex(
+      privateIndex,
+      "feat: initial atomic commit",
+      repo,
+      gitExec,
+    );
+    expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(
+      committed.sha,
+    );
+    expect(await git(repo, ["show", "-s", "--format=%P", committed.sha])).toBe(
+      "",
+    );
+  } finally {
+    cleanupPrivateIndex(privateIndex);
+  }
+});
+
 describe("commit-work real-git atomic plumbing publication", () => {
   test("commit-tree uses the frozen tree and parent, then publishes one CAS", async () => {
     const { repo, expected } = await repoWithBase();
@@ -1556,7 +1586,8 @@ describe("commit-work real-git exact push and trailers", () => {
       ),
     ).resolves.toMatchObject({
       success: false,
-      pushed: false,
+      pushed: null,
+      indeterminate: true,
       push_error_class: "timeout",
       push_error: "push timed out",
     });

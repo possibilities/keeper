@@ -14,6 +14,7 @@
 
 import { resolveDefaultBranch } from "../worktree-git";
 import {
+  GIT_OUTPUT_LIMIT_CODE,
   GIT_PUSH_TIMEOUT_MS,
   GIT_SPAWN_TIMEOUT_CODE,
   type GitRunner,
@@ -69,9 +70,23 @@ export interface PushFailure {
   push_error: string;
 }
 
-/** Discriminated push result. `success` keys success vs failure; on the
- * success side, `pushed` distinguishes an actual push from a worktree skip. */
-export type PushEnvelope = PushSuccess | PushSkippedWorktree | PushFailure;
+/** The client lost a complete push result after the remote write could have
+ * occurred. No caller may turn this into `pushed:false` or retry blindly. */
+export interface PushIndeterminate {
+  success: false;
+  pushed: null;
+  indeterminate: true;
+  push_error_class: "timeout" | "output_lost" | "signal";
+  push_error: string;
+}
+
+/** Discriminated push result. `pushed:null` is an explicit unknown remote
+ * state, distinct from a server-confirmed refusal and a deliberate skip. */
+export type PushEnvelope =
+  | PushSuccess
+  | PushSkippedWorktree
+  | PushFailure
+  | PushIndeterminate;
 
 /**
  * Classify a push failure into a named class. Matches the well-known git push
@@ -287,15 +302,31 @@ function pushFailure(result: {
   code: number;
   stdout: string;
   stderr: string;
-}): PushFailure {
+  signal?: NodeJS.Signals | null;
+}): PushFailure | PushIndeterminate {
   const combined = (result.stdout + result.stderr).trim();
+  if (
+    result.code === GIT_SPAWN_TIMEOUT_CODE ||
+    result.code === GIT_OUTPUT_LIMIT_CODE ||
+    result.signal != null
+  ) {
+    return {
+      success: false,
+      pushed: null,
+      indeterminate: true,
+      push_error_class:
+        result.code === GIT_SPAWN_TIMEOUT_CODE
+          ? "timeout"
+          : result.code === GIT_OUTPUT_LIMIT_CODE
+            ? "output_lost"
+            : "signal",
+      push_error: combined,
+    };
+  }
   return {
     success: false,
     pushed: false,
-    push_error_class:
-      result.code === GIT_SPAWN_TIMEOUT_CODE
-        ? "timeout"
-        : classifyPushError(combined),
+    push_error_class: classifyPushError(combined),
     push_error: combined,
   };
 }

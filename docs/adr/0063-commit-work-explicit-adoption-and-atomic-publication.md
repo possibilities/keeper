@@ -28,10 +28,11 @@ synchronous overlap evidence is required. Fresh pending/receipt mutations use pr
 `working` only as positive live evidence; every other projected state remains unknown until fold.
 
 One SQLite snapshot reads durable claims, root watermarks, event head, and pending rows under hard
-row/byte caps. Receipt tails are read from stable bounded regular descriptors at captured offsets.
-After the snapshot closes, Keeper compares a fresh append-only event head and rechecks every
-receipt descriptor/directory identity, closing ingest-and-delete handoff gaps. Canonical aliases
-are normalized before overlap classification.
+row/byte caps. Authority readers and hook producers use fixed OS-user receipt/dead-letter stores;
+environment overrides cannot hide evidence. Receipt and dead-letter tails use stable bounded
+regular descriptors, with event heads and monotonic dead-letter import state sandwiching source
+handoffs. Canonical aliases and legacy paths relative to their recorded cwd are normalized before
+overlap classification.
 
 ### Observation-bound attribution
 Immediately before each Git read, producers capture inclusive `MAX(events.id)`. Reducers admit
@@ -42,19 +43,20 @@ Mutation producers sandwich `realpath` with stable device/inode/type reads and f
 parent-canonical lexical leaf on any swap.
 
 ### Frozen identity and bounded execution
-Under a close-on-exec worktree flock, Keeper captures branch/parent and constructs a private index
-from exactly the sorted selected path/kind/mode/blob set, including deletions and both rename
-halves. The resulting tree is immutable. Ambient staged carryover refuses unless the narrow
+Under a close-on-exec worktree flock, Keeper captures branch/parent (including an unborn branch)
+and constructs a private index from exactly the sorted selected path/kind/mode/blob set, including
+deletions and both rename halves. The resulting tree is immutable. Ambient staged carryover
+refuses unless the narrow
 override losslessly restores exact base entries. Unmerged paths, operations, jams, mass reversion,
 stale indexes, and compare-and-swap conflicts retain typed refusals.
 
 Before executable filters, Keeper captures dirty, untracked, and individually enumerated ignored
-bytes between equal status path sets; primary/split indexes; effective config; hooks; signing
-policy; and selected tree identity. Raw inputs, messages, fingerprints, samples, outputs, and
-result envelopes have explicit file/count/aggregate ceilings even when `--max-files 0`. Subprocess
-pipes drain concurrently under output/time bounds. Timeout cleanup freezes ancestry plus bounded
-inherited-token descendants, including reparented children. Package lint fan-out is concurrent and
-capped; the in-process domain-doc arm uses descriptor-bound count and byte caps.
+bytes between equal helper-disabled status path sets; primary/split indexes; effective config;
+hooks; signing policy; and selected tree identity. Raw inputs, messages, fingerprints, samples,
+outputs, and result envelopes have explicit ceilings. Every Git/tool process has a finite bound;
+timeout refuses publication and kills the process group plus observed/token-bearing descendants.
+Repository executables are trusted same-user programs and must not intentionally escape that OS
+boundary. Package lint fan-out is concurrent and capped; domain-doc reads are descriptor-bound.
 
 ### Hooks, signing, CAS, and push
 Keeper fingerprints `pre-commit`, `prepare-commit-msg`, `commit-msg`, `post-commit`, and
@@ -68,9 +70,10 @@ program selection are pinned at command scope. `commit-tree` receives the immuta
 bounded message, and its object is verified after signing. Publication is one timed CAS
 `update-ref` with hooks pinned to an empty private directory. An executable `reference-transaction`
 hook is refused because it cannot compose atomically with Keeper's protocol. A moved ref is never
-rolled back. `post-commit` runs captured bytes after CAS; failure/replacement is committed-local.
-Push uses the exact commit SHA and captured branch. Tracking configuration occurs only after remote
-success, and local/remote/indeterminate outcomes remain explicit.
+rolled back. A CAS timeout/output loss is explicitly indeterminate and is never retried or pushed
+without inspection. `post-commit` runs captured bytes after CAS; failure/replacement is
+committed-local. Push uses the exact commit SHA and captured branch. A timeout, signal, or output
+loss yields `pushed:null`; tracking changes occur only after confirmed remote success.
 
 ### Wrapped close-out and explainability
 Wrapped workers use fresh atomic handoffs, constrained launch-bound provider legs, helper-disabled

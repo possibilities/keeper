@@ -134,6 +134,19 @@ test("mutation producer falls back to the Git leaf on a symlink swap", () => {
   ).toBe("/repo/file.ts");
 });
 
+test("mutation producer refuses when no stable ancestor can be established", () => {
+  const unavailable = (): never => {
+    throw Object.assign(new Error("unavailable"), { code: "EIO" });
+  };
+  expect(
+    canonicalMutationPathForEvent("/repo/file.ts", "/repo", {
+      lstat: unavailable as typeof import("node:fs").lstatSync,
+      stat: unavailable as typeof import("node:fs").statSync,
+      realpath: unavailable as unknown as typeof import("node:fs").realpathSync,
+    }),
+  ).toBeNull();
+});
+
 test("nameFromArgs parses --name=foo", () => {
   expect(nameFromArgs("/path/to/claude --name=foo --other")).toBe("foo");
 });

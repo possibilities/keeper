@@ -15,8 +15,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { GIT_LOCAL_TIMEOUT_MS, type GitRunner } from "./git-exec";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import {
+  GIT_LOCAL_TIMEOUT_MS,
+  GIT_OUTPUT_LIMIT_CODE,
+  GIT_SPAWN_TIMEOUT_CODE,
+  type GitRunner,
+} from "./git-exec";
 
 export const MAX_COMMIT_MESSAGE_BYTES = 65_536;
 const MAX_RENDERED_COMMIT_MESSAGE_BYTES = MAX_COMMIT_MESSAGE_BYTES + 4_096;
@@ -47,6 +60,8 @@ export interface FrozenPrivateIndex {
   dir: string;
   indexPath: string;
   expectedHead: string | null;
+  /** All-zero object id in this repository's hash format for create-only CAS. */
+  zeroOid: string;
   branchRef: string;
   tree: string;
   entries: GitPathEntry[];
@@ -77,7 +92,7 @@ export type PrivateIndexErrorCode =
   | "surface_changed"
   | "ref_conflict"
   | "operation_in_progress"
-  | "initial_commit_unsupported"
+  | "commit_state_indeterminate"
   | "commit_failed"
   | "commit_signing_failed"
   | "commit_hook_mutated";
@@ -466,7 +481,13 @@ async function preflightDirectoryFileCollisions(
     allTrackedPaths(expectedHead, worktree, git),
     git(["status", "--porcelain=v2", "-z", "--untracked-files=all"], {
       cwd: worktree,
-      env: { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1" },
+      env: {
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_NO_REPLACE_OBJECTS: "1",
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.fsmonitor",
+        GIT_CONFIG_VALUE_0: "false",
+      },
       timeoutMs: GIT_LOCAL_TIMEOUT_MS,
     }),
   ]);
@@ -689,11 +710,15 @@ export async function createFrozenPrivateIndex(
       throw new PrivateIndexError("index_seed_failed", seed.stderr);
     }
     const baseTree = await writeTree(worktree, run);
+    if (!/^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$/.test(baseTree)) {
+      throw new PrivateIndexError("tree_write_failed", "invalid base tree id");
+    }
     const selectedPaths = [...new Set(paths)].sort();
     const frozen: FrozenPrivateIndex = {
       dir,
       indexPath,
       expectedHead,
+      zeroOid: "0".repeat(baseTree.length),
       branchRef,
       tree: "",
       entries: [],
@@ -926,14 +951,8 @@ async function currentRef(
   frozen: Pick<FrozenPrivateIndex, "branchRef">,
   worktree: string,
   git: GitRunner,
-): Promise<string | undefined> {
-  const result = await git(
-    ["rev-parse", "--verify", `${frozen.branchRef}^{commit}`],
-    { cwd: worktree, env: { GIT_NO_REPLACE_OBJECTS: "1" } },
-  );
-  return result.code === 0 && result.stdout.trim()
-    ? result.stdout.trim()
-    : undefined;
+): Promise<string | null> {
+  return await capturedHead(frozen.branchRef, worktree, git);
 }
 
 interface ParsedCommit {
@@ -1337,7 +1356,13 @@ async function worktreeSnapshot(
       ],
       {
         cwd: worktree,
-        env: { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1" },
+        env: {
+          GIT_OPTIONAL_LOCKS: "0",
+          GIT_NO_REPLACE_OBJECTS: "1",
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "core.fsmonitor",
+          GIT_CONFIG_VALUE_0: "false",
+        },
         timeoutMs: GIT_LOCAL_TIMEOUT_MS,
       },
     );
@@ -1505,6 +1530,18 @@ export function fingerprintIndexFileForTest(indexPath: string): string {
   return fingerprintIndexFile(indexPath, {});
 }
 
+function fingerprintIndexFileOrMissing(
+  indexPath: string,
+  fs: PrivateIndexFs,
+): string {
+  try {
+    return fingerprintIndexFile(indexPath, fs);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
 function refingerprintKnownIndexState(
   indexPath: string,
   baseline: string,
@@ -1519,7 +1556,7 @@ function refingerprintKnownIndexState(
   if (pathEnd < 0) throw new Error("invalid split-index baseline");
   const sharedPath = baseline.slice(pathStart, pathEnd);
   const previousShared = baseline.slice(pathEnd + 1);
-  const primary = fingerprintIndexFile(indexPath, fs);
+  const primary = fingerprintIndexFileOrMissing(indexPath, fs);
   let shared = "none";
   if (sharedPath !== "") {
     try {
@@ -1550,7 +1587,8 @@ async function fingerprintIndexState(
   // resolves from that primary file.
   if (fs.fingerprintIndex) return fs.fingerprintIndex(indexPath);
 
-  const primaryBefore = fingerprintIndexFile(indexPath, fs);
+  const primaryBefore = fingerprintIndexFileOrMissing(indexPath, fs);
+  if (primaryBefore === "missing") return "missing\0shared:\0none";
   const shared = await git(
     ["rev-parse", "--path-format=absolute", "--shared-index-path"],
     {
@@ -1615,7 +1653,15 @@ async function targetWorktreeIndexPath(
     throw new PrivateIndexError("commit_failed", found.stderr);
   }
   try {
-    return realpathSync(resolve(worktree, found.stdout.trim()));
+    const absolute = resolve(worktree, found.stdout.trim());
+    try {
+      return realpathSync(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return join(realpathSync(dirname(absolute)), basename(absolute));
+      }
+      throw error;
+    }
   } catch (error) {
     throw new PrivateIndexError(
       "commit_failed",
@@ -2164,9 +2210,6 @@ export async function commitFrozenPrivateIndex(
   fs: PrivateIndexFs = {},
   guards: PrivateCommitGuards = {},
 ): Promise<PrivateCommitResult> {
-  if (frozen.expectedHead === null) {
-    throw new PrivateIndexError("initial_commit_unsupported");
-  }
   const before = await currentRef(frozen, worktree, git);
   if (before !== frozen.expectedHead) {
     throw new PrivateIndexError("ref_conflict");
@@ -2309,8 +2352,7 @@ export async function commitFrozenPrivateIndex(
       [
         "commit-tree",
         frozen.tree,
-        "-p",
-        frozen.expectedHead,
+        ...(frozen.expectedHead === null ? [] : ["-p", frozen.expectedHead]),
         "-F",
         "-",
         ...signing.args,
@@ -2341,8 +2383,9 @@ export async function commitFrozenPrivateIndex(
       });
     }
     if (
-      parsed.parents.length !== 1 ||
-      parsed.parents[0] !== frozen.expectedHead ||
+      parsed.parents.length !== (frozen.expectedHead === null ? 0 : 1) ||
+      (frozen.expectedHead !== null &&
+        parsed.parents[0] !== frozen.expectedHead) ||
       parsed.tree !== frozen.tree
     ) {
       throw new PrivateIndexError(
@@ -2454,7 +2497,7 @@ export async function commitFrozenPrivateIndex(
         "keeper commit-work: publish isolated commit",
         frozen.branchRef,
         sha,
-        frozen.expectedHead,
+        frozen.expectedHead ?? frozen.zeroOid,
       ],
       {
         cwd: worktree,
@@ -2463,6 +2506,20 @@ export async function commitFrozenPrivateIndex(
       },
     );
     if (publish.code !== 0) {
+      if (
+        publish.code === GIT_SPAWN_TIMEOUT_CODE ||
+        publish.code === GIT_OUTPUT_LIMIT_CODE ||
+        publish.signal != null
+      ) {
+        throw new PrivateIndexError(
+          "commit_state_indeterminate",
+          publish.stderr,
+          {
+            commitSha: sha,
+            indeterminate: true,
+          },
+        );
+      }
       throw new PrivateIndexError("ref_conflict", publish.stderr, {
         commitSha: sha,
       });

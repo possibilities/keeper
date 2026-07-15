@@ -29,8 +29,8 @@ import {
   evaluateWrappedBash,
   fsProbe,
   type TreeProbe,
-  writeAtomicWrappedHandoff,
   type WrappedGuardPayload,
+  writeAtomicWrappedHandoff,
 } from "../plugins/keeper/plugin/hooks/wrapped-guard.ts";
 
 // ---------------------------------------------------------------------------
@@ -42,7 +42,8 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     taskId: "fn-1-x.2",
     envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
   };
-  const gitRead = "git -c core.fsmonitor=false -c core.pager=cat --no-pager";
+  const gitRead =
+    "git -c core.fsmonitor=false -c core.pager=cat -c log.showSignature=false --no-pager";
   const allow = [
     // delegation surface: the blocking leg launch + resume + wait + read (no shell
     // operators — a clean `keeper agent run` is the whole point of the courier)
@@ -68,7 +69,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     `${gitRead} diff --no-ext-diff --no-textconv HEAD~1`,
     `${gitRead} show --no-ext-diff --no-textconv HEAD`,
     "git rev-parse HEAD",
-    `git -C /repo -c core.fsmonitor=false -c core.pager=cat --no-pager log --no-ext-diff --no-textconv --oneline`,
+    `git -C /repo -c core.fsmonitor=false -c core.pager=cat -c log.showSignature=false --no-pager log --no-ext-diff --no-textconv --oneline`,
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
     `${gitRead} log --no-ext-diff --no-textconv -c --format=%H`,
     // a stripped benign wrapper in front of an allowed command
@@ -174,6 +175,9 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "git cat-file --filters HEAD:file",
     `${gitRead} show --no-ext-diff --no-textconv --textconv HEAD`,
     `${gitRead} log --no-ext-diff --no-textconv --show-signature`,
+    `${gitRead} log --no-ext-diff --no-textconv --format=%GG`,
+    `${gitRead} show --no-ext-diff --no-textconv --pretty=repoAlias HEAD`,
+    "git -c core.fsmonitor=false -c core.pager=cat --no-pager log --no-ext-diff --no-textconv --oneline",
     // --- exec-bearing / file-writing flags on an allowlisted read subcommand ---
     "git grep --open-files-in-pager=/tmp/evil pattern",
     "git grep -O/tmp/evil pattern",

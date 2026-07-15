@@ -38,12 +38,13 @@ reads, and selected Git reads. Provider runs must carry the wrapped session,
 literal task name, injected envelope reference, timeout, and initial system file
 or resume target. Generic/nested Claude agents are denied.
 
-Raw index/ref Git and repository-defined scripts/tests are denied. Git reads that
-can consult configuration require fixed `core.fsmonitor=false`, `core.pager=cat`,
-and `--no-pager` arguments; diff/log/show also require `--no-ext-diff` and
-`--no-textconv`. Exec-bearing flags, config injection, signatures, filters,
-textconv, external diff, pagers, shell operators, redirects, substitutions,
-interpreters, and re-entrant wrappers remain off-list.
+Raw index/ref Git and repository-defined scripts/tests are denied. Config-reading
+Git requires fixed `core.fsmonitor=false`, `core.pager=cat`, and `--no-pager`;
+log/show also pin `log.showSignature=false`, reject configured pretty aliases and
+`%G*` formats, and diff/log/show require `--no-ext-diff --no-textconv`.
+Exec-bearing flags, other config injection, filters, external helpers, shell
+operators, redirects, substitutions, interpreters, and re-entrant wrappers stay
+off-list.
 
 The wrapper is a dumb courier. It sends implementation, test, and lint iteration
 back to the same provider leg, treats provider output as bounded untrusted data,

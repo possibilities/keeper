@@ -450,7 +450,11 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
     }
     if (t === "-c") {
       const val = tokens[i + 1];
-      if (val !== "core.fsmonitor=false" && val !== "core.pager=cat") {
+      if (
+        val !== "core.fsmonitor=false" &&
+        val !== "core.pager=cat" &&
+        val !== "log.showSignature=false"
+      ) {
         return "git `-c <name>=<value>` config injection (only fixed helper-disabling overrides are permitted)";
       }
       i += 1;
@@ -627,6 +631,65 @@ function wrappedAgentViolation(
   return null;
 }
 
+const SAFE_PRETTY_FORMATS = new Set([
+  "oneline",
+  "short",
+  "medium",
+  "full",
+  "fuller",
+  "reference",
+  "email",
+  "mboxrd",
+  "raw",
+]);
+
+function gitSignatureFormatViolation(args: string[]): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index] as string;
+    if (arg === "--") break;
+    const longFlag = arg.split("=", 1)[0] as string;
+    if (
+      longFlag.length >= "--show-s".length &&
+      "--show-signature".startsWith(longFlag)
+    ) {
+      return "git signature display may execute a configured verification program";
+    }
+    if (/%G[?GSFKPT]/.test(arg)) {
+      return "git `%G*` formatting may execute a configured verification program";
+    }
+    const glued = /^(?:--format|--pretty|--tformat)=(.*)$/.exec(arg);
+    if (glued) {
+      const value = glued[1] as string;
+      if (
+        arg.startsWith("--pretty=") &&
+        !value.startsWith("format:") &&
+        !value.startsWith("tformat:") &&
+        !SAFE_PRETTY_FORMATS.has(value)
+      ) {
+        return "configured git pretty-format aliases are forbidden for a wrapped worker";
+      }
+      continue;
+    }
+    if (arg === "--format" || arg === "--tformat" || arg === "--pretty") {
+      const value = args[index + 1];
+      if (value === undefined) continue;
+      if (/%G[?GSFKPT]/.test(value)) {
+        return "git `%G*` formatting may execute a configured verification program";
+      }
+      if (
+        arg === "--pretty" &&
+        !value.startsWith("format:") &&
+        !value.startsWith("tformat:") &&
+        !SAFE_PRETTY_FORMATS.has(value)
+      ) {
+        return "configured git pretty-format aliases are forbidden for a wrapped worker";
+      }
+      index += 1;
+    }
+  }
+  return null;
+}
+
 function safeGitReadViolation(
   tokens: string[],
   sub: { name: string; index: number },
@@ -634,6 +697,7 @@ function safeGitReadViolation(
   let noPager = false;
   let fsmonitorDisabled = false;
   let pagerPinned = false;
+  let signaturesDisabled = false;
   for (let index = 1; index < sub.index; index += 1) {
     const token = tokens[index] as string;
     if (token === "--no-pager" || token === "-P") {
@@ -647,8 +711,9 @@ function safeGitReadViolation(
       const value = tokens[index + 1];
       if (value === "core.fsmonitor=false") fsmonitorDisabled = true;
       else if (value === "core.pager=cat") pagerPinned = true;
+      else if (value === "log.showSignature=false") signaturesDisabled = true;
       else {
-        return "git -c is limited to the fixed core.fsmonitor=false/core.pager=cat hardening overrides";
+        return "git -c is limited to the fixed helper-disabling hardening overrides";
       }
       index += 1;
     }
@@ -673,11 +738,17 @@ function safeGitReadViolation(
       !args.includes("--no-ext-diff") ||
       !args.includes("--no-textconv") ||
       args.includes("--ext-diff") ||
-      args.includes("--textconv") ||
-      args.some((arg) => arg.startsWith("--show-signature"))
+      args.includes("--textconv")
     ) {
       return `git ${sub.name} requires --no-ext-diff and --no-textconv to suppress configured executables`;
     }
+  }
+  if (sub.name === "log" || sub.name === "show") {
+    if (!signaturesDisabled) {
+      return `git ${sub.name} requires -c log.showSignature=false to suppress configured verification programs`;
+    }
+    const signatureViolation = gitSignatureFormatViolation(args);
+    if (signatureViolation !== null) return signatureViolation;
   }
   if (sub.name === "grep" && args.includes("--textconv")) {
     return "git grep --textconv may execute a configured helper";

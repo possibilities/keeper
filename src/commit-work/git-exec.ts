@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, openSync, readSync, readdirSync } from "node:fs";
+import { closeSync, constants, openSync, readdirSync, readSync } from "node:fs";
 
 /**
  * Write-capable git spawn helper for the `keeper commit-work` family.
@@ -25,6 +25,8 @@ export interface GitExecResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Non-null when the child terminated by an external or containment signal. */
+  signal?: NodeJS.Signals | null;
 }
 
 /** Options for {@link gitExec}. */
@@ -406,6 +408,7 @@ export async function spawnBoundedExec(
       code: GIT_SPAWN_FAILED_CODE,
       stdout: "",
       stderr: proc.spawnFailed,
+      signal: null,
     };
   }
 
@@ -463,6 +466,7 @@ export async function spawnBoundedExec(
           : code,
       stdout: stdout.text,
       stderr: `${stderr.text}${limitNote}`,
+      signal: proc.signalCode,
     };
   } finally {
     if (timer !== undefined) {

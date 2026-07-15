@@ -43,6 +43,7 @@ export interface RecordedGitCall {
   stdin?: string;
   cwd?: string;
   env?: Record<string, string>;
+  timeoutMs?: number;
 }
 
 /** Helpers shared across the three runner flavors. */
@@ -88,7 +89,13 @@ export function fakeAsyncGit(rules: FakeGitRule[] = []): FakeAsyncGit {
       options.stdin !== undefined
         ? new TextDecoder().decode(options.stdin)
         : undefined;
-    calls.push({ args: [...args], stdin, cwd: options.cwd, env: options.env });
+    calls.push({
+      args: [...args],
+      stdin,
+      cwd: options.cwd,
+      env: options.env,
+      timeoutMs: options.timeoutMs,
+    });
     const out = applyRules(args, rules);
     return {
       code: out.exitCode ?? 0,

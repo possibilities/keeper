@@ -31,7 +31,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   DeadLetterBindings,
@@ -178,7 +178,10 @@ export function canonicalMutationPathForEvent(
       // Keep walking to a stable existing ancestor.
     }
     const next = dirname(parent);
-    if (next === parent) return absolute;
+    // No stable ancestor means there is no trustworthy filesystem identity to
+    // persist. Returning the unchecked lexical absolute here would turn an I/O
+    // failure into positive ownership evidence.
+    if (next === parent) return null;
     suffix.push(basename(parent));
     parent = next;
   }
@@ -493,38 +496,17 @@ async function scrapeSpawnInfo(): Promise<SpawnInfo> {
   }
 }
 
-/**
- * Resolve the keeper dead-letter directory. `KEEPER_DEAD_LETTER_DIR` env wins
- * (hermetic tests point it at a tmpdir); otherwise default to
- * `~/.local/state/keeper/dead-letters/`, a sibling of the DB. The directory is
- * created best-effort 0o700-ish by {@link writeDeadLetter} on demand — the
- * helper is pure + does no I/O.
- */
+/** Authority-producing hook records always land in the fixed OS-user store.
+ * Caller-controlled environment overrides are daemon/test configuration, not a
+ * capability to divert a live session's mutation evidence. */
 function resolveDeadLetterDir(): string {
-  const override = process.env.KEEPER_DEAD_LETTER_DIR;
-  if (override && override.length > 0) {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+  return join(userInfo().homedir, ".local", "state", "keeper", "dead-letters");
 }
 
-/**
- * Resolve the keeper events-log directory (fn-736). `KEEPER_EVENTS_LOG` env
- * wins (hermetic tests point it at a tmp dir, mirroring the daemon's matching
- * override); otherwise default to `~/.local/state/keeper/events-log`, a sibling
- * of the DB file.
- *
- * MUST match `resolveEventsLogDir` in `src/db.ts` byte-for-byte — the hook
- * keeps its own local copy because it is FORBIDDEN from importing `bun:sqlite`;
- * the shared dep-free `serializeEventLogRecord` structurally enforces the
- * byte-identical line round-trip between the two sides.
- */
+/** Fixed OS-user events-log tree. This isolated hook cannot import `src/db.ts`;
+ * keep the default byte-identical to `defaultEventsLogDir()` there. */
 function resolveEventsLogDir(): string {
-  const override = process.env.KEEPER_EVENTS_LOG;
-  if (override && override.length > 0) {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "events-log");
+  return join(userInfo().homedir, ".local", "state", "keeper", "events-log");
 }
 
 /**
@@ -698,7 +680,13 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
 function dropLogPath(): string {
   const env = process.env.KEEPER_DROP_LOG;
   if (env != null && env.length > 0) return env;
-  return join(homedir(), ".local", "state", "keeper", "hook-drops.ndjson");
+  return join(
+    userInfo().homedir,
+    ".local",
+    "state",
+    "keeper",
+    "hook-drops.ndjson",
+  );
 }
 
 /**

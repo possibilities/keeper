@@ -33,6 +33,9 @@ import {
 } from "./helpers/fake-git";
 
 const FAKE_COMMIT = "abcdef0123456789abcdef0123456789abcdef01";
+const FAKE_PARENT = "1111111111111111111111111111111111111111";
+const FAKE_BASE_TREE = "2222222222222222222222222222222222222222";
+const FAKE_TREE = "3333333333333333333333333333333333333333";
 
 // The pipeline fixture supplies an explicit empty `deps.env`; no test mutates
 // process-wide invocation identity carriers.
@@ -152,7 +155,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
         args[2] === "refs/heads/keeper/epic/x^{commit}"
       ) {
         await fake.run(args, options);
-        return { code: 0, stdout: "parent\n", stderr: "" };
+        return { code: 0, stdout: `${FAKE_PARENT}\n`, stderr: "" };
       }
       if (
         args[0] === "rev-parse" &&
@@ -189,7 +192,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
         await fake.run(args, options);
         return {
           code: 0,
-          stdout: privateUpdated ? "tree\n" : "base-tree\n",
+          stdout: `${privateUpdated ? FAKE_TREE : FAKE_BASE_TREE}\n`,
           stderr: "",
         };
       }
@@ -230,7 +233,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
         return {
           code: 0,
           stdout:
-            "tree tree\nparent parent\nauthor Test <t@example.com> 1 +0000\n" +
+            `tree ${FAKE_TREE}\nparent ${FAKE_PARENT}\nauthor Test <t@example.com> 1 +0000\n` +
             "committer Test <t@example.com> 1 +0000\n\nmessage\n",
           stderr: "",
         };
@@ -281,9 +284,9 @@ describe("commit-work: worktree-pinned cwd threading", () => {
     expect(commitTree?.cwd).toBe(worktree);
     expect(commitTree?.args.slice(0, 4)).toEqual([
       "commit-tree",
-      "tree",
+      FAKE_TREE,
       "-p",
-      "parent",
+      FAKE_PARENT,
     ]);
 
     // The one terminal envelope carries the worktree push-skip fields.

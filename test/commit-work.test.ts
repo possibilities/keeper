@@ -33,6 +33,7 @@ import {
   trustedClaudeAuthority,
   trustedClaudeIdentity,
 } from "../cli/commit-work";
+import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import { LintFailure } from "../src/commit-work/lint-matrix";
 import { MAX_COMMIT_MESSAGE_BYTES } from "../src/commit-work/private-index";
 import {
@@ -63,6 +64,9 @@ import { freshDbFile } from "./helpers/template-db.ts";
 // depend on the process-wide harness environment.
 const TEST_ID = "11111111-1111-4111-8111-111111111111";
 const FAKE_COMMIT = "abcdef0123456789abcdef0123456789abcdef01";
+const FAKE_PARENT = "1111111111111111111111111111111111111111";
+const FAKE_BASE_TREE = "2222222222222222222222222222222222222222";
+const FAKE_TREE = "3333333333333333333333333333333333333333";
 
 /** Keep the broad legacy scenarios readable while exercising UUID-only input. */
 function runForTest(argv: string[], deps: CommitWorkDeps = {}) {
@@ -238,7 +242,7 @@ function deps(opts: {
       await baseRun(args, options);
       return {
         code: 0,
-        stdout: published ? `${FAKE_COMMIT}\n` : "parent\n",
+        stdout: published ? `${FAKE_COMMIT}\n` : `${FAKE_PARENT}\n`,
         stderr: "",
       };
     }
@@ -297,7 +301,7 @@ function deps(opts: {
       if (base.code !== 0) return base;
       return {
         code: 0,
-        stdout: privateUpdated ? "tree\n" : "base-tree\n",
+        stdout: `${privateUpdated ? FAKE_TREE : FAKE_BASE_TREE}\n`,
         stderr: "",
       };
     }
@@ -328,7 +332,7 @@ function deps(opts: {
       return {
         code: 0,
         stdout:
-          "tree tree\nparent parent\nauthor Test <t@example.com> 1 +0000\n" +
+          `tree ${FAKE_TREE}\nparent ${FAKE_PARENT}\nauthor Test <t@example.com> 1 +0000\n` +
           "committer Test <t@example.com> 1 +0000\n\nmessage\n",
         stderr: "",
       };
@@ -1170,6 +1174,31 @@ describe("commit-work: push failure", () => {
       push?.args.some((arg) => arg === "--force" || arg.startsWith("+")),
     ).toBe(false);
   });
+
+  test("a timed-out push reports unknown remote state", async () => {
+    const { d } = deps({
+      files: ["a.txt"],
+      rules: successRules({
+        stagedNames: ["a.txt"],
+        pushOutcome: {
+          exitCode: GIT_SPAWN_TIMEOUT_CODE,
+          stderr: "push timed out",
+        },
+      }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: uncertain remote", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "push_state_indeterminate",
+      success: false,
+      committed: true,
+      pushed: null,
+      push_error_class: "timeout",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1510,9 +1539,9 @@ describe("commit-work: index-purity gate", () => {
     const commit = calls.find((c) => argvStartsWith(c.args, "commit-tree"));
     expect(commit?.args.slice(0, 5)).toEqual([
       "commit-tree",
-      "tree",
+      FAKE_TREE,
       "-p",
-      "parent",
+      FAKE_PARENT,
       "-F",
     ]);
     // Line 1 reports the attributed file only.
@@ -1557,9 +1586,9 @@ describe("commit-work: isolated-index commit", () => {
     const commit = calls.find((c) => argvStartsWith(c.args, "commit-tree"));
     expect(commit?.args.slice(0, 5)).toEqual([
       "commit-tree",
-      "tree",
+      FAKE_TREE,
       "-p",
-      "parent",
+      FAKE_PARENT,
       "-F",
     ]);
     // The staged-name read forces --no-renames so a rename splits into both halves.

@@ -20,7 +20,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import {
   extractBackgroundTaskId,
@@ -4372,7 +4372,7 @@ export function computeSchemaFingerprint(db: Database): string {
 
 /** Fixed per-user store; authority-sensitive callers never trust env overrides. */
 export function defaultDbPath(): string {
-  return join(homedir(), ".local", "state", "keeper", "keeper.db");
+  return join(userInfo().homedir, ".local", "state", "keeper", "keeper.db");
 }
 
 /** `KEEPER_DB` env wins for daemon/test configuration; else the fixed store. */
@@ -4925,7 +4925,7 @@ export function resolveStatuslineRoot(): string {
  * import `bun:sqlite`.
  */
 export function defaultDeadLetterDir(): string {
-  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+  return join(userInfo().homedir, ".local", "state", "keeper", "dead-letters");
 }
 
 export function resolveDeadLetterDir(): string {
@@ -4935,7 +4935,7 @@ export function resolveDeadLetterDir(): string {
 
 /** Fixed per-user event receipt tree used by authority-sensitive readers. */
 export function defaultEventsLogDir(): string {
-  return join(homedir(), ".local", "state", "keeper", "events-log");
+  return join(userInfo().homedir, ".local", "state", "keeper", "events-log");
 }
 
 /**

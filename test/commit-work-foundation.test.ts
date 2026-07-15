@@ -279,6 +279,38 @@ describe("readOwnershipClaims", () => {
     ]);
   });
 
+  test("legacy relative receipts resolve against the producer cwd", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'working', 1)",
+    );
+    db.close();
+    writeFileSync(
+      join(eventsLogDir, "legacy-relative.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "foreign",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          cwd: "/repo/sub",
+          data: JSON.stringify({
+            hook_event_name: "PostToolUse",
+            tool_name: "Write",
+            tool_input: { file_path: "file.ts" },
+          }),
+        },
+      }),
+    );
+
+    expect(readClaims()).toEqual([
+      expect.objectContaining({
+        path: "sub/file.ts",
+        sessionId: "foreign",
+        source: "direct",
+      }),
+    ]);
+  });
+
   test("fresh pending and receipt mutations never inherit stale terminal liveness", () => {
     const { db } = openDb(dbPath, { migrate: false });
     db.run(
@@ -347,6 +379,63 @@ describe("readOwnershipClaims", () => {
       }),
     );
     expect(readClaims()).toBeNull();
+  });
+
+  test("rechecks the dead-letter tree after the final event-head read", () => {
+    expect(
+      readClaims("/repo", {
+        afterDeadLetterRead: () => {
+          writeFileSync(
+            join(deadLetterDir, "late.ndjson"),
+            serializeDeadLetterRecord({
+              dl_id: "dead-mutation-late",
+              session_id: "foreign",
+              hook_event: "PostToolUse",
+              ts: 1,
+              dl_written_at: 2,
+              pid: 322,
+              bindings: {
+                session_id: "foreign",
+                hook_event: "PostToolUse",
+                ts: 1,
+                tool_name: "Write",
+                mutation_path: "/repo/late-dead.ts",
+              },
+            }),
+          );
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("fails closed when a dead-letter imports during its disk scan", () => {
+    let imported = false;
+    expect(
+      readClaims("/repo", {
+        duringDeadLetterRead: () => {
+          if (imported) return;
+          imported = true;
+          const { db } = openDb(dbPath, { migrate: false });
+          db.run(
+            `INSERT INTO dead_letters
+               (dl_id, session_id, hook_event, ts, dl_written_at, pid,
+                bindings, status, recovered_at, replayed_event_id)
+             VALUES ('import-race', 'foreign', 'PostToolUse', 1, 2, 333,
+                     ?, 'recovered', 3, 1)`,
+            [
+              JSON.stringify({
+                session_id: "foreign",
+                hook_event: "PostToolUse",
+                tool_name: "Write",
+                mutation_path: "/repo/imported.ts",
+              }),
+            ],
+          );
+          db.close();
+        },
+      }),
+    ).toBeNull();
+    expect(imported).toBe(true);
   });
 
   test("fails closed when a receipt is ingested and deleted across the DB snapshot", () => {
