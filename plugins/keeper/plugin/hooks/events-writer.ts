@@ -23,9 +23,16 @@
  *   interpreted cross-platform; the matcher does string equality.
  */
 
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   DeadLetterBindings,
   DeadLetterRecord,
@@ -92,6 +99,89 @@ async function readStdin(): Promise<string> {
     offset += c.byteLength;
   }
   return new TextDecoder().decode(merged);
+}
+
+/** Filesystem seam for stable producer-side mutation-path canonicalization. */
+export interface CanonicalMutationPathFs {
+  lstat: typeof lstatSync;
+  stat: typeof statSync;
+  realpath: typeof realpathSync;
+}
+
+function sameFsIdentity(
+  left: { dev: number | bigint; ino: number | bigint; mode: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint; mode: number | bigint },
+): boolean {
+  return (
+    BigInt(left.dev) === BigInt(right.dev) &&
+    BigInt(left.ino) === BigInt(right.ino) &&
+    (BigInt(left.mode) & 0o170000n) === (BigInt(right.mode) & 0o170000n)
+  );
+}
+
+/** Canonical producer identity for exact mutation paths (folds stay I/O-free). */
+export function canonicalMutationPathForEvent(
+  path: string | null,
+  cwd: string | null,
+  fs: CanonicalMutationPathFs = {
+    lstat: lstatSync,
+    stat: statSync,
+    realpath: realpathSync,
+  },
+): string | null {
+  if (path === null || path.includes("\0")) return null;
+  const absolute = isAbsolute(path)
+    ? path
+    : resolve(cwd ?? process.cwd(), path);
+  try {
+    const before = fs.lstat(absolute);
+    if (!before.isSymbolicLink()) {
+      const followedBefore = fs.stat(absolute);
+      const canonical = fs.realpath(absolute);
+      const canonicalIdentity = fs.stat(canonical);
+      const after = fs.lstat(absolute);
+      const followedAfter = fs.stat(absolute);
+      if (
+        !after.isSymbolicLink() &&
+        sameFsIdentity(before, after) &&
+        sameFsIdentity(followedBefore, followedAfter) &&
+        sameFsIdentity(followedBefore, canonicalIdentity) &&
+        fs.realpath(absolute) === canonical
+      ) {
+        return canonical;
+      }
+      // A leaf swap makes the followed target untrustworthy. Preserve the Git
+      // leaf identity through the stable-parent path below instead.
+    }
+  } catch {
+    // New/deleted/swapped leaf: canonicalize the nearest existing parent below.
+  }
+  let parent = dirname(absolute);
+  const suffix: string[] = [basename(absolute)];
+  for (;;) {
+    try {
+      const before = fs.lstat(parent);
+      const followedBefore = fs.stat(parent);
+      const canonical = fs.realpath(parent);
+      const canonicalIdentity = fs.stat(canonical);
+      const after = fs.lstat(parent);
+      const followedAfter = fs.stat(parent);
+      if (
+        sameFsIdentity(before, after) &&
+        sameFsIdentity(followedBefore, followedAfter) &&
+        sameFsIdentity(followedBefore, canonicalIdentity) &&
+        fs.realpath(parent) === canonical
+      ) {
+        return join(canonical, ...suffix.reverse());
+      }
+    } catch {
+      // Keep walking to a stable existing ancestor.
+    }
+    const next = dirname(parent);
+    if (next === parent) return absolute;
+    suffix.push(basename(parent));
+    parent = next;
+  }
 }
 
 /**
@@ -225,9 +315,7 @@ export function accountRouteFromEnv(env: NodeJS.ProcessEnv): string | null {
 /** Parse the bounded exact-attempt carrier injected by the generic dispatcher.
  * Kept local because this hook's dependency-free island cannot import launch
  * configuration. Malformed or missing metadata is unfenced evidence. */
-export function dispatchAttemptFromEnv(
-  env: NodeJS.ProcessEnv,
-): number | null {
+export function dispatchAttemptFromEnv(env: NodeJS.ProcessEnv): number | null {
   const raw = env.KEEPER_DISPATCH_ATTEMPT_ID;
   if (raw === undefined || !/^[1-9]\d{0,15}$/.test(raw)) {
     return null;
@@ -823,10 +911,14 @@ export function buildEventBindings(
   // Promote the git-attribution fold's lone cross-event field
   // (`tool_input.file_path`) to `events.mutation_path`. Gated on
   // (PostToolUse, Write/Edit/MultiEdit/NotebookEdit); null on every other row,
-  // so a `WHERE mutation_path IS NOT NULL` partial index stays selective. Pure
-  // + null-on-malformed (same re-fold-determinism contract as the bash mutation
-  // deriver). The ingester recomputes it for any line a pre-deriver hook wrote.
-  const mutationPath = extractMutationPath(hookEvent, toolName, data);
+  // so a `WHERE mutation_path IS NOT NULL` partial index stays selective. The
+  // producer canonicalizes directory/root aliases and regular-file casing here;
+  // the deterministic fold consumes only this persisted identity and performs
+  // no filesystem reads. Legacy pre-deriver lines retain their lexical fallback.
+  const mutationPath = canonicalMutationPathForEvent(
+    extractMutationPath(hookEvent, toolName, data),
+    cwd,
+  );
 
   // The canonical bare-column binding map — the on-disk NDJSON shape is bare
   // column names (no `$` prefix). The daemon's ingester (`scanEventsLogDir`)

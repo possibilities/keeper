@@ -19,6 +19,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import type { Event } from "../src/types";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -67,6 +68,11 @@ function insertEvent(
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
+  const eventData = bindGitObservationWatermark(
+    db,
+    overrides.hook_event,
+    overrides.data ?? "{}",
+  );
   const row = {
     ts,
     session_id: overrides.session_id ?? "sess-a",
@@ -84,7 +90,7 @@ function insertEvent(
     agent_id: overrides.agent_id ?? null,
     agent_type: overrides.agent_type ?? null,
     stop_hook_active: overrides.stop_hook_active ?? null,
-    data: overrides.data ?? "{}",
+    data: eventData,
     subagent_agent_id: overrides.subagent_agent_id ?? null,
     spawn_name: overrides.spawn_name ?? null,
     start_time: overrides.start_time ?? null,

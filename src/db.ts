@@ -4302,6 +4302,29 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    version: 128,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "git_status",
+        "attribution_event_id",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+      // The retired fence used a synthetic snapshot/drop event id, which can
+      // be newer than mutation events that were not visible to its Git read.
+      // No exact pre-read watermark can be recovered from old rows. Reset to
+      // zero so the first new observation conservatively rescans history; this
+      // may retain extra claims but can never erase an unseen foreign claim.
+      ctx.db.run(
+        `UPDATE file_attributions
+            SET last_event_id = 0
+          WHERE session_id = ? AND file_path = ?`,
+        ["\u0000keeper-attribution-floor", "\u0000"],
+      );
+    },
+  },
 ];
 
 /**
@@ -4322,7 +4345,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v127:aee87103019d329f1c9e718a7f48eb6a70e9cca9f0c6b4a4bc2a53f047572da0";
+  "v128:d0e720621579caa457c2ec1189cfc115a256f08c9ada98b0f013d59d989ddf25";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4347,13 +4370,15 @@ export function computeSchemaFingerprint(db: Database): string {
   return `v${SCHEMA_VERSION}:${hash}`;
 }
 
-/** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
+/** Fixed per-user store; authority-sensitive callers never trust env overrides. */
+export function defaultDbPath(): string {
+  return join(homedir(), ".local", "state", "keeper", "keeper.db");
+}
+
+/** `KEEPER_DB` env wins for daemon/test configuration; else the fixed store. */
 export function resolveDbPath(): string {
   const override = process.env.KEEPER_DB;
-  if (override && override.length > 0) {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "keeper.db");
+  return override && override.length > 0 ? override : defaultDbPath();
 }
 
 /** `KEEPER_SOCK` env wins; else `~/.local/state/keeper/keeperd.sock`. Pure. */
@@ -4899,12 +4924,18 @@ export function resolveStatuslineRoot(): string {
  * NDJSON, daemon reads it) — the hook keeps its own copy because it cannot
  * import `bun:sqlite`.
  */
+export function defaultDeadLetterDir(): string {
+  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+}
+
 export function resolveDeadLetterDir(): string {
   const override = process.env.KEEPER_DEAD_LETTER_DIR;
-  if (override && override.length > 0) {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "dead-letters");
+  return override && override.length > 0 ? override : defaultDeadLetterDir();
+}
+
+/** Fixed per-user event receipt tree used by authority-sensitive readers. */
+export function defaultEventsLogDir(): string {
+  return join(homedir(), ".local", "state", "keeper", "events-log");
 }
 
 /**
@@ -4919,7 +4950,7 @@ export function resolveEventsLogDir(): string {
   if (override && override.length > 0) {
     return override;
   }
-  return join(homedir(), ".local", "state", "keeper", "events-log");
+  return defaultEventsLogDir();
 }
 
 /**
@@ -5423,7 +5454,10 @@ CREATE TABLE IF NOT EXISTS git_status (
     orphaned_files TEXT NOT NULL DEFAULT '[]',
     jobs TEXT NOT NULL DEFAULT '[]',
     last_event_id INTEGER,
-    updated_at REAL NOT NULL DEFAULT 0
+    updated_at REAL NOT NULL DEFAULT 0,
+    -- Inclusive MAX(events.id) captured immediately before the Git status read.
+    -- Distinct from last_event_id, which identifies the synthetic snapshot.
+    attribution_event_id INTEGER NOT NULL DEFAULT 0
 )
 `;
 

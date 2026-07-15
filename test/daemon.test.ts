@@ -20,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
+import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
 import {
   appendBackstopRecord,
   BackstopCounters,
@@ -33,7 +34,6 @@ import type {
 } from "../src/baseline-store";
 import {
   ALL_WORKERS,
-  selectWorkerNames,
   AUDIT_READY_ORCHESTRATOR_GRACE_MS,
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
@@ -177,6 +177,7 @@ import {
   selectPendingWorkMergeNotifications,
   selectPendingWorkResolverDispatches,
   selectRepairCandidates,
+  selectWorkerNames,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
   shouldEscalateBlockedCategory,
@@ -233,7 +234,7 @@ import {
 } from "../src/server-worker";
 import type { Event, Job } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
-import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -325,15 +326,19 @@ test("git first-frame: a worktree with thousands of dirty files serves a git sna
       projectDir,
       null,
       projectDir,
-      JSON.stringify({
-        project_dir: projectDir,
-        branch: "main",
-        head_oid: "abc123",
-        upstream: "origin/main",
-        ahead: 0,
-        behind: 0,
-        dirty_files: dirtyFiles,
-      }),
+      bindGitObservationWatermark(
+        db,
+        "GitSnapshot",
+        JSON.stringify({
+          project_dir: projectDir,
+          branch: "main",
+          head_oid: "abc123",
+          upstream: "origin/main",
+          ahead: 0,
+          behind: 0,
+          dirty_files: dirtyFiles,
+        }),
+      ),
     ],
   );
 
@@ -2728,9 +2733,11 @@ test("seed sweep folds dead/recycled rows to killed; leaves matching and legacy 
   drainToCompletion(db);
 
   const stateOf = (jobId: string): string | undefined =>
-    (db.query("SELECT state FROM jobs WHERE job_id = ?").get(jobId) as {
-      state: string;
-    } | null)?.state;
+    (
+      db.query("SELECT state FROM jobs WHERE job_id = ?").get(jobId) as {
+        state: string;
+      } | null
+    )?.state;
   expect(stateOf("sess-b-alive-recycled")).toBe("killed");
   expect(stateOf("sess-c-dead-with-start")).toBe("killed");
   expect(stateOf("sess-d-dead-no-start")).toBe("killed");
@@ -3704,10 +3711,12 @@ test("archive eligibility leaves a file with a waiting record in place", () => {
 });
 
 test("archive eligibility excludes recovered records without a landed event", () => {
-  expect(archiveEligibility(dlLine("dl-noid", "sess-noid"), new Set())).toEqual({
-    eligible: false,
-    records: 1,
-  });
+  expect(archiveEligibility(dlLine("dl-noid", "sess-noid"), new Set())).toEqual(
+    {
+      eligible: false,
+      records: 1,
+    },
+  );
 });
 
 test("archive eligibility leaves an all-torn file untouched", () => {
@@ -4090,7 +4099,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // onto the tail, and to 124 appending fn-1252 task .6's
   // `dispatch_failures.conflicted_files` TEXT column — both idempotent additive
   // ALTERs, NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(127);
+  expect(SCHEMA_VERSION).toBe(128);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -9371,19 +9380,39 @@ test("spill documents reject escapes, empty content, and oversized content witho
   const canonicalize = (path: string): string => paths[path] ?? path;
   const read = (path: string): string =>
     path.endsWith("empty.md") ? "" : path.endsWith("big.md") ? "12345" : "ok";
-  expect(readSpillDocument("await", "/spill", "/spill/../escape.md", 4, { canonicalize, read })).toMatchObject({
+  expect(
+    readSpillDocument("await", "/spill", "/spill/../escape.md", 4, {
+      canonicalize,
+      read,
+    }),
+  ).toMatchObject({
     ok: false,
     error: expect.stringContaining("outside the spill dir"),
   });
-  expect(readSpillDocument("await", "/spill", "/spill/empty.md", 4, { canonicalize, read })).toMatchObject({
+  expect(
+    readSpillDocument("await", "/spill", "/spill/empty.md", 4, {
+      canonicalize,
+      read,
+    }),
+  ).toMatchObject({
     ok: false,
     error: expect.stringContaining("is empty"),
   });
-  expect(readSpillDocument("await", "/spill", "/spill/big.md", 4, { canonicalize, read })).toMatchObject({
+  expect(
+    readSpillDocument("await", "/spill", "/spill/big.md", 4, {
+      canonicalize,
+      read,
+    }),
+  ).toMatchObject({
     ok: false,
     error: expect.stringContaining("over the 4-byte cap"),
   });
-  expect(readSpillDocument("await", "/spill", "/spill/ok.md", 4, { canonicalize, read })).toEqual({
+  expect(
+    readSpillDocument("await", "/spill", "/spill/ok.md", 4, {
+      canonicalize,
+      read,
+    }),
+  ).toEqual({
     ok: true,
     text: "ok",
   });

@@ -22,9 +22,20 @@
 
 import { expect, test } from "bun:test";
 import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
   accountRouteFromEnv,
   backendExecCoordsFromEnv,
   buildEventBindings,
+  canonicalMutationPathForEvent,
   configDirFromEnv,
   dispatchAttemptFromEnv,
   KNOWN_EVENT_COLUMNS,
@@ -78,6 +89,50 @@ function build(
 // ---------------------------------------------------------------------------
 // nameFromArgs unit
 // ---------------------------------------------------------------------------
+
+test("mutation producer canonicalizes a directory symlink alias", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-event-path-"));
+  try {
+    mkdirSync(join(root, "real"));
+    writeFileSync(join(root, "real", "file.ts"), "x\n");
+    symlinkSync("real", join(root, "alias"));
+    expect(
+      canonicalMutationPathForEvent(join(root, "alias", "file.ts"), root),
+    ).toBe(realpathSync(join(root, "real", "file.ts")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mutation producer falls back to the Git leaf on a symlink swap", () => {
+  let reads = 0;
+  const regular = {
+    dev: 1,
+    ino: 10,
+    mode: 0o100644,
+    isSymbolicLink: () => false,
+  } as ReturnType<typeof import("node:fs").lstatSync>;
+  const swapped = {
+    dev: 1,
+    ino: 11,
+    mode: 0o120777,
+    isSymbolicLink: () => true,
+  } as ReturnType<typeof import("node:fs").lstatSync>;
+
+  expect(
+    canonicalMutationPathForEvent("/repo/file.ts", "/repo", {
+      lstat: (() =>
+        reads++ === 0
+          ? regular
+          : swapped) as typeof import("node:fs").lstatSync,
+      stat: (() => regular) as typeof import("node:fs").statSync,
+      realpath: ((path: string) =>
+        path === "/repo/file.ts"
+          ? "/outside/target.ts"
+          : path) as typeof import("node:fs").realpathSync,
+    }),
+  ).toBe("/repo/file.ts");
+});
 
 test("nameFromArgs parses --name=foo", () => {
   expect(nameFromArgs("/path/to/claude --name=foo --other")).toBe("foo");

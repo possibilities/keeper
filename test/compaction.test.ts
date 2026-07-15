@@ -41,6 +41,7 @@ import {
   retainColdPayloads,
 } from "../src/compaction";
 import { drain } from "../src/reducer";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -90,7 +91,11 @@ function insertEvent(overrides: {
       overrides.hook_event,
       overrides.tool_name ?? null,
       overrides.cwd ?? null,
-      overrides.data ?? "{}",
+      bindGitObservationWatermark(
+        db,
+        overrides.hook_event,
+        overrides.data ?? "{}",
+      ),
       overrides.mutation_path ?? null,
       overrides.subagent_agent_id ?? null,
     ],

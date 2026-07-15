@@ -57,13 +57,16 @@ import {
   isContextDocPath,
   runDomainDocsLint,
 } from "./domain-docs-lint";
-import type { GitExecResult } from "./git-exec";
+import { type GitExecResult, spawnBoundedExec } from "./git-exec";
 
 /** JS/TS suffixes routed to the npm-lint arm (mirrors Python `_JS_TS_SUFFIXES`). */
 const JS_TS_SUFFIXES = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]);
 
 /** TS suffixes routed to the dedicated `tsc --project` arm (NEW vs Python). */
 const TS_SUFFIXES = new Set([".ts", ".tsx"]);
+const LINT_TIMEOUT_MS = 120_000;
+const LINT_OUTPUT_LIMIT_BYTES = 4 * 1_048_576;
+const MAX_NPM_LINT_PACKAGE_GROUPS = 64;
 
 /**
  * Thrown when the scoped lint matrix detects errors. The caller catches it,
@@ -212,20 +215,14 @@ function groupJsTsByPkg(
  * and failure-aggregation logic is testable without spawning a subprocess. */
 export type ToolRunner = (cmd: string[], cwd: string) => Promise<GitExecResult>;
 
-/** Spawn `cmd` (non-git) draining both pipes concurrently; returns exit + output. */
+/** Spawn one non-git checker with the same bounded process-tree contract as Git. */
 async function spawnTool(cmd: string[], cwd: string): Promise<GitExecResult> {
-  const proc = Bun.spawn(cmd, {
+  return spawnBoundedExec(cmd, {
     cwd,
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
+    timeoutMs: LINT_TIMEOUT_MS,
+    maxStdoutBytes: LINT_OUTPUT_LIMIT_BYTES,
+    maxStderrBytes: LINT_OUTPUT_LIMIT_BYTES,
   });
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { code, stdout, stderr };
 }
 
 /**
@@ -449,17 +446,30 @@ export async function runScopedLint(
         // Sorted package-dir order so concatenated stderr is deterministic
         // (mirrors Python's `sorted(pkg_groups.items())`).
         const sortedDirs = [...pkgGroups.keys()].sort();
-        const npmStderrs: string[] = [];
-        for (const pkgDir of sortedDirs) {
-          const filesInPkg = pkgGroups.get(pkgDir) ?? [];
-          const r = await runTool(
-            ["npm", "run", "lint", "--", ...filesInPkg],
-            pkgDir,
-          );
-          if (r.code !== 0) {
-            npmStderrs.push((r.stderr || "") + (r.stdout || ""));
-          }
+        if (sortedDirs.length > MAX_NPM_LINT_PACKAGE_GROUPS) {
+          return {
+            linter: "npm",
+            files: jsTsFiles,
+            stderr:
+              `npm lint spans ${sortedDirs.length} package roots; ` +
+              `the bounded maximum is ${MAX_NPM_LINT_PACKAGE_GROUPS}`,
+          };
         }
+        // Package roots run concurrently. Every child has the same wall-clock
+        // timeout, so matrix duration is bounded by one tool window rather than
+        // package-count × timeout when --max-files disables cardinality refusal.
+        const results = await Promise.all(
+          sortedDirs.map(async (pkgDir) => ({
+            pkgDir,
+            result: await runTool(
+              ["npm", "run", "lint", "--", ...(pkgGroups.get(pkgDir) ?? [])],
+              pkgDir,
+            ),
+          })),
+        );
+        const npmStderrs = results
+          .filter(({ result }) => result.code !== 0)
+          .map(({ result }) => (result.stderr || "") + (result.stdout || ""));
         return npmStderrs.length > 0
           ? { linter: "npm", files: jsTsFiles, stderr: npmStderrs.join("") }
           : null;

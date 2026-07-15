@@ -1,80 +1,63 @@
-# 50. Wrapped-cell total-edit-denial guard and dumb-courier wrapper contract
+# 50. Wrapped-cell total-edit-denial guard and dumb-courier contract
 
 ## Status
 
 Accepted. Builds on
-[ADR 0010](0010-host-provider-matrix-and-wrapped-worker-cells.md) (the wrapped-cell
-architecture) and [ADR 0047](0047-provider-equivalence-map-and-worker-provider-pin.md)
-(the worker-provider dispatch pin this guard deliberately does NOT key on). Reuses the
-`PreToolUse` guard precedent [ADR 0025](0025-wrong-tree-write-guard.md) (marker-keyed
-jurisdiction) and its escalation-guard-derived fail-closed-when-marked posture.
+[ADR 0010](0010-host-provider-matrix-and-wrapped-worker-cells.md),
+[ADR 0047](0047-provider-equivalence-map-and-worker-provider-pin.md), and the
+marker-keyed guard model in [ADR 0025](0025-wrong-tree-write-guard.md).
 
 ## Context
 
-The wrapped-worker contract that delegates implementation to a foreign provider leg has
-always been prompt-only: nothing mechanically stopped a wrapped `work:worker` from
-reaching for Edit/Write/Bash and implementing natively instead of delegating. A wave of
-wrapped-cell runs showed the failure mode is real — several gpt-cell workers carried the
-correct wrapped system prompt yet implemented natively with sonnet anyway. With
-`worker_provider` pinnable to codex (ADR 0047), every future wrapped-cell dispatch
-depends on this contract holding, so a prompt-only guard is no longer acceptable.
-
-A mechanical guard needs a reliable, forgeable-proof signal that THIS session is a
-wrapped cell's worker, deniable before any edit lands, and a wrapper tool surface narrow
-enough that denying source-editing tools doesn't also break launch/wait/adjudicate/
-close-out. The second did not hold while a wrapper was expected to hand-fix lint
-and test failures itself after the leg's implementation pass — denying Edit/Write
-there would break every run needing even one lint fix.
+A wrapped work worker delegates implementation to a foreign provider. Prompt text
+alone cannot stop its Claude wrapper from editing source, running repository code,
+launching an unrelated writer, or closing another task. The wrapper still needs a
+small launch, observation, handoff, and close-out surface.
 
 ## Decision
 
-**A launch-injected marker carries wrapped-cell identity.** The exec boundary
-(`buildKeeperAgentLaunchArgv`) always emits `KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE`
-on every `work` launch — empty for a native effective cell, the effective
-`<model>::<effort>` plus the provider-leg result-envelope path for a wrapped one.
-Always-emit matters because a reused tmux session must never inherit a stale marker. The
-marker is keyed on effective-cell wrappedness — never the `worker_provider` pin (ADR
-0047): a pin translates which cell dispatches, jurisdiction here is about what the
-launched worker IS. Both work-launch producers (autopilot, manual `keeper dispatch`)
-inject it through the same shared seam.
+Every work launch emits `KEEPER_WRAPPED_CELL` and `KEEPER_WRAPPED_ENVELOPE` through
+the shared exec seam. Native cells receive empty values. Wrapped cells receive the
+effective cell and a per-task envelope path whose basename binds the launch task.
+Jurisdiction requires both a non-empty marker and subagent identity in the tool
+payload; human and orchestrator turns remain inert.
 
-**`wrapped-guard`, an eighth `PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash)` hook,
-is a single-state total edit-denial — no envelope gate, nothing forgeable.** It need not
-distinguish "the leg isn't done" from "unlock now": under the dumb-courier contract
-below the wrapper NEVER authors source at any point, so denial holds for the whole
-session. Jurisdiction is two conditions, both required: the marker is non-empty, AND the
-tool payload carries `agent_id`/`agent_type` (the wrapped subagent, not the wrapper's own
-orchestrator turn). A marked subagent gets Edit/MultiEdit/NotebookEdit denied outright,
-an in-tree Write denied (outside every tracked tree stays allowed), and every Bash
-command must clear a POSITIVE allowlist covering only delegation and close-out (`keeper
-agent`/`commit-work`/`plan`/`session`/`baseline`, read-only + staging git but no
-raw commit, and the test runner) — the whole shell-operator/redirect/heredoc/substitution surface and every
-re-entrant wrapper are rejected before classifying a command at all, a blocklist having
-been rejected outright given Claude Code's own regex blocklist fell to documented
-bypasses. A marked session fails CLOSED on anything it cannot positively clear; an
-unmarked one is inert. Every path exits 0.
+`wrapped-guard` is a fail-closed
+`PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash)` guard. Edit, MultiEdit, and
+NotebookEdit are always denied. A handoff Write is eligible only for a fresh
+`.json`, `.txt`, or `.md` leaf in a newly created owner-private system-temp
+directory. The guard writes the bounded content itself with exclusive, no-follow,
+close-on-exec descriptor flags, then denies the host Write with an
+`ATOMIC_HANDOFF_WRITTEN` receipt. Existing leaves are never reopened, eliminating
+the validation-to-open hardlink window.
 
-**The wrapper contract is rewritten as a dumb courier so the guard never has anything
-legitimate to deny.** It no longer hand-fixes a red test, a lint failure, or a gap the
-leg left — every one goes back to the SAME leg via `keeper agent run --resume`, driven
-across turns until the leg reports done. Its tool surface shrinks to exactly what the
-guard allows: launch (a native `keeper agent run` detach, replacing the earlier
-hand-rolled `nohup`/pidfile launch the re-entrant-wrapper denial would have blocked
-anyway), wait, read the provider-leg result envelope, re-run tests, and the keeper
-close-out — a compliant wrapper never needs an edit tool, so denying all of them costs
-it nothing.
+Bash uses a positive allowlist. It permits the exact private-temp `mktemp` shape,
+launch-bound non-Claude provider runs, bounded wait/read operations, task-bound
+`commit-work`, task-bound non-forced `plan done`, bounded Plan/session/baseline
+reads, and selected Git reads. Provider runs must carry the wrapped session,
+literal task name, injected envelope reference, timeout, and initial system file
+or resume target. Generic/nested Claude agents are denied.
+
+Raw index/ref Git and repository-defined scripts/tests are denied. Git reads that
+can consult configuration require fixed `core.fsmonitor=false`, `core.pager=cat`,
+and `--no-pager` arguments; diff/log/show also require `--no-ext-diff` and
+`--no-textconv`. Exec-bearing flags, config injection, signatures, filters,
+textconv, external diff, pagers, shell operators, redirects, substitutions,
+interpreters, and re-entrant wrappers remain off-list.
+
+The wrapper is a dumb courier. It sends implementation, test, and lint iteration
+back to the same provider leg, treats provider output as bounded untrusted data,
+derives the actual path set from Git, and supplies fresh descriptor-written
+manifest/message files to `commit-work`. It never authors source or executes
+repository code itself.
 
 ## Consequences
 
-- A wrapped worker reaching for Edit/Write/an off-allowlist Bash command is mechanically
-  stopped before the edit lands, independent of system-prompt drift.
-- Raw `git commit` is denied. The wrapper derives the provider delta, writes a
-  versioned path manifest outside the tree, previews it, and passes it to
-  `keeper commit-work --adopt-from`; adoption is invocation-local and remains
-  subject to foreign-claim, byte/mode, hook, signing, and compare-and-swap gates.
-- `bun run` permits only a named package script — a path-shaped target is denied, so an
-  out-of-tree Write cannot become an in-tree edit by running the written file.
-- Marker integrity is load-bearing: a launch bypassing `buildKeeperAgentLaunchArgv` would
-  escape jurisdiction — both work-launch producers ride the shared seam; a future one must.
-- The wrapper cannot self-recover by editing around a stuck leg — every iteration runs back through the leg under launch's budget; a non-converging leg ends in `BLOCKED`.
-- The guard is single-state: marker-gated denial and the provider-leg envelope's `outcome` are independent.
+- Prompt drift cannot grant the wrapper a native source-edit path.
+- Provider code runs only through the constrained launch-bound leg shape.
+- Completion and commit authority cannot target another task or use `--force`.
+- Handoff bytes cannot truncate an existing hardlink target.
+- Provider tests remain provider-side; Keeper independently runs its scoped gates.
+- Adoption stays invocation-local and retains foreign-claim, byte/mode, hook,
+  signing, and compare-and-swap protections.
+- Every new launch producer must emit both wrapped carriers through the shared seam.

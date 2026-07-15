@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, openSync, readSync, readdirSync } from "node:fs";
+
 /**
  * Write-capable git spawn helper for the `keeper commit-work` family.
  *
@@ -8,10 +11,11 @@
  * opportunistic index stat-cache refresh that `--no-optional-locks` defeats —
  * so this helper deliberately OMITS that flag.
  *
- * Both stdout and stderr are drained CONCURRENTLY via `Promise.all`. A linter
+ * Both stdout and stderr are drained CONCURRENTLY via `Promise.all`, retained
+ * only to explicit byte ceilings, and still consumed after truncation. A linter
  * or `git` subprocess that fills one pipe buffer while we await the other
- * sequentially would deadlock once its output exceeds the OS pipe capacity
- * (~64KB on macOS) — the classic single-pipe-drain hang. The array-form
+ * sequentially would deadlock once its output exceeds the OS pipe capacity;
+ * retaining unlimited hook output would instead exhaust memory. The array-form
  * `Bun.spawn` with `shell: false` (Bun's default for array args) keeps the
  * argv unsplit, sidestepping shell-injection on paths.
  */
@@ -39,6 +43,10 @@ export interface GitExecOptions {
    * `GIT_TERMINAL_PROMPT` + ssh `ConnectTimeout` do not catch.
    */
   timeoutMs?: number;
+  /** Complete-output ceiling; overflow is drained, truncated, and fails closed. */
+  maxStdoutBytes?: number;
+  /** Complete-error ceiling; overflow is drained, truncated, and fails closed. */
+  maxStderrBytes?: number;
 }
 
 /**
@@ -62,6 +70,11 @@ export const GIT_SPAWN_TIMEOUT_CODE = 124;
  * of unwinding an entire recover/finalize sweep.
  */
 export const GIT_SPAWN_FAILED_CODE = 127;
+
+/** A child exceeded a bounded output stream; its semantic output is unusable. */
+export const GIT_OUTPUT_LIMIT_CODE = 125;
+export const GIT_STDOUT_LIMIT_BYTES = 64 * 1_048_576;
+export const GIT_STDERR_LIMIT_BYTES = 4 * 1_048_576;
 
 /**
  * Default wall-clock bound (ms) for a NETWORK git op (push / push --dry-run)
@@ -148,10 +161,215 @@ export function buildGitEnv(
  * an ancestor may have exported. PATH/HOME and the rest of the ambient env still
  * ride through so git's credential + config discovery keeps working.
  */
-export async function spawnGitExec(
-  args: string[],
+const DRAIN_ABORTED = Symbol("drain-aborted");
+
+async function drainBoundedOutput(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  abort: Promise<void>,
+): Promise<{ text: string; truncated: boolean }> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let retained = 0;
+  let truncated = false;
+  for (;;) {
+    const next = await Promise.race([
+      reader.read(),
+      abort.then(() => DRAIN_ABORTED),
+    ]);
+    if (typeof next === "symbol") {
+      // An escaped setsid descendant can retain the inherited pipe after the
+      // original process group is killed. Cancel our reader so timeout remains
+      // a wall-clock bound instead of waiting forever for that foreign fd.
+      void reader.cancel().catch(() => {});
+      truncated = true;
+      break;
+    }
+    const { done, value } = next;
+    if (done) break;
+    if (value === undefined || value.byteLength === 0) continue;
+    const available = Math.max(0, maxBytes - retained);
+    if (available > 0) {
+      const keep = Math.min(available, value.byteLength);
+      chunks.push(value.slice(0, keep));
+      retained += keep;
+    }
+    if (value.byteLength > available) truncated = true;
+  }
+  const bytes = Buffer.concat(chunks, retained);
+  return { text: bytes.toString("utf8"), truncated };
+}
+
+function outputLimit(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : fallback;
+}
+
+const MAX_TIMEOUT_TREE_PROCESSES = 10_000;
+const MAX_PS_TREE_BYTES = 4 * 1_048_576;
+
+/** Snapshot the current descendant closure while the timed-out root still lives. */
+function timeoutDescendants(rootPid: number): number[] {
+  if (process.platform === "win32") return [];
+  try {
+    const ps = Bun.spawnSync(["/bin/ps", "-axo", "pid=,ppid="], {
+      timeout: 500,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (
+      !ps.success ||
+      ps.exitCode !== 0 ||
+      ps.stdout.byteLength > MAX_PS_TREE_BYTES
+    ) {
+      return [];
+    }
+    const children = new Map<number, number[]>();
+    for (const line of ps.stdout.toString().split("\n")) {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const ppid = Number(match[2]);
+      if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid)) continue;
+      const bucket = children.get(ppid) ?? [];
+      bucket.push(pid);
+      children.set(ppid, bucket);
+    }
+    const found: number[] = [];
+    const queue = [...(children.get(rootPid) ?? [])];
+    const seen = new Set<number>([rootPid]);
+    while (queue.length > 0 && found.length < MAX_TIMEOUT_TREE_PROCESSES) {
+      const pid = queue.shift();
+      if (pid === undefined || pid <= 1 || seen.has(pid)) continue;
+      seen.add(pid);
+      found.push(pid);
+      queue.push(...(children.get(pid) ?? []));
+    }
+    return found;
+  } catch {
+    return [];
+  }
+}
+
+function timeoutTokenProcesses(token: string): number[] {
+  const needle = `KEEPER_BOUNDED_EXEC_TOKEN=${token}`;
+  if (process.platform === "linux") {
+    const found: number[] = [];
+    try {
+      for (const entry of readdirSync("/proc").slice(
+        0,
+        MAX_TIMEOUT_TREE_PROCESSES,
+      )) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        if (pid <= 1 || pid === process.pid) continue;
+        let fd: number | null = null;
+        try {
+          fd = openSync(
+            `/proc/${entry}/environ`,
+            constants.O_RDONLY | constants.O_NONBLOCK,
+          );
+          const bytes = Buffer.alloc(64 * 1_024);
+          const count = readSync(fd, bytes, 0, bytes.length, 0);
+          if (bytes.subarray(0, count).includes(Buffer.from(needle))) {
+            found.push(pid);
+          }
+        } catch {
+          // A process may exit or be unreadable while /proc is scanned.
+        } finally {
+          if (fd !== null) closeSync(fd);
+        }
+      }
+    } catch {
+      return [];
+    }
+    return found;
+  }
+  if (process.platform !== "win32") {
+    try {
+      const ps = Bun.spawnSync(["/bin/ps", "eww", "-axo", "pid=,command="], {
+        timeout: 500,
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (
+        !ps.success ||
+        ps.exitCode !== 0 ||
+        ps.stdout.byteLength > MAX_PS_TREE_BYTES
+      ) {
+        return [];
+      }
+      return ps.stdout
+        .toString()
+        .split("\n")
+        .filter((line) => line.includes(needle))
+        .map((line) => Number(/^\s*(\d+)/.exec(line)?.[1] ?? 0))
+        .filter((pid) => pid > 1 && pid !== process.pid)
+        .slice(0, MAX_TIMEOUT_TREE_PROCESSES);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/** Stop descendants before killing the root so setsid children cannot retain pipes. */
+function killTimedOutProcessTree(rootPid: number, token: string): void {
+  if (process.platform === "win32") {
+    try {
+      process.kill(rootPid, "SIGKILL");
+    } catch {
+      // The child may have exited at the deadline.
+    }
+    return;
+  }
+  try {
+    process.kill(-rootPid, "SIGSTOP");
+  } catch {
+    try {
+      process.kill(rootPid, "SIGSTOP");
+    } catch {
+      // Continue with the ancestry snapshot; a racing exit is harmless.
+    }
+  }
+  const descendants = [
+    ...new Set([
+      ...timeoutDescendants(rootPid),
+      ...timeoutTokenProcesses(token),
+    ]),
+  ];
+  // Freeze every out-of-group descendant before any parent is reaped/reparented.
+  for (const pid of descendants) {
+    try {
+      process.kill(pid, "SIGSTOP");
+    } catch {
+      // Already exited.
+    }
+  }
+  for (const pid of descendants.reverse()) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }
+  try {
+    process.kill(-rootPid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(rootPid, "SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  }
+}
+
+export async function spawnBoundedExec(
+  command: string[],
   options: GitExecOptions = {},
 ): Promise<GitExecResult> {
+  const containmentToken = randomUUID();
   // `Bun.spawn` throws SYNCHRONOUSLY when posix_spawn fails before the child runs
   // — an ENOENT on a vanished `cwd` (a lane dir removed out from under a sweep) or
   // a `git` missing from PATH. Convert that throw into a nonzero RESULT so every
@@ -160,12 +378,15 @@ export async function spawnGitExec(
   // that a `let`-typed binding would lose.
   const proc = (() => {
     try {
-      return Bun.spawn(["git", ...args], {
+      return Bun.spawn(command, {
         cwd: options.cwd,
         stdin: options.stdin ?? "ignore",
         stdout: "pipe",
         stderr: "pipe",
-        env: buildGitEnv(options.env),
+        env: buildGitEnv({
+          ...options.env,
+          KEEPER_BOUNDED_EXEC_TOKEN: containmentToken,
+        }),
         // Timed Git commands may launch SSH, credential, signing, or hook
         // descendants which retain their pipes. Isolate a process group so the
         // timeout closes the complete subprocess tree.
@@ -193,44 +414,68 @@ export async function spawnGitExec(
   // caller forever. The kill closes both pipes, so the concurrent drain below
   // resolves promptly with whatever partial output arrived.
   let timedOut = false;
+  let abortDrain = (): void => {};
+  const drainAbort = new Promise<void>((resolve) => {
+    abortDrain = resolve;
+  });
   const timer =
     options.timeoutMs !== undefined && options.timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          if (process.platform !== "win32") {
-            try {
-              process.kill(-proc.pid, "SIGKILL");
-              return;
-            } catch {
-              // The child may have exited between the timer and group signal.
-            }
-          }
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            // A concurrently exited child already closed its descriptors.
-          }
+          killTimedOutProcessTree(proc.pid, containmentToken);
+          abortDrain();
         }, options.timeoutMs)
       : undefined;
 
   try {
-    // Drain both pipes CONCURRENTLY. Awaiting stdout fully before stderr would
-    // deadlock on any child whose stderr fills the pipe buffer mid-run (and
-    // vice-versa) — the pipe-buffer-backpressure hang the epic's best-practices
-    // call out. `Bun.readableStreamToText` consumes the whole stream.
+    // Drain both pipes CONCURRENTLY and keep consuming after each retention
+    // ceiling. Awaiting one pipe first deadlocks; retaining attacker-sized hook
+    // output exhausts memory. A truncated semantic stream fails closed instead
+    // of letting a caller parse a partial status/path list as complete.
     const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
+      drainBoundedOutput(
+        proc.stdout,
+        outputLimit(options.maxStdoutBytes, GIT_STDOUT_LIMIT_BYTES),
+        drainAbort,
+      ),
+      drainBoundedOutput(
+        proc.stderr,
+        outputLimit(options.maxStderrBytes, GIT_STDERR_LIMIT_BYTES),
+        drainAbort,
+      ),
       proc.exited,
     ]);
-    // A timeout-kill reports as GIT_SPAWN_TIMEOUT_CODE regardless of the signal's
-    // raw exit so the caller's transient/hard classification stays unambiguous.
-    return { code: timedOut ? GIT_SPAWN_TIMEOUT_CODE : code, stdout, stderr };
+    const outputLimited = stdout.truncated || stderr.truncated;
+    const notes = [
+      stdout.truncated ? "stdout" : null,
+      stderr.truncated ? "stderr" : null,
+    ].filter((value): value is string => value !== null);
+    const limitNote = outputLimited
+      ? `${stderr.text.length > 0 ? "\n" : ""}[keeper process-exec: ${notes.join("+")} output limit exceeded]`
+      : "";
+    // Timeout has priority over output overflow; otherwise partial output gets a
+    // dedicated non-Git exit code so every existing `code !== 0` path refuses.
+    return {
+      code: timedOut
+        ? GIT_SPAWN_TIMEOUT_CODE
+        : outputLimited
+          ? GIT_OUTPUT_LIMIT_CODE
+          : code,
+      stdout: stdout.text,
+      stderr: `${stderr.text}${limitNote}`,
+    };
   } finally {
     if (timer !== undefined) {
       clearTimeout(timer);
     }
   }
+}
+
+export async function spawnGitExec(
+  args: string[],
+  options: GitExecOptions = {},
+): Promise<GitExecResult> {
+  return spawnBoundedExec(["git", ...args], options);
 }
 
 /**

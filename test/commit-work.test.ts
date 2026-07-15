@@ -16,14 +16,25 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOUNDED_INPUT_OPEN_FLAGS,
   type CommitWorkDeps,
   runForTest as runCommitWorkForTest,
+  taskBoundToIdentity,
+  trustedClaudeAuthority,
+  trustedClaudeIdentity,
 } from "../cli/commit-work";
 import { LintFailure } from "../src/commit-work/lint-matrix";
+import { MAX_COMMIT_MESSAGE_BYTES } from "../src/commit-work/private-index";
 import {
   describePushNotReady,
   inLinkedWorktree,
@@ -57,7 +68,11 @@ const FAKE_COMMIT = "abcdef0123456789abcdef0123456789abcdef01";
 function runForTest(argv: string[], deps: CommitWorkDeps = {}) {
   return runCommitWorkForTest(
     argv.map((arg) => (arg === "s1" ? TEST_ID : arg)),
-    deps,
+    {
+      validateIdentity: () => true,
+      validateTaskBinding: () => true,
+      ...deps,
+    },
   );
 }
 
@@ -156,6 +171,7 @@ function deps(opts: {
   runLint?: (files: string[], cwd: string) => Promise<void>;
   detectInProgress?: CommitWorkDeps["detectInProgress"];
   checkSharedCheckoutJam?: CommitWorkDeps["checkSharedCheckoutJam"];
+  fingerprintIndex?: (path: string) => string;
 }): { d: CommitWorkDeps; calls: ReturnType<typeof fakeAsyncGit>["calls"] } {
   const fake = fakeAsyncGit(opts.rules);
   const baseRun = fake.run;
@@ -181,9 +197,14 @@ function deps(opts: {
       const trailers = args
         .flatMap((arg, index) => (arg === "--trailer" ? [args[index + 1]] : []))
         .filter((value): value is string => value !== undefined);
+      const input = msg.trimEnd();
+      const separator =
+        /\n\n[A-Za-z0-9-]+:[^\n]*(?:\n[A-Za-z0-9-]+:[^\n]*)*$/.test(input)
+          ? "\n"
+          : "\n\n";
       return {
         code: 0,
-        stdout: `${msg.trimEnd()}\n\n${trailers.join("\n")}\n`,
+        stdout: `${input}${separator}${trailers.join("\n")}\n`,
         stderr: "",
       };
     }
@@ -341,7 +362,7 @@ function deps(opts: {
           : "file",
         executable: false,
       }),
-      fingerprintIndex: () => "stable-private-index",
+      fingerprintIndex: opts.fingerprintIndex ?? (() => "stable-private-index"),
       targetIndexPath: () => "/repo/.git/index",
     },
     detectInProgress: opts.detectInProgress ?? (async () => null),
@@ -365,6 +386,131 @@ describe("commit-work: session id", () => {
     expect(parsed.hint).toContain("git");
     // Compact single line (no pretty indentation).
     expect(stdout).not.toContain("\n  ");
+  });
+
+  test("default authority binds identity and Task to this Claude process ancestry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-commit-authority-"));
+    const path = join(root, "keeper.db");
+    const { db } = freshDbFile(path);
+    const sibling = "44444444-4444-4444-8444-444444444444";
+    const legacy = "55555555-5555-4555-8555-555555555555";
+    const processOptions = {
+      currentPid: 9000,
+      read: (pid: number) => {
+        if (pid === 9000) return { ppid: 8000, startTime: "linux:900" };
+        if (pid === 8000) return { ppid: 4242, startTime: "linux:800" };
+        if (pid === 4242) return { ppid: 1, startTime: "linux:100" };
+        return null;
+      },
+    };
+    try {
+      db.run(
+        `INSERT INTO jobs
+           (job_id, created_at, state, updated_at, harness, plan_verb, plan_ref,
+            pid, start_time)
+         VALUES (?, 1, 'working', 1, 'claude', 'work', 'fn-1-task.1', 4242, 'linux:100'),
+                (?, 1, 'working', 1, 'pi', 'work', 'fn-1-task.1', 4242, 'linux:100'),
+                (?, 1, 'stopped', 1, 'claude', 'work', 'fn-1-task.1', 4242, 'linux:100'),
+                (?, 1, 'working', 1, 'claude', 'work', 'fn-1-task.1', 5252, 'linux:200'),
+                (?, 1, 'working', 1, NULL, 'work', 'fn-1-task.1', 4242, 'linux:100')`,
+        [
+          TEST_ID,
+          "22222222-2222-4222-8222-222222222222",
+          "33333333-3333-4333-8333-333333333333",
+          sibling,
+          legacy,
+        ],
+      );
+      expect(await trustedClaudeIdentity(TEST_ID, path, processOptions)).toBe(
+        true,
+      );
+      expect(taskBoundToIdentity(TEST_ID, "fn-1-task.1", path)).toBe(true);
+      expect(taskBoundToIdentity(TEST_ID, "fn-1-other.1", path)).toBe(false);
+      expect(
+        await trustedClaudeIdentity(
+          "22222222-2222-4222-8222-222222222222",
+          path,
+          processOptions,
+        ),
+      ).toBe(false);
+      expect(
+        await trustedClaudeIdentity(
+          "33333333-3333-4333-8333-333333333333",
+          path,
+          processOptions,
+        ),
+      ).toBe(false);
+      // A live Claude sibling cannot borrow its UUID: its pid is not an ancestor.
+      expect(await trustedClaudeIdentity(sibling, path, processOptions)).toBe(
+        false,
+      );
+      // Pre-harness rows are not sufficient evidence for the Claude-only verb.
+      expect(await trustedClaudeIdentity(legacy, path, processOptions)).toBe(
+        false,
+      );
+      expect(taskBoundToIdentity(legacy, "fn-1-task.1", path)).toBe(false);
+
+      let rebound = false;
+      expect(
+        await trustedClaudeAuthority(TEST_ID, "fn-1-task.1", path, {
+          currentPid: 9000,
+          read: (pid) => {
+            if (pid === 8000 && !rebound) {
+              db.run(
+                "UPDATE jobs SET plan_ref = 'fn-1-other.2' WHERE job_id = ?",
+                [TEST_ID],
+              );
+              rebound = true;
+            }
+            return processOptions.read(pid);
+          },
+        }),
+      ).toBe("identity_untrusted");
+      expect(rebound).toBe(true);
+      db.run("UPDATE jobs SET plan_ref = 'fn-1-task.1' WHERE job_id = ?", [
+        TEST_ID,
+      ]);
+
+      let revoked = false;
+      expect(
+        await trustedClaudeIdentity(TEST_ID, path, {
+          currentPid: 9000,
+          read: (pid) => {
+            if (pid === 8000 && !revoked) {
+              db.run("UPDATE jobs SET state = 'stopped' WHERE job_id = ?", [
+                TEST_ID,
+              ]);
+              revoked = true;
+            }
+            return processOptions.read(pid);
+          },
+        }),
+      ).toBe(false);
+      expect(revoked).toBe(true);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an identity not bound to an active Claude job", async () => {
+    const { d } = deps({ files: [], rules: [] });
+    const { code, stdout } = await runForTest(
+      ["--preview-files", "--session-id", "s1"],
+      { ...d, validateIdentity: () => false },
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).outcome).toBe("identity_untrusted");
+  });
+
+  test("rejects a Task id not bound to this work session", async () => {
+    const { d } = deps({ files: [], rules: [] });
+    const { code, stdout } = await runForTest(
+      ["--preview-files", "--session-id", "s1", "--task-id", "fn-1-task.1"],
+      { ...d, validateTaskBinding: () => false },
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).outcome).toBe("task_unbound");
   });
 });
 
@@ -447,6 +593,37 @@ describe("commit-work: --preview-files", () => {
     expect(code).toBe(0);
     expect(JSON.parse(stdout).files.length).toBe(3);
   });
+
+  test("--max-files 0 keeps the result envelope bounded", async () => {
+    const files = Array.from(
+      { length: 600 },
+      (_, i) => `f${i}-${"x".repeat(1_990)}`,
+    );
+    const { d } = deps({
+      files,
+      rules: [
+        {
+          when: (a) => argvStartsWith(a, "check-ignore"),
+          result: { exitCode: 1 },
+        },
+      ],
+    });
+    const { code, stdout } = await runForTest(
+      ["--preview-files", "--session-id", "s1", "--max-files", "0"],
+      d,
+    );
+    expect(code).toBe(0);
+    const parsed = JSON.parse(stdout) as {
+      files: string[];
+      file_total: number;
+      files_truncated: boolean;
+    };
+    expect(parsed.file_total).toBe(600);
+    expect(parsed.files).toHaveLength(500);
+    expect(parsed.files_truncated).toBe(true);
+    expect(parsed.files.every((path) => path.length <= 1_024)).toBe(true);
+    expect(Buffer.byteLength(stdout)).toBeLessThan(750_000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -467,6 +644,16 @@ describe("commit-work: message validation", () => {
     const { code, stdout } = await runForTest(["--session-id", "s1"], d);
     expect(code).toBe(1);
     expect(JSON.parse(stdout).outcome).toBe("message_required");
+  });
+
+  test("rejects an oversized positional message before discovery", async () => {
+    const { code, stdout } = await runForTest([
+      "x".repeat(MAX_COMMIT_MESSAGE_BYTES + 1),
+      "--session-id",
+      "s1",
+    ]);
+    expect(code).toBe(2);
+    expect(JSON.parse(stdout).outcome).toBe("argument_error");
   });
 
   test("rejects a multi-line message carrying a forbidden trailer", async () => {
@@ -503,6 +690,59 @@ describe("commit-work: message validation", () => {
       expect(code).toBe(1);
       expect(JSON.parse(stdout).outcome).toBe("forbidden_trailer");
     }
+  });
+
+  test("caller-supplied Task trailers are always rejected", async () => {
+    const { d } = deps({ files: ["a.txt"], rules: [] });
+    const { code, stdout } = await runForTest(
+      ["feat: forged\n\nTask: fn-1-forged.1", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).outcome).toBe("forbidden_trailer");
+  });
+
+  test("--task-id validates and appends exactly one trusted Task trailer", async () => {
+    const taskId = "fn-1-task.2";
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+    });
+    const landed = await runForTest(
+      ["feat: wrapped", "--session-id", "s1", "--task-id", taskId],
+      d,
+    );
+    expect(landed.code).toBe(0);
+    const trailers = calls.find((call) =>
+      argvStartsWith(call.args, "interpret-trailers"),
+    );
+    const message =
+      typeof trailers?.stdin === "string"
+        ? trailers.stdin
+        : new TextDecoder().decode(trailers?.stdin);
+    expect(message.match(/^Task:/gm)).toEqual(["Task:"]);
+    expect(message).toContain(`Task: ${taskId}`);
+
+    const forged = await runForTest(
+      [
+        "feat: wrapped\n\nTask: fn-999-forged.1",
+        "--session-id",
+        "s1",
+        "--task-id",
+        taskId,
+      ],
+      d,
+    );
+    expect(forged.code).toBe(1);
+    expect(JSON.parse(forged.stdout).outcome).toBe("forbidden_trailer");
+
+    const invalid = await runForTest([
+      "--preview-files",
+      "--task-id",
+      "not-a-task",
+    ]);
+    expect(invalid.code).toBe(2);
+    expect(JSON.parse(invalid.stdout).outcome).toBe("argument_error");
   });
 });
 
@@ -580,6 +820,28 @@ describe("commit-work: success path", () => {
     expect(calls.some((c) => argvStartsWith(c.args, "push"))).toBe(true);
   });
 
+  test("revoked authority after the final ownership scan blocks publication", async () => {
+    const { d, calls } = deps({
+      files: ["a.txt"],
+      rules: successRules({ stagedNames: ["a.txt"] }),
+    });
+    let validations = 0;
+    const result = await runForTest(
+      ["feat: bounded authority", "--session-id", "s1"],
+      {
+        ...d,
+        validateIdentity: () => {
+          validations += 1;
+          return validations < 3;
+        },
+      },
+    );
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout).outcome).toBe("identity_untrusted");
+    expect(validations).toBe(3);
+    expect(calls.some((call) => call.args[0] === "update-ref")).toBe(false);
+  });
+
   test("appends the Job-Id trailer from explicit --session-id", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
@@ -612,6 +874,15 @@ describe("commit-work: success path", () => {
 });
 
 describe("commit-work: adoption manifests", () => {
+  test("opens untrusted input paths nonblocking before descriptor validation", () => {
+    expect(BOUNDED_INPUT_OPEN_FLAGS & constants.O_RDONLY).toBe(
+      constants.O_RDONLY,
+    );
+    expect(BOUNDED_INPUT_OPEN_FLAGS & constants.O_NONBLOCK).toBe(
+      constants.O_NONBLOCK,
+    );
+  });
+
   test("adopts exact JSON paths without shell interpolation", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-manifest-"));
     try {
@@ -692,6 +963,137 @@ describe("commit-work: adoption manifests", () => {
       ]);
       expect(code).toBe(2);
       expect(JSON.parse(stdout).outcome).toBe("argument_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects manifest path counts before spreading an attacker-sized array", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-count-"));
+    try {
+      const manifest = join(dir, "paths.json");
+      writeFileSync(
+        manifest,
+        JSON.stringify({
+          schema_version: 1,
+          kind: "commit-work-adoption",
+          paths: Array.from({ length: 10_001 }, (_, i) => `p${i}`),
+        }),
+      );
+      const { code, stdout } = await runForTest([
+        "--preview-files",
+        "--adopt-from",
+        manifest,
+      ]);
+      expect(code).toBe(2);
+      expect(JSON.parse(stdout).outcome).toBe("argument_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("caps cumulative manifest bytes and manifest-file count", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-total-"));
+    try {
+      const paths = Array.from(
+        { length: 4_500 },
+        (_, i) => `${String(i).padStart(4, "0")}-${"x".repeat(110)}.ts`,
+      );
+      const first = join(dir, "first.json");
+      const second = join(dir, "second.json");
+      const body = JSON.stringify({
+        schema_version: 1,
+        kind: "commit-work-adoption",
+        paths,
+      });
+      expect(Buffer.byteLength(body)).toBeLessThan(1_048_576);
+      expect(Buffer.byteLength(body) * 2).toBeGreaterThan(1_048_576);
+      writeFileSync(first, body);
+      writeFileSync(second, body);
+      const cumulative = await runForTest([
+        "--preview-files",
+        "--adopt-from",
+        first,
+        "--adopt-from",
+        second,
+      ]);
+      expect(cumulative.code).toBe(2);
+      expect(JSON.parse(cumulative.stdout).outcome).toBe("argument_error");
+
+      const tinyFiles: string[] = [];
+      for (let i = 0; i < 33; i++) {
+        const path = join(dir, `tiny-${i}.json`);
+        writeFileSync(
+          path,
+          JSON.stringify({
+            schema_version: 1,
+            kind: "commit-work-adoption",
+            paths: [],
+          }),
+        );
+        tinyFiles.push(path);
+      }
+      const argv = ["--preview-files"];
+      for (const path of tinyFiles) argv.push("--adopt-from", path);
+      const tooMany = await runForTest(argv);
+      expect(tooMany.code).toBe(2);
+      expect(JSON.parse(tooMany.stdout).outcome).toBe("argument_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts the exact manifest byte cap and rejects NUL or non-regular inputs", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-boundary-"));
+    try {
+      const manifest = join(dir, "boundary.json");
+      const body = JSON.stringify({
+        schema_version: 1,
+        kind: "commit-work-adoption",
+        paths: ["a.ts"],
+      });
+      writeFileSync(manifest, body + " ".repeat(1_048_576 - body.length));
+      const { d } = deps({
+        files: ["a.ts"],
+        rules: successRules({ stagedNames: ["a.ts"] }),
+      });
+      d.directEvidence = () => ({ complete: true });
+      const boundary = await runForTest(
+        ["--preview-files", "--session-id", "s1", "--adopt-from", manifest],
+        d,
+      );
+      expect(boundary.code).toBe(0);
+
+      const nulManifest = join(dir, "nul.json");
+      writeFileSync(
+        nulManifest,
+        JSON.stringify({
+          schema_version: 1,
+          kind: "commit-work-adoption",
+          paths: ["bad\0path"],
+        }),
+      );
+      const nulPath = await runForTest([
+        "--preview-files",
+        "--adopt-from",
+        nulManifest,
+      ]);
+      expect(nulPath.code).toBe(2);
+      expect(JSON.parse(nulPath.stdout).outcome).toBe("argument_error");
+
+      const nonRegular = await runForTest([
+        "--preview-files",
+        "--adopt-from",
+        dir,
+      ]);
+      expect(nonRegular.code).toBe(2);
+      expect(JSON.parse(nonRegular.stdout).outcome).toBe("argument_error");
+
+      const messageFile = join(dir, "message.txt");
+      writeFileSync(messageFile, "feat: bad\0message");
+      const nulMessage = await runForTest(["--message-file", messageFile]);
+      expect(nulMessage.code).toBe(2);
+      expect(JSON.parse(nulMessage.stdout).outcome).toBe("argument_error");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -954,6 +1356,28 @@ describe("commit-work: lint_failed", () => {
     expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
       false,
     );
+  });
+
+  test("a linter cannot mutate and re-baseline the ambient index", async () => {
+    let targetChanged = false;
+    const { d, calls } = deps({
+      files: ["a.ts"],
+      rules: successRules({ stagedNames: ["a.ts"] }),
+      runLint: async () => {
+        targetChanged = true;
+      },
+      fingerprintIndex: (path) =>
+        path === "/repo/.git/index" && targetChanged
+          ? "changed-target-index"
+          : "stable-private-index",
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: guarded lint", "--session-id", "s1"],
+      d,
+    );
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).outcome).toBe("surface_changed");
+    expect(calls.some((call) => call.args[0] === "commit-tree")).toBe(false);
   });
 });
 

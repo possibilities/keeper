@@ -39,6 +39,7 @@ import {
 } from "../src/git-boot-seed";
 import type { GitSnapshotPayload } from "../src/git-worker";
 import { drain } from "../src/reducer";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let kdb: KeeperDb;
@@ -193,7 +194,75 @@ test("boot-seed re-derives git_status + file_attributions for a currently-dirty 
   // git_status.dirty_count is the authoritative currently-dirty fidelity check.
 });
 
-test("boot seed compacts a discharged tombstone into the snapshot floor", () => {
+test("boot seed captures each attribution watermark immediately before that root's Git read", () => {
+  const repo = fakeRoot("watermark-race");
+  const foreign = "foreign-seed-session";
+  let mutationId = 0;
+
+  const result = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [repo],
+    buildSnapshotForRoot: () => {
+      // Simulate a PostToolUse becoming durable after the pre-read watermark but
+      // before the Git read returns. This event must remain above the seed
+      // snapshot's attribution boundary for the next observation.
+      const inserted = kdb.db.run(
+        `INSERT INTO events
+           (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+         VALUES (1, ?, 'PostToolUse', 'post_tool_use', 'Write', ?, '{}', ?)`,
+        [foreign, repo, `${repo}/dirty.ts`],
+      );
+      mutationId = Number(inserted.lastInsertRowid);
+      return dirtySnapshot(repo);
+    },
+  });
+  expect(result.complete).toBe(true);
+  expect(mutationId).toBeGreaterThan(0);
+  expect(
+    kdb.db
+      .query(
+        "SELECT attribution_event_id FROM git_status WHERE project_dir = ?",
+      )
+      .get(repo),
+  ).toEqual({ attribution_event_id: 0 });
+  expect(
+    kdb.db
+      .query("SELECT 1 FROM file_attributions WHERE project_dir = ?")
+      .get(repo),
+  ).toBeNull();
+
+  const nextWatermark = (
+    kdb.db.query("SELECT MAX(id) AS id FROM events").get() as { id: number }
+  ).id;
+  kdb.db.run(
+    `INSERT INTO events
+       (ts, session_id, hook_event, event_type, cwd, data)
+     VALUES (2, ?, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [
+      repo,
+      repo,
+      JSON.stringify({
+        ...dirtySnapshot(repo),
+        attribution_event_id: nextWatermark,
+      }),
+    ],
+  );
+  drainAll();
+  expect(
+    kdb.db
+      .query(
+        `SELECT session_id, source, last_event_id FROM file_attributions
+          WHERE project_dir = ? AND file_path = ?`,
+      )
+      .get(repo, "dirty.ts"),
+  ).toEqual({
+    session_id: foreign,
+    source: "tool",
+    last_event_id: mutationId,
+  });
+});
+
+test("boot seed compacts a discharged tombstone into the snapshot watermark", () => {
   const repo = fakeRoot("discharged-tombstone");
   const session = "11111111-1111-4111-8111-111111111111";
   const absPath = `${repo}/dirty.ts`;
@@ -256,9 +325,9 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
   // GitSnapshot for the SAME dirty set. That re-emit must fold idempotently —
   // no double-counted attributions, no drifted git_status, no bumped jobs
   // git-counters. It is the invariant the whole live-only design rests on (see
-  // the git-boot-seed.ts header). Bookkeeping columns (last_event_id /
-  // updated_at) DO advance on the re-fold and are excluded; the OBSERVABLE git
-  // surface must not move.
+  // the git-boot-seed.ts header). Bookkeeping columns (last_event_id,
+  // updated_at, and the pre-read attribution_event_id boundary) DO advance on
+  // the re-fold and are excluded; the OBSERVABLE git surface must not move.
   const repo = fakeRoot("idempotent");
   const sess = "11111111-1111-1111-1111-111111111111";
   const dirtyPath = `${repo}/dirty.ts`;
@@ -288,6 +357,7 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
     if (row !== null) {
       delete row.last_event_id;
       delete row.updated_at;
+      delete row.attribution_event_id;
     }
     return row;
   };
@@ -331,10 +401,22 @@ test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + f
   //    SAME dirty set, folded ABOVE the floor with NO reset (its id is the
   //    highest in the log — appended after the boot-seed's synthetic snapshot).
   const snapshot = snapshotForRoot(repo);
+  const attributionEventId = (
+    kdb.db.query("SELECT MAX(id) AS id FROM events").get() as {
+      id: number;
+    }
+  ).id;
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
        VALUES (2000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
-    [repo, repo, JSON.stringify(snapshot)],
+    [
+      repo,
+      repo,
+      JSON.stringify({
+        ...snapshot,
+        attribution_event_id: attributionEventId,
+      }),
+    ],
   );
   drainAll();
 
@@ -449,7 +531,15 @@ test("self-clear (fold path): a gated root seeded ONLY by a later above-floor Gi
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
        VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
-    [missed, missed, JSON.stringify(snapshot)],
+    [
+      missed,
+      missed,
+      bindGitObservationWatermark(
+        kdb.db,
+        "GitSnapshot",
+        JSON.stringify(snapshot),
+      ),
+    ],
   );
   drainAll();
 
@@ -504,7 +594,15 @@ test("fn-905: unseededGatedRoots returns ONLY the gated roots lacking an above-f
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
        VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
-    [flaky, flaky, JSON.stringify(dirtySnapshot(flaky))],
+    [
+      flaky,
+      flaky,
+      bindGitObservationWatermark(
+        kdb.db,
+        "GitSnapshot",
+        JSON.stringify(dirtySnapshot(flaky)),
+      ),
+    ],
   );
   drainAll();
   expect(unseededGatedRoots(kdb.db, floor).size).toBe(0);
@@ -525,7 +623,15 @@ test("fn-921: a gated effectiveRoot keyed differently from its toplevel write ke
   kdb.db.run(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
        VALUES (9000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
-    [toplevel, toplevel, JSON.stringify(dirtySnapshot(toplevel))],
+    [
+      toplevel,
+      toplevel,
+      bindGitObservationWatermark(
+        kdb.db,
+        "GitSnapshot",
+        JSON.stringify(dirtySnapshot(toplevel)),
+      ),
+    ],
   );
   drainAll();
 

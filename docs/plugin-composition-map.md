@@ -99,7 +99,14 @@ is display metadata, while run handles and harness resume targets own waiting
 and continuation. The launch boundary always emits
 `KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE` (empty for native cells). A
 non-empty marker plus subagent identity is the sole jurisdiction for the
-`wrapped-guard` total source-edit denial ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)).
+`wrapped-guard` total source-edit denial. The guard descriptor-creates fresh
+inert handoffs in private temp directories, constrains provider launches to the
+launch-bound non-Claude leg, binds `plan done`/`commit-work` to the launch task,
+and denies repository scripts/tests plus raw index/ref Git. Read-only Git runs
+only in helper-disabled forms; close-out passes the Git-derived versioned path
+manifest to invocation-local `commit-work --adopt-from`, retaining exact
+byte/mode, hook, signing, and CAS protections
+([ADR 0050](./adr/0050-wrapped-delegation-guard.md)).
 The required host matrix ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
 remains the composition input for every worker cell.
 

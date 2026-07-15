@@ -42,6 +42,7 @@ import {
 } from "../src/compaction";
 import { extractMutationPath } from "../src/derivers";
 import { drain } from "../src/reducer";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -76,7 +77,11 @@ function insertEvent(overrides: {
   plan_target?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
-  const data = overrides.data ?? "{}";
+  const data = bindGitObservationWatermark(
+    db,
+    overrides.hook_event,
+    overrides.data ?? "{}",
+  );
   // Derive `mutation_path` the SAME way the live hook does, so a seeded mutation
   // row carries the column the git-attribution scan reads (a no-file_path body
   // folds to NULL, matching the forward deriver).

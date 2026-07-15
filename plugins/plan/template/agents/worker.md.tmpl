@@ -139,7 +139,7 @@ The stamp that closes the task (Phase 6 verifies, then yields). `keeper plan don
 $PLAN_CLI done $TASK_ID --summary "<1-2 sentence summary>"
 ```
 
-The invocation above is complete — run it as-is. Running `keeper plan done --help` first is a wasted call.
+The invocation above is complete — substitute the literal `PLAN_CLI` and task id from your launch header (they are notation, not shell environment references), then run it as-is. Running `keeper plan done --help` first is a wasted call.
 
 The success envelope on stdout carries `status: done` — that's your confirmation. **Hard ban: no post-`done` `keeper plan show`.** Do not re-fetch the task to confirm the stamp; the envelope is the confirmation.
 

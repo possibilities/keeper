@@ -160,6 +160,8 @@ export interface GitSnapshotPayload {
 
 export interface GitSnapshotMessage extends GitSnapshotPayload {
   kind: "git-snapshot";
+  /** Inclusive events.id watermark captured immediately before readStatus. */
+  attribution_event_id: number;
 }
 
 /**
@@ -173,6 +175,11 @@ export interface GitSnapshotMessage extends GitSnapshotPayload {
 export interface GitRootDroppedMessage {
   kind: "git-root-dropped";
   project_dir: string;
+  /**
+   * Inclusive events.id watermark captured before a confirming clean status
+   * read. Null for a vanished root whose filesystem state cannot be observed.
+   */
+  attribution_event_id: number | null;
 }
 
 /**
@@ -1840,6 +1847,19 @@ export function decideGitPoll(
   return { rescan: cur !== prev };
 }
 
+/** Read the inclusive event watermark that a subsequent Git observation covers. */
+export function readGitAttributionWatermark(db: Database): number | null {
+  try {
+    const row = db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+      max_id: number | null;
+    } | null;
+    const value = row?.max_id ?? 0;
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Pure decision for the quiet-repo `seed_required` clear (fn-921). The boot-seed
  * captures the floor at `max(events.id)` BEFORE its scan; if a gated root's last
@@ -2062,6 +2082,17 @@ function startWorker(): void {
     force = false,
   ): boolean {
     if (shuttingDown) return false;
+    // Capture BEFORE reading Git. The eventual synthetic event id is not an
+    // observation fence: a hook event can land after readStatus but before main
+    // appends the snapshot. Such an event must remain above this watermark for
+    // the next observation rather than being compacted away unseen.
+    const attributionEventId = readGitAttributionWatermark(db);
+    if (attributionEventId === null) {
+      console.error(
+        `[git-worker] attribution watermark unavailable for ${root}; snapshot suppressed`,
+      );
+      return false;
+    }
     let status: ParsedGitStatus | null;
     try {
       status = readStatus(root);
@@ -2232,6 +2263,7 @@ function startWorker(): void {
     port.postMessage({
       kind: "git-snapshot",
       ...snapshot,
+      attribution_event_id: attributionEventId,
     } satisfies GitSnapshotMessage);
     return true;
   }
@@ -2410,7 +2442,10 @@ function startWorker(): void {
     }
   }
 
-  async function unsubscribeRoot(root: string): Promise<void> {
+  async function unsubscribeRoot(
+    root: string,
+    attributionEventId: number,
+  ): Promise<void> {
     // Tombstone first — main lifts this into a synthetic GitRootDropped event
     // whose reducer fold DELETEs the projection row. Posting before teardown
     // keeps the producer-only contract: the event log is the sole driver of
@@ -2421,6 +2456,7 @@ function startWorker(): void {
       port.postMessage({
         kind: "git-root-dropped",
         project_dir: root,
+        attribution_event_id: attributionEventId,
       } satisfies GitRootDroppedMessage);
     }
     // fn-921 poll-only: a watched root is just a map entry now — no async
@@ -2492,6 +2528,9 @@ function startWorker(): void {
           port.postMessage({
             kind: "git-root-dropped",
             project_dir: dir,
+            // A vanished root has no status observation to bind a newer event
+            // watermark. The reducer preserves its prior per-root floor.
+            attribution_event_id: null,
           } satisfies GitRootDroppedMessage);
         }
       }
@@ -2531,7 +2570,31 @@ function startWorker(): void {
       }
 
       for (const root of toDrop) {
-        await unsubscribeRoot(root);
+        // Re-confirm clean state with a watermark captured BEFORE the read. The
+        // membership verdict can be TTL-cached; using the tombstone's eventual
+        // event id would consume a concurrent mutation that this read never saw.
+        const attributionEventId = readGitAttributionWatermark(db);
+        let clean = false;
+        if (attributionEventId !== null) {
+          try {
+            const status = readStatus(root);
+            clean =
+              status !== null &&
+              status.files.length === 0 &&
+              (status.ahead ?? 0) === 0 &&
+              !snapshotSuppressedByDivergence(root, status.head_oid);
+          } catch {
+            clean = false;
+          }
+        }
+        if (!clean || attributionEventId === null) {
+          // Force a fresh membership decision and a new dwell rather than
+          // dropping from stale or unavailable evidence.
+          watchProbeCache.delete(root);
+          cleanSinceByRoot.delete(root);
+          continue;
+        }
+        await unsubscribeRoot(root, attributionEventId);
       }
     } finally {
       reconciling = false;

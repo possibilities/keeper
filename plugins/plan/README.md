@@ -122,9 +122,7 @@ For source-code commits from worker agents, use `keeper commit-work`:
 keeper commit-work --preview-files
 
 # Commit with a message (auto-pushes to origin on success)
-keeper commit-work "feat(scope): add the feature
-
-Task: fn-N-slug.M"
+keeper commit-work --task-id fn-N-slug.M "feat(scope): add the feature"
 ```
 
 Every invocation emits one versioned `commit-work-result` JSON line. Preview
@@ -140,7 +138,11 @@ arguments or a versioned `--adopt-from` manifest after inspection. Adoption is
 bound to the frozen blob OID/mode, creates no durable claim, and refuses a live
 or unknown foreign exclusive claimant. Bash/codegen/package-manager evidence is
 an observation, never automatic ownership. Do not fall back to raw Git around
-ownership, lint, hooks, signing, or compare-and-swap publication.
+ownership, lint, hooks, signing, or compare-and-swap publication. Wrapped cells
+use fresh descriptor-created temp handoffs, launch-bound non-Claude provider
+legs, helper-disabled Git reads, and the literal launch task for both
+`commit-work` and non-forced `plan done`; the wrapper itself never runs repository
+code.
 
 ## Version Control Advice
 

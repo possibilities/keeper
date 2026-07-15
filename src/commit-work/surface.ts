@@ -1,4 +1,14 @@
-import { realpathSync } from "node:fs";
+import type { Database } from "bun:sqlite";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import {
   basename,
   dirname,
@@ -8,7 +18,18 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { openDb, resolveDbPath } from "../db";
+import {
+  defaultDbPath,
+  defaultDeadLetterDir,
+  defaultEventsLogDir,
+  openDb,
+} from "../db";
+import { parseDeadLetterLine, parseEventLogLine } from "../dead-letter";
+import { extractMutationPath } from "../derivers";
+import {
+  ATTRIBUTION_FLOOR_PATH,
+  ATTRIBUTION_FLOOR_SESSION_ID,
+} from "../git-attribution-floor";
 import type { GitRunner } from "./git-exec";
 
 export type ClaimLiveness = "live" | "terminal" | "unknown";
@@ -66,7 +87,8 @@ export type AdoptionRejectionCode =
   | "excluded"
   | "clean"
   | "unknown_path"
-  | "ownership_conflict";
+  | "ownership_conflict"
+  | "ownership_unavailable";
 
 export interface AdoptionRejection {
   input: string;
@@ -104,39 +126,414 @@ export interface SurfaceDiscoveryDeps {
   classifyClaim?: (claim: OwnershipClaim) => ClaimLiveness;
 }
 
-const EXCLUDED_PREFIX = ".keeper/";
+export interface OwnershipClaimsReadTestHooks {
+  /** Test-only seam for interleaving a reducer fold after the first snapshot read. */
+  afterDurableRead?: () => void;
+  /** Test-only seam for moving a receipt into SQLite during the source handoff. */
+  afterReceiptRead?: () => void;
+  /** Isolated receipt tree; production uses the fixed events-log directory. */
+  eventsLogDir?: string;
+  /** Isolated dead-letter tree; production uses the fixed recovery directory. */
+  deadLetterDir?: string;
+}
 
-function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
+const EXCLUDED_PREFIX = ".keeper/";
+const DURABLE_CLAIM_LIMIT = 10_000;
+const PENDING_DIRECT_CLAIM_LIMIT = 10_000;
+const RECEIPT_FILE_LIMIT = 1_024;
+const RECEIPT_RECORD_LIMIT = 10_000;
+const RECEIPT_BYTE_LIMIT = 8 * 1_048_576;
+
+function canonicalMutationPath(
+  worktree: string,
+  mutationPath: string,
+): string | null {
+  if (mutationPath.includes("\0")) return null;
+  const canonical = canonicalizeAdoptedPath(worktree, mutationPath);
+  if ("code" in canonical) return null;
+
+  // Parent canonicalization above preserves a symlink leaf as Git content. For
+  // a regular existing leaf, realpath also normalizes case on case-insensitive
+  // filesystems so `/repo/Foo` and Git's `foo` cannot become distinct owners.
   try {
-    const { db } = openDb(resolveDbPath(), { readonly: true });
+    const absolute = isAbsolute(mutationPath)
+      ? mutationPath
+      : resolve(worktree, mutationPath);
+    if (!lstatSync(absolute).isSymbolicLink()) {
+      const root = realpathSync(worktree);
+      const rel = relative(root, realpathSync(absolute));
+      if (
+        rel !== "" &&
+        rel !== ".." &&
+        !rel.startsWith(`..${sep}`) &&
+        !isAbsolute(rel)
+      ) {
+        return rel.split(sep).join("/");
+      }
+    }
+  } catch {
+    // Deleted/new files are identified by their canonical existing parent.
+  }
+  return canonical.path;
+}
+
+function mutationPathFromReceipt(
+  bindings: Record<string, string | number | boolean | null>,
+): string | null {
+  if (typeof bindings.mutation_path === "string") {
+    return bindings.mutation_path;
+  }
+  if (typeof bindings.data !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bindings.data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  return extractMutationPath(
+    typeof bindings.hook_event === "string" ? bindings.hook_event : "",
+    typeof bindings.tool_name === "string" ? bindings.tool_name : null,
+    parsed as Record<string, unknown>,
+  );
+}
+
+/**
+ * Read every complete event-log tail not covered by this SQLite snapshot's
+ * durable ingest offsets. Descriptor-bound regular-file reads plus a second
+ * stat/directory pass turn concurrent append/create activity into unavailable
+ * evidence rather than a silently incomplete ownership decision.
+ */
+interface ReceiptClaimsSnapshot {
+  claims: OwnershipClaim[];
+  /** Exact descriptor/directory identity recheck after the DB snapshot closes. */
+  stillStable: () => boolean;
+}
+
+function readReceiptClaims(
+  db: Database,
+  worktree: string,
+  dir: string,
+): ReceiptClaimsSnapshot | null {
+  const list = (): string[] | null => {
     try {
-      const rows = db
+      const names = readdirSync(dir)
+        .filter((name) => name.endsWith(".ndjson"))
+        .sort();
+      return names.length <= RECEIPT_FILE_LIMIT ? names : null;
+    } catch {
+      return null;
+    }
+  };
+  const beforeNames = list();
+  if (beforeNames === null) return null;
+
+  const offsetStmt = db.query(
+    "SELECT offset FROM event_ingest_offsets WHERE path = ? AND inode = ?",
+  );
+  const stateStmt = db.query("SELECT state FROM jobs WHERE job_id = ?");
+  const stateBySession = new Map<string, string | null>();
+  const claims: OwnershipClaim[] = [];
+  const identities = new Map<
+    string,
+    {
+      dev: number;
+      ino: number;
+      size: number;
+      mtimeMs: number;
+      ctimeMs: number;
+    }
+  >();
+  let totalBytes = 0;
+  let totalRecords = 0;
+
+  for (const name of beforeNames) {
+    const full = join(dir, name);
+    let fd: number;
+    try {
+      fd = openSync(full, constants.O_RDONLY | constants.O_NONBLOCK);
+    } catch {
+      return null;
+    }
+    try {
+      const before = fstatSync(fd);
+      if (!before.isFile() || !Number.isSafeInteger(before.size)) return null;
+      identities.set(name, {
+        dev: before.dev,
+        ino: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs,
+        ctimeMs: before.ctimeMs,
+      });
+      const stored = offsetStmt.get(full, before.ino) as {
+        offset: unknown;
+      } | null;
+      const storedOffset = stored?.offset ?? 0;
+      if (
+        typeof storedOffset !== "number" ||
+        !Number.isSafeInteger(storedOffset) ||
+        storedOffset < 0
+      ) {
+        return null;
+      }
+      const start = storedOffset <= before.size ? storedOffset : 0;
+      const unreadBytes = before.size - start;
+      totalBytes += unreadBytes;
+      if (totalBytes > RECEIPT_BYTE_LIMIT) return null;
+
+      const unread = Buffer.alloc(unreadBytes);
+      let read = 0;
+      while (read < unread.length) {
+        const count = readSync(
+          fd,
+          unread,
+          read,
+          unread.length - read,
+          start + read,
+        );
+        if (count <= 0) return null;
+        read += count;
+      }
+      const after = fstatSync(fd);
+      if (
+        !after.isFile() ||
+        after.dev !== before.dev ||
+        after.ino !== before.ino ||
+        after.size !== before.size ||
+        after.mtimeMs !== before.mtimeMs ||
+        after.ctimeMs !== before.ctimeMs
+      ) {
+        return null;
+      }
+      if (unread.length > 0 && unread[unread.length - 1] !== 0x0a) {
+        return null;
+      }
+
+      const lines = unread.toString("utf8").split("\n");
+      lines.pop(); // a complete tail ends in exactly one consumed delimiter
+      for (const line of lines) {
+        if (line.trim() === "") continue;
+        totalRecords += 1;
+        if (totalRecords > RECEIPT_RECORD_LIMIT) return null;
+        const record = parseEventLogLine(line);
+        if (record === null) return null;
+        const mutationPath = mutationPathFromReceipt(record.bindings);
+        if (mutationPath === null) continue;
+        const sessionId = record.bindings.session_id;
+        if (typeof sessionId !== "string" || sessionId.length === 0) {
+          return null;
+        }
+        const path = canonicalMutationPath(worktree, mutationPath);
+        if (path === null) continue;
+        if (!stateBySession.has(sessionId)) {
+          const state = stateStmt.get(sessionId) as { state: unknown } | null;
+          stateBySession.set(
+            sessionId,
+            typeof state?.state === "string" ? state.state : null,
+          );
+        }
+        const state = stateBySession.get(sessionId) ?? null;
+        claims.push({
+          path,
+          sessionId,
+          // A fresh mutation may precede the resume lifecycle fold. Projection
+          // terminality is therefore not positive abandonment evidence here.
+          liveness: state === "working" ? "live" : "unknown",
+          state,
+          oid: null,
+          mode: null,
+          source: "direct",
+        });
+      }
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  const stillStable = (): boolean => {
+    const afterNames = list();
+    if (
+      afterNames === null ||
+      afterNames.length !== beforeNames.length ||
+      afterNames.some((name, index) => name !== beforeNames[index])
+    ) {
+      return false;
+    }
+    // Re-probe every descriptor identity after the complete directory pass. An
+    // append to an early file while a later file was scanned is therefore not
+    // mistaken for a stable, complete receipt set.
+    for (const name of afterNames) {
+      const expected = identities.get(name);
+      if (expected === undefined) return false;
+      let fd: number;
+      try {
+        fd = openSync(
+          join(dir, name),
+          constants.O_RDONLY | constants.O_NONBLOCK,
+        );
+      } catch {
+        return false;
+      }
+      try {
+        const actual = fstatSync(fd);
+        if (
+          !actual.isFile() ||
+          actual.dev !== expected.dev ||
+          actual.ino !== expected.ino ||
+          actual.size !== expected.size ||
+          actual.mtimeMs !== expected.mtimeMs ||
+          actual.ctimeMs !== expected.ctimeMs
+        ) {
+          return false;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    }
+    return true;
+  };
+  return stillStable() ? { claims, stillStable } : null;
+}
+
+function unresolvedMutationDeadLetter(
+  worktree: string,
+  dbPath: string,
+  dir: string,
+): boolean | null {
+  const relevant = (
+    bindings: Record<string, string | number | boolean | null>,
+  ) => {
+    const mutationPath = mutationPathFromReceipt(bindings);
+    return (
+      mutationPath !== null &&
+      canonicalMutationPath(worktree, mutationPath) !== null
+    );
+  };
+  try {
+    const { db } = openDb(dbPath, { readonly: true });
+    try {
+      const unresolved = db
         .query(
-          `SELECT fa.file_path, fa.session_id, fa.worktree_oid, fa.worktree_mode,
-                  fa.source, j.state
-             FROM file_attributions fa
-             LEFT JOIN jobs j ON j.job_id = fa.session_id
-            WHERE fa.project_dir = ?
-              AND fa.last_mutation_at > COALESCE(fa.last_commit_at, 0)
-            ORDER BY fa.file_path, fa.session_id`,
+          `SELECT bindings
+             FROM dead_letters
+            WHERE status != 'recovered'
+            LIMIT ?`,
         )
-        .all(worktree) as Array<{
-        file_path: string;
-        session_id: string;
-        worktree_oid: string | null;
-        worktree_mode: string | null;
-        source: string | null;
-        state: string | null;
-      }>;
-      return rows.map((row) => ({
-        path: row.file_path,
-        sessionId: row.session_id,
-        liveness: defaultClaimLiveness({ state: row.state } as OwnershipClaim),
-        state: row.state,
-        oid: row.worktree_oid,
-        mode: row.worktree_mode,
-        source: row.source,
-      }));
+        .all(RECEIPT_RECORD_LIMIT + 1) as Array<{ bindings: unknown }>;
+      if (unresolved.length > RECEIPT_RECORD_LIMIT) return null;
+      for (const row of unresolved) {
+        if (typeof row.bindings !== "string") return null;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(row.bindings);
+        } catch {
+          return null;
+        }
+        if (
+          parsed === null ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed)
+        ) {
+          return null;
+        }
+        if (
+          relevant(parsed as Record<string, string | number | boolean | null>)
+        ) {
+          return true;
+        }
+      }
+
+      let names: string[];
+      try {
+        names = readdirSync(dir)
+          .filter((name) => name.endsWith(".ndjson"))
+          .sort();
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT"
+          ? false
+          : null;
+      }
+      if (names.length > RECEIPT_FILE_LIMIT) return null;
+      const identities = new Map<string, string>();
+      let totalBytes = 0;
+      let totalRecords = 0;
+      const status = db.query(
+        "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = ?",
+      );
+      for (const name of names) {
+        const full = join(dir, name);
+        const fd = openSync(full, constants.O_RDONLY | constants.O_NONBLOCK);
+        try {
+          const before = fstatSync(fd);
+          if (!before.isFile() || !Number.isSafeInteger(before.size))
+            return null;
+          totalBytes += before.size;
+          if (totalBytes > RECEIPT_BYTE_LIMIT) return null;
+          const bytes = Buffer.alloc(before.size);
+          let offset = 0;
+          while (offset < bytes.length) {
+            const count = readSync(
+              fd,
+              bytes,
+              offset,
+              bytes.length - offset,
+              offset,
+            );
+            if (count <= 0) return null;
+            offset += count;
+          }
+          const after = fstatSync(fd);
+          const identity = `${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}`;
+          if (
+            !after.isFile() ||
+            before.dev !== after.dev ||
+            before.ino !== after.ino ||
+            before.size !== after.size ||
+            before.mtimeMs !== after.mtimeMs ||
+            before.ctimeMs !== after.ctimeMs
+          ) {
+            return null;
+          }
+          identities.set(name, identity);
+          if (bytes.length > 0 && bytes[bytes.length - 1] !== 0x0a) return null;
+          for (const line of bytes.toString("utf8").split("\n")) {
+            if (line.trim() === "") continue;
+            totalRecords += 1;
+            if (totalRecords > RECEIPT_RECORD_LIMIT) return null;
+            const record = parseDeadLetterLine(line);
+            if (record === null) return null;
+            if (!relevant(record.bindings)) continue;
+            const row = status.get(record.dl_id) as {
+              status: unknown;
+              replayed_event_id: unknown;
+            } | null;
+            if (
+              row?.status !== "recovered" ||
+              typeof row.replayed_event_id !== "number" ||
+              !Number.isSafeInteger(row.replayed_event_id)
+            ) {
+              return true;
+            }
+          }
+        } finally {
+          closeSync(fd);
+        }
+      }
+      const afterNames = readdirSync(dir)
+        .filter((name) => name.endsWith(".ndjson"))
+        .sort();
+      if (afterNames.join("\0") !== names.join("\0")) return null;
+      for (const name of afterNames) {
+        const stats = lstatSync(join(dir, name));
+        if (
+          !stats.isFile() ||
+          identities.get(name) !==
+            `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`
+        ) {
+          return null;
+        }
+      }
+      return false;
     } finally {
       db.close();
     }
@@ -145,7 +542,228 @@ function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
   }
 }
 
+/**
+ * Read folded claims plus exact tool mutations newer than the root's last Git
+ * observation. The pending tail closes the producer-lag window synchronously at
+ * commit time: a PostToolUse that landed after a status read remains above
+ * `git_status.attribution_event_id` and is an exclusive direct claim even before
+ * the next GitSnapshot fold. A path-scoped hard row cap fails evidence closed
+ * instead of turning an unexpectedly stale root into an unbounded DB read.
+ */
+export function readOwnershipClaims(
+  worktree: string,
+  dbPath = defaultDbPath(),
+  testHooks: OwnershipClaimsReadTestHooks = {},
+): OwnershipClaim[] | null {
+  try {
+    const { db } = openDb(dbPath, { readonly: true });
+    let transactionOpen = false;
+    try {
+      // All four reads share one SQLite snapshot. Otherwise a reducer fold can
+      // materialize a mutation after the durable read, advance the watermark,
+      // and make the later tail read skip the same mutation from both surfaces.
+      db.run("BEGIN");
+      transactionOpen = true;
+      const durable = db
+        .query(
+          `SELECT fa.file_path, fa.session_id, fa.worktree_oid, fa.worktree_mode,
+                  fa.source, j.state
+             FROM file_attributions fa
+             LEFT JOIN jobs j ON j.job_id = fa.session_id
+            WHERE fa.project_dir = ?
+              AND fa.last_mutation_at > COALESCE(fa.last_commit_at, 0)
+            ORDER BY fa.file_path, fa.session_id
+            LIMIT ?`,
+        )
+        .all(worktree, DURABLE_CLAIM_LIMIT + 1) as Array<{
+        file_path: string;
+        session_id: string;
+        worktree_oid: string | null;
+        worktree_mode: string | null;
+        source: string | null;
+        state: string | null;
+      }>;
+      if (durable.length > DURABLE_CLAIM_LIMIT) {
+        db.run("ROLLBACK");
+        transactionOpen = false;
+        return null;
+      }
+      testHooks.afterDurableRead?.();
+
+      const floorValue = (
+        db
+          .query(
+            `SELECT MAX(attribution_event_id) AS attribution_event_id
+               FROM (
+                 SELECT attribution_event_id
+                   FROM git_status
+                  WHERE project_dir = ?
+                 UNION ALL
+                 SELECT last_event_id AS attribution_event_id
+                   FROM file_attributions
+                  WHERE project_dir = ?
+                    AND session_id = ?
+                    AND file_path = ?
+               )`,
+          )
+          .get(
+            worktree,
+            worktree,
+            ATTRIBUTION_FLOOR_SESSION_ID,
+            ATTRIBUTION_FLOOR_PATH,
+          ) as { attribution_event_id: unknown } | null
+      )?.attribution_event_id;
+      // No active row/sentinel means no Git observation has consumed any exact
+      // mutation evidence for this root. A genesis scan is conservative and
+      // complete over the retained sparse mutation_path column; the hard row
+      // cap below returns unavailable rather than truncating a large history.
+      const floor = floorValue ?? 0;
+      const headValue = (
+        db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+          max_id: unknown;
+        } | null
+      )?.max_id;
+      const head = headValue ?? 0;
+      if (
+        typeof floor !== "number" ||
+        !Number.isSafeInteger(floor) ||
+        floor < 0 ||
+        typeof head !== "number" ||
+        !Number.isSafeInteger(head) ||
+        head < 0 ||
+        floor > head
+      ) {
+        db.run("ROLLBACK");
+        transactionOpen = false;
+        return null;
+      }
+
+      // Scan the bounded global interval, not only a lexical root prefix: a
+      // tool path may name this same worktree through a symlink/case/root alias.
+      const pending = db
+        .query(
+          `SELECT e.mutation_path, e.session_id, j.state
+             FROM events e
+             LEFT JOIN jobs j ON j.job_id = e.session_id
+            WHERE e.id > ?
+              AND e.id <= ?
+              AND e.mutation_path IS NOT NULL
+            ORDER BY e.id
+            LIMIT ?`,
+        )
+        .all(floor, head, PENDING_DIRECT_CLAIM_LIMIT + 1) as Array<{
+        mutation_path: string;
+        session_id: string;
+        state: string | null;
+      }>;
+      if (pending.length > PENDING_DIRECT_CLAIM_LIMIT) {
+        db.run("ROLLBACK");
+        transactionOpen = false;
+        return null;
+      }
+
+      const claims: OwnershipClaim[] = durable.map((row) => ({
+        path: row.file_path,
+        sessionId: row.session_id,
+        liveness: defaultClaimLiveness({ state: row.state } as OwnershipClaim),
+        state: row.state,
+        oid: row.worktree_oid,
+        mode: row.worktree_mode,
+        source: row.source,
+      }));
+      for (const row of pending) {
+        const relativePath = canonicalMutationPath(worktree, row.mutation_path);
+        if (relativePath === null) continue;
+        claims.push({
+          path: relativePath,
+          sessionId: row.session_id,
+          // Pending exact evidence can be newer than jobs.state. Only a working
+          // projection proves live; every other state stays unknown, never
+          // positively terminal/adoptable, until a consistent fold observes it.
+          liveness: row.state === "working" ? "live" : "unknown",
+          state: row.state,
+          oid: null,
+          mode: null,
+          source: "direct",
+        });
+      }
+
+      const receiptSnapshot = readReceiptClaims(
+        db,
+        worktree,
+        testHooks.eventsLogDir ?? defaultEventsLogDir(),
+      );
+      if (receiptSnapshot === null) {
+        db.run("ROLLBACK");
+        transactionOpen = false;
+        return null;
+      }
+      claims.push(...receiptSnapshot.claims);
+      testHooks.afterReceiptRead?.();
+      db.run("COMMIT");
+      transactionOpen = false;
+
+      // Close the SQLite↔receipt handoff race. A valid receipt that the daemon
+      // inserts and unlinks while the old read snapshot is pinned increments the
+      // append-only event head; a receipt that remains outside SQLite changes
+      // the exact directory/descriptor snapshot. Check the fresh head FIRST and
+      // the receipt tree SECOND: activity wholly after the head read is later
+      // than this validation's linearization point, while any pre-existing
+      // source move changes at least one of these two observations.
+      const freshHeadValue = (
+        db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+          max_id: unknown;
+        } | null
+      )?.max_id;
+      const freshHead = freshHeadValue ?? 0;
+      if (
+        typeof freshHead !== "number" ||
+        !Number.isSafeInteger(freshHead) ||
+        freshHead < 0 ||
+        freshHead !== head ||
+        !receiptSnapshot.stillStable()
+      ) {
+        return null;
+      }
+      const deadLetterState = unresolvedMutationDeadLetter(
+        worktree,
+        dbPath,
+        testHooks.deadLetterDir ?? defaultDeadLetterDir(),
+      );
+      if (deadLetterState !== false) return null;
+      const postDeadLetterHead =
+        (
+          db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+            max_id: unknown;
+          } | null
+        )?.max_id ?? 0;
+      if (postDeadLetterHead !== head || !receiptSnapshot.stillStable()) {
+        return null;
+      }
+      return claims;
+    } finally {
+      if (transactionOpen) {
+        try {
+          db.run("ROLLBACK");
+        } catch {
+          // Closing a read-only connection also releases its snapshot.
+        }
+      }
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
+  return readOwnershipClaims(worktree);
+}
+
 function defaultClaimLiveness(claim: OwnershipClaim): ClaimLiveness {
+  if (claim.source === "direct" && claim.state !== undefined) {
+    return claim.state === "working" ? "live" : "unknown";
+  }
   if (claim.state === "working") return "live";
   if (claim.state === "ended" || claim.state === "killed") return "terminal";
   // A durable row with a missing/stopped/unrecognized job state is not positive
@@ -216,7 +834,9 @@ export async function readDirtySurface(
 ): Promise<Map<string, DirtyPath> | null> {
   const status = await git(
     ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
-    { cwd: worktree },
+    // This reader may be the final ownership linearization immediately before
+    // ref CAS. Disable Git's optional index refresh so validation is read-only.
+    { cwd: worktree, env: { GIT_OPTIONAL_LOCKS: "0" } },
   );
   if (status.code !== 0) return null;
   return parseDirtySurface(status.stdout);
@@ -368,7 +988,8 @@ async function ignoredPaths(
 /**
  * Discover and explain the complete dirty surface. Automatic ownership is
  * conservative on unavailable/unknown evidence; exact adoption is validated
- * path-by-path and is allowed to continue when durable evidence is unavailable.
+ * path-by-path and requires either durable evidence or a complete direct
+ * overlap observation.
  */
 export async function discoverCommitWorkSurface(
   options: SurfaceDiscoveryOptions,
@@ -382,6 +1003,28 @@ export async function discoverCommitWorkSurface(
     deps = {},
   } = options;
   const limit = options.sampleLimit ?? 20;
+  const dirtyRead = await readDirtySurface(worktree, git);
+  const dirtyAvailable = dirtyRead !== null;
+  const dirtyByPath = dirtyRead ?? new Map();
+
+  const canonical: Array<{ input: string; path: string }> = [];
+  const rejections: AdoptionRejection[] = [];
+  for (const input of adoptedPaths) {
+    const result = canonicalizeAdoptedPath(worktree, input);
+    if ("code" in result) {
+      rejections.push({ input, code: result.code });
+      continue;
+    }
+    canonical.push({ input, path: result.path });
+  }
+  const missing = canonical
+    .map((entry) => entry.path)
+    .filter((path) => !dirtyByPath.has(path));
+  const ignored = await ignoredPaths(worktree, missing, git);
+
+  // Keep the ownership snapshot as this discovery's final external read. The
+  // caller may use discovery as the publication linearization immediately
+  // before ref CAS; all classification below is pure in-memory work.
   let durable: OwnershipClaim[] | null = null;
   try {
     durable = (deps.readClaims ?? defaultReadClaims)(worktree);
@@ -392,9 +1035,6 @@ export async function discoverCommitWorkSurface(
     durable !== null || directEvidence?.complete === true;
   const classify = deps.classifyClaim ?? defaultClaimLiveness;
   const claimsByPath = mergeClaims(durable, directEvidence, identity, classify);
-  const dirtyRead = await readDirtySurface(worktree, git);
-  const dirtyAvailable = dirtyRead !== null;
-  const dirtyByPath = dirtyRead ?? new Map();
 
   const caller: string[] = [];
   const unattributed: string[] = [];
@@ -417,7 +1057,9 @@ export async function discoverCommitWorkSurface(
     if (observations.length > 0) observed.push(path);
     const ownershipClaims = claims.filter(claimIsExclusiveOwnership);
     const mine = identity
-      ? ownershipClaims.filter((claim) => claim.sessionId === identity)
+      ? ownershipClaims.filter(
+          (claim) => claim.sessionId === identity && claim.liveness === "live",
+        )
       : [];
     const foreign = ownershipClaims.filter(
       (claim) => claim.sessionId !== identity,
@@ -471,21 +1113,6 @@ export async function discoverCommitWorkSurface(
     caller.push(peer);
   }
 
-  const canonical: Array<{ input: string; path: string }> = [];
-  const rejections: AdoptionRejection[] = [];
-  for (const input of adoptedPaths) {
-    const result = canonicalizeAdoptedPath(worktree, input);
-    if ("code" in result) {
-      rejections.push({ input, code: result.code });
-      continue;
-    }
-    canonical.push({ input, path: result.path });
-  }
-  const missing = canonical
-    .map((entry) => entry.path)
-    .filter((path) => !dirtyByPath.has(path));
-  const ignored = await ignoredPaths(worktree, missing, git);
-
   const adopted = new Set<string>();
   for (const entry of canonical) {
     const { input, path } = entry;
@@ -503,6 +1130,10 @@ export async function discoverCommitWorkSurface(
             ? "ignored"
             : "clean",
       });
+      continue;
+    }
+    if (!evidenceAvailable) {
+      rejections.push({ input, path, code: "ownership_unavailable" });
       continue;
     }
     const conflicts = unsafeForeignSessions(

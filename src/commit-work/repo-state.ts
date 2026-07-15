@@ -23,7 +23,7 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { openDb, resolveDbPath } from "../db";
+import { defaultDbPath, openDb } from "../db";
 import {
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -138,7 +138,7 @@ export function normalizeRepoDir(p: string): string {
  */
 export function sharedCheckoutJamActive(
   worktree: string,
-  dbPath: string = resolveDbPath(),
+  dbPath: string = defaultDbPath(),
 ): boolean {
   try {
     const { db } = openDb(dbPath, { readonly: true });

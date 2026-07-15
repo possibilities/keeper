@@ -11,10 +11,10 @@
  *   4. `KEEPER_JOB_ID` — the stable identity carried by tracked Pi and other
  *      Keeper-launched harnesses.
  *
- * The Python's ancestor-pid fallback is dropped: tracked harnesses carry an
- * explicit identity. The id is a spoofable correlation hint, not auth — this is
- * attribution, not access control — so fail-open (`null`) is correct when no
- * source is set.
+ * The Python's guessed ancestor-id fallback is dropped: tracked harnesses carry
+ * an explicit identity. Resolution alone is only a correlation hint; mutating
+ * consumers separately bind it to the invoking process's recycle-safe Claude
+ * ancestry. This helper remains fail-open (`null`) for read-only callers.
  */
 
 /** Resolve a tracked agent session id, or `null`. */

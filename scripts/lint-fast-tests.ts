@@ -177,6 +177,11 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
       "Reviewed scheduler-boundary fixture retains its legacy timing probe.",
   },
   {
+    file: "test/commit-work.test.ts",
+    rule: "production-scale-fixture",
+    reason: "Reviewed adoption-count boundary requires one over-limit payload.",
+  },
+  {
     file: "test/daemon.test.ts",
     rule: "full-migration",
     reason:

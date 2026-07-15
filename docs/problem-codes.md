@@ -344,8 +344,8 @@ Usage and invocation-file faults exit 2 with `argument_error`; policy, ownership
 publication, and push failures exit 1. A failure also repeats `outcome` in the
 flat `error` alias, but consumers should branch on `outcome`.
 
-Automatic selection trusts only exclusive tool/plan/direct claims owned by the
-invocation. Bash, inferred, package-manager, and codegen evidence is reported as
+Automatic selection trusts only live exclusive tool/plan/direct claims owned by
+an active Claude invocation. Bash, inferred, package-manager, and codegen evidence is reported as
 `surface.observed_adoptable` and never auto-selected. A coverage gap is resolved
 only by invocation-local `--adopt <path>` or a versioned `--adopt-from` manifest.
 There is no raw-Git recovery: the private index freezes exact blob OIDs and modes,
@@ -356,11 +356,12 @@ publication, and exact-SHA push remain mandatory.
 | ------- | ------- | -------- | ---------- |
 | `argument_error` | CLI syntax, a malformed/oversized adoption manifest, an unreadable bounded input file, or both positional MSG and `--message-file`. | Correct the invocation or versioned input file, then retry. | yes (nothing ran) |
 | `identity_conflict`, `invalid_identity`, `no_session_id` | Invocation identity is conflicting, malformed, or absent. Adoption never bypasses identity. | Supply one valid UUID identity and remove conflicting environment carriers. | yes (nothing committed) |
+| `identity_untrusted`, `task_unbound` | The UUID is not a working Claude job on this invocation's exact `(pid, start_time)` ancestor chain, or `--task-id` is not that work job's bound task. | Invoke from the owning active Claude work session; a copied UUID/environment carrier from a sibling is not authority. | yes (nothing committed) |
 | `surface_unavailable` | Git could not provide the complete dirty surface. | Restore the checkout/Git read path, preview again, then retry. | yes |
 | `ownership_conflict` | A selected/adopted path has a live or unknown foreign exclusive claimant. Positive terminal evidence is required before adoption. | Let that claimant land or become positively terminal; do not force or broaden the path set. | yes after ownership settles |
-| `ownership_ambiguous` | Automatic evidence is incomplete, multi-claim, or changed during lint/publication. | Preview again; explicitly adopt only paths whose ownership you have inspected. | yes with a fresh decision |
+| `ownership_ambiguous` | Ownership evidence is unavailable/incomplete, multi-claim, or changed during lint/publication. Adoption requires durable evidence or a complete synchronous overlap observation. | Restore the ownership reader or obtain complete direct evidence, then preview again; adopt only exact paths whose ownership is inspectable. | yes with fresh evidence |
 | `adoption_rejected` | An adopted path is outside the worktree, invalid, ignored, excluded, clean, or unknown. `selection.rejections` carries per-path codes. | Correct the exact manifest/path set; never replace it with a broad pathspec. | yes |
-| `message_required`, `forbidden_trailer` | A commit message is absent or contains Keeper-owned/forged trailer keys. | Supply a message and remove forbidden trailers; Keeper appends its own identity trailers. | yes |
+| `message_required`, `forbidden_trailer` | A commit message is absent or contains any caller-supplied authority trailer, including `Task:`. | Supply plain prose and use the bound `--task-id`; Keeper appends identity/task authority mechanically. | yes |
 | `operation_in_progress` | Merge, cherry-pick, revert, rebase, or bisect state appeared before publication. No override exists. | Finish/abort the operation (or reset bisect), preview, and retry. | yes after settlement |
 | `shared_checkout_jam` | A live shared-checkout dirty/desync distress row matches this repo. | Let recovery clear it, or use `--override-jam` only after verifying the frozen set is current. | conditional |
 | `lock_timeout` | Another commit/base-merge retained the per-worktree flock past the deadline. | Wait for that operation to finish, then retry unchanged. | yes |
@@ -370,8 +371,8 @@ publication, and exact-SHA push remain mandatory.
 | `mass_reversion` | The frozen set matches the bulk ancestor-reversion signature. | Inspect history; use `--allow-mass-reversion` only for an intentional revert. | conditional |
 | `lint_failed` | The scoped lint matrix rejected the frozen non-deleted paths. | Fix the reported files and re-run the same message/adoption decision. Adoption is not a lint bypass. | yes after fixing |
 | `surface_changed` | A selected OID/mode/tree, branch context, or automatic claim identity changed after it was frozen. | Re-preview and make a fresh adoption decision against current bytes. | yes with fresh evidence |
-| `commit_hook_mutated` | A commit hook or signer changed the worktree, branch, private index, or ambient index. Nothing was published unless `commit.sha` says otherwise. | Inspect the named hook/signer side effect; make it validation-only or commit its generated output in a separate fresh invocation. | conditional |
-| `commit_failed`, `commit_signing_failed`, `head_read_failed`, `index_seed_failed`, `stage_failed`, `tree_write_failed`, `detached_head`, `initial_commit_unsupported` | Exact private-index construction or commit-object creation could not complete. | Fix the typed Git/signing/repository condition, preview, and retry; never disable verification/signing as a shortcut. | conditional |
+| `commit_hook_mutated` | A hook, signer, or linter changed the complete worktree, branch, either index, Git config/signing policy, or the captured hook set. Nothing was published unless `commit.sha` says otherwise. | Inspect the named executable side effect; make it validation-only or commit generated output in a separate fresh invocation. | conditional |
+| `commit_failed`, `commit_signing_failed`, `head_read_failed`, `index_seed_failed`, `stage_failed`, `tree_write_failed`, `detached_head`, `initial_commit_unsupported` | Exact private-index construction or commit-object creation could not complete. | Fix the typed Git/signing/repository condition (including removing or integrating an executable `reference-transaction` hook), preview, and retry; never disable verification/signing as a shortcut. | conditional |
 | `ref_conflict` | The captured branch moved before compare-and-swap publication. A temporary commit may exist but the ref was not overwritten. | Reconcile the new tip, preview again, then retry. | yes with fresh base |
 | `post_commit_hook_failed` | CAS publication succeeded, then `post-commit` failed. The envelope carries `committed:true`, the exact SHA, and `pushed:false`. | Treat the local commit as real; fix/run the post-commit side effect, then push that exact SHA deliberately. Do not retry the commit. | no (already committed) |
 | `push_failed` | Local publication succeeded but the exact-SHA remote update failed. | Use `push.push_error_class` to fix auth/non-fast-forward/hook/timeout state, then push or reconcile the reported exact SHA. | no commit retry |

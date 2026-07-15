@@ -17,19 +17,15 @@
  *   // …autopilot re-arm, then spawn git-worker (first-emit suppressed)
  *
  * Per-root work (the panel-verified live-tail-equivalence recipe):
- *   1. read `max(events.id)` FIRST — this is the floor we will persist. Events
- *      that arrive DURING the scan (id > this) re-apply idempotently via the live
- *      fold, so capturing the floor before the scan is the correctness anchor.
+ *   1. read `max(events.id)` FIRST — this is the replay floor we will persist.
  *   2. mark `seed_required = 1` (crash mid-seed ⇒ next boot re-seeds).
- *   3. per watched root: `readStatus` → `buildGitSnapshot` (REUSED from
- *      git-worker — never reimplemented), append a synthetic `GitSnapshot` via
- *      the prepared `stmts.insertEvent` (NOT a raw INSERT — avoids EVENT_COLUMNS
- *      drift), and drain it. Folding over the prior live row clears departed
- *      jobs through its bounded fan-out and retains the per-root attribution
- *      floor. The synthetic event's id > floor, so `projectGitStatus` does
- *      the full pass1/pass2/pass4 against evidence newer than each root's prior
- *      snapshot floor → full fidelity without resurrecting old mutations.
- *   4. persist `floor = capturedMaxId` and clear `seed_required` atomically.
+ *   3. per watched root: capture a fresh inclusive `max(events.id)` watermark
+ *      IMMEDIATELY before `readStatus` → `buildGitSnapshot` (REUSED from
+ *      git-worker — never reimplemented), append both in a synthetic
+ *      `GitSnapshot` through `stmts.insertEvent`, and drain it. The watermark,
+ *      not the later synthetic event id, bounds attribution evidence visible to
+ *      that Git read; events arriving after it remain for the next observation.
+ *   4. persist the original replay floor and clear `seed_required` atomically.
  *
  * **Degrade, NOT fatalExit.** This is the FIRST git shell-out on the daemon main
  * thread; a hang or failure must NOT take down the control plane (jobs / epics /
@@ -328,6 +324,12 @@ export function seedGitProjection(
       break;
     }
     try {
+      // Fold over the prior live row rather than deleting it first. The prior
+      // `git_status.jobs` set drives the bounded dirty→clean counter fan-out.
+      // Bind attribution to the inclusive event watermark captured immediately
+      // BEFORE this root's Git read — the synthetic event id is publication
+      // order, not proof that the read observed an intervening mutation.
+      const attributionEventId = readMaxEventId(db);
       const snapshot = buildSnapshotForRoot(root);
       if (snapshot == null) {
         // Time-bound git read failed/timed out for this root — skip it (the row
@@ -343,11 +345,14 @@ export function seedGitProjection(
         );
         continue;
       }
-      // Fold over the prior live row rather than deleting it first. The prior
-      // `git_status.jobs` set drives the bounded dirty→clean counter fan-out,
-      // while its last_event_id is the per-root attribution floor that prevents
-      // an old mutation from resurrecting when a path is dirtied again later.
-      insertSyntheticGitSnapshot(stmts, root, JSON.stringify(snapshot));
+      insertSyntheticGitSnapshot(
+        stmts,
+        root,
+        JSON.stringify({
+          ...snapshot,
+          attribution_event_id: attributionEventId,
+        }),
+      );
       // Fold the just-appended snapshot (id > floor → full-fidelity re-derive).
       options.drainToCompletion(db);
       seededRoots.push(root);

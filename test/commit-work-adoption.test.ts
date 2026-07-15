@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runForTest } from "../cli/commit-work";
+import {
+  type CommitWorkDeps,
+  runForTest as runCommitWorkForTest,
+} from "../cli/commit-work";
 import type { GitRunner } from "../src/commit-work/git-exec";
 import {
   IdentityConflictError,
@@ -12,6 +22,7 @@ import {
 import {
   commitFrozenPrivateIndex,
   createFrozenPrivateIndex,
+  MAX_COMMIT_MESSAGE_BYTES,
   type PrivateIndexError,
 } from "../src/commit-work/private-index";
 import { discoverCommitWorkSurface } from "../src/commit-work/surface";
@@ -28,6 +39,14 @@ const FOREIGN = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const COMMIT = "cccccccccccccccccccccccccccccccccccccccc";
 const TREE = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const MUTATED_TREE = "ffffffffffffffffffffffffffffffffffffffff";
+
+function runForTest(argv: string[], deps: CommitWorkDeps = {}) {
+  return runCommitWorkForTest(argv, {
+    validateIdentity: () => true,
+    validateTaskBinding: () => true,
+    ...deps,
+  });
+}
 
 function statusRecord(path = "a.txt"): string {
   return `? ${path}\0`;
@@ -102,6 +121,31 @@ describe("commit-work foreign claim adoption", () => {
       },
     });
     expect(terminal.adopted).toEqual(["a.txt"]);
+  });
+
+  test("unavailable overlap evidence blocks adoption unless direct evidence is complete", async () => {
+    const unavailable = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: ID,
+      adoptedPaths: ["a.txt"],
+      git: surfaceGit(),
+      deps: { readClaims: () => null },
+    });
+    expect(unavailable.adopted).toEqual([]);
+    expect(unavailable.rejections).toEqual([
+      { input: "a.txt", path: "a.txt", code: "ownership_unavailable" },
+    ]);
+
+    const directComplete = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: ID,
+      adoptedPaths: ["a.txt"],
+      git: surfaceGit(),
+      directEvidence: { complete: true, claims: [] },
+      deps: { readClaims: () => null },
+    });
+    expect(directComplete.adopted).toEqual(["a.txt"]);
+    expect(directComplete.rejections).toEqual([]);
   });
 
   test("Bash and inferred observations require explicit adoption", async () => {
@@ -229,6 +273,7 @@ interface RefFixtureOptions {
   tree?: string;
   casFails?: boolean;
   commitFails?: boolean;
+  signingConfigRace?: boolean;
   onHook?: (name: string) => void;
 }
 
@@ -241,6 +286,7 @@ function refFixture(options: RefFixtureOptions = {}) {
   let privateUpdated = false;
   let hookRan = false;
   let removeCount = 0;
+  let configFingerprint = "before";
   const calls: Array<{
     args: string[];
     cwd?: string;
@@ -280,7 +326,11 @@ function refFixture(options: RefFixtureOptions = {}) {
     if (args[0] === "config" && args.includes("core.filemode")) {
       return { code: 0, stdout: "true\n", stderr: "" };
     }
+    if (args[0] === "config" && args.includes("--list")) {
+      return { code: 0, stdout: configFingerprint, stderr: "" };
+    }
     if (args[0] === "config" && args.includes("commit.gpgSign")) {
+      if (options.signingConfigRace) configFingerprint = "after";
       return { code: 0, stdout: "false\n", stderr: "" };
     }
     if (args[0] === "ls-tree") {
@@ -452,6 +502,12 @@ describe("commit-work atomic plumbing publication", () => {
           tree: TREE,
           entries: [],
           paths: [],
+          worktreeBaseline: "",
+          targetIndexPath: "",
+          targetIndexBaseline: "",
+          gitConfigBaseline: "",
+          hookSetBaseline: "",
+          signing: { args: [], enabled: false },
         },
         "initial",
         "/repo",
@@ -510,6 +566,45 @@ describe("commit-work atomic plumbing publication", () => {
     ).toBe(false);
   });
 
+  test("revalidates ownership after final index checks and before CAS", async () => {
+    const fixture = refFixture();
+    const originalFingerprint = fixture.fs.fingerprintIndex;
+    let fingerprintReads = 0;
+    fixture.fs.fingerprintIndex = () => {
+      fingerprintReads += 1;
+      return originalFingerprint();
+    };
+    const validationBoundaries: number[] = [];
+    let updateRefCalled = false;
+    const run: GitRunner = async (args, options) => {
+      if (args[0] === "update-ref") updateRefCalled = true;
+      return fixture.run(args, options);
+    };
+    const frozen = await createFrozenPrivateIndex(
+      "/repo",
+      ["a.txt"],
+      run,
+      fixture.fs,
+    );
+
+    await expect(
+      commitFrozenPrivateIndex(frozen, "message", "/repo", run, fixture.fs, {
+        validateOwnership: async () => {
+          validationBoundaries.push(fingerprintReads);
+          if (validationBoundaries.length === 3) {
+            throw new Error("foreign claim arrived during final checks");
+          }
+        },
+      }),
+    ).rejects.toThrow("foreign claim arrived during final checks");
+
+    expect(validationBoundaries).toHaveLength(3);
+    expect(validationBoundaries[2]).toBeGreaterThan(
+      validationBoundaries[1] ?? 0,
+    );
+    expect(updateRefCalled).toBe(false);
+  });
+
   test("unexpected parent discards the temporary commit without a ref write", async () => {
     const fixture = refFixture({ parents: [FOREIGN] });
     const error = await capturePrivateError(fixture);
@@ -560,6 +655,17 @@ describe("commit-work atomic plumbing publication", () => {
     );
   });
 
+  test("a signing-policy/config race refuses construction", async () => {
+    const fixture = refFixture({ signingConfigRace: true });
+    await expect(frozenFixture(fixture)).rejects.toMatchObject({
+      code: "surface_changed",
+      stderr: "Git configuration changed while signing policy was captured",
+    });
+    expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+      false,
+    );
+  });
+
   test("construction failure removes its private-index directory", async () => {
     const fixture = refFixture();
     const run: GitRunner = async (args, options) => {
@@ -573,6 +679,162 @@ describe("commit-work atomic plumbing publication", () => {
     ).rejects.toMatchObject({ code: "index_seed_failed" });
     expect(fixture.removed()).toBe(1);
   });
+
+  test("a hook cannot add an untrusted Task trailer", async () => {
+    const fixture = refFixture();
+    const run: GitRunner = async (args, options) => {
+      const result = await fixture.run(args, options);
+      if (args[0] === "hook" && args.includes("prepare-commit-msg")) {
+        const separator = args.indexOf("--");
+        const messagePath = separator >= 0 ? args[separator + 1] : undefined;
+        if (messagePath) {
+          appendFileSync(messagePath, "Task: fn-999-forged.1\n");
+        }
+      }
+      return result;
+    };
+    const frozen = await createFrozenPrivateIndex(
+      "/repo",
+      ["a.txt"],
+      run,
+      fixture.fs,
+    );
+    await expect(
+      commitFrozenPrivateIndex(
+        frozen,
+        "feat: exact\n\nTask: fn-1-real.1",
+        "/repo",
+        run,
+        fixture.fs,
+      ),
+    ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+    expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+      false,
+    );
+  });
+
+  for (const injected of [
+    `Session-Id: ${OTHER}`,
+    "Signed-off-by: attacker@example.test",
+    "Planctl-Op: refine-apply",
+    "Planctl-Target: fn-999-forged.1",
+  ]) {
+    test(`a hook cannot inject protected authority trailer ${injected.split(":")[0]}`, async () => {
+      const fixture = refFixture();
+      const run: GitRunner = async (args, options) => {
+        const result = await fixture.run(args, options);
+        if (args[0] === "hook" && args.includes("prepare-commit-msg")) {
+          const separator = args.indexOf("--");
+          const messagePath = separator >= 0 ? args[separator + 1] : undefined;
+          if (messagePath) appendFileSync(messagePath, `${injected}\n`);
+        }
+        return result;
+      };
+      const frozen = await createFrozenPrivateIndex(
+        "/repo",
+        ["a.txt"],
+        run,
+        fixture.fs,
+      );
+      await expect(
+        commitFrozenPrivateIndex(
+          frozen,
+          "feat: exact\n\nTask: fn-1-real.1",
+          "/repo",
+          run,
+          fixture.fs,
+          { jobId: ID },
+        ),
+      ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+      expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+        false,
+      );
+    });
+  }
+
+  test("a hook cannot expand the commit message beyond its byte bound", async () => {
+    const fixture = refFixture();
+    const run: GitRunner = async (args, options) => {
+      const result = await fixture.run(args, options);
+      if (args[0] === "hook" && args.includes("prepare-commit-msg")) {
+        const separator = args.indexOf("--");
+        const messagePath = separator >= 0 ? args[separator + 1] : undefined;
+        if (messagePath) {
+          writeFileSync(
+            messagePath,
+            "x".repeat(MAX_COMMIT_MESSAGE_BYTES + 8_192),
+          );
+        }
+      }
+      return result;
+    };
+    const frozen = await createFrozenPrivateIndex(
+      "/repo",
+      ["a.txt"],
+      run,
+      fixture.fs,
+    );
+    await expect(
+      commitFrozenPrivateIndex(
+        frozen,
+        "feat: bounded message",
+        "/repo",
+        run,
+        fixture.fs,
+        { jobId: ID },
+      ),
+    ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+    expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+      false,
+    );
+  });
+
+  for (const [key, value] of [
+    ["Task", "fn-1-real.1"],
+    ["Job-Id", ID],
+    ["Keeper-Commit-Id", "keeper-commit-work:audit-marker"],
+  ] as const) {
+    test(`a hook cannot alter ${key} with a trailer continuation`, async () => {
+      const fixture = refFixture();
+      const run: GitRunner = async (args, options) => {
+        const result = await fixture.run(args, options);
+        if (args[0] === "hook" && args.includes("prepare-commit-msg")) {
+          const separator = args.indexOf("--");
+          const messagePath = separator >= 0 ? args[separator + 1] : undefined;
+          if (messagePath) {
+            const before = readFileSync(messagePath, "utf8");
+            writeFileSync(
+              messagePath,
+              before.replace(
+                `${key}: ${value}`,
+                `${key}: ${value}\n forged-continuation`,
+              ),
+            );
+          }
+        }
+        return result;
+      };
+      const frozen = await createFrozenPrivateIndex(
+        "/repo",
+        ["a.txt"],
+        run,
+        fixture.fs,
+      );
+      await expect(
+        commitFrozenPrivateIndex(
+          frozen,
+          "feat: exact\n\nTask: fn-1-real.1",
+          "/repo",
+          run,
+          fixture.fs,
+          { jobId: ID },
+        ),
+      ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+      expect(fixture.calls.some((call) => call.args[0] === "commit-tree")).toBe(
+        false,
+      );
+    });
+  }
 
   test("private construction uses exact NUL index-info and one trailer render", async () => {
     const fixture = refFixture();

@@ -18,7 +18,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,15 +34,30 @@ import {
 } from "../src/commit-work/attribution";
 import { CommitWorkLock, FLOCK_CONSTANTS } from "../src/commit-work/flock";
 import { resolveSessionId } from "../src/commit-work/session-id";
+import { readOwnershipClaims } from "../src/commit-work/surface";
 import { openDb } from "../src/db";
+import {
+  serializeDeadLetterRecord,
+  serializeEventLogRecord,
+} from "../src/dead-letter";
+import {
+  ATTRIBUTION_FLOOR_PATH,
+  ATTRIBUTION_FLOOR_SESSION_ID,
+} from "../src/git-attribution-floor";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
+let eventsLogDir: string;
+let deadLetterDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-commit-work-"));
   dbPath = join(tmpDir, "keeper.db");
+  eventsLogDir = join(tmpDir, "events-log");
+  deadLetterDir = join(tmpDir, "dead-letters");
+  mkdirSync(eventsLogDir);
+  mkdirSync(deadLetterDir);
   // fn-769 file variant: seeds and the attribution reader open this SAME path
   // across separate connections, so the migrated schema must live on disk.
   // Pre-write the template image once (skipping the ladder); later opens pass
@@ -94,6 +116,17 @@ describe("resolveSessionId", () => {
 // attribution reader
 // ---------------------------------------------------------------------------
 
+function readClaims(
+  worktree = "/repo",
+  hooks: Parameters<typeof readOwnershipClaims>[2] = {},
+) {
+  return readOwnershipClaims(worktree, dbPath, {
+    eventsLogDir,
+    deadLetterDir,
+    ...hooks,
+  });
+}
+
 /** Seed an undischarged file_attributions row in the temp DB. */
 function seedAttribution(opts: {
   projectDir: string;
@@ -120,6 +153,380 @@ function seedAttribution(opts: {
   );
   db.close();
 }
+
+describe("readOwnershipClaims", () => {
+  test("includes exact tool mutations above the root's pre-read Git watermark", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'working', 1)",
+    );
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       VALUES ('/repo', 1, 0)`,
+    );
+    const mutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/a.ts')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (2, 'outside', 'PostToolUse', 'post_tool_use', 'Write', '/other', '{}', '/other/a.ts')`,
+    );
+    db.close();
+
+    expect(readClaims()).toEqual([
+      {
+        path: "a.ts",
+        sessionId: "foreign",
+        liveness: "live",
+        state: "working",
+        oid: null,
+        mode: null,
+        source: "direct",
+      },
+    ]);
+
+    const { db: folded } = openDb(dbPath, { migrate: false });
+    folded.run(
+      `INSERT INTO file_attributions
+         (project_dir, session_id, file_path, last_mutation_at, op, source,
+          last_event_id, updated_at)
+       VALUES ('/repo', 'foreign', 'a.ts', 1, 'Write', 'tool', ?, 1)`,
+      [mutation.lastInsertRowid],
+    );
+    folded.run(
+      "UPDATE git_status SET attribution_event_id = ? WHERE project_dir = '/repo'",
+      [mutation.lastInsertRowid],
+    );
+    folded.close();
+
+    const claims = readClaims();
+    expect(claims).toHaveLength(1);
+    expect(claims?.[0]).toMatchObject({
+      path: "a.ts",
+      sessionId: "foreign",
+      source: "tool",
+    });
+  });
+
+  test("a never-observed root conservatively scans exact mutations from genesis", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'working', 1)",
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/genesis.ts')`,
+    );
+    db.close();
+
+    expect(readClaims()).toEqual([
+      {
+        path: "genesis.ts",
+        sessionId: "foreign",
+        liveness: "live",
+        state: "working",
+        oid: null,
+        mode: null,
+        source: "direct",
+      },
+    ]);
+  });
+
+  test("merges a foreign exact mutation receipt before daemon ingestion", () => {
+    const repo = join(tmpDir, "repo");
+    mkdirSync(join(repo, "real"), { recursive: true });
+    writeFileSync(join(repo, "real", "late.ts"), "late\n");
+    symlinkSync("real", join(repo, "alias"));
+
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'working', 1)",
+    );
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       VALUES (?, 1, 0)`,
+      [repo],
+    );
+    db.close();
+    writeFileSync(
+      join(eventsLogDir, "123.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "foreign",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          mutation_path: join(repo, "alias", "late.ts"),
+        },
+      }),
+    );
+
+    expect(readClaims(repo)).toEqual([
+      {
+        path: "real/late.ts",
+        sessionId: "foreign",
+        liveness: "live",
+        state: "working",
+        oid: null,
+        mode: null,
+        source: "direct",
+      },
+    ]);
+  });
+
+  test("fresh pending and receipt mutations never inherit stale terminal liveness", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'ended', 1)",
+    );
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       VALUES ('/repo', 1, 0)`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', '{}', '/repo/pending.ts')`,
+    );
+    db.close();
+    writeFileSync(
+      join(eventsLogDir, "terminal-lag.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "foreign",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          mutation_path: "/repo/receipt.ts",
+        },
+      }),
+    );
+
+    expect(readClaims()).toEqual([
+      expect.objectContaining({
+        path: "pending.ts",
+        sessionId: "foreign",
+        liveness: "unknown",
+        state: "ended",
+        source: "direct",
+      }),
+      expect.objectContaining({
+        path: "receipt.ts",
+        sessionId: "foreign",
+        liveness: "unknown",
+        state: "ended",
+        source: "direct",
+      }),
+    ]);
+  });
+
+  test("fails closed while an exact mutation waits in the dead-letter channel", () => {
+    writeFileSync(
+      join(deadLetterDir, "321.ndjson"),
+      serializeDeadLetterRecord({
+        dl_id: "dead-mutation-1",
+        session_id: "foreign",
+        hook_event: "PostToolUse",
+        ts: 1,
+        dl_written_at: 2,
+        pid: 321,
+        bindings: {
+          session_id: "foreign",
+          hook_event: "PostToolUse",
+          ts: 1,
+          tool_name: "Write",
+          mutation_path: "/repo/dead.ts",
+        },
+      }),
+    );
+    expect(readClaims()).toBeNull();
+  });
+
+  test("fails closed when a receipt is ingested and deleted across the DB snapshot", () => {
+    const receipt = join(eventsLogDir, "late.ndjson");
+    let moved = false;
+    const claims = readClaims("/repo", {
+      afterReceiptRead: () => {
+        writeFileSync(
+          receipt,
+          serializeEventLogRecord({
+            bindings: {
+              session_id: "foreign",
+              hook_event: "PostToolUse",
+              tool_name: "Write",
+              mutation_path: "/repo/handoff.ts",
+            },
+          }),
+        );
+        const { db } = openDb(dbPath, { migrate: false });
+        db.run(
+          `INSERT INTO events
+             (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+              mutation_path)
+           VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write',
+                   '/repo', '{}', '/repo/handoff.ts')`,
+        );
+        db.close();
+        unlinkSync(receipt);
+        moved = true;
+      },
+    });
+
+    expect(moved).toBe(true);
+    // The old SQLite snapshot and both directory listings are individually
+    // empty, but the fresh append-only head exposes the source handoff.
+    expect(claims).toBeNull();
+  });
+
+  test("cannot miss a reducer fold between durable and watermark reads", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('foreign', 1, 'working', 1)",
+    );
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       VALUES ('/repo', 1, 0)`,
+    );
+    const mutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/race.ts')`,
+    );
+    db.close();
+
+    let folded = false;
+    const claims = readClaims("/repo", {
+      afterDurableRead: () => {
+        const { db: writer } = openDb(dbPath, { migrate: false });
+        writer
+          .transaction(() => {
+            writer.run(
+              `INSERT INTO file_attributions
+               (project_dir, session_id, file_path, last_mutation_at, op,
+                source, last_event_id, updated_at)
+             VALUES ('/repo', 'foreign', 'race.ts', 1, 'Write', 'tool', ?, 1)`,
+              [mutation.lastInsertRowid],
+            );
+            writer.run(
+              "UPDATE git_status SET attribution_event_id = ? WHERE project_dir = '/repo'",
+              [mutation.lastInsertRowid],
+            );
+          })
+          .immediate();
+        writer.close();
+        folded = true;
+      },
+    });
+
+    expect(folded).toBe(true);
+    // The reader's one snapshot predates the fold: its durable set is empty,
+    // but its old watermark still admits the exact event through the tail.
+    expect(claims).toEqual([
+      {
+        path: "race.ts",
+        sessionId: "foreign",
+        liveness: "live",
+        state: "working",
+        oid: null,
+        mode: null,
+        source: "direct",
+      },
+    ]);
+  });
+
+  test("a dropped root reads its retained sentinel floor", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES ('old', 1, 'working', 1), ('new', 1, 'working', 1)",
+    );
+    const oldMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1, 'old', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/old.ts')`,
+    );
+    db.run(
+      `INSERT INTO file_attributions
+         (project_dir, session_id, file_path, last_mutation_at, last_commit_at,
+          op, source, last_event_id, updated_at)
+       VALUES (?, ?, ?, 1, 1, 'attribution-floor', 'plan', ?, 1)`,
+      [
+        "/repo",
+        ATTRIBUTION_FLOOR_SESSION_ID,
+        ATTRIBUTION_FLOOR_PATH,
+        oldMutation.lastInsertRowid,
+      ],
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (2, 'new', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/new.ts')`,
+    );
+    db.close();
+
+    expect(readClaims()).toEqual([
+      {
+        path: "new.ts",
+        sessionId: "new",
+        liveness: "live",
+        state: "working",
+        oid: null,
+        mode: null,
+        source: "direct",
+      },
+    ]);
+  });
+
+  test("durable claim overflow returns unavailable rather than truncating", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `WITH RECURSIVE n(value) AS (
+         SELECT 0
+         UNION ALL
+         SELECT value + 1 FROM n WHERE value < 10000
+       )
+       INSERT INTO file_attributions
+         (project_dir, session_id, file_path, last_mutation_at, op, source)
+       SELECT '/repo', 'foreign-' || value, 'f-' || value, 1, 'Write', 'tool'
+         FROM n`,
+    );
+    db.close();
+
+    expect(readClaims()).toBeNull();
+  });
+
+  test("future or corrupt persisted watermarks make ownership unavailable", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    const mutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1, 'foreign', 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/a.ts')`,
+    );
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       VALUES ('/repo', 1, ?)`,
+      [Number(mutation.lastInsertRowid) + 1],
+    );
+    db.close();
+
+    expect(readClaims()).toBeNull();
+
+    const { db: corrupt } = openDb(dbPath, { migrate: false });
+    corrupt.run(
+      "UPDATE git_status SET attribution_event_id = -1 WHERE project_dir = '/repo'",
+    );
+    corrupt.close();
+    expect(readClaims()).toBeNull();
+  });
+});
 
 describe("getSessionDirtyFiles", () => {
   test("returns on-hook files intersected with the live dirty set, sorted", () => {

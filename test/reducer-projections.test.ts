@@ -25,6 +25,7 @@ import {
   serializeBuildSnapshot,
 } from "../src/reducer";
 import type { Event } from "../src/types";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -74,6 +75,11 @@ function insertEvent(
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
+  const eventData = bindGitObservationWatermark(
+    db,
+    overrides.hook_event,
+    overrides.data ?? "{}",
+  );
   const row = {
     ts,
     session_id: overrides.session_id ?? "sess-a",
@@ -91,7 +97,7 @@ function insertEvent(
     agent_id: overrides.agent_id ?? null,
     agent_type: overrides.agent_type ?? null,
     stop_hook_active: overrides.stop_hook_active ?? null,
-    data: overrides.data ?? "{}",
+    data: eventData,
     subagent_agent_id: overrides.subagent_agent_id ?? null,
     spawn_name: overrides.spawn_name ?? null,
     start_time: overrides.start_time ?? null,
@@ -136,7 +142,7 @@ function insertEvent(
         : deriveSeedMutationPath(
             overrides.hook_event,
             overrides.tool_name ?? null,
-            overrides.data ?? "{}",
+            eventData,
           ),
   };
   db.run(

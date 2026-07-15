@@ -1634,6 +1634,7 @@ function makeGitStatus(overrides: Partial<GitStatus>): GitStatus {
     jobs: [],
     last_event_id: 0,
     updated_at: 0,
+    attribution_event_id: 0,
     ...overrides,
   };
 }

@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -284,6 +285,16 @@ test("a clean docs/adr commit passes runScopedLint and writes no ledger", async 
     runScopedLint(["docs/adr/0001-use-events.md"], repo),
   ).resolves.toBeUndefined();
   expect(existsSync(ledger)).toBe(false);
+});
+
+test("an oversized domain doc fails closed before an unbounded read", async () => {
+  const context = join(repo, "CONTEXT.md");
+  writeFileSync(context, "x");
+  truncateSync(context, 1_048_577);
+  await expect(runScopedLint(["CONTEXT.md"], repo)).rejects.toMatchObject({
+    linter: "domain-docs",
+    stderr: expect.stringContaining("bounded domain-docs input size"),
+  });
 });
 
 test("a repo with no CONTEXT.md or docs/adr staged is untouched by the arm", async () => {

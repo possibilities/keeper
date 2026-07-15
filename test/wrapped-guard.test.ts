@@ -13,11 +13,23 @@
 // a virtual repo layout.
 
 import { describe, expect, test } from "bun:test";
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   decideWrappedGuard,
   evaluateWrappedBash,
+  fsProbe,
   type TreeProbe,
+  writeAtomicWrappedHandoff,
   type WrappedGuardPayload,
 } from "../plugins/keeper/plugin/hooks/wrapped-guard.ts";
 
@@ -26,17 +38,23 @@ import {
 // ---------------------------------------------------------------------------
 
 describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const gitRead = "git -c core.fsmonitor=false -c core.pager=cat --no-pager";
   const allow = [
     // delegation surface: the blocking leg launch + resume + wait + read (no shell
     // operators — a clean `keeper agent run` is the whole point of the courier)
-    "keeper agent run codex --preset gpt-5::high 'implement task'",
-    "keeper agent run --resume leg-fn-1-x.2 'address the lint failure'",
+    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
+    "keeper agent run codex 'address the lint failure' --resume leg-fn-1-x.2 --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
     "keeper agent wait leg-fn-1-x.2",
     "keeper agent wait-for-stop leg-fn-1-x.2",
     "keeper agent show-last-message leg-fn-1-x.2",
     "keeper agent providers resolve gpt-5 high",
+    `mktemp -d ${join(tmpdir(), "keeper-wrapped-XXXXXX")}`,
     // close-out surface
-    "keeper commit-work 'feat(scope): implement X'",
+    "keeper commit-work --task-id fn-1-x.2 'feat(scope): implement X'",
     "keeper plan done fn-1-x.2 --summary 'done'",
     // reads / orientation
     "keeper plan cat fn-1-x.2",
@@ -44,39 +62,27 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "keeper plan find-task-commit fn-1-x.2",
     "keeper session state",
     "keeper baseline abc123 --wait",
-    // read-only + staging git
-    "git add src/x.ts",
-    "git add -A",
-    "git status",
-    "git log --oneline",
-    "git diff HEAD~1",
-    "git show HEAD",
+    // read-only git
+    `${gitRead} status`,
+    `${gitRead} log --no-ext-diff --no-textconv --oneline`,
+    `${gitRead} diff --no-ext-diff --no-textconv HEAD~1`,
+    `${gitRead} show --no-ext-diff --no-textconv HEAD`,
     "git rev-parse HEAD",
-    "git reset --soft HEAD~1",
-    "git -C /repo log --oneline",
+    `git -C /repo -c core.fsmonitor=false -c core.pager=cat --no-pager log --no-ext-diff --no-textconv --oneline`,
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
-    "git log -c --format=%H",
-    // explicit test files + stable named gates
-    "bun test test/wrapped-guard.test.ts",
-    "bun test test/wrapped-guard.test.ts test/escalation-guard.test.ts",
-    "bun test --test-name-pattern allow test/wrapped-guard.test.ts",
-    "bun test --coverage test/wrapped-guard.test.ts",
-    "bun run test:gate",
-    "bun run test:full",
+    `${gitRead} log --no-ext-diff --no-textconv -c --format=%H`,
     // a stripped benign wrapper in front of an allowed command
-    "timeout 300 bun test test/wrapped-guard.test.ts",
-    "nohup bun run test:gate",
     "nohup keeper agent wait leg-x",
     // pipes between two allowlisted commands
-    "git log --oneline | git rev-parse HEAD",
+    `${gitRead} log --no-ext-diff --no-textconv --oneline | git rev-parse HEAD`,
     // a `>` INSIDE single quotes is literal — not a redirect
-    "git log --grep 'fix > bug'",
+    `${gitRead} log --no-ext-diff --no-textconv --grep 'fix > bug'`,
     // an empty command runs nothing
     "",
   ];
   for (const cmd of allow) {
     test(`allows: ${cmd}`, () => {
-      expect(evaluateWrappedBash(cmd)).toBeNull();
+      expect(evaluateWrappedBash(cmd, context)).toBeNull();
     });
   }
 
@@ -91,7 +97,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "bun -e 'code'",
     "bun --eval 'code'",
     "bun -p 'code'",
-    // --- aggregate discovery must use the stable named package gate ---
+    // --- repository tests/scripts are transitive code execution ---
     "bun test",
     "bun test .",
     "bun test test",
@@ -102,11 +108,22 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "bun test --coverage",
     "timeout 300 bun test",
     "nohup bun test --coverage",
+    "bun test test/wrapped-guard.test.ts",
+    "bun test test/wrapped-guard.test.ts test/escalation-guard.test.ts",
+    "bun test --test-name-pattern allow test/wrapped-guard.test.ts",
+    "bun test --coverage test/wrapped-guard.test.ts",
+    "bun run test:gate",
+    "bun run test:full",
+    "timeout 300 bun test test/wrapped-guard.test.ts",
+    "nohup bun run test:gate",
     // --- bun run demands a NAMED package script: a path-shaped target could run a
     //     just-written out-of-tree file, and a bare run has no script ---
+    "bun run start",
     "bun run /scratch/gen.ts",
     "bun run ./gen.ts",
     "bun run",
+    "mktemp -d /tmp/arbitrary-XXXXXX",
+    "mktemp /tmp/keeper-wrapped-XXXXXX",
     // --- in-tree write vectors: redirect / heredoc / here-string / tee / sed -i ---
     "echo hacked > src/x.ts",
     "echo more >> src/x.ts",
@@ -127,14 +144,22 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "tar -x -f /tmp/payload.tar",
     "tar xf /tmp/payload.tar",
     // --- mutating / off-list git (source commits route through commit-work) ---
+    "git add src/x.ts",
+    "git add -A",
     "git commit -m 'feat(x): land the leg work'",
     "git commit -F /scratch/msg.txt",
     "git commit --trailer 'Job-Id: job-1' -m msg",
+    "keeper commit-work 'feat(x): missing trusted task'",
+    "keeper commit-work -- --task-id",
+    "keeper commit-work --task-id fn-1-other.9 'wrong task'",
+    "keeper agent run claude 'escape' --model opus --system-file /tmp/c.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
+    "keeper agent run codex 'unbound nested agent' --model gpt-5",
     "git push",
     "git rm src/x.ts",
     "git mv a b",
     "git checkout -- src/x.ts",
     "git restore src/x.ts",
+    "git reset --soft HEAD~1",
     "git reset --hard HEAD~1",
     "git reset --mixed HEAD~1",
     "git reset",
@@ -144,13 +169,24 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "git -c core.sshCommand=/tmp/x log",
     "git --config-env=core.pager=EVIL --paginate log",
     "git --git-dir d -c x=y status",
+    "git -ccore.pager=/tmp/x log",
+    "git --no-pager --paginate log",
+    "git cat-file --filters HEAD:file",
+    `${gitRead} show --no-ext-diff --no-textconv --textconv HEAD`,
+    `${gitRead} log --no-ext-diff --no-textconv --show-signature`,
     // --- exec-bearing / file-writing flags on an allowlisted read subcommand ---
     "git grep --open-files-in-pager=/tmp/evil pattern",
     "git grep -O/tmp/evil pattern",
     "git grep --op=/tmp/evil",
     "git log --output=/tmp/evil",
     "git diff --output /tmp/evil HEAD~1",
-    // --- off-list keeper subcommands ---
+    // --- off-list keeper subcommands / mutating plan verbs ---
+    "keeper plan scaffold --file /tmp/plan.yaml",
+    "keeper plan refine-apply fn-1-x --file /tmp/delta.yaml",
+    "keeper plan claim fn-1-x.2",
+    "keeper plan done fn-1-other.9 --summary done",
+    "keeper plan done fn-1-x.2 --force",
+    "keeper plan done fn-1-x.2 --project /tmp/other",
     "keeper prompt render",
     "keeper tabs restore",
     "keeper dispatch work::fn-1-x.2",
@@ -168,7 +204,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
   ];
   for (const cmd of deny) {
     test(`denies: ${cmd}`, () => {
-      expect(evaluateWrappedBash(cmd)).not.toBeNull();
+      expect(evaluateWrappedBash(cmd, context)).not.toBeNull();
     });
   }
 });
@@ -220,7 +256,7 @@ test("evaluateWrappedBash: the deny reason NAMES the offending construct / comma
 // ---------------------------------------------------------------------------
 
 const REPO = "/w/repo";
-const OUTSIDE = "/w/scratch"; // not a tracked tree
+const OUTSIDE = join(tmpdir(), "keeper-wrapped-test"); // inert scratch root
 
 /** A virtual repo layout: identity realpath (a sentinel resolves to null), and a
  *  longest-prefix `.git`-toplevel over the single tracked repo root. */
@@ -230,11 +266,16 @@ function fakeProbe(opts?: { unresolvable?: string[] }): TreeProbe {
     realpath: (abs) => (unresolvable.has(abs) ? null : abs),
     repoToplevel: (resolved) =>
       resolved === REPO || resolved.startsWith(`${REPO}/`) ? REPO : null,
+    scratchFileSafe: () => true,
   };
 }
 
 // The marker is the effective wrapped `<model>::<effort>`; any non-empty value marks.
-const MARKED = { KEEPER_WRAPPED_CELL: "gpt-5::high" };
+const MARKED = {
+  KEEPER_WRAPPED_CELL: "gpt-5::high",
+  KEEPER_WRAPPED_ENVELOPE:
+    "/repo/.keeper/state/wrapped-envelopes/fn-1-x.2.json",
+};
 
 function bashPayload(
   command: string,
@@ -353,8 +394,96 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
     expect(decide(writePayload(`${OUTSIDE}/contract.md`))).toBeNull();
   });
 
+  test("denies out-of-tree writes outside inert system-temp handoff files", () => {
+    expect(
+      decide(writePayload("/w/scratch/contract.md"))?.hookSpecificOutput
+        .permissionDecision,
+    ).toBe("deny");
+    expect(
+      decide(writePayload(`${OUTSIDE}/gen.ts`))?.hookSpecificOutput
+        .permissionDecision,
+    ).toBe("deny");
+  });
+
+  test("rejects a hard-linked scratch handoff target", () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-wrapped-hardlink-"));
+    try {
+      const repo = join(root, "repo");
+      const scratch = join(root, "handoff.json");
+      mkdirSync(join(repo, ".git"), { recursive: true });
+      const tracked = join(repo, "package.json");
+      writeFileSync(tracked, "{}\n");
+      linkSync(tracked, scratch);
+      const denied = decideWrappedGuard(
+        {
+          tool_name: "Write",
+          agent_id: "agent-7",
+          cwd: repo,
+          tool_input: { file_path: scratch },
+        },
+        MARKED,
+        fsProbe(),
+      );
+      expect(denied?.hookSpecificOutput.permissionDecision).toBe("deny");
+
+      rmSync(scratch);
+      expect(
+        decideWrappedGuard(
+          {
+            tool_name: "Write",
+            agent_id: "agent-7",
+            cwd: repo,
+            tool_input: { file_path: scratch },
+          },
+          MARKED,
+          fsProbe(),
+        ),
+      ).toBeNull();
+
+      writeFileSync(scratch, "{}\n", { mode: 0o600 });
+      expect(
+        decideWrappedGuard(
+          {
+            tool_name: "Write",
+            agent_id: "agent-7",
+            cwd: repo,
+            tool_input: { file_path: scratch },
+          },
+          MARKED,
+          fsProbe(),
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("atomic handoff creation is exclusive and never follows a hardlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-wrapped-atomic-"));
+    try {
+      const handoff = join(root, "manifest.json");
+      expect(writeAtomicWrappedHandoff(handoff, '{"ok":true}\n', root)).toBe(
+        true,
+      );
+      expect(readFileSync(handoff, "utf8")).toBe('{"ok":true}\n');
+      expect(writeAtomicWrappedHandoff(handoff, "replacement\n", root)).toBe(
+        false,
+      );
+      expect(readFileSync(handoff, "utf8")).toBe('{"ok":true}\n');
+
+      const source = join(root, "source.txt");
+      const alias = join(root, "message.txt");
+      writeFileSync(source, "caller-owned\n");
+      linkSync(source, alias);
+      expect(writeAtomicWrappedHandoff(alias, "attacker\n", root)).toBe(false);
+      expect(readFileSync(source, "utf8")).toBe("caller-owned\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("contains an out-of-tree Write followed by bun run of that file", () => {
-    const generated = `${OUTSIDE}/gen.ts`;
+    const generated = `${OUTSIDE}/contract.json`;
     expect(decide(writePayload(generated))).toBeNull();
     expect(
       decide(bashPayload(`bun run ${generated}`))?.hookSpecificOutput
@@ -383,17 +512,13 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
 
   test("permits the delegation + close-out Bash surface for a marked subagent", () => {
     for (const cmd of [
-      "keeper agent run codex --preset gpt-5::high 'go'",
-      "keeper agent run --resume leg 'fix lint'",
+      "keeper agent run codex 'go' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
+      "keeper agent run codex 'fix lint' --resume leg --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
       "keeper agent wait leg",
-      "keeper commit-work 'feat(x): y'",
+      "keeper commit-work --task-id fn-1-x.2 'feat(x): y'",
       "keeper plan done fn-1-x.2 --summary 'done'",
       "keeper session state",
-      "git add -A",
-      "git status",
-      "git reset --soft HEAD~1",
-      "bun test test/wrapped-guard.test.ts",
-      "bun run test:gate",
+      "git -c core.fsmonitor=false -c core.pager=cat --no-pager status",
     ]) {
       expect(decide(bashPayload(cmd))).toBeNull();
     }

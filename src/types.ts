@@ -1061,6 +1061,8 @@ export interface GitStatus {
   jobs: unknown[];
   last_event_id: number | null;
   updated_at: number;
+  /** Inclusive events.id watermark captured immediately before the Git read. */
+  attribution_event_id: number;
 }
 
 /**

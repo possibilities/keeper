@@ -25,6 +25,7 @@ import {
   setTmuxProjectionSeedRequired,
 } from "../src/db";
 import { drain } from "../src/reducer";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -65,7 +66,11 @@ function insertEvent(overrides: {
       overrides.hook_event,
       null,
       overrides.cwd ?? "/repo",
-      overrides.data ?? "{}",
+      bindGitObservationWatermark(
+        db,
+        overrides.hook_event,
+        overrides.data ?? "{}",
+      ),
       overrides.plan_op ?? null,
       overrides.plan_target ?? null,
       overrides.plan_epic_id ?? null,

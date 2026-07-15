@@ -73,6 +73,7 @@ import {
   __resetSubagentPreParseMemoForTest,
   resolveBridgeAgentId,
 } from "../src/subagent-invocations";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -526,7 +527,11 @@ function insertEvent(overrides: {
   account_route?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
-  const data = overrides.data ?? "{}";
+  const data = bindGitObservationWatermark(
+    db,
+    overrides.hook_event,
+    overrides.data ?? "{}",
+  );
   // Derive `mutation_path` (the v73 promoted column) from `data` the SAME way
   // the live hook does, so a seeded mutation row carries the column BEFORE the
   // body is shed — the post-shed git-attribution scan reads the column, not the

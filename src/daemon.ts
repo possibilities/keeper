@@ -6958,7 +6958,9 @@ export function readSpillDocument(
   }
   let text: string;
   try {
-    text = (deps.read ?? ((path: string) => readFileSync(path, "utf8")))(realDoc);
+    text = (deps.read ?? ((path: string) => readFileSync(path, "utf8")))(
+      realDoc,
+    );
   } catch (error) {
     return {
       ok: false,
@@ -6970,9 +6972,9 @@ export function readSpillDocument(
   if (text.length === 0) {
     return { ok: false, error: `${label} spill file \`${docPath}\` is empty` };
   }
-  const bytes = (deps.byteLength ?? ((value: string) => Buffer.byteLength(value, "utf8")))(
-    text,
-  );
+  const bytes = (
+    deps.byteLength ?? ((value: string) => Buffer.byteLength(value, "utf8"))
+  )(text);
   if (bytes > maxBytes) {
     return {
       ok: false,
@@ -9345,10 +9347,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         data = JSON.stringify(snapshot);
       } else if (msg.kind === "git-root-dropped") {
         // Tombstone: the reducer DELETEs the `git_status` row whose primary key
-        // is `project_dir`. No payload beyond the pk in `session_id` — matches
-        // the EpicDeleted / TaskDeleted shape so re-fold reproduces the deletion.
+        // is `project_dir`. A clean observation carries its pre-read attribution
+        // watermark; a vanished root carries null and preserves the prior floor.
         hookEvent = "GitRootDropped";
-        data = "";
+        data = JSON.stringify({
+          attribution_event_id: msg.attribution_event_id,
+        });
       } else if (msg.kind === "commit") {
         // Per-commit attribution event. The reducer's `foldCommit` arm reads
         // the payload's `files` + `committer_session_id` and updates

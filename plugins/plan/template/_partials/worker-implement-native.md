@@ -42,14 +42,12 @@ Before you escalate a test failure outside your scope, consult `keeper baseline 
 Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `keeper plan done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — per-extension shellcheck/zig/lua/hadolint + npm lint per JS/TS package. Never invoke linters separately.
 
 ```bash
-keeper commit-work "<type>(<scope>): <summary>
+keeper commit-work --task-id "$TASK_ID" "<type>(<scope>): <summary>
 
-<optional body — 1-3 bullets>
-
-Task: $TASK_ID"
+<optional body — 1-3 bullets>"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. Always run `keeper commit-work --preview-files` first and inspect its one versioned result. Automatic selection uses this invocation's exclusive tool/plan claims; Bash, inferred, package-manager, and codegen rows are observations only. Push to origin is automatic on a successful main-worktree commit.
+`--task-id` validates the task ref and appends the sole trusted `Task:` trailer mechanically. `<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. Always run `keeper commit-work --preview-files` first and inspect its one versioned result. Automatic selection uses this invocation's exclusive tool/plan claims; Bash, inferred, package-manager, and codegen rows are observations only. Push to origin is automatic on a successful main-worktree commit.
 
 **An inspected missing path is an explicit adoption decision.** Re-preview with repeatable exact `--adopt <path>` arguments (or a versioned `--adopt-from` manifest). Adoption is invocation-local, byte/mode-bound, and refuses any live or unknown foreign exclusive claim. Never broaden the set or fall back to raw Git.
 

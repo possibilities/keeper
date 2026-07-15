@@ -19,8 +19,8 @@
 //       ORCHESTRATOR session (no `agent_id`) stays inert.
 //
 // Denied for a marked subagent: Edit / MultiEdit / NotebookEdit outright; Write
-// whose target resolves INSIDE a tracked repo working tree (a Write OUTSIDE every
-// tree — e.g. the scratchpad contract file — is allowed); and every Bash command
+// whose target is not a fresh inert handoff leaf in an owner-private system-temp
+// directory (the guard descriptor-writes it, then denies the host Write); and every Bash command
 // off the delegation + close-out allowlist. The Bash decision is a POSITIVE
 // allowlist, never a blocklist (Claude Code's own regex blocklist fell to
 // CVE-2025-66032): the whole shell-operator / expansion / redirect / heredoc /
@@ -40,13 +40,28 @@
 
 import {
   appendFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   realpathSync,
   statSync,
+  writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 // ---------------------------------------------------------------------------
 // Payload + envelope types.
@@ -61,6 +76,7 @@ export interface WrappedGuardPayload {
   tool_input?: {
     command?: string;
     file_path?: string;
+    content?: string;
     notebook_path?: string;
   };
 }
@@ -88,6 +104,8 @@ export interface TreeProbe {
    *  nearest ancestor directory holding a `.git` entry — or null when the path is
    *  in no tracked repo. */
   repoToplevel(resolved: string): string | null;
+  /** Existing scratch targets must be inert, singly linked regular files. */
+  scratchFileSafe(resolved: string): boolean;
 }
 
 /** Optional private-log sink threaded through the pure core (noop in tests). */
@@ -283,13 +301,24 @@ const BUN_EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
 const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
   "agent",
   "session",
-  "plan",
   "commit-work",
   "baseline",
 ]);
 
-/** Read-only git subcommands allowed for a wrapped worker (staging `add` and
- *  `reset --soft` are handled separately; source commits route through Keeper).
+const WRAPPED_PLAN_VERBS = new Set([
+  "done",
+  "status",
+  "tasks",
+  "show",
+  "cat",
+  "list",
+  "epics",
+  "reconcile",
+  "find-task-commit",
+]);
+
+/** Read-only git subcommands allowed for a wrapped worker. Source/index/ref
+ *  mutations route through the provider leg or Keeper close-out.
  *  Mirrors escalation-guard's read set minus the ref-mutating `branch`, which a
  *  wrapped worker never needs. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
@@ -299,13 +328,17 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
   "status",
   "rev-parse",
   "ls-files",
-  "blame",
   "grep",
-  "describe",
-  "shortlog",
   "ls-tree",
   "cat-file",
 ]);
+
+const WRAPPED_PROVIDER_HARNESSES = new Set(["codex", "hermes", "pi"]);
+
+export interface WrappedCommandContext {
+  taskId?: string;
+  envelopeReference?: string;
+}
 
 /**
  * Strip the leading wrapper tokens (timeout/time/nice/nohup/stdbuf/bare xargs)
@@ -412,11 +445,15 @@ function gitSubcommandInfo(
 function gitConfigInjection(tokens: string[], boundary: number): string | null {
   for (let i = 1; i < boundary; i++) {
     const t = tokens[i] as string;
+    if (t.startsWith("-c") && t !== "-c") {
+      return "glued git -c configuration injection is forbidden";
+    }
     if (t === "-c") {
       const val = tokens[i + 1];
-      if (val?.includes("=")) {
-        return "git `-c <name>=<value>` config injection (an exec-bearing config key turns an allowlisted read subcommand into arbitrary program execution)";
+      if (val !== "core.fsmonitor=false" && val !== "core.pager=cat") {
+        return "git `-c <name>=<value>` config injection (only fixed helper-disabling overrides are permitted)";
       }
+      i += 1;
       continue;
     }
     if (t === "--config-env" || t.startsWith("--config-env=")) {
@@ -460,73 +497,200 @@ function gitReadSubcommandExecFlag(
   return null;
 }
 
-/** git reset is allowed ONLY in its `--soft` form (moves HEAD, keeps index and
- *  working tree). Bare/`--mixed`/`--hard`/`--merge`/`--keep` can discard staged or
- *  working-tree state, so they are denied. */
-function classifyGitReset(resetArgs: string[]): string | null {
-  const destructive = new Set([
-    "--mixed",
-    "--hard",
-    "--merge",
-    "--keep",
-    "-p",
-    "--patch",
-  ]);
-  if (resetArgs.some((a) => destructive.has(a))) {
-    return "git `reset` with a working-tree/index-discarding mode (only `reset --soft` is permitted for a wrapped worker)";
-  }
-  if (resetArgs.includes("--soft")) return null;
-  return "git `reset` is permitted only in its `--soft` form for a wrapped worker (bare reset defaults to --mixed and unstages)";
+/** Raw reset moves a shared branch before Keeper can validate a captured base. */
+function classifyGitReset(_resetArgs: string[]): string {
+  return "raw `git reset` is forbidden for a wrapped worker; a provider-created commit must be unwound by the provider leg or treated as a tooling failure";
 }
 
-const BUN_TEST_VALUE_FLAGS = new Set([
-  "--timeout",
-  "--rerun-each",
-  "--retry",
-  "--seed",
-  "--coverage-reporter",
-  "--coverage-dir",
-  "--test-name-pattern",
-  "-t",
-  "--reporter",
-  "--reporter-outfile",
-  "--max-concurrency",
-  "--path-ignore-patterns",
-  "--changed",
-  "--parallel",
-  "--parallel-delay",
-  "--shard",
-  "--preload",
-]);
-
-/** A direct Bun test is targeted only when it names a literal TypeScript test
- * file. Directories, globs, and option-only/name/watch/coverage forms are broad
- * discovery and must go through the named package gate. */
-function classifyBunTest(tokens: string[]): string | null {
-  const args = tokens.slice(2);
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === "--") {
-      return args
-        .slice(i + 1)
-        .some((value) => !value.startsWith("-") && value.endsWith(".test.ts"))
-        ? null
-        : "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
-    }
-    if (BUN_TEST_VALUE_FLAGS.has(arg)) {
-      i += 1;
-      continue;
-    }
-    if (!arg.startsWith("-") && arg.endsWith(".test.ts")) {
-      return null;
+function wrappedCommitWorkHasTaskId(
+  tokens: string[],
+  expectedTask: string | undefined,
+): boolean {
+  if (expectedTask === undefined) return false;
+  for (let index = 2; index < tokens.length; index += 1) {
+    const arg = tokens[index] as string;
+    if (arg === "--") return false;
+    if (arg === "--task-id") return tokens[index + 1] === expectedTask;
+    if (arg.startsWith("--task-id=")) {
+      return arg.slice("--task-id=".length) === expectedTask;
     }
   }
-  return "direct `bun test` requires an explicit `*.test.ts` file (use `bun run test:gate` for aggregate discovery)";
+  return false;
+}
+
+function wrappedPlanViolation(
+  tokens: string[],
+  context: WrappedCommandContext,
+): string | null {
+  const verb = tokens[2];
+  if (verb === undefined || !WRAPPED_PLAN_VERBS.has(verb)) {
+    return "wrapped `keeper plan` permits only task-bound `done` and read-only status/tasks/show/cat/list/epics/reconcile verbs";
+  }
+  if (verb !== "done") return null;
+  if (context.taskId === undefined || tokens[3] !== context.taskId) {
+    return "wrapped `keeper plan done` must name the launch-bound task";
+  }
+  for (let index = 4; index < tokens.length; index += 1) {
+    const option = tokens[index] as string;
+    if (option === "--force" || option.startsWith("--force=")) {
+      return "wrapped `keeper plan done --force` is forbidden";
+    }
+    if (option !== "--summary" && option !== "--evidence") {
+      return "wrapped `keeper plan done` permits only --summary/--evidence metadata";
+    }
+    if (tokens[index + 1] === undefined) {
+      return `wrapped \`keeper plan done ${option}\` requires a value`;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+function wrappedAgentViolation(
+  tokens: string[],
+  context: WrappedCommandContext,
+): string | null {
+  const verb = tokens[2];
+  if (verb === "providers") {
+    return tokens[3] === "resolve" && tokens.length === 6
+      ? null
+      : "wrapped provider discovery permits only `keeper agent providers resolve <model> <effort>`";
+  }
+  if (verb === "wait" || verb === "wait-for-stop") {
+    if (tokens.length === 4) return null;
+    return tokens.length === 6 &&
+      tokens[4] === "--stop-timeout" &&
+      /^\d+(?:ms|s|m)$/.test(tokens[5] as string)
+      ? null
+      : `wrapped \`keeper agent ${verb}\` accepts one handle and an optional bounded --stop-timeout`;
+  }
+  if (verb === "show-last-message") {
+    return tokens.length === 4
+      ? null
+      : "wrapped `keeper agent show-last-message` accepts exactly one handle";
+  }
+  if (verb !== "run") {
+    return "wrapped `keeper agent` permits only constrained provider run/wait/show/providers operations";
+  }
+  const provider = tokens[3];
+  if (provider === undefined || !WRAPPED_PROVIDER_HARNESSES.has(provider)) {
+    return "wrapped provider runs must use the non-Claude codex, hermes, or pi harness";
+  }
+  const values = new Map<string, string>();
+  const valueOptions = new Set([
+    "--model",
+    "--preset",
+    "--system-file",
+    "--session",
+    "--name",
+    "--output",
+    "--stop-timeout",
+    "--resume",
+  ]);
+  const positional: string[] = [];
+  for (let index = 4; index < tokens.length; index += 1) {
+    const token = tokens[index] as string;
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    if (!valueOptions.has(token) || values.has(token)) {
+      return `wrapped provider run option '${token}' is not permitted`;
+    }
+    const value = tokens[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      return `wrapped provider run option '${token}' requires one value`;
+    }
+    values.set(token, value);
+    index += 1;
+  }
+  if (positional.length !== 1) {
+    return "wrapped provider run requires exactly one inert instruction argument";
+  }
+  if (
+    values.get("--session") !== "wrapped" ||
+    context.taskId === undefined ||
+    values.get("--name") !== context.taskId ||
+    context.envelopeReference === undefined ||
+    values.get("--output") !== context.envelopeReference ||
+    !/^\d+(?:ms|s|m)$/.test(values.get("--stop-timeout") ?? "")
+  ) {
+    return "wrapped provider run must bind --session wrapped, --name, --output, and --stop-timeout to the launch context";
+  }
+  const resumed = values.has("--resume");
+  if (!resumed && !values.has("--system-file")) {
+    return "an initial wrapped provider run requires --system-file";
+  }
+  if (!resumed && values.has("--model") === values.has("--preset")) {
+    return "an initial wrapped provider run requires exactly one --model or --preset";
+  }
+  return null;
+}
+
+function safeGitReadViolation(
+  tokens: string[],
+  sub: { name: string; index: number },
+): string | null {
+  let noPager = false;
+  let fsmonitorDisabled = false;
+  let pagerPinned = false;
+  for (let index = 1; index < sub.index; index += 1) {
+    const token = tokens[index] as string;
+    if (token === "--no-pager" || token === "-P") {
+      noPager = true;
+      continue;
+    }
+    if (token === "--paginate" || token === "-p") {
+      return "git pagination is forbidden for a wrapped worker";
+    }
+    if (token === "-c") {
+      const value = tokens[index + 1];
+      if (value === "core.fsmonitor=false") fsmonitorDisabled = true;
+      else if (value === "core.pager=cat") pagerPinned = true;
+      else {
+        return "git -c is limited to the fixed core.fsmonitor=false/core.pager=cat hardening overrides";
+      }
+      index += 1;
+    }
+  }
+  const args = tokens.slice(sub.index + 1);
+  if (
+    sub.name === "cat-file" &&
+    args.some((arg) =>
+      new Set(["--filters", "--textconv"]).has(arg.split("=")[0] as string),
+    )
+  ) {
+    return "git cat-file filters/textconv may execute configured repository helpers";
+  }
+  if (new Set(["rev-parse", "ls-tree", "cat-file"]).has(sub.name)) {
+    return null;
+  }
+  if (!noPager || !fsmonitorDisabled || !pagerPinned) {
+    return "configured Git helpers are disabled only by the required `-c core.fsmonitor=false -c core.pager=cat --no-pager` prefix";
+  }
+  if (new Set(["diff", "log", "show"]).has(sub.name)) {
+    if (
+      !args.includes("--no-ext-diff") ||
+      !args.includes("--no-textconv") ||
+      args.includes("--ext-diff") ||
+      args.includes("--textconv") ||
+      args.some((arg) => arg.startsWith("--show-signature"))
+    ) {
+      return `git ${sub.name} requires --no-ext-diff and --no-textconv to suppress configured executables`;
+    }
+  }
+  if (sub.name === "grep" && args.includes("--textconv")) {
+    return "git grep --textconv may execute a configured helper";
+  }
+  return null;
 }
 
 /** Classify one already-wrapper-stripped segment's executable for a wrapped
  *  worker. Returns a deny reason, or null when the command is on the allowlist. */
-function classifyWrappedExecutable(tokens: string[]): string | null {
+function classifyWrappedExecutable(
+  tokens: string[],
+  context: WrappedCommandContext,
+): string | null {
   const exe = tokens[0] as string;
 
   if (INTERPRETER_EXECUTABLES.has(exe)) {
@@ -536,8 +700,15 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
   if (exe === "keeper") {
     const sub = tokens[1];
     if (sub === undefined) return "bare `keeper` with no subcommand";
+    if (sub === "commit-work") {
+      return wrappedCommitWorkHasTaskId(tokens, context.taskId)
+        ? null
+        : "wrapped `keeper commit-work` requires the launch-bound --task-id";
+    }
+    if (sub === "plan") return wrappedPlanViolation(tokens, context);
+    if (sub === "agent") return wrappedAgentViolation(tokens, context);
     if (WRAPPED_KEEPER_SUBCOMMANDS.has(sub)) return null;
-    return `\`keeper ${sub}\` is not on the wrapped-worker allowlist (permitted: agent, session, plan, commit-work, baseline)`;
+    return `\`keeper ${sub}\` is not on the wrapped-worker allowlist (permitted: agent, session, bounded plan reads/done, commit-work, baseline)`;
   }
 
   if (exe === "git") {
@@ -545,7 +716,6 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     const injection = gitConfigInjection(tokens, sub?.index ?? tokens.length);
     if (injection !== null) return injection;
     if (sub === undefined) return "bare `git` with no subcommand";
-    if (sub.name === "add") return null; // staging
     if (sub.name === "commit")
       return "raw `git commit` is forbidden; pass the provider's versioned path manifest to `keeper commit-work --adopt-from <file>`";
     if (sub.name === "reset")
@@ -556,9 +726,24 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
         sub.name,
       );
       if (execFlag !== null) return execFlag;
+      return safeGitReadViolation(tokens, sub);
+    }
+    return `git '${sub.name}' is not a permitted git subcommand for a wrapped worker (read-only Git only; source commits use keeper commit-work)`;
+  }
+
+  if (exe === "mktemp") {
+    const template = tokens[2];
+    if (
+      tokens.length === 3 &&
+      tokens[1] === "-d" &&
+      template !== undefined &&
+      isAbsolute(template) &&
+      pathInside(tmpdir(), template) &&
+      /^keeper-wrapped-[A-Za-z0-9._-]*X{6,}$/.test(basename(template))
+    ) {
       return null;
     }
-    return `git '${sub.name}' is not a permitted git subcommand for a wrapped worker (read + \`add\` / \`reset --soft\` only; source commits use keeper commit-work)`;
+    return "mktemp is limited to `mktemp -d <system-tmp>/keeper-wrapped-XXXXXX` private handoff directories";
   }
 
   if (exe === "bun") {
@@ -569,22 +754,7 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     ) {
       return "`bun` inline-eval (-e/--eval/-p/--print) is never permitted";
     }
-    if (sub === "test") return classifyBunTest(tokens);
-    if (sub === "run") {
-      const target = tokens[2];
-      if (
-        target !== undefined &&
-        target.length > 0 &&
-        !target.startsWith("-") &&
-        !target.includes(".") &&
-        !target.includes("/") &&
-        !target.includes("\\")
-      ) {
-        return null;
-      }
-      return "`bun run` requires a named package script (file-path and option targets are not permitted)";
-    }
-    return `\`bun ${sub ?? ""}\` is not permitted (only \`bun test\` or \`bun run <named-package-script>\`)`;
+    return "repository-defined Bun scripts/tests are transitive code execution; run them in the provider leg, never the write-denied wrapper";
   }
 
   return `off-list command '${exe}' (a wrapped worker's Bash surface is the delegation + close-out allowlist only)`;
@@ -597,7 +767,10 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
  * caught by the lexer; each segment must then present an allowlisted executable
  * with no environment-assignment prefix. Exported for the table-driven tests.
  */
-export function evaluateWrappedBash(command: string): string | null {
+export function evaluateWrappedBash(
+  command: string,
+  context: WrappedCommandContext = {},
+): string | null {
   const lexed = lexSegments(command);
   if (lexed.kind === "deny") return lexed.reason;
   for (const tokens of lexed.segments) {
@@ -609,7 +782,7 @@ export function evaluateWrappedBash(command: string): string | null {
     if ("deny" in stripped) return stripped.deny;
     if (stripped.tokens.length === 0)
       return "a command wrapper with no command";
-    const reason = classifyWrappedExecutable(stripped.tokens);
+    const reason = classifyWrappedExecutable(stripped.tokens, context);
     if (reason !== null) return reason;
   }
   return null;
@@ -652,9 +825,9 @@ function bashReason(violation: string): string {
     `Wrapped-cell worker BLOCKED: this Bash command is off the delegation + ` +
     `close-out allowlist: ${violation}. Permitted: \`keeper agent\` (run/--resume/` +
     `wait/wait-for-stop/show-last-message/providers), \`keeper commit-work\`, ` +
-    `\`keeper plan done\` + reads, \`keeper session state\`, the permitted git ` +
-    `surface (add / reset --soft / log / status / diff / show / rev-parse), ` +
-    `and explicit \`bun test *.test.ts\` / named \`bun run test:gate\` gates. ` +
+    `\`keeper plan done\` + bounded reads, \`keeper session state\`, and the ` +
+    `read-only git surface (log / status / diff / show / rev-parse). ` +
+    `Repository-defined tests/scripts execute only inside the provider leg. ` +
     `Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
     `patch, cp/mv/tar, git apply/am, interpreters, and re-entrant shells — is denied.`
   );
@@ -681,6 +854,45 @@ export function isWrappedMarked(
   env: Record<string, string | undefined>,
 ): boolean {
   return (env.KEEPER_WRAPPED_CELL ?? "").trim() !== "";
+}
+
+function pathInside(base: string, target: string): boolean {
+  const rel = relative(base, target);
+  return (
+    rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+  );
+}
+
+function wrappedCommandContext(
+  env: Record<string, string | undefined>,
+): WrappedCommandContext {
+  const envelope = (env.KEEPER_WRAPPED_ENVELOPE ?? "").trim();
+  const file = basename(envelope);
+  const taskId = file.endsWith(".json") ? file.slice(0, -5) : "";
+  return {
+    ...(taskId.match(/^fn-\d+-[a-z0-9-]+\.\d+$/) ? { taskId } : {}),
+    ...(envelope !== ""
+      ? { envelopeReference: "$KEEPER_WRAPPED_ENVELOPE" }
+      : {}),
+  };
+}
+
+function scratchWriteAllowed(
+  raw: string,
+  cwd: string,
+  probe: TreeProbe,
+): boolean {
+  const abs = isAbsolute(raw) ? raw : resolve(cwd, raw);
+  const target = probe.realpath(abs);
+  const scratch = probe.realpath(tmpdir());
+  if (target === null || scratch === null || !pathInside(scratch, target)) {
+    return false;
+  }
+  // Wrapped scratch files are inert handoff data only. Executable/script-shaped
+  // output is unnecessary and would turn a later allowlisted command into an
+  // arbitrary source-write trampoline.
+  return /\.(?:json|txt|md)$/i.test(target) && probe.scratchFileSafe(target);
 }
 
 /** Classify a Write target: true when it resolves inside a tracked repo tree,
@@ -751,7 +963,12 @@ export function decideWrappedGuard(
     const resolvedProbe = probe ?? fsProbe();
     const inTree = writeTargetInTree(fp, cwd, resolvedProbe, log);
     if (inTree === null) return denyEnvelope(MALFORMED_REASON); // unresolvable → fail closed
-    if (!inTree) return null; // outside every tracked tree → allow
+    if (!inTree) {
+      if (scratchWriteAllowed(fp, cwd, resolvedProbe)) return null;
+      return denyEnvelope(
+        "Wrapped-cell worker BLOCKED: out-of-tree Write is limited to inert .json/.txt/.md handoff files under the system temporary directory.",
+      );
+    }
     const abs = isAbsolute(fp) ? fp : resolve(cwd, fp);
     const toplevel =
       resolvedProbe.repoToplevel(resolvedProbe.realpath(abs) ?? abs) ?? "";
@@ -761,7 +978,7 @@ export function decideWrappedGuard(
   if (tool === "Bash") {
     const command = p.tool_input?.command;
     if (typeof command !== "string") return denyEnvelope(MALFORMED_REASON);
-    const violation = evaluateWrappedBash(command);
+    const violation = evaluateWrappedBash(command, wrappedCommandContext(env));
     if (violation === null) return null; // allowlisted → allow
     return denyEnvelope(bashReason(violation));
   }
@@ -826,8 +1043,117 @@ function repoToplevelOf(resolved: string): string | null {
 }
 
 /** The node:fs-backed probe wired into production. */
+function scratchFileSafe(resolved: string): boolean {
+  try {
+    // Existing handoffs are never rewritten: that would leave an inode
+    // validation→Write gap in which a hardlink/symlink replacement could target
+    // caller-owned bytes. Every handoff write gets a fresh lexical leaf.
+    lstatSync(resolved);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    try {
+      const parent = lstatSync(realpathSync(dirname(resolved)));
+      const getuid = process.getuid;
+      return (
+        parent.isDirectory() &&
+        (parent.mode & 0o077) === 0 &&
+        (getuid === undefined || parent.uid === getuid.call(process))
+      );
+    } catch {
+      return false;
+    }
+  }
+}
+
 export function fsProbe(): TreeProbe {
-  return { realpath: realpathNearest, repoToplevel: repoToplevelOf };
+  return {
+    realpath: realpathNearest,
+    repoToplevel: repoToplevelOf,
+    scratchFileSafe,
+  };
+}
+
+const MAX_ATOMIC_HANDOFF_BYTES = 1_048_576;
+const WRAPPED_O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
+
+/**
+ * Materialize an allowed handoff through O_EXCL|O_NOFOLLOW, then let the hook
+ * deny the host Write. The checked leaf can never be an existing hardlink and
+ * no validation→open window can truncate caller-owned bytes.
+ */
+export function writeAtomicWrappedHandoff(
+  raw: string,
+  content: string,
+  cwd: string,
+): boolean {
+  const probe = fsProbe();
+  if (!scratchWriteAllowed(raw, cwd, probe)) return false;
+  const bytes = Buffer.from(content, "utf8");
+  if (bytes.byteLength > MAX_ATOMIC_HANDOFF_BYTES) return false;
+  const lexical = isAbsolute(raw) ? raw : resolve(cwd, raw);
+  const path = probe.realpath(lexical);
+  if (path === null) return false;
+  const parentPath = dirname(path);
+  let parentBefore: ReturnType<typeof lstatSync>;
+  try {
+    parentBefore = lstatSync(parentPath);
+    if (
+      !parentBefore.isDirectory() ||
+      realpathSync(parentPath) !== parentPath
+    ) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  let fd: number | null = null;
+  try {
+    fd = openSync(
+      path,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW |
+        constants.O_NONBLOCK |
+        WRAPPED_O_CLOEXEC,
+      0o600,
+    );
+    const descriptorBeforeWrite = fstatSync(fd);
+    const lexicalAfterOpen = lstatSync(path);
+    const parentAfterOpen = lstatSync(parentPath);
+    if (
+      !descriptorBeforeWrite.isFile() ||
+      descriptorBeforeWrite.nlink !== 1 ||
+      lexicalAfterOpen.dev !== descriptorBeforeWrite.dev ||
+      lexicalAfterOpen.ino !== descriptorBeforeWrite.ino ||
+      parentAfterOpen.dev !== parentBefore.dev ||
+      parentAfterOpen.ino !== parentBefore.ino ||
+      realpathSync(parentPath) !== parentPath
+    ) {
+      return false;
+    }
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = writeSync(fd, bytes, offset, bytes.byteLength - offset);
+      if (count <= 0) return false;
+      offset += count;
+    }
+    fsyncSync(fd);
+    const descriptor = fstatSync(fd);
+    const lexical = lstatSync(path);
+    return (
+      descriptor.isFile() &&
+      descriptor.nlink === 1 &&
+      (descriptor.mode & 0o111) === 0 &&
+      lexical.dev === descriptor.dev &&
+      lexical.ino === descriptor.ino
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -888,14 +1214,49 @@ async function main(): Promise<void> {
   try {
     // A parse failure under a marker is a malformed payload → decideWrappedGuard
     // fails closed on the non-object; an unmarked session stays silent.
-    emit(
-      decideWrappedGuard(
-        parsed ? payload : null,
-        env,
-        fsProbe(),
-        makeLogSink(env),
-      ),
+    const candidate = parsed ? payload : null;
+    const decision = decideWrappedGuard(
+      candidate,
+      env,
+      fsProbe(),
+      makeLogSink(env),
     );
+    if (
+      decision === null &&
+      isWrappedMarked(env) &&
+      candidate !== null &&
+      typeof candidate === "object" &&
+      (candidate as WrappedGuardPayload).tool_name === "Write" &&
+      ((candidate as WrappedGuardPayload).agent_id !== undefined ||
+        (candidate as WrappedGuardPayload).agent_type !== undefined)
+    ) {
+      const write = candidate as WrappedGuardPayload;
+      const path = write.tool_input?.file_path;
+      const content = write.tool_input?.content;
+      const cwd =
+        typeof write.cwd === "string" && write.cwd.length > 0
+          ? write.cwd
+          : process.cwd();
+      if (
+        typeof path === "string" &&
+        typeof content === "string" &&
+        writeAtomicWrappedHandoff(path, content, cwd)
+      ) {
+        emit(
+          denyEnvelope(
+            `ATOMIC_HANDOFF_WRITTEN: '${path}' was created descriptor-bound; the host Write is intentionally suppressed. Treat this receipt as success and never retry this leaf.`,
+          ),
+        );
+      } else {
+        emit(
+          denyEnvelope(
+            "Wrapped-cell atomic handoff creation failed closed; choose a fresh inert leaf in a new private keeper-wrapped temp directory.",
+          ),
+        );
+      }
+    } else {
+      emit(decision);
+    }
   } catch {
     // Last-resort internal error: fail CLOSED for a marked session, OPEN otherwise.
     if (isWrappedMarked(env)) emit(denyEnvelope(MALFORMED_REASON));

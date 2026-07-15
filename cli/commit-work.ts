@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import {
@@ -15,13 +15,20 @@ import {
   createFrozenPrivateIndex,
   exactEntriesFromTree,
   type FrozenPrivateIndex,
+  MAX_COMMIT_MESSAGE_BYTES,
   PrivateIndexError,
   type PrivateIndexFs,
   privateIndexGit,
   reconcileAmbientAfterPublication,
   reconcileAmbientIndexEntries,
+  refreshFrozenPublicationBaseline,
+  verifyFrozenPublicationBaseline,
   verifyFrozenSurface,
 } from "../src/commit-work/private-index";
+import {
+  invocationDescendsFrom,
+  type ProcessIdentityReader,
+} from "../src/commit-work/process-identity";
 import { pushExactCommit } from "../src/commit-work/push";
 import {
   analyzeReversionSweep,
@@ -41,6 +48,8 @@ import {
   type SurfaceDiscoveryResult,
 } from "../src/commit-work/surface";
 import { emitCommitWorkOutcome } from "../src/commit-work/telemetry";
+import { defaultDbPath, openDb } from "../src/db";
+import { parsePlanRef } from "../src/derivers";
 
 const HELP = `keeper commit-work [MSG] [options]
 
@@ -49,11 +58,12 @@ Preview explains the complete dirty surface. Attribution gaps are covered with
 explicit, invocation-local adoption; adoption never creates a durable claim.
 
 Options:
-  --session-id <uuid>  Invocation identity (must agree with non-empty env carriers)
+  --session-id <uuid>  Claude identity (carrier agreement + process ancestry required)
   --adopt <path>       Adopt one exact dirty path; repeat for multiple paths
   --adopt-from <file>  Read paths from a versioned JSON adoption manifest
   --message-file <file>
                        Read the commit message without shell interpolation
+  --task-id <task>     Append the active work job's bound Task trailer
   --preview-files      Emit an advisory surface envelope; make no commit
   --max-files <n>      Refuse a selected set larger than n (default 500; 0 disables)
   --allow-stale-unstage
@@ -80,12 +90,21 @@ command. Commit hooks and signing remain on.
 
 const FORBIDDEN_TRAILER_RE =
   /^(Job-Id:|Keeper-Commit-Id:|Session-Id:|Signed-off-by:|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[A-Za-z]+:)/im;
+const TASK_TRAILER_RE = /^Task:/im;
 const DEFAULT_MAX_FILES = 500;
 const SAMPLE_LIMIT = 20;
+const RESULT_FILE_LIMIT = DEFAULT_MAX_FILES;
+const RESULT_PATH_BYTES = 1_024;
 const STDERR_LIMIT = 4000;
 const MAX_ADOPTION_MANIFEST_BYTES = 1_048_576;
+const MAX_ADOPTION_MANIFEST_TOTAL_BYTES = 1_048_576;
+const MAX_ADOPTION_MANIFEST_FILES = 32;
 const MAX_ADOPTION_MANIFEST_PATHS = 10_000;
-const MAX_MESSAGE_BYTES = 65_536;
+const MAX_ADOPTION_PATH_BYTES = 4_096;
+const MAX_ADOPTION_TOTAL_PATH_BYTES = 1_048_576;
+/** Atomic nonblocking open: FIFOs/devices cannot hang before descriptor fstat. */
+export const BOUNDED_INPUT_OPEN_FLAGS =
+  constants.O_RDONLY | constants.O_NONBLOCK;
 
 export interface ParsedArgs {
   msg: string | null;
@@ -93,6 +112,7 @@ export interface ParsedArgs {
   adopt: string[];
   adoptFrom: string[];
   messageFile: string | null;
+  taskId: string | null;
   previewFiles: boolean;
   allowStaleUnstage: boolean;
   overrideJam: boolean;
@@ -130,6 +150,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     adopt: [],
     adoptFrom: [],
     messageFile: null,
+    taskId: null,
     previewFiles: false,
     allowStaleUnstage: false,
     overrideJam: false,
@@ -172,6 +193,17 @@ export function parseArgs(argv: string[]): ParsedArgs {
         throw new UsageError("--message-file may be passed only once");
       }
       parsed.messageFile = arg.slice("--message-file=".length);
+    } else if (arg === "--task-id") {
+      if (parsed.taskId !== null) {
+        throw new UsageError("--task-id may be passed only once");
+      }
+      parsed.taskId = valueAfter(argv, i, arg);
+      i += 1;
+    } else if (arg.startsWith("--task-id=")) {
+      if (parsed.taskId !== null) {
+        throw new UsageError("--task-id may be passed only once");
+      }
+      parsed.taskId = arg.slice("--task-id=".length);
     } else if (arg === "--max-files") {
       parsed.maxFiles = parseMaxFiles(valueAfter(argv, i, arg));
       i += 1;
@@ -185,6 +217,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
     } else if (!arg.startsWith("-") && parsed.msg === null) parsed.msg = arg;
     else throw new UsageError(`unexpected argument '${arg}'`);
   }
+  if (parsed.taskId !== null) {
+    const task = parsePlanRef(parsed.taskId);
+    if (task?.kind !== "task" || task.task_id !== parsed.taskId) {
+      throw new UsageError(
+        `--task-id must be a valid task ref (got '${parsed.taskId}')`,
+      );
+    }
+  }
   return parsed;
 }
 
@@ -196,7 +236,7 @@ function readBoundedInputFile(
 ): string {
   let fd: number | null = null;
   try {
-    fd = openSync(path, "r");
+    fd = openSync(path, BOUNDED_INPUT_OPEN_FLAGS);
     const stat = fstatSync(fd);
     if (!stat.isFile()) {
       throw new UsageError(`${flag} '${path}' must name a regular file`);
@@ -235,15 +275,53 @@ function readBoundedInputFile(
   }
 }
 
+function validateAdoptionPaths(paths: readonly string[]): void {
+  if (paths.length > MAX_ADOPTION_MANIFEST_PATHS) {
+    throw new UsageError(
+      `adoption inputs exceed ${MAX_ADOPTION_MANIFEST_PATHS} paths`,
+    );
+  }
+  let totalBytes = 0;
+  for (const path of paths) {
+    if (path.includes("\0")) {
+      throw new UsageError("adoption paths may not contain NUL");
+    }
+    const bytes = Buffer.byteLength(path, "utf8");
+    if (bytes > MAX_ADOPTION_PATH_BYTES) {
+      throw new UsageError(
+        `an adoption path exceeds ${MAX_ADOPTION_PATH_BYTES} bytes`,
+      );
+    }
+    totalBytes += bytes;
+    if (totalBytes > MAX_ADOPTION_TOTAL_PATH_BYTES) {
+      throw new UsageError(
+        `adoption paths exceed ${MAX_ADOPTION_TOTAL_PATH_BYTES} total bytes`,
+      );
+    }
+  }
+}
+
 /** Expand invocation files without granting durable ownership. */
 function expandInvocationFiles(args: ParsedArgs): ParsedArgs {
+  if (args.adoptFrom.length > MAX_ADOPTION_MANIFEST_FILES) {
+    throw new UsageError(
+      `too many --adopt-from files (maximum ${MAX_ADOPTION_MANIFEST_FILES})`,
+    );
+  }
   const manifestPaths: string[] = [];
+  let manifestBytes = 0;
   for (const manifestPath of args.adoptFrom) {
     const text = readBoundedInputFile(
       manifestPath,
       "--adopt-from",
       MAX_ADOPTION_MANIFEST_BYTES,
     );
+    manifestBytes += Buffer.byteLength(text, "utf8");
+    if (manifestBytes > MAX_ADOPTION_MANIFEST_TOTAL_BYTES) {
+      throw new UsageError(
+        `--adopt-from files exceed ${MAX_ADOPTION_MANIFEST_TOTAL_BYTES} total bytes`,
+      );
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -270,13 +348,25 @@ function expandInvocationFiles(args: ParsedArgs): ParsedArgs {
         `--adopt-from '${manifestPath}' must match {"schema_version":1,"kind":"commit-work-adoption","paths":[...]}`,
       );
     }
-    manifestPaths.push(...(manifest.paths as string[]));
-    if (manifestPaths.length > MAX_ADOPTION_MANIFEST_PATHS) {
+    const paths = manifest.paths as string[];
+    if (paths.length > MAX_ADOPTION_MANIFEST_PATHS - manifestPaths.length) {
       throw new UsageError(
         `--adopt-from manifests exceed ${MAX_ADOPTION_MANIFEST_PATHS} paths`,
       );
     }
+    // Append iteratively only after the count check. Spreading an attacker-sized
+    // JSON array can exceed the JavaScript argument limit before a typed refusal.
+    for (const path of paths) manifestPaths.push(path);
   }
+
+  if (args.adopt.length > MAX_ADOPTION_MANIFEST_PATHS - manifestPaths.length) {
+    throw new UsageError(
+      `adoption inputs exceed ${MAX_ADOPTION_MANIFEST_PATHS} paths`,
+    );
+  }
+  const adoptionPaths = args.adopt.slice();
+  for (const path of manifestPaths) adoptionPaths.push(path);
+  validateAdoptionPaths(adoptionPaths);
 
   let message = args.msg;
   if (args.messageFile !== null) {
@@ -288,16 +378,26 @@ function expandInvocationFiles(args: ParsedArgs): ParsedArgs {
     message = readBoundedInputFile(
       args.messageFile,
       "--message-file",
-      MAX_MESSAGE_BYTES,
+      MAX_COMMIT_MESSAGE_BYTES,
     );
     if (message.includes("\0")) {
       throw new UsageError("--message-file may not contain NUL");
     }
   }
+  if (message !== null) {
+    if (message.includes("\0")) {
+      throw new UsageError("commit message may not contain NUL");
+    }
+    if (Buffer.byteLength(message, "utf8") > MAX_COMMIT_MESSAGE_BYTES) {
+      throw new UsageError(
+        `commit message exceeds ${MAX_COMMIT_MESSAGE_BYTES} bytes`,
+      );
+    }
+  }
   return {
     ...args,
     msg: message,
-    adopt: [...args.adopt, ...manifestPaths],
+    adopt: adoptionPaths,
   };
 }
 
@@ -310,6 +410,8 @@ export type CommitWorkOutcome =
   | "identity_conflict"
   | "invalid_identity"
   | "no_session_id"
+  | "identity_untrusted"
+  | "task_unbound"
   | "surface_unavailable"
   | "ownership_conflict"
   | "ownership_ambiguous"
@@ -377,7 +479,20 @@ function capStderr(stderr: string | undefined): string | undefined {
 }
 
 function pathSample(paths: string[]): string[] {
-  return paths.slice(0, SAMPLE_LIMIT).map((path) => path.slice(0, 1024));
+  return paths
+    .slice(0, SAMPLE_LIMIT)
+    .map((path) => path.slice(0, RESULT_PATH_BYTES));
+}
+
+/** Bounded compatibility array plus explicit cardinality for every result. */
+function resultFileFields(paths: readonly string[]): Record<string, unknown> {
+  return {
+    files: paths
+      .slice(0, RESULT_FILE_LIMIT)
+      .map((path) => path.slice(0, RESULT_PATH_BYTES)),
+    file_total: paths.length,
+    files_truncated: paths.length > RESULT_FILE_LIMIT,
+  };
 }
 
 function pushAliases(push: Record<string, unknown>): Record<string, unknown> {
@@ -483,6 +598,11 @@ export interface CommitWorkDeps {
   push?: typeof pushExactCommit;
   privateIndexFs?: PrivateIndexFs;
   emitOutcome?: (result: CommitWorkResult, identity: string | null) => void;
+  validateIdentity?: (identity: string) => boolean | Promise<boolean>;
+  validateTaskBinding?: (
+    identity: string,
+    taskId: string,
+  ) => boolean | Promise<boolean>;
 }
 
 async function discover(
@@ -564,7 +684,9 @@ function selectedForeignConflicts(
           .map((claim) => claim.sessionId),
       ),
     ].sort();
-    if (sessions.length > 0) conflicts.push({ path, sessions });
+    if (sessions.length > 0) {
+      conflicts.push({ path, sessions: sessions.slice(0, SAMPLE_LIMIT) });
+    }
   }
   return conflicts;
 }
@@ -583,10 +705,17 @@ function surfaceFailure(
   const conflict = surface.rejections.some(
     (rejection) => rejection.code === "ownership_conflict",
   );
+  const unavailable = surface.rejections.some(
+    (rejection) => rejection.code === "ownership_unavailable",
+  );
   if (surface.rejections.length > 0) {
     return result(
       "commit-work-result",
-      conflict ? "ownership_conflict" : "adoption_rejected",
+      conflict
+        ? "ownership_conflict"
+        : unavailable
+          ? "ownership_ambiguous"
+          : "adoption_rejected",
       false,
       {
         identity,
@@ -624,7 +753,7 @@ function finalOwnershipFailure(
       reason: "foreign_claim_before_publication",
       count: foreign.length,
       sample: foreign.slice(0, SAMPLE_LIMIT),
-      files: frozen.paths,
+      ...resultFileFields(frozen.paths),
       selection: selectionEnvelope(current, identity),
       surface: current.summary,
     });
@@ -639,7 +768,7 @@ function finalOwnershipFailure(
       reason: "automatic_ownership_changed_before_publication",
       count: automaticLost.length,
       sample: pathSample(automaticLost),
-      files: frozen.paths,
+      ...resultFileFields(frozen.paths),
       selection: selectionEnvelope(current, identity),
       surface: current.summary,
     });
@@ -657,13 +786,151 @@ function finalOwnershipFailure(
       reason: "claim_identity_changed_before_publication",
       count: claimDrift.length,
       sample: pathSample(claimDrift),
-      files: frozen.paths,
+      ...resultFileFields(frozen.paths),
       selection: selectionEnvelope(current, identity),
       surface: current.summary,
     });
   }
 
   return null;
+}
+
+interface ClaudeAuthorityRow {
+  state: unknown;
+  harness: unknown;
+  pid: unknown;
+  start_time: unknown;
+  plan_verb: unknown;
+  plan_ref: unknown;
+}
+
+export type ClaudeAuthorityVerdict =
+  | "ok"
+  | "identity_untrusted"
+  | "task_unbound";
+
+function readClaudeAuthorityRow(
+  identity: string,
+  dbPath: string,
+): ClaudeAuthorityRow | null {
+  const { db } = openDb(dbPath, { readonly: true });
+  try {
+    return db
+      .query(
+        `SELECT state, harness, pid, start_time, plan_verb, plan_ref
+           FROM jobs
+          WHERE job_id = ?`,
+      )
+      .get(identity) as ClaudeAuthorityRow | null;
+  } finally {
+    db.close();
+  }
+}
+
+function validClaudeAuthorityRow(
+  row: ClaudeAuthorityRow | null,
+): row is ClaudeAuthorityRow & { pid: number; start_time: string } {
+  return (
+    row?.state === "working" &&
+    row.harness === "claude" &&
+    typeof row.pid === "number" &&
+    Number.isSafeInteger(row.pid) &&
+    row.pid > 1 &&
+    typeof row.start_time === "string" &&
+    row.start_time.length > 0
+  );
+}
+
+export async function trustedClaudeAuthority(
+  identity: string,
+  taskId: string | null,
+  dbPath = defaultDbPath(),
+  processOptions: {
+    currentPid?: number;
+    read?: ProcessIdentityReader;
+    maxDepth?: number;
+  } = {},
+): Promise<ClaudeAuthorityVerdict> {
+  try {
+    const before = readClaudeAuthorityRow(identity, dbPath);
+    if (!validClaudeAuthorityRow(before)) return "identity_untrusted";
+    if (
+      !(await invocationDescendsFrom(
+        before.pid,
+        before.start_time,
+        processOptions,
+      ))
+    ) {
+      return "identity_untrusted";
+    }
+    // PID identity and task authority are one generation-bound row. Sandwich
+    // the ancestry walk with every authority field, not two independent reads.
+    const after = readClaudeAuthorityRow(identity, dbPath);
+    if (
+      !validClaudeAuthorityRow(after) ||
+      after.pid !== before.pid ||
+      after.start_time !== before.start_time ||
+      after.plan_verb !== before.plan_verb ||
+      after.plan_ref !== before.plan_ref
+    ) {
+      return "identity_untrusted";
+    }
+    return taskId !== null &&
+      (after.plan_verb !== "work" || after.plan_ref !== taskId)
+      ? "task_unbound"
+      : "ok";
+  } catch {
+    return "identity_untrusted";
+  }
+}
+
+export async function trustedClaudeIdentity(
+  identity: string,
+  dbPath = defaultDbPath(),
+  processOptions: {
+    currentPid?: number;
+    read?: ProcessIdentityReader;
+    maxDepth?: number;
+  } = {},
+): Promise<boolean> {
+  return (
+    (await trustedClaudeAuthority(identity, null, dbPath, processOptions)) ===
+    "ok"
+  );
+}
+
+export function taskBoundToIdentity(
+  identity: string,
+  taskId: string,
+  dbPath = defaultDbPath(),
+): boolean {
+  try {
+    const { db } = openDb(dbPath, { readonly: true });
+    try {
+      const row = db
+        .query(
+          `SELECT plan_verb, plan_ref, state, harness
+             FROM jobs
+            WHERE job_id = ?`,
+        )
+        .get(identity) as {
+        plan_verb: unknown;
+        plan_ref: unknown;
+        state: unknown;
+        harness: unknown;
+      } | null;
+      return (
+        row?.plan_verb === "work" &&
+        row.plan_ref === taskId &&
+        row.state === "working" &&
+        row.harness === "claude"
+      );
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
+  }
 }
 
 async function runAttempt(
@@ -717,6 +984,52 @@ async function runAttempt(
     };
   }
 
+  const validateInvocationAuthority =
+    async (): Promise<ClaudeAuthorityVerdict> => {
+      if (
+        deps.validateIdentity === undefined &&
+        deps.validateTaskBinding === undefined
+      ) {
+        return await trustedClaudeAuthority(identity, args.taskId);
+      }
+      if (!(await (deps.validateIdentity ?? trustedClaudeIdentity)(identity))) {
+        return "identity_untrusted";
+      }
+      if (
+        args.taskId !== null &&
+        !(await (deps.validateTaskBinding ?? taskBoundToIdentity)(
+          identity,
+          args.taskId,
+        ))
+      ) {
+        return "task_unbound";
+      }
+      return "ok";
+    };
+
+  const initialAuthority = await validateInvocationAuthority();
+  if (initialAuthority === "identity_untrusted") {
+    return {
+      code: 1,
+      identity,
+      result: result(invocationKind, "identity_untrusted", false, {
+        identity,
+        hint: "Run from the active Claude session whose Keeper job owns this invocation.",
+      }),
+    };
+  }
+  if (initialAuthority === "task_unbound") {
+    return {
+      code: 1,
+      identity,
+      result: result(invocationKind, "task_unbound", false, {
+        identity,
+        task_id: args.taskId,
+        hint: "--task-id must equal this active work session's bound plan task.",
+      }),
+    };
+  }
+
   const git = deps.gitRunner ?? gitExec;
   const worktree = await resolveWorktreeRoot(deps.cwd ?? process.cwd(), git);
   // Ownership discovery is immediate: durable claims are used when available,
@@ -737,7 +1050,7 @@ async function runAttempt(
       identity,
       result: result(invocationKind, "file_list_too_large", false, {
         identity,
-        files: advisory.selected,
+        ...resultFileFields(advisory.selected),
         count: advisory.selected.length,
         limit: args.maxFiles,
         sample: pathSample(advisory.selected),
@@ -753,7 +1066,7 @@ async function runAttempt(
       identity,
       result: result("commit-work-result", "preview", true, {
         identity,
-        files: advisory.selected,
+        ...resultFileFields(advisory.selected),
         selection: selectionEnvelope(advisory, identity),
         surface: advisory.summary,
       }),
@@ -771,7 +1084,7 @@ async function runAttempt(
       }),
     };
   }
-  if (FORBIDDEN_TRAILER_RE.test(args.msg)) {
+  if (FORBIDDEN_TRAILER_RE.test(args.msg) || TASK_TRAILER_RE.test(args.msg)) {
     return {
       code: 1,
       identity,
@@ -782,6 +1095,10 @@ async function runAttempt(
       }),
     };
   }
+  const commitMessage =
+    args.taskId === null
+      ? args.msg
+      : `${args.msg.replace(/\n+$/, "")}\n\nTask: ${args.taskId}`;
 
   const detect = deps.detectInProgress ?? detectInProgressOperation;
   const inProgress = await detect(worktree, git);
@@ -915,7 +1232,7 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "file_list_too_large", false, {
           identity,
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           count: surface.selected.length,
           limit: args.maxFiles,
           sample: pathSample(surface.selected),
@@ -944,7 +1261,7 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "nothing_to_commit", true, {
           identity,
-          files: [],
+          ...resultFileFields([]),
           committed: false,
           selection: selectionEnvelope(surface, identity),
           surface: surface.summary,
@@ -1013,6 +1330,12 @@ async function runAttempt(
           worktree,
           git,
         );
+        await refreshFrozenPublicationBaseline(
+          frozen,
+          worktree,
+          git,
+          deps.privateIndexFs,
+        );
       }
       // The first verification makes the binding explicit before lint starts.
       await verifyFrozenSurface(frozen, worktree, git, deps.privateIndexFs);
@@ -1047,7 +1370,7 @@ async function runAttempt(
           reason: "automatic_claim_identity_changed",
           count: claimDrift.length,
           sample: pathSample(claimDrift),
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           selection: selectionEnvelope(surface, identity),
           surface: surface.summary,
         }),
@@ -1133,7 +1456,7 @@ async function runAttempt(
           reason: "foreign_claim_after_lint",
           count: foreignAfterLint.length,
           sample: foreignAfterLint.slice(0, SAMPLE_LIMIT),
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           selection: selectionEnvelope(postLintSurface, identity),
           surface: postLintSurface.summary,
         }),
@@ -1152,7 +1475,7 @@ async function runAttempt(
           reason: "automatic_ownership_changed_after_lint",
           count: automaticLost.length,
           sample: pathSample(automaticLost),
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           selection: selectionEnvelope(postLintSurface, identity),
           surface: postLintSurface.summary,
         }),
@@ -1174,7 +1497,7 @@ async function runAttempt(
           reason: "automatic_claim_identity_changed_after_lint",
           count: postLintClaimDrift.length,
           sample: pathSample(postLintClaimDrift),
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           selection: selectionEnvelope(postLintSurface, identity),
           surface: postLintSurface.summary,
         }),
@@ -1182,9 +1505,15 @@ async function runAttempt(
     }
 
     try {
-      // Re-hash and compare the same selected OIDs, modes, and whole tree only
-      // after the post-lint ownership read has accepted the claim set.
+      // Re-hash the selected tree and require the complete pre-lint worktree,
+      // ambient index, Git config, hooks, and signing policy to remain frozen.
       await verifyFrozenSurface(frozen, worktree, git, deps.privateIndexFs);
+      await verifyFrozenPublicationBaseline(
+        frozen,
+        worktree,
+        git,
+        deps.privateIndexFs,
+      );
     } catch (error) {
       const typed = error instanceof PrivateIndexError ? error : null;
       return {
@@ -1207,13 +1536,27 @@ async function runAttempt(
     try {
       committed = await commitFrozenPrivateIndex(
         publicationFrozen,
-        args.msg,
+        commitMessage,
         worktree,
         git,
         deps.privateIndexFs,
         {
           beforeCommit: async () => await detect(worktree, git),
           validateOwnership: async () => {
+            const validateAuthority = async (): Promise<void> => {
+              const verdict = await validateInvocationAuthority();
+              if (verdict !== "ok") {
+                throw new PublicationValidationError(
+                  result("commit-work-result", verdict, false, {
+                    identity,
+                    ...(verdict === "task_unbound"
+                      ? { task_id: args.taskId }
+                      : {}),
+                  }),
+                );
+              }
+            };
+            await validateAuthority();
             const current = await discover(args, identity, worktree, git, deps);
             const failure = finalOwnershipFailure(
               surface,
@@ -1222,6 +1565,10 @@ async function runAttempt(
               identity,
             );
             if (failure) throw new PublicationValidationError(failure);
+            // Discovery includes Git and bounded durable/receipt scans. Rebind
+            // process/task authority after that potentially-long boundary so
+            // only the immediately following CAS remains.
+            await validateAuthority();
           },
           jobId: identity,
         },
@@ -1240,7 +1587,7 @@ async function runAttempt(
           stderr: capStderr(typed?.stderr),
           stderr_sample: capStderr(typed?.stderr),
           commit_sha: typed?.commitSha,
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
           commit: typed?.commitSha ? { sha: typed.commitSha } : undefined,
           committed: typed?.committed || undefined,
@@ -1295,7 +1642,7 @@ async function runAttempt(
         result: result("commit-work-result", "post_commit_hook_failed", false, {
           identity,
           commit_sha: committed.sha,
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           committed: true,
           pushed: false,
           stderr: capStderr(committed.postCommitHookWarning.stderr),
@@ -1342,7 +1689,7 @@ async function runAttempt(
         result: result("commit-work-result", "push_failed", false, {
           identity,
           commit_sha: committed.sha,
-          files: surface.selected,
+          ...resultFileFields(surface.selected),
           committed: true,
           ...pushAliases(pushEnvelope),
           ambient_reconciliation_warning: ambientWarning,
@@ -1362,7 +1709,7 @@ async function runAttempt(
       result: result("commit-work-result", pushOutcome, true, {
         identity,
         commit_sha: committed.sha,
-        files: surface.selected,
+        ...resultFileFields(surface.selected),
         committed: true,
         ...pushAliases(pushEnvelope),
         ambient_reconciliation_warning: ambientWarning,

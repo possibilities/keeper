@@ -939,6 +939,11 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         summary: "Read the commit message as bounded inert file data",
       },
       {
+        name: "task-id",
+        type: "string",
+        summary: "Append one validated Task trailer mechanically",
+      },
+      {
         name: "max-files",
         type: "string",
         summary: "Cap the selected file count (0 disables)",

@@ -3107,7 +3107,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(127);
+  expect(SCHEMA_VERSION).toBe(128);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -4242,7 +4242,92 @@ test("fresh openDb has git_status table for the git read surface", () => {
   expect(byName.get("jobs")?.dflt_value).toBe("'[]'");
   expect(byName.get("dirty_count")?.notnull).toBe(1);
   expect(byName.get("orphaned_count")?.notnull).toBe(1);
+  const attributionEventId = byName.get("attribution_event_id");
+  expect(attributionEventId?.type).toBe("INTEGER");
+  expect(attributionEventId?.notnull).toBe(1);
+  expect(attributionEventId?.dflt_value).toBe("0");
   db.close();
+});
+
+test("v127→v128 adds the Git attribution watermark and distrusts legacy synthetic-event floors", () => {
+  const { db: legacy } = openDb(dbPath);
+  legacy.run("ALTER TABLE git_status RENAME TO git_status_v128");
+  legacy.run(`
+    CREATE TABLE git_status (
+      project_dir TEXT PRIMARY KEY,
+      branch TEXT,
+      head_oid TEXT,
+      upstream TEXT,
+      ahead INTEGER,
+      behind INTEGER,
+      dirty_count INTEGER NOT NULL DEFAULT 0,
+      orphaned_count INTEGER NOT NULL DEFAULT 0,
+      unattributed_to_live_count INTEGER NOT NULL DEFAULT 0,
+      dirty_files TEXT NOT NULL DEFAULT '[]',
+      orphaned_files TEXT NOT NULL DEFAULT '[]',
+      jobs TEXT NOT NULL DEFAULT '[]',
+      last_event_id INTEGER,
+      updated_at REAL NOT NULL DEFAULT 0
+    )
+  `);
+  legacy.run("DROP TABLE git_status_v128");
+  legacy.run("UPDATE meta SET value = '127' WHERE key = 'schema_version'");
+  legacy.run(
+    `INSERT INTO git_status
+       (project_dir, last_event_id, updated_at)
+     VALUES ('/repo', 91, 1)`,
+  );
+  legacy.run(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at,
+        op, source, last_event_id, updated_at)
+     VALUES (?, ?, ?, 1, 1, 'attribution-floor', 'plan', 91, 1)`,
+    ["/repo", "\u0000keeper-attribution-floor", "\u0000"],
+  );
+  legacy.close();
+
+  const { db: migrated } = openDb(dbPath);
+  const column = (
+    migrated.prepare("PRAGMA table_info(git_status)").all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[]
+  ).find((candidate) => candidate.name === "attribution_event_id");
+  expect(column?.name).toBe("attribution_event_id");
+  expect(column?.type).toBe("INTEGER");
+  expect(column?.notnull).toBe(1);
+  expect(column?.dflt_value).toBe("0");
+  const status = migrated
+    .prepare(
+      "SELECT last_event_id, attribution_event_id FROM git_status WHERE project_dir = '/repo'",
+    )
+    .get() as { last_event_id: number; attribution_event_id: number };
+  expect(status).toEqual({ last_event_id: 91, attribution_event_id: 0 });
+  const floor = migrated
+    .prepare(
+      "SELECT last_event_id FROM file_attributions WHERE project_dir = ? AND session_id = ? AND file_path = ?",
+    )
+    .get("/repo", "\u0000keeper-attribution-floor", "\u0000") as {
+    last_event_id: number;
+  };
+  expect(floor.last_event_id).toBe(0);
+  migrated.close();
+
+  // Version guarding makes a second open a no-op with the conservative values
+  // intact.
+  const { db: reopened } = openDb(dbPath);
+  expect(
+    (
+      reopened
+        .prepare(
+          "SELECT attribution_event_id FROM git_status WHERE project_dir = '/repo'",
+        )
+        .get() as { attribution_event_id: number }
+    ).attribution_event_id,
+  ).toBe(0);
+  reopened.close();
 });
 
 test("fresh openDb (0→head): usage is absent at head — retired v120 (fn-1239 task .6, formerly fn-615)", () => {

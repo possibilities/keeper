@@ -24,6 +24,7 @@ import {
 } from "../src/reducer";
 import { __resetSubagentPreParseMemoForTest } from "../src/subagent-invocations";
 import type { Event } from "../src/types";
+import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -76,6 +77,11 @@ function insertEvent(
   },
 ): number {
   const ts = overrides.ts ?? tsCounter++;
+  const eventData = bindGitObservationWatermark(
+    db,
+    overrides.hook_event,
+    overrides.data ?? "{}",
+  );
   const row = {
     ts,
     session_id: overrides.session_id ?? "sess-a",
@@ -93,7 +99,7 @@ function insertEvent(
     agent_id: overrides.agent_id ?? null,
     agent_type: overrides.agent_type ?? null,
     stop_hook_active: overrides.stop_hook_active ?? null,
-    data: overrides.data ?? "{}",
+    data: eventData,
     subagent_agent_id: overrides.subagent_agent_id ?? null,
     spawn_name: overrides.spawn_name ?? null,
     start_time: overrides.start_time ?? null,
@@ -138,7 +144,7 @@ function insertEvent(
         : deriveSeedMutationPath(
             overrides.hook_event,
             overrides.tool_name ?? null,
-            overrides.data ?? "{}",
+            eventData,
           ),
     // Schema v94 / fn-997: durable worktree-lane BRANCH. NULL by default so a
     // non-worktree SessionStart folds jobs.worktree NULL; worktree tests set it.
@@ -4582,6 +4588,273 @@ test("GitSnapshot attribution never reads future events already in the batch", (
   ).toEqual({ op: "Edit", last_event_id: futureEditId });
 });
 
+test("GitSnapshot pre-read watermarks preserve a foreign claim that lands after a stale clean read", () => {
+  const foreignSessionId = "foreign-session";
+  insertEvent({ hook_event: "SessionStart", session_id: foreignSessionId });
+  const cleanReadWatermark = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: foreignSessionId,
+  });
+  const foreignMutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: foreignSessionId,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } }),
+  });
+
+  // This clean Git read happened before the mutation event was visible, but its
+  // synthetic event is appended afterward. Its own event id must not become the
+  // floor or it would jump over the unseen foreign claim.
+  const staleCleanSnapshotId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+      attribution_event_id: cleanReadWatermark,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+      // A later read observes every event through the stale snapshot append.
+      attribution_event_id: staleCleanSnapshotId,
+    }),
+  });
+  drainAll();
+
+  expect(
+    db
+      .query(
+        `SELECT op, source, last_event_id FROM file_attributions
+          WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+      )
+      .get("/repo", foreignSessionId, "a.ts"),
+  ).toEqual({ op: "Write", source: "tool", last_event_id: foreignMutationId });
+  const status = db
+    .query(
+      "SELECT attribution_event_id, dirty_files FROM git_status WHERE project_dir = ?",
+    )
+    .get("/repo") as { attribution_event_id: number; dirty_files: string };
+  expect(status.attribution_event_id).toBe(staleCleanSnapshotId);
+  const rendered = JSON.parse(status.dirty_files) as Array<{
+    attributions: Array<{ session_id: string; source: string }>;
+  }>;
+  // `tool` is an exclusive ownership source; commit-work's separately-tested
+  // adoption classifier therefore treats this live foreign row as a conflict.
+  expect(rendered[0]?.attributions).toEqual([
+    expect.objectContaining({ session_id: foreignSessionId, source: "tool" }),
+  ]);
+});
+
+test("GitSnapshot suppresses malformed, stale, and future attribution watermarks", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-owner" });
+  const mutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-owner",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } }),
+  });
+  const validSnapshotId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+      attribution_event_id: mutationId,
+    }),
+  });
+  drainAll();
+
+  for (const attributionEventId of [
+    mutationId - 1,
+    validSnapshotId + 10,
+    "bad",
+  ]) {
+    const eventId = insertEvent({
+      hook_event: "GitSnapshot",
+      session_id: "/repo",
+      cwd: "/repo",
+      data: JSON.stringify({
+        project_dir: "/repo",
+        branch: "main",
+        head_oid: null,
+        upstream: null,
+        ahead: null,
+        behind: null,
+        dirty_files: [],
+        attribution_event_id: attributionEventId,
+      }),
+    });
+    drainAll();
+    expect(
+      (
+        db
+          .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+          .get() as { last_event_id: number }
+      ).last_event_id,
+    ).toBe(eventId);
+  }
+
+  // Bypass the fixture's producer-contract helper to prove an omitted current
+  // watermark no-ops rather than falling back to the later synthetic event id.
+  const missingId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+      attribution_event_id: mutationId,
+    }),
+  });
+  db.run("UPDATE events SET data = ? WHERE id = ?", [
+    JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [],
+    }),
+    missingId,
+  ]);
+  drainAll();
+
+  // Every invalid clean snapshot was a safe fold no-op: it neither replaced the
+  // current surface nor compacted the valid exclusive claim.
+  expect(
+    db
+      .query(
+        "SELECT dirty_count, attribution_event_id FROM git_status WHERE project_dir = ?",
+      )
+      .get("/repo"),
+  ).toEqual({ dirty_count: 1, attribution_event_id: mutationId });
+  expect(
+    db
+      .query(
+        `SELECT last_event_id FROM file_attributions
+          WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+      )
+      .get("/repo", "sess-owner", "a.ts"),
+  ).toEqual({ last_event_id: mutationId });
+});
+
+test("GitSnapshot rejects a malformed persisted attribution floor", () => {
+  const mutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-owner",
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+      attribution_event_id: mutationId,
+    }),
+  });
+  drainAll();
+  db.run(
+    "UPDATE git_status SET attribution_event_id = 'malformed' WHERE project_dir = '/repo'",
+  );
+
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [],
+    }),
+  });
+  drainAll();
+
+  expect(
+    db
+      .query(
+        "SELECT dirty_count, typeof(attribution_event_id) AS floor_type FROM git_status WHERE project_dir = '/repo'",
+      )
+      .get(),
+  ).toEqual({ dirty_count: 1, floor_type: "text" });
+  expect(
+    db
+      .query(
+        "SELECT last_event_id FROM file_attributions WHERE project_dir = '/repo' AND file_path = 'a.ts'",
+      )
+      .get(),
+  ).toEqual({ last_event_id: mutationId });
+});
+
+test("GitSnapshot rejects a payload root that differs from its synthetic event key", () => {
+  const eventId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo-a",
+    cwd: "/repo-a",
+    data: JSON.stringify({
+      project_dir: "/repo-b",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [{ path: "cross-root.ts", xy: " M", mtime_ms: null }],
+    }),
+  });
+  drainAll();
+
+  expect(
+    db.query("SELECT 1 FROM git_status WHERE project_dir = ?").get("/repo-a"),
+  ).toBeNull();
+  expect(
+    db.query("SELECT 1 FROM git_status WHERE project_dir = ?").get("/repo-b"),
+  ).toBeNull();
+  expect(getCursor()).toBe(eventId);
+});
+
 test("GitSnapshot project isolation: file in /repo-a does not affect /repo-b's attributions", () => {
   // Sess-a writes a file in cwd=/repo-a. A snapshot of /repo-b that
   // includes the same path should NOT find the attribution (the
@@ -4816,6 +5089,161 @@ test("GitRootDropped compacts attribution history into a bounded floor", () => {
     (JSON.parse(returned.dirty_files) as Array<{ attributions: unknown[] }>)[0]
       ?.attributions,
   ).toEqual([]);
+});
+
+test("GitRootDropped keeps a clean read's watermark so an intervening foreign claim is recovered", () => {
+  const foreignSessionId = "foreign-drop-session";
+  insertEvent({ hook_event: "SessionStart", session_id: foreignSessionId });
+  const initialWatermark = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: foreignSessionId,
+  });
+  const initialSnapshotId = insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [],
+      attribution_event_id: initialWatermark,
+    }),
+  });
+
+  // The clean drop read captured initialSnapshotId, then this mutation landed
+  // before main appended its tombstone.
+  const mutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: foreignSessionId,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/a.ts" } }),
+  });
+  const dropId = insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({ attribution_event_id: initialSnapshotId }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+      attribution_event_id: dropId,
+    }),
+  });
+  drainAll();
+
+  expect(
+    db
+      .query(
+        `SELECT op, source, last_event_id FROM file_attributions
+          WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+      )
+      .get("/repo", foreignSessionId, "a.ts"),
+  ).toEqual({ op: "Write", source: "tool", last_event_id: mutationId });
+});
+
+test("GitRootDropped with a vanished-root null watermark preserves the prior observation floor", () => {
+  const watermark = insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-a",
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [],
+      attribution_event_id: watermark,
+    }),
+  });
+  insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({ attribution_event_id: null }),
+  });
+  drainAll();
+
+  expect(
+    db.query("SELECT 1 FROM git_status WHERE project_dir = ?").get("/repo"),
+  ).toBeNull();
+  expect(
+    db
+      .query(
+        `SELECT last_event_id FROM file_attributions
+          WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+      )
+      .get("/repo", "\u0000keeper-attribution-floor", "\u0000"),
+  ).toEqual({ last_event_id: watermark });
+});
+
+test("GitRootDropped without an explicit watermark is a safe no-op", () => {
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: null,
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      dirty_files: [],
+    }),
+  });
+  const dropId = insertEvent({
+    hook_event: "GitRootDropped",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({ attribution_event_id: null }),
+  });
+  db.run("UPDATE events SET data = '{}' WHERE id = ?", [dropId]);
+  drainAll();
+
+  expect(
+    db.query("SELECT 1 FROM git_status WHERE project_dir = ?").get("/repo"),
+  ).not.toBeNull();
+  expect(getCursor()).toBe(dropId);
+});
+
+test("GitSnapshot attribution compaction uses one non-correlated dirty-path set", () => {
+  const plan = db
+    .query(
+      `EXPLAIN QUERY PLAN
+       DELETE FROM file_attributions
+        WHERE project_dir = ?
+          AND (
+            last_mutation_at <= COALESCE(last_commit_at, 0)
+            OR file_path NOT IN (SELECT value FROM json_each(?))
+          )`,
+    )
+    .all("/repo", JSON.stringify(["a.ts", "b.ts"])) as Array<{
+    detail: string;
+  }>;
+  const detail = plan.map((row) => row.detail).join("\n");
+  expect(detail).toContain("json_each");
+  expect(detail).not.toContain("CORRELATED");
 });
 
 test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically", () => {

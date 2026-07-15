@@ -36,7 +36,16 @@
  * unhandled rejection out of the matrix's `Promise.all`.
  */
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+} from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { keeperStateDir } from "../keeper-state-dir";
 
@@ -46,6 +55,10 @@ const CONTEXT_MAX_LINES = 140;
 const MAX_DEF_SENTENCES = 2;
 /** Per-ADR line cap — a decision record is a page, not an essay. */
 const ADR_MAX_LINES = 80;
+const MAX_DOMAIN_DOC_FILES = 1_000;
+const MAX_DOMAIN_DOC_FILE_BYTES = 1_048_576;
+const MAX_DOMAIN_DOC_TOTAL_BYTES = 8 * 1_048_576;
+const O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
 
 /** A NNNN-slug.md ADR filename: zero-padded 4-digit number + kebab slug. */
 const ADR_NAME_RE = /^\d{4}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
@@ -455,6 +468,54 @@ function formatStderr(
   );
 }
 
+function readBoundedDomainDoc(
+  path: string,
+  remaining: number,
+): {
+  text: string;
+  bytes: number;
+} {
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | constants.O_NONBLOCK | O_CLOEXEC,
+  );
+  try {
+    const before = fstatSync(fd);
+    if (!before.isFile()) throw new Error(`${path} is not a regular file`);
+    if (
+      !Number.isSafeInteger(before.size) ||
+      before.size > MAX_DOMAIN_DOC_FILE_BYTES ||
+      before.size > remaining
+    ) {
+      throw new Error(`${path} exceeds the bounded domain-docs input size`);
+    }
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (count <= 0) throw new Error(`${path} changed while read`);
+      offset += count;
+    }
+    const after = fstatSync(fd);
+    const lexical = lstatSync(path);
+    if (
+      !after.isFile() ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs ||
+      after.ctimeMs !== before.ctimeMs ||
+      lexical.dev !== after.dev ||
+      lexical.ino !== after.ino
+    ) {
+      throw new Error(`${path} changed while read`);
+    }
+    return { text: bytes.toString("utf8"), bytes: before.size };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * The impure lint arm: filter the staged files to glossary + ADR paths, run the
  * pure scanners, append one pain-ledger record per finding, and return a
@@ -472,15 +533,26 @@ export async function runDomainDocsLint(
     const contextDocs = stagedFiles.filter(isContextDocPath);
     const adrFiles = stagedFiles.filter(isAdrPath);
     if (contextDocs.length === 0 && adrFiles.length === 0) return null;
+    if (domainFiles.length > MAX_DOMAIN_DOC_FILES) {
+      throw new Error(
+        `domain-docs input exceeds ${MAX_DOMAIN_DOC_FILES} files`,
+      );
+    }
 
+    let remainingBytes = MAX_DOMAIN_DOC_TOTAL_BYTES;
+    const readDoc = (file: string): string => {
+      const read = readBoundedDomainDoc(join(cwd, file), remainingBytes);
+      remainingBytes -= read.bytes;
+      return read.text;
+    };
     const tagged: { file: string; finding: DomainDocFinding }[] = [];
     for (const f of contextDocs) {
-      const text = readFileSync(join(cwd, f), "utf8");
+      const text = readDoc(f);
       for (const finding of scanContextDoc(text))
         tagged.push({ file: f, finding });
     }
     for (const f of adrFiles) {
-      const text = readFileSync(join(cwd, f), "utf8");
+      const text = readDoc(f);
       for (const finding of scanAdrFile(f, text))
         tagged.push({ file: f, finding });
     }

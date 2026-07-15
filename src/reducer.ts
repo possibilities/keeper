@@ -32,6 +32,10 @@ import {
 } from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import { allGatedRootsSeeded } from "./gated-roots";
+import {
+  ATTRIBUTION_FLOOR_PATH,
+  ATTRIBUTION_FLOOR_SESSION_ID,
+} from "./git-attribution-floor";
 import { compileFnmatch, isGlobToken } from "./glob";
 import {
   type ClassifierInvocation,
@@ -1073,6 +1077,8 @@ interface ParsedGitSnapshot {
   upstream: string | null;
   ahead: number | null;
   behind: number | null;
+  /** Inclusive events.id watermark captured before the producer read Git. */
+  attribution_event_id: number;
   dirty_files: ReducerDirtyFile[];
 }
 
@@ -1091,6 +1097,20 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
     console.error(
       `keeper reducer: failed to parse git snapshot blob for event id=${event.id} project=${event.session_id}: ${err}`,
     );
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return null;
+  }
+  const rawAttributionEventId = parsed.attribution_event_id;
+  // Missing is malformed too. Historical unwatermarked snapshots belong to the
+  // live-only pre-seed era and safely no-op; guessing from this synthetic
+  // event's later id would recreate the observation-fence race.
+  if (
+    typeof rawAttributionEventId !== "number" ||
+    !Number.isSafeInteger(rawAttributionEventId) ||
+    rawAttributionEventId < 0
+  ) {
     return null;
   }
   if (
@@ -1152,6 +1172,7 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
     upstream: typeof parsed.upstream === "string" ? parsed.upstream : null,
     ahead: typeof parsed.ahead === "number" ? parsed.ahead : null,
     behind: typeof parsed.behind === "number" ? parsed.behind : null,
+    attribution_event_id: rawAttributionEventId,
     dirty_files: dirtyFiles,
   };
 }
@@ -1487,7 +1508,7 @@ function buildExplicitAttribHoist(
           AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
           AND mutation_path = ?
           AND id > ?
-          AND id < ?`,
+          AND id <= ?`,
   );
 
   // Per-`Database` incremental memo (fn-892): scan only `id > maxId` and append
@@ -1585,7 +1606,7 @@ function buildExplicitAttribHoist(
               bash_mutation_targets AS targets
          FROM events INDEXED BY idx_events_package_attr_window
         WHERE id > ?
-          AND id < ?
+          AND id <= ?
           AND cwd = ?
           AND bash_mutation_kind IN ('pkg-install', 'pkg-uninstall')`,
     );
@@ -1786,7 +1807,7 @@ function findExplicitAttributions(
     const bashRows = hoist.bashByToken.get(candidatePath);
     if (bashRows == null) continue;
     for (const row of bashRows) {
-      if (row.id <= attributionFloor || row.id >= attributionCeiling) continue;
+      if (row.id <= attributionFloor || row.id > attributionCeiling) continue;
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
       // Break ties on event id (a later row in the same ts has a higher id) so
@@ -1835,7 +1856,7 @@ function findExplicitAttributions(
   // directory-prefix / fnmatch match via `bashTargetMatches` still runs per file
   // in JS — pure (no FS, no wall-clock), so re-fold determinism holds.
   for (const row of hoist.deletionRows) {
-    if (row.id <= attributionFloor || row.id >= attributionCeiling) continue;
+    if (row.id <= attributionFloor || row.id > attributionCeiling) continue;
     let matched = false;
     for (const rawToken of row.tokens) {
       let hit = false;
@@ -1951,8 +1972,8 @@ function computeRepoBashWindows(
           AND pre.tool_use_id IS NOT NULL
           AND pre.id > ?
           AND post.id > ?
-          AND pre.id < ?
-          AND post.id < ?
+          AND pre.id <= ?
+          AND post.id <= ?
           AND pre.ts >= ?
           AND pre.ts < ?
           AND post.ts >= ?
@@ -2127,26 +2148,37 @@ export const GIT_STATUS_DIRTY_FILES_WIRE_CAP = 200;
 /**
  * One impossible Git-path row retains the per-root attribution scan floor while
  * a root is absent. Active roots carry the same floor in
- * `git_status.last_event_id`; a snapshot compacts all discharged/non-dirty rows,
- * so attribution storage stays proportional to the current dirty surface rather
- * than every path ever touched. Git paths cannot contain NUL.
+ * `git_status.attribution_event_id`; a snapshot compacts all discharged/non-dirty
+ * rows, so attribution storage stays proportional to the current dirty surface
+ * rather than every path ever touched. Git paths cannot contain NUL.
  */
-const ATTRIBUTION_FLOOR_SESSION_ID = "\u0000keeper-attribution-floor";
-const ATTRIBUTION_FLOOR_PATH = "\u0000";
-
-function readRootAttributionFloor(db: Database, projectDir: string): number {
+function readRootAttributionFloor(
+  db: Database,
+  projectDir: string,
+): number | null {
   const active = db
-    .query("SELECT last_event_id FROM git_status WHERE project_dir = ?")
-    .get(projectDir) as { last_event_id: number | null } | null;
+    .query("SELECT attribution_event_id FROM git_status WHERE project_dir = ?")
+    .get(projectDir) as { attribution_event_id: unknown } | null;
   const dropped = db
     .query(
       `SELECT last_event_id FROM file_attributions
         WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
     )
     .get(projectDir, ATTRIBUTION_FLOOR_SESSION_ID, ATTRIBUTION_FLOOR_PATH) as {
-    last_event_id: number | null;
+    last_event_id: unknown;
   } | null;
-  return Math.max(active?.last_event_id ?? 0, dropped?.last_event_id ?? 0);
+  const values = [active?.attribution_event_id, dropped?.last_event_id].filter(
+    (value) => value !== undefined && value !== null,
+  );
+  if (
+    values.some(
+      (value) =>
+        typeof value !== "number" || !Number.isSafeInteger(value) || value < 0,
+    )
+  ) {
+    return null;
+  }
+  return Math.max(0, ...(values as number[]));
 }
 
 function projectGitStatus(db: Database, event: Event): void {
@@ -2166,10 +2198,28 @@ function projectGitStatus(db: Database, event: Event): void {
   const eventTs = event.ts;
   const eventId = event.id;
   const projectDir = snapshot.project_dir;
+  // Main keys synthetic snapshots by this same root. A mismatched payload must
+  // not read one root's event interval while mutating another root's surface.
+  if (event.session_id !== projectDir) {
+    return;
+  }
   // Only evidence newer than the preceding snapshot/drop can create a new row.
   // Existing active rows already materialize older evidence; this compact floor
   // prevents a cold memo or boot seed from resurrecting discharged history.
   const attributionFloor = readRootAttributionFloor(db, projectDir);
+  if (attributionFloor === null) return;
+  // Current producers carry the inclusive watermark captured BEFORE
+  // readStatus. A stale/future reported watermark cannot bind this read to
+  // event history, so suppress the whole snapshot rather than guessing and
+  // potentially compacting an unseen claim.
+  const latestPublishedEvidence = Math.max(0, eventId - 1);
+  const attributionCeiling = snapshot.attribution_event_id;
+  if (
+    attributionCeiling < attributionFloor ||
+    attributionCeiling > latestPublishedEvidence
+  ) {
+    return;
+  }
   const priorSurfaceRow = db
     .query("SELECT jobs FROM git_status WHERE project_dir = ?")
     .get(projectDir) as { jobs: string | null } | null;
@@ -2206,7 +2256,7 @@ function projectGitStatus(db: Database, event: Event): void {
   );
   // Stamp the latest snapshot's `worktree_oid` AND `worktree_mode` onto active
   // rows for this file, AFTER the upsert. Discharged rows need no churn and are
-  // compacted into the snapshot floor below; a later mutation reactivates its
+  // compacted into the snapshot watermark below; a later mutation reactivates its
   // row before this refresh. Both columns stay in one statement so the pair is
   // atomic.
   const refreshWorktreeOidStmt = db.prepare(
@@ -2232,7 +2282,7 @@ function projectGitStatus(db: Database, event: Event): void {
   const _explicitHoist = buildExplicitAttribHoist(db, _pass1Acc, {
     projectDir,
     floor: attributionFloor,
-    ceiling: eventId,
+    ceiling: attributionCeiling,
     dirtyRootLockfiles,
   });
   for (const file of snapshot.dirty_files) {
@@ -2241,7 +2291,7 @@ function projectGitStatus(db: Database, event: Event): void {
       file,
       _explicitHoist,
       attributionFloor,
-      eventId,
+      attributionCeiling,
       _pass1Acc,
     );
     for (const m of explicit) {
@@ -2310,7 +2360,7 @@ function projectGitStatus(db: Database, event: Event): void {
       minMtimeSec,
       maxMtimeSec,
       attributionFloor,
-      eventId,
+      attributionCeiling,
     );
     for (const file of inferNeeded) {
       const mtimeSec = (file.mtime_ms as number) / 1000;
@@ -2540,8 +2590,8 @@ function projectGitStatus(db: Database, event: Event): void {
        project_dir, branch, head_oid, upstream, ahead, behind,
        dirty_count, orphaned_count, unattributed_to_live_count,
        dirty_files, orphaned_files, jobs,
-       last_event_id, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       last_event_id, updated_at, attribution_event_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(project_dir) DO UPDATE SET
        branch = excluded.branch,
        head_oid = excluded.head_oid,
@@ -2555,7 +2605,8 @@ function projectGitStatus(db: Database, event: Event): void {
        orphaned_files = excluded.orphaned_files,
        jobs = excluded.jobs,
        last_event_id = excluded.last_event_id,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       attribution_event_id = excluded.attribution_event_id`,
     [
       projectDir,
       snapshot.branch,
@@ -2571,20 +2622,21 @@ function projectGitStatus(db: Database, event: Event): void {
       JSON.stringify(projectionJobs),
       eventId,
       eventTs,
+      attributionCeiling,
     ],
   );
 
-  // The snapshot itself is now the root's durable evidence floor. Keep only
-  // active claims for paths in its current dirty set; every other per-path row
-  // is represented by this one floor rather than an unbounded tombstone tail.
+  // The snapshot's pre-read watermark is now the root's durable evidence floor.
+  // Keep only active claims for paths in its current dirty set; every other
+  // per-path row is represented by that one boundary instead of an unbounded
+  // tombstone tail.
   db.run(
     `DELETE FROM file_attributions
       WHERE project_dir = ?
         AND (
           last_mutation_at <= COALESCE(last_commit_at, 0)
-          OR NOT EXISTS (
-            SELECT 1 FROM json_each(?) AS dirty
-             WHERE dirty.value = file_attributions.file_path
+          OR file_path NOT IN (
+            SELECT value FROM json_each(?)
           )
         )`,
     [projectDir, JSON.stringify(snapshot.dirty_files.map((file) => file.path))],
@@ -2675,6 +2727,50 @@ function retractGitStatus(db: Database, event: Event): void {
   if (projectDir == null || projectDir.length === 0) {
     return;
   }
+  const priorAttributionFloor = readRootAttributionFloor(db, projectDir);
+  if (priorAttributionFloor === null) return;
+  let observedAttributionFloor: number | null = null;
+  if (event.data == null || event.data.length === 0) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as unknown;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("attribution_event_id" in parsed)
+    ) {
+      return;
+    }
+    const reported = (parsed as { attribution_event_id?: unknown })
+      .attribution_event_id;
+    // Explicit null is the vanished-root producer: no Git read was possible,
+    // so preserve the prior floor. A numeric clean-read watermark must precede
+    // this synthetic tombstone. Missing/anything else is unbound evidence and
+    // suppresses the retraction fail-closed.
+    if (reported !== null) {
+      if (
+        typeof reported !== "number" ||
+        !Number.isSafeInteger(reported) ||
+        reported < 0 ||
+        reported > Math.max(0, event.id - 1)
+      ) {
+        return;
+      }
+      observedAttributionFloor = reported;
+    }
+  } catch {
+    // A malformed tombstone cannot prove what its status read observed.
+    return;
+  }
+  if (
+    observedAttributionFloor !== null &&
+    observedAttributionFloor < priorAttributionFloor
+  ) {
+    return;
+  }
+  const dropAttributionFloor =
+    observedAttributionFloor ?? priorAttributionFloor;
   // Pre-DELETE: read the stored `jobs` JSON to enumerate the job_ids the last
   // fan-out stamped. A missing / empty / malformed value folds to `[]` — never
   // throw inside the fold.
@@ -2703,9 +2799,10 @@ function retractGitStatus(db: Database, event: Event): void {
       syncIfPlanRef(db, jobId, event.id, event.ts);
     }
   }
-  // The drop event itself supersedes every earlier per-path observation. One
-  // impossible Git-path row retains that floor while `git_status` is absent;
-  // a returning snapshot consumes it and compacts back to current active rows.
+  // A clean observation supersedes evidence only through its pre-read event
+  // watermark. A vanished drop has no newer observation and preserves
+  // the prior floor. One impossible Git-path row retains that boundary while
+  // `git_status` is absent; a returning snapshot compacts it back into the row.
   db.run("DELETE FROM file_attributions WHERE project_dir = ?", [projectDir]);
   db.run(
     `INSERT INTO file_attributions
@@ -2718,7 +2815,7 @@ function retractGitStatus(db: Database, event: Event): void {
       ATTRIBUTION_FLOOR_PATH,
       event.ts,
       event.ts,
-      event.id,
+      dropAttributionFloor,
       event.ts,
     ],
   );

@@ -247,6 +247,7 @@ describe("commit-work: worktree-pinned cwd threading", () => {
         cwd: worktree,
         env: {},
         gitRunner: run,
+        validateIdentity: () => true,
         directEvidence: () => ({
           currentSessionPaths: ["f.txt"],
           complete: true,
