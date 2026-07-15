@@ -13336,7 +13336,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     ? new Worker(new URL("./renamer-worker.ts", import.meta.url).href, {
         workerData: {
           dbPath,
-          tabIcons: apConfig.tabIcons,
+          harnessIcons: apConfig.harnessIcons,
+          stateIcons: apConfig.stateIcons,
         } satisfies RenamerWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;

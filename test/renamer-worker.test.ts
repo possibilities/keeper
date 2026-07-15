@@ -128,6 +128,15 @@ function fakeBackend(opts: {
   };
 }
 
+const STATE_ICONS = {
+  error: robotGlyph("error"),
+  awaiting: robotGlyph("awaiting"),
+  working: robotGlyph("working"),
+  ended: robotGlyph("ended"),
+  stopped: robotGlyph("stopped"),
+  killed: robotGlyph("killed"),
+};
+
 const pane = (
   paneId: string,
   windowId: string,
@@ -282,7 +291,7 @@ test("computeRenames: latest created_at wins, target is the winner's title", () 
   });
   const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
   expect(computeRenames([older, newer], panes)).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} new` },
+    { windowId: "@1", name: "new" },
   ]);
 });
 
@@ -301,7 +310,7 @@ test("computeRenames: created_at tie breaks on higher job_id", () => {
   });
   const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
   expect(computeRenames([lo, hi], panes)).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} hi` },
+    { windowId: "@1", name: "hi" },
   ]);
 });
 
@@ -312,7 +321,7 @@ test("computeRenames: a window already named its winner is NOT re-renamed", () =
     title: "match",
     created_at: 100,
   });
-  const panes = [pane("%1", "@1", `${robotGlyph("working")} match`)];
+  const panes = [pane("%1", "@1", "match")];
   expect(computeRenames([c], panes)).toEqual([]);
 });
 
@@ -326,10 +335,12 @@ test("computeRenames: state robot precedes the harness icon and title", () => {
   });
   const icons = { pi: "󰏿" };
   const target = `${robotGlyph("working")} 󰏿 orbit`;
-  expect(computeRenames([c], [pane("%1", "@1", "stale")], icons)).toEqual([
-    { windowId: "@1", name: target },
-  ]);
-  expect(computeRenames([c], [pane("%1", "@1", target)], icons)).toEqual([]);
+  expect(
+    computeRenames([c], [pane("%1", "@1", "stale")], icons, STATE_ICONS),
+  ).toEqual([{ windowId: "@1", name: target }]);
+  expect(
+    computeRenames([c], [pane("%1", "@1", target)], icons, STATE_ICONS),
+  ).toEqual([]);
 });
 
 test("renameCandidates treats a legacy NULL harness as claude for icon lookup", () => {
@@ -345,9 +356,12 @@ test("renameCandidates treats a legacy NULL harness as claude for icon lookup", 
     } as Job,
   ]);
   expect(
-    computeRenames(candidates, [pane("%1", "@1", "stale")], {
-      claude: "󰛄",
-    }),
+    computeRenames(
+      candidates,
+      [pane("%1", "@1", "stale")],
+      { claude: "󰛄" },
+      STATE_ICONS,
+    ),
   ).toEqual([{ windowId: "@1", name: `${robotGlyph("working")} 󰛄 legacy` }]);
 });
 
@@ -360,7 +374,7 @@ test("computeRenames: a spawn-name `::`/`.` title tabs verbatim, and is not re-r
   });
   // Fresh window: the title lands verbatim — tmux accepts `:` and `.` in a
   // window name, so no rewriting is needed.
-  const target = `${robotGlyph("working")} work::fn-1019.2`;
+  const target = "work::fn-1019.2";
   expect(computeRenames([c], [pane("%1", "@1", "stale")])).toEqual([
     { windowId: "@1", name: target },
   ]);
@@ -393,8 +407,8 @@ test("computeRenames: independent windows each get their own winner, sorted by w
   });
   const panes = [pane("%2", "@2", "stale"), pane("%1", "@1", "stale")];
   expect(computeRenames([c1, c2], panes)).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} one` },
-    { windowId: "@2", name: `${robotGlyph("working")} two` },
+    { windowId: "@1", name: "one" },
+    { windowId: "@2", name: "two" },
   ]);
 });
 
@@ -412,9 +426,7 @@ test("renamerPulse renames the winning window and fires only on mismatch", async
   const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   const state = { lastHash: null };
   await renamerPulse(db, fb.backend, state);
-  expect(fb.renameCalls).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} winner` },
-  ]);
+  expect(fb.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
 });
 
 test("renamerPulse applies the configured icon for the job harness", async () => {
@@ -427,9 +439,7 @@ test("renamerPulse applies the configured icon for the job harness", async () =>
   db.run("UPDATE jobs SET harness = 'pi' WHERE job_id = 'a'");
   const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   await renamerPulse(db, fb.backend, { lastHash: null }, { pi: "󰏿" });
-  expect(fb.renameCalls).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} 󰏿 winner` },
-  ]);
+  expect(fb.renameCalls).toEqual([{ windowId: "@1", name: "󰏿 winner" }]);
 });
 
 test("renamerPulse re-fires with the stopped robot when job state changes", async () => {
@@ -441,9 +451,9 @@ test("renamerPulse re-fires with the stopped robot when job state changes", asyn
   });
   const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   const state = { lastHash: null };
-  await renamerPulse(db, fb.backend, state);
+  await renamerPulse(db, fb.backend, state, {}, STATE_ICONS);
   db.run("UPDATE jobs SET state = 'stopped' WHERE job_id = 'a'");
-  await renamerPulse(db, fb.backend, state);
+  await renamerPulse(db, fb.backend, state, {}, STATE_ICONS);
   expect(fb.listPanesCalls).toBe(2);
   expect(fb.renameCalls).toEqual([
     { windowId: "@1", name: `${robotGlyph("working")} winner` },
@@ -489,9 +499,7 @@ test("renamerPulse on a degraded (null) sweep skips the cycle without advancing 
   // Gate NOT advanced: a healthy backend on the same candidate set still sweeps.
   const healthy = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   await renamerPulse(db, healthy.backend, state);
-  expect(healthy.renameCalls).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} winner` },
-  ]);
+  expect(healthy.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
 });
 
 test("renamerPulse swallows a TOCTOU rename failure as a non-fatal skip", async () => {
@@ -508,7 +516,5 @@ test("renamerPulse swallows a TOCTOU rename failure as a non-fatal skip", async 
   const state = { lastHash: null };
   // The failure is logged, not thrown — the pulse resolves and the gate advances.
   await renamerPulse(db, fb.backend, state);
-  expect(fb.renameCalls).toEqual([
-    { windowId: "@1", name: `${robotGlyph("working")} winner` },
-  ]);
+  expect(fb.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
 });

@@ -4546,10 +4546,11 @@ export interface KeeperConfig {
   // undefined here); `resolveKeeperAgentPath()` supplies the derived default +
   // the `KEEPER_AGENT_PATH` env override + tilde-expansion.
   keeperAgentPath?: string;
-  // Optional harness → icon map for tmux tab names. Parsed from `tab_icons`;
-  // absent, malformed, or entry-invalid values contribute no harness segment.
-  // The renamer separates state icon, optional harness icon, and title by spaces.
-  tabIcons: Record<string, string>;
+  // Optional harness/status → icon maps for tmux tab names. Parsed independently
+  // from `harness_icons` / `state_icons`; absent, malformed, or entry-invalid
+  // values contribute no segment. Order is state icon, harness icon, title.
+  harnessIcons: Record<string, string>;
+  stateIcons: Record<string, string>;
   // The autoclose worker's off-switch (default TRUE = on). Parsed from
   // `autoclose_enabled`. Because it gates a WINDOW-KILLING feature the disable
   // set is deliberately GENEROUS: boolean `false`, OR any of the trimmed,
@@ -4574,12 +4575,12 @@ export const DEFAULT_AUTOCLOSE_ENABLED = true;
 export const DEFAULT_AUTOCLOSE_GRACE_SECONDS = 30;
 
 /**
- * Resolve the optional `tab_icons` harness → icon mapping. The map is
- * best-effort like the rest of config.yaml: a non-mapping contributes nothing,
- * and malformed entries are skipped without disturbing valid siblings. Keys
- * and icons are trimmed; empty results are ignored. Pure.
+ * Resolve an optional icon mapping. Both `harness_icons` and `state_icons` use
+ * this best-effort parser: a non-mapping contributes nothing, and malformed
+ * entries are skipped without disturbing valid siblings. Keys and icons are
+ * trimmed; empty results are ignored. Pure.
  */
-export function resolveTabIcons(raw: unknown): Record<string, string> {
+export function resolveIconMap(raw: unknown): Record<string, string> {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     return {};
   }
@@ -4716,7 +4717,8 @@ export function resolveConfig(): KeeperConfig {
   // either falls back through the pure resolvers below.
   let autocloseEnabled: boolean = DEFAULT_AUTOCLOSE_ENABLED;
   let autocloseGraceSeconds: number = DEFAULT_AUTOCLOSE_GRACE_SECONDS;
-  let tabIcons: Record<string, string> = {};
+  let harnessIcons: Record<string, string> = {};
+  let stateIcons: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
       return {
@@ -4725,7 +4727,8 @@ export function resolveConfig(): KeeperConfig {
         repoCloneRoot,
         repoForkRoot,
         claudeProjectsRoot,
-        tabIcons,
+        harnessIcons,
+        stateIcons,
         autocloseEnabled,
         autocloseGraceSeconds,
       };
@@ -4787,9 +4790,14 @@ export function resolveConfig(): KeeperConfig {
       if (typeof kap === "string" && kap.length > 0) {
         keeperAgentPath = kap;
       }
-      // Optional harness → icon mapping for tmux tab prefixes. Malformed rows
-      // are skipped independently; absent/malformed whole values resolve to {}.
-      tabIcons = resolveTabIcons((raw as { tab_icons?: unknown }).tab_icons);
+      // Optional icon mappings for tmux tab prefixes. Each map and each row
+      // resolves independently; absent/malformed values resolve to {}.
+      harnessIcons = resolveIconMap(
+        (raw as { harness_icons?: unknown }).harness_icons,
+      );
+      stateIcons = resolveIconMap(
+        (raw as { state_icons?: unknown }).state_icons,
+      );
       // Autoclose keys — resolved through the generous pure resolvers so a
       // mistyped off-switch never silently keeps killing windows, and each key
       // falls back to its default independently of the other.
@@ -4811,7 +4819,8 @@ export function resolveConfig(): KeeperConfig {
       repoCloneRoot: DEFAULT_REPO_CLONE_ROOT,
       repoForkRoot: DEFAULT_REPO_FORK_ROOT,
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
-      tabIcons: {},
+      harnessIcons: {},
+      stateIcons: {},
       autocloseEnabled: DEFAULT_AUTOCLOSE_ENABLED,
       autocloseGraceSeconds: DEFAULT_AUTOCLOSE_GRACE_SECONDS,
     };
@@ -4826,7 +4835,8 @@ export function resolveConfig(): KeeperConfig {
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
-    tabIcons,
+    harnessIcons,
+    stateIcons,
     autocloseEnabled,
     autocloseGraceSeconds,
   };

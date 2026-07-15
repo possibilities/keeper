@@ -17,7 +17,7 @@ import {
   resolveAutocloseEnabled,
   resolveAutocloseGraceSeconds,
   resolveConfig,
-  resolveTabIcons,
+  resolveIconMap,
 } from "../src/db";
 
 let dir: string;
@@ -168,30 +168,47 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
 });
 
 // ---------------------------------------------------------------------------
-// tab_icons — optional harness → icon prefixes for the tmux renamer
+// harness_icons / state_icons — optional tmux-renamer prefix segments
 // ---------------------------------------------------------------------------
 
-test("tabIcons defaults to an empty map when the file or key is absent", () => {
+test("icon maps default empty when the file or keys are absent", () => {
   process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().tabIcons).toEqual({});
+  expect(resolveConfig().harnessIcons).toEqual({});
+  expect(resolveConfig().stateIcons).toEqual({});
   writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().tabIcons).toEqual({});
+  expect(resolveConfig().harnessIcons).toEqual({});
+  expect(resolveConfig().stateIcons).toEqual({});
 });
 
-test("tab_icons resolves valid harness mappings and trims their values", () => {
-  writeConfig('tab_icons:\n  pi: " 󰏿 "\n  claude: "󰛄"\n');
-  expect(resolveConfig().tabIcons).toEqual({ pi: "󰏿", claude: "󰛄" });
+test("harness_icons and state_icons resolve independently and trim values", () => {
+  writeConfig(
+    'harness_icons:\n  pi: " 󰏿 "\n  claude: "󰛄"\n' +
+      'state_icons:\n  working: " 󰚩 "\n  stopped: "󱙺"\n',
+  );
+  const cfg = resolveConfig();
+  expect(cfg.harnessIcons).toEqual({ pi: "󰏿", claude: "󰛄" });
+  expect(cfg.stateIcons).toEqual({ working: "󰚩", stopped: "󱙺" });
 });
 
-test("tab_icons skips malformed entries without disturbing valid siblings", () => {
-  writeConfig('tab_icons:\n  pi: "󰏿"\n  claude: 42\n  empty: "   "\n');
-  expect(resolveConfig().tabIcons).toEqual({ pi: "󰏿" });
+test("icon maps skip malformed entries without disturbing valid siblings", () => {
+  writeConfig(
+    'harness_icons:\n  pi: "󰏿"\n  claude: 42\n' +
+      'state_icons:\n  working: "󰚩"\n  empty: "   "\n',
+  );
+  const cfg = resolveConfig();
+  expect(cfg.harnessIcons).toEqual({ pi: "󰏿" });
+  expect(cfg.stateIcons).toEqual({ working: "󰚩" });
 });
 
-test("resolveTabIcons rejects a malformed whole value to the empty default", () => {
-  expect(resolveTabIcons(["pi", "󰏿"])).toEqual({});
-  expect(resolveTabIcons("pi=󰏿")).toEqual({});
-  expect(resolveTabIcons(null)).toEqual({});
+test("the retired tab_icons key is ignored", () => {
+  writeConfig('tab_icons:\n  pi: "󰏿"\n');
+  expect(resolveConfig().harnessIcons).toEqual({});
+});
+
+test("resolveIconMap rejects a malformed whole value to the empty default", () => {
+  expect(resolveIconMap(["pi", "󰏿"])).toEqual({});
+  expect(resolveIconMap("pi=󰏿")).toEqual({});
+  expect(resolveIconMap(null)).toEqual({});
 });
 
 // ---------------------------------------------------------------------------
