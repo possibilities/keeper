@@ -29,6 +29,7 @@ import {
   type Driver,
   type HostMatrixV2,
   hostMatrixV2EffortsFor,
+  hostMatrixV2ProviderRoute,
   parseHostMatrixV2Bytes,
 } from "../../plan/src/host_matrix.ts";
 import {
@@ -260,10 +261,6 @@ function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function relPosix(from: string, to: string): string {
-  return relative(from, to).split(sep).join("/");
-}
-
 function isWithin(candidate: string, root: string): boolean {
   const rel = relative(root, candidate);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`));
@@ -291,29 +288,37 @@ export function resolveClaudeCompilerRoots(input: {
           : planRoot),
       "keeper root",
     );
-    return { repoRoot, planRoot };
+    return validateCompilerRoots(repoRoot, planRoot);
   }
   const candidate = realpathDirectory(
     input.repoRoot ?? resolve(import.meta.dir, "../../.."),
     "project root",
   );
   if (isPlanRoot(candidate)) {
-    return {
-      planRoot: candidate,
-      repoRoot:
-        basename(candidate) === "plan" &&
+    return validateCompilerRoots(
+      basename(candidate) === "plan" &&
         basename(dirname(candidate)) === "plugins"
-          ? realpathDirectory(resolve(candidate, "../.."), "keeper root")
-          : candidate,
-    };
+        ? realpathDirectory(resolve(candidate, "../.."), "keeper root")
+        : candidate,
+      candidate,
+    );
   }
-  return {
-    repoRoot: candidate,
-    planRoot: realpathDirectory(
-      join(candidate, "plugins", "plan"),
-      "plan plugin root",
-    ),
-  };
+  return validateCompilerRoots(
+    candidate,
+    realpathDirectory(join(candidate, "plugins", "plan"), "plan plugin root"),
+  );
+}
+
+function validateCompilerRoots(
+  repoRoot: string,
+  planRoot: string,
+): CompilerRoots {
+  if (!isWithin(planRoot, repoRoot)) {
+    throw new Error(
+      `${planRoot}: physical plan plugin root is outside physical keeper root ${repoRoot}`,
+    );
+  }
+  return { repoRoot, planRoot };
 }
 
 function realpathDirectory(path: string, label: string): string {
@@ -505,6 +510,28 @@ function parseFrontmatter(
   return parsed as Record<string, unknown>;
 }
 
+function validateRenderedLaunchFrontmatter(input: {
+  frontmatter: Readonly<Record<string, unknown>>;
+  sourcePath: string;
+  cellRoot: string;
+  launch: ClaudeWorkerLaunchCell;
+  maxTurns: 160 | 300;
+}): void {
+  const expected: Readonly<Record<"model" | "effort" | "maxTurns", unknown>> = {
+    model: input.launch.model,
+    effort: input.launch.effort,
+    maxTurns: input.maxTurns,
+  };
+  for (const field of ["model", "effort", "maxTurns"] as const) {
+    if (input.frontmatter[field] !== expected[field]) {
+      throw new Error(
+        `${input.sourcePath}: rendered ${input.cellRoot} frontmatter ${field} ` +
+          `must be ${JSON.stringify(expected[field])}, got ${JSON.stringify(input.frontmatter[field])}`,
+      );
+    }
+  }
+}
+
 function stripWorkerCompilerFields(rendered: string): string {
   return rendered
     .replace(VARIANTS_STRIP_RE, "")
@@ -573,6 +600,28 @@ function normalizeNestedPath(path: string, label: string): string {
   return path;
 }
 
+function containedSourceTemplate(
+  roots: CompilerRoots,
+  sourcePath: string,
+): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync(sourcePath);
+    if (!statSync(canonical).isFile()) throw new Error("not a file");
+  } catch {
+    throw new Error(`${sourcePath}: source template is not a physical file`);
+  }
+  if (!isWithin(canonical, roots.repoRoot)) {
+    throw new Error(
+      `${canonical}: source template is outside physical keeper root ${roots.repoRoot}`,
+    );
+  }
+  return normalizeNestedPath(
+    relative(roots.repoRoot, canonical).split(sep).join("/"),
+    "source template",
+  );
+}
+
 function artifact(input: {
   path: string;
   content: string;
@@ -600,6 +649,30 @@ function artifact(input: {
   };
 }
 
+function claudeLaunchCell(
+  matrix: HostMatrixV2,
+  capability: string,
+  effort: string,
+  label: string,
+): ClaudeWorkerLaunchCell {
+  const route = hostMatrixV2ProviderRoute(matrix, "claude", capability);
+  if (route === undefined) {
+    throw new Error(
+      `${label}: Claude provider has no route for capability '${capability}'`,
+    );
+  }
+  if (!route.efforts.includes(effort)) {
+    throw new Error(
+      `${label}: Claude route '${route.launchId}' does not allow effort '${effort}'`,
+    );
+  }
+  return {
+    provider: "claude",
+    model: route.launchId,
+    effort,
+  };
+}
+
 function buildCells(input: {
   roots: CompilerRoots;
   snapshot: ClaudeSnapshot;
@@ -608,6 +681,12 @@ function buildCells(input: {
   const cells: PlannedCell[] = [];
   const artifacts = new Map<string, Artifact>();
   const wrapper = input.snapshot.matrix.wrapper_driver;
+  const wrapperLaunch = claudeLaunchCell(
+    input.snapshot.matrix,
+    wrapper.model,
+    wrapper.effort,
+    "wrapper_driver",
+  );
   for (const model of [...input.snapshot.matrix.models].sort()) {
     const strategy =
       input.snapshot.matrix.driverByModel.get(model) ?? "wrapped";
@@ -616,15 +695,17 @@ function buildCells(input: {
       model,
     ).sort()) {
       const assigned = { model, effort };
-      const launch: ClaudeWorkerLaunchCell =
-        strategy === "native"
-          ? { provider: "claude", model, effort }
-          : {
-              provider: "claude",
-              model: wrapper.model,
-              effort: wrapper.effort,
-            };
       const cellRoot = `${model}-${effort}`;
+      const launch =
+        strategy === "native"
+          ? claudeLaunchCell(
+              input.snapshot.matrix,
+              model,
+              effort,
+              `native cell ${cellRoot}`,
+            )
+          : wrapperLaunch;
+      const maxTurns = strategy === "native" ? 300 : 160;
       let cellPlugin: Artifact | undefined;
       let metadata: ClaudeWorkerPluginMetadata | undefined;
       for (const role of input.snapshot.roles) {
@@ -633,14 +714,21 @@ function buildCells(input: {
           throw new Error(`${role.role}: capture is missing`);
         const rendered = `${
           renderCapturedTemplate(graph, {
-            current_model: model,
+            current_model: strategy === "native" ? launch.model : model,
             current_effort: effort,
             current_driver: strategy,
-            wrapper_model: wrapper.model,
-            wrapper_effort: wrapper.effort,
+            wrapper_model: wrapperLaunch.model,
+            wrapper_effort: wrapperLaunch.effort,
           }).text
         }\n`;
         const frontmatter = parseFrontmatter(rendered, role.sourcePath);
+        validateRenderedLaunchFrontmatter({
+          frontmatter,
+          sourcePath: role.sourcePath,
+          cellRoot,
+          launch,
+          maxTurns,
+        });
         const description = frontmatter.manifest_description;
         if (typeof description !== "string" || description.trim() === "") {
           throw new Error(
@@ -657,7 +745,10 @@ function buildCells(input: {
           );
         }
         metadata = roleMetadata;
-        const sourceTemplate = relPosix(input.roots.repoRoot, role.sourcePath);
+        const sourceTemplate = containedSourceTemplate(
+          input.roots,
+          role.sourcePath,
+        );
         const local = role.role.slice(role.role.indexOf(":") + 1);
         const agent = artifact({
           path: `${cellRoot}/agents/${local}.md`,
@@ -694,7 +785,7 @@ function buildCells(input: {
           effective: assigned,
           strategy,
           launch,
-          maxTurns: strategy === "native" ? 300 : 160,
+          maxTurns,
           agent,
           plugin: cellPlugin,
           pluginMetadata: roleMetadata,
@@ -1043,7 +1134,7 @@ function validateNewSidecar(
     typeof data.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(data.sha256)
       ? "sha256"
       : null,
-    !sidecarSourceIsCanonical(data.source_template, roots, role.sourcePath)
+    data.source_template !== containedSourceTemplate(roots, role.sourcePath)
       ? "source_template"
       : null,
   ].filter((name): name is string => name !== null);
@@ -1101,10 +1192,15 @@ function validateUnclaimedPlannedArtifacts(
     }
     const data = parseSidecar(sidecarPath);
     if (data.publisher === CLAUDE_WORKER_PUBLISHER) {
-      validateNewSidecar(sidecarPath, item.role, prepared.roots);
-      if (!primaryExists && data.sha256 !== item.hash) {
+      const marker = validateNewSidecar(sidecarPath, item.role, prepared.roots);
+      const markerHash = marker.sha256 as string;
+      const intactPriorPublication =
+        primaryExists && fileMatches(primaryPath, markerHash);
+      const currentMarkerFirstPublication =
+        markerHash === item.hash && marker.fingerprint === prepared.fingerprint;
+      if (!intactPriorPublication && !currentMarkerFirstPublication) {
         throw new Error(
-          `${sidecarPath}: interrupted marker does not describe the planned primary`,
+          `${sidecarPath}: refusing new-format sidecar adoption without an intact primary or current marker-first proof`,
         );
       }
       continue;

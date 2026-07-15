@@ -47,8 +47,8 @@ function matrix(
     "providers:",
     "  - name: claude",
     "    models:",
-    `      - { id: opus, efforts: ${opusEfforts} }`,
-    "      - sonnet",
+    `      - { id: anthropic/opus, efforts: ${opusEfforts} }`,
+    "      - anthropic/sonnet",
     "  - name: codex",
     "    models:",
     "      - { id: gpt-5.6, efforts: [medium] }",
@@ -102,14 +102,15 @@ function legacyRendered(
   model: string,
   effort: string,
   driver: "native" | "wrapped",
+  launchModel: string,
 ): string {
   const source = join(fx.planRoot, "template", "agents", "worker.md.tmpl");
   return `${
     renderTemplate(source, {
-      current_model: model,
+      current_model: driver === "native" ? launchModel : model,
       current_effort: effort,
       current_driver: driver,
-      wrapper_model: "sonnet",
+      wrapper_model: "anthropic/sonnet",
       wrapper_effort: "high",
     }).text
   }\n`
@@ -138,7 +139,11 @@ describe("Claude worker cohort compiler", () => {
       assigned_cell: { model: "gpt-5.6", effort: "medium" },
       effective_cell: { model: "gpt-5.6", effort: "medium" },
       strategy: "wrapped",
-      launch_cell: { provider: "claude", model: "sonnet", effort: "high" },
+      launch_cell: {
+        provider: "claude",
+        model: "anthropic/sonnet",
+        effort: "high",
+      },
       max_turns: 160,
       plugin_manifest: {
         metadata: {
@@ -150,7 +155,11 @@ describe("Claude worker cohort compiler", () => {
     });
     expect(result.outputs[1]).toMatchObject({
       strategy: "native",
-      launch_cell: { provider: "claude", model: "opus", effort: "high" },
+      launch_cell: {
+        provider: "claude",
+        model: "anthropic/opus",
+        effort: "high",
+      },
       max_turns: 300,
     });
     for (const row of result.outputs) {
@@ -159,12 +168,84 @@ describe("Claude worker cohort compiler", () => {
         row.cell.model,
         row.cell.effort,
         row.strategy,
+        row.launch_cell.model,
       );
       expect(readFileSync(join(fx.targetDir, row.output), "utf8")).toBe(
         expected,
       );
     }
     expect(verify(fx).ok).toBe(true);
+  });
+
+  test("rejects rendered launch frontmatter that disagrees with computed cells", () => {
+    const cases: Array<[string, string, RegExp]> = [
+      [
+        "model: {{ current_model }}",
+        "model: wrong-model",
+        /frontmatter model must be/,
+      ],
+      [
+        `effort: "{{ current_effort }}"`,
+        `effort: "low"`,
+        /frontmatter effort must be/,
+      ],
+      ["maxTurns: 300", "maxTurns: 301", /frontmatter maxTurns must be/],
+    ];
+    for (const [from, to, error] of cases) {
+      const fx = fixture();
+      const source = join(fx.planRoot, "template", "agents", "worker.md.tmpl");
+      const template = readFileSync(source, "utf8");
+      expect(template).toContain(from);
+      writeFileSync(source, template.replace(from, to));
+      expect(() => compile(fx)).toThrow(error);
+      expect(existsSync(fx.targetDir)).toBe(false);
+    }
+  });
+
+  test("validates exact native and wrapper Claude routes and efforts", () => {
+    const missingWrapper = fixture();
+    writeFileSync(
+      missingWrapper.matrixPath,
+      matrix().replace("      - anthropic/sonnet\n", ""),
+    );
+    expect(() => compile(missingWrapper)).toThrow(
+      /wrapper_driver: Claude provider has no route for capability 'sonnet'/,
+    );
+
+    const unsupportedWrapper = fixture();
+    writeFileSync(
+      unsupportedWrapper.matrixPath,
+      matrix().replace(
+        "      - anthropic/sonnet",
+        "      - { id: anthropic/sonnet, efforts: [low] }",
+      ),
+    );
+    expect(() => compile(unsupportedWrapper)).toThrow(
+      /wrapper_driver: Claude route 'anthropic\/sonnet' does not allow effort 'high'/,
+    );
+
+    const unsupportedNative = fixture();
+    writeFileSync(
+      unsupportedNative.matrixPath,
+      [
+        "efforts: [low, high]",
+        "subagent_templates: [template/agents/worker.md.tmpl]",
+        "subagent_models: [opus]",
+        "providers:",
+        "  - name: codex",
+        "    models:",
+        "      - { id: openai/opus, efforts: [high] }",
+        "  - name: claude",
+        "    models:",
+        "      - { id: anthropic/opus, efforts: [low] }",
+        "      - anthropic/sonnet",
+        "wrapper_driver: { model: sonnet, effort: high }",
+        "",
+      ].join("\n"),
+    );
+    expect(() => compile(unsupportedNative)).toThrow(
+      /native cell opus-high: Claude route 'anthropic\/opus' does not allow effort 'high'/,
+    );
   });
 
   test("accepts plan:work scope, ignores static members, and rejects static-only scope", () => {
@@ -301,6 +382,41 @@ describe("Claude worker cohort compiler", () => {
     expect(existsSync(join(fx.targetDir, CLAUDE_WORKER_MANIFEST))).toBe(false);
   });
 
+  test("refuses forged or stale new-format markers without a manifest", () => {
+    const fx = fixture();
+    const first = compile(fx);
+    rmSync(join(fx.targetDir, CLAUDE_WORKER_MANIFEST));
+    const row = first.outputs[0];
+    if (row === undefined) throw new Error("missing compiled row");
+    const primary = join(fx.targetDir, row.output);
+    const sidecar = join(fx.targetDir, row.sidecar);
+    const marker = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
+      string,
+      unknown
+    >;
+
+    writeFileSync(primary, "forged primary\n");
+    writeFileSync(
+      sidecar,
+      `${JSON.stringify({ ...marker, sha256: "a".repeat(64) }, null, 2)}\n`,
+    );
+    expect(() => compile(fx)).toThrow(/refusing new-format sidecar adoption/);
+    expect(readFileSync(primary, "utf8")).toBe("forged primary\n");
+
+    writeFileSync(primary, "stale primary\n");
+    writeFileSync(
+      sidecar,
+      `${JSON.stringify(
+        { ...marker, sha256: row.sha256, fingerprint: "b".repeat(64) },
+        null,
+        2,
+      )}\n`,
+    );
+    expect(() => compile(fx)).toThrow(/refusing new-format sidecar adoption/);
+    expect(readFileSync(primary, "utf8")).toBe("stale primary\n");
+    expect(existsSync(join(fx.targetDir, CLAUDE_WORKER_MANIFEST))).toBe(false);
+  });
+
   test("prunes clean manifest-owned cells after matrix contraction", () => {
     const fx = fixture();
     compile(fx);
@@ -370,6 +486,22 @@ describe("Claude worker cohort compiler", () => {
     });
   });
 
+  test("rejects a physical plan root outside the physical keeper root", () => {
+    const fx = fixture();
+    const otherRepo = mkdtempSync(join(tmpdir(), "claude-worker-other-root-"));
+    temps.push(otherRepo);
+    expect(() =>
+      compileClaudeWorkerArtifacts({
+        request: { target: "claude", role: "work:worker" },
+        repoRoot: otherRepo,
+        planRoot: fx.planRoot,
+        matrixPath: fx.matrixPath,
+        targetDir: fx.targetDir,
+      }),
+    ).toThrow(/physical plan plugin root is outside physical keeper root/);
+    expect(existsSync(fx.targetDir)).toBe(false);
+  });
+
   test("manifest is canonical, target-scoped, and carries exact cell metadata", () => {
     const fx = fixture();
     const result = compile(fx);
@@ -382,6 +514,15 @@ describe("Claude worker cohort compiler", () => {
       fingerprint: result.fingerprint,
     });
     expect((manifest.cells as unknown[]).length).toBe(result.outputs.length);
+    const first = result.outputs[0];
+    if (first === undefined) throw new Error("missing compiled row");
+    const sidecar = JSON.parse(
+      readFileSync(join(fx.targetDir, first.sidecar), "utf8"),
+    ) as Record<string, unknown>;
+    expect(sidecar.source_template).toBe(
+      "plugins/plan/template/agents/worker.md.tmpl",
+    );
+    expect(String(sidecar.source_template)).not.toContain("..");
     expect(existsSync(join(fx.repoRoot, "pi-agent"))).toBe(false);
   });
 });
