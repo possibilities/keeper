@@ -12,7 +12,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,7 +28,10 @@ import {
   type Route,
   writeObservationSidecar,
 } from "../src/account-observation";
-import { selectRoute } from "../src/account-router";
+import {
+  selectRoute,
+  selectRouteByAccountOrdinal,
+} from "../src/account-router";
 import {
   ledgerPath,
   NATIVE_ROUTE_ID,
@@ -71,6 +80,7 @@ function seedObservation(
     health?: ObservationHealth;
     observedAtMs?: number;
     accountOrdinals?: Record<string, number>;
+    accountActiveRouteable?: boolean;
   } = {},
 ): void {
   const obs: Observation = {
@@ -90,6 +100,9 @@ function seedObservation(
           claude_accounts: {
             count: new Set(Object.values(opts.accountOrdinals)).size,
             ordinals: opts.accountOrdinals,
+            ...(opts.accountActiveRouteable === undefined
+              ? {}
+              : { active_routeable: opts.accountActiveRouteable }),
           },
         }),
     notes: [],
@@ -168,6 +181,162 @@ describe("selectRoute — fail-open disable gates", () => {
 });
 
 // ---------- headroom selection ----------------------------------------------
+
+describe("selectRouteByAccountOrdinal — exact requested account", () => {
+  test("maps an inventory ordinal to its sparse managed slot and reserves it", () => {
+    const dir = tmp();
+    try {
+      seedObservation(
+        dir,
+        [
+          nativeRoute(win("session", 0.1)),
+          managedRoute(9, win("session", 0.9)),
+        ],
+        {
+          accountOrdinals: {
+            default: 0,
+            "claude-swap:4": 0,
+            "claude-swap:9": 1,
+          },
+        },
+      );
+      const resolved = selectRouteByAccountOrdinal(1, {
+        stateDir: dir,
+        nowMs: NOW_MS,
+      });
+      expect(resolved).toEqual({
+        ok: true,
+        selection: {
+          id: "claude-swap:9",
+          kind: "managed",
+          slot: 9,
+          accountOrdinal: 1,
+          reason: "requested-account",
+        },
+      });
+      const ledger = JSON.parse(readFileSync(ledgerPath(dir), "utf8")) as {
+        routes: Record<string, { reservations: number[] }>;
+      };
+      expect(ledger.routes["claude-swap:9"].reservations).toEqual([NOW_MS]);
+      expect(ledger.routes.default).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the active inventory ordinal selects the native route even when balancing is disabled", () => {
+    const dir = tmp();
+    try {
+      seedObservation(dir, [nativeRoute()], {
+        health: "absent",
+        accountOrdinals: {
+          default: 1,
+          "claude-swap:4": 0,
+          "claude-swap:9": 1,
+        },
+        accountActiveRouteable: true,
+      });
+      const resolved = selectRouteByAccountOrdinal(1, {
+        stateDir: dir,
+        nowMs: NOW_MS,
+      });
+      expect(resolved).toEqual({
+        ok: true,
+        selection: {
+          id: "default",
+          kind: "native",
+          slot: null,
+          accountOrdinal: 1,
+          reason: "requested-account",
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a sole requested account resolves but keeps the statusline unlabeled", () => {
+    const dir = tmp();
+    try {
+      seedObservation(dir, [nativeRoute()], {
+        accountOrdinals: { default: 0, "claude-swap:7": 0 },
+        accountActiveRouteable: true,
+      });
+      const resolved = selectRouteByAccountOrdinal(0, {
+        stateDir: dir,
+        nowMs: NOW_MS,
+      });
+      expect(resolved.ok).toBe(true);
+      if (resolved.ok) {
+        expect(resolved.selection.accountOrdinal).toBeUndefined();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("missing, stale, out-of-range, and unrouteable requests fail without fallback", () => {
+    const absent = tmp();
+    const stale = tmp();
+    const unavailable = tmp();
+    try {
+      expect(
+        selectRouteByAccountOrdinal(0, { stateDir: absent, nowMs: NOW_MS }),
+      ).toMatchObject({
+        ok: false,
+        error: "no account inventory is available",
+      });
+
+      seedObservation(stale, [nativeRoute()], {
+        observedAtMs: NOW_MS - 60 * 60_000,
+        accountOrdinals: { default: 0, "claude-swap:4": 0 },
+      });
+      expect(
+        selectRouteByAccountOrdinal(0, { stateDir: stale, nowMs: NOW_MS }),
+      ).toMatchObject({ ok: false, error: "account inventory is stale" });
+
+      seedObservation(unavailable, [nativeRoute()], {
+        accountOrdinals: {
+          default: 0,
+          "claude-swap:4": 0,
+          "claude-swap:9": 1,
+        },
+      });
+      expect(
+        selectRouteByAccountOrdinal(2, {
+          stateDir: unavailable,
+          nowMs: NOW_MS,
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("out of range"),
+      });
+      expect(
+        selectRouteByAccountOrdinal(0, {
+          stateDir: unavailable,
+          nowMs: NOW_MS,
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: "account c0 is known but is not currently routeable",
+      });
+      expect(
+        selectRouteByAccountOrdinal(1, {
+          stateDir: unavailable,
+          nowMs: NOW_MS,
+        }),
+      ).toMatchObject({
+        ok: false,
+        error: "account c1 is known but is not currently routeable",
+      });
+      expect(existsSync(ledgerPath(unavailable))).toBe(false);
+    } finally {
+      rmSync(absent, { recursive: true, force: true });
+      rmSync(stale, { recursive: true, force: true });
+      rmSync(unavailable, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("selectRoute — account display ordinal", () => {
   test("a single Claude account omits its ordinal", () => {

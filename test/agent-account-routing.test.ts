@@ -148,6 +148,64 @@ describe("Claude native route preserves the launch and carries the route id", ()
   });
 });
 // ---------------------------------------------------------------------------
+// explicit account selection
+// ---------------------------------------------------------------------------
+describe("Claude explicit account selection", () => {
+  test("c1 resolves through the exact selector and wraps the resolved sparse slot", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--x-account", "c1", "hello"],
+      rawArgv: true,
+      env: {},
+      randomUuid: () => UUID,
+      selectAccountRouteByOrdinal: (ordinal) => ({
+        ok: true,
+        selection: managed(9, ordinal)(),
+      }),
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(h.requestedAccountOrdinals()).toEqual([1]);
+    expect(h.routerCalls()).toBe(0);
+    expect(cmd.slice(0, 3)).toEqual([CSWAP, "run", "9"]);
+    expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:9");
+    expect(h.deps.env.KEEPER_ACCOUNT_ORDINAL).toBe("1");
+  });
+
+  test("an explicitly requested active account launches natively", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--x-account=0", "hello"],
+      rawArgv: true,
+      env: {},
+      randomUuid: () => UUID,
+      selectAccountRouteByOrdinal: () => ({
+        ok: true,
+        selection: native(0)(),
+      }),
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(cmd[0]).toBe("/fake-home/.local/bin/claude");
+    expect(cmd).not.toContain("run");
+    expect(h.requestedAccountOrdinals()).toEqual([0]);
+    expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("default");
+    expect(h.deps.env.KEEPER_ACCOUNT_ORDINAL).toBe("0");
+  });
+
+  test("an unresolved explicit request exits 2 without spawning or falling back", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--x-account", "c3", "hello"],
+      rawArgv: true,
+      selectAccountRouteByOrdinal: () => ({
+        ok: false,
+        error: "account c3 is out of range (available: c0-c1)",
+      }),
+    });
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.spawned).toEqual([]);
+    expect(h.routerCalls()).toBe(0);
+    expect(h.err.join("")).toContain("account c3 is out of range");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // independence across fresh / resume / restore
 // ---------------------------------------------------------------------------
 describe("route selection is independent per launch", () => {

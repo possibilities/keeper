@@ -20,9 +20,11 @@ import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   inspectRouting,
+  type RequestedRouteResolution,
   type RouteSelection,
   type RoutingInspection,
   selectRoute,
+  selectRouteByAccountOrdinal,
 } from "../account-router";
 import {
   KEEPER_ACCOUNT_ORDINAL_ENV,
@@ -319,6 +321,11 @@ export interface MainDeps {
    */
   selectAccountRouteFn: () => RouteSelection;
   /**
+   * Resolve a human-requested zero-based Claude account index exactly. Unlike
+   * automatic routing this is fail-loud and never substitutes another account.
+   */
+  selectAccountRouteByOrdinalFn: (ordinal: number) => RequestedRouteResolution;
+  /**
    * Read-only account-routing diagnostic behind `accounts check` — reports
    * integration health, snapshot age, PII-free candidates, and the route policy
    * would choose WITHOUT recording a reservation. `realDeps()` binds
@@ -422,6 +429,8 @@ export function realDeps(): MainDeps {
         requireHarness,
       ),
     selectAccountRouteFn: () => selectRoute(),
+    selectAccountRouteByOrdinalFn: (ordinal) =>
+      selectRouteByAccountOrdinal(ordinal),
     inspectRoutingFn: () => inspectRouting(),
     cswapBin: resolveCswapCommand(),
   };
@@ -2410,6 +2419,10 @@ export async function main(deps: MainDeps): Promise<never> {
   const { remainingArgs, hasContinueOrResume, hasForkSession, hasPrint } =
     parsed;
   const { launcherVerbose, launcherVeryVerbose, launcherNoConfirm } = parsed;
+  if (parsed.launcherAccountError !== null) {
+    deps.writeErr(`Error: ${parsed.launcherAccountError}.\n`);
+    return deps.exit(2);
+  }
 
   // Launch-triple resolution: the `--x-preset` flag value (or the harnessless
   // head, already mirrored onto parsed.launcherPreset). Parse it once here so its
@@ -2837,7 +2850,19 @@ export async function main(deps: MainDeps): Promise<never> {
   // optional ordinal carries only the selected position in a multi-account
   // cswap inventory; sparse slot numbers are never shown as account ordinals.
   if (agent === "claude") {
-    const route = deps.selectAccountRouteFn();
+    let route: RouteSelection;
+    if (parsed.launcherAccountOrdinal !== null) {
+      const requested = deps.selectAccountRouteByOrdinalFn(
+        parsed.launcherAccountOrdinal,
+      );
+      if (!requested.ok) {
+        deps.writeErr(`Error: ${requested.error}.\n`);
+        return deps.exit(2);
+      }
+      route = requested.selection;
+    } else {
+      route = deps.selectAccountRouteFn();
+    }
     deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = route.id;
     delete deps.env[KEEPER_ACCOUNT_ORDINAL_ENV];
     if (route.accountOrdinal !== undefined) {

@@ -181,6 +181,10 @@ Wrapper flags:
                                     not both --model + --effort/--thinking) is
                                     fail-loud (exit 2). Run
                                     \`keeper agent presets list\` for the names.
+  --x-account <cN|N>        Claude only: select zero-based position N from the
+                                    ordered cswap inventory for this launch.
+                                    The request fails loudly if the inventory is
+                                    stale or that account is not routeable.
 
 Preset resolution:
   keeper agent presets resolve <name>  Emit the resolved JSON for a single preset
@@ -190,7 +194,11 @@ Preset resolution:
   keeper agent presets list [--json]   List the configured catalog presets
                                     (name + harness/model/effort) and panels.
 
-Account routing diagnostics:
+Account routing:
+  keeper agent claude --x-account c1   Request the second account in cswap
+                                    inventory order for this launch. cN labels
+                                    match the Claude statusline; they are not
+                                    claude-swap slot numbers.
   keeper agent accounts check [--json] Report integration health, snapshot age,
                                     PII-free candidates, and the route the
                                     policy would choose for the next Claude

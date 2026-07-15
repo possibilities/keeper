@@ -300,6 +300,8 @@ describe("main() dispatch routing", () => {
     expect(code).toBe(0);
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.out.join("")).toContain("--x-tmux");
+    expect(h.out.join("")).toContain("--x-account <cN|N>");
+    expect(h.out.join("")).toContain("claude-swap slot numbers");
     expect(h.err.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });

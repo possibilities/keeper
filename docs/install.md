@@ -77,6 +77,12 @@ policy would choose without reserving it. Every Claude start, resume, and restor
 from the latest observation; launch attribution explains one process but never creates account affinity
 for a later process.
 
+Use `keeper agent claude --x-account cN` to request one account for a launch, where `c0`, `c1`, … are
+zero-based positions in the ordered `cswap list --json` inventory and match the Claude statusline label.
+The index is not a claude-swap slot number. An explicit request requires a fresh inventory and a currently
+routeable account; it exits without launching rather than substituting another account. The active cswap
+account uses the native route when its index is requested. A bare launch keeps automatic balancing.
+
 The selection policy is continuous: each routeable candidate is scored by its worst normalized quota
 window after short-lived launch reservations, the greatest remaining headroom wins, and
 least-recently-used order breaks ties. Every observer uses the same per-refresh lock and timestamp, so a

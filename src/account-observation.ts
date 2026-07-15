@@ -125,6 +125,12 @@ export interface ClaudeAccountDisplay {
   count: number;
   /** Route id → zero-based inventory position; `default` aliases the active slot. */
   ordinals: Record<string, number>;
+  /**
+   * Whether cswap reports the active/native account as currently routeable.
+   * Optional only for compatibility with sidecars written before explicit
+   * account selection; a missing value is never trusted for a request.
+   */
+  active_routeable?: boolean;
 }
 
 // ---------- provider run outcomes ------------------------------------------
@@ -164,6 +170,8 @@ export interface CswapInventory {
    * with callers constructing an empty inventory.
    */
   accountOrdinals?: Record<string, number>;
+  /** Whether the active slot passed the same launchability checks as managed rows. */
+  activeRouteable?: boolean;
   notes: string[];
 }
 
@@ -448,6 +456,7 @@ export function parseCswapList(
       routes: [],
       activeSlot: null,
       accountOrdinals: {},
+      activeRouteable: false,
       notes: ["cswap: unavailable"],
     };
   }
@@ -457,6 +466,7 @@ export function parseCswapList(
       routes: [],
       activeSlot: null,
       accountOrdinals: {},
+      activeRouteable: false,
       notes: ["cswap: malformed json"],
     };
   }
@@ -467,6 +477,7 @@ export function parseCswapList(
       routes: [],
       activeSlot: null,
       accountOrdinals: {},
+      activeRouteable: false,
       notes: ["cswap: reported error"],
     };
   }
@@ -475,6 +486,7 @@ export function parseCswapList(
       routes: [],
       activeSlot: null,
       accountOrdinals: {},
+      activeRouteable: false,
       notes: [`cswap: unsupported schema ${String(parsed.schemaVersion)}`],
     };
   }
@@ -484,6 +496,7 @@ export function parseCswapList(
       routes: [],
       activeSlot: null,
       accountOrdinals: {},
+      activeRouteable: false,
       notes: ["cswap: no accounts array"],
     };
   }
@@ -498,6 +511,7 @@ export function parseCswapList(
   const seenRoutes = new Set<number>();
   const seenAccounts = new Set<number>();
   const accountOrdinals: Record<string, number> = {};
+  let activeRouteable = false;
   for (const row of accounts) {
     // Inventory order, not slot arithmetic, defines the human-facing c<N>
     // label. Retain valid rows even when they are active, stale, or otherwise
@@ -514,31 +528,32 @@ export function parseCswapList(
         accountOrdinals[managedRouteId(slot)] = seenAccounts.size - 1;
       }
     }
-    const parsedRow = parseCswapAccount(
-      row,
-      activeSlot,
-      nowMs,
-      freshnessCeilingMs,
-    );
+    const parsedRow = parseCswapAccount(row, nowMs, freshnessCeilingMs);
     if (parsedRow.note) {
       notes.push(parsedRow.note);
     }
-    if (parsedRow.route && !seenRoutes.has(parsedRow.route.slot as number)) {
-      seenRoutes.add(parsedRow.route.slot as number);
-      routes.push(parsedRow.route);
+    if (parsedRow.route) {
+      const slot = parsedRow.route.slot as number;
+      if (activeSlot !== null && slot === activeSlot) {
+        activeRouteable = true;
+        notes.push(`cswap: slot ${slot} is active (deduped to native)`);
+      } else if (!seenRoutes.has(slot)) {
+        seenRoutes.add(slot);
+        routes.push(parsedRow.route);
+      }
     }
   }
-  return { routes, activeSlot, accountOrdinals, notes };
+  return { routes, activeSlot, accountOrdinals, activeRouteable, notes };
 }
 
 /**
  * Parse one claude-swap account row into a managed {@link Route}, or an exclusion
- * with a PII-free note. Applies, in order: valid positive slot, active-slot
- * dedup, routeable status, freshness ceiling, and non-empty normalized windows.
+ * with a PII-free note. Applies, in order: valid positive slot, routeable status,
+ * freshness ceiling, and non-empty normalized windows. The caller deduplicates a
+ * successfully parsed active slot to native while retaining its routeability.
  */
 function parseCswapAccount(
   row: unknown,
-  activeSlot: number | null,
   nowMs: number,
   freshnessCeilingMs: number,
 ): { route?: Route; note?: string } {
@@ -548,11 +563,6 @@ function parseCswapAccount(
   const slot = row.number;
   if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
     return { note: "cswap: invalid slot" };
-  }
-  if (activeSlot !== null && slot === activeSlot) {
-    // The active managed slot IS the ambient account the native route covers —
-    // never a second capacity row for the same account.
-    return { note: `cswap: slot ${slot} is active (deduped to native)` };
   }
   if (row.usageStatus !== CSWAP_ROUTEABLE_STATUS) {
     return {
@@ -698,6 +708,7 @@ export function buildObservation(input: {
     claude_accounts: {
       count: Object.keys(inventoryOrdinals).length,
       ordinals: displayOrdinals,
+      active_routeable: cswap.activeRouteable ?? false,
     },
     notes: boundNotes([...codex.notes, ...codexCapacity.notes, ...cswap.notes]),
   };
@@ -844,7 +855,17 @@ function validateClaudeAccountDisplay(
       return null;
     }
   }
-  return { count: data.count, ordinals };
+  const activeRouteable = data.active_routeable;
+  if (activeRouteable !== undefined && typeof activeRouteable !== "boolean") {
+    return null;
+  }
+  return {
+    count: data.count,
+    ordinals,
+    ...(activeRouteable === undefined
+      ? {}
+      : { active_routeable: activeRouteable }),
+  };
 }
 
 function isObservationHealth(v: unknown): v is ObservationHealth {

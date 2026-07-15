@@ -56,6 +56,45 @@ describe("parseArgs", () => {
     expect(parseArgs(["hi"]).launcherPreset).toBeNull();
   });
 
+  test("account selector accepts canonical cN and numeric zero-based forms", () => {
+    const split = parseArgs(["--x-account", "c2", "hello"]);
+    expect(split.launcherAccountOrdinal).toBe(2);
+    expect(split.launcherAccountError).toBeNull();
+    expect(split.remainingArgs).toEqual(["hello"]);
+
+    const joined = parseArgs(["--x-account=0", "hello"]);
+    expect(joined.launcherAccountOrdinal).toBe(0);
+    expect(joined.launcherAccountError).toBeNull();
+    expect(joined.remainingArgs).toEqual(["hello"]);
+    expect(parseArgs(["hello"]).launcherAccountOrdinal).toBeNull();
+  });
+
+  test("account selector rejects invalid, missing, overflow, and Pi values", () => {
+    for (const value of ["", "c", "c-1", "01", "c01", "default", "1.5"]) {
+      const parsed = parseArgs([`--x-account=${value}`, "hello"]);
+      expect(parsed.launcherAccountOrdinal).toBeNull();
+      expect(parsed.launcherAccountError).toContain("zero-based");
+      expect(parsed.remainingArgs).toEqual(["hello"]);
+    }
+    expect(
+      parseArgs([`--x-account=${Number.MAX_SAFE_INTEGER + 1}`])
+        .launcherAccountError,
+    ).toContain("zero-based");
+    expect(parseArgs(["--x-account"]).launcherAccountError).toContain(
+      "zero-based",
+    );
+    expect(
+      parseArgsForAgent(["--x-account", "c1", "hello"], "pi")
+        .launcherAccountError,
+    ).toContain("only valid for Claude");
+  });
+
+  test("account selector is last-wins", () => {
+    const parsed = parseArgs(["--x-account=bad", "--x-account", "c3", "hello"]);
+    expect(parsed.launcherAccountOrdinal).toBe(3);
+    expect(parsed.launcherAccountError).toBeNull();
+  });
+
   test("legacy profile selection is an inert compatibility flag", () => {
     const split = parseArgs([
       "--x-profile",

@@ -298,7 +298,26 @@ describe("parseCswapList — inventory normalization", () => {
       FRESH_CEIL_MS,
     );
     expect(out.activeSlot).toBe(2);
+    expect(out.activeRouteable).toBe(true);
     expect(out.routes.map((r) => r.slot)).toEqual([5]);
+  });
+
+  test("an unlaunchable active slot stays identified but is not routeable", () => {
+    const out = parseCswapList(
+      {
+        code: 0,
+        stdout: cswapJson(
+          [cswapRow({ number: 2, usageStatus: "token_expired" })],
+          { activeAccountNumber: 2 },
+        ),
+      },
+      NOW_MS,
+      FRESH_CEIL_MS,
+    );
+    expect(out.activeSlot).toBe(2);
+    expect(out.accountOrdinals).toEqual({ "claude-swap:2": 0 });
+    expect(out.activeRouteable).toBe(false);
+    expect(out.routes).toEqual([]);
   });
 
   test("inventory order supplies stable zero-based display ordinals", () => {
@@ -503,6 +522,7 @@ describe("buildObservation", () => {
         "claude-swap:9": 1,
         default: 1,
       },
+      active_routeable: true,
     });
   });
 

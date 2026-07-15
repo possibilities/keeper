@@ -12,6 +12,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  RequestedRouteResolution,
   RouteSelection,
   RoutingInspection,
 } from "../../src/account-router";
@@ -105,8 +106,10 @@ export interface Harness {
   birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
   tmuxCommands: string[][];
-  /** Call count for the injected account router (claude routing). */
+  /** Call count for the injected automatic account router. */
   routerCalls: () => number;
+  /** Ordinals passed to the injected explicit account resolver. */
+  requestedAccountOrdinals: () => number[];
 }
 
 export interface HarnessOptions {
@@ -173,6 +176,8 @@ export interface HarnessOptions {
    * touches no fs. Pass a managed selection to exercise the claude-swap wrap.
    */
   selectAccountRoute?: () => RouteSelection;
+  /** Exact result for a requested zero-based account ordinal. */
+  selectAccountRouteByOrdinal?: (ordinal: number) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
@@ -197,6 +202,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let routerCalls = 0;
+  const requestedAccountOrdinals: number[] = [];
 
   const selectAccountRoute =
     opts.selectAccountRoute ??
@@ -301,6 +307,21 @@ export function makeHarness(opts: HarnessOptions): Harness {
       routerCalls += 1;
       return selectAccountRoute();
     },
+    selectAccountRouteByOrdinalFn: (ordinal) => {
+      requestedAccountOrdinals.push(ordinal);
+      return (
+        opts.selectAccountRouteByOrdinal?.(ordinal) ?? {
+          ok: true,
+          selection: {
+            id: "default",
+            kind: "native" as const,
+            slot: null,
+            accountOrdinal: ordinal,
+            reason: "requested-account",
+          },
+        }
+      );
+    },
     inspectRoutingFn:
       opts.inspectRouting ??
       (() => ({
@@ -333,6 +354,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     birthRecords,
     tmuxCommands,
     routerCalls: () => routerCalls,
+    requestedAccountOrdinals: () => [...requestedAccountOrdinals],
   };
 }
 

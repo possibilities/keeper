@@ -1,14 +1,14 @@
 /**
  * Launcher flag parsing — the pre-pass that strips the launcher's own
  * `--x-*` flags from argv before the residual is handed to the agent, and
- * surfaces the launch mode signals (continuation, headless, fork, profile) the
+ * surfaces the launch mode signals (continuation, headless, fork, account) the
  * rest of main() branches on.
  *
  * Three consumed flags carry no value (`--x-verbose`,
  * `--x-very-verbose`, `--x-no-confirm`) and wrapper value flags
- * (`--x-preset`) take split or joined forms. The legacy `--x-profile` value
- * is consumed inertly so existing launch commands retain their no-profile-farm
- * behavior. Every other token passes through verbatim into
+ * (`--x-preset`, `--x-account`) take split or joined forms. The legacy
+ * `--x-profile` value is consumed inertly so existing launch commands retain
+ * their no-profile-farm behavior. Every other token passes through verbatim into
  * `remainingArgs`, preserving order — the agent sees exactly what the human
  * typed minus the launcher flags. A stray non-launcher flag (including the
  * retired `--arthack-*` spelling) is forwarded to the agent, which rejects it
@@ -42,13 +42,18 @@ export interface ParsedArgs {
    * never overrides an explicit `--model`/`--effort`.
    */
   launcherPreset: string | null;
+  /**
+   * `--x-account <cN|N>` — the requested zero-based position in Claude's
+   * ordered cswap inventory. `null` means automatic account routing.
+   */
+  launcherAccountOrdinal: number | null;
+  /** Invalid/missing selector diagnostic; main exits 2 before launching. */
+  launcherAccountError: string | null;
 }
 
 /**
  * Parse the launcher's own flags out of `args`, returning the residual argv plus
- * the launch-mode signals. Does NOT apply the KEEPER_AGENT_PROFILE env override or
- * the "default"-normalization — those happen in main() after parsing, logged as
- * separate action-log entries.
+ * the launch-mode signals.
  */
 export function parseArgs(args: string[]): ParsedArgs {
   return parseArgsForAgent(args, "claude");
@@ -70,8 +75,29 @@ export function parseArgsForAgent(
   let launcherVeryVerbose = false;
   let launcherNoConfirm = false;
   let launcherPreset: string | null = null;
+  let launcherAccountOrdinal: number | null = null;
+  let launcherAccountError: string | null = null;
   let parsingIgnoredProfile = false;
   let parsingLauncherPreset = false;
+  let parsingLauncherAccount = false;
+
+  const setLauncherAccount = (raw: string): void => {
+    if (agent !== "claude") {
+      launcherAccountOrdinal = null;
+      launcherAccountError = "--x-account is only valid for Claude";
+      return;
+    }
+    const match = raw.trim().match(/^(?:c)?(0|[1-9]\d*)$/);
+    const ordinal = match ? Number(match[1]) : Number.NaN;
+    if (!Number.isSafeInteger(ordinal)) {
+      launcherAccountOrdinal = null;
+      launcherAccountError =
+        "--x-account expects cN or N (a zero-based cswap inventory index)";
+      return;
+    }
+    launcherAccountOrdinal = ordinal;
+    launcherAccountError = null;
+  };
 
   for (const arg of args) {
     if (parsingIgnoredProfile) {
@@ -81,6 +107,11 @@ export function parseArgsForAgent(
     if (parsingLauncherPreset) {
       launcherPreset = arg.trim() || null;
       parsingLauncherPreset = false;
+      continue;
+    }
+    if (parsingLauncherAccount) {
+      setLauncherAccount(arg);
+      parsingLauncherAccount = false;
       continue;
     }
     if (arg === "--x-verbose") {
@@ -97,6 +128,10 @@ export function parseArgsForAgent(
       parsingLauncherPreset = true;
     } else if (arg.startsWith("--x-preset=")) {
       launcherPreset = arg.slice("--x-preset=".length).trim() || null;
+    } else if (arg === "--x-account") {
+      parsingLauncherAccount = true;
+    } else if (arg.startsWith("--x-account=")) {
+      setLauncherAccount(arg.slice("--x-account=".length));
     } else {
       remainingArgs.push(arg);
       if (isContinueOrResumeArg(arg, agent)) {
@@ -110,6 +145,11 @@ export function parseArgsForAgent(
     }
   }
 
+  if (parsingLauncherAccount) {
+    launcherAccountError =
+      "--x-account expects cN or N (a zero-based cswap inventory index)";
+  }
+
   return {
     remainingArgs,
     hasContinueOrResume,
@@ -119,6 +159,8 @@ export function parseArgsForAgent(
     launcherVeryVerbose,
     launcherNoConfirm,
     launcherPreset,
+    launcherAccountOrdinal,
+    launcherAccountError,
   };
 }
 

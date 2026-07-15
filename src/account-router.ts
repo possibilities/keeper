@@ -52,6 +52,7 @@ import {
   ledgerLockPath,
   ledgerPath,
   MAX_RESERVATIONS_PER_ROUTE,
+  managedRouteId,
   NATIVE_ROUTE_ID,
   observationSidecarPath,
   RESERVATION_TTL_MS,
@@ -76,6 +77,11 @@ export interface RouteSelection {
   accountOrdinal?: number;
   reason: string;
 }
+
+/** A user-directed account request either resolves exactly or fails loudly. */
+export type RequestedRouteResolution =
+  | { ok: true; selection: RouteSelection }
+  | { ok: false; error: string };
 
 /** Injectable seams — tests pin the state root and the clock; production defaults. */
 export interface SelectRouteDeps {
@@ -122,6 +128,114 @@ export function selectRoute(deps: SelectRouteDeps = {}): RouteSelection {
   } catch {
     return nativeSelection("error");
   }
+}
+
+/**
+ * Resolve one explicit zero-based cswap inventory position. Unlike automatic
+ * routing, uncertainty is an error: a human-requested account is never replaced
+ * with another route. CodexBar health does not gate this path because it governs
+ * balancing, while explicit selection depends only on fresh cswap inventory and
+ * the requested account's routeability.
+ */
+export function selectRouteByAccountOrdinal(
+  ordinal: number,
+  deps: SelectRouteDeps = {},
+): RequestedRouteResolution {
+  try {
+    return doSelectRouteByAccountOrdinal(ordinal, deps);
+  } catch {
+    return { ok: false, error: `account c${ordinal} could not be resolved` };
+  }
+}
+
+function doSelectRouteByAccountOrdinal(
+  ordinal: number,
+  deps: SelectRouteDeps,
+): RequestedRouteResolution {
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
+    return { ok: false, error: "account index must be a non-negative integer" };
+  }
+  const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
+  const nowMs = deps.nowMs ?? Date.now();
+  const obs = readObservationSidecar(observationSidecarPath(stateDir));
+  if (obs === null) {
+    return { ok: false, error: "no account inventory is available" };
+  }
+  if (!isObservationFresh(obs, nowMs)) {
+    return { ok: false, error: "account inventory is stale" };
+  }
+  const display = obs.claude_accounts;
+  if (!display) {
+    return { ok: false, error: "account inventory has no index metadata" };
+  }
+  if (ordinal >= display.count) {
+    const available =
+      display.count === 0
+        ? "none"
+        : display.count === 1
+          ? "c0"
+          : `c0-c${display.count - 1}`;
+    return {
+      ok: false,
+      error: `account c${ordinal} is out of range (available: ${available})`,
+    };
+  }
+
+  let selected: Route | undefined;
+  if (
+    display.ordinals[NATIVE_ROUTE_ID] === ordinal &&
+    display.active_routeable === true
+  ) {
+    selected = obs.routes.find(
+      (route) =>
+        route.id === NATIVE_ROUTE_ID &&
+        route.kind === "native" &&
+        route.slot === null,
+    );
+  } else {
+    const routeId = Object.entries(display.ordinals).find(
+      ([id, index]) => id !== NATIVE_ROUTE_ID && index === ordinal,
+    )?.[0];
+    if (routeId !== undefined) {
+      selected = obs.routes.find(
+        (route) =>
+          route.id === routeId &&
+          route.kind === "managed" &&
+          route.slot !== null &&
+          route.slot > 0 &&
+          managedRouteId(route.slot) === route.id &&
+          route.windows.length > 0,
+      );
+    }
+  }
+  if (!selected) {
+    return {
+      ok: false,
+      error: `account c${ordinal} is known but is not currently routeable`,
+    };
+  }
+
+  mkdirSync(stateDir, { recursive: true });
+  const lock = FileLock.acquire(ledgerLockPath(stateDir));
+  try {
+    const ledger = pruneLedger(loadLedger(stateDir), nowMs);
+    recordReservation(ledger, selected.id, nowMs);
+    writeLedger(stateDir, ledger);
+  } finally {
+    lock.release();
+  }
+
+  const accountOrdinal = displayOrdinal(obs, selected.id);
+  return {
+    ok: true,
+    selection: {
+      id: selected.id,
+      kind: selected.kind,
+      slot: selected.slot,
+      ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
+      reason: "requested-account",
+    },
+  };
 }
 
 function doSelectRoute(deps: SelectRouteDeps): RouteSelection {

@@ -113,7 +113,7 @@ describe("--x-tmux", () => {
     const cwd = "/fake-home/code/proj";
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
-      argv: ["claude", "--x-tmux", "--x-profile", "work", "hello"],
+      argv: ["claude", "--x-tmux", "--x-account", "c1", "hello"],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -173,7 +173,7 @@ describe("--x-tmux", () => {
       'KEEPER_AGENT_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'claude' '--x-profile' 'work' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'claude' '--x-account' 'c1' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
