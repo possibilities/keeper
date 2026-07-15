@@ -13,4 +13,8 @@ bun.lock
 package.json
 plist/arthack.keeperd.plist
 plugins/plan/src
+plugins/prompt/src/artifact_catalog.ts
+plugins/prompt/src/claude_worker_compiler.ts
+plugins/prompt/src/project_root.ts
+plugins/prompt/src/render_engine.ts
 src
