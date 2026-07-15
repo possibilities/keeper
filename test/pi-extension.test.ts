@@ -18,7 +18,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import keeperEvents, {
-  clampTranscriptParams,
+  clampHistoryParams,
+  executeHistoryTool,
+  type HistoryExecFile,
+  historyCliArgs,
+  historyParamError,
+  historyToolResult,
   type PiEventBindings,
   type PiExtensionApi,
   type PiObservedEvent,
@@ -30,9 +35,6 @@ import keeperEvents, {
   sendPiBusMessage,
   serializePiLine,
   titleEventBindings,
-  transcriptCliArgs,
-  transcriptIdError,
-  transcriptToolResult,
   translatePiEvent,
 } from "../plugins/keeper/pi-extension/keeper-events";
 import {
@@ -274,84 +276,121 @@ describe("pi extension — NDJSON line contract", () => {
   });
 });
 
-describe("pi extension — transcript tool argv", () => {
-  test("omitted session id lists the current project with bounded filters", () => {
+describe("pi extension — history tool argv", () => {
+  test("list and search route through the cross-harness history surface", () => {
     expect(
-      transcriptCliArgs({
-        global: true,
-        since: "7d",
+      historyCliArgs({
+        operation: "list",
+        harness: "pi",
         offset: 20,
         limit: 10,
       }),
     ).toEqual([
-      "transcript",
-      "claude",
+      "history",
       "list",
+      "--harness",
+      "pi",
       "--offset",
       "20",
       "--limit",
       "10",
-      "--since",
-      "7d",
-      "--global",
+    ]);
+    expect(
+      historyCliArgs({
+        operation: "search",
+        query: "needle phrase",
+        session: "Historical title",
+        limit: 5,
+      }),
+    ).toEqual([
+      "history",
+      "search",
+      "--session",
+      "Historical title",
+      "--limit",
+      "5",
+      "--",
+      "needle phrase",
     ]);
   });
 
-  test("session mode forwards subagent, detail, and content filters as argv", () => {
+  test("show/page keep Session references argv-safe, including flag-shaped titles", () => {
     expect(
-      transcriptCliArgs({
-        session_id: "session-1",
-        subagent: "abc123",
+      historyCliArgs({
+        operation: "page",
+        session: "--project",
         project: "/work/repo",
         before: 40,
         max_chars: 12000,
-        tools: "full",
         grep: "failure",
-        global: true,
-        include_meta: true,
-        include_thinking: true,
       }),
     ).toEqual([
-      "transcript",
-      "claude",
-      "session-1",
+      "history",
+      "show",
       "--project",
       "/work/repo",
-      "--subagent",
-      "abc123",
       "--before",
       "40",
       "--max-chars",
       "12000",
-      "--tools",
-      "full",
       "--grep",
       "failure",
-      "--meta",
-      "--thinking",
+      "--",
+      "--project",
     ]);
+  });
+
+  test("specialist transcript parameters require an explicit low-level operation", () => {
+    expect(
+      historyCliArgs({
+        operation: "transcript_show",
+        harness: "claude",
+        session: "Session title",
+        subagent: "abc123",
+        tools: "full",
+        include_meta: true,
+      }),
+    ).toEqual([
+      "transcript",
+      "claude",
+      "show",
+      "--subagent",
+      "abc123",
+      "--tools",
+      "full",
+      "--meta",
+      "--",
+      "Session title",
+    ]);
+    expect(
+      historyParamError({ operation: "show", session: "s", subagent: "x" }),
+    ).toContain("transcript_show");
   });
 });
 
-describe("pi extension — param clamping", () => {
-  test("a list limit clamps to 100 with a recorded clamp", () => {
-    const { params, clamps } = clampTranscriptParams({ limit: 999 });
-    expect(params.limit).toBe(100);
-    expect(clamps).toEqual([{ param: "limit", requested: 999, applied: 100 }]);
-  });
-
-  test("a show limit clamps to 500 (session_id present)", () => {
-    const { params, clamps } = clampTranscriptParams({
-      session_id: "s",
+describe("pi extension — history param clamping", () => {
+  test("list/search/show limits use operation-specific caps", () => {
+    expect(
+      clampHistoryParams({ operation: "list", limit: 999 }).params.limit,
+    ).toBe(100);
+    expect(
+      clampHistoryParams({ operation: "search", query: "q", limit: 999 }).params
+        .limit,
+    ).toBe(200);
+    const { params, clamps } = clampHistoryParams({
+      operation: "show",
+      session: "s",
       limit: 5000,
     });
     expect(params.limit).toBe(500);
     expect(clamps).toEqual([{ param: "limit", requested: 5000, applied: 500 }]);
   });
 
-  test("max_chars clamps to 60000 in show mode", () => {
-    const { params, clamps } = clampTranscriptParams({
-      session_id: "s",
+  test("max_chars clamps to 60000 for show/page", () => {
+    const { params, clamps } = clampHistoryParams({
+      operation: "page",
+      session: "s",
+      before: 4,
       max_chars: 999_999,
     });
     expect(params.max_chars).toBe(60_000);
@@ -360,114 +399,171 @@ describe("pi extension — param clamping", () => {
     ]);
   });
 
-  test("in-bounds values are left untouched, no clamp recorded", () => {
-    const { params, clamps } = clampTranscriptParams({
-      session_id: "s",
+  test("in-bounds values are untouched and argv carries applied clamps", () => {
+    const inBounds = clampHistoryParams({
+      operation: "show",
+      session: "s",
       limit: 50,
       max_chars: 12_000,
     });
-    expect(params.limit).toBe(50);
-    expect(params.max_chars).toBe(12_000);
-    expect(clamps).toEqual([]);
-  });
-
-  test("transcriptCliArgs emits the clamped bound in argv", () => {
-    expect(transcriptCliArgs({ limit: 999 })).toEqual([
-      "transcript",
-      "claude",
+    expect(inBounds.params.limit).toBe(50);
+    expect(inBounds.clamps).toEqual([]);
+    expect(historyCliArgs({ operation: "list", limit: 999 })).toEqual([
+      "history",
       "list",
       "--limit",
       "100",
     ]);
     expect(
-      transcriptCliArgs({ session_id: "s", max_chars: 999_999 }),
+      historyCliArgs({
+        operation: "show",
+        session: "s",
+        max_chars: 999_999,
+      }),
     ).toContain("60000");
   });
 });
 
-describe("pi extension — id validation before spawn", () => {
-  test("a flag-shaped session_id is rejected", () => {
-    expect(transcriptIdError({ session_id: "--project" })).not.toBeNull();
-    expect(transcriptIdError({ session_id: "-x" })).not.toBeNull();
-  });
-
-  test("a verb/injection-shaped session_id is rejected", () => {
-    expect(transcriptIdError({ session_id: "; rm -rf /" })).not.toBeNull();
-    expect(transcriptIdError({ session_id: "$(whoami)" })).not.toBeNull();
-  });
-
-  test("an over-200-char id is rejected", () => {
-    expect(transcriptIdError({ session_id: "a".repeat(201) })).not.toBeNull();
-  });
-
-  test("a well-formed session_id and subagent pass", () => {
-    expect(transcriptIdError({ session_id: "abc-123_9.session" })).toBeNull();
-    expect(transcriptIdError({ session_id: "s", subagent: "all" })).toBeNull();
+describe("pi extension — history validation before spawn", () => {
+  test("Session titles may contain spaces/shell text because execFile + -- keep argv inert", () => {
     expect(
-      transcriptIdError({ session_id: "s", subagent: "abc12" }),
+      historyParamError({
+        operation: "show",
+        session: "; rm -rf / $(whoami)",
+      }),
     ).toBeNull();
+    expect(
+      historyCliArgs({ operation: "show", session: "--project" }).at(-1),
+    ).toBe("--project");
   });
 
-  test("a flag-shaped subagent is rejected", () => {
+  test("oversized/NUL references and malformed specialist ids are rejected", () => {
     expect(
-      transcriptIdError({ session_id: "s", subagent: "--all" }),
+      historyParamError({ operation: "show", session: "a".repeat(4097) }),
+    ).not.toBeNull();
+    expect(
+      historyParamError({ operation: "show", session: "bad\0title" }),
+    ).not.toBeNull();
+    expect(
+      historyParamError({
+        operation: "transcript_show",
+        harness: "claude",
+        session: "s",
+        subagent: "--all",
+      }),
     ).not.toBeNull();
   });
 
-  test("omitted ids are legal (list mode)", () => {
-    expect(transcriptIdError({})).toBeNull();
+  test("paging and size parameters require integers", () => {
+    expect(historyParamError({ operation: "list", offset: 1.5 })).toContain(
+      "non-negative integer",
+    );
+    expect(historyParamError({ operation: "list", limit: 0.5 })).toContain(
+      "positive integer",
+    );
+    expect(
+      historyParamError({ operation: "show", session: "s", max_chars: 2.5 }),
+    ).toContain("positive integer");
+  });
+
+  test("required operation fields and supported low-level harnesses are enforced", () => {
+    expect(historyParamError({ operation: "show" })).toContain("session");
+    expect(historyParamError({ operation: "search" })).toContain("query");
+    expect(
+      historyParamError({
+        operation: "transcript_show",
+        harness: "codex",
+        session: "s",
+      }),
+    ).toContain("claude or pi");
+    expect(
+      historyParamError({
+        operation: "transcript_turn",
+        harness: "claude",
+        session: "s",
+        leaf: "root",
+      }),
+    ).toContain("pi-only");
+    expect(historyParamError({})).toBeNull();
   });
 });
 
-describe("pi extension — transcript tool result shaping", () => {
-  test("a maxBuffer overflow returns truncated content, not a failure", () => {
-    const r = transcriptToolResult(
+describe("pi extension — history tool result shaping and cancellation", () => {
+  test("a maxBuffer overflow returns bounded partial content, not a failure", () => {
+    const r = historyToolResult(
       {
         code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
         message: "stdout maxBuffer length exceeded",
       },
-      "partial transcript body",
+      "partial history body",
       "",
-      ["transcript", "s"],
+      ["history", "show", "s"],
       [],
     );
-    expect(r.content[0].text).toContain("partial transcript body");
-    expect(r.content[0].text).toContain("truncated - narrow with grep/limit");
-    expect(r.content[0].text).not.toContain("keeper transcript failed");
+    expect(r.content[0].text).toContain("partial history body");
+    expect(r.content[0].text).toContain("history output truncated");
+    expect(r.content[0].text).not.toContain("keeper history failed");
     expect(r.details.truncated).toBe(true);
   });
 
-  test("a non-overflow error still fails with the CLI message", () => {
-    const r = transcriptToolResult(
+  test("failure/success preserve CLI messages and applied clamps", () => {
+    const failed = historyToolResult(
       { code: 1, message: "boom" },
       "",
       "no such session",
-      ["transcript", "s"],
+      ["history", "show", "s"],
       [],
     );
-    expect(r.content[0].text).toBe("keeper transcript failed: no such session");
-    expect(r.details.exit_code).toBe(1);
-  });
-
-  test("a successful call surfaces applied clamps in details", () => {
-    const r = transcriptToolResult(
+    expect(failed.content[0].text).toBe(
+      "keeper history failed: no such session",
+    );
+    const ok = historyToolResult(
       null,
-      "the transcript",
+      "the history",
       "",
-      ["transcript", "list", "--limit", "100"],
+      ["history", "list", "--limit", "100"],
       [{ param: "limit", requested: 999, applied: 100 }],
     );
-    expect(r.content[0].text).toBe("the transcript");
-    expect(r.details.exit_code).toBe(0);
-    expect(r.details.clamps).toEqual([
+    expect(ok.content[0].text).toBe("the history");
+    expect(ok.details.clamps).toEqual([
       { param: "limit", requested: 999, applied: 100 },
     ]);
+    expect(
+      historyToolResult(null, "", "", ["history", "list"], []).content[0].text,
+    ).toBe("(no history output)");
   });
 
-  test("empty stdout on success yields the no-output placeholder", () => {
-    const r = transcriptToolResult(null, "", "", ["transcript", "list"], []);
-    expect(r.content[0].text).toBe("(no transcript output)");
-    expect(r.details.clamps).toBeUndefined();
+  test("passes AbortSignal to execFile and reports callback cancellation", async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    const run: HistoryExecFile = (_file, _args, options, callback) => {
+      received = options.signal;
+      callback({ code: "ABORT_ERR", message: "aborted" }, "", "");
+    };
+    const result = await executeHistoryTool(
+      { operation: "list" },
+      controller.signal,
+      run,
+    );
+    expect(received).toBe(controller.signal);
+    expect(result.details.cancelled).toBe(true);
+    expect(result.content[0].text).toContain("cancelled");
+  });
+
+  test("an already-aborted call spawns nothing", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let spawned = false;
+    const run: HistoryExecFile = () => {
+      spawned = true;
+    };
+    const result = await executeHistoryTool(
+      { operation: "list" },
+      controller.signal,
+      run,
+    );
+    expect(spawned).toBe(false);
+    expect(result.details.cancelled).toBe(true);
   });
 });
 
@@ -572,7 +668,14 @@ describe("pi extension — factory arming + fail-open", () => {
       "tool_result",
       "turn_end",
     ]);
-    expect([...pi.tools.keys()]).toEqual(["keeper_transcript", "Task"]);
+    expect([...pi.tools.keys()]).toEqual(["keeper_history", "Task"]);
+    const history = pi.tools.get("keeper_history") as {
+      description: string;
+      promptGuidelines: string[];
+    };
+    expect(history.description).toContain("Claude/Pi Session history");
+    expect(history.description).not.toContain("Claude Code sessions");
+    expect(history.promptGuidelines.join(" ")).toContain("cross-harness");
   });
 
   test("session start hides skill commands shadowed by extension aliases", () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * `keeper session events --session-id <id>` — emit the prompt/tool-call
- * spine for one session as a pretty JSON envelope (epic fn-794): the ordered
+ * `keeper session events <session-reference>` — resolve one tracked Session
+ * and emit its prompt/tool-call spine as a pretty JSON envelope: the ordered
  * UserPromptSubmit / PreToolUse rows with `ts`, `hook_event`, `tool_name`,
  * `slash_command`, `skill_name`, and `plan_op`. Read-only over keeper.db so
  * external consumers stop hand-writing sqlite against a schema keeper owns.
@@ -15,7 +15,8 @@
  * the shared one-shot envelope (`cli/envelope.ts`): a hit is
  * `data:{session_id, events}` (exit 0); a keeper.db read failure is `ok:false`
  * with `error.{code,message,recovery}` (exit 1), NOT an empty result.
- * Argument-usage errors (incl. missing `--session-id`) stay on stderr (exit 2),
+ * Argument-usage errors (including a missing Session reference) stay on stderr
+ * (exit 2),
  * never the envelope.
  */
 
@@ -28,24 +29,34 @@ import {
   RECOVERY_DB_READ,
   successEnvelope,
 } from "./envelope";
+import {
+  resolveTrackedCliSession,
+  type SessionReferenceCliDeps,
+  trackedSessionProblem,
+} from "./session-reference";
 
 /** Envelope schema version for `keeper session events`. */
 export const SHOW_SESSION_EVENTS_SCHEMA_VERSION = 1;
 
-const HELP = `keeper session events --session-id <id> [options]
+const HELP = `keeper session events <session-reference> [options]
 
-Emit the prompt/tool-call spine for one session (ts, hook_event, tool_name,
-slash_command, skill_name, plan_op) as a pretty JSON envelope, ordered
-chronologically. Read-only over keeper.db — no commit, no lock.
+Emit the prompt/tool-call spine for one tracked Session, ordered chronologically.
+Qualified native ids, exact job/native ids, and exact current/historical titles
+resolve through the shared Session catalog before the Keeper job is read.
 
 Options:
-  --session-id <id>    Claude Code session id (REQUIRED)
-  --limit <n>          Max rows (chronological; default 500)
-  --help, -h           Show this help
+  --session <ref>       Shared Session reference (alternative to positional)
+  --session-id <ref>    Compatibility alias of --session
+  --limit <n>           Max rows (chronological; default 500)
+  --help, -h            Show this help
 `;
 
+export interface SessionEventsDeps extends SessionReferenceCliDeps {
+  dbPath?: string;
+}
+
 interface ParsedArgs {
-  sessionId: string | null;
+  sessionReference: string | null;
   limit: number;
   help: boolean;
 }
@@ -54,22 +65,41 @@ const DEFAULT_LIMIT = 500;
 
 function parseArgs(argv: string[]): ParsedArgs {
   const parsed: ParsedArgs = {
-    sessionId: null,
+    sessionReference: null,
     limit: DEFAULT_LIMIT,
     help: false,
   };
+  const setReference = (value: string | undefined, spelling: string): void => {
+    if (value === undefined || value.length === 0) {
+      process.stderr.write(
+        `keeper session events: ${spelling} requires a value\n`,
+      );
+      process.exit(2);
+    }
+    if (parsed.sessionReference !== null) {
+      process.stderr.write(
+        "keeper session events: specify the Session reference only once\n",
+      );
+      process.exit(2);
+    }
+    parsed.sessionReference = value;
+  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    const a = argv[i] as string;
     if (a === "--help" || a === "-h") {
       parsed.help = true;
-    } else if (a === "--session-id") {
-      parsed.sessionId = argv[++i] ?? null;
+    } else if (a === "--session" || a === "--session-id") {
+      setReference(argv[++i], a);
+    } else if (a.startsWith("--session=")) {
+      setReference(a.slice("--session=".length), "--session");
     } else if (a.startsWith("--session-id=")) {
-      parsed.sessionId = a.slice("--session-id=".length);
+      setReference(a.slice("--session-id=".length), "--session-id");
     } else if (a === "--limit") {
       parsed.limit = parseLimit(argv[++i]);
     } else if (a.startsWith("--limit=")) {
       parsed.limit = parseLimit(a.slice("--limit=".length));
+    } else if (!a.startsWith("-")) {
+      setReference(a, "<session-reference>");
     } else {
       process.stderr.write(
         `keeper session events: unexpected argument '${a}'\n`,
@@ -108,7 +138,7 @@ interface SpineRow {
  * Load the UserPromptSubmit / PreToolUse spine for `sessionId`, ordered by `id`
  * ASC (stable chronology). All fields are direct `events` columns.
  */
-function showSessionEvents(
+export function showSessionEvents(
   dbPath: string,
   sessionId: string,
   limit: number,
@@ -133,21 +163,36 @@ function showSessionEvents(
 export function main(
   argv: string[],
   sink: EnvelopeSink = processEnvelopeSink,
+  deps: SessionEventsDeps = {},
 ): void {
   const args = parseArgs(argv);
   if (args.help) {
-    process.stdout.write(HELP);
+    sink.writeStdout(HELP);
     return;
   }
-  if (args.sessionId === null) {
-    process.stderr.write("keeper session events: --session-id is required\n\n");
+  if (args.sessionReference === null) {
+    process.stderr.write(
+      "keeper session events: <session-reference> or --session is required\n\n",
+    );
     process.stderr.write(HELP);
     process.exit(2);
   }
+  const resolution = resolveTrackedCliSession(args.sessionReference, deps);
+  if (resolution.kind !== "resolved") {
+    emitEnvelope(
+      errorEnvelope(
+        SHOW_SESSION_EVENTS_SCHEMA_VERSION,
+        trackedSessionProblem(resolution),
+      ),
+      sink,
+    );
+    return;
+  }
+  const jobId = resolution.job.jobId;
   // A read failure surfaces as an ok:false envelope, never an empty result.
   let rows: SpineRow[];
   try {
-    rows = showSessionEvents(resolveDbPath(), args.sessionId, args.limit);
+    rows = showSessionEvents(deps.dbPath ?? resolveDbPath(), jobId, args.limit);
   } catch {
     emitEnvelope(
       errorEnvelope(SHOW_SESSION_EVENTS_SCHEMA_VERSION, {
@@ -162,7 +207,7 @@ export function main(
   }
   emitEnvelope(
     successEnvelope(SHOW_SESSION_EVENTS_SCHEMA_VERSION, {
-      session_id: args.sessionId,
+      session_id: jobId,
       events: rows,
     }),
     sink,

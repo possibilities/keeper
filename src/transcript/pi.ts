@@ -641,8 +641,7 @@ export function listPiSessions(options: PiListOptions): PiListResult {
         title: spine?.title ?? null,
         titleHistory: spine?.titleHistory ?? [],
         startedAt: spine?.startedAt ?? null,
-        updatedAt:
-          spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        updatedAt: spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
         bytes: file.bytes,
         subagentCount: 0,
         firstPrompt: null,
@@ -1013,9 +1012,41 @@ export type PiTurnOutcome =
   | { kind: "read_failed"; message: string }
   | { kind: "ok"; selectedLeaf: string; turn: LatestTurn | null };
 
+/** Resolve a branch-aware turn from an already-disambiguated Pi artifact. */
+export function resolvePiTurnFromHandle(
+  handle: TranscriptSessionHandle,
+  leaf: string,
+  stripSkills = false,
+): PiTurnOutcome {
+  if (leaf === "root") {
+    return { kind: "ok", selectedLeaf: "root", turn: null };
+  }
+  let text: string;
+  try {
+    text = readFileSync(handle.path, "utf8");
+  } catch (error) {
+    return {
+      kind: "read_failed",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const entries = parsePiEntriesForTurn(text);
+  const walked = walkPiPath(entries, leaf);
+  if (walked.kind === "not_found") {
+    return { kind: "leaf_not_found" };
+  }
+  if (walked.kind === "malformed") {
+    return { kind: "leaf_malformed", message: walked.message };
+  }
+  return {
+    kind: "ok",
+    selectedLeaf: leaf,
+    turn: reducePiTurn(walked.path, stripSkills),
+  };
+}
+
 /** Resolve the Latest turn for one pi session's requested leaf. Session
- *  resolution (no_roots/not_found/ambiguous) reuses `piFind` verbatim; only
- *  the leaf-to-root walk and turn reduction are new. */
+ * resolution (no_roots/not_found/ambiguous) reuses `piFind` verbatim. */
 export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
   const found = piFind({
     root: query.root,
@@ -1025,29 +1056,9 @@ export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
   if (found.kind !== "found") {
     return found;
   }
-  if (query.leaf === "root") {
-    return { kind: "ok", selectedLeaf: "root", turn: null };
-  }
-  let text: string;
-  try {
-    text = readFileSync(found.handle.path, "utf8");
-  } catch (error) {
-    return {
-      kind: "read_failed",
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-  const entries = parsePiEntriesForTurn(text);
-  const walked = walkPiPath(entries, query.leaf);
-  if (walked.kind === "not_found") {
-    return { kind: "leaf_not_found" };
-  }
-  if (walked.kind === "malformed") {
-    return { kind: "leaf_malformed", message: walked.message };
-  }
-  return {
-    kind: "ok",
-    selectedLeaf: query.leaf,
-    turn: reducePiTurn(walked.path, query.stripSkills === true),
-  };
+  return resolvePiTurnFromHandle(
+    found.handle,
+    query.leaf,
+    query.stripSkills === true,
+  );
 }

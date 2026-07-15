@@ -1042,13 +1042,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    // The four session-scoped reads live under one group; each verb maps to its
-    // own leaf main (`cli/{session-state,show-session-files,show-session-events,
-    // session-summary}.ts`), preserving that leaf's flags, envelope, and exit
-    // codes byte-for-byte. `cli/session.ts` is the group dispatcher.
+    // The four job-backed reads share the Session catalog selector contract.
+    // Their established `--session-id` spelling remains a compatibility alias
+    // that enters the same resolver and has no id-only path.
     name: "session",
     summary:
-      "Session-scoped reads: `keeper session <state|files|events|summary>`",
+      "Session-reference reads: `keeper session <state|files|events|summary>`",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1057,7 +1056,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     verbs: [
       {
         name: "state",
-        summary: "Current session git context + on-hook files (JSON)",
+        summary: "Session git context + on-hook files (JSON)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1066,9 +1065,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference (default: ambient auto-detect)",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "log-count",
@@ -1088,9 +1092,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "cwd",
@@ -1101,7 +1110,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         name: "events",
-        summary: "Prompt/tool-call spine for one session (JSON)",
+        summary: "Prompt/tool-call spine for one Session (JSON)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1110,9 +1119,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "limit",
@@ -1124,7 +1138,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "summary",
         summary:
-          "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
+          "Bounded one-shot summary of one tracked Session (title/prompts/counts)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1133,9 +1147,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "max-snippet",
@@ -1149,7 +1168,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "transcript",
     summary:
-      "Discover and extract bounded agent-ready session transcripts: `keeper transcript <harness> <list|show|<session-id>>`",
+      "Specialist bounded transcripts by harness and shared Session reference",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1198,7 +1217,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         name: "show",
-        summary: "Extract a bounded page from one session or subagent",
+        summary:
+          "Extract a bounded page by native id, job alias, or exact title",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1280,7 +1300,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "turn",
         summary:
-          "Extract the selected branch's Latest turn as a bounded JSON contract (pi only)",
+          "Extract a Session reference's selected-branch Latest turn (pi only)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1423,7 +1443,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "show-job",
     summary:
-      "One job's full metadata by job-id/title/cwd/pane or auto-detect (JSON)",
+      "One job by shared Session reference or orthogonal job/cwd/pane selectors (JSON)",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1431,11 +1451,20 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["json"],
     flags: [
       FLAG_HELP,
-      { name: "job-id", type: "string", summary: "Match by job id" },
+      {
+        name: "session",
+        type: "string",
+        summary: "Resolve a shared Session reference",
+      },
       {
         name: "session-title",
         type: "string",
-        summary: "Match by session title",
+        summary: "Compatibility alias of --session",
+      },
+      {
+        name: "job-id",
+        type: "string",
+        summary: "Exact job-only filter or Session-job narrowing filter",
       },
       { name: "cwd", type: "string", summary: "Match by working directory" },
       {
@@ -1447,7 +1476,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "latest",
         type: "boolean",
-        summary: "Pick the most-recent match",
+        summary: "Pick the most-recent job-only cwd/pane match",
       },
       { name: "raw", type: "boolean", summary: "Emit the raw row, unshaped" },
     ],

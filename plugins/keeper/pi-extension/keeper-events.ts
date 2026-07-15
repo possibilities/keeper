@@ -8,7 +8,7 @@
  * events-log NDJSON contract so a pi session shows the same working/stopped churn
  * on the board that a claude session does, installs keeper's status footer and
  * telemetry sink, holds a session-scoped Agent Bus inbox, and registers a
- * read-only transcript tool backed by the keeper CLI.
+ * read-only cross-harness history tool backed by the keeper CLI.
  *
  * EPHEMERAL, NEVER a persistent `pi install`: a global install would fire on the
  * human's own non-keeper pi sessions. The `-e` per-launch arming plus the
@@ -36,7 +36,7 @@
  * pi to presence-only (the birth record still seeds the row), and can NEVER crash
  * or interfere with the human's pi session. Lifecycle handlers are pure
  * observers: they return nothing, so they never block or rewrite a message. The
- * transcript tool runs only when the model explicitly calls it.
+ * history tool runs only when the model explicitly calls it.
  *
  * IDENTITY: the birth record the launcher drops is pi's authoritative presence +
  * identity seed (pi pins its session uuid at launch, so `KEEPER_JOB_ID` == that
@@ -141,21 +141,28 @@ export interface PiExtensionApi extends PiSkillAutocompleteApi {
   ): void;
 }
 
-export interface PiTranscriptParams {
-  session_id?: string;
-  subagent?: string;
+export interface PiHistoryParams {
+  operation?: string;
+  session?: string;
+  query?: string;
+  harness?: string;
   project?: string;
+  artifact?: string;
   offset?: number;
   before?: number;
   limit?: number;
   max_chars?: number;
-  tools?: string;
   grep?: string;
   since?: string;
   until?: string;
-  global?: boolean;
+  /** Specialist transcript-show parameters. */
+  subagent?: string;
+  tools?: string;
   include_meta?: boolean;
   include_thinking?: boolean;
+  /** Specialist Pi turn parameters. */
+  leaf?: string;
+  strip_skills?: boolean;
 }
 
 interface PiToolDefinition<TParams> {
@@ -451,65 +458,88 @@ function appendEventsLogLine(
 }
 
 // ---------------------------------------------------------------------------
-// transcript tool (read-only keeper CLI bridge)
+// bounded cross-harness history tool (keeper CLI bridge)
 // ---------------------------------------------------------------------------
 
-const TRANSCRIPT_TOOL_TIMEOUT_MS = 20_000;
-const TRANSCRIPT_TOOL_MAX_BUFFER = 256 * 1024;
+const HISTORY_TOOL_TIMEOUT_MS = 20_000;
+const HISTORY_TOOL_MAX_BUFFER = 256 * 1024;
+const HISTORY_MAX_CHARS_CAP = 60_000;
+const HISTORY_LIST_LIMIT_CAP = 100;
+const HISTORY_SHOW_LIMIT_CAP = 500;
+const HISTORY_SEARCH_LIMIT_CAP = 200;
+const HISTORY_REFERENCE_MAX_CHARS = 4_096;
+const HISTORY_QUERY_MAX_CHARS = 4_096;
+const HISTORY_PATH_MAX_CHARS = 4_096;
+const HISTORY_OPERATIONS = [
+  "list",
+  "show",
+  "page",
+  "search",
+  "transcript_show",
+  "transcript_turn",
+] as const;
 
-/**
- * Tool parameter schema — DELIBERATELY plain JSON Schema, carrying NO TypeBox
- * marker.
- *
- * Verified against the installed pi (0.80.6, `validateToolArguments` in
- * `@earendil-works/pi-ai/compat`): pi gates STRICT TypeBox validation on the
- * SYMBOL `Symbol.for("TypeBox.Kind")` — a symbol property, never a string one.
- * A tool schema WITHOUT that symbol is treated as plain JSON Schema and routed
- * through pi's own lenient `coerceWithJsonSchema` + `Compile().Check()`, which
- * accepts this shape and coerces the string-typed numbers/booleans an LLM
- * commonly emits ("5" -> 5, "true" -> true). Attaching the real Kind symbol
- * would flip pi to STRICT mode and REJECT those coercions, so plain JSON is
- * both the robust choice and the one that keeps this island node:*-only (no
- * pi/typebox import). Confirmed empirically, not assumed. (A prior string-keyed
- * "~kind" marker was inert — pi never reads a string key — and is dropped.)
- */
+type HistoryOperation = (typeof HISTORY_OPERATIONS)[number];
+
+/** Plain JSON Schema keeps this isolated extension node:*-only while retaining
+ * Pi's normal number/boolean coercion behavior. */
 function stringSchema(description: string): Record<string, unknown> {
   return { type: "string", description };
 }
 
-function numberSchema(description: string): Record<string, unknown> {
-  return { type: "number", description };
+function integerSchema(description: string): Record<string, unknown> {
+  return { type: "integer", description };
 }
 
 function booleanSchema(description: string): Record<string, unknown> {
   return { type: "boolean", description };
 }
 
-const TRANSCRIPT_TOOL_PARAMETERS: Record<string, unknown> = {
+const HISTORY_TOOL_PARAMETERS: Record<string, unknown> = {
   type: "object",
   properties: {
-    session_id: stringSchema(
-      "Claude session id. Omit to list sessions in the current project.",
+    operation: {
+      type: "string",
+      enum: HISTORY_OPERATIONS,
+      description:
+        "list, show, page, or search unified history; transcript_show/transcript_turn explicitly select specialist low-level readers.",
+    },
+    session: stringSchema(
+      "Shared Session reference: qualified native id, exact job/native id, or exact title.",
     ),
-    subagent: stringSchema("Subagent id/prefix, or all. Requires session_id."),
-    project: stringSchema(
-      "Project path for list scope or session disambiguation.",
+    query: stringSchema("Literal history search query."),
+    harness: stringSchema(
+      "Harness filter (claude or pi), or the explicit low-level harness.",
     ),
-    offset: numberSchema("Page offset. Show defaults to the newest page."),
-    before: numberSchema(
-      "Backward page boundary. Requires session_id; mutually exclusive with offset.",
+    project: stringSchema("Optional project path used to filter/disambiguate."),
+    artifact: stringSchema(
+      "History show/page only: exact artifact path for duplicate native ids.",
     ),
-    limit: numberSchema("Maximum sessions or transcript entries."),
-    max_chars: numberSchema("Maximum rendered characters for transcript show."),
-    tools: stringSchema("Tool detail: none, compact, or full."),
+    offset: integerSchema("Result or transcript page offset."),
+    before: integerSchema("Backward transcript page boundary."),
+    limit: integerSchema("Maximum sessions, hits, or transcript entries."),
+    max_chars: integerSchema("Maximum rendered transcript characters."),
     grep: stringSchema("Case-insensitive transcript content filter."),
-    since: stringSchema("ISO time/date or relative duration such as 7d."),
-    until: stringSchema("ISO time/date or relative duration."),
-    global: booleanSchema("When listing, search every project instead of cwd."),
-    include_meta: booleanSchema(
-      "Include Claude-injected meta and system entries.",
+    since: stringSchema(
+      "Show/search entry lower time bound (ISO/date or relative duration).",
     ),
-    include_thinking: booleanSchema("Include thinking blocks."),
+    until: stringSchema("Show/search entry upper time bound."),
+    subagent: stringSchema(
+      "Low-level transcript_show only: subagent id/prefix or all.",
+    ),
+    tools: stringSchema(
+      "Low-level transcript_show only: none, compact, or full.",
+    ),
+    include_meta: booleanSchema(
+      "Low-level transcript_show only: include injected meta/system entries.",
+    ),
+    include_thinking: booleanSchema(
+      "Low-level transcript_show only: include thinking blocks.",
+    ),
+    leaf: stringSchema("Low-level transcript_turn only: Pi entry id or root."),
+    strip_skills: booleanSchema(
+      "Low-level transcript_turn only: remove expanded skill envelopes.",
+    ),
   },
 };
 
@@ -525,42 +555,34 @@ function pushNumberFlag(args: string[], flag: string, value: unknown): void {
   }
 }
 
-/**
- * Upper bounds on the model-supplied size params. keeper's stdout rides a 256KB
- * byte {@link TRANSCRIPT_TOOL_MAX_BUFFER}; `maxBuffer` counts BYTES while these
- * params count UTF-16 chars, so the caps assume a ~4-bytes/char worst case
- * (60_000 * 4 = 240KB < 256KB) to keep a compliant render inside the buffer.
- * limit is capped tighter for a session listing than for a transcript show.
- */
-const TRANSCRIPT_MAX_CHARS_CAP = 60_000;
-const TRANSCRIPT_LIST_LIMIT_CAP = 100;
-const TRANSCRIPT_SHOW_LIMIT_CAP = 500;
+function historyOperation(params: PiHistoryParams): HistoryOperation | string {
+  if (typeof params.operation === "string" && params.operation.length > 0) {
+    return params.operation;
+  }
+  if ((params.query?.trim() ?? "").length > 0) return "search";
+  if ((params.session?.trim() ?? "").length > 0) return "show";
+  return "list";
+}
 
-/** One recorded clamp of an oversized model param — surfaced in the tool result
- *  details (never as an error), so the caller sees the applied bound. */
-export interface TranscriptClamp {
+export interface HistoryClamp {
   param: "limit" | "max_chars";
   requested: number;
   applied: number;
 }
 
-/**
- * Clamp the oversized size params down to their caps, returning the bounded
- * params plus the list of applied clamps. PURE. A clamp is recorded only when a
- * finite numeric value actually exceeds its cap; `limit`'s cap depends on list
- * vs show mode, and `max_chars` is bounded only in show mode (list never
- * forwards it).
- */
-export function clampTranscriptParams(params: PiTranscriptParams): {
-  params: PiTranscriptParams;
-  clamps: TranscriptClamp[];
+export function clampHistoryParams(params: PiHistoryParams): {
+  params: PiHistoryParams;
+  clamps: HistoryClamp[];
 } {
-  const clamps: TranscriptClamp[] = [];
-  const next: PiTranscriptParams = { ...params };
-  const listing = (params.session_id?.trim() ?? "").length === 0;
-  const limitCap = listing
-    ? TRANSCRIPT_LIST_LIMIT_CAP
-    : TRANSCRIPT_SHOW_LIMIT_CAP;
+  const next: PiHistoryParams = { ...params };
+  const clamps: HistoryClamp[] = [];
+  const operation = historyOperation(params);
+  const limitCap =
+    operation === "list"
+      ? HISTORY_LIST_LIMIT_CAP
+      : operation === "search"
+        ? HISTORY_SEARCH_LIMIT_CAP
+        : HISTORY_SHOW_LIMIT_CAP;
   if (
     typeof next.limit === "number" &&
     Number.isFinite(next.limit) &&
@@ -570,207 +592,412 @@ export function clampTranscriptParams(params: PiTranscriptParams): {
     next.limit = limitCap;
   }
   if (
-    !listing &&
+    (operation === "show" ||
+      operation === "page" ||
+      operation === "transcript_show") &&
     typeof next.max_chars === "number" &&
     Number.isFinite(next.max_chars) &&
-    next.max_chars > TRANSCRIPT_MAX_CHARS_CAP
+    next.max_chars > HISTORY_MAX_CHARS_CAP
   ) {
     clamps.push({
       param: "max_chars",
       requested: next.max_chars,
-      applied: TRANSCRIPT_MAX_CHARS_CAP,
+      applied: HISTORY_MAX_CHARS_CAP,
     });
-    next.max_chars = TRANSCRIPT_MAX_CHARS_CAP;
+    next.max_chars = HISTORY_MAX_CHARS_CAP;
   }
   return { params: next, clamps };
 }
 
-/**
- * The safe-id shape a session_id / subagent must match before it reaches argv.
- * DELIBERATELY mirrors `isSafeSessionId` in `src/transcript/claude.ts`
- * (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, length 1..200) — the isolation rule forbids
- * importing it, so this is a hand-kept copy; drift is accepted and noted. The
- * leading-alphanumeric anchor is what rejects a flag-like ("--project") or
- * verb/injection-like ("; rm") value before any subprocess spawns.
- */
-const TRANSCRIPT_SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const LOW_LEVEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-function isSafeTranscriptId(value: string): boolean {
-  return (
-    value.length > 0 && value.length <= 200 && TRANSCRIPT_SAFE_ID.test(value)
-  );
+function invalidText(
+  value: unknown,
+  name: string,
+  maxChars: number,
+): string | null {
+  if (typeof value !== "string" || value.length === 0) {
+    return `${name} is required`;
+  }
+  if (value.length > maxChars) return `${name} exceeds ${maxChars} characters`;
+  if (value.includes("\0")) return `${name} contains a NUL byte`;
+  return null;
 }
 
-/**
- * Validate the id-shaped params (session_id, subagent) against the safe-id
- * shape, returning a clean error message for the first offender or `null` when
- * every present id is safe. PURE — the caller rejects BEFORE argv assembly and
- * before any subprocess spawns. Empty/absent ids are legal (list mode omits
- * session_id) and skip validation.
- */
-export function transcriptIdError(params: PiTranscriptParams): string | null {
-  const fields: Array<["session_id" | "subagent", string | undefined]> = [
-    ["session_id", params.session_id],
-    ["subagent", params.subagent],
-  ];
-  for (const [field, raw] of fields) {
-    const value = typeof raw === "string" ? raw.trim() : "";
-    if (value.length === 0) continue;
-    if (!isSafeTranscriptId(value)) {
-      const shown = value.length > 80 ? `${value.slice(0, 80)}...` : value;
-      return `${field} ${JSON.stringify(shown)} is not a valid id (must start with a letter or digit; only letters, digits, dot, underscore, hyphen; max 200 chars)`;
+/** Validate semantic/tool argv constraints before any subprocess is spawned. */
+export function historyParamError(params: PiHistoryParams): string | null {
+  const operation = historyOperation(params);
+  if (!(HISTORY_OPERATIONS as readonly string[]).includes(operation)) {
+    return `operation must be one of ${HISTORY_OPERATIONS.join(", ")}`;
+  }
+  if (params.offset !== undefined && params.before !== undefined) {
+    return "offset and before are mutually exclusive";
+  }
+  for (const [name, value] of [
+    ["offset", params.offset],
+    ["before", params.before],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (!Number.isFinite(value) || !Number.isInteger(value) || value < 0)
+    ) {
+      return `${name} must be a non-negative integer`;
+    }
+  }
+  for (const [name, value] of [
+    ["limit", params.limit],
+    ["max_chars", params.max_chars],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0)
+    ) {
+      return `${name} must be a positive integer`;
+    }
+  }
+  for (const [name, value, max] of [
+    ["project", params.project, HISTORY_PATH_MAX_CHARS],
+    ["artifact", params.artifact, HISTORY_PATH_MAX_CHARS],
+    ["session", params.session, HISTORY_REFERENCE_MAX_CHARS],
+    ["query", params.query, HISTORY_QUERY_MAX_CHARS],
+    ["grep", params.grep, HISTORY_QUERY_MAX_CHARS],
+    ["since", params.since, 512],
+    ["until", params.until, 512],
+  ] as const) {
+    if (value !== undefined) {
+      const error = invalidText(value, name, max);
+      if (error !== null) return error;
+    }
+  }
+
+  if (operation === "show" || operation === "page") {
+    const error = invalidText(
+      params.session,
+      "session",
+      HISTORY_REFERENCE_MAX_CHARS,
+    );
+    if (error !== null) return error;
+  }
+  if (
+    operation === "page" &&
+    params.offset === undefined &&
+    params.before === undefined
+  ) {
+    return "page requires offset or before";
+  }
+  if (operation === "search") {
+    const error = invalidText(params.query, "query", HISTORY_QUERY_MAX_CHARS);
+    if (error !== null) return error;
+  }
+  if (operation === "transcript_show" || operation === "transcript_turn") {
+    const sessionError = invalidText(
+      params.session,
+      "session",
+      HISTORY_REFERENCE_MAX_CHARS,
+    );
+    if (sessionError !== null) return sessionError;
+    if (
+      typeof params.harness !== "string" ||
+      !["claude", "pi"].includes(params.harness)
+    ) {
+      return "an explicit claude or pi harness is required for a low-level operation";
+    }
+  }
+  if (operation === "transcript_turn") {
+    if (params.harness !== "pi") return "transcript_turn is pi-only";
+    const leafError = invalidText(params.leaf, "leaf", 512);
+    if (leafError !== null) return leafError;
+    if (params.leaf !== "root" && !LOW_LEVEL_ID.test(params.leaf as string)) {
+      return "leaf must be root or an id containing letters, digits, dot, underscore, or hyphen";
+    }
+  }
+  if (operation !== "transcript_show") {
+    if (
+      params.subagent !== undefined ||
+      params.tools !== undefined ||
+      params.include_meta !== undefined ||
+      params.include_thinking !== undefined
+    ) {
+      return "subagent/tools/include_meta/include_thinking require operation=transcript_show";
+    }
+  } else {
+    if (
+      params.subagent !== undefined &&
+      (!LOW_LEVEL_ID.test(params.subagent) || params.subagent.length > 200)
+    ) {
+      return "subagent is not a valid bounded id/prefix";
+    }
+    if (
+      params.tools !== undefined &&
+      !["none", "compact", "full"].includes(params.tools)
+    ) {
+      return "tools must be none, compact, or full";
+    }
+  }
+  if (
+    operation !== "transcript_turn" &&
+    (params.leaf !== undefined || params.strip_skills !== undefined)
+  ) {
+    return "leaf/strip_skills require operation=transcript_turn";
+  }
+  if (
+    operation === "list" &&
+    (params.since !== undefined || params.until !== undefined)
+  ) {
+    return "since/until apply to show/search, not history list";
+  }
+  if (params.query !== undefined && operation !== "search") {
+    return "query requires operation=search";
+  }
+  if (
+    params.artifact !== undefined &&
+    operation !== "show" &&
+    operation !== "page"
+  ) {
+    return "artifact applies only to history show/page";
+  }
+  if (params.session !== undefined && operation === "list") {
+    return "session does not apply to history list";
+  }
+  if (
+    params.before !== undefined &&
+    operation !== "show" &&
+    operation !== "page" &&
+    operation !== "transcript_show"
+  ) {
+    return "before applies only to show/page/transcript_show";
+  }
+  if (
+    params.grep !== undefined &&
+    operation !== "show" &&
+    operation !== "page" &&
+    operation !== "transcript_show"
+  ) {
+    return "grep applies only to show/page/transcript_show";
+  }
+  if (
+    params.max_chars !== undefined &&
+    operation !== "show" &&
+    operation !== "page" &&
+    operation !== "transcript_show"
+  ) {
+    return "max_chars applies only to show/page/transcript_show";
+  }
+  if (
+    params.harness !== undefined &&
+    operation !== "transcript_show" &&
+    operation !== "transcript_turn"
+  ) {
+    if (!["claude", "pi"].includes(params.harness)) {
+      return "history harness must be claude or pi";
+    }
+    if (operation !== "list" && operation !== "search") {
+      return "harness filters apply only to list/search; qualify a show/page Session reference instead";
     }
   }
   return null;
 }
 
-/** Build the argv-only keeper invocation from already-clamped params. The
- *  extension stays claude-only, but the CLI grammar requires the harness
- *  positional up front regardless. */
-function buildTranscriptArgv(params: PiTranscriptParams): string[] {
-  const sessionId = params.session_id?.trim() ?? "";
-  const listing = sessionId.length === 0;
-  const args = ["transcript", "claude", ...(listing ? ["list"] : [sessionId])];
-  pushStringFlag(args, "--project", params.project);
-  pushNumberFlag(args, "--offset", params.offset);
-  pushNumberFlag(args, "--limit", params.limit);
-  pushStringFlag(args, "--since", params.since);
-  pushStringFlag(args, "--until", params.until);
-
-  if (listing) {
-    if (params.global === true) args.push("--global");
+function buildHistoryArgv(params: PiHistoryParams): string[] {
+  const operation = historyOperation(params) as HistoryOperation;
+  if (operation === "list") {
+    const args = ["history", "list"];
+    pushStringFlag(args, "--harness", params.harness);
+    pushStringFlag(args, "--project", params.project);
+    pushNumberFlag(args, "--offset", params.offset);
+    pushNumberFlag(args, "--limit", params.limit);
     return args;
   }
-
-  pushStringFlag(args, "--subagent", params.subagent);
+  if (operation === "search") {
+    const args = ["history", "search"];
+    pushStringFlag(args, "--session", params.session);
+    pushStringFlag(args, "--harness", params.harness);
+    pushStringFlag(args, "--project", params.project);
+    pushNumberFlag(args, "--offset", params.offset);
+    pushNumberFlag(args, "--limit", params.limit);
+    pushStringFlag(args, "--since", params.since);
+    pushStringFlag(args, "--until", params.until);
+    args.push("--", params.query as string);
+    return args;
+  }
+  if (operation === "show" || operation === "page") {
+    const args = ["history", "show"];
+    pushStringFlag(args, "--project", params.project);
+    pushStringFlag(args, "--artifact", params.artifact);
+    pushNumberFlag(args, "--offset", params.offset);
+    pushNumberFlag(args, "--before", params.before);
+    pushNumberFlag(args, "--limit", params.limit);
+    pushNumberFlag(args, "--max-chars", params.max_chars);
+    pushStringFlag(args, "--grep", params.grep);
+    pushStringFlag(args, "--since", params.since);
+    pushStringFlag(args, "--until", params.until);
+    args.push("--", params.session as string);
+    return args;
+  }
+  const harness = params.harness as string;
+  if (operation === "transcript_turn") {
+    const args = ["transcript", harness, "turn"];
+    pushStringFlag(args, "--project", params.project);
+    pushStringFlag(args, "--leaf", params.leaf);
+    if (params.strip_skills === true) args.push("--strip-skills");
+    args.push("--", params.session as string);
+    return args;
+  }
+  const args = ["transcript", harness, "show"];
+  pushStringFlag(args, "--project", params.project);
+  pushNumberFlag(args, "--offset", params.offset);
   pushNumberFlag(args, "--before", params.before);
+  pushNumberFlag(args, "--limit", params.limit);
   pushNumberFlag(args, "--max-chars", params.max_chars);
-  pushStringFlag(args, "--tools", params.tools);
   pushStringFlag(args, "--grep", params.grep);
+  pushStringFlag(args, "--since", params.since);
+  pushStringFlag(args, "--until", params.until);
+  pushStringFlag(args, "--subagent", params.subagent);
+  pushStringFlag(args, "--tools", params.tools);
   if (params.include_meta === true) args.push("--meta");
   if (params.include_thinking === true) args.push("--thinking");
+  args.push("--", params.session as string);
   return args;
 }
 
-/** Convert tool parameters to an argv-only keeper invocation, with the oversized
- *  size params clamped to their caps first. */
-export function transcriptCliArgs(params: PiTranscriptParams): string[] {
-  return buildTranscriptArgv(clampTranscriptParams(params).params);
+export function historyCliArgs(params: PiHistoryParams): string[] {
+  return buildHistoryArgv(clampHistoryParams(params).params);
 }
 
 function boundedToolText(text: string): string {
-  if (text.length <= TRANSCRIPT_TOOL_MAX_BUFFER) return text;
-  return `${text.slice(0, TRANSCRIPT_TOOL_MAX_BUFFER)}\n[output truncated by pi extension]`;
+  if (text.length <= HISTORY_TOOL_MAX_BUFFER) return text;
+  return `${text.slice(0, HISTORY_TOOL_MAX_BUFFER)}\n[output truncated by pi extension]`;
 }
 
-/** The Node error `code` a `maxBuffer` overflow carries; the truncated stdout
- *  rides along on the same callback, so it is a partial-success, not a failure. */
-const TRANSCRIPT_MAXBUFFER_CODE = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+const HISTORY_MAXBUFFER_CODE = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+const HISTORY_ABORT_CODE = "ABORT_ERR";
 
-type TranscriptToolResult = {
+export type HistoryToolResult = {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
 };
 
-/**
- * Shape the keeper CLI outcome into a tool result. PURE (no spawn) so the
- * success / overflow / failure branches are unit-testable with a synthetic
- * error object. A `maxBuffer` overflow is re-routed OUT of the failure path:
- * the truncated stdout is returned as content plus an explicit truncation
- * notice; every other error keeps failing with the CLI's message. Applied
- * clamps ride in details, never as an error.
- */
-export function transcriptToolResult(
+export function historyToolResult(
   error: { code?: unknown; message?: string } | null | undefined,
   stdout: string,
   stderr: string,
   args: string[],
-  clamps: TranscriptClamp[],
-): TranscriptToolResult {
+  clamps: HistoryClamp[],
+): HistoryToolResult {
   const out = boundedToolText(stdout);
   const err = boundedToolText(stderr);
   const details: Record<string, unknown> = { argv: args };
   if (clamps.length > 0) details.clamps = clamps;
   if (error === null || error === undefined) {
     return {
-      content: [{ type: "text", text: out || "(no transcript output)" }],
+      content: [{ type: "text", text: out || "(no history output)" }],
       details: { ...details, exit_code: 0 },
     };
   }
   const code = error.code ?? null;
-  if (code === TRANSCRIPT_MAXBUFFER_CODE) {
+  if (code === HISTORY_MAXBUFFER_CODE) {
     return {
       content: [
         {
           type: "text",
-          text: `${out}${out ? "\n" : ""}[transcript truncated - narrow with grep/limit]`,
+          text: `${out}${out ? "\n" : ""}[history output truncated - narrow with session/query/limit]`,
         },
       ],
       details: { ...details, exit_code: null, truncated: true },
     };
   }
+  if (code === HISTORY_ABORT_CODE) {
+    return {
+      content: [{ type: "text", text: "keeper history cancelled" }],
+      details: { ...details, exit_code: null, cancelled: true },
+    };
+  }
   const message = err.trim() || out.trim() || error.message || "unknown error";
   return {
-    content: [{ type: "text", text: `keeper transcript failed: ${message}` }],
+    content: [{ type: "text", text: `keeper history failed: ${message}` }],
     details: { ...details, exit_code: code },
   };
 }
 
-async function executeTranscriptTool(
-  params: PiTranscriptParams,
+export type HistoryExecFile = (
+  file: string,
+  args: string[],
+  options: {
+    encoding: "utf8";
+    timeout: number;
+    maxBuffer: number;
+    signal?: AbortSignal;
+  },
+  callback: (
+    error: { code?: unknown; message?: string } | null,
+    stdout: string,
+    stderr: string,
+  ) => void,
+) => unknown;
+
+export async function executeHistoryTool(
+  params: PiHistoryParams,
   signal?: AbortSignal,
-): Promise<TranscriptToolResult> {
-  const idError = transcriptIdError(params);
-  if (idError !== null) {
-    // Reject a flag/verb-shaped id BEFORE any subprocess spawns — a clean
-    // tool-error, not a thrown exception.
+  run: HistoryExecFile = execFile as unknown as HistoryExecFile,
+): Promise<HistoryToolResult> {
+  const paramError = historyParamError(params);
+  if (paramError !== null) {
     return {
       content: [
-        { type: "text", text: `keeper transcript rejected: ${idError}` },
+        { type: "text", text: `keeper history rejected: ${paramError}` },
       ],
-      details: { rejected: idError },
+      details: { rejected: paramError },
     };
   }
-  const { params: clamped, clamps } = clampTranscriptParams(params);
-  const args = buildTranscriptArgv(clamped);
+  const { params: clamped, clamps } = clampHistoryParams(params);
+  const args = buildHistoryArgv(clamped);
+  if (signal?.aborted === true) {
+    return historyToolResult(
+      { code: HISTORY_ABORT_CODE, message: "aborted" },
+      "",
+      "",
+      args,
+      clamps,
+    );
+  }
   return new Promise((resolve) => {
     const options = {
       encoding: "utf8" as const,
-      timeout: TRANSCRIPT_TOOL_TIMEOUT_MS,
-      maxBuffer: TRANSCRIPT_TOOL_MAX_BUFFER,
+      timeout: HISTORY_TOOL_TIMEOUT_MS,
+      maxBuffer: HISTORY_TOOL_MAX_BUFFER,
       ...(signal === undefined ? {} : { signal }),
     };
-    execFile("keeper", args, options, (error, stdout, stderr) => {
-      resolve(transcriptToolResult(error, stdout, stderr, args, clamps));
+    run("keeper", args, options, (error, stdout, stderr) => {
+      resolve(historyToolResult(error, stdout, stderr, args, clamps));
     });
   });
 }
 
-const TRANSCRIPT_TOOL: PiToolDefinition<PiTranscriptParams> = {
-  name: "keeper_transcript",
-  label: "Keeper Transcript",
+const HISTORY_TOOL: PiToolDefinition<PiHistoryParams> = {
+  name: "keeper_history",
+  label: "Keeper History",
   description:
-    "List Claude Code sessions or read a compact, paginated main/subagent transcript. Omit session_id to list the current project; provide it to read the newest page.",
+    "List, resolve, search, and page bounded Claude/Pi Session history. Session references accept qualified native ids, job aliases, native ids, and exact titles. Specialist transcript operations must be selected explicitly.",
   promptSnippet:
-    "Read Claude Code session transcripts and subagent transcripts through Keeper.",
+    "Traverse bounded cross-harness Session history through Keeper.",
   promptGuidelines: [
-    "Use keeper_transcript to recover Claude context; page backward with before=older_before, forward with offset=newer_offset, and inspect subagents by the ids in the header.",
+    "Use keeper_history for cross-harness discovery: list/search to find context, show for the newest bounded page, and page with older_before or newer_offset. Use transcript_show/transcript_turn only for specialist subagent or Pi branch operations.",
   ],
-  parameters: TRANSCRIPT_TOOL_PARAMETERS,
+  parameters: HISTORY_TOOL_PARAMETERS,
   async execute(_toolCallId, params, signal) {
     try {
-      return await executeTranscriptTool(params, signal);
+      return await executeHistoryTool(params, signal);
     } catch (error) {
       return {
         content: [
           {
             type: "text",
-            text: `keeper transcript failed: ${
+            text: `keeper history failed: ${
               error instanceof Error ? error.message : String(error)
             }`,
           },
         ],
-        details: { argv: transcriptCliArgs(params), exit_code: null },
+        details: { exit_code: null },
       };
     }
   },
@@ -806,7 +1033,7 @@ const KEEPER_JOB_ID_ENV = "KEEPER_JOB_ID";
 
 /**
  * The pi extension entry point. Registers observer handlers that mirror pi's
- * lifecycle into the events-log plus the read-only transcript tool. NO-OPS
+ * lifecycle into the events-log plus the bounded history tool. NO-OPS
  * entirely when `KEEPER_JOB_ID` is absent
  * (a pi session started outside keeper), and is wrapped so it can NEVER throw out
  * of the factory (pi aborts the launch on a load-time throw) nor out of a handler
@@ -920,7 +1147,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       }
     });
     if (typeof pi.registerTool === "function") {
-      pi.registerTool(TRANSCRIPT_TOOL);
+      pi.registerTool(HISTORY_TOOL);
       if (pi.events !== undefined) {
         pi.registerTool(createTaskFacadeTool(pi.events));
       }

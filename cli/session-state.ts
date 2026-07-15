@@ -22,6 +22,19 @@ import type { AttributionDeps } from "../src/commit-work/attribution";
 import { discoverSessionFiles } from "../src/commit-work/attribution";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import { resolveSessionId } from "../src/commit-work/session-id";
+import {
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+} from "./envelope";
+import {
+  resolveTrackedCliSession,
+  type SessionReferenceCliDeps,
+  trackedSessionProblem,
+} from "./session-reference";
+
+export const SESSION_STATE_SCHEMA_VERSION = 1;
 
 /**
  * Injectable seams for {@link run} / {@link buildSessionState}. Production omits
@@ -35,22 +48,27 @@ export interface SessionStateDeps {
   gitRunner?: GitRunner;
   /** Attribution deps forwarded to {@link discoverSessionFiles}. */
   attribution?: AttributionDeps;
+  /** Ambient id carriers used only by the zero-reference auto-detection path. */
+  env?: Record<string, string | undefined>;
 }
 
-const HELP = `keeper session state [options]
+export type SessionStateMainDeps = SessionStateDeps & SessionReferenceCliDeps;
 
-Emit the current session's git context (branch, head sha, porcelain status,
-recent log) plus its on-hook dirty files as a pretty JSON envelope. Purely
-informational — no commit, no lock.
+const HELP = `keeper session state [<session-reference>] [options]
+
+Emit git context plus on-hook dirty files for one shared Session reference.
+Qualified native ids, exact job/native ids, and exact current/historical titles
+are accepted. With no reference, the existing ambient id auto-detection remains.
 
 Options:
-  --session-id <id>    Claude Code session id (auto-resolved if omitted)
-  --log-count <n>      Number of log lines (default 5)
-  --help, -h           Show this help
+  --session <ref>       Shared Session reference (alternative to positional)
+  --session-id <ref>    Compatibility alias of --session
+  --log-count <n>       Number of log lines (default 5)
+  --help, -h            Show this help
 `;
 
 interface ParsedArgs {
-  sessionId: string | null;
+  sessionReference: string | null;
   logCount: number;
   help: boolean;
 }
@@ -59,22 +77,42 @@ const DEFAULT_LOG_COUNT = 5;
 
 function parseArgs(argv: string[]): ParsedArgs {
   const parsed: ParsedArgs = {
-    sessionId: null,
+    sessionReference: null,
     logCount: DEFAULT_LOG_COUNT,
     help: false,
   };
+  const setReference = (value: string | undefined, spelling: string): void => {
+    if (value === undefined || value.length === 0) {
+      process.stderr.write(
+        `keeper session state: ${spelling} requires a value\n`,
+      );
+      process.exit(2);
+    }
+    if (parsed.sessionReference !== null) {
+      process.stderr.write(
+        "keeper session state: specify the Session reference only once\n",
+      );
+      process.exit(2);
+    }
+    parsed.sessionReference = value;
+  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    const a = argv[i] as string;
     if (a === "--help" || a === "-h") {
       parsed.help = true;
-    } else if (a === "--session-id") {
-      parsed.sessionId = argv[++i] ?? null;
-    } else if (a.startsWith("--session-id=")) {
-      parsed.sessionId = a.slice("--session-id=".length);
+    } else if (a === "--session" || a === "--session-id") {
+      setReference(argv[++i], a);
+    } else if (a.startsWith("--session=") || a.startsWith("--session-id=")) {
+      const spelling = a.startsWith("--session-id=")
+        ? "--session-id"
+        : "--session";
+      setReference(a.slice(a.indexOf("=") + 1), spelling);
     } else if (a === "--log-count") {
       parsed.logCount = parseLogCount(argv[++i]);
     } else if (a.startsWith("--log-count=")) {
       parsed.logCount = parseLogCount(a.slice("--log-count=".length));
+    } else if (!a.startsWith("-")) {
+      setReference(a, "<session-reference>");
     } else {
       process.stderr.write(
         `keeper session state: unexpected argument '${a}'\n`,
@@ -100,11 +138,6 @@ function parseLogCount(raw: string | undefined): number {
     process.exit(2);
   }
   return n;
-}
-
-/** Emit a pretty (`indent=2`, trailing `\n`) JSON envelope. */
-function printPretty(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 /** Full HEAD SHA, or `null` in an empty repo (no commits yet). */
@@ -161,12 +194,12 @@ export interface SessionStateEnvelope {
  * so tests assert the verb's decisions in-process with a faked runner.
  */
 export async function buildSessionState(
-  args: { sessionId: string | null; logCount: number },
+  args: { sessionId: string | null; logCount: number; cwd?: string },
   deps: SessionStateDeps = {},
 ): Promise<SessionStateEnvelope> {
   const git = deps.gitRunner ?? gitExec;
-  const cwd = process.cwd();
-  const sessionId = resolveSessionId(args.sessionId);
+  const cwd = args.cwd ?? process.cwd();
+  const sessionId = resolveSessionId(args.sessionId, deps.env);
 
   // The Python wraps discover_files in a bare `except` so a DB hiccup degrades
   // to `[]` instead of throwing the verb. Mirror that exactly — attribution is
@@ -195,24 +228,48 @@ export async function buildSessionState(
   };
 }
 
-async function run(args: ParsedArgs): Promise<number> {
-  printPretty(
-    await buildSessionState({
-      sessionId: args.sessionId,
-      logCount: args.logCount,
-    }),
-  );
-  return 0;
-}
-
-export async function main(argv: string[]): Promise<void> {
+export async function main(
+  argv: string[],
+  deps: SessionStateMainDeps = {},
+  sink: EnvelopeSink = processEnvelopeSink,
+): Promise<void> {
   const args = parseArgs(argv);
   if (args.help) {
-    process.stdout.write(HELP);
+    sink.writeStdout(HELP);
     return;
   }
-  const code = await run(args);
-  if (code !== 0) process.exit(code);
+
+  let jobId: string | null = null;
+  let targetCwd = process.cwd();
+  if (args.sessionReference !== null) {
+    const resolution = resolveTrackedCliSession(args.sessionReference, deps);
+    if (resolution.kind !== "resolved") {
+      emitEnvelope(
+        errorEnvelope(
+          SESSION_STATE_SCHEMA_VERSION,
+          trackedSessionProblem(resolution),
+        ),
+        sink,
+      );
+      return;
+    }
+    jobId = resolution.job.jobId;
+    targetCwd =
+      resolution.job.project ?? resolution.session.project ?? targetCwd;
+  }
+
+  const stateDeps: SessionStateDeps =
+    deps.dbPath !== undefined && deps.attribution?.dbPath === undefined
+      ? {
+          ...deps,
+          attribution: { ...deps.attribution, dbPath: deps.dbPath },
+        }
+      : deps;
+  const value = await buildSessionState(
+    { sessionId: jobId, logCount: args.logCount, cwd: targetCwd },
+    stateDeps,
+  );
+  sink.writeStdout(`${JSON.stringify(value, null, 2)}\n`);
 }
 
 if (import.meta.main) {

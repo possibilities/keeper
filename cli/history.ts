@@ -42,7 +42,11 @@ import {
   HISTORY_HARNESSES,
   isHistoryHarness,
 } from "../src/history/model";
-import { resolveSessionReference } from "../src/history/resolver";
+import {
+  resolveSessionReference,
+  SESSION_RESOLUTION_CANDIDATES_MAX,
+  sessionAmbiguityDetails,
+} from "../src/history/resolver";
 import {
   HISTORY_SEARCH_LIMIT_MAX,
   HISTORY_SEARCH_OFFSET_MAX,
@@ -79,7 +83,6 @@ const SHOW_MAX_ENTRY_CHARS = 128_000;
 const OUTPUT_TITLE_CHARS = 2_000;
 const OUTPUT_TITLE_ALIASES_MAX = 100;
 const OUTPUT_JOBS_MAX = 100;
-const RESOLUTION_CANDIDATES_MAX = 50;
 const CANONICAL_MUTATION_ROWS_MAX = 500;
 const FILE_CANDIDATES_MAX = 10_500;
 const FILE_FRAGMENT_MAX_CHARS = 4_096;
@@ -493,7 +496,7 @@ function resolutionFailure(
   if (resolution.kind === "ambiguous") {
     const candidates = resolution.candidates.slice(
       0,
-      RESOLUTION_CANDIDATES_MAX,
+      SESSION_RESOLUTION_CANDIDATES_MAX,
     );
     const truncated = candidates.length < resolution.candidates.length;
     return historyFailure(
@@ -502,12 +505,10 @@ function resolutionFailure(
       "the supplied reference matches multiple sessions",
       "Retry with a more specific reference; use --project and, when needed, the candidate artifact path with --artifact.",
       {
-        details: {
-          match: resolution.match,
-          candidate_count: resolution.candidates.length,
-          candidates_truncated: truncated,
-          candidates,
-        },
+        details: sessionAmbiguityDetails(
+          resolution.match,
+          resolution.candidates,
+        ),
         humanDetails: [
           ...candidates.map(
             (candidate) =>

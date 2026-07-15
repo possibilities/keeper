@@ -2,9 +2,8 @@
 /**
  * `keeper session <state|files|events|summary>` — the session-scoped read group.
  * Each verb maps to its own leaf main (`cli/{session-state,show-session-files,
- * show-session-events,session-summary}.ts`), preserving that leaf's flags,
- * envelope shape, and exit codes byte-for-byte — only the invocation spelling is
- * the group.
+ * show-session-events,session-summary}.ts`). The leaves share Session-reference
+ * resolution while retaining their established success payloads.
  *
  * The leaf mains are lazy-imported ONLY on the dispatch path, so group `--help`
  * (and the help-purity walk) never boots a leaf or opens keeper.db. Each leaf
@@ -45,7 +44,7 @@ const VERB_LINES = Object.entries(SUBVERBS)
 const HELP = `keeper session — session-scoped reads
 
 Usage:
-  keeper session <${Object.keys(SUBVERBS).join("|")}> [options]
+  keeper session <${Object.keys(SUBVERBS).join("|")}> [<session-reference>] [options]
 
 Verbs:
 ${VERB_LINES}

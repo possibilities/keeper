@@ -4,10 +4,10 @@
  * projection as a pretty JSON envelope (epic fn-840). Read-only over keeper.db
  * so consumers stop hand-writing sqlite against a schema keeper owns.
  *
- * The verb resolves a job by the cheapest available signal: explicit
- * `--job-id` / `--session-title` (the Claude session TITLE) / `--cwd` / `--pane`,
- * or zero-flag auto-detection that (a) shows your own job when run inside a
- * Claude session (`$CLAUDE_CODE_SESSION_ID`), (b) shows the single live agent
+ * A positional/`--session` reference resolves through the shared Session
+ * catalog before selecting one associated job. Exact job-only/cwd/pane filters
+ * remain orthogonal, plus zero-flag auto-detection that (a) shows your own job
+ * when run inside a Claude session (`$CLAUDE_CODE_SESSION_ID`), (b) shows the single live agent
  * in your current tmux WINDOW when you split a shell pane beside it, else
  * (c) the git-toplevel containing your cwd.
  *
@@ -43,30 +43,37 @@ import {
   RECOVERY_DB_READ,
   successEnvelope,
 } from "./envelope";
+import {
+  resolveTrackedCliSession,
+  type SessionReferenceCliDeps,
+  trackedSessionProblem,
+} from "./session-reference";
 
 /** Envelope schema version for `keeper show-job` (versions the `data` payload). */
 export const SHOW_JOB_SCHEMA_VERSION = 1;
 
-const HELP = `keeper show-job [selectors] [options]
+const HELP = `keeper show-job [<session-reference>] [selectors] [options]
 
-Fetch a single job's full metadata from the jobs projection as a pretty JSON
-envelope. Read-only over keeper.db — no commit, no lock.
+Fetch one job's full metadata. A positional or --session reference resolves by
+qualified native id, exact job/native id, or exact current/historical title,
+then requires exactly one associated Keeper job. Native-only Sessions return
+not_tracked; multiple associated jobs return bounded candidates.
 
 With no selector, auto-detects: your own job inside a Claude session
 ($CLAUDE_CODE_SESSION_ID), else the single live agent in your current tmux
 window (split a shell pane beside it), else the job whose cwd contains yours.
 
 Selectors (explicit flags AND together — they narrow):
-  --job-id <id>        Match job_id exactly
-  --session-title <t>  Match the Claude session title (case-insensitive),
-                       current title OR any name_history entry
+  --session <ref>      Shared Session reference (alternative to positional)
+  --session-title <t>  Compatibility alias of --session
+  --job-id <id>        Exact job-only filter; also narrows a Session's jobs
   --cwd <dir>          Match jobs under <dir>'s git toplevel (default: cwd)
   --cwd-exact          Strict cwd equality instead of toplevel containment
   --pane <%N>          Match backend_exec_pane_id exactly (bare N → %N)
 
 Options:
-  --latest             Collapse an ambiguous (>1) match to the top of the
-                       deterministic sort (never fabricates from not_found)
+  --latest             Collapse an ambiguous job-only cwd/pane query; ignored
+                       for Session references, which never recency-collapse
   --raw                Leave JSON-TEXT columns (name_history/epic_links/
                        monitors) as raw TEXT instead of decoding them
   --help, -h           Show this help
@@ -89,10 +96,10 @@ const LIVE_STATES = new Set(["working", "stopped"]);
  * resolution path is unit-testable in-process.
  */
 export interface Selectors {
-  /** Exact `job_id` match (== session id). */
+  /** Exact `job_id` match. */
   jobId?: string;
-  /** Claude session TITLE — current title OR any name_history entry, NOCASE. */
-  title?: string;
+  /** Candidate job ids from one already-resolved Session. */
+  jobIds?: string[];
   /** Git-toplevel containment root (realpath'd) for prefix matching. */
   cwdRoot?: string;
   /** Strict cwd equality target (raw, un-realpath'd to match stored cwd). */
@@ -101,6 +108,8 @@ export interface Selectors {
   paneIds?: string[];
   /** Collapse a >1 ambiguity to the deterministic-sort top. */
   latest?: boolean;
+  /** Session-derived candidates never use the live/latest collapse rules. */
+  strictAmbiguity?: boolean;
   /** Resolution method label echoed back in the success envelope. */
   method?: string;
 }
@@ -133,17 +142,20 @@ function escapeLike(term: string): string {
  * Apply the ambiguity rule to an ORDER-BY-sorted candidate set:
  *   0 matches            → not_found
  *   exactly 1            → return it (a lone TERMINAL job IS returned)
- *   >1 with exactly 1 live → return the live one
- *   >1 with 0 or ≥2 live → ambiguous (unless --latest collapses to sort top)
- * `--latest` is strictly a >1 tiebreaker — it NEVER turns not_found into a hit.
+ *   >1 Session-derived     → ambiguous (strict; no liveness/recency collapse)
+ *   >1 job-only, 1 live    → return the live one
+ *   >1 job-only otherwise  → ambiguous (unless --latest selects sort top)
+ * `--latest` is strictly a job-only >1 tiebreaker and never fabricates a hit.
  */
 function applyAmbiguity(
   rows: JobRow[],
   matchedField: string | undefined,
   latest: boolean,
+  strictAmbiguity: boolean,
 ): ResolveResult {
   if (rows.length === 0) return { kind: "not_found" };
   if (rows.length === 1) return { kind: "ok", row: rows[0], matchedField };
+  if (strictAmbiguity) return { kind: "ambiguous", candidates: rows };
   const live = rows.filter((r) => LIVE_STATES.has(String(r.state)));
   if (live.length === 1) return { kind: "ok", row: live[0], matchedField };
   if (latest) return { kind: "ok", row: rows[0], matchedField };
@@ -156,9 +168,8 @@ function applyAmbiguity(
  * returns a discriminated result. No env / tmux / cwd / `Date.now()` reads —
  * those happen in `main` and arrive as plain data.
  *
- * Explicit selectors AND together: they NARROW. A `--job-id` paired with
- * any other selector is a consistency check — a row failing it yields
- * `not_found`, never a blind-trust of the id.
+ * Explicit job-only selectors AND together: they NARROW. Session/title
+ * matching happens before this query in the shared catalog resolver.
  */
 export function resolveJob(db: Database, sel: Selectors): ResolveResult {
   const where: string[] = [];
@@ -171,16 +182,11 @@ export function resolveJob(db: Database, sel: Selectors): ResolveResult {
     fields.push("job_id");
   }
 
-  if (sel.title !== undefined) {
-    // Current title OR an exact (NOCASE) entry in the name_history JSON array.
-    // `json_each` over the default '[]' (or any well-formed array) is safe; a
-    // malformed blob is guarded at the producer (default '[]') — but COALESCE
-    // to '[]' here too so a NULL never breaks the join.
-    where.push(`(title = ? COLLATE NOCASE OR EXISTS (
-      SELECT 1 FROM json_each(COALESCE(name_history, '[]')) je
-       WHERE je.value = ? COLLATE NOCASE))`);
-    params.push(sel.title, sel.title);
-    fields.push("title");
+  if (sel.jobIds !== undefined) {
+    if (sel.jobIds.length === 0) return { kind: "not_found" };
+    where.push(`job_id IN (${sel.jobIds.map(() => "?").join(",")})`);
+    params.push(...sel.jobIds);
+    fields.push("job_id");
   }
 
   if (sel.cwdExact !== undefined) {
@@ -208,15 +214,19 @@ export function resolveJob(db: Database, sel: Selectors): ResolveResult {
   // as not_found rather than returning an arbitrary row.
   if (where.length === 0) return { kind: "not_found" };
 
-  // DISTINCT so a row matching on both title and a name_history entry (the
-  // EXISTS sub-select can't double it, but a future OR-join could) counts once.
+  // DISTINCT keeps future join-based narrowing from duplicating a job row.
   const sql = `SELECT DISTINCT * FROM jobs WHERE ${where.join(
     " AND ",
   )} ORDER BY ${ORDER_BY}`;
   const rows = db.query(sql).all(...(params as never[])) as JobRow[];
 
   const matchedField = fields.length === 1 ? fields[0] : undefined;
-  return applyAmbiguity(rows, matchedField, sel.latest ?? false);
+  return applyAmbiguity(
+    rows,
+    matchedField,
+    sel.latest ?? false,
+    sel.strictAmbiguity ?? false,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -247,14 +257,24 @@ export function decodeFor(row: JobRow, raw: boolean): JobRow {
   return out;
 }
 
-/** The compact candidate-list shape for the ambiguous envelope. */
+const SHOW_JOB_CANDIDATES_MAX = 25;
+const SHOW_JOB_CANDIDATE_TEXT_MAX = 512;
+const SHOW_JOB_SESSION_FILTER_IDS_MAX = 500;
+
+function boundedCandidateValue(value: unknown): unknown {
+  return typeof value === "string" && value.length > SHOW_JOB_CANDIDATE_TEXT_MAX
+    ? value.slice(0, SHOW_JOB_CANDIDATE_TEXT_MAX)
+    : value;
+}
+
+/** The compact, field- and count-bounded ambiguous-candidate shape. */
 function candidateView(row: JobRow): JobRow {
   return {
-    job_id: row.job_id,
-    title: row.title,
-    state: row.state,
-    cwd: row.cwd,
-    backend_exec_pane_id: row.backend_exec_pane_id,
+    job_id: boundedCandidateValue(row.job_id),
+    title: boundedCandidateValue(row.title),
+    state: boundedCandidateValue(row.state),
+    cwd: boundedCandidateValue(row.cwd),
+    backend_exec_pane_id: boundedCandidateValue(row.backend_exec_pane_id),
     updated_at: row.updated_at,
   };
 }
@@ -346,7 +366,7 @@ function tmuxWindowPaneIds(
 interface ParsedArgs {
   help: boolean;
   jobId: string | null;
-  title: string | null;
+  sessionReference: string | null;
   cwd: string | null;
   cwdExact: boolean;
   pane: string | null;
@@ -377,24 +397,39 @@ function parseArgs(argv: string[]): ParsedArgs {
   const p: ParsedArgs = {
     help: false,
     jobId: null,
-    title: null,
+    sessionReference: null,
     cwd: null,
     cwdExact: false,
     pane: null,
     latest: false,
     raw: false,
   };
+  const setReference = (value: string, spelling: string): void => {
+    if (value.length === 0) die(`${spelling} requires a value`);
+    if (p.sessionReference !== null) {
+      die("specify the Session reference only once");
+    }
+    p.sessionReference = value;
+  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    const a = argv[i] as string;
     if (a === "--help" || a === "-h") {
       p.help = true;
     } else if (a === "--job-id" || a.startsWith("--job-id=")) {
       const r = takeValue(argv, i, "--job-id");
       p.jobId = r.value;
       i = r.next;
-    } else if (a === "--session-title" || a.startsWith("--session-title=")) {
-      const r = takeValue(argv, i, "--session-title");
-      p.title = r.value;
+    } else if (
+      a === "--session" ||
+      a.startsWith("--session=") ||
+      a === "--session-title" ||
+      a.startsWith("--session-title=")
+    ) {
+      const flag = a.startsWith("--session-title")
+        ? "--session-title"
+        : "--session";
+      const r = takeValue(argv, i, flag);
+      setReference(r.value, flag);
       i = r.next;
     } else if (a === "--cwd" || a.startsWith("--cwd=")) {
       const r = takeValue(argv, i, "--cwd");
@@ -410,6 +445,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       p.latest = true;
     } else if (a === "--raw") {
       p.raw = true;
+    } else if (!a.startsWith("-")) {
+      setReference(a, "<session-reference>");
     } else {
       die(`unexpected argument '${a}'`);
     }
@@ -429,28 +466,36 @@ function normalizePane(raw: string): string {
 export function main(
   argv: string[],
   sink: EnvelopeSink = processEnvelopeSink,
+  referenceDeps: SessionReferenceCliDeps = {},
 ): void {
   const args = parseArgs(argv);
   if (args.help) {
-    process.stdout.write(HELP);
+    sink.writeStdout(HELP);
     return;
   }
 
-  const env = process.env as Record<string, string | undefined>;
+  const env = (referenceDeps.env ?? process.env) as Record<
+    string,
+    string | undefined
+  >;
+  const sessionMode = args.sessionReference !== null;
 
   // An explicit PRIMARY selector pins the job; auto-detection runs only when
   // none is given. `--cwd <dir>` / `--cwd-exact` are explicit; bare cwd is auto.
   const hasExplicitPrimary =
+    sessionMode ||
     args.jobId !== null ||
-    args.title !== null ||
     args.pane !== null ||
     args.cwd !== null ||
     args.cwdExact;
 
-  // Build the explicit narrowing selectors that always apply.
-  const baseSelectors: Selectors = { latest: args.latest };
-  if (args.jobId !== null) baseSelectors.jobId = args.jobId;
-  if (args.title !== null) baseSelectors.title = args.title;
+  // Build job-only filters first. Session resolution below supplies either one
+  // exact job id or the complete associated-job candidate set.
+  const baseSelectors: Selectors = {
+    latest: sessionMode ? false : args.latest,
+    strictAmbiguity: sessionMode,
+  };
+  if (!sessionMode && args.jobId !== null) baseSelectors.jobId = args.jobId;
   if (args.pane !== null) baseSelectors.paneIds = [normalizePane(args.pane)];
 
   if (args.cwd !== null || args.cwdExact) {
@@ -459,20 +504,65 @@ export function main(
       baseSelectors.cwdExact = dir;
     } else {
       const root = resolveGitRoot(dir);
-      // A non-repo cwd / missing git degrades — skip the cwd signal (never
-      // throw). If it was the ONLY selector, the no-effective-filter guard below
-      // catches it as exit 2.
       if (root !== null) baseSelectors.cwdRoot = safeRealpath(root);
+    }
+  }
+
+  let sessionMatch: string | undefined;
+  if (args.sessionReference !== null) {
+    const tracked = resolveTrackedCliSession(
+      args.sessionReference,
+      referenceDeps,
+      args.jobId === null ? {} : { jobId: args.jobId },
+    );
+    if (tracked.kind === "resolved") {
+      baseSelectors.jobId = tracked.job.jobId;
+      sessionMatch = tracked.match;
+    } else if (
+      (tracked.kind === "job_ambiguous" ||
+        tracked.kind === "session_ambiguous") &&
+      (baseSelectors.paneIds !== undefined ||
+        baseSelectors.cwdExact !== undefined ||
+        baseSelectors.cwdRoot !== undefined)
+    ) {
+      const candidateJobIds = [
+        ...new Set(
+          tracked.kind === "job_ambiguous"
+            ? tracked.candidates.map((candidate) => candidate.jobId)
+            : tracked.candidates.flatMap((candidate) => candidate.jobIds),
+        ),
+      ];
+      if (
+        candidateJobIds.length === 0 ||
+        candidateJobIds.length > SHOW_JOB_SESSION_FILTER_IDS_MAX
+      ) {
+        emitEnvelope(
+          errorEnvelope(
+            SHOW_JOB_SCHEMA_VERSION,
+            trackedSessionProblem(tracked),
+          ),
+          sink,
+        );
+        return;
+      }
+      baseSelectors.jobIds = candidateJobIds;
+      sessionMatch = tracked.match;
+    } else {
+      emitEnvelope(
+        errorEnvelope(SHOW_JOB_SCHEMA_VERSION, trackedSessionProblem(tracked)),
+        sink,
+      );
+      return;
     }
   }
 
   // Open read-only; busy_timeout is set by applyPragmas, no immutable=1.
   let db: Database;
   try {
-    db = openDb(resolveDbPath(), { readonly: true }).db;
+    db = openDb(referenceDeps.dbPath ?? resolveDbPath(), {
+      readonly: true,
+    }).db;
   } catch {
-    // A broken DB ≠ no job — a read failure, distinct from not_found. Emit a
-    // clean corrective message (no path / stack leak in an agent-facing error).
     emitEnvelope(
       errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
         code: "read_failed",
@@ -492,28 +582,28 @@ export function main(
     if (hasExplicitPrimary) {
       const hasFilter =
         baseSelectors.jobId !== undefined ||
-        baseSelectors.title !== undefined ||
+        baseSelectors.jobIds !== undefined ||
         baseSelectors.paneIds !== undefined ||
         baseSelectors.cwdExact !== undefined ||
         baseSelectors.cwdRoot !== undefined;
       if (!hasFilter) {
-        // e.g. `--cwd <non-repo>` with no other selector: no effective filter.
         die("no effective filter (cwd is not inside a git repository)");
       }
-      method = explicitMethod(baseSelectors);
+      method = sessionMode
+        ? "session-reference"
+        : explicitMethod(baseSelectors);
       result = resolveJob(db, baseSelectors);
     } else {
-      // Auto-detection LADDER. Each rung's matches run through the ambiguity
-      // rule; a rung matching ≥1 but ambiguous REPORTS ambiguity; a rung
-      // matching 0 falls through to the next.
       const auto = autoDetect(db, env, args.latest);
       result = auto.result;
       method = auto.method;
     }
 
-    envelope = buildEnvelope(result, method, args.raw);
+    envelope = buildEnvelope(result, method, args.raw, {
+      sessionReference: sessionMode,
+      sessionMatch,
+    });
   } catch {
-    // A query throw mid-resolution is a read failure, not not_found.
     envelope = errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
       code: "read_failed",
       message: "could not read from the keeper database",
@@ -529,7 +619,6 @@ export function main(
 /** Label the resolution method for an explicit-selector run. */
 function explicitMethod(sel: Selectors): string {
   if (sel.jobId !== undefined) return "job-id";
-  if (sel.title !== undefined) return "session-title";
   if (sel.paneIds !== undefined) return "pane";
   if (sel.cwdExact !== undefined) return "cwd-exact";
   return "cwd";
@@ -590,12 +679,19 @@ export function buildEnvelope(
   result: ResolveResult,
   method: string,
   raw: boolean,
+  options: {
+    sessionReference?: boolean;
+    sessionMatch?: string;
+  } = {},
 ): Envelope<unknown> {
   if (result.kind === "ok") {
     const job = decodeFor(result.row, raw);
     const resolution: Record<string, unknown> = { method };
     if (result.matchedField !== undefined) {
       resolution.matched_field = result.matchedField;
+    }
+    if (options.sessionMatch !== undefined) {
+      resolution.session_match = options.sessionMatch;
     }
     return successEnvelope(SHOW_JOB_SCHEMA_VERSION, { job, resolution });
   }
@@ -610,14 +706,19 @@ export function buildEnvelope(
     });
   }
   // ambiguous
+  const candidates = result.candidates.slice(0, SHOW_JOB_CANDIDATES_MAX);
+  const sessionReference = options.sessionReference === true;
   return errorEnvelope(SHOW_JOB_SCHEMA_VERSION, {
-    code: "ambiguous",
+    code: sessionReference ? "job_ambiguous" : "ambiguous",
     message: `the selectors matched ${result.candidates.length} jobs; narrow to one`,
-    recovery:
-      "Add a narrowing selector (--job-id pins exactly one) or pass " +
-      "--latest to take the most recent; the matches are on " +
-      "error.details.candidates.",
-    details: { candidates: result.candidates.map(candidateView) },
+    recovery: sessionReference
+      ? "Add --job-id with one exact candidate; Session references never choose the newest associated job."
+      : "Add a narrowing selector (--job-id pins exactly one) or pass --latest for this job-only query.",
+    details: {
+      candidate_count: result.candidates.length,
+      candidates_truncated: candidates.length < result.candidates.length,
+      candidates: candidates.map(candidateView),
+    },
   });
 }
 

@@ -78,67 +78,43 @@ describe("resolveJob — job-id", () => {
   });
 
   test("id + a failing consistency selector → not_found, never blind-trust", () => {
-    seed({ job_id: "sess-A", title: "Alpha" });
-    // Right id, wrong title → the AND narrows it away.
-    const r = resolveJob(db, { jobId: "sess-A", title: "WrongTitle" });
+    seed({ job_id: "sess-A", cwd: "/repo" });
+    const r = resolveJob(db, { jobId: "sess-A", cwdExact: "/wrong" });
     expect(r.kind).toBe("not_found");
   });
 
   test("id + a passing consistency selector → ok", () => {
-    seed({ job_id: "sess-A", title: "Alpha" });
-    const r = resolveJob(db, { jobId: "sess-A", title: "alpha" });
+    seed({ job_id: "sess-A", cwd: "/repo" });
+    const r = resolveJob(db, { jobId: "sess-A", cwdExact: "/repo" });
     expect(okRow(r).job_id).toBe("sess-A");
   });
 });
 
-describe("resolveJob — session title", () => {
-  test("matches current title case-insensitively", () => {
-    seed({ job_id: "j1", title: "My Session" });
-    expect(okRow(resolveJob(db, { title: "my session" })).job_id).toBe("j1");
+describe("resolveJob — Session-derived candidate ids", () => {
+  test("candidate ids constrain without copying title matching into show-job", () => {
+    seed({ job_id: "j1" });
+    seed({ job_id: "j2" });
+    seed({ job_id: "outside" });
+    const r = resolveJob(db, { jobIds: ["j1", "j2"], strictAmbiguity: true });
+    expect(r.kind).toBe("ambiguous");
+    if (r.kind === "ambiguous") {
+      expect(r.candidates.map((row) => row.job_id).sort()).toEqual([
+        "j1",
+        "j2",
+      ]);
+    }
   });
 
-  test("matches a name_history entry (NOCASE)", () => {
-    seed({
-      job_id: "j1",
-      title: "Renamed Now",
-      name_history: JSON.stringify(["Old Name", "Older"]),
-    });
-    expect(okRow(resolveJob(db, { title: "old name" })).job_id).toBe("j1");
-  });
-
-  test("same-row title+history match dedups to ONE row", () => {
-    // Title equals a history entry — must not double-count into ambiguity.
-    seed({
-      job_id: "j1",
-      title: "Same",
-      name_history: JSON.stringify(["Same"]),
-    });
-    const r = resolveJob(db, { title: "same" });
-    expect(r.kind).toBe("ok");
-  });
-
-  test("cross-row peers (current title vs renamed-away history) → ambiguity rule", () => {
-    seed({
-      job_id: "live",
-      title: "Shared",
-      state: "working",
-    });
-    seed({
-      job_id: "dead",
-      title: "Else",
-      name_history: JSON.stringify(["Shared"]),
-      state: "ended",
-    });
-    // Two rows match "Shared"; exactly one is live → the live one wins.
-    const r = resolveJob(db, { title: "shared" });
-    expect(okRow(r).job_id).toBe("live");
-  });
-
-  test("malformed name_history blob does not throw the query", () => {
-    seed({ job_id: "j1", title: "T", name_history: "{not json" });
-    // The query must still run (json_each over the COALESCE'd column); the
-    // current-title arm still matches.
-    expect(okRow(resolveJob(db, { title: "t" })).job_id).toBe("j1");
+  test("strict Session ambiguity never picks the sole live candidate", () => {
+    seed({ job_id: "live", state: "working" });
+    seed({ job_id: "dead", state: "ended" });
+    expect(
+      resolveJob(db, {
+        jobIds: ["live", "dead"],
+        strictAmbiguity: true,
+        latest: true,
+      }).kind,
+    ).toBe("ambiguous");
   });
 });
 
@@ -206,36 +182,39 @@ describe("resolveJob — paneIds (tmux window-scope predicate)", () => {
 
 describe("resolveJob — ambiguity rule", () => {
   test("0 matches → not_found", () => {
-    expect(resolveJob(db, { title: "ghost" }).kind).toBe("not_found");
+    expect(resolveJob(db, { jobId: "ghost" }).kind).toBe("not_found");
   });
 
   test("exactly 1 (terminal) IS returned — you can inspect a dead session", () => {
     seed({ job_id: "dead", title: "T", state: "killed" });
-    expect(okRow(resolveJob(db, { title: "t" })).job_id).toBe("dead");
+    expect(okRow(resolveJob(db, { jobId: "dead" })).job_id).toBe("dead");
   });
 
   test(">1 with 0 live → ambiguous", () => {
     seed({ job_id: "d1", title: "Dup", state: "ended" });
     seed({ job_id: "d2", title: "Dup", state: "killed" });
-    expect(resolveJob(db, { title: "dup" }).kind).toBe("ambiguous");
+    expect(resolveJob(db, { jobIds: ["d1", "d2"] }).kind).toBe("ambiguous");
   });
 
   test(">1 with ≥2 live → ambiguous", () => {
     seed({ job_id: "l1", title: "Dup", state: "working" });
     seed({ job_id: "l2", title: "Dup", state: "stopped" });
-    expect(resolveJob(db, { title: "dup" }).kind).toBe("ambiguous");
+    expect(resolveJob(db, { jobIds: ["l1", "l2"] }).kind).toBe("ambiguous");
   });
 
   test("--latest collapses ambiguity to the deterministic-sort top", () => {
     // Both live → ambiguous without --latest; with it, the most-recent wins.
     seed({ job_id: "older", title: "Dup", state: "working", updated_at: 100 });
     seed({ job_id: "newer", title: "Dup", state: "working", updated_at: 200 });
-    const r = resolveJob(db, { title: "dup", latest: true });
+    const r = resolveJob(db, {
+      jobIds: ["older", "newer"],
+      latest: true,
+    });
     expect(okRow(r).job_id).toBe("newer");
   });
 
   test("--latest never fabricates a result from not_found", () => {
-    expect(resolveJob(db, { title: "ghost", latest: true }).kind).toBe(
+    expect(resolveJob(db, { jobId: "ghost", latest: true }).kind).toBe(
       "not_found",
     );
   });
@@ -243,7 +222,7 @@ describe("resolveJob — ambiguity rule", () => {
   test("ambiguous candidate list is deterministic (live first, recency, id)", () => {
     seed({ job_id: "zzz", title: "Dup", state: "ended", updated_at: 50 });
     seed({ job_id: "aaa", title: "Dup", state: "ended", updated_at: 50 });
-    const r = resolveJob(db, { title: "dup" });
+    const r = resolveJob(db, { jobIds: ["zzz", "aaa"] });
     expect(r.kind).toBe("ambiguous");
     if (r.kind === "ambiguous") {
       // Equal state + recency → job_id ASC final tiebreak.
@@ -355,12 +334,12 @@ describe("buildEnvelope: envelope mapping", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Retired spellings — the selectors are --job-id and --session-title; the old
-// --session-id and --session hard-fail (unknown argument → exit 2) at parse,
-// before any keeper.db open.
+// Compatibility grammar: --session is the shared reference spelling;
+// --session-title feeds that same resolver while broad guidance is cut over.
+// The old id-only --session-id spelling remains retired for show-job.
 // ---------------------------------------------------------------------------
 
-describe("main: retired selector spellings hard-fail exit 2", () => {
+describe("main: retired id-only selector spelling hard-fails exit 2", () => {
   /** Drive show-job's main() capturing the exit code + stderr, patching the
    *  process globals it writes through directly. Parse dies before DB open. */
   function runMain(argv: string[]): { code: number | undefined; err: string } {
@@ -387,11 +366,9 @@ describe("main: retired selector spellings hard-fail exit 2", () => {
     return { code, err };
   }
 
-  for (const flag of ["--session-id", "--session"] as const) {
-    test(`${flag} is a retired spelling → exit 2`, () => {
-      const r = runMain([flag, "abc"]);
-      expect(r.code).toBe(2);
-      expect(r.err).toContain(flag);
-    });
-  }
+  test("--session-id is retired → exit 2", () => {
+    const r = runMain(["--session-id", "abc"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("--session-id");
+  });
 });
