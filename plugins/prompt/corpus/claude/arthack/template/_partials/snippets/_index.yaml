@@ -342,7 +342,7 @@ snippets:
     token-estimate: 97
     used-in: []
   - name: docs-dir-and-gist-open
-    summary: Documents go under ~/docs (a related set gets ~/docs/<topic-slug>); doc metadata lives only in the .yaml sidecar; "open it" means publish both files with gh gist create <doc>.md <doc>.yaml --web.
+    summary: Documents save under ~/docs with .yaml sidecars; "open" publishes both files with gh gist create --web; combined save-and-open requests do both in order and never use macOS open.
     domain: source-dirs
     audience: agent
     severity: guard
@@ -360,5 +360,5 @@ snippets:
       - source-dirs
       - output-conventions
     path: _partials/snippets/source-dirs/docs-dir-and-gist-open.md.tmpl
-    token-estimate: 190
+    token-estimate: 248
     used-in: []
