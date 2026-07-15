@@ -381,6 +381,7 @@ test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the ar
   writeMatrix(CLAUDE_MATRIX);
   let freshnessCalls = 0;
   let inventoryCalls = 0;
+  let inventoriedCwd: string | undefined;
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,
@@ -388,8 +389,9 @@ test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the ar
       freshnessCalls++;
       return { ok: true };
     },
-    probeShadowingWorkManifest: () => {
+    probeShadowingWorkManifest: (_pluginDir, launchCwd) => {
       inventoryCalls++;
+      inventoriedCwd = launchCwd;
       return null;
     },
   });
@@ -404,6 +406,7 @@ test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the ar
   expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/opus-max");
   expect(freshnessCalls).toBe(1);
   expect(inventoryCalls).toBe(1);
+  expect(inventoriedCwd).toBe(dir);
 });
 
 test("plan work: a cell-less task (no model/tier) launches with NO --plugin-dir", async () => {

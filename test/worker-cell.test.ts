@@ -3,7 +3,7 @@
  * (`src/worker-cell.ts`) — the ONE decision both the autopilot producer and the
  * manual dispatch CLI route through. Covers every union variant, the injected
  * filesystem-probe CADENCE (a lazy shadow probe reached only for a present cell),
- * the precedence (bad-matrix → out-of-matrix → missing → shadowed), and the
+ * the precedence (bad-matrix → out-of-matrix → missing → stale → shadowed), and the
  * no-prose contract (the helper returns machine kinds only; each caller owns its
  * operator text).
  *
@@ -33,7 +33,10 @@ import {
 } from "../src/agent/matrix";
 import {
   composeWorkerCellDir,
+  createWorkPluginShadowProbe,
   findShadowingWorkManifest,
+  inventoryConfiguredWorkPluginManifests,
+  inventoryLaunchCwdWorkPluginManifests,
   inventoryWorkPluginManifests,
   resolveWorkerCell as resolveWorkerCellBase,
   selectedWorkerCellFreshness,
@@ -436,16 +439,18 @@ test("resolveWorkerCell: stale cohort ranks after missing and before shadow", ()
 });
 
 test("verifyWorkerCellCohort: compiler output cells become the exact selected-dir inventory", () => {
-  const verified = verifyWorkerCellCohort(() => ({
-    ok: true,
-    target: "claude",
-    fingerprint: "compiler-fingerprint",
-    outputs: [
-      {
-        cell: { model: "opus", effort: "max" },
-      } as ClaudeWorkerCompileCellResult,
-    ],
-  }));
+  const verified = verifyWorkerCellCohort({
+    verify: () => ({
+      ok: true,
+      target: "claude",
+      fingerprint: "compiler-fingerprint",
+      outputs: [
+        {
+          cell: { model: "opus", effort: "max" },
+        } as ClaudeWorkerCompileCellResult,
+      ],
+    }),
+  });
   expect(verified).toEqual({
     ok: true,
     fingerprint: "compiler-fingerprint",
@@ -455,20 +460,73 @@ test("verifyWorkerCellCohort: compiler output cells become the exact selected-di
 
 test("verifyWorkerCellCohort: typed compiler failure becomes concise machine stale detail", () => {
   expect(
-    verifyWorkerCellCohort(() => ({
-      ok: false,
-      target: "claude",
-      failure: {
-        kind: "hash-mismatch",
-        message: "primary hash does not match",
-        path: "/workers/opus-max/agents/worker.md",
-      },
-    })),
+    verifyWorkerCellCohort({
+      verify: () => ({
+        ok: false,
+        target: "claude",
+        failure: {
+          kind: "hash-mismatch",
+          message: "primary hash does not match",
+          path: "/workers/opus-max/agents/worker.md",
+        },
+      }),
+    }),
   ).toEqual({
     ok: false,
     detail:
       "hash-mismatch: primary hash does not match (/workers/opus-max/agents/worker.md)",
   });
+});
+
+test("verifyWorkerCellCohort: one alternate checkout root owns verification and physical allowed cells", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "worker-cohort-root-")));
+  try {
+    const checkoutA = join(root, "checkout-a");
+    const checkoutB = join(root, "checkout-b");
+    const cellA = join(checkoutA, "plugins", "plan", "workers", "opus-max");
+    const cellB = join(checkoutB, "plugins", "plan", "workers", "opus-max");
+    mkdirSync(cellA, { recursive: true });
+    mkdirSync(cellB, { recursive: true });
+    const checkoutAlias = join(root, "checkout-a-alias");
+    const cellAlias = join(root, "opus-max-alias");
+    symlinkSync(checkoutA, checkoutAlias);
+    symlinkSync(cellA, cellAlias);
+
+    let verifierRoot: string | undefined;
+    const verified = verifyWorkerCellCohort({
+      repoRoot: checkoutAlias,
+      verify: (options) => {
+        verifierRoot = options?.repoRoot;
+        return {
+          ok: true,
+          target: "claude",
+          fingerprint: "checkout-a",
+          outputs: [
+            {
+              cell: { model: "opus", effort: "max" },
+            } as ClaudeWorkerCompileCellResult,
+          ],
+        };
+      },
+    });
+
+    expect(verifierRoot).toBe(checkoutAlias);
+    expect(verified).toMatchObject({
+      ok: true,
+      pluginDirs: [realpathSync(cellA)],
+    });
+    // A symlink to checkout A's selected cell is the same physical identity.
+    expect(selectedWorkerCellFreshness(cellAlias, verified)).toEqual({
+      ok: true,
+    });
+    // Identically named output in checkout B cannot ride checkout A's proof.
+    expect(selectedWorkerCellFreshness(cellB, verified)).toEqual({
+      ok: false,
+      detail: `selected-cell-not-in-verified-cohort: ${cellB}`,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("selectedWorkerCellFreshness: verified exact membership is fresh; absent selected cell is stale", () => {
@@ -576,6 +634,97 @@ test("work manifest inventory: missing and malformed entries are ignored", () =>
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("configured work inventory: strip-scan-dirs omits scan shadows but hard plugin_dirs still shadow", () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "worker-cell-isolation-")),
+  );
+  try {
+    const selected = join(root, "selected");
+    dropWorkPlugin(selected);
+    const scanDir = join(root, "scan");
+    dropWorkPlugin(join(scanDir, "scanned-work"));
+    const explicit = join(root, "explicit-work");
+    const explicitManifest = dropWorkPlugin(explicit);
+
+    const isolatedScanOnly = inventoryConfiguredWorkPluginManifests({
+      pluginDirs: [],
+      pluginScanDirs: [scanDir],
+      workerPluginIsolation: true,
+    });
+    expect(isolatedScanOnly).toEqual([]);
+    expect(findShadowingWorkManifest(isolatedScanOnly, selected)).toBeNull();
+
+    const isolatedWithExplicit = inventoryConfiguredWorkPluginManifests({
+      pluginDirs: [explicit],
+      pluginScanDirs: [scanDir],
+      workerPluginIsolation: true,
+    });
+    expect(findShadowingWorkManifest(isolatedWithExplicit, selected)).toBe(
+      explicitManifest,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("launch cwd inventory uses discovery's auto-plugin predicate and physical identity", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "worker-cwd-plugin-")));
+  try {
+    const cwd = join(root, "repo");
+    const manifest = dropWorkPlugin(cwd);
+    // A manifest alone is not a launcher input: discoverPlugins does not add '.'.
+    expect(inventoryLaunchCwdWorkPluginManifests(cwd)).toEqual([]);
+    mkdirSync(join(cwd, "agents"));
+    const inventory = inventoryLaunchCwdWorkPluginManifests(cwd);
+    expect(inventory).toEqual([
+      { manifest, physicalPluginDir: realpathSync(cwd) },
+    ]);
+
+    const selected = join(root, "selected-cell");
+    dropWorkPlugin(selected);
+    const selectedAlias = join(root, "selected-alias");
+    symlinkSync(selected, selectedAlias);
+    mkdirSync(join(selected, "skills"));
+    expect(
+      findShadowingWorkManifest(
+        inventoryLaunchCwdWorkPluginManifests(selectedAlias),
+        realpathSync(selected),
+      ),
+    ).toBeNull();
+    expect(findShadowingWorkManifest(inventory, realpathSync(selected))).toBe(
+      manifest,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cycle shadow probe scans configured inputs once and bounds/refreshes cwd memo entries", () => {
+  let configuredCalls = 0;
+  const cwdCalls: string[] = [];
+  const probe = createWorkPluginShadowProbe({
+    inventoryConfigured: () => {
+      configuredCalls++;
+      return [];
+    },
+    inventoryCwd: (cwd) => {
+      cwdCalls.push(cwd);
+      return [];
+    },
+    physicalize: (path) => path,
+    maxCwdEntries: 2,
+  });
+
+  expect(probe("/selected", "/cwd-a")).toBeNull();
+  expect(probe("/selected", "/cwd-a")).toBeNull(); // cache hit
+  expect(probe("/selected", "/cwd-b")).toBeNull();
+  expect(probe("/selected", "/cwd-c")).toBeNull(); // evicts cwd-a
+  expect(probe("/selected", "/cwd-a")).toBeNull();
+  expect(probe("/selected", "/cwd-a", { refreshCwd: true })).toBeNull();
+  expect(configuredCalls).toBe(1);
+  expect(cwdCalls).toEqual(["/cwd-a", "/cwd-b", "/cwd-c", "/cwd-a", "/cwd-a"]);
 });
 
 // ---------------------------------------------------------------------------

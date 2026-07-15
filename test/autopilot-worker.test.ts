@@ -531,6 +531,7 @@ interface FakeDepsOptions {
   probeShadowingWorkManifest?: () => string | null;
   verifyWorkerCellCohort?: ConfirmRunningDeps["verifyWorkerCellCohort"];
   inventoryWorkPluginManifests?: ConfirmRunningDeps["inventoryWorkPluginManifests"];
+  inventoryLaunchCwdWorkPluginManifests?: ConfirmRunningDeps["inventoryLaunchCwdWorkPluginManifests"];
   physicalPluginDir?: ConfirmRunningDeps["physicalPluginDir"];
   stampEpicCloseRecovery?: ConfirmRunningDeps["stampEpicCloseRecovery"];
 }
@@ -619,6 +620,8 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
           ? []
           : [{ manifest, physicalPluginDir: "/test-shadow-work-plugin" }];
       }),
+    inventoryLaunchCwdWorkPluginManifests:
+      opts.inventoryLaunchCwdWorkPluginManifests ?? (() => []),
     physicalPluginDir: opts.physicalPluginDir ?? ((p) => p),
     isEpicDone: opts.isEpicDone ?? (async () => true),
     async stampEpicCloseRecovery(epicId, projectDir) {
@@ -4952,6 +4955,49 @@ test("runReconcileCycle: a shadowing `work` plugin in a scan dir blocks the laun
   }
 });
 
+test("runReconcileCycle: an auto-added launch-cwd work plugin blocks before launch", async () => {
+  const cwd = "/repo-with-work-plugin";
+  const manifest = join(cwd, ".claude-plugin", "plugin.json");
+  let configuredCalls = 0;
+  const inventoriedCwds: string[] = [];
+  const { deps, log } = makeFakeDeps({
+    inventoryWorkPluginManifests: () => {
+      configuredCalls++;
+      return [];
+    },
+    inventoryLaunchCwdWorkPluginManifests: (launchCwd) => {
+      inventoriedCwds.push(launchCwd);
+      return [
+        {
+          manifest,
+          physicalPluginDir: launchCwd,
+        },
+      ];
+    },
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: cwd,
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const state = makeState();
+  await runReconcileCycle(
+    reconcile(makeSnapshot({ epics: [epic] }), state, 0),
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(log.emissions[0]?.reason).toContain("work-plugin-shadowed");
+  expect(log.emissions[0]?.reason).toContain(manifest);
+  expect(configuredCalls).toBe(1);
+  // The final pre-launch check reuses the bounded cwd cache in non-worktree mode.
+  expect(inventoriedCwds).toEqual([cwd]);
+});
+
 test("runReconcileCycle: a sibling worker-cell manifest is an exact-cell shadow (not exempt as a cell)", async () => {
   const siblingManifest =
     "/plugins/plan/workers/sonnet-max/.claude-plugin/plugin.json";
@@ -8098,6 +8144,58 @@ test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched
   // The (drift-guarded) shell command rebuilt with the worktree cwd.
   expect(depsLog.launches[0]?.argv.join(" ")).toContain(`cd ${wtPath} `);
   expect(depsLog.emissions).toEqual([]); // no DispatchFailed
+});
+
+test("runReconcileCycle: final provisioned worktree cwd is refreshed for auto-plugin shadowing", async () => {
+  const { driver, log: worktreeLog } = makeFakeWorktreeDriver();
+  const inventoriedCwds: string[] = [];
+  let configuredCalls = 0;
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/home/me/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const snap = makeSnapshot({ epics: [epic], worktreeMode: true });
+  const wtPath = worktreePathFor("/home/me/repo", "keeper/epic/fn-1-foo");
+  const manifest = join(wtPath, ".claude-plugin", "plugin.json");
+  const { deps, log } = makeFakeDeps({
+    worktree: driver,
+    inventoryWorkPluginManifests: () => {
+      configuredCalls++;
+      return [];
+    },
+    inventoryLaunchCwdWorkPluginManifests: (cwd) => {
+      inventoriedCwds.push(cwd);
+      // The first probe precedes provisioning; the refreshed final probe sees
+      // what the newly materialized lane will make discoverPlugins add as '.'.
+      return inventoriedCwds.length === 1
+        ? []
+        : [{ manifest, physicalPluginDir: cwd }];
+    },
+  });
+  const state = makeState();
+
+  await runReconcileCycle(
+    reconcile(snap, state, 0),
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(worktreeLog.calls).toEqual(["provision:fn-1-foo.1"]);
+  expect(inventoriedCwds).toEqual([wtPath, wtPath]);
+  expect(configuredCalls).toBe(1);
+  expect(log.dispatchedEmissions).toEqual([]);
+  expect(log.launches).toEqual([]);
+  expect(log.emissions[0]).toMatchObject({
+    verb: "work",
+    id: "fn-1-foo.1",
+    dir: wtPath,
+  });
+  expect(log.emissions[0]?.reason).toContain("work-plugin-shadowed");
+  expect(log.emissions[0]?.reason).toContain(manifest);
 });
 
 test("fn-976 runReconcileCycle: a worktree-mode launch carries the realpath-normalized lane on the LaunchSpec (KEEPER_PLAN_WORKTREE)", async () => {

@@ -190,8 +190,10 @@ import type { HarnessActivity } from "./session-activity";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
+  createWorkPluginShadowProbe,
   defaultWorkPluginManifestInventory,
   findShadowingWorkManifest,
+  inventoryLaunchCwdWorkPluginManifests,
   physicalPluginDir,
   providerRejectReason,
   resolveWorkerCell,
@@ -815,10 +817,15 @@ export interface ConfirmRunningDeps {
   /** Read-only compiler cohort verifier. Lazily called at most once per cycle,
    * only after a selected cell manifest exists. Tests may inject `{ok:true}`. */
   verifyWorkerCellCohort?(): WorkerCellCohortVerification;
-  /** Complete launcher-config `work` inventory. Lazily scanned at most once per
-   * cycle after freshness succeeds; comparison remains exact per selected cell. */
+  /** Effective automated-work launcher-config `work` inventory. Lazily scanned
+   * at most once per cycle after freshness succeeds. */
   inventoryWorkPluginManifests?(): WorkPluginManifestInventory;
-  /** Physical identity seam used to compare a selected cell with the inventory. */
+  /** Launch-cwd `work` inventory using the launcher's cwd auto-plugin predicate.
+   * Results are cached by bounded physical cwd within one cycle. */
+  inventoryLaunchCwdWorkPluginManifests?(
+    cwd: string,
+  ): WorkPluginManifestInventory;
+  /** Physical identity seam used for exact cell and cwd cache comparisons. */
   physicalPluginDir?(pluginDir: string): string;
   /**
    * Sleep `ms`, abortable via the worker's shutdown signal. Resolves
@@ -4367,26 +4374,29 @@ export async function runReconcileCycle(
     const key = stripTrailingSlashPath(realpath(info.assignment.worktreePath));
     return liveAttributedDirtyByWorktree.get(key) ?? EMPTY_STRING_SET;
   };
-  // Compiler verification and launcher-config inventory are producer reads,
-  // lazy and memoized independently for this cycle. No selected cell means no
-  // read; missing/stale cells never trigger the later inventory scan.
+  // Compiler verification and launcher inventories are producer reads, lazy and
+  // memoized independently for this cycle. No selected cell means no read;
+  // missing/stale cells never trigger the later inventory scans. Configured
+  // inputs scan once; launch cwd inputs use a hard-bounded physical-path cache.
   const verifyCohort = deps.verifyWorkerCellCohort ?? verifyWorkerCellCohort;
   let cohortVerification: WorkerCellCohortVerification | undefined;
+  const physicalize = deps.physicalPluginDir ?? physicalPluginDir;
   const probeFreshnessMemoized = (pluginDir: string) => {
     cohortVerification ??= verifyCohort();
-    return selectedWorkerCellFreshness(pluginDir, cohortVerification);
-  };
-  const inventoryWork =
-    deps.inventoryWorkPluginManifests ?? defaultWorkPluginManifestInventory;
-  let workManifestInventory: WorkPluginManifestInventory | undefined;
-  const physicalize = deps.physicalPluginDir ?? physicalPluginDir;
-  const probeShadowMemoized = (pluginDir: string): string | null => {
-    workManifestInventory ??= inventoryWork();
-    return findShadowingWorkManifest(
-      workManifestInventory,
-      physicalize(pluginDir),
+    return selectedWorkerCellFreshness(
+      pluginDir,
+      cohortVerification,
+      physicalize,
     );
   };
+  const probeShadowMemoized = createWorkPluginShadowProbe({
+    inventoryConfigured:
+      deps.inventoryWorkPluginManifests ?? defaultWorkPluginManifestInventory,
+    inventoryCwd:
+      deps.inventoryLaunchCwdWorkPluginManifests ??
+      inventoryLaunchCwdWorkPluginManifests,
+    physicalize,
+  });
   // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
   // Surface every wedged slot (a stopped-but-live session blocking a wanted mint)
   // as a visible `DispatchFailed` through the change-gate, and KILL the pane of a
@@ -4544,7 +4554,7 @@ export async function runReconcileCycle(
     // Per-cell worker-plugin guards, BEFORE any launch side effect (mirrors the
     // `worktreeReject` / `cwd-missing` per-key skip shape). The shared
     // `resolveWorkerCell` seam applies the bad-matrix → invalid → missing →
-    // shadowed precedence over the pure compose result the launch already carries
+    // stale → shadowed precedence over the pure compose result the launch carries
     // (`plan.pluginDir` / `plan.pluginDirReject` / `plan.matrixReject` — the last
     // built from the cycle's ONE host-matrix snapshot); this producer re-composes
     // the EXACT sticky reason strings from the machine kind, so a doomed launch
@@ -4552,6 +4562,10 @@ export async function runReconcileCycle(
     // per-key without burning a cold boot, and a sibling launch keeps
     // dispatching. The switch is closed by `assertNever` — a new reject kind
     // fails compilation here.
+    const prospectiveLaunchCwd =
+      deps.worktree !== undefined && plan.worktree !== undefined
+        ? plan.worktree.assignment.worktreePath
+        : plan.cwd;
     const cell = resolveWorkerCell(
       {
         pluginDir: plan.pluginDir,
@@ -4573,7 +4587,8 @@ export async function runReconcileCycle(
       {
         dirExists,
         probeFreshness: probeFreshnessMemoized,
-        probeShadow: probeShadowMemoized,
+        probeShadow: (pluginDir) =>
+          probeShadowMemoized(pluginDir, prospectiveLaunchCwd),
       },
     );
     if (!cell.ok) {
@@ -4695,6 +4710,30 @@ export async function runReconcileCycle(
         // The pure per-node branch (base / inheriting / closer → base lane;
         // rib → `<base>--<task>`), NOT anything derived from the realpath'd cwd.
         worktreeBranch = plan.worktree.assignment.branch;
+      }
+    }
+    // Provisioning can materialize the prospective lane after the first cwd
+    // inventory was empty. Re-probe a worktree geometry's FINAL actual launch
+    // cwd, replacing that bounded cache entry, before minting Dispatched or
+    // launching. Non-worktree launches reuse the already-checked cached cwd.
+    if (resolvedPluginDir !== null) {
+      const finalShadow = probeShadowMemoized(resolvedPluginDir, launchCwd, {
+        refreshCwd: plan.worktree !== undefined,
+      });
+      if (finalShadow !== null) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason:
+            `work-plugin-shadowed: ${finalShadow} — another preloaded ` +
+            `'work'-named plugin would steal 'work:worker' from the exact ` +
+            `'${resolvedPluginDir}' cell at launch (silent wrong-worker spawn); ` +
+            "remove or rename it, then 'keeper retry-dispatch'",
+          dir: launchCwd,
+          conflictedFiles: null,
+          ts: deps.now(),
+        });
+        continue;
       }
     }
     state.inFlight.add(plan.key);

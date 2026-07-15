@@ -142,9 +142,12 @@ export interface MainDeps {
   readonly probeWorkerCellFreshness?: (
     pluginDir: string,
   ) => WorkerCellFreshness;
-  /** Complete-config exact shadow probe for the selected cell. One manual
-   *  dispatch invokes it at most once, after freshness succeeds. */
-  readonly probeShadowingWorkManifest?: (pluginDir: string) => string | null;
+  /** Configured + actual-launch-cwd exact shadow probe for the selected cell.
+   *  One manual dispatch invokes it at most once, after freshness succeeds. */
+  readonly probeShadowingWorkManifest?: (
+    pluginDir: string,
+    launchCwd: string,
+  ) => string | null;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -860,8 +863,11 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
         dirExists: deps.dirExists ?? existsSync,
         probeFreshness:
           deps.probeWorkerCellFreshness ?? defaultWorkerCellFreshnessProbe,
-        probeShadow:
-          deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
+        probeShadow: (pluginDir) =>
+          (deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe)(
+            pluginDir,
+            cwd,
+          ),
       });
       if (!cell.ok) {
         switch (cell.kind) {

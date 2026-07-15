@@ -62,6 +62,17 @@ function isFile(p: string): boolean {
   }
 }
 
+/**
+ * Whether plugin discovery will auto-add `cwd` as `--plugin-dir .`. Exported so
+ * pre-launch collision checks inspect the exact same launcher input instead of
+ * reimplementing (and drifting from) this predicate.
+ */
+export function discoversCwdPlugin(cwd: string): boolean {
+  return ["commands", "agents", "skills", "hooks"].some((dir) =>
+    isDir(join(cwd, dir)),
+  );
+}
+
 function hasPluginManifest(dir: string): boolean {
   return isFile(join(dir, ".claude-plugin", "plugin.json"));
 }
@@ -81,8 +92,7 @@ export function discoverPlugins(
   const actions: string[] = [];
 
   // 1. cwd `--plugin-dir .` detection (stays in code).
-  const cwdPluginDirs = ["commands", "agents", "skills", "hooks"];
-  if (cwdPluginDirs.some((d) => isDir(join(cwd, d)))) {
+  if (discoversCwdPlugin(cwd)) {
     args.push("--plugin-dir", ".");
     actions.push("Detected plugin directory, added --plugin-dir .");
   }

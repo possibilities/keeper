@@ -4,7 +4,7 @@
  * decide which per-cell `work` plugin a task's launch loads.
  *
  * PRODUCER-ONLY, filesystem-probing by contract. Every function here may read
- * the on-disk plugin tree (manifest existence, a scan-dir shadow probe), so it
+ * the on-disk plugin tree (manifest existence, launcher-input shadow probes), so it
  * lives OUTSIDE the pure reducer: {@link resolveWorkerCell} is called from a
  * producer path (`runReconcileCycle` / the dispatch CLI), NEVER a `reconcile`
  * arm or any fold — re-fold determinism holds because no fold reaches this
@@ -29,8 +29,13 @@ import {
   type ClaudeWorkerVerificationResult,
   verifyClaudeWorkerCohort,
 } from "../plugins/prompt/src/claude_worker_compiler.ts";
-import { ConfigError, loadPluginSources } from "./agent/config";
+import {
+  ConfigError,
+  loadPluginSources,
+  type PluginSources,
+} from "./agent/config";
 import { loadMatrixV2, MatrixConfigError, type MatrixV2 } from "./agent/matrix";
+import { discoversCwdPlugin } from "./agent/plugins";
 import { assertNever } from "./dispatch-failure-key";
 import type {
   EquivalenceCell,
@@ -48,8 +53,8 @@ import {
 /**
  * The ABSOLUTE base of the generated per-cell `work`-plugin tree
  * (`${KEEPER_ROOT}/plugins/plan/workers`). Every `--plugin-dir`-selected
- * `work:worker` cell lives UNDER this base; a `work`-named manifest found OUTSIDE
- * it while scanning a claude `plugin_scan_dir` is a shadowing collision that would
+ * `work:worker` cell lives UNDER this base; any other `work`-named manifest in a
+ * configured or auto-added cwd plugin dir is a shadowing collision that would
  * silently steal the `work:worker` constant from the selected cell.
  */
 export const WORKER_CELL_BASE: string = join(
@@ -121,18 +126,42 @@ export function inventoryWorkPluginManifests(
   return inventory;
 }
 
-/** Read launcher config and produce its complete preloaded `work` inventory. */
+/**
+ * Inventory the configured inputs an automated worker launch actually receives.
+ * Hard `plugin_dirs` always participate. `plugin_scan_dirs` participate only
+ * when worker isolation is off, matching `discoverPlugins`' resolved
+ * `stripScanDirs` behavior for the human-less work launch.
+ */
+export function inventoryConfiguredWorkPluginManifests(
+  sources: PluginSources,
+): WorkPluginManifestInventory {
+  return inventoryWorkPluginManifests(
+    sources.pluginDirs,
+    sources.workerPluginIsolation === true ? [] : sources.pluginScanDirs,
+  );
+}
+
+/** Read launcher config and produce the automated-work configured inventory. */
 export function defaultWorkPluginManifestInventory(): WorkPluginManifestInventory {
   try {
-    const sources = loadPluginSources();
-    return inventoryWorkPluginManifests(
-      sources.pluginDirs,
-      sources.pluginScanDirs,
-    );
+    return inventoryConfiguredWorkPluginManifests(loadPluginSources());
   } catch (err) {
     if (err instanceof ConfigError) return [];
     throw err;
   }
+}
+
+/**
+ * Inventory the launch cwd only when plugin discovery will auto-add
+ * `--plugin-dir .`. The predicate is imported from `discoverPlugins`' module so
+ * commands/agents/skills/hooks detection cannot drift between launch and audit.
+ */
+export function inventoryLaunchCwdWorkPluginManifests(
+  cwd: string,
+): WorkPluginManifestInventory {
+  if (!discoversCwdPlugin(cwd)) return [];
+  const entry = inspectWorkManifest(cwd);
+  return entry === null ? [] : [entry];
 }
 
 /** Physical identity for the selected cell; injected at callers for pure tests. */
@@ -161,12 +190,72 @@ export function findShadowingWorkManifest(
   return null;
 }
 
-/** One-shot production shadow probe used by manual dispatch. */
-export function defaultShadowingWorkProbe(pluginDir: string): string | null {
-  return findShadowingWorkManifest(
-    defaultWorkPluginManifestInventory(),
-    physicalPluginDir(pluginDir),
+/** Hard bound for one cycle's launch-cwd inventory memo. */
+export const WORK_PLUGIN_CWD_CACHE_MAX = 64;
+
+export interface WorkPluginShadowProbeOptions {
+  /** Re-probe after a producer side effect materialized or changed the cwd. */
+  readonly refreshCwd?: boolean;
+}
+
+/**
+ * Build a cycle-shareable shadow probe: configured inputs are inventoried once,
+ * while launch-cwd inventories are physical-path keyed and hard bounded. A
+ * refresh replaces one cwd entry, allowing worktree provisioning to be checked
+ * again against the final actual launch cwd without rescanning configuration.
+ */
+export function createWorkPluginShadowProbe(deps: {
+  readonly inventoryConfigured: () => WorkPluginManifestInventory;
+  readonly inventoryCwd: (cwd: string) => WorkPluginManifestInventory;
+  readonly physicalize?: (path: string) => string;
+  readonly maxCwdEntries?: number;
+}): (
+  pluginDir: string,
+  launchCwd: string,
+  options?: WorkPluginShadowProbeOptions,
+) => string | null {
+  let configured: WorkPluginManifestInventory | undefined;
+  const cwdInventory = new Map<string, WorkPluginManifestInventory>();
+  const physicalize = deps.physicalize ?? physicalPluginDir;
+  const maxCwdEntries = Math.max(
+    1,
+    deps.maxCwdEntries ?? WORK_PLUGIN_CWD_CACHE_MAX,
   );
+
+  return (pluginDir, launchCwd, options = {}): string | null => {
+    configured ??= deps.inventoryConfigured();
+    const selectedPhysical = physicalize(pluginDir);
+    const configuredShadow = findShadowingWorkManifest(
+      configured,
+      selectedPhysical,
+    );
+    if (configuredShadow !== null) return configuredShadow;
+
+    const cwdKey = physicalize(launchCwd);
+    let launchInventory = cwdInventory.get(cwdKey);
+    if (launchInventory === undefined || options.refreshCwd === true) {
+      launchInventory = deps.inventoryCwd(launchCwd);
+      cwdInventory.delete(cwdKey);
+      cwdInventory.set(cwdKey, launchInventory);
+      while (cwdInventory.size > maxCwdEntries) {
+        const oldest = cwdInventory.keys().next().value;
+        if (oldest === undefined) break;
+        cwdInventory.delete(oldest);
+      }
+    }
+    return findShadowingWorkManifest(launchInventory, selectedPhysical);
+  };
+}
+
+/** One-shot production shadow probe used by manual dispatch. */
+export function defaultShadowingWorkProbe(
+  pluginDir: string,
+  launchCwd: string,
+): string | null {
+  return createWorkPluginShadowProbe({
+    inventoryConfigured: defaultWorkPluginManifestInventory,
+    inventoryCwd: inventoryLaunchCwdWorkPluginManifests,
+  })(pluginDir, launchCwd);
 }
 
 /** Machine-only freshness result accepted by the shared resolution seam. */
@@ -189,9 +278,21 @@ export type WorkerCellCohortVerification =
 
 /** Run the compiler-owned read-only verifier and retain exact output cell dirs. */
 export function verifyWorkerCellCohort(
-  verify: () => ClaudeWorkerVerificationResult = verifyClaudeWorkerCohort,
+  deps: {
+    readonly repoRoot?: string;
+    readonly verify?: typeof verifyClaudeWorkerCohort;
+    readonly physicalize?: (path: string) => string;
+  } = {},
 ): WorkerCellCohortVerification {
-  const verified: ClaudeWorkerVerificationResult = verify();
+  const repoRoot = deps.repoRoot ?? KEEPER_ROOT;
+  let verified: ClaudeWorkerVerificationResult;
+  if (deps.verify !== undefined) {
+    verified = deps.verify({ repoRoot });
+  } else if (deps.repoRoot !== undefined) {
+    verified = verifyClaudeWorkerCohort({ repoRoot });
+  } else {
+    verified = verifyClaudeWorkerCohort({ repoRoot: KEEPER_ROOT });
+  }
   if (!verified.ok) {
     const path = verified.failure.path;
     return {
@@ -201,13 +302,18 @@ export function verifyWorkerCellCohort(
         (path === undefined ? "" : ` (${path})`),
     };
   }
+  const physicalize = deps.physicalize ?? physicalPluginDir;
+  const workerCellBase = join(repoRoot, "plugins", "plan", WORKERS_BASE);
   return {
     ok: true,
     fingerprint: verified.fingerprint,
     pluginDirs: verified.outputs.map((output) =>
       // The compiler output row's cell is the ownership inventory. Do not infer
-      // capabilities through provider equivalence at runtime.
-      join(WORKER_CELL_BASE, `${output.cell.model}-${output.cell.effort}`),
+      // capabilities through provider equivalence at runtime. Build it from the
+      // SAME checkout root the verifier read, then retain physical identity.
+      physicalize(
+        join(workerCellBase, `${output.cell.model}-${output.cell.effort}`),
+      ),
     ),
   };
 }
@@ -216,12 +322,13 @@ export function verifyWorkerCellCohort(
 export function selectedWorkerCellFreshness(
   pluginDir: string,
   verified: WorkerCellCohortVerification,
+  physicalize: (path: string) => string = physicalPluginDir,
 ): WorkerCellFreshness {
   if (!verified.ok) return verified;
   // `{ok:true}` is the intentionally tiny injected clean fixture contract.
   if (verified.pluginDirs === undefined) return { ok: true };
-  const selected = resolve(pluginDir);
-  if (verified.pluginDirs.some((dir) => resolve(dir) === selected)) {
+  const selected = physicalize(pluginDir);
+  if (verified.pluginDirs.some((dir) => physicalize(dir) === selected)) {
     return { ok: true };
   }
   return {
