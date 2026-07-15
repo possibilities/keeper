@@ -38,7 +38,7 @@ export interface DeriveFileEvidenceOptions {
   project: string | null;
   canonicalMutations?: readonly CanonicalMutationFact[];
   /** Supplies an index-compatible context handle without coupling this pure
-   * derivation to the sidecar. */
+   * derivation to the History index. */
   contextForEntry?: (entry: TranscriptEntry) => HistoryContextHandle | null;
 }
 

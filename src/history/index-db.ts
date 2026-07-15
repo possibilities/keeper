@@ -40,7 +40,7 @@ function ensurePrivateDirectory(path: string): void {
   chmodSync(path, 0o700);
 }
 
-function assertSeparateSidecar(path: string): void {
+function assertSeparateHistoryIndex(path: string): void {
   if (basename(resolve(path)) === "keeper.db") {
     throw new Error("history index must not use keeper.db");
   }
@@ -144,7 +144,7 @@ function configureConnection(db: Database): void {
 }
 
 export function createHistoryIndexDatabase(path: string): Database {
-  assertSeparateSidecar(path);
+  assertSeparateHistoryIndex(path);
   ensurePrivateDirectory(dirname(path));
   rmSync(path, { force: true });
   rmSync(`${path}-wal`, { force: true });
@@ -228,7 +228,7 @@ function inspectOpenHistoryIndex(db: Database): HistoryIndexStatus {
 export function inspectHistoryIndex(
   paths: HistoryIndexPaths,
 ): HistoryIndexStatus {
-  assertSeparateSidecar(paths.database);
+  assertSeparateHistoryIndex(paths.database);
   if (!existsSync(paths.database)) return { kind: "missing" };
   let db: Database | null = null;
   try {
@@ -252,14 +252,14 @@ function fsyncPath(path: string): void {
 }
 
 function acquireHistoryIndexLock(paths: HistoryIndexPaths): FileLock {
-  assertSeparateSidecar(paths.database);
+  assertSeparateHistoryIndex(paths.database);
   ensurePrivateDirectory(paths.directory);
   const lock = FileLock.acquire(paths.lock);
   chmodSync(paths.lock, 0o600);
   return lock;
 }
 
-/** Caller holds the sidecar lock. The temporary DB is closed and fsynced before
+/** Caller holds the History-index lock. The temporary DB is closed and fsynced before
  * its one atomic rename onto the publication path. */
 function publishHistoryIndexRebuildLocked<T>(
   paths: HistoryIndexPaths,
@@ -294,7 +294,7 @@ function publishHistoryIndexRebuildLocked<T>(
 }
 
 /** Build a fresh closed image and atomically publish it while holding the one
- * sidecar lock. The callback never sees keeper.db. */
+ * History-index lock. The callback never sees keeper.db. */
 export function publishHistoryIndexRebuild<T>(
   paths: HistoryIndexPaths,
   populate: (db: Database) => T,
@@ -376,7 +376,7 @@ export function refreshHistoryIndexDatabase<T>(
 }
 
 export function openHistoryIndexReadOnly(paths: HistoryIndexPaths): Database {
-  assertSeparateSidecar(paths.database);
+  assertSeparateHistoryIndex(paths.database);
   let db: Database | null = null;
   try {
     // Validate the same handle that is returned. There is no inspect-then-open
@@ -395,13 +395,13 @@ export function openHistoryIndexReadOnly(paths: HistoryIndexPaths): Database {
   }
 }
 
-/** Remove only the closed private history sidecar image family. The lock file
- * remains as the serialization primitive and no path outside this sidecar's
+/** Remove only the closed private History-index image family. The lock file
+ * remains as the serialization primitive and no path outside this index's
  * basename is touched. */
 export function purgeHistoryIndex(paths: HistoryIndexPaths): void {
   const lock = acquireHistoryIndexLock(paths);
   try {
-    assertSeparateSidecar(paths.database);
+    assertSeparateHistoryIndex(paths.database);
     const rebuildPrefix = `${basename(paths.database)}.rebuild-`;
     let staleRebuilds: string[] = [];
     try {

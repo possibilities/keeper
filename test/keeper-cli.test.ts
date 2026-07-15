@@ -91,8 +91,6 @@ function makeHarness(): Harness {
       transcript: mkHandler("transcript"),
       history: mkHandler("history"),
       resume: mkHandler("resume"),
-      "search-history": mkHandler("search-history"),
-      "find-file-history": mkHandler("find-file-history"),
       "show-job": mkHandler("show-job"),
       "escalation-brief": mkHandler("escalation-brief"),
       plan: mkHandler("plan"),
@@ -233,8 +231,8 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("session")).toBe(true);
     expect(isSubcommand("transcript")).toBe(true);
     expect(isSubcommand("history")).toBe(true);
-    expect(isSubcommand("search-history")).toBe(true);
-    expect(isSubcommand("find-file-history")).toBe(true);
+    expect(isSubcommand("search-history")).toBe(false);
+    expect(isSubcommand("find-file-history")).toBe(false);
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
@@ -265,6 +263,30 @@ describe("cli/keeper dispatch", () => {
     ).not.toContain("usage");
     expect(USAGE).not.toContain("  usage");
   });
+
+  for (const retired of ["search-history", "find-file-history"] as const) {
+    test(`the retired ${retired} command has no route, descriptor, help, or JSON-index alias`, async () => {
+      const h = makeHarness();
+      let caught: unknown;
+      try {
+        await dispatch([retired, "needle"], h.deps);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ExitError);
+      expect((caught as ExitError).code).toBe(1);
+      expect(h.stderr.join("")).toContain(`unknown subcommand '${retired}'`);
+      expect(h.calls).toEqual([]);
+      expect(SUBCOMMANDS as readonly string[]).not.toContain(retired);
+      expect(NATIVE_COMMANDS.map((command) => command.name)).not.toContain(
+        retired,
+      );
+      expect(
+        buildHelpIndex().subcommands.map((command) => command.name),
+      ).not.toContain(retired);
+      expect(USAGE).not.toContain(retired);
+    });
+  }
 
   test("dispatch is a registered subcommand routed to its handler", async () => {
     const h = makeHarness();
@@ -1554,7 +1576,7 @@ describe("keeper --help --json recursive descriptor tree", () => {
     expect(baseline?.exit_codes?.["3"]?.length ?? 0).toBeGreaterThan(0);
   });
 
-  test("history mutation metadata matches sidecar-refresh behavior", () => {
+  test("history mutation metadata matches History-index refresh behavior", () => {
     const history = buildHelpIndex().subcommands.find(
       (command) => command.name === "history",
     );

@@ -13,13 +13,13 @@ import {
   publishHistoryIndexRebuild,
   refreshHistoryIndexDatabase,
 } from "./index-db";
-import { aggregateHistoryDiagnostics } from "./model";
 import type {
   CatalogSession,
   HistoryDiagnostic,
   HistoryHarness,
   SessionCatalog,
 } from "./model";
+import { aggregateHistoryDiagnostics } from "./model";
 import { historySourceStat } from "./source-stat";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -75,7 +75,8 @@ function physicalSource(
     (record) => record.source === "native",
   );
   const artifactTitle =
-    [...artifactTitleRecords].reverse().find((record) => record.current)?.title ??
+    [...artifactTitleRecords].reverse().find((record) => record.current)
+      ?.title ??
     artifactTitleRecords.at(-1)?.title ??
     null;
   return {
@@ -562,7 +563,7 @@ export function rebuildHistoryIndex(options: {
   );
 }
 
-/** Incrementally refresh changed source files; a missing/incompatible sidecar is
+/** Incrementally refresh changed source files; a missing/incompatible History index is
  * rebuilt as a closed image and atomically published. */
 export function refreshHistoryIndex(options: {
   paths: HistoryIndexPaths;

@@ -129,7 +129,7 @@ describe("private disposable History index", () => {
     }
   });
 
-  test("refuses keeper.db even on read-only sidecar paths", () => {
+  test("refuses keeper.db even on read-only History-index paths", () => {
     const forbidden = {
       directory: root,
       database: join(root, "keeper.db"),

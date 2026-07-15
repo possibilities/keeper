@@ -42,23 +42,33 @@ is `ok:false` at exit 1, and the envelope still lands on stdout.
 
 Every code above is a read-path failure, so a retry never risks a double-mutate.
 
-## In-binary bare readers (`show-job`, `search-history`, `find-file-history`, `show-session-events`)
+## Unified history, job reads, and foreground resume
 
-These open keeper.db read-only and ride the `{schema_version, ok, error, data}`
-envelope. A hit is `data` at exit 0; a keeper.db read failure or a resolver miss
-is `ok:false` at exit 1, still on stdout. Messages are corrective — never a raw
-`String(e)`, a stack trace, or a filesystem path.
+`history list/show` read native Claude/Pi artifacts plus optional Keeper aliases.
+`history search/files` also refresh the disposable private History index; index
+maintenance mutates only that index. Native-only Sessions carry no Keeper
+job/event/attribution rows. A shared Session reference never newest-collapses an
+ambiguity.
 
-| code          | emitted by        | meaning                                                            | recovery                                                                          | retry-safe |
-| ------------- | ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------- | ---------- |
-| `read_failed` | the bare readers  | keeper.db could not be opened / read for this one-shot read.       | Retry — the read opens keeper.db read-only and never mutates. If it persists, confirm the daemon is healthy. | yes (read-only) |
-| `not_found`   | `keeper show-job` | No job matched the given selectors.                               | Widen or correct the selector (--job-id / --session-title / --cwd / --pane), or run with no selector to auto-detect. | yes (read-only) |
-| `ambiguous`   | `keeper show-job` | The selectors matched more than one job; `error.details.candidates` lists them. | Add a narrowing selector (--job-id pins one) or pass --latest to take the most recent. | yes (read-only) |
+| code | emitted by | meaning / recovery | retry-safe |
+| ---- | ---------- | ------------------ | ---------- |
+| `keeper_jobs_read_failed` | `history list|show|search|files`, `history index refresh|rebuild` | Keeper aliases could not be read safely. Confirm keeper.db health; use the specialist native `keeper transcript` reader when aliases are unavailable. | yes; no source mutation |
+| `session_not_found`, `session_ambiguous` | `history show`, scoped `search/files` | The shared reference missed or stayed ambiguous. Run `keeper history list --format json`; retry with a qualified id, `--project`, and for `show` an exact `--artifact` when needed. | yes; no source mutation |
+| `artifact_unavailable`, `unsupported_harness`, `read_failed`, `subagent_not_found` | `history show` | The selected native artifact cannot be rendered or the specialist subagent selector missed. Choose a readable Claude/Pi artifact or a listed subagent. | yes; no source mutation |
+| `index_refresh_failed`, `index_read_failed` | `history search|files` | The private History index could not refresh or read. Retry or run `keeper history index rebuild`. | yes; refresh is idempotent and index-only |
+| `invalid_fts_query` | `history search --syntax fts` | Raw FTS5 syntax is malformed. Revise it or use the default literal syntax. Empty and oversized queries are usage errors on stderr, not problem envelopes. | yes |
+| `index_operation_failed` | `history index` | Status/refresh/rebuild/purge failed. Confirm owner permissions and History-index path availability, then retry; purge/rebuild remain safe because the index is disposable. | yes; index-only mutation |
+| `catalog_read_failed`, `keeper_jobs_unavailable`, `session_not_found`, `session_ambiguous`, `not_tracked`, `job_ambiguous` | `show-job <session-reference>` | Catalog or job resolution failed honestly. Follow `error.recovery`; choose a qualified Session reference or exact job id, and use `keeper history show` for native-only history. | yes; read-only |
+| `read_failed`, `not_found`, `ambiguous` | `show-job` | keeper.db could not be read, no job matched, or several job-only candidates remain. Narrow with exact `--job-id`, `--cwd`, or `--pane`; `--latest` applies only to an explicitly job-only query. | yes; read-only |
 
-**Compatibility note:** the bare readers previously emitted
-`{success:false, error:"<String(e)>"}` on failure. The `error` field is now the
-converged `{code, message, recovery}` object; consumers scraping the old flat
-`error` string should read `error.code` (or `error.message`) instead.
+`keeper resume` returns before launch for `catalog_read_failed`,
+`session_not_found`, `session_ambiguous`, `picker_cancelled`, `picker_invalid`,
+`artifact_ambiguous`, `artifact_missing`, `artifact_unreadable`,
+`artifact_identity_conflict`, `artifact_cwd_unresolved`, `cwd_vanished`,
+`current_cwd_vanished`, `alias_conflict`, `unsupported_harness`, `session_live`,
+and `wrong_cwd`. Follow `error.recovery`; `wrong_cwd` carries the shell-safe
+re-entry command. `binary_not_found` and `launch_failed` identify native harness
+startup failures—confirm no process started before retrying.
 
 ## Autopilot control ops (`keeper autopilot pause|play|mode|arm|disarm|retry|config|worktree`)
 

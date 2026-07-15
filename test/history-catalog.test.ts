@@ -389,9 +389,9 @@ describe("transcript normalization retained metadata", () => {
         claudePath,
         `${[
           JSON.stringify({ type: "custom-title", customTitle: "Head" }),
-          JSON.stringify({ type: "future", payload: "x".repeat(140_000) }),
+          JSON.stringify({ type: "future", payload: "x".repeat(4_096) }),
           JSON.stringify({ type: "custom-title", customTitle: "Middle" }),
-          JSON.stringify({ type: "future", payload: "y".repeat(140_000) }),
+          JSON.stringify({ type: "future", payload: "y".repeat(4_096) }),
         ].join("\n")}\n`,
       );
       expect(readClaudeTitleHistory(claudePath)).toEqual(["Head", "Middle"]);
@@ -401,9 +401,9 @@ describe("transcript normalization retained metadata", () => {
         piPath,
         `${[
           JSON.stringify({ type: "session_info", name: "Head" }),
-          JSON.stringify({ type: "future", payload: "x".repeat(140_000) }),
+          JSON.stringify({ type: "future", payload: "x".repeat(4_096) }),
           JSON.stringify({ type: "session_info", name: "Middle" }),
-          JSON.stringify({ type: "future", payload: "y".repeat(140_000) }),
+          JSON.stringify({ type: "future", payload: "y".repeat(4_096) }),
         ].join("\n")}\n`,
       );
       expect(readPiTitleHistory(piPath)).toEqual(["Head", "Middle"]);

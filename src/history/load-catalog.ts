@@ -78,7 +78,7 @@ export function loadSessionCatalog(
       resolveHistoryIndexPaths(options.stateDir),
     );
   } catch {
-    // A cache miss or malformed disposable sidecar never masks native history.
+    // A cache miss or malformed disposable History index never masks native history.
   }
   const catalog = discoverSessionCatalog({
     root: options.root,

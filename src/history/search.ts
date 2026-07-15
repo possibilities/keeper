@@ -107,7 +107,7 @@ function emptyResult(offset: number): HistorySearchResult {
   };
 }
 
-/** Search an already-open compatible sidecar. This pure/injected DB seam keeps
+/** Search an already-open compatible History index. This pure/injected DB seam keeps
  * tests away from host transcript homes and Keeper's control database. */
 export function searchHistoryDatabase(
   db: Database,

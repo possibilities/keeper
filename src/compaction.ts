@@ -20,8 +20,8 @@
  * of event classes whose `data` BODY no live fold parses — a new/unlisted type
  * defaults to KEPT (the fail-safe direction). Its complement IS the keep-set:
  * every class a live fold reads (snapshot/synthetic folds, session/prompt folds,
- * the subagent PreToolUse:Agent bridge, search-history's UserPromptSubmit
- * `$.prompt`, the legacy Agent `tool_response.agentId` fallback, plan Bash
+ * the subagent PreToolUse:Agent bridge, the reducer's UserPromptSubmit
+ * prompt/title/lifecycle inputs, the legacy Agent `tool_response.agentId` fallback, plan Bash
  * `tool_response.stdout`, …) PLUS PostToolUse:Agent and SubagentStop, kept not for
  * a fold but for deliberate offline-analysis capture of the subagent IO pair. The
  * shed-set spans PostToolUse

@@ -161,8 +161,8 @@ function monitorsForJob(jobId: string): unknown[] {
 function seedStream(): { coldMutationId: number; promptId: number } {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
 
-  // KEEP-SET: a UserPromptSubmit whose body carries `$.prompt` (search-history
-  // reads it). Must NEVER be NULLed by retention.
+  // KEEP-SET: a UserPromptSubmit whose body carries reducer prompt/title/lifecycle
+  // inputs. Must NEVER be NULLed by retention.
   const promptId = insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: TEST_UUID,
@@ -567,7 +567,7 @@ test("data-loss sentinel: no false alarm on intentional shed NULLs; flags a miss
 test("data-loss sentinel: NULL-tolerant keep-set classes are exempt; a mandatory-body keep-set loss still fires", () => {
   // MANDATORY-BODY keep-set rows — the body is the SOLE source of a fold-read
   // value, so a NULL body IS data loss the sentinel must flag.
-  //  - UserPromptSubmit: `$.prompt` (search-history / title folds).
+  //  - UserPromptSubmit: prompt/title/lifecycle fold inputs.
   const promptId = insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: TEST_UUID,

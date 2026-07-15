@@ -90,12 +90,14 @@ With a red loop in hand:
 
 <!-- POINTER: keeper prompt render engineering/keeper-history-forensics -->
 
-Keeper's read-only history subcommands turn "when did this regress" into a
-query: `keeper find-file-history <path-fragment>` gives the sessions that
-mutated a file most-recent-first, `keeper search-history <term>` finds the
-prompt where a change was discussed, and `keeper session events
---session-id <id>` replays what that session actually did. Run `keeper prompt
-render engineering/keeper-history-forensics` for the full recipe set.
+Keeper's history surface turns "when did this regress" into a query:
+`keeper history list` finds the exact Session reference, `keeper history
+show <session-reference>` replays a bounded page, and `keeper history
+search|files` recover prompt and file evidence. `keeper resume
+<session-reference>` is the foreground continuation path. `keeper transcript`
+stays only for explicit Claude subagent/tool-detail or Pi branch-aware turns.
+Run `keeper prompt render engineering/keeper-history-forensics` for the full
+recipe set.
 
 ## Phase 3 — Instrument with tagged probes, then remove them all
 

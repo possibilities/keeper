@@ -80,6 +80,12 @@ describe("keeper complete responder candidates", () => {
     expect(values).not.toContain(COMPLETION_RESPONDER);
   });
 
+  test("top-level TAB omits retired legacy history command names", async () => {
+    const values = candidateValues(await completionResponder([""], VERSION));
+    expect(values).not.toContain("search-history");
+    expect(values).not.toContain("find-file-history");
+  });
+
   test("second-level TAB suggests the SUBCOMMAND_META verbs", async () => {
     const twoLevel = SUBCOMMANDS.filter(
       (name) => (SUBCOMMAND_META[name].verbs?.length ?? 0) > 0,

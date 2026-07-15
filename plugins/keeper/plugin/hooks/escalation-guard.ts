@@ -63,8 +63,6 @@ const KEEPER_READ_SUBCOMMANDS = new Set([
   "baseline",
   "status",
   "show-job",
-  "search-history",
-  "find-file-history",
 ]);
 
 /** Read-only git subcommands allowed for the diagnosis roles (write-capable
@@ -631,6 +629,40 @@ function isNamedBunScript(target: string | undefined): boolean {
   );
 }
 
+const HISTORY_INSPECTION_VERBS = new Set(["list", "show", "search", "files"]);
+
+/** History search/files may perform their intrinsic History-index refresh,
+ * but explicit index maintenance is outside every escalation role's authority. */
+function classifyKeeperHistory(tokens: string[]): string | null {
+  const verb = tokens[2];
+  if (verb === undefined || verb === "--help" || verb === "-h") return null;
+  if (HISTORY_INSPECTION_VERBS.has(verb)) return null;
+  if (verb !== "index") {
+    return `\`keeper history ${verb}\` is not on the escalation allowlist`;
+  }
+
+  let action: string | undefined;
+  for (let i = 3; i < tokens.length; i++) {
+    const arg = tokens[i] as string;
+    if (arg === "--help" || arg === "-h" || arg === "--json") continue;
+    if (arg === "--format") {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--format=")) continue;
+    if (arg.startsWith("-")) {
+      return `unknown \`keeper history index\` option '${arg}' is denied`;
+    }
+    if (action !== undefined) {
+      return "`keeper history index` accepts at most one action";
+    }
+    action = arg;
+  }
+  return action === undefined || action === "status"
+    ? null
+    : `\`keeper history index ${action}\` is explicit History-index maintenance and denied for escalation sessions`;
+}
+
 /** Classify one already-wrapper-stripped segment's executable against the role.
  *  Returns a deny reason, or null when the command is on the role's allowlist. */
 function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
@@ -660,6 +692,7 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
         ? null
         : `\`keeper autopilot ${tokens[2] ?? ""}\` is not permitted (only \`retry\`)`;
     }
+    if (sub === "history") return classifyKeeperHistory(tokens);
     if (KEEPER_READ_SUBCOMMANDS.has(sub)) return null;
     return `\`keeper ${sub}\` is not on the escalation allowlist`;
   }

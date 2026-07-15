@@ -27,7 +27,7 @@ function parseTitles(raw: string): string[] | null {
   return titles;
 }
 
-/** Read only native-main title metadata from a compatible sidecar. Any caller
+/** Read only native-main title metadata from a compatible History index. Any caller
  * treats failure as a cache miss; native artifacts remain authoritative. */
 export function readHistoryCatalogCache(
   paths: HistoryIndexPaths,

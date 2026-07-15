@@ -2478,7 +2478,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       // RELOCATED (`events.data IS NULL`) keep-set body back into `events.data`.
       // The keep-set is the explicit ALLOW-list of event types whose body a live
       // fold reads (drain → applyEvent, the subagent PreToolUse:Agent bridge,
-      // search-history's UserPromptSubmit `$.prompt`); the SHED CLASS is the four
+      // the reducer's UserPromptSubmit prompt/title/lifecycle inputs); the SHED CLASS is the four
       // PostToolUse mutation tools (Write/Edit/MultiEdit/NotebookEdit) whose ONLY
       // fold consumption is `tool_input.file_path`, already promoted to the
       // `mutation_path` column (.2/.3). So the restore predicate is "relocated AND

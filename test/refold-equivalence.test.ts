@@ -421,11 +421,6 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
       needle: "SELECT e.id AS id, e.tool_use_id, e.data AS data",
       why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline (fn-1052 adds e.id for the per-event-id parse cache)",
     },
-    {
-      file: "cli/search-history.ts",
-      needle: "json_extract(events.data, '$.prompt')",
-      why: "search-history reads UserPromptSubmit $.prompt inline — keep-set",
-    },
   ];
   for (const r of foldPathReaders) {
     const src = readSrc(r.file);
@@ -442,8 +437,8 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
   expect(reducerSrc).toContain("AND mutation_path = ?");
 
   // Count NON-COMMENT lines that JOIN `event_blobs`. The fold-path files
-  // (reducer, subagent bridges, search-history, the mutation_path backfill) must
-  // be ZERO — the shed dropped every body read there. `db.ts` (the v57 ladder
+  // (reducer, subagent bridges, the mutation_path backfill) must be ZERO — the
+  // shed dropped every body read there. `db.ts` (the v57 ladder
   // CREATE + the v67 Commit-trailer backfill read, both historical migration
   // steps that run against the transiently-recreated table on a fresh walk) still
   // references it and is exempt. (`compaction.ts` was the relocator/sentinel; .5
@@ -477,7 +472,6 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
   const foldPathFiles = [
     "src/reducer.ts",
     "src/subagent-invocations.ts",
-    "cli/search-history.ts",
     "src/backfill-mutation-path.ts",
   ];
   for (const file of foldPathFiles) {
@@ -622,7 +616,7 @@ function seedLiveShapedCorpus(): void {
   insertEvent({ hook_event: "SessionStart", session_id: SESS_A });
   insertEvent({ hook_event: "SessionStart", session_id: SESS_B });
 
-  // A keep-set UserPromptSubmit body (search-history reads $.prompt).
+  // A keep-set UserPromptSubmit body (the reducer reads prompt/title/lifecycle inputs).
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: SESS_A,

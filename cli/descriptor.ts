@@ -1407,40 +1407,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     flags: RESUME_FLAGS,
   },
   {
-    name: "search-history",
-    summary: "Search UserPromptSubmit history by LIKE term (JSON)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: false,
-    requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
-      {
-        name: "limit",
-        type: "string",
-        summary: "Max rows to return (positive int)",
-      },
-    ],
-  },
-  {
-    name: "find-file-history",
-    summary: "List file attributions matching a path fragment (JSON)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: false,
-    requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
-      {
-        name: "limit",
-        type: "string",
-        summary: "Max rows to return (positive int)",
-      },
-    ],
-  },
-  {
     name: "show-job",
     summary:
       "One job by shared Session reference or orthogonal job/cwd/pane selectors (JSON)",

@@ -27,6 +27,7 @@ function json(value: unknown): string {
 }
 
 interface ParsedEnvelope {
+  schema_version: number;
   ok: boolean;
   data: Record<string, unknown>;
   error: { code: string; details?: Record<string, unknown> } | null;
@@ -155,7 +156,7 @@ describe("keeper history CLI", () => {
     expect(shown.stdout).toContain("session: pi:pi-a");
   });
 
-  test("search refreshes the sidecar and emits ready-to-run context locators", () => {
+  test("search refreshes the History index and emits ready-to-run context locators", () => {
     writePiSession("pi-search", [
       { type: "session_info", name: "Search title" },
       {
@@ -168,7 +169,17 @@ describe("keeper history CLI", () => {
     ]);
 
     const result = runHistoryCli(
-      ["search", "needle", "--format", "json", "--limit", "5"],
+      [
+        "search",
+        "--syntax",
+        "literal",
+        "--format",
+        "json",
+        "--limit",
+        "5",
+        "--",
+        "needle",
+      ],
       deps,
     );
     expect(result.code).toBe(0);
@@ -229,9 +240,16 @@ describe("keeper history CLI", () => {
       deps,
     );
     expect(observed.code).toBe(0);
-    expect(rows(envelope(observed.stdout).data.matches)[0]?.grade).toBe(
+    const observedEnvelope = envelope(observed.stdout);
+    expect(observedEnvelope.schema_version).toBe(2);
+    expect(rows(observedEnvelope.data.matches)[0]?.grade).toBe(
       "observed_mutation",
     );
+    expect(observedEnvelope.data.coverage).toMatchObject({
+      indexed_total: expect.any(Number),
+      indexed_considered: expect.any(Number),
+      indexed_truncated: expect.any(Boolean),
+    });
 
     const hidden = runHistoryCli(
       ["files", "mentioned.ts", "--format", "json"],
@@ -331,8 +349,7 @@ describe("keeper history CLI", () => {
         ?.count,
     ).toBe(40);
     expect(
-      diagnostics.find((item) => item.code === "job_missing_native_id")
-        ?.count,
+      diagnostics.find((item) => item.code === "job_missing_native_id")?.count,
     ).toBe(3);
     expect(diagnostics.length).toBeLessThanOrEqual(4);
   });
@@ -397,7 +414,7 @@ describe("keeper history CLI", () => {
     ).toBe(sessionId);
   });
 
-  test("sidecar metadata makes later plain lists title-complete without body indexing", () => {
+  test("History-index metadata makes later plain lists title-complete without body indexing", () => {
     writePiSession("pi-cached-titles", [
       { type: "session_info", name: "First title" },
       {
@@ -450,7 +467,9 @@ describe("keeper history CLI", () => {
       deps,
     );
     expect(searched.code).toBe(0);
-    const command = String(rows(envelope(searched.stdout).data.hits)[0]?.show_command);
+    const command = String(
+      rows(envelope(searched.stdout).data.hits)[0]?.show_command,
+    );
     expect(command).toContain(`--artifact ${realpathSync(paths[1] as string)}`);
     expect(command).toContain("--meta --thinking --tools full --offset 0");
 

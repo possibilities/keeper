@@ -70,7 +70,7 @@ import { parseOptions } from "./descriptor";
 import { errorEnvelope, successEnvelope } from "./envelope";
 import { parseTranscriptTime } from "./transcript";
 
-export const HISTORY_SCHEMA_VERSION = 1;
+export const HISTORY_SCHEMA_VERSION = 2;
 
 const DEFAULT_LIST_LIMIT = 20;
 const DEFAULT_SEARCH_LIMIT = 20;
@@ -91,7 +91,7 @@ const HELP = `keeper history <list|show|search|files|index> [options]
 
 Unified Claude/Pi Harness session history. Reads native transcript artifacts
 across projects by default, joins Keeper job aliases when keeper.db is readable,
-and keeps the private full-text sidecar rebuildable and disposable.
+and keeps the private History index rebuildable and disposable.
 
 Commands:
   list                   List cataloged sessions globally by default
@@ -187,7 +187,7 @@ const INDEX_HELP = `keeper history index [status|refresh|rebuild|purge] [options
 
 Inspect or maintain the private disposable history index. Refresh and rebuild
 scan native Claude/Pi transcript artifacts; purge removes only the closed private
-sidecar image family.
+History-index image family.
 
 Options:
   --format human|json    Output format (default human)
@@ -1185,7 +1185,7 @@ function mergeFileMatches(
   const byKey = new Map<string, HistoryFileEvidenceMatch>();
   for (const match of matches) {
     // One strongest grade per (Session,path). A canonical observed fact must
-    // replace—not sit beside—a weaker mention from the transcript sidecar.
+    // replace—not sit beside—a weaker mention from the transcript index.
     const key = `${match.sessionKey}\0${match.path}`;
     const existing = byKey.get(key);
     if (
@@ -1346,7 +1346,7 @@ function canonicalMutationMatches(
   }
 }
 
-function readSidecarFileCandidates(
+function readIndexedFileCandidates(
   db: Database,
   options: {
     fragment: string;
@@ -1471,13 +1471,13 @@ function parseFiles(argv: string[], deps: HistoryCliDeps): HistoryCliResult {
     fragment,
     sessionKeys,
   );
-  let sidecar: ReturnType<typeof readSidecarFileCandidates>;
+  let indexed: ReturnType<typeof readIndexedFileCandidates>;
   try {
     const db = openHistoryIndexReadOnly(
       resolveHistoryIndexPaths(deps.stateDir),
     );
     try {
-      sidecar = readSidecarFileCandidates(db, {
+      indexed = readIndexedFileCandidates(db, {
         fragment,
         sessionKeys,
         includeMentions: parsed.values.mentions === true,
@@ -1495,7 +1495,7 @@ function parseFiles(argv: string[], deps: HistoryCliDeps): HistoryCliResult {
     );
   }
   const byKey = sessionByKey(catalog);
-  const merged = mergeFileMatches([...sidecar.matches, ...canonical.matches]);
+  const merged = mergeFileMatches([...indexed.matches, ...canonical.matches]);
   const pageMatches = merged.slice(offset, offset + limit).map((match) => {
     const session = byKey.get(match.sessionKey);
     const context =
@@ -1512,11 +1512,11 @@ function parseFiles(argv: string[], deps: HistoryCliDeps): HistoryCliResult {
       locator: context,
     };
   });
-  const resultsComplete = !sidecar.truncated && !canonical.truncated;
+  const resultsComplete = !indexed.truncated && !canonical.truncated;
   const exactTotal = resultsComplete ? merged.length : null;
   const hasMore =
     offset + pageMatches.length < merged.length ||
-    sidecar.truncated ||
+    indexed.truncated ||
     canonical.truncated;
   const nextOffset =
     pageMatches.length > 0 && hasMore ? offset + pageMatches.length : null;
@@ -1542,9 +1542,9 @@ function parseFiles(argv: string[], deps: HistoryCliDeps): HistoryCliResult {
         "Bounded shell inference only; never upgraded to observed.",
       mention: "Text/tool path mentions only, included only with --mentions.",
       results_complete: resultsComplete,
-      sidecar_total: sidecar.total,
-      sidecar_considered: sidecar.considered,
-      sidecar_truncated: sidecar.truncated,
+      indexed_total: indexed.total,
+      indexed_considered: indexed.considered,
+      indexed_truncated: indexed.truncated,
       keeper_fact_scan_truncated: canonical.truncated,
     },
     refresh: stats,

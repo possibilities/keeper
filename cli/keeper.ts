@@ -55,8 +55,6 @@ export const SUBCOMMANDS = [
   "transcript",
   "history",
   "resume",
-  "search-history",
-  "find-file-history",
   "show-job",
   "escalation-brief",
   "plan",
@@ -588,10 +586,6 @@ export async function main(): Promise<void> {
     transcript: async (argv) => (await import("./transcript")).main(argv),
     history: async (argv) => (await import("./history")).main(argv),
     resume: async (argv) => (await import("./resume")).main(argv),
-    "search-history": async (argv) =>
-      (await import("./search-history")).main(argv),
-    "find-file-history": async (argv) =>
-      (await import("./find-file-history")).main(argv),
     "show-job": async (argv) => (await import("./show-job")).main(argv),
     "escalation-brief": async (argv) =>
       (await import("./escalation-brief")).main(argv),

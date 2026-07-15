@@ -12,9 +12,10 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
   Resource holds remain independently observable and recoverable
-- **History forensics** — `keeper transcript <harness>` extracts bounded main/subagent
-  conversations; `keeper search-history`, `keeper find-file-history`, and
-  `keeper session events` answer who/when/what across sessions
+- **History forensics** — `keeper history list|show|search|files|index` is the
+  canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
+  foreground continuation path; `keeper transcript` stays for explicit
+  subagent/tool-detail or Pi branch-aware drill-down
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling
   cadence of verified DB snapshots guards the log
 - **Agent Bus** — `keeper bus chat send <target> "message"` stores new content in a

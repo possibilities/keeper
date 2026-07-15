@@ -36,8 +36,12 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "keeper baseline abc123 --wait",
     "keeper bus list",
     "keeper show-job j-1",
-    "keeper search-history foo",
-    "keeper find-file-history src/x.ts",
+    "keeper history list --format json",
+    "keeper history show claude:session-1 --format json",
+    "keeper history search --syntax literal --format json --limit 20 -- foo",
+    "keeper history files --format json --limit 20 -- src/x.ts",
+    "keeper history index status --format json",
+    "keeper history index --format json status",
     "keeper dispatch work::fn-1-x.3",
     // `keeper autopilot retry` is the one autopilot verb on the allowlist
     "keeper autopilot retry work::fn-1-x.3",
@@ -102,6 +106,13 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
   }
 
   const deny = [
+    // retired Keeper history names have no compatibility allowlist aliases
+    "keeper search-history foo",
+    "keeper find-file-history src/x.ts",
+    "keeper history index refresh",
+    "keeper history index rebuild",
+    "keeper history index purge",
+    "keeper history index future-action",
     // interpreter one-liners — the exact observed bypass class
     "python3 -c 'print(1)'",
     'python3 -c "open(1)"',
@@ -318,6 +329,9 @@ describe("evaluateEscalationCommand — write-capable role (deconflict/repair)",
     "FOO=1 git commit -m x",
     "keeper commit-work 'x' > out",
     "keeper dispatch --prompt x",
+    "keeper history index refresh",
+    "keeper history index rebuild",
+    "keeper history index purge",
     "tee out.txt",
   ];
   for (const cmd of deny) {
@@ -349,9 +363,7 @@ test("evaluateEscalationCommand: the deny reason NAMES the offending command / c
   expect(
     evaluateEscalationCommand("git branch -D feature", DIAGNOSIS),
   ).toContain("mutates refs");
-  expect(evaluateEscalationCommand("rg --pre x .", DIAGNOSIS)).toContain(
-    "pre",
-  );
+  expect(evaluateEscalationCommand("rg --pre x .", DIAGNOSIS)).toContain("pre");
   expect(
     evaluateEscalationCommand("keeper dispatch --prompt x", DIAGNOSIS),
   ).toContain("prompt");
