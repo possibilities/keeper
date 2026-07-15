@@ -69,7 +69,11 @@ export function readJsonlMetadataSpineSync(
   try {
     const head = readSlice(fd, 0, Math.min(size, JSONL_METADATA_SPINE_BYTES));
     const tailStart = Math.max(0, size - JSONL_METADATA_SPINE_BYTES);
-    let tail = readSlice(fd, tailStart, Math.min(size, JSONL_METADATA_SPINE_BYTES));
+    let tail = readSlice(
+      fd,
+      tailStart,
+      Math.min(size, JSONL_METADATA_SPINE_BYTES),
+    );
     if (tailStart > 0) {
       const firstNewline = tail.indexOf("\n");
       tail = firstNewline < 0 ? "" : tail.slice(firstNewline + 1);

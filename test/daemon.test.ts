@@ -226,7 +226,6 @@ import {
   censusConns,
   type FanoutCursor,
   isDaemonSelfConn,
-  isPidAlive,
   MAX_SUBS_PER_TICK,
   newFanoutCursor,
   runQuery,

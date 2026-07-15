@@ -276,9 +276,15 @@ function win(
 const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
 function seed(stateDir: string, routes: Route[]): void {
   const obs: Observation = {
-    schema_version: 1,
+    schema_version: 2,
     observed_at_ms: NOW,
     health: "ok",
+    codex: {
+      health: "absent",
+      windows: [],
+      resetCreditsAvailableCount: null,
+      notes: [],
+    },
     routes,
     notes: [],
   };

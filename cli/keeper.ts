@@ -43,6 +43,7 @@ export const SUBCOMMANDS = [
   "frames",
   "dash",
   "status",
+  "usage",
   "daemon",
   "query",
   "watch",
@@ -52,6 +53,7 @@ export const SUBCOMMANDS = [
   "setup-tmux",
   "tabs",
   "session",
+  "conversation",
   "transcript",
   "history",
   "resume",
@@ -288,7 +290,7 @@ Flags:
   --help, -h     Show this help (\`--help --json\` → machine-readable command index)
   --version, -V  Show keeper version
 
-The six snapshot-capable viewer subcommands (board/jobs/git/usage/autopilot/builds)
+The five snapshot-capable viewer subcommands (board/jobs/git/autopilot/builds)
 auto-detect a non-TTY stdout (piped, redirected, CI) and emit ONE current frame
 followed by a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of
 streaming forever. Override per subcommand with \`--snapshot\` (force one-shot on a
@@ -575,6 +577,7 @@ export async function main(): Promise<void> {
     frames: async (argv) => (await import("./frames")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
     status: async (argv) => (await import("./status")).main(argv),
+    usage: async (argv) => (await import("./usage")).main(argv),
     daemon: async (argv) => (await import("./daemon")).main(argv),
     query: async (argv) => (await import("./query")).main(argv),
     watch: async (argv) => (await import("./watch")).main(argv),
@@ -584,6 +587,7 @@ export async function main(): Promise<void> {
     "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     tabs: async (argv) => (await import("./tabs")).main(argv),
     session: async (argv) => (await import("./session")).main(argv),
+    conversation: async (argv) => (await import("./conversation")).main(argv),
     transcript: async (argv) => (await import("./transcript")).main(argv),
     history: async (argv) => (await import("./history")).main(argv),
     resume: async (argv) => (await import("./resume")).main(argv),

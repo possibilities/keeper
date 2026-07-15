@@ -315,7 +315,9 @@ export function buildPublishFrame(
   >;
   const payload: ChatPayload = {
     media_type: "text/markdown",
-    text: `read ${artifact.path}`,
+    // The relay validates the artifact reference from payload.text; the typed
+    // mirror fields remain for old readers but are not the authority.
+    text: encodeBusArtifactRef(artifact.ref),
     ...encoded,
   };
   return {

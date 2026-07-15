@@ -10,6 +10,7 @@ import type {
   TranscriptReader,
   TranscriptRootInputs,
 } from "../transcript/reader";
+import type { HistoryCatalogCacheEntry } from "./catalog-cache";
 import {
   aggregateHistoryDiagnostics,
   type CatalogSession,
@@ -23,7 +24,6 @@ import {
   type SessionCatalog,
   type SessionTitleRecord,
 } from "./model";
-import type { HistoryCatalogCacheEntry } from "./catalog-cache";
 import { historySourceStat } from "./source-stat";
 
 // Transcript readers already enumerate and sort the complete candidate set per
@@ -94,7 +94,8 @@ function readerAdapter(
           let currentTitle = item.title;
           let titleHistoryComplete = false;
           const cached = titleCache?.get(canonicalArtifactPath(item.path));
-          const stat = cached === undefined ? null : historySourceStat(item.path);
+          const stat =
+            cached === undefined ? null : historySourceStat(item.path);
           if (
             cached !== undefined &&
             cached.harness === harness &&

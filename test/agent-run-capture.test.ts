@@ -278,14 +278,8 @@ describe("parseRunArgs", () => {
       parseRunArgs(["claude", "p", "--preset", "claude::opus::high"]),
     ).toEqual(okParse({ preset: "claude::opus::high" }));
     expect(
-      parseRunArgs([
-        "pi",
-        "p",
-        "--preset=pi::openai-codex/gpt-5::high",
-      ]),
-    ).toEqual(
-      okParse({ cli: "pi", preset: "pi::openai-codex/gpt-5::high" }),
-    );
+      parseRunArgs(["pi", "p", "--preset=pi::openai-codex/gpt-5::high"]),
+    ).toEqual(okParse({ cli: "pi", preset: "pi::openai-codex/gpt-5::high" }));
     expect(parseRunArgs(["claude", "p", "--session", "panels"])).toEqual(
       okParse({ session: "panels" }),
     );
@@ -328,9 +322,9 @@ describe("parseRunArgs", () => {
   });
 
   test("--model / --effort parse as value flags (split + = forms)", () => {
-    expect(
-      parseRunArgs(["pi", "p", "--model", "openai-codex/gpt-5"]),
-    ).toEqual(okParse({ cli: "pi", model: "openai-codex/gpt-5" }));
+    expect(parseRunArgs(["pi", "p", "--model", "openai-codex/gpt-5"])).toEqual(
+      okParse({ cli: "pi", model: "openai-codex/gpt-5" }),
+    );
     expect(parseRunArgs(["claude", "p", "--model=opus"])).toEqual(
       okParse({ model: "opus" }),
     );

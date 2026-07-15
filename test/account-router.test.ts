@@ -70,9 +70,15 @@ function seedObservation(
   opts: { health?: ObservationHealth; observedAtMs?: number } = {},
 ): void {
   const obs: Observation = {
-    schema_version: 1,
+    schema_version: 2,
     observed_at_ms: opts.observedAtMs ?? NOW_MS,
     health: opts.health ?? "ok",
+    codex: {
+      health: "absent",
+      windows: [],
+      resetCreditsAvailableCount: null,
+      notes: [],
+    },
     routes,
     notes: [],
   };

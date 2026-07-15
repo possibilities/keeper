@@ -8,17 +8,16 @@
  * observer injects the raw command outcomes and the cycle instant; nothing here
  * spawns a process, reads wall-clock, or touches the network.
  *
- * **Two provider roles, deliberately asymmetric.** CodexBar observes the AMBIENT
- * Claude account and GATES automatic balancing: a healthy CodexBar observation
- * both enables selection and contributes the native default route's capacity. It
- * never supplies managed rows — its ordinary provider payload is not the app-only
- * claude-swap projection. claude-swap is authoritative for managed-account
- * inventory, launchability, quota windows, and freshness.
+ * **Provider roles, deliberately asymmetric.** Claude CodexBar observes the
+ * ambient Claude account and GATES automatic balancing. Codex CodexBar supplies
+ * PII-free quota capacity for foreground Codex policy but never a route.
+ * claude-swap remains authoritative for managed Claude inventory, launchability,
+ * quota windows, and freshness.
  *
  * **PII containment.** Both parsers drop email, organization, credential paths,
- * identity blocks, and tokens at the boundary. The normalized shapes carry only a
- * stable route id, its slot, its normalized windows, and a measurement instant —
- * so the sidecar and every log line are credential-free by construction.
+ * identity blocks, and tokens at the boundary. The normalized shapes carry only
+ * route metadata, quota windows, reset-credit count, health, and measurement
+ * instants, so the sidecar and every log line are credential-free by construction.
  *
  * **Unknown is not zero.** A stale, malformed, expired, signed-out, API-key-only,
  * or otherwise unrouteable candidate is EXCLUDED, never coerced to spare capacity.
@@ -105,8 +104,10 @@ export interface Observation {
   schema_version: number;
   /** Epoch ms the observer produced this observation. Drives the staleness gate. */
   observed_at_ms: number;
-  /** The CodexBar gate. Selection is disabled unless this is `"ok"`. */
+  /** The Claude CodexBar gate. Selection is disabled unless this is `"ok"`. */
   health: ObservationHealth;
+  /** PII-free Codex quota capacity; never a route or identity. */
+  codex: CodexCapacityObservation;
   /** Native default + every routeable managed candidate. */
   routes: Route[];
   /** Bounded, PII-free diagnostics (excluded rows, parser rejections). */
@@ -126,11 +127,17 @@ export interface ProviderRunOutcome {
   stdout: string;
 }
 
-/** The CodexBar half of an observation cycle. */
+/** One normalized CodexBar provider result. */
 export interface CodexBarObservation {
   health: ObservationHealth;
   windows: NormalizedWindow[];
   notes: string[];
+}
+
+/** PII-free Codex capacity retained in the shared sidecar. */
+export interface CodexCapacityObservation extends CodexBarObservation {
+  /** Available Full reset credits, only when CodexBar supplied a finite number. */
+  resetCreditsAvailableCount: number | null;
 }
 
 /** The claude-swap half of an observation cycle. */
@@ -147,9 +154,15 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** Clamp a raw percent (0..100) to a `[0,1]` utilization fraction; NaN → null. */
-function utilizationFromPercent(raw: unknown): number | null {
+/** Normalize a raw percent; strict callers reject rather than clamp bad input. */
+function utilizationFromPercent(
+  raw: unknown,
+  strictRange = false,
+): number | null {
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    return null;
+  }
+  if (strictRange && (raw < 0 || raw > 100)) {
     return null;
   }
   return Math.max(0, Math.min(1, raw / 100));
@@ -254,14 +267,22 @@ export function parseCodexBar(
       notes: ["codexbar: malformed json"],
     };
   }
-  if (!isRecord(parsed)) {
+  const payload = unwrapCodexBarPayload(parsed);
+  if (!payload) {
     return {
       health: "unsupported",
       windows: [],
-      notes: ["codexbar: non-object payload"],
+      notes: ["codexbar: expected one object"],
     };
   }
-  const usage = parsed.usage;
+  if (payload.provider !== "claude") {
+    return {
+      health: "unsupported",
+      windows: [],
+      notes: ["codexbar: provider mismatch"],
+    };
+  }
+  const usage = payload.usage;
   if (!isRecord(usage)) {
     return {
       health: "unsupported",
@@ -293,19 +314,90 @@ function parseCodexBarWindows(
 ): NormalizedWindow[] {
   const out: NormalizedWindow[] = [];
   const add = (raw: unknown, key: string): void => {
-    if (!isRecord(raw)) {
-      return;
-    }
-    const utilization = utilizationFromPercent(raw.usedPercent);
-    if (utilization === null) {
-      return;
-    }
-    out.push({ key, utilization, resetsAt: trustworthyResetsAt(raw.resetsAt) });
+    const window = parseCodexBarWindow(raw, key);
+    if (window) out.push(window);
   };
   add(usage.primary, "session");
   add(usage.secondary, "week");
   add(usage.tertiary, "tertiary");
   return out;
+}
+
+function parseCodexBarWindow(
+  raw: unknown,
+  key: string,
+  strictRange = false,
+): NormalizedWindow | null {
+  if (!isRecord(raw)) return null;
+  const utilization = utilizationFromPercent(raw.usedPercent, strictRange);
+  if (utilization === null) return null;
+  return { key, utilization, resetsAt: trustworthyResetsAt(raw.resetsAt) };
+}
+
+/** Accept CodexBar's legacy object or its real, exactly-one-element array. */
+function unwrapCodexBarPayload(
+  parsed: unknown,
+): Record<string, unknown> | null {
+  if (isRecord(parsed)) return parsed;
+  if (Array.isArray(parsed) && parsed.length === 1 && isRecord(parsed[0])) {
+    return parsed[0];
+  }
+  return null;
+}
+
+/** Strictly parse CodexBar's Codex provider capacity and Full reset credits. */
+export function parseCodexBarCodex(
+  outcome: ProviderRunOutcome,
+): CodexCapacityObservation {
+  const empty = (
+    health: ObservationHealth,
+    note: string,
+  ): CodexCapacityObservation => ({
+    health,
+    windows: [],
+    resetCreditsAvailableCount: null,
+    notes: [note],
+  });
+  if (outcome.code === null || outcome.code === 2) {
+    return empty("absent", "codexbar-codex: unavailable");
+  }
+  if (outcome.code !== 0) {
+    return empty("error", `codexbar-codex: exit ${outcome.code}`);
+  }
+  const parsed = parseBoundedJson(outcome.stdout);
+  if (parsed === null) {
+    return empty("malformed", "codexbar-codex: malformed json");
+  }
+  const payload = unwrapCodexBarPayload(parsed);
+  if (!payload) {
+    return empty("unsupported", "codexbar-codex: expected one object");
+  }
+  if (payload.provider !== "codex") {
+    return empty("unsupported", "codexbar-codex: provider mismatch");
+  }
+  if (!isRecord(payload.usage)) {
+    return empty("unsupported", "codexbar-codex: no usage block");
+  }
+  const week = parseCodexBarWindow(payload.usage.secondary, "week", true);
+  const credits = payload.usage.codexResetCredits;
+  const availableCount =
+    isRecord(credits) &&
+    typeof credits.availableCount === "number" &&
+    Number.isInteger(credits.availableCount) &&
+    credits.availableCount >= 0
+      ? credits.availableCount
+      : null;
+  if (!week) {
+    const result = empty("unsupported", "codexbar-codex: no weekly window");
+    result.resetCreditsAvailableCount = availableCount;
+    return result;
+  }
+  return {
+    health: "ok",
+    windows: [week],
+    resetCreditsAvailableCount: availableCount,
+    notes: [],
+  };
 }
 
 // ---------- claude-swap parser ---------------------------------------------
@@ -510,10 +602,18 @@ function boundNotes(notes: string[]): string[] {
  */
 export function buildObservation(input: {
   observedAtMs: number;
+  /** Claude provider result retained under the legacy name for compatibility. */
   codex: CodexBarObservation;
+  codexCapacity?: CodexCapacityObservation;
   cswap: CswapInventory;
 }): Observation {
   const { observedAtMs, codex, cswap } = input;
+  const codexCapacity = input.codexCapacity ?? {
+    health: "absent" as const,
+    windows: [],
+    resetCreditsAvailableCount: null,
+    notes: ["codexbar-codex: not observed"],
+  };
   const nativeRoute: Route = {
     id: NATIVE_ROUTE_ID,
     kind: "native",
@@ -525,8 +625,14 @@ export function buildObservation(input: {
     schema_version: OBSERVATION_SCHEMA_VERSION,
     observed_at_ms: observedAtMs,
     health: codex.health,
+    codex: {
+      health: codexCapacity.health,
+      windows: codexCapacity.windows,
+      resetCreditsAvailableCount: codexCapacity.resetCreditsAvailableCount,
+      notes: boundNotes(codexCapacity.notes),
+    },
     routes: [nativeRoute, ...cswap.routes],
-    notes: boundNotes([...codex.notes, ...cswap.notes]),
+    notes: boundNotes([...codex.notes, ...codexCapacity.notes, ...cswap.notes]),
   };
 }
 
@@ -595,7 +701,8 @@ export function validateObservation(data: unknown): Observation | null {
   if (!isObservationHealth(data.health)) {
     return null;
   }
-  if (!Array.isArray(data.routes)) {
+  const codex = validateCodexCapacity(data.codex);
+  if (!codex || !Array.isArray(data.routes)) {
     return null;
   }
   const routes: Route[] = [];
@@ -612,6 +719,7 @@ export function validateObservation(data: unknown): Observation | null {
     schema_version: OBSERVATION_SCHEMA_VERSION,
     observed_at_ms: data.observed_at_ms,
     health: data.health,
+    codex,
     routes,
     notes,
   };
@@ -626,6 +734,53 @@ function isObservationHealth(v: unknown): v is ObservationHealth {
     v === "unsupported" ||
     v === "error"
   );
+}
+
+function validateCodexCapacity(data: unknown): CodexCapacityObservation | null {
+  if (!isRecord(data) || !isObservationHealth(data.health)) return null;
+  if (!Array.isArray(data.windows)) return null;
+  const windows: NormalizedWindow[] = [];
+  for (const raw of data.windows) {
+    const window = validateWindow(raw, true);
+    if (!window) return null;
+    windows.push(window);
+  }
+  const count = data.resetCreditsAvailableCount;
+  if (
+    count !== null &&
+    (typeof count !== "number" || !Number.isInteger(count) || count < 0)
+  ) {
+    return null;
+  }
+  const notes = Array.isArray(data.notes)
+    ? data.notes.filter((n): n is string => typeof n === "string")
+    : [];
+  return {
+    health: data.health,
+    windows,
+    resetCreditsAvailableCount: count,
+    notes,
+  };
+}
+
+function validateWindow(
+  w: unknown,
+  strictRange = false,
+): NormalizedWindow | null {
+  if (
+    !isRecord(w) ||
+    typeof w.key !== "string" ||
+    typeof w.utilization !== "number" ||
+    !Number.isFinite(w.utilization) ||
+    (strictRange && (w.utilization < 0 || w.utilization > 1))
+  ) {
+    return null;
+  }
+  return {
+    key: w.key,
+    utilization: Math.max(0, Math.min(1, w.utilization)),
+    resetsAt: typeof w.resetsAt === "string" ? w.resetsAt : null,
+  };
 }
 
 function validateRoute(r: unknown): Route | null {
@@ -643,18 +798,8 @@ function validateRoute(r: unknown): Route | null {
   const windows: NormalizedWindow[] = [];
   if (Array.isArray(r.windows)) {
     for (const w of r.windows) {
-      if (
-        isRecord(w) &&
-        typeof w.key === "string" &&
-        typeof w.utilization === "number" &&
-        Number.isFinite(w.utilization)
-      ) {
-        windows.push({
-          key: w.key,
-          utilization: Math.max(0, Math.min(1, w.utilization)),
-          resetsAt: typeof w.resetsAt === "string" ? w.resetsAt : null,
-        });
-      }
+      const window = validateWindow(w);
+      if (window) windows.push(window);
     }
   }
   const measuredAtMs =
@@ -664,7 +809,12 @@ function validateRoute(r: unknown): Route | null {
   return { id: r.id, kind: r.kind, slot, windows, measuredAtMs };
 }
 
-/** True iff `obs` is within the freshness ceiling relative to `nowMs`. */
-export function isObservationFresh(obs: Observation, nowMs: number): boolean {
-  return nowMs - obs.observed_at_ms <= OBSERVATION_FRESHNESS_CEILING_MS;
+/** True iff `obs` is not future-dated and is within the caller's max age. */
+export function isObservationFresh(
+  obs: Observation,
+  nowMs: number,
+  maxAgeMs: number = OBSERVATION_FRESHNESS_CEILING_MS,
+): boolean {
+  const ageMs = nowMs - obs.observed_at_ms;
+  return ageMs >= 0 && maxAgeMs >= 0 && ageMs <= maxAgeMs;
 }

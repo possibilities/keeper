@@ -67,6 +67,7 @@ uses the native default instead of prompting.
 | Capability | Public command | Keeper role |
 |---|---|---|
 | Ambient gate | `codexbar --provider claude --format json` | Observes the ambient Claude account and gates automatic balancing; never supplies managed-account rows. |
+| Codex quota | `codexbar --provider codex --format json` | Supplies the PII-free weekly window and Full reset count used by foreground quota controls; never enters Claude route scoring. |
 | Managed telemetry | `cswap list --json` | Supplies managed-account inventory, launchability, quota windows, and freshness. |
 | Managed execution | `cswap run <slot> --share-history -- <claude arguments...>` | Runs one managed Claude process without globally switching other terminals. |
 
@@ -78,8 +79,18 @@ for a later process.
 
 The selection policy is continuous: each routeable candidate is scored by its worst normalized quota
 window after short-lived launch reservations, the greatest remaining headroom wins, and
-least-recently-used order breaks ties. The account-routing rationale lives in
-[ADR 0064](./adr/0064-managed-codexbar-cli-and-per-launch-account-routing.md).
+least-recently-used order breaks ties. Every observer uses the same per-refresh lock and timestamp, so a
+fresh result produced by the daemon or a foreground command suppresses duplicate provider work until the
+caller's cadence expires.
+
+Run `keeper usage reset-codex-before-exceeding` when one Full reset is available and a foreground process
+should wait for the weekly Codex window to reach its guarded 99% trigger. It checks every 30 seconds and
+notifies every five used-percentage points by default; `--check-every <duration>` and `--notify-every
+<integer>` tune those values. The command accepts only the pinned two-menu Codex layout, writes a durable
+same-window submission latch before the final Enter, submits at most once, reports one final outcome, and
+exits. It installs no background watcher. Account routing is specified by [ADR
+0064](./adr/0064-managed-codexbar-cli-and-per-launch-account-routing.md); shared refresh and reset safety
+are specified by [ADR 0065](./adr/0065-shared-capacity-refresh-and-foreground-codex-reset.md).
 
 Claude `settings.json` is seeded at install time from the keeper stow source only when the live file is
 absent. After that seed, the local file is the canonical value: keeper leaves local edits in place and

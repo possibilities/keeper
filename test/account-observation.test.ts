@@ -20,6 +20,7 @@ import {
   isObservationFresh,
   type Observation,
   parseCodexBar,
+  parseCodexBarCodex,
   parseCswapList,
   readObservationSidecar,
   writeObservationSidecar,
@@ -114,6 +115,95 @@ describe("parseCodexBar — health gate", () => {
     expect(result.windows).toEqual([
       { key: "session", utilization: 0.1, resetsAt: null },
     ]);
+  });
+});
+
+describe("CodexBar provider shape + Codex capacity", () => {
+  test("accepts exactly one provider object in an array", () => {
+    const result = parseCodexBar({
+      code: 0,
+      stdout: JSON.stringify([
+        {
+          provider: "claude",
+          usage: { primary: { usedPercent: 12 } },
+        },
+      ]),
+    });
+    expect(result.health).toBe("ok");
+  });
+
+  test("rejects empty, multi-element, non-object arrays and provider mismatch", () => {
+    for (const payload of [
+      [],
+      [
+        { provider: "claude", usage: {} },
+        { provider: "claude", usage: {} },
+      ],
+      [42],
+      [{ provider: "codex", usage: { primary: { usedPercent: 10 } } }],
+    ]) {
+      expect(
+        parseCodexBar({ code: 0, stdout: JSON.stringify(payload) }).health,
+      ).toBe("unsupported");
+    }
+  });
+
+  test("Codex retains only weekly capacity and strictly numeric reset count", () => {
+    const result = parseCodexBarCodex({
+      code: 0,
+      stdout: JSON.stringify([
+        {
+          provider: "codex",
+          email: "secret@example.com",
+          usage: {
+            primary: { usedPercent: 5 },
+            secondary: {
+              usedPercent: 44,
+              resetsAt: "2026-06-08T12:00:00Z",
+            },
+            codexResetCredits: { availableCount: 2, raw: "discard" },
+          },
+        },
+      ]),
+    });
+    expect(result).toEqual({
+      health: "ok",
+      windows: [
+        {
+          key: "week",
+          utilization: 0.44,
+          resetsAt: "2026-06-08T12:00:00Z",
+        },
+      ],
+      resetCreditsAvailableCount: 2,
+      notes: [],
+    });
+
+    for (const invalidCount of ["2", -1, 1.5]) {
+      const invalid = parseCodexBarCodex({
+        code: 0,
+        stdout: JSON.stringify({
+          provider: "codex",
+          usage: {
+            secondary: { usedPercent: 1 },
+            codexResetCredits: { availableCount: invalidCount },
+          },
+        }),
+      });
+      expect(invalid.resetCreditsAvailableCount).toBeNull();
+    }
+
+    for (const invalidPercent of [-1, 101, Number.POSITIVE_INFINITY]) {
+      const invalid = parseCodexBarCodex({
+        code: 0,
+        stdout: JSON.stringify({
+          provider: "codex",
+          usage: { secondary: { usedPercent: invalidPercent } },
+        }),
+      });
+      expect(invalid.health).toBe("unsupported");
+      expect(invalid.windows).toEqual([]);
+    }
   });
 });
 
@@ -382,6 +472,20 @@ describe("buildObservation", () => {
         },
       }),
     });
+    const codexCapacity = parseCodexBarCodex({
+      code: 0,
+      stdout: JSON.stringify([
+        {
+          provider: "codex",
+          email: "codex-secret@example.com",
+          identity: { organization: "CodexOrg" },
+          usage: {
+            secondary: { usedPercent: 25 },
+            codexResetCredits: { availableCount: 3 },
+          },
+        },
+      ]),
+    });
     const cswap = parseCswapList(
       {
         code: 0,
@@ -397,7 +501,14 @@ describe("buildObservation", () => {
       NOW_MS,
       FRESH_CEIL_MS,
     );
-    const obs = buildObservation({ observedAtMs: NOW_MS, codex, cswap });
+    const obs = buildObservation({
+      observedAtMs: NOW_MS,
+      codex,
+      codexCapacity,
+      cswap,
+    });
+    expect(obs.schema_version).toBe(2);
+    expect(obs.codex.resetCreditsAvailableCount).toBe(3);
     const serialized = JSON.stringify(obs);
     expect(serialized).not.toContain("@");
     expect(serialized.toLowerCase()).not.toContain("email");
@@ -429,9 +540,15 @@ describe("observation sidecar", () => {
     try {
       const path = join(dir, "observation.json");
       const obs: Observation = {
-        schema_version: 1,
+        schema_version: 2,
         observed_at_ms: NOW_MS,
         health: "ok",
+        codex: {
+          health: "ok",
+          windows: [{ key: "week", utilization: 0.4, resetsAt: null }],
+          resetCreditsAvailableCount: 1,
+          notes: [],
+        },
         routes: [
           {
             id: NATIVE_ROUTE_ID,
@@ -461,9 +578,46 @@ describe("observation sidecar", () => {
       writeFileSync(
         path,
         JSON.stringify({
+          schema_version: 1,
+          observed_at_ms: NOW_MS,
+          health: "ok",
+          routes: [],
+          notes: [],
+        }),
+      );
+      expect(readObservationSidecar(path)).toBeNull();
+      writeFileSync(
+        path,
+        JSON.stringify({
           schema_version: 99,
           observed_at_ms: NOW_MS,
           health: "ok",
+          routes: [],
+          notes: [],
+        }),
+      );
+      expect(readObservationSidecar(path)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects out-of-range normalized Codex utilization", () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-obs-"));
+    try {
+      const path = join(dir, "observation.json");
+      writeFileSync(
+        path,
+        JSON.stringify({
+          schema_version: 2,
+          observed_at_ms: NOW_MS,
+          health: "ok",
+          codex: {
+            health: "ok",
+            windows: [{ key: "week", utilization: 1.01, resetsAt: null }],
+            resetCreditsAvailableCount: 1,
+            notes: [],
+          },
           routes: [],
           notes: [],
         }),
@@ -479,9 +633,15 @@ describe("observation sidecar", () => {
     try {
       const path = join(dir, "observation.json");
       writeObservationSidecar(path, {
-        schema_version: 1,
+        schema_version: 2,
         observed_at_ms: NOW_MS,
         health: "ok",
+        codex: {
+          health: "absent",
+          windows: [],
+          resetCreditsAvailableCount: null,
+          notes: [],
+        },
         routes: [],
         notes: [],
       });
@@ -494,13 +654,22 @@ describe("observation sidecar", () => {
 
   test("freshness gate: within the ceiling is fresh, past it is stale", () => {
     const obs: Observation = {
-      schema_version: 1,
+      schema_version: 2,
       observed_at_ms: NOW_MS,
       health: "ok",
+      codex: {
+        health: "absent",
+        windows: [],
+        resetCreditsAvailableCount: null,
+        notes: [],
+      },
       routes: [],
       notes: [],
     };
     expect(isObservationFresh(obs, NOW_MS + 60_000)).toBe(true);
     expect(isObservationFresh(obs, NOW_MS + 6 * 60_000)).toBe(false);
+    expect(isObservationFresh(obs, NOW_MS - 1)).toBe(false);
+    expect(isObservationFresh(obs, NOW_MS + 1_000, 2_000)).toBe(true);
+    expect(isObservationFresh(obs, NOW_MS + 3_000, 2_000)).toBe(false);
   });
 });

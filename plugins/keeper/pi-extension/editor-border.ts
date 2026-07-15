@@ -51,9 +51,13 @@ export interface PiEditorBorderContext {
 export type LoadEditorHostModules = () => Promise<EditorHostModules>;
 
 async function loadEditorHostModules(): Promise<EditorHostModules> {
+  // These host packages are supplied by Pi's runtime isolation, not Keeper's
+  // package graph. Variable specifiers keep the root typecheck independent.
+  const codingAgentSpecifier = "@earendil-works/pi-coding-agent";
+  const tuiSpecifier = "@earendil-works/pi-tui";
   const [codingAgent, tui] = await Promise.all([
-    import("@earendil-works/pi-coding-agent"),
-    import("@earendil-works/pi-tui"),
+    import(codingAgentSpecifier),
+    import(tuiSpecifier),
   ]);
   return {
     CustomEditor: codingAgent.CustomEditor as EditorConstructor,

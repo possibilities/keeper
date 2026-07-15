@@ -213,7 +213,9 @@ describe("Session catalog and resolver", () => {
         ],
       );
       expect(catalog.sessions).toHaveLength(2);
-      const joined = catalog.sessions.find((session) => session.jobs.length > 0);
+      const joined = catalog.sessions.find(
+        (session) => session.jobs.length > 0,
+      );
       expect(joined?.artifact?.path).toBe(realpathSync(second));
       expect(joined?.jobs.map((item) => item.jobId)).toEqual(["job-a"]);
       expect(
@@ -357,10 +359,7 @@ describe("Session catalog and resolver", () => {
       expect(bare.session.nativeId).toBe("real-native-id");
     }
 
-    const qualified = resolveSessionReference(
-      catalog,
-      "pi:shared-selector",
-    );
+    const qualified = resolveSessionReference(catalog, "pi:shared-selector");
     expect(qualified.kind).toBe("resolved");
     if (qualified.kind === "resolved") {
       expect(qualified.match).toBe("qualified_native_id");

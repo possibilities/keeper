@@ -1,21 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
   installPiEditorBorder,
+  type LoadEditorHostModules,
   orangeEditorLabel,
   orangeEditorText,
-  type LoadEditorHostModules,
 } from "../plugins/keeper/pi-extension/editor-border";
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 
 class FakeEditor {
   borderColor = (text: string): string => `native(${text})`;
-
-  constructor(
-    _tui: unknown,
-    _theme: unknown,
-    _keybindings: unknown,
-  ) {}
 
   render(width: number): string[] {
     const border = "─".repeat(width);
@@ -54,16 +48,16 @@ describe("Pi editor border", () => {
       fakeLoader(),
     );
 
-    const editor = factory?.({}, {}, {});
-    expect(editor).toBeDefined();
-    const first = editor!.render(30);
+    if (factory === undefined) throw new Error("editor factory not installed");
+    const editor = factory({}, {}, {});
+    const first = editor.render(30);
     expect(first[0]).toEndWith(
       orangeEditorLabel(" keeper-pi ") + orangeEditorText("──"),
     );
     expect(first[2]).toBe(orangeEditorText("─".repeat(30)));
 
     name = "renamed";
-    expect(editor!.render(30)[0]).toEndWith(
+    expect(editor.render(30)[0]).toEndWith(
       orangeEditorLabel(" renamed ") + orangeEditorText("──"),
     );
   });
@@ -74,10 +68,17 @@ describe("Pi editor border", () => {
       | undefined;
     await installPiEditorBorder(
       { getSessionName: () => "pi" },
-      { ui: { setEditorComponent: (next) => (factory = next as typeof factory) } },
+      {
+        ui: {
+          setEditorComponent: (next) => {
+            factory = next as typeof factory;
+          },
+        },
+      },
       fakeLoader(),
     );
-    const editor = factory!({}, {}, {});
+    if (factory === undefined) throw new Error("editor factory not installed");
+    const editor = factory({}, {}, {});
     editor.borderColor = (text) => `thinking(${text})`;
     expect(editor.render(20)[2]).toBe(orangeEditorText("─".repeat(20)));
   });

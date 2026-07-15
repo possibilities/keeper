@@ -711,8 +711,7 @@ export function listClaudeSessions(
         title: spine?.title ?? null,
         titleHistory: spine?.titleHistory ?? [],
         startedAt: spine?.startedAt ?? null,
-        updatedAt:
-          spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        updatedAt: spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
         bytes: file.bytes,
         subagentCount: 0,
         firstPrompt: null,

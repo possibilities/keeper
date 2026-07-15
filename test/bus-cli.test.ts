@@ -211,7 +211,7 @@ describe("registerFrame", () => {
 });
 
 describe("buildPublishFrame", () => {
-  test("send carries a typed artifact reference and a legacy-safe read instruction", () => {
+  test("send carries the validated artifact reference in payload.text", () => {
     const artifact = {
       path: "/trusted/bus-artifacts/00000000000000000000000000000001",
       ref: {
@@ -229,7 +229,7 @@ describe("buildPublishFrame", () => {
       to: "bob",
       payload: {
         media_type: "text/markdown",
-        text: "read /trusted/bus-artifacts/00000000000000000000000000000001",
+        text: '{"t":"bus-artifact-ref","v":1,"id":"00000000000000000000000000000001","len":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}',
         t: "bus-artifact-ref",
         v: 1,
         id: "00000000000000000000000000000001",
@@ -239,9 +239,13 @@ describe("buildPublishFrame", () => {
       },
     });
     expect(JSON.stringify(f)).not.toContain("hello");
-    expect(f.payload.text).toBe(
-      "read /trusted/bus-artifacts/00000000000000000000000000000001",
-    );
+    expect(JSON.parse(f.payload.text)).toEqual({
+      t: "bus-artifact-ref",
+      v: 1,
+      id: artifact.ref.id,
+      len: artifact.ref.len,
+      sha256: artifact.ref.sha256,
+    });
     expect((f as unknown as Record<string, unknown>).from).toBeUndefined();
   });
 });

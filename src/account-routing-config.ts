@@ -6,9 +6,9 @@
  *
  * Two installed public CLIs back the subsystem, wrapped with exact argument
  * arrays and no shell:
- *  - **CodexBar** (`codexbar`) observes the AMBIENT Claude account's usage and
- *    gates automatic balancing. Its ordinary provider payload is NOT the app-only
- *    claude-swap projection, so it never supplies managed rows.
+ *  - **CodexBar** (`codexbar`) observes ambient Claude usage for the routing gate
+ *    and Codex quota capacity for foreground policy. It never supplies managed
+ *    rows.
  *  - **claude-swap** (`cswap`) reports managed-account inventory, launchability,
  *    quota windows, and measurement freshness under a versioned schema.
  *
@@ -27,7 +27,7 @@ import { join } from "node:path";
  * as absent (start fresh) rather than migrated — the router fails open to the
  * native default, costing at most one stale-read.
  */
-export const OBSERVATION_SCHEMA_VERSION = 1;
+export const OBSERVATION_SCHEMA_VERSION = 2;
 
 /** The reservation-ledger schema. A mismatch discards the ledger (fail-open). */
 export const LEDGER_SCHEMA_VERSION = 1;
@@ -182,6 +182,21 @@ export function ledgerLockPath(root: string): string {
   return join(root, "reservations.json.lock");
 }
 
+/** The per-refresh advisory lock guarding observation publication. */
+export function observationRefreshLockPath(root: string): string {
+  return join(root, "observation.json.refresh.lock");
+}
+
+/** Lifetime non-blocking lock for the foreground Codex reset controller. */
+export function codexUsageResetCommandLockPath(root: string): string {
+  return join(root, "codex-usage-reset.lock");
+}
+
+/** Durable at-most-once latch for one Codex weekly reset window. */
+export function codexUsageResetLatchPath(root: string): string {
+  return join(root, "codex-usage-reset.json");
+}
+
 // ---------- executable resolution ------------------------------------------
 
 /**
@@ -203,16 +218,24 @@ export function resolveCswapCommand(): string {
   return override && override.length > 0 ? override : "cswap";
 }
 
-/**
- * The exact argv (no shell) that fetches CodexBar's Claude usage as JSON. Scoped
- * to the claude provider so the payload is the single ambient-account object the
- * strict parser expects, never a multi-provider array.
- */
-export function codexBarUsageArgv(
+/** Exact argv (no shell) that fetches CodexBar's Claude usage as JSON. */
+export function codexBarClaudeUsageArgv(
   bin: string = resolveCodexBarCommand(),
 ): string[] {
   return [bin, "--provider", "claude", "--format", "json"];
 }
+
+/** Exact argv (no shell) that fetches CodexBar's Codex usage as JSON. */
+export function codexBarCodexUsageArgv(
+  bin: string = resolveCodexBarCommand(),
+): string[] {
+  return [bin, "--provider", "codex", "--format", "json"];
+}
+
+/** Compatibility aliases for callers using either established naming order. */
+export const claudeCodexBarUsageArgv = codexBarClaudeUsageArgv;
+export const codexCodexBarUsageArgv = codexBarCodexUsageArgv;
+export const codexBarUsageArgv = codexBarClaudeUsageArgv;
 
 /** The exact argv (no shell) that fetches the claude-swap managed inventory. */
 export function cswapListArgv(bin: string = resolveCswapCommand()): string[] {
