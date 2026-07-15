@@ -60,6 +60,19 @@ is `ok:false` at exit 1, still on stdout. Messages are corrective — never a ra
 converged `{code, message, recovery}` object; consumers scraping the old flat
 `error` string should read `error.code` (or `error.message`) instead.
 
+## Personal notes (`keeper note list|show`)
+
+The finite Note readers use the shared envelope on stdout. `show --raw` emits the
+exact body, while `show --preview` neutralizes terminal controls for fzf; a miss
+still emits the failure envelope. The interactive `new` and `browse` workflows
+report effect failures on stderr because they may already have preserved an
+active Note.
+
+| code | meaning | recovery | retry-safe |
+| ---- | ------- | -------- | ---------- |
+| `note_not_found` | No Note matched the supplied id. | Choose an id from `keeper note list --state all` and retry. | yes (read-only) |
+| `notes_store_unavailable` | The independent notes.db could not be opened or read. | Check the private Keeper state directory and retry; the failed read did not mutate Notes. | yes (read-only) |
+
 ## Autopilot control ops (`keeper autopilot pause|play|mode|arm|disarm|retry|config|worktree`)
 
 Each control op round-trips one control RPC and rides the shared envelope. The

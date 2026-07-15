@@ -8,7 +8,7 @@
 git clone <repo-url> ~/code/keeper
 cd ~/code/keeper
 mkdir -p ~/.local/state/keeper   # launchd does not pre-create the state dir
-bash scripts/install.sh          # bun install -> bun link -> keeperd LaunchAgent bootstrap
+bash scripts/install.sh          # deps (including current Gum) -> bun link -> keeperd bootstrap
 ```
 
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
@@ -269,6 +269,28 @@ or fish config — when a shell needs activation (e.g. adding the zsh dir to `fp
 the installer prints a one-time snippet to opt into. Set `KEEPER_SKIP_COMPLETIONS=1` to skip the step,
 or regenerate a script by hand with `keeper completions <bash|zsh|fish>`.
 
+## Note capture popups (optional)
+
+`keeper setup-tmux` symlinks Keeper's two tmux drop-ins into `~/.config/tmux/conf.d/`: the existing
+load-last managed-session guard and `tmux/keeper-notes.conf`. The Note drop-in binds prefix `N` to
+`keeper note new --fresh` (blank editor first, then the action menu) and prefix `B` to
+`keeper note browse`, using 90% popups rooted at the caller pane's working directory. Successful commands
+close; a failure remains visible until Enter. The installer is
+idempotent, repairs stale symlinks, and never replaces a real file at either destination. Your tmux config
+must source `conf.d/*.conf`; reload it after setup to activate the bindings in a running server.
+
+`scripts/install.sh` installs or upgrades the Homebrew `gum` formula. Fresh capture uses a `gum write`
+textarea sized to the popup: Enter continues to the action picker, Ctrl-J inserts a newline, and Gum's
+native Ctrl-E opens the current
+text in `$VISUAL`/`$EDITOR` before returning it to the textarea. Gum does not expose a custom-key option,
+so Ctrl-G cannot replace that native binding without carrying a fork. Install `fzf` and keep `$VISUAL` or
+`$EDITOR` set to a blocking command. Notes live in the mode-0600
+`~/.local/state/keeper/notes.db`; unfinished editor drafts live beside it and remain recoverable after a
+popup or editor exits unexpectedly. Successful clipboard copies and fresh-agent launches move a Note from
+active to archived history. Sending hands the body to the selected harness through the existing launcher,
+so process visibility and that harness's transcript policy apply beyond the mode-0600 local store.
+`keeper note --help` carries the interaction and failure semantics.
+
 ## Sitter scanners (optional)
 
 One manual step has no code home: the read-only sitter set lives in its own repo at `~/code/sitter`;
@@ -281,6 +303,7 @@ launchctl bootout gui/$(id -u)/arthack.keeperd
 rm ~/Library/LaunchAgents/arthack.keeperd.plist
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+rm ~/.config/tmux/conf.d/keeper-notes.conf
 rm ~/.config/tmux/conf.d/zz-keeper-guard.conf
 rm ~/.config/keeper/plugins.yaml   # the shipped keeper-agent plugin sources
 # Shell completions (whichever the installer wrote — safe if absent):
@@ -301,8 +324,26 @@ and offline size-reclaim runbooks are rendered from code — the single
 source of truth — via `keeper reclaim --agent-help`, `bun scripts/backup-db.ts`, and
 `reclaimInstructions()` / `restoreInstructions()` in `src/backup.ts`. Because projections fold
 deterministically from the immutable `events` table, a restored snapshot re-derives byte-identical
-projections. (`keeper tabs` crash-restore of agent windows is a separate surface — it restores tmux
-windows, not the DB.)
+projections.
+
+The independent `notes.db` takes the same verified `VACUUM INTO` snapshots after a mutating
+`keeper note` command when its rolling interval is due. Its snapshots live under
+`~/.local/state/keeper/notes-backups/`. Restore a chosen snapshot only while no `keeper note`
+command is running, replacing the database atomically and removing the old journal sidecars:
+
+```sh
+db="${KEEPER_NOTES_DB:-$HOME/.local/state/keeper/notes.db}"
+leaf="$(basename "$db")"; [ "$leaf" = notes.db ] && ns=notes || ns="$leaf"
+snapshot="$(dirname "$db")/${ns}-backups/keeper-YYYYMMDDTHHMMSS.db"
+cp "$snapshot" "$db.restore"
+cmp -s "$snapshot" "$db.restore" || exit 1
+chmod 600 "$db.restore"
+rm -f "${db}-wal" "${db}-shm" "${db}-journal"
+mv "$db.restore" "$db"
+```
+
+Notes never ride a `keeper.db` reclaim or restore. (`keeper tabs` crash-restore of agent windows is
+a separate surface — it restores tmux windows, not either DB.)
 
 **Offline reclaim maintenance window** — `bun scripts/maintenance-window.ts` is the supported
 one-command path for the whole window (pause autopilot, drain, snapshot, stop the daemon, reclaim,

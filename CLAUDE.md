@@ -97,7 +97,7 @@ file is imperative guardrails only.
 - **Keep correctness tests deterministic and in-process.** Never boot a real daemon, Worker thread, UDS socket, subprocess, git, or tmux; test git-boundary decisions through a pure seam.
 - **Sandbox ALL state classes** under the per-test tmpdir for real-state tests:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_LANE_DIRT_SPOOL_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
-  the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK`, and `KEEPER_CONFIG_DIR` — never
+  the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK`, `KEEPER_NOTES_DB`, and `KEEPER_CONFIG_DIR` — never
   `{ ...process.env, KEEPER_DB }`; build via `sandboxEnv(...)`. Pure tests use `freshMemDb()` /
   `freshDbFile()` over a full `migrate()`.
 - **Keep test runs lock-free.** Never add a host-wide lock.

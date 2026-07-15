@@ -64,6 +64,7 @@ async function runPure(fn: () => unknown | Promise<unknown>): Promise<PureRun> {
     KEEPER_DB: process.env.KEEPER_DB,
     KEEPER_BUS_DB: process.env.KEEPER_BUS_DB,
     KEEPER_BUS_SOCK: process.env.KEEPER_BUS_SOCK,
+    KEEPER_NOTES_DB: process.env.KEEPER_NOTES_DB,
     KEEPER_SOCK: process.env.KEEPER_SOCK,
   };
   const boom = (op: string) => (): never => {
@@ -74,6 +75,7 @@ async function runPure(fn: () => unknown | Promise<unknown>): Promise<PureRun> {
   process.env.KEEPER_DB = `${junk}.db`;
   process.env.KEEPER_BUS_DB = `${junk}-bus.db`;
   process.env.KEEPER_BUS_SOCK = `${junk}.sock`;
+  process.env.KEEPER_NOTES_DB = `${junk}-notes.db`;
   process.env.KEEPER_SOCK = `${junk}.sock`;
   // biome-ignore lint/suspicious/noExplicitAny: patching Bun globals for the walk.
   (Bun as any).spawn = boom("Bun.spawn");

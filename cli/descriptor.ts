@@ -1304,6 +1304,82 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ),
   },
   {
+    name: "note",
+    summary:
+      "Capture, process, and browse private notes in an independent notes.db",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: [],
+    verbs: [
+      {
+        name: "new",
+        summary: "Edit a new note, then save, copy, send, or discard it",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: true,
+        flags: [
+          FLAG_HELP,
+          {
+            name: "fresh",
+            type: "boolean",
+            summary: "Start a blank Gum writer without the recovery picker",
+          },
+        ],
+      },
+      {
+        name: "browse",
+        summary: "Browse active notes and archived processing history in fzf",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: true,
+        flags: [FLAG_HELP],
+      },
+      {
+        name: "list",
+        summary: "List note summaries as JSON",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "state",
+            type: "string",
+            summary: "active, archived, or all (default: active)",
+          },
+        ],
+      },
+      {
+        name: "show",
+        summary: "Show one note as JSON, exact raw text, or a safe preview",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json", "human"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "raw",
+            type: "boolean",
+            summary: "Write the exact note body",
+          },
+          {
+            name: "preview",
+            type: "boolean",
+            summary: "Write a terminal-safe body preview",
+          },
+        ],
+      },
+    ],
+  },
+  {
     name: "repo",
     summary: "Create, clone, and fork GitHub repos into configured roots",
     visibility: "public",
