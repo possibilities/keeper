@@ -381,8 +381,8 @@ describe("claude-to-pi conversion core", () => {
     expect(orphan?.warningCodes).toContain("unmatched_subagent");
     expect(prepared.manifest.warningCodes).toEqual(
       expect.arrayContaining([
+        "claude_record_raw_only",
         "malformed_line",
-        "unknown_record_type",
         "unmatched_subagent",
       ]),
     );
@@ -536,6 +536,32 @@ describe("claude-to-pi conversion core", () => {
     expect(last.type).toBe("custom");
     expect(last.customType).toBe("keeper.conversation.active-leaf");
     expect(last.parentId).toBe((mainRecords.at(-2) as JsonRecord).id);
+  });
+
+  test("known raw-only Claude records are distinct from unknown record types", () => {
+    const known = prepareClaudeToPiConversion({
+      claudeMainPath: mainPath,
+      piAgentDir,
+    });
+    expect(known.manifest.warningCodes).toContain("claude_record_raw_only");
+    expect(known.manifest.warningCodes).not.toContain("unknown_record_type");
+
+    writeJsonl(mainPath, [
+      ...mainLines,
+      json({
+        type: "future-claude-record",
+        uuid: "future-1",
+        parentUuid: "a3",
+        timestamp: "2026-01-01T00:00:09.000Z",
+        cwd: CWD,
+        sessionId: SOURCE_SESSION_ID,
+      }),
+    ]);
+    const unknown = prepareClaudeToPiConversion({
+      claudeMainPath: mainPath,
+      piAgentDir,
+    });
+    expect(unknown.manifest.warningCodes).toContain("unknown_record_type");
   });
 
   test("a shared-resolver native id is authoritative over transcript content", () => {

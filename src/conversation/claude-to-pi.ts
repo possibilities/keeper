@@ -27,7 +27,7 @@ import {
 } from "node:path";
 import { encodePiCwd } from "../transcript/pi";
 
-export const CLAUDE_TO_PI_MAPPING_VERSION = 1;
+export const CLAUDE_TO_PI_MAPPING_VERSION = 2;
 export const CLAUDE_TO_PI_MANIFEST_SCHEMA_VERSION = 1;
 export const CLAUDE_TO_PI_READ_CHUNK_BYTES = 64 * 1024;
 export const CLAUDE_TO_PI_MAX_LINE_BYTES = 8 * 1024 * 1024;
@@ -39,6 +39,18 @@ const RAW_SHADOW_CUSTOM_TYPE = "keeper.conversation.claude-record";
 const METADATA_ROOT_CUSTOM_TYPE = "keeper.conversation.metadata";
 const ACTIVE_LEAF_CUSTOM_TYPE = "keeper.conversation.active-leaf";
 const DEFAULT_TIMESTAMP = "1970-01-01T00:00:00.000Z";
+const KNOWN_RAW_ONLY_CLAUDE_RECORD_TYPES = new Set([
+  "agent-name",
+  "attachment",
+  "file-history-snapshot",
+  "file_snapshot",
+  "mode",
+  "permission",
+  "permission-mode",
+  "queue",
+  "queue-operation",
+  "system",
+]);
 
 type JsonObject = Record<string, unknown>;
 
@@ -48,6 +60,7 @@ export type WarningCode =
   | "assistant_missing_model"
   | "assistant_response_id_inconsistent"
   | "compaction_untrusted"
+  | "claude_record_raw_only"
   | "duplicate_uuid"
   | "malformed_line"
   | "malformed_parent_cycle"
@@ -1972,16 +1985,21 @@ function prepareStreamSession(
       continue;
     }
 
+    if (line.type === "last-prompt") {
+      pushRawShadow(anchorId);
+      linePlans[line.ordinal] = {
+        anchorId: anchorId ?? terminalId ?? metadataRootId,
+        terminalId: terminalId ?? metadataRootId,
+        entries: draftEntries,
+      };
+      continue;
+    }
+
     if (
-      line.type === "system" ||
-      line.type === "attachment" ||
-      line.type === "queue" ||
-      line.type === "mode" ||
-      line.type === "permission" ||
-      line.type === "file_snapshot" ||
-      line.type === "agent-name"
+      line.type !== null &&
+      KNOWN_RAW_ONLY_CLAUDE_RECORD_TYPES.has(line.type)
     ) {
-      warningSet.add("unknown_record_type");
+      warningSet.add("claude_record_raw_only");
       pushRawShadow(anchorId);
       linePlans[line.ordinal] = {
         anchorId: anchorId ?? terminalId ?? metadataRootId,
