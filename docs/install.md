@@ -298,15 +298,20 @@ or fish config — when a shell needs activation (e.g. adding the zsh dir to `fp
 the installer prints a one-time snippet to opt into. Set `KEEPER_SKIP_COMPLETIONS=1` to skip the step,
 or regenerate a script by hand with `keeper completions <bash|zsh|fish>`.
 
-## Note capture popups (optional)
+## Tmux drop-ins (optional)
 
-`keeper setup-tmux` symlinks Keeper's two tmux drop-ins into `~/.config/tmux/conf.d/`: the existing
-load-last managed-session guard and `tmux/keeper-notes.conf`. The Note drop-in binds prefix `N` to
-`keeper note new --fresh` (blank editor first, then the action menu) and prefix `B` to
-`keeper note browse`, using 90% popups rooted at the caller pane's working directory. Successful commands
-close; a failure remains visible until Enter. The installer is
-idempotent, repairs stale symlinks, and never replaces a real file at either destination. Your tmux config
-must source `conf.d/*.conf`; reload it after setup to activate the bindings in a running server.
+`keeper setup-tmux` symlinks Keeper's three tmux drop-ins into `~/.config/tmux/conf.d/`: the load-last
+managed-session guard, `tmux/keeper-notes.conf`, and `tmux/keeper-shell.conf`. The shell drop-in marks new
+tmux panes with `KEEPER_ZSH_DROPINS=1`; a zsh startup file may use that marker to source the fixed
+`~/code/keeper/shell/zsh/*.zsh` path. Keeper's matrix defines `c0`–`c3` account selectors and their
+model/effort combinations only in marked tmux shells. The marker never carries a caller-controlled source
+path.
+
+The Note drop-in binds prefix `N` to `keeper note new --fresh` (blank editor first, then the action menu)
+and prefix `B` to `keeper note browse`, using 90% popups rooted at the caller pane's working directory.
+Successful commands close; a failure remains visible until Enter. The installer is idempotent, repairs
+stale symlinks, and never replaces a real file at any destination. Your tmux config must source
+`conf.d/*.conf`; reload it after setup to activate the drop-ins in a running server.
 
 Fresh capture uses Keeper's OpenTUI composer: Enter continues to the action picker,
 Shift-Enter or Ctrl-J inserts a newline, Ctrl-G saves the draft and temporarily cedes the terminal to
@@ -331,6 +336,7 @@ rm ~/Library/LaunchAgents/arthack.keeperd.plist
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 rm ~/.config/tmux/conf.d/keeper-notes.conf
+rm ~/.config/tmux/conf.d/keeper-shell.conf
 rm ~/.config/tmux/conf.d/zz-keeper-guard.conf
 rm ~/.config/keeper/plugins.yaml   # the shipped keeper-agent plugin sources
 # Shell completions (whichever the installer wrote — safe if absent):

@@ -10,6 +10,7 @@ import {
   buildSelectLayoutArgs,
   buildSelectPaneArgs,
   buildSetMainPaneWidthArgs,
+  buildSourceShellConfArgs,
   buildTabsRestoreArgv,
   buildWorkNewSessionArgs,
   DASH_SUB_PANES,
@@ -35,6 +36,8 @@ import {
   type SyncSpawnFn,
   type SyncSpawnResult,
   selectionToOfferBundle,
+  shellConfLink,
+  shellConfSource,
   sweepBusyPanes,
 } from "../cli/setup-tmux";
 import { TABS_EXIT_PARTIAL_FAILURE } from "../cli/tabs";
@@ -1653,6 +1656,8 @@ function makeGuardFs(
 const HOME_FOR_TEST = process.env.HOME ?? "";
 const NOTES_LINK = `${HOME_FOR_TEST}/.config/tmux/conf.d/keeper-notes.conf`;
 const NOTES_SOURCE = `${HOME_FOR_TEST}/code/keeper/tmux/keeper-notes.conf`;
+const SHELL_LINK = `${HOME_FOR_TEST}/.config/tmux/conf.d/keeper-shell.conf`;
+const SHELL_SOURCE = `${HOME_FOR_TEST}/code/keeper/tmux/keeper-shell.conf`;
 const GUARD_LINK = `${HOME_FOR_TEST}/.config/tmux/conf.d/zz-keeper-guard.conf`;
 const GUARD_SOURCE = `${HOME_FOR_TEST}/code/keeper/tmux/keeper-guard.conf`;
 
@@ -1705,28 +1710,57 @@ async function runWithGuardFs(
 describe("tmux drop-in symlink path builders", () => {
   test("sources are the Keeper-owned tmux files", () => {
     expect(notesConfSource()).toBe(NOTES_SOURCE);
+    expect(shellConfSource()).toBe(SHELL_SOURCE);
     expect(guardConfSource()).toBe(GUARD_SOURCE);
   });
 
-  test("links use the ordinary notes name and load-last guard name", () => {
+  test("links use ordinary names and the load-last guard name", () => {
     expect(notesConfLink(HOME_FOR_TEST)).toBe(NOTES_LINK);
+    expect(shellConfLink(HOME_FOR_TEST)).toBe(SHELL_LINK);
     expect(guardConfLink(HOME_FOR_TEST)).toBe(GUARD_LINK);
   });
 
   test("empty HOME yields empty links", () => {
     expect(notesConfLink("")).toBe("");
+    expect(shellConfLink("")).toBe("");
     expect(guardConfLink("")).toBe("");
+  });
+
+  test("warm-server reload sources the Keeper shell drop-in", () => {
+    expect(buildSourceShellConfArgs()).toEqual([
+      "tmux",
+      "source-file",
+      SHELL_SOURCE,
+    ]);
   });
 });
 
 describe("tmux drop-in symlink idempotence (via main, injected fs)", () => {
+  test("shell marker is sourced before work-session provisioning is probed", async () => {
+    const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
+    const spawnCalls: string[][] = [];
+    await runWithGuardFs(makeGuardFs({ isLink: null }, calls), spawnCalls);
+    const sourceIndex = spawnCalls.findIndex(
+      (argv) => argv.join("\0") === buildSourceShellConfArgs().join("\0"),
+    );
+    const workProbeIndex = spawnCalls.findIndex(
+      (argv) => argv.includes("has-session") && argv.includes("=work"),
+    );
+    expect(sourceIndex).toBeGreaterThanOrEqual(0);
+    expect(workProbeIndex).toBeGreaterThan(sourceIndex);
+  });
+
   test("correct existing symlinks ⇒ no relink", async () => {
     const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
     const guardFs = makeGuardFs(
       {
         isLink: true,
         readlinkTarget: (path) =>
-          path === NOTES_LINK ? NOTES_SOURCE : GUARD_SOURCE,
+          path === NOTES_LINK
+            ? NOTES_SOURCE
+            : path === SHELL_LINK
+              ? SHELL_SOURCE
+              : GUARD_SOURCE,
       },
       calls,
     );
@@ -1735,7 +1769,7 @@ describe("tmux drop-in symlink idempotence (via main, injected fs)", () => {
     expect(calls.symlink).toHaveLength(0);
   });
 
-  test("wrong symlinks ⇒ relink both to their Keeper sources", async () => {
+  test("wrong symlinks ⇒ relink all to their Keeper sources", async () => {
     const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
     const guardFs = makeGuardFs(
       { isLink: true, readlinkTarget: "/somewhere/stale.conf" },
@@ -1744,37 +1778,42 @@ describe("tmux drop-in symlink idempotence (via main, injected fs)", () => {
     await runWithGuardFs(guardFs, []);
     expect(calls.symlink).toEqual([
       { target: NOTES_SOURCE, path: NOTES_LINK },
+      { target: SHELL_SOURCE, path: SHELL_LINK },
       { target: GUARD_SOURCE, path: GUARD_LINK },
     ]);
   });
 
-  test("absent links ⇒ create both symlinks", async () => {
+  test("absent links ⇒ create all symlinks", async () => {
     const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
     const guardFs = makeGuardFs({ isLink: null }, calls);
     await runWithGuardFs(guardFs, []);
     expect(calls.mkdirp).toHaveLength(1);
     expect(calls.symlink).toEqual([
       { target: NOTES_SOURCE, path: NOTES_LINK },
+      { target: SHELL_SOURCE, path: SHELL_LINK },
       { target: GUARD_SOURCE, path: GUARD_LINK },
     ]);
   });
 
-  test("a real notes file is preserved while the guard still installs", async () => {
+  test("a real notes file is preserved while the other drop-ins install", async () => {
     const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
     const guardFs = makeGuardFs(
       { isLink: (path) => (path === NOTES_LINK ? false : null) },
       calls,
     );
     await runWithGuardFs(guardFs, []);
-    expect(calls.symlink).toEqual([{ target: GUARD_SOURCE, path: GUARD_LINK }]);
+    expect(calls.symlink).toEqual([
+      { target: SHELL_SOURCE, path: SHELL_LINK },
+      { target: GUARD_SOURCE, path: GUARD_LINK },
+    ]);
   });
 
-  test("parent missing ⇒ mkdir -p once, then link both", async () => {
+  test("parent missing ⇒ mkdir -p once, then link all", async () => {
     const calls: GuardFsCalls = { mkdirp: [], symlink: [] };
     const guardFs = makeGuardFs({ isLink: null }, calls);
     await runWithGuardFs(guardFs, []);
     expect(calls.mkdirp).toEqual([`${HOME_FOR_TEST}/.config/tmux/conf.d`]);
-    expect(calls.symlink).toHaveLength(2);
+    expect(calls.symlink).toHaveLength(3);
   });
 
   test("parent mkdir failure warns and still provisions", async () => {
@@ -1795,9 +1834,10 @@ describe("tmux drop-in symlink idempotence (via main, injected fs)", () => {
   });
 });
 
-describe("HELP mentions both tmux drop-in installs", () => {
-  test("names both links and the conf.d-sourcing precondition", () => {
+describe("HELP mentions the tmux drop-in installs", () => {
+  test("names every link and the conf.d-sourcing precondition", () => {
     expect(HELP).toContain("keeper-notes.conf");
+    expect(HELP).toContain("keeper-shell.conf");
     expect(HELP).toContain("zz-keeper-guard.conf");
     expect(HELP).toContain("conf.d");
   });

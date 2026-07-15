@@ -69,11 +69,13 @@ the dashboard with: tmux -L dash attach.
 
 Also symlinks Keeper's tmux drop-ins idempotently and fail-open:
   tmux/keeper-notes.conf → ~/.config/tmux/conf.d/keeper-notes.conf
+  tmux/keeper-shell.conf → ~/.config/tmux/conf.d/keeper-shell.conf
   tmux/keeper-guard.conf → ~/.config/tmux/conf.d/zz-keeper-guard.conf
-The first binds prefix N/B to fresh Note capture/browse popups; the second makes a
-keeper-managed session (autopilot/pair/panels/agentbus/wrapped) prompt before a
-keyboard-triggered window/split creation. They activate only if your tmux.conf
-sources conf.d/*.conf. A real (non-symlink) destination is never clobbered.
+The first binds prefix N/B to fresh Note capture/browse popups; the shell drop-in
+marks new tmux shells to load Keeper's zsh aliases; the guard makes a keeper-managed
+session (autopilot/pair/panels/agentbus/wrapped) prompt before a keyboard-triggered
+window/split creation. They activate only if your tmux.conf sources conf.d/*.conf.
+A real (non-symlink) destination is never clobbered.
 
 When the work session ('work') is absent or only a one-shell skeleton (the first
 run after a crash) and the last tmux-server generation left crashed agents for it,
@@ -587,6 +589,15 @@ export function notesConfSource(): string {
   return `${KEEPER_DIR}/tmux/keeper-notes.conf`;
 }
 
+export function shellConfSource(): string {
+  return `${KEEPER_DIR}/tmux/keeper-shell.conf`;
+}
+
+/** Reload the shell marker into an already-running default tmux server. */
+export function buildSourceShellConfArgs(): string[] {
+  return ["tmux", "source-file", shellConfSource()];
+}
+
 export function guardConfSource(): string {
   return `${KEEPER_DIR}/tmux/keeper-guard.conf`;
 }
@@ -594,6 +605,10 @@ export function guardConfSource(): string {
 /** The Note popup destination. `home` empty ⇒ no root-relative path. */
 export function notesConfLink(home: string): string {
   return home === "" ? "" : `${home}/.config/tmux/conf.d/keeper-notes.conf`;
+}
+
+export function shellConfLink(home: string): string {
+  return home === "" ? "" : `${home}/.config/tmux/conf.d/keeper-shell.conf`;
 }
 
 /** `zz-` sources the guard after the human's own create-key bindings. */
@@ -613,6 +628,11 @@ function tmuxConfSpecs(home: string): readonly TmuxConfSpec[] {
       label: "note popup",
       source: notesConfSource(),
       link: notesConfLink(home),
+    },
+    {
+      label: "zsh drop-in marker",
+      source: shellConfSource(),
+      link: shellConfLink(home),
     },
     {
       label: "managed-session guard",
@@ -644,7 +664,7 @@ function ensureTmuxConfSymlink(gfs: GuardFs, spec: TmuxConfSpec): void {
 }
 
 /**
- * Idempotently install both Keeper tmux drop-ins. The shared parent is created
+ * Idempotently install Keeper's tmux drop-ins. The shared parent is created
  * once. Each link fails open independently, so one stale or protected
  * destination never prevents installing the other or provisioning sessions.
  */
@@ -1158,6 +1178,11 @@ export async function main(
         `keeper setup-tmux: tmux drop-in install failed, continuing — ${String(e)}\n`,
       );
     }
+    // A warm default server does not reread tmux.conf merely because a new
+    // conf.d symlink appeared. Source this one drop-in before provisioning so
+    // every subsequently spawned pane inherits the zsh marker. No server yet
+    // is a benign non-zero: the first new-session loads tmux.conf normally.
+    run(spawn, buildSourceShellConfArgs());
 
     if (parsed.values["kill-sessions"]) {
       // Gate on server liveness first: no server ⇒ nothing to kill, nothing
