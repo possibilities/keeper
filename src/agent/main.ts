@@ -25,6 +25,7 @@ import {
   selectRoute,
 } from "../account-router";
 import {
+  KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
   resolveCswapCommand,
 } from "../account-routing-config";
@@ -2832,10 +2833,16 @@ export async function main(deps: MainDeps): Promise<never> {
   // `cswap run <slot> --share-history -- <argv…>` contract, letting claude-swap
   // own account isolation and the exec handoff. The PII-free route id rides
   // KEEPER_ACCOUNT_ROUTE on BOTH paths — it survives claude-swap's same-account
-  // fast path, so route identity never depends on CLAUDE_CONFIG_DIR.
+  // fast path, so route identity never depends on CLAUDE_CONFIG_DIR. A separate
+  // optional ordinal carries only the selected position in a multi-account
+  // cswap inventory; sparse slot numbers are never shown as account ordinals.
   if (agent === "claude") {
     const route = deps.selectAccountRouteFn();
     deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = route.id;
+    delete deps.env[KEEPER_ACCOUNT_ORDINAL_ENV];
+    if (route.accountOrdinal !== undefined) {
+      deps.env[KEEPER_ACCOUNT_ORDINAL_ENV] = String(route.accountOrdinal);
+    }
     actionLog.push(`Resolved account route: ${route.id} (${route.reason})`);
     note(`route: ${route.id}`);
     if (route.kind === "managed" && route.slot !== null) {

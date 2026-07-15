@@ -66,6 +66,15 @@ export function managedRouteId(slot: number): string {
  */
 export const KEEPER_ACCOUNT_ROUTE_ENV = "KEEPER_ACCOUNT_ROUTE";
 
+/**
+ * Zero-based position of the selected Claude account in `cswap list --json`'s
+ * ordered inventory. Set only when that inventory contains multiple accounts;
+ * the Claude statusline renders it as `c<N>`. This display hint is deliberately
+ * separate from the stable route id because claude-swap slot numbers may be
+ * sparse and are not inventory ordinals.
+ */
+export const KEEPER_ACCOUNT_ORDINAL_ENV = "KEEPER_ACCOUNT_ORDINAL";
+
 // ---------- bounded-execution knobs ----------------------------------------
 
 /**

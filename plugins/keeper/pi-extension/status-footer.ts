@@ -1,5 +1,5 @@
-import { execFile, type ChildProcess } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { type ChildProcess, execFile } from "node:child_process";
+import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 const CONTEXT_GLYPH = "\uf295";
@@ -7,6 +7,9 @@ const LANE_GLYPH = "⑂";
 const NETWORK_GLYPH = "\uf0ec";
 const KEEPER_LANE_PREFIX = "keeper/epic/";
 const SEP = " ∕ ";
+const ANSI_SGR_PATTERN = `${String.fromCharCode(27)}\\[[0-9;]*m`;
+const ANSI_SGR_GLOBAL = new RegExp(ANSI_SGR_PATTERN, "g");
+const ANSI_SGR_PREFIX = new RegExp(`^${ANSI_SGR_PATTERN}`);
 
 export interface PiFooterTheme {
   fg(color: string, text: string): string;
@@ -86,7 +89,7 @@ export function compactPiKeeperLane(branch: string): string {
 }
 
 function stripAnsi(value: string): string {
-  return value.replace(/\u001b\[[0-9;]*m/g, "");
+  return value.replace(ANSI_SGR_GLOBAL, "");
 }
 
 function terminalCellWidth(point: number): number {
@@ -132,9 +135,9 @@ function truncateAnsi(value: string, width: number): string {
   if (visibleCells(value) <= width) return value;
   let visible = 0;
   let result = "";
-  for (let i = 0; i < value.length && visible < width;) {
+  for (let i = 0; i < value.length && visible < width; ) {
     if (value[i] === "\u001b") {
-      const match = value.slice(i).match(/^\u001b\[[0-9;]*m/);
+      const match = value.slice(i).match(ANSI_SGR_PREFIX);
       if (match) {
         result += match[0];
         i += match[0].length;
@@ -231,7 +234,18 @@ export async function probePiFooterGit(
 }
 
 export function resolvePiVersion(entryPath = process.argv[1] ?? ""): string {
-  let dir = dirname(entryPath);
+  // `pi` is commonly launched through an npm/nvm bin symlink. Node preserves
+  // that launcher path in argv, so walking its parents searches the bin tree
+  // rather than the installed package. Resolve the executable first; a bundled
+  // binary and a direct dist/cli.js launch both remain valid package anchors.
+  let packageEntryPath = entryPath;
+  try {
+    packageEntryPath = realpathSync(entryPath);
+  } catch {
+    // Tests, moved installs, or transient launcher paths still get the original
+    // best-effort parent walk below.
+  }
+  let dir = dirname(packageEntryPath);
   for (let depth = 0; depth < 8; depth++) {
     try {
       const pkg = JSON.parse(
@@ -253,7 +267,9 @@ export function resolvePiVersion(entryPath = process.argv[1] ?? ""): string {
     if (parent === dir) break;
     dir = parent;
   }
-  return "pi";
+  // An unresolved package version is not an account identity; omit the segment
+  // instead of showing the misleading fallback label `pi`.
+  return "";
 }
 
 export function buildPiTelemetryPayload(

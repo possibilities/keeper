@@ -38,20 +38,22 @@ import {
 const CSWAP = "/fake-home/.local/bin/cswap";
 const UUID = "11111111-1111-1111-1111-111111111111";
 /** A managed route selection for `slot`. */
-function managed(slot: number): () => RouteSelection {
+function managed(slot: number, accountOrdinal?: number): () => RouteSelection {
   return () => ({
     id: `claude-swap:${slot}`,
     kind: "managed",
     slot,
+    ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
     reason: "selected",
   });
 }
 /** A native route selection (the fail-open default). */
-function native(): () => RouteSelection {
+function native(accountOrdinal?: number): () => RouteSelection {
   return () => ({
     id: NATIVE_ROUTE_ID,
     kind: "native",
     slot: null,
+    ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
     reason: "no-observation",
   });
 }
@@ -87,18 +89,19 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
     // Byte-for-byte: the forwarded tail is exactly the native args, unreordered.
     expect(managedCmd.slice(5)).toEqual(nativeCmd.slice(1));
   });
-  test("a managed route carries the PII-free route id and sets no CLAUDE_CONFIG_DIR", async () => {
+  test("a managed route carries route identity and its separate display ordinal", async () => {
     const h = makeHarness({
       argv: ["claude", "hello"],
       rawArgv: true,
       env: {},
       randomUuid: () => UUID,
-      selectAccountRoute: managed(5),
+      selectAccountRoute: managed(5, 1),
     });
     await runAndCapture(h, main);
     // The same-account fast path relies on keeper NOT presetting CLAUDE_CONFIG_DIR.
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:5");
+    expect(h.deps.env.KEEPER_ACCOUNT_ORDINAL).toBe("1");
   });
   test("managed preserves model/effort/session-id/name after the -- boundary", async () => {
     const nativeH = makeHarness({
@@ -127,11 +130,11 @@ describe("Claude managed route wraps the built argv in the cswap contract", () =
 // native fallback preserves the launch
 // ---------------------------------------------------------------------------
 describe("Claude native route preserves the launch and carries the route id", () => {
-  test("a native route runs Claude directly and sets the carrier", async () => {
+  test("a native route runs Claude directly and omits a single-account label", async () => {
     const h = makeHarness({
       argv: ["claude", "hello"],
       rawArgv: true,
-      env: {},
+      env: { KEEPER_ACCOUNT_ORDINAL: "99" },
       randomUuid: () => UUID,
       selectAccountRoute: native(),
     });
@@ -140,6 +143,7 @@ describe("Claude native route preserves the launch and carries the route id", ()
     expect(cmd[0]).toBe("/fake-home/.local/bin/claude");
     expect(cmd).not.toContain("run");
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("default");
+    expect(h.deps.env.KEEPER_ACCOUNT_ORDINAL).toBeUndefined();
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 });

@@ -67,7 +67,11 @@ function managedRoute(slot: number, ...windows: NormalizedWindow[]): Route {
 function seedObservation(
   stateDir: string,
   routes: Route[],
-  opts: { health?: ObservationHealth; observedAtMs?: number } = {},
+  opts: {
+    health?: ObservationHealth;
+    observedAtMs?: number;
+    accountOrdinals?: Record<string, number>;
+  } = {},
 ): void {
   const obs: Observation = {
     schema_version: 2,
@@ -80,6 +84,14 @@ function seedObservation(
       notes: [],
     },
     routes,
+    ...(opts.accountOrdinals === undefined
+      ? {}
+      : {
+          claude_accounts: {
+            count: new Set(Object.values(opts.accountOrdinals)).size,
+            ordinals: opts.accountOrdinals,
+          },
+        }),
     notes: [],
   };
   writeObservationSidecar(observationSidecarPath(stateDir), obs);
@@ -149,6 +161,49 @@ describe("selectRoute — fail-open disable gates", () => {
       writeFileSync(observationSidecarPath(dir), "{ not json");
       const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
       expect(sel.id).toBe(NATIVE_ROUTE_ID);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------- headroom selection ----------------------------------------------
+
+describe("selectRoute — account display ordinal", () => {
+  test("a single Claude account omits its ordinal", () => {
+    const dir = tmp();
+    try {
+      seedObservation(dir, [nativeRoute(win("session", 0.2))], {
+        accountOrdinals: { default: 0, "claude-swap:7": 0 },
+      });
+      expect(
+        selectRoute({ stateDir: dir, nowMs: NOW_MS }).accountOrdinal,
+      ).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("multi-account selections use inventory position, not sparse slot", () => {
+    const dir = tmp();
+    try {
+      seedObservation(
+        dir,
+        [
+          nativeRoute(win("session", 0.8)),
+          managedRoute(9, win("session", 0.1)),
+        ],
+        {
+          accountOrdinals: {
+            default: 0,
+            "claude-swap:4": 0,
+            "claude-swap:9": 1,
+          },
+        },
+      );
+      const selected = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      expect(selected.id).toBe("claude-swap:9");
+      expect(selected.accountOrdinal).toBe(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

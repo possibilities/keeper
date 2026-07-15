@@ -72,6 +72,8 @@ export interface RouteSelection {
   id: string;
   kind: RouteKind;
   slot: number | null;
+  /** Zero-based cswap inventory position, present only for multi-account display. */
+  accountOrdinal?: number;
   reason: string;
 }
 
@@ -83,9 +85,31 @@ export interface SelectRouteDeps {
   nowMs?: number;
 }
 
+/** Return a display ordinal only when claude-swap reports multiple accounts. */
+function displayOrdinal(
+  obs: ReturnType<typeof readObservationSidecar>,
+  routeId: string,
+): number | undefined {
+  const display = obs?.claude_accounts;
+  if (!display || display.count <= 1) {
+    return undefined;
+  }
+  return display.ordinals[routeId];
+}
+
 /** The native default selection, returned on every fail-open path. */
-function nativeSelection(reason: string): RouteSelection {
-  return { id: NATIVE_ROUTE_ID, kind: "native", slot: null, reason };
+function nativeSelection(
+  reason: string,
+  obs: ReturnType<typeof readObservationSidecar> = null,
+): RouteSelection {
+  const accountOrdinal = displayOrdinal(obs, NATIVE_ROUTE_ID);
+  return {
+    id: NATIVE_ROUTE_ID,
+    kind: "native",
+    slot: null,
+    ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
+    reason,
+  };
 }
 
 /**
@@ -114,15 +138,16 @@ function doSelectRoute(deps: SelectRouteDeps): RouteSelection {
     return nativeSelection("stale-observation");
   }
   if (obs.health !== "ok") {
-    // CodexBar gate closed — automatic balancing disabled.
-    return nativeSelection(`disabled-${obs.health}`);
+    // CodexBar gate closed — automatic balancing disabled. The fresh cswap
+    // inventory can still identify the ambient account for display.
+    return nativeSelection(`disabled-${obs.health}`, obs);
   }
 
   // Candidates: every route carrying at least one window (an unknown-window route
   // is excluded, never treated as zero usage).
   const candidates = obs.routes.filter((r) => r.windows.length > 0);
   if (candidates.length === 0) {
-    return nativeSelection("native-fallback");
+    return nativeSelection("native-fallback", obs);
   }
 
   mkdirSync(stateDir, { recursive: true });
@@ -132,10 +157,12 @@ function doSelectRoute(deps: SelectRouteDeps): RouteSelection {
     const chosen = scoreAndPick(candidates, ledger, nowMs);
     recordReservation(ledger, chosen.id, nowMs);
     writeLedger(stateDir, ledger);
+    const accountOrdinal = displayOrdinal(obs, chosen.id);
     return {
       id: chosen.id,
       kind: chosen.kind,
       slot: chosen.slot,
+      ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
       reason: candidates.length === 1 ? "sole-candidate" : "selected",
     };
   } finally {
@@ -235,7 +262,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     return {
       ...base,
       enabled: false,
-      would_choose: nativeSelection(`disabled-${obs.health}`),
+      would_choose: nativeSelection(`disabled-${obs.health}`, obs),
       candidates: [],
     };
   }
@@ -244,7 +271,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     return {
       ...base,
       enabled: false,
-      would_choose: nativeSelection("native-fallback"),
+      would_choose: nativeSelection("native-fallback", obs),
       candidates: [],
     };
   }
@@ -262,6 +289,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     };
   });
   const chosen = scoreAndPick(routeable, ledger, nowMs);
+  const accountOrdinal = displayOrdinal(obs, chosen.id);
   return {
     ...base,
     enabled: true,
@@ -269,6 +297,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       id: chosen.id,
       kind: chosen.kind,
       slot: chosen.slot,
+      ...(accountOrdinal === undefined ? {} : { accountOrdinal }),
       reason: routeable.length === 1 ? "sole-candidate" : "selected",
     },
     candidates,

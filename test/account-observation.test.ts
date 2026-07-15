@@ -301,6 +301,32 @@ describe("parseCswapList — inventory normalization", () => {
     expect(out.routes.map((r) => r.slot)).toEqual([5]);
   });
 
+  test("inventory order supplies stable zero-based display ordinals", () => {
+    const out = parseCswapList(
+      {
+        code: 0,
+        stdout: cswapJson(
+          [
+            cswapRow({ number: 7 }),
+            cswapRow({ number: 2, usageStatus: "token_expired" }),
+            cswapRow({ number: 11 }),
+          ],
+          { activeAccountNumber: 7 },
+        ),
+      },
+      NOW_MS,
+      FRESH_CEIL_MS,
+    );
+    // Sparse slots and an unrouteable row retain their array-order positions;
+    // transient quota/auth state must not renumber the remaining accounts.
+    expect(out.accountOrdinals).toEqual({
+      "claude-swap:7": 0,
+      "claude-swap:2": 1,
+      "claude-swap:11": 2,
+    });
+    expect(out.routes.map((r) => r.slot)).toEqual([11]);
+  });
+
   test("unlaunchable statuses are excluded, not coerced to zero usage", () => {
     for (const status of [
       "api_key",
@@ -452,6 +478,32 @@ describe("buildObservation", () => {
       "claude-swap:3",
     ]);
     expect(obs.routes[0].windows).toHaveLength(1);
+  });
+
+  test("display metadata aliases the active slot to native without slot arithmetic", () => {
+    const cswap = parseCswapList(
+      {
+        code: 0,
+        stdout: cswapJson([cswapRow({ number: 4 }), cswapRow({ number: 9 })], {
+          activeAccountNumber: 9,
+        }),
+      },
+      NOW_MS,
+      FRESH_CEIL_MS,
+    );
+    const obs = buildObservation({
+      observedAtMs: NOW_MS,
+      codex: { health: "ok", windows: [], notes: [] },
+      cswap,
+    });
+    expect(obs.claude_accounts).toEqual({
+      count: 2,
+      ordinals: {
+        "claude-swap:4": 0,
+        "claude-swap:9": 1,
+        default: 1,
+      },
+    });
   });
 
   test("the serialized observation carries no PII from either provider", () => {
@@ -623,6 +675,44 @@ describe("observation sidecar", () => {
         }),
       );
       expect(readObservationSidecar(path)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects incomplete or duplicate Claude inventory ordinals", () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-obs-"));
+    try {
+      const path = join(dir, "observation.json");
+      for (const claudeAccounts of [
+        {
+          count: 2,
+          ordinals: { default: 0, "claude-swap:7": 0 },
+        },
+        {
+          count: 2,
+          ordinals: { "claude-swap:7": 0, "claude-swap:9": 0 },
+        },
+      ]) {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            schema_version: 2,
+            observed_at_ms: NOW_MS,
+            health: "ok",
+            codex: {
+              health: "absent",
+              windows: [],
+              resetCreditsAvailableCount: null,
+              notes: [],
+            },
+            routes: [],
+            claude_accounts: claudeAccounts,
+            notes: [],
+          }),
+        );
+        expect(readObservationSidecar(path)).toBeNull();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

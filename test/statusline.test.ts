@@ -12,11 +12,6 @@ import { runSink, type StatuslineLeaf } from "../cli/statusline-sink";
 
 const LANE_GLYPH = "⑂";
 const SEP = "∕";
-// Account-route labels rendered from the explicit KEEPER_ACCOUNT_ROUTE carrier:
-// `default` → `def`, `claude-swap:<slot>` → `cs<slot>` (hand-derived from the
-// label rule — the independent source of truth, never re-derived by the code).
-const ROUTE_DEFAULT = "def";
-const ROUTE_MANAGED = "cs1";
 const NETWORK_GLYPH = "";
 
 function stripAnsi(s: string): string {
@@ -64,7 +59,7 @@ function fakeGit(projectName = "keeper", branch = "main", diff = "") {
 }
 
 describe("statusline render", () => {
-  test("uses the soft slash separator and renders version/account-route last", () => {
+  test("uses the soft slash separator and omits a sole account", () => {
     const plain = stripAnsi(
       renderStatusline(payload("/Users/test/code/jobsearch"), {
         env: { KEEPER_ACCOUNT_ROUTE: "default" },
@@ -75,7 +70,7 @@ describe("statusline render", () => {
     );
 
     expect(plain).toBe(
-      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204 ${SEP} ${ROUTE_DEFAULT}`,
+      `13 ${SEP} jobsearch ${SEP} main ${SEP} opus 4.8 ${SEP} xhigh ${SEP} 2.1.204`,
     );
     expect(plain).not.toContain("❘");
     expect(plain).not.toContain("·");
@@ -111,12 +106,13 @@ describe("statusline render", () => {
     expect(plain).not.toContain("·");
   });
 
-  test("network and managed account-route ride in the final version segment", () => {
+  test("network and Claude inventory ordinal ride in the final version segment", () => {
     const plain = stripAnsi(
       renderStatusline(payload(), {
         env: {
           ANTHROPIC_BASE_URL: "http://127.0.0.1:9123",
-          KEEPER_ACCOUNT_ROUTE: "claude-swap:1",
+          KEEPER_ACCOUNT_ROUTE: "claude-swap:17",
+          KEEPER_ACCOUNT_ORDINAL: "1",
         },
         cwd: "/Users/test/code/keeper",
         palette: null,
@@ -124,19 +120,36 @@ describe("statusline render", () => {
       }),
     );
 
-    expect(
-      plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} ${ROUTE_MANAGED}`),
-    ).toBe(true);
+    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} c1`)).toBe(true);
   });
 
-  test("an absent or unrecognized account route renders no account segment and never inspects CLAUDE_CONFIG_DIR", () => {
-    // No KEEPER_ACCOUNT_ROUTE carrier — the launcher supplied none. The label
-    // resolves to "" and the version segment ends at the version, with no
-    // trailing account chunk. A CLAUDE_CONFIG_DIR / KEEPER_AGENT_CLAUDE_PROFILE
-    // in the env is NEVER consulted for an account label (acceptance #4).
+  test("renders c0/c1/c2 from validated inventory ordinals, never route slots", () => {
+    for (const ordinal of ["0", "1", "2"]) {
+      const plain = stripAnsi(
+        renderStatusline(payload(), {
+          env: {
+            KEEPER_ACCOUNT_ROUTE: "claude-swap:99",
+            KEEPER_ACCOUNT_ORDINAL: ordinal,
+          },
+          cwd: "/Users/test/code/keeper",
+          palette: null,
+          runGit: fakeGit("keeper"),
+        }),
+      );
+      expect(plain.endsWith(`2.1.204 ${SEP} c${ordinal}`)).toBe(true);
+      expect(plain).not.toContain("c99");
+    }
+  });
+
+  test("an absent or invalid ordinal renders no account segment and never inspects account-like env", () => {
+    // No valid KEEPER_ACCOUNT_ORDINAL carrier — the launcher supplied none. The
+    // label resolves to "" and the version segment ends at the version, with no
+    // trailing account chunk. Route/profile env is NEVER inferred as a label.
     const plain = stripAnsi(
       renderStatusline(payload(), {
         env: {
+          KEEPER_ACCOUNT_ROUTE: "claude-swap:2",
+          KEEPER_ACCOUNT_ORDINAL: "-1",
           CLAUDE_CONFIG_DIR: "/Users/test/.claude-profiles/multi-claude-2",
           KEEPER_AGENT_CLAUDE_PROFILE: "multi-claude-2",
         },

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -82,7 +88,7 @@ describe("Pi keeper status footer", () => {
     );
   });
 
-  test("discovers Pi's package version and degrades to a stable label", () => {
+  test("discovers Pi's package version and omits an unresolved version", () => {
     const root = mkdtempSync(join(tmpdir(), "pi-version-"));
     try {
       writeFileSync(
@@ -92,8 +98,14 @@ describe("Pi keeper status footer", () => {
           version: "1.2.3",
         }),
       );
+      mkdirSync(join(root, "dist"));
+      mkdirSync(join(root, "bin"));
+      writeFileSync(join(root, "dist", "cli.js"), "");
+      symlinkSync("../dist/cli.js", join(root, "bin", "pi"));
+
       expect(resolvePiVersion(join(root, "dist", "cli.js"))).toBe("1.2.3");
-      expect(resolvePiVersion("/definitely/missing/pi.js")).toBe("pi");
+      expect(resolvePiVersion(join(root, "bin", "pi"))).toBe("1.2.3");
+      expect(resolvePiVersion("/definitely/missing/pi.js")).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

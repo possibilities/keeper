@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { KEEPER_ACCOUNT_ORDINAL_ENV } from "../src/account-routing-config";
 import { resolveStatuslineDir, runSink } from "./statusline-sink";
 
 const TINTY_SCHEME_FILE = join(
@@ -239,19 +240,17 @@ export function compactKeeperLane(branch: string): string {
 }
 
 /**
- * Render a concise account-route label from the explicit `KEEPER_ACCOUNT_ROUTE`
- * launch carrier the Claude account router injects — `default` (native ambient
- * account) → `def`, `claude-swap:<slot>` (managed route) → `cs<slot>`. The value
- * is the launcher's PII-free route id; an absent or unrecognized value renders
- * nothing, so the label is PII-free by construction. Attribution is explicit —
- * this NEVER inspects `CLAUDE_CONFIG_DIR` for an account identity.
+ * Render the selected account's zero-based position in claude-swap's ordered
+ * inventory. The launcher supplies this only when multiple Claude accounts are
+ * known, so a sole account and every non-Claude provider render no account
+ * segment. Slot numbers are deliberately ignored: they may be sparse and are
+ * stable route identities, not human-facing ordinals.
  */
-function accountLabel(route: string): string {
-  if (route === "default") {
-    return "def";
+function accountLabel(rawOrdinal: string): string {
+  if (!/^(0|[1-9]\d*)$/.test(rawOrdinal)) {
+    return "";
   }
-  const slot = route.match(/^claude-swap:(\d+)$/)?.[1];
-  return slot === undefined ? "" : `cs${slot}`;
+  return `c${rawOrdinal}`;
 }
 
 function resolveGitBranch(
@@ -356,21 +355,21 @@ export function renderStatusline(
   if ((env.ANTHROPIC_BASE_URL ?? "").startsWith("http://127.0.0.1:")) {
     statusChunks.push(`${theme.account}${NETWORK_GLYPH}`);
   }
-  const profile = accountLabel((env.KEEPER_ACCOUNT_ROUTE ?? "").trim());
+  const account = accountLabel((env[KEEPER_ACCOUNT_ORDINAL_ENV] ?? "").trim());
 
   if (input.version !== "") {
     let versionSeg = `${theme.version}${input.version}`;
     if (statusChunks.length > 0) {
       versionSeg += ` ${statusChunks.join(" ")}`;
     }
-    if (profile !== "") {
-      versionSeg += `${theme.sep} ∕ ${theme.account}${profile}`;
+    if (account !== "") {
+      versionSeg += `${theme.sep} ∕ ${theme.account}${account}`;
     }
     parts += `${sep}${versionSeg}`;
-  } else if (statusChunks.length > 0 || profile !== "") {
+  } else if (statusChunks.length > 0 || account !== "") {
     const chunks = [...statusChunks];
-    if (profile !== "") {
-      chunks.push(`${theme.account}${profile}`);
+    if (account !== "") {
+      chunks.push(`${theme.account}${account}`);
     }
     parts += `${sep}${chunks.join(" ")}`;
   }
