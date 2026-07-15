@@ -16,6 +16,9 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
   foreground continuation path; `keeper transcript` stays for explicit
   subagent/tool-detail or Pi branch-aware drill-down
+- **Offline conversion** — `keeper conversation convert --from claude --to pi
+  <session-reference>` writes native Pi sessions for a Claude parent and all of its
+  subagents, with lossless provenance and no daemon or runtime dependency
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling
   cadence of verified DB snapshots guards the log
 - **Agent Bus** — `keeper bus chat send <target> "message"` stores new content in a

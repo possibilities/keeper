@@ -70,6 +70,25 @@ and `wrong_cwd`. Follow `error.recovery`; `wrong_cwd` carries the shell-safe
 re-entry command. `binary_not_found` and `launch_failed` identify native harness
 startup failures—confirm no process started before retrying.
 
+## Offline Session conversion (`keeper conversation convert`)
+
+Conversion resolves an exact Claude Session reference, snapshots the main transcript and
+its subagents, validates native Pi files, then publishes without replacing any destination.
+Human output uses the same codes as prose; `--format json` carries them in the shared
+envelope. No failure includes transcript content.
+
+| code | meaning / recovery | retry-safe |
+| ---- | ------------------ | ---------- |
+| `source_roots_unavailable`, `catalog_read_failed` | Claude's native projects tree is absent or unreadable. Check `--config-dir` and permissions, or use `--source-path <main.jsonl>`. | yes; no output prepared |
+| `source_not_found`, `source_ambiguous` | The exact native id/current-or-historical title missed or matched several Sessions. Correct the reference, add `--project`, or use `--source-path <main.jsonl>`. | yes; no output prepared |
+| `invalid_argument`, `source_not_regular` | The selected source is not a supported regular Claude main transcript. Correct the path or invocation. | yes; no output prepared |
+| `source_read_failed`, `source_decode_failed`, `source_missing_final_lf`, `source_too_large` | The source cannot form one bounded, complete UTF-8 JSONL snapshot. Repair or finish the source artifact before retrying. | yes; no output published |
+| `source_changed_during_read` | Claude changed a source file during the snapshot. Let the session become idle and retry. | yes; no output published |
+| `validation_failed` | The source-to-Pi mapping cannot satisfy the strict native graph/message contract. Preserve the source and report the artifact shape before retrying with corrected input or converter support. | yes; no output published |
+| `publish_collision` | A deterministic destination exists with different bytes or is not a regular file. Choose another Pi agent directory or remove only a verified stale conversion; Keeper never overwrites it. | yes after resolving the collision; the conflicting path is untouched |
+| `publish_failed` | Private staging or no-clobber publication failed. Check permissions/free space and retry; invocation-owned partial outputs are removed. | yes |
+| `conversion_failed` | An unexpected converter fault occurred without exposing its diagnostic or transcript data. Preserve the source and report the command context. | conditional; inspect before repeated retries |
+
 ## Personal notes (`keeper note list|show`)
 
 The finite Note readers use the shared envelope on stdout. `show --raw` emits the
