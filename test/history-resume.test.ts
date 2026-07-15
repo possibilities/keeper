@@ -270,6 +270,43 @@ describe("foreground Session resume", () => {
     });
   });
 
+  test("an artifact-less resume target cannot shadow a real Session title", async () => {
+    const fixture = claudeFixture({
+      id: "claude-real-native-id",
+      project: "/repo/claude",
+      titles: ["shared-selector"],
+    });
+    const catalog = buildSessionCatalog(
+      [fixture.artifact],
+      [
+        job({
+          jobId: "failed-pi-job",
+          harness: "pi",
+          nativeId: "shared-selector",
+          transcriptPath: null,
+          project: "/repo/claude",
+          currentTitle: null,
+          titleHistory: [],
+        }),
+      ],
+    );
+    const fs = fakeFs({
+      files: { [fixture.path]: fixture.text },
+      dirs: ["/repo/claude"],
+    });
+    const h = harness({ catalog, fs, cwd: "/repo/claude" });
+
+    const outcome = await runResumeCli(["shared-selector"], h.deps);
+
+    expect(outcome.code).toBe(0);
+    expect(h.launches).toHaveLength(1);
+    expect(h.launches[0]).toMatchObject({
+      harness: "claude",
+      target: "claude-real-native-id",
+      qualifiedId: "claude:claude-real-native-id",
+    });
+  });
+
   test("standalone Pi resumes by its full native session id and keeps liveness unknown", async () => {
     const fixture = piFixture({
       id: "pi-full-native-id",

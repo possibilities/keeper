@@ -91,8 +91,14 @@ export function resolveSessionReference(
   );
   if (byJobId.length > 0) return atTier(byJobId, "job_id");
 
+  // A bare native id is authoritative only when native discovery supplies its
+  // artifact. An artifact-less job may carry an attempted/stale
+  // `resume_target`; allowing that unverified alias to own this tier can shadow
+  // an exact title of a real Session forever. Explicit `harness:id` and exact
+  // job-id references still resolve artifact-less jobs and surface the honest
+  // missing-artifact capability error.
   const byNativeId = catalog.sessions.filter(
-    (session) => session.nativeId === reference,
+    (session) => session.artifact !== null && session.nativeId === reference,
   );
   if (byNativeId.length > 0) return atTier(byNativeId, "native_id");
 
