@@ -32,6 +32,12 @@ import {
   parsePromptArtifactCatalogBytes,
 } from "./artifact_catalog.ts";
 import {
+  type ClaudeWorkerCompileOptions,
+  type ClaudeWorkerCompileResult,
+  compileClaudeWorkerArtifacts,
+  resolveClaudeCompilerRoots,
+} from "./claude_worker_compiler.ts";
+import {
   findUnsnapshottedRenderDependencies,
   renderTemplateSource,
 } from "./render_engine.ts";
@@ -41,7 +47,7 @@ const SIDECAR_SUFFIX = ".managed-file-dont-edit";
 const COMPILER_REVISION = "keeper-prompt-pi-static-v3";
 
 export interface PromptCompileRequest {
-  readonly target: "pi";
+  readonly target: "pi" | "claude";
   readonly bundle?: string;
   readonly role?: string;
 }
@@ -54,7 +60,7 @@ export interface PromptCompileOptions {
   readonly catalogPath?: string;
   readonly matrixPath?: string;
   readonly equivalencePath?: string;
-  /** Pi definitions directory. Defaults to $PI_CODING_AGENT_DIR/agents. */
+  /** Publication root: Pi definitions directory or Claude workers directory. */
   readonly targetDir?: string;
   readonly taskFacadePath?: string;
   /** Explicit deterministic values for canonical shell expressions. Every value
@@ -99,7 +105,7 @@ export interface PromptCompileRoleResult {
   readonly sidecar_changed: boolean;
 }
 
-export interface PromptCompileResult {
+export interface PromptCompilePiResult {
   readonly schema_version: 1;
   readonly target: "pi";
   readonly request: { readonly kind: "bundle" | "role"; readonly name: string };
@@ -111,6 +117,10 @@ export interface PromptCompileResult {
   readonly check: boolean;
   readonly ok: boolean;
 }
+
+export type PromptCompileResult =
+  | PromptCompilePiResult
+  | ClaudeWorkerCompileResult;
 
 interface PlannedRole {
   role: PromptArtifactRole;
@@ -743,18 +753,43 @@ function roleResults(
   }));
 }
 
-/** Compile and publish the complete static plan-role set. A role/bundle request
- * is validated as the invocation scope, while publication deliberately ensures
- * the whole static set so one manifest has unambiguous orphan ownership. */
+/** Dispatch target-native compilation. A role/bundle request validates the
+ * invocation scope; each publisher still ensures its complete eligible cohort
+ * so one target manifest has unambiguous orphan ownership. */
+export function compilePromptArtifacts(
+  options: PromptCompileOptions & {
+    readonly request: PromptCompileRequest & { readonly target: "pi" };
+  },
+): PromptCompilePiResult;
+export function compilePromptArtifacts(
+  options: PromptCompileOptions & {
+    readonly request: PromptCompileRequest & { readonly target: "claude" };
+  },
+): ClaudeWorkerCompileResult;
+export function compilePromptArtifacts(
+  options: PromptCompileOptions,
+): PromptCompileResult;
 export function compilePromptArtifacts(
   options: PromptCompileOptions,
 ): PromptCompileResult {
-  const repoRoot = resolve(
-    options.repoRoot ?? resolve(import.meta.dir, "../../.."),
-  );
-  const planRoot = resolve(
-    options.planRoot ?? join(repoRoot, "plugins", "plan"),
-  );
+  if (options.request.target === "claude") {
+    const claudeOptions: ClaudeWorkerCompileOptions = {
+      request: { ...options.request, target: "claude" },
+      check: options.check,
+      repoRoot: options.repoRoot,
+      planRoot: options.planRoot,
+      catalogPath: options.catalogPath,
+      matrixPath: options.matrixPath,
+      targetDir: options.targetDir,
+    };
+    return compileClaudeWorkerArtifacts(claudeOptions);
+  }
+  const roots = resolveClaudeCompilerRoots({
+    repoRoot: options.repoRoot,
+    planRoot: options.planRoot,
+  });
+  const repoRoot = roots.repoRoot;
+  const planRoot = roots.planRoot;
   const catalogPath = resolve(
     options.catalogPath ?? join(planRoot, "prompt-artifacts.yaml"),
   );
@@ -832,7 +867,7 @@ export function compilePromptArtifacts(
 
 function compileAgainstTarget(input: {
   options: PromptCompileOptions;
-  request: PromptCompileResult["request"];
+  request: PromptCompilePiResult["request"];
   check: boolean;
   planRoot: string;
   targetDir: string;
@@ -840,7 +875,7 @@ function compileAgainstTarget(input: {
   fingerprint: string;
   snapshot: PromptCompilerSnapshot;
   planned: readonly PlannedRole[];
-}): PromptCompileResult {
+}): PromptCompilePiResult {
   const manifestPath = join(input.targetDir, PI_PROMPT_MANIFEST);
   const previous = readManifest(manifestPath);
 
@@ -969,7 +1004,7 @@ function compileAgainstTarget(input: {
     readFileSync(manifestPath, "utf8") === nextManifest;
   if (!manifestMatches) drifted.add(PI_PROMPT_MANIFEST);
   const drift = drifted.size > 0;
-  const outcome: PromptCompileResult["outcome"] =
+  const outcome: PromptCompilePiResult["outcome"] =
     previous.exists && previous.fingerprint === input.fingerprint
       ? "repaired"
       : "compiled";

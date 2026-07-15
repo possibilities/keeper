@@ -112,12 +112,12 @@ export const PROMPT_COMMANDS: readonly PromptCommandDescriptor[] = [
       {
         name: "role",
         type: "string",
-        summary: "Fully-qualified static role to ensure",
+        summary: "Fully-qualified catalog role to ensure",
       },
       {
         name: "target",
         type: "string",
-        summary: "Publication target (this slice: pi)",
+        summary: "Publication target (pi or claude)",
       },
       {
         name: "agent-dir",

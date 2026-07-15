@@ -35,6 +35,7 @@ const SIDECAR_SUFFIX = ".managed-file-dont-edit";
 interface SidecarData {
   source_template?: unknown;
   sha256?: unknown;
+  regenerate_cmd?: unknown;
 }
 
 /** Parse `<file>.managed-file-dont-edit` JSON, returning null on any failure
@@ -226,7 +227,9 @@ export function run(
   const absSource = sourceRelative
     ? resolve(join(projectRoot, sourceRelative))
     : "(source template unknown)";
-  const regenerateCmd = `keeper prompt render-plugin-templates --project-root ${projectRoot}`;
+  const regenerateCmd =
+    validatedRegenerateCmd(sidecarData?.regenerate_cmd) ??
+    `keeper prompt render-plugin-templates --project-root ${projectRoot}`;
 
   const drift = !editedSidecar && detectDrift(primary, expectedSha);
 
@@ -246,6 +249,22 @@ export function run(
   };
   process.stdout.write(`${JSON.stringify(envelope)}\n`);
   return 0;
+}
+
+function validatedRegenerateCmd(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length > 512 ||
+    value.trim() !== value ||
+    /[\0\r\n]/.test(value)
+  ) {
+    return null;
+  }
+  return /^keeper prompt compile --(?:role|bundle) [a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]* --target (?:pi|claude)$/.test(
+    value,
+  )
+    ? value
+    : null;
 }
 
 function isFile(path: string): boolean {

@@ -10,6 +10,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -19,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { main, positional } from "../src/cli.ts";
 import { PROMPT_COMMANDS } from "../src/descriptor.ts";
 
@@ -244,8 +245,21 @@ describe("keeper prompt dispatcher contract", () => {
     },
     {
       name: "unsupported target",
-      argv: ["compile", "--bundle", "plan:static", "--target", "claude"],
-      message: "does not support target 'claude'",
+      argv: ["compile", "--bundle", "plan:static", "--target", "codex"],
+      message: "does not support target 'codex'",
+    },
+    {
+      name: "Claude with Pi-only agent-dir",
+      argv: [
+        "compile",
+        "--role",
+        "work:worker",
+        "--target",
+        "claude",
+        "--agent-dir",
+        "/tmp/pi",
+      ],
+      message: "--agent-dir is Pi-only",
     },
   ])("compile rejects $name", ({ argv, message }) => {
     const r = run([...argv]);
@@ -297,6 +311,86 @@ describe("keeper prompt dispatcher contract", () => {
       });
       expect(
         statSync(join(agentDir, "agents", ".keeper-plan-agents.json")).isFile(),
+      ).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.KEEPER_CONFIG_DIR;
+      else process.env.KEEPER_CONFIG_DIR = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("check-generated honors a validated compiler regenerate command", () => {
+    const root = mkdtempSync(join(tmpdir(), "kp-check-generated-command-"));
+    const primary = join(root, "workers", "cell", "agents", "worker.md");
+    mkdirSync(dirname(primary), { recursive: true });
+    mkdirSync(join(root, ".git"));
+    writeFileSync(primary, "worker\n");
+    writeFileSync(
+      `${primary}.managed-file-dont-edit`,
+      JSON.stringify({
+        source_template: "plugins/plan/template/agents/worker.md.tmpl",
+        sha256: "0".repeat(64),
+        regenerate_cmd:
+          "keeper prompt compile --role work:worker --target claude",
+      }),
+    );
+    try {
+      const checked = run(["check-generated", primary, "--on", "read"]);
+      expect(JSON.parse(checked.stdout)).toMatchObject({
+        marked: true,
+        regenerate_cmd:
+          "keeper prompt compile --role work:worker --target claude",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("compile accepts Claude with a plan-plugin project root", () => {
+    const liveRoot = resolve(import.meta.dir, "../../..");
+    const root = mkdtempSync(join(tmpdir(), "kp-cli-claude-"));
+    const planRoot = join(root, "plugins", "plan");
+    const config = join(root, "config");
+    mkdirSync(planRoot, { recursive: true });
+    mkdirSync(config, { recursive: true });
+    mkdirSync(join(root, ".git"));
+    cpSync(
+      join(liveRoot, "plugins", "plan", "template"),
+      join(planRoot, "template"),
+      { recursive: true },
+    );
+    cpSync(
+      join(liveRoot, "plugins", "plan", "prompt-artifacts.yaml"),
+      join(planRoot, "prompt-artifacts.yaml"),
+    );
+    writeFileSync(
+      join(config, "matrix.yaml"),
+      readFileSync(join(liveRoot, "docs", "examples", "matrix.example.yaml")),
+    );
+    const saved = process.env.KEEPER_CONFIG_DIR;
+    process.env.KEEPER_CONFIG_DIR = config;
+    try {
+      const r = run([
+        "compile",
+        "--bundle",
+        "plan:work",
+        "--target",
+        "claude",
+        "--project-root",
+        planRoot,
+      ]);
+      expect(r.ret).toBe(0);
+      expect(r.code).toBeUndefined();
+      expect(r.stderr).toBe("");
+      expect(JSON.parse(r.stdout)).toMatchObject({
+        target: "claude",
+        ok: true,
+        request: { kind: "bundle", name: "plan:work" },
+      });
+      expect(
+        statSync(
+          join(planRoot, "workers", ".keeper-prompt-claude.json"),
+        ).isFile(),
       ).toBe(true);
     } finally {
       if (saved === undefined) delete process.env.KEEPER_CONFIG_DIR;

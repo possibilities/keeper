@@ -277,25 +277,40 @@ function dispatch(parsed: ParsedArgs): number {
       if (target === undefined) {
         usageError("compile requires --target");
       }
-      if (target !== "pi") {
+      if (target !== "pi" && target !== "claude") {
         usageError(`compile does not support target '${target}'`);
       }
       const projectRoot = options.strings.get("project-root");
       const agentDir = options.strings.get("agent-dir");
+      if (target === "claude" && agentDir !== undefined) {
+        usageError("compile option --agent-dir is Pi-only");
+      }
       try {
-        const result = compilePromptArtifacts({
-          request: {
-            target: "pi",
-            ...(bundle === undefined ? { role } : { bundle }),
-          },
+        const common = {
           check: options.booleans.has("check"),
           repoRoot:
             projectRoot === undefined ? undefined : resolve(projectRoot),
-          targetDir:
-            agentDir === undefined
-              ? undefined
-              : join(resolve(agentDir), "agents"),
-        });
+        };
+        const result =
+          target === "pi"
+            ? compilePromptArtifacts({
+                ...common,
+                request: {
+                  target: "pi",
+                  ...(bundle === undefined ? { role } : { bundle }),
+                },
+                targetDir:
+                  agentDir === undefined
+                    ? undefined
+                    : join(resolve(agentDir), "agents"),
+              })
+            : compilePromptArtifacts({
+                ...common,
+                request: {
+                  target: "claude",
+                  ...(bundle === undefined ? { role } : { bundle }),
+                },
+              });
         process.stdout.write(`${JSON.stringify(result)}\n`);
         return result.ok ? 0 : 1;
       } catch (error) {
