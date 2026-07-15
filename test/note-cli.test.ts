@@ -379,8 +379,10 @@ describe("keeper note capture lifecycle", () => {
     expect(calls[0].argv).toContain(
       "--header=New Note · Enter: continue · Ctrl-E: open $EDITOR · Esc: cancel",
     );
+    expect(calls[0].argv).toContain("--placeholder=Write a note…");
+    expect(calls[0].argv).not.toContain("--show-line-numbers");
     expect(calls[0].stdinMode).toBe("inherit");
-    expect(calls[0].stderrMode).toBe("gum-filter");
+    expect(calls[0].stderrMode).toBe("inherit");
     expect(store.creates).toEqual(["fresh capture"]);
     expect(store.removedDrafts).toEqual(["draft-2"]);
     expect(store.drafts.map((draft) => draft.id)).toEqual(["draft-1"]);
@@ -401,7 +403,7 @@ describe("keeper note capture lifecycle", () => {
     expect(calls[0].argv.slice(0, 2)).toEqual(["gum", "write"]);
     expect(store.drafts).toHaveLength(1);
     expect(store.creates).toEqual([]);
-    expect(err).toEqual([]);
+    expect(err.join("")).toBe("\u001b[2J\u001b[H");
   });
 
   test("a backup exception does not turn a committed save into a failure", async () => {

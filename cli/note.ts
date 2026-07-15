@@ -92,7 +92,7 @@ export interface ProcessSpec {
   stdin?: string;
   stdinMode?: "pipe" | "inherit";
   stdio?: "capture" | "inherit";
-  stderrMode?: "capture" | "inherit" | "gum-filter";
+  stderrMode?: "capture" | "inherit";
   timeoutMs?: number;
 }
 
@@ -202,48 +202,10 @@ function stringEnv(
   return out;
 }
 
-async function relayGumStderr(
-  stream: ReadableStream<Uint8Array> | undefined,
-): Promise<string> {
-  if (stream === undefined) {
-    throw new Error("spawned process did not expose the requested stderr pipe");
-  }
-  const reader = stream.getReader();
-  const holdBytes = Buffer.byteLength("not submitted\r\n");
-  let pending = Buffer.alloc(0);
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    pending = Buffer.concat([pending, Buffer.from(value)]);
-    if (pending.length > holdBytes) {
-      const emitLength = pending.length - holdBytes;
-      process.stderr.write(pending.subarray(0, emitLength));
-      pending = pending.subarray(emitLength);
-    }
-  }
-  const tail = pending.toString("utf8");
-  const cancelSuffix = tail.endsWith("not submitted\r\n")
-    ? "not submitted\r\n"
-    : tail.endsWith("not submitted\n")
-      ? "not submitted\n"
-      : null;
-  if (cancelSuffix !== null) {
-    const prefix = pending.subarray(
-      0,
-      pending.length - Buffer.byteLength(cancelSuffix),
-    );
-    if (prefix.length > 0) process.stderr.write(prefix);
-    return "";
-  }
-  if (pending.length > 0) process.stderr.write(pending);
-  return tail;
-}
-
 async function defaultRunProcess(spec: ProcessSpec): Promise<ProcessResult> {
   const inherited = spec.stdio === "inherit";
   const inheritStdin = inherited || spec.stdinMode === "inherit";
   const inheritStderr = inherited || spec.stderrMode === "inherit";
-  const filterGumStderr = spec.stderrMode === "gum-filter";
   try {
     const proc = Bun.spawn(spec.argv, {
       ...(spec.cwd === undefined ? {} : { cwd: spec.cwd }),
@@ -291,9 +253,7 @@ async function defaultRunProcess(spec: ProcessSpec): Promise<ProcessResult> {
         : new Response(proc.stdout).text();
       const stderrPromise = inheritStderr
         ? Promise.resolve("")
-        : filterGumStderr
-          ? relayGumStderr(proc.stderr)
-          : new Response(proc.stderr).text();
+        : new Response(proc.stderr).text();
       const [code, stdout, stderr] = await Promise.all([
         proc.exited,
         stdoutPromise,
@@ -517,12 +477,14 @@ async function runGumWriter(
       "write",
       `--width=${gumWriterWidth(process.stderr.columns)}`,
       `--height=${gumWriterHeight(process.stderr.rows)}`,
-      "--show-line-numbers",
       "--header=New Note · Enter: continue · Ctrl-E: open $EDITOR · Esc: cancel",
+      // Gum 0.17 combines placeholders and numbered rows incorrectly: the
+      // placeholder survives as a separate uneditable line. Keep the useful
+      // placeholder and omit line numbers so typed text replaces it normally.
       "--placeholder=Write a note…",
     ],
     stdinMode: "inherit",
-    stderrMode: "gum-filter",
+    stderrMode: "inherit",
   });
   if (result.code === 0) {
     // `gum write` prints the value with one framing newline. Remove that one
@@ -960,8 +922,9 @@ async function captureNewNote(
           : await runEditor(deps, draft);
       if (edited.code !== 0) {
         if (mode === "gum" && edited.code === 1) {
-          // Gum treats Escape as `not submitted`; the process adapter filters
-          // that post-TUI line so tmux can close without exposing an error frame.
+          // Gum prints `not submitted` after Escape. Clear that expected cancel
+          // frame immediately so tmux closes on a blank terminal surface.
+          deps.stderr("\u001b[2J\u001b[H");
           return 0;
         }
         deps.stderr(
