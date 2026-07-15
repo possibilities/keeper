@@ -203,8 +203,11 @@ function stringEnv(
 }
 
 async function relayGumStderr(
-  stream: ReadableStream<Uint8Array>,
+  stream: ReadableStream<Uint8Array> | undefined,
 ): Promise<string> {
+  if (stream === undefined) {
+    throw new Error("spawned process did not expose the requested stderr pipe");
+  }
   const reader = stream.getReader();
   const holdBytes = Buffer.byteLength("not submitted\r\n");
   let pending = Buffer.alloc(0);
