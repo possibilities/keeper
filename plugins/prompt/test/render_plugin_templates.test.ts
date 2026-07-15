@@ -423,7 +423,7 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
         "attacker-influenced",
         "re-run the authoritative test pass",
         "git reset --soft",
-        "forbidden-trailer gate",
+        "sanitized commit message",
         "Task: $TASK_ID",
         "Job-Id:",
         "keeper commit-work",

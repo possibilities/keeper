@@ -6,7 +6,7 @@ upstream:
   repo: arthack
   remote: git@github.com:possibilities/arthack.git
   path: claude/arthack/template/_partials
-  sha: a2c3171ef5699d857d0463cb23fe3f1049d12c40
+  sha: 568b32c41a01c83679ff638fe9a69588e117f66d
 filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
 files:
   claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
