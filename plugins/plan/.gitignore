@@ -22,11 +22,14 @@ node_modules/
 # template/agents/ source tree.
 /agents/
 
-# Generated per-cell `work` plugins (rendered from template/agents/worker.md.tmpl
-# into workers/<model>-<effort>/{.claude-plugin/plugin.json, agents/worker.md},
-# one plugin per cell of the required host matrix; each loads as the constant
-# work:worker, selected at launch via --plugin-dir).
+# Compiler-owned per-cell `work` plugins (published from
+# template/agents/worker.md.tmpl into
+# workers/<model>-<effort>/{.claude-plugin/plugin.json, agents/worker.md}, one
+# plugin per cell of the required host matrix; each loads as the constant
+# work:worker, selected at launch via --plugin-dir). The adjacent lock serializes
+# manifest-last cohort publication.
 workers/
+/workers.keeper-prompt-claude.lock
 
 # Generated skills (rendered from template/skills/*.md.tmpl;
 # each SKILL.md carries _promptctl_path marker).

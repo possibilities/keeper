@@ -86,7 +86,7 @@ function copyTemplatesDir(): string {
 function renderPlanInProcess(configDir: string): { work: string; rc: number } {
   const work = mkdtempSync(join(tmpdir(), "agent-pins-render-"));
   const livePlanRoot = join(KEEPER_ROOT, "plugins", "plan");
-  for (const entry of [".claude-plugin", "template"]) {
+  for (const entry of [".claude-plugin", "template", "prompt-artifacts.yaml"]) {
     cpSync(join(livePlanRoot, entry), join(work, entry), { recursive: true });
   }
   writeFileSync(join(work, ".git"), ""); // synthetic project-root marker

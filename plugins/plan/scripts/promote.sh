@@ -25,7 +25,8 @@ echo "promote: building dist/keeper-plan-bun (hard prerequisite)"
 
 keeper_root="$(cd "${repo_root}/../.." && pwd)"
 
-# Render the per-cell work plugins so the WORKERS_RENDERED-gated guards in
+# Render the plugin templates and delegate the per-cell work cohort to the
+# Claude prompt compiler so the WORKERS_RENDERED-gated guards in
 # consistency-generated-guard.test.ts see them on disk. Those guards hold
 # host-blind structural invariants on the rendered tree — every cell name parses
 # as <model>-<canonical-effort>, and no non-cell `work`-named plugin shadows the
@@ -36,22 +37,25 @@ keeper_root="$(cd "${repo_root}/../.." && pwd)"
 # render the plan guards silently skip. A `git status` diff here would be dead:
 # every rendered output (workers/, agents/practice-scout.md) is gitignored and so
 # invisible to porcelain, and the hand-authored agents/ files are never rendered.
-echo "promote: rendering per-cell work plugins for the cell-set guard"
+echo "promote: rendering plugin templates and compiling work cells for the cell-set guard"
 ( cd "${keeper_root}" && bun cli/prompt.ts render-plugin-templates --project-root "${keeper_root}" )
 
-# Report >0 plugins rendered. The render step is a SILENT no-op on an
-# already-rendered tree (only changed files print `✓ Rendered`), so counting
-# stdout lines is unreliable — verify the plan plugin's per-cell tree exists on
-# disk instead. A zero here means discoverPluginDirs failed to find the plan
-# plugin under the keeper-root --project-root (the `plugins/*` scan branch).
+# The front door is silent on an already-current tree, so verify compiler
+# ownership directly: publication requires its managed manifest, at least one
+# cell, and a drift-free compiler check against the same host matrix.
 plan_workers="${keeper_root}/plugins/plan/workers"
+compiler_manifest="${plan_workers}/.keeper-prompt-claude.json"
 cell_count="$(find "${plan_workers}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
-if [ "${cell_count}" -eq 0 ]; then
-  echo "promote: ABORT — render produced no plan-plugin work cells under ${plan_workers}" >&2
-  echo "  discoverPluginDirs must scan plugins/* so a keeper-root --project-root finds the plan plugin" >&2
+if [ ! -f "${compiler_manifest}" ] || [ "${cell_count}" -eq 0 ]; then
+  echo "promote: ABORT — delegated compiler publication is incomplete under ${plan_workers}" >&2
+  echo "  expected ${compiler_manifest} and at least one work cell" >&2
   exit 1
 fi
-echo "promote: rendered the plan plugin — ${cell_count} work cell(s) under plugins/plan/workers/"
+if ! ( cd "${keeper_root}" && bun cli/prompt.ts compile --bundle plan:work --target claude --project-root "${keeper_root}" --check >/dev/null ); then
+  echo "promote: ABORT — delegated Claude worker publication failed compiler verification" >&2
+  exit 1
+fi
+echo "promote: compiler-verified the plan plugin — ${cell_count} work cell(s) under plugins/plan/workers/"
 
 mkdir -p "${dest_dir}"
 

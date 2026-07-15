@@ -65,11 +65,12 @@ else
     echo "install: shell completions step failed (non-fatal); continuing" >&2
 fi
 
-# 3. Render the plan plugin's generated files (per-cell work plugins, skills/work,
-#    agents/practice-scout) so a fresh clone can spawn work:worker and the plan
-#    consistency suites run instead of skipping. Every rendered output + sidecar is
-#    gitignored, so this regenerates them locally on each install — the exact render
-#    command lives in the repo, recoverable, not in shell history. The prompt engine
+# 3. Render the plan plugin's generated files (skills/work and static agents),
+#    delegating the per-cell work cohort once to the Claude prompt compiler, so a
+#    fresh clone can spawn work:worker and the plan consistency suites run instead
+#    of skipping. Every rendered output + sidecar is gitignored, so this regenerates
+#    them locally on each install — the compatibility front-door command lives in
+#    the repo, recoverable, not in shell history. The prompt engine
 #    carries its own deps (liquidjs) that the repo-root `bun install` above does not
 #    reach, so install them in-tree first, then render from the keeper root
 #    (discoverPluginDirs scans plugins/* to find the plan plugin under it).
