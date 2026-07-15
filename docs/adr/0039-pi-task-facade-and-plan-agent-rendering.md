@@ -38,7 +38,9 @@ Publication is compiler-owned and lock-scoped. The compiler canonicalizes the ou
 
 The existing panel skill, runner, subprocess fan-out, durable waits, and judge contract remain unchanged. A Pi planning environment selects panel rosters containing only Pi launch triples when Claude inference is not permitted.
 
-Plan mutation resolves identity from `KEEPER_PLAN_SESSION_ID`, then native `CLAUDE_CODE_SESSION_ID`, then `KEEPER_JOB_ID`. The same resolved identity governs invocation payloads, touched paths, and session markers. `keeper commit-work` accepts `KEEPER_JOB_ID` after its existing explicit and Claude-specific sources, allowing plan-time source and ADR commits from a tracked Pi session without impersonating Claude.
+Plan mutation resolves identity from `KEEPER_PLAN_SESSION_ID`, then native `CLAUDE_CODE_SESSION_ID`, then `KEEPER_JOB_ID`. The same resolved identity governs invocation payloads, touched paths, and session markers. Commit authority accepts exactly tracked Claude/Pi jobs whose full working harness, process generation, and task row remains unchanged around an OS-ancestry walk; possession of `KEEPER_JOB_ID` alone grants nothing.
+
+The tracked Pi extension adapts only explicitly successful native `write`/`edit` results into canonical mutation receipts and dead-letters failed receipt appends. Its sequential `keeper_commit_work` tool invokes the launcher-stamped absolute Keeper CLI with array argv and no shell, exposes preview/adoption/task controls, and returns bounded explicit local/remote/indeterminate state. Pi therefore uses the same ownership, lint, hook, signing, frozen-index, CAS, and exact-SHA push implementation rather than a second commit engine.
 
 ## Alternatives considered
 

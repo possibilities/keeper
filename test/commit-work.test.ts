@@ -30,8 +30,8 @@ import {
   type CommitWorkDeps,
   runForTest as runCommitWorkForTest,
   taskBoundToIdentity,
-  trustedClaudeAuthority,
-  trustedClaudeIdentity,
+  trustedCommitWorkAuthority,
+  trustedCommitWorkIdentity,
 } from "../cli/commit-work";
 import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import { LintFailure } from "../src/commit-work/lint-matrix";
@@ -392,7 +392,7 @@ describe("commit-work: session id", () => {
     expect(stdout).not.toContain("\n  ");
   });
 
-  test("default authority binds identity and Task to this Claude process ancestry", async () => {
+  test("default authority binds Claude and Pi identities to exact process ancestry", async () => {
     const root = mkdtempSync(join(tmpdir(), "keeper-commit-authority-"));
     const path = join(root, "keeper.db");
     const { db } = freshDbFile(path);
@@ -425,38 +425,53 @@ describe("commit-work: session id", () => {
           legacy,
         ],
       );
-      expect(await trustedClaudeIdentity(TEST_ID, path, processOptions)).toBe(
-        true,
-      );
+      expect(
+        await trustedCommitWorkIdentity(TEST_ID, path, processOptions),
+      ).toBe(true);
       expect(taskBoundToIdentity(TEST_ID, "fn-1-task.1", path)).toBe(true);
       expect(taskBoundToIdentity(TEST_ID, "fn-1-other.1", path)).toBe(false);
       expect(
-        await trustedClaudeIdentity(
+        await trustedCommitWorkIdentity(
           "22222222-2222-4222-8222-222222222222",
           path,
           processOptions,
         ),
-      ).toBe(false);
+      ).toBe(true);
       expect(
-        await trustedClaudeIdentity(
+        taskBoundToIdentity(
+          "22222222-2222-4222-8222-222222222222",
+          "fn-1-task.1",
+          path,
+        ),
+      ).toBe(true);
+      expect(
+        await trustedCommitWorkAuthority(
+          "22222222-2222-4222-8222-222222222222",
+          "fn-1-other.9",
+          path,
+          processOptions,
+        ),
+      ).toBe("task_unbound");
+      expect(
+        await trustedCommitWorkIdentity(
           "33333333-3333-4333-8333-333333333333",
           path,
           processOptions,
         ),
       ).toBe(false);
       // A live Claude sibling cannot borrow its UUID: its pid is not an ancestor.
-      expect(await trustedClaudeIdentity(sibling, path, processOptions)).toBe(
-        false,
-      );
+      expect(
+        await trustedCommitWorkIdentity(sibling, path, processOptions),
+      ).toBe(false);
       // Pre-harness rows are not sufficient evidence for the Claude-only verb.
-      expect(await trustedClaudeIdentity(legacy, path, processOptions)).toBe(
-        false,
-      );
+      expect(
+        await trustedCommitWorkIdentity(legacy, path, processOptions),
+      ).toBe(false);
       expect(taskBoundToIdentity(legacy, "fn-1-task.1", path)).toBe(false);
 
       let rebound = false;
       expect(
-        await trustedClaudeAuthority(TEST_ID, "fn-1-task.1", path, {
+        await trustedCommitWorkAuthority(TEST_ID, "fn-1-task.1", path, {
           currentPid: 9000,
           read: (pid) => {
             if (pid === 8000 && !rebound) {
@@ -475,9 +490,27 @@ describe("commit-work: session id", () => {
         TEST_ID,
       ]);
 
+      let harnessSwapped = false;
+      expect(
+        await trustedCommitWorkIdentity(TEST_ID, path, {
+          currentPid: 9000,
+          read: (pid) => {
+            if (pid === 8000 && !harnessSwapped) {
+              db.run("UPDATE jobs SET harness = 'pi' WHERE job_id = ?", [
+                TEST_ID,
+              ]);
+              harnessSwapped = true;
+            }
+            return processOptions.read(pid);
+          },
+        }),
+      ).toBe(false);
+      expect(harnessSwapped).toBe(true);
+      db.run("UPDATE jobs SET harness = 'claude' WHERE job_id = ?", [TEST_ID]);
+
       let revoked = false;
       expect(
-        await trustedClaudeIdentity(TEST_ID, path, {
+        await trustedCommitWorkIdentity(TEST_ID, path, {
           currentPid: 9000,
           read: (pid) => {
             if (pid === 8000 && !revoked) {
@@ -497,7 +530,7 @@ describe("commit-work: session id", () => {
     }
   });
 
-  test("rejects an identity not bound to an active Claude job", async () => {
+  test("rejects an identity not bound to an active supported job", async () => {
     const { d } = deps({ files: [], rules: [] });
     const { code, stdout } = await runForTest(
       ["--preview-files", "--session-id", "s1"],

@@ -29,6 +29,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  piEventBindings,
+  serializePiLine,
+} from "../plugins/keeper/pi-extension/keeper-events";
 import { BackstopCounters } from "../src/backstop-telemetry";
 import type { EventsIngestContext } from "../src/daemon";
 import {
@@ -138,6 +142,112 @@ test("scanEventsLogDir ingests each NDJSON line as an events row", () => {
     expect(row.config_dir).toBe("/Users/x/.claude");
   }
 
+  db.close();
+});
+
+test("a canonical Pi mutation receipt lands its sparse mutation_path", () => {
+  const { db } = freshMemDb();
+  mkdirSync(eventsLogDir, { recursive: true });
+  const bindings = piEventBindings(
+    {
+      type: "tool_result",
+      toolName: "write",
+      input: { path: "owned.ts", content: "x" },
+      mutationPath: "/repo/owned.ts",
+      isError: false,
+    },
+    {
+      jobId: "pi-job",
+      pid: LIVE_PID,
+      cwd: "/repo",
+      tsSec: 2,
+    },
+  );
+  if (bindings === null) throw new Error("expected Pi bindings");
+  writeFileSync(
+    join(eventsLogDir, `${LIVE_PID}.ndjson`),
+    serializePiLine(bindings),
+  );
+
+  scanEventsLogDir(db, eventsLogDir);
+  expect(
+    db
+      .query(
+        "SELECT session_id, hook_event, tool_name, mutation_path FROM events",
+      )
+      .get(),
+  ).toEqual({
+    session_id: "pi-job",
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    mutation_path: "/repo/owned.ts",
+  });
+  db.close();
+});
+
+test("sparse Pi Bash results receive shared observation and Plan derivers", () => {
+  const { db } = freshMemDb();
+  mkdirSync(eventsLogDir, { recursive: true });
+  const meta = {
+    jobId: "pi-job",
+    pid: LIVE_PID,
+    cwd: "/repo",
+    tsSec: 2,
+  };
+  const packageBinding = piEventBindings(
+    {
+      type: "tool_result",
+      toolName: "bash",
+      input: { command: "pnpm install" },
+      isError: false,
+    },
+    meta,
+  );
+  const planBinding = piEventBindings(
+    {
+      type: "tool_result",
+      toolName: "bash",
+      input: { command: "keeper plan task-set-tier fn-1-pi.2 high" },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            plan_invocation: {
+              op: "task-set-tier",
+              target: "fn-1-pi.2",
+              subject: {},
+              files: ["src/pi.ts"],
+            },
+          }),
+        },
+      ],
+      isError: false,
+    },
+    { ...meta, tsSec: 3 },
+  );
+  if (packageBinding === null || planBinding === null)
+    throw new Error("expected Pi bindings");
+  writeFileSync(
+    join(eventsLogDir, `${LIVE_PID}.ndjson`),
+    serializePiLine(packageBinding) + serializePiLine(planBinding),
+  );
+
+  scanEventsLogDir(db, eventsLogDir);
+  const rows = db
+    .query(
+      `SELECT bash_mutation_kind, plan_op, plan_target, plan_task_id,
+              plan_files
+         FROM events
+        ORDER BY id`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  expect(rows[0]?.bash_mutation_kind).toBe("pkg-install");
+  expect(rows[1]).toMatchObject({
+    plan_op: "task-set-tier",
+    plan_target: "fn-1-pi.2",
+    plan_task_id: "fn-1-pi.2",
+    plan_files: '["src/pi.ts"]',
+  });
   db.close();
 });
 
@@ -695,6 +805,60 @@ test("recoverOneDeadLetter binds INGEST_EVENTS_COLUMNS — a replayed row carrie
   expect(ev?.background_task_id).toBe("bg-123");
   expect(ev?.backend_exec_type).toBe("zellij");
 
+  db.close();
+});
+
+test("dead-letter replay completes the same sparse Pi derivers as live ingest", () => {
+  const { db } = freshMemDb();
+  const bindings = piEventBindings(
+    {
+      type: "tool_result",
+      toolName: "bash",
+      input: { command: "keeper plan task-set-tier fn-1-pi.3 low" },
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            plan_invocation: {
+              op: "task-set-tier",
+              target: "fn-1-pi.3",
+              subject: {},
+              files: ["src/replayed.ts"],
+            },
+          }),
+        },
+      ],
+      isError: false,
+    },
+    {
+      jobId: "pi-replayed",
+      pid: LIVE_PID,
+      cwd: "/repo",
+      tsSec: 4,
+    },
+  );
+  if (bindings === null) throw new Error("expected Pi bindings");
+  db.query(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+     VALUES ('dl-pi-sparse', 'pi-replayed', 'PostToolUse', 4, 4, ?, ?, 'waiting')`,
+  ).run(LIVE_PID, JSON.stringify(bindings));
+
+  expect(recoverOneDeadLetter(db)).toBe("dl-pi-sparse");
+  expect(
+    db
+      .query(
+        `SELECT plan_op, plan_target, plan_task_id, plan_files
+           FROM events
+          WHERE session_id = 'pi-replayed'`,
+      )
+      .get(),
+  ).toEqual({
+    plan_op: "task-set-tier",
+    plan_target: "fn-1-pi.3",
+    plan_task_id: "fn-1-pi.3",
+    plan_files: '["src/replayed.ts"]',
+  });
   db.close();
 });
 

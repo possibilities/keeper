@@ -62,7 +62,7 @@ Preview explains the complete dirty surface. Attribution gaps are covered with
 explicit, invocation-local adoption; adoption never creates a durable claim.
 
 Options:
-  --session-id <uuid>  Claude identity (carrier agreement + process ancestry required)
+  --session-id <uuid>  Tracked harness identity (carrier + process ancestry required)
   --adopt <path>       Adopt one exact dirty path; repeat for multiple paths
   --adopt-from <file>  Read paths from a versioned JSON adoption manifest
   --message-file <file>
@@ -814,7 +814,7 @@ function finalOwnershipFailure(
   return null;
 }
 
-interface ClaudeAuthorityRow {
+interface CommitWorkAuthorityRow {
   state: unknown;
   harness: unknown;
   pid: unknown;
@@ -823,15 +823,15 @@ interface ClaudeAuthorityRow {
   plan_ref: unknown;
 }
 
-export type ClaudeAuthorityVerdict =
+export type CommitWorkAuthorityVerdict =
   | "ok"
   | "identity_untrusted"
   | "task_unbound";
 
-function readClaudeAuthorityRow(
+function readCommitWorkAuthorityRow(
   identity: string,
   dbPath: string,
-): ClaudeAuthorityRow | null {
+): CommitWorkAuthorityRow | null {
   const { db } = openDb(dbPath, { readonly: true });
   try {
     return db
@@ -840,18 +840,22 @@ function readClaudeAuthorityRow(
            FROM jobs
           WHERE job_id = ?`,
       )
-      .get(identity) as ClaudeAuthorityRow | null;
+      .get(identity) as CommitWorkAuthorityRow | null;
   } finally {
     db.close();
   }
 }
 
-function validClaudeAuthorityRow(
-  row: ClaudeAuthorityRow | null,
-): row is ClaudeAuthorityRow & { pid: number; start_time: string } {
+function validCommitWorkAuthorityRow(
+  row: CommitWorkAuthorityRow | null,
+): row is CommitWorkAuthorityRow & {
+  harness: "claude" | "pi";
+  pid: number;
+  start_time: string;
+} {
   return (
     row?.state === "working" &&
-    row.harness === "claude" &&
+    (row.harness === "claude" || row.harness === "pi") &&
     typeof row.pid === "number" &&
     Number.isSafeInteger(row.pid) &&
     row.pid > 1 &&
@@ -860,7 +864,7 @@ function validClaudeAuthorityRow(
   );
 }
 
-export async function trustedClaudeAuthority(
+export async function trustedCommitWorkAuthority(
   identity: string,
   taskId: string | null,
   dbPath = defaultDbPath(),
@@ -869,10 +873,10 @@ export async function trustedClaudeAuthority(
     read?: ProcessIdentityReader;
     maxDepth?: number;
   } = {},
-): Promise<ClaudeAuthorityVerdict> {
+): Promise<CommitWorkAuthorityVerdict> {
   try {
-    const before = readClaudeAuthorityRow(identity, dbPath);
-    if (!validClaudeAuthorityRow(before)) return "identity_untrusted";
+    const before = readCommitWorkAuthorityRow(identity, dbPath);
+    if (!validCommitWorkAuthorityRow(before)) return "identity_untrusted";
     if (
       !(await invocationDescendsFrom(
         before.pid,
@@ -884,9 +888,11 @@ export async function trustedClaudeAuthority(
     }
     // PID identity and task authority are one generation-bound row. Sandwich
     // the ancestry walk with every authority field, not two independent reads.
-    const after = readClaudeAuthorityRow(identity, dbPath);
+    const after = readCommitWorkAuthorityRow(identity, dbPath);
     if (
-      !validClaudeAuthorityRow(after) ||
+      !validCommitWorkAuthorityRow(after) ||
+      after.state !== before.state ||
+      after.harness !== before.harness ||
       after.pid !== before.pid ||
       after.start_time !== before.start_time ||
       after.plan_verb !== before.plan_verb ||
@@ -903,7 +909,7 @@ export async function trustedClaudeAuthority(
   }
 }
 
-export async function trustedClaudeIdentity(
+export async function trustedCommitWorkIdentity(
   identity: string,
   dbPath = defaultDbPath(),
   processOptions: {
@@ -913,8 +919,12 @@ export async function trustedClaudeIdentity(
   } = {},
 ): Promise<boolean> {
   return (
-    (await trustedClaudeAuthority(identity, null, dbPath, processOptions)) ===
-    "ok"
+    (await trustedCommitWorkAuthority(
+      identity,
+      null,
+      dbPath,
+      processOptions,
+    )) === "ok"
   );
 }
 
@@ -942,7 +952,7 @@ export function taskBoundToIdentity(
         row?.plan_verb === "work" &&
         row.plan_ref === taskId &&
         row.state === "working" &&
-        row.harness === "claude"
+        (row.harness === "claude" || row.harness === "pi")
       );
     } finally {
       db.close();
@@ -1004,14 +1014,16 @@ async function runAttempt(
   }
 
   const validateInvocationAuthority =
-    async (): Promise<ClaudeAuthorityVerdict> => {
+    async (): Promise<CommitWorkAuthorityVerdict> => {
       if (
         deps.validateIdentity === undefined &&
         deps.validateTaskBinding === undefined
       ) {
-        return await trustedClaudeAuthority(identity, args.taskId);
+        return await trustedCommitWorkAuthority(identity, args.taskId);
       }
-      if (!(await (deps.validateIdentity ?? trustedClaudeIdentity)(identity))) {
+      if (
+        !(await (deps.validateIdentity ?? trustedCommitWorkIdentity)(identity))
+      ) {
         return "identity_untrusted";
       }
       if (

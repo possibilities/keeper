@@ -10,15 +10,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import keeperEvents, {
+import { pathToFileURL } from "node:url";
+import keeperEventsExtension, {
+  canonicalPiMutationPath,
   clampHistoryParams,
+  defaultPiEventStorePaths,
   executeHistoryTool,
   type HistoryExecFile,
   historyCliArgs,
@@ -31,7 +37,8 @@ import keeperEvents, {
   type PiTranslateMeta,
   piDispatchAttemptFromEnv,
   piEventBindings,
-  resolvePiEventsLogDir,
+  preparePiMutationEvent,
+  resolvePiMutationInputPath,
   sendPiBusMessage,
   serializePiLine,
   titleEventBindings,
@@ -57,7 +64,7 @@ import {
   stripUnsafeText,
 } from "../plugins/keeper/pi-extension/rename-command";
 import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
-import { parseEventLogLine } from "../src/dead-letter";
+import { parseDeadLetterLine, parseEventLogLine } from "../src/dead-letter";
 import { slugify as canonicalSlugify } from "../src/slug";
 import { retryUntil } from "./helpers/retry-until";
 
@@ -141,27 +148,147 @@ describe("pi extension — pure translation", () => {
     );
     expect(b?.hook_event).toBe("PreToolUse");
     expect(b?.event_type).toBe("pre_tool_use");
-    expect(b?.tool_name).toBe("bash");
+    expect(b?.tool_name).toBe("Bash");
     expect(JSON.parse(b?.data as string)).toEqual({
       hook_event_name: "PreToolUse",
-      tool_name: "bash",
+      tool_name: "Bash",
       tool_input: { command: "ls -la" },
     });
   });
 
-  test("tool_result folds to PostToolUse carrying the error flag", () => {
+  test("failed tool_result folds to non-attributing PostToolUseFailure", () => {
     const b = piEventBindings(
-      { type: "tool_result", toolName: "edit", isError: true },
+      {
+        type: "tool_result",
+        toolName: "edit",
+        input: { path: "failed.ts" },
+        isError: true,
+      },
       META,
     );
-    expect(b?.hook_event).toBe("PostToolUse");
-    expect(b?.event_type).toBe("post_tool_use");
-    expect(b?.tool_name).toBe("edit");
+    expect(b?.hook_event).toBe("PostToolUseFailure");
+    expect(b?.event_type).toBe("post_tool_use_failure");
+    expect(b?.tool_name).toBe("Edit");
+    expect(b?.mutation_path).toBeUndefined();
     expect(JSON.parse(b?.data as string)).toEqual({
-      hook_event_name: "PostToolUse",
-      tool_name: "edit",
+      hook_event_name: "PostToolUseFailure",
+      tool_name: "Edit",
+      tool_input: { path: "failed.ts", file_path: "failed.ts" },
       is_error: true,
     });
+  });
+
+  test("successful Pi write/edit results carry canonical exclusive mutation evidence", () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-pi-mutation-"));
+    try {
+      mkdirSync(join(root, "real"));
+      writeFileSync(join(root, "real", "file.ts"), "x\n");
+      symlinkSync("real", join(root, "alias"));
+      const prepared = preparePiMutationEvent(
+        {
+          type: "tool_result",
+          toolName: "write",
+          input: { path: "alias/file.ts", content: "x" },
+          content: [{ type: "text", text: "Wrote alias/file.ts" }],
+          isError: false,
+        },
+        root,
+      );
+      const b = piEventBindings(prepared, { ...META, cwd: root });
+      expect(b?.hook_event).toBe("PostToolUse");
+      expect(b?.tool_name).toBe("Write");
+      expect(b?.mutation_path).toBe(
+        realpathSync(join(root, "real", "file.ts")),
+      );
+      expect(JSON.parse(String(b?.data))).toMatchObject({
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: {
+          path: "alias/file.ts",
+          file_path: "alias/file.ts",
+        },
+        tool_response: { stdout: "Wrote alias/file.ts" },
+        is_error: false,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("mutation inputs mirror Pi tilde, file URL, at-prefix, and Unicode-space resolution", () => {
+    expect(resolvePiMutationInputPath("~/owned.ts", "/repo")).toBe(
+      join(homedir(), "owned.ts"),
+    );
+    expect(
+      resolvePiMutationInputPath(
+        pathToFileURL("/repo/file url.ts").href,
+        "/ignored",
+      ),
+    ).toBe("/repo/file url.ts");
+    expect(resolvePiMutationInputPath("@src/owned.ts", "/repo")).toBe(
+      "/repo/src/owned.ts",
+    );
+    expect(resolvePiMutationInputPath("unicode\u202fspace.ts", "/repo")).toBe(
+      "/repo/unicode space.ts",
+    );
+  });
+
+  test("native Pi mutation attribution follows a stable leaf symlink", () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-pi-leaf-link-"));
+    try {
+      writeFileSync(join(root, "target.ts"), "target\n");
+      symlinkSync("target.ts", join(root, "leaf.ts"));
+      const event = preparePiMutationEvent(
+        {
+          type: "tool_result",
+          toolName: "edit",
+          input: { path: "leaf.ts", edits: [] },
+          isError: false,
+        },
+        root,
+      );
+      expect(event.mutationPath).toBe(realpathSync(join(root, "target.ts")));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("missing Pi result status is failure, never positive attribution", () => {
+    const event = preparePiMutationEvent(
+      {
+        type: "tool_result",
+        toolName: "write",
+        input: { path: "unknown.ts" },
+      },
+      "/repo",
+    );
+    expect(event.mutationPath).toBeUndefined();
+    const bindings = piEventBindings(event, META);
+    expect(bindings?.hook_event).toBe("PostToolUseFailure");
+    expect(bindings?.mutation_path).toBeUndefined();
+  });
+
+  test("Pi mutation canonicalization refuses an unavailable filesystem root", () => {
+    const unavailable = (): never => {
+      throw new Error("unavailable");
+    };
+    const fs = {
+      lstat: unavailable as typeof import("node:fs").lstatSync,
+      stat: unavailable as typeof import("node:fs").statSync,
+      realpath: unavailable as unknown as typeof import("node:fs").realpathSync,
+    };
+    expect(canonicalPiMutationPath("file.ts", "/repo", fs)).toBeNull();
+    const event = preparePiMutationEvent(
+      {
+        type: "tool_result",
+        toolName: "write",
+        input: { path: "file.ts" },
+        isError: false,
+      },
+      "/repo",
+      fs,
+    );
+    expect(piEventBindings(event, META)?.mutation_path).toBeNull();
   });
 
   test("session_shutdown[quit] folds to a clean SessionEnd", () => {
@@ -570,6 +697,14 @@ describe("pi extension — history tool result shaping and cancellation", () => 
 describe("pi extension — factory arming + fail-open", () => {
   const saved: Record<string, string | undefined> = {};
   let logDir: string;
+  let deadLetterDir: string;
+
+  function keeperEvents(
+    pi: PiExtensionApi,
+    paths = { eventsLogDir: logDir, deadLetterDir },
+  ): void {
+    keeperEventsExtension(pi, paths);
+  }
 
   function fakePi() {
     const handlers = new Map<
@@ -621,20 +756,15 @@ describe("pi extension — factory arming + fail-open", () => {
 
   beforeEach(() => {
     saved.KEEPER_JOB_ID = process.env.KEEPER_JOB_ID;
-    saved.KEEPER_EVENTS_LOG = process.env.KEEPER_EVENTS_LOG;
     saved.KEEPER_DISPATCH_ATTEMPT_ID = process.env.KEEPER_DISPATCH_ATTEMPT_ID;
     logDir = mkdtempSync(join(tmpdir(), "pi-ext-"));
-    process.env.KEEPER_EVENTS_LOG = logDir;
+    deadLetterDir = join(logDir, "dead-letters");
     delete process.env.KEEPER_JOB_ID;
     delete process.env.KEEPER_DISPATCH_ATTEMPT_ID;
   });
 
   afterEach(() => {
-    for (const k of [
-      "KEEPER_JOB_ID",
-      "KEEPER_EVENTS_LOG",
-      "KEEPER_DISPATCH_ATTEMPT_ID",
-    ]) {
+    for (const k of ["KEEPER_JOB_ID", "KEEPER_DISPATCH_ATTEMPT_ID"]) {
       if (saved[k] === undefined) {
         delete process.env[k];
       } else {
@@ -668,7 +798,11 @@ describe("pi extension — factory arming + fail-open", () => {
       "tool_result",
       "turn_end",
     ]);
-    expect([...pi.tools.keys()]).toEqual(["keeper_history", "Task"]);
+    expect([...pi.tools.keys()]).toEqual([
+      "keeper_history",
+      "keeper_commit_work",
+      "Task",
+    ]);
     const history = pi.tools.get("keeper_history") as {
       description: string;
       promptGuidelines: string[];
@@ -754,6 +888,34 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(parsed?.bindings.pid).toBe(process.pid);
   });
 
+  test("a successful native Pi write emits an immediately readable mutation receipt", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    const repo = join(logDir, "repo");
+    mkdirSync(repo);
+    writeFileSync(join(repo, "owned.ts"), "owned\n");
+    const pi = fakePi();
+    keeperEvents(pi);
+    pi.fire(
+      "tool_result",
+      {
+        type: "tool_result",
+        toolName: "write",
+        input: { path: "owned.ts", content: "owned" },
+        isError: false,
+      },
+      { cwd: repo } as PiSessionContext,
+    );
+    const body = readFileSync(join(logDir, `${process.pid}.ndjson`), "utf8");
+    const parsed = parseEventLogLine(body.trim());
+    expect(parsed?.bindings).toMatchObject({
+      session_id: "job-live",
+      hook_event: "PostToolUse",
+      tool_name: "Write",
+      cwd: repo,
+      mutation_path: realpathSync(join(repo, "owned.ts")),
+    });
+  });
+
   test("malformed attempt metadata stays fail-open and unfenced", () => {
     process.env.KEEPER_JOB_ID = "job-live";
     process.env.KEEPER_DISPATCH_ATTEMPT_ID = "not-an-attempt";
@@ -775,16 +937,44 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(existsSync(join(logDir, `${process.pid}.ndjson`))).toBe(false);
   });
 
-  test("a write that throws never propagates out of the handler guard", () => {
+  test("a failed receipt append dead-letters exact Pi mutation evidence", () => {
     process.env.KEEPER_JOB_ID = "job-live";
+    const repo = join(logDir, "dead-letter-repo");
+    mkdirSync(repo);
+    writeFileSync(join(repo, "owned.ts"), "owned\n");
     // Point the events-log dir UNDER an existing file so mkdir/append throw.
     const blocker = join(logDir, "blocker");
     writeFileSync(blocker, "not a dir");
-    process.env.KEEPER_EVENTS_LOG = join(blocker, "nested");
     const pi = fakePi();
-    keeperEvents(pi);
-    // The deliberately-failing write must be swallowed — no throw escapes.
-    expect(() => pi.fire("agent_start", { type: "agent_start" })).not.toThrow();
+    keeperEvents(pi, {
+      eventsLogDir: join(blocker, "nested"),
+      deadLetterDir,
+    });
+    expect(() =>
+      pi.fire(
+        "tool_result",
+        {
+          type: "tool_result",
+          toolName: "edit",
+          input: { path: "owned.ts", edits: [] },
+          isError: false,
+        },
+        { cwd: repo } as PiSessionContext,
+      ),
+    ).not.toThrow();
+    const body = readFileSync(
+      join(deadLetterDir, `${process.pid}.ndjson`),
+      "utf8",
+    );
+    expect(parseDeadLetterLine(body.trim())).toMatchObject({
+      session_id: "job-live",
+      hook_event: "PostToolUse",
+      pid: process.pid,
+      bindings: {
+        tool_name: "Edit",
+        mutation_path: realpathSync(join(repo, "owned.ts")),
+      },
+    });
   });
 
   test("bus delivery uses steer + idle wake and swallows a stale Pi API", () => {
@@ -848,12 +1038,30 @@ describe("pi extension — launcher arming", () => {
     expect(piExtensionArgs()).toEqual(["-e", piExtensionPath()]);
   });
 
-  test("resolvePiEventsLogDir honors KEEPER_EVENTS_LOG then the default", () => {
-    expect(resolvePiEventsLogDir({ KEEPER_EVENTS_LOG: "/tmp/x" })).toBe(
-      "/tmp/x",
-    );
-    expect(resolvePiEventsLogDir({})).toContain(
+  test("authority stores ignore caller-controlled path and HOME overrides", () => {
+    const baseline = defaultPiEventStorePaths();
+    const savedHome = process.env.HOME;
+    const savedEvents = process.env.KEEPER_EVENTS_LOG;
+    const savedDeadLetters = process.env.KEEPER_DEAD_LETTER_DIR;
+    try {
+      process.env.HOME = "/tmp/spoof-home";
+      process.env.KEEPER_EVENTS_LOG = "/tmp/spoof-events";
+      process.env.KEEPER_DEAD_LETTER_DIR = "/tmp/spoof-dead";
+      expect(defaultPiEventStorePaths()).toEqual(baseline);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedEvents === undefined) delete process.env.KEEPER_EVENTS_LOG;
+      else process.env.KEEPER_EVENTS_LOG = savedEvents;
+      if (savedDeadLetters === undefined)
+        delete process.env.KEEPER_DEAD_LETTER_DIR;
+      else process.env.KEEPER_DEAD_LETTER_DIR = savedDeadLetters;
+    }
+    expect(baseline.eventsLogDir).toContain(
       join(".local", "state", "keeper", "events-log"),
+    );
+    expect(baseline.deadLetterDir).toContain(
+      join(".local", "state", "keeper", "dead-letters"),
     );
   });
 });
@@ -1935,16 +2143,24 @@ describe("pi extension — /rename arming via the keeperEvents factory", () => {
   const saved: Record<string, string | undefined> = {};
   let logDir: string;
 
+  function keeperEvents(
+    pi: PiExtensionApi,
+    paths = {
+      eventsLogDir: logDir,
+      deadLetterDir: join(logDir, "dead-letters"),
+    },
+  ): void {
+    keeperEventsExtension(pi, paths);
+  }
+
   beforeEach(() => {
     saved.KEEPER_JOB_ID = process.env.KEEPER_JOB_ID;
-    saved.KEEPER_EVENTS_LOG = process.env.KEEPER_EVENTS_LOG;
     logDir = mkdtempSync(join(tmpdir(), "pi-ext-rename-"));
-    process.env.KEEPER_EVENTS_LOG = logDir;
     process.env.KEEPER_JOB_ID = "job-rename";
   });
 
   afterEach(() => {
-    for (const k of ["KEEPER_JOB_ID", "KEEPER_EVENTS_LOG"]) {
+    for (const k of ["KEEPER_JOB_ID"]) {
       if (saved[k] === undefined) {
         delete process.env[k];
       } else {
@@ -2034,9 +2250,11 @@ describe("pi extension — /rename arming via the keeperEvents factory", () => {
   test("a title-write failure never propagates out of session_info_changed", () => {
     const blocker = join(logDir, "blocker");
     writeFileSync(blocker, "not a dir");
-    process.env.KEEPER_EVENTS_LOG = join(blocker, "nested");
     const pi = fakeFullPi();
-    keeperEvents(pi);
+    keeperEvents(pi, {
+      eventsLogDir: join(blocker, "nested"),
+      deadLetterDir: join(logDir, "dead-letters"),
+    });
     expect(() => pi.fire("session_info_changed", { name: "x" })).not.toThrow();
   });
 

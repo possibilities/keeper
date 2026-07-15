@@ -13,10 +13,10 @@ and the selected bytes must remain fixed until one ref compare-and-swap.
 
 ## Decision
 ### Authority and ownership
-Every invocation binds to a currently working Claude job. A UUID or environment carrier is
-only a hint: the job's exact `(pid,start_time)` must occur on the caller's bounded OS ancestry
-chain. Equal active job rows sandwich that walk, and legacy NULL-harness/pid-only rows fail
-closed. A requested task must equal that work job's task. Identity/task authority is sampled
+Every invocation binds to a currently working tracked Claude or Pi job. A UUID or environment
+carrier is only a hint: the job's exact `(pid,start_time)` must occur on the caller's bounded OS
+ancestry chain. Equal full authority rows sandwich that walk, and unsupported/NULL harness or
+pid-only rows fail closed. A requested task must equal that work job's task. Authority is sampled
 again after each final ownership scan immediately before publication.
 
 Automatic selection admits only exclusive tool/Plan/direct claims belonging to that identity.
@@ -39,8 +39,9 @@ Immediately before each Git read, producers capture inclusive `MAX(events.id)`. 
 mutation evidence only in `(prior,captured]`; synthetic snapshot IDs are publication order, not
 observation fences. Missing, stale, malformed, or future watermarks no-op. Dropped roots retain a
 sentinel floor; never-observed roots scan from genesis. Folds remain deterministic and bounded.
-Mutation producers sandwich `realpath` with stable device/inode/type reads and fall back to a
-parent-canonical lexical leaf on any swap.
+Claude hooks and the ephemeral Pi extension sandwich `realpath` with stable device/inode/type
+reads and fall back to a parent-canonical lexical leaf on any swap. Pi adapts successful native
+`write`/`edit` results to canonical cross-harness names and never claims failed tool calls.
 
 ### Frozen identity and bounded execution
 Under a close-on-exec worktree flock, Keeper captures branch/parent (including an unborn branch)

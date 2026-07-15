@@ -149,7 +149,12 @@ import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
-import { extractMutationPath, parsePlanRef } from "./derivers";
+import {
+  extractBashMutation,
+  extractMutationPath,
+  extractPlanInvocation,
+  parsePlanRef,
+} from "./derivers";
 import {
   defaultPlanPrompt,
   type EscalationVerb,
@@ -5657,31 +5662,76 @@ export type EventsIngestContext = {
  * throw, which would roll back the whole ingest transaction. `hook_event` /
  * `tool_name` ride as plain string bindings; the deriver gates on them.
  */
-function recomputeMutationPath(
-  bindings: Record<string, string | number | boolean | null>,
-): string | null {
+function parsedEventBindingData(
+  bindings: Record<string, unknown>,
+): Record<string, unknown> | null {
   const rawData = bindings.data;
-  if (typeof rawData !== "string" || rawData.length === 0) {
-    return null;
-  }
-  let parsed: unknown;
+  if (typeof rawData !== "string" || rawData.length === 0) return null;
   try {
-    parsed = JSON.parse(rawData);
+    const parsed = JSON.parse(rawData) as unknown;
+    return parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
+}
+
+function recomputeMutationPath(
+  bindings: Record<string, string | number | boolean | null>,
+): string | null {
+  const parsed = parsedEventBindingData(bindings);
+  if (parsed === null) return null;
   const hookEvent =
     typeof bindings.hook_event === "string" ? bindings.hook_event : "";
   const toolName =
     typeof bindings.tool_name === "string" ? bindings.tool_name : null;
-  return extractMutationPath(
-    hookEvent,
-    toolName,
-    parsed as Record<string, unknown>,
-  );
+  return extractMutationPath(hookEvent, toolName, parsed);
+}
+
+/** Fill shared pure derivers omitted by sparse non-Claude producers. Present
+ * bindings, including NULL, remain authoritative and are never overwritten. */
+function recomputeSparseEventDerivers(
+  bindings: Record<string, unknown>,
+): Record<string, string | number | null> {
+  const parsed = parsedEventBindingData(bindings);
+  const hookEvent =
+    typeof bindings.hook_event === "string" ? bindings.hook_event : "";
+  const toolName =
+    typeof bindings.tool_name === "string" ? bindings.tool_name : null;
+  const cwd = typeof bindings.cwd === "string" ? bindings.cwd : null;
+  const plan =
+    parsed === null ? null : extractPlanInvocation(hookEvent, toolName, parsed);
+  const bash =
+    parsed === null
+      ? null
+      : extractBashMutation(hookEvent, toolName, parsed, cwd);
+  return {
+    plan_op: plan?.op ?? null,
+    plan_target: plan?.target ?? null,
+    plan_epic_id: plan?.epic_id ?? null,
+    plan_task_id: plan?.task_id ?? null,
+    plan_subject_present: plan === null ? null : plan.subject_present ? 1 : 0,
+    plan_files: plan?.files == null ? null : JSON.stringify(plan.files),
+    bash_mutation_kind: bash?.kind ?? null,
+    bash_mutation_targets: bash === null ? null : JSON.stringify(bash.targets),
+  };
+}
+
+/** Complete pure columns at either receipt transport seam. Forward producers'
+ * explicit values (including NULL) win; sparse and legacy records are derived. */
+function completeSparseEventBindings(bindings: Record<string, unknown>): void {
+  if (!Object.hasOwn(bindings, "mutation_path")) {
+    bindings.mutation_path = recomputeMutationPath(
+      bindings as Record<string, string | number | boolean | null>,
+    );
+  }
+  const sparseDerived = recomputeSparseEventDerivers(bindings);
+  for (const [column, value] of Object.entries(sparseDerived)) {
+    if (!Object.hasOwn(bindings, column)) bindings[column] = value;
+  }
 }
 
 /**
@@ -5909,9 +5959,14 @@ export function scanEventsLogDir(
             // hook's value). Reads `data` as a JSON string (the on-disk binding
             // shape); a malformed/non-string body folds to NULL, never a throw
             // that wedges the ingest transaction.
-            if (!presentCols.includes("mutation_path")) {
-              bindings.mutation_path = recomputeMutationPath(bindings);
-              presentCols.push("mutation_path");
+            completeSparseEventBindings(bindings);
+            for (const column of INGEST_EVENTS_COLUMNS) {
+              if (
+                Object.hasOwn(bindings, column) &&
+                !presentCols.includes(column)
+              ) {
+                presentCols.push(column);
+              }
             }
             const placeholders = presentCols.map(() => "?").join(", ");
             const values = presentCols.map((c) => {
@@ -6750,8 +6805,10 @@ export function scanBirthDir(
  * `replay_dead_letter` RPC routes through the worker→main bridge so the write
  * lands here. The replayed event is a PLAIN REAL event (original `pid`,
  * `start_time`, `data`, etc.), NOT a synthetic mint — a from-scratch re-fold
- * reproduces the projection byte-identically. The INSERT column list is
- * `INGEST_EVENTS_COLUMNS ∩ keys(bindings)`; an unknown column is dropped.
+ * reproduces the projection byte-identically. Missing pure derived columns are
+ * completed exactly as at live ingest; explicit values (including NULL) win.
+ * The INSERT column list is `INGEST_EVENTS_COLUMNS ∩ keys(bindings)` after that
+ * completion; an unknown column is dropped.
  *
  * A throw rolls back BOTH the INSERT and the UPDATE — the row stays `waiting`,
  * the events log stays untouched, and the next replay retries it. A recovered
@@ -6803,6 +6860,7 @@ export function recoverOneDeadLetter(db: Database): string | null {
       );
     }
     const bindings = parsed as Record<string, unknown>;
+    completeSparseEventBindings(bindings);
 
     // INSERT column list = events columns ∩ bindings keys. Unknown keys are
     // dropped. The list is interpolated directly (INGEST_EVENTS_COLUMNS is a

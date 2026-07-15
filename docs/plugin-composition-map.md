@@ -128,6 +128,12 @@ ID)` object present both in Pi's registry lookup and available-model list; a mis
 compiled role, or exact registry binding fails loudly. The static compiler therefore never
 turns a runtime work-worker assignment into a generic Pi agent.
 
+The same ephemeral tracked-Pi extension exposes `keeper_commit_work` through the
+launcher-stamped absolute Keeper CLI. Successful native Pi write/edit results emit canonical
+mutation receipts (with dead-letter recovery), while authority still requires the exact active
+Pi process generation and task row. Selection, adoption, lint, hooks, signing, CAS, push, and
+bounded result semantics remain the shared commit-work implementation, not extension-local Git.
+
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
 autopilot provisions each task's lane, so a hand-fired shared-checkout worker is

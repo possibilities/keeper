@@ -7,8 +7,8 @@
  * launch (interactive or detached); it translates pi's events into keeper's
  * events-log NDJSON contract so a pi session shows the same working/stopped churn
  * on the board that a claude session does, installs keeper's status footer and
- * telemetry sink, holds a session-scoped Agent Bus inbox, and registers a
- * read-only cross-harness history tool backed by the keeper CLI.
+ * telemetry sink, holds a session-scoped Agent Bus inbox, and registers bounded
+ * history and ownership-safe commit-work tools backed by the Keeper CLI.
  *
  * EPHEMERAL, NEVER a persistent `pi install`: a global install would fire on the
  * human's own non-keeper pi sessions. The `-e` per-launch arming plus the
@@ -25,9 +25,8 @@
  * keeper build — it can import nothing from keeper's `src/` tree and the pi
  * package is not on keeper's module path either. Its local helpers import only
  * `node:*`; this entry point carries minimal structural types for the pi events
- * it reads and its own copy of the events-log contract (the byte-identical NDJSON
- * shape + dir
- * resolver). The matching comments on both sides are the drift guard.
+ * it reads and local copies of the byte-identical events-log/dead-letter shapes
+ * plus fixed OS-user store resolver. Matching comments are the drift guard.
  *
  * FAIL-OPEN IS LOAD-BEARING, NOT OPTIONAL: pi ABORTS the launch when an extension
  * throws while loading (verified live against pi 0.80.3), and its handler-error
@@ -35,8 +34,8 @@
  * top-level guard and every handler swallows its own throws — a bug here degrades
  * pi to presence-only (the birth record still seeds the row), and can NEVER crash
  * or interfere with the human's pi session. Lifecycle handlers are pure
- * observers: they return nothing, so they never block or rewrite a message. The
- * history tool runs only when the model explicitly calls it.
+ * observers: they return nothing, so they never block or rewrite a message.
+ * Registered tools run only when the model explicitly calls them.
  *
  * IDENTITY: the birth record the launcher drops is pi's authoritative presence +
  * identity seed (pi pins its session uuid at launch, so `KEEPER_JOB_ID` == that
@@ -49,15 +48,28 @@
  */
 
 import { execFile } from "node:child_process";
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   type AmbientBusWatchTask,
   claimBusInboxOwnership,
   PiBusInboxController,
   releaseBusInboxOwnership,
 } from "./bus-inbox.ts";
+import {
+  createPiCommitWorkTool,
+  type PiCommitWorkToolDefinition,
+} from "./commit-work-tool.ts";
 import {
   installPiEditorBorder,
   type PiEditorBorderContext,
@@ -96,10 +108,17 @@ export interface PiObservedEvent {
   reason?: string;
   /** Tool name on `tool_call` / `tool_result`. */
   toolName?: string;
+  /** Correlator carried by Pi tool events. */
+  toolCallId?: string;
   /** Raw tool-call arguments (attacker-influenced — JSON-encoded as data only). */
   input?: unknown;
+  /** Tool result content/details (attacker-influenced, bounded before storage). */
+  content?: unknown;
+  details?: unknown;
   /** True when a `tool_result` carried an error. */
   isError?: boolean;
+  /** Producer-canonical path, computed only after a successful file mutation. */
+  mutationPath?: string | null;
 }
 
 /** The minimal surface of pi's `ExtensionAPI` this extension calls. Structural so
@@ -119,7 +138,12 @@ export interface PiExtensionApi extends PiSkillAutocompleteApi {
   events?: PiTaskEventBus;
   getThinkingLevel?(): string;
   getSessionName?(): string | undefined;
-  registerTool?(tool: PiToolDefinition<unknown> | PiTaskToolDefinition): void;
+  registerTool?(
+    tool:
+      | PiToolDefinition<unknown>
+      | PiTaskToolDefinition
+      | PiCommitWorkToolDefinition,
+  ): void;
   /** Presence-gated: `/rename` registers only when both this and
    *  `setSessionName` exist (see the `registerRenameCommand` call site). The
    *  real options/handler shape lives in `rename-command.ts`'s `PiRenameApi`
@@ -248,10 +272,217 @@ function boundedData(
   payload: Record<string, unknown>,
 ): string {
   const full = JSON.stringify(payload);
-  if (full.length <= MAX_DATA_BYTES) {
+  if (Buffer.byteLength(full, "utf8") <= MAX_DATA_BYTES) {
     return full;
   }
   return JSON.stringify({ hook_event_name: hookEvent, truncated: true });
+}
+
+function normalizedPiToolName(name: string | null): string | null {
+  switch (name) {
+    case "bash":
+      return "Bash";
+    case "edit":
+      return "Edit";
+    case "read":
+      return "Read";
+    case "write":
+      return "Write";
+    default:
+      return name;
+  }
+}
+
+function compatiblePiToolInput(
+  toolName: string | null,
+  input: unknown,
+): unknown {
+  if (
+    (toolName !== "Write" && toolName !== "Edit") ||
+    input === null ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
+    return input ?? null;
+  }
+  const record = input as Record<string, unknown>;
+  return typeof record.path === "string"
+    ? { ...record, file_path: record.path }
+    : record;
+}
+
+function piResultText(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  let bytes = 0;
+  for (const item of content) {
+    if (item === null || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") continue;
+    bytes +=
+      Buffer.byteLength(record.text, "utf8") + (parts.length > 0 ? 1 : 0);
+    if (bytes > 64_000) return null;
+    parts.push(record.text);
+  }
+  return parts.length === 0 ? null : parts.join("\n");
+}
+
+export interface PiMutationPathFs {
+  lstat: typeof lstatSync;
+  stat: typeof statSync;
+  realpath: typeof realpathSync;
+}
+
+function samePiFsIdentity(
+  left: { dev: number | bigint; ino: number | bigint; mode: number | bigint },
+  right: { dev: number | bigint; ino: number | bigint; mode: number | bigint },
+): boolean {
+  return (
+    BigInt(left.dev) === BigInt(right.dev) &&
+    BigInt(left.ino) === BigInt(right.ino) &&
+    (BigInt(left.mode) & 0o170000n) === (BigInt(right.mode) & 0o170000n)
+  );
+}
+
+const PI_UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/** Byte-for-byte local mirror of Pi's write/edit `resolveToCwd` path grammar.
+ * Keep self-contained: this extension is loaded in isolation and cannot import
+ * Pi's internal implementation. */
+export function resolvePiMutationInputPath(path: string, cwd: string): string {
+  const normalize = (
+    input: string,
+    options: { unicodeSpaces?: boolean; stripAt?: boolean } = {},
+  ): string => {
+    let normalized = options.unicodeSpaces
+      ? input.replace(PI_UNICODE_SPACES, " ")
+      : input;
+    if (options.stripAt && normalized.startsWith("@")) {
+      normalized = normalized.slice(1);
+    }
+    if (normalized === "~") return homedir();
+    if (
+      normalized.startsWith("~/") ||
+      (process.platform === "win32" && normalized.startsWith("~\\"))
+    ) {
+      normalized = join(homedir(), normalized.slice(2));
+    }
+    if (/^file:\/\//.test(normalized)) return fileURLToPath(normalized);
+    return normalized;
+  };
+  const normalized = normalize(path, {
+    unicodeSpaces: true,
+    stripAt: true,
+  });
+  const normalizedCwd = normalize(cwd);
+  return isAbsolute(normalized)
+    ? resolve(normalized)
+    : resolve(normalizedCwd, normalized);
+}
+
+/** Canonical successful Pi write/edit identity. Filesystem reads are producer-
+ * side only; reducers and commit-work consume the persisted scalar. */
+export function canonicalPiMutationPath(
+  path: string | null,
+  cwd: string,
+  fs: PiMutationPathFs = {
+    lstat: lstatSync,
+    stat: statSync,
+    realpath: realpathSync,
+  },
+): string | null {
+  if (
+    path === null ||
+    path === "" ||
+    path.includes("\0") ||
+    Buffer.byteLength(path, "utf8") > 32_768
+  ) {
+    return null;
+  }
+  let absolute: string;
+  try {
+    absolute = resolvePiMutationInputPath(path, cwd);
+  } catch {
+    return null;
+  }
+  if (absolute === "") return null;
+  try {
+    const before = fs.lstat(absolute);
+    const followedBefore = fs.stat(absolute);
+    const canonical = fs.realpath(absolute);
+    const canonicalIdentity = fs.stat(canonical);
+    const after = fs.lstat(absolute);
+    const followedAfter = fs.stat(absolute);
+    if (
+      samePiFsIdentity(before, after) &&
+      samePiFsIdentity(followedBefore, followedAfter) &&
+      samePiFsIdentity(followedBefore, canonicalIdentity) &&
+      fs.realpath(absolute) === canonical
+    ) {
+      // Pi's native write/edit follows a leaf symlink. Attribute the bytes it
+      // actually changed, unlike Git operations that intentionally edit the
+      // symlink entry itself.
+      return canonical;
+    }
+  } catch {
+    // A new/deleted/swapped leaf is represented through a stable parent below.
+  }
+  let parent = dirname(absolute);
+  const suffix = [basename(absolute)];
+  for (;;) {
+    try {
+      const before = fs.lstat(parent);
+      const followedBefore = fs.stat(parent);
+      const canonical = fs.realpath(parent);
+      const canonicalIdentity = fs.stat(canonical);
+      const after = fs.lstat(parent);
+      const followedAfter = fs.stat(parent);
+      if (
+        samePiFsIdentity(before, after) &&
+        samePiFsIdentity(followedBefore, followedAfter) &&
+        samePiFsIdentity(followedBefore, canonicalIdentity) &&
+        fs.realpath(parent) === canonical
+      ) {
+        return join(canonical, ...suffix.reverse());
+      }
+    } catch {
+      // Continue to the nearest stable existing ancestor.
+    }
+    const next = dirname(parent);
+    if (next === parent) return null;
+    suffix.push(basename(parent));
+    parent = next;
+  }
+}
+
+/** Enrich only a confirmed successful native Pi file mutation. */
+export function preparePiMutationEvent(
+  event: PiObservedEvent,
+  cwd: string,
+  fs?: PiMutationPathFs,
+): PiObservedEvent {
+  const toolName = normalizedPiToolName(
+    typeof event.toolName === "string" ? event.toolName : null,
+  );
+  if (
+    event.type !== "tool_result" ||
+    event.isError !== false ||
+    (toolName !== "Write" && toolName !== "Edit") ||
+    event.input === null ||
+    typeof event.input !== "object" ||
+    Array.isArray(event.input)
+  ) {
+    return event;
+  }
+  const path = (event.input as Record<string, unknown>).path;
+  return {
+    ...event,
+    mutationPath: canonicalPiMutationPath(
+      typeof path === "string" ? path : null,
+      cwd,
+      fs,
+    ),
+  };
 }
 
 /**
@@ -269,7 +500,7 @@ function boundedData(
  *   agent_start              → UserPromptSubmit  (turn begins → working)
  *   agent_end                → Stop              (turn ends → stopped)
  *   tool_call                → PreToolUse        (tool churn → working)
- *   tool_result              → PostToolUse       (tool churn → un-stop)
+ *   tool_result              → PostToolUse[/Failure] (tool churn → un-stop)
  *   session_shutdown[quit]   → SessionEnd        (clean terminal → ended)
  *
  * No SessionStart is emitted — the birth record owns pi presence + identity (see
@@ -311,33 +542,51 @@ export function piEventBindings(
         }),
       };
     case "tool_call": {
-      const toolName =
-        typeof event.toolName === "string" ? event.toolName : null;
+      const toolName = normalizedPiToolName(
+        typeof event.toolName === "string" ? event.toolName : null,
+      );
       return {
         ...base("PreToolUse", "pre_tool_use"),
         tool_name: toolName,
-        // The tool arguments ride in `data` JSON-encoded (attacker-influenced
-        // content — quotes / newlines / shell metacharacters — round-trips as
-        // data in a valid NDJSON line, never interpolated anywhere).
+        // Native Pi `{path}` is adapted to the cross-harness `file_path`
+        // shape, while the original inert fields remain available in `data`.
         data: boundedData("PreToolUse", {
           hook_event_name: "PreToolUse",
           ...dispatchAttemptPayload(meta),
           tool_name: toolName,
-          tool_input: event.input ?? null,
+          tool_input: compatiblePiToolInput(toolName, event.input),
         }),
       };
     }
     case "tool_result": {
-      const toolName =
-        typeof event.toolName === "string" ? event.toolName : null;
+      const toolName = normalizedPiToolName(
+        typeof event.toolName === "string" ? event.toolName : null,
+      );
+      const stdout = piResultText(event.content);
+      const succeeded = event.isError === false;
+      const failed = !succeeded;
+      const hookEvent = failed ? "PostToolUseFailure" : "PostToolUse";
       return {
-        ...base("PostToolUse", "post_tool_use"),
+        ...base(hookEvent, failed ? "post_tool_use_failure" : "post_tool_use"),
         tool_name: toolName,
-        data: boundedData("PostToolUse", {
-          hook_event_name: "PostToolUse",
+        ...(!failed && (toolName === "Write" || toolName === "Edit")
+          ? {
+              // Present NULL is authoritative at the ingest seam: a failed
+              // canonicalization must never be re-derived from lexical data as
+              // though it came from an older producer.
+              mutation_path:
+                typeof event.mutationPath === "string"
+                  ? event.mutationPath
+                  : null,
+            }
+          : {}),
+        data: boundedData(hookEvent, {
+          hook_event_name: hookEvent,
           ...dispatchAttemptPayload(meta),
           tool_name: toolName,
-          is_error: event.isError === true,
+          tool_input: compatiblePiToolInput(toolName, event.input),
+          is_error: failed,
+          ...(stdout === null ? {} : { tool_response: { stdout } }),
         }),
       };
     }
@@ -412,48 +661,72 @@ export function translatePiEvent(
 // events-log write (per-pid append)
 // ---------------------------------------------------------------------------
 
-/**
- * Resolve the keeper events-log directory. MUST match `resolveEventsLogDir` in
- * `src/db.ts` (and the claude events-writer hook's copy) byte-for-byte —
- * `KEEPER_EVENTS_LOG` wins (tests point it at a tmp dir), else
- * `~/.local/state/keeper/events-log`. Local copy (self-contained island); the
- * matching comment is the drift guard.
- */
-export function resolvePiEventsLogDir(env: NodeJS.ProcessEnv): string {
-  const override = env.KEEPER_EVENTS_LOG;
-  if (override && override.length > 0) {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "events-log");
+export interface PiEventStorePaths {
+  eventsLogDir: string;
+  deadLetterDir: string;
 }
 
-/**
- * Append one line to this pi process's per-pid events-log file. The pi process
- * is the SOLE long-lived writer of `<pid>.ndjson`, so single-`write()`-per-line
- * appends never interleave — the same guarantee the claude hook relies on. Best
- * -effort 0o600 (a line can carry tool payloads the user considers private); NO
- * fsync (the ingester re-reads from a durable byte-offset, so a lost buffer is
- * lag-not-loss). Never throws — the caller's guard is belt-and-suspenders.
- */
-function appendEventsLogLine(
-  env: NodeJS.ProcessEnv,
-  pid: number,
-  line: string,
-): void {
-  const dir = resolvePiEventsLogDir(env);
-  const file = join(dir, `${pid}.ndjson`);
+/** Fixed OS-user authority stores. Environment overrides are daemon/test
+ * configuration and cannot divert a live Pi session's mutation evidence. */
+export function defaultPiEventStorePaths(): PiEventStorePaths {
+  const state = join(userInfo().homedir, ".local", "state", "keeper");
+  return {
+    eventsLogDir: join(state, "events-log"),
+    deadLetterDir: join(state, "dead-letters"),
+  };
+}
+
+function appendPrivateLine(dir: string, pid: number, line: string): void {
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   } catch {
-    // Recursive mkdir is idempotent on absence; an existing dir with a different
-    // mode throws harmlessly — the append below is the real success signal.
+    // The append below is authoritative; mkdir can race an existing directory.
   }
+  const file = join(dir, `${pid}.ndjson`);
   appendFileSync(file, line);
   try {
     chmodSync(file, 0o600);
   } catch {
-    // chmod best-effort — the file may exist from a prior append this process
-    // cannot re-chmod; the data is on disk and ingestible regardless.
+    // Data is already append-complete; mode repair is best effort.
+  }
+}
+
+function serializePiDeadLetter(bindings: PiEventBindings, pid: number): string {
+  const sessionId = bindings.session_id;
+  const hookEvent = bindings.hook_event;
+  const ts = bindings.ts;
+  return `${JSON.stringify({
+    dl_id: randomUUID(),
+    session_id: typeof sessionId === "string" ? sessionId : "unknown",
+    hook_event: typeof hookEvent === "string" ? hookEvent : "unknown",
+    ts: typeof ts === "number" && Number.isFinite(ts) ? ts : Date.now() / 1000,
+    dl_written_at: Date.now() / 1000,
+    pid,
+    bindings,
+  })}\n`;
+}
+
+/** Append one complete receipt or route the exact bindings to the recovery
+ * channel. Neither failure may escape into the human's Pi session. */
+function appendPiBindings(
+  paths: PiEventStorePaths,
+  pid: number,
+  bindings: PiEventBindings,
+): void {
+  try {
+    appendPrivateLine(paths.eventsLogDir, pid, serializePiLine(bindings));
+    return;
+  } catch {
+    // Preserve the mutation evidence through the dead-letter channel below.
+  }
+  try {
+    appendPrivateLine(
+      paths.deadLetterDir,
+      pid,
+      serializePiDeadLetter(bindings, pid),
+    );
+  } catch {
+    // Presence-only degradation remains fail-open for the harness.
   }
 }
 
@@ -1039,7 +1312,10 @@ const KEEPER_JOB_ID_ENV = "KEEPER_JOB_ID";
  * of the factory (pi aborts the launch on a load-time throw) nor out of a handler
  * (degrade to presence-only, never crash the human's session).
  */
-export default function keeperEvents(pi: PiExtensionApi): void {
+export default function keeperEvents(
+  pi: PiExtensionApi,
+  injectedStorePaths?: PiEventStorePaths,
+): void {
   try {
     const jobId = (process.env[KEEPER_JOB_ID_ENV] ?? "").trim();
     if (jobId === "") {
@@ -1049,6 +1325,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     }
     const pid = process.pid;
     const cwd = process.cwd();
+    const storePaths = injectedStorePaths ?? defaultPiEventStorePaths();
     const dispatchAttemptId = piDispatchAttemptFromEnv(process.env);
     const busInbox =
       typeof pi.sendMessage === "function"
@@ -1060,12 +1337,17 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     let ownsBusInbox = false;
     let refreshStatusFooter = (): void => {};
 
-    const emit = (event: PiObservedEvent): void => {
+    const emit = (event: PiObservedEvent, context?: PiSessionContext): void => {
       try {
-        const line = translatePiEvent(event, {
+        const eventCwd =
+          typeof context?.cwd === "string" && context.cwd !== ""
+            ? context.cwd
+            : cwd;
+        const observed = preparePiMutationEvent(event, eventCwd);
+        const bindings = piEventBindings(observed, {
           jobId,
           pid,
-          cwd,
+          cwd: eventCwd,
           tsSec: Date.now() / 1000,
           ...(dispatchAttemptId == null ? {} : { dispatchAttemptId }),
           ...(event.type === "agent_end" && busInbox !== null
@@ -1076,9 +1358,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
               }
             : {}),
         });
-        if (line !== null) {
-          appendEventsLogLine(process.env, pid, line);
-        }
+        if (bindings !== null) appendPiBindings(storePaths, pid, bindings);
       } catch {
         // Fail-open: a translation / write failure degrades to presence-only.
         // Never propagate — the human's pi turn must not see a keeper error.
@@ -1094,7 +1374,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       "tool_result",
       "session_shutdown",
     ]) {
-      pi.on(kind, emit);
+      pi.on(kind, (event, context) => emit(event, context));
     }
     pi.on("session_start", (_event, context) => {
       try {
@@ -1148,6 +1428,7 @@ export default function keeperEvents(pi: PiExtensionApi): void {
     });
     if (typeof pi.registerTool === "function") {
       pi.registerTool(HISTORY_TOOL);
+      pi.registerTool(createPiCommitWorkTool());
       if (pi.events !== undefined) {
         pi.registerTool(createTaskFacadeTool(pi.events));
       }
@@ -1163,17 +1444,15 @@ export default function keeperEvents(pi: PiExtensionApi): void {
       registerRenameCommand(pi as unknown as PiRenameApi, {
         onTitleChange: (title) => {
           try {
-            appendEventsLogLine(
-              process.env,
+            appendPiBindings(
+              storePaths,
               pid,
-              serializePiLine(
-                titleEventBindings(title, {
-                  jobId,
-                  pid,
-                  cwd,
-                  tsSec: Date.now() / 1000,
-                }),
-              ),
+              titleEventBindings(title, {
+                jobId,
+                pid,
+                cwd,
+                tsSec: Date.now() / 1000,
+              }),
             );
           } catch {
             // Fail-open: an events-log write failure must never surface to

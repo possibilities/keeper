@@ -185,7 +185,10 @@ function mutationPathFromReceipt(
   bindings: Record<string, string | number | boolean | null>,
 ): string | null {
   let mutationPath: string | null = null;
-  if (typeof bindings.mutation_path === "string") {
+  if (Object.hasOwn(bindings, "mutation_path")) {
+    // Forward producers use present NULL to say canonicalization was unavailable.
+    // Only truly absent legacy bindings may be reconstructed from tool_input.
+    if (typeof bindings.mutation_path !== "string") return null;
     mutationPath = bindings.mutation_path;
   } else if (typeof bindings.data === "string") {
     let parsed: unknown;
@@ -211,6 +214,21 @@ function mutationPathFromReceipt(
   return typeof cwd === "string" && isAbsolute(cwd) && !cwd.includes("\0")
     ? resolve(cwd, mutationPath)
     : null;
+}
+
+function receiptCanonicalizationUnavailable(
+  bindings: Record<string, string | number | boolean | null>,
+): boolean {
+  const toolName = bindings.tool_name;
+  return (
+    Object.hasOwn(bindings, "mutation_path") &&
+    bindings.mutation_path === null &&
+    bindings.hook_event === "PostToolUse" &&
+    (toolName === "Write" ||
+      toolName === "Edit" ||
+      toolName === "MultiEdit" ||
+      toolName === "NotebookEdit")
+  );
 }
 
 /**
@@ -332,6 +350,7 @@ function readReceiptClaims(
         if (totalRecords > RECEIPT_RECORD_LIMIT) return null;
         const record = parseEventLogLine(line);
         if (record === null) return null;
+        if (receiptCanonicalizationUnavailable(record.bindings)) return null;
         const mutationPath = mutationPathFromReceipt(record.bindings);
         if (mutationPath === null) continue;
         const sessionId = record.bindings.session_id;
@@ -465,6 +484,7 @@ function unresolvedMutationDeadLetter(
   const relevant = (
     bindings: Record<string, string | number | boolean | null>,
   ) => {
+    if (receiptCanonicalizationUnavailable(bindings)) return true;
     const mutationPath = mutationPathFromReceipt(bindings);
     return (
       mutationPath !== null &&
@@ -730,12 +750,18 @@ export function readOwnershipClaims(
              LEFT JOIN jobs j ON j.job_id = e.session_id
             WHERE e.id > ?
               AND e.id <= ?
-              AND e.mutation_path IS NOT NULL
+              AND (
+                e.mutation_path IS NOT NULL
+                OR (
+                  e.hook_event = 'PostToolUse'
+                  AND e.tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
+                )
+              )
             ORDER BY e.id
             LIMIT ?`,
         )
         .all(floor, head, PENDING_DIRECT_CLAIM_LIMIT + 1) as Array<{
-        mutation_path: string;
+        mutation_path: string | null;
         session_id: string;
         state: string | null;
       }>;
@@ -755,6 +781,13 @@ export function readOwnershipClaims(
         source: row.source,
       }));
       for (const row of pending) {
+        if (row.mutation_path === null) {
+          // A successful mutator with no canonical path is unavailable evidence,
+          // not proof that no path was changed.
+          db.run("ROLLBACK");
+          transactionOpen = false;
+          return null;
+        }
         const relativePath = canonicalMutationPath(worktree, row.mutation_path);
         if (relativePath === null) continue;
         claims.push({

@@ -29,6 +29,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  piEventBindings,
+  preparePiMutationEvent,
+  serializePiLine,
+} from "../plugins/keeper/pi-extension/keeper-events";
+import {
   discoverSessionFiles,
   getSessionDirtyFiles,
 } from "../src/commit-work/attribution";
@@ -277,6 +282,79 @@ describe("readOwnershipClaims", () => {
         source: "direct",
       },
     ]);
+  });
+
+  test("an un-ingested successful Pi write is immediately ownership-visible", () => {
+    const repo = join(tmpDir, "pi-repo");
+    mkdirSync(repo);
+    writeFileSync(join(repo, "pi-owned.ts"), "owned\n");
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      "INSERT INTO jobs (job_id, created_at, state, updated_at, harness) VALUES ('pi-foreign', 1, 'working', 1, 'pi')",
+    );
+    db.close();
+    const event = preparePiMutationEvent(
+      {
+        type: "tool_result",
+        toolName: "write",
+        input: { path: "pi-owned.ts", content: "owned" },
+        isError: false,
+      },
+      repo,
+    );
+    const bindings = piEventBindings(event, {
+      jobId: "pi-foreign",
+      pid: 4242,
+      cwd: repo,
+      tsSec: 2,
+    });
+    if (bindings === null) throw new Error("expected Pi mutation bindings");
+    writeFileSync(join(eventsLogDir, "pi.ndjson"), serializePiLine(bindings));
+
+    expect(readClaims(repo)).toEqual([
+      expect.objectContaining({
+        path: "pi-owned.ts",
+        sessionId: "pi-foreign",
+        liveness: "live",
+        source: "direct",
+      }),
+    ]);
+  });
+
+  test("present-null canonical mutation evidence fails closed before and after ingest", () => {
+    const data = JSON.stringify({
+      hook_event_name: "PostToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: "unstable.ts" },
+    });
+    writeFileSync(
+      join(eventsLogDir, "canonical-unavailable.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "pi-foreign",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          cwd: "/repo",
+          data,
+          mutation_path: null,
+        },
+      }),
+    );
+    expect(readClaims()).toBeNull();
+
+    rmSync(eventsLogDir, { recursive: true, force: true });
+    mkdirSync(eventsLogDir);
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (1, 'pi-foreign', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', ?, NULL)`,
+      [data],
+    );
+    db.close();
+    expect(readClaims()).toBeNull();
   });
 
   test("legacy relative receipts resolve against the producer cwd", () => {
