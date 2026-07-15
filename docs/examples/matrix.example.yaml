@@ -20,15 +20,15 @@ efforts:
   - high
   - xhigh
 
-# The cell-template inventory: the templates the renderer fans out over
-# subagent_models × efforts. Each entry is a NON-EMPTY RELATIVE path (no leading
+# The cell-template inventory: the templates the compiler expands into the
+# complete shared cohort over subagent_models × efforts. Each entry is a NON-EMPTY RELATIVE path (no leading
 # `/`, no `..` segment, no NUL) — the traversal guard that replaces the retired
 # `render_to:` frontmatter.
 subagent_templates:
   - template/agents/worker.md.tmpl
 
-# Worker-cell eligibility: the capability tokens that render and select as worker
-# cells. A capability a provider serves but that is ABSENT here launches as a
+# Worker-cell eligibility: the capability tokens the compiler publishes and the
+# runtime selects as worker cells. A capability a provider serves but that is ABSENT here launches as a
 # triple (enumeration) yet never enters the cell set — that is the only "launch
 # only" mechanism; the `route:` flag is retired. Every entry MUST be served by at
 # least one provider below, or the matrix fails loud.

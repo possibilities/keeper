@@ -166,9 +166,20 @@ Pass `--format human` for human-readable text/tables.
 
 ## Worker matrix
 
-Each task carries a `{model, tier}` cell. The launcher renders one self-contained `work` plugin per `{model × effort}` cell under `workers/<model>-<effort>/` and selects the matching one at dispatch via `--plugin-dir`, so `/plan:work` always spawns the constant `work:worker` resolved to the tier-matched cell. The axes come from `subagents.yaml` composed with an optional host provider matrix (`~/.config/keeper/matrix.yaml`, ADR 0010): with no matrix the roster is the embedded claude-only default (opus/sonnet), byte-identical to a single-harness world.
+`~/.config/keeper/matrix.yaml` is required. It defines the worker-cell eligibility list, effort bands, cell-template inventory, ordered provider roster, and fixed wrapper driver (ADR 0036). Each task carries a `{model, tier}` cell; the task's cell plus any producer-side worker-provider constraint selects one matrix cell at dispatch. There are no task-specific worker prompt artifacts.
 
-A host matrix is an ordered provider roster (cost-ascending — the pecking order), each provider a harness name carrying the capability models it serves (with optional capability→native-id aliases), plus the effort axis and the **wrapper driver** (the fixed claude model/effort every wrapped cell runs at). Membership under the `claude` provider makes a model **native** — its worker runs that model in-session; every other model renders as a **wrapped cell** whose claude worker runs the wrapper driver and delegates implementation to the cost-preferred serving provider at run time via `keeper agent run`, owning the keeper close-out itself. Both kinds render from the single composed worker template, so the worker contract never drifts between them. Re-render after a matrix model/effort edit with `keeper prompt render-plugin-templates --project-root plugins/plan`; reordering the roster needs no re-render (the provider is chosen at run time).
+The Claude compiler owns the complete shared cohort under `workers/<model>-<effort>/`:
+
+```bash
+keeper prompt compile --role work:worker --target claude
+# equivalent scope: keeper prompt compile --bundle plan:work --target claude
+```
+
+It compiles every matrix-derived cell, snapshots the literal include graph, and fingerprints the catalog, matrix, and sources. It owns the nested plugin files, JSON sidecars, manifest, and owned-orphan cleanup; publication is verified and manifest-last. `--check` is write-free. `keeper prompt render-plugin-templates --project-root plugins/plan` remains a compatibility front door that delegates worker publication once; install and promote retain it, and promotion verifies compiler state.
+
+`/plan:work` always spawns the constant `work:worker`; the launcher adds the exact selected physical cell via `--plugin-dir`. Manual and autopilot dispatch use the same read-only verifier for current fingerprint, inventory, hashes, and selected membership. Missing or stale output fails as `worker-cell-stale`; compile the cohort to remediate. A configured or cwd `work` plugin is a shadow, not a substitute, and work-target isolation strips scanned plugin directories.
+
+Native cells launch their exact Claude route with `maxTurns: 300`. Wrapped cells retain their assigned and effective capability but run the fixed wrapper driver with `maxTurns: 160`, delegating implementation to the runtime-resolved provider leg while the wrapper owns keeper close-out. The compiler does not perform provider-equivalence adaptation.
 
 Run `keeper agent presets list --json` to enumerate the full virtual launch cube (every `<harness>::<model>::<effort>` triple the roster serves, the four `<harness>_default` triples, and each configured panel with its ordered members, authored strength, and description). `keeper agent providers check` lints the operator's configured host triples (defaults, worker, escalation, panel `members`) against that cube, flagging a well-formed triple outside it as drift. Inspect one route with `keeper agent providers resolve <model> <effort>` (emits the driver plus the cost-ordered candidate harnesses, each carrying an auto-generated `<provider>-<model>` label).
 

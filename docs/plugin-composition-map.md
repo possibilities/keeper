@@ -1,19 +1,13 @@
 # plugin composition map — what each launch channel loads
 
-This note is the observed reality of the Claude Code plugin layer under keeper:
-which plugins a session inherits, per launch channel, with file:line grounding.
-**By default** no worker isolation is applied — every claude launch inherits the
-same base set. A config-flagged worker sub-gate exists (`worker_plugin_isolation`,
-default OFF); it is documented in [The worker isolation gate](#the-worker-isolation-gate-config-flagged-default-off)
-below. A standing test (`test/plugin-composition-map.test.ts`) pins the seams and
-BOTH gate states so this map cannot silently drift.
+This note maps the Claude Code plugin layer under keeper by launch channel.
+Ordinary Claude launches use the configured plugin set. Work launches add one
+compiler-owned worker cell and use work-target isolation; their worker cohort is
+separate from Pi's static prompt-artifact cohort.
 
-## The base set (every claude launch)
+## The base set (ordinary Claude launches)
 
-`keeper agent claude …` discovers plugins in `src/agent/main.ts` behind a single
-gate — `if (agent === "claude")` (`src/agent/main.ts:2194`). By default there is
-**no worker sub-gate**: any launch whose agent token is `claude` runs the full
-discovery (the `worker_plugin_isolation` knob below can add one, OFF by default).
+`keeper agent claude …` discovers configured plugins for an ordinary launch.
 
 Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
 `~/.config/keeper/plugins.yaml` (parsed by `loadPluginSources`,
@@ -60,53 +54,52 @@ agent` passes it as `--settings` on Claude launches that do not already supply
 
 | Channel | Route | Base set | Extra |
 | --- | --- | --- | --- |
-| Interactive (human) | your launcher points `plugin_scan_dirs` at `~/code/keeper/plugins` (README "Load the plugins") | full plugins.yaml | — |
-| `keeper agent` manual dispatch / pair | `keeper agent claude …` → `src/agent/main.ts:2417` gate | full plugins.yaml | — |
-| Autopilot / dispatch worker | `buildKeeperAgentLaunchArgv` emits `keeper agent claude …` (`src/exec-backend.ts:952`); same gate | **full plugins.yaml** | per-cell `--plugin-dir <cell>` (`exec-backend.ts:968-974`), **additive** |
+| Interactive (human) | configured Claude launcher | configured plugins | — |
+| `keeper agent` manual dispatch / pair | `keeper agent claude …` | configured plugins | — |
+| Autopilot / manual work dispatch | shared work-launch seam | hard-listed `plugin_dirs`; scanned directories stripped | exact verified cell via additive `--plugin-dir <cell>` |
 
-Both work-launch producers — the autopilot reconciler (`src/autopilot-worker.ts`
-`runReconcileCycle`) and the manual `keeper dispatch work::<id>` (`cli/dispatch.ts`)
-— resolve the launch's per-cell `work` plugin through ONE shared seam,
-`resolveWorkerCell` (`src/worker-cell.ts`): it applies the same
-out-of-matrix → missing-manifest → shadowed-plugin precedence and returns a closed
-machine-kind union. Each caller owns its own failure surface — autopilot mints a
-sticky `DispatchFailed`, dispatch exits non-zero with an actionable error — but the
-decision is identical, so a hand-fired plan worker loads the byte-same cell an
-automated one does. The producer injects a per-cycle memoized shadow probe; dispatch
-injects a fresh scan (it fires one worker).
+Both work-launch producers — the autopilot reconciler and manual `keeper
+dispatch work::<id>` — use one shared resolution seam. Its precedence is
+**bad matrix → provider constraint reject → out-of-matrix → missing manifest →
+stale or unverified cohort → exact-cell shadow → launch**. Each caller owns its
+failure surface, but both make the same decision: autopilot mints a
+`DispatchFailed` sticky and manual dispatch exits non-zero. A stale result is
+`worker-cell-stale`; regenerate with `keeper prompt compile --role work:worker
+--target claude`.
 
-The per-cell worker manifest (`plugins/plan/workers/<model>-<effort>/`, rendered from the host
-`matrix.yaml`'s `subagent_templates × subagent_models`) is appended via `--plugin-dir` AFTER `--name`
-(`exec-backend.ts:968-974`). It is **additive, not isolating**: the worker still
-inherits everything above. Stripping that one `--plugin-dir <cell>` pair from a
-worker argv recovers the byte-identical interactive argv — pinned by the additive
-test.
+The compiler publishes the complete matrix-derived shared cohort under
+`plugins/plan/workers/<model>-<effort>/`. It snapshots the literal include
+graph; fingerprints the catalog, matrix, and all sources; owns nested files,
+JSON sidecars, and manifest; safely adopts valid managed output; prunes owned
+orphans; and atomically verifies artifacts before writing the manifest last.
+`--check` verifies that state without writing. `render-plugin-templates` skips
+worker writes and delegates once to this compiler; install and promote retain
+that front door, and promotion verifies compiler state.
 
-A **wrapped cell** (a worker model claude does not serve natively) rides this exact
-same additive `--plugin-dir <cell>` channel — there is no separate wrapped-cell
-launch path. Its manifest's driver is the fixed claude wrapper (the `wrapper_driver`
-model/effort from the host matrix); the wrapper is a dumb courier — it delegates ALL
-implementation, test, and lint iteration to the resolved foreign provider leg via
-`keeper agent run`/`--resume` and never edits source itself, owning only tests-
-adjudication and the keeper close-out (`commit-work` + `plan done`). Provider legs
-launch and resume in the shared `wrapped` tmux session with a bare task-ID title;
-the title is presentation-only, while waiting uses the returned run handle,
-continuation uses the captured harness resume target (or exact resolved stopped
-session), and daemon autoclose uses the exact tmux window identity. The launch
-boundary always emits the `KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE` env pair
-(empty for a native cell; the effective `<model>::<effort>` plus the provider-leg
-result-envelope path for a wrapped one, keyed on effective-cell wrappedness rather
-than the worker-provider pin). A non-empty marker, plus the tool payload's subagent
-identity, is the sole jurisdiction the `wrapped-guard` `PreToolUse` hook keys its
-single-state total source-edit denial on — no envelope gate, fail-closed only when
-marked ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)). The host
-`~/.config/keeper/matrix.yaml` ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
-is the composition input for runtime worker cells — claude-native included, since there is no
-embedded fallback. `render-plugin-templates` fans `subagent_templates` out over
-`subagent_models × efforts` into `plugins/plan/workers/`; an absent, unparseable,
-schema-invalid, or empty matrix is a typed loud failure rather than a claude-only default.
-That matrix-driven rendering remains the native/wrapped work-worker contract: a native cell
-runs its declared provider directly, while an unserved cell uses the wrapper described above.
+Before launch, the shared seam read-only verifies the compiler fingerprint,
+inventory, hashes, and selected membership. The exact physical selected cell is
+the only legitimate preloaded `work` plugin. A `work` plugin discovered from
+configuration or cwd is a shadow, not an equivalent substitute. The selected
+cell is appended by `--plugin-dir`, so the cell remains additive to the
+hard-listed plugins while work-target isolation consistently strips scanned
+plugin directories.
+
+A task's `{model, tier}` and any producer-side provider constraint select the
+runtime cell; no task-specific prompt artifact exists. A native cell launches
+its exact Claude route. A **wrapped cell** retains its assigned and effective
+capability but runs the fixed wrapper driver at `maxTurns: 160`; native cells
+use `maxTurns: 300`. The compiler does not adapt provider equivalence. The wrapper is a
+dumb courier: it delegates implementation, tests, and lint iteration to the
+resolved provider leg through `keeper agent run`/`--resume`, never edits source,
+and owns test adjudication and keeper close-out (`commit-work` plus `plan
+done`). Provider legs use the shared `wrapped` tmux session; their task-ID title
+is display metadata, while run handles and harness resume targets own waiting
+and continuation. The launch boundary always emits
+`KEEPER_WRAPPED_CELL`/`KEEPER_WRAPPED_ENVELOPE` (empty for native cells). A
+non-empty marker plus subagent identity is the sole jurisdiction for the
+`wrapped-guard` total source-edit denial ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)).
+The required host matrix ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
+remains the composition input for every worker cell.
 
 Static plan agents are a separate prompt-artifact surface. Their canonical identities — each
 `plan:<role>` and the named bundles that collect them — live in
@@ -172,47 +165,13 @@ command-family allowlist — unblock and resolve stay diagnosis-only, deconflict
 get write-capable families — failing CLOSED for a marked session regardless of
 `--dangerously-skip-permissions`.
 
-## The worker isolation gate (config-flagged, default OFF)
+## Work-target isolation
 
-The `worker_plugin_isolation` key in `~/.config/keeper/plugins.yaml` (parsed by
-`loadPluginSources`, `src/agent/config.ts`) is the sole worker sub-gate. It is a
-string, not a boolean (the config corpus is boolean-free):
-
-- **absent / `off`** (the default) — no isolation. Every launch inherits the full
-  base set above. The launcher argv is byte-identical to a machine that never set
-  the key.
-- **`strip-scan-dirs`** — a keeper-automated **worker** launch drops the
-  `plugin_scan_dirs` RESULTS from its argv, loading only the hard-listed
-  `plugin_dirs` (keeper + plan) plus its additive per-cell `--plugin-dir`.
-
-The seam (`src/agent/main.ts`, the `agent === "claude"` discovery gate) resolves
-the knob against worker-ness and passes the decision to `discoverPlugins` as
-`stripScanDirs`; discovery obeys the resolved decision.
-
-**The boundary (load-bearing):** the gate strips only `plugin_scan_dirs` RESULTS —
-best-effort third-party scans. It NEVER strips a `plugin_dirs` entry a machine
-explicitly hard-lists (those are hard deps, keeper + plan among them), and NEVER
-touches the cwd `--plugin-dir .` detection.
-
-**What counts as a worker:** a launch carrying `--dangerously-skip-permissions` —
-keeper's own human-less worker permission posture (`src/exec-backend.ts`
-`buildKeeperAgentLaunchArgv`; the pair partner in `launch-config.ts`
-`nativeClaudeArgs` carries it too). An interactive human session never carries the
-flag, so it is never gated — "interactive unaffected" holds by construction.
-
-`test/plugin-composition-map.test.ts` pins BOTH states: OFF is byte-identical to
-today (scan set intact), ON strips only the scanned child while keeper + plan
-survive, and the worker argv always carries the `--dangerously-skip-permissions`
-marker the seam keys on.
-
-**Opt-in + proof.** arthack is an optional plugin: a fresh machine's default
-`plugins.yaml` is keeper-only, and you opt a third-party set in by appending its
-parent to `plugin_scan_dirs`. Enable worker isolation from that set with
-`worker_plugin_isolation: strip-scan-dirs`. `bun scripts/clean-machine-check.ts`
-proves the whole fresh-machine path end to end — the installer default is
-arthack-free, prompt renders resolve from the in-repo vendored corpus, the worker
-argv carries the permission posture, and a gate-ON worker resolves no arthack
-checkout while an interactive launch is unaffected.
+Every work launch strips `plugin_scan_dirs` results. Hard-listed `plugin_dirs`
+remain, and the exact verified cell is added as an additive `--plugin-dir`.
+Cwd and configured plugin siblings are still examined for `work` identity so a
+shadow is refused rather than silently loaded. Interactive, pair, close, and
+other non-work launches retain ordinary configured discovery.
 
 ## Logged-vs-executed skew (read this before mining events)
 

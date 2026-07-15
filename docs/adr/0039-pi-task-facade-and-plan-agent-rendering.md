@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted.
+Accepted. Extended by ADR 0063, which applies the compiler-owned publication
+model to the Claude `work:worker` cohort; this record's Pi static-agent and
+Task-facade decisions stand.
 
 ## Context
 
