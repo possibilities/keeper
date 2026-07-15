@@ -56,17 +56,18 @@ describe("parseArgs", () => {
     expect(parseArgs(["hi"]).launcherPreset).toBeNull();
   });
 
-  test("retired wrapper flags pass through for ordinary native failure", () => {
-    const parsed = parseArgs([
+  test("legacy profile selection is an inert compatibility flag", () => {
+    const split = parseArgs([
       "--x-profile",
       "work",
       "--x-codex-session-name=old",
       "hello",
     ]);
-    expect(parsed.remainingArgs).toEqual([
-      "--x-profile",
-      "work",
+    expect(split.remainingArgs).toEqual([
       "--x-codex-session-name=old",
+      "hello",
+    ]);
+    expect(parseArgs(["--x-profile=work", "hello"]).remainingArgs).toEqual([
       "hello",
     ]);
   });

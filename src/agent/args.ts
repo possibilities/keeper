@@ -6,8 +6,9 @@
  *
  * Three consumed flags carry no value (`--x-verbose`,
  * `--x-very-verbose`, `--x-no-confirm`) and wrapper value flags
- * (`--x-preset`) take either split (`--x-profile x`)
- * or joined (`--x-profile=x`) form. Every other token passes through verbatim into
+ * (`--x-preset`) take split or joined forms. The legacy `--x-profile` value
+ * is consumed inertly so existing launch commands retain their no-profile-farm
+ * behavior. Every other token passes through verbatim into
  * `remainingArgs`, preserving order — the agent sees exactly what the human
  * typed minus the launcher flags. A stray non-launcher flag (including the
  * retired `--arthack-*` spelling) is forwarded to the agent, which rejects it
@@ -69,9 +70,14 @@ export function parseArgsForAgent(
   let launcherVeryVerbose = false;
   let launcherNoConfirm = false;
   let launcherPreset: string | null = null;
+  let parsingIgnoredProfile = false;
   let parsingLauncherPreset = false;
 
   for (const arg of args) {
+    if (parsingIgnoredProfile) {
+      parsingIgnoredProfile = false;
+      continue;
+    }
     if (parsingLauncherPreset) {
       launcherPreset = arg.trim() || null;
       parsingLauncherPreset = false;
@@ -83,6 +89,10 @@ export function parseArgsForAgent(
       launcherVeryVerbose = true;
     } else if (arg === "--x-no-confirm") {
       launcherNoConfirm = true;
+    } else if (arg === "--x-profile") {
+      parsingIgnoredProfile = true;
+    } else if (arg.startsWith("--x-profile=")) {
+      // Consumed compatibility no-op: Keeper no longer owns profile farms.
     } else if (arg === "--x-preset") {
       parsingLauncherPreset = true;
     } else if (arg.startsWith("--x-preset=")) {
