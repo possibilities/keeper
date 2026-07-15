@@ -17,6 +17,7 @@ const FILES = [
   "test/a.test.ts",
   "test/ansi-to-styled.test.ts",
   "test/live-shell.test.ts",
+  "test/note-composer.test.ts",
   "test/dash-app.test.ts",
   "test/dash-shell.test.ts",
   "test/slow/commit-work-publication-realgit.test.ts",
@@ -28,7 +29,7 @@ describe("test manifest classification", () => {
   test("maps every discovered file to one required phase", () => {
     const audit = auditTestManifest(FILES, TEST_MANIFEST, () => true);
     expect(audit.files.root).toEqual(["test/a.test.ts"]);
-    expect(audit.files.opentui).toHaveLength(4);
+    expect(audit.files.opentui).toHaveLength(5);
     expect(audit.files["slow-git"]).toEqual([
       "test/slow/commit-work-publication-realgit.test.ts",
     ]);

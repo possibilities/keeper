@@ -352,8 +352,8 @@ describe("private editor drafts", () => {
     ).toThrow();
     expect(readNoteDraft(older.path)).toBe("  old draft\n");
 
-    writeNoteDraft(newer, "updated by Gum\n");
-    expect(readNoteDraft(newer)).toBe("updated by Gum\n");
+    writeNoteDraft(newer, "updated by composer\n");
+    expect(readNoteDraft(newer)).toBe("updated by composer\n");
 
     expect(removeNoteDraft(older)).toBe(true);
     expect(removeNoteDraft(older)).toBe(false);

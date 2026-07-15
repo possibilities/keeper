@@ -23,7 +23,7 @@ Notes live in a physically separate `notes.db` under Keeper's private state
 directory. The store has its own forward-only `PRAGMA user_version` ladder and
 never passes through the control-plane database's open, migrate, event, reducer,
 or RPC paths. `keeper note` is the sole writer class; short mutations serialize
-through an advisory lock and SQLite transactions, while Gum/editor,
+through an advisory lock and SQLite transactions, while the composer, editor,
 fuzzy-picker, clipboard, and agent processes run outside both the lock and any
 transaction.
 Readers use the same store directly.
@@ -39,10 +39,12 @@ The `keeper note` commands remain ordinary terminal entrypoints. Keeper ships an
 opt-in `tmux/keeper-notes.conf` drop-in beside its managed-session guard;
 `keeper setup-tmux` symlinks both into the user's `conf.d`. The Note drop-in owns
 the default prefix-table chords, popup geometry, caller-cwd placement, and
-failure acknowledgement. Its capture chord requests a fresh blank Gum writer
-before every action menu; Gum's native Ctrl-E bridge carries the current text
-through `$VISUAL`/`$EDITOR` and back when a full editor is useful. Unfinished-
-draft recovery remains available through the ordinary CLI. The human's tmux
+failure acknowledgement. Its capture chord requests a fresh blank OpenTUI
+composer before every action menu. Enter continues, Shift-Enter and Ctrl-J add
+newlines, Esc preserves the draft, and Ctrl-G saves it before OpenTUI suspends
+and cedes the terminal directly to `$VISUAL`/`$EDITOR`; after the blocking
+editor exits, OpenTUI resumes and reloads the draft. Unfinished-draft recovery
+remains available through the ordinary CLI. The human's tmux
 config still owns the actual prefix and whether `conf.d` is sourced. Agent selection consumes Keeper's public
 project-ranking and launch-triple discovery outputs and carries the selected
 triple verbatim into the existing detached launcher.

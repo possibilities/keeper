@@ -8,7 +8,7 @@
 git clone <repo-url> ~/code/keeper
 cd ~/code/keeper
 mkdir -p ~/.local/state/keeper   # launchd does not pre-create the state dir
-bash scripts/install.sh          # deps (including current Gum) -> bun link -> keeperd bootstrap
+bash scripts/install.sh          # deps -> bun link -> keeperd bootstrap
 ```
 
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
@@ -291,14 +291,12 @@ close; a failure remains visible until Enter. The installer is
 idempotent, repairs stale symlinks, and never replaces a real file at either destination. Your tmux config
 must source `conf.d/*.conf`; reload it after setup to activate the bindings in a running server.
 
-`scripts/install.sh` installs or upgrades the Homebrew `gum` formula. Fresh capture uses a `gum write`
-textarea sized to the popup: Enter continues to the action picker, Ctrl-J inserts a newline, and Gum's
-native Ctrl-E opens the current
-text in `$VISUAL`/`$EDITOR` before returning it to the textarea. Gum does not expose a custom-key option,
-so Ctrl-G cannot replace that native binding without carrying a fork. Install `fzf` and keep `$VISUAL` or
-`$EDITOR` set to a blocking command. Notes live in the mode-0600
-`~/.local/state/keeper/notes.db`; unfinished editor drafts live beside it and remain recoverable after a
-popup or editor exits unexpectedly. Successful clipboard copies and fresh-agent launches move a Note from
+Fresh capture uses Keeper's OpenTUI composer: Enter continues to the action picker,
+Shift-Enter or Ctrl-J inserts a newline, Ctrl-G saves the draft and temporarily cedes the terminal to
+`$VISUAL`/`$EDITOR`, and Esc quietly closes while preserving the draft. Install `fzf` and keep `$VISUAL`
+or `$EDITOR` set to a blocking command. Notes live in the mode-0600
+`~/.local/state/keeper/notes.db`; composer changes and unfinished editor drafts live beside it and remain
+recoverable after a popup or editor exits unexpectedly. Successful clipboard copies and fresh-agent launches move a Note from
 active to archived history. Sending hands the body to the selected harness through the existing launcher,
 so process visibility and that harness's transcript policy apply beyond the mode-0600 local store.
 `keeper note --help` carries the interaction and failure semantics.

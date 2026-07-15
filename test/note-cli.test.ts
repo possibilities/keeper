@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  gumWriterHeight,
-  gumWriterWidth,
   HELP,
   hasInteractiveNoteTty,
   type ProcessResult,
@@ -9,6 +7,7 @@ import {
   parseNoteArgs,
   runNoteCommand,
 } from "../cli/note";
+import type { NoteComposerRequest } from "../src/note-composer";
 import type {
   ArchiveMetadata,
   MutationFailure,
@@ -243,15 +242,6 @@ describe("keeper note grammar", () => {
     expect(hasInteractiveNoteTty(false, true, true)).toBe(false);
   });
 
-  test("Gum fills the terminal while reserving its header and help rows", () => {
-    expect(gumWriterHeight(50)).toBe(45);
-    expect(gumWriterHeight(10)).toBe(5);
-    expect(gumWriterHeight(undefined)).toBe(18);
-    expect(gumWriterWidth(120)).toBe(118);
-    expect(gumWriterWidth(10)).toBe(20);
-    expect(gumWriterWidth(undefined)).toBe(78);
-  });
-
   test("interactive verbs refuse a non-TTY before opening notes.db", async () => {
     let opened = false;
     const err: string[] = [];
@@ -362,36 +352,44 @@ describe("keeper note capture lifecycle", () => {
     expect(out.join("")).toContain("Saved active note");
   });
 
-  test("new --fresh opens Gum before any draft recovery menu", async () => {
+  test("new --fresh opens the composer before any draft recovery menu", async () => {
     const store = new FakeStore();
     store.createDraft("unfinished older draft");
     const calls: ProcessSpec[] = [];
+    const composerRequests: NoteComposerRequest[] = [];
     const { deps } = baseDeps(store, {
+      compose: async (request: NoteComposerRequest) => {
+        composerRequests.push(request);
+        request.persist("fresh capture");
+        return { kind: "submitted" as const, body: "fresh capture" };
+      },
       runProcess: async (spec: ProcessSpec) => {
         calls.push(spec);
-        if (spec.argv[0] === "gum") return result(0, "fresh capture\n");
         return picker(0);
       },
     });
 
     expect(await runNoteCommand(["new", "--fresh"], deps)).toBe(0);
-    expect(calls[0].argv.slice(0, 2)).toEqual(["gum", "write"]);
-    expect(calls[0].argv).toContain(
-      "--header=New Note · Enter: continue · Ctrl-E: open $EDITOR · Esc: cancel",
-    );
-    expect(calls[0].argv).toContain("--placeholder=Write a note…");
-    expect(calls[0].argv).not.toContain("--show-line-numbers");
-    expect(calls[0].stdinMode).toBe("inherit");
-    expect(calls[0].stderrMode).toBe("inherit");
+    expect(composerRequests[0]?.initialText).toBe("");
+    expect(composerRequests[0]?.editorArgv).toEqual([
+      "editor",
+      "--wait",
+      "/tmp/draft-2.md",
+    ]);
+    expect(calls[0].argv[0]).toBe("fzf");
     expect(store.creates).toEqual(["fresh capture"]);
     expect(store.removedDrafts).toEqual(["draft-2"]);
     expect(store.drafts.map((draft) => draft.id)).toEqual(["draft-1"]);
   });
 
-  test("canceling Gum preserves the fresh draft without opening an action picker", async () => {
+  test("canceling the composer preserves its fresh draft without opening an action picker", async () => {
     const store = new FakeStore();
     const calls: ProcessSpec[] = [];
     const { deps, err } = baseDeps(store, {
+      compose: async (request: NoteComposerRequest) => {
+        request.persist("unfinished thought");
+        return { kind: "cancelled" as const, body: "unfinished thought" };
+      },
       runProcess: async (spec: ProcessSpec) => {
         calls.push(spec);
         return result(1);
@@ -399,11 +397,11 @@ describe("keeper note capture lifecycle", () => {
     });
 
     expect(await runNoteCommand(["new", "--fresh"], deps)).toBe(0);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].argv.slice(0, 2)).toEqual(["gum", "write"]);
+    expect(calls).toHaveLength(0);
     expect(store.drafts).toHaveLength(1);
+    expect(store.readDraft("draft-1")).toBe("unfinished thought");
     expect(store.creates).toEqual([]);
-    expect(err.join("")).toBe("\u001b[2J\u001b[H");
+    expect(err.join("")).toBe("");
   });
 
   test("a backup exception does not turn a committed save into a failure", async () => {

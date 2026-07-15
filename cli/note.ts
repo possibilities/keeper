@@ -17,6 +17,10 @@ import { type CopyResult, copyToClipboard } from "../src/clipboard";
 import { resolveConfig, resolveKeeperAgentPath } from "../src/db";
 import { validatePromptBytes } from "../src/dispatch-command";
 import { backupNotesIfDue } from "../src/note-backup";
+import type {
+  NoteComposerOutcome,
+  NoteComposerRequest,
+} from "../src/note-composer";
 import {
   type ArchiveMetadata,
   createNoteDraft,
@@ -64,10 +68,10 @@ Usage:
   keeper note --help
 
 Interactive commands:
-  new       Recover an unfinished draft in $EDITOR, or pass --fresh to open a
-            blank Gum writer before Save / Copy / Send / Discard.
-            Gum: Enter continues, Ctrl-J inserts a newline, Ctrl-E opens
-            $VISUAL/$EDITOR with the current text, and Esc preserves the draft.
+  new       Recover an unfinished draft in $EDITOR, or pass --fresh to open the
+            Note composer before Save / Copy / Send / Discard.
+            Enter continues; Shift-Enter/Ctrl-J inserts a newline; Ctrl-G cedes
+            the terminal to $VISUAL/$EDITOR; Esc preserves the draft.
   browse    Browse active notes; Ctrl-T toggles view-only archived history.
 
 Send wizard: choose project → harness → model → effort; Ctrl-B moves back.
@@ -90,7 +94,6 @@ export interface ProcessSpec {
   cwd?: string;
   env?: Record<string, string>;
   stdin?: string;
-  stdinMode?: "pipe" | "inherit";
   stdio?: "capture" | "inherit";
   stderrMode?: "capture" | "inherit";
   timeoutMs?: number;
@@ -117,6 +120,7 @@ export interface NoteCliDeps {
   openStore?: () => NoteStore;
   drafts?: NoteDraftOps;
   runProcess?: NoteProcessRunner;
+  compose?: (request: NoteComposerRequest) => Promise<NoteComposerOutcome>;
   copy?: (body: string) => Promise<CopyResult>;
   stdout?: (text: string) => void;
   stderr?: (text: string) => void;
@@ -134,6 +138,7 @@ interface ResolvedDeps {
   openStore: () => NoteStore;
   drafts: NoteDraftOps;
   runProcess: NoteProcessRunner;
+  compose: (request: NoteComposerRequest) => Promise<NoteComposerOutcome>;
   copy: (body: string) => Promise<CopyResult>;
   stdout: (text: string) => void;
   stderr: (text: string) => void;
@@ -168,30 +173,6 @@ export function hasInteractiveNoteTty(
   return stdinIsTty === true && stdoutIsTty === true && stderrIsTty === true;
 }
 
-/** Fill the terminal while reserving rows for Gum's header and help footer. */
-export function gumWriterHeight(terminalRows?: number): number {
-  if (
-    terminalRows === undefined ||
-    !Number.isFinite(terminalRows) ||
-    terminalRows <= 0
-  ) {
-    return 18;
-  }
-  return Math.max(5, Math.floor(terminalRows) - 5);
-}
-
-/** Gum loses terminal-width discovery when stderr passes through our filter. */
-export function gumWriterWidth(terminalColumns?: number): number {
-  if (
-    terminalColumns === undefined ||
-    !Number.isFinite(terminalColumns) ||
-    terminalColumns <= 0
-  ) {
-    return 78;
-  }
-  return Math.max(20, Math.floor(terminalColumns) - 2);
-}
-
 function stringEnv(
   env: Record<string, string | undefined>,
 ): Record<string, string> {
@@ -204,18 +185,17 @@ function stringEnv(
 
 async function defaultRunProcess(spec: ProcessSpec): Promise<ProcessResult> {
   const inherited = spec.stdio === "inherit";
-  const inheritStdin = inherited || spec.stdinMode === "inherit";
   const inheritStderr = inherited || spec.stderrMode === "inherit";
   try {
     const proc = Bun.spawn(spec.argv, {
       ...(spec.cwd === undefined ? {} : { cwd: spec.cwd }),
       env: { ...stringEnv(process.env), ...(spec.env ?? {}) },
-      stdin: inheritStdin ? "inherit" : "pipe",
+      stdin: inherited ? "inherit" : "pipe",
       stdout: inherited ? "inherit" : "pipe",
       stderr: inheritStderr ? "inherit" : "pipe",
     });
 
-    if (!inheritStdin) {
+    if (!inherited) {
       const stdin = proc.stdin;
       if (stdin === undefined) {
         throw new Error(
@@ -293,6 +273,10 @@ function resolveDeps(deps: NoteCliDeps): ResolvedDeps {
       remove: (draft) => removeNoteDraft(draft),
     },
     runProcess: deps.runProcess ?? defaultRunProcess,
+    compose:
+      deps.compose ??
+      (async (request) =>
+        (await import("../src/note-composer")).runNoteComposer(request)),
     copy: deps.copy ?? copyToClipboard,
     stdout: deps.stdout ?? ((text) => process.stdout.write(text)),
     stderr: deps.stderr ?? ((text) => process.stderr.write(text)),
@@ -440,18 +424,22 @@ function noteListRow(note: NoteRow): Record<string, unknown> {
   };
 }
 
-async function runEditor(
-  deps: ResolvedDeps,
-  draft: NoteDraft,
-): Promise<ProcessResult> {
+function editorArgv(deps: ResolvedDeps, draft: NoteDraft): string[] {
   const command =
     [deps.env.VISUAL, deps.env.EDITOR].find(
       (value): value is string =>
         typeof value === "string" && value.trim().length > 0,
     ) ?? "vi";
+  return [...parseCommandWords(command), draft.path];
+}
+
+async function runEditor(
+  deps: ResolvedDeps,
+  draft: NoteDraft,
+): Promise<ProcessResult> {
   let argv: string[];
   try {
-    argv = [...parseCommandWords(command), draft.path];
+    argv = editorArgv(deps, draft);
   } catch (error) {
     return {
       code: 2,
@@ -460,41 +448,6 @@ async function runEditor(
     };
   }
   return deps.runProcess({ argv, stdio: "inherit" });
-}
-
-/**
- * Capture a fresh Note with Gum's multiline writer. Gum renders on stderr and
- * returns the submitted value on stdout; its native Ctrl-E binding suspends the
- * textarea into $VISUAL/$EDITOR and restores the edited content on return.
- */
-async function runGumWriter(
-  deps: ResolvedDeps,
-  draft: NoteDraft,
-): Promise<ProcessResult> {
-  const result = await deps.runProcess({
-    argv: [
-      "gum",
-      "write",
-      `--width=${gumWriterWidth(process.stderr.columns)}`,
-      `--height=${gumWriterHeight(process.stderr.rows)}`,
-      "--header=New Note · Enter: continue · Ctrl-E: open $EDITOR · Esc: cancel",
-      // Gum 0.17 combines placeholders and numbered rows incorrectly: the
-      // placeholder survives as a separate uneditable line. Keep the useful
-      // placeholder and omit line numbers so typed text replaces it normally.
-      "--placeholder=Write a note…",
-    ],
-    stdinMode: "inherit",
-    stderrMode: "inherit",
-  });
-  if (result.code === 0) {
-    // `gum write` prints the value with one framing newline. Remove that one
-    // byte only; any newline already present in the textarea remains intact.
-    const body = result.stdout.endsWith("\n")
-      ? result.stdout.slice(0, -1)
-      : result.stdout;
-    deps.drafts.write(draft, body);
-  }
-  return result;
 }
 
 interface PickerOptions {
@@ -912,23 +865,33 @@ async function captureNewNote(
     ? deps.drafts.create(store.dbPath, "")
     : await chooseDraft(deps, store);
   if (draft === null) return 0;
-  let inputMode: "gum" | "editor" | null = fresh ? "gum" : "editor";
+  let inputMode: "editor" | null = fresh ? null : "editor";
+  if (fresh) {
+    let outcome: NoteComposerOutcome;
+    try {
+      outcome = await deps.compose({
+        initialText: draftBody(deps, draft),
+        persist: (body) => deps.drafts.write(draft, body),
+        reload: () => draftBody(deps, draft),
+        editorArgv: editorArgv(deps, draft),
+      });
+    } catch (error) {
+      deps.stderr(
+        `keeper note: composer failed; draft preserved at ${draft.path}: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+      return 1;
+    }
+    if (outcome.kind === "cancelled") return 0;
+  }
+
   while (true) {
-    if (inputMode !== null) {
-      const mode = inputMode;
-      const edited =
-        mode === "gum"
-          ? await runGumWriter(deps, draft)
-          : await runEditor(deps, draft);
+    if (inputMode === "editor") {
+      const edited = await runEditor(deps, draft);
       if (edited.code !== 0) {
-        if (mode === "gum" && edited.code === 1) {
-          // Gum prints `not submitted` after Escape. Clear that expected cancel
-          // frame immediately so tmux closes on a blank terminal surface.
-          deps.stderr("\u001b[2J\u001b[H");
-          return 0;
-        }
         deps.stderr(
-          `keeper note: ${mode === "gum" ? "writer" : "editor"} exited ${edited.code}; draft preserved at ${draft.path}\n`,
+          `keeper note: editor exited ${edited.code}; draft preserved at ${draft.path}\n`,
         );
         return 1;
       }

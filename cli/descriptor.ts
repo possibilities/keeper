@@ -1556,7 +1556,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           {
             name: "fresh",
             type: "boolean",
-            summary: "Start a blank Gum writer without the recovery picker",
+            summary: "Start the Note composer without the recovery picker",
           },
         ],
       },

@@ -24,6 +24,7 @@ export type TestManifest = {
 export const OPEN_TUI_FILES = [
   "test/ansi-to-styled.test.ts",
   "test/live-shell.test.ts",
+  "test/note-composer.test.ts",
   "test/dash-app.test.ts",
   "test/dash-shell.test.ts",
 ] as const;
