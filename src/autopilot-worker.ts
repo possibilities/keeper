@@ -190,9 +190,16 @@ import type { HarnessActivity } from "./session-activity";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
 import {
-  defaultShadowingWorkProbe,
+  defaultWorkPluginManifestInventory,
+  findShadowingWorkManifest,
+  physicalPluginDir,
   providerRejectReason,
   resolveWorkerCell,
+  selectedWorkerCellFreshness,
+  verifyWorkerCellCohort,
+  WORKER_CELL_COMPILE_COMMAND,
+  type WorkerCellCohortVerification,
+  type WorkPluginManifestInventory,
 } from "./worker-cell";
 import {
   ELIGIBLE_REASON,
@@ -355,10 +362,10 @@ export {
   worktreeRecoverEpicDispatchId,
 } from "./reconcile-core";
 // The producer-side worker-cell resolution seam lives in the filesystem-probing
-// `./worker-cell` leaf (shared with the dispatch CLI). `findShadowingWorkManifest`
-// moved there with it; re-exported so every existing `from "./autopilot-worker"`
-// import keeps resolving.
-export { findShadowingWorkManifest } from "./worker-cell";
+// `./worker-cell` leaf (shared with the dispatch CLI). Re-export inventory helpers
+// so existing producer-focused tests can import them from this module.
+export { inventoryWorkPluginManifests } from "./worker-cell";
+export { findShadowingWorkManifest };
 
 /**
  * Prune finalizer-guard entries older than the guard window (mirror
@@ -805,18 +812,14 @@ export interface ConfirmRunningDeps {
    * normalization seam without a real dir.
    */
   realpath?(p: string): string;
-  /**
-   * Producer-side scan-dir probe for a non-cell `work`-named plugin that would
-   * shadow the launch-time `work:worker` cell (see {@link
-   * findShadowingWorkManifest}). Returns the offending manifest path — the
-   * producer mints a sticky `work-plugin-shadowed` `DispatchFailed` (per-key,
-   * cleared by `retry_dispatch`) instead of spawning the wrong worker — or null
-   * when clean. Defaults to a real-config scan ({@link defaultShadowingWorkProbe})
-   * in `runReconcileCycle` when absent. A PRODUCER read by contract — lives in
-   * `runReconcileCycle`, never a fold arm, so re-fold determinism holds. Injected
-   * so tests assert the guard against a real scan-dir position without live config.
-   */
-  probeShadowingWorkManifest?(): string | null;
+  /** Read-only compiler cohort verifier. Lazily called at most once per cycle,
+   * only after a selected cell manifest exists. Tests may inject `{ok:true}`. */
+  verifyWorkerCellCohort?(): WorkerCellCohortVerification;
+  /** Complete launcher-config `work` inventory. Lazily scanned at most once per
+   * cycle after freshness succeeds; comparison remains exact per selected cell. */
+  inventoryWorkPluginManifests?(): WorkPluginManifestInventory;
+  /** Physical identity seam used to compare a selected cell with the inventory. */
+  physicalPluginDir?(pluginDir: string): string;
   /**
    * Sleep `ms`, abortable via the worker's shutdown signal. Resolves
    * early when `signal.aborted` flips; the caller checks the flag and
@@ -4364,21 +4367,25 @@ export async function runReconcileCycle(
     const key = stripTrailingSlashPath(realpath(info.assignment.worktreePath));
     return liveAttributedDirtyByWorktree.get(key) ?? EMPTY_STRING_SET;
   };
-  // Scan-dir shadow probe — resolved once, memoized across the loop (the scan dirs
-  // are cycle-invariant). `undefined` = not yet probed; a first `work`-cell launch
-  // triggers the single on-disk scan, so a cycle with no cell launches never reads
-  // the plugin config. Producer read (never a fold).
-  const probeShadow =
-    deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe;
-  let shadowManifest: string | null | undefined;
-  // Per-cycle memoized shadow probe handed to `resolveWorkerCell` — the on-disk
-  // scan fires at most once (first cell launch that reaches the shadow check),
-  // then serves the memo. Keeps the hot loop off a readdir-per-launch.
-  const probeShadowMemoized = (): string | null => {
-    if (shadowManifest === undefined) {
-      shadowManifest = probeShadow();
-    }
-    return shadowManifest;
+  // Compiler verification and launcher-config inventory are producer reads,
+  // lazy and memoized independently for this cycle. No selected cell means no
+  // read; missing/stale cells never trigger the later inventory scan.
+  const verifyCohort = deps.verifyWorkerCellCohort ?? verifyWorkerCellCohort;
+  let cohortVerification: WorkerCellCohortVerification | undefined;
+  const probeFreshnessMemoized = (pluginDir: string) => {
+    cohortVerification ??= verifyCohort();
+    return selectedWorkerCellFreshness(pluginDir, cohortVerification);
+  };
+  const inventoryWork =
+    deps.inventoryWorkPluginManifests ?? defaultWorkPluginManifestInventory;
+  let workManifestInventory: WorkPluginManifestInventory | undefined;
+  const physicalize = deps.physicalPluginDir ?? physicalPluginDir;
+  const probeShadowMemoized = (pluginDir: string): string | null => {
+    workManifestInventory ??= inventoryWork();
+    return findShadowingWorkManifest(
+      workManifestInventory,
+      physicalize(pluginDir),
+    );
   };
   // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
   // Surface every wedged slot (a stopped-but-live session blocking a wanted mint)
@@ -4565,6 +4572,7 @@ export async function runReconcileCycle(
       },
       {
         dirExists,
+        probeFreshness: probeFreshnessMemoized,
         probeShadow: probeShadowMemoized,
       },
     );
@@ -4591,25 +4599,26 @@ export async function runReconcileCycle(
         case "out-of-matrix":
           reason = `worker-cell-invalid: ${cell.message}`;
           break;
-        // (3) a cell whose generated plugin manifest is absent — `claude
-        //     --plugin-dir` would fall back to the dir basename and `/plan:work`
-        //     could not resolve `work:worker`. Remediation: regenerate the tree.
+        // (3) selected manifest absent: compile the complete owned cohort.
         case "missing":
           reason =
             `worker-cell-missing: ${cell.pluginDir} — regenerate via ` +
-            `'keeper prompt render-plugin-templates --project-root ` +
-            `${join(KEEPER_ROOT, "plugins", "plan")}' (without the cell manifest ` +
+            `'${WORKER_CELL_COMPILE_COMMAND}' (without the cell manifest ` +
             `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
             `cannot resolve 'work:worker')`;
           break;
-        // (4) a non-cell `work`-named plugin sitting in a claude `plugin_scan_dir`
-        //     re-claims the `work:worker` constant at launch and silently shadows
-        //     the `--plugin-dir`-selected cell (silent wrong-worker spawn).
+        // (4) verifier failure or selected dir absent from its exact output set.
+        case "stale":
+          reason =
+            `worker-cell-stale: ${cell.detail} — regenerate via ` +
+            `'${WORKER_CELL_COMPILE_COMMAND}'`;
+          break;
+        // (5) any other preloaded `work` manifest, including a generated sibling.
         case "shadowed":
           reason =
-            `work-plugin-shadowed: ${cell.shadowManifest} — a non-cell 'work'-named ` +
-            `plugin in a claude plugin_scan_dir would steal 'work:worker' from ` +
-            `the '${cell.pluginDir}' cell at launch (silent wrong-worker spawn); ` +
+            `work-plugin-shadowed: ${cell.shadowManifest} — another preloaded ` +
+            `'work'-named plugin would steal 'work:worker' from the exact ` +
+            `'${cell.pluginDir}' cell at launch (silent wrong-worker spawn); ` +
             "remove or rename it, then 'keeper retry-dispatch'";
           break;
         default:

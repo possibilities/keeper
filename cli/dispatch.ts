@@ -40,11 +40,9 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadMatrixV2, MatrixConfigError } from "../src/agent/matrix";
 import { parseTriple } from "../src/agent/triple";
-import { KEEPER_ROOT } from "../src/autopilot-worker";
 import { GIT_LOCAL_TIMEOUT_MS, gitExec } from "../src/commit-work/git-exec";
 import {
   resolveConfig,
@@ -74,9 +72,12 @@ import {
 import {
   composeWorkerCellDir,
   defaultShadowingWorkProbe,
+  defaultWorkerCellFreshnessProbe,
   providerRejectReason,
   resolveWorkerCell,
+  WORKER_CELL_COMPILE_COMMAND,
   type WorkerCellCompose,
+  type WorkerCellFreshness,
 } from "../src/worker-cell";
 import { KEEPER_EPIC_BRANCH_PREFIX, listWorktrees } from "../src/worktree-git";
 import { repoToken } from "../src/worktree-plan";
@@ -136,11 +137,14 @@ export interface MainDeps {
     projectDir: string,
     epicId: string,
   ) => Promise<string | null>;
-  /** Scan-dir shadow probe for the `work::` worker-cell resolution. Defaults to
-   *  the fresh `defaultShadowingWorkProbe` (a real plugin-config scan); injected
-   *  so a test drives the shadowed-cell reject without live config. A dispatch
-   *  fires ONE worker, so a per-launch fresh scan is fine (no hot loop). */
-  readonly probeShadowingWorkManifest?: () => string | null;
+  /** Exact selected-cell compiler freshness probe. One manual dispatch invokes
+   *  it at most once, after the selected manifest exists. */
+  readonly probeWorkerCellFreshness?: (
+    pluginDir: string,
+  ) => WorkerCellFreshness;
+  /** Complete-config exact shadow probe for the selected cell. One manual
+   *  dispatch invokes it at most once, after freshness succeeds. */
+  readonly probeShadowingWorkManifest?: (pluginDir: string) => string | null;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -854,6 +858,8 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           : composeWorkerCellDir(composeModel, composeTier);
       const cell = resolveWorkerCell(compose, {
         dirExists: deps.dirExists ?? existsSync,
+        probeFreshness:
+          deps.probeWorkerCellFreshness ?? defaultWorkerCellFreshnessProbe,
         probeShadow:
           deps.probeShadowingWorkManifest ?? defaultShadowingWorkProbe,
       });
@@ -882,18 +888,24 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
           case "missing":
             die(
               `refusing to launch ${claudeName}: the worker-cell plugin manifest is ` +
-                `absent under ${cell.pluginDir} — regenerate via 'keeper prompt ` +
-                `render-plugin-templates --project-root ${join(KEEPER_ROOT, "plugins", "plan")}' ` +
-                "(without it claude --plugin-dir falls back to the dir basename and " +
-                "'/plan:work' cannot resolve 'work:worker')",
+                `absent under ${cell.pluginDir} — regenerate via ` +
+                `'${WORKER_CELL_COMPILE_COMMAND}' (without it claude --plugin-dir ` +
+                "falls back to the dir basename and '/plan:work' cannot resolve " +
+                "'work:worker')",
+            );
+            break;
+          case "stale":
+            die(
+              `refusing to launch ${claudeName}: worker-cell-stale: ${cell.detail} — ` +
+                `regenerate via '${WORKER_CELL_COMPILE_COMMAND}'`,
             );
             break;
           case "shadowed":
             die(
-              `refusing to launch ${claudeName}: a non-cell 'work'-named plugin at ` +
-                `${cell.shadowManifest} would steal 'work:worker' from the ` +
-                `'${cell.pluginDir}' cell at launch (silent wrong-worker spawn) — ` +
-                "remove or rename it, then retry",
+              `refusing to launch ${claudeName}: another preloaded 'work'-named ` +
+                `plugin at ${cell.shadowManifest} would steal 'work:worker' from ` +
+                `the exact '${cell.pluginDir}' cell at launch (silent wrong-worker ` +
+                "spawn) — remove or rename it, then retry",
             );
             break;
           default:

@@ -99,6 +99,7 @@ import {
   findWrappedDelegationSkips,
   gateWedgedLanesByLiveness,
   gatherTipObservations,
+  inventoryWorkPluginManifests,
   isBareShellCommand,
   isEpicDoneById,
   isEpicInFlight,
@@ -528,6 +529,9 @@ interface FakeDepsOptions {
    * manifest path to drive the `work-plugin-shadowed` DispatchFailed branch.
    */
   probeShadowingWorkManifest?: () => string | null;
+  verifyWorkerCellCohort?: ConfirmRunningDeps["verifyWorkerCellCohort"];
+  inventoryWorkPluginManifests?: ConfirmRunningDeps["inventoryWorkPluginManifests"];
+  physicalPluginDir?: ConfirmRunningDeps["physicalPluginDir"];
   stampEpicCloseRecovery?: ConfirmRunningDeps["stampEpicCloseRecovery"];
 }
 
@@ -605,7 +609,17 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     },
     worktree: opts.worktree,
     realpath: opts.realpath ?? ((p: string) => p),
-    probeShadowingWorkManifest: opts.probeShadowingWorkManifest ?? (() => null),
+    verifyWorkerCellCohort:
+      opts.verifyWorkerCellCohort ?? (() => ({ ok: true })),
+    inventoryWorkPluginManifests:
+      opts.inventoryWorkPluginManifests ??
+      (() => {
+        const manifest = opts.probeShadowingWorkManifest?.() ?? null;
+        return manifest === null
+          ? []
+          : [{ manifest, physicalPluginDir: "/test-shadow-work-plugin" }];
+      }),
+    physicalPluginDir: opts.physicalPluginDir ?? ((p) => p),
     isEpicDone: opts.isEpicDone ?? (async () => true),
     async stampEpicCloseRecovery(epicId, projectDir) {
       log.closeRecoveryStamps.push({ epicId, projectDir });
@@ -4527,8 +4541,73 @@ test("runReconcileCycle: a missing worker-cell manifest blocks the launch with a
   expect(log.emissions.length).toBe(1);
   expect(log.emissions[0]).toMatchObject({ verb: "work", id: "fn-1-foo.1" });
   expect(log.emissions[0]?.reason).toContain("worker-cell-missing");
-  expect(log.emissions[0]?.reason).toContain("render-plugin-templates");
+  expect(log.emissions[0]?.reason).toContain(
+    "keeper prompt compile --role work:worker --target claude",
+  );
   expect(state.inFlight.size).toBe(0);
+});
+
+test("runReconcileCycle: stale selected cell fails before launch; verifier/inventory scan once and fresh sibling continues", async () => {
+  const epicA = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const epicB = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: "/repo-b",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-bar.1",
+        epic_id: "fn-2-bar",
+        task_number: 1,
+        tier: "max",
+        model: "sonnet",
+      }),
+    ],
+  });
+  const state = makeState();
+  const decision = reconcile(makeSnapshot({ epics: [epicA, epicB] }), state, 0);
+  const freshSiblingDir = decision.launches[1]?.pluginDir;
+  expect(freshSiblingDir).toContain("sonnet-max");
+  let verifierCalls = 0;
+  let inventoryCalls = 0;
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    verifyWorkerCellCohort: () => {
+      verifierCalls++;
+      return {
+        ok: true,
+        fingerprint: "test-fingerprint",
+        pluginDirs: [freshSiblingDir as string],
+      };
+    },
+    inventoryWorkPluginManifests: () => {
+      inventoryCalls++;
+      return [];
+    },
+  });
+  setJobByKey("work", "fn-2-bar.1", { job_id: "j-2", last_event_id: 201 });
+
+  await runReconcileCycle(
+    decision,
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(verifierCalls).toBe(1);
+  expect(inventoryCalls).toBe(1);
+  expect(log.launches.map((launch) => launch.name)).toEqual([
+    "work::fn-2-bar.1",
+  ]);
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]?.reason).toContain("worker-cell-stale:");
+  expect(log.emissions[0]?.reason).toContain(
+    "keeper prompt compile --role work:worker --target claude",
+  );
 });
 
 test("runReconcileCycle: an out-of-matrix worker cell blocks the launch with a sticky DispatchFailed", async () => {
@@ -4785,24 +4864,25 @@ test("findShadowingWorkManifest: flags a `work` plugin in a real scan-dir positi
   try {
     const scanDir = join(root, "claude-plugins");
     const manifest = dropScanPlugin(scanDir, "arthack-work", "work");
-    // A sibling non-`work` plugin in the same scan dir is ignored.
     dropScanPlugin(scanDir, "some-other", "notes");
-    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
-    expect(findShadowingWorkManifest([scanDir], cellBase)).toBe(manifest);
+    const selected = join(root, "workers", "opus-max");
+    const inventory = inventoryWorkPluginManifests([], [scanDir]);
+    expect(findShadowingWorkManifest(inventory, selected)).toBe(manifest);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("findShadowingWorkManifest: a `work` cell UNDER the cell base is not a shadow", () => {
+test("findShadowingWorkManifest: only the exact selected cell is legitimate; a workers sibling shadows", () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ap-scan-cell-")));
   try {
-    // A scan dir pointing straight at the generated workers tree enumerates the
-    // cells (all `work`-named) as children — those are the legitimate source.
     const cellBase = join(root, "plugins", "plan", "workers");
     dropScanPlugin(cellBase, "opus-max", "work");
-    dropScanPlugin(cellBase, "sonnet-max", "work");
-    expect(findShadowingWorkManifest([cellBase], cellBase)).toBeNull();
+    const siblingManifest = dropScanPlugin(cellBase, "sonnet-max", "work");
+    const inventory = inventoryWorkPluginManifests([], [cellBase]);
+    expect(
+      findShadowingWorkManifest(inventory, join(cellBase, "opus-max")),
+    ).toBe(siblingManifest);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -4814,12 +4894,12 @@ test("findShadowingWorkManifest: clean scan dir (no `work` plugin) → null; mis
     const scanDir = join(root, "claude-plugins");
     dropScanPlugin(scanDir, "keeper", "keeper");
     dropScanPlugin(scanDir, "plan", "plan");
-    const cellBase = join(root, "workers");
+    const inventory = inventoryWorkPluginManifests(
+      [],
+      [scanDir, join(root, "does-not-exist")],
+    );
     expect(
-      findShadowingWorkManifest(
-        [scanDir, join(root, "does-not-exist")],
-        cellBase,
-      ),
+      findShadowingWorkManifest(inventory, join(root, "opus-max")),
     ).toBeNull();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -4835,10 +4915,8 @@ test("runReconcileCycle: a shadowing `work` plugin in a scan dir blocks the laun
   try {
     const scanDir = join(root, "claude-plugins");
     const manifest = dropScanPlugin(scanDir, "arthack-work", "work");
-    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
     const { deps, log } = makeFakeDeps({
-      probeShadowingWorkManifest: () =>
-        findShadowingWorkManifest([scanDir], cellBase),
+      probeShadowingWorkManifest: () => manifest,
     });
     const epic = makeEpic({
       epic_id: "fn-1-foo",
@@ -4874,6 +4952,38 @@ test("runReconcileCycle: a shadowing `work` plugin in a scan dir blocks the laun
   }
 });
 
+test("runReconcileCycle: a sibling worker-cell manifest is an exact-cell shadow (not exempt as a cell)", async () => {
+  const siblingManifest =
+    "/plugins/plan/workers/sonnet-max/.claude-plugin/plugin.json";
+  const { deps, log } = makeFakeDeps({
+    inventoryWorkPluginManifests: () => [
+      {
+        manifest: siblingManifest,
+        physicalPluginDir: "/physical/workers/sonnet-max",
+      },
+    ],
+    physicalPluginDir: () => "/physical/workers/opus-max",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const state = makeState();
+  await runReconcileCycle(
+    reconcile(makeSnapshot({ epics: [epic] }), state, 0),
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  expect(log.launches).toEqual([]);
+  expect(log.emissions[0]?.reason).toContain("work-plugin-shadowed");
+  expect(log.emissions[0]?.reason).toContain(siblingManifest);
+  expect(log.emissions[0]?.reason).not.toContain("non-cell");
+});
+
 test("runReconcileCycle: a clean scan dir (no shadow) launches the cell normally (fn-1042)", async () => {
   // The no-collision path: the scan dir carries no `work` plugin, so the probe
   // returns null and the `work`-cell launch proceeds — no DispatchFailed.
@@ -4881,10 +4991,8 @@ test("runReconcileCycle: a clean scan dir (no shadow) launches the cell normally
   try {
     const scanDir = join(root, "claude-plugins");
     dropScanPlugin(scanDir, "keeper", "keeper");
-    const cellBase = join(root, "keeper", "plugins", "plan", "workers");
     const { deps, log, setJobByKey } = makeFakeDeps({
-      probeShadowingWorkManifest: () =>
-        findShadowingWorkManifest([scanDir], cellBase),
+      probeShadowingWorkManifest: () => null,
     });
     setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
     const epic = makeEpic({

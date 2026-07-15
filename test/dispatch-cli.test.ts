@@ -127,6 +127,10 @@ async function runDispatch(
       launchArgv = a;
       return { ok: true } as LaunchResult;
     },
+    // Focused CLI tests default compiler/inventory-clean without touching the
+    // repository's generated workers tree or launcher config.
+    probeWorkerCellFreshness: () => ({ ok: true }),
+    probeShadowingWorkManifest: () => null,
     ...extraDeps,
   };
   try {
@@ -375,10 +379,19 @@ test("a malformed --preset triple fails loud (exit 2)", async () => {
 
 test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the argv", async () => {
   writeMatrix(CLAUDE_MATRIX);
+  let freshnessCalls = 0;
+  let inventoryCalls = 0;
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,
-    probeShadowingWorkManifest: () => null,
+    probeWorkerCellFreshness: () => {
+      freshnessCalls++;
+      return { ok: true };
+    },
+    probeShadowingWorkManifest: () => {
+      inventoryCalls++;
+      return null;
+    },
   });
   expect(r.code).toBeUndefined(); // launched
   expect(r.spec?.pluginDir).toContain("plugins/plan/workers/opus-max");
@@ -389,6 +402,8 @@ test("plan work: an in-matrix cell threads --plugin-dir into the spec AND the ar
   expect(argv[nameIdx + 1]).toBe("work::fn-1-x.1");
   expect(argv[nameIdx + 2]).toBe("--plugin-dir");
   expect(argv[nameIdx + 3]).toContain("plugins/plan/workers/opus-max");
+  expect(freshnessCalls).toBe(1);
+  expect(inventoryCalls).toBe(1);
 });
 
 test("plan work: a cell-less task (no model/tier) launches with NO --plugin-dir", async () => {
@@ -469,21 +484,52 @@ test("plan work: a missing cell manifest refuses (exit 1) with the regenerate re
   expect(r.code).toBe(1);
   expect(r.spec).toBeUndefined();
   expect(r.stderr).toContain("manifest is");
-  expect(r.stderr).toContain("render-plugin-templates");
+  expect(r.stderr).toContain(
+    "keeper prompt compile --role work:worker --target claude",
+  );
 });
 
-test("plan work: a shadowing work plugin refuses (exit 1) naming the offending manifest", async () => {
+test("plan work: a stale compiler cohort fails closed before launch with canonical remediation", async () => {
+  writeMatrix(CLAUDE_MATRIX);
+  let freshnessCalls = 0;
+  let shadowCalls = 0;
+  const r = await runDispatch(["work::fn-1-x.1", "--force"], {
+    query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
+    dirExists: () => true,
+    probeWorkerCellFreshness: () => {
+      freshnessCalls++;
+      return { ok: false, detail: "hash-mismatch: compiled worker differs" };
+    },
+    probeShadowingWorkManifest: () => {
+      shadowCalls++;
+      return null;
+    },
+  });
+  expect(r.code).toBe(1);
+  expect(r.spec).toBeUndefined();
+  expect(freshnessCalls).toBe(1);
+  expect(shadowCalls).toBe(0);
+  expect(r.stderr).toContain("worker-cell-stale:");
+  expect(r.stderr).toContain(
+    "keeper prompt compile --role work:worker --target claude",
+  );
+});
+
+test("plan work: a sibling worker-cell work plugin refuses (exit 1) naming the offending manifest", async () => {
   writeMatrix(CLAUDE_MATRIX);
   const r = await runDispatch(["work::fn-1-x.1", "--force"], {
     query: makeQuery({ epics: epicWith(dir, { model: "opus", tier: "max" }) }),
     dirExists: () => true,
     probeShadowingWorkManifest: () =>
-      "/scan/arthack-work/.claude-plugin/plugin.json",
+      "/plugins/plan/workers/sonnet-max/.claude-plugin/plugin.json",
   });
   expect(r.code).toBe(1);
   expect(r.spec).toBeUndefined();
   expect(r.stderr).toContain("work:worker");
-  expect(r.stderr).toContain("/scan/arthack-work/.claude-plugin/plugin.json");
+  expect(r.stderr).toContain(
+    "/plugins/plan/workers/sonnet-max/.claude-plugin/plugin.json",
+  );
+  expect(r.stderr).not.toContain("non-cell");
 });
 
 // ---------------------------------------------------------------------------

@@ -16,22 +16,53 @@
 
 import { expect, test } from "bun:test";
 import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ClaudeWorkerCompileCellResult } from "../plugins/prompt/src/claude_worker_compiler";
+import {
   MatrixConfigError,
   type MatrixConfigState,
   type MatrixV2,
 } from "../src/agent/matrix";
 import {
   composeWorkerCellDir,
-  resolveWorkerCell,
+  findShadowingWorkManifest,
+  inventoryWorkPluginManifests,
+  resolveWorkerCell as resolveWorkerCellBase,
+  selectedWorkerCellFreshness,
+  verifyWorkerCellCohort,
+  WORKER_CELL_BASE,
   type WorkerCellCompose,
+  type WorkerCellProbeDeps,
   type WorkerCellResult,
 } from "../src/worker-cell";
+
+function resolveWorkerCell(
+  compose: WorkerCellCompose,
+  deps: Omit<WorkerCellProbeDeps, "probeFreshness"> &
+    Partial<Pick<WorkerCellProbeDeps, "probeFreshness">>,
+): WorkerCellResult {
+  return resolveWorkerCellBase(compose, {
+    probeFreshness: () => ({ ok: true }),
+    ...deps,
+  });
+}
 
 // A probe pair that FAILS the test if invoked — proves a code path never reaches
 // the filesystem. Each throws so an accidental call surfaces.
 const neverProbe = {
   dirExists: (_p: string): boolean => {
     throw new Error("dirExists must not be called on this path");
+  },
+  probeFreshness: (): { ok: true } => {
+    throw new Error("probeFreshness must not be called on this path");
   },
   probeShadow: (): string | null => {
     throw new Error("probeShadow must not be called on this path");
@@ -220,6 +251,36 @@ test("resolveWorkerCell: bad-matrix outranks a stale pluginDir + present shadow 
   expect(cell).toMatchObject({ kind: "bad-matrix", state: "schema-invalid" });
 });
 
+test("resolveWorkerCell: provider-reject ranks after bad-matrix and before out-of-matrix, with no probes", () => {
+  const providerReject: NonNullable<WorkerCellCompose["providerReject"]> = {
+    reason: "no-map-entry",
+    provider: "gpt",
+    direction: "claude_to_gpt",
+    assigned: { model: "opus", effort: "max" },
+    target: null,
+  };
+  expect(
+    resolveWorkerCell(
+      {
+        pluginDir: "/abs/cell",
+        providerReject,
+        reject: "out of matrix",
+      },
+      neverProbe,
+    ),
+  ).toMatchObject({ kind: "provider-reject", reason: "no-map-entry" });
+  expect(
+    resolveWorkerCell(
+      {
+        pluginDir: "/abs/cell",
+        providerReject,
+        matrixReject: { state: "absent", detail: "no matrix" },
+      },
+      neverProbe,
+    ),
+  ).toMatchObject({ kind: "bad-matrix" });
+});
+
 test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow probe", () => {
   const cell = resolveWorkerCell(
     { pluginDir: "/abs/cell" },
@@ -331,6 +392,193 @@ test("resolveWorkerCell: a fresh probe (dispatch cadence) scans on each call", (
 });
 
 // ---------------------------------------------------------------------------
+// Compiler freshness + exact preloaded-work inventory
+// ---------------------------------------------------------------------------
+
+test("resolveWorkerCell: stale cohort ranks after missing and before shadow", () => {
+  let shadowCalls = 0;
+  const stale = resolveWorkerCell(
+    { pluginDir: "/abs/cell" },
+    {
+      dirExists: () => true,
+      probeFreshness: () => ({
+        ok: false,
+        detail: "hash-mismatch: primary bytes differ",
+      }),
+      probeShadow: () => {
+        shadowCalls++;
+        return "/shadow/manifest.json";
+      },
+    },
+  );
+  expect(stale).toEqual({
+    ok: false,
+    kind: "stale",
+    pluginDir: "/abs/cell",
+    detail: "hash-mismatch: primary bytes differ",
+  });
+  expect(shadowCalls).toBe(0);
+
+  let freshnessCalls = 0;
+  const missing = resolveWorkerCell(
+    { pluginDir: "/abs/cell" },
+    {
+      dirExists: () => false,
+      probeFreshness: () => {
+        freshnessCalls++;
+        return { ok: false, detail: "stale" };
+      },
+      probeShadow: () => null,
+    },
+  );
+  expect(missing).toMatchObject({ kind: "missing" });
+  expect(freshnessCalls).toBe(0);
+});
+
+test("verifyWorkerCellCohort: compiler output cells become the exact selected-dir inventory", () => {
+  const verified = verifyWorkerCellCohort(() => ({
+    ok: true,
+    target: "claude",
+    fingerprint: "compiler-fingerprint",
+    outputs: [
+      {
+        cell: { model: "opus", effort: "max" },
+      } as ClaudeWorkerCompileCellResult,
+    ],
+  }));
+  expect(verified).toEqual({
+    ok: true,
+    fingerprint: "compiler-fingerprint",
+    pluginDirs: [join(WORKER_CELL_BASE, "opus-max")],
+  });
+});
+
+test("verifyWorkerCellCohort: typed compiler failure becomes concise machine stale detail", () => {
+  expect(
+    verifyWorkerCellCohort(() => ({
+      ok: false,
+      target: "claude",
+      failure: {
+        kind: "hash-mismatch",
+        message: "primary hash does not match",
+        path: "/workers/opus-max/agents/worker.md",
+      },
+    })),
+  ).toEqual({
+    ok: false,
+    detail:
+      "hash-mismatch: primary hash does not match (/workers/opus-max/agents/worker.md)",
+  });
+});
+
+test("selectedWorkerCellFreshness: verified exact membership is fresh; absent selected cell is stale", () => {
+  const verified = {
+    ok: true as const,
+    fingerprint: "fp",
+    pluginDirs: ["/workers/opus-max", "/workers/sonnet-high"],
+  };
+  expect(selectedWorkerCellFreshness("/workers/opus-max", verified)).toEqual({
+    ok: true,
+  });
+  expect(selectedWorkerCellFreshness("/workers/opus-high", verified)).toEqual({
+    ok: false,
+    detail: "selected-cell-not-in-verified-cohort: /workers/opus-high",
+  });
+  // Minimal injected clean fixture, intentionally no compiler inventory.
+  expect(selectedWorkerCellFreshness("/any/test-cell", { ok: true })).toEqual({
+    ok: true,
+  });
+});
+
+function dropWorkPlugin(pluginDir: string, name = "work"): string {
+  const manifestDir = join(pluginDir, ".claude-plugin");
+  mkdirSync(manifestDir, { recursive: true });
+  const manifest = join(manifestDir, "plugin.json");
+  writeFileSync(manifest, JSON.stringify({ name }));
+  return manifest;
+}
+
+test("work manifest inventory: exact selected manifest is legitimate, workers sibling shadows", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "worker-cell-exact-")));
+  try {
+    const workers = join(root, "workers");
+    dropWorkPlugin(join(workers, "opus-max"));
+    const sibling = dropWorkPlugin(join(workers, "sonnet-max"));
+    const inventory = inventoryWorkPluginManifests([], [workers]);
+    expect(
+      findShadowingWorkManifest(inventory, join(workers, "opus-max")),
+    ).toBe(sibling);
+    expect(
+      findShadowingWorkManifest(
+        inventory.filter((entry) => entry.manifest !== sibling),
+        join(workers, "opus-max"),
+      ),
+    ).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("work manifest inventory: explicit plugin_dirs work plugin shadows selected cell", () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "worker-cell-explicit-")),
+  );
+  try {
+    const selected = join(root, "workers", "opus-max");
+    dropWorkPlugin(selected);
+    const external = join(root, "explicit-work");
+    const manifest = dropWorkPlugin(external);
+    const inventory = inventoryWorkPluginManifests([external], []);
+    expect(findShadowingWorkManifest(inventory, selected)).toBe(manifest);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("work manifest inventory: symlink aliases compare by physical identity", () => {
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "worker-cell-symlink-")),
+  );
+  try {
+    const selected = join(root, "workers", "opus-max");
+    dropWorkPlugin(selected);
+    const sibling = join(root, "workers", "sonnet-max");
+    const siblingManifest = dropWorkPlugin(sibling);
+    const scan = join(root, "scan");
+    mkdirSync(scan);
+    symlinkSync(sibling, join(scan, "looks-like-opus-max"));
+    const inventory = inventoryWorkPluginManifests([], [scan]);
+    expect(inventory[0]?.physicalPluginDir).toBe(realpathSync(sibling));
+    // The alias path cannot exploit the old broad workers-tree exemption.
+    expect(findShadowingWorkManifest(inventory, realpathSync(selected))).toBe(
+      join(scan, "looks-like-opus-max", ".claude-plugin", "plugin.json"),
+    );
+    expect(siblingManifest).toContain("sonnet-max");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("work manifest inventory: missing and malformed entries are ignored", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "worker-cell-ignore-")));
+  try {
+    const explicitMissing = join(root, "missing");
+    const malformed = join(root, "scan", "malformed", ".claude-plugin");
+    mkdirSync(malformed, { recursive: true });
+    writeFileSync(join(malformed, "plugin.json"), "not json");
+    dropWorkPlugin(join(root, "scan", "notes"), "notes");
+    expect(
+      inventoryWorkPluginManifests(
+        [explicitMissing],
+        [join(root, "scan"), join(root, "absent-scan")],
+      ),
+    ).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // No-prose contract — the helper returns machine kinds ONLY; callers add text
 // ---------------------------------------------------------------------------
 
@@ -359,6 +607,22 @@ test("resolveWorkerCell: reject results carry machine fields ONLY, no operator p
   expect(JSON.stringify(shadowed)).not.toContain("steal");
   expect(JSON.stringify(shadowed)).not.toContain("rename");
 
+  const stale = resolveWorkerCell(
+    { pluginDir: "/abs/cell" },
+    {
+      dirExists: () => true,
+      probeFreshness: () => ({ ok: false, detail: "hash-mismatch" }),
+      probeShadow: () => null,
+    },
+  );
+  expect(Object.keys(stale).sort()).toEqual([
+    "detail",
+    "kind",
+    "ok",
+    "pluginDir",
+  ]);
+  expect(JSON.stringify(stale)).not.toContain("keeper prompt compile");
+
   // The bad-matrix reject carries the state + the raw detail ONLY — never the
   // caller's 'keeper retry-dispatch' remediation framing.
   const bad = resolveWorkerCell(
@@ -385,6 +649,8 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
         return "out-of-matrix";
       case "missing":
         return "missing";
+      case "stale":
+        return "stale";
       case "shadowed":
         return "shadowed";
       default:
@@ -430,6 +696,18 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
     classify(
       resolveWorkerCell(
         { pluginDir: "/c" },
+        {
+          dirExists: () => true,
+          probeFreshness: () => ({ ok: false, detail: "hash-mismatch" }),
+          probeShadow: () => null,
+        },
+      ),
+    ),
+  );
+  kinds.add(
+    classify(
+      resolveWorkerCell(
+        { pluginDir: "/c" },
         { dirExists: () => true, probeShadow: () => "/s" },
       ),
     ),
@@ -441,6 +719,7 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
       "bad-matrix",
       "provider-reject",
       "missing",
+      "stale",
       "shadowed",
     ]),
   );
