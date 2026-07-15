@@ -191,10 +191,10 @@ event, never a direct DB/tmux write.
 
 A host `~/.config/keeper/matrix.yaml`
 ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md)) is the single,
-REQUIRED worker-matrix config — there is no embedded fallback, so a fresh host cannot render,
+REQUIRED worker-matrix config — there is no embedded fallback, so a fresh host cannot compile,
 select, or dispatch worker cells (claude-native included) until it exists. Top level: the default
-`efforts` axis, `subagent_templates` (the cell-template inventory the renderer fans out),
-`subagent_models` (the explicit capability tokens eligible to render and select as worker cells),
+`efforts` axis, `subagent_templates` (the cell-template inventory the compiler expands into one
+shared cohort), `subagent_models` (the explicit capability tokens eligible to compile and select as worker cells),
 `wrapper_driver` (the fixed claude model/effort every wrapped cell's wrapper runs at),
 `agent_pins` (every static plan subagent's `{model, effort}` pin, baked into its rendered
 frontmatter — a pair, never a triple, since frontmatter carries no harness axis), and
@@ -216,9 +216,21 @@ members) against the enumerable cube, flagging a well-formed triple outside it a
 agent providers resolve <model> <effort>` prints the driver plus the cost-ordered candidate
 harnesses. Absence or malformedness is a typed loud failure discriminated into four states — absent,
 unparseable, schema-invalid (a retired key like `route:`/`native:`/`name:`/`subagents:` is named),
-or valid-but-empty — surfaced on every reading surface (loaders, the template renderer, plan verbs,
-`keeper agent` provider resolution); the daemon never exits on it, parking dispatch behind a visible
-distress sticky until the file is fixed. Standing up a host:
+or valid-but-empty — surfaced on every reading surface (loaders, the prompt compiler and its
+compatibility renderer, plan verbs, `keeper agent` provider resolution); the daemon never exits on
+it, parking dispatch behind a visible distress sticky until the file is fixed.
+
+`keeper prompt compile --role work:worker --target claude` owns the complete shared cohort under
+`plugins/plan/workers/`. It fingerprints the catalog, matrix, and captured template-include graph;
+owns every worker agent, plugin manifest, JSON sidecar, and cohort manifest; prunes only owned
+orphans; and publishes the manifest last after byte verification. `--check` is write-free. Manual
+and autopilot dispatch verify that state before launch: an absent selected manifest is
+`worker-cell-missing`, while a present but stale or corrupt cohort is `worker-cell-stale`. Both name
+the compiler command as recovery. Task `{model, tier}` assignment and any producer-side provider
+constraint still choose the runtime cell; compilation never creates task-specific prompts or
+provider-equivalence substitutes.
+
+Standing up a host:
 
 1. Copy [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) — a committed,
    load-tested reference shape (claude native models, a codex-served capability model with a
@@ -228,7 +240,7 @@ distress sticky until the file is fixed. Standing up a host:
    needs an `agent_pins:` entry per static plan agent — copy the example's block as a starting
    point, since it names all 11 by their current agent id.
 2. For a new model, add its selector guidance with `/plan:model-guidance <model>` (the drift gate fails until every roster model has a block).
-3. Re-render the worker cells AND the static agents: `keeper prompt render-plugin-templates --project-root plugins/plan` (confirm with `ls plugins/plan/workers/` and `ls plugins/plan/agents/`). A static agent template with no matching `agent_pins` entry fails the render loud, naming the agent.
+3. Render the plan plugin's generated surfaces with `keeper prompt render-plugin-templates --project-root plugins/plan`. This compatibility front door renders static agents and delegates worker publication once to the Claude compiler. Verify the worker cohort with `keeper prompt compile --role work:worker --target claude --check`, and confirm static agents with `ls plugins/plan/agents/`. A static agent template with no matching `agent_pins` entry fails loud, naming the agent. For a worker-only source or matrix change, the direct compiler command is sufficient.
 4. Compose and install the described panel roster with `/plan:panel-guidance`. It authors the committed `plugins/plan/panel-selector.yaml` as ten named panel objects, each with `strength`, `members`, and `description`; its structural gate verifies the roster before the skill copies that exact file to `~/.config/keeper/panel.yaml`.
 5. Discover the enumerable cube and verify routing: `keeper agent presets list --json` lists every
    `<harness>::<model>::<effort>` launch triple the roster now serves (cell-bearing and launch-only

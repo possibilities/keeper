@@ -13,7 +13,11 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { effectiveMatrix } from "../src/host_matrix.ts";
+import {
+  effectiveMatrix,
+  hostMatrixV2ProviderRoute,
+  loadHostMatrixV2,
+} from "../src/host_matrix.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import { runCli } from "./harness.ts";
 
@@ -900,11 +904,17 @@ describe("work.md.tmpl agentId capture regex", () => {
 });
 
 describe("generated work plugins in the plan plugin", () => {
-  // The renderer fans out over the EFFECTIVE matrix using each model's own effort
-  // list, so this per-cell existence gate walks the same ragged product. The
-  // committed workers/ tree renders from the test suite's pinned claude-only host
-  // matrix (bunfig.toml preload), so effectiveMatrix() here resolves the same axes.
+  // The Claude prompt compiler fans out over the effective matrix using each
+  // capability's own effort list. The cell path retains that assigned capability,
+  // while frontmatter carries the exact Claude launch route: the cell itself when
+  // native, or the fixed wrapper driver when wrapped.
   const matrix = effectiveMatrix();
+  const host = loadHostMatrixV2();
+  const wrapperRoute = hostMatrixV2ProviderRoute(
+    host,
+    "claude",
+    host.wrapper_driver.model,
+  );
   for (const model of matrix.models) {
     for (const effort of matrix.effortsFor(model)) {
       test.skipIf(!WORKERS_RENDERED)(
@@ -920,10 +930,15 @@ describe("generated work plugins in the plan plugin", () => {
           const agentPath = join(cellDir, "agents", "worker.md");
           expect(existsSync(agentPath)).toBe(true);
           const fm = parseFrontmatter(frontmatterBlock(agentPath));
+          const native = host.driverByModel.get(model) === "native";
+          const launch = native
+            ? hostMatrixV2ProviderRoute(host, "claude", model)
+            : wrapperRoute;
+          expect(launch).toBeDefined();
           expect(fm.name).toBe("worker");
-          expect(fm.model).toBe(model);
-          expect(fm.effort).toBe(effort);
-          expect(fm.maxTurns).toBe("300");
+          expect(fm.model).toBe(launch?.launchId);
+          expect(fm.effort).toBe(native ? effort : host.wrapper_driver.effort);
+          expect(fm.maxTurns).toBe(native ? "300" : "160");
         },
       );
     }

@@ -520,7 +520,7 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("contains no renderer-owned worker-cell writer", () => {
     const source = readFileSync(

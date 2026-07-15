@@ -3,8 +3,8 @@
 # Roles, not plugins, are the binding unit. Static roles draw their assigned
 # cell from matrix.yaml agent_pins and adapt through provider equivalence when a
 # publication target does not serve that cell. The work worker is cell-bound
-# and remains wrapped when unserved; Pi publication of that role is outside the
-# static compiler slice.
+# and remains wrapped when unserved; the Claude target publishes its complete
+# matrix-derived cohort separately from Pi's static-role cohort.
 
 schema_version: 1
 
