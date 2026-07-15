@@ -188,7 +188,9 @@ function rewindAndWipe(): void {
   db.run("DELETE FROM tmux_client_focus");
   // These charter tests deliberately REPLAY the historical git folds (the
   // production live-only surface is boot-seeded, but here we replay to keep the
-  // attribution rows observable), so reopen the skip-floor alongside the rewind.
+  // attribution rows observable), so clear both the per-root snapshot floor and
+  // the global skip-floor alongside the rewind.
+  db.run("DELETE FROM git_status");
   db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
 }
 

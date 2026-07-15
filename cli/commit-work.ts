@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { waitForAttributionCaughtUp } from "../src/commit-work/attribution";
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import { type GitRunner, gitExec } from "../src/commit-work/git-exec";
 import {
@@ -33,6 +33,7 @@ import {
 import {
   type ClaimLiveness,
   type CommitWorkSurfaceSummary,
+  claimIsExclusiveOwnership,
   type DirectSurfaceEvidence,
   discoverCommitWorkSurface,
   type OwnershipClaim,
@@ -43,13 +44,16 @@ import { emitCommitWorkOutcome } from "../src/commit-work/telemetry";
 
 const HELP = `keeper commit-work [MSG] [options]
 
-Commit only work owned by this invocation through an isolated Git index.
+Commit exact work selected by ownership or explicit invocation-local adoption.
 Preview explains the complete dirty surface. Attribution gaps are covered with
 explicit, invocation-local adoption; adoption never creates a durable claim.
 
 Options:
   --session-id <uuid>  Invocation identity (must agree with non-empty env carriers)
   --adopt <path>       Adopt one exact dirty path; repeat for multiple paths
+  --adopt-from <file>  Read paths from a versioned JSON adoption manifest
+  --message-file <file>
+                       Read the commit message without shell interpolation
   --preview-files      Emit an advisory surface envelope; make no commit
   --max-files <n>      Refuse a selected set larger than n (default 500; 0 disables)
   --allow-stale-unstage
@@ -59,17 +63,19 @@ Options:
                        Proceed past an intentional bulk reversion
   --help, -h           Show this help
 
-A coverage gap is resolved by re-running with --adopt <path>. Lint failures are
-fixed in the live worktree and retried through keeper commit-work; never bypass
-hooks or use --no-verify.
+A coverage gap is resolved by re-running with --adopt <path>, or by passing a
+manifest shaped {"schema_version":1,"kind":"commit-work-adoption","paths":[...]}.
+Lint failures are fixed in the live worktree and retried through commit-work;
+never bypass hooks or use --no-verify.
 `;
 
 const AGENT_HELP = `keeper commit-work — operator runbook
 
 Run --preview-files first. Automatic selection is attribution-backed; add an
-exact missing dirty path with repeatable --adopt <path>. Adoption is local to
-this invocation and refuses a live foreign owner. Fix lint failures in the live
-worktree and re-run the same command. Commit hooks and signing remain on.
+exact missing dirty path with repeatable --adopt <path> or a versioned
+--adopt-from manifest. Adoption is local to this invocation and refuses a live
+foreign owner. Fix lint failures in the live worktree and re-run the same
+command. Commit hooks and signing remain on.
 `;
 
 const FORBIDDEN_TRAILER_RE =
@@ -77,11 +83,16 @@ const FORBIDDEN_TRAILER_RE =
 const DEFAULT_MAX_FILES = 500;
 const SAMPLE_LIMIT = 20;
 const STDERR_LIMIT = 4000;
+const MAX_ADOPTION_MANIFEST_BYTES = 1_048_576;
+const MAX_ADOPTION_MANIFEST_PATHS = 10_000;
+const MAX_MESSAGE_BYTES = 65_536;
 
 export interface ParsedArgs {
   msg: string | null;
   sessionId: string | null;
   adopt: string[];
+  adoptFrom: string[];
+  messageFile: string | null;
   previewFiles: boolean;
   allowStaleUnstage: boolean;
   overrideJam: boolean;
@@ -117,6 +128,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
     msg: null,
     sessionId: null,
     adopt: [],
+    adoptFrom: [],
+    messageFile: null,
     previewFiles: false,
     allowStaleUnstage: false,
     overrideJam: false,
@@ -143,6 +156,22 @@ export function parseArgs(argv: string[]): ParsedArgs {
       i += 1;
     } else if (arg.startsWith("--adopt=")) {
       parsed.adopt.push(arg.slice("--adopt=".length));
+    } else if (arg === "--adopt-from") {
+      parsed.adoptFrom.push(valueAfter(argv, i, arg));
+      i += 1;
+    } else if (arg.startsWith("--adopt-from=")) {
+      parsed.adoptFrom.push(arg.slice("--adopt-from=".length));
+    } else if (arg === "--message-file") {
+      if (parsed.messageFile !== null) {
+        throw new UsageError("--message-file may be passed only once");
+      }
+      parsed.messageFile = valueAfter(argv, i, arg);
+      i += 1;
+    } else if (arg.startsWith("--message-file=")) {
+      if (parsed.messageFile !== null) {
+        throw new UsageError("--message-file may be passed only once");
+      }
+      parsed.messageFile = arg.slice("--message-file=".length);
     } else if (arg === "--max-files") {
       parsed.maxFiles = parseMaxFiles(valueAfter(argv, i, arg));
       i += 1;
@@ -157,6 +186,119 @@ export function parseArgs(argv: string[]): ParsedArgs {
     else throw new UsageError(`unexpected argument '${arg}'`);
   }
   return parsed;
+}
+
+/** Read one regular file through a single descriptor with a hard byte cap. */
+function readBoundedInputFile(
+  path: string,
+  flag: "--adopt-from" | "--message-file",
+  maxBytes: number,
+): string {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new UsageError(`${flag} '${path}' must name a regular file`);
+    }
+    if (stat.size > maxBytes) {
+      throw new UsageError(`${flag} '${path}' exceeds ${maxBytes} bytes`);
+    }
+    // Read from the already-open descriptor into a bounded buffer. This binds
+    // validation to one file identity and detects growth without a stat/read
+    // pathname race or an unbounded allocation.
+    const bytes = Buffer.alloc(maxBytes + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (read === 0) break;
+      offset += read;
+    }
+    if (offset > maxBytes) {
+      throw new UsageError(`${flag} '${path}' exceeds ${maxBytes} bytes`);
+    }
+    return bytes.subarray(0, offset).toString("utf8");
+  } catch (error) {
+    if (error instanceof UsageError) throw error;
+    throw new UsageError(
+      `cannot read ${flag} '${path}': ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The bounded input has already been copied; close failure cannot make
+        // an untrusted pathname authoritative or alter the invocation payload.
+      }
+    }
+  }
+}
+
+/** Expand invocation files without granting durable ownership. */
+function expandInvocationFiles(args: ParsedArgs): ParsedArgs {
+  const manifestPaths: string[] = [];
+  for (const manifestPath of args.adoptFrom) {
+    const text = readBoundedInputFile(
+      manifestPath,
+      "--adopt-from",
+      MAX_ADOPTION_MANIFEST_BYTES,
+    );
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new UsageError(`--adopt-from '${manifestPath}' is not valid JSON`);
+    }
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      throw new UsageError(
+        `--adopt-from '${manifestPath}' must contain a commit-work-adoption object`,
+      );
+    }
+    const manifest = parsed as Record<string, unknown>;
+    if (
+      manifest.schema_version !== 1 ||
+      manifest.kind !== "commit-work-adoption" ||
+      !Array.isArray(manifest.paths) ||
+      manifest.paths.some((path) => typeof path !== "string")
+    ) {
+      throw new UsageError(
+        `--adopt-from '${manifestPath}' must match {"schema_version":1,"kind":"commit-work-adoption","paths":[...]}`,
+      );
+    }
+    manifestPaths.push(...(manifest.paths as string[]));
+    if (manifestPaths.length > MAX_ADOPTION_MANIFEST_PATHS) {
+      throw new UsageError(
+        `--adopt-from manifests exceed ${MAX_ADOPTION_MANIFEST_PATHS} paths`,
+      );
+    }
+  }
+
+  let message = args.msg;
+  if (args.messageFile !== null) {
+    if (message !== null) {
+      throw new UsageError(
+        "pass either positional MSG or --message-file, not both",
+      );
+    }
+    message = readBoundedInputFile(
+      args.messageFile,
+      "--message-file",
+      MAX_MESSAGE_BYTES,
+    );
+    if (message.includes("\0")) {
+      throw new UsageError("--message-file may not contain NUL");
+    }
+  }
+  return {
+    ...args,
+    msg: message,
+    adopt: [...args.adopt, ...manifestPaths],
+  };
 }
 
 export type CommitWorkOutcome =
@@ -201,7 +343,7 @@ export type CommitWorkOutcome =
 
 export interface CommitWorkResult {
   schema_version: 1;
-  kind: "commit-work-preview" | "commit-work-result";
+  kind: "commit-work-result";
   outcome: CommitWorkOutcome;
   success: boolean;
   identity?: string | null;
@@ -327,7 +469,6 @@ export interface CommitWorkDeps {
     identity: string | null,
     worktree: string,
   ) => DirectSurfaceEvidence | undefined;
-  waitForAttribution?: (identity: string, worktree: string) => Promise<boolean>;
   readClaims?: (worktree: string) => OwnershipClaim[] | null;
   classifyClaim?: (claim: OwnershipClaim) => ClaimLiveness;
   runLint?: (files: string[], cwd: string) => Promise<void>;
@@ -383,7 +524,8 @@ function automaticClaimIdentityDrift(
       continue;
     }
     const mine = (surface.claimsByPath.get(path) ?? []).filter(
-      (claim) => claim.sessionId === identity,
+      (claim) =>
+        claimIsExclusiveOwnership(claim) && claim.sessionId === identity,
     );
     const frozenMode = entry.kind === "absent" ? "000000" : entry.mode;
     if (
@@ -415,7 +557,9 @@ function selectedForeignConflicts(
         (surface.claimsByPath.get(path) ?? [])
           .filter(
             (claim) =>
-              claim.sessionId !== identity && claim.liveness !== "terminal",
+              claimIsExclusiveOwnership(claim) &&
+              claim.sessionId !== identity &&
+              claim.liveness !== "terminal",
           )
           .map((claim) => claim.sessionId),
       ),
@@ -530,9 +674,7 @@ async function runAttempt(
   result: CommitWorkResult;
   identity: string | null;
 }> {
-  const invocationKind = args.previewFiles
-    ? "commit-work-preview"
-    : "commit-work-result";
+  const invocationKind: CommitWorkResult["kind"] = "commit-work-result";
   let identity: string | null = null;
   try {
     const resolved = resolveInvocationIdentity(
@@ -564,7 +706,7 @@ async function runAttempt(
     throw error;
   }
 
-  if (identity === null && args.adopt.length === 0) {
+  if (identity === null) {
     return {
       code: 1,
       identity,
@@ -577,20 +719,9 @@ async function runAttempt(
 
   const git = deps.gitRunner ?? gitExec;
   const worktree = await resolveWorktreeRoot(deps.cwd ?? process.cwd(), git);
-  // Receipt evidence is an injectable extension seam, not a wired production
-  // source yet. Keep the established 1.5s bounded fold-lag wait in production
-  // until such a source is actually supplied.
-  if (identity !== null && deps.directEvidence === undefined) {
-    try {
-      await (deps.waitForAttribution ?? waitForAttributionCaughtUp)(
-        identity,
-        worktree,
-      );
-    } catch {
-      // Attribution waiting is bounded and fail-open; an unavailable DB must
-      // not turn into an unbounded commit-work failure.
-    }
-  }
+  // Ownership discovery is immediate: durable claims are used when available,
+  // while fold-lagged or otherwise unattributed dirt is surfaced as explicitly
+  // adoptable. A fixed delay cannot establish a happens-before relationship.
   const advisory = await discover(args, identity, worktree, git, deps);
   const ambient = await stagedFileNames(worktree, git);
   if (ambient !== null) {
@@ -620,7 +751,7 @@ async function runAttempt(
     return {
       code: 0,
       identity,
-      result: result("commit-work-preview", "preview", true, {
+      result: result("commit-work-result", "preview", true, {
         identity,
         files: advisory.selected,
         selection: selectionEnvelope(advisory, identity),
@@ -722,19 +853,6 @@ async function runAttempt(
 
   let frozen: FrozenPrivateIndex | null = null;
   try {
-    // The advisory wait does not cover time spent contending for the lock. Keep
-    // the bounded wait inside the lock until direct receipts are production-wired.
-    if (identity !== null && deps.directEvidence === undefined) {
-      try {
-        await (deps.waitForAttribution ?? waitForAttributionCaughtUp)(
-          identity,
-          worktree,
-        );
-      } catch {
-        // Bounded attribution waiting remains fail-open.
-      }
-    }
-
     const underLockOperation = await detect(worktree, git);
     if (underLockOperation !== null) {
       return {
@@ -769,8 +887,8 @@ async function runAttempt(
       }
     }
 
-    // Preview is advisory. Definitive ownership discovery follows both the lock
-    // and its attribution wait, then binds exact live identities.
+    // Preview is advisory. Definitive ownership discovery follows the lock and
+    // binds exact live identities; unattributed dirt requires explicit adoption.
     const surface = await discover(args, identity, worktree, git, deps);
     const ambientNow = await stagedFileNames(worktree, git);
     if (ambientNow === null) {
@@ -846,7 +964,7 @@ async function runAttempt(
           sample: pathSample(stale),
           hint: "Ambient staged paths are outside this invocation's selected surface.",
           recovery:
-            "Commit the ambient paths separately, restore them with git add, or explicitly use --allow-stale-unstage.",
+            "If an ambient path is yours, add that exact path with --adopt and preview again; otherwise preserve the other work and use --allow-stale-unstage to restore only those ambient entries.",
           selection: selectionEnvelope(surface, identity),
           surface: surface.summary,
         }),
@@ -987,7 +1105,7 @@ async function runAttempt(
             stderr: capStderr(error.stderr),
             stderr_sample: capStderr(error.stderr),
             recovery:
-              "Fix the reported files in the live worktree, restage as needed, then re-invoke `keeper commit-work` with the same message. A lint failure is not a coverage gap; use --adopt only for missing attribution.",
+              "Fix the reported files in the live worktree, then re-invoke `keeper commit-work` with the same message and adoption arguments. A lint failure is not a coverage gap.",
           }),
         };
       }
@@ -1271,22 +1389,26 @@ async function runParsed(
     result: CommitWorkResult;
     identity: string | null;
   };
+  let effectiveArgs = args;
   try {
-    attempt = await runAttempt(args, deps);
+    effectiveArgs = expandInvocationFiles(args);
+    attempt = await runAttempt(effectiveArgs, deps);
   } catch (error) {
+    const usage = error instanceof UsageError;
     attempt = {
-      code: 1,
+      code: usage ? 2 : 1,
       identity: null,
-      result: result(
-        args.previewFiles ? "commit-work-preview" : "commit-work-result",
-        "internal_error",
-        false,
-        { detail: error instanceof Error ? error.name : "unknown" },
-      ),
+      result: usage
+        ? result("commit-work-result", "argument_error", false, {
+            message: error.message,
+          })
+        : result("commit-work-result", "internal_error", false, {
+            detail: error instanceof Error ? error.name : "unknown",
+          }),
     };
   }
   writeOut(`${JSON.stringify(attempt.result)}\n`);
-  if (!args.previewFiles) {
+  if (!effectiveArgs.previewFiles) {
     try {
       (deps.emitOutcome ?? emitCommitWorkOutcome)(
         attempt.result,

@@ -1,6 +1,6 @@
 {#-
 name: commit-via-keeper-default
-summary: Default to `keeper commit-work` for committing source changes — runs the project's lint matrix, lands the commit under a flock, pushes to origin. Skip only for explicit experimental or debugging scratch.
+summary: Default to `keeper commit-work` for byte-bound source commits — explicit adoption covers attribution gaps; hooks, signing, CAS publication, and exact-SHA push remain enforced.
 domain: engineering
 audience: agent
 severity: default
@@ -10,7 +10,7 @@ phase: [executing]
 topics: [engineering, git, commit]
 related: [commit-hygiene-flags]
 -#}
-**Commit source changes with `keeper commit-work`, not raw `git commit`.** `commit-work` runs the project's full lint matrix (ruff + ruff format + ty + cli-boundaries when Python is staged; npm lint per JS/TS package; shellcheck / zig / lua / hadolint per relevant staged file) inside a per-host flock, lands the commit, and pushes to origin — all in one call. Don't invoke linters separately; `commit-work` is the single seam.
+**Commit source changes with `keeper commit-work`, not raw `git commit`.** `commit-work` discovers the complete dirty surface, selects only exclusive tool/plan claims owned by this invocation, runs the lint matrix, freezes exact Git blob OIDs and modes in a private index, runs commit hooks and configured signing, compare-and-swap publishes the commit, and pushes that exact SHA. Don't invoke linters separately or bypass hooks.
 
 Preview, then commit:
 
@@ -21,19 +21,14 @@ keeper commit-work "<type>(<scope>): <summary>
 <optional body — 1-3 bullets>"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`. `<scope>` comes from the file set (CLI name, plugin name, package). Push to origin is automatic after a successful commit.
+Every invocation emits one versioned `commit-work-result` JSON line; inspect `outcome`, `selection`, `surface`, `commit`, and `push`. `<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`. Push to origin is automatic after a successful main-worktree commit.
 
-**On the `lint_failed` envelope** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>", "recovery": "<fix→restage→re-invoke contract>"}`): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `keeper commit-work` with the same message. This is the only `commit-work` failure mode you handle inline.
+**A missing path is an adoption decision, not a raw-Git escape hatch.** Re-run with repeatable `--adopt <exact-path>`, or a bounded versioned manifest via `--adopt-from <file>`. Adoption lasts for this invocation only, is frozen to the selected path/mode/blob identity, and refuses any live or unknown foreign exclusive claim. Bash, inferred, package-manager, and codegen evidence appears only as `observed_adoptable`; it never auto-selects. Never use a broad path, `git add -A`, or `git add .` to make a coverage gap disappear.
 
-**Any other non-zero exit** (`commit_failed`, `push_non_fast_forward`, `push_auth`, `push_hook_rejected`, `lock_timeout`, etc.) → stop and surface the verbatim envelope JSON to the human. Don't patch the tool you're calling; don't retry blindly.
+**On `outcome:"lint_failed"`:** read the named files, fix per bounded stderr, then re-run `keeper commit-work` with the same message and adoption arguments. A lint failure is not an attribution gap; do not add adoption just to bypass it.
+
+**On any other refusal:** follow the envelope's typed recovery. Ownership conflicts require the other claimant to become positively terminal or to land its own work; surface/index/ref drift requires a fresh preview; operation and jam gates require their named recovery. Do not retry blindly and never fall back to raw `git commit`.
 
 **Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `keeper prompt render engineering/commit-hygiene-flags`.
 
-**Escape hatch — when `commit-work` can't stage the file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), commit with plain `git`. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. **A lint failure is never a coverage gap.** When the envelope reports `"error": "lint_failed"`, this fallback does not apply — the only permitted recovery is: fix the reported lint errors, re-stage with `git add`, and re-invoke `keeper commit-work` with the same message. Never bare `git commit` or `--no-verify` after a lint failure.
-
-**The only times to skip `commit-work`:**
-
-- Explicitly experimental or scratch changes the human has flagged as throwaway.
-- Debugging prints or temporary instrumentation you'll discard before continuing.
-
-In those cases, don't commit at all unless asked.
+Scratch or debugging instrumentation the human marked throwaway should not be committed at all.

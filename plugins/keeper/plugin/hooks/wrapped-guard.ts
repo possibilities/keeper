@@ -288,8 +288,8 @@ const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
   "baseline",
 ]);
 
-/** Read-only git subcommands allowed for a wrapped worker (staging `add`, the
- *  `commit` that lands the leg's work, and `reset --soft` are handled separately).
+/** Read-only git subcommands allowed for a wrapped worker (staging `add` and
+ *  `reset --soft` are handled separately; source commits route through Keeper).
  *  Mirrors escalation-guard's read set minus the ref-mutating `branch`, which a
  *  wrapped worker never needs. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
@@ -546,7 +546,8 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
     if (injection !== null) return injection;
     if (sub === undefined) return "bare `git` with no subcommand";
     if (sub.name === "add") return null; // staging
-    if (sub.name === "commit") return null; // land the leg's staged work
+    if (sub.name === "commit")
+      return "raw `git commit` is forbidden; pass the provider's versioned path manifest to `keeper commit-work --adopt-from <file>`";
     if (sub.name === "reset")
       return classifyGitReset(tokens.slice(sub.index + 1));
     if (READONLY_GIT_SUBCOMMANDS.has(sub.name)) {
@@ -557,7 +558,7 @@ function classifyWrappedExecutable(tokens: string[]): string | null {
       if (execFlag !== null) return execFlag;
       return null;
     }
-    return `git '${sub.name}' is not a permitted git subcommand for a wrapped worker (read + \`add\` / \`commit\` / \`reset --soft\` only; branch create/switch and mutating stash are denied)`;
+    return `git '${sub.name}' is not a permitted git subcommand for a wrapped worker (read + \`add\` / \`reset --soft\` only; source commits use keeper commit-work)`;
   }
 
   if (exe === "bun") {
@@ -652,7 +653,7 @@ function bashReason(violation: string): string {
     `close-out allowlist: ${violation}. Permitted: \`keeper agent\` (run/--resume/` +
     `wait/wait-for-stop/show-last-message/providers), \`keeper commit-work\`, ` +
     `\`keeper plan done\` + reads, \`keeper session state\`, the permitted git ` +
-    `surface (add / commit / reset --soft / log / status / diff / show / rev-parse), ` +
+    `surface (add / reset --soft / log / status / diff / show / rev-parse), ` +
     `and explicit \`bun test *.test.ts\` / named \`bun run test:gate\` gates. ` +
     `Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
     `patch, cp/mv/tar, git apply/am, interpreters, and re-entrant shells — is denied.`

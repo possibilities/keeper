@@ -782,6 +782,7 @@ test("all expected indexes are present", () => {
     "idx_events_bash_attr",
     "idx_events_bashwin_pre",
     "idx_events_bashwin_post",
+    "idx_events_package_attr_window",
   ];
   for (const name of required) {
     expect(names.has(name)).toBe(true);
@@ -3106,7 +3107,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(126);
+  expect(SCHEMA_VERSION).toBe(127);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

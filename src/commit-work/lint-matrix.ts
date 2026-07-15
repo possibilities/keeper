@@ -68,8 +68,8 @@ const TS_SUFFIXES = new Set([".ts", ".tsx"]);
 /**
  * Thrown when the scoped lint matrix detects errors. The caller catches it,
  * releases the flock, and emits `{success:false, error:"lint_failed", linter,
- * files, stderr, recovery}` — `recovery` is a static contract string steering
- * the agent to fix→restage→re-invoke rather than bypass to bare git.
+ * files, stderr, recovery}` — `recovery` steers the agent to
+ * fix→re-invoke with the same adoption decision, never around the gate.
  */
 export class LintFailure extends Error {
   /** Concatenated stderr (labelled blocks when more than one checker failed). */

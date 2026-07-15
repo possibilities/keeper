@@ -193,6 +193,50 @@ test("boot-seed re-derives git_status + file_attributions for a currently-dirty 
   // git_status.dirty_count is the authoritative currently-dirty fidelity check.
 });
 
+test("boot seed compacts a discharged tombstone into the snapshot floor", () => {
+  const repo = fakeRoot("discharged-tombstone");
+  const session = "11111111-1111-4111-8111-111111111111";
+  const absPath = `${repo}/dirty.ts`;
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1001, ?, 'PostToolUse', 'tool_use', 'Write', ?, '{}', ?)`,
+    [session, repo, absPath],
+  );
+  kdb.db.run(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at)
+       VALUES (?, ?, 'dirty.ts', 1001, 2000, 'Write', 'tool', 1, 2000)`,
+    [repo, session],
+  );
+
+  seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [repo],
+    buildSnapshotForRoot: (root) => dirtySnapshot(root, "dirty.ts"),
+  });
+
+  // The old discharged row suppresses resurrection during this seed, then is
+  // removed: git_status.last_event_id is now the compact per-root floor.
+  expect(
+    kdb.db
+      .query(
+        `SELECT COUNT(*) AS n FROM file_attributions
+          WHERE project_dir = ?`,
+      )
+      .get(repo) as { n: number },
+  ).toEqual({ n: 0 });
+  const status = kdb.db
+    .query(
+      "SELECT last_event_id, dirty_files FROM git_status WHERE project_dir = ?",
+    )
+    .get(repo) as { last_event_id: number; dirty_files: string };
+  expect(status.last_event_id).toBeGreaterThan(1);
+  expect(
+    (JSON.parse(status.dirty_files) as Array<{ attributions: unknown[] }>)[0]
+      ?.attributions,
+  ).toEqual([]);
+});
+
 test("tail-equivalence: a clean repo seeds an empty/clean git_status (dirty_count 0)", () => {
   const dir = fakeRoot("clean");
   const result = seedGitProjection(kdb.db, kdb.stmts, {

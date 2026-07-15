@@ -104,6 +104,41 @@ describe("commit-work foreign claim adoption", () => {
     expect(terminal.adopted).toEqual(["a.txt"]);
   });
 
+  test("Bash and inferred observations require explicit adoption", async () => {
+    for (const source of ["bash", "inferred"] as const) {
+      const preview = await discoverCommitWorkSurface({
+        worktree: "/repo",
+        identity: ID,
+        adoptedPaths: [],
+        git: surfaceGit(),
+        deps: {
+          readClaims: () => [
+            { path: "a.txt", sessionId: ID, liveness: "live", source },
+          ],
+        },
+      });
+      expect(preview.automatic).toEqual([]);
+      expect(preview.summary.adoptable_unattributed.total).toBe(1);
+      expect(preview.summary.observed_adoptable).toEqual({
+        total: 1,
+        sample: ["a.txt"],
+      });
+
+      const adopted = await discoverCommitWorkSurface({
+        worktree: "/repo",
+        identity: ID,
+        adoptedPaths: ["a.txt"],
+        git: surfaceGit(),
+        deps: {
+          readClaims: () => [
+            { path: "a.txt", sessionId: OTHER, liveness: "live", source },
+          ],
+        },
+      });
+      expect(adopted.adopted).toEqual(["a.txt"]);
+    }
+  });
+
   test("newer direct identity evidence replaces null and stale durable duplicates", async () => {
     for (const [durableOid, durableLiveness] of [
       [null, "live"],
@@ -582,83 +617,20 @@ describe("commit-work atomic plumbing publication", () => {
   });
 });
 
-describe("commit-work wait and frozen claim binding", () => {
-  test("the production path retains the attribution wait while direct evidence is immediate", async () => {
-    let waited = 0;
+describe("commit-work immediate discovery and frozen claim binding", () => {
+  test("fold-lagged dirt is surfaced immediately as adoptable", async () => {
     const preview = await runForTest(["--preview-files", "--session-id", ID], {
       cwd: "/repo",
       env: {},
-      gitRunner: async (args) => {
-        if (args[0] === "rev-parse") {
-          return { code: 0, stdout: "/repo\n", stderr: "" };
-        }
-        if (args[0] === "status") {
-          return { code: 0, stdout: "", stderr: "" };
-        }
-        return { code: 0, stdout: "", stderr: "" };
-      },
-      waitForAttribution: async () => {
-        waited += 1;
-        return true;
-      },
+      gitRunner: surfaceGit(),
       readClaims: () => [],
     });
     expect(preview.code).toBe(0);
-    expect(waited).toBe(1);
-
-    await runForTest(["--preview-files", "--session-id", ID], {
-      cwd: "/repo",
-      env: {},
-      gitRunner: surfaceGit(),
-      directEvidence: () => ({ complete: true }),
-      waitForAttribution: async () => {
-        waited += 1;
-        return true;
-      },
-      readClaims: () => [],
+    expect(JSON.parse(preview.stdout)).toMatchObject({
+      outcome: "preview",
+      files: [],
+      surface: { adoptable_unattributed: { total: 1, sample: ["a.txt"] } },
     });
-    expect(waited).toBe(1);
-  });
-
-  test("a commit waits again after lock acquisition before definitive discovery", async () => {
-    const fixture = refFixture();
-    const sequence: string[] = [];
-    let waits = 0;
-    const output = await runForTest(["message", "--session-id", ID], {
-      cwd: "/repo",
-      env: {},
-      gitRunner: pipelineRun(fixture),
-      waitForAttribution: async () => {
-        waits += 1;
-        sequence.push(`wait-${waits}`);
-        return true;
-      },
-      readClaims: () => {
-        sequence.push("discover");
-        return [{ path: "a.txt", sessionId: ID, liveness: "live" as const }];
-      },
-      detectInProgress: async () => null,
-      checkSharedCheckoutJam: () => false,
-      acquireLock: () => {
-        sequence.push("lock");
-        return { release: () => {} };
-      },
-      runLint: async () => {},
-      privateIndexFs: fixture.fs,
-      push: async () => ({
-        success: true,
-        pushed: false,
-        branch: "main",
-        skipped: "worktree",
-      }),
-    });
-    expect(output.code).toBe(0);
-    expect(waits).toBe(2);
-    const lockAt = sequence.indexOf("lock");
-    const postLockWaitAt = sequence.indexOf("wait-2");
-    const definitiveDiscoverAt = sequence.indexOf("discover", lockAt + 1);
-    expect(lockAt).toBeLessThan(postLockWaitAt);
-    expect(postLockWaitAt).toBeLessThan(definitiveDiscoverAt);
   });
 
   test("a live foreign claim appearing during lint blocks identical frozen bytes", async () => {

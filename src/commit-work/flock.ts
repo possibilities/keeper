@@ -11,21 +11,21 @@
  * and HEAD are per-worktree, so disjoint linked worktrees share no staging
  * state and take distinct locks.
  *
- * Two macOS-aarch64 correctness hazards the epic's risks call out, both
- * asserted in tests because they fail SILENTLY:
+ * Two macOS-aarch64 correctness hazards are asserted in tests because they
+ * fail SILENTLY:
  *
  *  1. **FFI return type.** `flock` returns `int`; declaring it anything but
  *     `FFIType.i32` on aarch64 reads the wrong register width and can
  *     segfault. We declare `i32` and read `__error()` for errno on failure,
  *     mirroring `src/exit-watcher-ffi.ts`.
  *
- *  2. **FD_CLOEXEC.** Without `fcntl(fd, F_SETFD, FD_CLOEXEC)` the lock fd is
- *     INHERITED by every `git` / `ruff` / `tsc` child we spawn while holding
- *     the lock. `flock` locks are released only when the LAST fd referencing
- *     the open-file-description closes — so an inherited copy in a still-
- *     running child keeps the lock held long after we release ours, blocking
- *     the next committer until that child exits. Marking the fd close-on-exec
- *     makes spawned children NOT inherit it.
+ *  2. **FD_CLOEXEC.** The lock fd must be opened with platform-specific
+ *     `O_CLOEXEC` in the SAME `open(2)` call that creates it. A later
+ *     `fcntl(F_SETFD)` has a fork/exec race and, because `fcntl` is variadic,
+ *     Bun FFI can silently mis-pass its third argument on darwin-arm64. An
+ *     inherited copy in a child keeps the open-file-description (and lock)
+ *     alive after our release. `fcntl(F_GETFD)` takes no variadic argument, so
+ *     it remains a reliable readback seam for the focused test.
  */
 
 import {
@@ -36,7 +36,7 @@ import {
   suffix,
   toArrayBuffer,
 } from "bun:ffi";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, constants, openSync } from "node:fs";
 
 // flock(2) operations, from <sys/file.h>. ABI-stable across darwin/linux.
 const LOCK_SH = 1;
@@ -44,12 +44,21 @@ const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
-// fcntl(2) F_SETFD command + FD_CLOEXEC flag, from <fcntl.h>. Stable.
-const F_SETFD = 2;
+// fcntl(2) F_GETFD command + FD_CLOEXEC flag, from <fcntl.h>. Stable.
+// F_GETFD has no variadic argument; the fixed FFI signature's dummy third arg
+// is ignored, making this a reliable readback (never use this seam to SET).
+const F_GETFD = 1;
 const FD_CLOEXEC = 1;
 
-// errno values we branch on; stable across darwin/linux.
-const EWOULDBLOCK = 35; // == EAGAIN on darwin; flock(LOCK_NB) on a held lock
+// flock(LOCK_NB) reports contention as EWOULDBLOCK. Unlike the flock operation
+// values, errno is platform-specific.
+const EWOULDBLOCK = process.platform === "darwin" ? 35 : 11;
+
+// Node's fs constants omit O_CLOEXEC. Its value differs by platform and must be
+// ORed into the numeric open flags so close-on-exec is established atomically.
+const O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
+const CLOEXEC_OPEN_FLAGS =
+  constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | O_CLOEXEC;
 
 const LE = true; // both supported targets are little-endian
 
@@ -72,8 +81,8 @@ export const COMMIT_WORK_LOCK_DEADLINE_MS = 45_000;
 interface LibcSyms {
   // flock(int fd, int operation) -> int
   flock: (fd: number, operation: number) => number;
-  // fcntl(int fd, int cmd, int arg) -> int  (variadic; the 3-arg form for
-  // F_SETFD takes an int flag, which the fixed i32 signature matches)
+  // fcntl(int fd, int cmd, ...) -> int. We call only F_GETFD, which consumes no
+  // variadic argument; the fixed signature's third i32 is a harmless dummy.
   fcntl: (fd: number, cmd: number, arg: number) => number;
   // errno accessor — `__error` on darwin, `__errno_location` on linux.
   errnoLocation: () => unknown;
@@ -159,26 +168,19 @@ export class CommitWorkLock {
 
   /**
    * Acquire `LOCK_EX` on `lockPath`, blocking until it is available. The lock
-   * file is created if missing (`openSync(..., "w")` → `O_CREAT | O_WRONLY |
-   * O_TRUNC`); its CONTENT is irrelevant — `flock` locks the open-file-
-   * description, not the bytes. The fd is marked `FD_CLOEXEC` BEFORE the
-   * blocking `flock` so a child spawned by a concurrent waiter can never
-   * inherit a half-armed lock.
+   * file is created if missing (`O_CREAT | O_WRONLY | O_TRUNC`); its CONTENT is
+   * irrelevant — `flock` locks the open-file-description, not the bytes.
+   * `O_CLOEXEC` is part of that SAME atomic open so a child can never inherit a
+   * half-armed lock.
    */
   static acquire(lockPath: string): CommitWorkLock {
     const { lib, syms } = loadLibc();
-    const fd = openSync(lockPath, "w");
-
-    // Mark close-on-exec FIRST — see the module header (hazard 2). A spawned
-    // child must never inherit this fd, or the lock outlives our release.
-    const fr = syms.fcntl(fd, F_SETFD, FD_CLOEXEC);
-    if (fr < 0) {
-      const errno = readErrno(syms.errnoLocation());
-      closeSync(fd);
+    let fd: number;
+    try {
+      fd = openSync(lockPath, CLOEXEC_OPEN_FLAGS);
+    } catch (err) {
       lib.close();
-      throw new Error(
-        `commit-work flock: fcntl(F_SETFD) failed errno=${errno}`,
-      );
+      throw err;
     }
 
     // Blocking exclusive lock. flock auto-retries internally on EINTR in
@@ -204,16 +206,12 @@ export class CommitWorkLock {
    */
   static tryAcquire(lockPath: string): CommitWorkLock | null {
     const { lib, syms } = loadLibc();
-    const fd = openSync(lockPath, "w");
-
-    const fr = syms.fcntl(fd, F_SETFD, FD_CLOEXEC);
-    if (fr < 0) {
-      const errno = readErrno(syms.errnoLocation());
-      closeSync(fd);
+    let fd: number;
+    try {
+      fd = openSync(lockPath, CLOEXEC_OPEN_FLAGS);
+    } catch (err) {
       lib.close();
-      throw new Error(
-        `commit-work flock: fcntl(F_SETFD) failed errno=${errno}`,
-      );
+      throw err;
     }
 
     const r = syms.flock(fd, LOCK_EX | LOCK_NB);
@@ -268,6 +266,25 @@ export class CommitWorkLock {
   }
 
   /**
+   * Read this held fd's descriptor flags through `fcntl(F_GETFD)`. Test-only
+   * seam proving the atomic `O_CLOEXEC` open really set `FD_CLOEXEC`; unlike
+   * F_SETFD, F_GETFD consumes no variadic argument and is reliable via Bun FFI.
+   */
+  readFdFlagsForTest(): number {
+    if (this.released) {
+      throw new Error("commit-work flock: cannot read flags after release");
+    }
+    const flags = this.syms.fcntl(this.fd, F_GETFD, 0);
+    if (flags < 0) {
+      const errno = readErrno(this.syms.errnoLocation());
+      throw new Error(
+        `commit-work flock: fcntl(F_GETFD) failed errno=${errno}`,
+      );
+    }
+    return flags;
+  }
+
+  /**
    * Release the lock (`LOCK_UN`) and close the fd. Idempotent — a second call
    * is a no-op. Closing the fd alone would release the lock, but the explicit
    * `LOCK_UN` matches the man-page convention and is harmless.
@@ -290,6 +307,8 @@ export const FLOCK_CONSTANTS = {
   LOCK_EX,
   LOCK_NB,
   LOCK_UN,
-  F_SETFD,
+  EWOULDBLOCK,
+  F_GETFD,
   FD_CLOEXEC,
+  O_CLOEXEC,
 } as const;

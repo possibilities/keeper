@@ -281,12 +281,30 @@ describe("discoverSessionFiles", () => {
 // ---------------------------------------------------------------------------
 
 describe("CommitWorkLock", () => {
-  test("constants are the on-the-wire flock(2)/fcntl values", () => {
+  test("constants are the platform-correct flock(2)/fcntl/open values", () => {
     expect(FLOCK_CONSTANTS.LOCK_EX).toBe(2);
     expect(FLOCK_CONSTANTS.LOCK_NB).toBe(4);
     expect(FLOCK_CONSTANTS.LOCK_UN).toBe(8);
-    expect(FLOCK_CONSTANTS.F_SETFD).toBe(2);
+    expect(FLOCK_CONSTANTS.EWOULDBLOCK).toBe(
+      process.platform === "darwin" ? 35 : 11,
+    );
+    expect(FLOCK_CONSTANTS.F_GETFD).toBe(1);
     expect(FLOCK_CONSTANTS.FD_CLOEXEC).toBe(1);
+    expect(FLOCK_CONSTANTS.O_CLOEXEC).toBe(
+      process.platform === "darwin" ? 0x1000000 : 0o2000000,
+    );
+  });
+
+  test("atomic O_CLOEXEC open sets FD_CLOEXEC", () => {
+    const lockPath = join(tmpDir, "keeper-commit-work-cloexec.lock");
+    const lock = CommitWorkLock.acquire(lockPath);
+    try {
+      expect(lock.readFdFlagsForTest() & FLOCK_CONSTANTS.FD_CLOEXEC).toBe(
+        FLOCK_CONSTANTS.FD_CLOEXEC,
+      );
+    } finally {
+      lock.release();
+    }
   });
 
   test("acquire then release round-trips; re-acquire after release succeeds", () => {

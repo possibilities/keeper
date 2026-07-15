@@ -1180,7 +1180,7 @@ interface RenderedAttribution {
 /**
  * Project the latest `(session_id, file_path)` mutation evidence the persisted
  * event log carries for a given dirty file, reading the per-snapshot
- * {@link ExplicitAttribHoist} (built once before the pass-1 loop). Three match
+ * {@link ExplicitAttribHoist} (built once before the pass-1 loop). Four match
  * modes feed the same `file_attributions` UPSERT in pass 1:
  *
  *   - tool mutations (exact): PostToolUse Write/Edit/MultiEdit/NotebookEdit
@@ -1190,6 +1190,8 @@ interface RenderedAttribution {
  *     `bash_mutation_targets` array contains the path — an O(1) lookup into the
  *     once-built `bashByToken` index (the old SQL-side `json_each` probe,
  *     materialized per token);
+ *   - root package-lock observations: bare canonical lockfile tokens from an
+ *     exact-root command, fenced to this snapshot's event-id interval;
  *   - bash mutations (prefix + fnmatch) for `git-rm` / `git-mv`: targets may
  *     name directories or globs (which SQL can't probe) AND the deleted files
  *     carry `mtime_ms=null` (no pass-2 inference), so the once-parsed
@@ -1220,6 +1222,25 @@ interface SessionMutation {
  * directory-prefix or fnmatch.
  */
 const BASH_TREE_SENTINEL = "__TREE__";
+
+/** Bare lockfile targets emitted by package-manager mutation derivation. */
+const ROOT_PACKAGE_LOCKFILES = new Set([
+  "pnpm-lock.yaml",
+  "package-lock.json",
+  "yarn.lock",
+  "bun.lockb",
+  "uv.lock",
+  "requirements.txt",
+  "Cargo.lock",
+  "poetry.lock",
+]);
+
+interface ExplicitAttribWindow {
+  projectDir: string;
+  floor: number;
+  ceiling: number;
+  dirtyRootLockfiles: Set<string>;
+}
 
 /**
  * Does a stored bash_mutation_targets `token` (absolute path or glob)
@@ -1280,6 +1301,9 @@ interface ExplicitAttribAccumulator {
   bashScanPrepMs: number;
   bashScanExecMs: number;
   bashScanRows: number;
+  packageScanPrepMs: number;
+  packageScanExecMs: number;
+  packageScanRows: number;
   deletionScanPrepMs: number;
   deletionScanExecMs: number;
   deletionScanRows: number;
@@ -1292,6 +1316,9 @@ function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
     bashScanPrepMs: 0,
     bashScanExecMs: 0,
     bashScanRows: 0,
+    packageScanPrepMs: 0,
+    packageScanExecMs: 0,
+    packageScanRows: 0,
     deletionScanPrepMs: 0,
     deletionScanExecMs: 0,
     deletionScanRows: 0,
@@ -1339,6 +1366,11 @@ interface ExplicitAttribHoist {
   // Owned by the per-`Database` {@link GitAttribMemo} — INCREMENTALLY appended,
   // not rebuilt, so the returned reference is the live memo map.
   bashByToken: Map<string, BashMutationRow[]>;
+  // Bare package lockfile observations in this snapshot's exact event-id window,
+  // scoped to commands run at this project root. Unlike the process memo this is
+  // rebuilt from only `(previous snapshot, current snapshot)` and cannot grow
+  // with history or leak a same-named lockfile across repositories.
+  packageByToken: Map<string, BashMutationRow[]>;
   // The git-rm/git-mv rows, pulled and JSON-parsed ONCE; matched per file in JS
   // via `bashTargetMatches` (exact / dir-prefix / fnmatch) exactly as before.
   // Also owned by the per-`Database` memo (appended, not rebuilt).
@@ -1366,7 +1398,7 @@ interface ExplicitAttribHoist {
  *    (the watermark axis) need not match ts order — a later-inserted older-ts row
  *    still loses correctly on re-evaluation;
  *  - the persisted `file_attributions` projection is order-insensitive
- *    (newest-wins UPSERT by `last_mutation_at`), so an in-memory append never
+ *    (newest-wins UPSERT by `(last_mutation_at, last_event_id)`), so an in-memory append never
  *    perturbs the on-disk bytes — a warm-cache fold equals a cold rescan.
  *
  * This is the LIVE-ONLY / charter-excluded git surface (`git_status`,
@@ -1426,17 +1458,18 @@ export function warmGitAttribMemo(db: Database): void {
 
 /**
  * Build the per-snapshot {@link ExplicitAttribHoist} once before the pass-1
- * loop. The two scans here ran once per dirty file (fn-787 hoisted them to once
- * per snapshot); fn-892 makes each INCREMENTAL via the per-`Database`
- * {@link GitAttribMemo}, so a steady-state fold scans only the `id > maxId`
- * delta and appends into the cached structures instead of re-scanning the whole
- * `events` table. `acc` carries the prepare-vs-execute timing split for the
+ * loop. The ordinary Bash/deletion scans are incremental via the per-`Database`
+ * {@link GitAttribMemo}; the root-package fallback reads only this root's exact
+ * `(prior snapshot, current snapshot)` event-id interval. A steady-state fold
+ * therefore avoids a package-history rescan and keeps its fallback state bounded
+ * to one snapshot window. `acc` carries the prepare-vs-execute timing split for the
  * `[gitfold-breakdown]` line (pure instrumentation; `p1_bash_rows` /
  * `p1_del_rows` now report the per-fold delta, not full history).
  */
 function buildExplicitAttribHoist(
   db: Database,
   acc?: ExplicitAttribAccumulator,
+  window?: ExplicitAttribWindow,
 ): ExplicitAttribHoist {
   // Single-arm tool-mutation scan off the promoted `mutation_path` column
   // (fn-836.3): the file_path the old two-arm scan parsed from the JSON body
@@ -1452,7 +1485,9 @@ function buildExplicitAttribHoist(
          FROM events
         WHERE hook_event = 'PostToolUse'
           AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-          AND mutation_path = ?`,
+          AND mutation_path = ?
+          AND id > ?
+          AND id < ?`,
   );
 
   // Per-`Database` incremental memo (fn-892): scan only `id > maxId` and append
@@ -1466,6 +1501,7 @@ function buildExplicitAttribHoist(
     gitAttribMemos.set(db, memo);
   }
   const bashByToken = memo.bashByToken;
+  const packageByToken = new Map<string, BashMutationRow[]>();
   const deletionRows = memo.deletionRows;
   const fromId = memo.maxId;
   // Highest `id` seen across BOTH scans — including malformed/body-nulled rows
@@ -1535,6 +1571,71 @@ function buildExplicitAttribHoist(
     acc.bashScanRows += bashScanRows.length;
   }
 
+  // Package-lock fallback. Package-manager derivers intentionally emit a bare
+  // lockfile basename because hooks cannot probe the Git root. Query only the
+  // exact event-id interval since this root's preceding snapshot and require
+  // event.cwd === projectDir; a workspace-subdir command remains an explicit-
+  // adoption hint rather than risking a nested/sibling-repository collision.
+  // The rowid interval is incremental even on a cold memo and the winner below
+  // is total-ordered by (ts, id).
+  if (window != null && window.dirtyRootLockfiles.size > 0) {
+    const _pkgP0 = acc != null ? performance.now() : 0;
+    const packageStmt = db.prepare(
+      `SELECT id, ts, session_id, bash_mutation_kind AS kind,
+              bash_mutation_targets AS targets
+         FROM events INDEXED BY idx_events_package_attr_window
+        WHERE id > ?
+          AND id < ?
+          AND cwd = ?
+          AND bash_mutation_kind IN ('pkg-install', 'pkg-uninstall')`,
+    );
+    const _pkgP1 = acc != null ? performance.now() : 0;
+    const rows = packageStmt.all(
+      window.floor,
+      window.ceiling,
+      window.projectDir,
+    ) as Array<{
+      id: number;
+      ts: number;
+      session_id: string | null;
+      kind: string;
+      targets: string | null;
+    }>;
+    for (const row of rows) {
+      if (row.session_id == null || row.session_id.length === 0) continue;
+      if (row.targets == null || row.targets.length === 0) continue;
+      let targets: unknown;
+      try {
+        targets = JSON.parse(row.targets);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(targets)) continue;
+      const mutation: BashMutationRow = {
+        id: row.id,
+        ts: row.ts,
+        session_id: row.session_id,
+        kind: row.kind,
+      };
+      for (const target of targets) {
+        if (
+          typeof target !== "string" ||
+          !window.dirtyRootLockfiles.has(target)
+        ) {
+          continue;
+        }
+        const bucket = packageByToken.get(target) ?? [];
+        bucket.push(mutation);
+        packageByToken.set(target, bucket);
+      }
+    }
+    if (acc != null) {
+      acc.packageScanPrepMs += _pkgP1 - _pkgP0;
+      acc.packageScanExecMs += performance.now() - _pkgP1;
+      acc.packageScanRows += rows.length;
+    }
+  }
+
   // git-rm / git-mv deletion scan — same incremental `id > ?` bound; per file the
   // directory-prefix / fnmatch match still runs in JS via bashTargetMatches. This
   // selects a strict SUBSET of the bash scan's rows (git-rm/git-mv both satisfy
@@ -1589,13 +1690,15 @@ function buildExplicitAttribHoist(
   // Commit the advanced watermark. Strict-`>` scans next fold resume from here.
   memo.maxId = newMaxId;
 
-  return { toolStmt, bashByToken, deletionRows };
+  return { toolStmt, bashByToken, packageByToken, deletionRows };
 }
 
 function findExplicitAttributions(
   projectDir: string,
   file: ReducerDirtyFile,
   hoist: ExplicitAttribHoist,
+  attributionFloor: number,
+  attributionCeiling: number,
   acc?: ExplicitAttribAccumulator,
 ): SessionMutation[] {
   // Build the candidate path list as ABSOLUTE paths anchored on
@@ -1639,7 +1742,11 @@ function findExplicitAttributions(
     // overhead. The `mutation_path = ?` predicate is a covering SEEK on the
     // partial index.
     const _armAP0 = acc != null ? performance.now() : 0;
-    const toolRows = hoist.toolStmt.all(candidatePath) as Array<{
+    const toolRows = hoist.toolStmt.all(
+      candidatePath,
+      attributionFloor,
+      attributionCeiling,
+    ) as Array<{
       id: number;
       ts: number;
       session_id: string;
@@ -1652,7 +1759,12 @@ function findExplicitAttributions(
     for (const row of toolRows) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
-      if (existing == null || row.ts > existing.last_mutation_at) {
+      if (
+        existing == null ||
+        row.ts > existing.last_mutation_at ||
+        (row.ts === existing.last_mutation_at &&
+          row.id > existing.last_event_id)
+      ) {
         perSession.set(row.session_id, {
           session_id: row.session_id,
           last_mutation_at: row.ts,
@@ -1674,6 +1786,7 @@ function findExplicitAttributions(
     const bashRows = hoist.bashByToken.get(candidatePath);
     if (bashRows == null) continue;
     for (const row of bashRows) {
+      if (row.id <= attributionFloor || row.id >= attributionCeiling) continue;
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
       // Break ties on event id (a later row in the same ts has a higher id) so
@@ -1695,6 +1808,26 @@ function findExplicitAttributions(
     }
   }
 
+  // Root package-lock observation: the interval query is project-root scoped
+  // and newest-wins on the same (ts, id) order as every other Bash row.
+  const packageRows = hoist.packageByToken.get(file.path) ?? [];
+  for (const row of packageRows) {
+    const existing = perSession.get(row.session_id);
+    if (
+      existing == null ||
+      row.ts > existing.last_mutation_at ||
+      (row.ts === existing.last_mutation_at && row.id > existing.last_event_id)
+    ) {
+      perSession.set(row.session_id, {
+        session_id: row.session_id,
+        last_mutation_at: row.ts,
+        last_event_id: row.id,
+        op: row.kind,
+        source: "bash",
+      });
+    }
+  }
+
   // Deletion-attribution scan (git-rm / git-mv): these events store directory
   // and glob tokens an exact SQL probe never hits, and the deleted files carry
   // `mtime_ms=null` (no pass-2 inference). The candidate rows are pulled +
@@ -1702,6 +1835,7 @@ function findExplicitAttributions(
   // directory-prefix / fnmatch match via `bashTargetMatches` still runs per file
   // in JS — pure (no FS, no wall-clock), so re-fold determinism holds.
   for (const row of hoist.deletionRows) {
+    if (row.id <= attributionFloor || row.id >= attributionCeiling) continue;
     let matched = false;
     for (const rawToken of row.tokens) {
       let hit = false;
@@ -1796,6 +1930,8 @@ function computeRepoBashWindows(
   projectDir: string,
   minMtimeSec: number,
   maxMtimeSec: number,
+  attributionFloor: number,
+  attributionCeiling: number,
 ): BashWindow[] {
   const projectDirPrefix = projectDir.endsWith("/")
     ? projectDir
@@ -1813,12 +1949,20 @@ function computeRepoBashWindows(
         WHERE pre.hook_event = 'PreToolUse'
           AND pre.tool_name = 'Bash'
           AND pre.tool_use_id IS NOT NULL
+          AND pre.id > ?
+          AND post.id > ?
+          AND pre.id < ?
+          AND post.id < ?
           AND pre.ts >= ?
           AND pre.ts < ?
           AND post.ts >= ?
           AND (post.cwd = ? OR post.cwd LIKE ?)`,
     )
     .all(
+      attributionFloor,
+      attributionFloor,
+      attributionCeiling,
+      attributionCeiling,
       minMtimeSec - MAX_BASH_WINDOW_SEC,
       maxMtimeSec,
       minMtimeSec,
@@ -1980,6 +2124,31 @@ const GIT_FOLD_BREAKDOWN_MS = 1000;
  */
 export const GIT_STATUS_DIRTY_FILES_WIRE_CAP = 200;
 
+/**
+ * One impossible Git-path row retains the per-root attribution scan floor while
+ * a root is absent. Active roots carry the same floor in
+ * `git_status.last_event_id`; a snapshot compacts all discharged/non-dirty rows,
+ * so attribution storage stays proportional to the current dirty surface rather
+ * than every path ever touched. Git paths cannot contain NUL.
+ */
+const ATTRIBUTION_FLOOR_SESSION_ID = "\u0000keeper-attribution-floor";
+const ATTRIBUTION_FLOOR_PATH = "\u0000";
+
+function readRootAttributionFloor(db: Database, projectDir: string): number {
+  const active = db
+    .query("SELECT last_event_id FROM git_status WHERE project_dir = ?")
+    .get(projectDir) as { last_event_id: number | null } | null;
+  const dropped = db
+    .query(
+      `SELECT last_event_id FROM file_attributions
+        WHERE project_dir = ? AND session_id = ? AND file_path = ?`,
+    )
+    .get(projectDir, ATTRIBUTION_FLOOR_SESSION_ID, ATTRIBUTION_FLOOR_PATH) as {
+    last_event_id: number | null;
+  } | null;
+  return Math.max(active?.last_event_id ?? 0, dropped?.last_event_id ?? 0);
+}
+
 function projectGitStatus(db: Database, event: Event): void {
   // LIVE-ONLY skip-floor: `git_status` + `file_attributions` are producer-fed,
   // not replayed. A historical GitSnapshot (`id <= floor`) no-ops — the boot-seed
@@ -1997,6 +2166,13 @@ function projectGitStatus(db: Database, event: Event): void {
   const eventTs = event.ts;
   const eventId = event.id;
   const projectDir = snapshot.project_dir;
+  // Only evidence newer than the preceding snapshot/drop can create a new row.
+  // Existing active rows already materialize older evidence; this compact floor
+  // prevents a cold memo or boot seed from resurrecting discharged history.
+  const attributionFloor = readRootAttributionFloor(db, projectDir);
+  const priorSurfaceRow = db
+    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
+    .get(projectDir) as { jobs: string | null } | null;
 
   // Per-pass timing — emitted (below) ONLY when the whole fold is slow. Never
   // persisted, so it has no bearing on re-fold determinism.
@@ -2018,21 +2194,27 @@ function projectGitStatus(db: Database, event: Event): void {
        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
          last_mutation_at = excluded.last_mutation_at,
+         last_commit_at = NULL,
          op = excluded.op,
          source = excluded.source,
          last_event_id = excluded.last_event_id,
          updated_at = excluded.updated_at
-       WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
+       WHERE excluded.last_mutation_at > file_attributions.last_mutation_at
+          OR (excluded.last_mutation_at = file_attributions.last_mutation_at
+              AND COALESCE(excluded.last_event_id, 0) >
+                  COALESCE(file_attributions.last_event_id, 0))`,
   );
-  // Stamp the latest snapshot's `worktree_oid` AND `worktree_mode` onto every
-  // file_attributions row for this file, AFTER the upsert, so a new row and a
-  // stale row both converge on the freshest content axes. Both columns in ONE
-  // statement so a mid-statement crash can't desync the pair.
+  // Stamp the latest snapshot's `worktree_oid` AND `worktree_mode` onto active
+  // rows for this file, AFTER the upsert. Discharged rows need no churn and are
+  // compacted into the snapshot floor below; a later mutation reactivates its
+  // row before this refresh. Both columns stay in one statement so the pair is
+  // atomic.
   const refreshWorktreeOidStmt = db.prepare(
     `UPDATE file_attributions
         SET worktree_oid = ?, worktree_mode = ?
       WHERE project_dir = ?
-        AND file_path = ?`,
+        AND file_path = ?
+        AND last_mutation_at > COALESCE(last_commit_at, 0)`,
   );
   // Per-arm pass1 accumulator — only allocated/threaded so the eventual
   // breakdown line (emitted below only above threshold) can attribute pass1 to
@@ -2042,12 +2224,24 @@ function projectGitStatus(db: Database, event: Event): void {
   // deletion) and the two tool prepared statements ONCE before the per-file
   // loop, mirroring `computeRepoBashWindows`. The matched-row set per file is
   // identical to the old per-file scans, so re-fold determinism is untouched.
-  const _explicitHoist = buildExplicitAttribHoist(db, _pass1Acc);
+  const dirtyRootLockfiles = new Set(
+    snapshot.dirty_files
+      .map((file) => file.path)
+      .filter((path) => ROOT_PACKAGE_LOCKFILES.has(path)),
+  );
+  const _explicitHoist = buildExplicitAttribHoist(db, _pass1Acc, {
+    projectDir,
+    floor: attributionFloor,
+    ceiling: eventId,
+    dirtyRootLockfiles,
+  });
   for (const file of snapshot.dirty_files) {
     const explicit = findExplicitAttributions(
       projectDir,
       file,
       _explicitHoist,
+      attributionFloor,
+      eventId,
       _pass1Acc,
     );
     for (const m of explicit) {
@@ -2115,6 +2309,8 @@ function projectGitStatus(db: Database, event: Event): void {
       projectDir,
       minMtimeSec,
       maxMtimeSec,
+      attributionFloor,
+      eventId,
     );
     for (const file of inferNeeded) {
       const mtimeSec = (file.mtime_ms as number) / 1000;
@@ -2243,13 +2439,14 @@ function projectGitStatus(db: Database, event: Event): void {
   // committed all its files keeps a stale git_dirty_count. The canonical
   // pre-write enumeration is the prior snapshot's persisted `git_status.jobs`
   // JSON (a first-ever snapshot reads `[]`).
-  const priorRow = db
-    .prepare("SELECT jobs FROM git_status WHERE project_dir = ?")
-    .get(projectDir) as { jobs: string | null } | null;
   const priorSessions = new Set<string>();
-  if (priorRow != null && priorRow.jobs != null && priorRow.jobs.length > 0) {
+  if (
+    priorSurfaceRow != null &&
+    priorSurfaceRow.jobs != null &&
+    priorSurfaceRow.jobs.length > 0
+  ) {
     try {
-      const parsed = JSON.parse(priorRow.jobs) as unknown;
+      const parsed = JSON.parse(priorSurfaceRow.jobs) as unknown;
       if (Array.isArray(parsed)) {
         for (const entry of parsed) {
           if (typeof entry === "object" && entry !== null) {
@@ -2268,9 +2465,10 @@ function projectGitStatus(db: Database, event: Event): void {
   // (currently-dirty attributed) ∪ `priorSessions` (the zero-out-transition set
   // from prior git_status.jobs). Safe because any nonzero per-session
   // git_dirty_count was persisted into git_status.jobs in a prior snapshot →
-  // is in priorSessions on the next → no stale-count strand. The project-wide
-  // counters narrow to the bounded set, which is cosmetic (readiness reads
-  // git_status scalars, not the per-job columns).
+  // is in priorSessions on the next → no stale-count strand. Project-wide
+  // warnings fan out only to sessions that still own current dirt; a prior-only
+  // session receives zeroes on its final transition so cosmetic warning counts
+  // cannot strand after it drops from this bounded set.
   const sessionsToFanOut = new Set<string>();
   for (const s of sessionDirtyCount.keys()) sessionsToFanOut.add(s);
   for (const s of priorSessions) sessionsToFanOut.add(s);
@@ -2297,10 +2495,13 @@ function projectGitStatus(db: Database, event: Event): void {
   const _gfT4 = performance.now();
   for (const sessionId of sortedSessions) {
     const dirtyForSession = sessionDirtyCount.get(sessionId) ?? 0;
+    const warningUnattributed =
+      dirtyForSession > 0 ? unattributedToLiveCount : 0;
+    const warningOrphans = dirtyForSession > 0 ? orphanCount : 0;
     jobUpdateStmt.run(
       dirtyForSession,
-      unattributedToLiveCount,
-      orphanCount,
+      warningUnattributed,
+      warningOrphans,
       eventId,
       eventTs,
       sessionId,
@@ -2373,6 +2574,22 @@ function projectGitStatus(db: Database, event: Event): void {
     ],
   );
 
+  // The snapshot itself is now the root's durable evidence floor. Keep only
+  // active claims for paths in its current dirty set; every other per-path row
+  // is represented by this one floor rather than an unbounded tombstone tail.
+  db.run(
+    `DELETE FROM file_attributions
+      WHERE project_dir = ?
+        AND (
+          last_mutation_at <= COALESCE(last_commit_at, 0)
+          OR NOT EXISTS (
+            SELECT 1 FROM json_each(?) AS dirty
+             WHERE dirty.value = file_attributions.file_path
+          )
+        )`,
+    [projectDir, JSON.stringify(snapshot.dirty_files.map((file) => file.path))],
+  );
+
   // PRODUCER-ONLY SELF-HEAL: clear `seed_required` once every GATED root has an
   // above-floor `git_status` row. This snapshot just wrote one (it is above the
   // floor — the early return gated `id <= floor`), so a gated root the boot-seed
@@ -2418,6 +2635,9 @@ function projectGitStatus(db: Database, event: Event): void {
         `p1_bash_prep=${_pass1Acc.bashScanPrepMs.toFixed(0)}ms ` +
         `p1_bash_exec=${_pass1Acc.bashScanExecMs.toFixed(0)}ms ` +
         `p1_bash_rows=${_pass1Acc.bashScanRows} ` +
+        `p1_pkg_prep=${_pass1Acc.packageScanPrepMs.toFixed(0)}ms ` +
+        `p1_pkg_exec=${_pass1Acc.packageScanExecMs.toFixed(0)}ms ` +
+        `p1_pkg_rows=${_pass1Acc.packageScanRows} ` +
         `p1_del_prep=${_pass1Acc.deletionScanPrepMs.toFixed(0)}ms ` +
         `p1_del_exec=${_pass1Acc.deletionScanExecMs.toFixed(0)}ms ` +
         `p1_del_rows=${_pass1Acc.deletionScanRows}`,
@@ -2440,9 +2660,9 @@ function projectGitStatus(db: Database, event: Event): void {
  * `git_dirty_count` / `git_unattributed_to_live_count` / `git_orphan_count`, and
  * re-emit the `syncJobIntoEpic` fan-out so the embedded arrays clear in lockstep
  * — walking the SAME `jobs[]` the write side fanned over keeps an unrelated
- * project's jobs untouched. The retract also DELETEs every `file_attributions`
- * row for this `project_dir`; a re-fold re-creates and re-deletes them across
- * the snapshot + retract pair, preserving byte-identical re-fold.
+ * project's jobs untouched. Per-path attribution rows compact into one
+ * impossible-path floor row, preventing historical mutations from resurrecting
+ * if the root returns without retaining an unbounded tombstone set.
  */
 function retractGitStatus(db: Database, event: Event): void {
   // LIVE-ONLY skip-floor: a historical GitRootDropped (`id <= floor`) no-ops —
@@ -2483,9 +2703,25 @@ function retractGitStatus(db: Database, event: Event): void {
       syncIfPlanRef(db, jobId, event.id, event.ts);
     }
   }
-  // Also drop every file_attributions row for this project_dir — symmetric with
-  // the projectGitStatus pass-1/2 upserts.
+  // The drop event itself supersedes every earlier per-path observation. One
+  // impossible Git-path row retains that floor while `git_status` is absent;
+  // a returning snapshot consumes it and compacts back to current active rows.
   db.run("DELETE FROM file_attributions WHERE project_dir = ?", [projectDir]);
+  db.run(
+    `INSERT INTO file_attributions
+       (project_dir, session_id, file_path, last_mutation_at, last_commit_at,
+        op, source, last_event_id, updated_at, worktree_oid, worktree_mode)
+     VALUES (?, ?, ?, ?, ?, 'attribution-floor', 'plan', ?, ?, NULL, NULL)`,
+    [
+      projectDir,
+      ATTRIBUTION_FLOOR_SESSION_ID,
+      ATTRIBUTION_FLOOR_PATH,
+      event.ts,
+      event.ts,
+      event.id,
+      event.ts,
+    ],
+  );
   db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
 }
 

@@ -902,7 +902,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   },
   {
     name: "commit-work",
-    summary: "Stage session-attributed files, lint, commit, push",
+    summary: "Preview ownership, freeze exact files, lint, publish, push",
     visibility: "public",
     mutates: true,
     requires_daemon: false,
@@ -914,7 +914,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "preview-files",
         type: "boolean",
-        summary: "Print the session-scoped file list and exit (no commit)",
+        summary: "Emit the explained dirty surface and exit (no commit)",
       },
       {
         name: "session-id",
@@ -922,9 +922,41 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         summary: "Session id to attribute files for (default: auto-detect)",
       },
       {
+        name: "adopt",
+        type: "string",
+        multiple: true,
+        summary: "Adopt one exact dirty path for this invocation only",
+      },
+      {
+        name: "adopt-from",
+        type: "string",
+        multiple: true,
+        summary: "Read exact paths from a versioned JSON adoption manifest",
+      },
+      {
+        name: "message-file",
+        type: "string",
+        summary: "Read the commit message as bounded inert file data",
+      },
+      {
         name: "max-files",
         type: "string",
-        summary: "Cap the staged file count (Click IntRange(min=0) parity)",
+        summary: "Cap the selected file count (0 disables)",
+      },
+      {
+        name: "allow-stale-unstage",
+        type: "boolean",
+        summary: "Restore ambient staged entries outside the selected set",
+      },
+      {
+        name: "override-jam",
+        type: "boolean",
+        summary: "Proceed past a verified shared-checkout jam",
+      },
+      {
+        name: "allow-mass-reversion",
+        type: "boolean",
+        summary: "Proceed with an inspected bulk reversion",
       },
     ],
   },

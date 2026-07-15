@@ -4293,6 +4293,15 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    version: 127,
+    kind: "additive",
+    apply: (ctx) => {
+      for (const sql of CREATE_V127_INDEXES) {
+        ctx.db.run(sql);
+      }
+    },
+  },
 ];
 
 /**
@@ -4313,7 +4322,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v126:1aedde7dc902769e00f549d7f0e30bf242f683606496f7de1dd6d343810b0f97";
+  "v127:aee87103019d329f1c9e718a7f48eb6a70e9cca9f0c6b4a4bc2a53f047572da0";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5168,6 +5177,15 @@ const CREATE_V73_INDEXES = [
  */
 const CREATE_V107_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_tmux_generation ON events(tmux_generation_id, id, ts) WHERE hook_event = 'TmuxTopologySnapshot'",
+];
+
+/**
+ * Sparse covering interval index for package-manager lockfile attribution.
+ * `projectGitStatus` probes one exact cwd and event-id fence; ts+id form the
+ * deterministic winner key, while the remaining columns avoid table lookups.
+ */
+const CREATE_V127_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_package_attr_window ON events(cwd, id, ts, session_id, bash_mutation_kind, bash_mutation_targets) WHERE bash_mutation_kind IN ('pkg-install', 'pkg-uninstall')",
 ];
 
 /**
@@ -6077,13 +6095,13 @@ CREATE TABLE IF NOT EXISTS event_ingest_offsets (
 `;
 
 /**
- * `file_attributions` projection — one row per `(project_dir, session_id,
- * file_path)` triple recording an un-discharged mutation claim. A reducer
- * projection (re-fold deterministic). The discharge rule lives in the column
- * shape: a session is attributed iff `last_commit_at IS NULL OR last_commit_at <
- * last_mutation_at`; the row stays for the historical record and the readiness
- * pass filters by the inequality. The three-axis PK makes multi-attribution per
- * file (different worktrees / different sessions) distinct rows by design.
+ * `file_attributions` live projection — one row per `(project_dir, session_id,
+ * file_path)` active mutation claim, plus at most one impossible-path attribution
+ * floor while a root is dropped. The discharge rule lives in the column shape:
+ * a session is attributed iff `last_commit_at IS NULL OR last_commit_at <
+ * last_mutation_at`; the next GitSnapshot compacts discharged and no-longer-dirty
+ * rows behind its per-root event-id floor. The three-axis PK makes concurrent
+ * multi-attribution per file distinct by design.
  *
  * `worktree_oid` / `worktree_mode` are the filter-correct git blob oid + mode of
  * the WORKTREE bytes, frozen into the event payload (no fold-time git probe) so

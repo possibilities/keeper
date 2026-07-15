@@ -21,13 +21,14 @@
  *      that arrive DURING the scan (id > this) re-apply idempotently via the live
  *      fold, so capturing the floor before the scan is the correctness anchor.
  *   2. mark `seed_required = 1` (crash mid-seed ⇒ next boot re-seeds).
- *   3. per watched root: reset (`DELETE`) its `git_status` + `file_attributions`
- *      rows and zero the 3 `jobs` git-counters, then `readStatus` →
- *      `buildGitSnapshot` (REUSED from git-worker — never reimplemented), append
- *      a synthetic `GitSnapshot` via the prepared `stmts.insertEvent` (NOT a raw
- *      INSERT — avoids EVENT_COLUMNS drift), and drain it. The synthetic event's
- *      id > floor, so `projectGitStatus` does the full pass1/pass2/pass4 against
- *      the intact log → full fidelity.
+ *   3. per watched root: `readStatus` → `buildGitSnapshot` (REUSED from
+ *      git-worker — never reimplemented), append a synthetic `GitSnapshot` via
+ *      the prepared `stmts.insertEvent` (NOT a raw INSERT — avoids EVENT_COLUMNS
+ *      drift), and drain it. Folding over the prior live row clears departed
+ *      jobs through its bounded fan-out and retains the per-root attribution
+ *      floor. The synthetic event's id > floor, so `projectGitStatus` does
+ *      the full pass1/pass2/pass4 against evidence newer than each root's prior
+ *      snapshot floor → full fidelity without resurrecting old mutations.
  *   4. persist `floor = capturedMaxId` and clear `seed_required` atomically.
  *
  * **Degrade, NOT fatalExit.** This is the FIRST git shell-out on the daemon main
@@ -227,48 +228,6 @@ export function discoverSeedRoots(
 }
 
 /**
- * Reset one root's live git rows so the synthetic snapshot repopulates from a
- * clean slate: DELETE its `git_status` + `file_attributions` rows and zero the 3
- * `jobs` git-counters for every job attributed to this root. Without the reset a
- * file that was dirty pre-restart but is now clean would strand a stale
- * `file_attributions` row (the snapshot only re-renders CURRENTLY-dirty files).
- *
- * Mirrors `retractGitStatus` (minus the floor gate — this runs ABOVE the floor as
- * a producer). Pulls the attributed `job_id`s from the stored `git_status.jobs`
- * JSON, same as the live retract.
- */
-function resetRootGitRows(db: Database, projectDir: string): void {
-  const row = db
-    .query("SELECT jobs FROM git_status WHERE project_dir = ?")
-    .get(projectDir) as { jobs: string | null } | null;
-  if (row != null && row.jobs != null && row.jobs.length > 0) {
-    let attributedJobs: Array<{ job_id?: unknown }> = [];
-    try {
-      const parsed = JSON.parse(row.jobs);
-      if (Array.isArray(parsed)) {
-        attributedJobs = parsed as Array<{ job_id?: unknown }>;
-      }
-    } catch {
-      attributedJobs = [];
-    }
-    for (const job of attributedJobs) {
-      const jobId = job.job_id;
-      if (typeof jobId !== "string" || jobId.length === 0) continue;
-      db.run(
-        `UPDATE jobs
-            SET git_dirty_count = 0,
-                git_unattributed_to_live_count = 0,
-                git_orphan_count = 0
-          WHERE job_id = ?`,
-        [jobId],
-      );
-    }
-  }
-  db.run("DELETE FROM file_attributions WHERE project_dir = ?", [projectDir]);
-  db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
-}
-
-/**
  * Append a synthetic `GitSnapshot` event for one root, EXACTLY matching the live
  * git-worker's `stmts.insertEvent` shape in `daemon.ts` (so a future column add
  * is caught by the prepared statement's named bindings, not silently shifted).
@@ -384,7 +343,10 @@ export function seedGitProjection(
         );
         continue;
       }
-      resetRootGitRows(db, root);
+      // Fold over the prior live row rather than deleting it first. The prior
+      // `git_status.jobs` set drives the bounded dirty→clean counter fan-out,
+      // while its last_event_id is the per-root attribution floor that prevents
+      // an old mutation from resurrecting when a path is dirtied again later.
       insertSyntheticGitSnapshot(stmts, root, JSON.stringify(snapshot));
       // Fold the just-appended snapshot (id > floor → full-fidelity re-derive).
       options.drainToCompletion(db);

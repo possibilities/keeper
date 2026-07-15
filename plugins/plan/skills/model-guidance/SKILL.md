@@ -263,13 +263,12 @@ keeper commit-work "docs(plan): <what was researched or refreshed>"
 The commit scope is exactly the pass's artifacts: `model-selector.yaml`,
 `provider-equivalence.yaml`, each touched `references/<model>.md` and
 `references/cards/<model>.md`, and any test that pins the on-disk guidance state. Unrelated dirty
-files
-(concurrent workers often leave some) stay out — when the preview shows `commit-work` would sweep
-in files outside the pass or miss one of its artifacts, fall back to plain git with explicit paths
-(`git add <path> …`, never `-A` / `.`), then `git commit` + `git push`. On a `lint_failed`
-envelope: fix the named files, re-stage, re-invoke `keeper commit-work` with the same message —
-never bare `git commit` or `--no-verify` after a lint failure. Any other failure envelope surfaces
-verbatim to the human.
+files (concurrent workers often leave some) stay out. If preview misses one of this pass's
+inspected artifacts, re-run with exact invocation-local `--adopt <path>` arguments; if it selects
+an unrelated path, resolve that ownership instead of broadening the commit. On
+`outcome:"lint_failed"`, fix the named files and re-invoke `keeper commit-work` with the same
+message and adoption set. Never bypass ownership, lint, hooks, signing, or publication with raw
+Git; surface any other failure envelope verbatim to the human.
 
 ## Cadence
 

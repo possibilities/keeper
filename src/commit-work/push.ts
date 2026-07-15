@@ -343,14 +343,11 @@ export async function pushExactCommit(
     // The object-id source keeps the network write independent of mutable HEAD.
     // Git cannot attach branch tracking to an object id, so configure it only
     // after the exact remote update has succeeded.
-    const first = await run(
-      ["push", "--no-progress", "-u", "origin", refspec],
-      {
-        cwd: worktree,
-        env,
-        timeoutMs: GIT_PUSH_TIMEOUT_MS,
-      },
-    );
+    const first = await run(["push", "--no-progress", "origin", refspec], {
+      cwd: worktree,
+      env,
+      timeoutMs: GIT_PUSH_TIMEOUT_MS,
+    });
     if (first.code !== 0) return pushFailure(first);
     const track = await run(
       ["branch", `--set-upstream-to=origin/${branch}`, branch],

@@ -127,18 +127,20 @@ keeper commit-work "feat(scope): add the feature
 Task: fn-N-slug.M"
 ```
 
-On success, `keeper commit-work` emits two NDJSON envelopes on stdout — the
-commit envelope (`{success, commit_sha, files}`) and the push envelope
-(`{success, pushed, remote, branch}`). If the branch has no upstream, it is
-auto-set via `git push -u origin HEAD` on the first push. On push failure the
-exit code is 1 and the push envelope carries `push_error_class` (one of
-`non_fast_forward | auth | hook_rejected | no_upstream | network | other`) plus
-verbatim stderr; the caller resolves inline (rebase/pull/auth fix) before
-retrying. There is no `--no-push` flag; `GIT_TERMINAL_PROMPT=0` is set on every
-push subprocess so non-TTY invocations fail fast instead of hanging on a
-prompt.
+Every invocation emits one versioned `commit-work-result` JSON line. Preview
+explains the complete dirty surface and ownership categories; success carries
+both the exact local `commit` identity and `push` state. A first push updates the
+captured remote branch from the immutable commit SHA, then configures tracking
+separately. Push failures carry `push_error_class`; no result ever asks an agent
+to recreate an already-published local commit. There is no `--no-push` flag, and
+`GIT_TERMINAL_PROMPT=0` keeps non-TTY failures bounded.
 
-**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need. **A lint failure is never a coverage gap.** When the commit-work envelope reports `"error": "lint_failed"`, this fallback does not apply — the only permitted recovery is: fix the reported lint errors, re-stage with `git add`, and re-invoke `keeper commit-work` with the same message. Never bare `git commit` or `--no-verify` after a lint failure.
+A missing file is covered only by exact invocation-local `--adopt <path>`
+arguments or a versioned `--adopt-from` manifest after inspection. Adoption is
+bound to the frozen blob OID/mode, creates no durable claim, and refuses a live
+or unknown foreign exclusive claimant. Bash/codegen/package-manager evidence is
+an observation, never automatic ownership. Do not fall back to raw Git around
+ownership, lint, hooks, signing, or compare-and-swap publication.
 
 ## Version Control Advice
 

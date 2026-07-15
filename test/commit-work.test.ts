@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -392,7 +392,7 @@ describe("commit-work: --preview-files", () => {
     expect(code).toBe(0);
     expect(JSON.parse(stdout)).toMatchObject({
       schema_version: 1,
-      kind: "commit-work-preview",
+      kind: "commit-work-result",
       outcome: "preview",
       success: true,
       files: ["a.txt", "b.txt"],
@@ -596,20 +596,105 @@ describe("commit-work: success path", () => {
     expect(trailers?.args).toContain(`Job-Id: ${TEST_ID}`);
   });
 
-  test("an identity-free exact adoption carries no Job-Id trailer", async () => {
+  test("exact adoption still requires an invocation identity", async () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: ["a.txt"] }),
     });
-    const { code } = await runForTest(
-      ["feat: no trailer", "--adopt", "a.txt"],
+    const { code, stdout } = await runForTest(
+      ["feat: no identity", "--adopt", "a.txt"],
       d,
     );
-    expect(code).toBe(0);
-    const trailers = calls.find((c) =>
-      argvStartsWith(c.args, "interpret-trailers"),
-    );
-    expect(trailers?.args.some((arg) => arg.startsWith("Job-Id:"))).toBe(false);
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout).outcome).toBe("no_session_id");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("commit-work: adoption manifests", () => {
+  test("adopts exact JSON paths without shell interpolation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-manifest-"));
+    try {
+      const manifest = join(dir, "paths.json");
+      writeFileSync(
+        manifest,
+        JSON.stringify({
+          schema_version: 1,
+          kind: "commit-work-adoption",
+          paths: ["generated file.ts"],
+        }),
+      );
+      const { d } = deps({
+        files: ["generated file.ts"],
+        rules: successRules({ stagedNames: ["generated file.ts"] }),
+      });
+      d.directEvidence = () => ({ complete: true });
+      const { code, stdout } = await runForTest(
+        [
+          "feat: adopt manifest",
+          "--session-id",
+          "s1",
+          "--adopt-from",
+          manifest,
+        ],
+        d,
+      );
+      expect(code).toBe(0);
+      const envelope = JSON.parse(stdout) as {
+        selection: { adopted_total: number; adopted_sample: string[] };
+      };
+      expect(envelope.selection.adopted_total).toBe(1);
+      expect(envelope.selection.adopted_sample).toEqual(["generated file.ts"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("reads a commit message file as inert data", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-message-file-"));
+    try {
+      const messageFile = join(dir, "message.txt");
+      const message = "feat: keep $(touch nope) and 'quotes' literal\n";
+      writeFileSync(messageFile, message);
+      const { d, calls } = deps({
+        files: ["a.txt"],
+        rules: successRules({ stagedNames: ["a.txt"] }),
+      });
+      const { code } = await runForTest(
+        ["--message-file", messageFile, "--session-id", "s1"],
+        d,
+      );
+      expect(code).toBe(0);
+      const trailers = calls.find((call) =>
+        argvStartsWith(call.args, "interpret-trailers"),
+      );
+      const renderedMessage =
+        typeof trailers?.stdin === "string"
+          ? trailers.stdin
+          : new TextDecoder().decode(trailers?.stdin);
+      expect(renderedMessage).toContain(
+        "feat: keep $(touch nope) and 'quotes' literal",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an unversioned manifest as an argument error", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-adopt-manifest-"));
+    try {
+      const manifest = join(dir, "paths.json");
+      writeFileSync(manifest, JSON.stringify(["a.ts"]));
+      const { code, stdout } = await runForTest([
+        "--preview-files",
+        "--adopt-from",
+        manifest,
+      ]);
+      expect(code).toBe(2);
+      expect(JSON.parse(stdout).outcome).toBe("argument_error");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -638,7 +723,6 @@ describe("commit-work: no upstream", () => {
     expect(push?.args).toEqual([
       "push",
       "--no-progress",
-      "-u",
       "origin",
       `${FAKE_COMMIT}:refs/heads/main`,
     ]);
@@ -914,11 +998,12 @@ describe("commit-work: index-purity gate", () => {
     expect(parsed.count).toBe(2);
     // Sorted sample of the offending staged-but-unattributed paths.
     expect(parsed.sample).toEqual(["stale-a.txt", "stale-b.txt"]);
-    // Recovery names BOTH paths forward: the explicit override AND plain git.
+    // Recovery names both ownership decisions: exact adoption or narrow unstage.
     expect(typeof parsed.hint).toBe("string");
     expect(parsed.hint.length).toBeGreaterThan(0);
     expect(parsed.recovery).toContain("--allow-stale-unstage");
-    expect(parsed.recovery).toContain("git add");
+    expect(parsed.recovery).toContain("--adopt");
+    expect(parsed.recovery).not.toContain("git commit");
     // Compact single line.
     expect(stdout).not.toContain("\n  ");
     // The commit was GATED — neither commit nor push issued, and the index was

@@ -166,6 +166,13 @@ export async function spawnGitExec(
         stdout: "pipe",
         stderr: "pipe",
         env: buildGitEnv(options.env),
+        // Timed Git commands may launch SSH, credential, signing, or hook
+        // descendants which retain their pipes. Isolate a process group so the
+        // timeout closes the complete subprocess tree.
+        detached:
+          options.timeoutMs !== undefined &&
+          options.timeoutMs > 0 &&
+          process.platform !== "win32",
       });
     } catch (err) {
       return {
@@ -190,7 +197,19 @@ export async function spawnGitExec(
     options.timeoutMs !== undefined && options.timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          proc.kill("SIGKILL");
+          if (process.platform !== "win32") {
+            try {
+              process.kill(-proc.pid, "SIGKILL");
+              return;
+            } catch {
+              // The child may have exited between the timer and group signal.
+            }
+          }
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+            // A concurrently exited child already closed its descriptors.
+          }
         }, options.timeoutMs)
       : undefined;
 

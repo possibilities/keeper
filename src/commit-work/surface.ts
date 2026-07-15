@@ -51,6 +51,7 @@ export interface CommitWorkSurfaceSummary {
   dirty_total: number;
   caller_owned_selected: SurfaceCategory;
   adoptable_unattributed: SurfaceCategory;
+  observed_adoptable: SurfaceCategory;
   terminal_foreign_adoptable: SurfaceCategory;
   live_foreign_conflict: SurfaceCategory;
   multi_ambiguous: SurfaceCategory;
@@ -279,6 +280,10 @@ function boundedCategory(
   };
 }
 
+export function claimIsExclusiveOwnership(claim: OwnershipClaim): boolean {
+  return claim.source !== "bash" && claim.source !== "inferred";
+}
+
 function mergeClaims(
   durable: OwnershipClaim[] | null,
   direct: DirectSurfaceEvidence | undefined,
@@ -336,7 +341,9 @@ function unsafeForeignSessions(
       claims
         .filter(
           (claim) =>
-            claim.sessionId !== identity && claim.liveness !== "terminal",
+            claimIsExclusiveOwnership(claim) &&
+            claim.sessionId !== identity &&
+            claim.liveness !== "terminal",
         )
         .map((claim) => claim.sessionId),
     ),
@@ -391,6 +398,7 @@ export async function discoverCommitWorkSurface(
 
   const caller: string[] = [];
   const unattributed: string[] = [];
+  const observed: string[] = [];
   const terminalForeign: string[] = [];
   const liveForeign: string[] = [];
   const ambiguous: string[] = [];
@@ -403,10 +411,17 @@ export async function discoverCommitWorkSurface(
       continue;
     }
     const claims = claimsByPath.get(path) ?? [];
+    const observations = claims.filter(
+      (claim) => !claimIsExclusiveOwnership(claim),
+    );
+    if (observations.length > 0) observed.push(path);
+    const ownershipClaims = claims.filter(claimIsExclusiveOwnership);
     const mine = identity
-      ? claims.filter((claim) => claim.sessionId === identity)
+      ? ownershipClaims.filter((claim) => claim.sessionId === identity)
       : [];
-    const foreign = claims.filter((claim) => claim.sessionId !== identity);
+    const foreign = ownershipClaims.filter(
+      (claim) => claim.sessionId !== identity,
+    );
     const live = foreign.filter((claim) => claim.liveness === "live");
     const terminal = foreign.filter((claim) => claim.liveness === "terminal");
     const unknown = foreign.filter((claim) => claim.liveness === "unknown");
@@ -440,6 +455,7 @@ export async function discoverCommitWorkSurface(
     const peerClaims = claimsByPath.get(peer) ?? [];
     const peerUnsafe = peerClaims.some(
       (claim) =>
+        claimIsExclusiveOwnership(claim) &&
         claim.sessionId !== identity &&
         (claim.liveness === "live" || claim.liveness === "unknown"),
     );
@@ -543,6 +559,7 @@ export async function discoverCommitWorkSurface(
       dirty_total: dirtyByPath.size,
       caller_owned_selected: boundedCategory(caller, limit),
       adoptable_unattributed: boundedCategory(unattributed, limit),
+      observed_adoptable: boundedCategory(observed, limit),
       terminal_foreign_adoptable: boundedCategory(terminalForeign, limit),
       live_foreign_conflict: boundedCategory(liveForeign, limit),
       multi_ambiguous: boundedCategory(ambiguous, limit),

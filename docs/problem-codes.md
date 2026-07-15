@@ -337,26 +337,48 @@ see their `README.md` entries for that shared vocabulary's meaning and recovery.
 
 ## keeper commit-work
 
-`cli/commit-work.ts` stages the session-attributed dirty set, runs the lint matrix,
-commits pathspec-limited, and pushes. Every failure is a compact single-line
-`{"success": false, "error": "<code>", …}` envelope at exit 1 (an arg fault is exit 2).
-Three repo-state gates plus the index-purity gate guard the commit; each names the ONE
-sanctioned exception — plain-git-with-explicit-paths — as the deliberate mixed-commit path
-it exists to make visible (`git add <explicit paths>` — never `-A` / `.` — then `git commit`
-/ `git push`). That escape hatch, the `--allow-stale-unstage` / `--override-jam` /
-`--allow-mass-reversion` overrides, and this table tell ONE recovery story; the commit stays
-pathspec-limited even when a gate is overridden, so a poisoned index never enters the tree.
+Every invocation emits exactly one line with
+`{schema_version:1, kind:"commit-work-result", outcome, success, …}`. Preview is
+`outcome:"preview"`; a local commit and its push state share the same envelope.
+Usage and invocation-file faults exit 2 with `argument_error`; policy, ownership,
+publication, and push failures exit 1. A failure also repeats `outcome` in the
+flat `error` alias, but consumers should branch on `outcome`.
 
-| code                     | meaning                                                                                                                                                                                                 | recovery                                                                                                                                                                            | retry-safe |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `operation_in_progress`  | Gate 1 (pre-lock, NO override). The repo is mid-merge / -cherry-pick / -revert / -rebase / -bisect (probed worktree-portably via `rev-parse`); `operation` names it. A full commit here silently makes a two-parent merge commit — the shape that spread the incident's stale blobs through an auto-merge. Nothing was staged or committed. | Conclude the operation (finish it, or `git bisect reset`) or abort it (`git <op> --abort`), then re-run unchanged. No override — a mid-operation partial commit is never correct. | yes (after the op concludes / aborts) |
-| `shared_checkout_jam`    | Gate 2 (pre-lock, `--override-jam`). A live `dispatch_failures` shared-checkout **dirty** / **desync** distress row (`shared-checkout-{dirty,desync}:<hash>`) matches this repo under a normalized dir compare — the working tree may trail landed history, so a commit risks sweeping stale content. FAIL-OPEN: a repo with no keeper.db (or an unreadable one) commits normally. | Let the daemon recover the checkout: dirt is backed up to the lane dirt spool and cleaned only when every cwd-matched writer is grace-stale and provably dead, with no merge in progress; ambiguous ownership pages once and remains untouched. Desync recovery and the observed-clean tracker clear the row. Inspect with `keeper query dispatch_failures`; if the staged set is certainly correct and current, `--override-jam` remains available. | yes (once the jam clears, or with `--override-jam`) |
-| `mass_reversion`         | Gate 3 (in-lock, `--allow-mass-reversion`). The staged set mass-matches ANCESTOR blobs while differing from HEAD (≥ 5 paths AND ≥ 30% of the staged set, excluding gitlinks + regenerated surfaces) — the desynced-checkout bulk-revert signature green suites cannot catch (the tests revert in the same sweep). `count` / `staged` / `sample` name the flagged paths. Nothing was committed. | Inspect the flagged paths against landed history (`git log -p -- <path>`). For a genuine intended bulk revert, re-run with `--allow-mass-reversion`; otherwise the checkout is stale — reconcile it with landed history first. | yes (with `--allow-mass-reversion`, or after reconciling the checkout) |
-| `unmerged_paths`         | Gate 3. The index carries unmerged (stage 1/2/3) paths — committing now would record a half-resolved conflict. `sample` names them. Nothing was committed. | Resolve the conflicted paths (`git add` each once fixed) or abort the in-progress operation, then re-run. | yes (once the conflict is resolved) |
-| `stale_index_carryover`  | Index-purity gate (in-lock, `--allow-stale-unstage`). Staged content sits OUTSIDE the session-attributed set — a dead worker's residue, a shared checkout trailing landed history, or a git-apply / codegen / script write the attribution hooks never saw. `sample` lists the offending paths. The default refuses (never a silent unstage); the commit is always pathspec-limited so the extras cannot leak. | If the extra paths are genuinely yours, commit the mixed set with plain git + explicit paths; otherwise re-run with `--allow-stale-unstage` to unstage the extras and commit only the attributed set. | yes (with either recovery path) |
-| `nothing_to_commit`      | The session-attributed files were discovered + staged but carry no actual index change (already committed, or their edits were reverted) — an empty-tree commit was skipped. | Nothing to do; if you expected a change, confirm the files still differ from HEAD. | yes (read-only outcome) |
+Automatic selection trusts only exclusive tool/plan/direct claims owned by the
+invocation. Bash, inferred, package-manager, and codegen evidence is reported as
+`surface.observed_adoptable` and never auto-selected. A coverage gap is resolved
+only by invocation-local `--adopt <path>` or a versioned `--adopt-from` manifest.
+There is no raw-Git recovery: the private index freezes exact blob OIDs and modes,
+then hooks, configured signing, commit-object verification, compare-and-swap ref
+publication, and exact-SHA push remain mandatory.
 
-The lint (`lint_failed`), coverage (`file_list_too_large`), session (`no_session_id`), and
-message (`forbidden trailer pattern`) envelopes are documented inline in the verb's `--help`
-/ `--agent-help`; `lint_failed`'s only recovery loops back through `commit-work` (fix →
-`git add` → re-invoke the SAME message), never a bare-git bypass.
+| outcome | meaning | recovery | retry-safe |
+| ------- | ------- | -------- | ---------- |
+| `argument_error` | CLI syntax, a malformed/oversized adoption manifest, an unreadable bounded input file, or both positional MSG and `--message-file`. | Correct the invocation or versioned input file, then retry. | yes (nothing ran) |
+| `identity_conflict`, `invalid_identity`, `no_session_id` | Invocation identity is conflicting, malformed, or absent. Adoption never bypasses identity. | Supply one valid UUID identity and remove conflicting environment carriers. | yes (nothing committed) |
+| `surface_unavailable` | Git could not provide the complete dirty surface. | Restore the checkout/Git read path, preview again, then retry. | yes |
+| `ownership_conflict` | A selected/adopted path has a live or unknown foreign exclusive claimant. Positive terminal evidence is required before adoption. | Let that claimant land or become positively terminal; do not force or broaden the path set. | yes after ownership settles |
+| `ownership_ambiguous` | Automatic evidence is incomplete, multi-claim, or changed during lint/publication. | Preview again; explicitly adopt only paths whose ownership you have inspected. | yes with a fresh decision |
+| `adoption_rejected` | An adopted path is outside the worktree, invalid, ignored, excluded, clean, or unknown. `selection.rejections` carries per-path codes. | Correct the exact manifest/path set; never replace it with a broad pathspec. | yes |
+| `message_required`, `forbidden_trailer` | A commit message is absent or contains Keeper-owned/forged trailer keys. | Supply a message and remove forbidden trailers; Keeper appends its own identity trailers. | yes |
+| `operation_in_progress` | Merge, cherry-pick, revert, rebase, or bisect state appeared before publication. No override exists. | Finish/abort the operation (or reset bisect), preview, and retry. | yes after settlement |
+| `shared_checkout_jam` | A live shared-checkout dirty/desync distress row matches this repo. | Let recovery clear it, or use `--override-jam` only after verifying the frozen set is current. | conditional |
+| `lock_timeout` | Another commit/base-merge retained the per-worktree flock past the deadline. | Wait for that operation to finish, then retry unchanged. | yes |
+| `file_list_too_large` | The selected set exceeds `--max-files`. | Inspect the preview; narrow it or deliberately raise/disable the cap. | yes |
+| `stale_index_carryover` | Ambient staged paths exist outside the selected set. | Preserve the other work, or use `--allow-stale-unstage` to restore only those ambient entries before the private commit. Do not raw-commit a mixed set. | conditional |
+| `unmerged_paths`, `directory_file_conflict` | The selected/index surface is conflicted or cannot represent the exact path set safely. | Resolve the conflict without broad staging, then preview and retry. | yes after repair |
+| `mass_reversion` | The frozen set matches the bulk ancestor-reversion signature. | Inspect history; use `--allow-mass-reversion` only for an intentional revert. | conditional |
+| `lint_failed` | The scoped lint matrix rejected the frozen non-deleted paths. | Fix the reported files and re-run the same message/adoption decision. Adoption is not a lint bypass. | yes after fixing |
+| `surface_changed` | A selected OID/mode/tree, branch context, or automatic claim identity changed after it was frozen. | Re-preview and make a fresh adoption decision against current bytes. | yes with fresh evidence |
+| `commit_hook_mutated` | A commit hook or signer changed the worktree, branch, private index, or ambient index. Nothing was published unless `commit.sha` says otherwise. | Inspect the named hook/signer side effect; make it validation-only or commit its generated output in a separate fresh invocation. | conditional |
+| `commit_failed`, `commit_signing_failed`, `head_read_failed`, `index_seed_failed`, `stage_failed`, `tree_write_failed`, `detached_head`, `initial_commit_unsupported` | Exact private-index construction or commit-object creation could not complete. | Fix the typed Git/signing/repository condition, preview, and retry; never disable verification/signing as a shortcut. | conditional |
+| `ref_conflict` | The captured branch moved before compare-and-swap publication. A temporary commit may exist but the ref was not overwritten. | Reconcile the new tip, preview again, then retry. | yes with fresh base |
+| `post_commit_hook_failed` | CAS publication succeeded, then `post-commit` failed. The envelope carries `committed:true`, the exact SHA, and `pushed:false`. | Treat the local commit as real; fix/run the post-commit side effect, then push that exact SHA deliberately. Do not retry the commit. | no (already committed) |
+| `push_failed` | Local publication succeeded but the exact-SHA remote update failed. | Use `push.push_error_class` to fix auth/non-fast-forward/hook/timeout state, then push or reconcile the reported exact SHA. | no commit retry |
+| `nothing_to_commit` | The selected paths produce the parent tree exactly. | Nothing to do; inspect current dirt if a change was expected. | yes (successful no-op) |
+| `internal_error` | An unexpected implementation fault escaped typed handling. | Preserve the envelope and diagnose Keeper; do not loop blindly. | no automatic retry |
+
+`ambient_reconciliation_warning` is not an outcome: the exact commit is already
+published, but Keeper could not reconcile selected entries back into the ambient
+index without risking concurrent staged work. Preserve the warning and repair the
+ambient index separately; never recreate the commit.

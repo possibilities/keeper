@@ -49,13 +49,13 @@ keeper commit-work "<type>(<scope>): <summary>
 Task: $TASK_ID"
 ```
 
-`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. `commit-work` scopes to session-touched files and hard-stops a runaway list (`file_list_too_large`) on its own — run `keeper commit-work --preview-files` first only if you're unsure what's staged. Push to origin is automatic on success.
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`; `<scope>` comes from the task's file list. Always run `keeper commit-work --preview-files` first and inspect its one versioned result. Automatic selection uses this invocation's exclusive tool/plan claims; Bash, inferred, package-manager, and codegen rows are observations only. Push to origin is automatic on a successful main-worktree commit.
 
-**On `lint_failed`** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>", "recovery": "<fix→restage→re-invoke contract>"}`, or `"linter": "multiple"` with aggregated stderr): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `keeper commit-work` with the same message. The only `commit-work` failure you handle inline.
+**An inspected missing path is an explicit adoption decision.** Re-preview with repeatable exact `--adopt <path>` arguments (or a versioned `--adopt-from` manifest). Adoption is invocation-local, byte/mode-bound, and refuses any live or unknown foreign exclusive claim. Never broaden the set or fall back to raw Git.
 
-**Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
+**On `outcome:"lint_failed"`** (including `linter:"multiple"` with aggregated bounded stderr): read the named files, fix per the stderr, then re-invoke `keeper commit-work` with the same message and adoption set. A lint failure is not an attribution gap.
 
-**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly:** stage only the files you're committing by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This never applies to a `lint_failed` envelope — that has exactly one recovery (fix, re-stage, re-invoke `commit-work` per above), never a bare `git commit` or `--no-verify`.
+**Any other non-zero exit → follow its typed recovery or `BLOCKED: TOOLING_FAILURE`** with the verbatim result JSON. In particular, a committed-local post-hook/push failure is not safe to recommit. Don't patch or bypass the tool you're calling.
 
 If you reach this phase with a clean tree (a predecessor already shipped the source commit — see Phase 1), skip it: *"tree clean, no source commit needed."*
 

@@ -54,11 +54,6 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "git rev-parse HEAD",
     "git reset --soft HEAD~1",
     "git -C /repo log --oneline",
-    // commit: the wrapper lands the leg's staged work as its own single commit
-    // via the git-add + bare git-commit escape hatch (-m / -F <file> / --trailer)
-    "git commit -m 'feat(x): land the leg work'",
-    "git commit -F /scratch/msg.txt",
-    "git commit --trailer 'Job-Id: job-1' -m msg",
     // combined-diff `-c` is the log/show subcommand's OWN flag, a read
     "git log -c --format=%H",
     // explicit test files + stable named gates
@@ -131,7 +126,10 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "mv /tmp/evil.ts src/x.ts",
     "tar -x -f /tmp/payload.tar",
     "tar xf /tmp/payload.tar",
-    // --- mutating / off-list git (a wrapped worker gets read + staging + commit only) ---
+    // --- mutating / off-list git (source commits route through commit-work) ---
+    "git commit -m 'feat(x): land the leg work'",
+    "git commit -F /scratch/msg.txt",
+    "git commit --trailer 'Job-Id: job-1' -m msg",
     "git push",
     "git rm src/x.ts",
     "git mv a b",
@@ -393,7 +391,6 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
       "keeper session state",
       "git add -A",
       "git status",
-      "git commit -m 'feat(x): y'",
       "git reset --soft HEAD~1",
       "bun test test/wrapped-guard.test.ts",
       "bun run test:gate",
