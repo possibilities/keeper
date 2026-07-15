@@ -123,6 +123,31 @@ describe("commit-work foreign claim adoption", () => {
     expect(terminal.adopted).toEqual(["a.txt"]);
   });
 
+  test("adoption reports outside, excluded, ignored, and clean paths separately", async () => {
+    const git: GitRunner = async (args) => {
+      if (args[0] === "status") {
+        return { code: 0, stdout: statusRecord(".keeper/x"), stderr: "" };
+      }
+      if (args[0] === "check-ignore") {
+        return { code: 0, stdout: "ignored\0", stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: ID,
+      adoptedPaths: ["../outside", ".keeper/x", "ignored", "clean"],
+      git,
+      deps: { readClaims: () => [] },
+    });
+    expect(surface.rejections.map((entry) => entry.code)).toEqual([
+      "outside_worktree",
+      "excluded",
+      "ignored",
+      "clean",
+    ]);
+  });
+
   test("explicit adoption supersedes the caller's stale automatic identity", async () => {
     const surface = await discoverCommitWorkSurface({
       worktree: "/repo",
