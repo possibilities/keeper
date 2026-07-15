@@ -201,13 +201,13 @@ when the restore plan targets the managed autopilot session, unless --force is p
 proceed); any tab that failed (a died resume) exits ${TABS_EXIT_PARTIAL_FAILURE} with a verified/failed/unverified summary.
 `;
 
-const HELP_REPAIR = `keeper tabs repair — report non-claude tabs with a rotted resume target
+const HELP_REPAIR = `keeper tabs repair — report Pi tabs with a rotted resume target
 
 Usage:
   keeper tabs repair [--db <path>]
 
-READ-ONLY. Sweeps non-claude jobs whose recorded resume target names no on-disk
-artifact — the rot a pre-fix resume cycle could leave — and emits a
+READ-ONLY. Sweeps Pi jobs whose recorded resume target names no on-disk artifact
+and emits a
 {schema_version, ok, error, data} envelope on stdout (exit 0). 'data.proposals'
 lists each rotted job with its harness, cwd, old target, the disk-anchored
 'proposed_target' (null when ambiguous or unmatched), an 'ambiguous' flag, and a
@@ -216,9 +216,8 @@ AMBIGUOUS (listed, never resolved).
 
 repair NEVER mutates. The actual re-pin is landed by the daemon's resume-target
 back-fill producer, which applies ONLY the unambiguous single-candidate proposals
-through the same event-sourced path the codex back-fill uses — so a repair takes
-effect on the daemon's next sweep, and 'keeper tabs dump' then emits a target that
-exists on disk.
+through the event-sourced path — so a repair takes effect on the daemon's next
+sweep, and 'keeper tabs dump' then emits a target that exists on disk.
 
 Flags:
   --db <path>   keeper.db path override ($KEEPER_DB / default otherwise)

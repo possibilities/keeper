@@ -1006,60 +1006,7 @@ test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mod
   ]);
 });
 
-test("buildKeeperAgentLaunchArgv: codex resume emits `keeper agent codex … resume <t>` with NO claude permission flags", () => {
-  // A non-claude harness swaps the agent token, DROPS the claude worker-permission
-  // posture (keeper agent applies codex's own `--dangerously-bypass…` default), and
-  // resumes via the VERB-POSITION `resume <uuid>` subcommand, not `--resume`.
-  const argv = buildKeeperAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    session: "pair",
-    prompt: "",
-    resumeTarget: "rollout-uuid",
-    harness: "codex",
-    noConfirm: true,
-  });
-  expect(argv).toEqual([
-    ...LAP,
-    "codex",
-    "--x-tmux",
-    "--x-tmux-detached",
-    "--x-tmux-session",
-    "pair",
-    "--x-tmux-env",
-    "KEEPER_TMUX_SESSION=pair",
-    "--x-tmux-env",
-    "KEEPER_PLAN_WORKTREE=",
-    "--x-tmux-env",
-    "KEEPER_PLAN_WORKTREE_BRANCH=",
-    "--x-tmux-env",
-    "KEEPER_JOB_ID=",
-    // ...and an empty escalation-role entry (the 5th always-present carrier), so a
-    // stale KEEPER_ESCALATION_ROLE can never be inherited by a non-escalation launch.
-    "--x-tmux-env",
-    "KEEPER_ESCALATION_ROLE=",
-    // Dispatched-cell carriers (ADR 0047) — the 6th/7th/8th always-present env,
-    // EMPTY on an unconstrained launch (byte-inert).
-    "--x-tmux-env",
-    "KEEPER_PLAN_DISPATCHED_MODEL=",
-    "--x-tmux-env",
-    "KEEPER_PLAN_DISPATCHED_TIER=",
-    "--x-tmux-env",
-    "KEEPER_PLAN_DISPATCH_CONSTRAINT=",
-    // Wrapped-cell guard carriers (task .1) ride even a non-claude resume (they sit
-    // in the env block, BEFORE the claude-only permission posture) — EMPTY here.
-    "--x-tmux-env",
-    "KEEPER_WRAPPED_CELL=",
-    "--x-tmux-env",
-    "KEEPER_WRAPPED_ENVELOPE=",
-    "--x-no-confirm",
-    "resume",
-    "rollout-uuid",
-  ]);
-  expect(argv).not.toContain("--permission-mode");
-  expect(argv).not.toContain("--dangerously-skip-permissions");
-});
-
-test("buildKeeperAgentLaunchArgv: pi resume emits `--session <t>`, hermes emits `--resume <t>`", () => {
+test("buildKeeperAgentLaunchArgv: Pi resume emits `--session <t>`", () => {
   const pi = buildKeeperAgentLaunchArgv({
     launcherArgvPrefix: LAP,
     session: "s",
@@ -1071,17 +1018,6 @@ test("buildKeeperAgentLaunchArgv: pi resume emits `--session <t>`, hermes emits 
   expect(pi.slice(-2)).toEqual(["--session", "pi-42"]);
   expect(pi[LAP.length]).toBe("pi");
   expect(pi).not.toContain("--dangerously-skip-permissions");
-
-  const hermes = buildKeeperAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    session: "s",
-    prompt: "",
-    resumeTarget: "hx-9",
-    harness: "hermes",
-    noConfirm: true,
-  });
-  expect(hermes.slice(-2)).toEqual(["--resume", "hx-9"]);
-  expect(hermes[LAP.length]).toBe("hermes");
 });
 
 test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical to the default", () => {
@@ -1391,7 +1327,7 @@ test("buildKeeperAgentLaunchArgv: a wrapped-cell work launch carries the marker 
   expect(cellIdx).toBeLessThan(argv.indexOf("--permission-mode"));
 });
 
-test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and argv-safe", () => {
+test("buildKeeperAgentLaunchArgv: exact attempt metadata is emitted for Claude and Pi", () => {
   const base = {
     launcherArgvPrefix: ["/bun", "/keeper.ts", "agent"],
     session: "work",
@@ -1407,13 +1343,25 @@ test("buildKeeperAgentLaunchArgv: exact attempt metadata is capability-gated and
   expect(
     pi.filter((arg) => arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID=")),
   ).toEqual(["KEEPER_DISPATCH_ATTEMPT_ID=42"]);
-  for (const harness of ["codex", "hermes"] as const) {
-    expect(
-      buildKeeperAgentLaunchArgv({ ...base, harness }).some((arg) =>
-        arg.startsWith("KEEPER_DISPATCH_ATTEMPT_ID="),
-      ),
-    ).toBe(false);
-  }
+});
+
+test("buildKeeperAgentLaunchArgv: empty harness remains Claude; unregistered harnesses are rejected", () => {
+  const base = {
+    launcherArgvPrefix: LAP,
+    session: "agentbus",
+    prompt: "",
+    resumeTarget: "session-1",
+    noConfirm: true,
+  } as const;
+  expect(buildKeeperAgentLaunchArgv({ ...base, harness: "" })).toEqual(
+    buildKeeperAgentLaunchArgv(base),
+  );
+  expect(() =>
+    buildKeeperAgentLaunchArgv({ ...base, harness: "codex" }),
+  ).toThrow("unknown harness 'codex'");
+  expect(() =>
+    buildKeeperAgentLaunchArgv({ ...base, harness: "hermes" }),
+  ).toThrow("unknown harness 'hermes'");
 });
 
 test("buildKeeperAgentLaunchArgv: every worker launch carries keeper-owned permission posture (skip-permissions + acceptEdits, mirroring the pair path)", () => {
@@ -1559,6 +1507,32 @@ test("fixture-fed keeperAgentLaunch: exit 0 + real stdout → ok (full launch→
     spawn,
   });
   expect(res).toEqual({ ok: true });
+});
+
+test("keeperAgentLaunch: an unregistered harness fails before spawn", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const warnings: string[] = [];
+  const spawn = makeKeeperAgentSpawnStub(
+    LAP,
+    { stdout: KEEPER_AGENT_FIXTURE_STDOUT, exitCode: 0 },
+    records,
+  );
+  const res = await keeperAgentLaunch({
+    noteLine: (line) => warnings.push(line),
+    launcherArgvPrefix: LAP,
+    session: "agentbus",
+    cwd: "/repo",
+    label: "retired resume",
+    spec: { prompt: "", resumeTarget: "old-session", harness: "codex" },
+    spawn,
+  });
+  expect(res).toEqual({
+    ok: false,
+    error:
+      "keeper agent launch rejected for retired resume: unknown harness 'codex'",
+  });
+  expect(records).toEqual([]);
+  expect(warnings.join("\n")).toContain("unknown harness 'codex'");
 });
 
 test("KEEPER_AGENT_TMUX_EXIT mirrors keeper agent's landed TMUX_EXIT taxonomy (1/2/3/4) and maps to the right outcome class", () => {

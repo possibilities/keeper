@@ -12,7 +12,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  realpathSync,
   renameSync,
   writeFileSync,
 } from "node:fs";
@@ -34,25 +33,14 @@ import {
   buildBirthDraft,
   emitBirthRecord,
 } from "../birth-record";
-import { ensureCodexDirTrust } from "../codex-trust";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
-import {
-  HERMES_SHIM_EVENTS,
-  HERMES_SHIM_VERSION,
-} from "../hermes-shim-contract";
-import { ensureHermesShimTrust } from "../hermes-trust";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
-import { normalizeKeeperAgentProfileArg, parseArgsForAgent } from "./args";
-import {
-  type CodexSessionNameIndexerOptions,
-  codexSessionIdFromRolloutPath,
-  startCodexSessionNameIndexer,
-} from "./codex-session-index";
+import { parseArgsForAgent } from "./args";
 import {
   ConfigError,
   loadPanelSelections,
@@ -93,7 +81,6 @@ import {
   READ_ONLY_DIRECTIVE,
 } from "./launch-config";
 import {
-  hermesShimCommand,
   type LaunchHandleDeps,
   launchEnvForAgent,
   launchToResolvedHandle,
@@ -116,13 +103,8 @@ import {
   type VerbDeps,
 } from "./pair-subcommands";
 import {
-  findCodexPassthroughCommand,
-  findHermesPassthroughCommand,
   findPassthroughCommand,
   findPiPassthroughCommand,
-  hasExplicitCodexEffortArg,
-  hasExplicitCodexModelArg,
-  hasExplicitCodexProfileArg,
   hasExplicitEffortArg,
   hasExplicitModelArg,
   hasExplicitThinkingArg,
@@ -169,7 +151,6 @@ import {
   defaultClaudeStowDir,
   defaultSharedStowDir,
   ensureClaudeStateSharing,
-  ensureCodexStateSharing,
   ensurePiStateSharing,
   StateError,
 } from "./state-sharing";
@@ -215,9 +196,7 @@ export interface MainDeps {
   // (it reads the passwd db), so these cannot be isolated by redirecting HOME —
   // they must be seams. realDeps() wires the production implementations.
   claudeBin: string;
-  codexBin: string;
   piBin: string;
-  hermesBin: string;
   pluginConfigPath: string;
   loadPluginSourcesFn: () => PluginSources;
   /**
@@ -239,14 +218,6 @@ export interface MainDeps {
    * repairs, or blocks a launch on its live drift.
    */
   ensureClaudeStateSharingFn: (actionLog: string[]) => void;
-  /**
-   * Re-assert codex's canonical `<CODEX_HOME|~/.codex>/AGENTS.md` link onto the one
-   * shared source. HOME/env-coupled, so a seam; `realDeps()` binds it against
-   * `homedir()` + `process.env` + `defaultSharedStowDir()`. Runs unconditionally on
-   * every codex launch (codex is almost always passthrough), warn-and-respect so a
-   * human-edited file never aborts the launch.
-   */
-  ensureCodexStateSharingFn: (actionLog: string[]) => void;
   /**
    * Materialize Pi's canonical `~/.pi/agent` root and re-assert its canonical
    * `AGENTS.md` global-instruction link onto the one shared source. HOME-coupled,
@@ -284,12 +255,8 @@ export interface MainDeps {
    * `realDeps()` binds it against the resolved per-harness bins.
    */
   providerReachableFn: (harness: HarnessName) => boolean;
-  startCodexSessionNameIndexerFn: (
-    opts: CodexSessionNameIndexerOptions,
-  ) => () => void;
   /**
-   * Emit a birth record for a freshly-spawned non-claude harness child (codex /
-   * pi / hermes): probe the child's platform-tagged start_time and atomically
+   * Emit a birth record for a freshly-spawned Pi child: probe the child's platform-tagged start_time and atomically
    * write the maildir record the ingest worker turns into a synthetic
    * SessionStart. Fail-open — a write failure degrades to presence-only. Injected
    * so the launcher wiring is testable without a real fs write or `ps` fork;
@@ -384,9 +351,7 @@ export function realDeps(): MainDeps {
   migrateLegacyAgentStateDir();
   const bins: Record<HarnessName, string> = {
     claude: join(homedir(), ".local", "bin", "claude"),
-    codex: resolveCodexBin(process.env),
     pi: "pi",
-    hermes: resolveHermesBin(),
   };
   const launcherArgvPrefix = buildLauncherArgvPrefix(
     process.execPath,
@@ -409,9 +374,7 @@ export function realDeps(): MainDeps {
     writeErr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
     claudeBin: bins.claude,
-    codexBin: bins.codex,
     piBin: bins.pi,
-    hermesBin: bins.hermes,
     pluginConfigPath: pluginConfigPath(),
     loadPluginSourcesFn: loadPluginSources,
     loadPresetCatalogFn: loadPresetCatalog,
@@ -421,13 +384,6 @@ export function realDeps(): MainDeps {
         actionLog,
         homedir(),
         defaultClaudeStowDir(),
-        defaultSharedStowDir(),
-      ),
-    ensureCodexStateSharingFn: (actionLog) =>
-      ensureCodexStateSharing(
-        actionLog,
-        homedir(),
-        process.env,
         defaultSharedStowDir(),
       ),
     ensurePiStateSharingFn: (actionLog) =>
@@ -449,7 +405,6 @@ export function realDeps(): MainDeps {
         readYamlFileIfPresent(panelConfigPath()),
       ),
     providerReachableFn: (harness) => isBinaryReachable(bins[harness]),
-    startCodexSessionNameIndexerFn: startCodexSessionNameIndexer,
     emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
     tmuxBin: resolveTmuxBin(process.env),
     launcherArgvPrefix,
@@ -552,40 +507,6 @@ function scrubInheritedClaudeSessionEnv(
   }
 }
 
-function resolveCodexBin(env: NodeJS.ProcessEnv): string {
-  for (const pathEntry of (env.PATH ?? "").split(delimiter)) {
-    const dir = pathEntry || ".";
-    const candidate = join(dir, "codex");
-    try {
-      accessSync(candidate, constants.X_OK);
-      const resolved = realpathSync(candidate);
-      if (basename(resolved) === "arthack-codex.py") {
-        continue;
-      }
-      return resolved;
-    } catch {
-      // Try the next PATH entry.
-    }
-  }
-  return "codex";
-}
-
-/**
- * Resolve the hermes binary: the canonical `~/.local/bin/hermes` install path
- * when present + executable, else the bare `hermes` name (PATH fallback). Mirrors
- * the binary-before-config ordering — a machine without the install path still
- * launches if `hermes` is on PATH.
- */
-function resolveHermesBin(): string {
-  const installed = join(homedir(), ".local", "bin", "hermes");
-  try {
-    accessSync(installed, constants.X_OK);
-    return installed;
-  } catch {
-    return "hermes";
-  }
-}
-
 /**
  * True when a resolved harness binary is reachable + executable — the
  * `providers check` reachability probe. An absolute path is X_OK-tested directly;
@@ -609,34 +530,6 @@ function isBinaryReachable(bin: string): boolean {
     }
   }
   return false;
-}
-
-/**
- * Run `hermes sessions export --source cli -` and return its JSONL text, or null
- * on any failure. The hermes M2 capture seam ({@link runHermesSessionsExport} is
- * bound onto {@link VerbDeps.hermesExport} for the wait/show verbs). `--source cli`
- * bounds the export to keeper's own one-shot launches (`source: cli`); reading is
- * strictly read-only. A non-zero exit / spawn error / empty stdout → null so the
- * poll loop keeps trying and fails to `no_transcript`, never hangs. Production
- * only — tests inject a fixture seam, so this subprocess never runs under test.
- */
-function runHermesSessionsExport(
-  hermesBin: string,
-  env: NodeJS.ProcessEnv,
-): string | null {
-  try {
-    const result = spawnSync(
-      hermesBin,
-      ["sessions", "export", "--source", "cli", "-"],
-      { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-    );
-    if (result.status !== 0 || typeof result.stdout !== "string") {
-      return null;
-    }
-    return result.stdout.trim() === "" ? null : result.stdout;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -693,12 +586,6 @@ function findPassthroughForAgent(
   if (agent === "claude") {
     return findPassthroughCommand(args);
   }
-  if (agent === "codex") {
-    return findCodexPassthroughCommand(args);
-  }
-  if (agent === "hermes") {
-    return findHermesPassthroughCommand(args);
-  }
   return findPiPassthroughCommand(args);
 }
 
@@ -726,36 +613,10 @@ function hasPiMetadataPassthrough(args: string[]): boolean {
   return false;
 }
 
-function resolveCodexStartupModelOverride(
-  args: string[],
-  defaultModel: string | null,
-): string | null {
-  if (hasExplicitCodexModelArg(args)) {
-    return null;
-  }
-  return defaultModel;
-}
-
-function resolveCodexStartupEffortOverride(
-  args: string[],
-  defaultEffort: string | null,
-): string | null {
-  if (hasExplicitCodexEffortArg(args)) {
-    return null;
-  }
-  return defaultEffort;
-}
-
-function codexEffortConfigArg(effort: string): string {
-  return `model_reasoning_effort="${effort}"`;
-}
-
 /**
  * Whether a launch supplied its model + effort/thinking explicitly (the
  * both-explicit escape from the fresh-launch default gate). Per harness: claude
- * counts `--effort` OR the `CLAUDE_CODE_EFFORT_LEVEL` env; codex counts `-c
- * model_reasoning_effort=`, and a `--profile` exempts the whole launch (the
- * profile is the model/effort source); pi counts `--thinking` OR the
+ * counts `--effort` OR the `CLAUDE_CODE_EFFORT_LEVEL` env; Pi counts `--thinking` OR the
  * `--model <id>:<thinking>` colon shorthand.
  */
 interface LaunchConfigSignals {
@@ -769,23 +630,6 @@ function resolveLaunchConfigSignals(
   args: string[],
   env: NodeJS.ProcessEnv,
 ): LaunchConfigSignals {
-  if (agent === "codex") {
-    return {
-      model: hasExplicitCodexModelArg(args),
-      effortOrThinking: hasExplicitCodexEffortArg(args),
-      exemptAll: hasExplicitCodexProfileArg(args),
-    };
-  }
-  if (agent === "hermes") {
-    // Model-only: hermes shares codex's `-m`/`--model` spelling and exposes no
-    // second axis, so `effortOrThinking` is trivially satisfied (readiness rests
-    // on the model alone via the descriptor-driven core).
-    return {
-      model: hasExplicitCodexModelArg(args),
-      effortOrThinking: true,
-      exemptAll: false,
-    };
-  }
   if (agent === "pi") {
     const colon = piModelColonThinking(args) !== null;
     return {
@@ -810,27 +654,12 @@ function resolveLaunchConfigSignals(
  */
 function unresolvedDefaultMessage(agent: AgentKind): string {
   const key = `${agent}_default`;
-  if (agent === "codex") {
-    return (
-      `Error: keeper agent codex: no model/effort resolved for a fresh launch. ` +
-      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
-      `or pass --model <model> -c model_reasoning_effort=<effort> ` +
-      `(or --profile <profile>).\n`
-    );
-  }
   if (agent === "pi") {
     return (
       `Error: keeper agent pi: no model/thinking resolved for a fresh launch. ` +
       `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
       `or pass --model <model> --thinking <thinking> ` +
       `(or --model <model>:<thinking>).\n`
-    );
-  }
-  if (agent === "hermes") {
-    return (
-      `Error: keeper agent hermes: no model resolved for a fresh launch. ` +
-      `Set ${key} in presets.yaml (see 'keeper agent presets list'), ` +
-      `or pass -m <model> (hermes is model-only — no effort/thinking).\n`
     );
   }
   return (
@@ -850,20 +679,16 @@ function harnessDefaultTriple(
   switch (agent) {
     case "claude":
       return catalog.claude_default ?? null;
-    case "codex":
-      return catalog.codex_default ?? null;
     case "pi":
       return catalog.pi_default ?? null;
-    case "hermes":
-      return catalog.hermes_default ?? null;
   }
 }
 
 /**
  * Bridge a parsed launch {@link Triple} into the {@link Preset} shape the launch
  * resolver machinery consumes. The triple's single `effort` segment routes onto the
- * harness's own second axis (descriptor-driven): claude/codex take it as `effort`,
- * pi as `thinking`, and an axisless harness (hermes, effort `na`) takes neither.
+ * harness's own second axis (descriptor-driven): Claude takes it as `effort`
+ * and Pi as `thinking`.
  * The launch path then translates that band per-harness at argv-build time exactly
  * as a hand-authored preset did. `role` is never carried by a triple.
  */
@@ -881,7 +706,7 @@ function presetFromTriple(t: Triple): Preset {
 /**
  * The shared fresh-launch readiness core both gates route through: does the
  * RESOLVED preset (plus any explicit-flag `signals`) supply BOTH a model and the
- * harness's correct SECOND AXIS — `effort` for claude/codex, `thinking` for pi?
+ * harness's correct SECOND AXIS — `effort` for Claude, `thinking` for Pi?
  * Pure; each gate keeps its OWN emission contract (the run path emits its
  * bad_args envelope, the launcher path keeps its exit-2 fail-loud message). A
  * null `preset` means no default resolved, so readiness rests entirely on the
@@ -894,122 +719,11 @@ function resolveLaunchReadiness(
   signals: LaunchConfigSignals,
 ): boolean {
   const modelResolved = (preset?.model ?? null) !== null || signals.model;
-  // A model-only harness (hermes, `secondAxis: "none"`) needs no second axis —
-  // the model alone makes it ready. The axis is descriptor-driven, never a
-  // harness-name literal.
   const axis = HARNESS_DESCRIPTORS[agent].secondAxis;
-  if (axis === "none") {
-    return modelResolved;
-  }
   const second =
     axis === "thinking" ? (preset?.thinking ?? null) : (preset?.effort ?? null);
   const secondResolved = second !== null || signals.effortOrThinking;
   return modelResolved && secondResolved;
-}
-
-function codexConfigValue(args: string[], index: number): string | null {
-  const arg = args[index];
-  if (arg === "-c" || arg === "--config") {
-    return args[index + 1] ?? "";
-  }
-  if (arg?.startsWith("--config=")) {
-    return arg.slice("--config=".length);
-  }
-  return null;
-}
-
-function configStartsWithKey(
-  value: string,
-  keys: ReadonlySet<string>,
-): boolean {
-  const trimmed = value.trim();
-  for (const key of keys) {
-    if (trimmed === key || trimmed.startsWith(`${key}=`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function hasCodexPermissionsOverride(args: string[]): boolean {
-  const configKeys = new Set(["sandbox_mode", "approval_policy"]);
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === "--") {
-      return false;
-    }
-    if (
-      arg === "--dangerously-bypass-approvals-and-sandbox" ||
-      arg === "--yolo" ||
-      arg === "-s" ||
-      arg === "--sandbox" ||
-      arg.startsWith("--sandbox=") ||
-      arg === "-a" ||
-      arg === "--ask-for-approval" ||
-      arg.startsWith("--ask-for-approval=")
-    ) {
-      return true;
-    }
-
-    const configValue = codexConfigValue(args, i);
-    if (configValue !== null) {
-      if (configStartsWithKey(configValue, configKeys)) {
-        return true;
-      }
-      if (arg === "-c" || arg === "--config") {
-        i += 1;
-      }
-    }
-  }
-  return false;
-}
-
-function hasCodexWebSearchOverride(args: string[]): boolean {
-  const configKeys = new Set(["web_search"]);
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i] as string;
-    if (arg === "--") {
-      return false;
-    }
-    if (arg === "--search") {
-      return true;
-    }
-
-    const configValue = codexConfigValue(args, i);
-    if (configValue !== null) {
-      if (configStartsWithKey(configValue, configKeys)) {
-        return true;
-      }
-      if (arg === "-c" || arg === "--config") {
-        i += 1;
-      }
-    }
-  }
-  return false;
-}
-
-function codexWrapperDefaults(args: string[]): string[] {
-  const defaults: string[] = [];
-  if (!hasCodexPermissionsOverride(args)) {
-    defaults.push("--dangerously-bypass-approvals-and-sandbox");
-  }
-  if (!hasCodexWebSearchOverride(args)) {
-    defaults.push("--search");
-  }
-  return defaults;
-}
-
-/**
- * The no-approval posture keeper prepends for a hermes launch: `--yolo` unless the
- * caller already set an explicit posture (`--yolo` or `--safe-mode`). Paired with
- * the `HERMES_ACCEPT_HOOKS=1` pane env (set at launch) so a detached one-shot never
- * stalls on an approval or a first-use hook-consent prompt.
- */
-function hermesWrapperDefaults(args: string[]): string[] {
-  if (args.includes("--yolo") || args.includes("--safe-mode")) {
-    return [];
-  }
-  return ["--yolo"];
 }
 
 /** Return the plugin-owned statusLine settings file, or null fail-open. */
@@ -1021,19 +735,6 @@ export function resolveKeeperPluginStatuslineSettingsPath(): string | null {
     "settings.json",
   );
   return existsSync(path) ? path : null;
-}
-
-/** The hermes model override, or null to leave it to the caller. An explicit
- *  `-m`/`--model` (hermes shares codex's model-flag spelling) wins over the
- *  preset/hermes_default. */
-function resolveHermesStartupModelOverride(
-  args: string[],
-  defaultModel: string | null,
-): string | null {
-  if (hasExplicitCodexModelArg(args)) {
-    return null;
-  }
-  return defaultModel;
 }
 
 /**
@@ -1185,14 +886,11 @@ async function runTranscriptSubcommand(
 }
 
 /** The transcript-verb deps shared by wait-for-stop / show-last-message / the
- *  run-capture compose — the env + home for the file-transcript agents, plus the
- *  hermes export seam (a bounded `hermes sessions export` subprocess) its
- *  store-based capture polls. */
+ *  run-capture compose. */
 function makeVerbDeps(deps: MainDeps): VerbDeps {
   return {
     env: deps.env,
     homeDir: deps.transcriptHomeDir,
-    hermesExport: () => runHermesSessionsExport(deps.hermesBin, deps.env),
   };
 }
 
@@ -1203,8 +901,6 @@ function runCaptureSeams(deps: MainDeps): RunCaptureDeps {
     waitForStop: runWaitForStop,
     showLastMessage: runShowLastMessage,
     now: deps.now,
-    resolveCodexResumeTarget: ({ transcriptPath }) =>
-      codexSessionIdFromRolloutPath(transcriptPath),
   };
 }
 
@@ -1219,8 +915,6 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     launcherArgvPrefix: deps.launcherArgvPrefix,
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
-    ensureCodexDirTrust,
-    ensureHermesShimTrust,
     now: deps.now,
     writeErr: deps.writeErr,
   };
@@ -1421,7 +1115,7 @@ async function runRunCaptureSubcommand(
   // contract — here bad_args, there exit 2). `agent run` is always a fresh
   // one-shot (no --continue/--resume analog), so an underspecified preset /
   // `<cli>_default` that resolves neither a model nor the harness's second axis
-  // (effort for claude/codex, thinking for pi) would launch a DOOMED detached
+  // (effort for Claude, thinking for Pi) would launch a DOOMED detached
   // pane surfacing as no_transcript/timed_out — short-circuit to bad_args instead.
   // The both-explicit escape (`--model` + `--effort`) needs no default and never
   // reads the catalog. `--preset` is config-free otherwise, so its harness must
@@ -1564,8 +1258,8 @@ type ComposedPrompt =
 /**
  * Compose the `agent run` prompt CALLER-SIDE (raw `\n\n` join, no `User:` scaffold
  * — `agent run` has no role framing): [read-only directive]? → [final-message
- * directive] → [System: <text>]? → [user prompt], UNIFORM across claude/codex/pi/
- * hermes and across fresh AND resume runs (a resumed leg carries the same directive
+ * directive] → [System: <text>]? → [user prompt], uniform across Claude/Pi and
+ * across fresh AND resume runs (a resumed leg carries the same directive
  * contract). The shared launch helper stays directive-free so this is the sole
  * prepender. Read-only is prompting-only (the directive is the whole mechanism —
  * keeper enforces nothing); the final-message directive is always-on; the `System:`
@@ -1619,7 +1313,7 @@ function composeRunPrompt(
  * Launch + capture happen in the RECORDED cwd (resume is cwd-scoped — the native
  * CLI finds the session only there), pinning the resumed session's id on the handle
  * so discovery + the envelope resume_target resolve the POST-resume id: claude's
- * freshly-forked CHILD uuid, codex's unchanged rollout uuid.
+ * freshly-forked child uuid.
  */
 async function runResumeCaptureSubcommand(
   deps: MainDeps,
@@ -1718,17 +1412,14 @@ async function runResumeCaptureSubcommand(
 
   // claude forks a NEW child session file on --resume (ADR 0034); mint + pin the
   // child uuid so strict discovery resolves the child (never the parent) and the
-  // envelope reports it as the POST-resume id. codex/pi resume their existing
-  // session in place, so the resumed id IS the target; hermes has no file
-  // transcript (store-based capture attributes by cwd + time).
+  // envelope reports it as the POST-resume id. Pi resumes its existing
+  // session in place, so the resumed id IS the target.
   const childSessionId =
     decision.harness === "claude" ? deps.randomUuid() : undefined;
   const discoverySessionId =
     decision.harness === "claude"
       ? (childSessionId as string)
-      : decision.harness === "hermes"
-        ? null
-        : decision.resume_target;
+      : decision.resume_target;
 
   let killWindowCommand: string[] | null = null;
   let control: { path: string; artifact: RunControlArtifact } | undefined;
@@ -2030,9 +1721,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
   const harnesses = matrix === null ? [] : enumerateTriplesV2(matrix);
   const defaults = {
     claude: host.defaults.claude ?? null,
-    codex: host.defaults.codex ?? null,
     pi: host.defaults.pi ?? null,
-    hermes: host.defaults.hermes ?? null,
   };
   const panelNames = sortedPanelNames(host);
   const dispatchRows = buildDispatchListRows(catalog);
@@ -2084,7 +1773,7 @@ function runPresetsList(deps: MainDeps, json: boolean): never {
     }
   }
   lines.push(`Harness defaults (${presetsCatalogPath()}):`);
-  for (const harness of ["claude", "codex", "pi", "hermes"] as const) {
+  for (const harness of ["claude", "pi"] as const) {
     lines.push(`  ${harness}_default  ${defaults[harness] ?? "(unset)"}`);
   }
   lines.push(`Dispatch table (${presetsCatalogPath()}):`);
@@ -2470,8 +2159,8 @@ function runResumeSubcommand(
   }
 
   // A resume launch must mint a FRESH job id — never fold onto the matched
-  // row (claude is immune: its --session-id above is explicit argv, not
-  // env-carried). codex/pi/hermes derive identity from KEEPER_JOB_ID, which a
+  // row (Claude is immune: its --session-id above is explicit argv, not
+  // env-carried). Pi derives identity from KEEPER_JOB_ID, which a
   // freshly-forked tmux SERVER would otherwise inherit from THIS process's own
   // ambient env (a resume launch with no explicit --x-tmux-session lands in
   // the shared 'keeper-agent' session, per tmux-launch.ts's resolveSession
@@ -2484,18 +2173,6 @@ function runResumeSubcommand(
   if (tmuxLaunch.error !== null) {
     deps.writeErr(`keeper agent resume: ${tmuxLaunch.error}\n`);
     return deps.exit(2);
-  }
-
-  if (decision.harness === "codex") {
-    ensureCodexDirTrust({ cwd, env: deps.env });
-  }
-  if (decision.harness === "hermes") {
-    ensureHermesShimTrust({
-      env: deps.env,
-      shimCommand: hermesShimCommand(deps.launcherArgvPrefix),
-      events: HERMES_SHIM_EVENTS,
-      version: HERMES_SHIM_VERSION,
-    });
   }
 
   try {
@@ -2635,9 +2312,7 @@ export async function main(deps: MainDeps): Promise<never> {
   // the old `agent === "claude" ? … : …` chain (byte-identical selection).
   const bins: Record<AgentKind, string> = {
     claude: deps.claudeBin,
-    codex: deps.codexBin,
     pi: deps.piBin,
-    hermes: deps.hermesBin,
   };
   const bin = bins[agent];
   const agentLabel = displayAgent(agent);
@@ -2734,8 +2409,6 @@ export async function main(deps: MainDeps): Promise<never> {
   const { remainingArgs, hasContinueOrResume, hasForkSession, hasPrint } =
     parsed;
   const { launcherVerbose, launcherVeryVerbose, launcherNoConfirm } = parsed;
-  const { launcherCodexSessionName } = parsed;
-  let { launcherProfile, explicitLauncherProfile } = parsed;
 
   // Launch-triple resolution: the `--x-preset` flag value (or the harnessless
   // head, already mirrored onto parsed.launcherPreset). Parse it once here so its
@@ -2772,29 +2445,7 @@ export async function main(deps: MainDeps): Promise<never> {
   if (launcherNoConfirm) {
     actionLog.push("Parsed --x-no-confirm: cwd confirmation suppressed");
   }
-  if (launcherCodexSessionName !== null) {
-    actionLog.push(
-      `Parsed --x-codex-session-name: ${launcherCodexSessionName}`,
-    );
-  }
-
-  if (explicitLauncherProfile && launcherProfile) {
-    actionLog.push(`Parsed --x-profile: ${launcherProfile}`);
-    if (launcherProfile !== "auto") {
-      const normalized = normalizeKeeperAgentProfileArg(launcherProfile);
-      if (normalized !== launcherProfile) {
-        actionLog.push(
-          `Normalized --x-profile default to native ${agentLabel} account`,
-        );
-      }
-      launcherProfile = normalized;
-    }
-  }
-
-  const passthroughFlags =
-    agent === "codex"
-      ? new Set(["-h", "--help", "-V", "--version"])
-      : new Set(["-h", "--help", "-v", "--version"]);
+  const passthroughFlags = new Set(["-h", "--help", "-v", "--version"]);
   const passthroughCommand = findPassthroughForAgent(agent, remainingArgs);
   let shouldPassthrough = remainingArgs.some((a) => passthroughFlags.has(a));
   if (agent === "pi" && hasPiMetadataPassthrough(remainingArgs)) {
@@ -2845,7 +2496,7 @@ export async function main(deps: MainDeps): Promise<never> {
       }
     }
     // Shared readiness core (same as the run gate): the resolved model AND the
-    // harness's second axis (effort for claude/codex, thinking for pi) must both
+    // harness's second axis (effort for Claude, thinking for Pi) must both
     // resolve from the triple or an explicit flag.
     if (!resolveLaunchReadiness(agent, resolvedPreset, launchSignals)) {
       deps.writeErr(unresolvedDefaultMessage(agent));
@@ -2897,23 +2548,6 @@ export async function main(deps: MainDeps): Promise<never> {
       }
       throw exc;
     }
-  } else if (agent === "codex") {
-    // Codex is almost always a passthrough invocation, so the canonical
-    // AGENTS.md leaf guard runs UNCONDITIONALLY (matching claude's guard) or it
-    // would never reach real codex launches. Warn-and-respect: a human-edited
-    // codex AGENTS.md is left in place, never a throw — but a wrong-target
-    // symlink is repaired, which is codex's cutover onto keeper's shared source.
-    try {
-      phase("ensure shared Codex state", () => {
-        deps.ensureCodexStateSharingFn(actionLog);
-      });
-    } catch (exc) {
-      if (exc instanceof StateError) {
-        deps.writeErr(`Error: ${exc.message}\n`);
-        return deps.exit(1);
-      }
-      throw exc;
-    }
   } else if (agent === "pi") {
     // Compile before touching Pi's state root or resolving Pi launch resources.
     // This inner-only branch covers managed and passthrough launches; the outer
@@ -2934,193 +2568,13 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  if (shouldPassthrough && launcherProfile === "auto") {
-    launcherProfile = "";
-    actionLog.push("Skipped auto profile routing for passthrough invocation");
-  }
-
   if (shouldPassthrough) {
     const ptCmd = [bin];
-    if (agent === "codex") {
-      const defaults = codexWrapperDefaults(remainingArgs);
-      ptCmd.push(...defaults);
-      if (defaults.includes("--dangerously-bypass-approvals-and-sandbox")) {
-        actionLog.push("Added Codex full-access default");
-      }
-      if (defaults.includes("--search")) {
-        actionLog.push("Added Codex live-search default");
-      }
-    }
-    if (agent === "codex" && launcherProfile) {
-      if (!hasExplicitCodexProfileArg(remainingArgs)) {
-        ptCmd.push("--profile", launcherProfile);
-        actionLog.push(
-          `Added Codex profile override: --profile ${launcherProfile}`,
-        );
-      }
-    }
-
     ptCmd.push(...remainingArgs);
     if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, ptCmd.join(" "));
     }
     return runPassthrough(ptCmd, deps.spawn, deps.exit, {
-      env: deps.env,
-      cwd: deps.cwd,
-    });
-  }
-
-  if (agent === "codex") {
-    if (launcherProfile === "auto") {
-      launcherProfile = "";
-      actionLog.push("Using native Codex profile");
-    }
-
-    const runCmd = [bin];
-    const defaults = codexWrapperDefaults(remainingArgs);
-    runCmd.push(...defaults);
-    if (defaults.includes("--dangerously-bypass-approvals-and-sandbox")) {
-      actionLog.push("Added Codex full-access default");
-    }
-    if (defaults.includes("--search")) {
-      actionLog.push("Added Codex live-search default");
-    }
-
-    if (launcherProfile && !hasExplicitCodexProfileArg(remainingArgs)) {
-      runCmd.push("--profile", launcherProfile);
-      actionLog.push(
-        `Added Codex profile override: --profile ${launcherProfile}`,
-      );
-    }
-
-    // Preset (--x-preset or the resolved codex_default) supplies the default;
-    // resolveCodexStartup*Override still gives an explicit flag priority.
-    const defaultModel = resolvedPreset?.model ?? null;
-    const defaultEffort = resolvedPreset?.effort ?? null;
-    const startupModel = resolveCodexStartupModelOverride(
-      remainingArgs,
-      defaultModel,
-    );
-    const startupEffort = resolveCodexStartupEffortOverride(
-      remainingArgs,
-      defaultEffort,
-    );
-    if (startupModel !== null) {
-      runCmd.push("--model", startupModel);
-      actionLog.push(`Added startup model override: --model ${startupModel}`);
-      note(`model: ${startupModel}`);
-    }
-    if (startupEffort !== null) {
-      // A keeper effort maps onto codex's reasoning band via the descriptor
-      // (keeper `max` → codex `xhigh`); an already-native band passes through.
-      const band = mapKeeperEffortToAxis("codex", startupEffort);
-      const effortConfig = codexEffortConfigArg(band);
-      runCmd.push("-c", effortConfig);
-      actionLog.push(`Added Codex effort override: -c ${effortConfig}`);
-      note(`effort: ${band}`);
-    }
-
-    runCmd.push(...remainingArgs);
-    const codexSessionName =
-      launcherCodexSessionName ??
-      resolveLaunchSessionName(remainingArgs, deps.cwd, deps.nextCwdOrdinalFn)
-        .sessionName;
-    note(`profile: ${launcherProfile || "default"}`);
-    note(`session: ${codexSessionName}`);
-    if (launcherCodexSessionName === null) {
-      actionLog.push(
-        `Derived Codex synthetic session-name: ${codexSessionName}`,
-      );
-    }
-    actionLog.push(
-      `Started Codex synthetic session-name indexer: ${codexSessionName}`,
-    );
-
-    if (launcherVeryVerbose) {
-      printVerbose(deps, actionLog, formatCommand(runCmd));
-    }
-
-    if (sectionsOn) {
-      deps.write("~ launching codex\n");
-    }
-
-    const codexHome = deps.env.CODEX_HOME || join(homedir(), ".codex");
-    deps.startCodexSessionNameIndexerFn({
-      codexHome,
-      threadName: codexSessionName,
-      expectedCwd: deps.cwd,
-      startedAtMs: Date.now(),
-    });
-
-    const onCodexSpawned = armBirthRecord(deps, "codex", {
-      spawnName: codexSessionName,
-      configDir: codexHome,
-      pinnedSessionId: null,
-      hasContinueOrResume,
-      remainingArgs,
-    });
-    return runWithJobControl(runCmd, deps.spawn, deps.exit, onCodexSpawned, {
-      env: deps.env,
-      cwd: deps.cwd,
-    });
-  }
-
-  if (agent === "hermes") {
-    // Hermes uses its native config — keeper does no profile routing for it (M0-M2).
-    if (launcherProfile === "auto") {
-      launcherProfile = "";
-      actionLog.push("Using native Hermes config");
-    }
-
-    const runCmd = [bin];
-    // No-approval posture: --yolo (unless the caller set one) + the hook-consent
-    // env below. hermes is model-only, so there is no effort/thinking to inject.
-    const defaults = hermesWrapperDefaults(remainingArgs);
-    runCmd.push(...defaults);
-    if (defaults.includes("--yolo")) {
-      actionLog.push("Added Hermes no-approval default (--yolo)");
-    }
-
-    // Preset (--x-preset or the resolved hermes_default) supplies the model;
-    // an explicit -m/--model still wins.
-    const startupModel = resolveHermesStartupModelOverride(
-      remainingArgs,
-      resolvedPreset?.model ?? null,
-    );
-    if (startupModel !== null) {
-      runCmd.push("-m", startupModel);
-      actionLog.push(`Added startup model override: -m ${startupModel}`);
-      note(`model: ${startupModel}`);
-    }
-
-    runCmd.push(...remainingArgs);
-
-    // Seed hook consent so a non-TTY / fresh pane never silently skips (or blocks
-    // on) hermes's first-use shell-hook prompt. Equivalent to `--accept-hooks`,
-    // but as pane env it survives the detached re-exec.
-    deps.env.HERMES_ACCEPT_HOOKS = "1";
-    actionLog.push("Set HERMES_ACCEPT_HOOKS=1");
-
-    if (launcherVeryVerbose) {
-      printVerbose(deps, actionLog, formatCommand(runCmd));
-    }
-    if (sectionsOn) {
-      deps.write("~ launching hermes\n");
-    }
-
-    const hermesSpawnName = resolveLaunchSessionName(
-      remainingArgs,
-      deps.cwd,
-      deps.nextCwdOrdinalFn,
-    ).sessionName;
-    const onHermesSpawned = armBirthRecord(deps, "hermes", {
-      spawnName: hermesSpawnName,
-      configDir: null,
-      pinnedSessionId: null,
-      hasContinueOrResume,
-      remainingArgs,
-    });
-    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned, {
       env: deps.env,
       cwd: deps.cwd,
     });
@@ -3153,12 +2607,8 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  // The account router owns every Claude launch — there is no Keeper-owned
-  // profile dir for it to take. An explicit Claude --x-profile is parsed above
-  // but has no downstream effect: the account route is resolved unconditionally
-  // at the spawn boundary below (native default, or a claude-swap wrap). Pi has
-  // no profile system either — every pi launch runs against its one canonical
-  // account.
+  // The account router owns every Claude launch. Pi launches against its one
+  // canonical account.
 
   // Build agent command.
   let runCmd = [bin, ...remainingArgs];
@@ -3430,44 +2880,28 @@ export async function main(deps: MainDeps): Promise<never> {
 }
 
 /**
- * Arm the birth record for a non-claude launch: resolve the keeper job identity,
- * export it (plus codex's rollout originator override) to the harness child, and
- * return the post-spawn callback that writes the maildir record. A birth record
- * is the ONLY presence channel for codex/pi/hermes (they fire no keeper hook);
- * claude is exempt — its SessionStart hook is authoritative for both presence and
- * resume seed — and never calls this.
- *
- * Identity: pi pins its session id at launch (`job_id = session_id`); codex/hermes
- * get a keeper-minted uuid. A RESUME relaunch reuses the ORIGINAL job id carried
- * back in `KEEPER_JOB_ID` (set by the revive script / keeper tabs restore) so the
- * revived session folds onto its existing row instead of minting an orphan. The
- * callback runs shared by interactive AND detached launches: a detached pane
- * re-execs `keeper agent` and passes back through this same spawn choke point, so
- * the record is written by the pane's own launcher, never the outer wrapper.
+ * Arm the birth record for a Pi launch: resolve the keeper job identity,
+ * export it to the harness child, and return the post-spawn callback that writes
+ * the maildir record. Claude is exempt because its SessionStart hook is
+ * authoritative for both presence and resume seed.
  *
  * Identity (the job id) and the resume key (the harness-native target) stay
- * DISTINCT per the glossary: on a resume the `resume_target` is read from the
- * harness-native argv token ({@link resumeTargetFromArgv}), NEVER the carried job
- * id — an adopted-then-resumed session whose job id diverged from its native
- * session id must re-emit the SESSION id as its next resume key, not its identity.
+ * distinct: on a resume the `resume_target` is read from the harness-native argv
+ * token ({@link resumeTargetFromArgv}), never the carried job id.
  */
 function armBirthRecord(
   deps: MainDeps,
-  agent: Exclude<AgentKind, "claude">,
+  agent: "pi",
   opts: {
     spawnName: string | null;
     configDir: string | null;
-    /** The session id keeper pinned at launch (pi), or null for a harness that
-     *  mints its own (codex/hermes). */
+    /** The session id keeper pinned at launch. */
     pinnedSessionId: string | null;
     hasContinueOrResume: boolean;
-    /** The harness-native argv forwarded to the child — the source the resume
-     *  target is read from on a resume relaunch (pi `--session`, codex `resume`,
-     *  hermes `--resume`). */
+    /** The harness-native argv forwarded to the child. */
     remainingArgs: string[];
   },
 ): ChildSpawnedFn {
-  const descriptor = HARNESS_DESCRIPTORS[agent];
   const carried = (deps.env.KEEPER_JOB_ID ?? "").trim();
   let jobId: string;
   if (opts.hasContinueOrResume && carried !== "") {
@@ -3477,20 +2911,10 @@ function armBirthRecord(
   } else {
     jobId = deps.randomUuid();
   }
-  // Export the identity to the harness child. Codex additionally overrides its
-  // rollout originator so the rollout tail can positively attribute the session.
   deps.env.KEEPER_JOB_ID = jobId;
-  if (agent === "codex") {
-    deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE = jobId;
-  }
-  // Resume: the native resume key lives in the argv, distinct from the job id.
-  // Fresh: pi's key is its pinned session id (= job id, authoritative at launch);
-  // codex/hermes back-fill theirs post-stop, so it is null at birth.
   const resumeTarget = opts.hasContinueOrResume
     ? resumeTargetFromArgv(opts.remainingArgs, agent)
-    : descriptor.mintsOwnSessionId
-      ? null
-      : jobId;
+    : jobId;
   const draft = buildBirthDraft(deps.env, {
     session_id: jobId,
     harness: agent,
@@ -3505,17 +2929,13 @@ function armBirthRecord(
 
 /**
  * The harness-native resume key present in a resume launch's forwarded argv —
- * the token FOLLOWING the harness's own resume verb/flag (pi `--session <t>`,
- * codex `resume <t>`, hermes `--resume <t>`, sourced from the descriptor). Returns
+ * the token following the harness's own resume flag. Returns
  * null when the token is absent or has no following value (a target-less
  * `--continue`/`resume`), so the caller stamps a null resume key rather than the
  * job id. Scanned ONLY on a resume relaunch, so a fresh launch whose prompt
  * happens to contain the verb never false-matches. Pure.
  */
-function resumeTargetFromArgv(
-  args: string[],
-  agent: Exclude<AgentKind, "claude">,
-): string | null {
+function resumeTargetFromArgv(args: string[], agent: "pi"): string | null {
   const token = HARNESS_DESCRIPTORS[agent].resumeArgv.token;
   const idx = args.indexOf(token);
   if (idx === -1) {
@@ -3527,9 +2947,7 @@ function resumeTargetFromArgv(
 
 /**
  * Resolve the launcher's display session name once, using a prompt slug when
- * available and the cwd ordinal fallback otherwise. Claude and Pi turn that
- * into `--name`; Codex feeds the same resolved name into its synthetic thread
- * index.
+ * available and the cwd ordinal fallback otherwise. Claude and Pi turn that into `--name`.
  */
 function resolveLaunchSessionName(
   remainingArgs: string[],

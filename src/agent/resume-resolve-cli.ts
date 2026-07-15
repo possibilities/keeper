@@ -23,18 +23,9 @@
  * tool-error.
  */
 
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { openDb, resolveDbPath } from "../db";
 import { type HarnessName, isHarnessName } from "./harness";
 import { resolveResumeDecision } from "./resume-policy";
-
-/** Mirrors `codex-trust.ts`'s `resolveCodexHome`: an explicit non-empty
- *  CODEX_HOME wins, else `~/.codex`. Reimplemented here (not imported) since
- *  that helper is private to its module. */
-function resolveCodexHome(env: NodeJS.ProcessEnv): string {
-  return (env.CODEX_HOME ?? "").trim() || join(homedir(), ".codex");
-}
 
 function writeDecision(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -67,9 +58,7 @@ function main(): void {
   let db: ReturnType<typeof openDb> | null = null;
   try {
     db = openDb(resolveDbPath(), { readonly: true, prepareStmts: false });
-    const decision = resolveResumeDecision(target, db.db, requireHarness, {
-      codexHome: resolveCodexHome(process.env),
-    });
+    const decision = resolveResumeDecision(target, db.db, requireHarness);
     writeDecision(decision);
     closeQuietly(db);
     process.exit(0);

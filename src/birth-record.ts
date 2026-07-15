@@ -1,16 +1,16 @@
 /**
- * Birth records — the non-hook presence channel for non-claude harnesses.
+ * Birth records — the non-hook presence channel for Pi.
  *
  * The `keeper agent` launcher cannot write keeper.db (it is a db-free cold-start
  * path), and a claude session announces its own presence through the SessionStart
- * hook. codex/pi/hermes fire no such hook, so the launcher instead drops a BIRTH
+ * hook. Pi fires no such hook, so the launcher instead drops a BIRTH
  * RECORD the moment it spawns the harness child: a maildir-style file the
  * birth-ingest worker reacts to and turns into a MAIN-minted synthetic
  * SessionStart. This module is that record's contract — the shape, the
  * serialize/parse round-trip, the atomic maildir write, and the child start_time
  * probe — nothing else.
  *
- * SCOPE: NON-CLAUDE only. claude's hook SessionStart is authoritative for both
+ * SCOPE: PI only. claude's hook SessionStart is authoritative for both
  * presence and resume identity; a second birth seed would double-fire the fold's
  * revive arm.
  *
@@ -31,7 +31,6 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { HARNESS_DESCRIPTORS, isHarnessName } from "./agent/harness";
 import {
   DISPATCH_ATTEMPT_ENV,
   parseDispatchAttemptCarrier,
@@ -43,22 +42,21 @@ import { execBackendEnvMeta, isDefaultTmuxEnvValue } from "./exec-backend";
 export const BIRTH_RECORD_SCHEMA_VERSION = 1;
 
 /**
- * One harness birth: the launcher's snapshot of a freshly-spawned non-claude
+ * One harness birth: the launcher's snapshot of a freshly-spawned Pi
  * session, complete enough for the ingest worker to mint a synthetic
  * SessionStart WITHOUT re-reading any live process or env.
  *
- * `session_id` is the keeper job identity (becomes `jobs.job_id`): pi pins it at
- * launch, codex/hermes get a keeper-minted uuid. `resume_target` is the
- * harness-native id a `--resume` reuses — pinned for pi, null-at-birth (back-filled
- * post-stop) for codex/hermes. `pid` + `start_time` are the recycle-safe identity
+ * `session_id` is the keeper job identity (becomes `jobs.job_id`): Pi pins it at
+ * launch. `resume_target` is the harness-native id a resume reuses. `pid` +
+ * `start_time` are the recycle-safe identity
  * (the child's, never the launcher wrapper's).
  */
 export interface BirthRecord {
   schema_version: number;
   /** Keeper job identity — folds to `jobs.job_id`. */
   session_id: string;
-  /** Harness name (`codex` | `pi` | `hermes`; never `claude`). */
-  harness: string;
+  /** Harness name (`pi`; never `claude`). */
+  harness: "pi";
   /** The spawned harness CHILD's pid (not the launcher wrapper's). */
   pid: number;
   /** Platform-tagged child start_time (`darwin:<lstart>` / `linux:<jiffies>`),
@@ -126,10 +124,10 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   if (
     typeof o.schema_version !== "number" ||
     !Number.isInteger(o.schema_version) ||
+    o.schema_version !== BIRTH_RECORD_SCHEMA_VERSION ||
     !isStr(o.session_id) ||
     o.session_id === "" ||
-    !isStr(o.harness) ||
-    o.harness === "" ||
+    o.harness !== "pi" ||
     typeof o.pid !== "number" ||
     !Number.isInteger(o.pid) ||
     !isStrOrNull(o.start_time) ||
@@ -146,7 +144,7 @@ export function parseBirthRecord(line: string): BirthRecord | null {
     return null;
   }
   return {
-    schema_version: o.schema_version,
+    schema_version: BIRTH_RECORD_SCHEMA_VERSION,
     session_id: o.session_id,
     harness: o.harness,
     pid: o.pid,
@@ -278,7 +276,7 @@ export function birthWorktreeFromEnv(env: NodeJS.ProcessEnv): string | null {
 /** Inputs the launcher assembles up front, before it has the child. */
 export interface BirthDraftInputs {
   session_id: string;
-  harness: string;
+  harness: "pi";
   cwd: string;
   spawn_name: string | null;
   config_dir: string | null;
@@ -309,11 +307,7 @@ export function buildBirthDraft(
     worktree: birthWorktreeFromEnv(env),
     launch_ts: inputs.launch_ts,
     resume_target: inputs.resume_target,
-    dispatch_attempt_id:
-      isHarnessName(inputs.harness) &&
-      HARNESS_DESCRIPTORS[inputs.harness].carriesDispatchAttempt
-        ? parseDispatchAttemptCarrier(env[DISPATCH_ATTEMPT_ENV])
-        : null,
+    dispatch_attempt_id: parseDispatchAttemptCarrier(env[DISPATCH_ATTEMPT_ENV]),
   };
 }
 

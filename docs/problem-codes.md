@@ -161,7 +161,7 @@ the compiled-in default at dispatch time, never a drift target here).
 | ------------------ | ---------------------------------------------------------------------| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ---------------- |
 | `binary-unreachable` | (none — carries `provider`/`binary`)                                | A roster provider's harness binary is off PATH.                                   | Install the missing binary, or drop the provider from `matrix.yaml`.                                       | yes (read-only)  |
 | `off-cube-triple`  | `claude_default`, `dispatch.work`, `dispatch.unblock`, `panel 'x' member 1` | A well-formed `<harness>::<model>::<effort>` triple names a combination the roster does not enumerate. | Correct the triple in `presets.yaml`/`panel.yaml`, or add the model/effort to `matrix.yaml`.                | yes (read-only)  |
-| `malformed-triple` | `dispatch.close`, `codex_default`, `panel 'x' member 2`               | A host triple fails the `<harness>::<model>::<effort>` grammar (tool fault, not drift). | Fix the triple's syntax in `presets.yaml`/`panel.yaml`.                                                     | yes (read-only)  |
+| `malformed-triple` | `dispatch.close`, `pi_default`, `panel 'x' member 2`               | A host triple fails the `<harness>::<model>::<effort>` grammar (tool fault, not drift). | Fix the triple's syntax in `presets.yaml`/`panel.yaml`.                                                     | yes (read-only)  |
 
 Exit codes (distinct from the shared 0/1/2 core, published in `keeper --help --json`):
 
@@ -218,7 +218,7 @@ Distinct from the run-time `no_route` the `agent providers resolve` verb emits
 reject that parks the task.
 
 The three `worker-provider-*` rejects surface ONLY while `autopilot_state.worker_provider`
-is pinned (`claude`/`codex`), the durable work-dispatch provider pin that translates each
+is pinned (`claude`/`gpt`), the durable work-dispatch provider-family pin that translates each
 task's assigned worker cell through the committed equivalence map at launch. They are the
 override's observability contract: an untranslatable cell spikes a visible sticky rather
 than silently starving the board or falling back to the wrong provider family.

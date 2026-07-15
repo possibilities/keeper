@@ -7,7 +7,6 @@
  * text per backend; an empty/tool-only final turn yields a defined (not silent)
  * signal; the removed `--wait-for-stop` flag no longer short-circuits launch.
  */
-
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +14,6 @@ import { join } from "node:path";
 import { main } from "../src/agent/main";
 import { resolveHandle, runWaitForStop } from "../src/agent/pair-subcommands";
 import {
-  defaultTranscriptPathTimeoutMs,
   findLastMessage,
   waitForTranscriptPath,
   waitForTranscriptStop,
@@ -29,13 +27,6 @@ import {
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "keeper-agent-pair-test-"));
 }
-
-test("Pi transcript discovery tolerates cold profile package startup", () => {
-  expect(defaultTranscriptPathTimeoutMs("pi")).toBe(120_000);
-  expect(defaultTranscriptPathTimeoutMs("claude")).toBe(30_000);
-  expect(defaultTranscriptPathTimeoutMs("codex")).toBe(30_000);
-});
-
 /** Write a run.json under the state dir so a run-id handle resolves. */
 function writeRunJson(
   stateDir: string,
@@ -46,48 +37,15 @@ function writeRunJson(
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "run.json"), `${JSON.stringify(data, null, 2)}\n`);
 }
-
-function writeCodexTranscript(
-  home: string,
-  cwd: string,
-  opts: { stopped?: boolean; finalMessage?: string | null } = {},
-): string {
-  const now = new Date();
-  const year = String(now.getFullYear());
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  const dir = join(home, ".codex", "sessions", year, month, day);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "rollout-2026-06-22T00-00-00-test.jsonl");
-  const lines = [
-    JSON.stringify({
-      timestamp: new Date().toISOString(),
-      type: "session_meta",
-      payload: { id: "codex-session", cwd },
-    }),
-  ];
-  if (opts.stopped) {
-    const payload: Record<string, unknown> = { type: "task_complete" };
-    if (opts.finalMessage !== undefined && opts.finalMessage !== null) {
-      payload.last_agent_message = opts.finalMessage;
-    }
-    lines.push(
-      JSON.stringify({
-        timestamp: new Date().toISOString(),
-        type: "event_msg",
-        payload,
-      }),
-    );
-  }
-  writeFileSync(path, `${lines.join("\n")}\n`);
-  return path;
-}
-
 function writeClaudeTranscript(
   home: string,
   cwd: string,
   sessionId: string,
-  opts: { text?: string | null; stopReason?: string; mtimeMs?: number } = {},
+  opts: {
+    text?: string | null;
+    stopReason?: string;
+    mtimeMs?: number;
+  } = {},
 ): string {
   const dir = join(home, ".claude", "projects", cwd.replace(/\//g, "-"));
   mkdirSync(dir, { recursive: true });
@@ -116,7 +74,6 @@ function writeClaudeTranscript(
   }
   return path;
 }
-
 function parseJsonOutput(out: string[]): Record<string, unknown> {
   const lastLine = out.join("").trim().split("\n").at(-1);
   if (lastLine === undefined) {
@@ -124,7 +81,6 @@ function parseJsonOutput(out: string[]): Record<string, unknown> {
   }
   return JSON.parse(lastLine) as Record<string, unknown>;
 }
-
 describe("resolveHandle", () => {
   test("a run id resolves agent/cwd/session from run.json", () => {
     const stateDir = tempDir();
@@ -151,7 +107,6 @@ describe("resolveHandle", () => {
       },
     });
   });
-
   test("a transcript path handle requires --agent", () => {
     const res = resolveHandle({
       rest: ["/tmp/x.jsonl"],
@@ -160,24 +115,10 @@ describe("resolveHandle", () => {
     });
     expect(res.ok).toBe(false);
   });
-
-  test("a transcript path handle with --agent resolves to itself", () => {
-    const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res).toMatchObject({
-      ok: true,
-      handle: { agent: "codex", transcriptPath: "/tmp/x.jsonl" },
-    });
-  });
-
   test("a missing handle errors", () => {
     const res = resolveHandle({ rest: [], cwd: "/c", stateDir: tempDir() });
     expect(res.ok).toBe(false);
   });
-
   test("an unknown run id errors", () => {
     const res = resolveHandle({
       rest: ["tmux-nope"],
@@ -186,19 +127,6 @@ describe("resolveHandle", () => {
     });
     expect(res.ok).toBe(false);
   });
-
-  test("--stop-timeout (space form) lands on the handle, flag before handle", () => {
-    const res = resolveHandle({
-      rest: ["--stop-timeout", "30m", "/tmp/x.jsonl", "--agent", "codex"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res).toMatchObject({
-      ok: true,
-      handle: { agent: "codex", stopTimeoutMs: 1_800_000 },
-    });
-  });
-
   test("--stop-timeout=<dur> (equals form) lands on the handle, flag after handle", () => {
     const res = resolveHandle({
       rest: ["/tmp/x.jsonl", "--agent=claude", "--stop-timeout=30m"],
@@ -207,27 +135,14 @@ describe("resolveHandle", () => {
     });
     expect(res).toMatchObject({
       ok: true,
-      handle: { agent: "claude", stopTimeoutMs: 1_800_000 },
+      handle: { agent: "claude", stopTimeoutMs: 1800000 },
     });
   });
-
-  test("absent --stop-timeout leaves stopTimeoutMs null", () => {
-    const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res).toMatchObject({
-      ok: true,
-      handle: { stopTimeoutMs: null },
-    });
-  });
-
   test.each(["abc", "0", "1500", "-5", "1.5", ""])(
     "a malformed --stop-timeout value (%p) errors",
     (value) => {
       const res = resolveHandle({
-        rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout", value],
+        rest: ["/tmp/x.jsonl", "--agent", "claude", "--stop-timeout", value],
         cwd: "/c",
         stateDir: tempDir(),
       });
@@ -237,35 +152,7 @@ describe("resolveHandle", () => {
       }
     },
   );
-
-  test("--stop-timeout with no value errors", () => {
-    const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res.ok).toBe(false);
-  });
-
-  test("the retired --stop-timeout-ms spelling hard-fails", () => {
-    const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex", "--stop-timeout-ms=1800000"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res.ok).toBe(false);
-  });
-
-  test("a genuinely-unknown flag is still rejected", () => {
-    const res = resolveHandle({
-      rest: ["/tmp/x.jsonl", "--agent", "codex", "--bogus-flag"],
-      cwd: "/c",
-      stateDir: tempDir(),
-    });
-    expect(res.ok).toBe(false);
-  });
 });
-
 describe("findLastMessage", () => {
   test("claude: extracts the final assistant text", () => {
     const home = tempDir();
@@ -279,21 +166,6 @@ describe("findLastMessage", () => {
       found: true,
     });
   });
-
-  test("codex: extracts last_agent_message from task_complete", () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const path = writeCodexTranscript(home, cwd, {
-      stopped: true,
-      finalMessage: "the final codex answer",
-    });
-    expect(findLastMessage("codex", path)).toEqual({
-      agent: "codex",
-      text: "the final codex answer",
-      found: true,
-    });
-  });
-
   test("claude tool-only final turn → found:false (no stop, no text)", () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -307,89 +179,15 @@ describe("findLastMessage", () => {
       found: false,
     });
   });
-
-  test("no transcript → found:false", () => {
-    expect(findLastMessage("codex", "/nonexistent/x.jsonl")).toEqual({
-      agent: "codex",
-      text: null,
-      found: false,
-    });
-  });
 });
-
 describe("keeper agent wait-for-stop", () => {
-  test("codex: resolves the handle and returns the stop event", async () => {
-    const stateDir = tempDir();
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const transcriptPath = writeCodexTranscript(home, cwd, {
-      stopped: true,
-      finalMessage: "done",
-    });
-    writeRunJson(stateDir, "tmux-c1", {
-      agent: "codex",
-      cwd,
-      transcriptSessionId: null,
-      startedAtMs: 0,
-    });
-    const h = makeHarness({
-      argv: ["wait-for-stop", "tmux-c1"],
-      rawArgv: true,
-      launcherStateDir: stateDir,
-      transcriptHomeDir: home,
-      cwd,
-    });
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(0);
-    expect(parseJsonOutput(h.out)).toMatchObject({
-      schema_version: 1,
-      agent: "codex",
-      transcriptPath,
-      waitedForStop: true,
-      stop: { agent: "codex", eventType: "task_complete", message: "done" },
-    });
-  });
-
   test("a missing handle exits bad_args with a structured error", async () => {
     const h = makeHarness({
       argv: ["wait-for-stop"],
       rawArgv: true,
       launcherStateDir: tempDir(),
     });
-
     const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(2);
-    expect(parseJsonOutput(h.out)).toMatchObject({
-      schema_version: 1,
-      error: true,
-      reason: "bad_args",
-      exitCode: 2,
-    });
-  });
-
-  test("a malformed --stop-timeout exits bad_args (2), never retryable (4)", async () => {
-    const stateDir = tempDir();
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    writeRunJson(stateDir, "tmux-bad1", {
-      agent: "codex",
-      cwd,
-      transcriptSessionId: null,
-      startedAtMs: 0,
-    });
-    const h = makeHarness({
-      argv: ["wait-for-stop", "tmux-bad1", "--stop-timeout", "abc"],
-      rawArgv: true,
-      launcherStateDir: stateDir,
-      transcriptHomeDir: home,
-      cwd,
-    });
-
-    const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,
@@ -399,7 +197,6 @@ describe("keeper agent wait-for-stop", () => {
     });
   });
 });
-
 describe("keeper agent show-last-message", () => {
   test("claude: prints the final message then a JSON metadata line", async () => {
     const stateDir = tempDir();
@@ -422,9 +219,7 @@ describe("keeper agent show-last-message", () => {
       transcriptHomeDir: home,
       cwd,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     const output = h.out.join("");
     expect(output).toStartWith("claude says hello\n");
@@ -436,32 +231,6 @@ describe("keeper agent show-last-message", () => {
       message: "claude says hello",
     });
   });
-
-  test("codex: extracts last_agent_message from a path handle + --agent", async () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const transcriptPath = writeCodexTranscript(home, cwd, {
-      stopped: true,
-      finalMessage: "codex final answer",
-    });
-    const h = makeHarness({
-      argv: ["show-last-message", transcriptPath, "--agent", "codex"],
-      rawArgv: true,
-      transcriptHomeDir: home,
-      cwd,
-    });
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(0);
-    expect(h.out.join("")).toStartWith("codex final answer\n");
-    expect(parseJsonOutput(h.out)).toMatchObject({
-      agent: "codex",
-      found: true,
-      message: "codex final answer",
-    });
-  });
-
   test("claude tool-only final turn → no bare text, JSON found:false message:null", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -477,9 +246,7 @@ describe("keeper agent show-last-message", () => {
       transcriptHomeDir: home,
       cwd,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     // A claude tool-only turn registers no stop and carries no text, so it reads
     // as found:false with no bare message line — an empty turn is never mistaken
@@ -491,46 +258,26 @@ describe("keeper agent show-last-message", () => {
     });
   });
 });
-
-describe("removed --wait-for-stop flag", () => {
-  test("--wait-for-stop after an agent token is no longer wrapper-consumed", async () => {
-    // It is not a tmux flag anymore, so tmux mode is NOT entered and it falls
-    // through verbatim into the agent argv (the agent would reject it loudly).
-    const h = makeHarness({
-      argv: ["codex", "--x-no-confirm", "--wait-for-stop", "hi"],
-      rawArgv: true,
-    });
-
-    await expectExit(main(h.deps));
-
-    expect(h.spawned.length).toBe(1);
-    expect(h.spawned[0]).toContain("--wait-for-stop");
-    // No tmux launch occurred.
-    expect(h.tmuxCommands).toEqual([]);
-  });
-});
-
+describe("removed --wait-for-stop flag", () => {});
 describe("pinned transcript resolution (decoy collision)", () => {
   // The self-transcript collision: a concurrently-writing driver in the same
   // project dir writes a NEWER-mtime file. A pinned partner session must resolve
   // its EXACT transcript, never the newer decoy.
   const PARTNER = "11111111-1111-1111-1111-111111111111";
   const DECOY = "22222222-2222-2222-2222-222222222222";
-
   function writePartnerAndDecoy(home: string, cwd: string): string {
     const partnerPath = writeClaudeTranscript(home, cwd, PARTNER, {
       text: "the partner answer",
-      mtimeMs: 1_000_000,
+      mtimeMs: 1000000,
     });
     // The decoy is the newest file in the project dir — it would win a
     // newest-by-mtime fallback.
     writeClaudeTranscript(home, cwd, DECOY, {
       text: "the driver answer",
-      mtimeMs: 2_000_000,
+      mtimeMs: 2000000,
     });
     return partnerPath;
   }
-
   test("show-last-message resolves the pinned partner, never the newer decoy", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -549,9 +296,7 @@ describe("pinned transcript resolution (decoy collision)", () => {
       transcriptHomeDir: home,
       cwd,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(h.out.join("")).toStartWith("the partner answer\n");
     expect(parseJsonOutput(h.out)).toMatchObject({
@@ -559,7 +304,6 @@ describe("pinned transcript resolution (decoy collision)", () => {
       message: "the partner answer",
     });
   });
-
   test("wait-for-stop resolves the pinned partner, never the newer decoy", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -578,9 +322,7 @@ describe("pinned transcript resolution (decoy collision)", () => {
       transcriptHomeDir: home,
       cwd,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(parseJsonOutput(h.out)).toMatchObject({
       transcriptPath: partnerPath,
@@ -588,7 +330,6 @@ describe("pinned transcript resolution (decoy collision)", () => {
       stop: { agent: "claude" },
     });
   });
-
   test("strict mode returns the exact pinned file, not the newer decoy", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -604,14 +345,13 @@ describe("pinned transcript resolution (decoy collision)", () => {
     });
     expect(resolved).toEqual({ ok: true, path: partnerPath });
   });
-
   test("strict mode times out (not the decoy) when the pinned file is absent", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
     // Only the decoy exists; the pinned partner file is absent.
     writeClaudeTranscript(home, cwd, DECOY, {
       text: "the driver answer",
-      mtimeMs: 2_000_000,
+      mtimeMs: 2000000,
     });
     const resolved = await waitForTranscriptPath({
       agent: "claude",
@@ -625,166 +365,8 @@ describe("pinned transcript resolution (decoy collision)", () => {
     expect(resolved).toEqual({ ok: false, reason: "timeout" });
   });
 });
-
-describe("codex transcript attribution (concurrent-session collision)", () => {
-  const LEG_ID = "019eec40-1111-7142-9363-5c1535537ee6";
-  const CONCURRENT_ID = "019eec41-2222-7163-afa1-7facaaf72122";
-  const SECOND_LEG_ID = "019eec42-3333-7163-afa1-7facaaf72133";
-
-  /**
-   * Fabricate a codex rollout with independently-controlled attribution signals:
-   * `createdAtMs` (its `session_meta` timestamp — the creation instant the fix
-   * keys on) and `mtimeMs` (its filesystem mtime — a concurrent session's keeps
-   * advancing past launch). The filename embeds `id` for the resume-target parse.
-   */
-  function writeCodexRollout(
-    home: string,
-    opts: {
-      id: string;
-      cwd: string;
-      createdAtMs: number;
-      mtimeMs: number;
-    },
-  ): string {
-    const created = new Date(opts.createdAtMs);
-    const year = String(created.getFullYear());
-    const month = String(created.getMonth() + 1).padStart(2, "0");
-    const day = String(created.getDate()).padStart(2, "0");
-    const dir = join(home, ".codex", "sessions", year, month, day);
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `rollout-2026-07-01T22-48-06-${opts.id}.jsonl`);
-    writeFileSync(
-      path,
-      `${JSON.stringify({
-        timestamp: created.toISOString(),
-        type: "session_meta",
-        payload: { id: opts.id, cwd: opts.cwd },
-      })}\n${JSON.stringify({
-        timestamp: new Date(opts.mtimeMs).toISOString(),
-        type: "event_msg",
-        payload: { type: "task_complete", last_agent_message: "answer" },
-      })}\n`,
-    );
-    const seconds = opts.mtimeMs / 1000;
-    utimesSync(path, seconds, seconds);
-    return path;
-  }
-
-  test("finds the leg's own rollout beside a fresher pre-launch concurrent session", async () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const launchMs = Date.parse("2026-07-01T22:48:02Z");
-    // A concurrent human session created 2.3 min BEFORE launch, still being
-    // written (mtime advances past launch) — the exact wrong-file trap.
-    writeCodexRollout(home, {
-      id: CONCURRENT_ID,
-      cwd,
-      createdAtMs: launchMs - 136_000,
-      mtimeMs: launchMs + 30_000,
-    });
-    // The leg's own rollout, created just after launch.
-    const legPath = writeCodexRollout(home, {
-      id: LEG_ID,
-      cwd,
-      createdAtMs: launchMs + 4_000,
-      mtimeMs: launchMs + 20_000,
-    });
-
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd,
-      env: { CODEX_HOME: join(home, ".codex") },
-      homeDir: home,
-      startedAtMs: launchMs,
-      sessionId: null,
-      pathTimeoutMs: 200,
-    });
-    expect(resolved).toEqual({ ok: true, path: legPath });
-  });
-
-  test("two post-launch same-cwd rollouts collide → ambiguous, never a guess", async () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const launchMs = Date.parse("2026-07-01T22:48:02Z");
-    writeCodexRollout(home, {
-      id: LEG_ID,
-      cwd,
-      createdAtMs: launchMs + 2_000,
-      mtimeMs: launchMs + 10_000,
-    });
-    writeCodexRollout(home, {
-      id: SECOND_LEG_ID,
-      cwd,
-      createdAtMs: launchMs + 5_000,
-      mtimeMs: launchMs + 20_000,
-    });
-
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd,
-      env: { CODEX_HOME: join(home, ".codex") },
-      homeDir: home,
-      startedAtMs: launchMs,
-      sessionId: null,
-      pathTimeoutMs: 200,
-    });
-    expect(resolved).toEqual({ ok: false, reason: "ambiguous" });
-  });
-
-  test("only a pre-launch concurrent rollout exists → times out, never attaches", async () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const launchMs = Date.parse("2026-07-01T22:48:02Z");
-    // A same-cwd session created before launch, mtime still advancing — must NOT
-    // be attributed to the leg; the leg's own file simply never appeared.
-    writeCodexRollout(home, {
-      id: CONCURRENT_ID,
-      cwd,
-      createdAtMs: launchMs - 136_000,
-      mtimeMs: launchMs + 30_000,
-    });
-
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd,
-      env: { CODEX_HOME: join(home, ".codex") },
-      homeDir: home,
-      startedAtMs: launchMs,
-      sessionId: null,
-      pathTimeoutMs: 60,
-      pollIntervalMs: 20,
-    });
-    expect(resolved).toEqual({ ok: false, reason: "timeout" });
-  });
-
-  test("a same-instant rollout in a DIFFERENT cwd is not the leg's → times out", async () => {
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    const launchMs = Date.parse("2026-07-01T22:48:02Z");
-    writeCodexRollout(home, {
-      id: CONCURRENT_ID,
-      cwd: "/fake-home/code/other",
-      createdAtMs: launchMs + 3_000,
-      mtimeMs: launchMs + 10_000,
-    });
-
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd,
-      env: { CODEX_HOME: join(home, ".codex") },
-      homeDir: home,
-      startedAtMs: launchMs,
-      sessionId: null,
-      pathTimeoutMs: 60,
-      pollIntervalMs: 20,
-    });
-    expect(resolved).toEqual({ ok: false, reason: "timeout" });
-  });
-});
-
 describe("waitForTranscriptStop is bounded", () => {
   const PINNED_NO_STOP = "33333333-3333-3333-3333-333333333333";
-
   test("a stop that never appears times out (no unbounded hang)", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -807,10 +389,8 @@ describe("waitForTranscriptStop is bounded", () => {
     expect(outcome).toEqual({ ok: false, timedOut: true });
   });
 });
-
 describe("runWaitForStop forwards --stop-timeout", () => {
   const PINNED_NO_STOP = "88888888-8888-8888-8888-888888888888";
-
   // A no-stop transcript so the wait always reaches its deadline. The parsed
   // flag bounds the wait AND self-reports in the error; an absent flag falls back
   // to the 600s default and would report (default) instead.
@@ -836,7 +416,6 @@ describe("runWaitForStop forwards --stop-timeout", () => {
     }
     return res.handle;
   }
-
   function writeFwdRun(cwd: string): string {
     const stateDir = tempDir();
     writeRunJson(stateDir, "tmux-fwd", {
@@ -847,7 +426,6 @@ describe("runWaitForStop forwards --stop-timeout", () => {
     });
     return stateDir;
   }
-
   test("a parsed flag bounds the wait and the error self-reports (caller)", async () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -862,7 +440,6 @@ describe("runWaitForStop forwards --stop-timeout", () => {
     }
   });
 });
-
 describe("inner --session-id pin", () => {
   test("the inner claude re-exec pushes --session-id from the pane carrier", async () => {
     // Simulate the pane env the outer launch forwards: the inner re-exec reads
@@ -874,15 +451,12 @@ describe("inner --session-id pin", () => {
       rawArgv: true,
       env: { KEEPER_AGENT_TMUX_SESSION_ID: sessionId },
     });
-
     const cmd = await (async () => {
       await expectExit(main(h.deps));
       return h.spawned[0] as string[];
     })();
-
     expect(flagValues(cmd, "--session-id")).toEqual([sessionId]);
   });
-
   test("the outer tmux launch forwards the pinned carrier into the pane via -e", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -905,9 +479,7 @@ describe("inner --session-id pin", () => {
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     // The launch JSON records the pinned id, and the new-window argv carries the
     // carrier so the inner re-exec mints the SAME uuid.

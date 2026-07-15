@@ -7,8 +7,8 @@
  *
  * `plugins.yaml` supplies the Claude plugin sources (fail-loud on a missing
  * file). The launch-config catalog (`presets.yaml`) holds ONLY launch triples
- * (ADR 0033): the four `<harness>_default` keys (`claude_default`/`codex_default`/
- * `pi_default`/`hermes_default`) naming the `<harness>::<model>::<effort>` triple a
+ * (ADR 0033): the two `<harness>_default` keys (`claude_default`/`pi_default`)
+ * naming the `<harness>::<model>::<effort>` triple a
  * bare `keeper agent <harness>` launch resolves, the `worker`/`escalation`
  * machine-launch triples, and the nested `dispatch:` per-verb table (ADR 0040,
  * ADDITIVE alongside `worker`/`escalation` today). The freeform named-preset
@@ -269,7 +269,7 @@ export type PresetHarness = HarnessName;
 /**
  * A resolved launch posture the panel-member path (task .5) still reads.
  * `model`/`effort`/`thinking` are partial: an omitted field sends no override for
- * it. `effort` is claude/codex-only, `thinking` is pi-only (never both). `role` is
+ * it. `effort` is Claude-only, `thinking` is Pi-only (never both). `role` is
  * an optional pair-only label carried verbatim. The launch path derives one of
  * these from a parsed {@link Triple} via `presetFromTriple` (`src/agent/main.ts`);
  * the freeform named-preset catalog that once populated {@link
@@ -285,7 +285,7 @@ export interface Preset {
 
 /**
  * The launch-config catalog parsed from `presets.yaml` (ADR 0033, ADR 0040) —
- * ONLY launch triples: the four `<harness>_default` keys naming the triple a bare
+ * ONLY launch triples: the three `<harness>_default` keys naming the triple a bare
  * `keeper agent <harness>` launch resolves, plus the nested `dispatch:` per-verb
  * launch table. Each `<harness>_default` is an optional `<harness>::<model>::<effort>`
  * value parsed to a {@link Triple}, fail-loud when its harness disagrees with its
@@ -301,12 +301,8 @@ export interface PresetCatalog {
   presets: Record<string, Preset>;
   /** Triple a bare `keeper agent claude` resolves; null/absent when unset. */
   claude_default?: Triple | null;
-  /** Triple a bare `keeper agent codex` resolves; null/absent when unset. */
-  codex_default?: Triple | null;
   /** Triple a bare `keeper agent pi` resolves; null/absent when unset. */
   pi_default?: Triple | null;
-  /** Triple a bare `keeper agent hermes` resolves; null/absent when unset. */
-  hermes_default?: Triple | null;
   /** The `dispatch:` per-verb launch table (ADR 0040) — the SOLE machine-launch
    *  surface, replacing the retired `worker`/`escalation` keys. Every {@link
    *  DispatchVerb} key present, null when unset. Optional in the type though {@link
@@ -350,9 +346,7 @@ export interface PanelDefinition {
  */
 const RESERVED_PRESET_NAMES: ReadonlySet<string> = new Set([
   "claude",
-  "codex",
   "pi",
-  "hermes",
   "wait-for-stop",
   "show-last-message",
   "default",
@@ -386,15 +380,13 @@ function validatePresetName(name: string, configPath: string): void {
   }
 }
 
-/** The four `<harness>_default` catalog keys plus the `dispatch` block — the ONLY
+/** The three `<harness>_default` catalog keys plus the `dispatch` block — the ONLY
  *  top-level keys `presets.yaml` admits (ADR 0033, ADR 0040). Anything else is a
  *  strict-reject; a legacy `presets:` block or a retired `worker`/`escalation`
  *  key is caught first with a migration hint. */
 const ALLOWED_CATALOG_KEYS: ReadonlySet<string> = new Set([
   "claude_default",
-  "codex_default",
   "pi_default",
-  "hermes_default",
   "dispatch",
 ]);
 const ALLOWED_PANEL_KEYS: ReadonlySet<string> = new Set(["panels", "default"]);
@@ -492,7 +484,7 @@ function parseDispatchBlock(
 /**
  * Read the launch-config catalog from `presets.yaml` (ADR 0033, ADR 0040). REQUIRED
  * + validated: a missing file is fail-LOUD (ConfigError). The file holds ONLY launch
- * triples — the four `<harness>_default` keys and the nested `dispatch:` per-verb
+ * triples — the three `<harness>_default` keys and the nested `dispatch:` per-verb
  * table (each an optional `<harness>::<model>::<effort>` string). A leftover freeform
  * `presets:` block OR a retired `worker`/`escalation` machine-launch key fails loud
  * with a migration hint naming the `dispatch:` block; any other unknown key
@@ -511,7 +503,7 @@ export function loadPresetCatalog(
   if ("presets" in raw) {
     throw new ConfigError(
       `The freeform 'presets:' catalog is retired (ADR 0033) in ${configPath}. ` +
-        `presets.yaml now holds only launch triples: the four <harness>_default ` +
+        `presets.yaml now holds only launch triples: the two <harness>_default ` +
         `keys plus the per-verb 'dispatch:' table, each a ` +
         `'<harness>::<model>::<effort>' string. See 'keeper agent presets list'.`,
     );
@@ -532,9 +524,7 @@ export function loadPresetCatalog(
   return {
     presets: {},
     claude_default: parseDefaultTriple(raw, "claude", configPath),
-    codex_default: parseDefaultTriple(raw, "codex", configPath),
     pi_default: parseDefaultTriple(raw, "pi", configPath),
-    hermes_default: parseDefaultTriple(raw, "hermes", configPath),
     dispatch: parseDispatchBlock(raw, configPath),
   };
 }
@@ -611,9 +601,8 @@ function parseMachineTriple(
 
 /**
  * True when a harness may serve as a panel member: its final message is capturable
- * (a panel leg must read a verdict) AND it exposes a second reasoning axis (an
- * axisless harness has no effort/thinking rung to compare, so it is not a panel
- * comparand — panels are claude/codex/pi). The SINGLE eligibility predicate both
+ * (a panel leg must read a verdict). Every supported harness exposes a second
+ * reasoning axis. The SINGLE eligibility predicate both
  * the load gate ({@link loadPanelSelections}) and the launch gate (panel.ts
  * `resolvePanelMembers`) read, so panel eligibility can never drift between them.
  */
@@ -622,7 +611,7 @@ export function isPanelEligibleHarness(name: string): boolean {
   if (d === undefined) {
     return false;
   }
-  return d.capturable && d.secondAxis !== "none";
+  return d.capturable;
 }
 
 /**
@@ -634,8 +623,8 @@ export function isPanelEligibleHarness(name: string): boolean {
  * of launch-triple members (`<harness>::<model>::<effort>`) parsed with the shared
  * grammar — a malformed triple is fail-loud naming the panel and the offending member.
  * Every member's harness must be panel-eligible ({@link isPanelEligibleHarness}:
- * capturable AND carrying a reasoning axis; claude/codex/pi qualify, an axisless
- * harness is rejected AT LOAD, the same predicate the launch path re-checks).
+ * capturable and registered; Claude/Pi qualify), with the same predicate the
+ * launch path re-checks.
  * Duplicate identical triples are legal (the launch path disambiguates by ordinal).
  * `strength`/`description` must be non-empty strings — structure only; band
  * vocabulary and roster policy are the plan plugin gate's job, not this loader's.
@@ -700,7 +689,7 @@ export function loadPanelSelections(
       }
       if (!isPanelEligibleHarness(parsed.triple.harness)) {
         throw new ConfigError(
-          `Panel '${name}' member '${triple}' pins harness ${parsed.triple.harness}, which is not panel-eligible (panels compare a reasoning axis — claude/codex/pi only) in ${configPath}`,
+          `Panel '${name}' member '${triple}' pins harness ${parsed.triple.harness}, which is not panel-eligible (panels compare a reasoning axis — claude|pi only) in ${configPath}`,
         );
       }
       out.push(triple);

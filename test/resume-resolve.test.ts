@@ -4,9 +4,8 @@
  * fake (no real fs, hermetic). Covers the four claude cases the epic names —
  * rehomed transcript, zero-match, multi-match with tail-cwd disambiguation,
  * multi-match unresolvable — plus torn-tail safety, the vanished-resolved-cwd
- * risk guard, realpath dedup, and the pi/codex/hermes existence gates.
+ * risk guard, realpath dedup, and the Pi existence gate.
  */
-
 import { expect, test } from "bun:test";
 import { basename, dirname, join } from "node:path";
 import {
@@ -21,7 +20,6 @@ import {
 // ---------------------------------------------------------------------------
 // In-memory fs fake — files keyed by absolute path, dirs derived from ancestors.
 // ---------------------------------------------------------------------------
-
 interface FakeFsSpec {
   /** Absolute file path → contents. */
   files?: Record<string, string>;
@@ -30,7 +28,6 @@ interface FakeFsSpec {
   /** path → realpath target, for the symlinked-projects dedup case. */
   symlinks?: Record<string, string>;
 }
-
 function makeFakeFs(spec: FakeFsSpec): ResumeResolveFs {
   const files = spec.files ?? {};
   const symlinks = spec.symlinks ?? {};
@@ -85,19 +82,15 @@ function makeFakeFs(spec: FakeFsSpec): ResumeResolveFs {
     },
   };
 }
-
 /** A claude transcript line carrying a top-level `cwd`, newline-terminated. */
 function transcriptLine(cwd: string): string {
   return `${JSON.stringify({ type: "user", cwd })}\n`;
 }
-
 const ROOT = "/home/tester/.claude";
 const UUID = "51ee6f32-dead-beef-0000-000000000001";
-
 // ---------------------------------------------------------------------------
 // claudeCwdSlug — the lossy forward-only slug
 // ---------------------------------------------------------------------------
-
 test("claudeCwdSlug collapses both / and . to -", () => {
   // Hand-computed against the spec: `/` and `.` both become `-`.
   expect(claudeCwdSlug("/Users/mike/code/keeper")).toBe(
@@ -105,38 +98,31 @@ test("claudeCwdSlug collapses both / and . to -", () => {
   );
   expect(claudeCwdSlug("/Users/mike/.pi/agent")).toBe("-Users-mike--pi-agent");
 });
-
 // ---------------------------------------------------------------------------
 // newestTailCwd — torn-tail safety
 // ---------------------------------------------------------------------------
-
 test("newestTailCwd returns the newest COMPLETE line's cwd, dropping torn head + tail", () => {
   // A torn head (read began mid-line), two complete lines, then a torn trailing
   // partial (mid-write, no newline). The newest COMPLETE cwd is `/b`.
   const text = `rbage","cwd":"/torn-head"}\n${transcriptLine("/a")}${transcriptLine("/b")}{"type":"user","cwd":"/torn`;
   expect(newestTailCwd({ text, fromStart: false })).toBe("/b");
 });
-
 test("newestTailCwd keeps the first line when the read began at byte 0", () => {
   const text = transcriptLine("/only");
   expect(newestTailCwd({ text, fromStart: true })).toBe("/only");
 });
-
 test("newestTailCwd drops the first line when the read did NOT begin at byte 0", () => {
   // fromStart false ⇒ the sole segment is a torn head and is dropped.
   const text = transcriptLine("/only");
   expect(newestTailCwd({ text, fromStart: false })).toBeNull();
 });
-
 test("newestTailCwd skips lines with no cwd and returns null when none carries one", () => {
   const text = `${JSON.stringify({ type: "summary" })}\n${JSON.stringify({ type: "system" })}\n`;
   expect(newestTailCwd({ text, fromStart: true })).toBeNull();
 });
-
 // ---------------------------------------------------------------------------
 // resolveClaudeCwd — the four cases
 // ---------------------------------------------------------------------------
-
 test("rehomed transcript resolves to the transcript's holding dir, not the recorded cwd", () => {
   // Recorded cwd A drifted; the transcript lives under the slug of B and its
   // tail carries cwd B. Resolution must be B (independent fixture constant).
@@ -157,7 +143,6 @@ test("rehomed transcript resolves to the transcript's holding dir, not the recor
   });
   expect(res).toEqual({ kind: "resolved", cwd: B });
 });
-
 test("zero-match: no transcript on disk is a preflight failure with the fixing command", () => {
   const fs = makeFakeFs({ files: {} });
   const res = resolveClaudeCwd(fs, {
@@ -173,7 +158,6 @@ test("zero-match: no transcript on disk is a preflight failure with the fixing c
     expect(res.fixCommand).toContain("no transcript");
   }
 });
-
 test("multi-match with tail-cwd disambiguation resolves to the slug-matching holding dir", () => {
   // The same uuid.jsonl copied under two holding dirs (a rehome). Only the copy
   // under slug(B) has a tail cwd that slug-matches its holding dir ⇒ resolves B.
@@ -197,7 +181,6 @@ test("multi-match with tail-cwd disambiguation resolves to the slug-matching hol
   });
   expect(res).toEqual({ kind: "resolved", cwd: B });
 });
-
 test("multi-match unresolvable (two confident cwds) is a preflight failure naming both", () => {
   const A = "/Users/mike/proj-a";
   const B = "/Users/mike/proj-b";
@@ -224,7 +207,6 @@ test("multi-match unresolvable (two confident cwds) is a preflight failure namin
     expect(res.fixCommand).toContain(`claude --resume "${UUID}"`);
   }
 });
-
 test("observed-cwd history disambiguates when no transcript tail carries a cwd", () => {
   // The transcript exists under slug(B) but its tail has no cwd field; the
   // observed-cwd history's B slug-matches the holding dir ⇒ resolves B.
@@ -245,7 +227,6 @@ test("observed-cwd history disambiguates when no transcript tail carries a cwd",
   });
   expect(res).toEqual({ kind: "resolved", cwd: B });
 });
-
 test("a resolved cwd that no longer exists on disk fails preflight, naming the project dir", () => {
   // Torn-down worktree: the transcript resolves to B, but B is gone from disk.
   const B = "/Users/mike/torn-down-worktree";
@@ -268,7 +249,6 @@ test("a resolved cwd that no longer exists on disk fails preflight, naming the p
     expect(res.fixCommand).not.toContain("cd $HOME");
   }
 });
-
 test("realpath-deduped roots never double-count a symlinked projects dir", () => {
   // Two roots whose projects/ realpath to the SAME physical dir (profiles share
   // projects/ via symlink). A single transcript must resolve, NOT read as an
@@ -293,14 +273,11 @@ test("realpath-deduped roots never double-count a symlinked projects dir", () =>
   });
   expect(res).toEqual({ kind: "resolved", cwd: B });
 });
-
 // ---------------------------------------------------------------------------
 // resolveNonClaudeArtifact — the existence gates
 // ---------------------------------------------------------------------------
-
 const HOME = "/home/tester";
 const PI_TARGET = "d98a2d54-pi00-0000-0000-000000000002";
-
 test("pi: a session file under the cwd's pi project dir is resumable", () => {
   const cwd = "/Users/mike/code/arthack";
   // encodePiCwd(cwd) = --Users-mike-code-arthack--
@@ -323,7 +300,6 @@ test("pi: a session file under the cwd's pi project dir is resumable", () => {
   });
   expect(res).toEqual({ kind: "resumable" });
 });
-
 test("pi: a target with no on-disk session file is not-resumable with a reason", () => {
   const fs = makeFakeFs({ files: {} });
   const res = resolveNonClaudeArtifact(fs, {
@@ -338,7 +314,6 @@ test("pi: a target with no on-disk session file is not-resumable with a reason",
     expect(res.reason).toContain(PI_TARGET);
   }
 });
-
 test("pi: a session drifted onto a DIFFERENT cwd dir is still found by the sessions scan", () => {
   // The recorded cwd is /Users/mike/here, but the session file sits under a
   // different cwd's dir — the fallback scan of sessions/* finds it by uuid.
@@ -363,66 +338,7 @@ test("pi: a session drifted onto a DIFFERENT cwd dir is still found by the sessi
   });
   expect(res).toEqual({ kind: "resumable" });
 });
-
-test("codex: a rollout file carrying the target uuid is resumable; absent is not", () => {
-  const target = "codex-uuid-9999";
-  const rollout = join(
-    HOME,
-    ".codex",
-    "sessions",
-    "2026",
-    "07",
-    "07",
-    `rollout-2026-07-07T00-00-00-${target}.jsonl`,
-  );
-  const present = makeFakeFs({ files: { [rollout]: "{}\n" } });
-  expect(
-    resolveNonClaudeArtifact(present, {
-      harness: "codex",
-      resumeTarget: target,
-      cwd: "/repo",
-      homeDir: HOME,
-      env: {},
-    }),
-  ).toEqual({ kind: "resumable" });
-
-  const absent = makeFakeFs({ dirs: [join(HOME, ".codex", "sessions")] });
-  const res = resolveNonClaudeArtifact(absent, {
-    harness: "codex",
-    resumeTarget: target,
-    cwd: "/repo",
-    homeDir: HOME,
-    env: {},
-  });
-  expect(res.kind).toBe("not-resumable");
-});
-
-test("hermes: gated on the session store's presence", () => {
-  const store = join(HOME, ".hermes", "state.db");
-  const present = makeFakeFs({ files: { [store]: "sqlite" } });
-  expect(
-    resolveNonClaudeArtifact(present, {
-      harness: "hermes",
-      resumeTarget: "hermes-id",
-      cwd: "/repo",
-      homeDir: HOME,
-      env: {},
-    }),
-  ).toEqual({ kind: "resumable" });
-
-  const absent = makeFakeFs({ files: {} });
-  expect(
-    resolveNonClaudeArtifact(absent, {
-      harness: "hermes",
-      resumeTarget: "hermes-id",
-      cwd: "/repo",
-      homeDir: HOME,
-      env: {},
-    }).kind,
-  ).toBe("not-resumable");
-});
-
-test("non-claude with an empty resume target is not-resumable (no artifact to name)", () => {
+test("pi with an empty resume target is not-resumable (no artifact to name)", () => {
   const fs = makeFakeFs({ files: {} });
   const res = resolveNonClaudeArtifact(fs, {
     harness: "pi",
@@ -434,10 +350,21 @@ test("non-claude with an empty resume target is not-resumable (no artifact to na
   expect(res.kind).toBe("not-resumable");
 });
 
+test("the non-Claude artifact resolver rejects an unregistered harness", () => {
+  const fs = makeFakeFs({ files: {} });
+  expect(() =>
+    resolveNonClaudeArtifact(fs, {
+      harness: "codex" as "pi",
+      resumeTarget: "legacy-target",
+      cwd: "/repo",
+      homeDir: HOME,
+      env: {},
+    }),
+  ).toThrow("unknown harness 'codex'");
+});
 // ---------------------------------------------------------------------------
 // makeResumeResolver — the candidate → verdict seam
 // ---------------------------------------------------------------------------
-
 test("makeResumeResolver routes claude to disk anchoring and non-claude to the gate", () => {
   const B = "/Users/mike/code/keeper";
   const slugB = claudeCwdSlug(B);
@@ -457,7 +384,6 @@ test("makeResumeResolver routes claude to disk anchoring and non-claude to the g
     dirs: [B],
   });
   const resolver = makeResumeResolver({ fs, homeDir: HOME, env: {} });
-
   expect(
     resolver({
       job_id: UUID,
@@ -466,7 +392,6 @@ test("makeResumeResolver routes claude to disk anchoring and non-claude to the g
       harness: "claude",
     }),
   ).toEqual({ kind: "resolved", cwd: B });
-
   expect(
     resolver({
       job_id: "pi-job",
@@ -475,7 +400,6 @@ test("makeResumeResolver routes claude to disk anchoring and non-claude to the g
       harness: "pi",
     }),
   ).toEqual({ kind: "resumable" });
-
   expect(
     resolver({
       job_id: "pi-gone",
@@ -484,4 +408,12 @@ test("makeResumeResolver routes claude to disk anchoring and non-claude to the g
       harness: "pi",
     }).kind,
   ).toBe("not-resumable");
+  expect(() =>
+    resolver({
+      job_id: "retired",
+      resume_target: "legacy-target",
+      cwd: B,
+      harness: "hermes",
+    }),
+  ).toThrow("unknown harness 'hermes'");
 });

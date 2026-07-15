@@ -8,7 +8,6 @@
  * function only of the input flags. The pinned arrays are the exact native
  * commands the launcher produces for the same inputs.
  */
-
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -28,10 +27,8 @@ import {
 } from "./helpers/agent-main-harness";
 
 const CLAUDE_BIN = "/fake-home/.local/bin/claude";
-const CODEX_BIN = "/fake-home/bin/codex";
 const PI_BIN = "/fake-home/.local/bin/pi";
 const UUID = "11111111-1111-1111-1111-111111111111";
-
 describe("keeper agent byte-pin — claude native argv", () => {
   test("bare prompt launch composes the pinned claude command", async () => {
     const h = makeHarness({
@@ -58,7 +55,6 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "proj-001",
     ]);
   });
-
   test("--continue keeps the persisted session (no id/name injected)", async () => {
     const h = makeHarness({
       argv: ["claude", "--continue"],
@@ -76,7 +72,6 @@ describe("keeper agent byte-pin — claude native argv", () => {
       "/fake-home/code/keeper/plugins/keeper/settings.json",
     ]);
   });
-
   test("caller --settings wins over keeper statusline config", async () => {
     const h = makeHarness({
       argv: ["claude", "--settings", "/tmp/custom.json", "hello"],
@@ -90,28 +85,6 @@ describe("keeper agent byte-pin — claude native argv", () => {
     );
   });
 });
-
-describe("keeper agent byte-pin — codex native argv", () => {
-  test("bare prompt launch composes the pinned codex command", async () => {
-    const h = makeHarness({
-      argv: ["codex", "hello"],
-      rawArgv: true,
-      randomUuid: () => UUID,
-    });
-    const cmd = await runAndCapture(h, main);
-    expect(cmd).toEqual([
-      CODEX_BIN,
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--search",
-      "--model",
-      "gpt",
-      "-c",
-      'model_reasoning_effort="high"',
-      "hello",
-    ]);
-  });
-});
-
 describe("keeper agent byte-pin — pi native argv", () => {
   test("bare prompt launch composes the pinned pi command", async () => {
     const h = makeHarness({
@@ -134,7 +107,6 @@ describe("keeper agent byte-pin — pi native argv", () => {
     ]);
   });
 });
-
 /**
  * Negative byte-pin: the bare `agent <cli>` launch and the managed
  * `buildKeeperAgentLaunchArgv` worker/dispatch launch must carry NO read-only
@@ -149,9 +121,8 @@ const POSTURE_FLAGS = [
   "--exclude-tools",
   "--disallowed-tools",
 ] as const;
-
 describe("keeper agent byte-pin — bare launch carries no posture", () => {
-  for (const cli of ["claude", "codex", "pi"] as const) {
+  for (const cli of ["claude", "pi"] as const) {
     test(`bare ${cli} launch emits no posture flags or CLAUDE env delete`, async () => {
       const h = makeHarness({
         argv: [cli, "hello"],
@@ -167,7 +138,6 @@ describe("keeper agent byte-pin — bare launch carries no posture", () => {
     });
   }
 });
-
 describe("keeper agent byte-pin — managed launch carries no posture", () => {
   test("buildKeeperAgentLaunchArgv (prompt mode) emits no posture flags", () => {
     const cmd = buildKeeperAgentLaunchArgv({
@@ -187,7 +157,6 @@ describe("keeper agent byte-pin — managed launch carries no posture", () => {
     // The only env carriers are KEEPER_*; no CLAUDE-prefixed env delete leaks.
     expect(cmd.join(" ")).not.toContain("CLAUDE");
   });
-
   test("buildKeeperAgentLaunchArgv (resume mode) emits no posture flags", () => {
     const cmd = buildKeeperAgentLaunchArgv({
       launcherArgvPrefix: [
@@ -206,7 +175,6 @@ describe("keeper agent byte-pin — managed launch carries no posture", () => {
     expect(cmd.join(" ")).not.toContain("CLAUDE");
   });
 });
-
 /**
  * Positive byte-pins for the `agent run` POSTURE path (the increment this file's
  * negative pins anticipated). `agent run` routes through the shared launch helper,
@@ -215,11 +183,9 @@ describe("keeper agent byte-pin — managed launch carries no posture", () => {
  * `run.json` `command` is the exact native argv the detached pane would exec.
  */
 const RUN_UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "agent-byte-pin-run-"));
 }
-
 /** Write a minimal claude transcript so the run's wait-for-stop resolves at once. */
 function writeClaudeTranscript(home: string, cwd: string, text: string): void {
   const dir = join(home, ".claude", "projects", cwd.replace(/\//g, "-"));
@@ -237,7 +203,6 @@ function writeClaudeTranscript(home: string, cwd: string, text: string): void {
     })}\n`,
   );
 }
-
 interface RunCommandOpts {
   readOnly?: boolean;
   system?: string;
@@ -245,7 +210,6 @@ interface RunCommandOpts {
   preset?: string;
   session?: string;
 }
-
 /** The native `command` the launch persisted to run.json (`tmux-<uuid>/run.json`). */
 async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
   const stateDir = tempDir();
@@ -292,10 +256,11 @@ async function runCommand(opts: RunCommandOpts = {}): Promise<string[]> {
       join(stateDir, "tmux-runs", `tmux-${RUN_UUID}`, "run.json"),
       "utf8",
     ),
-  ) as { command: string[] };
+  ) as {
+    command: string[];
+  };
   return runJson.command;
 }
-
 describe("keeper agent byte-pin — agent run posture", () => {
   test("run --read-only claude: read-only then final-message directive, NO tool strip (prompting-only)", async () => {
     const cmd = await runCommand({ readOnly: true });
@@ -311,14 +276,12 @@ describe("keeper agent byte-pin — agent run posture", () => {
     );
     expect(cmd.filter((t) => t === READ_ONLY_DIRECTIVE).length).toBe(0);
   });
-
   test("run claude (no --read-only): bare prompt carries the final-message directive only", async () => {
     const cmd = await runCommand();
     expect(cmd).not.toContain("--disallowed-tools");
     expect(cmd.at(-1)).toBe(`${FINAL_MESSAGE_DIRECTIVE}\n\nsay hi`);
     expect(cmd.join("\n")).not.toContain(READ_ONLY_DIRECTIVE);
   });
-
   test("run --system claude: final-message directive then `System:` block, no --append-system-prompt", async () => {
     const cmd = await runCommand({ system: "be terse" });
     // Uniform caller-side compose: the always-on final-message directive leads,
@@ -330,7 +293,6 @@ describe("keeper agent byte-pin — agent run posture", () => {
     expect(cmd).not.toContain("--append-system-prompt");
     expect(cmd).not.toContain("--append-system-prompt-file");
   });
-
   test("run --read-only --system claude: read-only → final-message → System → prompt block order", async () => {
     const cmd = await runCommand({ readOnly: true, system: "be terse" });
     expect(cmd.at(-1)).toBe(
@@ -338,13 +300,11 @@ describe("keeper agent byte-pin — agent run posture", () => {
     );
     expect(cmd).not.toContain("--append-system-prompt");
   });
-
   test("run --system '' claude: empty-after-trim is a no-op (no System: block)", async () => {
     const cmd = await runCommand({ system: "   " });
     expect(cmd.at(-1)).toBe(`${FINAL_MESSAGE_DIRECTIVE}\n\nsay hi`);
     expect(cmd.join("\n")).not.toContain("System:");
   });
-
   test("run --system-file claude: file body composes the System: block", async () => {
     const dir = tempDir();
     const path = join(dir, "sys.txt");
@@ -355,7 +315,6 @@ describe("keeper agent byte-pin — agent run posture", () => {
     );
     expect(cmd).not.toContain("--append-system-prompt");
   });
-
   test("run --system-file <missing> claude: bad_args exit 2, no launch", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -377,7 +336,6 @@ describe("keeper agent byte-pin — agent run posture", () => {
     expect(envelope.outcome).toBe("bad_args");
   });
 });
-
 /**
  * Byte-pins for the `agent run --preset`/`--session` threading. The positive arm
  * confirms the two flags reach the launch as the wrapper flags `--x-preset` /
@@ -404,7 +362,6 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     expect(cmd).toContain("--x-tmux-env");
     expect(cmd).toContain("KEEPER_TMUX_SESSION=panels");
   });
-
   test("buildAgentLaunchArgv without preset/session carries NEITHER (absent-flag pin)", () => {
     const cmd = buildAgentLaunchArgv({
       launcherArgvPrefix: [],
@@ -415,7 +372,6 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     expect(cmd).not.toContain("--x-tmux-session");
     expect(cmd.join(" ")).not.toContain("KEEPER_TMUX_SESSION");
   });
-
   test("agent run --preset threads the launch triple as --x-preset into the launched command", async () => {
     const cmd = await runCommand({ preset: "claude::opus::high" });
     // --x-preset survives into the pane's inner argv (the tmux parser leaves it
@@ -424,14 +380,12 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
     expect(cmd).toContain("--x-preset");
     expect(cmd[cmd.indexOf("--x-preset") + 1]).toBe("claude::opus::high");
   });
-
   test("agent run without --preset/--session carries no wrapper posture (regression)", async () => {
     const cmd = await runCommand();
     expect(cmd).not.toContain("--x-preset");
     expect(cmd).not.toContain("--x-tmux-session");
   });
 });
-
 /**
  * The `System:`-composed prompt rides as the FINAL positional for EVERY harness
  * (`buildAgentLaunchArgv` places `prompt` last, uniform across claude/codex/pi),
@@ -440,7 +394,7 @@ describe("keeper agent byte-pin — agent run preset/session threading", () => {
  */
 describe("keeper agent byte-pin — System: prompt uniform across harnesses", () => {
   const composed = "System: be terse\n\nsay hi";
-  for (const cli of ["claude", "codex", "pi"] as const) {
+  for (const cli of ["claude", "pi"] as const) {
     test(`${cli}: composed prompt is the final positional, no --append-system-prompt`, () => {
       const cmd = buildAgentLaunchArgv({
         launcherArgvPrefix: [],
@@ -453,7 +407,6 @@ describe("keeper agent byte-pin — System: prompt uniform across harnesses", ()
     });
   }
 });
-
 /**
  * `agent run codex`/`pi` launch with `CLAUDE*` stripped by default (the
  * agent-conditional partner-isolation scrub — a new-verb improvement, pinned so a
@@ -464,8 +417,7 @@ describe("keeper agent byte-pin — System: prompt uniform across harnesses", ()
  */
 describe("keeper agent byte-pin — agent run env scrub", () => {
   const env = { PATH: "/usr/bin", CLAUDE_CODE_X: "leak", ANTHROPIC_X: "kept" };
-
-  for (const agent of ["codex", "pi"] as const) {
+  for (const agent of ["pi"] as const) {
     test(`run ${agent} drops CLAUDE* carriers, keeps the rest`, () => {
       const out = launchEnvForAgent(agent, env);
       expect(out.CLAUDE_CODE_X).toBeUndefined();
@@ -475,7 +427,6 @@ describe("keeper agent byte-pin — agent run env scrub", () => {
       expect(out.ANTHROPIC_X).toBe("kept");
     });
   }
-
   test("run claude keeps the full inherited env (no scrub)", () => {
     expect(launchEnvForAgent("claude", env)).toBe(env);
   });

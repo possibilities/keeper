@@ -7,7 +7,6 @@
  * The pure classifier is unit-tested directly; the routing + parity are driven
  * through the shared main() harness.
  */
-
 import { describe, expect, test } from "bun:test";
 import { main as agentCliMain, routeMetaBeforeDeps } from "../cli/agent";
 import { splitSubcommand } from "../src/agent/dispatch";
@@ -27,14 +26,12 @@ class ExitError extends Error {
     this.code = code;
   }
 }
-
 function harness(argv: string[]) {
   return makeHarness({
     argv,
     rawArgv: true,
   });
 }
-
 describe("splitSubcommand", () => {
   test("leading claude runs with the remaining args", () => {
     expect(splitSubcommand(["claude", "--print", "hi"])).toEqual({
@@ -43,7 +40,6 @@ describe("splitSubcommand", () => {
       rest: ["--print", "hi"],
     });
   });
-
   test("bare claude runs with an empty rest", () => {
     expect(splitSubcommand(["claude"])).toEqual({
       kind: "run",
@@ -51,15 +47,6 @@ describe("splitSubcommand", () => {
       rest: [],
     });
   });
-
-  test("leading codex runs with the remaining args", () => {
-    expect(splitSubcommand(["codex", "exec", "hi"])).toEqual({
-      kind: "run",
-      agent: "codex",
-      rest: ["exec", "hi"],
-    });
-  });
-
   test("leading pi runs with the remaining args", () => {
     expect(splitSubcommand(["pi", "--print", "hi"])).toEqual({
       kind: "run",
@@ -67,7 +54,6 @@ describe("splitSubcommand", () => {
       rest: ["--print", "hi"],
     });
   });
-
   test("strips exactly one token — a second claude survives", () => {
     expect(splitSubcommand(["claude", "claude"])).toEqual({
       kind: "run",
@@ -75,15 +61,6 @@ describe("splitSubcommand", () => {
       rest: ["claude"],
     });
   });
-
-  test("strips exactly one token — a second codex survives", () => {
-    expect(splitSubcommand(["codex", "codex"])).toEqual({
-      kind: "run",
-      agent: "codex",
-      rest: ["codex"],
-    });
-  });
-
   test("strips exactly one token — a second pi survives", () => {
     expect(splitSubcommand(["pi", "pi"])).toEqual({
       kind: "run",
@@ -91,20 +68,17 @@ describe("splitSubcommand", () => {
       rest: ["pi"],
     });
   });
-
   test("help/version flags classify", () => {
     expect(splitSubcommand(["-h"])).toEqual({ kind: "help" });
     expect(splitSubcommand(["--help"])).toEqual({ kind: "help" });
     expect(splitSubcommand(["-v"])).toEqual({ kind: "version" });
     expect(splitSubcommand(["--version"])).toEqual({ kind: "version" });
   });
-
   test("leading --x-help classifies as wrapper help", () => {
     expect(splitSubcommand(["--x-help"])).toEqual({
       kind: "help-wrapper",
     });
   });
-
   test("--x-help after an agent token lands in rest", () => {
     expect(splitSubcommand(["claude", "--x-help"])).toEqual({
       kind: "run",
@@ -112,7 +86,6 @@ describe("splitSubcommand", () => {
       rest: ["--x-help"],
     });
   });
-
   test("leading --x-preset is the harnessless run-preset form (the value is a triple)", () => {
     expect(
       splitSubcommand(["--x-preset", "claude::opus::xhigh", "/p"]),
@@ -123,57 +96,42 @@ describe("splitSubcommand", () => {
       rest: ["--x-preset", "claude::opus::xhigh", "/p"],
     });
   });
-
-  test("leading --x-preset=joined form classifies as run-preset", () => {
-    expect(splitSubcommand(["--x-preset=codex::gpt-5.5::high"])).toEqual({
-      kind: "run-preset",
-      presetName: "codex::gpt-5.5::high",
-      rest: ["--x-preset=codex::gpt-5.5::high"],
-    });
-  });
-
   test("--x-preset with no name is usage", () => {
     expect(splitSubcommand(["--x-preset"])).toEqual({
       kind: "usage",
       unknown: "--x-preset",
     });
   });
-
   test("presets resolve <name> classifies", () => {
     expect(splitSubcommand(["presets", "resolve", "default"])).toEqual({
       kind: "presets-resolve",
       presetName: "default",
     });
   });
-
   test("presets resolve with no name is usage", () => {
     expect(splitSubcommand(["presets", "resolve"])).toEqual({
       kind: "usage",
       unknown: "presets resolve",
     });
   });
-
   test("presets list classifies (bare → human-readable)", () => {
     expect(splitSubcommand(["presets", "list"])).toEqual({
       kind: "presets-list",
       json: false,
     });
   });
-
   test("presets list --json classifies", () => {
     expect(splitSubcommand(["presets", "list", "--json"])).toEqual({
       kind: "presets-list",
       json: true,
     });
   });
-
   test("presets with an unknown verb is usage", () => {
     expect(splitSubcommand(["presets", "frobnicate"])).toEqual({
       kind: "usage",
       unknown: "presets frobnicate",
     });
   });
-
   // The profile-check command is retired (no Keeper-owned profile farm to
   // diagnose) — `profiles` is now an ordinary unrecognized leading token,
   // classified identically regardless of what follows it.
@@ -183,54 +141,46 @@ describe("splitSubcommand", () => {
       unknown: "profiles",
     });
   });
-
   test("profiles check --json is no longer a recognized subcommand", () => {
     expect(splitSubcommand(["profiles", "check", "--json"])).toEqual({
       kind: "usage",
       unknown: "profiles",
     });
   });
-
   test("bare profiles is usage", () => {
     expect(splitSubcommand(["profiles"])).toEqual({
       kind: "usage",
       unknown: "profiles",
     });
   });
-
   test("providers resolve <model> <effort> classifies", () => {
     expect(
       splitSubcommand(["providers", "resolve", "gpt-5.5", "high"]),
     ).toEqual({ kind: "providers-resolve", model: "gpt-5.5", effort: "high" });
   });
-
   test("providers resolve missing effort is usage", () => {
     expect(splitSubcommand(["providers", "resolve", "gpt-5.5"])).toEqual({
       kind: "usage",
       unknown: "providers resolve",
     });
   });
-
   test("providers check classifies", () => {
     expect(splitSubcommand(["providers", "check"])).toEqual({
       kind: "providers-check",
     });
   });
-
   test("providers with an unknown verb is usage", () => {
     expect(splitSubcommand(["providers", "frobnicate"])).toEqual({
       kind: "usage",
       unknown: "providers frobnicate",
     });
   });
-
   test("bare providers is usage", () => {
     expect(splitSubcommand(["providers"])).toEqual({
       kind: "usage",
       unknown: "providers",
     });
   });
-
   test("resume <target> classifies with an empty rest", () => {
     expect(splitSubcommand(["resume", "my-partner"])).toEqual({
       kind: "resume",
@@ -238,7 +188,6 @@ describe("splitSubcommand", () => {
       rest: [],
     });
   });
-
   test("resume <target> <prompt> classifies, rest carries the prompt tokens", () => {
     expect(
       splitSubcommand(["resume", "my-partner", "follow", "up", "ask"]),
@@ -248,7 +197,6 @@ describe("splitSubcommand", () => {
       rest: ["follow", "up", "ask"],
     });
   });
-
   test("resume <id> accepts a bare session-id-shaped target", () => {
     expect(splitSubcommand(["resume", "abc-123-def"])).toEqual({
       kind: "resume",
@@ -256,25 +204,21 @@ describe("splitSubcommand", () => {
       rest: [],
     });
   });
-
   test("bare resume (no target) is usage", () => {
     expect(splitSubcommand(["resume"])).toEqual({
       kind: "usage",
       unknown: "resume",
     });
   });
-
   test("resume with a blank target is usage", () => {
     expect(splitSubcommand(["resume", "  "])).toEqual({
       kind: "usage",
       unknown: "resume",
     });
   });
-
   test("empty argv is bare usage (no unknown)", () => {
     expect(splitSubcommand([])).toEqual({ kind: "usage" });
   });
-
   test("an unknown leading token carries its name", () => {
     expect(splitSubcommand(["frobnicate"])).toEqual({
       kind: "usage",
@@ -282,7 +226,6 @@ describe("splitSubcommand", () => {
     });
   });
 });
-
 describe("main() dispatch routing", () => {
   test("claude + args reaches the spawn recorder", async () => {
     const h = harness(["claude", "--x-no-confirm", "hello"]);
@@ -292,7 +235,6 @@ describe("main() dispatch routing", () => {
     // The leading `claude` token was stripped — it must not leak into argv.
     expect(cmd.slice(1)).not.toContain("claude");
   });
-
   test("parity: stripping `claude` leaves the composed argv identical", async () => {
     const args = ["--x-no-confirm", "--print", "hello world"];
     const withSub = await runAndCapture(harness(["claude", ...args]), main);
@@ -310,15 +252,6 @@ describe("main() dispatch routing", () => {
     expect(withSub).toContain("--print");
     expect(withSub.slice(1)).not.toContain("claude");
   });
-
-  test("codex + args reaches the spawn recorder", async () => {
-    const h = harness(["codex", "--x-no-confirm", "hello"]);
-    const cmd = await runAndCapture(h, main);
-    expect(cmd[0]).toBe(h.deps.codexBin);
-    expect(cmd).toContain("hello");
-    expect(cmd.slice(1)).not.toContain("codex");
-  });
-
   test("pi + args reaches the spawn recorder", async () => {
     const h = harness(["pi", "--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
@@ -326,13 +259,11 @@ describe("main() dispatch routing", () => {
     expect(cmd).toContain("hello");
     expect(cmd.slice(1)).not.toContain("pi");
   });
-
   test("bare claude launches interactively (spawn fires)", async () => {
     const h = harness(["claude", "--x-no-confirm"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.claudeBin);
   });
-
   test("bare keeper agent → usage on stderr + exit 2", async () => {
     const h = harness([]);
     const code = await expectExit(main(h.deps));
@@ -341,7 +272,6 @@ describe("main() dispatch routing", () => {
     expect(h.out.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });
-
   test("unknown subcommand → stderr 'unknown subcommand' + exit 2", async () => {
     const h = harness(["frobnicate"]);
     const code = await expectExit(main(h.deps));
@@ -349,7 +279,6 @@ describe("main() dispatch routing", () => {
     expect(h.err.join("")).toContain("unknown subcommand 'frobnicate'");
     expect(h.spawned.length).toBe(0);
   });
-
   test("--help → stdout usage + exit 0", async () => {
     const h = harness(["--help"]);
     const code = await expectExit(main(h.deps));
@@ -358,7 +287,6 @@ describe("main() dispatch routing", () => {
     expect(h.err.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });
-
   test("--version → stdout version + exit 0", async () => {
     const h = harness(["--version"]);
     const code = await expectExit(main(h.deps));
@@ -366,7 +294,6 @@ describe("main() dispatch routing", () => {
     expect(h.out.join("")).toContain("keeper agent ");
     expect(h.spawned.length).toBe(0);
   });
-
   test("--x-help → stdout wrapper help + exit 0", async () => {
     const h = harness(["--x-help"]);
     const code = await expectExit(main(h.deps));
@@ -376,7 +303,6 @@ describe("main() dispatch routing", () => {
     expect(h.err.join("")).toBe("");
     expect(h.spawned.length).toBe(0);
   });
-
   test("claude --x-help → wrapper help + exit 0, no launch", async () => {
     const h = harness(["claude", "--x-help"]);
     const code = await expectExit(main(h.deps));
@@ -384,15 +310,6 @@ describe("main() dispatch routing", () => {
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.spawned.length).toBe(0);
   });
-
-  test("codex --x-help → wrapper help + exit 0, no launch", async () => {
-    const h = harness(["codex", "--x-help"]);
-    const code = await expectExit(main(h.deps));
-    expect(code).toBe(0);
-    expect(h.out.join("")).toContain("Wrapper flags:");
-    expect(h.spawned.length).toBe(0);
-  });
-
   test("pi --x-help → wrapper help + exit 0, no launch", async () => {
     const h = harness(["pi", "--x-help"]);
     const code = await expectExit(main(h.deps));
@@ -400,21 +317,12 @@ describe("main() dispatch routing", () => {
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.spawned.length).toBe(0);
   });
-
   test("claude --help passes --help through to claude", async () => {
     const h = harness(["claude", "--help"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd[0]).toBe(h.deps.claudeBin);
     expect(cmd).toContain("--help");
   });
-
-  test("codex --help passes --help through to codex", async () => {
-    const h = harness(["codex", "--help"]);
-    const cmd = await runAndCapture(h, main);
-    expect(cmd[0]).toBe(h.deps.codexBin);
-    expect(cmd).toContain("--help");
-  });
-
   test("pi --help passes --help through to pi", async () => {
     const h = harness(["pi", "--help"]);
     const cmd = await runAndCapture(h, main);
@@ -422,7 +330,6 @@ describe("main() dispatch routing", () => {
     expect(cmd).toContain("--help");
   });
 });
-
 describe("resume route", () => {
   test("unknown target: exit 2, no launch, message names the target", async () => {
     const h = harness(["resume", "ghost"]);
@@ -433,26 +340,6 @@ describe("resume route", () => {
     expect(h.tmuxCommands.length).toBe(0);
     expect(h.spawned.length).toBe(0);
   });
-
-  test("live target: exit 2, points at the bus, no launch", async () => {
-    const h = makeHarness({
-      argv: ["resume", "codey"],
-      rawArgv: true,
-      resolveResumeDecision: {
-        kind: "live",
-        job_id: "job-live-1",
-        harness: "codex",
-        title: "codey",
-      },
-    });
-    const code = await expectExit(main(h.deps));
-    expect(code).toBe(2);
-    expect(h.err.join("")).toContain("LIVE");
-    expect(h.err.join("")).toContain("job-live-1");
-    expect(h.err.join("")).toContain("keeper bus chat send job-live-1");
-    expect(h.tmuxCommands.length).toBe(0);
-  });
-
   test("ambiguous target: exit 2, lists every tied candidate", async () => {
     const h = makeHarness({
       argv: ["resume", "twin"],
@@ -472,7 +359,6 @@ describe("resume route", () => {
     expect(h.err.join("")).toContain("job-b");
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("no-target: exit 2, names the matched job, no launch", async () => {
     const h = makeHarness({
       argv: ["resume", "stale"],
@@ -480,7 +366,7 @@ describe("resume route", () => {
       resolveResumeDecision: {
         kind: "no-target",
         job_id: "job-nt",
-        harness: "hermes",
+        harness: "pi",
         title: "stale",
       },
     });
@@ -490,7 +376,6 @@ describe("resume route", () => {
     expect(h.err.join("")).toContain("job-nt");
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("harness-mismatch: exit 2, names both the required and matched harness", async () => {
     const h = makeHarness({
       argv: ["resume", "wrong-cli"],
@@ -509,7 +394,6 @@ describe("resume route", () => {
     expect(h.err.join("")).toContain("job-hm");
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("ok decision but the recorded cwd vanished: exit 2, no launch", async () => {
     const h = makeHarness({
       argv: ["resume", "gone-dir"],
@@ -528,7 +412,6 @@ describe("resume route", () => {
     expect(h.err.join("")).toContain("no longer exists");
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("resolver tool failure: exit 2, no launch", async () => {
     const h = makeHarness({
       argv: ["resume", "whoever"],
@@ -544,10 +427,14 @@ describe("resume route", () => {
     expect(h.tmuxCommands.length).toBe(0);
   });
 });
-
 describe("cli/agent.ts meta routing precedes deps construction", () => {
   test("routeMetaBeforeDeps renders help / version / wrapper-help purely", () => {
-    const run = (argv: string[]): { handled: boolean; out: string } => {
+    const run = (
+      argv: string[],
+    ): {
+      handled: boolean;
+      out: string;
+    } => {
       let out = "";
       const handled = routeMetaBeforeDeps(argv, (s) => {
         out += s;
@@ -574,7 +461,6 @@ describe("cli/agent.ts meta routing precedes deps construction", () => {
     expect(launch.handled).toBe(false);
     expect(launch.out).toBe("");
   });
-
   test("agent --help / --version / --agent-help exit 0 with output and NEVER construct deps", async () => {
     // realDeps() runs the launcher state-dir migration; a buildDeps that throws
     // when called proves the meta path never reaches it (no db/daemon/state dir).
@@ -606,7 +492,6 @@ describe("cli/agent.ts meta routing precedes deps construction", () => {
       expect(out.join("")).not.toBe("");
     }
   });
-
   test("a real launch DOES construct deps — the buildDeps seam is wired, not dead", async () => {
     const throwingBuild = (): never => {
       throw new Error("realDeps constructed");

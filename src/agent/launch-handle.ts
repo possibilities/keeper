@@ -14,19 +14,6 @@
  * (pinned by the `agent-launch-handle-depgraph` hygiene test).
  */
 
-import { fileURLToPath } from "node:url";
-import type {
-  CodexTrustStatus,
-  EnsureCodexDirTrustOptions,
-} from "../codex-trust";
-import {
-  HERMES_SHIM_EVENTS,
-  HERMES_SHIM_VERSION,
-} from "../hermes-shim-contract";
-import type {
-  EnsureHermesShimTrustOptions,
-  HermesTrustStatus,
-} from "../hermes-trust";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_DESCRIPTORS, ResumeLaunchUnsupportedError } from "./harness";
@@ -59,9 +46,8 @@ function existingSessionId(args: string[]): string | null {
 
 /**
  * The pinned transcript session id for a tmux launch: an explicit user
- * `--session-id`, else a freshly minted uuid for a new claude/pi session. Null
- * for a harness that mints its OWN id keeper can't pin at launch (codex/hermes)
- * and for a continue/resume launch (keeps the persisted session). This one id is
+ * `--session-id`, else a freshly minted uuid for a new Claude/Pi session. Null
+ * for a continue/resume launch (keeps the persisted session). This one id is
  * recorded in run.json `transcriptSessionId`, forwarded into the pane via the
  * `-e KEEPER_AGENT_TMUX_SESSION_ID` carrier, and consumed by the inner re-exec's
  * `--session-id` push — one source of truth, no divergence.
@@ -100,7 +86,7 @@ export interface LaunchPosture {
   session?: string;
   preset?: string;
   /** Launch NAME — lands on the tmux window name for every harness and on the
-   *  harness-native `--name` for claude/pi (codex has none). Omitted = no name. */
+   *  harness-native `--name` for claude/pi. Omitted = no name. */
   name?: string;
 }
 
@@ -115,55 +101,15 @@ export interface LaunchHandleDeps {
   launcherArgvPrefix: string[];
   randomUuid: () => string;
   runTmuxCommand: TmuxCommandRunner;
-  /**
-   * Seed codex per-directory trust for the launch cwd (codex-only, fired before
-   * the launch) so a detached interactive codex window never hangs on codex's
-   * directory-trust prompt. Injected as a seam — not a direct import — so this
-   * module keeps its "every effect via LaunchHandleDeps" DI contract and tests
-   * stub it (no real `~/.codex` write). Fail-open by contract (never throws).
-   */
-  ensureCodexDirTrust: (opts: EnsureCodexDirTrustOptions) => CodexTrustStatus;
-  /**
-   * Seed hermes shell-hook trust for the keeper events-shim (hermes-only, fired
-   * before the launch) so a keeper-launched hermes session fires the shim WITHOUT
-   * an interactive first-use consent prompt — the M3b live-churn channel. Injected
-   * as a seam (not a direct import) so this module keeps its "every effect via
-   * LaunchHandleDeps" DI contract and tests stub it (no real `~/.hermes` write).
-   * Fail-open by contract (never throws); a deferred/failed seed degrades hermes to
-   * presence-only, never blocks the launch.
-   */
-  ensureHermesShimTrust: (
-    opts: EnsureHermesShimTrustOptions,
-  ) => HermesTrustStatus;
   /** Wall clock (ms), sampled as the handle's `startedAtMs`. */
   now: () => number;
   writeErr: (s: string) => void;
 }
 
 /**
- * The EXACT command hermes runs for the keeper events-shim, registered
- * identically in `<hermes-home>/config.yaml` and its allowlist. Two tokens —
- * `<abs bun> <abs shim path>` — so it depends on neither the shim's exec bit nor
- * `bun` on PATH: the launcher's own bun (`launcherArgvPrefix[0]`) runs the shim
- * resolved relative to THIS module (robust across worktrees). Assumes neither path
- * contains a space (keeper worktree + bin paths never do); a mis-split command
- * merely degrades hermes to presence-only, never errors.
- */
-export function hermesShimCommand(launcherArgvPrefix: string[]): string {
-  const bun = launcherArgvPrefix[0] ?? "bun";
-  const shimPath = fileURLToPath(
-    new URL(
-      "../../plugins/keeper/plugin/hooks/hermes-events-shim.ts",
-      import.meta.url,
-    ),
-  );
-  return `${bun} ${shimPath}`;
-}
-
-/**
  * The env the detached partner pane launches with. claude keeps the full
  * inherited env (its `--session-id` pin, not a scrub, keeps the partner
- * transcript distinct); codex/pi get `CLAUDE*` stripped so the orchestrator's
+ * transcript distinct); Pi gets `CLAUDE*` stripped so the orchestrator's
  * identity never leaks into the headless partner. An agent-conditional DEFAULT,
  * never a user flag — it is identity-isolation, not credential-security. Pure —
  * exported for the byte-pin tests.
@@ -187,16 +133,15 @@ export function launchEnvForAgent(
  */
 export interface LaunchResume {
   /** The native resume token forwarded to the harness (buildAgentLaunchArgv's
-   *  `resumeTarget`): claude parent uuid / codex rollout uuid / pi session id /
-   *  hermes session id. */
+   *  `resumeTarget`): Claude parent uuid or Pi session id. */
   target: string;
   /** claude-only: the fresh CHILD uuid `--resume` forks into (buildAgentLaunchArgv's
    *  `resumeSessionId`), minted by the caller. Undefined for the other harnesses,
    *  which resume their existing session in place. */
   childSessionId?: string;
   /** The handle's `sessionId` — the strict-pin transcript-discovery key AND the
-   *  envelope resume_target base: claude → the child uuid; codex/pi → the resumed
-   *  session's own id (== target); hermes → null (store-based capture, no file). */
+   *  envelope resume_target base: Claude → the child uuid; Pi → the resumed
+   *  session's own id. */
   sessionId: string | null;
 }
 
@@ -224,8 +169,7 @@ export interface LaunchHandleArgs {
  * A RESUME launch ({@link LaunchHandleArgs.resume} set) composes the harness's
  * native resume argv instead of a fresh one, pins the resumed session's id on the
  * handle (so strict discovery + the envelope resume_target resolve it), and marks
- * the handle `isResume` (so codex discovery resolves its pre-existing rollout by
- * uuid). An unsupported resume composition maps to `{ok:false}` like a tmux error.
+ * the handle `isResume`. An unsupported resume composition maps to `{ok:false}` like a tmux error.
  */
 export function launchToResolvedHandle(
   args: LaunchHandleArgs,
@@ -265,8 +209,8 @@ export function launchToResolvedHandle(
       resumeSessionId: resume?.childSessionId,
     });
   } catch (exc) {
-    // A harness that cannot compose a resume launch (claude missing the child
-    // uuid; pi/hermes handed a leading-dash prompt they can't dash-guard) is a
+    // A harness that cannot compose a resume launch (Claude missing the child
+    // uuid; Pi handed a leading-dash prompt it can't dash-guard) is a
     // launch failure, not a crash — surface it as `{ok:false}` like a tmux error.
     if (exc instanceof ResumeLaunchUnsupportedError) {
       deps.writeErr(`agent: ${exc.message}\n`);
@@ -282,35 +226,13 @@ export function launchToResolvedHandle(
   const startedAtMs = deps.now();
   // A resume launch pins the resumed session's id on the HANDLE for discovery
   // (claude → the forked child uuid, which also rides the argv's own --session-id;
-  // codex/pi → the resumed session's own id). The pane env carrier stays null so
+  // Pi resumes its existing session id). The pane env carrier stays null so
   // no fresh --session-id is minted or double-pushed — the inner re-exec keeps the
   // native resume argv verbatim (it skips the mint whenever --resume/--continue is
   // present). A fresh launch keeps the minted-uuid carrier, byte-unchanged.
   const transcriptSessionId = resume
     ? null
     : tmuxTranscriptSessionId(agent, tmuxLaunch.remainingArgs, deps.randomUuid);
-  // Seed codex trust before the launch (codex-only; keyed on agent, not session
-  // id). Fail-open by contract — the seam never throws, so an unseedable trust
-  // merely lets codex re-prompt (reaped by the stop-wait timeout), never worse
-  // than the headless past. Uses the RAW env (codex reads CODEX_HOME off it).
-  if (agent === "codex") {
-    deps.ensureCodexDirTrust({ cwd: deps.cwd, env: deps.env });
-  }
-  // Seed hermes shell-hook trust before the launch (hermes-only; keyed on agent).
-  // The seed EDITS the persistent `<hermes-home>/config.yaml`, so it takes effect
-  // on the pane's inner `keeper agent hermes` re-exec (which exports KEEPER_JOB_ID
-  // + HERMES_ACCEPT_HOOKS) and every later hermes launch. Fail-open — the seam
-  // never throws; an unseedable trust merely lets hermes run without the shim
-  // (presence-only via the birth record). Uses the RAW env (hermes reads
-  // HERMES_HOME off it).
-  if (agent === "hermes") {
-    deps.ensureHermesShimTrust({
-      env: deps.env,
-      shimCommand: hermesShimCommand(deps.launcherArgvPrefix),
-      events: HERMES_SHIM_EVENTS,
-      version: HERMES_SHIM_VERSION,
-    });
-  }
   try {
     const result = launchKeeperAgentInTmux({
       agent,

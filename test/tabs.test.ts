@@ -1058,117 +1058,6 @@ test("renderOutcomes apply summary counts verified as restored, notes unverified
 });
 
 // ---------------------------------------------------------------------------
-// harness-aware restore — mixed-harness plan / render / launch
-// ---------------------------------------------------------------------------
-
-test("planRestore marks a candidate with no resume target not-resumable, would-restore the rest", () => {
-  const plan = planRestore(
-    [
-      fakeCandidate({ job_id: "claude-a" }),
-      fakeCandidate({
-        job_id: "codex-b",
-        harness: "codex",
-        resume_target: "",
-      }),
-    ],
-    null,
-  );
-  expect(plan.map((p) => p.kind)).toEqual(["would-restore", "not-resumable"]);
-  expect((plan[1] as { reason: string }).reason).toContain("codex");
-});
-
-test("applyRestore passes each candidate's harness to ensureLaunched and skips a not-resumable one", async () => {
-  const plan = planRestore(
-    [
-      fakeCandidate({ job_id: "j1", resume_target: "u1" }),
-      fakeCandidate({
-        job_id: "j2",
-        harness: "codex",
-        resume_target: "codex-id",
-      }),
-      fakeCandidate({ job_id: "j3", harness: "hermes", resume_target: "" }),
-    ],
-    null,
-  );
-  const calls: { resumeTarget: string; harness: string }[] = [];
-  const out = await applyRestore(
-    plan,
-    async (_session, resumeTarget, _cwd, harness) => {
-      calls.push({ resumeTarget, harness });
-      return { ok: true };
-    },
-    async () => {},
-  );
-  expect(out.map((o) => o.kind)).toEqual([
-    "restored",
-    "restored",
-    "not-resumable",
-  ]);
-  expect(calls).toEqual([
-    { resumeTarget: "u1", harness: "claude" },
-    { resumeTarget: "codex-id", harness: "codex" },
-  ]);
-});
-
-test("renderOutcomes: per-harness resume command + a not-resumable stanza and summary note", () => {
-  const plan = planRestore(
-    [
-      fakeCandidate({
-        job_id: "cx",
-        harness: "codex",
-        resume_target: "rollout-9",
-        label: "codex tab",
-        cwd: "/repo",
-      }),
-      fakeCandidate({
-        job_id: "hz",
-        harness: "hermes",
-        resume_target: "",
-        label: "hermes tab",
-      }),
-    ],
-    null,
-  );
-  const out = renderOutcomes(plan, false, 0);
-  // codex renders its native subcommand resume form.
-  expect(out).toContain('cd /repo && codex resume "rollout-9"');
-  // the not-resumable agent is reported with a reason, no command line.
-  expect(out).toContain("NOT-RESUMABLE hermes tab");
-  expect(out).toContain("not-resumable=1");
-});
-
-test("renderSnapshotScript: a codex candidate emits `agent codex … resume`, a targetless one is a comment", () => {
-  const script = renderSnapshotScript(
-    [
-      fakeCandidate({
-        job_id: "cx",
-        harness: "codex",
-        resume_target: "rollout-9",
-        label: "codex tab",
-        cwd: "/repo",
-      }),
-      fakeCandidate({
-        job_id: "hz",
-        harness: "hermes",
-        resume_target: "",
-        label: "hermes tab",
-      }),
-    ],
-    {
-      prefix: RESTORE_PREFIX,
-      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
-      sourcePath: "/tmp/keeper.db",
-    },
-  );
-  expect(script).toContain("'agent' 'codex'");
-  expect(script).toContain("'resume' 'rollout-9'");
-  expect(script).not.toContain("'--permission-mode'"); // codex omits claude flags
-  expect(script).toContain(
-    "# not-resumable: hermes tab (hermes session has no resolved resume target)",
-  );
-});
-
-// ---------------------------------------------------------------------------
 // disk-anchored resume — planRestore / renderSnapshotScript consume the resolver
 // ---------------------------------------------------------------------------
 
@@ -1280,8 +1169,8 @@ test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wi
       fakeCandidate({ job_id: "pf", resume_target: "pf", cwd: "/stale" }),
       fakeCandidate({
         job_id: "nr",
-        harness: "codex",
-        resume_target: "cx",
+        harness: "pi",
+        resume_target: "pi-missing",
         cwd: "/repo",
       }),
     ],
@@ -1298,6 +1187,54 @@ test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wi
   expect((plan[1] as { fixCommand: string }).fixCommand).toBe(
     "# not resumable",
   );
+});
+
+test("planRestore rejects an unregistered harness before deriving a partial plan", () => {
+  let resolverCalls = 0;
+  const resolver: ResumeResolver = () => {
+    resolverCalls++;
+    return { kind: "resumable" };
+  };
+  expect(() =>
+    planRestoreRaw(
+      [
+        fakeCandidate({ job_id: "ok", resume_target: "ok" }),
+        fakeCandidate({
+          job_id: "retired",
+          harness: "hermes",
+          resume_target: "legacy-target",
+        }),
+      ],
+      null,
+      resolver,
+    ),
+  ).toThrow("unknown harness 'hermes'");
+  expect(resolverCalls).toBe(0);
+});
+
+test("applyRestore rejects an unregistered harness before any launch", async () => {
+  let launches = 0;
+  const plan: AgentOutcome[] = [
+    {
+      kind: "would-restore",
+      candidate: fakeCandidate({ job_id: "ok", resume_target: "ok" }),
+    },
+    {
+      kind: "would-restore",
+      candidate: fakeCandidate({
+        job_id: "retired",
+        harness: "codex",
+        resume_target: "legacy-target",
+      }),
+    },
+  ];
+  await expect(
+    applyRestore(plan, async () => {
+      launches++;
+      return { ok: true };
+    }),
+  ).rejects.toThrow("unknown harness 'codex'");
+  expect(launches).toBe(0);
 });
 
 test("renderOutcomes surfaces the preflight-failed stanza + summary note", () => {
@@ -1916,8 +1853,8 @@ function writePiSession(
   writeFileSync(join(dir, piFileName(uuid, createdAtMs)), "{}\n");
 }
 
-/** Insert a raw event row (all columns default NULL; overrides win) — mirrors the
- *  codex-resume harness so the reducer folds it exactly as MAIN would. */
+/** Insert a raw event row (all columns default NULL; overrides win) so the
+ *  reducer folds it exactly as MAIN would. */
 function insertRawEvent(
   db: Database,
   overrides: {

@@ -66,7 +66,7 @@ flags." Every control op below is a bare one-shot Bash call:
 | Worktree mode on/off | "worktree mode on/off", "run lanes in worktrees" — durable toggle, rejected mid-epic (`--force` to override) | `keeper autopilot worktree on` / `keeper autopilot worktree off` |
 | Set a concurrency cap | "limit to N workers", "cap concurrency at N", "at most N per repo" — runtime config; per-root is legal to set any time (stores intent, effective floors to 1 while worktree mode is off) | `keeper autopilot config max_concurrent_jobs <N>` (or `unlimited`) / `keeper autopilot config max_concurrent_per_root <N>` |
 | Multi-repo worktree grouping | "cluster a multi-repo epic into per-repo lanes", "multi-repo worktree mode" — durable rollout flag, default OFF, only meaningful with worktree mode on | `keeper autopilot config worktree_multi_repo <on\|off>` |
-| Pin work dispatch to a provider | "pin work to claude/codex", "only dispatch claude cells", "stop using codex for work" — durable work-cells-only dispatch pin (docs/adr/0047); `none` clears it | `keeper autopilot config worker_provider <claude\|codex\|none>` |
+| Pin work dispatch to a provider family | "pin work to Claude/GPT", "only dispatch Claude cells", "stop using GPT tiers for work" — durable work-cells-only dispatch pin (docs/adr/0047); `none` clears it | `keeper autopilot config worker_provider <claude\|gpt\|none>` |
 | Retry a stuck dispatch | A sticky failure key `<verb>::<id>`, verb one of `work\|close\|approve` | `keeper autopilot retry work::fn-N-slug.3` |
 | Clear / approve a phantom | "approve fn-X" — clears a resurrected/phantom approve pending (the reconciler never dispatches `approve` itself) | `keeper autopilot retry approve::fn-N-slug` |
 | Show me what it's doing | "what's autopilot doing", "show me the autopilot", "is it paused" | `keeper status --json \| jq .data.autopilot` (read) |
@@ -111,7 +111,7 @@ the config and the activity. Exit 0 on any board state; exit 1 only on
 transport/usage.
 
 `keeper autopilot show` additionally carries `worker_provider` (the
-work-cells-only dispatch pin, `null | "claude" | "codex"`) plus its
+work-cells-only dispatch pin, `null | "claude" | "gpt"`) plus its
 `worker_provider_scope` ("work cells only…") and `worker_provider_note` (the
 many-to-one GPT-tier collapse, present only when pinned to `claude`) —
 `keeper status` does NOT surface these three; read/capture them via
@@ -156,8 +156,8 @@ the same eight fields as its own envelope; restore `worktree_multi_repo` via
 **If the take-over touches the work-dispatch provider pin, capture
 `worker_provider` too** — it is NOT one of the `keeper status` eight fields, so
 read it separately via `keeper autopilot show` (`.data.worker_provider`,
-`null | "claude" | "codex"`) and restore it via `keeper autopilot config
-worker_provider <claude|codex|none>` (`none` writes the captured `null`).
+`null | "claude" | "gpt"`) and restore it via `keeper autopilot config
+worker_provider <claude|gpt|none>` (`none` writes the captured `null`).
 
 **Per-root cap: capture and restore the STORED field, never the effective
 one.** `max_concurrent_per_root` in the envelope is the derived EFFECTIVE cap

@@ -2,15 +2,15 @@
 
 <!--
 provenance:
-  model_id: gpt-5.3-codex-spark  # host-roster capability model (matrix.yaml alias target), NOT an embedded subagents.yaml axis value
-  resolves_to: gpt-5.3-codex-spark  # bare capability id served through the codex harness; codex accepts the bare id directly, no alias target needed
+  model_id: gpt-5.3-codex-spark  # host-roster capability token, NOT an embedded subagents.yaml axis value
+  resolves_to: openai-codex/gpt-5.3-codex-spark  # Pi-hosted launch id; the capability remains its basename
   researched: 2026-07-09
   status: researched             # provenance state: this cache reflects a real capability-review pass
-  method: model-capability review (OpenAI Codex gpt-5.3-codex-spark model docs) + in-repo planning-session live probe of the codex wrapped-cell path
+  method: model-capability review (OpenAI Codex gpt-5.3-codex-spark model docs) + in-repo planning-session live probe of the Pi wrapped-cell path
   sources:
     - OpenAI Codex gpt-5.3-codex-spark model card / capability docs: a fast, lightweight coding tier tuned for quick, tightly-scoped edits with a lower reasoning ceiling than the heavier codex tiers
-    - keeper wrapped-cell architecture (ADR 0010): gpt-5.3-codex-spark is a host-roster capability model claude does not serve natively; a claude wrapper delegates implementation to the codex provider and re-owns tests/commit
-    - planning-session live probe: the codex provider's host matrix entry runs the bare `gpt-5.3-codex-spark` capability id directly at startup — unlike pi's provider-qualified slashed-id requirement, codex needs no matrix alias target for this model
+    - keeper wrapped-cell architecture (ADR 0010): gpt-5.3-codex-spark is a host-roster capability model Claude does not serve natively; a Claude wrapper delegates implementation to the Pi provider and re-owns tests/commit
+    - planning-session live probe: Pi's host-matrix entry launches `openai-codex/gpt-5.3-codex-spark`; the capability token remains the basename
 -->
 
 This file is the raw research backing the distilled `models.gpt-5.3-codex-spark` guidance block in
@@ -24,8 +24,8 @@ version, or when out-of-band cell-review cohort evidence materially re-grades it
 
 ## What `gpt-5.3-codex-spark` is
 
-`gpt-5.3-codex-spark` is a **wrapped cell** capability: keeper does not serve it natively, so a claude
-wrapper delegates implementation to the model's serving provider (the `codex` harness in the host
+`gpt-5.3-codex-spark` is a **wrapped cell** capability: keeper does not serve it natively, so a Claude
+wrapper delegates implementation to the model's serving provider (the `pi` harness in the host
 matrix) and re-owns the keeper close-out (tests, soft-reset of foreign commits, the single sanitized
 trailer commit). It is a fast, lightweight coding tier tuned for quick, tightly-scoped edits — the
 low end of the codex model family, built for snappy turnaround on small, well-bounded work rather
@@ -34,10 +34,9 @@ policy, and its capability ceiling keeps its lane narrow — small, fully-specif
 with out-of-band cell-review cohorts grading fit and re-tuning this guidance as evidence
 accumulates.
 
-A dispatch note the launch path (not this capability research) owns: the codex provider's host matrix
-entry accepts the bare `gpt-5.3-codex-spark` capability id directly, so this model needs no
-provider-qualified slashed alias target in the host matrix — unlike `pi`-served models, which reject a
-bare id at startup.
+A dispatch note the launch path (not this capability research) owns: the Pi provider's host-matrix
+entry uses the provider-qualified `openai-codex/gpt-5.3-codex-spark` launch id; the derived
+`gpt-5.3-codex-spark` capability token remains the model-selection axis.
 
 ## Strengths (worker-relevant)
 
@@ -52,7 +51,7 @@ bare id at startup.
 
 ## Weaknesses / failure modes (worker-relevant)
 
-- **Lower reasoning ceiling.** A lighter tier than the heavier codex and claude models — multi-file
+- **Lower reasoning ceiling.** A lighter tier than the heavier Pi-hosted and Claude models — multi-file
   design and cross-module reasoning under-resolve here rather than being reliably worked through.
 - **Ambiguous acceptance under-resolves.** An under-specified or interpretation-requiring acceptance
   is a poor fit; it needs the choice pre-made, not discovered.

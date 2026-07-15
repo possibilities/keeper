@@ -6,7 +6,6 @@
  * The target is a pure builder — no subprocess/tmux/git is touched (per
  * CLAUDE.md test isolation).
  */
-
 import { describe, expect, test } from "bun:test";
 import { buildAgentLaunchArgv } from "../src/agent/launch-config";
 
@@ -15,7 +14,6 @@ const PREFIX = [
   "/fake-home/code/keeper/cli/keeper.ts",
   "agent",
 ] as const;
-
 describe("golden: buildAgentLaunchArgv", () => {
   test("claude write-mode launch (model + session, no preset)", () => {
     expect(
@@ -46,7 +44,6 @@ describe("golden: buildAgentLaunchArgv", () => {
       "do the thing",
     ]);
   });
-
   test("claude read-only launch (preset, no session) — posture-independent flags (no strip)", () => {
     expect(
       buildAgentLaunchArgv({
@@ -71,46 +68,6 @@ describe("golden: buildAgentLaunchArgv", () => {
       "explore",
     ]);
   });
-
-  test("codex read-only launch (model + effort + session) — keeps write flags", () => {
-    expect(
-      buildAgentLaunchArgv({
-        launcherArgvPrefix: PREFIX,
-        cli: "codex",
-        prompt: "review this",
-        model: "gpt-5",
-        effort: "high",
-        session: "pair",
-      }),
-    ).toEqual([
-      "/fake-home/.bun/bin/bun",
-      "/fake-home/code/keeper/cli/keeper.ts",
-      "agent",
-      "codex",
-      "--x-tmux",
-      "--x-tmux-detached",
-      "--x-no-confirm",
-      "--x-tmux-session",
-      "pair",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "-m",
-      "gpt-5",
-      "-c",
-      'model_reasoning_effort="high"',
-      "review this",
-    ]);
-  });
-
-  test("codex omits the claude-only KEEPER_TMUX_SESSION env carrier", () => {
-    const argv = buildAgentLaunchArgv({
-      launcherArgvPrefix: PREFIX,
-      cli: "codex",
-      prompt: "p",
-      session: "pair",
-    });
-    expect(argv).not.toContain("--x-tmux-env");
-  });
-
   test("claude with --name — window-name knob + native --name, both pinned", () => {
     expect(
       buildAgentLaunchArgv({
@@ -142,30 +99,6 @@ describe("golden: buildAgentLaunchArgv", () => {
       "weigh in",
     ]);
   });
-
-  test("codex with --name — window-name knob only, NO native --name", () => {
-    expect(
-      buildAgentLaunchArgv({
-        launcherArgvPrefix: PREFIX,
-        cli: "codex",
-        prompt: "weigh in",
-        name: "panel::smoke::gpt5",
-      }),
-    ).toEqual([
-      "/fake-home/.bun/bin/bun",
-      "/fake-home/code/keeper/cli/keeper.ts",
-      "agent",
-      "codex",
-      "--x-tmux",
-      "--x-tmux-detached",
-      "--x-no-confirm",
-      "--x-tmux-window-name",
-      "panel::smoke::gpt5",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "weigh in",
-    ]);
-  });
-
   test("claude RESUME launch — fork pins (--session-id + --fork-session) and a dash-guarded prompt, no trailing positional", () => {
     expect(
       buildAgentLaunchArgv({
@@ -200,61 +133,6 @@ describe("golden: buildAgentLaunchArgv", () => {
       "keep going",
     ]);
   });
-
-  test("codex RESUME launch — verb-position resume LEADS, dash-guarded prompt trails, no separate positional", () => {
-    expect(
-      buildAgentLaunchArgv({
-        launcherArgvPrefix: PREFIX,
-        cli: "codex",
-        prompt: "keep going",
-        resumeTarget: "rollout-uuid",
-      }),
-    ).toEqual([
-      "/fake-home/.bun/bin/bun",
-      "/fake-home/code/keeper/cli/keeper.ts",
-      "agent",
-      "codex",
-      "--x-tmux",
-      "--x-tmux-detached",
-      "--x-no-confirm",
-      "resume",
-      "rollout-uuid",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--",
-      "keep going",
-    ]);
-  });
-
-  test("codex RESUME launch with shared wrapped presentation — window title is display-only", () => {
-    expect(
-      buildAgentLaunchArgv({
-        launcherArgvPrefix: PREFIX,
-        cli: "codex",
-        prompt: "keep going",
-        session: "wrapped",
-        name: "fn-1277.2",
-        resumeTarget: "rollout-uuid",
-      }),
-    ).toEqual([
-      "/fake-home/.bun/bin/bun",
-      "/fake-home/code/keeper/cli/keeper.ts",
-      "agent",
-      "codex",
-      "--x-tmux",
-      "--x-tmux-detached",
-      "--x-no-confirm",
-      "--x-tmux-session",
-      "wrapped",
-      "--x-tmux-window-name",
-      "fn-1277.2",
-      "resume",
-      "rollout-uuid",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--",
-      "keep going",
-    ]);
-  });
-
   test("pi RESUME launch with shared wrapped presentation — native target is retained", () => {
     expect(
       buildAgentLaunchArgv({

@@ -153,19 +153,6 @@ describe("loadHostMatrixV2 — dedup + launch-only", () => {
     ).toThrow(/same-provider duplicate/);
   });
 
-  test("a cross-provider dedup keeps the first provider + logs the shadow", () => {
-    const h = loadHostMatrixV2(writeMatrix(fx.CROSS_PROVIDER_DEDUP));
-    expect(h.effortsByModel.get("gpt-5.5")).toEqual(["high"]);
-    expect(h.shadowed).toEqual([
-      {
-        provider: "pi",
-        capability: "gpt-5.5",
-        launchId: "openai/gpt-5.5",
-        winner: "codex",
-      },
-    ]);
-  });
-
   test("a subagent_models entry no provider serves errors at load", () => {
     expect(() =>
       loadHostMatrixV2(writeMatrix(fx.SUBAGENT_MODEL_UNSERVED)),
@@ -364,7 +351,7 @@ describe("cross-island parity (launcher matrix.ts vs plan host_matrix.ts)", () =
     }
   });
 
-  test("both islands reduce the committed example to the same projection", () => {
+  test("both islands accept the committed Claude/Pi example", () => {
     const examplePath = join(
       import.meta.dir,
       "..",
@@ -374,8 +361,13 @@ describe("cross-island parity (launcher matrix.ts vs plan host_matrix.ts)", () =
       "examples",
       "matrix.example.yaml",
     );
-    expect(projectPlan(loadHostMatrixV2(examplePath))).toEqual(
-      projectLauncher(loadMatrixV2(examplePath)),
-    );
+    const host = loadHostMatrixV2(examplePath);
+    const launcher = loadMatrixV2(examplePath);
+    expect(host.models).toEqual(["opus", "sonnet", "gpt-5.3-codex-spark"]);
+    expect(host.shadowed).toEqual([]);
+    expect(launcher.providers.map((provider) => provider.name)).toEqual([
+      "claude",
+      "pi",
+    ]);
   });
 });

@@ -73,9 +73,7 @@ describe("loadPresetCatalog", () => {
   const EMPTY_CATALOG = {
     presets: {},
     claude_default: null,
-    codex_default: null,
     pi_default: null,
-    hermes_default: null,
     dispatch: EMPTY_DISPATCH,
   };
 
@@ -132,9 +130,7 @@ describe("loadPresetCatalog", () => {
       "presets.yaml",
       [
         "claude_default: claude::opus::xhigh",
-        "codex_default: codex::gpt-5.5::high",
         "pi_default: pi::glm::high",
-        "hermes_default: hermes::gpt-5.5::na",
         "",
       ].join("\n"),
     );
@@ -144,20 +140,10 @@ describe("loadPresetCatalog", () => {
       model: "opus",
       effort: "xhigh",
     });
-    expect(cat.codex_default).toEqual({
-      harness: "codex",
-      model: "gpt-5.5",
-      effort: "high",
-    });
     expect(cat.pi_default).toEqual({
       harness: "pi",
       model: "glm",
       effort: "high",
-    });
-    expect(cat.hermes_default).toEqual({
-      harness: "hermes",
-      model: "gpt-5.5",
-      effort: "na",
     });
   });
 
@@ -168,9 +154,7 @@ describe("loadPresetCatalog", () => {
     );
     const cat = loadPresetCatalog(p);
     expect(cat.claude_default).toBeNull();
-    expect(cat.codex_default).toBeNull();
     expect(cat.pi_default).toBeNull();
-    expect(cat.hermes_default).toBeNull();
   });
 
   test("a malformed `<harness>_default` triple is fail-loud naming the segment", () => {
@@ -180,15 +164,17 @@ describe("loadPresetCatalog", () => {
   });
 
   test("a `<harness>_default` whose harness mismatches its key is fail-loud", () => {
-    const p = writeYaml("presets.yaml", "claude_default: codex::gpt::high\n");
+    const p = writeYaml("presets.yaml", "claude_default: pi::gpt::high\n");
     expect(() => loadPresetCatalog(p)).toThrow(
-      /claude_default 'codex::gpt::high' pins harness codex, expected claude/,
+      /claude_default 'pi::gpt::high' pins harness pi, expected claude/,
     );
   });
 
   test("an empty-string `<harness>_default` is fail-loud", () => {
-    const p = writeYaml("presets.yaml", 'codex_default: ""\n');
-    expect(() => loadPresetCatalog(p)).toThrow(/codex_default must be/);
+    const p = writeYaml("presets.yaml", "codex_default: pi::gpt::high\n");
+    expect(() => loadPresetCatalog(p)).toThrow(
+      /Unknown top-level key 'codex_default'/,
+    );
   });
 
   test("a missing-file error names the absent path", () => {
@@ -222,7 +208,7 @@ describe("loadPresetCatalog", () => {
           "  unblock: claude::sonnet::high",
           "  deconflict: claude::sonnet::high",
           "  repair: claude::sonnet::high",
-          "  handoff: codex::gpt::high",
+          "  handoff: pi::gpt::high",
           "",
         ].join("\n"),
       );
@@ -234,7 +220,7 @@ describe("loadPresetCatalog", () => {
         unblock: { harness: "claude", model: "sonnet", effort: "high" },
         deconflict: { harness: "claude", model: "sonnet", effort: "high" },
         repair: { harness: "claude", model: "sonnet", effort: "high" },
-        handoff: { harness: "codex", model: "gpt", effort: "high" },
+        handoff: { harness: "pi", model: "gpt", effort: "high" },
       });
     });
 
@@ -271,12 +257,9 @@ describe("loadPresetCatalog", () => {
     });
 
     test("a non-claude dispatch triple parses (the resolver warns-and-ignores)", () => {
-      const p = writeYaml(
-        "presets.yaml",
-        "dispatch:\n  work: codex::gpt::high\n",
-      );
+      const p = writeYaml("presets.yaml", "dispatch:\n  work: pi::gpt::high\n");
       expect(loadPresetCatalog(p).dispatch?.work).toEqual({
-        harness: "codex",
+        harness: "pi",
         model: "gpt",
         effort: "high",
       });
@@ -294,12 +277,12 @@ describe("loadPanelSelections", () => {
   test("a panel of triple members is read in declaration order", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: a pair.\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\n",
+      "panels:\n  duo:\n    strength: standard\n    description: a pair.\n    members:\n      - claude::opus::high\n      - pi::openai-codex/gpt-5.3::high\n",
     );
     expect(loadPanelSelections(p).panels.duo).toEqual({
       strength: "standard",
       description: "a pair.",
-      members: ["claude::opus::high", "codex::gpt-5.3::high"],
+      members: ["claude::opus::high", "pi::openai-codex/gpt-5.3::high"],
     });
   });
 
@@ -324,17 +307,6 @@ describe("loadPanelSelections", () => {
     ]);
   });
 
-  test("an axisless harness member is fail-loud (not panel-eligible)", () => {
-    // hermes is capturable but exposes no reasoning axis (na) — panels compare an
-    // axis, so it is rejected AT LOAD with the member named.
-    const p = writeYaml(
-      "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - hermes::hermes-m::na\n",
-    );
-    expect(() => loadPanelSelections(p)).toThrow(/hermes::hermes-m::na/);
-    expect(() => loadPanelSelections(p)).toThrow(/not panel-eligible/);
-  });
-
   test("duplicate identical triples are legal at load (kept in order)", () => {
     const p = writeYaml(
       "panel.yaml",
@@ -357,7 +329,7 @@ describe("loadPanelSelections", () => {
   test("a legacy list-form panel value is fail-loud, naming the panel and /plan:panel-guidance", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    - claude::opus::high\n    - codex::gpt-5.3::high\n",
+      "panels:\n  duo:\n    - claude::opus::high\n    - pi::openai-codex/gpt-5.3::high\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(/'duo'/);
     expect(() => loadPanelSelections(p)).toThrow(/legacy list form/);
@@ -414,7 +386,7 @@ describe("loadPanelSelections", () => {
   test("the default key names a defined panel", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\ndefault: duo\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - pi::openai-codex/gpt-5.3::high\ndefault: duo\n",
     );
     expect(loadPanelSelections(p).default).toBe("duo");
   });
@@ -422,7 +394,7 @@ describe("loadPanelSelections", () => {
   test("no default key leaves default null", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - pi::openai-codex/gpt-5.3::high\n",
     );
     expect(loadPanelSelections(p).default).toBeNull();
   });
@@ -430,7 +402,7 @@ describe("loadPanelSelections", () => {
   test("a default naming an undefined panel is fail-loud", () => {
     const p = writeYaml(
       "panel.yaml",
-      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - codex::gpt-5.3::high\ndefault: ghost\n",
+      "panels:\n  duo:\n    strength: standard\n    description: d\n    members:\n      - claude::opus::high\n      - pi::openai-codex/gpt-5.3::high\ndefault: ghost\n",
     );
     expect(() => loadPanelSelections(p)).toThrow(/default panel 'ghost'/);
   });

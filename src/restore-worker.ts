@@ -266,8 +266,7 @@ const RESTORE_GENERATION_IDLE_MS = 1000;
  *
  * **v5 (epic fn-1103): resume_target is HARNESS-NATIVE + a `harness` tag rides.**
  * Each agent gains a `harness` field, and `resume_target` is now the harness's own
- * resume token — the session UUID for claude/pi, the back-filled native id for
- * codex/hermes (EMPTY when keeper never resolved one ⇒ not-resumable). A v4 reader
+ * resume token — the session UUID for Claude/Pi. A v4 reader
  * assumed `resume_target` was always the claude UUID, so bump only the side-file
  * version.
  */
@@ -314,7 +313,7 @@ export interface RestoreAgent {
   plan_ref: string | null;
   window_index: number | null;
   created_at: number;
-  /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). ABSENT ⇒ claude
+  /** Launching harness (`"claude"`/`"pi"`). ABSENT ⇒ claude
    *  (a NULL `jobs.harness` reads as claude), so a legacy/claude-only file stays
    *  byte-stable. `resume_target` is this harness's own resume token. */
   harness?: string;
@@ -425,8 +424,8 @@ export function buildRestoreTier(
     const agent: RestoreAgent = {
       job_id: job.job_id,
       cwd: job.cwd,
-      // Per-harness (see resumeTarget): the session UUID for claude/pi, the
-      // back-filled native id for codex/hermes, "" when not-resumable.
+      // Per-harness (see resumeTarget): the session UUID for Claude/Pi,
+      // or "" when not-resumable.
       resume_target: resumeTarget(job),
       tier,
       plan_verb: job.plan_verb,

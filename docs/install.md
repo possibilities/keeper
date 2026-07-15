@@ -241,8 +241,8 @@ provider-equivalence substitutes.
 Standing up a host:
 
 1. Copy [`docs/examples/matrix.example.yaml`](./examples/matrix.example.yaml) — a committed,
-   load-tested reference shape (claude native models, a codex-served capability model with a
-   per-provider effort override, a launch-only pi entry absent from `subagent_models`, the wrapper
+   load-tested reference shape (Claude-native models, a Pi-hosted capability model with a
+   per-provider effort override, a launch-only Pi entry absent from `subagent_models`, the wrapper
    driver, the 11 seeded `agent_pins`) — to `~/.config/keeper/matrix.yaml`, or author your own
    roster from scratch. It is not itself a discovered config path. Authoring from scratch still
    needs an `agent_pins:` entry per static plan agent — copy the example's block as a starting

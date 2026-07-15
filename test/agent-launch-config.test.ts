@@ -16,8 +16,6 @@ import {
   isAgentRole,
   loadRolePrompt,
   nativeClaudeArgs,
-  nativeCodexArgs,
-  nativeHermesArgs,
   nativePiArgs,
   stripClaudeEnv,
 } from "../src/agent/launch-config";
@@ -227,112 +225,6 @@ test("nativeClaudeArgs: resume mode without resumeSessionId throws ResumeLaunchU
 });
 
 // ---------------------------------------------------------------------------
-// native flag sets — codex
-// ---------------------------------------------------------------------------
-
-test("nativeCodexArgs: interactive YOLO flags, never strips tools", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-  });
-  // Interactive TUI shape — never the headless `exec` one-shot or its exec-only
-  // `--skip-git-repo-check`, and web search is on by default so the deprecated
-  // `--enable web_search_request` is gone.
-  expect(args).not.toContain("exec");
-  expect(args).not.toContain("--skip-git-repo-check");
-  expect(args).not.toContain("--enable");
-  expect(args).not.toContain("web_search_request");
-  // YOLO mode so the single-turn partner never stalls on an approval prompt.
-  expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
-  // codex must NEVER strip tools the way claude used to.
-  expect(args).not.toContain("--disallowed-tools");
-});
-
-test("nativeCodexArgs: --name is NEVER emitted (codex has no native name flag)", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-    name: "panel::smoke::gpt5",
-  });
-  expect(args).not.toContain("--name");
-  expect(args).not.toContain("panel::smoke::gpt5");
-});
-
-test("nativeCodexArgs: --effort maps to quoted TOML model_reasoning_effort", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-    effort: "high",
-  });
-  const idx = args.indexOf("-c");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(args[idx + 1]).toBe('model_reasoning_effort="high"');
-});
-
-test("nativeCodexArgs: keeper effort max caps at codex band xhigh", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-    effort: "max",
-  });
-  const idx = args.indexOf("-c");
-  expect(args[idx + 1]).toBe('model_reasoning_effort="xhigh"');
-});
-
-test("nativeCodexArgs: an already-native band (minimal) passes through unmapped", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "p",
-    effort: "minimal",
-  });
-  const idx = args.indexOf("-c");
-  expect(args[idx + 1]).toBe('model_reasoning_effort="minimal"');
-});
-
-test("nativeCodexArgs: resume mode LEADS with the verb-position resume + target, ends with -- guarded prompt", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "follow-up ask",
-    resumeTarget: "rollout-uuid",
-  });
-  expect(args).toEqual([
-    "resume",
-    "rollout-uuid",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--",
-    "follow-up ask",
-  ]);
-});
-
-test("nativeCodexArgs: resume mode still composes model/effort flags between target and prompt", () => {
-  const args = nativeCodexArgs({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "-dash-ask",
-    model: "gpt-5.5",
-    effort: "high",
-    resumeTarget: "rollout-uuid",
-  });
-  expect(args).toEqual([
-    "resume",
-    "rollout-uuid",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "-m",
-    "gpt-5.5",
-    "-c",
-    'model_reasoning_effort="high"',
-    "--",
-    "-dash-ask",
-  ]);
-});
-
-// ---------------------------------------------------------------------------
 // native flag sets — pi (posture-independent: read-only is prompting-only)
 // ---------------------------------------------------------------------------
 
@@ -425,80 +317,20 @@ test("nativePiArgs: resume mode with a leading-dash prompt fails loud instead of
 });
 
 // ---------------------------------------------------------------------------
-// native flag sets — hermes
-// ---------------------------------------------------------------------------
-
-test("nativeHermesArgs: fresh launch stays -z-then-separate-prompt-token (byte-unchanged)", () => {
-  const args = nativeHermesArgs({
-    launcherArgvPrefix: LAP,
-    cli: "hermes",
-    prompt: "p",
-    model: "some-model",
-  });
-  expect(args).toEqual(["--yolo", "-m", "some-model", "-z"]);
-});
-
-test("nativeHermesArgs: resume mode uses --resume <target> then -z=<prompt> equals-joined (never a bare -z token)", () => {
-  const args = nativeHermesArgs({
-    launcherArgvPrefix: LAP,
-    cli: "hermes",
-    prompt: "follow-up ask",
-    resumeTarget: "hermes-session-id",
-  });
-  expect(args).toEqual([
-    "--yolo",
-    "--resume",
-    "hermes-session-id",
-    "-z=follow-up ask",
-  ]);
-  expect(args).not.toContain("-z");
-});
-
-test("nativeHermesArgs: resume mode with a leading-dash prompt still rides safely joined", () => {
-  const args = nativeHermesArgs({
-    launcherArgvPrefix: LAP,
-    cli: "hermes",
-    prompt: "-dash-ask",
-    model: "some-model",
-    resumeTarget: "hermes-session-id",
-  });
-  expect(args).toEqual([
-    "--yolo",
-    "-m",
-    "some-model",
-    "--resume",
-    "hermes-session-id",
-    "-z=-dash-ask",
-  ]);
-});
-
-// ---------------------------------------------------------------------------
 // effort → second-axis band mapping (descriptor-driven, no harness-name switch)
 // ---------------------------------------------------------------------------
 
-test("mapKeeperEffortToAxis: claude/hermes null map passes every token through", () => {
+test("mapKeeperEffortToAxis: Claude passes native effort tokens through", () => {
   for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
     expect(mapKeeperEffortToAxis("claude", effort)).toBe(effort);
-    expect(mapKeeperEffortToAxis("hermes", effort)).toBe(effort);
   }
 });
 
-test("mapKeeperEffortToAxis: codex/pi are identity for the four shared rungs", () => {
+test("mapKeeperEffortToAxis: Pi maps Keeper's max and preserves native bands", () => {
   for (const effort of ["low", "medium", "high", "xhigh"]) {
-    expect(mapKeeperEffortToAxis("codex", effort)).toBe(effort);
     expect(mapKeeperEffortToAxis("pi", effort)).toBe(effort);
   }
-});
-
-test("mapKeeperEffortToAxis: keeper max caps at codex/pi band xhigh", () => {
-  expect(mapKeeperEffortToAxis("codex", "max")).toBe("xhigh");
   expect(mapKeeperEffortToAxis("pi", "max")).toBe("xhigh");
-});
-
-test("mapKeeperEffortToAxis: already-native bands pass through unmapped (precedence)", () => {
-  // Tokens outside keeper's five efforts are left as-is — the map rewrites only
-  // genuine keeper efforts, never an already-native band the caller supplied.
-  expect(mapKeeperEffortToAxis("codex", "minimal")).toBe("minimal");
   expect(mapKeeperEffortToAxis("pi", "off")).toBe("off");
   expect(mapKeeperEffortToAxis("pi", "minimal")).toBe("minimal");
 });
@@ -546,35 +378,6 @@ test("buildAgentLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION 
   const sessIdx = argv.indexOf("--x-tmux-session");
   expect(sessIdx).toBeGreaterThanOrEqual(0);
   expect(argv[sessIdx + 1]).toBe("panels");
-});
-
-test("buildAgentLaunchArgv: codex never gets the binding carrier (stays untracked)", () => {
-  const argv = buildAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "P",
-    session: "pair",
-  });
-  // codex fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION
-  // carrier, even with a session named for the window.
-  expect(argv).not.toContain("--x-tmux-env");
-  expect(argv).toContain("--x-tmux-session");
-});
-
-test("buildAgentLaunchArgv: codex — agent token is codex, interactive native flags, prompt last", () => {
-  const argv = buildAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "P",
-    effort: "medium",
-  });
-  expect(argv[LAP.length]).toBe("codex");
-  // Interactive TUI — never the headless `exec` one-shot or the deprecated web
-  // search flag.
-  expect(argv).not.toContain("exec");
-  expect(argv).not.toContain("web_search_request");
-  expect(argv).toContain("--dangerously-bypass-approvals-and-sandbox");
-  expect(argv.at(-1)).toBe("P");
 });
 
 test("buildAgentLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no strip, no carrier, prompt last", () => {
@@ -646,8 +449,8 @@ test("buildAgentLaunchArgv: no preset → no --x-preset flag (zero behavior chan
   expect(argv).not.toContain("--x-preset");
 });
 
-test("buildAgentLaunchArgv: --name lands on the tmux window name for EVERY harness", () => {
-  for (const cli of ["claude", "codex", "pi"] as const) {
+test("buildAgentLaunchArgv: --name lands on the tmux window name for every harness", () => {
+  for (const cli of ["claude", "pi"] as const) {
     const argv = buildAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       cli,
@@ -660,7 +463,7 @@ test("buildAgentLaunchArgv: --name lands on the tmux window name for EVERY harne
   }
 });
 
-test("buildAgentLaunchArgv: native --name for claude/pi, but NEVER for codex", () => {
+test("buildAgentLaunchArgv: native --name reaches Claude and Pi", () => {
   const claude = buildAgentLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "claude",
@@ -680,16 +483,6 @@ test("buildAgentLaunchArgv: native --name for claude/pi, but NEVER for codex", (
   const piIdx = pi.indexOf("--name");
   expect(piIdx).toBeGreaterThanOrEqual(0);
   expect(pi[piIdx + 1]).toBe("panel::smoke::pi");
-
-  // codex carries the window name but NO native --name (it has no such flag).
-  const codex = buildAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "P",
-    name: "panel::smoke::gpt5",
-  });
-  expect(codex).toContain("--x-tmux-window-name");
-  expect(codex).not.toContain("--name");
 });
 
 test("buildAgentLaunchArgv: no name → no window-name flag, no native --name (zero behavior change)", () => {
@@ -705,22 +498,6 @@ test("buildAgentLaunchArgv: no name → no window-name flag, no native --name (z
 // ---------------------------------------------------------------------------
 // launch argv — resume-launch composition
 // ---------------------------------------------------------------------------
-
-test("buildAgentLaunchArgv: resume launch omits the trailing prompt append — the prompt already rides inside native", () => {
-  const argv = buildAgentLaunchArgv({
-    launcherArgvPrefix: LAP,
-    cli: "codex",
-    prompt: "follow-up ask",
-    resumeTarget: "rollout-uuid",
-  });
-  // The verb-position resume token leads the forwarded (post-wrapper-flag)
-  // codex argv, and the prompt appears EXACTLY once — not double-appended.
-  const idx = argv.indexOf("resume");
-  expect(idx).toBeGreaterThanOrEqual(0);
-  expect(argv[idx + 1]).toBe("rollout-uuid");
-  expect(argv.at(-1)).toBe("follow-up ask");
-  expect(argv.filter((a) => a === "follow-up ask")).toHaveLength(1);
-});
 
 test("buildAgentLaunchArgv: claude resume launch composes the full pinned-child-session shape", () => {
   const argv = buildAgentLaunchArgv({
@@ -799,7 +576,7 @@ test("buildAgentLaunchArgv: pi resume keeps shared wrapped presentation while pr
 });
 
 test("buildAgentLaunchArgv: fresh launch is unaffected when resumeTarget is absent (byte-unchanged)", () => {
-  for (const cli of ["claude", "codex", "pi", "hermes"] as const) {
+  for (const cli of ["claude", "pi"] as const) {
     const argv = buildAgentLaunchArgv({
       launcherArgvPrefix: LAP,
       cli,

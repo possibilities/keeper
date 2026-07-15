@@ -18,13 +18,6 @@ import { parseDuration } from "../duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import {
-  attributeHermesSession,
-  type HermesExportFn,
-  hermesLastMessage,
-  hermesSessionStop,
-  parseHermesExport,
-} from "./hermes-capture";
-import {
   DEFAULT_STOP_TIMEOUT_MS,
   defaultTranscriptPathTimeoutMs,
   findLastMessage,
@@ -50,11 +43,8 @@ export interface ResolvedHandle {
    */
   stopTimeoutMs: number | null;
   /**
-   * Resume marker threaded into transcript discovery: a resumed codex leg resolves
-   * its PRE-EXISTING rollout by the known uuid (`sessionId`) rather than the
-   * fresh-launch created-at floor. claude/pi stay strict-pinned. codex/claude
-   * anchor the stop-scan at `startedAtMs` so a pre-resume stop is skipped; a
-   * resumed pi wait anchors on a structural stop-count watermark instead, since pi
+   * Resume marker threaded into transcript discovery. Claude/Pi stay
+   * strict-pinned; a resumed Pi wait anchors on a structural stop-count watermark instead, since pi
    * re-stamps its copied history with resume-time timestamps. Absent/false = fresh
    * launch, byte-unchanged.
    */
@@ -224,22 +214,6 @@ function coerceAgent(value: unknown): AgentKind | null {
 export interface VerbDeps {
   env: NodeJS.ProcessEnv;
   homeDir: string;
-  /**
-   * Hermes capture seam: run `hermes sessions export` and return its JSONL text
-   * (or null on failure). Hermes has no per-session transcript FILE — its sessions
-   * live in a SQLite store — so its wait/show path polls this export instead of
-   * watching the filesystem. Bound in `main.ts` (a bounded subprocess); absent for
-   * the claude/codex/pi file-transcript verbs, which never read it.
-   */
-  hermesExport?: HermesExportFn;
-}
-
-/** Poll cadence for the hermes export (heavier than a file stat — a full
- *  subprocess + SQLite read per tick — so gentler than the 250ms file poll). */
-const HERMES_POLL_INTERVAL_MS = 1_000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export type WaitForStopResult =
@@ -271,9 +245,6 @@ export async function runWaitForStop(
   handle: ResolvedHandle,
   deps: VerbDeps,
 ): Promise<WaitForStopResult> {
-  if (handle.agent === "hermes") {
-    return hermesWaitForStop(handle, deps);
-  }
   const totalMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const deadlineMs = Date.now() + totalMs;
   const remainingForPath = Math.max(1, deadlineMs - Date.now());
@@ -331,9 +302,6 @@ export async function runShowLastMessage(
   handle: ResolvedHandle,
   deps: VerbDeps,
 ): Promise<ShowLastMessageResult> {
-  if (handle.agent === "hermes") {
-    return hermesShowLastMessage(handle, deps);
-  }
   const resolved = await resolveTranscriptPath(handle, deps);
   if (!resolved.ok) {
     return transcriptPathFailure(resolved.reason);
@@ -352,9 +320,7 @@ export async function runShowLastMessage(
 
 /**
  * A direct-path handle resolves to itself; a run-id handle polls for the
- * backend's transcript file (bounded by the watcher's path timeout). The
- * `ambiguous` failure — a codex leg colliding with a concurrent same-cwd session
- * — is propagated distinctly so the caller never degrades it into a plain
+ * backend's transcript file (bounded by the watcher's path timeout). The `ambiguous` failure is propagated distinctly so the caller never degrades it into a plain
  * path-timeout (or, worse, a guessed foreign transcript).
  */
 async function resolveTranscriptPath(
@@ -375,115 +341,6 @@ async function resolveTranscriptPath(
     isResume: handle.isResume,
     pathTimeoutMs,
   });
-}
-
-const HERMES_AMBIGUOUS_ERROR =
-  "hermes session ambiguous: multiple concurrent same-cwd sessions match, cannot attribute";
-
-/**
- * Block until the leg's hermes session records a terminal assistant turn, polling
- * `hermes sessions export` and attributing by cwd + created-at. A concurrent
- * same-cwd session collision fails distinctly (`ambiguous`) so the caller never
- * degrades it into a plain timeout; the session id doubles as the "transcript
- * path" (hermes has no transcript FILE — the id is its resume target).
- */
-async function hermesWaitForStop(
-  handle: ResolvedHandle,
-  deps: VerbDeps,
-): Promise<WaitForStopResult> {
-  const exportFn = deps.hermesExport;
-  if (exportFn === undefined) {
-    return {
-      ok: false,
-      reason: "timeout",
-      error: "hermes export seam unavailable",
-    };
-  }
-  const deadline =
-    Date.now() + (handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
-  while (true) {
-    const text = exportFn();
-    if (text !== null) {
-      const attr = attributeHermesSession(
-        parseHermesExport(text),
-        handle.cwd,
-        handle.startedAtMs,
-      );
-      if (attr.kind === "ambiguous") {
-        return {
-          ok: false,
-          reason: "ambiguous",
-          error: HERMES_AMBIGUOUS_ERROR,
-        };
-      }
-      if (attr.kind === "found") {
-        const stop = hermesSessionStop(attr.session, handle.startedAtMs);
-        if (stop !== null) {
-          return { ok: true, transcriptPath: attr.session.id, stop };
-        }
-      }
-    }
-    if (Date.now() >= deadline) {
-      const effectiveMs = handle.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-      const source = handle.stopTimeoutMs !== null ? "caller" : "default";
-      return {
-        ok: false,
-        reason: "timeout",
-        error: `timed out waiting for hermes session stop after ${effectiveMs}ms (${source})`,
-      };
-    }
-    await sleep(HERMES_POLL_INTERVAL_MS);
-  }
-}
-
-/**
- * Resolve the leg's hermes session (one export snapshot, no blocking) and return
- * its final assistant message. `ambiguous` propagates distinctly; a session not
- * yet present maps to the retryable timeout reason (mirrors a transcript that
- * never appeared). The session id rides back as the transcript path.
- */
-async function hermesShowLastMessage(
-  handle: ResolvedHandle,
-  deps: VerbDeps,
-): Promise<ShowLastMessageResult> {
-  const exportFn = deps.hermesExport;
-  if (exportFn === undefined) {
-    return {
-      ok: false,
-      reason: "timeout",
-      error: "hermes export seam unavailable",
-    };
-  }
-  const text = exportFn();
-  if (text === null) {
-    return {
-      ok: false,
-      reason: "timeout",
-      error: "hermes export produced no output",
-    };
-  }
-  const attr = attributeHermesSession(
-    parseHermesExport(text),
-    handle.cwd,
-    handle.startedAtMs,
-  );
-  if (attr.kind === "ambiguous") {
-    return { ok: false, reason: "ambiguous", error: HERMES_AMBIGUOUS_ERROR };
-  }
-  if (attr.kind !== "found") {
-    return {
-      ok: false,
-      reason: "timeout",
-      error: "no attributable hermes session found in export",
-    };
-  }
-  const last = hermesLastMessage(attr.session);
-  return {
-    ok: true,
-    transcriptPath: attr.session.id,
-    text: last.text,
-    found: last.found,
-  };
 }
 
 /** Map a transcript-path resolution failure to a verb result — carrying the

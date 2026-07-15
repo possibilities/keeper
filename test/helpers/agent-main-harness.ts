@@ -15,7 +15,6 @@ import type {
   RouteSelection,
   RoutingInspection,
 } from "../../src/account-router";
-import type { CodexSessionNameIndexerOptions } from "../../src/agent/codex-session-index";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
 import type { MainDeps } from "../../src/agent/main";
@@ -48,15 +47,13 @@ export const DEFAULT_HOST_TRIPLES: HostTriples = {
  * fresh launch pin them) instead of the fresh-launch fail-loud. Bare launches that
  * don't assert the exact command are unaffected; exact-command tests either see
  * these injected values or pass their own catalog / explicit flags. `presets` is
- * empty (the freeform named catalog is retired); pi's effort segment `high`
- * translates to its thinking band, hermes carries the axisless `na`.
+ * empty (the freeform named catalog is retired); Pi's effort segment `high`
+ * translates to its thinking band.
  */
 export const DEFAULT_PRESET_CATALOG: PresetCatalog = {
   presets: {},
   claude_default: { harness: "claude", model: "opus", effort: "high" },
-  codex_default: { harness: "codex", model: "gpt", effort: "high" },
   pi_default: { harness: "pi", model: "glm", effort: "high" },
-  hermes_default: { harness: "hermes", model: "gpt-5.5", effort: "na" },
 };
 
 /** Throwing exit so a test sees the exit code without killing the runner. */
@@ -94,9 +91,6 @@ export interface Harness {
   out: string[];
   /** stderr sink. */
   err: string[];
-  /** Action logs ensureCodexStateSharingFn was invoked with, in order (call count
-   *  = length) — the codex leaf-guard reaches every codex launch, passthrough too. */
-  codexStateSharingCalls: string[][];
   /** Action logs ensurePiStateSharingFn was invoked with, in order (call count =
    *  length) — the pi leaf-guard reaches every pi launch, passthrough included;
    *  there is no Keeper-owned Pi profile farm to gate it behind. */
@@ -107,8 +101,6 @@ export interface Harness {
   piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[];
   /** Pi preflight/state/spawn ordering recorder. */
   piLaunchOrder: string[];
-  /** Codex synthetic session-name indexer starts, in order. */
-  codexSessionNameIndexers: CodexSessionNameIndexerOptions[];
   /** Every birth record the launcher emitted (draft + child pid), in order. */
   birthRecords: { draft: BirthRecordDraft; pid: number }[];
   /** Every tmux command handed to the tmux seam, in order. */
@@ -126,13 +118,11 @@ export interface HarnessOptions {
    * the dispatch suite to test bare/unknown/help/version classification.
    */
   rawArgv?: boolean;
-  agent?: "claude" | "codex" | "pi" | "hermes";
+  agent?: "claude" | "pi";
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   homeBin?: string;
-  codexBin?: string;
   piBin?: string;
-  hermesBin?: string;
   /**
    * Preset catalog loadPresetCatalogFn returns. Default: {@link
    * DEFAULT_PRESET_CATALOG} — a `<harness>_default` for each harness so a bare
@@ -200,12 +190,10 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const spawnOptions: SpawnOptions[] = [];
   const out: string[] = [];
   const err: string[] = [];
-  const codexStateSharingCalls: string[][] = [];
   const piStateSharingCalls: string[][] = [];
   const piPromptArtifactsCalls: string[][] = [];
   const piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[] = [];
   const piLaunchOrder: string[] = [];
-  const codexSessionNameIndexers: CodexSessionNameIndexerOptions[] = [];
   const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
   const tmuxCommands: string[][] = [];
   let routerCalls = 0;
@@ -226,9 +214,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     ...(opts.env ?? {}),
   };
   const homeBin = opts.homeBin ?? "/fake-home/.local/bin/claude";
-  const codexBin = opts.codexBin ?? "/fake-home/bin/codex";
   const piBin = opts.piBin ?? "/fake-home/.local/bin/pi";
-  const hermesBin = opts.hermesBin ?? "/fake-home/.local/bin/hermes";
 
   const spawn: SpawnFn =
     opts.spawn ??
@@ -253,9 +239,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     writeErr: (s) => err.push(s),
     exit: throwingExit,
     claudeBin: homeBin,
-    codexBin,
     piBin,
-    hermesBin,
     pluginConfigPath: "/fake-home/.config/keeper/plugins.yaml",
     loadPluginSourcesFn: () => ({ pluginDirs: [], pluginScanDirs: [] }),
     loadPresetCatalogFn: () => opts.presetCatalog ?? DEFAULT_PRESET_CATALOG,
@@ -263,9 +247,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.panelSelections ?? { panels: {}, default: null },
     loadHostTriplesFn: () => opts.hostTriples ?? DEFAULT_HOST_TRIPLES,
     ensureClaudeStateSharingFn: () => {},
-    ensureCodexStateSharingFn: (actionLog: string[]) => {
-      codexStateSharingCalls.push(actionLog);
-    },
     ensurePiStateSharingFn: (actionLog: string[]) => {
       piStateSharingCalls.push(actionLog);
       piLaunchOrder.push("state");
@@ -287,10 +268,6 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return opts.matrix;
     },
     providerReachableFn: opts.providerReachable ?? (() => true),
-    startCodexSessionNameIndexerFn: (opts: CodexSessionNameIndexerOptions) => {
-      codexSessionNameIndexers.push(opts);
-      return () => {};
-    },
     emitBirthRecord: (draft: BirthRecordDraft, pid: number) => {
       birthRecords.push({ draft, pid });
     },
@@ -349,12 +326,10 @@ export function makeHarness(opts: HarnessOptions): Harness {
     spawnOptions,
     out,
     err,
-    codexStateSharingCalls,
     piStateSharingCalls,
     piPromptArtifactsCalls,
     piPromptArtifactEnvSnapshots,
     piLaunchOrder,
-    codexSessionNameIndexers,
     birthRecords,
     tmuxCommands,
     routerCalls: () => routerCalls,

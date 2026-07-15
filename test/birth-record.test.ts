@@ -3,9 +3,9 @@
  *
  * Two halves: the pure `src/birth-record.ts` leaf (serialize/parse round-trip,
  * torn-record rejection, maildir atomic write, start_time parsers, env-derived
- * coords/worktree/draft), and the `main()` launcher wiring — every non-claude
- * launch emits exactly one draft with the right identity + env exports, claude
- * emits none, a resume reuses the original job id, and the detached OUTER wrapper
+ * coords/worktree/draft), and the `main()` launcher wiring — every Pi launch
+ * emits exactly one draft with the right identity + env exports, claude emits
+ * none, a resume reuses the original job id, and the detached OUTER wrapper
  * emits nothing (the inner re-exec owns the write). No live harness / ps fork:
  * the launcher's `emitBirthRecord` seam records in memory, the probe is tested
  * via its pure parsers.
@@ -33,11 +33,7 @@ import {
   DARWIN_LSTART_CASES,
   LINUX_STAT_CASES,
 } from "./fixtures/start-time-parser-cases";
-import {
-  expectExit,
-  makeHarness,
-  runAndCapture,
-} from "./helpers/agent-main-harness";
+import { makeHarness, runAndCapture } from "./helpers/agent-main-harness";
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "keeper-birth-test-"));
@@ -46,12 +42,12 @@ function tempDir(): string {
 const FULL: BirthRecord = {
   schema_version: BIRTH_RECORD_SCHEMA_VERSION,
   session_id: "job-123",
-  harness: "codex",
+  harness: "pi",
   pid: 4242,
   start_time: "darwin:Wed Jul  3 12:00:00 2026",
   cwd: "/home/u/proj",
   spawn_name: "proj-001",
-  config_dir: "/home/u/.codex",
+  config_dir: "/home/u/.pi",
   backend_exec_type: "tmux",
   backend_exec_session_id: "pair",
   backend_exec_pane_id: "%8",
@@ -129,6 +125,20 @@ describe("parse rejects torn / malformed records", () => {
     ).toBeNull();
     expect(
       parseBirthRecord(JSON.stringify({ ...FULL, spawn_name: 7 })),
+    ).toBeNull();
+  });
+
+  test("unsupported harnesses and schema versions parse to null", () => {
+    for (const harness of ["claude", "codex", "other"]) {
+      expect(parseBirthRecord(JSON.stringify({ ...FULL, harness }))).toBeNull();
+    }
+    expect(
+      parseBirthRecord(
+        JSON.stringify({
+          ...FULL,
+          schema_version: BIRTH_RECORD_SCHEMA_VERSION + 1,
+        }),
+      ),
     ).toBeNull();
   });
 });
@@ -270,12 +280,6 @@ describe("env-derived coords / worktree / draft", () => {
         { ...common, harness: "pi" },
       ).dispatch_attempt_id,
     ).toBeNull();
-    expect(
-      buildBirthDraft(
-        { KEEPER_DISPATCH_ATTEMPT_ID: "42" },
-        { ...common, harness: "codex" },
-      ).dispatch_attempt_id,
-    ).toBeNull();
   });
 
   test("worktree reads KEEPER_PLAN_WORKTREE_BRANCH; empty → null", () => {
@@ -329,7 +333,7 @@ describe("env-derived coords / worktree / draft", () => {
 
 const UUID = "00000000-0000-0000-0000-000000000000";
 
-function harness(agent: "claude" | "codex" | "pi" | "hermes", argv: string[]) {
+function harness(agent: "claude" | "pi", argv: string[]) {
   return makeHarness({
     argv: [agent, ...argv],
     rawArgv: true,
@@ -337,22 +341,7 @@ function harness(agent: "claude" | "codex" | "pi" | "hermes", argv: string[]) {
   });
 }
 
-describe("main() emits birth records for non-claude launches", () => {
-  test("codex interactive → one record, keeper-minted id, null resume target", async () => {
-    const h = harness("codex", ["--x-no-confirm", "hi"]);
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toHaveLength(1);
-    const { draft, pid } = h.birthRecords[0] as (typeof h.birthRecords)[number];
-    expect(draft.harness).toBe("codex");
-    expect(draft.session_id).toBe(UUID);
-    expect(draft.resume_target).toBeNull();
-    expect(draft.schema_version).toBe(BIRTH_RECORD_SCHEMA_VERSION);
-    expect(pid).toBe(4242);
-    // Env exports: keeper job id (all non-claude) + codex originator override.
-    expect(h.deps.env.KEEPER_JOB_ID).toBe(UUID);
-    expect(h.deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBe(UUID);
-  });
-
+describe("main() emits birth records for Pi launches", () => {
   test("pi interactive → one record, pinned session id = job id = resume target", async () => {
     const h = harness("pi", ["--x-no-confirm", "hi"]);
     await runAndCapture(h, main);
@@ -362,19 +351,6 @@ describe("main() emits birth records for non-claude launches", () => {
     expect(draft.session_id).toBe(UUID);
     expect(draft.resume_target).toBe(UUID);
     expect(h.deps.env.KEEPER_JOB_ID).toBe(UUID);
-    // pi is not codex — no rollout originator override.
-    expect(h.deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBeUndefined();
-  });
-
-  test("hermes interactive → one record, keeper-minted id, null resume target", async () => {
-    const h = harness("hermes", ["--x-no-confirm", "-z", "hi"]);
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toHaveLength(1);
-    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
-    expect(draft.harness).toBe("hermes");
-    expect(draft.session_id).toBe(UUID);
-    expect(draft.resume_target).toBeNull();
-    expect(h.deps.env.KEEPER_JOB_ID).toBe(UUID);
     expect(h.deps.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE).toBeUndefined();
   });
 
@@ -383,19 +359,6 @@ describe("main() emits birth records for non-claude launches", () => {
     await runAndCapture(h, main);
     expect(h.birthRecords).toEqual([]);
     expect(h.deps.env.KEEPER_JOB_ID).toBeUndefined();
-  });
-
-  test("a resume relaunch reuses the ORIGINAL job id carried in KEEPER_JOB_ID", async () => {
-    const h = makeHarness({
-      argv: ["codex", "resume"],
-      rawArgv: true,
-      env: { KEEPER_JOB_ID: "orig-job-id" },
-    });
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toHaveLength(1);
-    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
-    expect(draft.session_id).toBe("orig-job-id");
-    expect(h.deps.env.KEEPER_JOB_ID).toBe("orig-job-id");
   });
 
   test("a pi resume folds onto the carried job id AND stamps resume_target from the --session argv (identity ≠ resume key)", async () => {
@@ -418,64 +381,5 @@ describe("main() emits birth records for non-claude launches", () => {
     expect(h.deps.env.KEEPER_JOB_ID).toBe("45f94c4d-orig");
     // Resume key: the harness-native target from the argv, NOT the job id.
     expect(draft.resume_target).toBe("d98a2d54-native");
-  });
-
-  test("a codex resume stamps resume_target from the `resume <target>` subcommand argv", async () => {
-    const h = makeHarness({
-      argv: ["codex", "resume", "rollout-uuid-7"],
-      rawArgv: true,
-      env: { KEEPER_JOB_ID: "codex-orig" },
-    });
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toHaveLength(1);
-    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
-    expect(draft.session_id).toBe("codex-orig");
-    expect(draft.resume_target).toBe("rollout-uuid-7");
-  });
-
-  test("a hermes resume stamps resume_target from the `--resume <target>` argv", async () => {
-    const h = makeHarness({
-      argv: ["hermes", "--resume", "hermes-native-9"],
-      rawArgv: true,
-      env: { KEEPER_JOB_ID: "hermes-orig" },
-    });
-    await runAndCapture(h, main);
-    expect(h.birthRecords).toHaveLength(1);
-    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
-    expect(draft.session_id).toBe("hermes-orig");
-    expect(draft.resume_target).toBe("hermes-native-9");
-  });
-});
-
-describe("the detached OUTER wrapper writes no birth record", () => {
-  test("codex --x-tmux --x-tmux-detached emits none (the inner re-exec owns it)", async () => {
-    const stateDir = tempDir();
-    const home = tempDir();
-    try {
-      const h = makeHarness({
-        argv: ["codex", "--x-tmux", "--x-tmux-detached", "hi"],
-        rawArgv: true,
-        launcherStateDir: stateDir,
-        transcriptHomeDir: home,
-        tmuxCommand: (cmd) => {
-          if (cmd.includes("new-window")) {
-            return {
-              exitCode: 0,
-              stdout: "keeper agent\x01@7\x01%8\n",
-              stderr: "",
-            };
-          }
-          return { exitCode: 0, stdout: "", stderr: "" };
-        },
-      });
-      const code = await expectExit(main(h.deps));
-      expect(code).toBe(0);
-      // The outer launch spawned no harness child and wrote no record.
-      expect(h.birthRecords).toEqual([]);
-      expect(h.spawned).toEqual([]);
-    } finally {
-      rmSync(stateDir, { recursive: true, force: true });
-      rmSync(home, { recursive: true, force: true });
-    }
   });
 });

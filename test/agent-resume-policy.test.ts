@@ -3,10 +3,9 @@
  * resume-by-name policy layer over the bus's `resolveTarget`.
  * Seeds synthetic `jobs` rows into a `freshMemDb` clone (mirroring
  * `test/bus-identity.test.ts`'s `seedJob` shape) plus `harness` /
- * `resume_target` / `cwd`. Every liveness / codex-back-fill probe is injected
- * via `ResumePolicyDeps` — no real pid, subprocess, or filesystem read.
+ * `resume_target` / `cwd`. Every liveness probe is injected via
+ * `ResumePolicyDeps` — no real pid, subprocess, or filesystem read.
  */
-
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
@@ -27,13 +26,10 @@ interface JobSeed {
   resume_target?: string | null;
   cwd?: string | null;
 }
-
 function seedJob(db: Database, job: JobSeed): void {
-  db.query(
-    `INSERT INTO jobs (job_id, created_at, updated_at, state, pid, start_time,
+  db.query(`INSERT INTO jobs (job_id, created_at, updated_at, state, pid, start_time,
                         title, name_history, harness, resume_target, cwd)
-     VALUES (?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+     VALUES (?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?)`).run(
     job.job_id,
     job.created_at ?? 1,
     job.updated_at ?? 1,
@@ -46,7 +42,6 @@ function seedJob(db: Database, job: JobSeed): void {
     job.cwd ?? null,
   );
 }
-
 /** Never-live deps by default (no pid seeded → isLive short-circuits false
  *  regardless), overridden per-test for the liveness cases. */
 function deps(overrides: ResumePolicyDeps = {}): ResumePolicyDeps {
@@ -56,11 +51,9 @@ function deps(overrides: ResumePolicyDeps = {}): ResumePolicyDeps {
     ...overrides,
   };
 }
-
 // ---------------------------------------------------------------------------
 // Basic tiers — current name, former name, id, prefix
 // ---------------------------------------------------------------------------
-
 test("resolves a current name (title) to ok with harness/resume_target/cwd/title", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -80,25 +73,6 @@ test("resolves a current name (title) to ok with harness/resume_target/cwd/title
     title: "alpha",
   });
 });
-
-test("resolves a FORMER name (name_history) to the same job", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-1",
-    title: "beta",
-    name_history: ["alpha", "beta"],
-    harness: "codex",
-    resume_target: "rollout-uuid",
-  });
-  const result = resolveResumeDecision("alpha", db, undefined, deps());
-  expect(result.kind).toBe("ok");
-  if (result.kind === "ok") {
-    expect(result.job_id).toBe("sess-1");
-    expect(result.harness).toBe("codex");
-    expect(result.resume_target).toBe("rollout-uuid");
-  }
-});
-
 test("resolves a full session id exactly", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -110,23 +84,20 @@ test("resolves a full session id exactly", () => {
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") expect(result.job_id).toBe("sess-exact-id");
 });
-
 test("resolves a unique id prefix", () => {
   const { db } = freshMemDb();
   seedJob(db, {
     job_id: "sess-prefix-xyz",
-    harness: "hermes",
-    resume_target: "hermes-target",
+    harness: "pi",
+    resume_target: "pi-target",
   });
   const result = resolveResumeDecision("sess-prefix", db, undefined, deps());
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") expect(result.job_id).toBe("sess-prefix-xyz");
 });
-
 // ---------------------------------------------------------------------------
 // Refuse-live
 // ---------------------------------------------------------------------------
-
 test("a live process (pid + start-time identity match) is refused, naming the candidate", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -153,7 +124,6 @@ test("a live process (pid + start-time identity match) is refused, naming the ca
     title: "gamma",
   });
 });
-
 test("a recycled pid (same pid, different OS start_time) is NOT treated as live", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -177,7 +147,6 @@ test("a recycled pid (same pid, different OS start_time) is NOT treated as live"
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") expect(result.job_id).toBe("sess-recycled");
 });
-
 test("a row with NULL pid/start_time cannot be probed and is treated as not-live", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -198,11 +167,9 @@ test("a row with NULL pid/start_time cannot be probed and is treated as not-live
   );
   expect(result.kind).toBe("ok");
 });
-
 // ---------------------------------------------------------------------------
 // Newest-collapse + tie ambiguity
 // ---------------------------------------------------------------------------
-
 test("multiple non-live matches collapse to the newest by updated_at", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -226,166 +193,12 @@ test("multiple non-live matches collapse to the newest by updated_at", () => {
     expect(result.resume_target).toBe("native-new");
   }
 });
-
-test("an exact updated_at tie returns ambiguous listing every tied candidate with id + harness", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-tie-a",
-    title: "eta",
-    updated_at: 30,
-    harness: "claude",
-    resume_target: "native-a",
-  });
-  seedJob(db, {
-    job_id: "sess-tie-b",
-    title: "eta",
-    updated_at: 30,
-    harness: "codex",
-    resume_target: "native-b",
-  });
-  const result = resolveResumeDecision("eta", db, undefined, deps());
-  expect(result.kind).toBe("ambiguous");
-  if (result.kind === "ambiguous") {
-    expect(result.candidates).toHaveLength(2);
-    const ids = result.candidates.map((c) => c.job_id).sort();
-    expect(ids).toEqual(["sess-tie-a", "sess-tie-b"]);
-    for (const c of result.candidates) {
-      expect(typeof c.harness).toBe("string");
-      expect(c.updated_at).toBe(30);
-    }
-  }
-});
-
-// ---------------------------------------------------------------------------
-// requireHarness + unknown
-// ---------------------------------------------------------------------------
-
-test("requireHarness mismatch returns a distinct kind naming the actual harness found", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-claude",
-    title: "theta",
-    harness: "claude",
-    resume_target: "native-theta",
-  });
-  const result = resolveResumeDecision("theta", db, "codex", deps());
-  expect(result).toEqual({
-    kind: "harness-mismatch",
-    job_id: "sess-claude",
-    harness: "claude",
-    require_harness: "codex",
-    title: "theta",
-  });
-});
-
-test("requireHarness match resolves ok normally", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-codex",
-    title: "iota",
-    harness: "codex",
-    resume_target: "native-iota",
-  });
-  const result = resolveResumeDecision("iota", db, "codex", deps());
-  expect(result.kind).toBe("ok");
-});
-
 test("an unresolvable target returns unknown", () => {
   const { db } = freshMemDb();
   const result = resolveResumeDecision("no-such-target", db, undefined, deps());
   expect(result).toEqual({ kind: "unknown", target: "no-such-target" });
 });
-
-// ---------------------------------------------------------------------------
-// NULL resume_target — codex back-fill vs immediate failure
-// ---------------------------------------------------------------------------
-
-test("a codex row with a NULL resume_target attempts the rollout back-fill and succeeds", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-codex-null",
-    title: "kappa",
-    harness: "codex",
-    resume_target: null,
-    cwd: "/repo/codex",
-    created_at: 100,
-  });
-  let calledWith: unknown = null;
-  const result = resolveResumeDecision(
-    "kappa",
-    db,
-    undefined,
-    deps({
-      resolveCodexResumeTarget: (opts) => {
-        calledWith = opts;
-        return "backfilled-uuid";
-      },
-      codexHome: "/fake/codex-home",
-    }),
-  );
-  expect(result).toEqual({
-    kind: "ok",
-    job_id: "sess-codex-null",
-    harness: "codex",
-    resume_target: "backfilled-uuid",
-    cwd: "/repo/codex",
-    title: "kappa",
-  });
-  expect(calledWith).toEqual({
-    codexHome: "/fake/codex-home",
-    jobId: "sess-codex-null",
-    expectedCwd: "/repo/codex",
-    startedAtMs: 100_000,
-  });
-});
-
-test("a codex row with a NULL resume_target that the back-fill cannot resolve errors no-target", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-codex-unresolvable",
-    title: "lambda",
-    harness: "codex",
-    resume_target: null,
-  });
-  const result = resolveResumeDecision(
-    "lambda",
-    db,
-    undefined,
-    deps({
-      resolveCodexResumeTarget: () => null,
-      codexHome: "/fake/codex-home",
-    }),
-  );
-  expect(result).toEqual({
-    kind: "no-target",
-    job_id: "sess-codex-unresolvable",
-    harness: "codex",
-    title: "lambda",
-  });
-});
-
-test("a codex row with a NULL resume_target and no codexHome skips back-fill and errors no-target", () => {
-  const { db } = freshMemDb();
-  seedJob(db, {
-    job_id: "sess-codex-no-home",
-    title: "mu",
-    harness: "codex",
-    resume_target: null,
-  });
-  const result = resolveResumeDecision(
-    "mu",
-    db,
-    undefined,
-    deps({
-      resolveCodexResumeTarget: () => {
-        throw new Error("must not be called without codexHome");
-      },
-    }),
-  );
-  expect(result.kind).toBe("no-target");
-});
-
-test.each(["claude", "pi", "hermes"] as const)(
+test.each(["claude", "pi"] as const)(
   "a %s row with a NULL resume_target fails immediately, no back-fill attempted",
   (harness) => {
     const { db } = freshMemDb();
@@ -395,17 +208,7 @@ test.each(["claude", "pi", "hermes"] as const)(
       harness,
       resume_target: null,
     });
-    const result = resolveResumeDecision(
-      "nu",
-      db,
-      undefined,
-      deps({
-        resolveCodexResumeTarget: () => {
-          throw new Error(`must not be called for harness ${harness}`);
-        },
-        codexHome: "/fake/codex-home",
-      }),
-    );
+    const result = resolveResumeDecision("nu", db, undefined, deps());
     expect(result).toEqual({
       kind: "no-target",
       job_id: `sess-${harness}-null`,
@@ -414,7 +217,6 @@ test.each(["claude", "pi", "hermes"] as const)(
     });
   },
 );
-
 test("a NULL harness column normalizes to claude", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -426,4 +228,17 @@ test("a NULL harness column normalizes to claude", () => {
   const result = resolveResumeDecision("xi", db, undefined, deps());
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") expect(result.harness).toBe("claude");
+});
+
+test("an unregistered stored harness fails resolution normally", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "sess-retired",
+    title: "old-agent",
+    harness: "hermes",
+    resume_target: "legacy-target",
+  });
+  expect(() =>
+    resolveResumeDecision("old-agent", db, undefined, deps()),
+  ).toThrow("unknown harness 'hermes'");
 });

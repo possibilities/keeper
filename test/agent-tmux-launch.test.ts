@@ -113,7 +113,7 @@ describe("--x-tmux", () => {
     const cwd = "/fake-home/code/proj";
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
-      argv: ["codex", "--x-tmux", "--x-profile", "work", "hello"],
+      argv: ["claude", "--x-tmux", "--x-profile", "work", "hello"],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -156,6 +156,8 @@ describe("--x-tmux", () => {
         "#{session_name}\x01#{window_id}\x01#{pane_id}",
         "-t",
         "=dash:",
+        "-e",
+        "KEEPER_AGENT_TMUX_SESSION_ID=11111111-1111-1111-1111-111111111111",
         "-c",
         cwd,
         `exec bash '${launchScript}'`,
@@ -171,14 +173,14 @@ describe("--x-tmux", () => {
       'KEEPER_AGENT_SHELL="' + "$" + "{SHELL:-/bin/sh}" + '"',
     );
     expect(script).toContain(
-      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'codex' '--x-profile' 'work' 'hello'`,
+      `exec "$KEEPER_AGENT_SHELL" -l -i -c '"$@"; __kr=$?; [ "$__kr" -eq 0 ] || printf "\\n[keeper] pane command exited %s - run keeper tabs list for restore state and the rerun command.\\n" "$__kr" >&2; exec "$0" -l -i' "$KEEPER_AGENT_SHELL" '/fake-home/.bun/bin/bun' '/fake-home/code/keeper/cli/keeper.ts' 'agent' 'claude' '--x-profile' 'work' 'hello'`,
     );
     expect(script).not.toContain("--x-tmux");
     // Non-wait launch: one JSON line, transcriptPath null, exits before the poll.
     expect(h.out.join("").trim().split("\n")).toHaveLength(1);
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,
-      agent: "codex",
+      agent: "claude",
       session: "dash",
       windowId: "@9",
       paneId: "%10",
@@ -195,7 +197,7 @@ describe("--x-tmux", () => {
     const cwd = "/fake-home/code/proj";
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
-      argv: ["codex", "--x-tmux", "hello"],
+      argv: ["claude", "--x-tmux", "hello"],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -435,7 +437,7 @@ describe("--x-tmux", () => {
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
     const h = makeHarness({
-      argv: ["codex", "--x-tmux", "--x-tmux-detached", "hello"],
+      argv: ["claude", "--x-tmux", "--x-tmux-detached", "hello"],
       rawArgv: true,
       launcherStateDir: stateDir,
       transcriptHomeDir: home,
@@ -464,7 +466,7 @@ describe("--x-tmux", () => {
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,
       id: "tmux-abababab-abab-abab-abab-abababababab",
-      agent: "codex",
+      agent: "claude",
       transcriptPath: null,
       waitedForStop: false,
       stop: null,
@@ -481,13 +483,13 @@ describe("--x-tmux", () => {
         "utf8",
       ),
     );
-    expect(runJson).toMatchObject({ agent: "codex", cwd });
+    expect(runJson).toMatchObject({ agent: "claude", cwd });
     expect(typeof runJson.startedAtMs).toBe("number");
   });
 
   test("missing tmux flag values fail before any tmux command", async () => {
     const h = makeHarness({
-      argv: ["codex", "--x-tmux-session"],
+      argv: ["claude", "--x-tmux-session"],
       rawArgv: true,
     });
 
@@ -810,7 +812,7 @@ describe("--x-tmux-env injection", () => {
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
       argv: [
-        "codex",
+        "claude",
         "--x-tmux-session=work",
         "--x-tmux-detached",
         "--x-tmux-env",
@@ -862,7 +864,7 @@ describe("--x-tmux-env injection", () => {
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
       argv: [
-        "codex",
+        "claude",
         "--x-tmux-L",
         "scratch",
         "--x-tmux-session=cold",
@@ -1025,7 +1027,7 @@ describe("--no-artifacts", () => {
     writeCodexTranscript(home, cwd);
     const h = makeHarness({
       argv: [
-        "codex",
+        "claude",
         "--x-tmux-L",
         "scratch",
         "--x-tmux-session=work",
@@ -1058,7 +1060,7 @@ describe("--no-artifacts", () => {
     );
     expect(parseJsonOutput(h.out)).toMatchObject({
       schema_version: 1,
-      agent: "codex",
+      agent: "claude",
       session: "work",
       windowId: "@3",
       paneId: "%4",

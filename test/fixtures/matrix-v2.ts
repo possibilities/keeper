@@ -31,13 +31,11 @@ export const CLAUDE_ONLY = [
 ].join("\n");
 
 /**
- * A valid multi-provider roster with every launch-id form: claude native
- * (opus/sonnet); codex with a provider-level effort override serving a BARE
- * launch-id (gpt-5.3-codex-spark); pi with a PROVIDER-QUALIFIED launch-id whose
- * basename collides with codex's (cross-provider dedup → codex wins, pi shadowed)
- * and a {id, efforts} band whose capability is launch-only (absent from
- * subagent_models). Mirrors docs/examples/matrix.example.yaml (plus a second
- * template).
+ * A valid two-provider roster with every launch-id form: Claude native
+ * (opus/sonnet); Pi with a provider-level effort override serving a
+ * provider-qualified launch id and a `{id, efforts}` band whose capability is
+ * launch-only (absent from `subagent_models`). Mirrors the supported harness
+ * boundary.
  */
 export const MULTI_PROVIDER = [
   "efforts:",
@@ -55,13 +53,10 @@ export const MULTI_PROVIDER = [
   "    models:",
   "      - opus",
   "      - sonnet",
-  "  - name: codex",
+  "  - name: pi",
   "    efforts:",
   "      - high",
   "      - xhigh",
-  "    models:",
-  "      - gpt-5.3-codex-spark",
-  "  - name: pi",
   "    models:",
   "      - id: openai-codex/gpt-5.3-codex-spark",
   "      - id: gpt-5.3-spark-preview",
@@ -93,37 +88,8 @@ export const MULTI_PROVIDER_EXPECTED = {
     "gpt-5.3-codex-spark": ["high", "xhigh"],
     "gpt-5.3-spark-preview": ["medium"],
   } as Record<string, string[]>,
-  shadowed: [
-    {
-      provider: "pi",
-      capability: "gpt-5.3-codex-spark",
-      launchId: "openai-codex/gpt-5.3-codex-spark",
-      winner: "codex",
-    },
-  ],
+  shadowed: [],
 };
-
-/** A cross-provider dedup: codex (roster-first) wins gpt-5.5; pi's slashed
- *  launch-id (basename gpt-5.5) is shadowed, not an error. */
-export const CROSS_PROVIDER_DEDUP = [
-  "efforts:",
-  "  - high",
-  "subagent_templates:",
-  "  - template/agents/worker.md.tmpl",
-  "subagent_models:",
-  "  - gpt-5.5",
-  "providers:",
-  "  - name: codex",
-  "    models:",
-  "      - gpt-5.5",
-  "  - name: pi",
-  "    models:",
-  "      - openai/gpt-5.5",
-  "wrapper_driver:",
-  "  model: sonnet",
-  "  effort: high",
-  "",
-].join("\n");
 
 /** A provider serving a cell capability AND a launch-only one (absent from
  *  subagent_models): gpt-5.5 is a cell; gpt-5.5-preview enumerates but never
@@ -136,7 +102,7 @@ export const LAUNCH_ONLY = [
   "subagent_models:",
   "  - gpt-5.5",
   "providers:",
-  "  - name: codex",
+  "  - name: pi",
   "    models:",
   "      - gpt-5.5",
   "      - gpt-5.5-preview",
@@ -156,7 +122,7 @@ export const SAME_PROVIDER_COLLISION = [
   "subagent_models:",
   "  - gpt-5.5",
   "providers:",
-  "  - name: codex",
+  "  - name: pi",
   "    models:",
   "      - openai/gpt-5.5",
   "      - anthropic/gpt-5.5",
@@ -176,7 +142,7 @@ export const SUBAGENT_MODEL_UNSERVED = [
   "  - gpt-5.5",
   "  - ghost-model",
   "providers:",
-  "  - name: codex",
+  "  - name: pi",
   "    models:",
   "      - gpt-5.5",
   "wrapper_driver:",
@@ -310,7 +276,7 @@ export const RETIRED_KEY_FIXTURES: {
   {
     key: "route",
     body: claudeBase([
-      "  - name: codex",
+      "  - name: pi",
       "    route: false",
       "    models:",
       "      - gpt-5.5",
@@ -319,7 +285,7 @@ export const RETIRED_KEY_FIXTURES: {
   {
     key: "native",
     body: claudeBase([
-      "  - name: codex",
+      "  - name: pi",
       "    models:",
       "      - id: gpt-5.5",
       "        native: gpt-5.5-codex",
@@ -327,11 +293,7 @@ export const RETIRED_KEY_FIXTURES: {
   },
   {
     key: "name",
-    body: claudeBase([
-      "  - name: codex",
-      "    models:",
-      "      - name: gpt-5.5",
-    ]),
+    body: claudeBase(["  - name: pi", "    models:", "      - name: gpt-5.5"]),
   },
 ];
 
@@ -399,7 +361,6 @@ export const BAD_TEMPLATE_TRAVERSAL = [
 export const VALID_FIXTURES: { name: string; body: string }[] = [
   { name: "claude-only", body: CLAUDE_ONLY },
   { name: "multi-provider", body: MULTI_PROVIDER },
-  { name: "cross-provider-dedup", body: CROSS_PROVIDER_DEDUP },
   { name: "launch-only", body: LAUNCH_ONLY },
   { name: "agent-pins-valid", body: AGENT_PINS_VALID },
 ];

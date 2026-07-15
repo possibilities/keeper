@@ -31,9 +31,9 @@ band and `description` says which work the panel fits; read both live with `keep
 the host matrix's enumerable cube — no separate preset catalog names them. Eligibility is
 **capability-derived**: a triple is panel-valid when its harness is *capturable* (keeper can read that
 harness's final message) AND carries a second reasoning axis (an effort or thinking rung to compare
-across panelists) — a capability flag, never a harness-name allowlist. Today that is claude, codex,
-and pi; hermes is axisless (no second reasoning axis), so it is never panel-eligible. A triple on a
-non-panel-eligible harness is rejected when the panel loads.
+across panelists) — a capability flag, never a harness-name allowlist. Both supported harnesses,
+Claude and Pi, are panel-eligible. A triple on a non-panel-eligible harness is rejected when the
+panel loads.
 `keeper agent presets resolve <panel>` returns the selected object's members in declaration order, each
 identified by its **triple** (not just its harness), so two panelists on the same harness but different
 models or efforts stay distinguishable; duplicate identical triples are legal too — each gets a
@@ -44,11 +44,9 @@ result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
 - **A claude member** (`claude::<model>::<effort>`) runs `keeper agent run claude --preset <triple>
   --read-only`. `--read-only` prepends an explore-only directive to the prompt — it reads, greps, and
   runs bash to research, then reports.
-- **A codex member** (`codex::<model>::<effort>`) is the cross-family diversity the panel is built to
-  harvest. Codex's read-only posture is carried by the same prompt directive (agent run's read-only is
-  prompting-only — keeper enforces nothing) — panelists are explorers, so a best-effort directive is
-  acceptable. A codex member runs as an interactive TUI with its cwd directory-trust pre-seeded
-  (fail-open), so its window never hangs on codex's trust prompt.
+- **A pi member** (`pi::<model>::<effort>`) provides cross-family diversity. Pi's read-only posture is
+  carried by the same prompt directive (`agent run` read-only is prompting-only — keeper enforces
+  nothing), which is appropriate for explorer panelists.
 
 No member gets an assigned role or persona — every member answers the human's task straight, and the
 diversity comes from running the panel's triple spread cold (see "No lenses, no personas" above).
@@ -67,8 +65,8 @@ top-level `default:` pointer:
 providers:
   - name: claude
     models: [sonnet]
-  - name: codex
-    models: [<model>]
+  - name: pi
+    models: [openai-codex/<model>]
 
 # ~/.config/keeper/panel.yaml — described panel objects plus the default pointer
 panels:
@@ -76,7 +74,7 @@ panels:
     strength: standard
     members:
       - claude::sonnet::high
-      - codex::<model>::<effort>
+      - pi::openai-codex/<model>::<effort>
     description: >-
       An everyday cross-check for a moderate-stakes question with real judgment.
 default: core   # the literal `default` resolves here; never name a panel `default`

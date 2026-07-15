@@ -46,25 +46,16 @@ providers:
       # capability token is the basename (here the whole id — it is slash-free).
       - opus
       - sonnet
-  # codex is cost-ascending first among the wrapped providers, so it WINS the
-  # gpt-5.3-codex-spark capability and owns its effort list.
-  - name: codex
-    # A per-provider effort override clobbers the top-level axis for codex's
-    # cells (absent inherits; a per-model {id, efforts} override is more specific
-    # still). Each override must be a subset of the canonical vocabulary.
+  # pi serves the wrapped OpenAI model family. A per-provider effort override
+  # clobbers the top-level axis for Pi's cells (absent inherits; a per-model
+  # {id, efforts} override is more specific still).
+  - name: pi
     efforts:
       - high
       - xhigh
     models:
-      # A bare launch-id — capability = the whole slash-free string.
-      - gpt-5.3-codex-spark
-  # pi is later in the roster, so its gpt-5.3-codex-spark entry is SHADOWED by
-  # codex (the derived capability collides cross-provider — first provider wins,
-  # the shadow is logged, not an error).
-  - name: pi
-    models:
       # A provider-qualified launch-id: the capability is the basename after the
-      # last `/` (gpt-5.3-codex-spark), which codex already owns → shadowed.
+      # last `/` (gpt-5.3-codex-spark).
       - id: openai-codex/gpt-5.3-codex-spark
       # The {id, efforts} long form carries a per-model effort override. Its
       # capability (gpt-5.3-spark-preview) is absent from subagent_models, so it

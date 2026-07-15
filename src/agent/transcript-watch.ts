@@ -1,6 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
-import { codexSessionIdFromRolloutPath } from "./codex-session-index";
 import type { AgentKind } from "./dispatch";
 
 export interface TranscriptStop {
@@ -10,8 +9,7 @@ export interface TranscriptStop {
   timestamp: string | null;
   /**
    * The final assistant message text carried by the stop event, when the
-   * backend's stop record exposes it (codex `task_complete.last_agent_message`;
-   * claude/pi assistant content). `null` for a tool-only / structural stop with
+   * backend's stop record exposes it (Claude/Pi assistant content). `null` for a tool-only / structural stop with
    * no readable text — `show-last-message` then falls back to scanning the
    * transcript for the latest assistant text.
    */
@@ -42,13 +40,8 @@ export interface TranscriptWatchOptions {
   stopTimeoutMs?: number;
   /**
    * Resume marker: when true, transcript DISCOVERY resolves a PRE-EXISTING
-   * session file rather than a fresh one. codex resolves its rollout strictly by
-   * the known resume-target uuid (carried on {@link sessionId}), bypassing the
-   * fresh-launch created-at floor that would reject a rollout whose session-start
-   * predates this launch — codex appends to the SAME rollout on resume. claude/pi
-   * are already strict-pinned by their session id, so their discovery is
-   * unchanged. codex/claude anchor the stop-scan at {@link startedAtMs} so a
-   * pre-resume stop is skipped; pi re-stamps its copied history with resume-time
+   * session file rather than a fresh one. Claude/Pi are strict-pinned by their
+   * session id. Claude anchors the stop-scan at {@link startedAtMs}; Pi re-stamps its copied history with resume-time
    * timestamps, defeating that window, so a resumed pi wait anchors on a
    * structural stop-count watermark instead (see {@link waitForTranscriptStop}).
    * Omitted/false = fresh launch, byte-unchanged.
@@ -66,8 +59,8 @@ export type WaitForStopOutcome =
  *  - `found`: exactly one positively-attributed transcript.
  *  - `pending`: nothing attributable yet — the caller keeps polling.
  *  - `ambiguous`: more than one candidate the leg cannot attribute to itself
- *    (a concurrent same-cwd codex session collided). TERMINAL — never guessed,
- *    since a confident wrong transcript is worse than a retryable failure.
+ *   . `ambiguous` is terminal because a confident wrong transcript is worse than
+ *  a retryable failure.
  */
 type TranscriptPathLookup =
   | { kind: "found"; path: string }
@@ -96,8 +89,7 @@ export function defaultTranscriptPathTimeoutMs(agent: AgentKind): number {
 }
 
 /**
- * Wall-clock ceiling for the stop wait. A real model turn runs minutes (codex
- * took 238s observed), so this is generous — it is a fail-loud backstop against
+ * Wall-clock ceiling for the stop wait. A real model turn can run for minutes, so this is generous — it is a fail-loud backstop against
  * an unbounded hang, not a turn-length SLA. Overridable via `stopTimeoutMs`.
  */
 export const DEFAULT_STOP_TIMEOUT_MS = 600_000;
@@ -136,8 +128,7 @@ export async function waitForTranscriptStop(
 
   // Resumed pi copies the whole prior conversation into the new session file and
   // RE-STAMPS every entry with resume-time timestamps, so the started-at window
-  // can't exclude the copied stops (codex keeps original timestamps and stays
-  // handled by that filter). Anchor on a structural watermark instead: the count
+  // cannot exclude the copied stops. Anchor on a structural watermark instead: the count
   // of stops already present when the wait begins. Only a STRICTLY newer stop is
   // the resumed turn's — sampled ONCE here so a stop the turn appends later is
   // the first past this floor.
@@ -171,8 +162,7 @@ export async function waitForTranscriptStop(
  * which includes a claude tool-only final turn, since `claudeStopFromObject`
  * excludes `stopReason:"tool_use"` and such a turn carries no assistant text,
  * so neither `sawStop` nor `sawAssistant` flips. `text:null` with `found:true`
- * means a turn was observed but carried no readable text (e.g. a codex refusal
- * whose stop event still registered).
+ * means a turn was observed but carried no readable text.
  *
  * `opts.isResume` cuts the scan for pi: a resumed pi session file copies the
  * whole prior conversation with resume-time timestamps, so a whole-file scan
@@ -257,20 +247,6 @@ function assistantMessageText(
   agent: AgentKind,
   obj: Record<string, unknown>,
 ): string | null {
-  if (agent === "codex") {
-    if (obj.type !== "event_msg") {
-      return null;
-    }
-    const payload = objectValue(obj.payload);
-    if (stringValue(payload?.type) === "agent_message") {
-      const text = stringValue(payload?.message);
-      return text !== null && text !== "" ? text : null;
-    }
-    if (stringValue(payload?.type) === "task_complete") {
-      return codexMessageText(obj);
-    }
-    return null;
-  }
   const type = stringValue(obj.type);
   const message = objectValue(obj.message);
   const role = stringValue(message?.role);
@@ -294,10 +270,7 @@ function sleep(ms: number): Promise<void> {
 function findTranscriptPath(
   opts: TranscriptWatchOptions,
 ): TranscriptPathLookup {
-  if (opts.agent === "codex") {
-    return findCodexTranscriptPath(opts);
-  }
-  // claude/pi pin their session id at launch, so their resolution is exact-or-
+  // Claude/Pi pin their session id at launch, so their resolution is exact-or-
   // absent — never ambiguous. Map the string|null shape onto the lookup union.
   const path =
     opts.agent === "claude"
@@ -317,68 +290,12 @@ function findClaudeTranscriptPath(opts: TranscriptWatchOptions): string | null {
   // `<uuid>.jsonl` or null — never the newest-by-mtime fallback. A concurrent
   // driver in the same project dir writes a newer file; falling through to it is
   // the self-transcript collision this guards against. A future id divergence
-  // surfaces as a loud path-timeout, not a silent wrong file. Newest-by-mtime is
-  // kept ONLY for the no-id case (codex never reaches here).
+  // surfaces as a loud path-timeout, not a silent wrong file. Newest-by-mtime is kept only for the no-id case.
   if (opts.sessionId !== null) {
     const exact = join(projectDir, `${opts.sessionId}.jsonl`);
     return existsSync(exact) ? exact : null;
   }
   return newestFreshFile(jsonlFiles(projectDir, false), opts.startedAtMs);
-}
-
-function findCodexTranscriptPath(
-  opts: TranscriptWatchOptions,
-): TranscriptPathLookup {
-  const codexHome =
-    (opts.env.CODEX_HOME ?? "").trim() || join(opts.homeDir, ".codex");
-  const files = jsonlFiles(join(codexHome, "sessions"), true).filter((path) => {
-    const name = basename(path);
-    return name.startsWith("rollout-") && name.endsWith(".jsonl");
-  });
-  // RESUME: `codex resume <uuid>` appends to the SAME rollout, so the file
-  // already exists and its session-start predates this launch — the fresh-launch
-  // created-at floor below would wrongly reject it. Resolve strictly by the known
-  // resume-target uuid (carried on `sessionId`, the same uuid the rollout is
-  // named after) instead: the rollout whose filename uuid matches IS the resumed
-  // session, no freshness/cwd guessing. A uuid is unique so at most one matches;
-  // none yet keeps polling for the file to appear.
-  if (opts.isResume && opts.sessionId !== null) {
-    const match = files.find(
-      (path) => codexSessionIdFromRolloutPath(path) === opts.sessionId,
-    );
-    return match === undefined
-      ? { kind: "pending" }
-      : { kind: "found", path: match };
-  }
-  // Positive attribution, NEVER a newest-by-mtime guess. A codex leg cannot pin
-  // its session id at launch, so a rollout is attributable to the leg only when
-  // it is (a) still being written since launch (fresh mtime), (b) CREATED at or
-  // after the launch instant — a rollout whose session_meta timestamp predates
-  // launch belongs to a concurrent session even while its mtime keeps advancing,
-  // the exact wrong-file trap the newest-by-mtime heuristic fell into — and (c)
-  // rooted at the leg's cwd. Exactly one survivor IS the leg's transcript; more
-  // than one is an unresolvable concurrent-session collision (ambiguous, never
-  // guessed); none yet means keep polling for the leg's own file to appear.
-  const floor = opts.startedAtMs - START_SLOP_MS;
-  const cwdMatches = files.filter((path) => {
-    const stat = safeStat(path);
-    if (stat === null || stat.mtimeMs < floor) {
-      return false;
-    }
-    const meta = readCodexRolloutMeta(path);
-    if (meta.createdAtMs === null || meta.createdAtMs < floor) {
-      return false;
-    }
-    return meta.cwd === opts.cwd;
-  });
-  const [first] = cwdMatches;
-  if (cwdMatches.length === 1 && first !== undefined) {
-    return { kind: "found", path: first };
-  }
-  if (cwdMatches.length > 1) {
-    return { kind: "ambiguous" };
-  }
-  return { kind: "pending" };
 }
 
 function findPiTranscriptPath(opts: TranscriptWatchOptions): string | null {
@@ -480,7 +397,7 @@ function findTranscriptStop(
   startedAtMs: number,
 ): TranscriptStop | null {
   // claude gates terminality on background-agent quiescence (a settled stop);
-  // codex/pi keep the plain first-stop scan, byte-identical.
+  // Pi keeps the plain first-stop scan.
   if (agent === "claude") {
     return findClaudeStopGated(path, startedAtMs);
   }
@@ -695,9 +612,6 @@ function stopFromObject(
   if (agent === "claude") {
     return claudeStopFromObject(obj);
   }
-  if (agent === "codex") {
-    return codexStopFromObject(obj);
-  }
   return piStopFromObject(obj);
 }
 
@@ -733,33 +647,6 @@ function claudeStopFromObject(
       obj,
       null,
     );
-  }
-  return null;
-}
-
-/**
- * The codex rollout `event_msg` payload types that mark a turn's END. The single
- * source of truth for a codex stop marker, shared by `show-last-message`'s stop
- * parser here and the daemon-side live-state producer (`codex-state-worker`).
- * codex's rollout stream carries no turn-START marker, so codex live churn is
- * stop-only — a fact recorded in its harness descriptor's `hookMechanism`.
- */
-export const CODEX_STOP_MARKERS: ReadonlySet<string> = new Set([
-  "task_complete",
-  "turn_aborted",
-  "error",
-]);
-
-function codexStopFromObject(
-  obj: Record<string, unknown>,
-): TranscriptStop | null {
-  if (obj.type !== "event_msg") {
-    return null;
-  }
-  const payload = objectValue(obj.payload);
-  const eventType = stringValue(payload?.type);
-  if (eventType !== null && CODEX_STOP_MARKERS.has(eventType)) {
-    return stopInfo("codex", eventType, eventType, obj, codexMessageText(obj));
   }
   return null;
 }
@@ -832,17 +719,6 @@ function claudeMessageText(obj: Record<string, unknown>): string | null {
 
 function piMessageText(obj: Record<string, unknown>): string | null {
   return contentArrayText(objectValue(obj.message)?.content);
-}
-
-/**
- * Codex carries the final assistant text on the `task_complete` event payload
- * as `last_agent_message`. `turn_aborted` / `error` stops have no such field, so
- * they resolve to null (a defined empty/failed signal).
- */
-function codexMessageText(obj: Record<string, unknown>): string | null {
-  const payload = objectValue(obj.payload);
-  const text = stringValue(payload?.last_agent_message);
-  return text !== null && text !== "" ? text : null;
 }
 
 function encodeClaudeCwd(cwd: string): string {
@@ -923,35 +799,6 @@ function safeStat(path: string): { mtimeMs: number } | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Read a codex rollout's `session_meta` line for the two attribution signals the
- * codex path lookup needs: the recorded `cwd` and the creation instant
- * (`createdAtMs`, from the meta `timestamp`). The timestamp is codex's own ISO
- * string with a timezone — authoritative and unambiguous, unlike the tz-naive
- * timestamp embedded in the filename. Either field is null when the meta line is
- * absent/unparseable, which the caller treats as "cannot attribute".
- */
-function readCodexRolloutMeta(path: string): {
-  cwd: string | null;
-  createdAtMs: number | null;
-} {
-  for (const line of readLines(path, 64 * 1024)) {
-    if (!line.includes('"type":"session_meta"')) {
-      continue;
-    }
-    const parsed = parseJsonObject(line);
-    if (parsed === null) {
-      return { cwd: null, createdAtMs: null };
-    }
-    const payload = objectValue(parsed.payload);
-    return {
-      cwd: stringValue(payload?.cwd),
-      createdAtMs: objectTimestampMs(parsed),
-    };
-  }
-  return { cwd: null, createdAtMs: null };
 }
 
 function readPiMeta(path: string): { id: string | null; cwd: string | null } {

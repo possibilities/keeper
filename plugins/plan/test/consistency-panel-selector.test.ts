@@ -73,7 +73,7 @@ describe("on-disk panel roster", () => {
 // legal members and a 150-900 char description. Expectations below are
 // asserted against these constants, never re-derived from the committed file.
 const VALID_MEMBER_A = "claude::sonnet::high";
-const VALID_MEMBER_B = "codex::gpt-5.6-terra::high";
+const VALID_MEMBER_B = "pi::openai-codex/gpt-5.6-terra::high";
 const VALID_MEMBER_C = "pi::openai-codex/gpt-5.4::xhigh";
 // A description sized in-band (150-900 chars) by repetition, independent of
 // any prose authored in the committed roster.

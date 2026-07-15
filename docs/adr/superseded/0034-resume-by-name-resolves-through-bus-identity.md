@@ -2,7 +2,9 @@
 
 ## Status
 
-Superseded by [ADR 0062](../0062-unified-session-history-and-resume.md). The detached partner-resume mechanics retained by ADR 0062 remain applicable.
+Superseded by [ADR 0062](../0062-unified-session-history-and-resume.md).
+The Codex resume behavior below is historical; the detached partner-resume
+mechanics retained by ADR 0062 remain applicable to Claude and Pi.
 
 ## Context
 

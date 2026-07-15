@@ -22,8 +22,8 @@
  *
  * RESULT. Each candidate carries a `harness` tag and a harness-native
  * `resume_target`: a claude candidate re-attaches by session UUID
- * (`claude --resume <uuid>`), while codex/pi/hermes resume via their own verb
- * (`codex resume`, `pi --session`, `hermes --resume`) off the stored target. A
+ * (`claude --resume <uuid>`), while Pi resumes via its own `--session` flag off
+ * the stored target. A
  * non-claude agent whose target keeper never resolved is reported NOT-RESUMABLE
  * (never launched) so the rest of the generation still restores. The `label` is
  * the latest title (read live from the jobs projection) for display only. The
@@ -54,8 +54,8 @@
  * ONE plausible match within the proximity window, proposes the re-pin — two or
  * more is AMBIGUOUS and never resolved. `keeper tabs repair` REPORTS these
  * proposals read-only ({@link loadRepairProposals}); the actual re-pin is landed
- * by the daemon's resume-target back-fill producer (a twin pass beside the codex
- * back-fill), which mints the sanctioned `ResumeTargetResolved` synthetic event —
+ * by the daemon's resume-target back-fill producer, which mints the sanctioned
+ * `ResumeTargetResolved` synthetic event —
  * never a direct `jobs` write, never a new RPC surface.
  *
  * This module imports ONLY `src/` peers (no `cli/`), so both `cli/tabs.ts` and the
@@ -172,11 +172,27 @@ export type AgentOutcome =
  *    `"not-resumable"` with a reason.
  * The `--apply` path upgrades each `"would-restore"` to `"restored"` / `"failed"`.
  */
+function assertSupportedCandidateHarnesses(
+  candidates: readonly RestoreCandidate[],
+): void {
+  for (const candidate of candidates) {
+    harnessOrClaude(candidate.harness);
+  }
+}
+
+function assertSupportedPlanHarnesses(plan: readonly AgentOutcome[]): void {
+  assertSupportedCandidateHarnesses(plan.map((entry) => entry.candidate));
+}
+
 export function planRestore(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
   resolver: ResumeResolver = defaultResumeResolver,
 ): AgentOutcome[] {
+  // Validate the complete set before deriving any per-candidate policy. A stale
+  // unregistered harness rejects the restore as one ordinary failure; it cannot
+  // become a special not-resumable entry beside a partially actionable plan.
+  assertSupportedCandidateHarnesses(candidates);
   const out: AgentOutcome[] = [];
   for (const candidate of candidates) {
     if (
@@ -258,6 +274,8 @@ export async function applyRestore(
   ensureLaunched: EnsureLaunchedFn,
   sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
+  // Reject the whole externally supplied plan before the first process launch.
+  assertSupportedPlanHarnesses(plan);
   const out: AgentOutcome[] = [];
   let launched = 0;
   for (const entry of plan) {
@@ -369,6 +387,9 @@ export async function applyRestoreVerified(
   plan: AgentOutcome[],
   deps: VerifiedApplyDeps,
 ): Promise<AgentOutcome[]> {
+  // Reject the whole externally supplied plan before writing an intent or
+  // launching a process; unsupported rows never produce a partial restore.
+  assertSupportedPlanHarnesses(plan);
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
   const out: Promise<AgentOutcome>[] = [];
@@ -591,8 +612,8 @@ export function renderOutcomes(
       );
       continue;
     }
-    // The resume command is per-harness (claude --resume / codex resume /
-    // pi --session / hermes --resume), sourced from the candidate's harness tag.
+    // The resume command is per-harness (Claude --resume / Pi --session),
+    // sourced from the candidate's harness tag.
     const cmd = buildResumeCommand(cwd, c.resume_target, null, c.harness);
     if (o.kind === "would-restore") {
       stanzas.push(`# (${session}) would restore ${label}\n${cmd}`);
@@ -693,6 +714,7 @@ export function renderSnapshotScript(
   const excludedManagedCount = options.excludedManagedCount ?? 0;
   const resolver = options.resolver ?? defaultResumeResolver;
   const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
+  assertSupportedCandidateHarnesses(candidates);
   const included = candidates.filter(
     (c) =>
       sessionFilter === null || c.backend_exec_session_id === sessionFilter,

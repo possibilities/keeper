@@ -1222,7 +1222,7 @@ function parseTurn(
  * peels its own leading agent token (`src/agent/dispatch.ts`), then route the
  * remainder through the existing list/show/bare-id router. Bare `keeper
  * transcript`, `-h`/`--help`, `--agent-help`, and a harness token with an
- * empty remainder all print help; an unrecognized harness token (hermes
+ * empty remainder all print help; an unrecognized harness token
  * included) fails naming the registry's supported set.
  */
 export function runTranscriptCli(

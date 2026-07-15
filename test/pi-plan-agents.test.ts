@@ -63,8 +63,6 @@ function matrix(
     "providers:",
     "  - name: claude",
     "    models: [opus, sonnet]",
-    "  - name: codex",
-    "    models: [gpt-5.6-sol, gpt-5.6-terra]",
     "  - name: pi",
     "    models:",
     ...piModels.map((model) => `      - ${model}`),
@@ -585,6 +583,13 @@ describe("role-scoped Pi prompt compiler", () => {
 
   test("fails when Pi has no route for the mapped effective cell", () => {
     const fx = fixture(["openai-codex/gpt-5.6-terra"]);
+    writeFileSync(
+      fx.matrixPath,
+      readFileSync(fx.matrixPath, "utf8").replace(
+        "models: [opus, sonnet]",
+        "models: [opus, sonnet, gpt-5.6-sol]",
+      ),
+    );
     expect(() => compile(fx)).toThrow(
       "provider pi has no route for effective capability 'gpt-5.6-sol'",
     );

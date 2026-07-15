@@ -2,11 +2,11 @@
 
 <!--
 provenance:
-  model_id: gpt-5.4              # host-roster capability model (matrix.yaml alias target), served through the codex harness as a wrapped cell
-  resolves_to: gpt-5.4          # bare capability id; the vendor `gpt-5.4` alias currently pins the dated upstream snapshot gpt-5.4-2026-03-05
+  model_id: gpt-5.4              # host-roster capability token, served through Pi as a wrapped cell
+  resolves_to: openai-codex/gpt-5.4  # Pi-hosted launch id; the vendor `gpt-5.4` alias currently pins the dated upstream snapshot gpt-5.4-2026-03-05
   researched: 2026-07-10
   status: researched            # provenance state: this cache reflects a real web-sourced capability-review pass
-  method: web-sourced capability review of OpenAI's own gpt-5.4 API model page, the GPT-5.4 model-guidance page, and the GPT-5.4 Thinking System Card (March 5, 2026). No in-repo codex live probe — capability judgment is drawn from vendor docs + the cached card, not a wrapped-cell run
+  method: web-sourced capability review of OpenAI's own gpt-5.4 API model page, the GPT-5.4 model-guidance page, and the GPT-5.4 Thinking System Card (March 5, 2026). No in-repo Pi live probe — capability judgment is drawn from vendor docs + the cached card, not a wrapped-cell run
   sources:
     - OpenAI API model page (developers.openai.com/api/docs/models/gpt-5.4): 1,050,000-token context window, 128,000 max output tokens, Aug 31 2025 knowledge cutoff, $2.50 / $15 per 1M input/output ($0.25 cached input), reasoning.effort none|low|medium|high|xhigh (none = default + lowest), text+image in / text out; >272K-input prompts priced 2x input / 1.5x output for the session
     - OpenAI GPT-5.4 model guidance (developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4) — "frontier model for professional work across the API and Codex"; brings GPT-5.3-Codex coding to the flagship; new tool_search deferred loading, 1M context, first mainline model with built-in computer use, first mainline model trained for native compaction
@@ -25,8 +25,8 @@ re-grades its routing fit.
 
 ## What `gpt-5.4` is
 
-`gpt-5.4` is a **wrapped cell** capability: keeper does not serve it natively, so a claude wrapper
-delegates implementation to the model's serving provider (the `codex` harness in the host matrix)
+`gpt-5.4` is a **wrapped cell** capability: keeper does not serve it natively, so a Claude wrapper
+delegates implementation to the model's serving provider (the `pi` harness in the host matrix)
 and re-owns the keeper close-out (tests, soft-reset of foreign commits, the single sanitized trailer
 commit). Upstream it is OpenAI's **frontier general-purpose reasoning model** — the flagship of the
 GPT-5.4 generation, released for professional work "across the API and Codex," with a **1.05M-token
@@ -58,7 +58,7 @@ grade fit through the wrapped-cell path, re-tuning this guidance as evidence acc
 ## Weaknesses / failure modes (worker-relevant)
 
 - **Unproven through the wrapped-cell path.** Capability is vendor-documented, not yet cohort-graded
-  in keeper's codex harness — integration evidence, not model strength, is the open question.
+  through Keeper's Pi harness — integration evidence, not model strength, is the open question.
 - **Not the intelligence-bound exception.** For a genuinely nameable reasoning-bound task, opus is the
   reserved exception; gpt-5.4 is a capable generalist, not that ceiling.
 - **`none`-default reasoning under-thinks if unguided.** Its lowest effort is the default; a task that

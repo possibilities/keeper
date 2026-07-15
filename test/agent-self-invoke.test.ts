@@ -9,23 +9,15 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { main } from "../src/agent/main";
 import { resolveKeeperAgentPath } from "../src/db";
 import {
   buildLauncherArgvPrefix,
   defaultKeeperAgentPath,
   resolveKeeperAgentPathDepFree,
 } from "../src/keeper-agent-path";
-import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 // The repo root from this test file's own location (test/ → ..).
 const repoRoot = realpathSync(resolve(dirname(import.meta.dirname), "."));
@@ -33,25 +25,6 @@ const expectedDefault = realpathSync(join(repoRoot, "cli", "keeper.ts"));
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "agent-self-invoke-test-"));
-}
-
-/** Minimal codex transcript so the tmux-launch path finds a session to record. */
-function writeCodexTranscript(home: string, cwd: string): void {
-  const now = new Date();
-  const year = String(now.getFullYear());
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  const dir = join(home, ".codex", "sessions", year, month, day);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "rollout-2026-06-22T00-00-00-test.jsonl");
-  writeFileSync(
-    path,
-    `${JSON.stringify({
-      timestamp: now.toISOString(),
-      type: "session_meta",
-      payload: { id: "codex-session", cwd },
-    })}\n`,
-  );
 }
 
 describe("resolveKeeperAgentPathDepFree (cold-start / pair variant)", () => {
@@ -162,55 +135,5 @@ describe("cold-start variant is db.ts-free (hygiene grep)", () => {
       .join("\n");
     expect(imports).not.toMatch(/from\s+["'][^"']*\bdb["']/);
     expect(imports).not.toMatch(/bun:sqlite/);
-  });
-});
-
-describe("launch script embeds the launcherArgvPrefix (not argv[1])", () => {
-  test("the detached launch.sh re-execs [bun, keeper.ts, agent, codex, …]", async () => {
-    const stateDir = tempDir();
-    const home = tempDir();
-    const cwd = "/fake-home/code/proj";
-    writeCodexTranscript(home, cwd);
-    const h = makeHarness({
-      argv: ["codex", "--x-tmux", "hello"],
-      rawArgv: true,
-      launcherStateDir: stateDir,
-      transcriptHomeDir: home,
-      env: { TMUX: "/tmp/tmux-501/default,1,0", PATH: "/fake/bin" },
-      cwd,
-      // Synthetic launcher prefix mimicking the keeperd-context resolve: the
-      // re-exec target is the ABS keeper.ts + "agent", regardless of argv[1].
-      launcherArgvPrefix: [
-        "/abs/bun",
-        "/install/keeper/cli/keeper.ts",
-        "agent",
-      ],
-      randomUuid: () => "44444444-4444-4444-4444-444444444444",
-      tmuxCommand: (cmd) => {
-        if (cmd.includes("display-message")) {
-          return { exitCode: 0, stdout: "dash\n", stderr: "" };
-        }
-        if (cmd.includes("new-window")) {
-          return { exitCode: 0, stdout: "dash\x01@9\x01%10\n", stderr: "" };
-        }
-        return { exitCode: 0, stdout: "", stderr: "" };
-      },
-    });
-
-    const code = await expectExit(main(h.deps));
-    expect(code).toBe(0);
-
-    const launchScript = join(
-      stateDir,
-      "tmux-runs",
-      "tmux-44444444-4444-4444-4444-444444444444",
-      "launch.sh",
-    );
-    const script = readFileSync(launchScript, "utf8");
-    expect(script).toContain(
-      `"$KEEPER_AGENT_SHELL" '/abs/bun' '/install/keeper/cli/keeper.ts' 'agent' 'codex' 'hello'`,
-    );
-    // Negative: the pane must NOT re-exec daemon.ts (argv[1] under keeperd).
-    expect(script).not.toContain("daemon.ts");
   });
 });

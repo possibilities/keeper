@@ -399,7 +399,7 @@ test("runWake: threads the creator's harness to the launch — claude by default
   // A default creator carries no harness ⇒ claude, resuming by its session UUID.
   expect(claudeCalls).toEqual([{ target: "s1", harness: "claude" }]);
 
-  const codexCalls: { target: string; harness: string }[] = [];
+  const piCalls: { target: string; harness: string }[] = [];
   await runWake(
     "fn-x",
     makeDeps({
@@ -407,21 +407,48 @@ test("runWake: threads the creator's harness to the launch — claude by default
         creator({
           job_id: "keeper-job",
           cwd: "/abs/repo",
-          harness: "codex",
-          resume_target: "codex-rollout-id",
+          harness: "pi",
+          resume_target: "pi-rollout-id",
         }),
       ],
       nowMs: WAKE_COOLDOWN_MS * 100,
       launch: async (_session, target, _cwd, harness) => {
-        codexCalls.push({ target, harness });
+        piCalls.push({ target, harness });
         return { ok: true };
       },
     }),
   );
-  // A codex creator resumes via its own harness + stored native target.
-  expect(codexCalls).toEqual([
-    { target: "codex-rollout-id", harness: "codex" },
-  ]);
+  // A pi creator resumes via its own harness + stored native target.
+  expect(piCalls).toEqual([{ target: "pi-rollout-id", harness: "pi" }]);
+});
+
+test("runWake: an unregistered creator harness fails before launch", async () => {
+  let launched = false;
+  const notes: string[] = [];
+  const cooldowns = new Map<string, WakeCooldownRecord>();
+  const res = await runWake(
+    "fn-x",
+    makeDeps({
+      jobs: [
+        creator({
+          job_id: "retired",
+          harness: "codex",
+          resume_target: "legacy-target",
+        }),
+      ],
+      cooldowns,
+      noteLine: (line) => notes.push(line),
+      launch: async () => {
+        launched = true;
+        return { ok: true };
+      },
+    }),
+  );
+  expect(res.outcome).toBe("launch_failed");
+  expect(res.detail).toContain("unknown harness 'codex'");
+  expect(launched).toBe(false);
+  expect(cooldowns.get("retired")?.failures).toBe(1);
+  expect(notes.join("\n")).toContain("unknown harness 'codex'");
 });
 
 test("runWake: resume target is the creator's session UUID (job_id) even with no name", async () => {

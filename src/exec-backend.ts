@@ -25,7 +25,7 @@
 import {
   buildHarnessResumeArgv,
   HARNESS_DESCRIPTORS,
-  isHarnessName,
+  harnessOrClaude,
 } from "./agent/harness";
 import {
   DISPATCH_ATTEMPT_ENV,
@@ -95,8 +95,8 @@ export interface LaunchSpec {
    *  `--resume <target>` and NO trailing prompt positional. */
   readonly prompt: string;
   /** Resume mode: when set (non-empty), the launch emits the harness's own resume
-   *  argv (`--resume <target>` for claude/hermes, `resume <target>` for codex,
-   *  `--session <target>` for pi) and DROPS the trailing prompt positional — a
+   *  argv (`--resume <target>` for Claude, `--session <target>` for Pi)
+   *  and DROPS the trailing prompt positional — a
    *  re-attach rather than a fresh prompted session. Omitted for the prompt-mode
    *  worker/dispatch launch (the byte-unchanged default). */
   readonly resumeTarget?: string;
@@ -108,7 +108,7 @@ export interface LaunchSpec {
    *  stale identity in a reused tmux session env can never poison it. Omitted for
    *  the prompt-mode worker/dispatch launch. */
   readonly jobId?: string;
-  /** Launching harness (`"claude"`/`"codex"`/`"pi"`/`"hermes"`). Absent/NULL ⇒
+  /** Launching harness (`"claude"`/`"pi"`). Absent/NULL ⇒
    *  claude: the agent token stays `claude` and the claude worker-permission
    *  posture is emitted (byte-unchanged). A non-claude value routes `keeper agent
    *  <harness>` with its native resume verb and NO claude permission flags (keeper
@@ -1203,11 +1203,14 @@ export function buildKeeperAgentLaunchArgv(
   if (opts.pluginDir !== undefined && opts.pluginDir !== "") {
     flags.push("--plugin-dir", opts.pluginDir);
   }
-  const harness = opts.harness ?? "claude";
+  // Normalize at the final argv seam: NULL/empty legacy rows are Claude, while
+  // every non-empty unregistered value is rejected before an executable argv
+  // can be returned.
+  const harness = harnessOrClaude(opts.harness);
   const isClaude = harness === "claude";
   // Resume mode drops the trailing prompt positional and emits the harness's OWN
-  // resume argv (claude/hermes `--resume <t>`, codex `resume <t>`, pi `--session
-  // <t>`) sourced from the descriptor registry — never a re-inlined switch.
+  // resume argv (Claude `--resume <t>`, Pi `--session <t>`) sourced from
+  // the descriptor registry — never a re-inlined switch.
   // Prompt mode keeps the prompt as the UNCONDITIONAL final positional, so the
   // claude worker/dispatch argv is byte-unchanged.
   const isResume = opts.resumeTarget !== undefined && opts.resumeTarget !== "";
@@ -1216,17 +1219,14 @@ export function buildKeeperAgentLaunchArgv(
     : [opts.prompt];
   // The claude worker-permission posture (`--permission-mode acceptEdits
   // --dangerously-skip-permissions`) is CLAUDE-native and forwarded to the claude
-  // CLI. A non-claude harness omits it — keeper agent applies that harness's own
-  // no-approval default (codex `--dangerously-bypass-approvals-and-sandbox`,
-  // hermes `--yolo`) at launch, so a claude flag here would reach the wrong CLI.
+  // CLI. A non-Claude harness omits it because a Claude flag would reach the
+  // wrong CLI.
   const permissionPosture = isClaude
     ? ["--permission-mode", "acceptEdits", "--dangerously-skip-permissions"]
     : [];
-  const descriptor = isHarnessName(harness)
-    ? HARNESS_DESCRIPTORS[harness]
-    : undefined;
+  const descriptor = HARNESS_DESCRIPTORS[harness];
   const dispatchAttemptCarrier =
-    descriptor?.carriesDispatchAttempt === true &&
+    descriptor.carriesDispatchAttempt === true &&
     opts.dispatchAttemptId !== undefined
       ? [
           "--x-tmux-env",
@@ -1496,52 +1496,61 @@ export async function keeperAgentLaunch(
     noteLine: deps.noteLine,
     kind: "keeper agent",
   });
-  const launchArgv = buildKeeperAgentLaunchArgv({
-    launcherArgvPrefix: deps.launcherArgvPrefix,
-    session: deps.session,
-    prompt: deps.spec.prompt,
-    ...(deps.spec.resumeTarget !== undefined
-      ? { resumeTarget: deps.spec.resumeTarget }
-      : {}),
-    ...(deps.spec.jobId !== undefined ? { jobId: deps.spec.jobId } : {}),
-    ...(deps.spec.harness !== undefined ? { harness: deps.spec.harness } : {}),
-    ...(deps.spec.claudeName !== undefined
-      ? { claudeName: deps.spec.claudeName }
-      : {}),
-    ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
-    ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
-    ...(deps.spec.pluginDir !== undefined
-      ? { pluginDir: deps.spec.pluginDir }
-      : {}),
-    ...(deps.spec.worktreePath !== undefined
-      ? { worktreePath: deps.spec.worktreePath }
-      : {}),
-    ...(deps.spec.worktreeBranch !== undefined
-      ? { worktreeBranch: deps.spec.worktreeBranch }
-      : {}),
-    ...(deps.spec.escalationRole !== undefined
-      ? { escalationRole: deps.spec.escalationRole }
-      : {}),
-    ...(deps.spec.dispatchedModel !== undefined
-      ? { dispatchedModel: deps.spec.dispatchedModel }
-      : {}),
-    ...(deps.spec.dispatchedTier !== undefined
-      ? { dispatchedTier: deps.spec.dispatchedTier }
-      : {}),
-    ...(deps.spec.dispatchConstraint !== undefined
-      ? { dispatchConstraint: deps.spec.dispatchConstraint }
-      : {}),
-    ...(deps.spec.wrappedCell !== undefined
-      ? { wrappedCell: deps.spec.wrappedCell }
-      : {}),
-    ...(deps.spec.wrappedEnvelope !== undefined
-      ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
-      : {}),
-    ...(deps.spec.dispatchAttemptId !== undefined
-      ? { dispatchAttemptId: deps.spec.dispatchAttemptId }
-      : {}),
-    noConfirm: true,
-  });
+  let launchArgv: string[];
+  try {
+    launchArgv = buildKeeperAgentLaunchArgv({
+      launcherArgvPrefix: deps.launcherArgvPrefix,
+      session: deps.session,
+      prompt: deps.spec.prompt,
+      ...(deps.spec.resumeTarget !== undefined
+        ? { resumeTarget: deps.spec.resumeTarget }
+        : {}),
+      ...(deps.spec.jobId !== undefined ? { jobId: deps.spec.jobId } : {}),
+      ...(deps.spec.harness !== undefined
+        ? { harness: deps.spec.harness }
+        : {}),
+      ...(deps.spec.claudeName !== undefined
+        ? { claudeName: deps.spec.claudeName }
+        : {}),
+      ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
+      ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
+      ...(deps.spec.pluginDir !== undefined
+        ? { pluginDir: deps.spec.pluginDir }
+        : {}),
+      ...(deps.spec.worktreePath !== undefined
+        ? { worktreePath: deps.spec.worktreePath }
+        : {}),
+      ...(deps.spec.worktreeBranch !== undefined
+        ? { worktreeBranch: deps.spec.worktreeBranch }
+        : {}),
+      ...(deps.spec.escalationRole !== undefined
+        ? { escalationRole: deps.spec.escalationRole }
+        : {}),
+      ...(deps.spec.dispatchedModel !== undefined
+        ? { dispatchedModel: deps.spec.dispatchedModel }
+        : {}),
+      ...(deps.spec.dispatchedTier !== undefined
+        ? { dispatchedTier: deps.spec.dispatchedTier }
+        : {}),
+      ...(deps.spec.dispatchConstraint !== undefined
+        ? { dispatchConstraint: deps.spec.dispatchConstraint }
+        : {}),
+      ...(deps.spec.wrappedCell !== undefined
+        ? { wrappedCell: deps.spec.wrappedCell }
+        : {}),
+      ...(deps.spec.wrappedEnvelope !== undefined
+        ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
+        : {}),
+      ...(deps.spec.dispatchAttemptId !== undefined
+        ? { dispatchAttemptId: deps.spec.dispatchAttemptId }
+        : {}),
+      noConfirm: true,
+    });
+  } catch (err) {
+    const error = `keeper agent launch rejected for ${deps.label}: ${err instanceof Error ? err.message : String(err)}`;
+    deps.noteLine(`# warn: ${error}`);
+    return { ok: false, error };
+  }
   // keeper agent has no cwd flag — it reads its own `process.cwd()` for the
   // launch-script `cd`, so set the worker cwd on the spawn.
   const res = await runCapture(

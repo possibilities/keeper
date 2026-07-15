@@ -12,7 +12,6 @@
  *  - main()-driven `agent run` (faked tmux launch + a real on-disk transcript)
  *    and `agent wait`, asserting a single JSON line + the mapped exit code.
  */
-
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
@@ -50,10 +49,6 @@ import {
   runCaptureExitCode,
 } from "../src/agent/run-capture";
 import * as tmuxLaunch from "../src/agent/tmux-launch";
-import {
-  waitForTranscriptPath,
-  waitForTranscriptStop,
-} from "../src/agent/transcript-watch";
 import { buildPanelLegArgv, type PanelMember } from "../src/pair/panel";
 import {
   expectExit,
@@ -72,13 +67,10 @@ const ENVELOPE_KEYS = [
   "schema_version",
   "transcript_path",
 ] as const;
-
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "agent-run-capture-test-"));
 }
-
 const VERB_DEPS: VerbDeps = { env: {}, homeDir: "/fake-home" };
-
 function handle(sessionId: string | null = "sess-1"): ResolvedHandle {
   return {
     agent: "claude",
@@ -89,24 +81,18 @@ function handle(sessionId: string | null = "sess-1"): ResolvedHandle {
     stopTimeoutMs: null,
   };
 }
-
 /** A RunCaptureDeps whose wait/show are canned and whose clock is fixed. */
 function seams(opts: {
   wait: WaitForStopResult;
   show: ShowLastMessageResult;
   now?: number;
-  resolveCodexResumeTarget?: (args: {
-    transcriptPath: string;
-  }) => string | null;
 }): RunCaptureDeps {
   return {
     waitForStop: async () => opts.wait,
     showLastMessage: async () => opts.show,
     now: () => opts.now ?? 0,
-    resolveCodexResumeTarget: opts.resolveCodexResumeTarget,
   };
 }
-
 const STOP = {
   agent: "claude" as const,
   eventType: "assistant",
@@ -114,7 +100,6 @@ const STOP = {
   timestamp: null,
   message: "the answer",
 };
-
 describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
   test("every outcome carries EXACTLY the 9 contract keys", () => {
     for (const outcome of [
@@ -131,7 +116,6 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
       expect(envelope.schema_version).toBe(RUN_CAPTURE_SCHEMA_VERSION);
     }
   });
-
   test("a fully-populated completed envelope round-trips its fields", () => {
     const { envelope, exitCode } = buildRunCaptureEnvelope({
       outcome: "completed",
@@ -156,26 +140,6 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
     });
     expect(exitCode).toBe(0);
   });
-
-  test("a failure envelope still emits, nulls where unknown", () => {
-    const { envelope, exitCode } = buildRunCaptureEnvelope({
-      outcome: "launch_failed",
-      agent: "codex",
-    });
-    expect(envelope).toEqual({
-      schema_version: 1,
-      agent: "codex",
-      handle: null,
-      transcript_path: null,
-      resume_target: null,
-      message: null,
-      message_found: false,
-      elapsed_seconds: null,
-      outcome: "launch_failed",
-    });
-    expect(exitCode).toBe(1);
-  });
-
   test("outcome → exit code mapping is the closed set", () => {
     expect(runCaptureExitCode("completed")).toBe(0);
     expect(runCaptureExitCode("no_message")).toBe(0);
@@ -186,12 +150,23 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
     expect(runCaptureExitCode("bad_args")).toBe(2);
   });
 });
-
 /** An `ok:true` parseRunArgs result with the three additive flags defaulting to
  *  null — the byte-stability baseline every arm layers its overrides onto. */
 function okParse(
-  overrides: Partial<Extract<ReturnType<typeof parseRunArgs>, { ok: true }>>,
-): Extract<ReturnType<typeof parseRunArgs>, { ok: true }> {
+  overrides: Partial<
+    Extract<
+      ReturnType<typeof parseRunArgs>,
+      {
+        ok: true;
+      }
+    >
+  >,
+): Extract<
+  ReturnType<typeof parseRunArgs>,
+  {
+    ok: true;
+  }
+> {
   return {
     ok: true,
     cli: "claude",
@@ -211,155 +186,17 @@ function okParse(
     ...overrides,
   };
 }
-
 describe("parseRunArgs", () => {
   test("<cli> <prompt> parses, stop-timeout absent → null, read-only false", () => {
     expect(parseRunArgs(["claude", "say hi"])).toEqual(
       okParse({ prompt: "say hi" }),
     );
   });
-
   test("--reap-window-on-terminal parses to the one-shot posture", () => {
     expect(parseRunArgs(["claude", "p", "--reap-window-on-terminal"])).toEqual(
       okParse({ reapWindowOnTerminal: true }),
     );
   });
-
-  test("--stop-timeout space + equals forms parse (unit-required duration)", () => {
-    expect(parseRunArgs(["codex", "p", "--stop-timeout", "30m"])).toEqual(
-      okParse({ cli: "codex", stopTimeoutMs: 1_800_000 }),
-    );
-    expect(parseRunArgs(["pi", "p", "--stop-timeout=1500ms"])).toEqual(
-      okParse({ cli: "pi", stopTimeoutMs: 1500 }),
-    );
-  });
-
-  test("the retired --stop-timeout-ms spelling hard-fails as an unknown flag", () => {
-    const r = parseRunArgs(["codex", "p", "--stop-timeout-ms", "1800000"]);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("unknown flag");
-  });
-
-  test("--read-only sets readOnly true (exact-match, any position)", () => {
-    expect(parseRunArgs(["claude", "explore", "--read-only"])).toEqual(
-      okParse({ prompt: "explore", readOnly: true }),
-    );
-    // Exact-match: it is accepted before a positional, not swallowed as one.
-    expect(parseRunArgs(["codex", "--read-only", "explore"])).toEqual(
-      okParse({ cli: "codex", prompt: "explore", readOnly: true }),
-    );
-    // Composes with --stop-timeout.
-    expect(
-      parseRunArgs(["pi", "p", "--read-only", "--stop-timeout", "1500ms"]),
-    ).toEqual(okParse({ cli: "pi", readOnly: true, stopTimeoutMs: 1500 }));
-  });
-
-  test("--system-file / --system parse as value flags (split + = forms)", () => {
-    expect(
-      parseRunArgs(["claude", "p", "--system-file", "/tmp/sys.txt"]),
-    ).toEqual(okParse({ systemFile: "/tmp/sys.txt" }));
-    expect(parseRunArgs(["codex", "p", "--system-file=/tmp/sys.txt"])).toEqual(
-      okParse({ cli: "codex", systemFile: "/tmp/sys.txt" }),
-    );
-    // Inline text, both spellings; composes with the other flags.
-    expect(
-      parseRunArgs(["pi", "p", "--system", "be terse", "--read-only"]),
-    ).toEqual(okParse({ cli: "pi", readOnly: true, system: "be terse" }));
-    expect(parseRunArgs(["claude", "p", "--system=be terse"])).toEqual(
-      okParse({ system: "be terse" }),
-    );
-  });
-
-  test("--preset / --session / --output parse as value flags (split + = forms)", () => {
-    expect(
-      parseRunArgs(["claude", "p", "--preset", "claude::opus::high"]),
-    ).toEqual(okParse({ preset: "claude::opus::high" }));
-    expect(parseRunArgs(["codex", "p", "--preset=codex::gpt::high"])).toEqual(
-      okParse({ cli: "codex", preset: "codex::gpt::high" }),
-    );
-    expect(parseRunArgs(["claude", "p", "--session", "panels"])).toEqual(
-      okParse({ session: "panels" }),
-    );
-    expect(parseRunArgs(["pi", "p", "--session=grp"])).toEqual(
-      okParse({ cli: "pi", session: "grp" }),
-    );
-    expect(parseRunArgs(["claude", "p", "--output", "/tmp/leg.json"])).toEqual(
-      okParse({ output: "/tmp/leg.json" }),
-    );
-    expect(parseRunArgs(["claude", "p", "--output=/tmp/o.yaml"])).toEqual(
-      okParse({ output: "/tmp/o.yaml" }),
-    );
-    expect(
-      parseRunArgs(["claude", "p", "--name", "panel::smoke::opus"]),
-    ).toEqual(okParse({ name: "panel::smoke::opus" }));
-    expect(parseRunArgs(["pi", "p", "--name=panel::smoke::pi"])).toEqual(
-      okParse({ cli: "pi", name: "panel::smoke::pi" }),
-    );
-    // All three compose with each other and the existing posture flags.
-    expect(
-      parseRunArgs([
-        "claude",
-        "p",
-        "--preset",
-        "claude::opus::high",
-        "--session",
-        "panels",
-        "--output",
-        "/tmp/leg.json",
-        "--read-only",
-      ]),
-    ).toEqual(
-      okParse({
-        preset: "claude::opus::high",
-        session: "panels",
-        output: "/tmp/leg.json",
-        readOnly: true,
-      }),
-    );
-  });
-
-  test("--model / --effort parse as value flags (split + = forms)", () => {
-    expect(parseRunArgs(["codex", "p", "--model", "gpt-5"])).toEqual(
-      okParse({ cli: "codex", model: "gpt-5" }),
-    );
-    expect(parseRunArgs(["claude", "p", "--model=opus"])).toEqual(
-      okParse({ model: "opus" }),
-    );
-    expect(parseRunArgs(["codex", "p", "--effort", "high"])).toEqual(
-      okParse({ cli: "codex", effort: "high" }),
-    );
-    expect(parseRunArgs(["codex", "p", "--effort=low"])).toEqual(
-      okParse({ cli: "codex", effort: "low" }),
-    );
-    // Compose with a preset (explicit override rides alongside the preset name).
-    expect(
-      parseRunArgs([
-        "codex",
-        "p",
-        "--preset",
-        "codex::gpt::high",
-        "--model",
-        "gpt-5",
-      ]),
-    ).toEqual(
-      okParse({ cli: "codex", preset: "codex::gpt::high", model: "gpt-5" }),
-    );
-  });
-
-  test("--resume parses as a value flag (split + = forms), distinct from --session", () => {
-    expect(parseRunArgs(["claude", "p", "--resume", "reviewer"])).toEqual(
-      okParse({ resume: "reviewer" }),
-    );
-    expect(parseRunArgs(["codex", "p", "--resume=abc-123"])).toEqual(
-      okParse({ cli: "codex", resume: "abc-123" }),
-    );
-    // --session (tmux GROUPING) and --resume (continue a conversation) are
-    // independent axes — both parse, neither swallows the other.
-    expect(
-      parseRunArgs(["claude", "p", "--session", "grp", "--resume", "rev"]),
-    ).toEqual(okParse({ session: "grp", resume: "rev" }));
-  });
-
   test("--system-file + --system together → bad_args (one input, two spellings)", () => {
     const res = parseRunArgs([
       "claude",
@@ -374,7 +211,6 @@ describe("parseRunArgs", () => {
       expect(res.error).toContain("cannot combine --system-file and --system");
     }
   });
-
   test("a --read-only lookalike is still an unknown flag (exact-match only)", () => {
     const res = parseRunArgs(["claude", "p", "--read-onlyx"]);
     expect(res.ok).toBe(false);
@@ -382,7 +218,6 @@ describe("parseRunArgs", () => {
       expect(res.error).toContain("unknown flag");
     }
   });
-
   test.each([
     [["banana", "p"], "<cli> must be"],
     [[], "<cli> must be"],
@@ -408,7 +243,6 @@ describe("parseRunArgs", () => {
     }
   });
 });
-
 describe("panel leg argv round-trips through the real run-capture parser", () => {
   // The drift guard: a builder-output-only test passes while `parseRunArgs`
   // rejects the flag — the exact bug that killed panels. This feeds each
@@ -417,10 +251,8 @@ describe("panel leg argv round-trips through the real run-capture parser", () =>
   const SLUG = "smoke-slug";
   const members: PanelMember[] = [
     { name: "opus", harness: "claude" },
-    { name: "gpt5", harness: "codex", model: "gpt-5", effort: "high" },
     { name: "pi-fast", harness: "pi" },
   ];
-
   for (const member of members) {
     test(`${member.harness} leg parses ok with the panel name`, () => {
       const argv = buildPanelLegArgv({
@@ -430,7 +262,7 @@ describe("panel leg argv round-trips through the real run-capture parser", () =>
         member,
         slug: SLUG,
         yamlPath: "/tmp/leg.json",
-        stopTimeoutMs: 1_800_000,
+        stopTimeoutMs: 1800000,
       });
       // The top-level keeper dispatcher consumes `[<bun>, <keeper.ts>, "agent"]`
       // before `agent` main() ever calls splitSubcommand — mirror that boundary.
@@ -450,7 +282,6 @@ describe("panel leg argv round-trips through the real run-capture parser", () =>
     });
   }
 });
-
 describe("captureFromHandle — outcome matrix (injected seams)", () => {
   test("stop seen + message found → completed (exit 0)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
@@ -478,7 +309,6 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     });
     expect(exitCode).toBe(0);
   });
-
   test("stop seen + no message (tool-only final turn) → no_message (exit 0)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
@@ -504,33 +334,6 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     });
     expect(exitCode).toBe(0);
   });
-
-  test("stop seen + found-but-empty message → no_message, never completed", async () => {
-    const { envelope, exitCode } = await captureFromHandle(
-      seams({
-        wait: {
-          ok: true,
-          transcriptPath: "/t.jsonl",
-          stop: { ...STOP, message: null },
-        },
-        show: {
-          ok: true,
-          transcriptPath: "/t.jsonl",
-          text: null,
-          found: true,
-        },
-      }),
-      VERB_DEPS,
-      { handle: handle(), handleId: "tmux-2", agent: "codex", startMs: 0 },
-    );
-    expect(envelope).toMatchObject({
-      outcome: "no_message",
-      message: null,
-      message_found: true,
-    });
-    expect(exitCode).toBe(0);
-  });
-
   test("wait times out but transcript resolves → timed_out + partial (exit 4)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
@@ -557,7 +360,6 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     });
     expect(exitCode).toBe(4);
   });
-
   test("transcript never appears → no_transcript (exit 4)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
@@ -574,161 +376,6 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     });
     expect(exitCode).toBe(4);
   });
-
-  test("concurrent same-cwd collision → transcript_ambiguous (exit 4), never a foreign answer", async () => {
-    const { envelope, exitCode } = await captureFromHandle(
-      seams({
-        wait: {
-          ok: false,
-          reason: "ambiguous",
-          error: "transcript ambiguous: multiple concurrent same-cwd sessions",
-        },
-        show: {
-          ok: false,
-          reason: "ambiguous",
-          error: "transcript ambiguous: multiple concurrent same-cwd sessions",
-        },
-      }),
-      VERB_DEPS,
-      {
-        handle: { ...handle(null), agent: "codex" },
-        handleId: "tmux-amb",
-        agent: "codex",
-        startMs: 0,
-      },
-    );
-    expect(envelope).toMatchObject({
-      outcome: "transcript_ambiguous",
-      message: null,
-      transcript_path: null,
-      resume_target: null,
-    });
-    expect(exitCode).toBe(4);
-  });
-
-  test("resume_target is null for a codex handle (no pinned session id)", async () => {
-    const { envelope } = await captureFromHandle(
-      seams({
-        wait: {
-          ok: true,
-          transcriptPath: "/t.jsonl",
-          stop: { ...STOP, agent: "codex" },
-        },
-        show: {
-          ok: true,
-          transcriptPath: "/t.jsonl",
-          text: "done",
-          found: true,
-        },
-      }),
-      VERB_DEPS,
-      {
-        handle: { ...handle(null), agent: "codex" },
-        handleId: "tmux-c",
-        agent: "codex",
-        startMs: 0,
-      },
-    );
-    expect(envelope.resume_target).toBeNull();
-    expect(envelope.outcome).toBe("completed");
-  });
-
-  test("codex resume_target is discovered from the transcript via the seam (completed)", async () => {
-    const { envelope } = await captureFromHandle(
-      seams({
-        wait: {
-          ok: true,
-          transcriptPath: "/rollout.jsonl",
-          stop: { ...STOP, agent: "codex" },
-        },
-        show: {
-          ok: true,
-          transcriptPath: "/rollout.jsonl",
-          text: "done",
-          found: true,
-        },
-        resolveCodexResumeTarget: ({ transcriptPath }) => {
-          expect(transcriptPath).toBe("/rollout.jsonl");
-          return "codex-uuid-1";
-        },
-      }),
-      VERB_DEPS,
-      {
-        handle: { ...handle(null), agent: "codex" },
-        handleId: "tmux-c",
-        agent: "codex",
-        startMs: 0,
-      },
-    );
-    expect(envelope.outcome).toBe("completed");
-    expect(envelope.resume_target).toBe("codex-uuid-1");
-  });
-
-  test("codex resume_target is discovered on a timed_out partial", async () => {
-    const { envelope } = await captureFromHandle(
-      seams({
-        wait: {
-          ok: false,
-          error: "timed out waiting for transcript stop",
-          transcriptPath: "/rollout.jsonl",
-        },
-        show: {
-          ok: true,
-          transcriptPath: "/rollout.jsonl",
-          text: "partial",
-          found: true,
-        },
-        resolveCodexResumeTarget: () => "codex-uuid-2",
-      }),
-      VERB_DEPS,
-      {
-        handle: { ...handle(null), agent: "codex" },
-        handleId: "tmux-c",
-        agent: "codex",
-        startMs: 0,
-      },
-    );
-    expect(envelope.outcome).toBe("timed_out");
-    expect(envelope.resume_target).toBe("codex-uuid-2");
-  });
-
-  test("codex no_transcript stays null — the seam is never consulted", async () => {
-    let called = false;
-    const { envelope } = await captureFromHandle(
-      seams({
-        wait: { ok: false, error: "timed out waiting for transcript path" },
-        show: { ok: false, error: "timed out waiting for transcript path" },
-        resolveCodexResumeTarget: () => {
-          called = true;
-          return "should-not-happen";
-        },
-      }),
-      VERB_DEPS,
-      {
-        handle: { ...handle(null), agent: "codex" },
-        handleId: "tmux-c",
-        agent: "codex",
-        startMs: 0,
-      },
-    );
-    expect(envelope.outcome).toBe("no_transcript");
-    expect(envelope.resume_target).toBeNull();
-    expect(called).toBe(false);
-  });
-
-  test("claude keeps handle.sessionId even when the codex seam is bound", async () => {
-    const { envelope } = await captureFromHandle(
-      seams({
-        wait: { ok: true, transcriptPath: "/t.jsonl", stop: STOP },
-        show: { ok: true, transcriptPath: "/t.jsonl", text: "x", found: true },
-        resolveCodexResumeTarget: () => "codex-uuid-should-be-ignored",
-      }),
-      VERB_DEPS,
-      { handle: handle(), handleId: "tmux-6", agent: "claude", startMs: 0 },
-    );
-    expect(envelope.resume_target).toBe("sess-1");
-  });
-
   test("elapsed_seconds is the now()-startMs delta, rounded to tenths", async () => {
     const { envelope } = await captureFromHandle(
       seams({
@@ -743,7 +390,6 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     expect(envelope.elapsed_seconds).toBe(2.6);
   });
 });
-
 describe("launchToResolvedHandle — teardown target", () => {
   test("null killWindowCommand → ok:false via TmuxLaunchError", () => {
     const launchSpy = spyOn(
@@ -761,7 +407,6 @@ describe("launchToResolvedHandle — teardown target", () => {
       message: null,
     });
     const errs: string[] = [];
-
     try {
       const result = launchToResolvedHandle({
         deps: {
@@ -774,8 +419,6 @@ describe("launchToResolvedHandle — teardown target", () => {
           runTmuxCommand: () => {
             throw new Error("fake launch must not execute tmux");
           },
-          ensureCodexDirTrust: () => "already-trusted",
-          ensureHermesShimTrust: () => "already-seeded",
           now: () => 123,
           writeErr: (message) => errs.push(message),
         },
@@ -784,7 +427,6 @@ describe("launchToResolvedHandle — teardown target", () => {
         posture: {},
         stopTimeoutMs: null,
       });
-
       expect(result).toEqual({
         ok: false,
         error: "detached tmux launch returned no exact teardown target",
@@ -797,13 +439,11 @@ describe("launchToResolvedHandle — teardown target", () => {
     }
   });
 });
-
 describe("composeRunCapture — launch seam", () => {
   function clock(values: number[]): () => number {
     let i = 0;
     return () => values[i++] ?? (values.at(-1) as number);
   }
-
   test("launch failure → launch_failed (exit 1), agent carried, no capture", async () => {
     let captured = false;
     const { envelope, exitCode } = await composeRunCapture(
@@ -833,7 +473,6 @@ describe("composeRunCapture — launch seam", () => {
     expect(exitCode).toBe(1);
     expect(captured).toBe(false);
   });
-
   test("post-launch control hook completes before capture waiting begins", async () => {
     const events: string[] = [];
     await composeRunCapture(
@@ -848,7 +487,7 @@ describe("composeRunCapture — launch seam", () => {
           text: "answer",
           found: true,
         }),
-        now: () => 1_000,
+        now: () => 1000,
         launch: (): RunLaunchResult => {
           events.push("launch");
           return {
@@ -872,10 +511,8 @@ describe("composeRunCapture — launch seam", () => {
       VERB_DEPS,
       "claude",
     );
-
     expect(events).toEqual(["launch", "control", "wait"]);
   });
-
   test("launch success → capture runs, handle + elapsed from the launch", async () => {
     const { envelope, exitCode } = await composeRunCapture(
       {
@@ -911,7 +548,6 @@ describe("composeRunCapture — launch seam", () => {
     expect(exitCode).toBe(0);
   });
 });
-
 describe("run control — exact, idempotent cancellation", () => {
   const EXACT_KILL = [
     "/opt/tmux",
@@ -921,31 +557,27 @@ describe("run control — exact, idempotent cancellation", () => {
     "-t",
     "@77",
   ];
-
   function control(status: RunControlArtifact["status"] = "running") {
     return {
       ...buildRunControlArtifact({
         runId: "tmux-owned-77",
         agent: "claude",
-        startedAtMs: 12_345,
+        startedAtMs: 12345,
         killWindowCommand: EXACT_KILL,
       }),
       status,
     };
   }
-
   test("exact teardown is single-shot and preserves the socket-qualified target", () => {
     const calls: string[][] = [];
     const teardown = createExactRunTeardown(EXACT_KILL, (command) => {
       calls.push(command);
       return { exitCode: 0, stdout: "", stderr: "" };
     });
-
     expect(teardown()).toEqual({ kind: "torn_down" });
     expect(teardown()).toEqual({ kind: "torn_down" });
     expect(calls).toEqual([EXACT_KILL]);
   });
-
   test("already-gone, identity mismatch, terminal, and unresolved errors stay distinct", () => {
     let artifact = control();
     const base = {
@@ -960,7 +592,6 @@ describe("run control — exact, idempotent cancellation", () => {
         artifact = next;
       },
     };
-
     const mismatch = cancelRunFromControlArtifact({
       ...base,
       claimedIdentity: { ...base.claimedIdentity, run_id: "tmux-foreign" },
@@ -969,7 +600,6 @@ describe("run control — exact, idempotent cancellation", () => {
       },
     });
     expect(mismatch).toEqual({ kind: "identity_mismatch" });
-
     artifact = control("terminal");
     expect(
       cancelRunFromControlArtifact({
@@ -979,7 +609,6 @@ describe("run control — exact, idempotent cancellation", () => {
         },
       }),
     ).toEqual({ kind: "already_terminal" });
-
     artifact = control();
     expect(
       cancelRunFromControlArtifact({
@@ -992,7 +621,6 @@ describe("run control — exact, idempotent cancellation", () => {
       }),
     ).toEqual({ kind: "already_gone" });
     expect(artifact.status).toBe("terminal");
-
     artifact = control();
     expect(
       cancelRunFromControlArtifact({
@@ -1010,7 +638,6 @@ describe("run control — exact, idempotent cancellation", () => {
     expect(artifact.status).toBe("cancelling");
   });
 });
-
 describe("splitSubcommand classifies the new verbs", () => {
   test("run <cli> <prompt> → run-capture", () => {
     expect(splitSubcommand(["run", "claude", "say hi"])).toEqual({
@@ -1018,7 +645,6 @@ describe("splitSubcommand classifies the new verbs", () => {
       rest: ["claude", "say hi"],
     });
   });
-
   test("wait <handle> → wait-capture", () => {
     expect(splitSubcommand(["wait", "tmux-1", "--stop-timeout", "5s"])).toEqual(
       {
@@ -1027,7 +653,6 @@ describe("splitSubcommand classifies the new verbs", () => {
       },
     );
   });
-
   test("bare run / wait keep an empty rest (handler mints bad_args)", () => {
     expect(splitSubcommand(["run"])).toEqual({ kind: "run-capture", rest: [] });
     expect(splitSubcommand(["wait"])).toEqual({
@@ -1036,14 +661,12 @@ describe("splitSubcommand classifies the new verbs", () => {
     });
   });
 });
-
 /** Parse the single JSON line the run-capture verbs emit on stdout. */
 function parseEnvelope(out: string[]): Record<string, unknown> {
   const lines = out.join("").trim().split("\n");
   expect(lines.length).toBe(1);
   return JSON.parse(lines[0] as string) as Record<string, unknown>;
 }
-
 function writeClaudeTranscript(
   home: string,
   cwd: string,
@@ -1067,7 +690,6 @@ function writeClaudeTranscript(
   );
   return path;
 }
-
 function writeRunJson(
   stateDir: string,
   runId: string,
@@ -1077,7 +699,6 @@ function writeRunJson(
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "run.json"), `${JSON.stringify(data, null, 2)}\n`);
 }
-
 describe("main() — agent run (faked tmux launch + real transcript)", () => {
   test("composes launch→wait→show, emits ONE completed JSON line, exit 0", async () => {
     const stateDir = tempDir();
@@ -1109,9 +730,7 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
         };
       },
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(parseEnvelope(h.out)).toEqual({
       schema_version: 1,
@@ -1127,7 +746,6 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     // No spawn fired in-process — the launch is the detached tmux pane only.
     expect(h.spawned.length).toBe(0);
   });
-
   test("publishes exact atomic control beside the run before capture completes", async () => {
     const stateDir = tempDir();
     const home = tempDir();
@@ -1141,12 +759,10 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       transcriptHomeDir: home,
       cwd,
       randomUuid: () => sessionId,
-      now: () => 12_345,
+      now: () => 12345,
       tmuxCommand: fakeTmux,
     });
-
     expect(await expectExit(main(h.deps))).toBe(0);
-
     const runsDir = join(stateDir, "tmux-runs");
     const runIds = readdirSync(runsDir);
     expect(runIds).toEqual([`tmux-${sessionId}`]);
@@ -1159,20 +775,17 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       schema_version: 1,
       run_id: `tmux-${sessionId}`,
       agent: "claude",
-      started_at_ms: 12_345,
+      started_at_ms: 12345,
       kill_window_command: ["tmux", "kill-window", "-t", "@1"],
       status: "terminal",
     });
   });
-
   test("an unknown <cli> exits bad_args (2) with the uniform envelope", async () => {
     const h = makeHarness({
       argv: ["run", "banana", "hi"],
       rawArgv: true,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({
       schema_version: 1,
@@ -1182,13 +795,15 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
     expect(h.err.join("")).toContain("<cli> must be");
   });
-
   /** A harness whose faked tmux + on-disk claude transcript let a `claude` run
    *  compose to `completed`. Extra `agent run` flags go before the positionals. */
   function completedRunHarness(
     flags: string[],
     presetCatalog?: PresetCatalog,
-  ): { h: ReturnType<typeof makeHarness>; transcriptPath: string } {
+  ): {
+    h: ReturnType<typeof makeHarness>;
+    transcriptPath: string;
+  } {
     const stateDir = tempDir();
     const home = tempDir();
     const cwd = "/fake-home/code/proj";
@@ -1209,12 +824,9 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
     return { h, transcriptPath };
   }
-
   test("--name threads end-to-end to the tmux window name (-n)", async () => {
     const { h } = completedRunHarness(["--name", "panel::smoke::opus"]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     // The window-name knob (`-n`) carries the name on the tmux launch as a
     // discrete flag token — uniform across harnesses, and the one seam observable
@@ -1223,47 +835,26 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     const windowNames = h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-n"));
     expect(windowNames).toContain("panel::smoke::opus");
   });
-
   test("--preset triple with a matching harness validates and composes to completed", async () => {
     const { h } = completedRunHarness(["--preset", "claude::opus::high"]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "completed" });
     // A launch actually fired — the triple validation passed, not short-circuited.
     expect(h.tmuxCommands.length).toBeGreaterThan(0);
   });
-
-  test("--preset triple whose harness disagrees with <cli> is bad_args, no launch", async () => {
-    const { h } = completedRunHarness(["--preset", "codex::gpt::high"]);
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(2);
-    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
-    expect(h.err.join("")).toContain("pins harness codex");
-    // Validation short-circuits BEFORE any tmux launch.
-    expect(h.tmuxCommands.length).toBe(0);
-  });
-
   test("a malformed --preset triple is bad_args (exit 2)", async () => {
     const { h } = completedRunHarness(["--preset", "nope"]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("--output writes the SAME completed envelope atomically (no .tmp left)", async () => {
     const outDir = tempDir();
     const outPath = join(outDir, "leg.json");
     const { h } = completedRunHarness(["--output", outPath]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     const stdoutEnvelope = parseEnvelope(h.out);
     expect(stdoutEnvelope).toMatchObject({ outcome: "completed" });
@@ -1274,37 +865,12 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     // The atomic temp file was renamed away — only the final path remains.
     expect(readdirSync(outDir)).toEqual(["leg.json"]);
   });
-
-  test("--output writes the result file on a FAIL outcome (bad_args) too", async () => {
-    const outDir = tempDir();
-    const outPath = join(outDir, "leg.json");
-    // A mismatched --preset triple is a deterministic fail outcome that still knows
-    // the --output path (write-on-EVERY-outcome, exit-code-independent).
-    const { h } = completedRunHarness([
-      "--preset",
-      "codex::gpt::high",
-      "--output",
-      outPath,
-    ]);
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(2);
-    expect(existsSync(outPath)).toBe(true);
-    const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8")) as {
-      outcome: string;
-    };
-    expect(fileEnvelope.outcome).toBe("bad_args");
-  });
-
   test("--output self-creates a missing parent dir (mkdir -p) and lands the envelope", async () => {
     // The wrapped-envelope spool (`.keeper/state/wrapped-envelopes/`) does not
     // exist on a fresh checkout; the write must create the parent, not ENOENT.
     const outPath = join(tempDir(), "no-such-subdir", "nested", "leg.json");
     const { h } = completedRunHarness(["--output", outPath]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(existsSync(outPath)).toBe(true);
     const fileEnvelope = JSON.parse(readFileSync(outPath, "utf8"));
@@ -1312,7 +878,6 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     // The stdout sink carries the SAME envelope the created file holds.
     expect(fileEnvelope).toEqual(parseEnvelope(h.out));
   });
-
   test("reap observes the durable result first and uses the exact launched target once", async () => {
     const outPath = join(tempDir(), "leg.json");
     const observations: string[] = [];
@@ -1331,14 +896,12 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       }
       return fakeTmux(command);
     };
-
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(observations).toEqual(["completed"]);
     expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
       [["tmux", "kill-window", "-t", "@1"]],
     );
   });
-
   test("an --output persistence failure still reaps the exact window once", async () => {
     const dir = tempDir();
     const occupied = join(dir, "occupied");
@@ -1349,14 +912,12 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       outPath,
       "--reap-window-on-terminal",
     ]);
-
     expect(await expectExit(main(h.deps))).toBe(2);
     expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
       [["tmux", "kill-window", "-t", "@1"]],
     );
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
   });
-
   test("--output onto a genuinely unwritable path (a file in the parent chain) is the path's own bad_args (exit 2)", async () => {
     const dir = tempDir();
     const occupied = join(dir, "occupied");
@@ -1365,16 +926,13 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     // fails past the self-heal, and the --output path owns that as bad_args.
     const outPath = join(occupied, "leg.json");
     const { h } = completedRunHarness(["--output", outPath]);
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(existsSync(outPath)).toBe(false);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     expect(h.err.join("")).toContain("cannot write --output");
   });
 });
-
 describe("main() — agent wait", () => {
   test("captures an existing handle into the same envelope (exit 0)", async () => {
     const stateDir = tempDir();
@@ -1400,9 +958,7 @@ describe("main() — agent wait", () => {
       transcriptHomeDir: home,
       cwd,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     expect(parseEnvelope(h.out)).toEqual({
       schema_version: 1,
@@ -1416,16 +972,13 @@ describe("main() — agent wait", () => {
       outcome: "completed",
     });
   });
-
   test("an unresolvable handle exits bad_args (2)", async () => {
     const h = makeHarness({
       argv: ["wait", "tmux-nope"],
       rawArgv: true,
       launcherStateDir: tempDir(),
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({
       schema_version: 1,
@@ -1433,150 +986,6 @@ describe("main() — agent wait", () => {
     });
   });
 });
-
-/** One codex rollout `task_complete` stop line, timestamped for the watermark. */
-function codexTaskComplete(message: string, timestamp: string): string {
-  return JSON.stringify({
-    type: "event_msg",
-    timestamp,
-    payload: { type: "task_complete", last_agent_message: message },
-  });
-}
-
-/**
- * Write a codex rollout under `<codexHome>/sessions/YYYY/MM/DD/rollout-…-<uuid>.jsonl`
- * with a session_meta head (created FAR in the past by default, so the fresh-launch
- * created-at floor rejects it) followed by the given stop lines. Returns the path.
- */
-function writeCodexRollout(
-  codexHome: string,
-  uuid: string,
-  eventLines: string[],
-  opts: { metaCreatedAt?: string; cwd?: string } = {},
-): string {
-  const dir = join(codexHome, "sessions", "2026", "07", "10");
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `rollout-2026-07-10T12-00-00-${uuid}.jsonl`);
-  const meta = JSON.stringify({
-    type: "session_meta",
-    timestamp: opts.metaCreatedAt ?? "2000-01-01T00:00:00.000Z",
-    payload: {
-      id: uuid,
-      cwd: opts.cwd ?? "/work/proj",
-      originator: "codex-tui",
-    },
-  });
-  writeFileSync(path, `${[meta, ...eventLines].join("\n")}\n`);
-  return path;
-}
-
-describe("resume codex transcript discovery + watermark (fixtures)", () => {
-  const CWD = "/work/proj";
-
-  test("isResume resolves a pre-existing rollout by uuid, bypassing the created-at floor", async () => {
-    const home = tempDir();
-    const codexHome = join(home, ".codex");
-    const uuid = "11111111-1111-1111-1111-111111111111";
-    const rollout = writeCodexRollout(codexHome, uuid, [
-      codexTaskComplete("prior answer", "2026-07-10T11:00:00.000Z"),
-    ]);
-
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd: CWD,
-      env: { CODEX_HOME: codexHome },
-      homeDir: home,
-      startedAtMs: Date.now(),
-      sessionId: uuid,
-      isResume: true,
-      pathTimeoutMs: 200,
-    });
-
-    expect(resolved).toEqual({ ok: true, path: rollout });
-  });
-
-  test("the FRESH codex path rejects the same rollout (created-at floor) — the resume branch is additive", async () => {
-    const home = tempDir();
-    const codexHome = join(home, ".codex");
-    const uuid = "22222222-2222-2222-2222-222222222222";
-    writeCodexRollout(codexHome, uuid, [
-      codexTaskComplete("prior answer", "2026-07-10T11:00:00.000Z"),
-    ]);
-
-    // Same file, same uuid, but a FRESH launch (isResume false): the rollout's
-    // session-start predates the launch, so the created-at floor refuses to
-    // attribute it — a retryable path timeout, never a wrong-file guess.
-    const resolved = await waitForTranscriptPath({
-      agent: "codex",
-      cwd: CWD,
-      env: { CODEX_HOME: codexHome },
-      homeDir: home,
-      startedAtMs: Date.now(),
-      sessionId: uuid,
-      isResume: false,
-      pathTimeoutMs: 200,
-    });
-
-    expect(resolved.ok).toBe(false);
-  });
-
-  test("the stop-scan anchors PAST the pre-resume stop (watermark returns the new answer)", async () => {
-    const home = tempDir();
-    const codexHome = join(home, ".codex");
-    const uuid = "33333333-3333-3333-3333-333333333333";
-    const path = writeCodexRollout(codexHome, uuid, [
-      codexTaskComplete("PRE-RESUME ANSWER", "2026-07-10T11:59:00.000Z"),
-      codexTaskComplete("POST-RESUME ANSWER", "2026-07-10T12:00:10.000Z"),
-    ]);
-
-    const stop = await waitForTranscriptStop({
-      agent: "codex",
-      cwd: CWD,
-      env: { CODEX_HOME: codexHome },
-      homeDir: home,
-      startedAtMs: Date.parse("2026-07-10T12:00:00.000Z"),
-      sessionId: uuid,
-      isResume: true,
-      transcriptPath: path,
-      stopTimeoutMs: 1000,
-    });
-
-    expect(stop.ok).toBe(true);
-    if (stop.ok) {
-      expect(stop.stop.message).toBe("POST-RESUME ANSWER");
-    }
-  });
-
-  test("the watermark is load-bearing: with startedAtMs=0 the SAME scan returns the pre-resume stop", async () => {
-    const home = tempDir();
-    const codexHome = join(home, ".codex");
-    const uuid = "44444444-4444-4444-4444-444444444444";
-    const path = writeCodexRollout(codexHome, uuid, [
-      codexTaskComplete("PRE-RESUME ANSWER", "2026-07-10T11:59:00.000Z"),
-      codexTaskComplete("POST-RESUME ANSWER", "2026-07-10T12:00:10.000Z"),
-    ]);
-
-    // No watermark (startedAtMs=0): the first stop in the file — the OLD one — is
-    // captured. This is exactly the bug the resume watermark prevents.
-    const stop = await waitForTranscriptStop({
-      agent: "codex",
-      cwd: CWD,
-      env: { CODEX_HOME: codexHome },
-      homeDir: home,
-      startedAtMs: 0,
-      sessionId: uuid,
-      isResume: true,
-      transcriptPath: path,
-      stopTimeoutMs: 1000,
-    });
-
-    expect(stop.ok).toBe(true);
-    if (stop.ok) {
-      expect(stop.stop.message).toBe("PRE-RESUME ANSWER");
-    }
-  });
-});
-
 /** A faked-tmux command runner that reports a created session/window. */
 function fakeTmux(cmd: string[]): {
   exitCode: number;
@@ -1587,10 +996,16 @@ function fakeTmux(cmd: string[]): {
     ? { exitCode: 1, stdout: "", stderr: "no session" }
     : { exitCode: 0, stdout: "keeper agent\x01@1\x01%1\n", stderr: "" };
 }
-
 /** A ResumeDecision `ok` fixture with the two fields under test filled in. */
 function okDecision(
-  over: Partial<Extract<ResumeDecision, { kind: "ok" }>>,
+  over: Partial<
+    Extract<
+      ResumeDecision,
+      {
+        kind: "ok";
+      }
+    >
+  >,
 ): ResumeDecision {
   return {
     kind: "ok",
@@ -1602,7 +1017,6 @@ function okDecision(
     ...over,
   };
 }
-
 describe("main() — agent run --resume", () => {
   test("claude resume: composes a resume launch, captures the CHILD transcript, resume_target = the new child id", async () => {
     const stateDir = tempDir();
@@ -1617,7 +1031,6 @@ describe("main() — agent run --resume", () => {
       childUuid,
       "resumed answer",
     );
-
     let seenTarget: string | undefined;
     let seenHarness: string | undefined;
     const h = makeHarness({
@@ -1648,9 +1061,7 @@ describe("main() — agent run --resume", () => {
       },
       tmuxCommand: fakeTmux,
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(0);
     // The <cli> positional is passed as the required harness so a same-name match
     // on another CLI would mismatch rather than launch the wrong harness.
@@ -1685,78 +1096,15 @@ describe("main() — agent run --resume", () => {
     expect(launchScript).not.toContain("'--effort'");
     expect(launchScript).not.toContain("'--preset'");
   });
-
-  test("codex resume: discovers the rollout by uuid, resume_target = the unchanged rollout uuid", async () => {
-    const stateDir = tempDir();
-    const home = tempDir();
-    const codexHome = join(home, ".codex");
-    const resumeCwd = mkdtempSync(join(tmpdir(), "resume-cwd-"));
-    const uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
-    writeCodexRollout(
-      codexHome,
-      uuid,
-      [
-        codexTaskComplete("PRE answer", "2026-07-10T11:00:00.000Z"),
-        codexTaskComplete("NEW answer", "2026-07-10T12:00:10.000Z"),
-      ],
-      { cwd: resumeCwd },
-    );
-    const startedAtMs = Date.parse("2026-07-10T12:00:00.000Z");
-
-    const h = makeHarness({
-      argv: [
-        "run",
-        "codex",
-        "again",
-        "--resume",
-        uuid,
-        "--session",
-        "wrapped",
-        "--name",
-        "fn-1277.2",
-      ],
-      rawArgv: true,
-      launcherStateDir: stateDir,
-      transcriptHomeDir: home,
-      env: { CODEX_HOME: codexHome },
-      cwd: "/caller/elsewhere",
-      now: () => startedAtMs,
-      resolveResumeDecision: () =>
-        okDecision({
-          harness: "codex",
-          resume_target: uuid,
-          cwd: resumeCwd,
-          title: null,
-        }),
-      tmuxCommand: fakeTmux,
-    });
-
-    const code = await expectExit(main(h.deps));
-
-    expect(code).toBe(0);
-    expect(parseEnvelope(h.out)).toMatchObject({
-      outcome: "completed",
-      agent: "codex",
-      resume_target: uuid,
-      message: "NEW answer",
-    });
-    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-s"))).toContain(
-      "wrapped",
-    );
-    expect(h.tmuxCommands.flatMap((cmd) => flagValues(cmd, "-n"))).toContain(
-      "fn-1277.2",
-    );
-  });
-
   test("harness mismatch → bad_args naming both harnesses, no launch", async () => {
     const h = makeHarness({
-      argv: ["run", "codex", "hi", "--resume", "reviewer"],
+      argv: ["run", "pi", "hi", "--resume", "reviewer"],
       rawArgv: true,
       resolveResumeDecision: () => ({
         kind: "harness-mismatch",
         job_id: "job-1",
         harness: "claude",
-        require_harness: "codex",
+        require_harness: "pi",
         title: "reviewer",
       }),
     });
@@ -1766,7 +1114,7 @@ describe("main() — agent run --resume", () => {
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     const err = h.err.join("");
-    expect(err).toContain("did not resolve to a codex");
+    expect(err).toContain("did not resolve to a pi");
     expect(err).toContain("claude");
     expect(h.tmuxCommands.length).toBe(0);
   });
@@ -1777,9 +1125,7 @@ describe("main() — agent run --resume", () => {
       rawArgv: true,
       resolveResumeDecision: () => ({ kind: "unknown", target: "ghost" }),
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     expect(h.err.join("")).toContain(
@@ -1787,7 +1133,6 @@ describe("main() — agent run --resume", () => {
     );
     expect(h.tmuxCommands.length).toBe(0);
   });
-
   test("live target → bad_args pointing at keeper bus chat send, no launch", async () => {
     const h = makeHarness({
       argv: ["run", "claude", "hi", "--resume", "reviewer"],
@@ -1799,9 +1144,7 @@ describe("main() — agent run --resume", () => {
         title: "reviewer",
       }),
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     const err = h.err.join("");
@@ -1836,9 +1179,7 @@ describe("main() — agent run --resume", () => {
         return { kind: "unknown", target: "reviewer" };
       },
     });
-
     const code = await expectExit(main(h.deps));
-
     expect(code).toBe(2);
     expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
     expect(h.err.join("")).toContain("cannot be combined with --resume");

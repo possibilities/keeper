@@ -40,7 +40,7 @@ describe("note workflow discovery parsers", () => {
     expect(parseRankedProjects("not json")).toEqual([]);
   });
 
-  test("parses the v2 launch cube and preserves exact triples", () => {
+  test("parses supported v2 launch triples and drops retired harness rows", () => {
     const choices = parseLaunchChoices(
       JSON.stringify({
         kind: "presets-list",
@@ -79,13 +79,6 @@ describe("note workflow discovery parsers", () => {
         capability: "gpt-5.4",
         nativeId: "openai-codex/gpt-5.4",
         effort: "high",
-      },
-      {
-        triple: "hermes::nous/hermes-3::na",
-        harness: "hermes",
-        capability: "hermes-3",
-        nativeId: "nous/hermes-3",
-        effort: "na",
       },
     ]);
   });

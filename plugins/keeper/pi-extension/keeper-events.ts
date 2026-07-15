@@ -16,7 +16,7 @@
  * no marker the extension registers nothing and writes nothing.
  *
  * HOOK-WRITER CLASS (same discipline as the claude events-writer hook and the
- * hermes shim): this is an in-process mechanism that dies with the harness, so it
+ * other event writers): this is an in-process mechanism that dies with the harness, so it
  * writes per-pid events-log NDJSON keyed on the keeper job id — NOT a synthetic
  * MAIN-minted event (that channel is for state decoupled from harness liveness:
  * birth records, the codex rollout tail).

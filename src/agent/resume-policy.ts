@@ -21,10 +21,9 @@
  *    matched `job_id` row (bound param, never a re-resolve) for those plus
  *    `cwd` / `updated_at` / `created_at`. `NULL` harness normalizes to claude
  *    (`harnessOrClaude`).
- *  - **`NULL` resume_target.** A codex row attempts the existing read-only
- *    rollout back-fill (`resolveCodexResumeTarget`) before erroring
- *    `no-target`; claude/pi/hermes error immediately (their targets are pinned
- *    at birth or filled post-stop, so `NULL` means genuinely not-resumable).
+ *  - **`NULL` resume_target.** Non-Claude harnesses error `no-target`; their
+ *    targets are pinned at birth or filled post-stop, so `NULL` means genuinely
+ *    not-resumable.
  *
  * The database handle is READ-ONLY input — every query here is a `SELECT`; the
  * module never writes. Rows with a `NULL` pid or start_time cannot run the
@@ -36,10 +35,6 @@ import type { Database } from "bun:sqlite";
 import { type LiveChannel, resolveTarget } from "../bus-identity";
 import { readOsStartTime } from "../seed-sweep";
 import { isPidAlive } from "../server-worker";
-import {
-  type CodexResumeResolveOptions,
-  resolveCodexResumeTarget as resolveCodexResumeTargetReal,
-} from "./codex-session-index";
 import { type HarnessName, harnessOrClaude } from "./harness";
 
 /** No live channels ever feed the resolver here — resume policy is decided
@@ -75,8 +70,7 @@ export type ResumeDecision =
   | { kind: "ambiguous"; candidates: ResumeCandidate[] }
   /** No jobs row and no live channel matched the target at any tier. */
   | { kind: "unknown"; target: string }
-  /** A matched row whose resume_target is unusable (NULL, and codex back-fill
-   *  — when attempted — came up empty). */
+  /** A matched row whose resume_target is unusable (NULL or empty). */
   | {
       kind: "no-target";
       job_id: string;
@@ -101,11 +95,6 @@ export interface ResumePolicyDeps {
   /** Defaults to `seed-sweep.ts`'s `readOsStartTime` (the same sync probe
    *  `bus-worker.ts`'s boot-time `isLiveIdentity` mirrors). */
   readStartTime?: (pid: number) => string | null;
-  /** Defaults to the real rollout back-fill (`codex-session-index.ts`). */
-  resolveCodexResumeTarget?: (opts: CodexResumeResolveOptions) => string | null;
-  /** Required for the codex back-fill attempt; a codex row with a NULL
-   *  resume_target and no `codexHome` skips straight to `no-target`. */
-  codexHome?: string;
 }
 
 interface JobsSecondLookup {
@@ -184,9 +173,6 @@ export function resolveResumeDecision(
     isPidAlive: deps.isPidAlive ?? isPidAlive,
     readStartTime: deps.readStartTime ?? readOsStartTime,
   };
-  const resolveCodex =
-    deps.resolveCodexResumeTarget ?? resolveCodexResumeTargetReal;
-
   const resolved = resolveTarget(NO_LIVE_CHANNELS, db, target);
   if (resolved.kind === "unknown") {
     return { kind: "unknown", target };
@@ -258,25 +244,6 @@ export function resolveResumeDecision(
       cwd: top.cwd,
       title: top.title,
     };
-  }
-
-  if (top.harness === "codex" && deps.codexHome != null) {
-    const backfilled = resolveCodex({
-      codexHome: deps.codexHome,
-      jobId: top.job_id,
-      expectedCwd: top.cwd,
-      startedAtMs: top.created_at * 1000,
-    });
-    if (backfilled != null) {
-      return {
-        kind: "ok",
-        job_id: top.job_id,
-        harness: top.harness,
-        resume_target: backfilled,
-        cwd: top.cwd,
-        title: top.title,
-      };
-    }
   }
 
   return {

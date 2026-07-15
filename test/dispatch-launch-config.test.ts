@@ -137,14 +137,11 @@ describe("resolveDispatchLaunchConfig — configured row", () => {
 
 describe("resolveDispatchLaunchConfig — non-claude harness", () => {
   test("resolves floor behavior (model/effort still applied) and warns once per (verb, harness)", () => {
-    const p = writeYaml(
-      "presets.yaml",
-      "dispatch:\n  work: codex::gpt::high\n",
-    );
+    const p = writeYaml("presets.yaml", "dispatch:\n  work: pi::gpt::high\n");
     const warned = new Set<string>();
     const first = resolveDispatchLaunchConfig("work", p, warned);
-    expect(first).toEqual({ harness: "codex", model: "gpt", effort: "high" });
-    expect(warned.has("work::codex")).toBe(true);
+    expect(first).toEqual({ harness: "pi", model: "gpt", effort: "high" });
+    expect(warned.has("work::pi")).toBe(true);
     expect(warned.size).toBe(1);
 
     // A second call with the SAME memo does not add a duplicate entry.
@@ -155,13 +152,13 @@ describe("resolveDispatchLaunchConfig — non-claude harness", () => {
   test("a distinct verb sharing the same harness warns under its own key", () => {
     const p = writeYaml(
       "presets.yaml",
-      "dispatch:\n  work: codex::gpt::high\n  close: codex::gpt::high\n",
+      "dispatch:\n  work: pi::gpt::high\n  close: pi::gpt::high\n",
     );
     const warned = new Set<string>();
     resolveDispatchLaunchConfig("work", p, warned);
     resolveDispatchLaunchConfig("close", p, warned);
-    expect(warned.has("work::codex")).toBe(true);
-    expect(warned.has("close::codex")).toBe(true);
+    expect(warned.has("work::pi")).toBe(true);
+    expect(warned.has("close::pi")).toBe(true);
     expect(warned.size).toBe(2);
   });
 });

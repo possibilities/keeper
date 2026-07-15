@@ -216,7 +216,7 @@ describe("selection-brief with a host provider matrix", () => {
     );
   });
 
-  // A guided roster: claude serves opus (native), codex serves the wrapped
+  // A guided roster: Claude serves opus natively and Pi serves the wrapped
   // capability gpt-5.5 (a committed guidance block covers it).
   const GUIDED_MATRIX = [
     "efforts: [medium, high]",
@@ -225,9 +225,9 @@ describe("selection-brief with a host provider matrix", () => {
     "providers:",
     "  - name: claude",
     "    models: [opus]",
-    "  - name: codex",
+    "  - name: pi",
     "    models:",
-    "      - gpt-5.5",
+    "      - openai-codex/gpt-5.5",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -242,8 +242,8 @@ describe("selection-brief with a host provider matrix", () => {
     "providers:",
     "  - name: claude",
     "    models: [opus]",
-    "  - name: codex",
-    "    models: [mystery-model]",
+    "  - name: pi",
+    "    models: [openai-codex/mystery-model]",
     "wrapper_driver:",
     "  model: sonnet",
     "  effort: xhigh",
@@ -300,9 +300,9 @@ describe("selection-brief with a host provider matrix", () => {
     "    models:",
     "      - id: opus",
     "        efforts: [high]",
-    "  - name: codex",
+    "  - name: pi",
     "    models:",
-    "      - id: gpt-5.5",
+    "      - id: openai-codex/gpt-5.5",
     "        efforts: [medium, high]",
     "wrapper_driver:",
     "  model: sonnet",

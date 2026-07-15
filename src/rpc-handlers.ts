@@ -359,10 +359,6 @@ export interface SetAutopilotConfigParams {
    *  `false` (the byte-identical default) keeps the whole-epic `>1`-toplevel
    *  reject. Only meaningful when `worktree_mode` is ON. */
   worktree_multi_repo?: boolean;
-  /** The durable codex rollout-adoption knob — a boolean. `true` enables
-   *  positive-evidence codex rollout adoption; `false` (the byte-identical
-   *  default) adopts nothing. */
-  codex_adoption?: boolean;
   /** The durable worker-provider dispatch pin (docs/adr/0047) — `"claude"` /
    *  `"gpt"` to pin every work dispatch to that provider family, or `null` to
    *  clear the pin (unconstrained, the byte-identical default). Scoped to
@@ -405,7 +401,6 @@ function validateSetAutopilotConfigParams(
     "max_concurrent_per_root",
     "worktree_mode",
     "worktree_multi_repo",
-    "codex_adoption",
     "worker_provider",
     "drift_behind_threshold",
     "drift_age_threshold_days",
@@ -466,18 +461,6 @@ function validateSetAutopilotConfigParams(
     } else {
       throw new BadParamsError(
         `set_autopilot_config: \`worktree_multi_repo\` must be a boolean (got ${JSON.stringify(raw)})`,
-      );
-    }
-  }
-  if ("codex_adoption" in obj) {
-    const raw = obj.codex_adoption;
-    // A strict boolean only — mirrors `worktree_mode`; reject anything else so a
-    // caller gets a clear signal rather than a silently-coerced toggle.
-    if (typeof raw === "boolean") {
-      patch.codex_adoption = raw;
-    } else {
-      throw new BadParamsError(
-        `set_autopilot_config: \`codex_adoption\` must be a boolean (got ${JSON.stringify(raw)})`,
       );
     }
   }

@@ -4,10 +4,8 @@
  * grammar is validate-by-construction: exactly three `::`-separated segments, so a
  * bare `:` inside a segment is unparseable (the model/effort charsets exclude it);
  * the harness segment is a registered harness, the model segment a slash-joined
- * matrix alias-target token, and the effort segment a canonical keeper effort — or
- * the `na` sentinel, REQUIRED for an axisless harness (hermes) and forbidden for
- * one that carries a second reasoning axis. Every rejection names the offending
- * segment.
+ * matrix alias-target token, and the effort segment a canonical keeper effort.
+ * Every rejection names the offending segment.
  *
  * The raw triple is the identity everywhere; {@link slugifyTriple} derives a
  * display/file form (tmux/window/file names) via the shared slug primitive, with a
@@ -24,7 +22,6 @@
 
 import { SLUG_MAX_LEN, slugify } from "../slug";
 import {
-  HARNESS_DESCRIPTORS,
   HARNESS_NAMES,
   type HarnessName,
   isHarnessName,
@@ -37,10 +34,6 @@ import {
   type MatrixV2,
   matrixV2EffortsFor,
 } from "./matrix";
-
-/** The `na` effort sentinel an axisless harness (hermes) carries in its triple —
- *  it exposes no second reasoning axis, so no keeper effort applies. */
-export const TRIPLE_EFFORT_NA = "na";
 
 /** The `::` segment delimiter — the ONLY colon site in a well-formed triple, which
  *  is exactly why a bare `:` inside a segment is unparseable by construction. */
@@ -69,9 +62,7 @@ export type ParseTripleResult =
  * message names the offending segment. Validate-by-construction: exactly three
  * `::`-separated segments (so a 2- or 4-segment string and a bare colon inside any
  * segment both reject), a registered harness, a slash-joined alias-target model
- * token, and an effort honoring the na-for-axisless rule — `na` REQUIRED for an
- * axisless harness (hermes) and forbidden for one with a second axis, where the
- * effort must be a canonical keeper effort. Every segment is length-bounded. Pure.
+ * token, and a canonical keeper effort. Every segment is length-bounded. Pure.
  */
 export function parseTriple(raw: string): ParseTripleResult {
   if (typeof raw !== "string" || raw.length === 0) {
@@ -112,20 +103,7 @@ export function parseTriple(raw: string): ParseTripleResult {
       error: `launch triple model segment '${model}' must be '/'-joined [a-z0-9._-] tokens (no leading dot, no empty segment, no bare colon)`,
     };
   }
-  const axisless = HARNESS_DESCRIPTORS[harness].secondAxis === "none";
-  if (axisless) {
-    if (effort !== TRIPLE_EFFORT_NA) {
-      return {
-        ok: false,
-        error: `launch triple effort segment '${effort}' must be '${TRIPLE_EFFORT_NA}' for the axisless harness '${harness}'`,
-      };
-    }
-  } else if (effort === TRIPLE_EFFORT_NA) {
-    return {
-      ok: false,
-      error: `launch triple effort segment '${TRIPLE_EFFORT_NA}' is forbidden for '${harness}', which carries a second axis (expected one of ${KEEPER_EFFORTS.join("|")})`,
-    };
-  } else if (!(KEEPER_EFFORTS as readonly string[]).includes(effort)) {
+  if (!(KEEPER_EFFORTS as readonly string[]).includes(effort)) {
     return {
       ok: false,
       error: `launch triple effort segment '${effort}' is not a canonical effort (expected one of ${KEEPER_EFFORTS.join("|")})`,
@@ -189,7 +167,7 @@ export interface EnumeratedTriple {
   /** The provider-native id (alias target, or the capability when unaliased) — the
    *  model segment of {@link EnumeratedTriple.triple}. */
   native_id: string;
-  /** A canonical keeper effort, or `na` for an axisless harness (hermes). */
+  /** A canonical keeper effort. */
   effort: string;
 }
 
@@ -206,20 +184,16 @@ export interface HarnessCube {
 /**
  * Enumerate the virtual launch cube from the host matrix: every provider — routed
  * OR launch-only — fans its models (by native id) over its effective effort list
- * ({@link effortsFor}, the model → provider → top-level clobber chain), except an
- * axisless harness (hermes) which emits a single `na` triple per model. The order
+ * ({@link effortsFor}, the model → provider → top-level clobber chain). The order
  * is provider declaration order, then model declaration order, then canonical
  * ascending efforts. Pure over the matrix.
  */
 export function enumerateTriples(matrix: Matrix): HarnessCube[] {
   const cube: HarnessCube[] = [];
   for (const provider of matrix.providers) {
-    const axisless = HARNESS_DESCRIPTORS[provider.name].secondAxis === "none";
     const triples: EnumeratedTriple[] = [];
     for (const [capability, nativeId] of provider.models) {
-      const efforts = axisless
-        ? [TRIPLE_EFFORT_NA]
-        : effortsFor(matrix, capability);
+      const efforts = effortsFor(matrix, capability);
       for (const effort of efforts) {
         triples.push({
           triple: formatTriple({
@@ -330,21 +304,17 @@ export interface HarnessCubeV2 {
 
 /**
  * Enumerate the v2 virtual launch cube: every provider fans its models (by
- * launch id) over its effective effort list ({@link matrixV2EffortsFor}),
- * except an axisless harness (hermes) which emits a single `na` triple per
- * model. The order is provider declaration order, then model declaration
- * order, then canonical ascending efforts. Pure over the matrix.
+ * launch id) over its effective effort list ({@link matrixV2EffortsFor}).
+ * The order is provider declaration order, then model declaration order, then
+ * canonical ascending efforts. Pure over the matrix.
  */
 export function enumerateTriplesV2(matrix: MatrixV2): HarnessCubeV2[] {
   const cells = new Set(matrix.subagentModels);
   const cube: HarnessCubeV2[] = [];
   for (const provider of matrix.providers) {
-    const axisless = HARNESS_DESCRIPTORS[provider.name].secondAxis === "none";
     const triples: EnumeratedTripleV2[] = [];
     for (const [capability, launchId] of provider.models) {
-      const efforts = axisless
-        ? [TRIPLE_EFFORT_NA]
-        : matrixV2EffortsFor(matrix, capability);
+      const efforts = matrixV2EffortsFor(matrix, capability);
       for (const effort of efforts) {
         triples.push({
           triple: formatTriple({

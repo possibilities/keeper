@@ -6052,7 +6052,6 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   max_concurrent_per_root: "max_concurrent_per_root",
   worktree_mode: "worktree_mode",
   worktree_multi_repo: "worktree_multi_repo",
-  codex_adoption: "codex_adoption",
   worker_provider: "worker_provider",
   drift_behind_threshold: "drift_behind_threshold",
   drift_age_threshold_days: "drift_age_threshold_days",
@@ -6092,14 +6091,6 @@ interface AutopilotConfigSetPayload {
    *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
    *  resolves to a concrete 0/1. */
   worktree_multi_repo?: number;
-  /** The durable codex rollout-adoption knob, stored as INTEGER 0/1 (`1` = ON =
-   *  positive-evidence codex rollout adoption enabled, `0` = OFF = the
-   *  byte-identical default, nothing adopted). Same shape/coercion as
-   *  {@link worktree_mode}: the wire field is a BOOLEAN; the parser coerces
-   *  `true`→1 / anything-else→0. No `null` sentinel; a present field always
-   *  resolves to a concrete 0/1. No fold reads it — the codex adoption producer
-   *  resolves an absent column `?? OFF` at read time. */
-  codex_adoption?: number;
   /** The durable worker-provider dispatch pin (docs/adr/0047), stored as TEXT —
    *  the FIRST non-numeric config column. `"claude"` / `"gpt"` pin every work
    *  dispatch to that provider family; `null` clears the pin (unconstrained,
@@ -6184,14 +6175,6 @@ function extractAutopilotConfigSetPayload(
       // present field always resolves to a concrete 0/1 — the reconciler resolves
       // an absent column `?? OFF`.
       patch.worktree_multi_repo = raw === true ? 1 : 0;
-    }
-    if ("codex_adoption" in parsed) {
-      const raw = parsed.codex_adoption;
-      // BOOLEAN wire field stored as INTEGER 0/1, mirroring `worktree_multi_repo`:
-      // `true` → 1 (ON), anything else (false / null / non-boolean) → 0 (OFF). A
-      // present field always resolves to a concrete 0/1 — the codex adoption
-      // producer resolves an absent column `?? OFF` at read time.
-      patch.codex_adoption = raw === true ? 1 : 0;
     }
     if ("worker_provider" in parsed) {
       const raw = parsed.worker_provider;
@@ -9281,7 +9264,7 @@ function projectJobsRow(db: Database, event: Event): void {
              -- claude). The fold copies the event value verbatim and never
              -- synthesizes, so a NULL excluded.harness preserves the prior value.
              -- resume_target stays on THIS SessionStart arm ONLY for claude/pi's
-             -- own seed value; a codex/hermes back-fill flows through the separate
+             -- own seed value; an older producer's back-fill flows through the separate
              -- ResumeTargetResolved arm precisely so it can never trip this arm's
              -- terminal-row revive (killed -> stopped) semantics.
              harness = COALESCE(excluded.harness, jobs.harness),
@@ -9289,7 +9272,7 @@ function projectJobsRow(db: Database, event: Event): void {
              -- v110 (fn-1131.1): set-once ADOPTED marker, mirroring worktree. The
              -- claude hook + every birth mint carry excluded.adopted NULL
              -- (launcher-owned), so COALESCE preserves an adopted marker a prior
-             -- non-launcher mint (hermes self-seed / codex rollout) set — a later
+             -- non-launcher mint set — a later
              -- resume or a racing launcher re-mint NEVER clobbers it. The fold
              -- copies the event value verbatim and never synthesizes, so a NULL
              -- excluded leaves the prior value (NULL stays NULL, 1 stays 1).
@@ -9970,7 +9953,7 @@ function projectJobsRow(db: Database, event: Event): void {
     case "ResumeTargetResolved":
       // Synthetic event (fn-1103) minted daemon-side when a harness's native
       // resume target is resolved AFTER launch — the codex rollout-poll match or
-      // the hermes on_session_start hook id back-fills a keeper-minted job. Folds
+      // an older producer's session-start hook id back-fills a keeper-minted job. Folds
       // ONLY `jobs.resume_target` (idempotent replace) and NEVER touches lifecycle
       // state, so a late back-fill can NEVER revive a terminal row — which is
       // exactly why this is a SEPARATE arm from SessionStart's killed->stopped

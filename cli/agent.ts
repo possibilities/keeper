@@ -1,6 +1,6 @@
 /**
  * `keeper agent` — the in-binary agent-launch surface: `keeper agent
- * <claude|codex|pi> [args...]` launches a supported agent CLI with keeper agent
+ * <claude|pi> [args...]` launches a supported agent CLI with keeper agent
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
  * The blocking run-and-capture verbs compose those primitives into the uniform
@@ -17,8 +17,8 @@
  * read-only directive to the prompt (prompting-only — keeper enforces nothing,
  * no tool strip, no changed-files audit); `run --system-file <path>`/`--system
  * <text>` prepend a caller-side `System:` block (mutually exclusive, uniform
- * across harnesses — user-turn text, not a privileged system prompt); codex/pi
- * launch with `CLAUDE*` env stripped by default (partner isolation). `run
+ * across harnesses — user-turn text, not a privileged system prompt); Pi
+ * launches with `CLAUDE*` env stripped by default (partner isolation). `run
  * --preset <name>` applies a launch-config preset (its resolved harness must
  * equal `<cli>`, else `bad_args`); `run --session <name>` names the tmux session
  * grouping (rides as `--x-tmux-session`, not the transcript id); `run --output

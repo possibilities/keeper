@@ -6,8 +6,7 @@
  *
  * Three consumed flags carry no value (`--x-verbose`,
  * `--x-very-verbose`, `--x-no-confirm`) and wrapper value flags
- * (`--x-profile`, `--x-preset`,
- * `--x-codex-session-name`) take either split (`--x-profile x`)
+ * (`--x-preset`) take either split (`--x-profile x`)
  * or joined (`--x-profile=x`) form. Every other token passes through verbatim into
  * `remainingArgs`, preserving order — the agent sees exactly what the human
  * typed minus the launcher flags. A stray non-launcher flag (including the
@@ -16,16 +15,6 @@
  */
 
 import type { AgentKind } from "./dispatch";
-import { CODEX_OPTIONS_WITH_REQUIRED_VALUE } from "./passthrough";
-
-/** Normalize a CLI-visible profile alias onto internal routing. */
-export function normalizeKeeperAgentProfileArg(profileName: string): string {
-  const normalized = profileName.trim();
-  if (normalized === "default") {
-    return "";
-  }
-  return normalized;
-}
 
 export interface ParsedArgs {
   /** argv with launcher flags stripped — forwarded to the agent verbatim. */
@@ -45,12 +34,6 @@ export interface ParsedArgs {
   launcherVeryVerbose: boolean;
   /** `--x-no-confirm` seen — suppress the cwd-confirm prompt. */
   launcherNoConfirm: boolean;
-  /** Resolved profile selector: `"auto"`, `""` (default account), or a name. */
-  launcherProfile: string;
-  /** True when a profile was specified on the CLI (vs. defaulted to "auto"). */
-  explicitLauncherProfile: boolean;
-  /** Synthetic Codex session name to index once the live session id is known. */
-  launcherCodexSessionName: string | null;
   /**
    * `--x-preset <name>` — a named launch-config preset resolved from
    * `presets.yaml` that supplies harness/model/effort defaults BELOW any
@@ -71,10 +54,8 @@ export function parseArgs(args: string[]): ParsedArgs {
 }
 
 /**
- * Agent-aware variant used by main(). Claude and Codex reuse the wrapper flags
- * but disagree on native short options: Claude `-p` is print and `-c` is
- * continue; Codex `-p` is profile and `-c` is config. Signal extraction must
- * respect that split while forwarding all native flags unchanged.
+ * Agent-aware variant used by main(). Signal extraction respects each active
+ * harness while forwarding native flags unchanged.
  */
 export function parseArgsForAgent(
   args: string[],
@@ -87,26 +68,10 @@ export function parseArgsForAgent(
   let launcherVerbose = false;
   let launcherVeryVerbose = false;
   let launcherNoConfirm = false;
-  let launcherProfile = "auto";
-  let launcherCodexSessionName: string | null = null;
   let launcherPreset: string | null = null;
-  let explicitLauncherProfile = false;
-  let parsingLauncherProfile = false;
-  let parsingLauncherCodexSessionName = false;
   let parsingLauncherPreset = false;
 
   for (const arg of args) {
-    if (parsingLauncherProfile) {
-      launcherProfile = arg;
-      explicitLauncherProfile = true;
-      parsingLauncherProfile = false;
-      continue;
-    }
-    if (parsingLauncherCodexSessionName) {
-      launcherCodexSessionName = arg.trim() || null;
-      parsingLauncherCodexSessionName = false;
-      continue;
-    }
     if (parsingLauncherPreset) {
       launcherPreset = arg.trim() || null;
       parsingLauncherPreset = false;
@@ -118,41 +83,20 @@ export function parseArgsForAgent(
       launcherVeryVerbose = true;
     } else if (arg === "--x-no-confirm") {
       launcherNoConfirm = true;
-    } else if (arg === "--x-profile") {
-      parsingLauncherProfile = true;
-      explicitLauncherProfile = true;
-    } else if (arg.startsWith("--x-profile=")) {
-      launcherProfile = arg.slice("--x-profile=".length);
-      explicitLauncherProfile = true;
-    } else if (arg === "--x-codex-session-name") {
-      parsingLauncherCodexSessionName = true;
-    } else if (arg.startsWith("--x-codex-session-name=")) {
-      launcherCodexSessionName =
-        arg.slice("--x-codex-session-name=".length).trim() || null;
     } else if (arg === "--x-preset") {
       parsingLauncherPreset = true;
     } else if (arg.startsWith("--x-preset=")) {
       launcherPreset = arg.slice("--x-preset=".length).trim() || null;
     } else {
       remainingArgs.push(arg);
-      if (agent !== "codex" && isContinueOrResumeArg(arg, agent)) {
+      if (isContinueOrResumeArg(arg, agent)) {
         hasContinueOrResume = true;
         if (isForkArg(arg, agent)) {
           hasForkSession = true;
         }
-      } else if (agent !== "codex" && isHeadlessArg(arg, agent)) {
+      } else if (isHeadlessArg(arg, agent)) {
         hasPrint = true;
       }
-    }
-  }
-
-  if (agent === "codex") {
-    const command = firstCodexCommand(remainingArgs);
-    if (command === "resume" || command === "fork") {
-      hasContinueOrResume = true;
-      hasForkSession = command === "fork";
-    } else if (command === "exec" || command === "review") {
-      hasPrint = true;
     }
   }
 
@@ -164,9 +108,6 @@ export function parseArgsForAgent(
     launcherVerbose,
     launcherVeryVerbose,
     launcherNoConfirm,
-    launcherProfile,
-    explicitLauncherProfile,
-    launcherCodexSessionName,
     launcherPreset,
   };
 }
@@ -179,16 +120,6 @@ function isContinueOrResumeArg(arg: string, agent: AgentKind): boolean {
       arg === "--fork-session" ||
       arg === "-c" ||
       arg === "-r"
-    );
-  }
-  if (agent === "codex") {
-    return arg === "resume" || arg === "fork";
-  }
-  if (agent === "hermes") {
-    // Hermes resumes by ID (`--resume`/`-r`) or by name/most-recent
-    // (`--continue`/`-c`); it has no fork or session-select flag.
-    return (
-      arg === "--resume" || arg === "--continue" || arg === "-r" || arg === "-c"
     );
   }
   return (
@@ -206,12 +137,6 @@ function isForkArg(arg: string, agent: AgentKind): boolean {
   if (agent === "claude") {
     return arg === "--fork-session";
   }
-  if (agent === "codex") {
-    return arg === "fork";
-  }
-  if (agent === "hermes") {
-    return false;
-  }
   return arg === "--fork";
 }
 
@@ -219,41 +144,10 @@ function isHeadlessArg(arg: string, agent: AgentKind): boolean {
   if (agent === "claude") {
     return arg === "--print" || arg === "-p";
   }
-  if (agent === "codex") {
-    return arg === "exec" || arg === "review";
-  }
-  if (agent === "hermes") {
-    // Hermes's one-shot mode prints only the final message — headless-equivalent.
-    return arg === "-z" || arg === "--oneshot";
-  }
   return (
     arg === "--print" ||
     arg === "-p" ||
     arg === "--mode" ||
     arg.startsWith("--mode=")
   );
-}
-
-function firstCodexCommand(args: string[]): string | null {
-  let idx = 0;
-  while (idx < args.length) {
-    const arg = args[idx] as string;
-    if (arg === "--") {
-      return null;
-    }
-    if (arg.startsWith("-") && arg !== "-") {
-      if (arg.includes("=")) {
-        idx += 1;
-        continue;
-      }
-      if (CODEX_OPTIONS_WITH_REQUIRED_VALUE.has(arg)) {
-        idx += 2;
-        continue;
-      }
-      idx += 1;
-      continue;
-    }
-    return arg;
-  }
-  return null;
 }
