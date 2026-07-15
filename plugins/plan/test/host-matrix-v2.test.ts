@@ -78,7 +78,7 @@ describe("loadHostMatrixV2 — valid parse", () => {
       provider: "pi",
       capability: "gpt-5.3-codex-spark",
       launchId: "openai-codex/gpt-5.3-codex-spark",
-      efforts: ["medium", "high"],
+      efforts: ["high", "xhigh"],
     });
     expect(hostMatrixV2ProviderRoute(h, "pi", "gpt-5.3-spark-preview")).toEqual(
       {
