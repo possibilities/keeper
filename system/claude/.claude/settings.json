@@ -17,7 +17,7 @@
     ],
     "defaultMode": "default"
   },
-  "model": "opus[1m]",
+  "model": "claude-fable-5[1m]",
   "enabledPlugins": {
     "swift-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
