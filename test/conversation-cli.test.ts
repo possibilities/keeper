@@ -20,11 +20,17 @@ import {
   ConversationConversionError,
   type ConvertedClaudeToPiConversation,
 } from "../src/conversation/claude-to-pi";
+import type {
+  ConvertedPiToClaudeConversation,
+  PiToClaudeConvertOptions,
+} from "../src/conversation/pi-to-claude";
 import { encodeClaudeProject } from "../src/transcript/claude";
+import { encodePiCwd } from "../src/transcript/pi";
 
 const SOURCE_SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const SOURCE_DIGEST = "sha256:fixture";
 const ROOT_PI_SESSION_ID = "pi-root-session";
+const ROOT_CLAUDE_SESSION_ID = "claude-root-session";
 const CWD = "/repo/project";
 
 const roots: string[] = [];
@@ -41,6 +47,9 @@ function makeHarness(
     convert?: (
       opts: ClaudeToPiConvertOptions,
     ) => ConvertedClaudeToPiConversation;
+    convertPiToClaude?: (
+      opts: PiToClaudeConvertOptions,
+    ) => ConvertedPiToClaudeConversation;
     loadCatalog?: ConversationCliDeps["loadCatalog"];
   } = {},
 ) {
@@ -52,9 +61,13 @@ function makeHarness(
   mkdirSync(homeDir, { recursive: true });
 
   const calls: ClaudeToPiConvertOptions[] = [];
+  const piToClaudeCalls: PiToClaudeConvertOptions[] = [];
   const convert =
     options.convert ??
     ((opts: ClaudeToPiConvertOptions) => makeConverted(opts, {}));
+  const reverseConvert =
+    options.convertPiToClaude ??
+    ((opts: PiToClaudeConvertOptions) => makePiConverted(opts));
   const deps: ConversationCliDeps = {
     cwd,
     homeDir,
@@ -64,9 +77,13 @@ function makeHarness(
       calls.push(opts);
       return convert(opts);
     },
+    convertPiToClaude: (opts) => {
+      piToClaudeCalls.push(opts);
+      return reverseConvert(opts);
+    },
   };
 
-  return { root, cwd, homeDir, calls, deps };
+  return { root, cwd, homeDir, calls, piToClaudeCalls, deps };
 }
 
 function writeText(path: string, text = "{}\n"): void {
@@ -185,6 +202,136 @@ function makeConverted(
   } as ConvertedClaudeToPiConversation;
 }
 
+function writePiSession(
+  homeDir: string,
+  projectPath: string,
+  sessionId: string,
+  titles: readonly string[],
+): string {
+  const path = join(
+    homeDir,
+    ".pi",
+    "agent",
+    "sessions",
+    encodePiCwd(projectPath),
+    `2026-01-01T00-00-00-000Z_${sessionId}.jsonl`,
+  );
+  const lines = [
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: sessionId,
+      cwd: projectPath,
+      timestamp: "2026-01-01T00:00:00.000Z",
+    }),
+    ...titles.map((title, index) =>
+      JSON.stringify({
+        type: "session_info",
+        id: `title${index}`,
+        parentId: index === 0 ? null : `title${index - 1}`,
+        timestamp: new Date(
+          Date.parse("2026-01-01T00:00:00.000Z") + index * 60_000,
+        ).toISOString(),
+        name: title,
+      }),
+    ),
+  ];
+  writeText(path, `${lines.join("\n")}\n`);
+  return path;
+}
+
+function makePiConverted(
+  opts: PiToClaudeConvertOptions,
+): ConvertedPiToClaudeConversation {
+  const dryRun = opts.dryRun === true;
+  const status = dryRun ? "dry_run" : "created";
+  const sessionPath = join(
+    opts.claudeConfigDir,
+    "projects",
+    "-repo-project",
+    `${ROOT_CLAUDE_SESSION_ID}.jsonl`,
+  );
+  const manifestPath = join(
+    opts.claudeConfigDir,
+    "conversation-imports",
+    "pi-to-claude",
+    `${ROOT_CLAUDE_SESSION_ID}.json`,
+  );
+  return {
+    prepared: {
+      mappingVersion: 1,
+      claudeConfigDir: opts.claudeConfigDir,
+      sourceMainPath: opts.piSessionPath,
+      sourceMainId: SOURCE_SESSION_ID,
+      sourceMainDigest: SOURCE_DIGEST,
+      rootClaudeSessionId: ROOT_CLAUDE_SESSION_ID,
+      manifest: {
+        schemaVersion: 1,
+        mappingVersion: 1,
+        sourceSessionId: SOURCE_SESSION_ID,
+        sourcePath: opts.piSessionPath,
+        sourceDigest: SOURCE_DIGEST,
+        sourceLineCount: 1,
+        sourceCwd: CWD,
+        targetSessionId: ROOT_CLAUDE_SESSION_ID,
+        destinationPath: "projects/-repo-project/session.jsonl",
+        manifestPath: "conversation-imports/pi-to-claude/manifest.json",
+        linkedRecordCount: 1,
+        rawRecordCount: 1,
+        warningCodes: [],
+      },
+      manifestBytes: new Uint8Array(),
+      manifestText: "",
+      sourceSnapshot: {
+        path: opts.piSessionPath,
+        identity: {
+          dev: 0,
+          ino: 0,
+          size: 0,
+          mtimeMs: 0,
+          ctimeMs: 0,
+        },
+        byteLength: 0,
+      },
+      sessions: [
+        {
+          sourceKey: "main",
+          agentId: null,
+          sourcePath: opts.piSessionPath,
+          sourceDigest: SOURCE_DIGEST,
+          sourceLineCount: 1,
+          claudeSessionId: ROOT_CLAUDE_SESSION_ID,
+          cwd: CWD,
+          sessionTimestamp: "1970-01-01T00:00:00.000Z",
+          destinationPath: "projects/-repo-project/session.jsonl",
+          entryCount: 2,
+          linkedRecordCount: 1,
+          rawRecordCount: 1,
+          warningCodes: [],
+          parentRelation: null,
+          bytes: new Uint8Array(),
+          text: "",
+        },
+      ],
+    },
+    published: {
+      dryRun,
+      sessions: [
+        {
+          relativePath: "projects/-repo-project/session.jsonl",
+          absolutePath: sessionPath,
+          status,
+        },
+      ],
+      manifest: {
+        relativePath: "conversation-imports/pi-to-claude/manifest.json",
+        absolutePath: manifestPath,
+        status,
+      },
+    },
+  };
+}
+
 function parseJson(stdout: string): unknown {
   return JSON.parse(stdout);
 }
@@ -207,7 +354,7 @@ describe("conversation CLI", () => {
     const help = runConversationCli(["--help"], helpHarness.deps);
     expect(help.code).toBe(0);
     expect(help.stdout).toContain(
-      "keeper conversation — offline Claude→Pi conversion",
+      "keeper conversation — offline native Session conversion",
     );
     expect(help.stderr).toBe("");
     expect(helpHarness.calls).toEqual([]);
@@ -554,6 +701,153 @@ describe("conversation CLI", () => {
     });
   });
 
+  test("explicit Pi paths dry-run to the default Claude config root", () => {
+    const harness = makeHarness();
+    const sourcePath = join(harness.cwd, "pi-session.jsonl");
+    writeText(sourcePath, "{}\n");
+
+    const result = runConversationCli(
+      [
+        "convert",
+        "--from",
+        "pi",
+        "--to",
+        "claude",
+        "--source-path",
+        sourcePath,
+        "--dry-run",
+        "--format",
+        "json",
+      ],
+      harness.deps,
+    );
+
+    expect(result.code).toBe(0);
+    expect(harness.calls).toEqual([]);
+    expect(harness.piToClaudeCalls).toEqual([
+      {
+        piSessionPath: sourcePath,
+        claudeConfigDir: join(harness.homeDir, ".claude"),
+        dryRun: true,
+      },
+    ]);
+    const parsed = parseJson(result.stdout) as {
+      ok: true;
+      data: {
+        source: { harness: string };
+        target: {
+          harness: string;
+          config_dir: string;
+          root_session_id: string;
+        };
+        sessions: Array<{ claude_session_id: string; status: string }>;
+      };
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.data.source.harness).toBe("pi");
+    expect(parsed.data.target).toEqual(
+      expect.objectContaining({
+        harness: "claude",
+        config_dir: join(harness.homeDir, ".claude"),
+        root_session_id: ROOT_CLAUDE_SESSION_ID,
+      }),
+    );
+    expect(parsed.data.sessions[0]).toEqual(
+      expect.objectContaining({
+        claude_session_id: ROOT_CLAUDE_SESSION_ID,
+        status: "dry_run",
+      }),
+    );
+  });
+
+  test("Pi native ids and historical titles resolve through the shared catalog", () => {
+    for (const reference of [SOURCE_SESSION_ID, "Historical Pi title"]) {
+      const harness = makeHarness();
+      const sourcePath = writePiSession(
+        harness.homeDir,
+        CWD,
+        SOURCE_SESSION_ID,
+        ["Historical Pi title", "Current Pi title"],
+      );
+      const outputDir = join(harness.cwd, "claude-output");
+
+      const result = runConversationCli(
+        [
+          "convert",
+          "--from",
+          "pi",
+          "--to",
+          "claude",
+          "--output-dir",
+          outputDir,
+          reference,
+        ],
+        harness.deps,
+      );
+
+      expect(result.code).toBe(0);
+      expect(harness.piToClaudeCalls).toEqual([
+        {
+          piSessionPath: realpathSync(sourcePath),
+          claudeConfigDir: outputDir,
+          dryRun: false,
+          expectedSourceSessionId: SOURCE_SESSION_ID,
+        },
+      ]);
+      expect(result.stdout).toContain(
+        `root claude session: ${ROOT_CLAUDE_SESSION_ID}`,
+      );
+    }
+  });
+
+  test("Pi title ambiguity is preserved and --project filters before resolution", () => {
+    const harness = makeHarness();
+    writePiSession(harness.homeDir, "/repo/pi-a", "pi-a", ["Shared Pi"]);
+    const selected = writePiSession(harness.homeDir, "/repo/pi-b", "pi-b", [
+      "Shared Pi",
+    ]);
+
+    const ambiguous = runConversationCli(
+      [
+        "convert",
+        "--from",
+        "pi",
+        "--to",
+        "claude",
+        "--format",
+        "json",
+        "Shared Pi",
+      ],
+      harness.deps,
+    );
+    expect(ambiguous.code).toBe(1);
+    expect((parseJson(ambiguous.stdout) as ErrorEnvelopeLike).error.code).toBe(
+      "source_ambiguous",
+    );
+    expect(harness.piToClaudeCalls).toEqual([]);
+
+    const filtered = runConversationCli(
+      [
+        "convert",
+        "--from",
+        "pi",
+        "--to",
+        "claude",
+        "--project",
+        "/repo/pi-b",
+        "Shared Pi",
+      ],
+      harness.deps,
+    );
+    expect(filtered.code).toBe(0);
+    expect(harness.piToClaudeCalls[0]).toEqual({
+      piSessionPath: realpathSync(selected),
+      claudeConfigDir: join(harness.homeDir, ".claude"),
+      dryRun: false,
+      expectedSourceSessionId: "pi-b",
+    });
+  });
+
   test("duplicate Claude titles stay ambiguous and never collapse to newest", () => {
     const harness = makeHarness();
     const oldPath = writeClaudeSession(
@@ -682,6 +976,70 @@ describe("conversation CLI", () => {
     expect(harness.calls).toEqual([]);
   });
 
+  test("a title match is still indeterminate when another title history is incomplete", () => {
+    const catalogSession = (
+      nativeId: string,
+      titles: string[],
+      complete: boolean,
+    ) => ({
+      sessionKey: `pi:${nativeId}@fixture`,
+      harness: "pi" as const,
+      nativeId,
+      qualifiedNativeId: `pi:${nativeId}`,
+      artifact: { path: `/repo/${nativeId}.jsonl`, bytes: 12 },
+      project: "/repo/project-a",
+      currentTitle: titles.at(-1) ?? null,
+      titleRecords: titles.map((title, ordinal) => ({
+        title,
+        source: "native" as const,
+        current: ordinal === titles.length - 1,
+        jobId: null,
+        ordinal,
+      })),
+      titles,
+      titleHistoryComplete: complete,
+      jobs: [],
+      startedAt: null,
+      updatedAt: null,
+    });
+    const harness = makeHarness({
+      loadCatalog: () => ({
+        sessions: [
+          catalogSession("matching", ["Requested title"], true),
+          catalogSession("incomplete", ["Visible title"], false),
+        ],
+        diagnostics: [
+          {
+            code: "artifact_read_failed",
+            harness: "pi",
+            scope: "artifact",
+          },
+        ],
+        authoritativeHarnesses: ["pi"],
+      }),
+    });
+
+    const result = runConversationCli(
+      [
+        "convert",
+        "--from",
+        "pi",
+        "--to",
+        "claude",
+        "--format",
+        "json",
+        "Requested title",
+      ],
+      harness.deps,
+    );
+
+    expect(result.code).toBe(1);
+    expect((parseJson(result.stdout) as ErrorEnvelopeLike).error.code).toBe(
+      "catalog_read_failed",
+    );
+    expect(harness.piToClaudeCalls).toEqual([]);
+  });
+
   test("missing Claude ids fail without collapsing to a newest result", () => {
     const harness = makeHarness();
     mkdirSync(
@@ -806,6 +1164,28 @@ describe("conversation CLI", () => {
       "either one Session reference or --source-path",
     );
     expect(harness.calls).toEqual([]);
+  });
+
+  test("Pi sources reject Claude-only --config-dir", () => {
+    const harness = makeHarness();
+    const result = runConversationCli(
+      [
+        "convert",
+        "--from",
+        "pi",
+        "--to",
+        "claude",
+        "--config-dir",
+        "/tmp/claude-source",
+        SOURCE_SESSION_ID,
+      ],
+      harness.deps,
+    );
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain(
+      "--config-dir applies only when Claude is the source harness",
+    );
+    expect(harness.piToClaudeCalls).toEqual([]);
   });
 
   test("unsupported harness pairs are usage faults", () => {

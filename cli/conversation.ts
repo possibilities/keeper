@@ -10,6 +10,11 @@ import {
   convertClaudeToPi,
 } from "../src/conversation/claude-to-pi";
 import {
+  type ConvertedPiToClaudeConversation,
+  convertPiToClaude,
+  type PiToClaudeConvertOptions,
+} from "../src/conversation/pi-to-claude";
+import {
   DEFAULT_HISTORY_CATALOG_ADAPTERS,
   discoverSessionCatalog,
 } from "../src/history/catalog";
@@ -34,19 +39,26 @@ export interface ConversationCliDeps {
   cwd: string;
   homeDir: string;
   env: NodeJS.ProcessEnv;
-  loadCatalog?: (root: TranscriptRootInputs) => SessionCatalog;
+  loadCatalog?: (
+    root: TranscriptRootInputs,
+    harness?: "claude" | "pi",
+  ) => SessionCatalog;
   convert: (
     options: ClaudeToPiConvertOptions,
   ) => ConvertedClaudeToPiConversation;
+  convertPiToClaude?: (
+    options: PiToClaudeConvertOptions,
+  ) => ConvertedPiToClaudeConversation;
 }
 
-const TOP_HELP = `keeper conversation — offline Claude→Pi conversion
+const TOP_HELP = `keeper conversation — offline native Session conversion
 
 Usage:
   keeper conversation convert --from claude --to pi <session-reference> [options]
-  keeper conversation convert --from claude --to pi --source-path <main.jsonl> [options]
+  keeper conversation convert --from pi --to claude <session-reference> [options]
+  keeper conversation convert --from <harness> --to <harness> --source-path <session.jsonl> [options]
 
-Convert one Claude transcript into Pi agent sessions. The command is offline and
+Convert native Claude and Pi Session files without a live harness. The command is
 filesystem-only: no Keeper DB, socket, daemon, subprocess, network, or wall
 clock.
 
@@ -56,62 +68,63 @@ Run \`keeper conversation --agent-help\` for the terse operator runbook.
 
 const AGENT_HELP = `keeper conversation operator runbook
 
-1. Pass one Claude Session reference, or use --source-path for an artifact.
-2. Use --project only when a Session reference is ambiguous across projects.
-3. Start with --dry-run to validate and inspect the planned Pi paths.
-4. Re-run without --dry-run once the paths and destination look right.
-5. Use --format json when another agent should parse the result.
+1. Choose \`--from claude --to pi\` or \`--from pi --to claude\`.
+2. Pass one exact Session reference, or use --source-path for an artifact.
+3. Use --project only when a Session reference is ambiguous across projects.
+4. Start with --dry-run to validate and inspect the planned target paths.
+5. Re-run without --dry-run once the paths and destination look right.
+6. Use --format json when another agent should parse the result.
 
-Session references resolve by exact bare native id, \`claude:<id>\`, exact
+Session references resolve by exact bare or harness-qualified native id, exact
 current title, or exact historical title; title matching is case-insensitive.
 The conversion is retry-safe when the source file and output directory stay
-stable; a collision or read failure is reported without writing transcript
-contents to stderr.
+stable; a collision or read failure never prints transcript content.
 `;
 
 const CONVERT_HELP = `keeper conversation convert --from claude --to pi <session-reference> [options]
-keeper conversation convert --from claude --to pi --source-path <main.jsonl> [options]
+keeper conversation convert --from pi --to claude <session-reference> [options]
+keeper conversation convert --from <harness> --to <harness> --source-path <session.jsonl> [options]
 
-Convert one Claude transcript into Pi agent sessions. The command is offline and
-filesystem-only: no Keeper DB, socket, daemon, subprocess, network, or wall
+Convert one native Session into the other harness's native format. The command
+is filesystem-only: no Keeper DB, socket, daemon, subprocess, network, or wall
 clock.
 
 Required options:
-  --from <harness>       Source harness (currently only exact 'claude')
-  --to <harness>         Target harness (currently only exact 'pi')
+  --from <harness>       Source harness: claude|pi
+  --to <harness>         Target harness: pi|claude (must differ from --from)
 
 Source resolution:
-  <session-reference>    Exact Claude native id, \`claude:<id>\`, exact current title,
-                         or exact historical title. Title matching is
-                         case-insensitive.
-  --source-path <file>   Explicit main JSONL path instead of a Session reference
-  --project <path>       Filters the Claude catalog before reference resolution
-  --config-dir <dir>     Claude config directory (repeatable)
+  <session-reference>    Exact native id, harness-qualified id, exact current
+                         title, or exact historical title (case-insensitive)
+  --source-path <file>   Explicit source JSONL path instead of a Session reference
+  --project <path>       Filters the source catalog before reference resolution
+  --config-dir <dir>     Claude source config directory (repeatable; Claude→Pi only)
 
 Output and rendering:
-  --output-dir <dir>     Pi AGENT directory (default $PI_CODING_AGENT_DIR, else ~/.pi/agent)
+  --output-dir <dir>     Target root: Pi AGENT dir or Claude config dir
   --dry-run              Prepare and validate without writing destination files
   --format human|json    Output format (default human)
   --json                 Alias of --format json
 
+Defaults: Claude→Pi writes to $PI_CODING_AGENT_DIR or ~/.pi/agent. Pi→Claude
+writes to ~/.claude. Human and JSON output contain bounded metadata only.
+
 Flags:
   --help, -h             Show this help
   --agent-help           Show the terse operator runbook
-
-The source path must be a regular Claude JSONL transcript. Human output reports
-converted vs dry-run, the root Pi session id, the session count, the manifest
-path, each artifact status/path, and warning codes. JSON output is a bounded
-metadata envelope only.
 `;
 
-function defaultLoadCatalog(root: TranscriptRootInputs): SessionCatalog {
-  const claudeOnlyAdapters = DEFAULT_HISTORY_CATALOG_ADAPTERS.filter(
-    (adapter) => adapter.harness === "claude",
+function defaultLoadCatalog(
+  root: TranscriptRootInputs,
+  harness: "claude" | "pi" = "claude",
+): SessionCatalog {
+  const adapters = DEFAULT_HISTORY_CATALOG_ADAPTERS.filter(
+    (adapter) => adapter.harness === harness,
   );
   return discoverSessionCatalog({
     root,
     jobs: [],
-    adapters: claudeOnlyAdapters,
+    adapters,
     completeTitleHistory: true,
   });
 }
@@ -123,6 +136,7 @@ function defaultDeps(): ConversationCliDeps {
     env: process.env,
     loadCatalog: defaultLoadCatalog,
     convert: convertClaudeToPi,
+    convertPiToClaude,
   };
 }
 
@@ -197,24 +211,28 @@ function resolveConversationFormat(values: {
   return { ok: true, format: requested };
 }
 
-function problemRecovery(code: string): string {
+function problemRecovery(code: string, sourceHarness: "claude" | "pi"): string {
   switch (code) {
     case "source_roots_unavailable":
-      return "Make the Claude config directories readable, pass --config-dir, or use --source-path <main.jsonl>, then retry.";
+      return sourceHarness === "pi"
+        ? "Make the Pi sessions directory readable, set PI_CODING_AGENT_DIR, or use --source-path <session.jsonl>, then retry."
+        : "Make the Claude config directories readable, pass --config-dir, or use --source-path <main.jsonl>, then retry.";
     case "catalog_read_failed":
-      return "Make the Claude project roots readable, pass --config-dir, or use --source-path <main.jsonl>, then retry.";
+      return sourceHarness === "pi"
+        ? "Make the Pi session artifacts readable, or use --source-path <session.jsonl>, then retry."
+        : "Make the Claude project roots readable, pass --config-dir, or use --source-path <main.jsonl>, then retry.";
     case "source_not_found":
-      return "Verify the Session reference or use --source-path <main.jsonl>, then retry.";
+      return "Verify the Session reference or use --source-path <session.jsonl>, then retry.";
     case "source_ambiguous":
-      return "Pass --project to disambiguate the Session reference, or use --source-path <main.jsonl>, then retry.";
+      return "Pass --project to disambiguate the Session reference, or use --source-path <session.jsonl>, then retry.";
     case "invalid_argument":
       return "Fix the conversion arguments and retry.";
     case "source_not_regular":
-      return "Point at a regular Claude .jsonl file, then retry.";
+      return `Point at a regular ${sourceHarness === "pi" ? "Pi" : "Claude"} .jsonl file, then retry.`;
     case "source_read_failed":
       return "Check the source path and retry; this conversion is read-only until publish time.";
     case "source_decode_failed":
-      return "Re-export the Claude session as UTF-8 JSONL and retry.";
+      return `Repair or re-export the ${sourceHarness === "pi" ? "Pi" : "Claude"} Session as UTF-8 JSONL, then retry.`;
     case "source_missing_final_lf":
       return "Rewrite the source file with a trailing newline, then retry.";
     case "source_changed_during_read":
@@ -236,13 +254,14 @@ function sanitizeProblem(
   code: string,
   details: Record<string, unknown> | undefined,
 ): ProblemError {
+  const sourceHarness = details?.source_harness === "pi" ? "pi" : "claude";
   return {
     code,
     message:
       code === "source_roots_unavailable"
-        ? "no readable Claude project roots were found"
+        ? `no readable ${sourceHarness === "pi" ? "Pi session" : "Claude project"} roots were found`
         : code === "catalog_read_failed"
-          ? "failed to read the Claude session catalog"
+          ? `failed to read the ${sourceHarness === "pi" ? "Pi" : "Claude"} session catalog`
           : code === "source_not_found"
             ? "Session reference not found"
             : code === "source_ambiguous"
@@ -252,7 +271,7 @@ function sanitizeProblem(
                 : code === "publish_collision"
                   ? "destination path already exists with different bytes"
                   : code === "publish_failed"
-                    ? "failed to publish the converted Pi artifacts"
+                    ? `failed to publish the converted ${sourceHarness === "pi" ? "Claude" : "Pi"} artifacts`
                     : code === "invalid_argument"
                       ? "invalid conversion arguments"
                       : code === "source_not_regular"
@@ -270,7 +289,7 @@ function sanitizeProblem(
                                   : code === "validation_failed"
                                     ? "source transcript failed validation"
                                     : "conversation conversion failed",
-    recovery: problemRecovery(code),
+    recovery: problemRecovery(code, sourceHarness),
     ...(details !== undefined ? { details } : {}),
   };
 }
@@ -377,6 +396,82 @@ function renderJsonSuccess(
   return `${JSON.stringify(successEnvelope(CONVERSATION_SCHEMA_VERSION, successData(conversion)), null, 2)}\n`;
 }
 
+function piToClaudeSuccessData(conversion: ConvertedPiToClaudeConversation) {
+  const prepared = conversion.prepared;
+  const published = conversion.published;
+  const artifactsByPath = new Map(
+    published.sessions.map((artifact) => [artifact.relativePath, artifact]),
+  );
+  const warningCodes = Array.from(
+    new Set(prepared.sessions.flatMap((session) => [...session.warningCodes])),
+  ).sort();
+  return {
+    source: {
+      harness: "pi" as const,
+      session_id: prepared.sourceMainId,
+      path: prepared.sourceMainPath,
+      sha256: prepared.sourceMainDigest,
+    },
+    target: {
+      harness: "claude" as const,
+      config_dir: prepared.claudeConfigDir,
+      root_session_id: prepared.rootClaudeSessionId,
+      manifest_path: published.manifest.absolutePath,
+    },
+    dry_run: published.dryRun,
+    sessions: prepared.sessions.map((session) => {
+      const artifact = artifactsByPath.get(session.destinationPath);
+      if (artifact === undefined) {
+        throw new Error("published session artifact is missing");
+      }
+      return {
+        source_key: session.sourceKey,
+        agent_id: session.agentId,
+        claude_session_id: session.claudeSessionId,
+        cwd: session.cwd,
+        path: artifact.absolutePath,
+        status: artifact.status,
+        parent_relation: null,
+        line_count: session.sourceLineCount,
+        entry_count: session.entryCount,
+        warning_codes: [...session.warningCodes],
+      };
+    }),
+    warning_codes: warningCodes,
+  };
+}
+
+function renderPiToClaudeHumanSuccess(
+  conversion: ConvertedPiToClaudeConversation,
+): string {
+  const data = piToClaudeSuccessData(conversion);
+  const prefix = data.dry_run ? "dry-run prepared" : "converted";
+  const lines = [
+    `keeper conversation convert: ${prefix} ${data.sessions.length} session${data.sessions.length === 1 ? "" : "s"}`,
+    `root claude session: ${data.target.root_session_id}`,
+    `config dir: ${data.target.config_dir}`,
+    `manifest: ${data.target.manifest_path}`,
+    `source: ${data.source.path}`,
+    `sessions (${data.sessions.length}):`,
+  ];
+  for (const session of data.sessions) {
+    lines.push(`  ${session.source_key}: ${session.status} ${session.path}`);
+    lines.push(
+      `    cwd: ${session.cwd}; lines: ${session.line_count}; entries: ${session.entry_count}`,
+    );
+  }
+  lines.push(
+    `warning codes: ${data.warning_codes.length === 0 ? "none" : data.warning_codes.join(", ")}`,
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function renderPiToClaudeJsonSuccess(
+  conversion: ConvertedPiToClaudeConversation,
+): string {
+  return `${JSON.stringify(successEnvelope(CONVERSATION_SCHEMA_VERSION, piToClaudeSuccessData(conversion)), null, 2)}\n`;
+}
+
 function renderHumanFailure(problem: ProblemError): string {
   const lines = [`keeper conversation convert: ${problem.message}`];
   if (problem.details !== undefined && problem.code === "source_ambiguous") {
@@ -413,9 +508,15 @@ function operationalFailure(
     : fail(1, renderHumanFailure(problem));
 }
 
-function catalogLoadProblem(format: ConversationFormat): ConversationCliResult {
+function catalogLoadProblem(
+  format: ConversationFormat,
+  harness: "claude" | "pi" = "claude",
+): ConversationCliResult {
   return operationalFailure(
-    sanitizeProblem("catalog_read_failed", undefined),
+    sanitizeProblem(
+      "catalog_read_failed",
+      harness === "pi" ? { source_harness: "pi" } : undefined,
+    ),
     format,
   );
 }
@@ -431,15 +532,18 @@ function filterCatalogByProject(
   };
 }
 
-function claudeCatalogHasReadFailure(catalog: SessionCatalog): boolean {
+function catalogHasReadFailure(catalog: SessionCatalog): boolean {
   return catalog.diagnostics.some(
     (diagnostic) => diagnostic.code === "root_read_failed",
   );
 }
 
-function claudeCatalogRootsUnavailable(catalog: SessionCatalog): boolean {
+function catalogRootsUnavailable(
+  catalog: SessionCatalog,
+  harness: "claude" | "pi",
+): boolean {
   return (
-    !catalog.authoritativeHarnesses.includes("claude") &&
+    !catalog.authoritativeHarnesses.includes(harness) &&
     catalog.diagnostics.some(
       (diagnostic) => diagnostic.code === "root_unavailable",
     )
@@ -448,6 +552,129 @@ function claudeCatalogRootsUnavailable(catalog: SessionCatalog): boolean {
 
 function catalogHasIncompleteTitleHistory(catalog: SessionCatalog): boolean {
   return catalog.sessions.some((session) => !session.titleHistoryComplete);
+}
+
+function converterFailure(
+  error: unknown,
+  format: ConversationFormat,
+  sourceHarness: "claude" | "pi" = "claude",
+): ConversationCliResult {
+  if (error && typeof error === "object" && "code" in error) {
+    const typed = error as ConversationConversionError & {
+      details?: Record<string, unknown>;
+    };
+    const details =
+      typed.path !== null && typed.path !== undefined
+        ? {
+            path: typed.path,
+            ...(sourceHarness === "pi" ? { source_harness: "pi" } : {}),
+          }
+        : sourceHarness === "pi"
+          ? { source_harness: "pi" }
+          : undefined;
+    return operationalFailure(sanitizeProblem(typed.code, details), format);
+  }
+  return operationalFailure(
+    sanitizeProblem("conversion_failed", undefined),
+    format,
+  );
+}
+
+function runPiToClaudeConvert(
+  options: {
+    readonly sourceToken: string | undefined;
+    readonly explicitSource: string | undefined;
+    readonly project: string | null;
+    readonly outputDir: string;
+    readonly dryRun: boolean;
+    readonly format: ConversationFormat;
+  },
+  deps: ConversationCliDeps,
+): ConversationCliResult {
+  let sourcePath: string;
+  let expectedSourceSessionId: string | undefined;
+  if (options.explicitSource !== undefined) {
+    sourcePath = resolvePath(options.explicitSource, deps);
+  } else {
+    const loadCatalog = deps.loadCatalog ?? defaultLoadCatalog;
+    let catalog: SessionCatalog;
+    try {
+      catalog = loadCatalog({ homeDir: deps.homeDir, env: deps.env }, "pi");
+    } catch {
+      return catalogLoadProblem(options.format, "pi");
+    }
+    if (catalogHasReadFailure(catalog)) {
+      return catalogLoadProblem(options.format, "pi");
+    }
+    if (catalogRootsUnavailable(catalog, "pi")) {
+      return operationalFailure(
+        sanitizeProblem("source_roots_unavailable", {
+          home_dir: deps.homeDir,
+          source_harness: "pi",
+        }),
+        options.format,
+      );
+    }
+    const resolvedCatalog = filterCatalogByProject(
+      {
+        ...catalog,
+        sessions: catalog.sessions.filter(
+          (session) => session.harness === "pi",
+        ),
+      },
+      options.project,
+    );
+    const resolution = resolveSessionReference(
+      resolvedCatalog,
+      options.sourceToken as string,
+    );
+    if (resolution.kind === "not_found") {
+      if (catalogHasIncompleteTitleHistory(resolvedCatalog)) {
+        return catalogLoadProblem(options.format, "pi");
+      }
+      return operationalFailure(
+        sanitizeProblem("source_not_found", undefined),
+        options.format,
+      );
+    }
+    if (
+      resolution.match === "title" &&
+      catalogHasIncompleteTitleHistory(resolvedCatalog)
+    ) {
+      return catalogLoadProblem(options.format, "pi");
+    }
+    if (resolution.kind === "ambiguous") {
+      return operationalFailure(
+        sanitizeProblem("source_ambiguous", {
+          ...sessionAmbiguityDetails(resolution.match, resolution.candidates),
+        }),
+        options.format,
+      );
+    }
+    if (resolution.session.artifact === null) {
+      return catalogLoadProblem(options.format, "pi");
+    }
+    sourcePath = resolution.session.artifact.path;
+    expectedSourceSessionId = resolution.session.nativeId;
+  }
+
+  try {
+    const conversion = (deps.convertPiToClaude ?? convertPiToClaude)({
+      piSessionPath: sourcePath,
+      claudeConfigDir: options.outputDir,
+      dryRun: options.dryRun,
+      ...(expectedSourceSessionId !== undefined
+        ? { expectedSourceSessionId }
+        : {}),
+    });
+    return ok(
+      options.format === "json"
+        ? renderPiToClaudeJsonSuccess(conversion)
+        : renderPiToClaudeHumanSuccess(conversion),
+    );
+  } catch (error) {
+    return converterFailure(error, options.format, "pi");
+  }
 }
 
 function runConvert(
@@ -519,15 +746,17 @@ function runConvert(
   const from = values.from;
   const to = values.to;
   if (from === undefined) {
-    return usage(CONVERT_HELP, "missing required --from claude");
+    return usage(CONVERT_HELP, "missing required --from");
   }
   if (to === undefined) {
-    return usage(CONVERT_HELP, "missing required --to pi");
+    return usage(CONVERT_HELP, "missing required --to");
   }
-  if (from !== "claude" || to !== "pi") {
+  const claudeToPi = from === "claude" && to === "pi";
+  const piToClaude = from === "pi" && to === "claude";
+  if (!claudeToPi && !piToClaude) {
     return usage(
       CONVERT_HELP,
-      `unsupported harness pair --from ${from} --to ${to}; expected claude -> pi`,
+      `unsupported harness pair --from ${from} --to ${to}; expected claude -> pi or pi -> claude`,
     );
   }
 
@@ -535,7 +764,32 @@ function runConvert(
   if (explicitSource !== undefined && project !== null) {
     return usage(
       CONVERT_HELP,
-      "--project is only used when resolving a Claude session reference",
+      "--project is only used when resolving a Session reference",
+    );
+  }
+
+  const configDirs = normalizeConfigDirs(values["config-dir"], deps);
+  const dryRun = values["dry-run"] === true;
+  if (piToClaude) {
+    if (configDirs !== undefined) {
+      return usage(
+        CONVERT_HELP,
+        "--config-dir applies only when Claude is the source harness",
+      );
+    }
+    const outputDir =
+      resolveMaybePath(values["output-dir"], deps) ??
+      join(deps.homeDir, ".claude");
+    return runPiToClaudeConvert(
+      {
+        sourceToken,
+        explicitSource,
+        project,
+        outputDir,
+        dryRun,
+        format: format.format,
+      },
+      deps,
     );
   }
 
@@ -545,9 +799,6 @@ function runConvert(
     deps.env.PI_CODING_AGENT_DIR.length > 0
       ? resolvePath(deps.env.PI_CODING_AGENT_DIR, deps)
       : join(deps.homeDir, ".pi", "agent"));
-
-  const configDirs = normalizeConfigDirs(values["config-dir"], deps);
-  const dryRun = values["dry-run"] === true;
 
   let sourcePath: string;
   let expectedSourceMainId: string | undefined;
@@ -565,10 +816,10 @@ function runConvert(
     } catch {
       return catalogLoadProblem(format.format);
     }
-    if (claudeCatalogHasReadFailure(catalog)) {
+    if (catalogHasReadFailure(catalog)) {
       return catalogLoadProblem(format.format);
     }
-    if (claudeCatalogRootsUnavailable(catalog)) {
+    if (catalogRootsUnavailable(catalog, "claude")) {
       const problem = sanitizeProblem("source_roots_unavailable", {
         home_dir: deps.homeDir,
         ...(configDirs !== undefined ? { config_dirs: configDirs } : {}),
@@ -596,6 +847,12 @@ function runConvert(
         sanitizeProblem("source_not_found", undefined),
         format.format,
       );
+    }
+    if (
+      resolution.match === "title" &&
+      catalogHasIncompleteTitleHistory(resolvedCatalog)
+    ) {
+      return catalogLoadProblem(format.format);
     }
     if (resolution.kind === "ambiguous") {
       return operationalFailure(
@@ -625,19 +882,7 @@ function runConvert(
         : renderHumanSuccess(conversion),
     );
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error) {
-      const typed = error as ConversationConversionError & {
-        details?: Record<string, unknown>;
-      };
-      const details =
-        typed.path !== null && typed.path !== undefined
-          ? { path: typed.path }
-          : undefined;
-      const problem = sanitizeProblem(typed.code, details);
-      return operationalFailure(problem, format.format);
-    }
-    const problem = sanitizeProblem("conversion_failed", undefined);
-    return operationalFailure(problem, format.format);
+    return converterFailure(error, format.format);
   }
 }
 

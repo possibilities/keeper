@@ -1244,7 +1244,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   },
   {
     name: "conversation",
-    summary: "Offline Claude→Pi conversion",
+    summary: "Offline native Claude↔Pi Session conversion",
     visibility: "public",
     mutates: true,
     requires_daemon: false,
@@ -1255,7 +1255,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     verbs: [
       {
         name: "convert",
-        summary: "Convert a Claude session export into Pi agent sessions",
+        summary: "Convert native Session files between Claude and Pi",
         visibility: "public",
         mutates: true,
         requires_daemon: false,
@@ -1268,36 +1268,34 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
           {
             name: "from",
             type: "string",
-            summary: "Source harness (currently only exact claude)",
+            summary: "Source harness: claude|pi",
           },
           {
             name: "to",
             type: "string",
-            summary: "Target harness (currently only exact pi)",
+            summary: "Target harness: pi|claude",
           },
           {
             name: "project",
             type: "string",
-            summary:
-              "Claude project path used to disambiguate a Session reference",
+            summary: "Project path used to disambiguate a Session reference",
           },
           {
             name: "source-path",
             type: "string",
             summary:
-              "Explicit Claude main JSONL path instead of a Session reference",
+              "Explicit source JSONL path instead of a Session reference",
           },
           {
             name: "config-dir",
             type: "string",
             multiple: true,
-            summary: "Claude config directory (repeatable)",
+            summary: "Claude source config directory (repeatable)",
           },
           {
             name: "output-dir",
             type: "string",
-            summary:
-              "Pi AGENT directory (default $PI_CODING_AGENT_DIR, else ~/.pi/agent)",
+            summary: "Target Pi agent dir or Claude config dir",
           },
           {
             name: "dry-run",
