@@ -8,10 +8,9 @@
  * Each job paints as a single minimal line — a status ICON, the job name, and a
  * right-justified project name. Status is DUAL-ENCODED on that one glyph: a Nerd
  * Font md-robot FACE ({@link robotGlyph}) plus the icon's COLOR ({@link CardVM.iconRole}),
- * both resolved fresh from the six-rung ladder in {@link robotRung} — annotation
- * columns (api-error, awaiting permission/input) outrank the base `state`. The
- * robot codepoints live in a DASH-LOCAL map ({@link ROBOT_CP}); the shared
- * `ACTIVE_THEME` / `FA_CLASSIC` (the board/jobs `fa-classic` glyphs) are untouched.
+ * both resolved fresh from the shared six-rung ladder in {@link robotRung} —
+ * annotation columns (api-error, awaiting permission/input) outrank the base
+ * `state`.
  *
  * Lines group by tmux session (`backend_exec_session_id`) — the priority
  * sessions `work` / `autopilot` first, then any other named
@@ -28,42 +27,15 @@
  * fast tier.
  */
 
+import { type RobotRung, robotGlyph, robotRung } from "../job-state-icon";
 import type { HandoffLinkEntry, Job } from "../types";
 import type { IconRole } from "./theme";
+
+export { type RobotRung, robotGlyph, robotRung } from "../job-state-icon";
 
 // ---------------------------------------------------------------------------
 // Status ladder — the six robot rungs
 // ---------------------------------------------------------------------------
-
-/**
- * The six rungs of the robot status ladder, in precedence order. Annotation
- * rungs (`error`, `awaiting`) outrank the base-state rungs (`working`, `ended`,
- * `stopped`, `killed`) so a working-but-blocked job reads as blocked, never as
- * quietly running. A malformed/unknown `state` folds to `stopped` (the calm
- * gray idle default — never thrown).
- */
-export type RobotRung =
-  | "error"
-  | "awaiting"
-  | "working"
-  | "ended"
-  | "stopped"
-  | "killed";
-
-/**
- * Dash-LOCAL md-robot codepoints (Nerd Font MDI), one per rung. Verified
- * present in the user's JetBrainsMono Nerd Font (nerd-fonts `i_md.sh`). Kept
- * here, NOT in `icon-theme.ts`'s `FA_CLASSIC` / `ACTIVE_THEME`, so the board and
- * `keeper jobs` views keep their `fa-classic` glyph map untouched.
- */
-const ROBOT_CP: Record<RobotRung, string> = {
-  error: "f169d", // robot_angry
-  awaiting: "f169f", // robot_confused
-  working: "f06a9", // robot
-  ended: "f1719", // robot_happy
-  stopped: "f167a", // robot_outline
-  killed: "f16a1", // robot_dead
-};
 
 /** The icon color role each rung paints. Mirrors the ladder's color column. */
 const RUNG_ICON: Record<RobotRung, IconRole> = {
@@ -74,58 +46,6 @@ const RUNG_ICON: Record<RobotRung, IconRole> = {
   stopped: "idle-stopped",
   killed: "idle-killed",
 };
-
-/**
- * Materialize a hex codepoint string (e.g. `"f169d"`) to its glyph. Mirrors
- * `icon-theme.ts`'s `cp` — `String.fromCodePoint(parseInt(hex, 16))` already
- * handles the 5-digit MDI codepoints.
- */
-function cp(hex: string): string {
-  return String.fromCodePoint(Number.parseInt(hex, 16));
-}
-
-/** The robot glyph for a rung (dash-local map). Pure. */
-export function robotGlyph(rung: RobotRung): string {
-  return cp(ROBOT_CP[rung]);
-}
-
-/**
- * Derive a job's status rung FRESH from `state` + the annotation columns,
- * mirroring the precedence the legacy `buildJobRows` encoded and `keeper jobs`
- * surfaces: ended/killed → api-error → awaiting (permission OR input) →
- * working → stopped. An unknown/malformed `state` folds to `stopped` (calm idle)
- * — never throws. Deliberately NOT `rolledUpJobVerdict`, which only emits
- * running/null and cannot express the six rungs.
- */
-export function robotRung(job: Job): RobotRung {
-  // Terminal state wins over a stale annotation stamp: the reducer's
-  // SessionEnd/Killed transitions never clear last_*_at, so a job that died
-  // mid-block keeps its stamp. Resolve ended/killed first so such a job is
-  // painted terminal (hidden by showTerminal) rather than pinned as blocked.
-  if (job.state === "ended") {
-    return "ended";
-  }
-  if (job.state === "killed") {
-    return "killed";
-  }
-  if (job.last_api_error_at != null) {
-    return "error";
-  }
-  if (
-    job.last_permission_prompt_at != null ||
-    job.last_input_request_at != null
-  ) {
-    return "awaiting";
-  }
-  switch (job.state) {
-    case "working":
-      return "working";
-    case "stopped":
-      return "stopped";
-    default:
-      return "stopped";
-  }
-}
 
 /** A rung is terminal when it represents a finished session — ended or killed.
  * Terminal lines are hidden unless `showTerminal` is set. */

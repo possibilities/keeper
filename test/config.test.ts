@@ -17,6 +17,7 @@ import {
   resolveAutocloseEnabled,
   resolveAutocloseGraceSeconds,
   resolveConfig,
+  resolveTabIcons,
 } from "../src/db";
 
 let dir: string;
@@ -164,6 +165,33 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
   const cfg = resolveConfig();
   expect(cfg.handoffPromptPrefix).toBe("/hack");
   expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// tab_icons — optional harness → icon prefixes for the tmux renamer
+// ---------------------------------------------------------------------------
+
+test("tabIcons defaults to an empty map when the file or key is absent", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  expect(resolveConfig().tabIcons).toEqual({});
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().tabIcons).toEqual({});
+});
+
+test("tab_icons resolves valid harness mappings and trims their values", () => {
+  writeConfig('tab_icons:\n  pi: " 󰏿 "\n  claude: "󰛄"\n');
+  expect(resolveConfig().tabIcons).toEqual({ pi: "󰏿", claude: "󰛄" });
+});
+
+test("tab_icons skips malformed entries without disturbing valid siblings", () => {
+  writeConfig('tab_icons:\n  pi: "󰏿"\n  claude: 42\n  empty: "   "\n');
+  expect(resolveConfig().tabIcons).toEqual({ pi: "󰏿" });
+});
+
+test("resolveTabIcons rejects a malformed whole value to the empty default", () => {
+  expect(resolveTabIcons(["pi", "󰏿"])).toEqual({});
+  expect(resolveTabIcons("pi=󰏿")).toEqual({});
+  expect(resolveTabIcons(null)).toEqual({});
 });
 
 // ---------------------------------------------------------------------------

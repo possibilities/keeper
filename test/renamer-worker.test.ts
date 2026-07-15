@@ -22,6 +22,7 @@
 import type { Database } from "bun:sqlite";
 import { beforeEach, expect, test } from "bun:test";
 import type { LaunchResult, PaneInfo, TmuxPaneOps } from "../src/exec-backend";
+import { robotGlyph } from "../src/job-state-icon";
 import {
   computeRenames,
   hashCandidates,
@@ -80,6 +81,8 @@ function candidate(
     job_id: opts.job_id ?? "job",
     pane_id: opts.pane_id,
     title: opts.title ?? "title",
+    harness: opts.harness ?? "claude",
+    robot_rung: opts.robot_rung ?? "working",
     created_at: opts.created_at ?? 1000,
   };
 }
@@ -225,6 +228,8 @@ test("renameCandidates keeps only live tmux jobs with a pane and a title", () =>
     job_id: "a",
     pane_id: "%1",
     title: "alpha",
+    harness: "claude",
+    robot_rung: "working",
     created_at: 1,
   });
 });
@@ -233,7 +238,7 @@ test("renameCandidates keeps only live tmux jobs with a pane and a title", () =>
 // hashCandidates — the input-side dedup gate
 // ---------------------------------------------------------------------------
 
-test("hashCandidates is order-independent and reacts to title/pane changes", () => {
+test("hashCandidates is order-independent and reacts to title/pane/status changes", () => {
   const a = candidate({
     pane_id: "%1",
     job_id: "a",
@@ -250,6 +255,10 @@ test("hashCandidates is order-independent and reacts to title/pane changes", () 
   expect(hashCandidates([a, b])).toBe(hashCandidates([b, a]));
   // A title change re-fires the gate.
   expect(hashCandidates([a])).not.toBe(hashCandidates([{ ...a, title: "z" }]));
+  // A lifecycle/attention status change also re-fires the gate.
+  expect(hashCandidates([a])).not.toBe(
+    hashCandidates([{ ...a, robot_rung: "stopped" }]),
+  );
   // Empty set is stable (the quiescent-board hash).
   expect(hashCandidates([])).toBe(hashCandidates([]));
 });
@@ -273,7 +282,7 @@ test("computeRenames: latest created_at wins, target is the winner's title", () 
   });
   const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
   expect(computeRenames([older, newer], panes)).toEqual([
-    { windowId: "@1", name: "new" },
+    { windowId: "@1", name: `${robotGlyph("working")} new` },
   ]);
 });
 
@@ -292,7 +301,7 @@ test("computeRenames: created_at tie breaks on higher job_id", () => {
   });
   const panes = [pane("%1", "@1", "stale"), pane("%2", "@1", "stale")];
   expect(computeRenames([lo, hi], panes)).toEqual([
-    { windowId: "@1", name: "hi" },
+    { windowId: "@1", name: `${robotGlyph("working")} hi` },
   ]);
 });
 
@@ -303,8 +312,43 @@ test("computeRenames: a window already named its winner is NOT re-renamed", () =
     title: "match",
     created_at: 100,
   });
-  const panes = [pane("%1", "@1", "match")];
+  const panes = [pane("%1", "@1", `${robotGlyph("working")} match`)];
   expect(computeRenames([c], panes)).toEqual([]);
+});
+
+test("computeRenames: state robot precedes the harness icon and title", () => {
+  const c = candidate({
+    pane_id: "%1",
+    job_id: "a",
+    title: "orbit",
+    harness: "pi",
+    created_at: 100,
+  });
+  const icons = { pi: "󰏿" };
+  const target = `${robotGlyph("working")} 󰏿 orbit`;
+  expect(computeRenames([c], [pane("%1", "@1", "stale")], icons)).toEqual([
+    { windowId: "@1", name: target },
+  ]);
+  expect(computeRenames([c], [pane("%1", "@1", target)], icons)).toEqual([]);
+});
+
+test("renameCandidates treats a legacy NULL harness as claude for icon lookup", () => {
+  const candidates = renameCandidates([
+    {
+      state: "working",
+      backend_exec_type: "tmux",
+      backend_exec_pane_id: "%1",
+      title: "legacy",
+      harness: null,
+      job_id: "a",
+      created_at: 1,
+    } as Job,
+  ]);
+  expect(
+    computeRenames(candidates, [pane("%1", "@1", "stale")], {
+      claude: "󰛄",
+    }),
+  ).toEqual([{ windowId: "@1", name: `${robotGlyph("working")} 󰛄 legacy` }]);
 });
 
 test("computeRenames: a spawn-name `::`/`.` title tabs verbatim, and is not re-renamed once worn", () => {
@@ -316,13 +360,12 @@ test("computeRenames: a spawn-name `::`/`.` title tabs verbatim, and is not re-r
   });
   // Fresh window: the title lands verbatim — tmux accepts `:` and `.` in a
   // window name, so no rewriting is needed.
+  const target = `${robotGlyph("working")} work::fn-1019.2`;
   expect(computeRenames([c], [pane("%1", "@1", "stale")])).toEqual([
-    { windowId: "@1", name: "work::fn-1019.2" },
+    { windowId: "@1", name: target },
   ]);
   // A window already wearing the name is NOT re-emitted (no churn).
-  expect(computeRenames([c], [pane("%1", "@1", "work::fn-1019.2")])).toEqual(
-    [],
-  );
+  expect(computeRenames([c], [pane("%1", "@1", target)])).toEqual([]);
 });
 
 test("computeRenames: a candidate whose pane is absent from the sweep is skipped", () => {
@@ -350,8 +393,8 @@ test("computeRenames: independent windows each get their own winner, sorted by w
   });
   const panes = [pane("%2", "@2", "stale"), pane("%1", "@1", "stale")];
   expect(computeRenames([c1, c2], panes)).toEqual([
-    { windowId: "@1", name: "one" },
-    { windowId: "@2", name: "two" },
+    { windowId: "@1", name: `${robotGlyph("working")} one` },
+    { windowId: "@2", name: `${robotGlyph("working")} two` },
   ]);
 });
 
@@ -369,7 +412,43 @@ test("renamerPulse renames the winning window and fires only on mismatch", async
   const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   const state = { lastHash: null };
   await renamerPulse(db, fb.backend, state);
-  expect(fb.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
+  expect(fb.renameCalls).toEqual([
+    { windowId: "@1", name: `${robotGlyph("working")} winner` },
+  ]);
+});
+
+test("renamerPulse applies the configured icon for the job harness", async () => {
+  insertJob({
+    job_id: "a",
+    created_at: 100,
+    title: "winner",
+    backend_exec_pane_id: "%1",
+  });
+  db.run("UPDATE jobs SET harness = 'pi' WHERE job_id = 'a'");
+  const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
+  await renamerPulse(db, fb.backend, { lastHash: null }, { pi: "󰏿" });
+  expect(fb.renameCalls).toEqual([
+    { windowId: "@1", name: `${robotGlyph("working")} 󰏿 winner` },
+  ]);
+});
+
+test("renamerPulse re-fires with the stopped robot when job state changes", async () => {
+  insertJob({
+    job_id: "a",
+    created_at: 100,
+    title: "winner",
+    backend_exec_pane_id: "%1",
+  });
+  const fb = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
+  const state = { lastHash: null };
+  await renamerPulse(db, fb.backend, state);
+  db.run("UPDATE jobs SET state = 'stopped' WHERE job_id = 'a'");
+  await renamerPulse(db, fb.backend, state);
+  expect(fb.listPanesCalls).toBe(2);
+  expect(fb.renameCalls).toEqual([
+    { windowId: "@1", name: `${robotGlyph("working")} winner` },
+    { windowId: "@1", name: `${robotGlyph("stopped")} winner` },
+  ]);
 });
 
 test("renamerPulse skips the tmux sweep when the candidate picture is unchanged", async () => {
@@ -410,7 +489,9 @@ test("renamerPulse on a degraded (null) sweep skips the cycle without advancing 
   // Gate NOT advanced: a healthy backend on the same candidate set still sweeps.
   const healthy = fakeBackend({ panes: [pane("%1", "@1", "stale")] });
   await renamerPulse(db, healthy.backend, state);
-  expect(healthy.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
+  expect(healthy.renameCalls).toEqual([
+    { windowId: "@1", name: `${robotGlyph("working")} winner` },
+  ]);
 });
 
 test("renamerPulse swallows a TOCTOU rename failure as a non-fatal skip", async () => {
@@ -427,5 +508,7 @@ test("renamerPulse swallows a TOCTOU rename failure as a non-fatal skip", async 
   const state = { lastHash: null };
   // The failure is logged, not thrown — the pulse resolves and the gate advances.
   await renamerPulse(db, fb.backend, state);
-  expect(fb.renameCalls).toEqual([{ windowId: "@1", name: "winner" }]);
+  expect(fb.renameCalls).toEqual([
+    { windowId: "@1", name: `${robotGlyph("working")} winner` },
+  ]);
 });
