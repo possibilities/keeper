@@ -47,6 +47,9 @@
 		<!-- Keeper-managed CodexBar CLI; independent of launchd's PATH. -->
 		<key>KEEPER_CODEXBAR_BIN</key>
 		<string>/Users/mike/.local/bin/codexbar</string>
+		<!-- Headless capacity probes must never request macOS Keychain access. -->
+		<key>CODEXBAR_DISABLE_KEYCHAIN_ACCESS</key>
+		<string>1</string>
 		<!--
 		  The subscribe server's UDS defaults to keeperd.sock in the state dir
 		  below (sibling of StandardOutPath / keeper.db). Uncomment to override:

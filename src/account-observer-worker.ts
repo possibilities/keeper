@@ -188,6 +188,23 @@ export class AccountObserver {
 
 // ---------- production bounded runner ---------------------------------------
 
+const CODEXBAR_DISABLE_KEYCHAIN_ACCESS = "CODEXBAR_DISABLE_KEYCHAIN_ACCESS";
+
+/**
+ * Build the environment inherited by both provider subprocesses. CodexBar is a
+ * headless observer here, never a user-authorized Keychain client, so the safety
+ * flag is forced on even when the parent environment explicitly set it to `0`.
+ * claude-swap ignores the unknown variable.
+ */
+export function providerSubprocessEnvironment(
+  inherited: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, string | undefined> {
+  return {
+    ...inherited,
+    [CODEXBAR_DISABLE_KEYCHAIN_ACCESS]: "1",
+  };
+}
+
 /**
  * Build the production exact-argv runner: no shell, a hard `timeoutMs` deadline
  * (the child is force-killed on expiry and the outcome degrades to unavailable),
@@ -197,10 +214,14 @@ export class AccountObserver {
 export function makeBoundedRunner(
   timeoutMs: number = SUBPROCESS_TIMEOUT_MS,
   maxBytes: number = MAX_OUTPUT_BYTES,
+  inheritedEnvironment: Readonly<
+    Record<string, string | undefined>
+  > = process.env,
 ): ExactArgvRunner {
   return async (argv: string[]): Promise<ProviderRunOutcome> => {
     try {
       const proc = Bun.spawn(argv, {
+        env: providerSubprocessEnvironment(inheritedEnvironment),
         stdout: "pipe",
         stderr: "ignore",
         stdin: "ignore",

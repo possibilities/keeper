@@ -24,6 +24,8 @@ Keeper owns only the latest validated Capacity observation, continuous per-launc
 
 The selector excludes stale, unknown, signed-out, expired, or otherwise unrouteable candidates. It evaluates every applicable normalized quota window, including a matching model-scoped window, and chooses the greatest worst-window headroom after Launch reservations. Deterministic least-recently-used order breaks ties; there is no threshold ladder, reserve account, or hysteresis latch.
 
+CodexBar runs as an unattended, headless observer. Keeper forces `CODEXBAR_DISABLE_KEYCHAIN_ACCESS=1` both in keeperd's launch environment and at the provider-subprocess boundary; parent configuration cannot weaken that invariant. The observer never requests a macOS password or reads CodexBar's Keychain cache. If ambient capacity cannot be obtained without Keychain, the CodexBar gate is unavailable and selection fails open to the native default.
+
 The installer has one exception to external-source non-ownership: it manages the CodexBar CLI artifact from `https://github.com/possibilities/CodexBar.git` `main`, with `https://github.com/steipete/CodexBar.git` `main` as upstream. These mutable main tips are intentional trusted automatic source authorities; the installer does not add SHA locks. It resolves each run's refs to immutable SHAs in disposable source state, attempts a noninteractive, config-sealed, hookless, unsigned `--rebase-merges` rebase, and never modifies or pushes a human checkout or remote. Upstream resolution or rebase failure builds the exact unrebased fork SHA; a rebased-build failure gets the same clean fallback. SwiftPM runs with prompt suppression and disposable HOME, config, and caches so dependency Git cannot inherit operator credentials or hooks while public fetches remain available.
 
 The only build product is `CodexBarCLI`. Each immutable generation contains the executable and `PROVENANCE`, and one atomic `current` symlink swap publishes them together. The stable `~/.local/bin/codexbar` path traverses `current`, including for keeperd; an existing direct-layout artifact remains the migration fallback until generation publication succeeds. Provenance records fork and upstream refs and SHAs, mode, built commit and tree SHAs, binary SHA-256, architecture, and a sanitized single-line Swift toolchain version. The binary digest is verified before an unchanged-input skip.
@@ -52,6 +54,7 @@ Fallback remains evidence-sensitive:
 ## Consequences
 
 - Keeper remains functional without either integration and falls open to native Claude behavior.
+- Headless polling cannot use Keychain-backed ambient credentials; losing that gate disables balancing rather than prompting.
 - The managed CLI has reproducible source provenance and a stable daemon path without mutating a developer checkout.
 - Rebase conflicts and upstream outages are visible notifications but do not sacrifice a buildable fork tip or an already installed CLI.
 - Cross-account resume, argv forwarding, freshness handling, launch attribution, and same-account behavior remain proof obligations at the public CLI boundaries.

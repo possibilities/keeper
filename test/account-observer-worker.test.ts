@@ -4,9 +4,10 @@
  * each absent, partial failure), the exact argv passed to the runner, the atomic
  * sidecar publish, the no-throw cycle guard, and the abort-terminated loop.
  *
- * Every test injects canned command outcomes + a pinned clock and a sandboxed
- * state dir — no real subprocess, worker thread, or daemon ever starts (the
- * worker body is `isMainThread`-guarded, so importing it here is inert).
+ * Provider-cycle tests inject canned outcomes + a pinned clock and a sandboxed
+ * state dir. One runner-policy test starts only the current Bun executable to
+ * inspect its environment; no provider, worker thread, daemon, or Keychain path
+ * runs (the worker body is `isMainThread`-guarded, so importing it here is inert).
  */
 
 import { describe, expect, test } from "bun:test";
@@ -20,8 +21,10 @@ import {
 import {
   AccountObserver,
   type ExactArgvRunner,
+  makeBoundedRunner,
   type ObserverClock,
   observeOnce,
+  providerSubprocessEnvironment,
   publishObservation,
 } from "../src/account-observer-worker";
 import {
@@ -167,6 +170,38 @@ describe("observeOnce", () => {
     await observeOnce({ runner, nowMs: () => NOW_MS });
     expect(calls).toContainEqual(codexBarUsageArgv());
     expect(calls).toContainEqual(cswapListArgv());
+  });
+});
+
+// ---------- subprocess safety -----------------------------------------------
+
+describe("production provider subprocess policy", () => {
+  test("forces CodexBar Keychain access off without mutating inherited env", () => {
+    const inherited = {
+      PATH: "/test/bin",
+      CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "0",
+      SENTINEL: "preserved",
+    };
+
+    expect(providerSubprocessEnvironment(inherited)).toEqual({
+      PATH: "/test/bin",
+      CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "1",
+      SENTINEL: "preserved",
+    });
+    expect(inherited.CODEXBAR_DISABLE_KEYCHAIN_ACCESS).toBe("0");
+  });
+
+  test("the bounded runner passes the forced safety flag to its child", async () => {
+    const runner = makeBoundedRunner(5_000, 4_096, {
+      CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "0",
+    });
+    const outcome = await runner([
+      process.execPath,
+      "-e",
+      "process.stdout.write(process.env.CODEXBAR_DISABLE_KEYCHAIN_ACCESS ?? 'missing')",
+    ]);
+
+    expect(outcome).toEqual({ code: 0, stdout: "1" });
   });
 });
 

@@ -59,6 +59,10 @@ symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon 
 path. Provenance records source and tree SHAs, mode, architecture, Swift toolchain, and the verified binary
 SHA-256. A failed build or publication retains the previous artifact, successful resolved-pair fallbacks
 are reused until either tip changes, and the Homebrew cask is removed only after publication succeeds.
+Keeper forces `CODEXBAR_DISABLE_KEYCHAIN_ACCESS=1` for the daemon and every observer subprocess: an
+unattended capacity poll must never request a macOS password or read CodexBar's credential/cookie cache.
+When ambient Claude capacity exists only in Keychain, that gate reports unavailable and routing safely
+uses the native default instead of prompting.
 
 | Capability | Public command | Keeper role |
 |---|---|---|

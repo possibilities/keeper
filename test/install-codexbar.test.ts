@@ -441,9 +441,13 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     expect(SECTION).toContain("the previous binary was retained");
   });
 
-  test("pins keeperd to the stable home path, independent of XDG data", () => {
+  test("pins keeperd to the stable home path with headless Keychain access disabled", () => {
     expect(PLIST).toContain("<key>KEEPER_CODEXBAR_BIN</key>");
     expect(PLIST).toContain("<string>/Users/mike/.local/bin/codexbar</string>");
+    expect(PLIST).toContain("<key>CODEXBAR_DISABLE_KEYCHAIN_ACCESS</key>");
+    expect(PLIST).toMatch(
+      /<key>CODEXBAR_DISABLE_KEYCHAIN_ACCESS<\/key>\s*<string>1<\/string>/,
+    );
     expect(PLIST).not.toContain(
       "<string>/Users/mike/.local/share/keeper/codexbar/CodexBarCLI</string>",
     );
