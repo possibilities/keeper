@@ -124,6 +124,12 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
     reason: "Reviewed byte-limit boundary requires an over-limit payload.",
   },
   {
+    file: "plugins/prompt/test/render_plugin_templates.test.ts",
+    rule: "large-timeout",
+    reason:
+      "Reviewed multi-root compiler publication fixture retains its scoped timeout.",
+  },
+  {
     file: "test/autopilot-worker.test.ts",
     rule: "fixed-sleep",
     reason:
