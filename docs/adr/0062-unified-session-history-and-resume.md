@@ -26,11 +26,11 @@ A Session reference resolves in deterministic tiers: an explicitly harness-quali
 - `show` renders bounded transcript content;
 - `search` searches normalized transcript entries with structured session, project, role, source, and time filters;
 - `files` returns provenance-graded file evidence and keeps observed mutation, possible mutation, and textual mention distinct;
-- `index` reports and rebuilds the derived search store.
+- `index` reports, refreshes, rebuilds, and purges the derived search store.
 
 Existing session-targeting reads resolve through the same Session reference contract while retaining honest capability errors for cataloged sessions that are not Keeper-tracked. The specialist transcript surface remains available for harness-specific operations such as Claude subagent selection and Pi branch-aware latest-turn extraction.
 
-Full-text search uses a private, independently versioned SQLite FTS sidecar under Keeper's state directory. Native transcript artifacts are authoritative; the sidecar is disposable, incrementally refreshed from source fingerprints, and replaced atomically on rebuild or incompatible schema. It never joins Keeper's migration ladder or Re-fold contract. Literal search is the default; advanced FTS syntax is explicit. Semantic embeddings are not part of this contract.
+Full-text search uses a private, independently versioned SQLite FTS History index under Keeper's state directory. Native transcript artifacts are authoritative; the History index is disposable, incrementally refreshed from source fingerprints, and replaced atomically on rebuild or incompatible schema. It never joins Keeper's migration ladder or Re-fold contract. Literal search is the default; advanced FTS syntax is explicit. Semantic embeddings are not part of this contract.
 
 File evidence carries source and confidence. Canonical successful mutation facts may establish an observed mutation; bounded shell inference may establish only a possible mutation; transcript text and tool references establish a mention. Path normalization never upgrades uncertain evidence.
 
@@ -56,6 +56,6 @@ This decision supersedes ADR 0034. Its title-is-not-identity and Refuse-live rul
 - Standalone Claude and Pi sessions are discoverable, searchable, and resumable when their native artifacts provide the required facts; Keeper-only reads report that an otherwise valid session is not tracked.
 - Complete historical-title resolution depends on native title records when available and reports reduced coverage for artifact-less jobs.
 - Search results carry stable session and entry provenance suitable for opening surrounding context.
-- The FTS sidecar duplicates sensitive local transcript text and therefore requires owner-only directories/files, redacted diagnostics, bounded queries, and whole-store purge/rebuild behavior; it does not add at-rest encryption beyond the existing local-user trust boundary.
+- The History index duplicates sensitive local transcript text and therefore requires owner-only directories/files, redacted diagnostics, bounded queries, and whole-store purge/rebuild behavior; it does not add at-rest encryption beyond the existing local-user trust boundary.
 - Pi's tree remains one Harness session. Search retains branch/entry provenance, display defaults to the selected branch, and Pi owns which native branch continuation resumes.
 - Foreground resume preserves native harness trust and permission behavior and remains distinct from detached partner resume and generation restore.

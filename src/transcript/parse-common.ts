@@ -13,6 +13,7 @@ import type {
   TranscriptEntry,
   TranscriptMetadata,
   TranscriptSource,
+  TranscriptUnknownRecord,
 } from "./model";
 
 /** Per-line byte cap applied before `JSON.parse`; an oversized line folds to
@@ -29,27 +30,81 @@ export interface ParsedTimestamp {
   ms: number;
 }
 
+/** A streaming transcript keeps only a bounded recency set of call-id → tool
+ * names. Whole-document parsing uses a local Map for complete backfill. */
+export function boundedToolNameMap(
+  maxEntries = 4096,
+  maxStringChars = 512,
+): Map<string, string> {
+  return new (class extends Map<string, string> {
+    override set(key: string, value: string): this {
+      if (key.length > maxStringChars || value.length > maxStringChars) {
+        return this;
+      }
+      if (this.has(key)) this.delete(key);
+      while (this.size >= maxEntries) {
+        const oldest = this.keys().next().value;
+        if (oldest === undefined) break;
+        this.delete(oldest);
+      }
+      return super.set(key, value);
+    }
+  })();
+}
+
 /** Mutable accumulator one reader's line-by-line parse threads through. */
 export interface ParseState {
   source: TranscriptSource;
   entries: TranscriptEntry[];
+  unknownRecords: TranscriptUnknownRecord[];
   toolNames: Map<string, string>;
   metadata: TranscriptMetadata;
   minTimestamp: ParsedTimestamp | null;
   maxTimestamp: ParsedTimestamp | null;
+  /** Independent of entries.length so a streaming consumer may drain batches. */
+  nextSourceOrdinal: number;
+  nextRecordOrdinal: number;
 }
 
 /** Append one entry, stamping the source-local ordinal every reader relies on. */
 export function pushEntry(
   state: ParseState,
-  entry: Omit<TranscriptEntry, "sourceOrdinal" | "ordinal" | "source">,
+  entry: Omit<
+    TranscriptEntry,
+    | "sourceOrdinal"
+    | "ordinal"
+    | "source"
+    | "nativeEntryId"
+    | "parentNativeEntryId"
+  > &
+    Partial<Pick<TranscriptEntry, "nativeEntryId" | "parentNativeEntryId">>,
 ): void {
-  const sourceOrdinal = state.entries.length;
+  const sourceOrdinal = state.nextSourceOrdinal++;
   state.entries.push({
     ...entry,
     source: state.source,
     sourceOrdinal,
     ordinal: sourceOrdinal,
+    nativeEntryId: entry.nativeEntryId ?? null,
+    parentNativeEntryId: entry.parentNativeEntryId ?? null,
+  });
+}
+
+/** Retain an understood-as-JSON but otherwise unknown native record. */
+export function preserveUnknownRecord(
+  state: ParseState,
+  raw: Record<string, unknown>,
+  timestamp: ParsedTimestamp | null,
+): void {
+  state.unknownRecords.push({
+    recordOrdinal: state.nextRecordOrdinal++,
+    source: state.source,
+    timestamp: timestamp?.text ?? null,
+    timestampMs: timestamp?.ms ?? null,
+    nativeEntryId: stringOrNull(raw.id),
+    parentNativeEntryId: stringOrNull(raw.parentId),
+    recordType: stringOrNull(raw.type),
+    raw,
   });
 }
 

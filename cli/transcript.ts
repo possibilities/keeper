@@ -1,7 +1,18 @@
 #!/usr/bin/env bun
 
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
+import { resolveDbPath } from "../src/db";
+import { readKeeperJobAliases } from "../src/history/load-catalog";
+import type { SessionCatalog, SessionResolution } from "../src/history/model";
+import { isHistoryHarness } from "../src/history/model";
+import {
+  parseQualifiedSessionReference,
+  resolveSessionReference,
+  sessionAmbiguityDetails,
+} from "../src/history/resolver";
+import { keeperStateDir } from "../src/keeper-state-dir";
 import type {
   SubagentSummary,
   TranscriptFilter,
@@ -11,10 +22,11 @@ import type {
   TranscriptToolDetail,
 } from "../src/transcript/model";
 import { TRANSCRIPT_ROLES } from "../src/transcript/model";
-import { resolvePiTurn } from "../src/transcript/pi";
+import { resolvePiTurnFromHandle } from "../src/transcript/pi";
 import type {
   TranscriptReader,
   TranscriptRootInputs,
+  TranscriptSessionHandle,
 } from "../src/transcript/reader";
 import {
   transcriptHarnessNames,
@@ -27,6 +39,10 @@ import {
 import { ellipsizeInline } from "../src/transcript/text";
 import { parseOptions } from "./descriptor";
 import { errorEnvelope, successEnvelope } from "./envelope";
+import {
+  loadCliSessionCatalog,
+  type SessionReferenceCliDeps,
+} from "./session-reference";
 
 export const TRANSCRIPT_SCHEMA_VERSION = 1;
 const DEFAULT_LIST_LIMIT = 20;
@@ -34,8 +50,8 @@ const DEFAULT_SHOW_LIMIT = 60;
 const DEFAULT_MAX_CHARS = 32_000;
 const DEFAULT_MAX_ENTRY_CHARS = 6_000;
 
-const HELP = `keeper transcript <harness> <session-id> [options]
-keeper transcript <harness> show <session-id> [options]
+const HELP = `keeper transcript <harness> <session-reference> [options]
+keeper transcript <harness> show <session-reference> [options]
 keeper transcript <harness> list [options]
 
 Discover agent sessions and extract compact, bounded text for another agent.
@@ -47,8 +63,8 @@ Harnesses: ${transcriptHarnessNames().join(", ")}
 
 Commands:
   list                   List sessions (current project by default)
-  show <session-id>      Extract one session ("show" may be omitted)
-  turn <session-id>      Extract the selected branch's Latest turn (pi only)
+  show <session-ref>     Extract by native id, job alias, or exact title
+  turn <session-ref>     Extract the selected branch's Latest turn (pi only)
 
 Global options:
   --config-dir <dir>     Claude config directory (repeatable; claude only)
@@ -82,7 +98,7 @@ Options:
   --help, -h             Show this help
 `;
 
-const SHOW_HELP = `keeper transcript <harness> show <session-id> [options]
+const SHOW_HELP = `keeper transcript <harness> show <session-reference> [options]
 
 Extract a bounded transcript page. Without --offset/--before, the newest
 matching page is returned. Use --before with older_before to page backward,
@@ -121,7 +137,7 @@ Options:
   --help, -h             Show this help
 `;
 
-const TURN_HELP = `keeper transcript pi turn <session-id> --leaf <entry-id|root> [options]
+const TURN_HELP = `keeper transcript pi turn <session-reference> --leaf <entry-id|root> [options]
 
 Extract the requested branch's Latest turn: the most recent non-empty user
 text, plus subsequent assistant text ONLY once that response reaches a
@@ -166,7 +182,7 @@ export interface TranscriptCliResult {
   stderr: string;
 }
 
-export interface TranscriptCliDeps {
+export interface TranscriptCliDeps extends SessionReferenceCliDeps {
   cwd: string;
   homeDir: string;
   env: NodeJS.ProcessEnv;
@@ -179,6 +195,8 @@ function defaultDeps(): TranscriptCliDeps {
     homeDir: homedir(),
     env: process.env,
     nowMs: Date.now(),
+    dbPath: resolveDbPath(),
+    stateDir: keeperStateDir(),
   };
 }
 
@@ -546,7 +564,11 @@ function parseList(
       total: outcome.total,
       next_offset: outcome.nextOffset,
     },
-    sessions: outcome.items,
+    // Title history is an internal catalog input in this slice; keep the
+    // public transcript-list envelope byte-compatible until history is exposed.
+    sessions: outcome.items.map(
+      ({ titleHistory: _titleHistory, ...item }) => item,
+    ),
   };
   return format.value === "json"
     ? ok(jsonText(successEnvelope(TRANSCRIPT_SCHEMA_VERSION, data)))
@@ -588,13 +610,345 @@ function jsonFailure(
   code: string,
   message: string,
   recovery: string,
+  details?: unknown,
 ): TranscriptCliResult {
   return {
     code: 1,
     stdout: jsonText(
-      errorEnvelope(TRANSCRIPT_SCHEMA_VERSION, { code, message, recovery }),
+      errorEnvelope(TRANSCRIPT_SCHEMA_VERSION, {
+        code,
+        message,
+        recovery,
+        ...(details === undefined ? {} : { details }),
+      }),
     ),
     stderr: "",
+  };
+}
+
+const TRANSCRIPT_AMBIGUITY_MAX = 50;
+const TRANSCRIPT_OWNER_MAX_CHARS = 2_000;
+
+function boundedOwner(owner: string): string {
+  return owner.length <= TRANSCRIPT_OWNER_MAX_CHARS
+    ? owner
+    : owner.slice(0, TRANSCRIPT_OWNER_MAX_CHARS);
+}
+
+function findAmbiguityFailure(
+  reference: string,
+  outcome: { owners: string[]; hint: string },
+  format: "human" | "json",
+): TranscriptCliResult {
+  const owners = outcome.owners
+    .slice(0, TRANSCRIPT_AMBIGUITY_MAX)
+    .map(boundedOwner);
+  const truncated = owners.length < outcome.owners.length;
+  const message =
+    `session '${reference}' exists in multiple transcript locations: ` +
+    `${owners.join(", ")}${truncated ? `, +${outcome.owners.length - owners.length} more` : ""}; pass ${outcome.hint}`;
+  const recovery = `pass ${outcome.hint} <${outcome.hint === "--config-dir" ? "dir" : "path"}>`;
+  return format === "json"
+    ? jsonFailure("session_ambiguous", message, recovery, {
+        candidate_count: outcome.owners.length,
+        candidates_truncated: truncated,
+        candidates: owners.map((owner) => ({ transcript_owner: owner })),
+        hint: outcome.hint,
+      })
+    : fail(message, 1);
+}
+
+function sessionResolutionFailure(
+  resolution: Exclude<SessionResolution, { kind: "resolved" }>,
+  format: "human" | "json",
+): TranscriptCliResult {
+  if (resolution.kind === "not_found") {
+    return format === "json"
+      ? jsonFailure(
+          "session_not_found",
+          "no session matched the supplied reference in the selected harness",
+          "run `keeper history list --format json` and retry with a qualified native id, exact job id, or exact title",
+        )
+      : fail(
+          "no session matched the supplied reference in the selected harness",
+          1,
+        );
+  }
+  const details = sessionAmbiguityDetails(
+    resolution.match,
+    resolution.candidates,
+  );
+  return format === "json"
+    ? jsonFailure(
+        "session_ambiguous",
+        "the supplied reference matches multiple sessions in the selected harness",
+        "retry with an exact native id and --project/--config-dir when needed",
+        details,
+      )
+    : fail(
+        `the supplied reference matches ${resolution.candidates.length} sessions in the selected harness; narrow with --project or --config-dir`,
+        1,
+      );
+}
+
+type TranscriptReferenceResolution =
+  | {
+      kind: "resolved";
+      handle: TranscriptSessionHandle;
+      nativeId: string;
+    }
+  | { kind: "failure"; result: TranscriptCliResult };
+
+function transcriptJobAliases(deps: TranscriptCliDeps) {
+  return deps.catalog === undefined
+    ? (
+        deps.readKeeperJobs?.() ??
+        readKeeperJobAliases(
+          deps.dbPath ??
+            join(deps.homeDir, ".local", "state", "keeper", "keeper.db"),
+        )
+      ).jobs
+    : deps.catalog.sessions.flatMap((session) => session.jobs);
+}
+
+/** Native ids take the reader's direct path. A miss falls through to the one
+ * shared catalog loader/resolver for exact job aliases and title history. */
+function resolveTranscriptReference(
+  reader: TranscriptReader,
+  reference: string,
+  values: Record<string, unknown>,
+  deps: TranscriptCliDeps,
+  format: "human" | "json",
+): TranscriptReferenceResolution {
+  const qualified = parseQualifiedSessionReference(reference);
+  if (qualified !== null && qualified.harness !== reader.harness) {
+    const result =
+      format === "json"
+        ? jsonFailure(
+            "harness_mismatch",
+            `the qualified reference selects ${qualified.harness}, not ${reader.harness}`,
+            `run the command with harness '${qualified.harness}' or use a ${reader.harness} Session reference`,
+            {
+              selected_harness: reader.harness,
+              reference_harness: qualified.harness,
+            },
+          )
+        : fail(
+            `qualified reference '${reference}' does not belong to harness '${reader.harness}'`,
+            1,
+          );
+    return { kind: "failure", result };
+  }
+
+  const nativeCandidate = qualified?.nativeId ?? reference;
+  const project = typeof values.project === "string" ? values.project : null;
+  const root = buildRootInputs(values, deps);
+  const direct = reader.find({
+    root,
+    sessionId: nativeCandidate,
+    project,
+  });
+  if (direct.kind === "found") {
+    // Unqualified references give exact Keeper job ids precedence over native
+    // ids. Check only the narrow alias projection; avoid a full title/artifact
+    // catalog scan on the ordinary native-id fast path.
+    let shadowedByJobAlias = false;
+    if (qualified === null && isHistoryHarness(reader.harness)) {
+      try {
+        shadowedByJobAlias = transcriptJobAliases(deps).some(
+          (job) =>
+            job.harness === reader.harness &&
+            job.jobId === reference &&
+            job.nativeId !== direct.handle.sessionId,
+        );
+      } catch {
+        return {
+          kind: "failure",
+          result:
+            format === "json"
+              ? jsonFailure(
+                  "catalog_read_failed",
+                  "could not read Keeper job aliases while resolving the Session reference",
+                  "confirm keeper.db is readable or use a qualified native id",
+                )
+              : fail(
+                  "could not read Keeper job aliases; use a qualified native id to select native history explicitly",
+                  1,
+                ),
+        };
+      }
+    }
+    if (!shadowedByJobAlias) {
+      return {
+        kind: "resolved",
+        handle: direct.handle,
+        nativeId: direct.handle.sessionId,
+      };
+    }
+  }
+  if (direct.kind === "ambiguous") {
+    let shadowedByJobAlias = false;
+    if (qualified === null && isHistoryHarness(reader.harness)) {
+      try {
+        shadowedByJobAlias = transcriptJobAliases(deps).some(
+          (job) => job.harness === reader.harness && job.jobId === reference,
+        );
+      } catch {
+        return {
+          kind: "failure",
+          result:
+            format === "json"
+              ? jsonFailure(
+                  "catalog_read_failed",
+                  "could not read Keeper job aliases while resolving the Session reference",
+                  "confirm keeper.db is readable or use a qualified native id",
+                )
+              : fail(
+                  "could not read Keeper job aliases; use a qualified native id to select native history explicitly",
+                  1,
+                ),
+        };
+      }
+    }
+    if (!shadowedByJobAlias) {
+      return {
+        kind: "failure",
+        result: findAmbiguityFailure(reference, direct, format),
+      };
+    }
+  }
+  if (direct.kind === "no_roots") {
+    return {
+      kind: "failure",
+      result:
+        format === "json"
+          ? jsonFailure(
+              "no_roots",
+              direct.message,
+              `check the ${reader.harness} transcript roots and retry`,
+            )
+          : fail(direct.message, 1),
+    };
+  }
+  if (!isHistoryHarness(reader.harness)) {
+    return {
+      kind: "failure",
+      result:
+        format === "json"
+          ? jsonFailure(
+              "session_not_found",
+              `session '${reference}' not found${project === null ? "" : ` in project ${project}`}`,
+              `run \`keeper transcript ${reader.harness} list --global\` to discover session ids`,
+            )
+          : fail(`session '${reference}' not found`, 1),
+    };
+  }
+
+  let fullCatalog: SessionCatalog;
+  try {
+    fullCatalog = loadCliSessionCatalog(
+      {
+        ...deps,
+        dbPath:
+          deps.dbPath ??
+          join(deps.homeDir, ".local", "state", "keeper", "keeper.db"),
+        stateDir:
+          deps.stateDir ?? join(deps.homeDir, ".local", "state", "keeper"),
+      },
+      { root, completeTitleHistory: true },
+    );
+  } catch {
+    return {
+      kind: "failure",
+      result:
+        format === "json"
+          ? jsonFailure(
+              "catalog_read_failed",
+              "could not read the shared Session catalog",
+              "confirm keeper.db and native transcript roots are readable, then retry",
+            )
+          : fail("could not read the shared Session catalog", 1),
+    };
+  }
+  const catalog: SessionCatalog = {
+    ...fullCatalog,
+    sessions: fullCatalog.sessions.filter(
+      (session) =>
+        session.harness === reader.harness &&
+        (project === null || session.project === project),
+    ),
+  };
+  const resolution = resolveSessionReference(catalog, reference);
+  if (resolution.kind === "not_found" && project === null) {
+    const anywhere = resolveSessionReference(fullCatalog, reference);
+    const otherHarness =
+      anywhere.kind === "resolved"
+        ? anywhere.session.harness !== reader.harness
+        : anywhere.kind === "ambiguous" &&
+          anywhere.candidates.length > 0 &&
+          anywhere.candidates.every(
+            (candidate) => candidate.harness !== reader.harness,
+          );
+    if (otherHarness) {
+      return {
+        kind: "failure",
+        result:
+          format === "json"
+            ? jsonFailure(
+                "harness_mismatch",
+                "the Session reference resolves only in another harness",
+                "select the harness shown by `keeper history list --format json` and retry",
+              )
+            : fail("the Session reference resolves only in another harness", 1),
+      };
+    }
+  }
+  if (resolution.kind !== "resolved") {
+    if (resolution.kind === "ambiguous") {
+      const nativeIds = new Set(
+        resolution.candidates.map((candidate) => candidate.nativeId),
+      );
+      if (nativeIds.size === 1) {
+        const nativeId = resolution.candidates[0]?.nativeId;
+        if (nativeId !== undefined) {
+          const duplicate = reader.find({ root, sessionId: nativeId, project });
+          if (duplicate.kind === "ambiguous") {
+            return {
+              kind: "failure",
+              result: findAmbiguityFailure(reference, duplicate, format),
+            };
+          }
+        }
+      }
+    }
+    return {
+      kind: "failure",
+      result: sessionResolutionFailure(resolution, format),
+    };
+  }
+  if (resolution.session.artifact === null) {
+    return {
+      kind: "failure",
+      result:
+        format === "json"
+          ? jsonFailure(
+              "artifact_unavailable",
+              "the Session resolves through Keeper metadata but has no native transcript artifact",
+              "choose a Session with an artifact in `keeper history list --format json`",
+            )
+          : fail(
+              "the Session has Keeper metadata but no native transcript artifact",
+              1,
+            ),
+    };
+  }
+  return {
+    kind: "resolved",
+    handle: {
+      sessionId: resolution.session.nativeId,
+      path: resolution.session.artifact.path,
+    },
+    nativeId: resolution.session.nativeId,
   };
 }
 
@@ -618,11 +972,11 @@ function parseShow(
   if (parsed.positionals.length !== 1) {
     return fail(
       parsed.positionals.length === 0
-        ? "show: <session-id> is required"
+        ? "show: <session-reference> is required"
         : `show: unexpected argument '${parsed.positionals[1]}'`,
     );
   }
-  const sessionId = parsed.positionals[0] as string;
+  const sessionReference = parsed.positionals[0] as string;
   const format = resolveOutputFormat(parsed.values);
   if (!format.ok) return fail(format.error);
   const offset =
@@ -675,40 +1029,19 @@ function parseShow(
   if (sinceMs !== null && untilMs !== null && sinceMs > untilMs) {
     return fail("--since must not be later than --until");
   }
-  const project =
-    typeof parsed.values.project === "string" ? parsed.values.project : null;
-  const outcome = reader.find({
-    root: buildRootInputs(parsed.values, deps),
-    sessionId,
-    project,
-  });
-  if (outcome.kind === "no_roots") {
-    return fail(outcome.message, 1);
-  }
-  if (outcome.kind === "not_found") {
-    const message = `session '${sessionId}' not found${project === null ? "" : ` in project ${project}`}`;
-    return format.value === "json"
-      ? jsonFailure(
-          "session_not_found",
-          message,
-          `run \`keeper transcript ${reader.harness} list --global\` to discover session ids`,
-        )
-      : fail(message, 1);
-  }
-  if (outcome.kind === "ambiguous") {
-    const message = `session '${sessionId}' exists in multiple projects: ${outcome.owners.join(", ")}; pass ${outcome.hint}`;
-    return format.value === "json"
-      ? jsonFailure(
-          "session_ambiguous",
-          message,
-          `pass ${outcome.hint} <${outcome.hint === "--config-dir" ? "dir" : "path"}>`,
-        )
-      : fail(message, 1);
-  }
+  const resolved = resolveTranscriptReference(
+    reader,
+    sessionReference,
+    parsed.values,
+    deps,
+    format.value,
+  );
+  if (resolved.kind === "failure") return resolved.result;
+
   let session: TranscriptSession | { error: string };
   try {
     session = reader.load(
-      outcome.handle,
+      resolved.handle,
       String(parsed.values.subagent ?? "main"),
     );
   } catch (error) {
@@ -754,7 +1087,11 @@ function parseShow(
   });
   const data = {
     harness: reader.harness,
-    session: session.main.metadata,
+    // Keep the public transcript JSON shape while the internal normalizer
+    // retains native title history for the unified Session catalog.
+    session: (({ titleHistory: _titleHistory, ...metadata }) => metadata)(
+      session.main.metadata,
+    ),
     selected_source: session.selectedSource,
     subagents: session.subagents,
     page: {
@@ -807,11 +1144,11 @@ function parseTurn(
   if (parsed.positionals.length !== 1) {
     return fail(
       parsed.positionals.length === 0
-        ? "turn: <session-id> is required"
+        ? "turn: <session-reference> is required"
         : `turn: unexpected argument '${parsed.positionals[1]}'`,
     );
   }
-  const sessionId = parsed.positionals[0] as string;
+  const sessionReference = parsed.positionals[0] as string;
   const format = resolveOutputFormat(parsed.values);
   if (!format.ok) return fail(format.error);
   // json is the only mode turn ever renders, so it is also the silent
@@ -827,42 +1164,33 @@ function parseTurn(
   if (typeof leaf !== "string" || leaf.length === 0) {
     return fail("turn: --leaf <entry-id|root> is required");
   }
-  const project =
-    typeof parsed.values.project === "string" ? parsed.values.project : null;
-  const outcome = resolvePiTurn({
-    root: buildRootInputs(parsed.values, deps),
-    sessionId,
-    project,
+  const resolved = resolveTranscriptReference(
+    reader,
+    sessionReference,
+    parsed.values,
+    deps,
+    "json",
+  );
+  if (resolved.kind === "failure") return resolved.result;
+  const outcome = resolvePiTurnFromHandle(
+    resolved.handle,
     leaf,
-    stripSkills: parsed.values["strip-skills"] === true,
-  });
-  if (outcome.kind === "no_roots") {
+    parsed.values["strip-skills"] === true,
+  );
+  if (outcome.kind === "no_roots" || outcome.kind === "not_found") {
     return jsonFailure(
-      "no_roots",
-      outcome.message,
-      "check the pi sessions directory and retry",
-    );
-  }
-  if (outcome.kind === "not_found") {
-    const message = `session '${sessionId}' not found${project === null ? "" : ` in project ${project}`}`;
-    return jsonFailure(
-      "session_not_found",
-      message,
-      "run `keeper transcript pi list --global` to discover session ids",
+      "read_failed",
+      "the resolved Pi transcript artifact disappeared before turn extraction",
+      "refresh history and retry",
     );
   }
   if (outcome.kind === "ambiguous") {
-    const message = `session '${sessionId}' exists in multiple projects: ${outcome.owners.join(", ")}; pass ${outcome.hint}`;
-    return jsonFailure(
-      "session_ambiguous",
-      message,
-      `pass ${outcome.hint} <path>`,
-    );
+    return findAmbiguityFailure(sessionReference, outcome, "json");
   }
   if (outcome.kind === "leaf_not_found") {
     return jsonFailure(
       "leaf_not_found",
-      `leaf '${leaf}' not found in session '${sessionId}'`,
+      `leaf '${leaf}' not found in session '${resolved.nativeId}'`,
       "pass an entry id present in this session, or 'root'",
     );
   }
@@ -882,7 +1210,7 @@ function parseTurn(
   }
   const data = {
     harness: reader.harness,
-    session_id: sessionId,
+    session_id: resolved.nativeId,
     selected_leaf: outcome.selectedLeaf,
     turn: outcome.turn,
   };

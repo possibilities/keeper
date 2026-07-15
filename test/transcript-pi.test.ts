@@ -535,6 +535,13 @@ describe("keeper transcript pi turn", () => {
         timestamp: "2026-07-09T10:00:00.100Z",
         name: "Turn test",
       }),
+      line({
+        type: "session_info",
+        id: "si2",
+        parentId: "si1",
+        timestamp: "2026-07-09T10:00:00.150Z",
+        name: "Turn current",
+      }),
       // u1 -> a1 (toolUse, has its own text too) -> t1 -> a2 (stop): a
       // multi-message tool-use response, terminated by a successful stop.
       userMsg("u1", "si1", [{ type: "text", text: "Build the alpha feature" }]),
@@ -611,18 +618,13 @@ describe("keeper transcript pi turn", () => {
     );
   });
 
-  function runTurn(leaf: string, extra: string[] = []) {
+  function runTurn(
+    leaf: string,
+    extra: string[] = [],
+    reference = TURN_SESSION,
+  ) {
     return runTranscriptCli(
-      [
-        "pi",
-        "turn",
-        TURN_SESSION,
-        "--leaf",
-        leaf,
-        "--format",
-        "json",
-        ...extra,
-      ],
+      ["pi", "turn", reference, "--leaf", leaf, "--format", "json", ...extra],
       deps,
     );
   }
@@ -640,6 +642,13 @@ describe("keeper transcript pi turn", () => {
       response: "Let me check.\nDone.",
       responseTruncated: false,
     });
+  });
+
+  test("turn resolves an exact historical title before branch-aware extraction", () => {
+    const parsed = JSON.parse(runTurn("a2", [], "Turn test").stdout);
+    expect(parsed.ok).toBe(true);
+    expect(parsed.data.session_id).toBe(TURN_SESSION);
+    expect(parsed.data.turn.response).toBe("Let me check.\nDone.");
   });
 
   test("a prompt with nothing following yet is prompt-only (response: null)", () => {

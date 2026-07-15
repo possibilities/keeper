@@ -307,6 +307,13 @@ test("restore and reclaim runbooks retain stop, swap, sidecar, and verify steps"
   );
   expect(reclaim).toContain("launchctl bootout <keeperd label>");
   expect(reclaim).toContain("keeper await server-up");
+  expect(reclaim).toContain(
+    "SELECT id FROM events WHERE hook_event = 'UserPromptSubmit'",
+  );
+  expect(reclaim).toContain(
+    "keeper history search --syntax literal --format json --limit 1 -- 'known term'",
+  );
+  expect(reclaim).not.toContain("keeper search-history");
 });
 
 test("keeperd target resolution is injectable and fail-safe", () => {

@@ -95,6 +95,11 @@ beforeEach(() => {
   const main = [
     line({
       type: "custom-title",
+      customTitle: "Earlier Alpha",
+      sessionId: SESSION,
+    }),
+    line({
+      type: "custom-title",
       customTitle: "Alpha handoff",
       sessionId: SESSION,
     }),
@@ -300,13 +305,81 @@ describe("keeper transcript show", () => {
     expect(noTools.stdout).not.toContain("tool-result");
   });
 
-  test("returns structured errors for JSON callers", () => {
-    const result = run(["missing-session", "--json"]);
-    expect(result.code).toBe(1);
-    expect(result.stderr).toBe("");
-    const parsed = JSON.parse(result.stdout);
-    expect(parsed.ok).toBe(false);
-    expect(parsed.error.code).toBe("session_not_found");
+  test("resolves current/historical titles and exact Keeper job aliases", () => {
+    const current = run(["Alpha handoff", "--offset", "0"]);
+    expect(current.code).toBe(0);
+    const historical = run(["Earlier Alpha", "--offset", "0"]);
+    expect(historical.code).toBe(0);
+    expect(historical.stdout).toContain("Build the alpha feature");
+
+    deps.readKeeperJobs = () => ({
+      diagnostics: [],
+      jobs: [
+        {
+          jobId: "keeper-job-alias",
+          harness: "claude",
+          nativeId: SESSION,
+          transcriptPath: join(
+            configDir,
+            "projects",
+            encodeClaudeProject(PROJECT),
+            `${SESSION}.jsonl`,
+          ),
+          project: PROJECT,
+          currentTitle: "Alpha handoff",
+          titleHistory: ["Earlier Alpha", "Alpha handoff"],
+          state: "ended",
+          createdAtMs: 1,
+          updatedAtMs: 2,
+          pid: null,
+          startTime: null,
+        },
+      ],
+    });
+    const alias = run(["keeper-job-alias", "--offset", "0"]);
+    expect(alias.code).toBe(0);
+    expect(alias.stdout).toContain(`session: ${SESSION}`);
+  });
+
+  test("an exact job alias keeps precedence over a colliding native id", () => {
+    deps.readKeeperJobs = () => ({
+      diagnostics: [],
+      jobs: [
+        {
+          jobId: SESSION,
+          harness: "claude",
+          nativeId: OTHER_SESSION,
+          transcriptPath: null,
+          project: OTHER_PROJECT,
+          currentTitle: "Beta session",
+          titleHistory: ["Beta session"],
+          state: "ended",
+          createdAtMs: 1,
+          updatedAtMs: 2,
+          pid: null,
+          startTime: null,
+        },
+      ],
+    });
+    const result = run([SESSION, "--json"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).data.session.sessionId).toBe(
+      OTHER_SESSION,
+    );
+  });
+
+  test("returns structured errors for misses and qualified harness mismatch", () => {
+    const missing = run(["missing-session", "--json"]);
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toBe("");
+    expect(JSON.parse(missing.stdout).error.code).toBe("session_not_found");
+
+    const mismatch = runTranscriptCli(
+      ["pi", "show", `claude:${SESSION}`, "--json"],
+      deps,
+    );
+    expect(mismatch.code).toBe(1);
+    expect(JSON.parse(mismatch.stdout).error.code).toBe("harness_mismatch");
   });
 
   test("human entry labels equal page.offset + array position and round-trip via --offset", () => {
@@ -589,6 +662,62 @@ describe("keeper transcript list", () => {
 });
 
 describe("keeper transcript show ambiguous session hint", () => {
+  test("an exact title ambiguity is narrowed by --project", () => {
+    const first = "33333333-aaaa-4333-8333-aaaaaaaaaaaa";
+    const second = "44444444-bbbb-4444-8444-bbbbbbbbbbbb";
+    writeSession(
+      PROJECT,
+      first,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Shared title",
+          sessionId: first,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T11:00:00.000Z",
+          cwd: PROJECT,
+          sessionId: first,
+          message: { role: "user", content: "first project" },
+        }),
+      ].join("\n"),
+      "2026-07-09T12:00:00.000Z",
+    );
+    writeSession(
+      OTHER_PROJECT,
+      second,
+      [
+        line({
+          type: "custom-title",
+          customTitle: "Shared title",
+          sessionId: second,
+        }),
+        line({
+          type: "user",
+          timestamp: "2026-07-09T11:00:00.000Z",
+          cwd: OTHER_PROJECT,
+          sessionId: second,
+          message: { role: "user", content: "second project" },
+        }),
+      ].join("\n"),
+      "2026-07-09T12:00:00.000Z",
+    );
+
+    const ambiguous = run(["Shared title", "--json"]);
+    expect(ambiguous.code).toBe(1);
+    expect(JSON.parse(ambiguous.stdout).error.code).toBe("session_ambiguous");
+
+    const selected = run([
+      "Shared title",
+      "--project",
+      OTHER_PROJECT,
+      "--json",
+    ]);
+    expect(selected.code).toBe(0);
+    expect(JSON.parse(selected.stdout).data.session.sessionId).toBe(second);
+  });
+
   test("duplicate session id within one config root names --project", () => {
     const dupSessionId = "66666666-6666-4666-8666-666666666666";
     writeSession(

@@ -40,6 +40,24 @@ export interface TranscriptEntry {
   text: string | null;
   meta: boolean;
   tool: TranscriptTool | null;
+  /** Native record identity when the harness persists one (Pi does). */
+  nativeEntryId: string | null;
+  /** Native parent link. Together with nativeEntryId this retains Pi branches. */
+  parentNativeEntryId: string | null;
+}
+
+/** A syntactically valid native record that this normalization version does not
+ * understand. It remains available to later consumers without changing the
+ * public transcript rendering contract. */
+export interface TranscriptUnknownRecord {
+  recordOrdinal: number;
+  source: TranscriptSource;
+  timestamp: string | null;
+  timestampMs: number | null;
+  nativeEntryId: string | null;
+  parentNativeEntryId: string | null;
+  recordType: string | null;
+  raw: Record<string, unknown>;
 }
 
 export interface TranscriptMetadata {
@@ -48,6 +66,8 @@ export interface TranscriptMetadata {
   path: string;
   project: string | null;
   title: string | null;
+  /** Every native title record in file order, including repeated aliases. */
+  titleHistory: string[];
   agentName: string | null;
   model: string | null;
   version: string | null;
@@ -61,6 +81,7 @@ export interface TranscriptDocument {
   metadata: TranscriptMetadata;
   source: TranscriptSource;
   entries: TranscriptEntry[];
+  unknownRecords: TranscriptUnknownRecord[];
 }
 
 export interface SubagentSummary {
@@ -84,6 +105,7 @@ export interface TranscriptListItem {
   path: string;
   project: string | null;
   title: string | null;
+  titleHistory: string[];
   startedAt: string | null;
   updatedAt: string;
   bytes: number;

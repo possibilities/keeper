@@ -193,7 +193,7 @@ snippets:
     token-estimate: 424
     used-in: []
   - name: keeper-history-forensics
-    summary: Read-only recipes against keeper.db — every prompt, tool call, file mutation, and subagent run across all sessions. Find who touched a file, search past prompts, replay what a session or worker actually did.
+    summary: 'Use keeper history as the canonical Claude and Pi session record: find sessions, prompts, and file evidence; resume a human session in the foreground.'
     domain: engineering
     audience: agent
     severity: default
@@ -210,7 +210,7 @@ snippets:
     related:
       - commit-via-keeper-default
     path: _partials/snippets/engineering/keeper-history-forensics.md.tmpl
-    token-estimate: 524
+    token-estimate: 324
     used-in: []
   - name: landed-vs-complete
     summary: keeper plan `landed <epic>` (lane merged to default) vs `complete <id>` (done AND idle) — under worktree mode complete can fire before files reach the default branch, so daisy-chains gate on landed.

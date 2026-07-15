@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(gh gist create:*), WebSearch, WebFetch, Agent, Skill, Monitor
+allowed-tools: Bash(keeper agent:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Bash(gh gist create:*), WebSearch, WebFetch, Agent, Skill, Monitor
 ---
 
 # Hack
@@ -24,7 +24,7 @@ Pick a mode from the wording, then operate in that shape. Don't pre-announce the
 
 - **Quick-answer** — bounded factoid, yes/no, "how does X work." Terse chat reply, optional brief `## Context` block from local sources only.
 - **Troubleshoot** — "broken," "fails," "why doesn't," "doesn't work." Reproduce, isolate, find root cause, quote evidence. No fix yet.
-- **Internal report** — "summarize," "compare," "give me a writeup." Project-internal sources only — codebase, git history, `knowctl`, `claudectl`. No web search, no scraping.
+- **Internal report** — "summarize," "compare," "give me a writeup." Project-internal sources only — codebase, git history, keeper history, `knowctl`. No web search, no scraping.
 - **External research** — "what does the web say," "current state of X," "what are people doing." `searchctl`, `scrapectl`, `agent-browser`, `knowctl`. Primary sources, cited URLs.
 - **Work-shaped** — "add X," "build Y," "implement Z," "fix this." Investigate enough to understand scope, then stop and confirm with the human before touching anything. If they greenlight, execute inline; otherwise route to `/plan:plan` or `/plan:defer`. **Scope-confirm reflex:** on an ambiguous or still-evolving design ask, state your assumption on the unstated axis in one sentence before proceeding (*"assuming per-repo, not per-epic — say so if not"*), rather than silently picking a direction on an axis the human left open. Fires on a genuinely unstated axis only; never re-litigate a settled directive.
 
@@ -32,12 +32,12 @@ If two modes feel equally plausible and the choice would meaningfully change the
 
 ## How to investigate
 
-**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `scrapectl`, `agent-browser`, `claudectl`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
+**Arthack CLIs degrade, never block.** Every arthack helper named below (`knowctl`, `searchctl`, `scrapectl`, `agent-browser`, `tmuxctl`) is a convenience that may not be on PATH. When one is absent, skip it and reach for the fallback — never stall on a missing binary:
 
 - `searchctl` (web search) → the harness `WebSearch` tool.
 - `scrapectl fetch-markdown` / `agent-browser` (fetch and read pages) → the harness `WebFetch` tool (static pages; no JS or interaction).
 - `knowctl` (internal docs) → note in one line that no local topic docs are reachable, then go straight to web search.
-- `claudectl list-sessions` / `show-session` → the keeper session-forensics verbs below (`keeper find-file-history`, `keeper search-history`, `keeper session events`, `keeper show-job`).
+- `keeper history list|show|search|files|index` → the keeper history verbs below; `keeper resume <session-reference>` continues the human foreground session; `keeper transcript` stays for explicit subagent/tool-detail or Pi branch-aware drill-down.
 - `tmuxctl` → plain `tmux` over Bash.
 
 Universal moves, in any mode:
@@ -46,8 +46,8 @@ Universal moves, in any mode:
 - Read evidence literally — quote exact errors, exact log lines, exact code paths, with `path:line` where useful.
 - Form one hypothesis at a time and test it. Don't pile guesses on guesses.
 - Follow data across boundaries (process/file/network/cache). Most surprises live at handoffs.
-- Check recent movement: `git log --oneline -20`, `git log -S <symbol>`, `git blame`, `claudectl list-sessions`.
-- Mine session history when the question is who/when/what-happened: keeper's database holds every prompt, tool call, file mutation, and subagent run across all sessions — recipes below.
+- Check recent movement: `git log --oneline -20`, `git log -S <symbol>`, `git blame`, `keeper history list`.
+- Mine session history when the question is who/when/what-happened: the unified Claude/Pi history surface catalogs readable native conversations, optional Keeper aliases, and provenance-graded file evidence; `keeper resume <session-reference>` is the continuation path, not a read.
 - Delegate when wide: if the investigation spans more than one subsystem or repo, or balloons past ~10 reads, fan out parallel read-only Explore agents (Agent tool, one per surface) and keep this context for synthesis and the conversation. Brief each agent to reproduce before theorizing, quote exact evidence with `path:line`, and return conclusions, not file dumps.
 - Bring in `/keeper:pair` for a quick second opinion when your mental model feels sticky — a single partner, lightweight, narrow. This is **not** the panel: the panel (the routing gate below) is a heavier multi-model fan-out plus a judge, reserved for answering the inquiry itself, not for unsticking a mid-investigation hunch.
 
@@ -55,49 +55,31 @@ Mode-specific moves:
 
 - **Quick-answer** — cap local reads around three; if you need more, you guessed the mode wrong, upgrade to report or troubleshoot.
 - **Troubleshoot** — reproduce → narrow surface → quote evidence → hypothesize → test → repeat. `keeper`, `tmuxctl`, recent `git log` and `git blame` are faster than guessing. When the trail is cold, the history recipes below find who touched what, when, and in which session.
-- **Internal report** — codebase, configs, git history, keeper session history, `knowctl`, `claudectl`. Skip `searchctl` and `scrapectl`. Gather enough to be thorough — don't exhaustively research.
+- **Internal report** — codebase, configs, git history, keeper history, `knowctl`. Skip `searchctl` and `scrapectl`. Gather enough to be thorough — don't exhaustively research.
 - **External research** — cast a wide net with `searchctl web-search` / `reason-search` / `pro-search`; pull primary sources via `scrapectl fetch-markdown`; use `agent-browser` for pages needing interaction or JS; cross-reference; flag disagreements; cite URLs for key claims.
-- **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`claudectl list-sessions` / `show-session` for related conversations, `keeper plan epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
+- **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`keeper history list` / `keeper history show` for related conversations, `keeper plan epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
 
-### Session history (keeper.db)
+### Session history (native artifacts + optional Keeper metadata)
 
 <!-- BAKE:BEGIN keeper prompt render engineering/keeper-history-forensics -->
 
-Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Reach for the read-only `keeper` JSON subcommands below first — they emit a parseable envelope and stay stable across schema shifts; drop to `sqlite3 -readonly` only for an ad-hoc column they don't surface (the daemon is the sole writer — never open the DB read-write).
-
-**Who last touched a file** — then replay that session:
+`keeper history` is the canonical session record for Claude and Pi, including sessions launched outside Keeper. Use it before any lower-level inspection:
 
 ```bash
-keeper find-file-history <path-fragment>   # session_id, mutation time, op, source, project_dir (most-recent-first)
+keeper history list                 # browse sessions
+keeper history search <query>       # find prompts and discussion
+keeper history files <path>         # find file evidence
+keeper history show <session-reference>  # inspect one session
+keeper history index                # inspect the available history index
 ```
 
-Feed a `session_id` to `keeper session events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
+A `<session-reference>` may be a qualified native id, exact Keeper job id, exact native id, or an exact current or historical title. The shared resolver reports ambiguity; never silently select the newest match.
 
-**Search past prompts** — "when did we discuss X / decide Y":
+`keeper history files` labels evidence truthfully: `observed_mutation` is recorded mutation evidence, `possible_mutation` is suggestive but unconfirmed, and `mention` is only a reference to the path.
 
-```bash
-keeper search-history <term>   # ts, session_id, prompt snippet for every matching UserPromptSubmit row
-```
+For a human continuing work, run `keeper resume <session-reference>` in the foreground. `keeper transcript` is for specialist transcript work only.
 
-**What a session did** — the prompt/tool-call spine without transcript bulk:
-
-```bash
-keeper session events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
-```
-
-**One session at a glance** — orient before touching any transcript:
-
-```bash
-keeper session summary <session-id>   # bounded envelope: title, lifecycle, plan linkage, first+last prompt, event counts
-```
-
-**One job's metadata / failed-worker forensics**:
-
-```bash
-keeper show-job --session-title <title>   # the full jobs-projection row (auto-detects your own job with no selector)
-```
-
-`subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.
+For Keeper-tracked lifecycle detail only, `keeper session events <session-reference>`, `keeper session summary <session-reference>`, and `keeper show-job <session-reference>` are optional supplements; they are not the cross-harness history source.
 
 <!-- BAKE:END keeper prompt render engineering/keeper-history-forensics -->
 

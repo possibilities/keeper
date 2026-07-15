@@ -12,22 +12,26 @@
  * failure path — including a mid-window `reclaim` failure that brings the
  * daemon back up for the board's sake — leaves it paused.
  *
- * A second block below unit-tests the pure helpers `buildRealDeps` wires its
- * `awaitDrain`/forensics-term logic through — `readInFlightCounts` /
- * `isBoardQuiet` / `deriveForensicsTerm` — with fabricated inputs, no
- * subprocess or DB required.
+ * A second block below unit-tests the helpers `buildRealDeps` wires into drain
+ * and verification. Command parsing stays pure; the Keeper event-retention probe
+ * uses only a sandboxed in-process DB file.
  */
 
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
-  deriveForensicsTerm,
+  captureKeeperEventProbe,
   type InFlightCounts,
   isBoardQuiet,
   type MaintenanceWindowDeps,
   type MaintenanceWindowResult,
   readInFlightCounts,
   runMaintenanceWindow,
+  verifyKeeperEventProbe,
 } from "../scripts/maintenance-window";
+import { freshDbFile } from "./helpers/template-db";
 
 interface FakeConfig {
   wasPaused?: boolean;
@@ -450,31 +454,53 @@ test("isBoardQuiet(): true only once both board-work and pending counts read zer
 });
 
 // ---------------------------------------------------------------------------
-// F2 — deriveForensicsTerm: the captured term must stay a literal substring
-// of the source prompt so `keeper search-history` (which ESCAPEs %/_/\ for a
-// literal LIKE match) can find it — never stripped.
+// Keeper event retention is verified directly against the reclaimed DB. It
+// never assumes the tracked event has a readable native transcript artifact.
 // ---------------------------------------------------------------------------
 
-test("deriveForensicsTerm(): keeps a literal '%' in the captured prefix instead of stripping it", () => {
-  // Under the 32-char cap, so the whole trimmed prompt is the term — the
-  // expected value is the hand-typed literal, not a re-slice of the input.
-  const term = deriveForensicsTerm("100% done with tests");
-  expect(term).toBe("100% done with tests");
+test("Keeper event probe verifies the reclaimed DB row independently of native history", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-maintenance-probe-"));
+  const dbPath = join(root, "keeper.db");
+  const { db } = freshDbFile(dbPath);
+  try {
+    expect(captureKeeperEventProbe(dbPath)).toBeNull();
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'UserPromptSubmit', 'UserPromptSubmit', ?)`,
+      [
+        1,
+        "session-probe",
+        JSON.stringify({ prompt: "known pre-reclaim prompt" }),
+      ],
+    );
+    const probe = captureKeeperEventProbe(dbPath);
+    expect(probe).not.toBeNull();
+    if (probe === null) throw new Error("expected Keeper event probe");
+    expect(verifyKeeperEventProbe(dbPath, probe)).toEqual({
+      ok: true,
+      error: null,
+    });
+
+    db.run("UPDATE events SET data = ? WHERE id = ?", [
+      JSON.stringify({ prompt: "changed after capture" }),
+      probe.eventId,
+    ]);
+    const mismatch = verifyKeeperEventProbe(dbPath, probe);
+    expect(mismatch.ok).toBe(false);
+    expect(mismatch.error).toContain("did not retain UserPromptSubmit event");
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
-test("deriveForensicsTerm(): keeps a literal '_' and '\\\\' in the captured prefix instead of stripping them", () => {
-  const term = deriveForensicsTerm("fix_the\\path bug");
-  expect(term).toBe("fix_the\\path bug");
-});
-
-test("deriveForensicsTerm(): trims and caps at 32 chars", () => {
-  const prompt = `  ${"a".repeat(50)}  `;
-  const term = deriveForensicsTerm(prompt);
-  expect(term).toBe("a".repeat(32));
-});
-
-test("deriveForensicsTerm(): null when the usable prefix is shorter than 8 chars", () => {
-  expect(deriveForensicsTerm("short")).toBeNull();
-  expect(deriveForensicsTerm("   ")).toBeNull();
-  expect(deriveForensicsTerm("")).toBeNull();
+test("Keeper event probe throws on an unreadable DB instead of reporting a skipped check", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-maintenance-probe-fail-"));
+  try {
+    expect(() =>
+      captureKeeperEventProbe(join(root, "missing", "keeper.db")),
+    ).toThrow();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -10,6 +10,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+  readJsonlMetadataSpineSync,
+  scanTranscriptJsonlSync,
+} from "./jsonl-scan";
 import type {
   SubagentSummary,
   TranscriptDocument,
@@ -22,11 +26,13 @@ import type {
 } from "./model";
 import {
   backfillToolNames,
+  boundedToolNameMap,
   contentText,
   finalizeTimestamps,
   markMalformedLine,
   type ParseState,
   parseTimestamp,
+  preserveUnknownRecord,
   pushEntry,
   recordOf,
   stringOrNull,
@@ -36,6 +42,7 @@ import {
 import type {
   TranscriptFindOutcome,
   TranscriptFindQuery,
+  TranscriptLineNormalizer,
   TranscriptListOutcome,
   TranscriptListQuery,
   TranscriptReader,
@@ -67,6 +74,7 @@ export interface ClaudeListOptions {
   untilMs: number | null;
   offset: number;
   limit: number;
+  metadataOnly?: boolean;
   /**
    * Extension seam invoked once per selected file, before it is inspected
    * (parsed). Lets a caller (tests, in practice) provoke a scan-to-parse
@@ -215,8 +223,11 @@ function updateMetadata(state: ParseState, obj: Record<string, unknown>): void {
   state.metadata.gitBranch =
     stringOrNull(obj.gitBranch) ?? state.metadata.gitBranch;
   if (obj.type === "custom-title") {
-    state.metadata.title =
-      stringOrNull(obj.customTitle) ?? state.metadata.title;
+    const title = stringOrNull(obj.customTitle);
+    if (title !== null) {
+      state.metadata.title = title;
+      state.metadata.titleHistory.push(title);
+    }
   }
   if (obj.type === "agent-name") {
     state.metadata.agentName =
@@ -413,7 +424,12 @@ function parseLine(state: ParseState, line: string): void {
       meta: true,
       tool: null,
     });
+    return;
   }
+  if (type === "custom-title" || type === "agent-name") {
+    return;
+  }
+  preserveUnknownRecord(state, obj, timestamp);
 }
 
 /** Parse one Claude JSONL transcript into the harness-neutral model. */
@@ -431,6 +447,7 @@ export function parseClaudeTranscriptText(
     path: options.path,
     project: null,
     title: null,
+    titleHistory: [],
     agentName: null,
     model: null,
     version: null,
@@ -442,10 +459,13 @@ export function parseClaudeTranscriptText(
   const state: ParseState = {
     source: options.source ?? "main",
     entries: [],
+    unknownRecords: [],
     toolNames: new Map(),
     metadata,
     minTimestamp: null,
     maxTimestamp: null,
+    nextSourceOrdinal: 0,
+    nextRecordOrdinal: 0,
   };
   for (const line of text.split("\n")) {
     if (line.trim().length > 0) {
@@ -454,7 +474,69 @@ export function parseClaudeTranscriptText(
   }
   finalizeTimestamps(state);
   backfillToolNames(state);
-  return { metadata, source: state.source, entries: state.entries };
+  return {
+    metadata,
+    source: state.source,
+    entries: state.entries,
+    unknownRecords: state.unknownRecords,
+  };
+}
+
+/** Create a bounded line-at-a-time Claude normalizer. Draining a batch never
+ * resets source ordinals; metadata and tool-name state remain file-scoped. */
+export function createClaudeLineNormalizer(options: {
+  path: string;
+  sessionId: string;
+  source?: TranscriptSource;
+}): TranscriptLineNormalizer {
+  const empty = parseClaudeTranscriptText("", options);
+  const state: ParseState = {
+    source: empty.source,
+    entries: [],
+    unknownRecords: [],
+    toolNames: boundedToolNameMap(),
+    metadata: empty.metadata,
+    minTimestamp: null,
+    maxTimestamp: null,
+    nextSourceOrdinal: 0,
+    nextRecordOrdinal: 0,
+  };
+  let finished = false;
+  return {
+    source: state.source,
+    feedLine(line) {
+      if (finished) throw new Error("Claude transcript normalizer is finished");
+      parseLine(state, line);
+      const entries = state.entries.splice(0);
+      const unknownRecords = state.unknownRecords.splice(0);
+      // The index stores catalog titles separately; retain only current title in
+      // this streaming state so a rename-heavy file cannot grow rebuild memory.
+      state.metadata.titleHistory.length = 0;
+      return { entries, unknownRecords };
+    },
+    finish() {
+      if (!finished) {
+        finalizeTimestamps(state);
+        backfillToolNames(state);
+        finished = true;
+      }
+      return state.metadata;
+    },
+  };
+}
+
+export function readClaudeTitleHistory(path: string): string[] {
+  const titles: string[] = [];
+  scanTranscriptJsonlSync(
+    path,
+    (record) => {
+      if (record.type !== "custom-title") return;
+      const title = stringOrNull(record.customTitle);
+      if (title !== null) titles.push(title);
+    },
+    "custom-title",
+  );
+  return titles;
 }
 
 export function readClaudeTranscript(
@@ -609,6 +691,33 @@ export function listClaudeSessions(
   );
   const items = selected.map((file): TranscriptListItem => {
     options.onBeforeInspect?.(file);
+    if (options.metadataOnly === true) {
+      let spine: ReturnType<typeof readJsonlMetadataSpineSync> | null;
+      try {
+        spine = readJsonlMetadataSpineSync(file.path, file.bytes, {
+          marker: "custom-title",
+          read: (record) =>
+            record.type === "custom-title"
+              ? stringOrNull(record.customTitle)
+              : null,
+        });
+      } catch {
+        spine = null;
+      }
+      return {
+        sessionId: file.sessionId,
+        path: file.path,
+        project: spine?.project ?? null,
+        title: spine?.title ?? null,
+        titleHistory: spine?.titleHistory ?? [],
+        startedAt: spine?.startedAt ?? null,
+        updatedAt:
+          spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        bytes: file.bytes,
+        subagentCount: 0,
+        firstPrompt: null,
+      };
+    }
     // Read-and-catch, never existsSync-then-read: the transcript tree
     // mutates live under the reader (TOCTOU). A file that vanished between
     // scan and parse degrades this one row instead of failing the page.
@@ -624,6 +733,7 @@ export function listClaudeSessions(
         path: file.path,
         project: null,
         title: null,
+        titleHistory: [],
         startedAt: null,
         updatedAt: new Date(file.modifiedMs).toISOString(),
         bytes: file.bytes,
@@ -636,6 +746,7 @@ export function listClaudeSessions(
       path: file.path,
       project: document.metadata.project,
       title: document.metadata.title,
+      titleHistory: [...document.metadata.titleHistory],
       startedAt: document.metadata.startedAt,
       updatedAt:
         document.metadata.updatedAt ?? new Date(file.modifiedMs).toISOString(),
@@ -806,6 +917,7 @@ function claudeList(query: TranscriptListQuery): TranscriptListOutcome {
       untilMs: query.untilMs,
       offset: query.offset,
       limit: query.limit,
+      metadataOnly: query.metadataOnly,
     });
     return {
       kind: "ok",

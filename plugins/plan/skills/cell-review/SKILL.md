@@ -71,17 +71,20 @@ yourself.
 (equal to `assigned_tier`/`assigned_model` when `constraint` is null), so the verdict you land always
 grades what actually ran — never the assigned cell a constraint overrode.
 
-**Enrich with observable difficulty proxies from keeper.db**, read-only, to sharpen the counterfactual
+**Enrich Keeper-tracked jobs with observable difficulty proxies** to sharpen the counterfactual
 grade beyond diff size. Per auditable task, gather the outcome signals a struggle leaves behind:
 
 ```bash
-keeper session events --session-id <id>   # tool-call spine: count tool calls, retries, edits
-keeper show-job --session-title <title>   # lifecycle, duration, subagent/block counts
-keeper find-file-history <task-id>         # which session ran it, when
+keeper session summary <session-reference>      # tracked totals + lifecycle summary
+keeper session events <session-reference>       # page the tracked prompt/tool-call spine
+keeper show-job --session <session-reference>   # duration, subagent/block metadata
+keeper history show <session-reference>         # bounded qualitative transcript context
+keeper history files <path-fragment>             # observed_mutation / possible_mutation / mention
 ```
 
 Session length, tool-call count, retry count, and block episodes are the proxies — positive evidence
-of triviality or of thrash, never merely "the task succeeded". These join to the brief by `task_id`.
+of triviality or of thrash, never merely "the task succeeded". Treat native-only transcript counts as
+incomplete, never whole-session totals. These join to the brief by `task_id`.
 
 **Read the selection sidecar (`.keeper/selections/<epic>.json`) for `confidence` and `label_source`
 — but keep them OUT of the auditor prompt.** They are the selector's own reasoning; the verdict pass

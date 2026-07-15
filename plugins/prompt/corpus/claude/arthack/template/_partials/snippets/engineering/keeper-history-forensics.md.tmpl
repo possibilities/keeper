@@ -1,6 +1,6 @@
 {#-
 name: keeper-history-forensics
-summary: 'Read-only recipes against keeper.db — every prompt, tool call, file mutation, and subagent run across all sessions. Find who touched a file, search past prompts, replay what a session or worker actually did.'
+summary: 'Use keeper history as the canonical Claude and Pi session record: find sessions, prompts, and file evidence; resume a human session in the foreground.'
 domain: engineering
 audience: agent
 severity: default
@@ -9,38 +9,20 @@ scope: [any]
 phase: [executing]
 related: [commit-via-keeper-default]
 -#}
-Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, plan op, file mutation, and subagent run. Reach for the read-only `keeper` JSON subcommands below first — they emit a parseable envelope and stay stable across schema shifts; drop to `sqlite3 -readonly` only for an ad-hoc column they don't surface (the daemon is the sole writer — never open the DB read-write).
-
-**Who last touched a file** — then replay that session:
+`keeper history` is the canonical session record for Claude and Pi, including sessions launched outside Keeper. Use it before any lower-level inspection:
 
 ```bash
-keeper find-file-history <path-fragment>   # session_id, mutation time, op, source, project_dir (most-recent-first)
+keeper history list                 # browse sessions
+keeper history search <query>       # find prompts and discussion
+keeper history files <path>         # find file evidence
+keeper history show <session-reference>  # inspect one session
+keeper history index                # inspect the available history index
 ```
 
-Feed a `session_id` to `keeper session events --session-id <id>` (the tool-call spine) or `claudectl show-session <id>` to see what that session actually did and why.
+A `<session-reference>` may be a qualified native id, exact Keeper job id, exact native id, or an exact current or historical title. The shared resolver reports ambiguity; never silently select the newest match.
 
-**Search past prompts** — "when did we discuss X / decide Y":
+`keeper history files` labels evidence truthfully: `observed_mutation` is recorded mutation evidence, `possible_mutation` is suggestive but unconfirmed, and `mention` is only a reference to the path.
 
-```bash
-keeper search-history <term>   # ts, session_id, prompt snippet for every matching UserPromptSubmit row
-```
+For a human continuing work, run `keeper resume <session-reference>` in the foreground. `keeper transcript` is for specialist transcript work only.
 
-**What a session did** — the prompt/tool-call spine without transcript bulk:
-
-```bash
-keeper session events --session-id <id>   # ts, hook_event, tool_name, slash_command, skill_name, plan_op
-```
-
-**One session at a glance** — orient before touching any transcript:
-
-```bash
-keeper session summary <session-id>   # bounded envelope: title, lifecycle, plan linkage, first+last prompt, event counts
-```
-
-**One job's metadata / failed-worker forensics**:
-
-```bash
-keeper show-job --session-title <title>   # the full jobs-projection row (auto-detects your own job with no selector)
-```
-
-`subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay. For an ad-hoc query the subcommands don't cover, `sqlite3 -readonly ~/.local/state/keeper/keeper.db` over `events` filters on `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd` — the schema shifts across keeper versions, so check `.schema events` rather than guessing.
+For Keeper-tracked lifecycle detail only, `keeper session events <session-reference>`, `keeper session summary <session-reference>`, and `keeper show-job <session-reference>` are optional supplements; they are not the cross-harness history source.

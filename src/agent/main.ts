@@ -2964,7 +2964,10 @@ export async function main(deps: MainDeps): Promise<never> {
     if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, ptCmd.join(" "));
     }
-    return runPassthrough(ptCmd, deps.spawn, deps.exit);
+    return runPassthrough(ptCmd, deps.spawn, deps.exit, {
+      env: deps.env,
+      cwd: deps.cwd,
+    });
   }
 
   if (agent === "codex") {
@@ -3056,7 +3059,10 @@ export async function main(deps: MainDeps): Promise<never> {
       hasContinueOrResume,
       remainingArgs,
     });
-    return runWithJobControl(runCmd, deps.spawn, deps.exit, onCodexSpawned);
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onCodexSpawned, {
+      env: deps.env,
+      cwd: deps.cwd,
+    });
   }
 
   if (agent === "hermes") {
@@ -3114,7 +3120,10 @@ export async function main(deps: MainDeps): Promise<never> {
       hasContinueOrResume,
       remainingArgs,
     });
-    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned);
+    return runWithJobControl(runCmd, deps.spawn, deps.exit, onHermesSpawned, {
+      env: deps.env,
+      cwd: deps.cwd,
+    });
   }
 
   if (agent === "claude") {
@@ -3348,12 +3357,10 @@ export async function main(deps: MainDeps): Promise<never> {
       deps.env.KEEPER_TMUX_PANE = pane;
       actionLog.push(`Carried tmux pane to KEEPER_TMUX_PANE=${pane}`);
     }
-    // This mutation reaches Claude only because defaultSpawn (run.ts) spawns
-    // with `env: { ...process.env }`. Bun's inherit-mode spawn ignores
-    // `delete process.env.X` (it hands the child the original OS environ), so
-    // run.ts MUST materialize the mutated env. deps.env === process.env, so the
-    // deletes below land on the object run.ts spreads. Keep that spread; never
-    // switch run.ts back to inherit-mode or this strip silently no-ops and
+    // This mutation reaches Claude because runWithJobControl passes deps.env to
+    // defaultSpawn, which materializes the map instead of using inherit-mode.
+    // Bun's inherited environ can ignore deletes from the launcher's env view;
+    // keep the explicit spread in run.ts or this strip silently no-ops and
     // Claude keeps $TMUX → caps to 256-color.
     delete deps.env.TMUX;
     delete deps.env.TMUX_PANE;
@@ -3416,7 +3423,10 @@ export async function main(deps: MainDeps): Promise<never> {
           remainingArgs,
         })
       : undefined;
-  return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned);
+  return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned, {
+    env: deps.env,
+    cwd: deps.cwd,
+  });
 }
 
 /**

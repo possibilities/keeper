@@ -456,6 +456,129 @@ export const TABS_DUMP_FLAGS = [
   { name: "db", type: "string", summary: "keeper.db path override" },
 ] as const satisfies readonly FlagDescriptor[];
 
+const HISTORY_FORMAT_FLAGS = [
+  {
+    name: "format",
+    type: "string",
+    summary: "Output format: human|json (default human)",
+  },
+  FLAG_JSON_ALIAS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_LIST_FLAGS = [
+  FLAG_HELP,
+  { name: "project", type: "string", summary: "Restrict to one project path" },
+  { name: "harness", type: "string", summary: "claude|pi" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max sessions" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_SHOW_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "project",
+    type: "string",
+    summary: "Restrict resolution to one project path",
+  },
+  {
+    name: "artifact",
+    type: "string",
+    summary: "Pin one artifact when id/project are duplicated",
+  },
+  {
+    name: "subagent",
+    type: "string",
+    summary: "Claude subagent id/prefix, or all",
+  },
+  { name: "offset", type: "string", summary: "Filtered entry offset" },
+  {
+    name: "before",
+    type: "string",
+    summary: "Page backward before this offset",
+  },
+  { name: "limit", type: "string", summary: "Max entries" },
+  { name: "max-chars", type: "string", summary: "Total character budget" },
+  {
+    name: "max-entry-chars",
+    type: "string",
+    summary: "Per-entry character cap",
+  },
+  { name: "tools", type: "string", summary: "none|compact|full" },
+  {
+    name: "role",
+    type: "string",
+    multiple: true,
+    summary: "Repeatable role filter",
+  },
+  { name: "since", type: "string", summary: "Entry at/after time" },
+  { name: "until", type: "string", summary: "Entry at/before time" },
+  { name: "grep", type: "string", summary: "Content filter" },
+  {
+    name: "meta",
+    type: "boolean",
+    summary: "Include injected meta/system entries",
+  },
+  { name: "thinking", type: "boolean", summary: "Include thinking blocks" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_SEARCH_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Restrict to one Session reference",
+  },
+  { name: "project", type: "string", summary: "Restrict to one project path" },
+  { name: "harness", type: "string", summary: "claude|pi" },
+  {
+    name: "role",
+    type: "string",
+    multiple: true,
+    summary: "Repeatable role filter",
+  },
+  { name: "since", type: "string", summary: "Entry at/after time" },
+  { name: "until", type: "string", summary: "Entry at/before time" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max hits" },
+  { name: "syntax", type: "string", summary: "literal|fts (default literal)" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_FILES_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "session",
+    type: "string",
+    summary: "Restrict to one Session reference",
+  },
+  { name: "mentions", type: "boolean", summary: "Include textual mentions" },
+  { name: "offset", type: "string", summary: "Result offset (default 0)" },
+  { name: "limit", type: "string", summary: "Max matches" },
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const HISTORY_INDEX_FLAGS = [
+  FLAG_HELP,
+  ...HISTORY_FORMAT_FLAGS,
+] as const satisfies readonly FlagDescriptor[];
+
+export const RESUME_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "project",
+    type: "string",
+    summary: "Restrict resolution to one artifact-derived project",
+  },
+  {
+    name: "format",
+    type: "string",
+    summary: "Decision/error format: human|json (default human)",
+  },
+  FLAG_JSON_ALIAS,
+] as const satisfies readonly FlagDescriptor[];
+
 // ── native command tree ──────────────────────────────────────────────────────
 
 /**
@@ -919,13 +1042,12 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    // The four session-scoped reads live under one group; each verb maps to its
-    // own leaf main (`cli/{session-state,show-session-files,show-session-events,
-    // session-summary}.ts`), preserving that leaf's flags, envelope, and exit
-    // codes byte-for-byte. `cli/session.ts` is the group dispatcher.
+    // The four job-backed reads share the Session catalog selector contract.
+    // Their established `--session-id` spelling remains a compatibility alias
+    // that enters the same resolver and has no id-only path.
     name: "session",
     summary:
-      "Session-scoped reads: `keeper session <state|files|events|summary>`",
+      "Session-reference reads: `keeper session <state|files|events|summary>`",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -934,7 +1056,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     verbs: [
       {
         name: "state",
-        summary: "Current session git context + on-hook files (JSON)",
+        summary: "Session git context + on-hook files (JSON)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -943,9 +1065,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference (default: ambient auto-detect)",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "log-count",
@@ -965,9 +1092,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "cwd",
@@ -978,7 +1110,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         name: "events",
-        summary: "Prompt/tool-call spine for one session (JSON)",
+        summary: "Prompt/tool-call spine for one Session (JSON)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -987,9 +1119,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "limit",
@@ -1001,7 +1138,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "summary",
         summary:
-          "Bounded one-shot summary of one session (title/prompts/counts) — skip the transcript (JSON)",
+          "Bounded one-shot summary of one tracked Session (title/prompts/counts)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1010,9 +1147,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [
           FLAG_HELP,
           {
+            name: "session",
+            type: "string",
+            summary: "Shared Session reference",
+          },
+          {
             name: "session-id",
             type: "string",
-            summary: "Session id (default: auto-detect)",
+            summary: "Compatibility alias of --session",
           },
           {
             name: "max-snippet",
@@ -1026,7 +1168,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "transcript",
     summary:
-      "Discover and extract bounded agent-ready session transcripts: `keeper transcript <harness> <list|show|<session-id>>`",
+      "Specialist bounded transcripts by harness and shared Session reference",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1075,7 +1217,8 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       },
       {
         name: "show",
-        summary: "Extract a bounded page from one session or subagent",
+        summary:
+          "Extract a bounded page by native id, job alias, or exact title",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1157,7 +1300,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "turn",
         summary:
-          "Extract the selected branch's Latest turn as a bounded JSON contract (pi only)",
+          "Extract a Session reference's selected-branch Latest turn (pi only)",
         visibility: "public",
         mutates: false,
         requires_daemon: false,
@@ -1188,43 +1331,85 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     ],
   },
   {
-    name: "search-history",
-    summary: "Search UserPromptSubmit history by LIKE term (JSON)",
+    name: "history",
+    summary:
+      "Unified Claude/Pi session history: list, show, search, files, and index",
     visibility: "public",
-    mutates: false,
+    mutates: true,
     requires_daemon: false,
     requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
+    format_modes: ["human", "json"],
+    flags: [FLAG_HELP],
+    verbs: [
       {
-        name: "limit",
-        type: "string",
-        summary: "Max rows to return (positive int)",
+        name: "list",
+        summary: "List cataloged sessions globally by default",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_LIST_FLAGS,
+      },
+      {
+        name: "show",
+        summary:
+          "Resolve a Session reference and render a bounded transcript page",
+        visibility: "public",
+        mutates: false,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_SHOW_FLAGS,
+      },
+      {
+        name: "search",
+        summary: "Refresh the private index and search transcript entries",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_SEARCH_FLAGS,
+      },
+      {
+        name: "files",
+        summary:
+          "Refresh the private index and search provenance-graded file evidence",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_FILES_FLAGS,
+      },
+      {
+        name: "index",
+        summary:
+          "Inspect, refresh, rebuild, or purge the private history index",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["human", "json"],
+        flags: HISTORY_INDEX_FLAGS,
       },
     ],
   },
   {
-    name: "find-file-history",
-    summary: "List file attributions matching a path fragment (JSON)",
+    name: "resume",
+    summary: "Resolve a Claude/Pi Session and continue it in the foreground",
     visibility: "public",
-    mutates: false,
+    mutates: true,
     requires_daemon: false,
     requires_tty: false,
-    format_modes: ["json"],
-    flags: [
-      FLAG_HELP,
-      {
-        name: "limit",
-        type: "string",
-        summary: "Max rows to return (positive int)",
-      },
-    ],
+    format_modes: ["human", "json"],
+    flags: RESUME_FLAGS,
   },
   {
     name: "show-job",
     summary:
-      "One job's full metadata by job-id/title/cwd/pane or auto-detect (JSON)",
+      "One job by shared Session reference or orthogonal job/cwd/pane selectors (JSON)",
     visibility: "public",
     mutates: false,
     requires_daemon: false,
@@ -1232,11 +1417,20 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     format_modes: ["json"],
     flags: [
       FLAG_HELP,
-      { name: "job-id", type: "string", summary: "Match by job id" },
+      {
+        name: "session",
+        type: "string",
+        summary: "Resolve a shared Session reference",
+      },
       {
         name: "session-title",
         type: "string",
-        summary: "Match by session title",
+        summary: "Compatibility alias of --session",
+      },
+      {
+        name: "job-id",
+        type: "string",
+        summary: "Exact job-only filter or Session-job narrowing filter",
       },
       { name: "cwd", type: "string", summary: "Match by working directory" },
       {
@@ -1248,7 +1442,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       {
         name: "latest",
         type: "boolean",
-        summary: "Pick the most-recent match",
+        summary: "Pick the most-recent job-only cwd/pane match",
       },
       { name: "raw", type: "boolean", summary: "Emit the raw row, unshaped" },
     ],

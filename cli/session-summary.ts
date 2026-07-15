@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * `keeper session summary <session-id>` — a BOUNDED one-shot summary of one
- * session so an agent orients without Reading a multi-MB transcript into its
+ * `keeper session summary <session-reference>` — a BOUNDED one-shot summary of
+ * one tracked Session so an agent orients without Reading a multi-MB transcript into its
  * token cap. Emits ONE `{schema_version, ok, error, data}` envelope: the job's
  * title / lifecycle state / plan linkage / transcript_path, the first + last
  * human prompt (each TRUNCATED), and event counts — all off keeper.db, the
@@ -23,7 +23,18 @@
 
 import type { Database } from "bun:sqlite";
 import { openDb, resolveDbPath } from "../src/db";
-import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
+import {
+  type EnvelopeSink,
+  emitEnvelope,
+  errorEnvelope,
+  processEnvelopeSink,
+  successEnvelope,
+} from "./envelope";
+import {
+  resolveTrackedCliSession,
+  type SessionReferenceCliDeps,
+  trackedSessionProblem,
+} from "./session-reference";
 
 /** Envelope schema version for `keeper session summary`. */
 export const SESSION_SUMMARY_SCHEMA_VERSION = 1;
@@ -32,24 +43,25 @@ export const SESSION_SUMMARY_SCHEMA_VERSION = 1;
  *  the verb is to STAY bounded, so a long first/last prompt is clipped. */
 export const MAX_SNIPPET_CHARS = 500;
 
-const HELP = `keeper session summary <session-id> [options]
+const HELP = `keeper session summary <session-reference> [options]
 
-Print a BOUNDED one-shot summary of one session as a {schema_version, ok, error,
-data} JSON envelope: title, lifecycle state, plan linkage, transcript_path, the
-first + last human prompt (truncated), and event counts. Read-only over
-keeper.db — no daemon, no commit, no lock. Use this instead of Reading the
-multi-MB transcript at transcript_path.
-
-Arguments:
-  <session-id>            Claude Code session id (== job_id) [REQUIRED]
+Print a BOUNDED one-shot summary of one tracked Session. Qualified native ids,
+exact job/native ids, and exact current/historical titles resolve through the
+shared Session catalog before the Keeper job row and events are read.
 
 Options:
+  --session <ref>         Shared Session reference (alternative to positional)
+  --session-id <ref>      Compatibility alias of --session
   --max-snippet <n>       Max chars per prompt snippet (default ${MAX_SNIPPET_CHARS})
   --help, -h              Show this help
 `;
 
+export interface SessionSummaryDeps extends SessionReferenceCliDeps {
+  dbPath?: string;
+}
+
 interface ParsedArgs {
-  sessionId: string | null;
+  sessionReference: string | null;
   maxSnippet: number;
   help: boolean;
 }
@@ -73,18 +85,36 @@ function parseMax(raw: string | undefined): number {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const p: ParsedArgs = {
-    sessionId: null,
+    sessionReference: null,
     maxSnippet: MAX_SNIPPET_CHARS,
     help: false,
   };
+  const setReference = (value: string | undefined, spelling: string): void => {
+    if (value === undefined || value.length === 0) {
+      process.stderr.write(
+        `keeper session summary: ${spelling} requires a value\n`,
+      );
+      process.exit(2);
+    }
+    if (p.sessionReference !== null) {
+      process.stderr.write(
+        "keeper session summary: specify the Session reference only once\n",
+      );
+      process.exit(2);
+    }
+    p.sessionReference = value;
+  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    const a = argv[i] as string;
     if (a === "--help" || a === "-h") {
       p.help = true;
-    } else if (a === "--session-id" || a.startsWith("--session-id=")) {
-      p.sessionId = a.startsWith("--session-id=")
-        ? a.slice("--session-id=".length)
-        : (argv[++i] ?? null);
+    } else if (a === "--session" || a === "--session-id") {
+      setReference(argv[++i], a);
+    } else if (a.startsWith("--session=") || a.startsWith("--session-id=")) {
+      const spelling = a.startsWith("--session-id=")
+        ? "--session-id"
+        : "--session";
+      setReference(a.slice(a.indexOf("=") + 1), spelling);
     } else if (a === "--max-snippet" || a.startsWith("--max-snippet=")) {
       p.maxSnippet = a.startsWith("--max-snippet=")
         ? parseMax(a.slice("--max-snippet=".length))
@@ -94,13 +124,8 @@ function parseArgs(argv: string[]): ParsedArgs {
         `keeper session summary: unexpected argument '${a}'\n`,
       );
       process.exit(2);
-    } else if (p.sessionId === null) {
-      p.sessionId = a;
     } else {
-      process.stderr.write(
-        `keeper session summary: unexpected argument '${a}'\n`,
-      );
-      process.exit(2);
+      setReference(a, "<session-reference>");
     }
   }
   return p;
@@ -262,36 +287,47 @@ export function loadSessionSummary(
   };
 }
 
-export function main(argv: string[]): void {
+export function main(
+  argv: string[],
+  sink: EnvelopeSink = processEnvelopeSink,
+  deps: SessionSummaryDeps = {},
+): void {
   const args = parseArgs(argv);
   if (args.help) {
-    process.stdout.write(HELP);
+    sink.writeStdout(HELP);
     return;
   }
-  if (args.sessionId === null) {
+  if (args.sessionReference === null) {
     process.stderr.write(
-      "keeper session summary: <session-id> is required\n\n",
+      "keeper session summary: <session-reference> or --session is required\n\n",
     );
     process.stderr.write(HELP);
     process.exit(2);
   }
 
-  const sink = {
-    writeStdout: (s: string) => process.stdout.write(s),
-    exit: (code: number): never => process.exit(code),
-  };
+  const resolution = resolveTrackedCliSession(args.sessionReference, deps);
+  if (resolution.kind !== "resolved") {
+    emitEnvelope(
+      errorEnvelope(
+        SESSION_SUMMARY_SCHEMA_VERSION,
+        trackedSessionProblem(resolution),
+      ),
+      sink,
+    );
+    return;
+  }
+  const jobId = resolution.job.jobId;
 
   let db: Database;
   try {
-    db = openDb(resolveDbPath(), { readonly: true }).db;
-  } catch (e) {
+    db = openDb(deps.dbPath ?? resolveDbPath(), { readonly: true }).db;
+  } catch {
     emitEnvelope(
       errorEnvelope(SESSION_SUMMARY_SCHEMA_VERSION, {
         code: "read_failed",
-        message: e instanceof Error ? e.message : String(e),
+        message: "could not open the keeper database for the Session summary",
         recovery:
-          "keeper.db could not be opened read-only. Confirm keeper is installed " +
-          "and the DB path ($KEEPER_DB / default) exists; this read never mutates state.",
+          "Confirm keeper.db is readable, then retry; this read never mutates state.",
       }),
       sink,
     );
@@ -299,15 +335,14 @@ export function main(argv: string[]): void {
   }
 
   try {
-    const result = loadSessionSummary(db, args.sessionId, args.maxSnippet);
+    const result = loadSessionSummary(db, jobId, args.maxSnippet);
     if (result.kind === "not_found") {
       emitEnvelope(
         errorEnvelope(SESSION_SUMMARY_SCHEMA_VERSION, {
           code: "session_not_found",
-          message: `no job row or events for session '${args.sessionId}'`,
+          message: "the resolved Keeper job no longer has a row or events",
           recovery:
-            "Confirm the session id (see `keeper query jobs` or `keeper show-job`); " +
-            "a summary needs at least one recorded job row or event.",
+            "Refresh `keeper history list` and retry; the job may have disappeared during the read.",
         }),
         sink,
       );
@@ -317,14 +352,13 @@ export function main(argv: string[]): void {
       successEnvelope(SESSION_SUMMARY_SCHEMA_VERSION, result.data),
       sink,
     );
-  } catch (e) {
+  } catch {
     emitEnvelope(
       errorEnvelope(SESSION_SUMMARY_SCHEMA_VERSION, {
         code: "read_failed",
-        message: e instanceof Error ? e.message : String(e),
+        message: "could not read the resolved Keeper job summary",
         recovery:
-          "A keeper.db read failed mid-summary. Retry — this read never mutates " +
-          "state; if it persists the DB may be corrupt.",
+          "Retry the read; it opens keeper.db read-only and never mutates state.",
       }),
       sink,
     );

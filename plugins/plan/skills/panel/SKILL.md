@@ -126,7 +126,7 @@ default. For a directly invoked `/plan:panel`, answer the question in its natura
 
 **Reveal on demand.** If the human asks how you reached the answer / what contributed / to see the panel,
 *then* surface the composition and point them at the panelist runs — each lands in the `panels` tmux
-session, one `tmux attach -t panels` away (or `claudectl show-session` when it's on PATH). A done claude
+session, one `tmux attach -t panels` away. A done claude
 panel leg auto-closes its window ~30s after it finishes (gated by `autoclose_enabled`, default on); codex
 and pi legs stay open (`tmux attach -t panels`) until you close them by hand. A
 substance follow-up ("are you sure?", "why?") is not that trigger — answer it substantively in your own

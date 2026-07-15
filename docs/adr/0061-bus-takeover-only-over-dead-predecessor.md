@@ -17,8 +17,8 @@ other, an infinite eviction war. One session that accidentally armed two
 bus accept loop hard enough to trip the serve-liveness watchdog
 ([ADR 0059](0059-bus-only-serve-stall-degrades-in-place.md)). One agent has no
 reason to hold two bus connections — duplicate live subscribers are a defect to
-reject, not a topology to serve — and [ADR 0034](0034-resume-by-name-resolves-through-bus-identity.md)'s
-one-live-session-per-identity assumption stays load-bearing for resume-by-name.
+reject, not a topology to serve — and [ADR 0062](0062-unified-session-history-and-resume.md)'s
+Refuse-live contract keeps one-live-session-per-identity load-bearing for resume.
 
 ## Decision
 
@@ -40,7 +40,7 @@ no-presence carve-out untouched.
   contract it broke.
 - Genuine reconnects keep working unchanged — a dead predecessor is evicted
   exactly as before.
-- Single-holder identity semantics survive, so resume-by-name (ADR 0034) and the
-  Presence and Refuse-live vocabulary keep their meaning without amendment.
+- Single-holder identity semantics survive, so ADR 0062's Refuse-live contract
+  and the Presence vocabulary keep their meaning without amendment.
 - The probe adds one liveness check to the duplicate-registration path only; the
   common single-registration path is untouched.

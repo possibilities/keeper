@@ -5,9 +5,14 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  realpathSync,
   statSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import {
+  readJsonlMetadataSpineSync,
+  scanTranscriptJsonlSync,
+} from "./jsonl-scan";
 import type {
   LatestTurn,
   TranscriptDocument,
@@ -20,11 +25,13 @@ import type {
 } from "./model";
 import {
   backfillToolNames,
+  boundedToolNameMap,
   contentText,
   finalizeTimestamps,
   markMalformedLine,
   type ParseState,
   parseTimestamp,
+  preserveUnknownRecord,
   pushEntry,
   recordOf,
   stringOrNull,
@@ -34,6 +41,7 @@ import {
 import type {
   TranscriptFindOutcome,
   TranscriptFindQuery,
+  TranscriptLineNormalizer,
   TranscriptListOutcome,
   TranscriptListQuery,
   TranscriptReader,
@@ -66,6 +74,14 @@ function discoverPiSessionsDir(root: TranscriptRootInputs): string | null {
   const dir = join(resolvePiRoot(root), "sessions");
   try {
     return statSync(dir).isDirectory() ? dir : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeRealpath(path: string): string | null {
+  try {
+    return realpathSync(path);
   } catch {
     return null;
   }
@@ -165,10 +181,33 @@ function scanBucketFiles(dir: string): PiSessionFile[] {
   return files;
 }
 
+function scanPiSessionFiles(
+  sessionsDir: string,
+  project: string | null,
+): PiSessionFile[] {
+  const files: PiSessionFile[] = [];
+  const seen = new Set<string>();
+  for (const dir of bucketDirs(sessionsDir, project)) {
+    for (const file of scanBucketFiles(dir)) {
+      const identity = safeRealpath(file.path) ?? file.path;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      files.push(file);
+    }
+  }
+  return files;
+}
+
+interface PiEntryProvenance {
+  nativeEntryId: string | null;
+  parentNativeEntryId: string | null;
+}
+
 function parsePiToolCall(
   state: ParseState,
   obj: Record<string, unknown>,
   timestamp: { text: string; ms: number } | null,
+  provenance: PiEntryProvenance,
 ): void {
   const useId = stringOrNull(obj.id);
   const name = stringOrNull(obj.name);
@@ -190,6 +229,7 @@ function parsePiToolCall(
     text: null,
     meta: false,
     tool,
+    ...provenance,
   });
 }
 
@@ -197,6 +237,7 @@ function parsePiAssistantBlock(
   state: ParseState,
   block: unknown,
   timestamp: { text: string; ms: number } | null,
+  provenance: PiEntryProvenance,
 ): void {
   const obj = recordOf(block);
   if (obj === null) {
@@ -216,6 +257,7 @@ function parsePiAssistantBlock(
       text,
       meta: false,
       tool: null,
+      ...provenance,
     });
     return;
   }
@@ -228,11 +270,12 @@ function parsePiAssistantBlock(
       text: stringOrNull(obj.thinking) ?? "",
       meta: false,
       tool: null,
+      ...provenance,
     });
     return;
   }
   if (type === "toolCall") {
-    parsePiToolCall(state, obj, timestamp);
+    parsePiToolCall(state, obj, timestamp, provenance);
   }
   // Every other block type (and every unrecognized future one) folds to a
   // silent skip rather than throwing.
@@ -242,6 +285,7 @@ function parsePiToolResult(
   state: ParseState,
   message: Record<string, unknown>,
   timestamp: { text: string; ms: number } | null,
+  provenance: PiEntryProvenance,
 ): void {
   const useId = stringOrNull(message.toolCallId);
   const tool: TranscriptTool = {
@@ -259,6 +303,7 @@ function parsePiToolResult(
     text: null,
     meta: false,
     tool,
+    ...provenance,
   });
 }
 
@@ -266,15 +311,16 @@ function parsePiMessage(
   state: ParseState,
   message: Record<string, unknown> | null,
   timestamp: { text: string; ms: number } | null,
-): void {
+  provenance: PiEntryProvenance,
+): boolean {
   if (message === null) {
-    return;
+    return false;
   }
   const role = stringOrNull(message.role);
   if (role === "user") {
     const text = contentText(message.content);
     if (text.trim().length === 0) {
-      return;
+      return true;
     }
     pushEntry(state, {
       timestamp: timestamp?.text ?? null,
@@ -284,22 +330,25 @@ function parsePiMessage(
       text,
       meta: false,
       tool: null,
+      ...provenance,
     });
-    return;
+    return true;
   }
   if (role === "assistant") {
     const content = message.content;
     const blocks = Array.isArray(content) ? content : [content];
     for (const block of blocks) {
-      parsePiAssistantBlock(state, block, timestamp);
+      parsePiAssistantBlock(state, block, timestamp, provenance);
     }
-    return;
+    return true;
   }
   if (role === "toolResult") {
-    parsePiToolResult(state, message, timestamp);
-    return;
+    parsePiToolResult(state, message, timestamp, provenance);
+    return true;
   }
-  // Any other message role (bashExecution and future roles) folds to skip.
+  // bashExecution is a known non-conversation record. A future role remains in
+  // unknownRecords so a later normalization version can recover it.
+  return role === "bashExecution";
 }
 
 function parsePiLine(state: ParseState, line: string): void {
@@ -320,15 +369,22 @@ function parsePiLine(state: ParseState, line: string): void {
   }
   const timestamp = parseTimestamp(obj.timestamp);
   trackTimestamp(state, timestamp);
+  const provenance: PiEntryProvenance = {
+    nativeEntryId: stringOrNull(obj.id),
+    parentNativeEntryId: stringOrNull(obj.parentId),
+  };
   const type = stringOrNull(obj.type);
   if (type === "session") {
     state.metadata.project = stringOrNull(obj.cwd) ?? state.metadata.project;
     return;
   }
   if (type === "session_info") {
-    // Renames append a new session_info entry; the LAST one in file order
-    // wins because this assignment simply overwrites on every occurrence.
-    state.metadata.title = stringOrNull(obj.name) ?? state.metadata.title;
+    // Renames append a new session_info entry; the LAST one in file order wins.
+    const title = stringOrNull(obj.name);
+    if (title !== null) {
+      state.metadata.title = title;
+      state.metadata.titleHistory.push(title);
+    }
     return;
   }
   if (type === "model_change") {
@@ -346,16 +402,21 @@ function parsePiLine(state: ParseState, line: string): void {
         text,
         meta: false,
         tool: null,
+        ...provenance,
       });
     }
     return;
   }
   if (type === "message") {
-    parsePiMessage(state, recordOf(obj.message), timestamp);
+    if (!parsePiMessage(state, recordOf(obj.message), timestamp, provenance)) {
+      preserveUnknownRecord(state, obj, timestamp);
+    }
     return;
   }
-  // thinking_level_change and every unrecognized/future entry type (custom,
-  // custom_message, turn.completed, ...) fold to a silent skip, never throw.
+  if (type === "thinking_level_change") {
+    return;
+  }
+  preserveUnknownRecord(state, obj, timestamp);
 }
 
 /** Parse one pi session JSONL transcript into the harness-neutral model.
@@ -374,6 +435,7 @@ export function parsePiTranscriptText(
     path: options.path,
     project: null,
     title: null,
+    titleHistory: [],
     agentName: null,
     model: null,
     version: null,
@@ -385,10 +447,13 @@ export function parsePiTranscriptText(
   const state: ParseState = {
     source: options.source ?? "main",
     entries: [],
+    unknownRecords: [],
     toolNames: new Map(),
     metadata,
     minTimestamp: null,
     maxTimestamp: null,
+    nextSourceOrdinal: 0,
+    nextRecordOrdinal: 0,
   };
   for (const line of text.split("\n")) {
     if (line.trim().length > 0) {
@@ -397,7 +462,66 @@ export function parsePiTranscriptText(
   }
   finalizeTimestamps(state);
   backfillToolNames(state);
-  return { metadata, source: state.source, entries: state.entries };
+  return {
+    metadata,
+    source: state.source,
+    entries: state.entries,
+    unknownRecords: state.unknownRecords,
+  };
+}
+
+/** Create a bounded line-at-a-time Pi normalizer retaining native id/parentId. */
+export function createPiLineNormalizer(options: {
+  path: string;
+  sessionId: string;
+  source?: TranscriptSource;
+}): TranscriptLineNormalizer {
+  const empty = parsePiTranscriptText("", options);
+  const state: ParseState = {
+    source: empty.source,
+    entries: [],
+    unknownRecords: [],
+    toolNames: boundedToolNameMap(),
+    metadata: empty.metadata,
+    minTimestamp: null,
+    maxTimestamp: null,
+    nextSourceOrdinal: 0,
+    nextRecordOrdinal: 0,
+  };
+  let finished = false;
+  return {
+    source: state.source,
+    feedLine(line) {
+      if (finished) throw new Error("Pi transcript normalizer is finished");
+      parsePiLine(state, line);
+      const entries = state.entries.splice(0);
+      const unknownRecords = state.unknownRecords.splice(0);
+      state.metadata.titleHistory.length = 0;
+      return { entries, unknownRecords };
+    },
+    finish() {
+      if (!finished) {
+        finalizeTimestamps(state);
+        backfillToolNames(state);
+        finished = true;
+      }
+      return state.metadata;
+    },
+  };
+}
+
+export function readPiTitleHistory(path: string): string[] {
+  const titles: string[] = [];
+  scanTranscriptJsonlSync(
+    path,
+    (record) => {
+      if (record.type !== "session_info") return;
+      const title = stringOrNull(record.name);
+      if (title !== null) titles.push(title);
+    },
+    "session_info",
+  );
+  return titles;
 }
 
 export function readPiTranscript(
@@ -465,6 +589,7 @@ export interface PiListOptions {
   untilMs: number | null;
   offset: number;
   limit: number;
+  metadataOnly?: boolean;
   /**
    * Extension seam invoked once per selected file, before it is inspected
    * (parsed). Lets a caller (tests, in practice) provoke a scan-to-parse
@@ -482,8 +607,7 @@ export interface PiListResult {
 
 /** List sessions by update time while parsing only the requested result page. */
 export function listPiSessions(options: PiListOptions): PiListResult {
-  const candidates = bucketDirs(options.sessionsDir, options.project)
-    .flatMap(scanBucketFiles)
+  const candidates = scanPiSessionFiles(options.sessionsDir, options.project)
     .filter(
       (file) =>
         (options.sinceMs === null || file.modifiedMs >= options.sinceMs) &&
@@ -499,6 +623,30 @@ export function listPiSessions(options: PiListOptions): PiListResult {
   );
   const items = selected.map((file): TranscriptListItem => {
     options.onBeforeInspect?.(file);
+    if (options.metadataOnly === true) {
+      let spine: ReturnType<typeof readJsonlMetadataSpineSync> | null;
+      try {
+        spine = readJsonlMetadataSpineSync(file.path, file.bytes, {
+          marker: "session_info",
+          read: (record) =>
+            record.type === "session_info" ? stringOrNull(record.name) : null,
+        });
+      } catch {
+        spine = null;
+      }
+      return {
+        sessionId: file.sessionId,
+        path: file.path,
+        project: spine?.project ?? null,
+        title: spine?.title ?? null,
+        titleHistory: spine?.titleHistory ?? [],
+        startedAt: spine?.startedAt ?? null,
+        updatedAt: spine?.updatedAt ?? new Date(file.modifiedMs).toISOString(),
+        bytes: file.bytes,
+        subagentCount: 0,
+        firstPrompt: null,
+      };
+    }
     // Read-and-catch, never existsSync-then-read: the sessions tree mutates
     // live under the reader (TOCTOU). A file that vanished between scan and
     // parse degrades this one row instead of failing the page.
@@ -514,6 +662,7 @@ export function listPiSessions(options: PiListOptions): PiListResult {
         path: file.path,
         project: null,
         title: null,
+        titleHistory: [],
         startedAt: null,
         updatedAt: new Date(file.modifiedMs).toISOString(),
         bytes: file.bytes,
@@ -526,6 +675,7 @@ export function listPiSessions(options: PiListOptions): PiListResult {
       path: file.path,
       project: document.metadata.project,
       title: document.metadata.title,
+      titleHistory: [...document.metadata.titleHistory],
       startedAt: document.metadata.startedAt,
       updatedAt:
         document.metadata.updatedAt ?? new Date(file.modifiedMs).toISOString(),
@@ -556,6 +706,7 @@ function piList(query: TranscriptListQuery): TranscriptListOutcome {
       untilMs: query.untilMs,
       offset: query.offset,
       limit: query.limit,
+      metadataOnly: query.metadataOnly,
     });
     return {
       kind: "ok",
@@ -581,14 +732,9 @@ function piFind(query: TranscriptFindQuery): TranscriptFindOutcome {
   if (!isSafePiSessionId(query.sessionId)) {
     return { kind: "not_found" };
   }
-  const found: PiSessionFile[] = [];
-  for (const dir of bucketDirs(sessionsDir, query.project)) {
-    for (const file of scanBucketFiles(dir)) {
-      if (file.sessionId === query.sessionId) {
-        found.push(file);
-      }
-    }
-  }
+  const found = scanPiSessionFiles(sessionsDir, query.project).filter(
+    (file) => file.sessionId === query.sessionId,
+  );
   if (found.length === 0) {
     return { kind: "not_found" };
   }
@@ -866,9 +1012,41 @@ export type PiTurnOutcome =
   | { kind: "read_failed"; message: string }
   | { kind: "ok"; selectedLeaf: string; turn: LatestTurn | null };
 
+/** Resolve a branch-aware turn from an already-disambiguated Pi artifact. */
+export function resolvePiTurnFromHandle(
+  handle: TranscriptSessionHandle,
+  leaf: string,
+  stripSkills = false,
+): PiTurnOutcome {
+  if (leaf === "root") {
+    return { kind: "ok", selectedLeaf: "root", turn: null };
+  }
+  let text: string;
+  try {
+    text = readFileSync(handle.path, "utf8");
+  } catch (error) {
+    return {
+      kind: "read_failed",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const entries = parsePiEntriesForTurn(text);
+  const walked = walkPiPath(entries, leaf);
+  if (walked.kind === "not_found") {
+    return { kind: "leaf_not_found" };
+  }
+  if (walked.kind === "malformed") {
+    return { kind: "leaf_malformed", message: walked.message };
+  }
+  return {
+    kind: "ok",
+    selectedLeaf: leaf,
+    turn: reducePiTurn(walked.path, stripSkills),
+  };
+}
+
 /** Resolve the Latest turn for one pi session's requested leaf. Session
- *  resolution (no_roots/not_found/ambiguous) reuses `piFind` verbatim; only
- *  the leaf-to-root walk and turn reduction are new. */
+ * resolution (no_roots/not_found/ambiguous) reuses `piFind` verbatim. */
 export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
   const found = piFind({
     root: query.root,
@@ -878,29 +1056,9 @@ export function resolvePiTurn(query: PiTurnQuery): PiTurnOutcome {
   if (found.kind !== "found") {
     return found;
   }
-  if (query.leaf === "root") {
-    return { kind: "ok", selectedLeaf: "root", turn: null };
-  }
-  let text: string;
-  try {
-    text = readFileSync(found.handle.path, "utf8");
-  } catch (error) {
-    return {
-      kind: "read_failed",
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-  const entries = parsePiEntriesForTurn(text);
-  const walked = walkPiPath(entries, query.leaf);
-  if (walked.kind === "not_found") {
-    return { kind: "leaf_not_found" };
-  }
-  if (walked.kind === "malformed") {
-    return { kind: "leaf_malformed", message: walked.message };
-  }
-  return {
-    kind: "ok",
-    selectedLeaf: query.leaf,
-    turn: reducePiTurn(walked.path, query.stripSkills === true),
-  };
+  return resolvePiTurnFromHandle(
+    found.handle,
+    query.leaf,
+    query.stripSkills === true,
+  );
 }

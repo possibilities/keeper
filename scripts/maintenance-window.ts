@@ -13,8 +13,8 @@
  * (launchctl bootout) -> `keeper reclaim` (which ITSELF snapshots +
  * checkpoints + VACUUM INTOs + self-verifies + atomically swaps) -> restart
  * (launchctl bootstrap) -> `keeper await server-up` -> verify the result
- * (auto_vacuum=2, size, a search-history forensics probe) -> `--hold` (leave
- * autopilot paused) or restore it to whatever it was before the window.
+ * (auto_vacuum=2, size, and an exact Keeper event-retention probe) -> `--hold`
+ * (leave autopilot paused) or restore it to whatever it was before the window.
  *
  * Fails safe at every step: once paused, this never unpauses except on the
  * single successful restore call at the very end. A `reclaim` failure (never
@@ -203,7 +203,7 @@ export async function runMaintenanceWindow(
       error: verified.error ?? "post-restart verify failed",
     };
   }
-  deps.log("post-restart verify passed (auto_vacuum, size, history probe)");
+  deps.log("post-restart verification passed");
 
   if (opts.hold) {
     deps.log("--hold: leaving autopilot paused");
@@ -361,44 +361,67 @@ export function isBoardQuiet(counts: InFlightCounts): boolean {
   return counts.boardWorkJobs === 0 && counts.pendingDispatches === 0;
 }
 
-/**
- * Trim/slice a prompt to the forensics probe term `captureForensicsTerm`
- * hands to `keeper search-history`. Never strips `%`/`_`/`\` — `search-history`
- * ESCAPEs those for a literal LIKE match, so stripping would break the
- * substring match the post-restart `verify()` probe depends on.
- */
-export function deriveForensicsTerm(prompt: string): string | null {
-  const cleaned = prompt.trim().slice(0, 32);
-  return cleaned.length >= 8 ? cleaned : null;
+export interface KeeperEventProbe {
+  eventId: number;
+  prompt: string;
 }
 
-/**
- * Best-effort pick of a search-history forensics term from an EXISTING
- * prompt row, taken BEFORE the daemon stops. `null` (no rows, or a read
- * failure) means the post-restart verify skips the probe rather than failing
- * a fresh/empty DB. Never throws.
- */
-function captureForensicsTerm(dbPath: string): string | null {
+/** Capture one exact Keeper event before reclaim. `null` means the readable
+ * database contains no prompt row; read failures throw so maintenance fails safe. */
+export function captureKeeperEventProbe(
+  dbPath: string,
+): KeeperEventProbe | null {
+  const { db } = openDb(dbPath, { readonly: true, migrate: false });
+  try {
+    const row = db
+      .query(
+        `SELECT id, json_extract(data, '$.prompt') AS prompt
+           FROM events
+          WHERE hook_event = 'UserPromptSubmit'
+            AND json_extract(data, '$.prompt') IS NOT NULL
+          ORDER BY id DESC
+          LIMIT 1`,
+      )
+      .get() as { id?: unknown; prompt?: unknown } | null;
+    if (typeof row?.id !== "number" || typeof row.prompt !== "string") {
+      return null;
+    }
+    return { eventId: row.id, prompt: row.prompt };
+  } finally {
+    db.close();
+  }
+}
+
+/** Verify the exact pre-reclaim event row and prompt in the reclaimed Keeper DB. */
+export function verifyKeeperEventProbe(
+  dbPath: string,
+  probe: KeeperEventProbe,
+): StepResult {
   try {
     const { db } = openDb(dbPath, { readonly: true, migrate: false });
     try {
       const row = db
         .query(
-          `SELECT json_extract(data, '$.prompt') AS prompt
+          `SELECT id, json_extract(data, '$.prompt') AS prompt
              FROM events
-            WHERE hook_event = 'UserPromptSubmit'
-              AND json_extract(data, '$.prompt') IS NOT NULL
-            ORDER BY id DESC
-            LIMIT 1`,
+            WHERE id = ? AND hook_event = 'UserPromptSubmit'`,
         )
-        .get() as { prompt?: unknown } | null;
-      const prompt = typeof row?.prompt === "string" ? row.prompt : "";
-      return deriveForensicsTerm(prompt);
+        .get(probe.eventId) as { id?: unknown; prompt?: unknown } | null;
+      if (row?.id !== probe.eventId || row.prompt !== probe.prompt) {
+        return {
+          ok: false,
+          error: `post-restart Keeper DB did not retain UserPromptSubmit event ${probe.eventId} verbatim`,
+        };
+      }
+      return { ok: true, error: null };
     } finally {
       db.close();
     }
-  } catch {
-    return null;
+  } catch (err) {
+    return {
+      ok: false,
+      error: `post-restart Keeper event probe failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
@@ -410,7 +433,7 @@ function buildRealDeps(
     console.log(`[maintenance-window] ${line}`);
   };
 
-  let forensicsTerm: string | null = null;
+  let eventProbe: KeeperEventProbe | null = null;
   let preReclaimBytes = 0;
 
   async function keeperStatusData(): Promise<Record<string, unknown> | null> {
@@ -483,7 +506,18 @@ function buildRealDeps(
       } catch {
         preReclaimBytes = 0;
       }
-      forensicsTerm = captureForensicsTerm(dbPath);
+      try {
+        eventProbe = captureKeeperEventProbe(dbPath);
+      } catch (err) {
+        return {
+          ok: false,
+          error: `pre-reclaim Keeper event probe failed: ${err instanceof Error ? err.message : String(err)}`,
+          path: null,
+        };
+      }
+      if (eventProbe === null) {
+        log("pre-reclaim Keeper event probe skipped: no UserPromptSubmit rows");
+      }
       const result = backupDb(dbPath);
       if (!result.verified || result.snapshotPath === null) {
         return {
@@ -606,35 +640,10 @@ function buildRealDeps(
           error: `post-restart DB size ${postBytes}B is not smaller than the pre-reclaim ${preReclaimBytes}B`,
         };
       }
-      if (forensicsTerm !== null) {
-        const res = await runCommand(
-          ["keeper", "search-history", forensicsTerm, "--limit", "1"],
-          COMMAND_TIMEOUT_MS,
-        );
-        if (!res.ok) {
-          return {
-            ok: false,
-            error: `search-history forensics probe failed: ${res.error}`,
-          };
-        }
-        try {
-          const envelope = JSON.parse(res.stdout) as {
-            data?: { matches?: unknown[] };
-          };
-          if (!envelope.data?.matches || envelope.data.matches.length === 0) {
-            return {
-              ok: false,
-              error:
-                "search-history forensics probe found no match for a known pre-reclaim term",
-            };
-          }
-        } catch (err) {
-          return {
-            ok: false,
-            error: `search-history forensics probe returned unparseable output: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          };
+      if (eventProbe !== null) {
+        const retained = verifyKeeperEventProbe(dbPath, eventProbe);
+        if (!retained.ok) {
+          return retained;
         }
       }
       return { ok: true, error: null };
@@ -658,8 +667,9 @@ gates: capture autopilot state, pause, wait for board-work to drain, take a
 pre-reclaim snapshot, stop keeperd, run 'keeper reclaim' (which itself
 snapshots + checkpoints + VACUUM INTOs + self-verifies + atomically swaps),
 restart keeperd, wait for it to come back up, verify the result (auto_vacuum,
-size, a search-history forensics probe), then either hold or restore
-autopilot to whatever it was before the window started.
+size, and an exact Keeper event-retention probe when the database has prompt
+rows), then either hold or restore autopilot to whatever it was before the
+window started.
 
 On any failure this NEVER unpauses autopilot — it fails safe and leaves the
 pre-reclaim snapshot in place for triage.

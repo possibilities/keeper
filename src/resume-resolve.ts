@@ -47,7 +47,7 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { type HarnessName, harnessOrClaude } from "./agent/harness";
 
 /**
@@ -205,6 +205,9 @@ export interface ClaudeResolveInput {
   projectRoots: string[];
   /** Observed cwd history (includes the recorded cwd) for the slug fallback. */
   observedCwds: string[];
+  /** Exact catalog-selected transcript. When present, resolution is pinned to
+   * this artifact instead of globbing every duplicate native id across roots. */
+  artifactPath?: string;
 }
 
 /** One found transcript: its holding-dir name (the slug), the project dir path,
@@ -235,42 +238,69 @@ export function resolveClaudeCwd(
     };
   }
 
-  // 1. Glob <root>/projects/<holdingDir>/<uuid>.jsonl across realpath-deduped roots.
+  // 1. Use the exact catalog artifact when supplied; crash restore has no
+  // catalog selection, so its legacy path still globs every configured root.
   const found: FoundTranscript[] = [];
-  const seenProjects = new Set<string>();
-  for (const root of input.projectRoots) {
-    if (root === "") {
-      continue;
+  if (input.artifactPath !== undefined) {
+    const transcriptPath = fs.realpath(input.artifactPath);
+    if (
+      basename(transcriptPath) !== `${uuid}.jsonl` ||
+      !fs.exists(transcriptPath)
+    ) {
+      return {
+        kind: "preflight-failed",
+        reason: `selected claude artifact does not match session ${uuid} or is absent`,
+        found: fs.exists(transcriptPath) ? [transcriptPath] : [],
+        fixCommand: `# selected artifact ${transcriptPath} is not resumable as session ${uuid}`,
+      };
     }
-    const projectsDir = join(root, "projects");
-    const real = fs.realpath(projectsDir);
-    if (seenProjects.has(real)) {
-      continue;
-    }
-    seenProjects.add(real);
-    for (const holdingDir of fs.listDir(projectsDir)) {
-      const projectDir = join(projectsDir, holdingDir);
-      const transcriptPath = join(projectDir, `${uuid}.jsonl`);
-      if (fs.exists(transcriptPath)) {
-        found.push({ holdingDir, projectDir, transcriptPath });
+    const projectDir = dirname(transcriptPath);
+    found.push({
+      holdingDir: basename(projectDir),
+      projectDir,
+      transcriptPath,
+    });
+  } else {
+    const seenProjects = new Set<string>();
+    for (const root of input.projectRoots) {
+      if (root === "") {
+        continue;
+      }
+      const projectsDir = join(root, "projects");
+      const real = fs.realpath(projectsDir);
+      if (seenProjects.has(real)) {
+        continue;
+      }
+      seenProjects.add(real);
+      for (const holdingDir of fs.listDir(projectsDir)) {
+        const projectDir = join(projectsDir, holdingDir);
+        const transcriptPath = join(projectDir, `${uuid}.jsonl`);
+        if (fs.exists(transcriptPath)) {
+          found.push({ holdingDir, projectDir, transcriptPath });
+        }
       }
     }
-  }
-  if (found.length === 0) {
-    const roots = input.projectRoots
-      .filter((r) => r !== "")
-      .map((r) => join(r, "projects"));
-    return {
-      kind: "preflight-failed",
-      reason: `no claude transcript on disk for session ${uuid}`,
-      found: [],
-      fixCommand: `# session ${uuid} has no transcript under ${
-        roots.join(", ") || "(no roots)"
-      }; not resumable`,
-    };
+    if (found.length === 0) {
+      const roots = input.projectRoots
+        .filter((r) => r !== "")
+        .map((r) => join(r, "projects"));
+      return {
+        kind: "preflight-failed",
+        reason: `no claude transcript on disk for session ${uuid}`,
+        found: [],
+        fixCommand: `# session ${uuid} has no transcript under ${
+          roots.join(", ") || "(no roots)"
+        }; not resumable`,
+      };
+    }
   }
 
-  // 2. Prefer a transcript-tail cwd whose slug matches its holding dir.
+  // 2. Prefer a transcript-tail cwd. A catalog-pinned foreground resume has
+  // already selected exactly one artifact, so that artifact's newest complete
+  // cwd is authoritative even when the projects bucket is symlinked or the
+  // transcript was rehomed under a non-slug physical directory. The legacy
+  // crash-restore glob path still requires a slug-matching tail cwd to break
+  // duplicate-artifact ties.
   const strong = new Set<string>();
   const tailCwds: string[] = [];
   for (const f of found) {
@@ -287,7 +317,9 @@ export function resolveClaudeCwd(
   // Exactly one confident tail cwd wins; otherwise fall back to the observed-cwd
   // history whose slug matches a holding dir. Zero or multiple ⇒ unresolvable.
   let resolved: string | null = null;
-  if (strong.size === 1) {
+  if (input.artifactPath !== undefined && uniq(tailCwds).length === 1) {
+    resolved = uniq(tailCwds)[0] ?? null;
+  } else if (strong.size === 1) {
     resolved = [...strong][0] ?? null;
   } else if (strong.size === 0) {
     resolved = resolveFromHistory(input.observedCwds, found);

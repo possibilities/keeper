@@ -246,7 +246,7 @@ You author a follow-up from observable state — you should almost never need to
 1. **Brief specs + done summaries** — re-read the `tasks[].done_summary` fields in the brief. What did the work claim to do?
 2. **Full report** — re-read `audits/<epic_id>/report.md` for the auditor's full reasoning on the concern, not just the section header.
 3. **Source commits** — `git -C <PRIMARY_REPO> show <sha>` the relevant commits to see the actual change in context. (Repo/sha come from the brief's `commit_groups`.)
-4. **Originating sessions** — mine the work sessions: `claudectl list-sessions --all` filtered to session-name `work::<task_id>`, then `claudectl show-session <id>` on a match. If `claudectl` is absent or no matching session exists, this rung yields nothing — that's fine, move on.
+4. **Originating sessions** — mine the work sessions: `keeper history list --project <PRIMARY_REPO>` filtered to the exact `work::<task_id>` Session reference (Claude or Pi), then `keeper history show <session-reference>` on a match. If `keeper history` is absent or no matching session exists, this rung yields nothing — that's fine, move on.
 
 Only a question that would **flip a verdict** and survives all four rungs qualifies. The budget is ONE question across the whole run. When one qualifies, return EXACTLY:
 

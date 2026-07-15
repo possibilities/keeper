@@ -23,7 +23,7 @@ import {
   matrixConfigPath,
 } from "../../src/agent/matrix";
 import type { ResumeDecision } from "../../src/agent/resume-policy";
-import type { SpawnedChild, SpawnFn } from "../../src/agent/run";
+import type { SpawnedChild, SpawnFn, SpawnOptions } from "../../src/agent/run";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
@@ -86,6 +86,8 @@ export interface Harness {
   deps: MainDeps;
   /** Every command handed to the spawn seam, in order. */
   spawned: string[][];
+  /** Spawn env/cwd options handed to the spawn seam, in order. */
+  spawnOptions: SpawnOptions[];
   /** stdout sink. */
   out: string[];
   /** stderr sink. */
@@ -193,6 +195,7 @@ export interface HarnessOptions {
  */
 export function makeHarness(opts: HarnessOptions): Harness {
   const spawned: string[][] = [];
+  const spawnOptions: SpawnOptions[] = [];
   const out: string[] = [];
   const err: string[] = [];
   const codexStateSharingCalls: string[][] = [];
@@ -222,8 +225,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
 
   const spawn: SpawnFn =
     opts.spawn ??
-    ((cmd: string[]): SpawnedChild => {
+    ((cmd: string[], options: SpawnOptions = {}): SpawnedChild => {
       spawned.push(cmd);
+      spawnOptions.push(options);
       piLaunchOrder.push("spawn");
       return okChild();
     });
@@ -335,6 +339,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
   return {
     deps,
     spawned,
+    spawnOptions,
     out,
     err,
     codexStateSharingCalls,
