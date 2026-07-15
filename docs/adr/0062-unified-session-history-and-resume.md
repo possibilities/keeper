@@ -18,7 +18,7 @@ Foreground continuation has a different interaction contract from detached partn
 
 Keeper has one Session catalog for supported Claude and Pi Harness sessions. The catalog joins native transcript artifacts with optional Keeper job aliases, resume targets, title records, and lifecycle metadata without making a job row or title the session's identity.
 
-A Session reference resolves in deterministic tiers: an explicitly harness-qualified native id, an exact Keeper job id, an exact native id, then an exact case-insensitive current or historical Session title. Distinct matching Harness sessions remain ambiguous; normal reads return structured candidates, and foreground resume may offer a TTY picker. No resolver silently chooses the newest title match. Titles select a Harness session but never become a Harness resume key.
+A Session reference resolves in deterministic tiers: an explicitly harness-qualified native id, an exact Keeper job id, an exact native id, then an exact case-insensitive current or historical Session title. The unqualified native-id tier requires native artifact evidence; an artifact-less job's claimed resume target remains addressable by qualified native id or exact job id but cannot shadow the title of an artifact-backed Session. Distinct matching Harness sessions remain ambiguous; normal reads return structured candidates, and foreground resume may offer a TTY picker. No resolver silently chooses the newest title match. Titles select a Harness session but never become a Harness resume key.
 
 `keeper history` is the canonical traversal surface:
 

@@ -325,6 +325,52 @@ describe("Session catalog and resolver", () => {
     );
   });
 
+  test("an unverified job resume target does not shadow an artifact-backed title", () => {
+    const catalog = buildSessionCatalog(
+      [
+        artifact(
+          "claude",
+          "real-native-id",
+          "/native/claude/real-native-id.jsonl",
+          "/project",
+          ["shared-selector"],
+          "2026-01-02T00:00:00.000Z",
+        ),
+      ],
+      [
+        job({
+          jobId: "failed-pi-job",
+          harness: "pi",
+          nativeId: "shared-selector",
+          transcriptPath: null,
+          project: "/project",
+          currentTitle: null,
+          titleHistory: [],
+        }),
+      ],
+    );
+
+    const bare = resolveSessionReference(catalog, "shared-selector");
+    expect(bare.kind).toBe("resolved");
+    if (bare.kind === "resolved") {
+      expect(bare.match).toBe("title");
+      expect(bare.session.nativeId).toBe("real-native-id");
+    }
+
+    const qualified = resolveSessionReference(
+      catalog,
+      "pi:shared-selector",
+    );
+    expect(qualified.kind).toBe("resolved");
+    if (qualified.kind === "resolved") {
+      expect(qualified.match).toBe("qualified_native_id");
+      expect(qualified.session.artifact).toBeNull();
+    }
+    const byJob = resolveSessionReference(catalog, "failed-pi-job");
+    expect(byJob.kind).toBe("resolved");
+    if (byJob.kind === "resolved") expect(byJob.match).toBe("job_id");
+  });
+
   test("adapts legacy Claude rows and refuses unsupported or targetless jobs", () => {
     const legacy = keeperJobAliasFromRow({
       job_id: "claude-job",
