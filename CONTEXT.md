@@ -46,6 +46,10 @@ keeper's terms of art, grouped by bounded context. Each entry is a role-and-beha
 - **Audited task**: A task whose selected tier is policy-flagged for review, parking AUDIT_READY instead of stamping done until a content-blind orchestrator's **audit gate** — typed refs, hashes, counts, and enums only, never a spec or a findings artifact — drives the task-scoped audit (the quality-auditor's per-task mode: no brief, implicitly lean, findings sink-persisted, a content-free finding-ref reply) to decide resume or escalation. Avoid: keystone task, gated task, flagged task, review gate, done gate, checkpoint, blind orchestrator.
 - **Blocking follow-up**: A follow-up epic the close audit requires to complete before its source epic may stamp done; the source stays open, holding every epic that depends on it. Avoid: gating epic, close blocker.
 
+## Personal notes
+- **Note**: A durable user-authored text capture that stays active until one successful external action archives it; archived Notes remain browsable history. Avoid: snippet (that names a prompt-corpus entry), task, handoff.
+- **Disposition**: The successful clipboard copy or fresh-agent launch that processes a Note and moves it to archived history. Avoid: send (only one kind), archive (the resulting state), delivery.
+
 ## Autopilot and dispatch
 - **Autopilot**: The server-side loop that reconciles the board against running work, dispatching ready tasks and closing finished epics without a human. Avoid: scheduler, cron, orchestrator.
 - **Autopilot arm**: The durable selection of an epic for dispatch under autopilot's armed mode, distinct from the Plan validation Arm. Avoid: validation marker, approval, readiness.

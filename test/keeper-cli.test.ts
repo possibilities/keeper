@@ -96,6 +96,7 @@ function makeHarness(): Harness {
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       projects: mkHandler("projects"),
+      note: mkHandler("note"),
       repo: mkHandler("repo"),
       dispatch: mkHandler("dispatch"),
       handoff: mkHandler("handoff"),
@@ -237,6 +238,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
     expect(isSubcommand("projects")).toBe(true);
+    expect(isSubcommand("note")).toBe(true);
     expect(isSubcommand("repo")).toBe(true);
     expect(isSubcommand("bus")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);

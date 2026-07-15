@@ -157,7 +157,7 @@ When a request asks you to create a document — a writeup, report, brief, or re
 
 Every doc carries a companion `~/docs/<name>.yaml` sidecar. Document metadata lives ONLY in that sidecar — never embed a metadata block in the `.md` body.
 
-When the human then asks to "open it" (or "open that doc"), that always means publish both files as a GitHub gist and open it in the browser — `gh gist create <doc>.md <doc>.yaml --web` (markdown first, sidecar second). "Open" is publish-and-view, never a local file open.
+Treat "save" and "open" as cumulative actions, including when they appear in the same request. "Save" writes the Markdown and YAML sidecar under `~/docs/`. "Open" publishes both files as a GitHub gist and opens its web page by running `gh gist create <doc>.md <doc>.yaml --web` (Markdown first, sidecar second). For "save … and open it," save both files first, then run that gist command. Never use the macOS `open` command for documents, and never open a local file, editor, Preview, or `file://` URL.
 
 <!-- BAKE:END keeper prompt render source-dirs/docs-dir-and-gist-open -->
 

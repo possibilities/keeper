@@ -77,24 +77,4 @@ export function buildDebugSnapshot(input: DebugSnapshotInputs): string {
   ].join("\n");
 }
 
-export type CopyResult = { ok: true } | { ok: false; error: string };
-
-/**
- * Pipe `payload` into `pbcopy`. macOS-only by design — non-darwin spawn
- * failure surfaces as `{ ok: false }` so the caller can route the
- * message to the lifecycle sidecar.
- */
-export async function copyToClipboard(payload: string): Promise<CopyResult> {
-  try {
-    const proc = Bun.spawn(["pbcopy"], { stdin: "pipe", stderr: "pipe" });
-    proc.stdin.write(payload);
-    await proc.stdin.end();
-    const code = await proc.exited;
-    if (code !== 0) {
-      return { ok: false, error: `pbcopy exited ${code}` };
-    }
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  }
-}
+export { type CopyResult, copyToClipboard } from "./clipboard";

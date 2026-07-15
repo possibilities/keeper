@@ -142,6 +142,9 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   // keeper paths so a bus-spawn test never strands them at production defaults.
   env.KEEPER_BUS_DB = join(tmpDir, "bus.db");
   env.KEEPER_BUS_SOCK = join(tmpDir, "bus.sock");
+  // Personal Note state: the independent notes.db and its sibling draft/lock
+  // paths derive from this sandboxed file, never the live Keeper state root.
+  env.KEEPER_NOTES_DB = join(tmpDir, "notes.db");
   // Drop any key whose value was cleared to undefined.
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;

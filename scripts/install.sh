@@ -35,6 +35,28 @@ fi
 echo "install: bun install"
 ( cd "${repo_root}" && bun install )
 
+# 1b. Gum is the interactive multiline writer behind fresh Note capture. Keep
+#     the Homebrew formula current on every install: `brew upgrade` is a clean
+#     no-op when the installed version is already latest. Fail loud when brew is
+#     unavailable because an apparently successful install would leave the
+#     shipped prefix-N binding unable to capture text.
+if ! command -v brew >/dev/null 2>&1; then
+  echo "install: Homebrew is required to install the Gum Note writer" >&2
+  exit 1
+fi
+if brew list --formula gum >/dev/null 2>&1; then
+  echo "install: upgrade Gum Note writer"
+  brew upgrade gum
+else
+  echo "install: install Gum Note writer"
+  brew install gum
+fi
+if ! command -v gum >/dev/null 2>&1; then
+  echo "install: Gum installation completed but 'gum' is not on PATH" >&2
+  exit 1
+fi
+echo "install: $(gum --version)"
+
 # 2. Put `keeper` on PATH via bun link. Idempotent — skip when the link exists.
 if [ -L "${HOME}/.bun/bin/keeper" ]; then
   echo "install: keeper already linked (${HOME}/.bun/bin/keeper)"

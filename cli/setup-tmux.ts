@@ -67,11 +67,13 @@ torn down by --kill-sessions. An existing 'work' session is left untouched.
 NEVER attaches or switch-clients — safe to run inside or outside tmux. Attach
 the dashboard with: tmux -L dash attach.
 
-Also symlinks the tmux guard drop-in (tmux/keeper-guard.conf →
-~/.config/tmux/conf.d/zz-keeper-guard.conf), idempotently and fail-open, so a
-keeper-managed session (autopilot/pair/panels/agentbus) prompts before a
-keyboard-triggered window/split creation. Only activates if your tmux.conf
-sources conf.d/*.conf. Refuses to clobber a real (non-symlink) file there.
+Also symlinks Keeper's tmux drop-ins idempotently and fail-open:
+  tmux/keeper-notes.conf → ~/.config/tmux/conf.d/keeper-notes.conf
+  tmux/keeper-guard.conf → ~/.config/tmux/conf.d/zz-keeper-guard.conf
+The first binds prefix N/B to fresh Note capture/browse popups; the second makes a
+keeper-managed session (autopilot/pair/panels/agentbus/wrapped) prompt before a
+keyboard-triggered window/split creation. They activate only if your tmux.conf
+sources conf.d/*.conf. A real (non-symlink) destination is never clobbered.
 
 When the work session ('work') is absent or only a one-shell skeleton (the first
 run after a crash) and the last tmux-server generation left crashed agents for it,
@@ -161,12 +163,12 @@ const defaultSpawn: SyncSpawnFn = (cmd, options) =>
   }) as unknown as SyncSpawnResult;
 
 /**
- * Injectable filesystem seam — the minimal `node:fs` subset
- * {@link ensureGuardSymlink} needs. Injected (never inlined) so `main` stays
- * test-drivable without touching real `~/.config`. `lstat` reports whether the
- * link path is a symlink (vs a real file); `readlink` resolves an existing
- * symlink's target; `symlink`/`mkdir` create. A method throwing surfaces as the
- * fail-open warn-and-continue path.
+ * Injectable filesystem seam — the minimal `node:fs` subset the tmux drop-in
+ * installer needs. Injected (never inlined) so `main` stays test-drivable
+ * without touching real `~/.config`. `lstat` reports whether a destination is a
+ * symlink (vs a real file); `readlink` resolves an existing symlink's target;
+ * `symlink`/`mkdir` create. A method throwing surfaces as the fail-open
+ * warn-and-continue path.
  */
 export interface GuardFs {
   lstatIsSymlink(path: string): boolean | null;
@@ -580,66 +582,91 @@ function rebuildDash(spawn: SyncSpawnFn): void {
   }
 }
 
-/** The guard drop-in's source (in this repo) and the conf.d link path. */
+/** Keeper-owned tmux drop-in sources in this repo. */
+export function notesConfSource(): string {
+  return `${KEEPER_DIR}/tmux/keeper-notes.conf`;
+}
+
 export function guardConfSource(): string {
   return `${KEEPER_DIR}/tmux/keeper-guard.conf`;
 }
 
-/** `~/.config/tmux/conf.d/zz-keeper-guard.conf` — the `zz-` prefix sources it
- *  last so it overrides the human's own create-key binds. `home` empty ⇒ "" so
- *  the caller no-ops rather than writing a root-relative path. */
-export function guardConfLink(home: string): string {
-  if (home === "") {
-    return "";
-  }
-  return `${home}/.config/tmux/conf.d/zz-keeper-guard.conf`;
+/** The Note popup destination. `home` empty ⇒ no root-relative path. */
+export function notesConfLink(home: string): string {
+  return home === "" ? "" : `${home}/.config/tmux/conf.d/keeper-notes.conf`;
 }
 
-/**
- * Idempotently install the tmux guard drop-in symlink
- * (`<repo>/tmux/keeper-guard.conf` → `~/.config/tmux/conf.d/zz-keeper-guard.conf`).
- * `mkdir -p` the conf.d parent, then: link already points at the source ⇒ quiet
- * no-op; a symlink to a wrong/missing target ⇒ relink; a REAL file (not a
- * symlink) ⇒ refuse + warn (never clobber); any fs error ⇒ warn + continue. The
- * caller wraps this in its own try/catch so a failure can't abort `main`.
- */
-function ensureGuardSymlink(gfs: GuardFs): void {
-  const home = process.env.HOME ?? "";
-  const link = guardConfLink(home);
-  if (link === "") {
-    process.stderr.write(
-      "keeper setup-tmux: empty HOME, skipping tmux guard symlink\n",
-    );
-    return;
-  }
-  const source = guardConfSource();
-  const parent = link.slice(0, link.lastIndexOf("/"));
-  gfs.mkdirp(parent);
+/** `zz-` sources the guard after the human's own create-key bindings. */
+export function guardConfLink(home: string): string {
+  return home === "" ? "" : `${home}/.config/tmux/conf.d/zz-keeper-guard.conf`;
+}
 
-  const isLink = gfs.lstatIsSymlink(link);
+interface TmuxConfSpec {
+  readonly label: string;
+  readonly source: string;
+  readonly link: string;
+}
+
+function tmuxConfSpecs(home: string): readonly TmuxConfSpec[] {
+  return [
+    {
+      label: "note popup",
+      source: notesConfSource(),
+      link: notesConfLink(home),
+    },
+    {
+      label: "managed-session guard",
+      source: guardConfSource(),
+      link: guardConfLink(home),
+    },
+  ];
+}
+
+/** Install or repair one symlink without ever replacing a real file. */
+function ensureTmuxConfSymlink(gfs: GuardFs, spec: TmuxConfSpec): void {
+  const isLink = gfs.lstatIsSymlink(spec.link);
   if (isLink === false) {
-    // A REAL file at the link path — never clobber the human's own config.
     process.stderr.write(
-      `keeper setup-tmux: ${link} is a real file (not a symlink), refusing to clobber — tmux guard not installed\n`,
+      `keeper setup-tmux: ${spec.link} is a real file (not a symlink), refusing to clobber — ${spec.label} not installed\n`,
     );
     return;
   }
   if (isLink === true) {
-    // Existing symlink: a no-op if it already points at the source, else relink.
     let current = "";
     try {
-      current = gfs.readlink(link);
+      current = gfs.readlink(spec.link);
     } catch {
-      current = "";
+      // A dangling or unreadable symlink is repaired below.
     }
-    if (current === source) {
-      return;
-    }
-    gfs.symlink(source, link);
+    if (current === spec.source) return;
+  }
+  gfs.symlink(spec.source, spec.link);
+}
+
+/**
+ * Idempotently install both Keeper tmux drop-ins. The shared parent is created
+ * once. Each link fails open independently, so one stale or protected
+ * destination never prevents installing the other or provisioning sessions.
+ */
+function ensureTmuxConfSymlinks(gfs: GuardFs): void {
+  const home = process.env.HOME ?? "";
+  if (home === "") {
+    process.stderr.write(
+      "keeper setup-tmux: empty HOME, skipping tmux drop-in symlinks\n",
+    );
     return;
   }
-  // Absent (lstat null) — create the link.
-  gfs.symlink(source, link);
+  const specs = tmuxConfSpecs(home);
+  gfs.mkdirp(join(home, ".config", "tmux", "conf.d"));
+  for (const spec of specs) {
+    try {
+      ensureTmuxConfSymlink(gfs, spec);
+    } catch (error) {
+      process.stderr.write(
+        `keeper setup-tmux: ${spec.label} symlink install failed, continuing — ${String(error)}\n`,
+      );
+    }
+  }
 }
 
 /** Ensure each provisioned session exists (mint when absent, never touch when
@@ -1121,14 +1148,14 @@ export async function main(
   }
 
   try {
-    // Fail-open: install the tmux guard drop-in symlink in its OWN inner
-    // try/catch so a failure (fs error, permissions) warns + continues and
-    // never skips dash rebuild / work-session ensure.
+    // Fail-open: install Keeper's tmux drop-ins before provisioning. A shared
+    // parent-creation failure is caught here; per-link failures are isolated by
+    // ensureTmuxConfSymlinks itself.
     try {
-      ensureGuardSymlink(guardFs);
+      ensureTmuxConfSymlinks(guardFs);
     } catch (e) {
       process.stderr.write(
-        `keeper setup-tmux: tmux guard symlink install failed, continuing — ${String(e)}\n`,
+        `keeper setup-tmux: tmux drop-in install failed, continuing — ${String(e)}\n`,
       );
     }
 
