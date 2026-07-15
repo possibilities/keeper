@@ -61,6 +61,7 @@ import {
   loadHostMatrixV2,
 } from "../../plan/src/host_matrix.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
+import { resolveClaudeCompilerRoots } from "./claude_worker_compiler.ts";
 import { compilePromptArtifacts } from "./prompt_compiler.ts";
 import { renderTemplate, sourceRelpath } from "./render_engine.ts";
 
@@ -626,10 +627,17 @@ export function runRenderPluginTemplates(
   const planPlugin = pluginDirs.find(isPlanPlugin);
   if (planPlugin !== undefined) {
     try {
+      // Normalize either accepted front-door shape through the compiler's core
+      // resolver. In particular, a plugins/plan root must infer the enclosing
+      // Keeper root so source identities and fingerprints match Keeper-root and
+      // direct compiler publication.
+      const compilerRoots = resolveClaudeCompilerRoots({
+        planRoot: planPlugin,
+      });
       const result = compilePromptArtifacts({
         request: { target: "claude", bundle: "plan:work" },
-        repoRoot: projectRoot,
-        planRoot: planPlugin,
+        repoRoot: compilerRoots.repoRoot,
+        planRoot: compilerRoots.planRoot,
         matrixPath,
       });
       const reported = new Set<string>();

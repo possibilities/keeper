@@ -16,6 +16,7 @@ import {
   CLAUDE_WORKER_MANIFEST,
   verifyClaudeWorkerCohort,
 } from "../src/claude_worker_compiler.ts";
+import { compilePromptArtifacts } from "../src/prompt_compiler.ts";
 import { renderTemplate } from "../src/render_engine.ts";
 import { runRenderPluginTemplates } from "../src/render_plugin_templates.ts";
 
@@ -444,7 +445,7 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
     }
   });
 
-  test("supports a keeper-root multi-plugin shape and ignores unrelated plugin trees", () => {
+  test("alternates plan and Keeper roots with one canonical multi-plugin publication", () => {
     const root = mkdtempSync(join(tmpdir(), "prompt-render-multi-root-"));
     const planRoot = join(root, "plugins", "plan");
     const otherRoot = join(root, "plugins", "other");
@@ -461,13 +462,57 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
           '"name": "other"',
         ),
       );
-      const rc = withConfig(SINGLE_NATIVE_MATRIX, () =>
-        runRenderPluginTemplates({ projectRoot: root }),
+      const publication = withConfig(SINGLE_NATIVE_MATRIX, () => {
+        const planRc = runRenderPluginTemplates({ projectRoot: planRoot });
+        const manifestPath = join(planRoot, "workers", CLAUDE_WORKER_MANIFEST);
+        const sidecarPath = join(
+          planRoot,
+          "workers",
+          "opus-high",
+          "agents",
+          "worker.md.managed-file-dont-edit",
+        );
+        const afterPlanRoot = {
+          manifest: readFileSync(manifestPath, "utf8"),
+          sidecar: readFileSync(sidecarPath, "utf8"),
+        };
+        const keeperRc = runRenderPluginTemplates({ projectRoot: root });
+        const afterKeeperRoot = {
+          manifest: readFileSync(manifestPath, "utf8"),
+          sidecar: readFileSync(sidecarPath, "utf8"),
+        };
+        const planAgainRc = runRenderPluginTemplates({ projectRoot: planRoot });
+        const checked = compilePromptArtifacts({
+          request: { target: "claude", bundle: "plan:work" },
+          repoRoot: root,
+          check: true,
+        });
+        return {
+          planRc,
+          keeperRc,
+          planAgainRc,
+          afterPlanRoot,
+          afterKeeperRoot,
+          afterPlanAgain: {
+            manifest: readFileSync(manifestPath, "utf8"),
+            sidecar: readFileSync(sidecarPath, "utf8"),
+          },
+          checked,
+        };
+      });
+      expect(publication.planRc).toBe(0);
+      expect(publication.keeperRc).toBe(0);
+      expect(publication.planAgainRc).toBe(0);
+      expect(publication.afterKeeperRoot).toEqual(publication.afterPlanRoot);
+      expect(publication.afterPlanAgain).toEqual(publication.afterPlanRoot);
+      expect(publication.checked).toMatchObject({
+        outcome: "hit",
+        check: true,
+        ok: true,
+      });
+      expect(JSON.parse(publication.afterPlanRoot.manifest)).toHaveProperty(
+        "fingerprint",
       );
-      expect(rc).toBe(0);
-      expect(
-        existsSync(join(planRoot, "workers", CLAUDE_WORKER_MANIFEST)),
-      ).toBe(true);
       expect(existsSync(join(otherRoot, "workers"))).toBe(false);
       expect(existsSync(join(otherRoot, "agents", "close-planner.md"))).toBe(
         true,
