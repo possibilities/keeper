@@ -61,13 +61,14 @@ matrix: the autopilot producer loads and validates once per reconcile cycle
 and injects an immutable snapshot (parsed axes or the failure discriminator)
 into the pure core, which parks dispatch behind a visible distress sticky
 until the file is fixed; the fs-free import boundary of the reconcile
-closure is unchanged. The Claude worker compiler reads the host matrix directly and publishes the
-complete `subagent_templates × subagent_models × efforts` cohort to the fixed
-`workers/<model>-<effort>` convention; `render-plugin-templates` delegates that
-publication as a compatibility front door. The inventory entries and derived
-capability token carry the path-traversal guards. ADR 0063 owns the publication,
-verification, and freshness contract. CI drift gates re-scope to what the repo can self-verify (hash
-parity, structural validation, a schema-valid example) while axis-coverage
+closure is unchanged. The Claude worker compiler reads the host matrix directly
+and publishes the complete `subagent_templates × subagent_models × efforts`
+cohort to the fixed `workers/<model>-<effort>` convention;
+`render-plugin-templates` delegates that publication as a compatibility front
+door. The inventory entries and derived capability token carry the
+path-traversal guards. ADR 0063 owns the publication, verification, and
+freshness contract. CI drift gates re-scope to what the repo can self-verify
+(hash parity, structural validation, a schema-valid example) while axis-coverage
 checks move host-side where the axis lives; test suites pin
 `KEEPER_CONFIG_DIR` at committed claude-only fixtures.
 

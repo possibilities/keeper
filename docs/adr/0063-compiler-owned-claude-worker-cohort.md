@@ -40,19 +40,25 @@ writes and delegates exactly once to the compiler. Install and promote retain
 that front door, while promotion verifies the compiler-owned cohort.
 
 Manual and autopilot work dispatch verify current compiler fingerprint,
-inventory, hashes, and selected-cell membership read-only before launch. A
-missing or stale cohort fails as `worker-cell-stale`; remediation is the
-compiler command. Resolution accepts only the exact selected physical cell as
-the preloaded `work` plugin. A `work` plugin from configuration or cwd is a
-shadow, not a substitute. Work-target isolation consistently removes scanned
-plugin directories.
+inventory, hashes, and selected-cell membership read-only before launch. An
+absent selected manifest fails as `worker-cell-missing`; a present manifest
+whose fingerprint, inventory, hashes, or membership is invalid fails as
+`worker-cell-stale`. Both remediate with:
+`keeper prompt compile --role work:worker --target claude`. Resolution accepts
+only the exact selected physical cell as the preloaded `work` plugin. A
+`work` plugin from configuration or cwd is a shadow, not a substitute.
+
+Worker isolation is config-gated. With `worker_plugin_isolation` absent or
+`off`, automated work launches retain `plugin_scan_dirs` results. With
+`strip-scan-dirs`, they remove only those scan results; hard `plugin_dirs` and
+cwd detection remain. Runtime shadow inventory mirrors the resolved gate.
 
 Compilation preserves the matrix's worker-cell topology. Native cells launch
 their exact Claude route. Wrapped cells retain their assigned and effective
 capability while running the fixed wrapper driver at `maxTurns: 160`; native
-cells use `maxTurns: 300`. The compiler performs no provider-equivalence adaptation. The task
-assignment and producer-side provider constraint continue to make the runtime
-cell choice.
+cells use `maxTurns: 300`. The compiler performs no provider-equivalence
+adaptation. The task assignment and producer-side provider constraint continue
+to make the runtime cell choice.
 
 ## Alternatives considered
 

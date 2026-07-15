@@ -1,13 +1,14 @@
 # plugin composition map — what each launch channel loads
 
 This note maps the Claude Code plugin layer under keeper by launch channel.
-Ordinary Claude launches use the configured plugin set. Work launches add one
-compiler-owned worker cell and use work-target isolation; their worker cohort is
-separate from Pi's static prompt-artifact cohort.
+Work launches add one compiler-owned worker cell; their `plugin_scan_dirs`
+composition follows the config-gated worker isolation setting. The Claude worker
+cohort is separate from Pi's static prompt-artifact cohort.
 
-## The base set (ordinary Claude launches)
+## The base set
 
-`keeper agent claude …` discovers configured plugins for an ordinary launch.
+`keeper agent claude …` discovers configured plugins. Automated work launches
+use the same discovery unless their worker-isolation setting removes scan results.
 
 Discovery (`src/agent/plugins.ts` `discoverPlugins`) composes, from
 `~/.config/keeper/plugins.yaml` (parsed by `loadPluginSources`,
@@ -56,16 +57,18 @@ agent` passes it as `--settings` on Claude launches that do not already supply
 | --- | --- | --- | --- |
 | Interactive (human) | configured Claude launcher | configured plugins | — |
 | `keeper agent` manual dispatch / pair | `keeper agent claude …` | configured plugins | — |
-| Autopilot / manual work dispatch | shared work-launch seam | hard-listed `plugin_dirs`; scanned directories stripped | exact verified cell via additive `--plugin-dir <cell>` |
+| Autopilot / manual work dispatch | shared work-launch seam | configured plugins; scan results remain with an absent or `off` gate, or are stripped with `strip-scan-dirs` | exact verified cell via additive `--plugin-dir <cell>` |
 
 Both work-launch producers — the autopilot reconciler and manual `keeper
 dispatch work::<id>` — use one shared resolution seam. Its precedence is
 **bad matrix → provider constraint reject → out-of-matrix → missing manifest →
 stale or unverified cohort → exact-cell shadow → launch**. Each caller owns its
 failure surface, but both make the same decision: autopilot mints a
-`DispatchFailed` sticky and manual dispatch exits non-zero. A stale result is
-`worker-cell-stale`; regenerate with `keeper prompt compile --role work:worker
---target claude`.
+`DispatchFailed` sticky and manual dispatch exits non-zero. An absent selected
+manifest is `worker-cell-missing`; a present manifest with invalid compiler
+fingerprint, inventory, hashes, or selected membership is `worker-cell-stale`.
+Regenerate either with:
+`keeper prompt compile --role work:worker --target claude`.
 
 The compiler publishes the complete matrix-derived shared cohort under
 `plugins/plan/workers/<model>-<effort>/`. It snapshots the literal include
@@ -80,9 +83,8 @@ Before launch, the shared seam read-only verifies the compiler fingerprint,
 inventory, hashes, and selected membership. The exact physical selected cell is
 the only legitimate preloaded `work` plugin. A `work` plugin discovered from
 configuration or cwd is a shadow, not an equivalent substitute. The selected
-cell is appended by `--plugin-dir`, so the cell remains additive to the
-hard-listed plugins while work-target isolation consistently strips scanned
-plugin directories.
+cell is appended by `--plugin-dir`, so it remains additive to the configured
+plugin set. Runtime shadow inventory mirrors the resolved isolation setting.
 
 A task's `{model, tier}` and any producer-side provider constraint select the
 runtime cell; no task-specific prompt artifact exists. A native cell launches
@@ -165,13 +167,18 @@ command-family allowlist — unblock and resolve stay diagnosis-only, deconflict
 get write-capable families — failing CLOSED for a marked session regardless of
 `--dangerously-skip-permissions`.
 
-## Work-target isolation
+## Worker isolation gate
 
-Every work launch strips `plugin_scan_dirs` results. Hard-listed `plugin_dirs`
-remain, and the exact verified cell is added as an additive `--plugin-dir`.
-Cwd and configured plugin siblings are still examined for `work` identity so a
-shadow is refused rather than silently loaded. Interactive, pair, close, and
-other non-work launches retain ordinary configured discovery.
+`worker_plugin_isolation` controls automated work-launch scan results:
+
+- **absent / `off`** (the default) retains `plugin_scan_dirs` results.
+- **`strip-scan-dirs`** removes only `plugin_scan_dirs` results. Hard
+  `plugin_dirs` and cwd detection remain.
+
+The runtime shadow inventory follows the same resolved gate. Cwd and configured
+plugin siblings are still examined for `work` identity, so a shadow is refused
+rather than silently loaded. Interactive, pair, close, and other non-work
+launches retain ordinary configured discovery.
 
 ## Logged-vs-executed skew (read this before mining events)
 
