@@ -50,7 +50,15 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 ### Account routing (optional)
 
 Claude account routing is optional and fails open to the native default account when either integration
-is absent or unusable.
+is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: it resolves the
+trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable source state,
+attempts a sealed noninteractive rebase with merge topology preserved, and builds the exact fork tip when
+upstream cannot be resolved, the rebase conflicts, or the rebased build fails. Each immutable generation
+under `~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic `current`
+symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and interactive-shell
+path. Provenance records source and tree SHAs, mode, architecture, Swift toolchain, and the verified binary
+SHA-256. A failed build or publication retains the previous artifact, successful resolved-pair fallbacks
+are reused until either tip changes, and the Homebrew cask is removed only after publication succeeds.
 
 | Capability | Public command | Keeper role |
 |---|---|---|
@@ -67,7 +75,7 @@ for a later process.
 The selection policy is continuous: each routeable candidate is scored by its worst normalized quota
 window after short-lived launch reservations, the greatest remaining headroom wins, and
 least-recently-used order breaks ties. The account-routing rationale lives in
-[ADR 0038](./adr/0038-external-capacity-and-per-launch-account-routing.md).
+[ADR 0064](./adr/0064-managed-codexbar-cli-and-per-launch-account-routing.md).
 
 Claude `settings.json` is seeded at install time from the keeper stow source only when the live file is
 absent. After that seed, the local file is the canonical value: keeper leaves local edits in place and
@@ -311,6 +319,8 @@ rm -f ~/.config/fish/completions/keeper.fish
 rm -f ~/.local/share/bash-completion/completions/keeper
 rm -f ~/.local/share/zsh/site-functions/_keeper
 rm -f "$(brew --prefix 2>/dev/null)/share/zsh/site-functions/_keeper"
+rm -f ~/.local/bin/codexbar
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/keeper/codexbar"
 # Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```

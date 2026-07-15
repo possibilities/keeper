@@ -4163,7 +4163,7 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       const { db } = ctx;
       // v119→v120 (fn-1239 task .6): retire the Keeper-owned `usage` /
       // `profiles` projections — superseded by the account-routing boundary
-      // (`docs/adr/0038`). DROP UNCONDITIONALLY at the tail — the `event_blobs`
+      // (`docs/adr/0064`). DROP UNCONDITIONALLY at the tail — the `event_blobs`
       // precedent (v74): both tables are (re)created above via the steady-state
       // `CREATE_USAGE` / `CREATE_PROFILES` (`IF NOT EXISTS`, which must stay —
       // every historical ADD-column step from v23/v33 onward still runs against
@@ -5464,7 +5464,7 @@ CREATE TABLE IF NOT EXISTS git_status (
 /**
  * `usage` projection table — RETIRED at schema v120 (fn-1239 task .6; DROPped
  * unconditionally by the tail step, mirroring `event_blobs`) in favor of the
- * account-routing boundary (`docs/adr/0038`). Kept here ONLY so the
+ * account-routing boundary (`docs/adr/0064`). Kept here ONLY so the
  * steady-state `CREATE TABLE IF NOT EXISTS` still gives every historical
  * ADD-column step (v23 onward) a table to run against during a fresh 0→head
  * migration walk; nothing at head folds into or reads it. Do NOT add a new

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Supersedes ADR 0009 and ADR 0012 (latched reserve profile balancer), and supersedes the usage-viewer-specific clauses of ADR 0012 (agent frame-stream wire contract).
+Superseded by [ADR 0064](../0064-managed-codexbar-cli-and-per-launch-account-routing.md). The per-launch routing decisions are consolidated there with the managed CodexBar CLI exception, and ADR 0064 preserves this record's supersession of ADRs 0009 and 0012.
 
 ## Context
 
