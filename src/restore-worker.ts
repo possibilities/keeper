@@ -101,7 +101,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import { harnessOrClaude } from "./agent/harness";
+import { type HarnessName, isHarnessName } from "./agent/harness";
 import {
   atomicWriteFile,
   openDb,
@@ -125,6 +125,16 @@ import type { TmuxTopologyPane } from "./tmux-focus-derive";
 import { keeperTmuxSessionCwd } from "./tmux-session-cwd";
 import type { Epic, Job } from "./types";
 import { watchLoop } from "./wake-worker";
+
+function batchHarnessOrNull(
+  name: string | null | undefined,
+): HarnessName | null {
+  const n = (name ?? "").trim();
+  if (n === "") {
+    return "claude";
+  }
+  return isHarnessName(n) ? n : null;
+}
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only the DB
@@ -347,6 +357,7 @@ export interface RestoreSession {
 export interface RestoreTier {
   captured_at: number;
   sessions: Record<string, RestoreSession>;
+  unregistered_harness_skip_count?: number;
 }
 
 /**
@@ -408,6 +419,7 @@ export function buildRestoreTier(
   capturedAt: number,
 ): RestoreTier {
   const sessions: Record<string, RestoreSession> = {};
+  let unregisteredHarnessSkipCount = 0;
   for (const job of jobs) {
     if (job.state !== "working" && job.state !== "stopped") {
       continue;
@@ -420,13 +432,21 @@ export function buildRestoreTier(
     }
     const sessionId = job.backend_exec_session_id;
     const tier = tierForJobFromEpics(job, epicsById);
-    const harness = harnessOrClaude(job.harness);
+    const harness = batchHarnessOrNull(job.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     const agent: RestoreAgent = {
       job_id: job.job_id,
       cwd: job.cwd,
       // Per-harness (see resumeTarget): the session UUID for Claude/Pi,
       // or "" when not-resumable.
-      resume_target: resumeTarget(job),
+      resume_target: resumeTarget({
+        job_id: job.job_id,
+        harness,
+        resume_target: job.resume_target,
+      }),
       tier,
       plan_verb: job.plan_verb,
       plan_ref: job.plan_ref,
@@ -462,7 +482,13 @@ export function buildRestoreTier(
       a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0,
     );
   }
-  return { captured_at: capturedAt, sessions };
+  return {
+    captured_at: capturedAt,
+    sessions,
+    ...(unregisteredHarnessSkipCount > 0
+      ? { unregistered_harness_skip_count: unregisteredHarnessSkipCount }
+      : {}),
+  };
 }
 
 /** Permission bits for the revive-script side-file. It rides agent titles and
@@ -490,9 +516,11 @@ const REVIVE_SCRIPT_MODE = 0o600;
 export function buildReviveScriptCandidates(jobs: Job[]): {
   candidates: RestoreCandidate[];
   excludedManagedCount: number;
+  unregisteredHarnessSkipCount: number;
 } {
   const candidates: RestoreCandidate[] = [];
   let excludedManagedCount = 0;
+  let unregisteredHarnessSkipCount = 0;
   for (const job of jobs) {
     if (job.state !== "working" && job.state !== "stopped") {
       continue;
@@ -514,22 +542,30 @@ export function buildReviveScriptCandidates(jobs: Job[]): {
       typeof job.title === "string" && job.title !== ""
         ? job.title
         : job.job_id;
-    const harness = harnessOrClaude(job.harness);
+    const harness = batchHarnessOrNull(job.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     candidates.push({
       job_id: job.job_id,
-      resume_target: resumeTarget(job),
+      resume_target: resumeTarget({
+        job_id: job.job_id,
+        harness,
+        resume_target: job.resume_target,
+      }),
       label,
       window_index: job.window_index ?? null,
       cwd: job.cwd != null && job.cwd !== "" ? job.cwd : null,
       backend_exec_session_id: job.backend_exec_session_id,
       created_at: job.created_at,
       // ABSENT ⇒ claude: tag only a non-claude harness so the claude revive
-      // script stays byte-identical (renderSnapshotScript reads harnessOrClaude).
+      // script stays byte-identical.
       ...(harness !== "claude" ? { harness } : {}),
     });
   }
   candidates.sort(compareCandidates);
-  return { candidates, excludedManagedCount };
+  return { candidates, excludedManagedCount, unregisteredHarnessSkipCount };
 }
 
 /** Strip the `current` tier's `captured_at` for hashing (or `null` passes
@@ -1037,13 +1073,14 @@ export function restorePulse(
   // input. Disabled when no `script` config is wired (the pure-JSON test path).
   if (snapshot?.script) {
     const { path: scriptPath, sourcePath, prefix, resolver } = snapshot.script;
-    const { candidates, excludedManagedCount } =
+    const { candidates, excludedManagedCount, unregisteredHarnessSkipCount } =
       buildReviveScriptCandidates(jobs);
     const script = renderSnapshotScript(candidates, {
       prefix,
       tmuxSessionCwd: keeperTmuxSessionCwd(process.env),
       sourcePath,
       excludedManagedCount,
+      unregisteredHarnessSkipCount,
       resolver,
     });
     const scriptHash = String(Bun.hash(script));

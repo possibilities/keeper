@@ -463,8 +463,15 @@ test("buildRestoreTier stamps resume_target as the session UUID (job_id), indepe
   ).toBe("sess-abc");
 });
 
-test("buildRestoreTier rejects an unregistered harness", () => {
+test("buildRestoreTier skips and surfaces an unregistered harness", () => {
   const jobs: Job[] = [
+    fakeJob({ job_id: "claude-ok", backend_exec_session_id: "s1" }),
+    fakeJob({
+      job_id: "pi-ok",
+      backend_exec_session_id: "s1",
+      harness: "pi",
+      resume_target: "pi-target",
+    }),
     fakeJob({
       job_id: "retired",
       backend_exec_session_id: "s1",
@@ -472,9 +479,12 @@ test("buildRestoreTier rejects an unregistered harness", () => {
       resume_target: "legacy-target",
     }),
   ];
-  expect(() => buildRestoreTier(jobs, new Map(), 1000)).toThrow(
-    "unknown harness 'hermes'",
-  );
+  const out = buildRestoreTier(jobs, new Map(), 1000);
+  expect(out.sessions.s1.agents.map((a) => a.job_id)).toEqual([
+    "claude-ok",
+    "pi-ok",
+  ]);
+  expect(out.unregistered_harness_skip_count).toBe(1);
 });
 
 test("buildRestoreTier sets captured_at on the tier shape (empty live set)", () => {
@@ -1137,6 +1147,21 @@ test("buildReviveScriptCandidates excludes reconciler-managed workers and counts
   // resume_target is the session UUID; label is the latest title.
   expect(candidates[0]?.resume_target).toBe("human");
   expect(candidates[0]?.label).toBe("hack");
+});
+
+test("buildReviveScriptCandidates skips and surfaces an unregistered harness", () => {
+  const { candidates, unregisteredHarnessSkipCount } =
+    buildReviveScriptCandidates([
+      fakeJob({ job_id: "claude-ok", backend_exec_session_id: "s1" }),
+      fakeJob({
+        job_id: "retired",
+        backend_exec_session_id: "s1",
+        harness: "codex",
+        resume_target: "legacy-target",
+      }),
+    ]);
+  expect(candidates.map((c) => c.job_id)).toEqual(["claude-ok"]);
+  expect(unregisteredHarnessSkipCount).toBe(1);
 });
 
 test("buildReviveScriptCandidates applies the same liveness filters as the JSON mirror", () => {

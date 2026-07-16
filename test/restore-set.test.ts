@@ -622,20 +622,46 @@ test("deriveRestoreSet: a Pi candidate with no resume_target is LISTED but not-r
   expect(isRestorableCandidate(pi as RestoreCandidate)).toBe(false);
 });
 
-test("deriveRestoreSet rejects an unregistered harness before returning a partial set", () => {
+test("deriveRestoreSet skips and surfaces an unregistered harness while keeping healthy candidates", () => {
+  seedJob(kdb.db, {
+    job_id: "claude-ok",
+    close_kind: "server_gone",
+    window_index: 0,
+  });
+  seedJob(kdb.db, {
+    job_id: "pi-ok",
+    close_kind: "server_gone",
+    harness: "pi",
+    resume_target: "pi-target",
+    window_index: 1,
+  });
+  seedJob(kdb.db, {
+    job_id: "retired",
+    close_kind: "server_gone",
+    harness: "codex",
+    resume_target: "legacy-target",
+    window_index: 2,
+  });
+  const res = derive();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["claude-ok", "pi-ok"]);
+  expect(res.unregisteredHarnessSkipCount).toBe(1);
+});
+
+test("deriveRestoreSet skips and surfaces a live unregistered harness row during dedup", () => {
   seedJob(kdb.db, {
     job_id: "claude-ok",
     close_kind: "server_gone",
   });
   seedJob(kdb.db, {
-    job_id: "retired-coordless",
-    close_kind: "server_gone",
-    harness: "codex",
+    job_id: "live-retired",
+    state: "working",
+    harness: "hermes",
     resume_target: "legacy-target",
-    backend_exec_session_id: null,
-    adopted: 1,
+    backend_exec_session_id: "work",
   });
-  expect(() => derive()).toThrow("unknown harness 'codex'");
+  const res = derive();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["claude-ok"]);
+  expect(res.unregisteredHarnessSkipCount).toBe(1);
 });
 test("deriveRestoreSet: a coordless NON-adopted row keeps today's silent skip (not counted)", () => {
   seedJob(kdb.db, {

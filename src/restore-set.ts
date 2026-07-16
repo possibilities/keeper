@@ -60,12 +60,12 @@
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
  * wall-clock outside the injected `now`. Empty inputs (first boot, zero killed
- * rows) return cleanly. An unregistered non-empty harness fails the derivation
- * before any restore plan can be returned.
+ * rows) return cleanly. An unregistered non-empty harness is counted and skipped
+ * so other restorable sessions still surface.
  */
 
 import type { Database } from "bun:sqlite";
-import { harnessOrClaude } from "./agent/harness";
+import { type HarnessName, isHarnessName } from "./agent/harness";
 import { type CloseKind, parseGenerationId } from "./exec-backend";
 import { extractTmuxTopologySnapshot } from "./reducer";
 import { resumeTarget } from "./resume-descriptor";
@@ -203,6 +203,10 @@ export interface RestoreSetResult {
    * marker — a coordless NON-adopted row keeps today's silent skip (never counted).
    */
   adoptedCoordlessSkipCount: number;
+  /** Count of otherwise in-scope rows dropped because `jobs.harness` carried an
+   *  unregistered non-empty value. Surfaced so one retired harness row cannot
+   *  hide the healthy restore set. */
+  unregisteredHarnessSkipCount: number;
   /**
    * A human-readable note set ONLY when {@link deriveLastGenerationSetFromTopology}
    * degraded to the retrospective {@link deriveLastGenerationSet} fallback (no
@@ -232,7 +236,22 @@ export interface DeriveRestoreSetOptions {
   idleCutoffSecs?: number;
 }
 
+export interface CurrentSetResult {
+  candidates: RestoreCandidate[];
+  unregisteredHarnessSkipCount: number;
+}
+
 const seg = (v: unknown): string => (v == null ? "" : String(v));
+
+function batchHarnessOrNull(
+  name: string | null | undefined,
+): HarnessName | null {
+  const n = (name ?? "").trim();
+  if (n === "") {
+    return "claude";
+  }
+  return isHarnessName(n) ? n : null;
+}
 
 /**
  * How many of the newest dead tmux-server generations enter DEFAULT restore
@@ -397,9 +416,13 @@ function resumeIdentityKey(
   target: string,
 ): string | null {
   const normalizedTarget = seg(target);
-  return normalizedTarget === ""
+  if (normalizedTarget === "") {
+    return null;
+  }
+  const normalizedHarness = batchHarnessOrNull(harness);
+  return normalizedHarness === null
     ? null
-    : `${harnessOrClaude(harness)}\0${normalizedTarget}`;
+    : `${normalizedHarness}\0${normalizedTarget}`;
 }
 
 /**
@@ -491,6 +514,7 @@ function loadRows(db: Database): {
   killed: KilledJobRow[];
   liveJobIds: Set<string>;
   liveResumeIdentities: Set<string>;
+  unregisteredHarnessSkipCount: number;
 } {
   const killed = db
     .query(
@@ -516,24 +540,36 @@ function loadRows(db: Database): {
   }[];
   const liveJobIds = new Set<string>();
   const liveResumeIdentities = new Set<string>();
+  let unregisteredHarnessSkipCount = 0;
   for (const r of liveRows) {
     const id = seg(r.job_id);
-    if (id !== "") {
-      liveJobIds.add(id);
-      const identity = resumeIdentityKey(
-        r.harness,
-        resumeTarget({
-          job_id: id,
-          harness: r.harness,
-          resume_target: r.resume_target,
-        }),
-      );
-      if (identity !== null) {
-        liveResumeIdentities.add(identity);
-      }
+    if (id === "") {
+      continue;
+    }
+    liveJobIds.add(id);
+    const harness = batchHarnessOrNull(r.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
+    const identity = resumeIdentityKey(
+      harness,
+      resumeTarget({
+        job_id: id,
+        harness,
+        resume_target: r.resume_target,
+      }),
+    );
+    if (identity !== null) {
+      liveResumeIdentities.add(identity);
     }
   }
-  return { killed, liveJobIds, liveResumeIdentities };
+  return {
+    killed,
+    liveJobIds,
+    liveResumeIdentities,
+    unregisteredHarnessSkipCount,
+  };
 }
 
 /**
@@ -544,18 +580,27 @@ function loadRows(db: Database): {
  *
  * Empty / zero-killed inputs return `{ candidates: [], excludedIdleCount: 0 }`
  * cleanly. Malformed structural values such as `window_index` coerce safely; an
- * unregistered harness throws so no partial restore plan can escape.
+ * unregistered harness is counted and skipped so healthy candidates still return.
  */
 export function deriveRestoreSet(
   db: Database,
   options: DeriveRestoreSetOptions = {},
 ): RestoreSetResult {
-  const { collected, excludedIdleCount, adoptedCoordlessSkipCount } =
-    collectCrashCandidates(db, options);
+  const {
+    collected,
+    excludedIdleCount,
+    adoptedCoordlessSkipCount,
+    unregisteredHarnessSkipCount,
+  } = collectCrashCandidates(db, options);
   const candidates = dedupeCandidatesByResumeIdentity(
     collected.map((c) => c.candidate),
   );
-  return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
+  return {
+    candidates,
+    excludedIdleCount,
+    adoptedCoordlessSkipCount,
+    unregisteredHarnessSkipCount,
+  };
 }
 
 /**
@@ -574,12 +619,18 @@ function collectCrashCandidates(
   collected: CandidateWithEventId[];
   excludedIdleCount: number;
   adoptedCoordlessSkipCount: number;
+  unregisteredHarnessSkipCount: number;
 } {
   const now = options.now ?? Date.now() / 1000;
   const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
   const idleBefore = now - idleCutoffSecs;
 
-  const { killed, liveJobIds, liveResumeIdentities } = loadRows(db);
+  const {
+    killed,
+    liveJobIds,
+    liveResumeIdentities,
+    unregisteredHarnessSkipCount: liveUnregisteredHarnessSkipCount,
+  } = loadRows(db);
 
   // Burst set is computed over the FULL killed cohort's Killed-event rowids, so
   // an `unknown`/NULL row's membership sees the same cluster the boot sweep made
@@ -589,6 +640,7 @@ function collectCrashCandidates(
   const collected: CandidateWithEventId[] = [];
   let excludedIdleCount = 0;
   let adoptedCoordlessSkipCount = 0;
+  let unregisteredHarnessSkipCount = liveUnregisteredHarnessSkipCount;
 
   for (const row of killed) {
     const jobId = seg(row.job_id);
@@ -600,9 +652,11 @@ function collectCrashCandidates(
     if (!isCrashLike(row.close_kind, inBurst)) {
       continue; // user-closed, or isolated unknown/legacy — not a candidate.
     }
-    // Validate before any per-candidate filter so an unsupported row cannot be
-    // hidden inside an otherwise actionable partial restore set.
-    const harness = harnessOrClaude(row.harness);
+    const harness = batchHarnessOrNull(row.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     // Filter: no backend coords ⇒ nothing to replay. An ADOPTED coordless row
     // (for example, when keeper never resolved coordinates) is
     // COUNTED and surfaced rather than silently dropped; a non-adopted coordless
@@ -624,7 +678,7 @@ function collectCrashCandidates(
     }
     const nativeTarget = resumeTarget({
       job_id: jobId,
-      harness: row.harness,
+      harness,
       resume_target: row.resume_target,
     });
     const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
@@ -671,7 +725,12 @@ function collectCrashCandidates(
     });
   }
 
-  return { collected, excludedIdleCount, adoptedCoordlessSkipCount };
+  return {
+    collected,
+    excludedIdleCount,
+    adoptedCoordlessSkipCount,
+    unregisteredHarnessSkipCount,
+  };
 }
 
 /**
@@ -720,10 +779,19 @@ export function deriveLastGenerationSet(
   db: Database,
   options: DeriveRestoreSetOptions = {},
 ): RestoreSetResult {
-  const { collected, excludedIdleCount, adoptedCoordlessSkipCount } =
-    collectCrashCandidates(db, options);
+  const {
+    collected,
+    excludedIdleCount,
+    adoptedCoordlessSkipCount,
+    unregisteredHarnessSkipCount,
+  } = collectCrashCandidates(db, options);
   if (collected.length === 0) {
-    return { candidates: [], excludedIdleCount, adoptedCoordlessSkipCount };
+    return {
+      candidates: [],
+      excludedIdleCount,
+      adoptedCoordlessSkipCount,
+      unregisteredHarnessSkipCount,
+    };
   }
 
   // K_max: the most-recent Killed-event rowid among the candidates. A candidate
@@ -733,7 +801,12 @@ export function deriveLastGenerationSet(
     .filter((x): x is number => typeof x === "number" && Number.isFinite(x));
   if (eventIds.length === 0) {
     // No positioned candidate at all — no window to bound. Empty, cleanly.
-    return { candidates: [], excludedIdleCount, adoptedCoordlessSkipCount };
+    return {
+      candidates: [],
+      excludedIdleCount,
+      adoptedCoordlessSkipCount,
+      unregisteredHarnessSkipCount,
+    };
   }
   const kMax = Math.max(...eventIds);
 
@@ -791,7 +864,12 @@ export function deriveLastGenerationSet(
   const candidates = dedupeCandidatesByResumeIdentity(
     kept.map((c) => c.candidate),
   );
-  return { candidates, excludedIdleCount, adoptedCoordlessSkipCount };
+  return {
+    candidates,
+    excludedIdleCount,
+    adoptedCoordlessSkipCount,
+    unregisteredHarnessSkipCount,
+  };
 }
 
 /**
@@ -993,6 +1071,7 @@ export function deriveLastGenerationSetFromTopology(
     candidates: sel.pick.candidates,
     excludedIdleCount: 0,
     adoptedCoordlessSkipCount: 0,
+    unregisteredHarnessSkipCount: sel.pick.unregisteredHarnessSkipCount,
     ...(sel.ambiguous ? { ambiguous: true } : {}),
   };
 }
@@ -1039,6 +1118,7 @@ export function enrichedTopologyGenerations(
 export interface EnrichedGeneration {
   summary: GenerationSummary;
   candidates: RestoreCandidate[];
+  unregisteredHarnessSkipCount: number;
 }
 
 /**
@@ -1265,6 +1345,7 @@ function enrichGeneration(
   snapshots.sort((a, b) => b.id - a.id);
   let maxPaneCount = 0;
   let candidates: RestoreCandidate[] = [];
+  let unregisteredHarnessSkipCount = 0;
   for (const snap of snapshots) {
     if (snap.panes.length > maxPaneCount) {
       maxPaneCount = snap.panes.length;
@@ -1279,8 +1360,9 @@ function enrichGeneration(
         liveJobIds,
         liveResumeIdentities,
       );
-      if (built.length > 0) {
-        candidates = built;
+      if (built.candidates.length > 0) {
+        candidates = built.candidates;
+        unregisteredHarnessSkipCount = built.unregisteredHarnessSkipCount;
       }
     }
   }
@@ -1310,6 +1392,7 @@ function enrichGeneration(
       restorable: candidates.filter(isRestorableCandidate).length,
     },
     candidates,
+    unregisteredHarnessSkipCount,
   };
 }
 
@@ -1375,9 +1458,10 @@ function buildCandidatesFromSnapshot(
   panes: TmuxTopologyPaneLike[],
   liveJobIds: Set<string>,
   liveResumeIdentities: Set<string>,
-): RestoreCandidate[] {
+): { candidates: RestoreCandidate[]; unregisteredHarnessSkipCount: number } {
   const candidates: RestoreCandidate[] = [];
   const seen = new Set<string>();
+  let unregisteredHarnessSkipCount = 0;
   for (const pane of panes) {
     const jobId =
       pane.job_id ?? resolvePaneJobId(db, generationId, pane.pane_id) ?? null;
@@ -1388,7 +1472,11 @@ function buildCandidatesFromSnapshot(
     if (row === null) {
       continue; // job row gone — nothing to resume.
     }
-    const harness = harnessOrClaude(row.harness);
+    const harness = batchHarnessOrNull(row.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     // Idempotence filters reused VERBATIM from collectCrashCandidates.
     if (
       row.dispatch_origin === "autopilot" &&
@@ -1398,7 +1486,7 @@ function buildCandidatesFromSnapshot(
     }
     const nativeTarget = resumeTarget({
       job_id: jobId,
-      harness: row.harness,
+      harness,
       resume_target: row.resume_target,
     });
     const nativeIdentity = resumeIdentityKey(harness, nativeTarget);
@@ -1436,7 +1524,10 @@ function buildCandidatesFromSnapshot(
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
   }
-  return dedupeCandidatesByResumeIdentity(candidates);
+  return {
+    candidates: dedupeCandidatesByResumeIdentity(candidates),
+    unregisteredHarnessSkipCount,
+  };
 }
 
 /** A snapshot pane as decoded by {@link extractTmuxTopologySnapshot} — the shape
@@ -1584,7 +1675,7 @@ function loadLatestTopologyPaneLocations(
 function derivePostTerminalCurrentSet(
   db: Database,
   seenJobIds: Set<string>,
-): RestoreCandidate[] {
+): { candidates: RestoreCandidate[]; unregisteredHarnessSkipCount: number } {
   let rows: PostTerminalBackendRow[];
   try {
     rows = db
@@ -1612,11 +1703,12 @@ function derivePostTerminalCurrentSet(
       )
       .all() as PostTerminalBackendRow[];
   } catch {
-    return [];
+    return { candidates: [], unregisteredHarnessSkipCount: 0 };
   }
 
   const locations = loadLatestTopologyPaneLocations(db);
   const candidates: RestoreCandidate[] = [];
+  let unregisteredHarnessSkipCount = 0;
   for (const row of rows) {
     const jobId = seg(row.job_id);
     if (jobId === "" || seenJobIds.has(jobId) || !pidAlive(row.pid)) {
@@ -1645,16 +1737,21 @@ function derivePostTerminalCurrentSet(
     if (backendSession === "") {
       continue;
     }
+    const harness = batchHarnessOrNull(row.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
       resume_target: resumeTarget({
         job_id: jobId,
-        harness: row.harness,
+        harness,
         resume_target: row.resume_target,
       }),
       label,
-      harness: harnessOrClaude(row.harness),
+      harness,
       window_index:
         paneLocation?.window_index !== undefined
           ? paneLocation.window_index
@@ -1668,7 +1765,7 @@ function derivePostTerminalCurrentSet(
     });
     seenJobIds.add(jobId);
   }
-  return candidates;
+  return { candidates, unregisteredHarnessSkipCount };
 }
 
 /**
@@ -1738,8 +1835,8 @@ function isRecycleSafeLive(
  * after a crash the automatic path can't be trusted to catch. The resume target
  * is the session UUID (`job_id`), same as a crash candidate, so the emitted
  * script resumes each session EXACTLY; the display `label` keeps the latest name
- * (`title`, `job_id` fallback). Read-only; empty input returns `[]`, never
- * throws.
+ * (`title`, `job_id` fallback). Read-only; empty input returns an empty result,
+ * never throws.
  *
  * The liveness probe is INJECTED (`opts.isAlive` / `opts.readStartTime`,
  * defaulting to the file-local `pidAlive` + `readOsStartTime`) so fast tests
@@ -1747,13 +1844,13 @@ function isRecycleSafeLive(
  * identity references; this reuses that seam rather than adding a 6th
  * `pidAlive` variant.
  */
-export function deriveCurrentSet(
+export function deriveCurrentSetWithSkips(
   db: Database,
   opts: {
     isAlive?: (pid: number) => boolean;
     readStartTime?: (pid: number) => string | null;
   } = {},
-): RestoreCandidate[] {
+): CurrentSetResult {
   const isAlive = opts.isAlive ?? pidAlive;
   const readStartTime = opts.readStartTime ?? readOsStartTime;
   const rows = db
@@ -1783,6 +1880,7 @@ export function deriveCurrentSet(
   }[];
 
   const candidates: RestoreCandidate[] = [];
+  let unregisteredHarnessSkipCount = 0;
   for (const row of rows) {
     const jobId = seg(row.job_id);
     if (jobId === "") {
@@ -1795,16 +1893,21 @@ export function deriveCurrentSet(
     if (!isRecycleSafeLive(row.pid, row.start_time, isAlive, readStartTime)) {
       continue;
     }
+    const harness = batchHarnessOrNull(row.harness);
+    if (harness === null) {
+      unregisteredHarnessSkipCount++;
+      continue;
+    }
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
       resume_target: resumeTarget({
         job_id: jobId,
-        harness: row.harness,
+        harness,
         resume_target: row.resume_target,
       }),
       label,
-      harness: harnessOrClaude(row.harness),
+      harness,
       window_index:
         typeof row.window_index === "number" &&
         Number.isFinite(row.window_index)
@@ -1817,8 +1920,20 @@ export function deriveCurrentSet(
   }
 
   const seenJobIds = new Set(candidates.map((c) => c.job_id));
-  candidates.push(...derivePostTerminalCurrentSet(db, seenJobIds));
+  const postTerminal = derivePostTerminalCurrentSet(db, seenJobIds);
+  candidates.push(...postTerminal.candidates);
+  unregisteredHarnessSkipCount += postTerminal.unregisteredHarnessSkipCount;
 
   candidates.sort(compareCandidates);
-  return candidates;
+  return { candidates, unregisteredHarnessSkipCount };
+}
+
+export function deriveCurrentSet(
+  db: Database,
+  opts: {
+    isAlive?: (pid: number) => boolean;
+    readStartTime?: (pid: number) => string | null;
+  } = {},
+): RestoreCandidate[] {
+  return deriveCurrentSetWithSkips(db, opts).candidates;
 }

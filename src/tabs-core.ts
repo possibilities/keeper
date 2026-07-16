@@ -68,7 +68,7 @@
 import type { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { harnessOrClaude } from "./agent/harness";
+import { type HarnessName, isHarnessName } from "./agent/harness";
 import { openDb } from "./db";
 import {
   buildKeeperAgentLaunchArgv,
@@ -85,6 +85,7 @@ import {
 } from "./keeper-agent-path";
 import {
   deriveCurrentSet,
+  deriveCurrentSetWithSkips,
   deriveLastGenerationSet,
   type EnrichedGeneration,
   enrichedTopologyGenerations,
@@ -109,6 +110,23 @@ import {
 } from "./resume-resolve";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
+
+function batchHarnessOrNull(
+  name: string | null | undefined,
+): HarnessName | null {
+  const n = (name ?? "").trim();
+  if (n === "") {
+    return "claude";
+  }
+  return isHarnessName(n) ? n : null;
+}
+
+function unregisteredHarnessReason(
+  name: string | null | undefined,
+): string | null {
+  const n = (name ?? "").trim();
+  return n === "" || isHarnessName(n) ? null : `unknown harness '${n}'`;
+}
 
 // ---------------------------------------------------------------------------
 // Outcome shape + plan / apply / render (moved from scripts/restore-agents.ts)
@@ -137,6 +155,7 @@ export type AgentOutcome =
   // verifies.
   | { kind: "launched-unverified"; candidate: RestoreCandidate; reason: string }
   | { kind: "failed"; candidate: RestoreCandidate; error: string }
+  | { kind: "unsupported-harness"; candidate: RestoreCandidate; reason: string }
   // A candidate keeper cannot resume — a non-claude harness whose native resume
   // target was never resolved, or whose target names no on-disk artifact.
   // Reported (never launched, never counted as a failure), so the REST of the
@@ -173,27 +192,11 @@ export type AgentOutcome =
  *    `"not-resumable"` with a reason.
  * The `--apply` path upgrades each `"would-restore"` to `"restored"` / `"failed"`.
  */
-function assertSupportedCandidateHarnesses(
-  candidates: readonly RestoreCandidate[],
-): void {
-  for (const candidate of candidates) {
-    harnessOrClaude(candidate.harness);
-  }
-}
-
-function assertSupportedPlanHarnesses(plan: readonly AgentOutcome[]): void {
-  assertSupportedCandidateHarnesses(plan.map((entry) => entry.candidate));
-}
-
 export function planRestore(
   candidates: RestoreCandidate[],
   sessionFilter: string | null,
   resolver: ResumeResolver = defaultResumeResolver,
 ): AgentOutcome[] {
-  // Validate the complete set before deriving any per-candidate policy. A stale
-  // unregistered harness rejects the restore as one ordinary failure; it cannot
-  // become a special not-resumable entry beside a partially actionable plan.
-  assertSupportedCandidateHarnesses(candidates);
   const out: AgentOutcome[] = [];
   for (const candidate of candidates) {
     if (
@@ -202,11 +205,21 @@ export function planRestore(
     ) {
       continue;
     }
+    const harness = batchHarnessOrNull(candidate.harness);
+    if (harness === null) {
+      out.push({
+        kind: "unsupported-harness",
+        candidate,
+        reason:
+          unregisteredHarnessReason(candidate.harness) ?? "unknown harness",
+      });
+      continue;
+    }
     if (!isRestorableCandidate(candidate)) {
       out.push({
         kind: "not-resumable",
         candidate,
-        reason: `${harnessOrClaude(candidate.harness)} session has no resolved resume target`,
+        reason: `${harness} session has no resolved resume target`,
       });
       continue;
     }
@@ -275,13 +288,22 @@ export async function applyRestore(
   ensureLaunched: EnsureLaunchedFn,
   sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
-  // Reject the whole externally supplied plan before the first process launch.
-  assertSupportedPlanHarnesses(plan);
   const out: AgentOutcome[] = [];
   let launched = 0;
   for (const entry of plan) {
     if (entry.kind !== "would-restore") {
       out.push(entry);
+      continue;
+    }
+    const harness = batchHarnessOrNull(entry.candidate.harness);
+    if (harness === null) {
+      out.push({
+        kind: "unsupported-harness",
+        candidate: entry.candidate,
+        reason:
+          unregisteredHarnessReason(entry.candidate.harness) ??
+          "unknown harness",
+      });
       continue;
     }
     // Pace BETWEEN real launches: pause before every launch after the first.
@@ -296,7 +318,7 @@ export async function applyRestore(
         session,
         entry.candidate.resume_target,
         cwd,
-        harnessOrClaude(entry.candidate.harness),
+        harness,
         entry.candidate.job_id,
       );
       if (res.ok) {
@@ -388,9 +410,6 @@ export async function applyRestoreVerified(
   plan: AgentOutcome[],
   deps: VerifiedApplyDeps,
 ): Promise<AgentOutcome[]> {
-  // Reject the whole externally supplied plan before writing an intent or
-  // launching a process; unsupported rows never produce a partial restore.
-  assertSupportedPlanHarnesses(plan);
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
   const out: Promise<AgentOutcome>[] = [];
@@ -401,6 +420,18 @@ export async function applyRestoreVerified(
       continue;
     }
     const candidate = entry.candidate;
+    const harness = batchHarnessOrNull(candidate.harness);
+    if (harness === null) {
+      out.push(
+        Promise.resolve({
+          kind: "unsupported-harness",
+          candidate,
+          reason:
+            unregisteredHarnessReason(candidate.harness) ?? "unknown harness",
+        }),
+      );
+      continue;
+    }
     const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
     const session = candidate.backend_exec_session_id;
     const base = deps.makeIntent(candidate);
@@ -428,7 +459,7 @@ export async function applyRestoreVerified(
         session,
         candidate.resume_target,
         cwd,
-        harnessOrClaude(candidate.harness),
+        harness,
         candidate.job_id,
       );
       if (!res.ok) {
@@ -526,6 +557,7 @@ export function countOutcomes(outcomes: AgentOutcome[]): {
   unverified: number;
   notResumable: number;
   preflightFailed: number;
+  unsupportedHarness: number;
 } {
   let restored = 0;
   let verified = 0;
@@ -534,6 +566,7 @@ export function countOutcomes(outcomes: AgentOutcome[]): {
   let unverified = 0;
   let notResumable = 0;
   let preflightFailed = 0;
+  let unsupportedHarness = 0;
   for (const o of outcomes) {
     if (o.kind === "restored") restored++;
     else if (o.kind === "verified") verified++;
@@ -541,6 +574,7 @@ export function countOutcomes(outcomes: AgentOutcome[]): {
     else if (o.kind === "launched-unverified") unverified++;
     else if (o.kind === "not-resumable") notResumable++;
     else if (o.kind === "preflight-failed") preflightFailed++;
+    else if (o.kind === "unsupported-harness") unsupportedHarness++;
     else wouldRestore++;
   }
   return {
@@ -551,6 +585,7 @@ export function countOutcomes(outcomes: AgentOutcome[]): {
     unverified,
     notResumable,
     preflightFailed,
+    unsupportedHarness,
   };
 }
 
@@ -575,6 +610,7 @@ export function renderOutcomes(
   outcomes: AgentOutcome[],
   apply: boolean,
   excludedIdleCount: number,
+  unregisteredHarnessSkipCount = 0,
 ): string {
   const stanzas: string[] = [];
   const {
@@ -585,6 +621,7 @@ export function renderOutcomes(
     unverified,
     notResumable,
     preflightFailed,
+    unsupportedHarness,
   } = countOutcomes(outcomes);
 
   for (const o of outcomes) {
@@ -592,6 +629,12 @@ export function renderOutcomes(
     const cwd = c.cwd == null ? "" : seg(c.cwd);
     const session = commentSafe(c.backend_exec_session_id);
     const label = commentSafe(c.label);
+    if (o.kind === "unsupported-harness") {
+      stanzas.push(
+        `# (${session}) UNSUPPORTED-HARNESS ${label}: ${commentSafe(o.reason)}`,
+      );
+      continue;
+    }
     if (o.kind === "not-resumable") {
       // No runnable command line — the harness has no resolved resume target.
       stanzas.push(
@@ -637,21 +680,28 @@ export function renderOutcomes(
     notResumable > 0 ? ` not-resumable=${notResumable}` : "";
   const preflightNote =
     preflightFailed > 0 ? ` preflight-failed=${preflightFailed}` : "";
+  const unsupportedTotal = unsupportedHarness + unregisteredHarnessSkipCount;
+  const unsupportedNote =
+    unsupportedTotal > 0 ? ` unsupported-harness=${unsupportedTotal}` : "";
   const unverifiedNote = unverified > 0 ? ` unverified=${unverified}` : "";
   // On the verified apply path `verified` supersedes `restored`; sum them so the
   // summary's restored count stays meaningful whichever apply path produced it.
   const applyRestored = restored + verified;
   const summary = apply
-    ? `# summary: restored=${applyRestored} failed=${failed}${unverifiedNote}${notResumableNote}${preflightNote}`
-    : `# summary: would-restore=${wouldRestore}${notResumableNote}${preflightNote}`;
+    ? `# summary: restored=${applyRestored} failed=${failed}${unverifiedNote}${notResumableNote}${preflightNote}${unsupportedNote}`
+    : `# summary: would-restore=${wouldRestore}${notResumableNote}${preflightNote}${unsupportedNote}`;
   const idleNote =
     excludedIdleCount > 0
       ? `\n# note: ${excludedIdleCount} crash-like candidate(s) excluded as idle past the cutoff`
       : "";
+  const unregisteredNote =
+    unregisteredHarnessSkipCount > 0
+      ? `\n# note: ${unregisteredHarnessSkipCount} candidate(s) skipped for unregistered harness`
+      : "";
 
   return stanzas.length > 0
-    ? `${stanzas.join("\n\n")}\n\n${summary}${idleNote}\n`
-    : `${summary}${idleNote}\n`;
+    ? `${stanzas.join("\n\n")}\n\n${summary}${idleNote}${unregisteredNote}\n`
+    : `${summary}${idleNote}${unregisteredNote}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +732,8 @@ export interface SnapshotScriptOptions {
   /** Count of live panes EXCLUDED from this script (reconciler-managed workers by
    *  default) — surfaced in the header so the human sees what won't be revived. */
   excludedManagedCount?: number;
+  /** Count of live panes skipped because they carry an unregistered harness. */
+  unregisteredHarnessSkipCount?: number;
   /** Disk-anchored resume resolver (default {@link defaultResumeResolver}, real
    *  fs). A claude candidate's `cd` prefix is repaired to the resolver's
    *  disk-anchored cwd; an unresolvable claude transcript or a non-claude target
@@ -713,23 +765,33 @@ export function renderSnapshotScript(
 ): string {
   const sessionFilter = options.sessionFilter ?? null;
   const excludedManagedCount = options.excludedManagedCount ?? 0;
+  const baseUnregisteredHarnessSkipCount =
+    options.unregisteredHarnessSkipCount ?? 0;
   const resolver = options.resolver ?? defaultResumeResolver;
   const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
-  assertSupportedCandidateHarnesses(candidates);
   const included = candidates.filter(
     (c) =>
       sessionFilter === null || c.backend_exec_session_id === sessionFilter,
   );
   const captured = included.length;
+  const unregisteredHarnessInIncluded = included.filter(
+    (c) => batchHarnessOrNull(c.harness) === null,
+  ).length;
+  const unregisteredHarnessSkipCount =
+    baseUnregisteredHarnessSkipCount + unregisteredHarnessInIncluded;
   const excludedNote =
     excludedManagedCount > 0
       ? `${excludedManagedCount} reconciler-managed pane(s) not included (pass --include-managed to add)`
       : "no reconciler-managed panes excluded";
+  const unregisteredNote =
+    unregisteredHarnessSkipCount > 0
+      ? `; ${unregisteredHarnessSkipCount} pane(s) skipped for unregistered harness`
+      : "";
   const lines: string[] = [
     "#!/usr/bin/env bash",
     "# keeper tabs dump — runnable snapshot of the CURRENT live keeper agents.",
     `# Source: ${options.sourcePath}. Pipe to a file and run to revive these tabs.`,
-    `# captured ${captured} keeper agent(s); ${excludedNote}.`,
+    `# captured ${captured} keeper agent(s); ${excludedNote}${unregisteredNote}.`,
     "# Each window relaunches via keeper agent <harness> with that harness's own resume argv; the session is get-or-created.",
     "set -euo pipefail",
   ];
@@ -768,12 +830,19 @@ export function renderSnapshotScript(
         `${quoteArgv(buildTmuxNewSessionArgs(sessionName, options.tmuxSessionCwd))}`,
     );
     for (const candidate of bucket) {
+      const harness = batchHarnessOrNull(candidate.harness);
+      if (harness === null) {
+        lines.push(
+          `# unsupported-harness: ${commentSafe(candidate.label)} (${commentSafe(unregisteredHarnessReason(candidate.harness) ?? "unknown harness")})`,
+        );
+        continue;
+      }
       // A non-claude agent keeper never back-filled a resume target for is
       // NOT-RESUMABLE — emit a comment (never a broken `--resume ''` line) so the
       // script stays runnable and the rest of the session still revives.
       if (!isRestorableCandidate(candidate)) {
         lines.push(
-          `# not-resumable: ${candidate.label} (${harnessOrClaude(candidate.harness)} session has no resolved resume target)`,
+          `# not-resumable: ${candidate.label} (${harness} session has no resolved resume target)`,
         );
         continue;
       }
@@ -817,7 +886,7 @@ export function renderSnapshotScript(
         prompt: "",
         resumeTarget: candidate.resume_target,
         jobId: candidate.job_id,
-        harness: harnessOrClaude(candidate.harness),
+        harness,
         noConfirm: true,
       });
       if (windowsEmitted > 0) {
@@ -833,7 +902,7 @@ export function renderSnapshotScript(
   }
   lines.push("");
   lines.push(
-    `# summary: keeper tabs dump sessions=${sessionCount} windows=${windowsEmitted} excluded-managed=${excludedManagedCount}`,
+    `# summary: keeper tabs dump sessions=${sessionCount} windows=${windowsEmitted} excluded-managed=${excludedManagedCount} unsupported-harness=${unregisteredHarnessSkipCount}`,
   );
   return `${lines.join("\n")}\n`;
 }
@@ -904,6 +973,7 @@ export interface RestoreSelection {
   ambiguous: boolean;
   fallbackNote?: string;
   unknownGeneration?: string;
+  unregisteredHarnessSkipCount?: number;
 }
 
 /** Knobs for {@link selectRestoreGeneration}: the idle/now cutoff plus an optional
@@ -950,6 +1020,7 @@ export function selectRestoreGeneration(
       pickedGeneration: hit.summary,
       eligible: [],
       ambiguous: false,
+      unregisteredHarnessSkipCount: hit.unregisteredHarnessSkipCount,
     };
   }
 
@@ -972,6 +1043,7 @@ export function selectRestoreGeneration(
     pickedGeneration: sel.pick.summary,
     eligible: sel.eligible.map((e) => e.summary),
     ambiguous: sel.ambiguous,
+    unregisteredHarnessSkipCount: sel.pick.unregisteredHarnessSkipCount,
   };
 }
 
@@ -1022,6 +1094,7 @@ export function loadRestorePlan(
       eligible: [],
       ambiguous: false,
       fallbackNote: KILLED_COHORT_FALLBACK_NOTE,
+      unregisteredHarnessSkipCount: fallback.unregisteredHarnessSkipCount,
     };
   } finally {
     try {
@@ -1113,6 +1186,7 @@ export function loadGenerationList(
 export interface DumpCurrentSet {
   candidates: RestoreCandidate[];
   excludedManagedCount: number;
+  unregisteredHarnessSkipCount: number;
 }
 
 /** Read the reconciler-managed (`plan_verb='work'`) live job-id set — the panes
@@ -1148,21 +1222,29 @@ export function loadCurrentSetForDump(
 ): DumpCurrentSet {
   const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
   try {
-    const all = deriveCurrentSet(db);
+    const all = deriveCurrentSetWithSkips(db);
     if (options.includeManaged === true) {
-      return { candidates: all, excludedManagedCount: 0 };
+      return {
+        candidates: all.candidates,
+        excludedManagedCount: 0,
+        unregisteredHarnessSkipCount: all.unregisteredHarnessSkipCount,
+      };
     }
     const managed = loadManagedJobIds(db);
     const kept: RestoreCandidate[] = [];
     let excluded = 0;
-    for (const c of all) {
+    for (const c of all.candidates) {
       if (managed.has(c.job_id)) {
         excluded++;
       } else {
         kept.push(c);
       }
     }
-    return { candidates: kept, excludedManagedCount: excluded };
+    return {
+      candidates: kept,
+      excludedManagedCount: excluded,
+      unregisteredHarnessSkipCount: all.unregisteredHarnessSkipCount,
+    };
   } finally {
     try {
       db.close();

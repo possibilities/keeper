@@ -148,14 +148,17 @@ interface SeedJob {
   backend_exec_session_id?: string | null;
   plan_verb?: string | null;
   last_event_id?: number | null;
+  harness?: string | null;
+  resume_target?: string | null;
 }
 
 function seedJob(db: Database, j: SeedJob): void {
   db.run(
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, cwd, close_kind,
-       window_index, backend_exec_session_id, plan_verb, last_event_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       window_index, backend_exec_session_id, plan_verb, last_event_id,
+       harness, resume_target
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? RECENT,
@@ -170,6 +173,8 @@ function seedJob(db: Database, j: SeedJob): void {
         : "work",
       j.plan_verb ?? null,
       j.last_event_id ?? null,
+      j.harness ?? null,
+      j.resume_target ?? null,
     ],
   );
 }
@@ -290,7 +295,11 @@ function enriched(
   summary: GenerationSummary,
   candidates: RestoreCandidate[],
 ): EnrichedGeneration {
-  return { summary: { ...summary, restorable: candidates.length }, candidates };
+  return {
+    summary: { ...summary, restorable: candidates.length },
+    candidates,
+    unregisteredHarnessSkipCount: 0,
+  };
 }
 
 const RESTORE_PREFIX = ["/abs/bun", "/abs/cli/keeper.ts", "agent"];
@@ -362,6 +371,30 @@ test("renderSnapshotScript header reports captured + excluded-managed counts", (
     "3 reconciler-managed pane(s) not included (pass --include-managed to add).",
   );
   expect(script).toContain("excluded-managed=3");
+});
+
+test("renderSnapshotScript comments and counts unregistered harness candidates", () => {
+  const script = renderSnapshotScript(
+    [
+      fakeCandidate({ job_id: "ok", resume_target: "ok", label: "ok" }),
+      fakeCandidate({
+        job_id: "retired",
+        harness: "codex",
+        resume_target: "legacy-target",
+        label: "retired",
+      }),
+    ],
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
+  );
+  expect(script).toContain(
+    "# unsupported-harness: retired (unknown harness 'codex')",
+  );
+  expect(script).toContain("unsupported-harness=1");
+  expect(script).toContain("windows=1");
 });
 
 test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper agent argv)", () => {
@@ -818,6 +851,7 @@ test("countOutcomes tallies every kind incl. verified / launched-unverified", ()
     unverified: 1,
     notResumable: 1,
     preflightFailed: 0,
+    unsupportedHarness: 0,
   });
 });
 
@@ -1190,30 +1224,35 @@ test("planRestore threads resolver verdicts into typed outcomes (resolved cwd wi
   );
 });
 
-test("planRestore rejects an unregistered harness before deriving a partial plan", () => {
+test("planRestore skips and surfaces an unregistered harness without dropping healthy candidates", () => {
   let resolverCalls = 0;
   const resolver: ResumeResolver = () => {
     resolverCalls++;
     return { kind: "resumable" };
   };
-  expect(() =>
-    planRestoreRaw(
-      [
-        fakeCandidate({ job_id: "ok", resume_target: "ok" }),
-        fakeCandidate({
-          job_id: "retired",
-          harness: "hermes",
-          resume_target: "legacy-target",
-        }),
-      ],
-      null,
-      resolver,
-    ),
-  ).toThrow("unknown harness 'hermes'");
-  expect(resolverCalls).toBe(0);
+  const plan = planRestoreRaw(
+    [
+      fakeCandidate({ job_id: "ok", resume_target: "ok" }),
+      fakeCandidate({
+        job_id: "retired",
+        harness: "hermes",
+        resume_target: "legacy-target",
+      }),
+    ],
+    null,
+    resolver,
+  );
+  expect(plan.map((p) => p.kind)).toEqual([
+    "would-restore",
+    "unsupported-harness",
+  ]);
+  expect((plan[1] as { reason: string }).reason).toBe(
+    "unknown harness 'hermes'",
+  );
+  expect(resolverCalls).toBe(1);
 });
 
-test("applyRestore rejects an unregistered harness before any launch", async () => {
+test("applyRestore skips an unregistered harness and still launches healthy entries", async () => {
   let launches = 0;
   const plan: AgentOutcome[] = [
     {
@@ -1229,13 +1268,12 @@ test("applyRestore rejects an unregistered harness before any launch", async () 
       }),
     },
   ];
-  await expect(
-    applyRestore(plan, async () => {
-      launches++;
-      return { ok: true };
-    }),
-  ).rejects.toThrow("unknown harness 'codex'");
-  expect(launches).toBe(0);
+  const out = await applyRestore(plan, async () => {
+    launches++;
+    return { ok: true };
+  });
+  expect(out.map((o) => o.kind)).toEqual(["restored", "unsupported-harness"]);
+  expect(launches).toBe(1);
 });
 
 test("renderOutcomes surfaces the preflight-failed stanza + summary note", () => {
@@ -1490,12 +1528,22 @@ test("loadRestorePlan: no restorable topology ⇒ labeled killed-cohort fallback
     last_event_id: 150,
     backend_exec_session_id: "work",
   });
+  seedJob(kdb.db, {
+    job_id: "retired-cohort",
+    close_kind: "server_gone",
+    harness: "hermes",
+    resume_target: "legacy-target",
+    window_index: 1,
+    last_event_id: 151,
+    backend_exec_session_id: "work",
+  });
   kdb.db.close();
 
   const sel = loadRestorePlan(dbPath, { probeNow: () => "gen-now" });
   expect(sel.candidates.map((c) => c.job_id)).toEqual(["killed-cohort"]);
   expect(sel.pickedGeneration).toBeNull();
   expect(sel.fallbackNote).toBeDefined();
+  expect(sel.unregisteredHarnessSkipCount).toBe(1);
 });
 
 test("loadRestorePlan: --generation targets one generation's panes", () => {
@@ -1538,11 +1586,19 @@ test("loadCurrentSetForDump excludes reconciler-managed workers + counts them; -
     plan_verb: "work",
     backend_exec_session_id: "autopilot",
   });
+  seedJob(kdb.db, {
+    job_id: "retired-1",
+    state: "working",
+    harness: "codex",
+    resume_target: "legacy-target",
+    backend_exec_session_id: "work",
+  });
   kdb.db.close();
 
   const excluded = loadCurrentSetForDump(dbPath);
   expect(excluded.candidates.map((c) => c.job_id)).toEqual(["human-1"]);
   expect(excluded.excludedManagedCount).toBe(1);
+  expect(excluded.unregisteredHarnessSkipCount).toBe(1);
 
   const included = loadCurrentSetForDump(dbPath, { includeManaged: true });
   expect(included.candidates.map((c) => c.job_id).sort()).toEqual([
@@ -1550,6 +1606,7 @@ test("loadCurrentSetForDump excludes reconciler-managed workers + counts them; -
     "worker-1",
   ]);
   expect(included.excludedManagedCount).toBe(0);
+  expect(included.unregisteredHarnessSkipCount).toBe(1);
 });
 
 test("loadGenerationList returns ranked generations (with sample labels) + the current set", () => {

@@ -226,10 +226,11 @@ export function isCapturableHarness(name: string): boolean {
 }
 
 /**
- * The harness a `jobs` row belongs to, defaulting a NULL/empty/unknown tag to
- * `"claude"`. NULL harness reads as claude at every consumer (the SessionStart
- * fold never synthesizes a value), so this is the single normalization point the
- * resume/restore surfaces resolve a stored `jobs.harness` through.
+ * The harness a `jobs` row belongs to. NULL/empty tags default to `"claude"`;
+ * an unknown non-empty tag throws. NULL harness reads as claude at every consumer
+ * (the SessionStart fold never synthesizes a value), so this is the single
+ * normalization point the resume/restore surfaces resolve a stored `jobs.harness`
+ * through.
  */
 export function harnessOrClaude(name: string | null | undefined): HarnessName {
   const n = (name ?? "").trim();
