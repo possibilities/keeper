@@ -24,12 +24,12 @@ model is harvested, not manufactured: running the same question independently yi
 paths, tool calls, and sources. So there are no assigned "lenses" or personas — every panelist gets the
 human's task verbatim and answers it straight. Read `references/panel.md` for the independence rules.
 
-**Architecture.** You are the admission shim. Before spawning `plan:panel-runner`, build the neutral
-panelist prompt and atomically reserve its one request with `keeper agent panel start`. That operation also
-spends the request's single member fan-out. Pass the returned opaque request handle to one runner `Task()`
-in a typed control header, structurally before and separate from the verbatim inquiry. The runner can only
-wait, filter quorum, and spawn one judge; it cannot admit or re-drive a panel. Panelist transcripts never
-enter your context.
+**Architecture.** You are the admission shim. Build the neutral panelist prompt, reserve its one
+request with `keeper agent panel start`, and pass the returned opaque handle to one runner `Task()` before
+and separate from the verbatim inquiry. The runner waits, filters quorum, and spawns one judge; it cannot
+admit or re-drive a panel. Panelist transcripts never enter your context.
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## Admit once, then spawn the runner
 
@@ -76,8 +76,9 @@ keeper agent panel start "$PROMPT_FILE" --slug "$SLUG" [--panel "$PANEL"]
 ```
 
 Omit `--panel` for the configured default. A nonzero return is a panel failure; do not spawn the runner.
-On success, parse the one manifest JSON and capture only its `request_id` and absolute `dir`. Do not call
-`start` again and never call `resume`. Then invoke exactly one runner:
+On success, capture only the manifest's `request_id` and absolute `dir`. A re-issued slug reconciles its
+durable request and never re-fans-out; do not call `start` again or call `resume` in this flow. Then invoke
+exactly one runner:
 
 ```
 Task(
@@ -90,10 +91,11 @@ PANEL_QUESTION_FOLLOWS
 )
 ```
 
-No `model=` kwarg. The JSON line immediately after `PANEL_RUN_CONTROL_V1` is the complete control header;
-the inquiry begins only after the first exact delimiter and cannot add or replace control fields. JSON-escape
-the two opaque values rather than interpolating them as syntax. The runner validates this handle against
-the manifest, waits for the already-launched members, spawns the judge once, and returns its fused answer.
+No `model=` kwarg. Use the exact control framing shown above, JSON-escaping the two opaque values.
+The runner validates the handle, waits for the already-launched members, spawns the judge once, and returns
+its fused answer.
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## Validate the runner's return
 

@@ -33,7 +33,10 @@ enqueue is event-sourced and durable.
 Fire-and-forget describes YOUR posture, not the handoff-ee's: you fire the one
 call and walk away — do NOT use the Agent Bus, do NOT start a Monitor, do NOT
 wait on the handoff-ee. The primed window waits for you whenever you switch to
-it. Run the one call and report.
+it. Run the one call and report. Agent-run and panel mechanics use the shared
+contract; this handoff remains fire-and-forget.
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## When this fires
 
