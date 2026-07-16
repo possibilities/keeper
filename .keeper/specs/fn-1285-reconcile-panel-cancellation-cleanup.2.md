@@ -69,5 +69,7 @@ Maintenance begins reconciling new pending/failed records immediately. Legacy re
 - [ ] README, install guidance, and problem-code documentation describe current automatic reconciliation behavior and recovery truthfully.
 
 ## Done summary
-
+Panel cancellation cleanup reconciled across tmux launch, maintenance, and pair panel surfaces (+ dedicated slow suite); worker-verified (targeted suite, slow smoke, typecheck, lint) + operator re-run 202/0 across four suites; landed via plain-git escape (stale predecessor claims a2ca7614/05470e2b) as 29784be9 on the epic lane
 ## Evidence
+- Commits: 29784be9
+- Tests: bun test pair-panel+agent-tmux-launch+maintenance-worker+agent-panel-cli 202/0 (operator re-run in lane), worker: targeted suite + slow smoke + typecheck + lint green
