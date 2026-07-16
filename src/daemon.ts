@@ -166,6 +166,7 @@ import {
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
+  isZombieSessionDistressKey,
   LANE_BACKUP_DISTRESS_ID_PREFIX,
   LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
@@ -180,6 +181,7 @@ import {
   SHARED_WEDGE_DISTRESS_VERB,
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
+  ZOMBIE_SESSION_DISTRESS_ID_PREFIX,
 } from "./dispatch-failure-key";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import type {
@@ -496,6 +498,9 @@ export function gcUnretryableDispatchFailures(
     // The monitor-slot paging row is likewise producer-owned: only positive
     // settle/exit/fact-clear evidence may drop it.
     if (isMonitorSlotWedgeDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    if (isZombieSessionDistressKey(row.verb, row.id)) {
       continue;
     }
     // A bus-only serve degradation is producer-owned and clears only after its
@@ -1476,6 +1481,16 @@ export function buildSharedCheckoutPageBody(row: {
       ``,
       `Inspect or settle that session. Keeper will not release or kill it based on`,
       `age; the row clears only after active, exited, or cleared-monitor evidence.`,
+    ].join("\n");
+  }
+  if (row.id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)) {
+    return [
+      `🔴 keeper: ${row.id} needs you — a stopped, done-stamped session in ${repo}`,
+      `could not be safely reaped. No signal was sent to an unverified process.`,
+      row.reason,
+      ``,
+      `Inspect the recorded pid, start time, and command ownership. The row clears`,
+      `after the session exits or positive harness activity resumes.`,
     ].join("\n");
   }
   if (
@@ -12514,7 +12529,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         db
           .query(
             `SELECT id, dir, reason FROM dispatch_failures
-               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
                  AND human_notified_at IS NULL`,
           )
           .all(
@@ -12524,6 +12539,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
             `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
             `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}%`,
+            `${ZOMBIE_SESSION_DISTRESS_ID_PREFIX}%`,
           ) as SharedCheckoutPageRow[]
       ).filter((row) => !excludeIds.has(row.id));
     } catch {

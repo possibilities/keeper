@@ -92,6 +92,7 @@ import {
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
+  ZOMBIE_SESSION_DISTRESS_REASON,
 } from "./dispatch-failure-key";
 // Type-only import — the shared needs-human projector ({@link projectNeedsHuman})
 // already imports `isJamReason` from THIS module for its jam classification, so a
@@ -1319,6 +1320,7 @@ export function isJamReason(reason: string): boolean {
     reason.startsWith(SHARED_DIRTY_DISTRESS_REASON) ||
     reason.startsWith(SHARED_DESYNC_DISTRESS_REASON) ||
     reason.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_REASON) ||
+    reason.startsWith(ZOMBIE_SESSION_DISTRESS_REASON) ||
     reason.startsWith(LANE_TEARDOWN_DISTRESS_REASON) ||
     reason.startsWith(LANE_BACKUP_DISTRESS_REASON)
   );

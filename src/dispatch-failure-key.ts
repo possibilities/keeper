@@ -498,6 +498,30 @@ export function monitorSlotWedgeJobId(id: string): string | null {
 }
 
 /**
+ * A stopped, done-stamped plan worker that remained pid-alive with canonical
+ * resource evidence stale past the reaper horizon, but could not be safely
+ * signalled. The synthetic per-session row is producer-owned and level-clears
+ * only after positive settle/exit evidence. It never enters dispatch suppression
+ * or the retry wire.
+ */
+export const ZOMBIE_SESSION_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const ZOMBIE_SESSION_DISTRESS_ID_PREFIX = "zombie-session:";
+export const ZOMBIE_SESSION_DISTRESS_REASON = "zombie-session";
+
+export function isZombieSessionDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === ZOMBIE_SESSION_DISTRESS_VERB &&
+    id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)
+  );
+}
+
+export function zombieSessionJobId(id: string): string | null {
+  return id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)
+    ? id.slice(ZOMBIE_SESSION_DISTRESS_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * The stuck-state-sentinel anomaly distress signal (ADR 0013 layer 3) — the
  * PER-SESSION sticky the producer mints when the board says `working` but the
  * session is demonstrably idle (a worker-done-but-working contradiction, or a
@@ -567,6 +591,7 @@ export type DispatchFailureDisplayKind =
   | "shared-dirty"
   | "shared-desync"
   | "monitor-slot-wedge"
+  | "zombie-session"
   | "lane-premerge"
   | "lane-wedge"
   | "stale-base"
@@ -603,6 +628,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // grouped with the shared-checkout family for readability.
   { prefix: SHARED_DESYNC_DISTRESS_REASON, kind: "shared-desync" },
   { prefix: MONITOR_SLOT_WEDGE_DISTRESS_REASON, kind: "monitor-slot-wedge" },
+  { prefix: ZOMBIE_SESSION_DISTRESS_REASON, kind: "zombie-session" },
   // MOST-SPECIFIC-FIRST: the lane WEDGE distress prefix (`worktree-lane-wedge`)
   // must precede the lane PREMERGE prefix (`worktree-lane-premerge`) — neither is a
   // prefix of the other, but ordering keeps the table's stated invariant true even

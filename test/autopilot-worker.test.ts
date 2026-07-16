@@ -87,6 +87,7 @@ import {
   type DispatchKey,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   type DupEpicNumberObservation,
+  decideZombieSessionReaper,
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
   epicFrameVerdict,
@@ -106,6 +107,7 @@ import {
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
+  isKeeperLaunchedZombieCommand,
   isLaneWedgeDistressKey,
   isOccupyingJob,
   isStuckSentinelDistressKey,
@@ -148,6 +150,7 @@ import {
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
+  runZombieSessionReaperStep,
   SHARED_CHECKOUT_DESYNC_GRACE_SEC,
   SHARED_CHECKOUT_DIRTY_GRACE_SEC,
   SHARED_CHECKOUT_WEDGE_GRACE_SEC,
@@ -191,7 +194,11 @@ import {
   worktreeFinalizeDispatchId,
   worktreeRecoverDispatchId,
   worktreeRecoverEpicDispatchId,
+  ZOMBIE_SESSION_REAPER_GRACE_SEC,
+  ZOMBIE_SESSION_TERM_GRACE_SEC,
+  type ZombieProcessEvidence,
 } from "../src/autopilot-worker";
+
 import { readTestGateCommand, type SpawnFn } from "../src/baseline-worker";
 import { DONE_EPICS_REAP_WINDOW_SEC } from "../src/collections";
 import {
@@ -340,6 +347,207 @@ function makeJob(overrides: Partial<Job>): Job {
     ...overrides,
   } as Job;
 }
+
+const ZOMBIE_MATCHING_PROCESS: ZombieProcessEvidence = {
+  alive: true,
+  startTime: "linux:123",
+  commandOwned: true,
+  defunct: false,
+};
+
+function zombieDecisionInput(
+  overrides: Partial<Parameters<typeof decideZombieSessionReaper>[0]> = {},
+): Parameters<typeof decideZombieSessionReaper>[0] {
+  return {
+    jobState: "stopped",
+    taskDone: true,
+    pid: 42,
+    storedStartTime: "linux:123",
+    updatedAt: 100,
+    nowSec: 100 + ZOMBIE_SESSION_REAPER_GRACE_SEC + 1,
+    activity: {
+      status: "unknown",
+      reason: "resource-evidence-stale",
+      reservation: null,
+    },
+    process: ZOMBIE_MATCHING_PROCESS,
+    ...overrides,
+  };
+}
+
+test("zombie-session decision partitions signals, pages, backstop, and no-op states", () => {
+  const staleAt = 100 + ZOMBIE_SESSION_REAPER_GRACE_SEC + 1;
+  const cases: Array<{
+    input: Partial<Parameters<typeof decideZombieSessionReaper>[0]>;
+    expected: ReturnType<typeof decideZombieSessionReaper>;
+  }> = [
+    { input: {}, expected: { action: "signal", signal: "SIGTERM" } },
+    {
+      input: { termSentAt: staleAt - ZOMBIE_SESSION_TERM_GRACE_SEC },
+      expected: { action: "signal", signal: "SIGKILL" },
+    },
+    {
+      input: { jobState: "working" },
+      expected: { action: "none", reason: "outside-scope" },
+    },
+    {
+      input: { process: { ...ZOMBIE_MATCHING_PROCESS, alive: false } },
+      expected: { action: "none", reason: "pid-dead" },
+    },
+    {
+      input: { taskDone: false },
+      expected: { action: "backstop", reason: "task-not-done" },
+    },
+    {
+      input: {
+        activity: { status: "active", reason: "main-turn", reservation: null },
+      },
+      expected: { action: "none", reason: "activity" },
+    },
+    {
+      input: {
+        activity: {
+          status: "quiescent",
+          reason: "parent-quiescent",
+          reservation: null,
+        },
+      },
+      expected: { action: "none", reason: "activity" },
+    },
+    {
+      input: { process: { ...ZOMBIE_MATCHING_PROCESS, defunct: true } },
+      expected: { action: "page", reason: "defunct" },
+    },
+    {
+      input: {
+        process: { ...ZOMBIE_MATCHING_PROCESS, startTime: "linux:reused" },
+      },
+      expected: { action: "page", reason: "identity-mismatch" },
+    },
+    {
+      input: { process: { ...ZOMBIE_MATCHING_PROCESS, commandOwned: false } },
+      expected: { action: "page", reason: "command-unowned" },
+    },
+    {
+      input: {
+        pid: null,
+        process: {
+          alive: null,
+          startTime: null,
+          commandOwned: false,
+          defunct: false,
+        },
+      },
+      expected: { action: "page", reason: "pid-unproven" },
+    },
+    {
+      input: { pid: 0 },
+      expected: { action: "page", reason: "pid-unproven" },
+    },
+    {
+      input: { storedStartTime: null },
+      expected: { action: "page", reason: "identity-unproven" },
+    },
+    {
+      input: { nowSec: 100 + ZOMBIE_SESSION_REAPER_GRACE_SEC },
+      expected: { action: "none", reason: "activity" },
+    },
+  ];
+  for (const row of cases) {
+    expect(decideZombieSessionReaper(zombieDecisionInput(row.input))).toEqual(
+      row.expected,
+    );
+  }
+});
+
+test("zombie-session ladder re-probes before each signal and aborts KILL on pid reuse", () => {
+  const signals: string[] = [];
+  let probeCount = 0;
+  const deps = {
+    probe(): ZombieProcessEvidence {
+      probeCount += 1;
+      return probeCount < 3
+        ? ZOMBIE_MATCHING_PROCESS
+        : { ...ZOMBIE_MATCHING_PROCESS, startTime: "linux:reused" };
+    },
+    signal(_pid: number, signal: "SIGTERM" | "SIGKILL"): void {
+      signals.push(signal);
+    },
+  };
+  const { process: _process, ...input } = zombieDecisionInput();
+  expect(runZombieSessionReaperStep(input, deps, "work", "fn-1-foo.1")).toEqual(
+    { action: "signal", signal: "SIGTERM" },
+  );
+  const killInput = {
+    ...input,
+    termSentAt: input.nowSec,
+    nowSec: input.nowSec + ZOMBIE_SESSION_TERM_GRACE_SEC,
+  };
+  expect(
+    runZombieSessionReaperStep(killInput, deps, "work", "fn-1-foo.1"),
+  ).toEqual({ action: "signal", signal: "SIGKILL" });
+  expect(
+    runZombieSessionReaperStep(killInput, deps, "work", "fn-1-foo.1"),
+  ).toEqual({ action: "page", reason: "identity-mismatch" });
+  expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+});
+
+test("zombie-session runner never signals defunct or unowned processes", () => {
+  const { process: _process, ...input } = zombieDecisionInput();
+  for (const evidence of [
+    { ...ZOMBIE_MATCHING_PROCESS, defunct: true },
+    { ...ZOMBIE_MATCHING_PROCESS, commandOwned: false },
+  ]) {
+    let signalled = false;
+    const decision = runZombieSessionReaperStep(
+      input,
+      {
+        probe: () => evidence,
+        signal: () => {
+          signalled = true;
+        },
+      },
+      "work",
+      "fn-1-foo.1",
+    );
+    expect(decision.action).toBe("page");
+    expect(signalled).toBe(false);
+  }
+});
+
+test("zombie-session signal failure degrades to a page-only verdict", () => {
+  const { process: _process, ...input } = zombieDecisionInput();
+  expect(
+    runZombieSessionReaperStep(
+      input,
+      {
+        probe: () => ZOMBIE_MATCHING_PROCESS,
+        signal: () => {
+          throw new Error("EPERM");
+        },
+      },
+      "work",
+      "fn-1-foo.1",
+    ),
+  ).toEqual({ action: "page", reason: "signal-failed" });
+});
+
+test("zombie-session command ownership requires the exact work dispatch name", () => {
+  expect(
+    isKeeperLaunchedZombieCommand(
+      "claude --name work::fn-1-foo.1 prompt",
+      "work",
+      "fn-1-foo.1",
+    ),
+  ).toBe(true);
+  expect(
+    isKeeperLaunchedZombieCommand(
+      "claude --name work::fn-1-foo.10 prompt",
+      "work",
+      "fn-1-foo.1",
+    ),
+  ).toBe(false);
+});
 
 function makeSnapshot(
   overrides: Partial<ReconcileSnapshot>,
