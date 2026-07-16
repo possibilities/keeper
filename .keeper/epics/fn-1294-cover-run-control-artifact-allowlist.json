@@ -7,7 +7,7 @@
     "fn-1285-reconcile-panel-cancellation-cleanup"
   ],
   "id": "fn-1294-cover-run-control-artifact-allowlist",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-16T21:08:13.273000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-16T21:08:12.662000Z"
+  "updated_at": "2026-07-16T21:08:13.273000Z"
 }
