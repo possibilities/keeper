@@ -2,11 +2,12 @@
  * Keeper daemon — the long-running reducer process. Managed in production by a
  * LaunchAgent that re-runs it on any non-clean exit.
  *
- * Crash policy (single recovery path): any unrecoverable error calls
- * `process.exit(1)`; the LaunchAgent restarts us. ONE well-tested recovery path
- * rather than in-process self-heal — never respawn a worker in-process. A worker
- * owning an external resource releases it in its own shutdown handler;
- * `terminate()` alone would leak it.
+ * Crash policy (single recovery path): any unrecoverable runtime error calls
+ * `process.exit(1)`; the LaunchAgent restarts us. Pre-open admission may use a
+ * distinct non-zero exit for attribution. ONE well-tested recovery path rather
+ * than in-process self-heal — never respawn a worker in-process. A worker owning
+ * an external resource releases it in its own shutdown handler; `terminate()`
+ * alone would leak it.
  */
 
 import type { Database } from "bun:sqlite";
@@ -7014,9 +7015,9 @@ export function checkKeeperAgentPresence(
  * Outcome of the single-instance gate, split from its I/O so the fast suite
  * covers the classification with no real daemon: `acquired` carries the held lock
  * (main pins it in a module-scope singleton for the process lifetime); `refused`
- * is a LIVE incumbent holding the flock (the caller exits 1 BEFORE the boot-ledger
- * append, so a refused boot mints no entry); `degraded` is an inconclusive
- * primitive — the caller logs loud and boots WITHOUT the gate (fail open).
+ * is a LIVE incumbent holding the flock; `degraded` is an inconclusive primitive.
+ * The action seam fails both non-acquired outcomes closed before the boot-ledger
+ * append, so neither opens the DB or mints a ledger entry.
  */
 export type SingleInstanceGateOutcome =
   | { kind: "acquired"; lock: FileLock }
@@ -7027,9 +7028,9 @@ export type SingleInstanceGateOutcome =
  * Pure classification of a single-instance-lock acquire attempt. `tryAcquire`
  * mirrors {@link FileLock.tryAcquire}: it returns the held lock, `null` on
  * contention (`EWOULDBLOCK` — a live incumbent), or THROWS on any other errno (an
- * inconclusive primitive: dlopen/fcntl/flock failure). Contention fails CLOSED
- * (`refused`); a throw fails OPEN (`degraded`), so a broken lock primitive can
- * never wedge every boot.
+ * inconclusive primitive: dlopen/fcntl/flock failure). Contention maps to
+ * `refused`; a throw maps to `degraded`. The action seam fails both closed because
+ * a loud boot wedge is safer than an ungated dual writer.
  */
 export function decideSingleInstanceGate(
   tryAcquire: (lockPath: string) => FileLock | null,
@@ -7047,6 +7048,50 @@ export function decideSingleInstanceGate(
   return lock === null ? { kind: "refused" } : { kind: "acquired", lock };
 }
 
+export type SingleInstanceGateAction =
+  | { action: "proceed"; lock: FileLock }
+  | { action: "exit"; code: 1 | 2; message: string };
+
+const SINGLE_INSTANCE_REFUSED_EXIT_CODE = 1;
+const SINGLE_INSTANCE_DEGRADED_EXIT_CODE = 2;
+const SINGLE_INSTANCE_DIAGNOSTIC_FIELD_MAX = 512;
+const SINGLE_INSTANCE_RECOVERY_LINE =
+  "[keeperd] recover with: launchctl kickstart -k gui/$(id -u)/arthack.keeperd";
+
+function boundedSingleInstanceDiagnosticField(value: string): string {
+  return value
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, SINGLE_INSTANCE_DIAGNOSTIC_FIELD_MAX);
+}
+
+/** Pure policy seam: translate a classified gate outcome into an inert action. */
+export function decideSingleInstanceAction(
+  outcome: SingleInstanceGateOutcome,
+  lockPath: string,
+): SingleInstanceGateAction {
+  if (outcome.kind === "acquired") {
+    return { action: "proceed", lock: outcome.lock };
+  }
+  const boundedPath = boundedSingleInstanceDiagnosticField(lockPath);
+  if (outcome.kind === "refused") {
+    return {
+      action: "exit",
+      code: SINGLE_INSTANCE_REFUSED_EXIT_CODE,
+      message:
+        `[keeperd] refusing to start: another keeperd already holds ${boundedPath}\n` +
+        SINGLE_INSTANCE_RECOVERY_LINE,
+    };
+  }
+  const boundedReason = boundedSingleInstanceDiagnosticField(outcome.reason);
+  return {
+    action: "exit",
+    code: SINGLE_INSTANCE_DEGRADED_EXIT_CODE,
+    message:
+      `[keeperd] refusing to start: single-instance lock primitive inconclusive at ${boundedPath} ` +
+      `(${boundedReason})\n${SINGLE_INSTANCE_RECOVERY_LINE}`,
+  };
+}
+
 /**
  * The single-instance flock, pinned in module scope on MAIN for the whole daemon
  * lifetime: NEVER released and NEVER handed to a worker — the flock's FD_CLOEXEC
@@ -7060,9 +7105,9 @@ let singleInstanceLock: FileLock | null = null;
 /**
  * Acquire the single-instance flock at the very top of {@link startDaemon} —
  * before `openDb`/`migrate`/any worker spawn AND before the boot-ledger append.
- * A live incumbent exits 1 (naming the holder path + the launchctl kickstart
- * recovery line), so a refused boot never opens the DB and mints no ledger entry.
- * An inconclusive primitive logs loud and returns, booting WITHOUT the gate.
+ * A live incumbent exits 1; an inconclusive primitive exits 2. Both diagnostics
+ * name the lock path and recovery command, and neither failed boot opens the DB
+ * or mints a ledger entry.
  */
 function acquireSingleInstanceLock(): void {
   if (singleInstanceLock !== null) {
@@ -7076,25 +7121,15 @@ function acquireSingleInstanceLock(): void {
   } catch {
     // best-effort; a pre-existing state dir is fine — the flock open still runs
   }
-  const outcome = decideSingleInstanceGate(
-    (p) => FileLock.tryAcquire(p),
+  const action = decideSingleInstanceAction(
+    decideSingleInstanceGate((p) => FileLock.tryAcquire(p), lockPath),
     lockPath,
   );
-  if (outcome.kind === "degraded") {
-    console.error(
-      `[keeperd] WARNING: single-instance lock primitive inconclusive at ${lockPath} ` +
-        `(${outcome.reason}) — booting WITHOUT the single-instance gate`,
-    );
-    return;
+  if (action.action === "exit") {
+    console.error(action.message);
+    process.exit(action.code);
   }
-  if (outcome.kind === "refused") {
-    console.error(
-      `[keeperd] refusing to start: another keeperd already holds ${lockPath}\n` +
-        `[keeperd] recover with: launchctl kickstart -k gui/$(id -u)/arthack.keeperd`,
-    );
-    process.exit(1);
-  }
-  singleInstanceLock = outcome.lock;
+  singleInstanceLock = action.lock;
 }
 
 /**
@@ -7110,10 +7145,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
   // Single-instance gate (docs/adr/0030): take a kernel flock on a dedicated
   // keeperd.lock BEFORE openDb/migrate/any worker spawn, so a second concurrent
-  // daemon can never open — let alone migrate — the DB. A live incumbent exits 1
-  // here (before the boot-ledger append below); an inconclusive primitive fails
-  // open. Skipped only by the in-process test opt (a same-process second boot
-  // shares the flock's open-file-description and would self-conflict).
+  // daemon can never open — let alone migrate — the DB. A live incumbent or an
+  // inconclusive primitive exits non-zero here, before the boot-ledger append;
+  // loud fail-closed admission is safer than an ungated dual writer. Skipped only
+  // by the in-process test opt (a same-process second boot shares the flock's
+  // open-file-description and would self-conflict).
   if (!opts.disableSingleInstanceLock) {
     acquireSingleInstanceLock();
   }
