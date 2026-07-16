@@ -39,5 +39,7 @@ Pure fold tests over freshMemDb()/migrate(): a pre-feature event (no capture fie
 - [ ] The schema ladder gains exactly one new entry and the fingerprint is re-pinned; a fresh DB and a migrated DB agree on the handoffs shape
 
 ## Done summary
-
+Threaded handoff capture fields through persistence (schema step 130 + fingerprint re-pin, collections/reducer/rpc/server surfaces); operator re-run 640/0 across db/handoff/rpc-handlers/daemon suites; landed via plain-git escape (leg 5a361ee6 claim wedge) as 187b8c5c on the epic lane
 ## Evidence
+- Commits: 187b8c5c
+- Tests: bun test db+handoff+rpc-handlers+daemon 640/0 (operator re-run in lane)
