@@ -38,5 +38,7 @@ plugins/plan consistency suite must stay green (skill tokens retained). Handoff/
 - [ ] Consistency and CLI test suites pass unmodified
 
 ## Done summary
-
+Launch-handle semantics aligned across dispatch/pair/panel surfaces + the three skill runbooks; operator re-run 160/0 + 53/0 across five agent suites; landed via plain-git escape (multi-session claim wedge, sessions discharged) as f3f331fb on the epic lane
 ## Evidence
+- Commits: f3f331fb
+- Tests: bun test agent-panel-cli+pair-panel+agent-launch-handle 160/0 (operator re-run), bun test agent-dispatch+agent-launch-handle-depgraph 53/0
