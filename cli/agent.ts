@@ -3,16 +3,20 @@
  * <claude|pi> [args...]` launches a supported agent CLI with keeper agent
  * routing + startup defaults, and `keeper agent wait-for-stop <handle>` /
  * `keeper agent show-last-message <handle>` read a detached run's transcript.
- * The blocking run-and-capture verbs compose those primitives into the uniform
- * schema-versioned JSON envelope: `keeper agent run <cli> <prompt>` launches,
- * waits, and captures in one process, and `keeper agent wait <handle>` does the
- * wait + capture on an already-launched handle. `keeper agent panel
+ * A caller-supplied launch handle is surface-scoped: it is the dedup key, resumes
+ * a dead target, and refuses a live target in favor of the Agent Bus. Partner
+ * names are host-global among tracked jobs; handoff slugs are host-global,
+ * event-sourced, and reject duplicates with exit 3; panel slugs are only
+ * display/discovery metadata, while the opaque panel request identity owns the
+ * run. The blocking run-and-capture verbs compose those primitives into the
+ * uniform schema-versioned JSON envelope: `keeper agent run <cli> <prompt>`
+ * launches, waits, and captures in one process, and `keeper agent wait <handle>`
+ * does the wait + capture on an already-launched handle. `keeper agent panel
  * start|wait|status|prune` fans a question out to a panel of detached read-only
  * run legs and waits for them token-free (routed into `src/pair/panel.ts`
- * `runPanel`, which owns its stdout + exit code); `start` is idempotent by slug
- * (re-issuing RECONCILES the durable per-slug run instead of re-fanning-out),
- * `wait`/`status` address a run by `--slug` or `--run-dir`, and `prune` GCs abandoned
- * run dirs. `run
+ * `runPanel`, which owns its stdout + exit code); re-issuing `start` reconciles
+ * the existing opaque request rather than re-fanning-out, `wait`/`status` locate
+ * it by display slug or `--run-dir`, and `prune` GCs abandoned run dirs. `run
  * --read-only` prepends a
  * read-only directive to the prompt (prompting-only — keeper enforces nothing,
  * no tool strip, no changed-files audit); `run --system-file <path>`/`--system

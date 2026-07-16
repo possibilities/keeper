@@ -14,11 +14,17 @@ import {
   buildRequestHandoffFrame,
   HANDOFF_DOC_MAX_BYTES,
   main as handoffMain,
+  resolveHandoffCaptureRequest,
   resolveTargetDir,
   spillHandoffDoc,
   validateHandoffDoc,
 } from "../cli/handoff";
+import { openDb, SCHEMA_VERSION } from "../src/db";
 import { encodeFrame } from "../src/protocol";
+import { drain } from "../src/reducer";
+import { requestHandoffHandler } from "../src/rpc-handlers";
+import type { ReplayBridge } from "../src/server-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 test("validateHandoffDoc: accepts an ordinary brief", () => {
   expect(validateHandoffDoc("investigate X; context: ...")).toEqual({
@@ -82,6 +88,121 @@ test("buildRequestHandoffFrame: carries desired_slug + doc_path, not the inline 
       initiator_pane: "%2",
     },
   });
+});
+
+test("buildRequestHandoffFrame: carries capture fields only for a capturing request", () => {
+  const req = {
+    desired_slug: "capture-result",
+    doc_path: "/state/handoff/rpc-capture.txt",
+    title: null,
+    target_session: "work",
+    target_dir: "/Users/dev/code/keeper",
+    initiator_session: null,
+    initiator_pane: null,
+  };
+  expect(
+    buildRequestHandoffFrame("rpc-capture", req, {
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-capture",
+    method: "request_handoff",
+    params: {
+      ...req,
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    },
+  });
+});
+
+test("resolveHandoffCaptureRequest: validates capture launch triples client-side", () => {
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: true,
+      preset: "pi::openai/gpt-5.5::high",
+      model: undefined,
+      effort: undefined,
+    }),
+  ).toEqual({
+    ok: true,
+    capture: {
+      capture: true,
+      model: null,
+      effort: null,
+      preset: "pi::openai/gpt-5.5::high",
+    },
+  });
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: true,
+      preset: undefined,
+      model: "opus",
+      effort: "high",
+    }),
+  ).toEqual({
+    ok: true,
+    capture: {
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    },
+  });
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: false,
+      preset: undefined,
+      model: undefined,
+      effort: undefined,
+    }),
+  ).toEqual({ ok: true, capture: null });
+
+  for (const args of [
+    {
+      capture: false,
+      preset: "claude::opus::high",
+      model: undefined,
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: "not-a-triple",
+      model: undefined,
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: "claude::opus::high",
+      model: "opus",
+      effort: "high",
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: "opus",
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: undefined,
+      effort: "high",
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: "bad:model",
+      effort: "high",
+    },
+  ]) {
+    expect(resolveHandoffCaptureRequest(args).ok).toBe(false);
+  }
 });
 
 test("buildRequestHandoffFrame: stays small even for a 64KB doc (the doc rides a file, not the wire)", () => {
@@ -192,6 +313,344 @@ test("resolveTargetDir: a --cwd pointing at a file (not a directory) is a miss (
 });
 
 // ── retired spelling: the launch dir is --cwd; the old --dir hard-fails ──────
+
+test("request_handoff capture fields validate and reach the worker bridge", async () => {
+  const calls: Parameters<ReplayBridge["requestHandoff"]>[0][] = [];
+  const bridge = {
+    requestHandoff: async (
+      req: Parameters<ReplayBridge["requestHandoff"]>[0],
+    ) => {
+      calls.push(req);
+      return { ok: true };
+    },
+  } as unknown as ReplayBridge;
+
+  await expect(
+    requestHandoffHandler(
+      {
+        desired_slug: "capture-result",
+        doc_path: "/state/handoff/rpc-capture.txt",
+        target_session: "work",
+        capture: true,
+        preset: "pi::openai/gpt-5.5::high",
+      },
+      bridge,
+    ),
+  ).resolves.toEqual({ ok: true, handoff_id: "capture-result" });
+  expect(calls).toEqual([
+    {
+      desired_slug: "capture-result",
+      doc_path: "/state/handoff/rpc-capture.txt",
+      title: null,
+      target_session: "work",
+      target_dir: null,
+      initiator_session: null,
+      initiator_pane: null,
+      capture: true,
+      model: null,
+      effort: null,
+      preset: "pi::openai/gpt-5.5::high",
+    },
+  ]);
+});
+
+test("request_handoff capture validation rejects malformed launch combinations", async () => {
+  let calls = 0;
+  const bridge = {
+    requestHandoff: async () => {
+      calls += 1;
+      return { ok: true };
+    },
+  } as unknown as ReplayBridge;
+  const base = {
+    desired_slug: "capture-bad",
+    doc_path: "/state/handoff/rpc-capture.txt",
+    target_session: "work",
+  };
+  for (const extra of [
+    { capture: "true" },
+    { model: "opus", effort: "high" },
+    { capture: true, model: "opus" },
+    {
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: "claude::opus::high",
+    },
+    { capture: true, preset: "not-a-triple" },
+  ]) {
+    await expect(
+      requestHandoffHandler({ ...base, ...extra }, bridge),
+    ).rejects.toThrow();
+  }
+  expect(calls).toBe(0);
+});
+
+function insertHandoffEvent(data: Record<string, unknown>): {
+  db: ReturnType<typeof freshMemDb>["db"];
+  eventId: number;
+} {
+  const { db } = freshMemDb();
+  db.query(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'HandoffRequested', 'handoffs', ?)`,
+  ).run(
+    100,
+    String(data.handoff_id ?? "malformed-handoff"),
+    JSON.stringify(data),
+  );
+  const eventId = Number(
+    (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
+  );
+  return { db, eventId };
+}
+
+test("HandoffRequested capture data folds into the authoritative projection fields", () => {
+  const { db, eventId } = insertHandoffEvent({
+    handoff_id: "capture-result",
+    doc: "return a complete answer",
+    target_session: "work",
+    capture: true,
+    model: "opus",
+    effort: "high",
+    preset: null,
+    envelope_path: "/state/handoff/capture-result.json",
+  });
+  try {
+    expect(drain(db)).toBe(1);
+    expect(
+      db
+        .query(
+          `SELECT capture, model, effort, preset, envelope_path, last_event_id
+           FROM handoffs WHERE handoff_id = ?`,
+        )
+        .get("capture-result"),
+    ).toEqual({
+      capture: 1,
+      model: "opus",
+      effort: "high",
+      preset: null,
+      envelope_path: "/state/handoff/capture-result.json",
+      last_event_id: eventId,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("pre-capture HandoffRequested events fold to capture-off defaults", () => {
+  const { db, eventId } = insertHandoffEvent({
+    handoff_id: "legacy-handoff",
+    doc: "park at confirmation",
+    target_session: "work",
+  });
+  try {
+    expect(drain(db)).toBe(1);
+    expect(
+      db
+        .query(
+          `SELECT capture, model, effort, preset, envelope_path
+           FROM handoffs WHERE handoff_id = ?`,
+        )
+        .get("legacy-handoff"),
+    ).toEqual({
+      capture: 0,
+      model: null,
+      effort: null,
+      preset: null,
+      envelope_path: null,
+    });
+    expect(
+      (
+        db
+          .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+          .get() as {
+          last_event_id: number;
+        }
+      ).last_event_id,
+    ).toBe(eventId);
+  } finally {
+    db.close();
+  }
+});
+
+test("malformed optional capture fields coerce safely and the cursor advances", () => {
+  const { db, eventId } = insertHandoffEvent({
+    handoff_id: "malformed-capture",
+    doc: "still a valid handoff",
+    capture: "yes",
+    model: 7,
+    effort: false,
+    preset: {},
+    envelope_path: ["bad"],
+  });
+  try {
+    expect(drain(db)).toBe(1);
+    expect(
+      db
+        .query(
+          `SELECT capture, model, effort, preset, envelope_path
+           FROM handoffs WHERE handoff_id = ?`,
+        )
+        .get("malformed-capture"),
+    ).toEqual({
+      capture: 0,
+      model: null,
+      effort: null,
+      preset: null,
+      envelope_path: null,
+    });
+    expect(
+      (
+        db
+          .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+          .get() as {
+          last_event_id: number;
+        }
+      ).last_event_id,
+    ).toBe(eventId);
+  } finally {
+    db.close();
+  }
+});
+
+test("fresh and migrated databases agree on the handoffs capture column shape", () => {
+  const path = join(
+    tmpdir(),
+    `keeper-handoff-migrate-${crypto.randomUUID()}.db`,
+  );
+  const current = openDb(path);
+  const captureColumns = [
+    "capture",
+    "model",
+    "effort",
+    "preset",
+    "envelope_path",
+  ];
+  try {
+    for (const column of [...captureColumns].reverse()) {
+      current.db.run(`ALTER TABLE handoffs DROP COLUMN ${column}`);
+    }
+    current.db.run(
+      "UPDATE meta SET value = '129' WHERE key = 'schema_version'",
+    );
+  } finally {
+    current.db.close();
+  }
+
+  const migrated = openDb(path);
+  const fresh = freshMemDb();
+  try {
+    const shape = (db: typeof migrated.db) =>
+      (
+        db.query("PRAGMA table_info(handoffs)").all() as Array<{
+          name: string;
+          type: string;
+          notnull: number;
+          dflt_value: string | null;
+        }>
+      ).map(({ name, type, notnull, dflt_value }) => ({
+        name,
+        type,
+        notnull,
+        dflt_value,
+      }));
+    expect(
+      migrated.db
+        .query("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get(),
+    ).toEqual({
+      value: String(SCHEMA_VERSION),
+    });
+    expect(shape(migrated.db)).toEqual(shape(fresh.db));
+  } finally {
+    migrated.db.close();
+    fresh.db.close();
+    rmSync(path, { force: true });
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(`${path}-shm`, { force: true });
+  }
+});
+
+test("handoff main: invalid capture/triple combinations exit 2 before any RPC work", async () => {
+  const realExit = process.exit;
+  const realErr = process.stderr.write.bind(process.stderr);
+  try {
+    for (const [argv, expected] of [
+      [
+        ["--slug", "x", "--prompt", "p", "--preset", "claude::opus::high"],
+        "require --capture",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--preset",
+          "not-a-triple",
+        ],
+        "--preset",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--model",
+          "bad:model",
+          "--effort",
+          "high",
+        ],
+        "--model/--effort",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--preset",
+          "claude::opus::high",
+          "--model",
+          "opus",
+          "--effort",
+          "high",
+        ],
+        "mutually exclusive",
+      ],
+      [
+        ["--capture", "--slug", "x", "--prompt", "p", "--model", "opus"],
+        "together",
+      ],
+      [
+        ["--capture", "--slug", "x", "--prompt", "p", "--effort", "high"],
+        "together",
+      ],
+    ] as const) {
+      let code: number | undefined;
+      let err = "";
+      process.exit = ((c?: number) => {
+        code = c ?? 0;
+        throw new Error(`exit ${code}`);
+      }) as typeof process.exit;
+      process.stderr.write = ((s: string | Uint8Array) => {
+        err += typeof s === "string" ? s : Buffer.from(s).toString();
+        return true;
+      }) as typeof process.stderr.write;
+      await expect(handoffMain([...argv])).rejects.toThrow("exit 2");
+      expect(code).toBe(2);
+      expect(err).toContain(expected);
+    }
+  } finally {
+    process.exit = realExit;
+    process.stderr.write = realErr;
+  }
+});
 
 test("handoff main: the retired --dir spelling hard-fails exit 2 (unknown flag, no daemon touch)", async () => {
   // The unknown flag throws at parseArgs BEFORE any daemon connection, so this

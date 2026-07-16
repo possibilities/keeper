@@ -24,19 +24,25 @@ model is harvested, not manufactured: running the same question independently yi
 paths, tool calls, and sources. So there are no assigned "lenses" or personas — every panelist gets the
 human's task verbatim and answers it straight. Read `references/panel.md` for the independence rules.
 
-**Architecture.** You are the admission shim. Build the neutral panelist prompt, reserve its one
-request with `keeper agent panel start`, and pass the returned opaque handle to one runner `Task()` before
-and separate from the verbatim inquiry. The runner waits, filters quorum, and spawns one judge; it cannot
-admit or re-drive a panel. Panelist transcripts never enter your context.
+**Architecture.** You are the admission shim. Build the neutral panelist prompt,
+reserve its one request with `keeper agent panel start`, and pass the returned
+opaque request identity and run directory to one runner `Task()` before and
+separate from the verbatim inquiry. The display slug only discovers that request;
+the opaque identity is the handle that owns admission and retries. The runner
+waits, filters quorum, and spawns one judge; it cannot admit or re-drive a panel.
+Panelist transcripts never enter your context.
 
-Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
+Canonical contract: [Panel-start idempotency](../../../../docs/agent-surface-contracts.md#panel-start-idempotency),
+[Chunked wait](../../../../docs/agent-surface-contracts.md#chunked-wait), and
+[Answer envelope](../../../../docs/agent-surface-contracts.md#answer-envelope) — on
+wording disputes those sections win.
 
 ## Admit once, then spawn the runner
 
 Pass the human's substantive inquiry **verbatim** — never summarize, reframe, or pre-read referenced content
 into it. Control prose from this skill is not part of the inquiry. Auto-derive one short display slug from
-the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`); it is only admission/discovery metadata, never a handle
-or retry key.
+the task (`[a-z0-9-]`, e.g. `oauth-token-refresh`); it is discovery metadata only,
+never the request handle or retry key.
 
 Which panel to name, and when a broader one earns its cost, follows the strength rubric:
 
@@ -76,8 +82,9 @@ keeper agent panel start "$PROMPT_FILE" --slug "$SLUG" [--panel "$PANEL"]
 ```
 
 Omit `--panel` for the configured default. A nonzero return is a panel failure; do not spawn the runner.
-On success, capture only the manifest's `request_id` and absolute `dir`. A re-issued slug reconciles its
-durable request and never re-fans-out; do not call `start` again or call `resume` in this flow. Then invoke
+On success, capture only the manifest's `request_id` and absolute `dir`. A re-issued
+display slug locates and reconciles that durable opaque request; it never creates a
+second fan-out. Do not call `start` again or call `resume` in this flow. Then invoke
 exactly one runner:
 
 ```

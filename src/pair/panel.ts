@@ -12,7 +12,8 @@
  *     digest and complete attempt skeleton, then spends its single normal fan-out.
  *     Repeated starts join that request and never launch again. `resume` is the only
  *     operation that may append a bounded replacement for a positively dead attempt.
- *     The slug remains display/discovery metadata, never the teardown identity.
+ *     The slug is display/discovery metadata; the opaque request identity is the
+ *     request handle and owns retries and teardown.
  *   - `wait (--slug <slug> | --run-dir <d>) [--chunk <dur>]` re-reads the manifest and
  *     blocks ONE chunk polling each leg's terminality; exit 0 + verdict JSON when
  *     all legs are terminal, exit 124 when the chunk elapses (re-issuable), exit 2
@@ -1581,27 +1582,27 @@ async function panelLaunch(
         );
         return 2;
       }
-      // Identity guard — a colliding slug must never silently merge into another
-      // run. The stored prompt must be byte-exact AND the resolved member set must
-      // match; either mismatch is a different run → exit 2.
+      // Identity guard — a display slug must never silently merge distinct opaque
+      // requests. The stored prompt must be byte-exact AND the resolved member set
+      // must match; either mismatch is a different request → exit 2.
       let storedPrompt: string;
       try {
         storedPrompt = readFileSync(join(dir, "prompt.md"), "utf8");
       } catch {
         deps.writeErr(
-          `pair panel start: cannot verify slug '${args.slug}' identity (missing ${join(dir, "prompt.md")}) — refusing to reconcile\n`,
+          `pair panel start: cannot verify display slug '${args.slug}' against its opaque request (missing ${join(dir, "prompt.md")}) — refusing to reconcile\n`,
         );
         return 2;
       }
       if (storedPrompt !== promptText) {
         deps.writeErr(
-          `pair panel start: slug '${args.slug}' already exists with a different prompt — refusing a colliding-run merge (use a new --slug)\n`,
+          `pair panel start: display slug '${args.slug}' already locates a request with a different prompt — refusing a colliding-request merge (use a new --slug)\n`,
         );
         return 2;
       }
       if (!sameMemberSet(resolved.members, existing.members)) {
         deps.writeErr(
-          `pair panel start: slug '${args.slug}' already exists with a different member set — refusing a colliding-run merge (use a new --slug)\n`,
+          `pair panel start: display slug '${args.slug}' already locates a request with a different member set — refusing a colliding-request merge (use a new --slug)\n`,
         );
         return 2;
       }
@@ -2724,7 +2725,8 @@ Usage:
 start  atomically reserves one opaque panel request and immutable argument digest,
        persists every member attempt before launch, and spends one normal fan-out.
        Repeated starts join without relaunching. The display slug locates the durable
-       directory but is never the teardown identity. Explicit resume alone may add
+       directory; the opaque request identity is the request handle and teardown identity.
+       Explicit resume alone may add
        one bounded replacement for a positively dead attempt. An ad-hoc
        --preset/--cli builds a 1-member panel; --panel and --preset/--cli are
        mutually exclusive.
@@ -2750,9 +2752,10 @@ prune  GC abandoned run dirs under ~/.local/state/keeper/panels/. Reclaims a slu
        {root, pruned, kept}.
 
 Options:
-  --slug <slug>     start: REQUIRED run id (each leg launches as
+  --slug <slug>     start: REQUIRED display/discovery id (each leg launches as
                     panel::<slug>::<member>). wait/status: resolves the durable
-                    slug dir. Slugified to [a-z0-9-]; empties-to-nothing → exit 2.
+                    slug dir; the opaque request identity owns the request and
+                    controls. Slugified to [a-z0-9-]; empties-to-nothing → exit 2.
   --panel <name>    Panel name, a launch triple (panel of one), or 'default' to
                     resolve the configured default panel in panel.yaml
   --preset <name>   Ad-hoc single member from a catalog preset (panel of one)
@@ -2789,12 +2792,15 @@ function resolvePanelDir(values: {
     if (slug === null) {
       return {
         ok: false,
-        msg: `--slug '${values.slug}' slugifies to nothing — use [a-z0-9-]`,
+        msg: `--slug '${values.slug}' slugifies to nothing — use a display/discovery slug with [a-z0-9-]`,
       };
     }
     return { ok: true, dir: join(keeperStateDir(), "panels", slug) };
   }
-  return { ok: false, msg: "--run-dir <d> or --slug <slug> is required" };
+  return {
+    ok: false,
+    msg: "--run-dir <d> or a display/discovery --slug <slug> is required",
+  };
 }
 
 /**
@@ -2881,20 +2887,20 @@ export async function runPanel(argv: string[]): Promise<void> {
       timeoutSeconds = dur.ms / 1000;
     }
 
-    // --slug is REQUIRED: it names the run, and each leg launches as
-    // `panel::<slug>::<member>`. Slugify to `[a-z0-9-]`; absent OR a value that
+    // --slug is REQUIRED: it is display/discovery metadata, and each leg launches
+    // as `panel::<slug>::<member>`. Slugify to `[a-z0-9-]`; absent OR a value that
     // slugifies to nothing (all non-ASCII / punctuation-only) is misuse → exit 2
     // with a panel-scoped message (never the leaf's raw string).
     if (parsed.values.slug === undefined) {
       process.stderr.write(
-        "pair panel start: --slug is required (a human-meaningful run id; each leg launches as panel::<slug>::<member>)\n",
+        "pair panel start: --slug is required (a human-meaningful display/discovery slug; each leg launches as panel::<slug>::<member>)\n",
       );
       process.exit(2);
     }
     const slug = slugify(parsed.values.slug);
     if (slug === null) {
       process.stderr.write(
-        `pair panel start: --slug '${parsed.values.slug}' slugifies to nothing — use [a-z0-9-]\n`,
+        `pair panel start: --slug '${parsed.values.slug}' slugifies to nothing — use a display/discovery slug with [a-z0-9-]\n`,
       );
       process.exit(2);
     }

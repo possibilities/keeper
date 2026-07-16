@@ -4369,6 +4369,22 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    version: 130,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "handoffs",
+        "capture",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+      addColumnIfMissing(ctx.db, "handoffs", "model", "TEXT");
+      addColumnIfMissing(ctx.db, "handoffs", "effort", "TEXT");
+      addColumnIfMissing(ctx.db, "handoffs", "preset", "TEXT");
+      addColumnIfMissing(ctx.db, "handoffs", "envelope_path", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4389,7 +4405,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v129:fb1b5b47d67939cc3bdb6dd5cf94195a1e586dd147061a36d8596e92fb655f20";
+  "v130:d18242e710c53bcbd3f3b7664cd53ebf49238a703bfbbe54a591f2d79b77c948";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6026,7 +6042,12 @@ CREATE TABLE IF NOT EXISTS handoffs (
     callee_job_id TEXT,
     claimed_at REAL,
     never_bound_count INTEGER NOT NULL DEFAULT 0,
-    last_event_id INTEGER NOT NULL
+    last_event_id INTEGER NOT NULL,
+    capture INTEGER NOT NULL DEFAULT 0,
+    model TEXT,
+    effort TEXT,
+    preset TEXT,
+    envelope_path TEXT
 )
 `;
 

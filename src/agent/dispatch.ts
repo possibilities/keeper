@@ -123,9 +123,11 @@ Usage:
                                     read-only run legs (members from a configured
                                     --panel <name>), then wait for them token-free.
                                     --slug is REQUIRED on start — each leg launches
-                                    as panel::<slug>::<preset>. start is idempotent
-                                    by slug (reconciles on re-issue); wait/status
-                                    address a run by --slug or --run-dir. status prints
+                                    as panel::<slug>::<preset>. The display slug
+                                    re-finds a durable request; its opaque request
+                                    identity owns the run and controls. Re-issuing
+                                    start reconciles that request; wait/status
+                                    address it by --slug or --run-dir. status prints
                                     a non-blocking per-leg snapshot; prune GCs
                                     abandoned run dirs. Exit 0 all-terminal / 124
                                     chunk-elapsed / 2 absent-slug-or-bad-config.
@@ -280,11 +282,13 @@ Panel fan-out (start | wait | status | prune):
                                         catalog preset). --slug is REQUIRED on start
                                         — each leg launches as panel::<slug>::<preset>
                                         and the run lives at the durable slug-keyed
-                                        ~/.local/state/keeper/panels/<slug>/. start
-                                        is idempotent by slug: re-issuing the same
-                                        line RECONCILES (reuse terminal legs, leave
-                                        running, relaunch no-result), never a blind
-                                        re-fan-out. wait/status address a run by
+                                        ~/.local/state/keeper/panels/<slug>/. The slug
+                                        is display/discovery metadata; the opaque
+                                        request identity owns the run and controls.
+                                        Re-issuing the same line RECONCILES (reuse
+                                        terminal legs, leave running, relaunch
+                                        no-result), never a blind re-fan-out.
+                                        wait/status address a run by
                                         --slug (or --run-dir; --run-dir wins). wait blocks
                                         ONE --chunk window + prints the N-of-N
                                         verdict; status prints a non-blocking per-leg
@@ -295,6 +299,13 @@ Panel fan-out (start | wait | status | prune):
                                         NOT the code), 124 = chunk elapsed (re-issue
                                         it), 2 = an absent/empty --slug, a
                                         missing/corrupt manifest, or bad config.
+
+Launch handles: a caller-supplied handle is the surface-local deduplication and
+routing anchor. A dead partner resumes by its name or id; a live partner refuses
+another attach and points at \`keeper bus chat send\`. Partner names are host-global
+among tracked jobs. Handoff slugs are host-global event-sourced handles whose
+duplicate exits 3. Panel slugs are display/discovery metadata; their opaque request
+identity owns the panel request and controls.
 
 Resume (harness-agnostic re-attach):
   keeper agent resume <name-or-id> [prompt]

@@ -396,6 +396,23 @@ export const HANDOFF_FLAGS = [
     type: "string",
     summary: "Directory the handoff-ee launches in",
   },
+  {
+    name: "capture",
+    type: "boolean",
+    default: false,
+    summary: "Request a captured terminal result envelope at a durable path",
+  },
+  {
+    name: "preset",
+    type: "string",
+    summary: "Launch triple <harness::model::effort> (--capture only)",
+  },
+  { name: "model", type: "string", summary: "Model override (--capture only)" },
+  {
+    name: "effort",
+    type: "string",
+    summary: "Reasoning-effort override (--capture only)",
+  },
   FLAG_SOCK,
   FLAG_HELP_DEFAULTED,
   FLAG_AGENT_HELP_DEFAULTED,
@@ -1752,7 +1769,10 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: true,
     requires_tty: false,
     agent_help: true,
-    exit_codes: { "3": "slug already in use" },
+    exit_codes: {
+      "2": "argument fault (bad/conflicting flags, or a bad capture/triple combination)",
+      "3": "slug already in use",
+    },
     flags: HANDOFF_FLAGS,
   },
   {

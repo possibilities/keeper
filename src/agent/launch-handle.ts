@@ -1,6 +1,12 @@
 /**
  * The shared launch→{@link ResolvedHandle} glue behind `agent run` and its panel
- * legs. It assembles the per-CLI detached launch argv via `buildAgentLaunchArgv`,
+ * legs. Surface-specific handle resolution happens before this seam: a caller
+ * resumes a dead target by its handle and refuses a live target in favor of the
+ * Agent Bus. Partner names are host-global among tracked jobs; handoff slugs are
+ * host-global event-sourced handles whose duplicate exits 3; panel slugs are
+ * display/discovery metadata, while the opaque request identity owns the panel
+ * request and its controls. This module receives the resolved target and
+ * assembles the per-CLI detached launch argv via `buildAgentLaunchArgv`,
  * mints the pinned transcript session id, drives `launchKeeperAgentInTmux`
  * DIRECTLY (no subprocess re-exec), and returns a {@link RunLaunchResult}. The
  * pinned {@link ResolvedHandle} is held LOCALLY by the caller's compose — no
@@ -127,9 +133,10 @@ export function launchEnvForAgent(
  * Resume-launch inputs for {@link launchToResolvedHandle}. When present, the
  * launch composes a RESUME argv (via {@link buildAgentLaunchArgv}'s resume opts)
  * instead of a fresh one, and the returned handle carries `isResume` plus the
- * harness-correct pinned session id for discovery. The caller (the run-capture
- * resume handler) resolves the target and mints any child id — this module just
- * threads the values through. Omitted = fresh launch, byte-unchanged.
+ * harness-correct pinned session id for discovery. The caller resolves its
+ * surface-specific handle, routes a live target to the Agent Bus, and mints any
+ * child id — this module just threads the resolved values through. Omitted =
+ * fresh launch, byte-unchanged.
  */
 export interface LaunchResume {
   /** The native resume token forwarded to the harness (buildAgentLaunchArgv's

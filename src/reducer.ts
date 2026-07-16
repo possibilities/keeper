@@ -6426,6 +6426,11 @@ interface HandoffRequestedPayload {
   initiator_session: string | null;
   initiator_pane: string | null;
   initiator_job_id: string | null;
+  capture: number;
+  model: string | null;
+  effort: string | null;
+  preset: string | null;
+  envelope_path: string | null;
 }
 
 /**
@@ -6443,7 +6448,7 @@ function extractHandoffRequestedPayload(
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<HandoffRequestedPayload>;
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
     if (
       typeof parsed.handoff_id !== "string" ||
       parsed.handoff_id.length === 0 ||
@@ -6462,6 +6467,11 @@ function extractHandoffRequestedPayload(
       initiator_session: str(parsed.initiator_session),
       initiator_pane: str(parsed.initiator_pane),
       initiator_job_id: str(parsed.initiator_job_id),
+      capture: parsed.capture === true ? 1 : 0,
+      model: str(parsed.model),
+      effort: str(parsed.effort),
+      preset: str(parsed.preset),
+      envelope_path: str(parsed.envelope_path),
     };
   } catch (err) {
     console.error(
@@ -6501,8 +6511,9 @@ function foldHandoffRequested(db: Database, event: Event): void {
     `INSERT INTO handoffs (
        handoff_id, status, doc, title, target_session, target_dir,
        initiator_session, initiator_pane, initiator_job_id,
-       callee_job_id, claimed_at, never_bound_count, last_event_id
-     ) VALUES (?, 'requested', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)
+       callee_job_id, claimed_at, never_bound_count, last_event_id,
+       capture, model, effort, preset, envelope_path
+     ) VALUES (?, 'requested', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(handoff_id) DO UPDATE SET
        doc = excluded.doc,
        title = excluded.title,
@@ -6511,6 +6522,11 @@ function foldHandoffRequested(db: Database, event: Event): void {
        initiator_session = excluded.initiator_session,
        initiator_pane = excluded.initiator_pane,
        initiator_job_id = excluded.initiator_job_id,
+       capture = excluded.capture,
+       model = excluded.model,
+       effort = excluded.effort,
+       preset = excluded.preset,
+       envelope_path = excluded.envelope_path,
        last_event_id = excluded.last_event_id`,
     [
       payload.handoff_id,
@@ -6522,6 +6538,11 @@ function foldHandoffRequested(db: Database, event: Event): void {
       payload.initiator_pane,
       payload.initiator_job_id,
       event.id,
+      payload.capture,
+      payload.model,
+      payload.effort,
+      payload.preset,
+      payload.envelope_path,
     ],
   );
   // Write the handoff-from edge onto the initiator job. The callee is unknown at
