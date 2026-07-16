@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-16T20:19:56.755000Z",
   "created_at": "2026-07-14T00:14:53.893000Z",
   "depends_on_epics": [
     "fn-1282-retire-hermes-codex-harnesses"
@@ -9,10 +10,10 @@
   "last_validated_at": "2026-07-14T00:20:58.003000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Single-source agent surface contracts",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T00:20:58.003000Z"
+  "updated_at": "2026-07-16T20:19:56.755000Z"
 }
