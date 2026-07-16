@@ -66,5 +66,5 @@ Older manifests parse with missing associations and fail closed when cancellatio
 - [ ] Missing, malformed, legacy, or ownership-mismatched controls never trigger title-, PID-, index-, or session-derived window teardown.
 
 ## Done summary
-
+Panel member attempts now pre-register a panel-owned Run-control association before launch; keeper agent run publishes the canonical control artifact to that caller-owned path immediately after tmux launch and tears the launch down on publication failure. panelCancel persists cancellation intent and pending cleanup before any teardown, freezes further registration, and consumes every registered attempt's exact control (including result-bearing attempts) before terminating wrappers; cleanup_status (pending/failed/settled) is now independent of the monotonic cancelled outcome, and malformed/legacy/mismatched controls fail closed with no title/pid/session/index-derived teardown.
 ## Evidence
