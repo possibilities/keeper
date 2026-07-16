@@ -10,7 +10,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decideSingleInstanceGate } from "../src/daemon";
+import {
+  decideSingleInstanceAction,
+  decideSingleInstanceGate,
+} from "../src/daemon";
 import { resolveSingleInstanceLockPath } from "../src/db";
 import {
   lockOwnedByUs,
@@ -73,7 +76,7 @@ describe("decideSingleInstanceGate (pure classification)", () => {
     expect(outcome.kind).toBe("refused");
   });
 
-  test("a throw (inconclusive primitive) → degraded, carrying the reason (fail OPEN)", () => {
+  test("a throw (inconclusive primitive) → degraded, carrying the reason", () => {
     const outcome = decideSingleInstanceGate(() => {
       throw new Error("dlopen boom");
     }, lockPath);
@@ -87,6 +90,83 @@ describe("decideSingleInstanceGate (pure classification)", () => {
     }, lockPath);
     expect(outcome.kind).toBe("degraded");
     if (outcome.kind === "degraded") expect(outcome.reason).toBe("bare string");
+  });
+});
+
+describe("decideSingleInstanceAction (pure policy)", () => {
+  const lockPath = "/state/keeper/keeperd.lock";
+  const recoveryLine =
+    "[keeperd] recover with: launchctl kickstart -k gui/$(id -u)/arthack.keeperd";
+
+  test("acquired → proceed, carrying the held lock through untouched", () => {
+    const sentinel = { released: false } as unknown as FileLock;
+    const action = decideSingleInstanceAction(
+      { kind: "acquired", lock: sentinel },
+      lockPath,
+    );
+
+    expect(action.action).toBe("proceed");
+    if (action.action === "proceed") expect(action.lock).toBe(sentinel);
+  });
+
+  test("refused → exit 1 with the incumbent diagnostic and recovery line", () => {
+    const action = decideSingleInstanceAction({ kind: "refused" }, lockPath);
+
+    expect(action).toEqual({
+      action: "exit",
+      code: 1,
+      message:
+        `[keeperd] refusing to start: another keeperd already holds ${lockPath}\n` +
+        recoveryLine,
+    });
+  });
+
+  test("an Error throw → degraded → distinct exit 2 with path, reason, and recovery", () => {
+    const outcome = decideSingleInstanceGate(() => {
+      throw new Error("flock errno=13");
+    }, lockPath);
+    const action = decideSingleInstanceAction(outcome, lockPath);
+
+    expect(action.action).toBe("exit");
+    if (action.action !== "exit") return;
+    expect(action.code).toBe(2);
+    expect(action.code).not.toBe(1);
+    const lines = action.message.split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain("single-instance lock primitive inconclusive");
+    expect(lines[0]).toContain(lockPath);
+    expect(lines[0]).toContain("flock errno=13");
+    expect(lines[1]).toBe(recoveryLine);
+  });
+
+  test("a non-Error throw → degraded → the same distinct fail-closed action", () => {
+    const outcome = decideSingleInstanceGate(() => {
+      throw "bare string";
+    }, lockPath);
+    const action = decideSingleInstanceAction(outcome, lockPath);
+
+    expect(action.action).toBe("exit");
+    if (action.action !== "exit") return;
+    expect(action.code).toBe(2);
+    expect(action.message).toContain(lockPath);
+    expect(action.message).toContain("bare string");
+    expect(action.message.split("\n")[1]).toBe(recoveryLine);
+  });
+
+  test("diagnostic interpolation is bounded and cannot add lines", () => {
+    const longPath = `/${"p".repeat(5_000)}\nforged-path-line`;
+    const longReason = `${"r".repeat(5_000)}\nforged-reason-line`;
+    const action = decideSingleInstanceAction(
+      { kind: "degraded", reason: longReason },
+      longPath,
+    );
+
+    expect(action.action).toBe("exit");
+    if (action.action !== "exit") return;
+    expect(action.message.length).toBeLessThan(2_048);
+    expect(action.message.split("\n")).toHaveLength(2);
+    expect(action.message).not.toContain("forged-path-line");
+    expect(action.message).not.toContain("forged-reason-line");
   });
 });
 
