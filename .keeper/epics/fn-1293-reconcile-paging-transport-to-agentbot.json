@@ -10,7 +10,7 @@
     "fn-1283-prune-stale-monitor-slot-backstop"
   ],
   "id": "fn-1293-reconcile-paging-transport-to-agentbot",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-16T20:33:16.108000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -18,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-16T20:33:15.722000Z"
+  "updated_at": "2026-07-16T20:33:16.108000Z"
 }
