@@ -39,5 +39,7 @@ Create `docs/agent-surface-contracts.md` as the canonical statement of the five 
 - [ ] plugins/prompt test suite passes; no file under plugins/prompt/corpus/ is modified
 
 ## Done summary
-
+Authored docs/agent-surface-contracts.md and pointed handoff/pair/panel skills + panel-runner template at the shared contract; landed via operator plain-git escape (commit-work terminal-adoption wedge) as 48fd5ca4 on the epic lane
 ## Evidence
+- Commits: 48fd5ca4
+- Tests: plugins/plan consistency-skills.test.ts 790 pass, plugins/prompt test:gate 157 pass
