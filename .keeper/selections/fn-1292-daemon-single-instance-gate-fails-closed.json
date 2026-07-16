@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Correctness-critical sole-writer integrity gate: getting the fail-closed inversion wrong reintroduces silent dual-writer event-store corruption, a subtle invariant that hard-gates opus, and the new pure outcome->action seam is contract-shaped with a documented entanglement fallback warranting xhigh.",
+      "task_id": "fn-1292-daemon-single-instance-gate-fails-closed.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-16T08:45:16.894000Z",
+  "epic_id": "fn-1292-daemon-single-instance-gate-fails-closed",
+  "input_hash": "91012c716eb091c8359b40467bc1307845a3f3bd0d14bed6c9d0788d8623c374",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2432773233,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1292-daemon-single-instance-gate-fails-closed.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Correctness-critical sole-writer integrity gate: getting the fail-closed inversion wrong reintroduces silent dual-writer event-store corruption, a subtle invariant that hard-gates opus, and the new pure outcome->action seam is contract-shaped with a documented entanglement fallback warranting xhigh.\",\"confidence\":0.72}]}\n"
+}
