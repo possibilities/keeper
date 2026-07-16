@@ -2,6 +2,7 @@
   "blocks_closing_of": "fn-1286-daemon-rides-through-subsystem-failure",
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-16T20:39:20.548000Z",
   "created_at": "2026-07-16T20:33:15.722000Z",
   "created_by_close_of": "fn-1286-daemon-rides-through-subsystem-failure",
   "depends_on_epics": [
@@ -13,10 +14,10 @@
   "last_validated_at": "2026-07-16T20:33:16.108000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Reconcile paging transport to agentbot vocabulary",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-16T20:33:16.108000Z"
+  "updated_at": "2026-07-16T20:39:20.548000Z"
 }
