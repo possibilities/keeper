@@ -34,5 +34,7 @@ No test surface; `bun scripts/lint-claude-md.ts` guards CLAUDE.md only. Review t
 - [ ] No existing entry is duplicated or contradicted; entries contain no file paths, code, or history
 
 ## Done summary
-
+Added the five agent-interaction glossary entries to CONTEXT.md (Elicit-an-answer/Delegate-work surfaces, Partner, Handoff, Launch handle with per-surface idempotency scope); operator-verified against spec acceptance and landed via plain-git escape (commit-work live-leg claim wedge) as c38c0dc3 on the .2 task lane
 ## Evidence
+- Commits: c38c0dc3
+- Tests: operator acceptance review: Term/Avoid shape, per-surface idempotency named, no paths/code/history, no duplication
