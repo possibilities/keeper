@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Threaded handoff capture fields through persistence (schema step 130 + fingerprint re-pin, collections/reducer/rpc/server surfaces); operator re-run 640/0 across db/handoff/rpc-handlers/daemon suites; landed via plain-git escape (leg 5a361ee6 claim wedge) as 187b8c5c on the epic lane",
+      "input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
+      "model": "opus",
+      "spec_chars": 3686,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/rpc-handlers.ts, src/reducer.ts, src/collections.ts, src/db.ts, src/server-worker.ts, test/handoff.test.ts\n\n### Approach\n\nExtend the existing `request_handoff` RPC payload (no new RPC \u2014 the write surface stays closed) with the capture fields: a `capture` boolean (defaults false), optional launch-triple fields (model/effort or preset reference), and a request-time-computed, slug-deterministic envelope path recorded as a `handoffs` projection column so waiters and the worker discover one authoritative location. Follow the `target_dir` additive template end-to-end: CLI-side validation happens in a later task, RPC re-validates at the socket trust boundary defaulting absent\u2192null/false, the payload extractor stays strict-on-load-bearing / coerce-rest-to-null / never-throws, and the fold UPSERTs with ON CONFLICT refreshing only request-time columns. A pre-feature `HandoffRequested` event must fold to defaults (capture off, null triple/path) \u2014 re-fold determinism is sacred, so no wall-clock/env/filesystem reads inside the fold. Append one SCHEMA_STEPS entry for the new columns, derive SCHEMA_VERSION from the ladder tail, and re-pin SCHEMA_FINGERPRINT (PROVISIONAL until landed; never hardcode \"the next\" version in prose). Thread the new params through the worker\u2192main request_handoff bridge.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/rpc-handlers.ts:604-696 \u2014 RequestHandoffParams + validateRequestHandoffParams; the trust-boundary validation this extends\n- src/reducer.ts:6102-6210 \u2014 HandoffRequestedPayload, extractor, foldHandoffRequested; the target_dir nullable pattern to copy\n- src/collections.ts:883-912 and src/db.ts:5875 \u2014 HANDOFFS_DESCRIPTOR.columns + DDL that must gain the columns\n- src/db.ts:69 \u2014 SCHEMA_STEPS ladder shape and the addColumnIfMissing convention\n- src/server-worker.ts:321-333,1636-1700 \u2014 the worker\u2192main bridge the params thread through\n\n**Optional** (reference as needed):\n- src/handoff-slug.ts \u2014 slug normalization the envelope path derives from\n- test/handoff.test.ts \u2014 existing request/fold test shapes to extend\n\n### Risks\n\n- A throwing extractor or a fold reading the environment breaks re-fold determinism \u2014 copy the target_dir discipline exactly.\n- Schema-ladder position is a singleton resource; the version renumbers at fan-in, so keep the step additive-idempotent.\n\n### Test notes\n\nPure fold tests over freshMemDb()/migrate(): a pre-feature event (no capture fields) folds to defaults; a capture event folds all fields; malformed capture data coerces to null without throwing. No daemon, no socket.\n\n## Acceptance\n\n- [ ] A capture-bearing handoff request round-trips: RPC validation accepts it, the event folds, and the handoffs projection exposes capture flag, triple, and envelope path\n- [ ] A pre-feature handoff event (no new fields) folds to defaults with no error and no behavior change\n- [ ] Malformed capture payload data folds safely (coerced/nulled), never throws, and the cursor advances\n- [ ] The schema ladder gains exactly one new entry and the fingerprint is re-pinned; a fresh DB and a migrated DB agree on the handoffs shape\n\n## Done summary\nThreaded handoff capture fields through persistence (schema step 130 + fingerprint re-pin, collections/reducer/rpc/server surfaces); operator re-run 640/0 across db/handoff/rpc-handlers/daemon suites; landed via plain-git escape (leg 5a361ee6 claim wedge) as 187b8c5c on the epic lane\n## Evidence\n- Commits: 187b8c5c\n- Tests: bun test db+handoff+rpc-handlers+daemon 640/0 (operator re-run in lane)",
+      "task_id": "fn-1288-handoff-capture-and-handle-semantics.1",
+      "tier": "xhigh",
+      "title": "Thread capture fields through persistence"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Captured handoff results surfaced through the handoff/descriptor CLIs (+ fast-test lint update); worker-verified full test:gate 9167/0 + operator re-run handoff suite 25/0; landed via plain-git escape (multi-leg claim wedge, sessions discharged) as e5d331b7 on the epic lane",
+      "input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2540,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/handoff.ts, cli/descriptor.ts, test/handoff.test.ts\n\n### Approach\n\nAdd `--capture` to `keeper handoff`, plus the launch-triple knob it unlocks (accept a `--preset <triple>` or `--model`/`--effort` pair, mirroring the dispatch CLI's shape); triple flags without `--capture` are a usage error. Validate CLI-side before any RPC send \u2014 an invalid triple or flag combination exits with a distinct documented exit code (alongside the existing dup-slug exit 3) and never mints an event; the RPC re-validation from the persistence task is the backstop, not the primary gate. Update the usage/--help/--agent-help blocks and the exit-code list to document the new flags and codes. Default path stays byte-identical: a no-flag invocation builds the same frame as today.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/handoff.ts:52-94,192-210,264-431 \u2014 flag table, usage blocks, frame builder, exit codes\n- cli/descriptor.ts:376 \u2014 HANDOFF_FLAGS registration\n- cli/dispatch.ts \u2014 the --preset/--model/--effort flag shape to mirror\n\n**Optional** (reference as needed):\n- src/agent/launch-handle.ts \u2014 triple parsing/validation helpers available client-side (post-fn-1282 surface)\n\n### Risks\n\n- Flag semantics drifting from `agent run --capture <path>` (which takes a path): here capture is a boolean request and the path is daemon-derived \u2014 the help text must make that distinction explicit.\n\n### Test notes\n\nExtend test/handoff.test.ts: flag parsing, usage errors (triple without capture, invalid triple), exit codes, and a no-flag frame byte-equal to the pre-change frame.\n\n## Acceptance\n\n- [ ] `keeper handoff --capture [--preset|--model/--effort]` validates client-side and sends the capture fields; invalid combinations exit non-zero with a distinct documented code and send nothing\n- [ ] `keeper handoff` without new flags produces a request identical to pre-change behavior\n- [ ] --help/--agent-help document the flags, their capture-only constraint, and the exit codes\n\n## Done summary\nCaptured handoff results surfaced through the handoff/descriptor CLIs (+ fast-test lint update); worker-verified full test:gate 9167/0 + operator re-run handoff suite 25/0; landed via plain-git escape (multi-leg claim wedge, sessions discharged) as e5d331b7 on the epic lane\n## Evidence\n- Commits: e5d331b7\n- Tests: worker: test:gate 9167/0, bun test handoff 25/0 (operator re-run in lane)",
+      "task_id": "fn-1288-handoff-capture-and-handle-semantics.2",
+      "tier": "medium",
+      "title": "Add handoff capture CLI flags"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Handoff worker emits the capture envelope at delegate completion (exec-backend + handoff-worker surfaces); operator re-run 120/0 exec-backend+handoff-worker and 140/0 board; landed via plain-git escape (leg cd143fc3 claims never reaching terminal liveness) as 8a72c59c on the .3 task lane",
+      "input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
+      "model": "sonnet",
+      "spec_chars": 3528,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/handoff-worker.ts, src/exec-backend.ts, test/handoff-worker.test.ts\n\n### Approach\n\nTeach the handoff worker's launch path to honor a capture-bearing handoff row: resolve the launch triple (request fields override the dispatch-table pin resolved via resolveDispatchLaunchConfig), swap the prompt to a new exported autonomous framing constant (the deliverable contract: investigate, act within the brief, and finish with a final message that IS the answer \u2014 no parking, no confirm beat), and thread the row's envelope path into the launch as an env carrier on LaunchSpec, mirroring the existing wrapped-envelope carrier, so the detached leg itself writes the standard 9-key envelope on terminal outcome. The worker leg is the SOLE writer of that envelope; the daemon writes no competing result row, and a waiter timeout only detaches the waiter (the session stays recoverable \u2014 explicit abort is out-of-scope). The envelope record is size-bounded, single-JSON-object, matching the run-capture schema exactly so the golden envelope test covers it. Non-capture rows build the identical spec they do today. Keep the capture branch pure and exported for direct testing; re-size the coupled prompt-cap pinning test (prefix + framing + doc \u2264 PROMPT_MAX_BYTES) for the longer autonomous framing.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/handoff-worker.ts:282-299,335-358,548-565 \u2014 spec construction, HANDOFF_PROMPT_FRAMING + buildHandoffPrompt, launch call\n- src/exec-backend.ts:84-180 \u2014 LaunchSpec fields and the wrapped-envelope env-carrier precedent to mirror\n- src/agent/run-capture.ts \u2014 the envelope schema/writer contract the leg must match (post-fn-1282 surface)\n\n**Optional** (reference as needed):\n- test/handoff-worker.test.ts \u2014 pure-decider test shape (synthetic rows, injected clock)\n- test/agent-run-capture-golden.test.ts \u2014 the full-key-set golden the envelope must satisfy\n\n### Risks\n\n- A parked capture leg hangs its waiter to timeout \u2014 the framing swap must be mechanical on the capture flag, never prompt-content detection.\n- Two writers on the envelope path (leg + daemon) would disagree on terminal state; keep the daemon read-only here.\n\n### Test notes\n\nPure tests: capture row \u2192 spec carries triple + env carrier + autonomous framing; non-capture row \u2192 spec byte-identical to today; framing constant fits the re-sized cap test. No real launches (slow tier only if needed behind KEEPER_RUN_SLOW).\n\n## Acceptance\n\n- [ ] A capture handoff row launches with the autonomous framing, the resolved triple, and an envelope-path carrier; the leg's terminal outcome produces one size-bounded envelope at that path matching the shared 9-key schema\n- [ ] A non-capture row launches byte-identically to pre-change behavior, parking framing included\n- [ ] No daemon or worker code path writes to the envelope path other than the launched leg\n- [ ] The prompt-cap pinning test passes with the new framing constant\n\n## Done summary\nHandoff worker emits the capture envelope at delegate completion (exec-backend + handoff-worker surfaces); operator re-run 120/0 exec-backend+handoff-worker and 140/0 board; landed via plain-git escape (leg cd143fc3 claims never reaching terminal liveness) as 8a72c59c on the .3 task lane\n## Evidence\n- Commits: 8a72c59c\n- Tests: bun test exec-backend+handoff-worker 120/0 (operator re-run in lane), bun test board 140/0",
+      "task_id": "fn-1288-handoff-capture-and-handle-semantics.3",
+      "tier": "xhigh",
+      "title": "Emit capture envelope from worker"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Launch-handle semantics aligned across dispatch/pair/panel surfaces + the three skill runbooks; operator re-run 160/0 + 53/0 across five agent suites; landed via plain-git escape (multi-session claim wedge, sessions discharged) as f3f331fb on the epic lane",
+      "input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
+      "model": "sonnet",
+      "spec_chars": 3665,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** cli/agent.ts, src/agent/launch-handle.ts, src/pair/panel.ts, plugins/keeper/skills/pair/SKILL.md, plugins/keeper/skills/handoff/SKILL.md, plugins/plan/skills/panel/SKILL.md\n\n### Approach\n\nAlign the documented and validated launch-handle semantics across the three surfaces \u2014 semantics only, storage keys untouched. In the CLI layer: make the cli/agent.ts header contract comment and help text state the unified model (a caller-supplied handle is the dedup key; a dead target resumes by handle; a live target refuses and routes to the Agent Bus; each surface's idempotency scope is explicit \u2014 partner names host-global among tracked jobs, handoff slugs host-global event-sourced with dup\u2192exit 3, panel slugs display/discovery-only with the opaque request identity as the real handle), and align any divergent validation/error wording in the handle-resolution and panel slug paths to say the same thing (touch src/pair/panel.ts doc/validation wording only \u2014 fn-1285 owns its lifecycle struct surface). In the skill layer: update the handoff runbook with the capture fire-and-wait recipe (request with --capture, then the standard chunked-wait loop against the envelope path, timeout-detaches-waiter semantics, capture-is-not-the-default cost note) and align pair/handoff/panel skill prose to the unified handle vocabulary, citing the fn-1287 contracts doc for the shared envelope and wait mechanics instead of restating them. Forward-facing prose only.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves (fn-1282 rewrites cli/agent.ts and launch-handle.ts before this runs).*\n\n**Required** (read before coding):\n- cli/agent.ts:1-35 \u2014 the header contract comment stating run/wait/panel handle addressing\n- src/agent/launch-handle.ts \u2014 post-fn-1282 handle resolution the prose must match\n- plugins/keeper/skills/handoff/SKILL.md \u2014 the fire-and-forget runbook gaining the capture recipe\n- docs/agent-surface-contracts.md \u2014 the fn-1287 doc this task cites (verify its final section names)\n\n**Optional** (reference as needed):\n- src/pair/panel.ts \u2014 slug/request_id doc + validation wording (coordinate with landed fn-1285 shape)\n- CONTEXT.md \u2014 the Launch handle glossary entry whose scope claims this prose must agree with\n\n### Risks\n\n- Contradicting the fn-1287 glossary/contract wording \u2014 read both before writing; the doc wins on wording disputes.\n- Drifting into behavior change in panel.ts \u2014 only doc comments and message wording are in scope there.\n\n### Test notes\n\nplugins/plan consistency suite must stay green (skill tokens retained). Handoff/panel CLI test suites green with no behavioral assertions changed.\n\n## Acceptance\n\n- [ ] The pair/handoff/panel CLI contracts and skill runbooks state one consistent handle model (dedup, resume-if-dead, message-if-live, per-surface scope) with no storage-key change\n- [ ] The handoff skill documents the capture fire-and-wait recipe end-to-end, including timeout-detach semantics and the opt-in cost note\n- [ ] Shared envelope/wait mechanics are cited from the contracts doc, not re-narrated\n- [ ] Consistency and CLI test suites pass unmodified\n\n## Done summary\nLaunch-handle semantics aligned across dispatch/pair/panel surfaces + the three skill runbooks; operator re-run 160/0 + 53/0 across five agent suites; landed via plain-git escape (multi-session claim wedge, sessions discharged) as f3f331fb on the epic lane\n## Evidence\n- Commits: f3f331fb\n- Tests: bun test agent-panel-cli+pair-panel+agent-launch-handle 160/0 (operator re-run), bun test agent-dispatch+agent-launch-handle-depgraph 53/0",
+      "task_id": "fn-1288-handoff-capture-and-handle-semantics.4",
+      "tier": "high",
+      "title": "Align handle semantics and runbooks"
+    }
+  ],
+  "created_at": "2026-07-16T22:42:39.281000Z",
+  "epic_id": "fn-1288-handoff-capture-and-handle-semantics",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "bb093e4b99fbad343853728852a010b26a017234cf354fe4037bcf0a8fece161",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
