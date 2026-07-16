@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-16T22:42:41.450000Z",
   "created_at": "2026-07-14T00:16:20.860000Z",
   "depends_on_epics": [
     "fn-1287-single-source-agent-surface-contracts",
@@ -11,10 +12,10 @@
   "last_validated_at": "2026-07-14T00:21:28.374000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Handoff capture and handle semantics",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-14T00:21:28.374000Z"
+  "updated_at": "2026-07-16T22:42:41.450000Z"
 }
