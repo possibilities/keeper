@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "low",
   "title": "Restore reread-timer unref",
-  "updated_at": "2026-07-14T00:56:38.272000Z"
+  "updated_at": "2026-07-16T20:09:34.142000Z",
+  "worker_done_at": "2026-07-16T20:09:34.142000Z"
 }

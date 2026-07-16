@@ -20,5 +20,7 @@ Fix: build the timer, call `.unref?.()` on it, and return it, e.g.
 - [ ] Behavior matches the pre-epic reread path; no change to the debounce interval or the `RereadScheduler` interface.
 
 ## Done summary
-
+Restored the reread-timer unref in tmux-control-worker; operator-verified 72/0 across both tmux-control suites and landed via plain-git escape (terminal leg 3d9c2f17 claim unadoptable) as cbf6f5da on the epic lane
 ## Evidence
+- Commits: cbf6f5da
+- Tests: bun test tmux-control-worker+tmux-control-parser 72/0 (operator re-run in lane)
