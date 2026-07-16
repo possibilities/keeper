@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
+  collectUnsettledPanelRunIds,
   parseKeeperAgentTmuxArgs,
   resolveKeeperAgentBin,
   resolveTmuxBin,
@@ -972,9 +973,25 @@ describe("selectRunDirsToSweep", () => {
       { name: "tmux-oldest-alive", mtimeMs: now - 120_000, pidAlive: true },
     ];
     const doomed = selectRunDirsToSweep(candidates, now, ttl, 1);
-    // cap=1 keeps tmux-newest; tmux-mid is dead overflow -> swept;
-    // tmux-oldest-alive is overflow but live -> kept.
     expect(new Set(doomed)).toEqual(new Set(["tmux-mid"]));
+  });
+
+  test("an unresolved Panel cleanup pin wins over both TTL and count limits", () => {
+    const doomed = selectRunDirsToSweep(
+      [
+        {
+          name: "tmux-panel-owned",
+          mtimeMs: now - 100 * HOUR,
+          pidAlive: false,
+          panelCleanupPinned: true,
+        },
+        { name: "tmux-recent", mtimeMs: now, pidAlive: false },
+      ],
+      now,
+      ttl,
+      1,
+    );
+    expect(doomed).toEqual([]);
   });
 });
 
@@ -1015,6 +1032,87 @@ describe("sweepRunArtifacts", () => {
     expect(() =>
       sweepRunArtifacts(join(tempDir(), "does-not-exist"), Date.now()),
     ).not.toThrow();
+  });
+
+  test("Panel-owned run artifacts stay pinned until cleanup settles, then release", () => {
+    const state = tempDir();
+    const panels = join(state, "panels");
+    const panelDir = join(panels, "request-a");
+    const runs = join(state, "tmux-runs");
+    const runId = "tmux-panel-run";
+    const runDir = makeRunDir(runs, runId, 30 * HOUR);
+    mkdirSync(panelDir, { recursive: true });
+    const controlPath = join(panelDir, "alpha.control.json");
+    writeFileSync(
+      controlPath,
+      JSON.stringify({
+        schema_version: 1,
+        run_id: runId,
+        agent: "claude",
+        started_at_ms: 1,
+        kill_window_command: [
+          "/opt/tmux",
+          "-S",
+          "/tmp/panel.sock",
+          "kill-window",
+          "-t",
+          "@9",
+        ],
+        status: "cancelling",
+        owner: { request_id: "req-a", member: "alpha", attempt: 1 },
+      }),
+    );
+    const manifest = {
+      dir: panelDir,
+      slug: "request-a",
+      request_id: "req-a",
+      state: "cancelled",
+      cleanup_status: "failed",
+      members: [
+        {
+          name: "alpha",
+          harness: "claude",
+          yaml: join(panelDir, "alpha.yaml"),
+          pidfile: join(panelDir, "alpha.pidfile"),
+          attempts: [
+            {
+              attempt: 1,
+              yaml: join(panelDir, "alpha.yaml"),
+              pidfile: join(panelDir, "alpha.pidfile"),
+              startfile: null,
+              launched_at: 1,
+              state: "cleanup_failed",
+              control: {
+                path: controlPath,
+                request_id: "req-a",
+                member: "alpha",
+                attempt: 1,
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const manifestPath = join(panelDir, "manifest.json");
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+
+    const pins = collectUnsettledPanelRunIds(panels);
+    expect([...(pins ?? [])]).toEqual([runId]);
+    sweepRunArtifacts(runs, Date.now(), pins ?? new Set());
+    expect(existsSync(runDir)).toBe(true);
+
+    writeFileSync(controlPath, "{}\n");
+    expect(collectUnsettledPanelRunIds(panels)).toBeNull();
+    expect(existsSync(runDir)).toBe(true);
+
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({ ...manifest, cleanup_status: "settled" }),
+    );
+    const released = collectUnsettledPanelRunIds(panels);
+    expect([...(released ?? [])]).toEqual([]);
+    sweepRunArtifacts(runs, Date.now(), released ?? new Set());
+    expect(existsSync(runDir)).toBe(false);
   });
 });
 

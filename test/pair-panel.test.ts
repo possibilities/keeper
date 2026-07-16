@@ -44,8 +44,11 @@ import {
   type PanelManifestMember,
   type PanelVerdict,
   panelCancel,
+  panelCleanupMaintenance,
+  panelReconcileCleanup,
   panelResume,
   panelStart,
+  panelStatus,
   panelWait,
   parseManifest,
   resolvePanelMembers,
@@ -1386,6 +1389,314 @@ test("failed exact cleanup remains retryable and converges through already-absen
     cleanup_status: "settled",
     unresolved_cleanup: [],
   });
+});
+
+function seedMaintenanceCleanupRun(
+  runName: string,
+  attempts: Array<{
+    member: string;
+    control?: "running" | "terminal" | "missing" | "malformed";
+  }>,
+): string {
+  const runDir = join(dir, "panels", runName);
+  mkdirSync(runDir, { recursive: true });
+  const requestId = `request-${runName}`;
+  const members: PanelManifestMember[] = attempts.map((spec, index) => {
+    const pidfile = join(runDir, `${spec.member}.pidfile`);
+    const controlPath = join(runDir, `${spec.member}.control.json`);
+    writeFileSync(pidfile, `${400 + index}\n`);
+    if (spec.control !== "missing") {
+      writeFileSync(
+        controlPath,
+        spec.control === "malformed"
+          ? "{}\n"
+          : `${JSON.stringify({
+              schema_version: 1,
+              run_id: `tmux-${runName}-${index}`,
+              agent: "claude",
+              started_at_ms: 1,
+              kill_window_command: [
+                "/opt/tmux",
+                "-S",
+                `/tmp/${runName}.sock`,
+                "kill-window",
+                "-t",
+                `@${index + 1}`,
+              ],
+              status: spec.control ?? "running",
+              owner: {
+                request_id: requestId,
+                member: spec.member,
+                attempt: 1,
+              },
+            })}\n`,
+      );
+    }
+    return {
+      name: spec.member,
+      harness: "claude",
+      yaml: join(runDir, `${spec.member}.yaml`),
+      pidfile,
+      startfile: null,
+      launched_at: 1,
+      attempts: [
+        {
+          attempt: 1,
+          yaml: join(runDir, `${spec.member}.yaml`),
+          pidfile,
+          startfile: null,
+          launched_at: 1,
+          state: "cleanup_failed",
+          control: {
+            path: controlPath,
+            request_id: requestId,
+            member: spec.member,
+            attempt: 1,
+          },
+        },
+      ],
+    };
+  });
+  writeFileSync(
+    join(runDir, "manifest.json"),
+    `${JSON.stringify({
+      dir: runDir,
+      slug: runName,
+      request_id: requestId,
+      state: "cancelled",
+      cancellation_requested_at: 1,
+      cleanup_status: "failed",
+      unresolved_cleanup: attempts.map((attempt) => `${attempt.member}#1`),
+      members,
+    } satisfies PanelManifest)}\n`,
+  );
+  return runDir;
+}
+
+test("maintenance fails closed across the spawn-to-manifest crash window", async () => {
+  const launched = seedMaintenanceCleanupRun("spawned-before-stamp", [
+    { member: "alpha", control: "running" },
+  ]);
+  const launchedManifest = JSON.parse(
+    readFileSync(join(launched, "manifest.json"), "utf8"),
+  ) as PanelManifest;
+  const launchedAttempt = launchedManifest.members[0]?.attempts?.[0];
+  if (launchedAttempt === undefined) throw new Error("missing fixture attempt");
+  launchedAttempt.launched_at = null;
+  launchedAttempt.state = "reserved";
+  writeFileSync(
+    join(launched, "manifest.json"),
+    JSON.stringify(launchedManifest),
+  );
+
+  const commands: string[] = [];
+  const deps = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      commands.push(command.at(-1) ?? "");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  expect((await panelCleanupMaintenance(deps.deps)).settled).toEqual([
+    launched,
+  ]);
+  expect(commands).toEqual(["@1"]);
+
+  const unpublished = seedMaintenanceCleanupRun("reserved-unpublished", [
+    { member: "alpha", control: "missing" },
+  ]);
+  const unpublishedManifest = JSON.parse(
+    readFileSync(join(unpublished, "manifest.json"), "utf8"),
+  ) as PanelManifest;
+  const unpublishedAttempt = unpublishedManifest.members[0]?.attempts?.[0];
+  if (unpublishedAttempt === undefined)
+    throw new Error("missing fixture attempt");
+  unpublishedAttempt.launched_at = null;
+  unpublishedAttempt.state = "reserved";
+  writeFileSync(unpublishedAttempt.pidfile ?? "", "");
+  writeFileSync(
+    join(unpublished, "manifest.json"),
+    JSON.stringify(unpublishedManifest),
+  );
+  const unresolved = await panelCleanupMaintenance(
+    makeDeps({ pidAlive: () => false }).deps,
+  );
+  expect(unresolved.unresolved).toContainEqual({
+    dir: unpublished,
+    identities: ["alpha#1"],
+  });
+});
+
+test("maintenance resumes failed cleanup after restart and converges an already-gone window", async () => {
+  const runDir = seedMaintenanceCleanupRun("restart", [
+    { member: "alpha", control: "running" },
+  ]);
+  const maintenance = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "can't find window: @1",
+    }),
+  });
+
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(pass.settled).toEqual([runDir]);
+  expect(pass.unresolved).toEqual([]);
+  const manifest: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(manifest).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+    unresolved_cleanup: [],
+  });
+  expect(manifest.cleanup_settled_at).toBe(0);
+
+  const status = makeDeps({ pidAlive: () => false });
+  expect(panelStatus({ dir: runDir }, status.deps)).toBe(0);
+  expect(JSON.parse(status.stdout().trim())).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+    unresolved_cleanup: [],
+  });
+});
+
+test("maintenance records partial progress in stable order and retries only unresolved work", async () => {
+  const runDir = seedMaintenanceCleanupRun("partial", [
+    { member: "zeta", control: "running" },
+    { member: "alpha", control: "running" },
+  ]);
+  const commands: string[] = [];
+  const first = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      commands.push(command.at(-1) ?? "");
+      return command.at(-1) === "@2"
+        ? { exitCode: 0, stdout: "", stderr: "" }
+        : { exitCode: 1, stdout: "", stderr: "permission denied" };
+    },
+  });
+  const firstPass = await panelCleanupMaintenance(first.deps);
+  expect(commands).toEqual(["@2", "@1"]);
+  expect(firstPass.unresolved).toEqual([
+    { dir: runDir, identities: ["zeta#1"] },
+  ]);
+  const partial: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(partial.cleanup_status).toBe("failed");
+  expect(partial.unresolved_cleanup).toEqual(["zeta#1"]);
+  expect(
+    partial.members.find((member) => member.name === "alpha")?.attempts?.[0]
+      ?.state,
+  ).toBe("cancelled");
+
+  const retryCommands: string[] = [];
+  const second = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      retryCommands.push(command.at(-1) ?? "");
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: "can't find window: @1",
+      };
+    },
+  });
+  expect((await panelCleanupMaintenance(second.deps)).settled).toEqual([
+    runDir,
+  ]);
+  expect(retryCommands).toEqual(["@1"]);
+});
+
+test("maintenance discovers a legacy cleanup-failed run without a cleanup status", async () => {
+  const runDir = seedMaintenanceCleanupRun("legacy-cleanup", [
+    { member: "legacy", control: "missing" },
+  ]);
+  const manifestPath = join(runDir, "manifest.json");
+  const legacy = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  delete legacy.cleanup_status;
+  legacy.state = "cleanup_failed";
+  writeFileSync(manifestPath, `${JSON.stringify(legacy)}\n`);
+
+  const pass = await panelCleanupMaintenance(
+    makeDeps({ pidAlive: () => false }).deps,
+  );
+  expect(pass.unresolved).toEqual([{ dir: runDir, identities: ["legacy#1"] }]);
+  expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "failed",
+    unresolved_cleanup: ["legacy#1"],
+  });
+});
+
+test("maintenance keeps missing and malformed controls exact, visible, and retryable", async () => {
+  const runDir = seedMaintenanceCleanupRun("bad-controls", [
+    { member: "missing", control: "missing" },
+    { member: "malformed", control: "malformed" },
+  ]);
+  const maintenance = makeDeps({ pidAlive: () => false });
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(maintenance.tmuxCommands).toEqual([]);
+  expect(pass.unresolved).toEqual([
+    {
+      dir: runDir,
+      identities: ["malformed#1", "missing#1"],
+    },
+  ]);
+  const manifest: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(manifest.cleanup_status).toBe("failed");
+  expect(manifest.unresolved_cleanup).toEqual(["malformed#1", "missing#1"]);
+  expect(
+    manifest.members.find((member) => member.name === "malformed")
+      ?.attempts?.[0]?.cleanup_error,
+  ).toBe("malformed_control");
+  expect(
+    manifest.members.find((member) => member.name === "missing")?.attempts?.[0]
+      ?.cleanup_error,
+  ).toStartWith("control_read_failed:");
+});
+
+test("maintenance skips a concurrently locked cleanup without blocking other runs", async () => {
+  const locked = seedMaintenanceCleanupRun("locked-cleanup", [
+    { member: "locked", control: "terminal" },
+  ]);
+  const free = seedMaintenanceCleanupRun("free-cleanup", [
+    { member: "free", control: "terminal" },
+  ]);
+  const maintenance = makeDeps({
+    pidAlive: () => false,
+    lock: (path) =>
+      path.includes("locked-cleanup") ? null : { release: () => {} },
+  });
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(pass.skipped).toEqual([locked]);
+  expect(pass.settled).toEqual([free]);
+  expect(
+    await panelReconcileCleanup(
+      { dir: locked, cleanupMs: 0 },
+      maintenance.deps,
+    ),
+  ).toEqual({ kind: "locked", dir: locked });
+});
+
+test("a terminal control repairs cleanup after an interrupted manifest write", async () => {
+  const runDir = seedMaintenanceCleanupRun("write-interrupted", [
+    { member: "alpha", control: "terminal" },
+  ]);
+  const maintenance = makeDeps({ pidAlive: () => false });
+  expect((await panelCleanupMaintenance(maintenance.deps)).settled).toEqual([
+    runDir,
+  ]);
+  expect(
+    JSON.parse(readFileSync(join(runDir, "manifest.json"), "utf8")),
+  ).toMatchObject({ cleanup_status: "settled", unresolved_cleanup: [] });
 });
 
 test("a marked panel member cannot reserve a nested panel request", async () => {

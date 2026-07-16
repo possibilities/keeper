@@ -25,7 +25,8 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   Bus message artifact; receivers explicitly read its confined path from the
   metadata-only notification. See the [bus skill](./plugins/keeper/skills/bus/SKILL.md).
 - **Owned panels** — each request admits one bounded fan-out and one generic Task-owned judge;
-  retries join the durable request and cancellation settles its exact registered children. See
+  retries join the durable request, cancellation settles exact registered children, and daemon
+  maintenance resumes pending or failed cleanup without reconstructing targets. See
   [installation and smoke checks](./docs/install.md#pi-task-and-panel-operations) and
   [machine-visible failures](./docs/problem-codes.md#panel-run-lifecycle).
 

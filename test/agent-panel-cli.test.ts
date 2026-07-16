@@ -1419,6 +1419,84 @@ describe("panelStatus (launched_at grace, no false running)", () => {
     expect(snap.all_terminal).toBe(true);
   });
 
+  test("pending cleanup derives exact identities before its first pass", () => {
+    const pdir = mkdtempSync(join(dir, "status-pending-cleanup-"));
+    writeFileSync(
+      join(pdir, "manifest.json"),
+      JSON.stringify({
+        dir: pdir,
+        slug: "pending-cleanup-run",
+        request_id: "request-pending-cleanup",
+        state: "cancelled",
+        cancellation_requested_at: 1,
+        cleanup_status: "pending",
+        members: [
+          {
+            name: "alpha",
+            harness: "claude",
+            yaml: join(pdir, "alpha.yaml"),
+            pidfile: join(pdir, "alpha.pidfile"),
+            attempts: [
+              {
+                attempt: 1,
+                yaml: join(pdir, "alpha.yaml"),
+                pidfile: join(pdir, "alpha.pidfile"),
+                startfile: null,
+                launched_at: 1,
+                state: "running",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const probe = makeProbeDeps({ now: 10 });
+    expect(panelStatus({ dir: pdir }, probe.deps)).toBe(0);
+    expect(JSON.parse(probe.out.join(""))).toMatchObject({
+      state: "cleanup_failed",
+      cleanup_status: "pending",
+      unresolved_cleanup: ["alpha#1"],
+    });
+  });
+
+  test("cleanup status reports exact unresolved identities until settled", () => {
+    const pdir = mkdtempSync(join(dir, "status-cleanup-"));
+    const manifest = {
+      dir: pdir,
+      slug: "cleanup-run",
+      request_id: "request-cleanup",
+      state: "cancelled",
+      cancellation_requested_at: 1,
+      cleanup_status: "failed",
+      unresolved_cleanup: ["zeta#2", "alpha#1"],
+      members: [],
+    } as const;
+    writeFileSync(join(pdir, "manifest.json"), JSON.stringify(manifest));
+    const first = makeProbeDeps({ now: 10 });
+    expect(panelStatus({ dir: pdir }, first.deps)).toBe(0);
+    expect(JSON.parse(first.out.join(""))).toMatchObject({
+      state: "cleanup_failed",
+      cleanup_status: "failed",
+      unresolved_cleanup: ["alpha#1", "zeta#2"],
+    });
+
+    writeFileSync(
+      join(pdir, "manifest.json"),
+      JSON.stringify({
+        ...manifest,
+        cleanup_status: "settled",
+        unresolved_cleanup: [],
+      }),
+    );
+    const settled = makeProbeDeps({ now: 20 });
+    expect(panelStatus({ dir: pdir }, settled.deps)).toBe(0);
+    expect(JSON.parse(settled.out.join(""))).toMatchObject({
+      state: "cancelled",
+      cleanup_status: "settled",
+      unresolved_cleanup: [],
+    });
+  });
+
   test("missing manifest → exit 2", () => {
     const { deps, err } = makeProbeDeps({ now: 0 });
     expect(panelStatus({ dir: join(dir, "no-such") }, deps)).toBe(2);
