@@ -505,7 +505,11 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
   // MUST stay too: it is half the canonical open-turn predicate
   // (`isOpenTurnRow`) — without it the readiness index + the render collapse
   // can't tell a backgrounded `ok` sub (in flight, NULL `duration_ms`) from a
-  // finished one. NOT a row-filter or page (those break render's count/stuck +
+  // finished one. `updated_at` MUST stay: readiness child-evidence
+  // completeness (`childEvidenceComplete`) requires a finite `updated_at` on
+  // every served child row — without it a stopped parent with ANY child row
+  // derives `unknown:child-evidence-incomplete` and holds its dispatch slot
+  // forever. NOT a row-filter or page (those break render's count/stuck +
   // the live-key diff).
   columns: [
     "job_id",
@@ -517,6 +521,7 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
     "duration_ms",
     "description",
     "last_event_id",
+    "updated_at",
   ],
   pk: "job_id",
   liveKeyColumns: ["job_id", "agent_id", "turn_seq"],

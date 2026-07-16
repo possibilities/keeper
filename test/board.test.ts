@@ -466,16 +466,18 @@ test("collapseSubagentsByName: out-of-order input still keeps max turn_seq", () 
   expect(g?.stuck).toBe(2);
 });
 
-test("collapseSubagentsByName: fn-697.2 safe-8 narrowed wire shape collapses losslessly", () => {
-  // fn-697.2 narrowed SUBAGENT_INVOCATIONS_DESCRIPTOR.columns; fn-1008 re-added
-  // `duration_ms` (load-bearing: it is half the canonical open-turn predicate),
-  // so the served set is now the safe-8 {job_id, subagent_type, turn_seq, ts,
-  // status, duration_ms, description, last_event_id}. The wire decode still does
-  // NOT surface agent_id / tool_use_id / prompt_chars / updated_at — those cells
-  // arrive `undefined`. This asserts the renderer's collapse (the heaviest
-  // consumer: ×N count + stuck-orphan detection + the surviving row's
-  // type/desc/status used by `subagentLinesFor`) is byte-identical when fed ONLY
-  // the safe-8, proving none of the 4 still-dropped columns is load-bearing.
+test("collapseSubagentsByName: safe-8 narrowed wire shape collapses losslessly", () => {
+  // SUBAGENT_INVOCATIONS_DESCRIPTOR serves a narrowed column set. The render
+  // collapse consumes only the safe-8 subset {job_id, subagent_type, turn_seq,
+  // ts, status, duration_ms, description, last_event_id}; the descriptor also
+  // serves `agent_id` (live-key diff) and `updated_at` (readiness
+  // child-evidence completeness), which render never reads. The wire decode
+  // does NOT surface tool_use_id / prompt_chars / last_disposition — those
+  // cells arrive `undefined`. This asserts the renderer's collapse (the
+  // heaviest consumer: ×N count + stuck-orphan detection + the surviving row's
+  // type/desc/status used by `subagentLinesFor`) is byte-identical when fed
+  // ONLY the safe-8, proving no dropped or render-unread column is
+  // load-bearing here.
   // Row shapes mirror a real trace: turn_seq=0 is a FINISHED `ok` (non-null
   // `duration_ms`), turn_seq=1 is the OPEN running orphan (NULL), turn_seq=2 is
   // the surviving close. Only the open orphan counts as stuck.

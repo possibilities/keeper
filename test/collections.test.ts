@@ -532,6 +532,36 @@ test("loadReadinessInputs exposes Dispatch claims separately from pending dispat
   db.close();
 });
 
+test("loadReadinessInputs: a stopped parent with a closed subagent child derives quiescent", () => {
+  // The readiness child-evidence gate (`childEvidenceComplete`) requires a
+  // finite `updated_at` on every served child row, so the descriptor MUST
+  // project it. This drives the full descriptor→runQuery→loadReadinessInputs→
+  // deriveHarnessActivities path: were the descriptor to drop `updated_at`,
+  // the closed child would arrive incomplete and the stopped parent would
+  // mis-derive `unknown:child-evidence-incomplete` — holding its dispatch
+  // slot forever — instead of `quiescent`.
+  expect(SUBAGENT_INVOCATIONS_DESCRIPTOR.columns).toContain("updated_at");
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // Real wall-clock seeding: the descriptor's `recencyBound` floor binds
+  // against `Date.now()` inside `runQuery`, so an epoch-anchored `ts` would
+  // fall outside the served window and dodge the child path entirely.
+  const now = Math.floor(Date.now() / 1000);
+  seedJob(db, "job-quiet", { state: "stopped" });
+  db.query(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, status, duration_ms,
+        last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, 'ok', 5000, ?, ?)`,
+  ).run("job-quiet", "agent-a", 1, now - 60, 9, now - 60);
+  const inputs = loadReadinessInputs(db, runQuery, now);
+  expect(inputs.harnessActivityByJobId.get("job-quiet")).toEqual({
+    status: "quiescent",
+    reason: "parent-quiescent",
+    reservation: null,
+  });
+  db.close();
+});
+
 test("getCollection resolves the builds collection (schema v64, fn-781)", () => {
   // Schema v64 (epic fn-781 task .1): the `keeper builds` buildbot dashboard
   // surface. One row per registered builder keyed by builder NAME (`project`),
