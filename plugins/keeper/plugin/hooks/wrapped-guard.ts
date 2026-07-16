@@ -597,11 +597,22 @@ function wrappedAgentViolation(
     "--stop-timeout",
     "--resume",
   ]);
+  // One-shot leg posture: a wrapped leg must not outlive its landed envelope —
+  // a resident leg holds live claims that wedge the wrapper's own commit-work.
+  const booleanOptions = new Set(["--reap-window-on-terminal"]);
+  const flags = new Set<string>();
   const positional: string[] = [];
   for (let index = 4; index < tokens.length; index += 1) {
     const token = tokens[index] as string;
     if (!token.startsWith("--")) {
       positional.push(token);
+      continue;
+    }
+    if (booleanOptions.has(token)) {
+      if (flags.has(token)) {
+        return `wrapped provider run option '${token}' is not permitted`;
+      }
+      flags.add(token);
       continue;
     }
     if (!valueOptions.has(token) || values.has(token)) {

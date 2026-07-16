@@ -48,6 +48,7 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     // delegation surface: the blocking leg launch + resume + wait + read (no shell
     // operators — a clean `keeper agent run` is the whole point of the courier)
     "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
+    "keeper agent run codex 'implement task' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --reap-window-on-terminal",
     "keeper agent run codex 'address the lint failure' --resume leg-fn-1-x.2 --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
     "keeper agent wait leg-fn-1-x.2",
     "keeper agent wait-for-stop leg-fn-1-x.2",
@@ -165,6 +166,8 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "keeper commit-work --task-id fn-1-other.9 'wrong task'",
     "keeper agent run claude 'escape' --model opus --system-file /tmp/c.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s",
     "keeper agent run codex 'unbound nested agent' --model gpt-5",
+    "keeper agent run codex 'dup reap flag' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --reap-window-on-terminal --reap-window-on-terminal",
+    "keeper agent run codex 'valueless boolean impostor' --preset gpt-5::high --system-file /tmp/contract.md --session wrapped --name fn-1-x.2 --output \"$KEEPER_WRAPPED_ENVELOPE\" --stop-timeout 300s --detach",
     "git push",
     "git rm src/x.ts",
     "git mv a b",
