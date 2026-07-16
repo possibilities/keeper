@@ -34,5 +34,7 @@ Extend test/handoff.test.ts: flag parsing, usage errors (triple without capture,
 - [ ] --help/--agent-help document the flags, their capture-only constraint, and the exit codes
 
 ## Done summary
-
+Captured handoff results surfaced through the handoff/descriptor CLIs (+ fast-test lint update); worker-verified full test:gate 9167/0 + operator re-run handoff suite 25/0; landed via plain-git escape (multi-leg claim wedge, sessions discharged) as e5d331b7 on the epic lane
 ## Evidence
+- Commits: e5d331b7
+- Tests: worker: test:gate 9167/0, bun test handoff 25/0 (operator re-run in lane)
