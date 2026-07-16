@@ -40,5 +40,5 @@ Truth-table the helper's outcome classification (spawn-throw/ENOENT → permanen
 - [ ] The touched suites and the named deterministic gate pass.
 
 ## Done summary
-
+Consolidated 8+ botctl page spawn sites (daemon deconflict/work-fan-in/unblock/shared-checkout/repair sweeps plus backup and maintenance-worker relay sinks) behind one sendBotctlPage + notifyHuman helper. A spawn-throw/ENOENT classifies as permanent_failure and mints an idempotent, producer-owned paging-channel-down distress row (dispatch-failure-key + gcUnretryableDispatchFailures exemption); a non-zero exit stays transient and mints nothing; a successful page level-clears the row. notify_failed is still returned on any non-success outcome and never stamps human_notified_at, preserving the re-sweep contract. Added docs/problem-codes.md row and truth-table tests in test/daemon.test.ts.
 ## Evidence
