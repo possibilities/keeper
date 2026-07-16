@@ -74,6 +74,7 @@ import {
   buildKeeperAgentLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
+  buildTmuxServerGenerationArgs,
   keeperAgentLaunch,
   localeDefaultedEnv,
   MANAGED_EXEC_SESSION,
@@ -850,16 +851,38 @@ export function renderSnapshotScript(
  */
 export type ProbeGenerationFn = () => string | null;
 
-export const defaultProbeGeneration: ProbeGenerationFn = () =>
-  probeServerGeneration((cmd) =>
-    Bun.spawnSync(cmd, {
-      stdout: "pipe",
-      stderr: "ignore",
-      env: localeDefaultedEnv(
-        process.env as Record<string, string | undefined>,
-      ),
-    }),
-  );
+/** A wedged default tmux server degrades the restore-generation read instead of
+ * freezing every `keeper tabs` / `keeper setup-tmux` caller. */
+const TABS_TMUX_PROBE_TIMEOUT_MS = 5_000;
+
+export interface BoundedGenerationProbeResult {
+  readonly success: boolean;
+  readonly exitCode: number | null;
+  readonly stdout: Buffer;
+  readonly exitedDueToTimeout?: boolean;
+}
+
+/** Keep an inconclusive timeout/signal distinct from confirmed server absence.
+ * `null` tells topology selection that the prior generation is dead; throwing
+ * instead prevents a live-but-wedged generation from becoming restorable. */
+export function generationFromBoundedProbe(
+  result: BoundedGenerationProbeResult,
+): string | null {
+  if (result.exitedDueToTimeout === true || result.exitCode === null) {
+    throw new Error("tmux generation probe timed out or was signal-killed");
+  }
+  return probeServerGeneration(() => result);
+}
+
+export const defaultProbeGeneration: ProbeGenerationFn = () => {
+  const result = Bun.spawnSync(buildTmuxServerGenerationArgs(), {
+    stdout: "pipe",
+    stderr: "ignore",
+    timeout: TABS_TMUX_PROBE_TIMEOUT_MS,
+    env: localeDefaultedEnv(process.env as Record<string, string | undefined>),
+  });
+  return generationFromBoundedProbe(result);
+};
 
 // ---------------------------------------------------------------------------
 // Bounded richness-ranked generation selection (the `restore` default)

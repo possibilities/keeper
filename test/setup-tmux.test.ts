@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildDashNewSessionArgs,
+  buildDashServerIdentityArgs,
   buildDashSplitArgs,
   buildHasSessionArgs,
   buildKillDashServerArgs,
@@ -14,6 +15,7 @@ import {
   buildTabsRestoreArgv,
   buildWorkNewSessionArgs,
   DASH_SUB_PANES,
+  type DashServerRecovery,
   dashPaneArgv,
   dashTmux,
   type GuardFs,
@@ -21,11 +23,13 @@ import {
   guardConfSource,
   HELP,
   isBusyCommand,
+  isInsideDashServer,
   isRestoreSessionSkeleton,
   main,
   notesConfLink,
   notesConfSource,
   parseBusyPanes,
+  parseDashServerIdentity,
   type RestoreOffer,
   type RestoreOfferBundle,
   type RestoreRetryStore,
@@ -33,9 +37,13 @@ import {
   renderBusyTable,
   renderRestoreOutcome,
   resolveDashSize,
+  SETUP_TMUX_COMMAND_TIMEOUT_MS,
+  SETUP_TMUX_NEW_SESSION_TIMEOUT_MS,
+  SETUP_TMUX_RESTORE_TIMEOUT_MS,
   type SyncSpawnFn,
   type SyncSpawnResult,
   selectionToOfferBundle,
+  setupTmuxSpawnTimeoutMs,
   shellConfLink,
   shellConfSource,
   sweepBusyPanes,
@@ -145,6 +153,52 @@ describe("dashTmux helper", () => {
       "display",
       "-p",
     ]);
+  });
+});
+
+describe("dash server identity and self-teardown guard", () => {
+  test("identity probe stays on the dedicated server", () => {
+    expect(buildDashServerIdentityArgs()).toEqual([
+      "tmux",
+      "-L",
+      "dash",
+      "display-message",
+      "-p",
+      "#{pid} #{socket_path}",
+    ]);
+  });
+
+  test("parses only a positive pid and absolute dash socket", () => {
+    expect(
+      parseDashServerIdentity("4242 /private/tmp/tmux-501/dash\n"),
+    ).toEqual({ pid: 4242, socketPath: "/private/tmp/tmux-501/dash" });
+    expect(parseDashServerIdentity("1 /private/tmp/tmux-501/dash")).toBeNull();
+    expect(parseDashServerIdentity("4242 relative/dash")).toBeNull();
+    expect(
+      parseDashServerIdentity("4242 /private/tmp/tmux-501/default"),
+    ).toBeNull();
+  });
+
+  test("detects only the current dash socket from TMUX", () => {
+    expect(isInsideDashServer("/private/tmp/tmux-501/dash,4242,0")).toBe(true);
+    expect(isInsideDashServer("/private/tmp/tmux-501/default,4242,0")).toBe(
+      false,
+    );
+    expect(isInsideDashServer(undefined)).toBe(false);
+  });
+});
+
+describe("bounded setup spawn policy", () => {
+  test("bounds ordinary tmux, server creation, and restore separately", () => {
+    expect(setupTmuxSpawnTimeoutMs(["tmux", "list-sessions"])).toBe(
+      SETUP_TMUX_COMMAND_TIMEOUT_MS,
+    );
+    expect(setupTmuxSpawnTimeoutMs(buildDashNewSessionArgs(200, 50))).toBe(
+      SETUP_TMUX_NEW_SESSION_TIMEOUT_MS,
+    );
+    expect(
+      setupTmuxSpawnTimeoutMs(buildTabsRestoreArgv("work", "generation")),
+    ).toBe(SETUP_TMUX_RESTORE_TIMEOUT_MS);
   });
 });
 
@@ -467,6 +521,18 @@ describe("sweepBusyPanes", () => {
     );
     expect(sweepBusyPanes(spawn)).toEqual([]);
   });
+
+  test("a timed-out sweep is never misclassified as an absent safe-to-kill session", () => {
+    const spawn: SyncSpawnFn = () => ({
+      exitCode: null,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from(""),
+      exitedDueToTimeout: true,
+    });
+    expect(() => sweepBusyPanes(spawn)).toThrow(
+      `command timed out after ${SETUP_TMUX_COMMAND_TIMEOUT_MS}ms`,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -763,6 +829,14 @@ describe("renderRestoreOutcome", () => {
       failResult(null, "killed"),
     );
     expect(line).toContain("restore FAILED (exit signal): killed");
+  });
+
+  test("timeout metadata ⇒ FAILED (exit timeout)", () => {
+    const line = renderRestoreOutcome("work", offer, {
+      ...failResult(null, "command timed out"),
+      exitedDueToTimeout: true,
+    });
+    expect(line).toContain("restore FAILED (exit timeout): command timed out");
   });
 
   test("no picked generation (fallback offer) ⇒ success line without generation context", () => {
@@ -1468,11 +1542,14 @@ const spawnedDashKillServer = (calls: string[][]): boolean =>
 async function runProvision(opts: {
   spawn: SyncSpawnFn;
   argv?: string[];
-}): Promise<void> {
+  dashRecovery?: DashServerRecovery;
+}): Promise<{ stdout: string; stderr: string }> {
   const savedStdinTTY = process.stdin.isTTY;
   const savedStdoutTTY = process.stdout.isTTY;
   const savedOut = process.stdout.write;
   const savedErr = process.stderr.write;
+  const stdout: string[] = [];
+  const stderr: string[] = [];
   Object.defineProperty(process.stdin, "isTTY", {
     value: false,
     writable: true,
@@ -1483,14 +1560,23 @@ async function runProvision(opts: {
     writable: true,
     configurable: true,
   });
-  process.stdout.write = (() => true) as typeof process.stdout.write;
-  process.stderr.write = (() => true) as typeof process.stderr.write;
+  process.stdout.write = ((value: string | Uint8Array) => {
+    stdout.push(String(value));
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((value: string | Uint8Array) => {
+    stderr.push(String(value));
+    return true;
+  }) as typeof process.stderr.write;
   try {
-    await main(opts.argv ?? [], opts.spawn, () => ({
-      offers: {},
-      ambiguous: false,
-      eligible: [],
-    }));
+    await main(
+      opts.argv ?? [],
+      opts.spawn,
+      () => ({ offers: {}, ambiguous: false, eligible: [] }),
+      undefined,
+      undefined,
+      opts.dashRecovery,
+    );
   } finally {
     Object.defineProperty(process.stdin, "isTTY", {
       value: savedStdinTTY,
@@ -1505,6 +1591,7 @@ async function runProvision(opts: {
     process.stdout.write = savedOut;
     process.stderr.write = savedErr;
   }
+  return { stdout: stdout.join(""), stderr: stderr.join("") };
 }
 
 describe("main() provision / sweep / teardown roles", () => {
@@ -1535,6 +1622,182 @@ describe("main() provision / sweep / teardown roles", () => {
     expect(calls.some((c) => c[0] === "tmux" && c[1] === "kill-server")).toBe(
       false,
     );
+  });
+
+  test("a timed-out dash kill recovers only through the injected identity owner, then rebuilds", async () => {
+    const calls: string[][] = [];
+    const recoveryCalls: string[] = [];
+    const recorded: Array<{ pid: number; socketPath: string }> = [];
+    const dashRecovery: DashServerRecovery = {
+      clear: () => recoveryCalls.push("clear"),
+      recoverTimedOutServer: () => {
+        recoveryCalls.push("recover");
+        return { recovered: true, detail: "terminated recorded server" };
+      },
+      record: (identity) => {
+        recoveryCalls.push("record");
+        recorded.push(identity);
+      },
+    };
+    const spawn: SyncSpawnFn = (cmd) => {
+      calls.push([...cmd]);
+      if (cmd.join("\0") === buildKillDashServerArgs().join("\0")) {
+        return {
+          exitCode: null,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(""),
+          exitedDueToTimeout: true,
+        };
+      }
+      if (cmd.join("\0") === buildDashServerIdentityArgs().join("\0")) {
+        return {
+          exitCode: 0,
+          stdout: Buffer.from(`${process.pid} /private/tmp/keeper-test/dash\n`),
+          stderr: Buffer.from(""),
+        };
+      }
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("no session"),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(cmd.includes("new-session") ? "%0" : ""),
+        stderr: Buffer.from(""),
+      };
+    };
+
+    const output = await runProvision({ spawn, dashRecovery });
+    expect(recoveryCalls).toEqual(["recover", "record"]);
+    expect(recorded).toHaveLength(1);
+    expect(
+      calls.some((cmd) => cmd[1] === "-L" && cmd[3] === "new-session"),
+    ).toBe(true);
+    expect(output.stderr).toContain("recovered unresponsive dash server");
+    expect(output.stdout).toContain("'dash' rebuilt");
+  });
+
+  test("a timed-out dash kill with no recorded owner fails open without claiming a rebuild", async () => {
+    const calls: string[][] = [];
+    const dashRecovery: DashServerRecovery = {
+      clear: () => undefined,
+      record: () => undefined,
+      recoverTimedOutServer: () => ({
+        recovered: false,
+        detail: "identity mismatch",
+      }),
+    };
+    const spawn: SyncSpawnFn = (cmd) => {
+      calls.push([...cmd]);
+      if (cmd.join("\0") === buildKillDashServerArgs().join("\0")) {
+        return {
+          exitCode: null,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(""),
+          exitedDueToTimeout: true,
+        };
+      }
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("no session"),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from(""),
+      };
+    };
+
+    const output = await runProvision({ spawn, dashRecovery });
+    expect(
+      calls.some((cmd) => cmd[1] === "-L" && cmd[3] === "new-session"),
+    ).toBe(false);
+    expect(mintedWorkSession(calls, "work")).toBe(true);
+    expect(output.stderr).toContain("identity-guarded recovery refused");
+    expect(output.stdout).toContain("'dash' is unavailable");
+    expect(output.stdout).not.toContain("'dash' rebuilt");
+  });
+
+  test("the macOS tmux ENOENT connection diagnostic is confirmed absence and permits first-run creation", async () => {
+    const calls: string[][] = [];
+    const spawn: SyncSpawnFn = (cmd) => {
+      calls.push([...cmd]);
+      if (cmd.join("\0") === buildKillDashServerArgs().join("\0")) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(
+            "error connecting to /private/tmp/tmux-501/dash (No such file or directory)\n",
+          ),
+        };
+      }
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("no server running"),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(cmd.includes("new-session") ? "%0" : ""),
+        stderr: Buffer.from(""),
+      };
+    };
+
+    const output = await runProvision({ spawn });
+    expect(
+      calls.some((cmd) => cmd[1] === "-L" && cmd[3] === "new-session"),
+    ).toBe(true);
+    expect(output.stdout).toContain("'dash' rebuilt");
+  });
+
+  test("an unexpected non-zero kill-server result preserves the lease and issues no further dash commands", async () => {
+    const calls: string[][] = [];
+    let clearCalls = 0;
+    const dashRecovery: DashServerRecovery = {
+      clear: () => {
+        clearCalls++;
+      },
+      record: () => undefined,
+      recoverTimedOutServer: () => ({ recovered: true, detail: "unused" }),
+    };
+    const spawn: SyncSpawnFn = (cmd) => {
+      calls.push([...cmd]);
+      if (cmd.join("\0") === buildKillDashServerArgs().join("\0")) {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("permission denied"),
+        };
+      }
+      if (cmd[1] === "has-session") {
+        return {
+          exitCode: 1,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("no session"),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from(""),
+      };
+    };
+
+    const output = await runProvision({ spawn, dashRecovery });
+    expect(clearCalls).toBe(0);
+    expect(
+      calls.some((cmd) => cmd[1] === "-L" && cmd[3] === "new-session"),
+    ).toBe(false);
+    expect(output.stderr).toContain("permission denied");
+    expect(output.stdout).toContain("'dash' is unavailable");
   });
 
   test("the sweep/kill set is [work, autopilot] under --kill-sessions", async () => {
@@ -1590,15 +1853,19 @@ describe("main() provision / sweep / teardown roles", () => {
         stderr: Buffer.from(fail ? "no server" : ""),
       };
     };
+    let output: { stdout: string; stderr: string };
     try {
-      await runProvision({ spawn });
+      output = await runProvision({ spawn });
     } finally {
       process.exit = savedExit;
     }
     // Never exited (no process.exit(1) from the dash failure).
     expect(exited).toBe(false);
-    // work still provisioned despite the dash failure.
+    // work still provisioned despite the dash failure, without a false rebuild
+    // success claim.
     expect(mintedWorkSession(calls, "work")).toBe(true);
+    expect(output.stdout).toContain("'dash' is unavailable");
+    expect(output.stdout).not.toContain("'dash' rebuilt");
   });
 });
 

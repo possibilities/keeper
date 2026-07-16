@@ -58,6 +58,7 @@ import {
   autopilotGateDecision,
   claudeAttachEvidenceFromDb,
   countOutcomes,
+  generationFromBoundedProbe,
   type IntentSink,
   loadCurrentSetForDump,
   loadGenerationList,
@@ -1422,6 +1423,38 @@ test("selectRestoreGeneration excludes generations idle past the cutoff", () => 
 // ---------------------------------------------------------------------------
 // load* readers over a seeded keeper.db (daemon-down, no socket)
 // ---------------------------------------------------------------------------
+
+test("bounded generation probe keeps timeout/signal inconclusive instead of marking the live generation dead", () => {
+  expect(() =>
+    generationFromBoundedProbe({
+      success: false,
+      exitCode: null,
+      stdout: Buffer.from(""),
+      exitedDueToTimeout: true,
+    }),
+  ).toThrow("timed out or was signal-killed");
+  expect(() =>
+    generationFromBoundedProbe({
+      success: false,
+      exitCode: null,
+      stdout: Buffer.from(""),
+    }),
+  ).toThrow("timed out or was signal-killed");
+  expect(
+    generationFromBoundedProbe({
+      success: false,
+      exitCode: 1,
+      stdout: Buffer.from(""),
+    }),
+  ).toBeNull();
+  expect(
+    generationFromBoundedProbe({
+      success: true,
+      exitCode: 0,
+      stdout: Buffer.from("4242:777\n"),
+    }),
+  ).toBe("4242:777");
+});
 
 test("loadRestorePlan: topology-anchored — offers ONLY the dying-gen snapshot panes", () => {
   seedJob(kdb.db, {

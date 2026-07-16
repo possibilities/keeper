@@ -7,7 +7,8 @@
  * default server (one shell window). `autopilot` is daemon-minted on demand on
  * the default server, so setup-tmux does not create it — but it is still swept
  * for busy panes and torn down by `--kill-sessions`. It NEVER attaches or
- * `switch-client`s, so it is safe to run inside or outside tmux.
+ * `switch-client`s. It may run outside tmux or inside another server, but
+ * refuses to destroy the `dash` server from one of that same server's panes.
  * `--kill-sessions` tears the `work`/`autopilot` default-server sessions down
  * first, gated by a busy-pane confirmation prompt; the dash server is always
  * rebuilt regardless of the flag.
@@ -36,9 +37,10 @@
  */
 
 import * as fs from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { probeChildStartTime } from "../src/birth-record";
 import { resolveDbPath, resolveRestorePath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import type { GenerationSummary } from "../src/restore-set";
@@ -64,8 +66,9 @@ main-vertical) and provisions only the human 'work' session on the default
 server (one shell window, stamped with KEEPER_TMUX_SESSION). 'autopilot' is
 daemon-minted on demand, so it is not created here — but it is still swept and
 torn down by --kill-sessions. An existing 'work' session is left untouched.
-NEVER attaches or switch-clients — safe to run inside or outside tmux. Attach
-the dashboard with: tmux -L dash attach.
+NEVER attaches or switch-clients. It is safe outside tmux or inside another
+tmux server; from a pane on the dash server itself it refuses the self-teardown.
+Attach the dashboard with: tmux -L dash attach.
 
 Also symlinks Keeper's tmux drop-ins idempotently and fail-open:
   tmux/keeper-notes.conf → ~/.config/tmux/conf.d/keeper-notes.conf
@@ -136,6 +139,13 @@ const KEEPER_DIR = `${HOME_DIR}/code/keeper`;
 const FALLBACK_WIDTH = 200;
 const FALLBACK_HEIGHT = 50;
 
+/** Every setup subprocess is bounded. Ordinary tmux probes and mutations are
+ * cheap; server/session creation gets startup slack; an accepted tab restore
+ * may launch several agents and gets a much larger, but still finite, bound. */
+export const SETUP_TMUX_COMMAND_TIMEOUT_MS = 5_000;
+export const SETUP_TMUX_NEW_SESSION_TIMEOUT_MS = 15_000;
+export const SETUP_TMUX_RESTORE_TIMEOUT_MS = 300_000;
+
 /** Foreground commands that mean an idle shell, NOT a busy pane. A leading `-`
  *  (login shell) is stripped before the membership test. */
 const SHELL_COMMANDS = new Set(["zsh", "bash", "sh", "fish", "dash"]);
@@ -149,18 +159,37 @@ export interface SyncSpawnResult {
   readonly exitCode: number | null;
   readonly stdout: Buffer;
   readonly stderr: Buffer;
+  readonly exitedDueToTimeout?: boolean;
+  readonly signalCode?: string | number | null;
+}
+
+export interface SyncSpawnOptions {
+  readonly env?: Record<string, string>;
+  readonly timeout?: number;
 }
 
 /** Injectable sync-spawn seam matching `Bun.spawnSync`. */
 export type SyncSpawnFn = (
   cmd: string[],
-  options?: { env?: Record<string, string> },
+  options?: SyncSpawnOptions,
 ) => SyncSpawnResult;
+
+/** Pure per-command timeout policy used by both production and injected tests. */
+export function setupTmuxSpawnTimeoutMs(cmd: readonly string[]): number {
+  if (cmd[0] === "keeper" && cmd[1] === "tabs" && cmd[2] === "restore") {
+    return SETUP_TMUX_RESTORE_TIMEOUT_MS;
+  }
+  if (cmd.includes("new-session")) {
+    return SETUP_TMUX_NEW_SESSION_TIMEOUT_MS;
+  }
+  return SETUP_TMUX_COMMAND_TIMEOUT_MS;
+}
 
 const defaultSpawn: SyncSpawnFn = (cmd, options) =>
   Bun.spawnSync(cmd, {
     stdout: "pipe",
     stderr: "pipe",
+    timeout: options?.timeout ?? setupTmuxSpawnTimeoutMs(cmd),
     ...(options?.env != null ? { env: options.env } : {}),
   }) as unknown as SyncSpawnResult;
 
@@ -205,6 +234,295 @@ const defaultGuardFs: GuardFs = {
   },
 };
 
+export interface DashServerIdentity {
+  readonly pid: number;
+  readonly startTime: string;
+  readonly socketPath: string;
+}
+
+export interface DashRecoveryResult {
+  readonly recovered: boolean;
+  readonly detail: string;
+}
+
+/** Injectable ownership store + identity-guarded recovery seam. Tests use a
+ * fake; production persists a pid/start-time and socket inode. */
+export interface DashServerRecovery {
+  clear(): void;
+  record(identity: DashServerIdentity): void;
+  recoverTimedOutServer(): DashRecoveryResult;
+}
+
+interface DashServerLease extends DashServerIdentity {
+  readonly schema_version: 1;
+  readonly socketDev: string;
+  readonly socketIno: string;
+}
+
+export function resolveDashServerLeasePath(): string {
+  return join(dirname(resolveRestorePath()), "dash-tmux-server.json");
+}
+
+function socketIdentity(
+  socketPath: string,
+): { socketDev: string; socketIno: string } | null {
+  try {
+    const stat = fs.lstatSync(socketPath, { bigint: true });
+    if (!stat.isSocket()) return null;
+    return { socketDev: String(stat.dev), socketIno: String(stat.ino) };
+  } catch {
+    return null;
+  }
+}
+
+function pidOwnsSocket(pid: number, socketPath: string): boolean {
+  try {
+    const result = Bun.spawnSync(
+      ["lsof", "-nP", "-a", "-p", String(pid), "-U", "-Fn"],
+      {
+        stdout: "pipe",
+        stderr: "ignore",
+        timeout: 1_000,
+      },
+    );
+    if (result.exitedDueToTimeout || result.exitCode !== 0) return false;
+    return result.stdout
+      .toString()
+      .split("\n")
+      .some((line) => line === `n${socketPath}`);
+  } catch {
+    return false;
+  }
+}
+
+function socketHasAnyOwner(socketPath: string): boolean {
+  try {
+    const result = Bun.spawnSync(["lsof", "-nP", "-U", "-Fn"], {
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: 1_000,
+    });
+    if (result.exitedDueToTimeout || result.exitCode !== 0) return true;
+    return result.stdout
+      .toString()
+      .split("\n")
+      .some((line) => line === `n${socketPath}`);
+  } catch {
+    // Inconclusive ownership fails safe: never unlink.
+    return true;
+  }
+}
+
+function parseDashServerLease(raw: string): DashServerLease | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const lease = value as Record<string, unknown>;
+  if (
+    lease.schema_version !== 1 ||
+    !Number.isSafeInteger(lease.pid) ||
+    (lease.pid as number) <= 1 ||
+    typeof lease.startTime !== "string" ||
+    lease.startTime === "" ||
+    typeof lease.socketPath !== "string" ||
+    !isAbsolute(lease.socketPath) ||
+    basename(lease.socketPath) !== DASH_SESSION ||
+    typeof lease.socketDev !== "string" ||
+    lease.socketDev === "" ||
+    typeof lease.socketIno !== "string" ||
+    lease.socketIno === ""
+  ) {
+    return null;
+  }
+  return lease as unknown as DashServerLease;
+}
+
+function unlinkRecordedSocket(lease: DashServerLease): void {
+  const current = socketIdentity(lease.socketPath);
+  if (
+    current?.socketDev !== lease.socketDev ||
+    current.socketIno !== lease.socketIno ||
+    socketHasAnyOwner(lease.socketPath)
+  ) {
+    return;
+  }
+  try {
+    fs.unlinkSync(lease.socketPath);
+  } catch {
+    // A concurrently completed teardown already removed it.
+  }
+}
+
+function fileDashServerRecovery(
+  path = resolveDashServerLeasePath(),
+): DashServerRecovery {
+  const clear = (): void => {
+    try {
+      fs.unlinkSync(path);
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "ENOENT") throw error;
+    }
+  };
+  const readLease = (): DashServerLease | null => {
+    try {
+      return parseDashServerLease(fs.readFileSync(path, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  return {
+    clear,
+    record: (identity) => {
+      const socket = socketIdentity(identity.socketPath);
+      if (socket === null) {
+        throw new Error("dash socket is absent or not a Unix socket");
+      }
+      const lease: DashServerLease = {
+        schema_version: 1,
+        ...identity,
+        ...socket,
+      };
+      fs.mkdirSync(dirname(path), { recursive: true });
+      const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(lease)}\n`, { mode: 0o600 });
+      fs.renameSync(tmp, path);
+    },
+    recoverTimedOutServer: () => {
+      const lease = readLease();
+      if (lease === null) {
+        return {
+          recovered: false,
+          detail: "no valid recorded dash-server identity",
+        };
+      }
+
+      type ProcessIdentityState = "owned" | "gone" | "foreign" | "inconclusive";
+      const probeIdentity = (): ProcessIdentityState => {
+        try {
+          process.kill(lease.pid, 0);
+        } catch (error) {
+          return (error as { code?: string })?.code === "ESRCH"
+            ? "gone"
+            : "inconclusive";
+        }
+        const startTime = probeChildStartTime(lease.pid);
+        if (startTime === null) return "inconclusive";
+        return startTime === lease.startTime ? "owned" : "foreign";
+      };
+
+      let state = probeIdentity();
+      if (state === "inconclusive") {
+        return {
+          recovered: false,
+          detail: `could not verify recorded pid ${lease.pid}`,
+        };
+      }
+      if (state !== "owned") {
+        // The recorded process identity is already gone. Do not unlink by pathname:
+        // a concurrent replacement may now own it. A new tmux client handles a
+        // genuinely stale socket itself.
+        clear();
+        return { recovered: true, detail: "recorded dash server was gone" };
+      }
+      const recordedSocketStillOwned = (): boolean => {
+        const socket = socketIdentity(lease.socketPath);
+        return (
+          socket?.socketDev === lease.socketDev &&
+          socket.socketIno === lease.socketIno &&
+          pidOwnsSocket(lease.pid, lease.socketPath)
+        );
+      };
+      if (!recordedSocketStillOwned()) {
+        return {
+          recovered: false,
+          detail: `recorded socket identity is not owned by pid ${lease.pid}`,
+        };
+      }
+
+      try {
+        process.kill(lease.pid, "SIGTERM");
+      } catch (error) {
+        return {
+          recovered: false,
+          detail: `failed to SIGTERM recorded pid ${lease.pid}: ${String(error)}`,
+        };
+      }
+      let deadline = Date.now() + 2_000;
+      while (state === "owned" && Date.now() < deadline) {
+        Bun.sleepSync(25);
+        state = probeIdentity();
+      }
+      if (state === "inconclusive") {
+        return {
+          recovered: false,
+          detail: `lost process identity after SIGTERM for pid ${lease.pid}`,
+        };
+      }
+      if (state === "owned") {
+        // If TERM released the recorded socket, rebuilding may proceed without
+        // any stronger signal. Otherwise re-check process + socket ownership as
+        // close to SIGKILL as the platform permits.
+        if (!recordedSocketStillOwned()) {
+          clear();
+          return {
+            recovered: true,
+            detail: `recorded pid ${lease.pid} released the dash socket`,
+          };
+        }
+        state = probeIdentity();
+        if (state !== "owned") {
+          if (state === "inconclusive") {
+            return {
+              recovered: false,
+              detail: `lost process identity before SIGKILL for pid ${lease.pid}`,
+            };
+          }
+          clear();
+          return {
+            recovered: true,
+            detail: `recorded pid ${lease.pid} exited after SIGTERM`,
+          };
+        }
+        try {
+          process.kill(lease.pid, "SIGKILL");
+        } catch (error) {
+          return {
+            recovered: false,
+            detail: `failed to SIGKILL recorded pid ${lease.pid}: ${String(error)}`,
+          };
+        }
+        deadline = Date.now() + 1_000;
+        while (state === "owned" && Date.now() < deadline) {
+          Bun.sleepSync(25);
+          state = probeIdentity();
+        }
+      }
+      if (state === "inconclusive") {
+        return {
+          recovered: false,
+          detail: `lost process identity after SIGKILL for pid ${lease.pid}`,
+        };
+      }
+      if (state === "owned") {
+        return {
+          recovered: false,
+          detail: `recorded pid ${lease.pid} survived SIGKILL`,
+        };
+      }
+      unlinkRecordedSocket(lease);
+      clear();
+      return {
+        recovered: true,
+        detail: `terminated recorded pid ${lease.pid}`,
+      };
+    },
+  };
+}
+
 // ===========================================================================
 // Pure argv builders — `zsh -ic` triples, never shell strings.
 // ===========================================================================
@@ -239,6 +557,38 @@ export function buildKillSessionArgs(session: string): string[] {
  *  first-ever run with no dash server yet is fine. */
 export function buildKillDashServerArgs(): string[] {
   return dashTmux("kill-server");
+}
+
+/** Read the dedicated server's pid and socket after a successful rebuild so a
+ * later timed-out `kill-server` can fence that recorded process. */
+export function buildDashServerIdentityArgs(): string[] {
+  return dashTmux("display-message", "-p", "#{pid} #{socket_path}");
+}
+
+/** Parse `<pid> <absolute-socket-path>` without assuming the path has no spaces. */
+export function parseDashServerIdentity(
+  output: string,
+): { pid: number; socketPath: string } | null {
+  const match = output.trim().match(/^(\d+)\s+(.+)$/s);
+  if (match === null) return null;
+  const pid = Number.parseInt(match[1] as string, 10);
+  const socketPath = (match[2] as string).trim();
+  if (
+    !Number.isSafeInteger(pid) ||
+    pid <= 1 ||
+    !isAbsolute(socketPath) ||
+    basename(socketPath) !== DASH_SESSION
+  ) {
+    return null;
+  }
+  return { pid, socketPath };
+}
+
+/** True when setup itself is hosted by the server it would destroy. */
+export function isInsideDashServer(tmuxEnv: string | undefined): boolean {
+  if (tmuxEnv == null || tmuxEnv === "") return false;
+  const socketPath = tmuxEnv.split(",", 1)[0] ?? "";
+  return isAbsolute(socketPath) && basename(socketPath) === DASH_SESSION;
 }
 
 /** `has-session -t =<session>` existence probe. Stderr is captured by the
@@ -488,7 +838,7 @@ export function resolveDashSize(spawn: SyncSpawnFn): {
 } {
   const probe = (metric: string, cap: string, fallback: number): number => {
     if (process.env.TMUX != null && process.env.TMUX !== "") {
-      const r = spawn(buildDisplayMetricArgs(metric));
+      const r = run(spawn, buildDisplayMetricArgs(metric));
       if (r.exitCode === 0) {
         const n = parseSize(r.stdout.toString());
         if (n != null) {
@@ -496,7 +846,7 @@ export function resolveDashSize(spawn: SyncSpawnFn): {
         }
       }
     }
-    const t = spawn(buildTputArgs(cap));
+    const t = run(spawn, buildTputArgs(cap));
     if (t.exitCode === 0) {
       const n = parseSize(t.stdout.toString());
       if (n != null) {
@@ -515,10 +865,13 @@ export function resolveDashSize(spawn: SyncSpawnFn): {
 // Spawn-and-act layer
 // ===========================================================================
 
+type TmuxFailureKind = "exit" | "signal" | "timeout" | "spawn";
+
 class TmuxError extends Error {
   constructor(
     readonly argv: string[],
     readonly stderr: string,
+    readonly kind: TmuxFailureKind = "exit",
   ) {
     super(`tmux failed: ${argv.join(" ")}\n${stderr}`);
     this.name = "TmuxError";
@@ -526,25 +879,47 @@ class TmuxError extends Error {
 }
 
 /** Run a tmux/tput command and return its result; surface ENOENT as a clear
- *  "tmux not found" error rather than a stack trace. */
+ *  "tmux not found" error rather than a stack trace. Timeout and signal death
+ *  are distinct from an ordinary non-zero exit, so callers never mistake a
+ *  wedged probe for "server/session absent". */
 function run(
   spawn: SyncSpawnFn,
   argv: string[],
   env?: Record<string, string>,
 ): SyncSpawnResult {
+  const timeout = setupTmuxSpawnTimeoutMs(argv);
+  let result: SyncSpawnResult;
   try {
-    return spawn(argv, env != null ? { env } : undefined);
+    result = spawn(argv, {
+      timeout,
+      ...(env != null ? { env } : {}),
+    });
   } catch (e) {
     const msg =
       (e as { code?: string })?.code === "ENOENT"
         ? `keeper setup-tmux: '${argv[0]}' not found on PATH`
         : `keeper setup-tmux: failed to spawn ${argv[0]}: ${String(e)}`;
-    throw new TmuxError(argv, msg);
+    throw new TmuxError(argv, msg, "spawn");
   }
+  if (result.exitedDueToTimeout === true) {
+    throw new TmuxError(
+      argv,
+      `command timed out after ${timeout}ms`,
+      "timeout",
+    );
+  }
+  if (result.exitCode === null) {
+    throw new TmuxError(
+      argv,
+      `command killed by signal ${result.signalCode ?? "unknown"}`,
+      "signal",
+    );
+  }
+  return result;
 }
 
-/** Run a command that MUST succeed; throw `TmuxError` (exit-code null = signal
- *  kill = failure) so `main` can fail loud with the argv + stderr. */
+/** Run a command that MUST succeed; throw `TmuxError` so `main` can fail loud
+ *  with the argv + stderr. */
 function runChecked(
   spawn: SyncSpawnFn,
   argv: string[],
@@ -560,14 +935,80 @@ function runChecked(
 /** Rebuild the dash session from scratch on its dedicated `-L dash` server:
  *  unconditional kill-server, sized new-session, main-pane-width, the four
  *  splits each followed by a layout pass, then re-focus the board pane by its
- *  captured id. */
-function rebuildDash(spawn: SyncSpawnFn): void {
-  // Unconditional dash-server kill — any non-zero (no server yet) is fine.
-  run(spawn, buildKillDashServerArgs());
+ *  captured id. A timed-out kill may terminate only the recycle-safe server
+ *  identity recorded by an earlier successful rebuild. */
+function rebuildDash(spawn: SyncSpawnFn, recovery?: DashServerRecovery): void {
+  try {
+    const result = run(spawn, buildKillDashServerArgs());
+    const stderr = result.stderr.toString().toLowerCase();
+    const confirmedAbsent =
+      result.exitCode !== 0 &&
+      (stderr.includes("no server running") ||
+        stderr.includes("failed to connect") ||
+        (stderr.includes("error connecting to") &&
+          stderr.includes("no such file or directory")));
+    if (result.exitCode !== 0 && !confirmedAbsent) {
+      throw new TmuxError(
+        buildKillDashServerArgs(),
+        result.stderr.toString() ||
+          `kill-server exited ${String(result.exitCode)} without a confirmed no-server result`,
+      );
+    }
+    try {
+      recovery?.clear();
+    } catch (error) {
+      process.stderr.write(
+        `keeper setup-tmux: could not clear stale dash recovery identity — ${String(error)}\n`,
+      );
+    }
+  } catch (error) {
+    if (
+      !(error instanceof TmuxError) ||
+      error.kind !== "timeout" ||
+      !recovery
+    ) {
+      throw error;
+    }
+    const result = recovery.recoverTimedOutServer();
+    if (!result.recovered) {
+      throw new TmuxError(
+        error.argv,
+        `${error.stderr}; identity-guarded recovery refused: ${result.detail}`,
+        "timeout",
+      );
+    }
+    process.stderr.write(
+      `keeper setup-tmux: recovered unresponsive dash server — ${result.detail}\n`,
+    );
+  }
 
   const { width, height } = resolveDashSize(spawn);
   const boardPane = runChecked(spawn, buildDashNewSessionArgs(width, height));
   const boardPaneId = boardPane.stdout.toString().trim();
+
+  // Lease the replacement immediately: if a later split/layout command wedges,
+  // the next setup run can still terminate this recorded partial server.
+  if (recovery !== undefined) {
+    try {
+      const result = runChecked(spawn, buildDashServerIdentityArgs());
+      const parsed = parseDashServerIdentity(result.stdout.toString());
+      if (parsed === null) {
+        throw new Error("tmux returned an invalid pid/socket identity");
+      }
+      const startTime = probeChildStartTime(parsed.pid);
+      if (startTime === null) {
+        throw new Error("could not read the dash server process start time");
+      }
+      recovery.record({ ...parsed, startTime });
+    } catch (error) {
+      // The dashboard remains usable, but a later wedged kill cannot be
+      // escalated without this recorded ownership proof.
+      process.stderr.write(
+        `keeper setup-tmux: dash recovery identity not recorded — ${String(error)}\n`,
+      );
+    }
+  }
+
   runChecked(spawn, buildSetMainPaneWidthArgs());
 
   for (const sub of DASH_SUB_PANES) {
@@ -1142,7 +1583,12 @@ export function renderRestoreOutcome(
     const unverifiedNote = unverified > 0 ? ` unverified=${unverified}` : "";
     return `keeper setup-tmux: '${session}' restore PARTIAL (exit ${TABS_EXIT_PARTIAL_FAILURE}): restored=${restored} failed=${failed}${unverifiedNote}${ctx}`;
   }
-  const code = result.exitCode === null ? "signal" : String(result.exitCode);
+  const code =
+    result.exitedDueToTimeout === true
+      ? "timeout"
+      : result.exitCode === null
+        ? "signal"
+        : String(result.exitCode);
   const stderr = result.stderr.toString().trim();
   const detail = stderr !== "" ? stderr : stdout.trim();
   return `keeper setup-tmux: '${session}' restore FAILED (exit ${code}): ${detail}`;
@@ -1154,6 +1600,7 @@ export async function main(
   restoreOffer: RestoreOfferFn = defaultRestoreOffer,
   guardFs: GuardFs = defaultGuardFs,
   retryStore: RestoreRetryStore = fileRestoreRetryStore(),
+  dashRecovery?: DashServerRecovery,
 ): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -1166,6 +1613,19 @@ export async function main(
     process.stdout.write(HELP);
     process.exit(0);
   }
+
+  if (isInsideDashServer(process.env.TMUX)) {
+    process.stderr.write(
+      "keeper setup-tmux: refusing to rebuild the dash server from inside one of its own panes — run this command outside `tmux -L dash`\n",
+    );
+    process.exit(1);
+  }
+
+  // Injected spawn seams stay filesystem-pure by default. Production records
+  // the dash process/socket identity for guarded recovery on a later timeout.
+  const effectiveDashRecovery =
+    dashRecovery ??
+    (spawn === defaultSpawn ? fileDashServerRecovery() : undefined);
 
   try {
     // Fail-open: install Keeper's tmux drop-ins before provisioning. A shared
@@ -1377,8 +1837,10 @@ export async function main(
     // Fail-open: the deprecated dash server is isolated on its own socket, so a
     // rebuild failure must not block provisioning the human's `work` session —
     // warn and continue, exit 0.
+    let dashRebuilt = false;
     try {
-      rebuildDash(spawn);
+      rebuildDash(spawn, effectiveDashRecovery);
+      dashRebuilt = true;
     } catch (e) {
       const detail = e instanceof TmuxError ? e.message : String(e);
       process.stderr.write(
@@ -1387,7 +1849,9 @@ export async function main(
     }
     ensureWorkSessions(spawn);
     process.stdout.write(
-      `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux -L ${DASH_SESSION} attach\n`,
+      dashRebuilt
+        ? `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux -L ${DASH_SESSION} attach\n`
+        : `keeper setup-tmux: work sessions ensured; '${DASH_SESSION}' is unavailable — rerun keeper setup-tmux\n`,
     );
 
     // Synchronous restore: spawn `keeper tabs restore --apply` per offered
@@ -1400,8 +1864,23 @@ export async function main(
       const offer = offers[session];
       const argv = buildTabsRestoreArgv(session, offer?.generationId ?? null);
       let result: SyncSpawnResult;
+      const timeout = setupTmuxSpawnTimeoutMs(argv);
       try {
-        result = spawn(argv);
+        result = spawn(argv, { timeout });
+        if (result.exitedDueToTimeout === true) {
+          result = {
+            ...result,
+            exitCode: null,
+            stderr: Buffer.from(`command timed out after ${timeout}ms`),
+          };
+        } else if (result.exitCode === null && result.stderr.length === 0) {
+          result = {
+            ...result,
+            stderr: Buffer.from(
+              `command killed by signal ${result.signalCode ?? "unknown"}`,
+            ),
+          };
+        }
       } catch (e) {
         result = {
           exitCode: null,
