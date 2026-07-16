@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-16T08:22:31.135000Z",
+  "created_by_close_of": "fn-1282-retire-hermes-codex-harnesses",
+  "depends_on_epics": [
+    "fn-1282-retire-hermes-codex-harnesses"
+  ],
+  "id": "fn-1291-harden-unregistered-harness-restore",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden unregistered-harness restore handling",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-16T08:22:31.135000Z"
+}
