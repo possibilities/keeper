@@ -14,6 +14,7 @@ import {
   buildRequestHandoffFrame,
   HANDOFF_DOC_MAX_BYTES,
   main as handoffMain,
+  resolveHandoffCaptureRequest,
   resolveTargetDir,
   spillHandoffDoc,
   validateHandoffDoc,
@@ -87,6 +88,121 @@ test("buildRequestHandoffFrame: carries desired_slug + doc_path, not the inline 
       initiator_pane: "%2",
     },
   });
+});
+
+test("buildRequestHandoffFrame: carries capture fields only for a capturing request", () => {
+  const req = {
+    desired_slug: "capture-result",
+    doc_path: "/state/handoff/rpc-capture.txt",
+    title: null,
+    target_session: "work",
+    target_dir: "/Users/dev/code/keeper",
+    initiator_session: null,
+    initiator_pane: null,
+  };
+  expect(
+    buildRequestHandoffFrame("rpc-capture", req, {
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    }),
+  ).toEqual({
+    type: "rpc",
+    id: "rpc-capture",
+    method: "request_handoff",
+    params: {
+      ...req,
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    },
+  });
+});
+
+test("resolveHandoffCaptureRequest: validates capture launch triples client-side", () => {
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: true,
+      preset: "pi::openai/gpt-5.5::high",
+      model: undefined,
+      effort: undefined,
+    }),
+  ).toEqual({
+    ok: true,
+    capture: {
+      capture: true,
+      model: null,
+      effort: null,
+      preset: "pi::openai/gpt-5.5::high",
+    },
+  });
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: true,
+      preset: undefined,
+      model: "opus",
+      effort: "high",
+    }),
+  ).toEqual({
+    ok: true,
+    capture: {
+      capture: true,
+      model: "opus",
+      effort: "high",
+      preset: null,
+    },
+  });
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: false,
+      preset: undefined,
+      model: undefined,
+      effort: undefined,
+    }),
+  ).toEqual({ ok: true, capture: null });
+
+  for (const args of [
+    {
+      capture: false,
+      preset: "claude::opus::high",
+      model: undefined,
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: "not-a-triple",
+      model: undefined,
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: "claude::opus::high",
+      model: "opus",
+      effort: "high",
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: "opus",
+      effort: undefined,
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: undefined,
+      effort: "high",
+    },
+    {
+      capture: true,
+      preset: undefined,
+      model: "bad:model",
+      effort: "high",
+    },
+  ]) {
+    expect(resolveHandoffCaptureRequest(args).ok).toBe(false);
+  }
 });
 
 test("buildRequestHandoffFrame: stays small even for a 64KB doc (the doc rides a file, not the wire)", () => {
@@ -453,6 +569,86 @@ test("fresh and migrated databases agree on the handoffs capture column shape", 
     rmSync(path, { force: true });
     rmSync(`${path}-wal`, { force: true });
     rmSync(`${path}-shm`, { force: true });
+  }
+});
+
+test("handoff main: invalid capture/triple combinations exit 2 before any RPC work", async () => {
+  const realExit = process.exit;
+  const realErr = process.stderr.write.bind(process.stderr);
+  try {
+    for (const [argv, expected] of [
+      [
+        ["--slug", "x", "--prompt", "p", "--preset", "claude::opus::high"],
+        "require --capture",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--preset",
+          "not-a-triple",
+        ],
+        "--preset",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--model",
+          "bad:model",
+          "--effort",
+          "high",
+        ],
+        "--model/--effort",
+      ],
+      [
+        [
+          "--capture",
+          "--slug",
+          "x",
+          "--prompt",
+          "p",
+          "--preset",
+          "claude::opus::high",
+          "--model",
+          "opus",
+          "--effort",
+          "high",
+        ],
+        "mutually exclusive",
+      ],
+      [
+        ["--capture", "--slug", "x", "--prompt", "p", "--model", "opus"],
+        "together",
+      ],
+      [
+        ["--capture", "--slug", "x", "--prompt", "p", "--effort", "high"],
+        "together",
+      ],
+    ] as const) {
+      let code: number | undefined;
+      let err = "";
+      process.exit = ((c?: number) => {
+        code = c ?? 0;
+        throw new Error(`exit ${code}`);
+      }) as typeof process.exit;
+      process.stderr.write = ((s: string | Uint8Array) => {
+        err += typeof s === "string" ? s : Buffer.from(s).toString();
+        return true;
+      }) as typeof process.stderr.write;
+      await expect(handoffMain([...argv])).rejects.toThrow("exit 2");
+      expect(code).toBe(2);
+      expect(err).toContain(expected);
+    }
+  } finally {
+    process.exit = realExit;
+    process.stderr.write = realErr;
   }
 });
 

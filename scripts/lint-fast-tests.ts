@@ -258,6 +258,12 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
     reason: "Reviewed byte-limit boundary requires an over-limit payload.",
   },
   {
+    file: "test/handoff.test.ts",
+    rule: "full-migration",
+    reason:
+      "Reviewed schema or file-connection semantics require a real migrated database.",
+  },
+  {
     file: "test/keeper-cli.test.ts",
     rule: "process-launch",
     reason:

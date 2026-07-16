@@ -28,7 +28,8 @@
  * handoff-ee with that path as its cwd.
  *
  * Exit codes: 0 success, 1 daemon-unreachable / generic failure, 2 arg fault
- * (missing/empty `--slug`, over-cap brief, bad `--cwd`), 3 slug already in use.
+ * (missing/empty `--slug`, over-cap brief, bad `--cwd`, or bad/conflicting
+ * capture/triple flags), 3 slug already in use.
  */
 
 import {
@@ -41,6 +42,7 @@ import {
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { parseArgs } from "node:util";
+import { parseTriple } from "../src/agent/triple";
 import { resolveHandoffSpillDir, resolveSockPath } from "../src/db";
 import { HANDOFF_DOC_MAX_BYTES } from "../src/handoff-contract";
 import { slugifyHandoffSlug } from "../src/handoff-slug";
@@ -67,6 +69,15 @@ Enqueue flags:
   --cwd <path>          Directory the handoff-ee launches in (default: this
                         caller's cwd). Expands ~, resolves a relative path to an
                         absolute one; a non-existent / non-directory path → exit 2.
+  --capture             Request a durable captured terminal-result envelope. This
+                        is a boolean request; unlike \`keeper agent run --capture\`,
+                        it takes no path (keeperd derives the durable path).
+  --preset <triple>     Launch triple <harness::model::effort> for a captured
+                        handoff; requires --capture and conflicts with --model/--effort.
+  --model <model>       Captured-handoff model override; requires --capture and
+                        --effort.
+  --effort <effort>     Captured-handoff reasoning-effort override; requires
+                        --capture and --model.
   --sock <path>         Override the daemon socket path
 
   show <slug>           Print the stored doc body for a handoff (inspection)
@@ -74,7 +85,8 @@ Enqueue flags:
 The brief is capped at 64KB — an over-cap brief is REJECTED (exit 2), never
 truncated, because it rides inline in the event log and a fold reads it back.
 
-Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault, 3 slug already in use.
+Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault (including bad or
+conflicting --capture/--preset/--model/--effort flags), 3 slug already in use.
 
 Run \`keeper handoff --agent-help\` for the terse operator runbook.
 `;
@@ -87,11 +99,16 @@ inline in your tmux session. The brief rides inline in the event log.
 
   keeper handoff --slug <slug> --prompt "<brief>" [--title <t>] [--cwd <path>]
   keeper handoff --slug <slug> --prompt-file <path> [...]
+  keeper handoff --capture --slug <slug> --prompt "<brief>" [--preset <triple>]
+  keeper handoff --capture --slug <slug> --prompt "<brief>" [--model <m> --effort <e>]
   keeper handoff show <slug>      # read back the stored brief (inspection)
 
 Rules: --slug is globally unique (reuse → exit 3); brief cap 64KB (over → exit 2,
 REJECTED never truncated); --cwd launches cross-repo (default: caller's cwd).
-Exit codes: 0 enqueued · 1 daemon-unreachable/generic · 2 arg fault · 3 slug in use.
+--capture requests a durable terminal-result envelope and takes no path;
+--preset or the --model/--effort pair require --capture and conflict with each other.
+Exit codes: 0 enqueued · 1 daemon-unreachable/generic · 2 arg fault (including bad
+capture/triple flags) · 3 slug in use.
 NOT a plan-id launch (that is keeper dispatch) or messaging a running agent (keeper bus).
 `;
 
@@ -189,6 +206,75 @@ export function validateHandoffDoc(doc: string): ValidateDocResult {
  * (the inline doc overflowed the ~8 KiB UDS send buffer and silently hung). Pure —
  * exported so tests can assert the wire shape.
  */
+export interface HandoffCaptureRequest {
+  capture: true;
+  model: string | null;
+  effort: string | null;
+  preset: string | null;
+}
+
+/**
+ * Validate the capture-only launch knobs before any spill or RPC work. A null
+ * result preserves the legacy request frame byte-for-byte; a captured request
+ * carries all capture fields required by the RPC's typed params.
+ */
+export function resolveHandoffCaptureRequest(args: {
+  capture: boolean;
+  preset: string | undefined;
+  model: string | undefined;
+  effort: string | undefined;
+}):
+  | { ok: true; capture: HandoffCaptureRequest | null }
+  | { ok: false; error: string } {
+  const hasPreset = args.preset !== undefined;
+  const hasModel = args.model !== undefined;
+  const hasEffort = args.effort !== undefined;
+  if (!args.capture && (hasPreset || hasModel || hasEffort)) {
+    return {
+      ok: false,
+      error: "--preset, --model, and --effort require --capture",
+    };
+  }
+  if (hasPreset && (hasModel || hasEffort)) {
+    return {
+      ok: false,
+      error: "--preset is mutually exclusive with --model/--effort",
+    };
+  }
+  if (hasModel !== hasEffort) {
+    return {
+      ok: false,
+      error: "--model and --effort must be supplied together",
+    };
+  }
+  if (hasPreset) {
+    const parsed = parseTriple(args.preset as string);
+    if (!parsed.ok) {
+      return { ok: false, error: `--preset ${parsed.error}` };
+    }
+  }
+  if (hasModel && hasEffort) {
+    const parsed = parseTriple(
+      `claude::${args.model as string}::${args.effort as string}`,
+    );
+    if (!parsed.ok) {
+      return { ok: false, error: `--model/--effort ${parsed.error}` };
+    }
+  }
+  if (!args.capture) {
+    return { ok: true, capture: null };
+  }
+  return {
+    ok: true,
+    capture: {
+      capture: true,
+      model: args.model ?? null,
+      effort: args.effort ?? null,
+      preset: args.preset ?? null,
+    },
+  };
+}
+
 export function buildRequestHandoffFrame(
   id: string,
   req: {
@@ -200,12 +286,13 @@ export function buildRequestHandoffFrame(
     initiator_session: string | null;
     initiator_pane: string | null;
   },
+  capture: HandoffCaptureRequest | null = null,
 ): ClientFrame {
   return {
     type: "rpc",
     id,
     method: "request_handoff",
-    params: { ...req },
+    params: capture === null ? { ...req } : { ...req, ...capture },
   };
 }
 
@@ -320,6 +407,20 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
+  // Validate capture-only launch knobs before any spill or RPC send. The RPC
+  // handler repeats this at its trust boundary, but CLI misuse must not mint an
+  // event (or even create a transient transport file).
+  const captureResult = resolveHandoffCaptureRequest({
+    capture: parsed.values.capture,
+    preset: parsed.values.preset,
+    model: parsed.values.model,
+    effort: parsed.values.effort,
+  });
+  if (!captureResult.ok) {
+    argFault(captureResult.error);
+  }
+  const capture = captureResult.capture;
+
   const hasPrompt = parsed.values.prompt !== undefined;
   const hasPromptFile = parsed.values["prompt-file"] !== undefined;
   if (hasPrompt === hasPromptFile) {
@@ -392,15 +493,19 @@ export async function main(argv: string[]): Promise<void> {
   try {
     response = await roundTrip(
       sockPath,
-      buildRequestHandoffFrame(rpcId, {
-        desired_slug: slug,
-        doc_path: docPath,
-        title,
-        target_session: session,
-        target_dir: targetDir,
-        initiator_session: initiatorSession,
-        initiator_pane: initiatorPane,
-      }),
+      buildRequestHandoffFrame(
+        rpcId,
+        {
+          desired_slug: slug,
+          doc_path: docPath,
+          title,
+          target_session: session,
+          target_dir: targetDir,
+          initiator_session: initiatorSession,
+          initiator_pane: initiatorPane,
+        },
+        capture,
+      ),
       rpcId,
     );
   } catch (err) {
