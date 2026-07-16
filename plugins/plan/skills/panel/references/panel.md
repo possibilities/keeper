@@ -38,8 +38,10 @@ panel loads.
 identified by its **triple** (not just its harness), so two panelists on the same harness but different
 models or efforts stay distinguishable; duplicate identical triples are legal too — each gets a
 1-based ordinal so repeats stay distinct. Every member answers **in parallel** via a detached
-`keeper agent run <harness> --preset <triple> --read-only` leg that writes its answer as a uniform JSON
-result envelope (`--output`), then the `plan:panel-judge` subagent fuses them:
+`keeper agent run <harness> --preset <triple> --read-only` leg; its `--output` is the uniform answer
+envelope that `plan:panel-judge` reads:
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 - **A claude member** (`claude::<model>::<effort>`) runs `keeper agent run claude --preset <triple>
   --read-only`. `--read-only` prepends an explore-only directive to the prompt — it reads, greps, and
@@ -93,11 +95,7 @@ content.
 
 ## Leg output-shape contract
 
-Every leg is a `keeper agent run` launch, so every leg's prompt also carries `agent run`'s final-message
-directive: the leg's final message is the captured deliverable and must be one complete, self-contained
-answer, with any background agent the leg launches folded in before the leg ends its turn — never an
-answer-then-follow-up delta. This is an OUTPUT-SHAPE rule only, never a reasoning lens — it says nothing
-about how a panelist should think about the task, so it does not compromise the independence above. The
-directive is a single always-on prompt block `agent run` injects itself; it is the sole injection
-mechanism for this contract, so this section documents it and nothing in panel-side prompt composition
-re-injects a second copy.
+Each leg is an `agent run` launch, so the final-message deliverable rule applies without changing its
+reasoning or independence. Panel-side prompt composition does not inject a second copy.
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.

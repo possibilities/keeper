@@ -37,23 +37,10 @@ resumable by name later — an unnamed partner is still resumable by job id, but
 a name is far easier to recall and to hand to a follow-up turn. A `--resume`
 launch ignores `--name`: the resumed partner keeps its original name.
 
-You wait with **blocking Bash calls**, never a Monitor — a blocking call bills
-zero tokens while it blocks (the model is suspended between emitting the tool_use
-and receiving the tool_result). The Bash tool's *default* foreground window is
-only `120000`ms (2 min) — a call that runs past it auto-backgrounds instead of
-returning an error, silently ending the wait rather than raising it. Reaching
-the tool's `600000`ms (10 min) per-call ceiling requires passing the tool's
-`timeout` parameter explicitly on every blocking call below; there is no
-config or env var that raises the default, only the per-call parameter. There
-are two shapes:
+Use **blocking Bash calls**, never a Monitor. A quick `agent run` call uses
+`timeout: 600000`; detached panel waits use the chunked-wait contract below.
 
-- **Quick single-shot** (`agent run`) — one blocking call, issued with
-  `timeout: 600000`, that returns the answer when the partner stops. Use it for
-  a partner expected to finish within ~10 minutes.
-- **Detached + chunked wait** (`agent panel start` + `agent panel wait`) — launch
-  the partner detached, then re-issue one explicitly-timed blocking `wait` call
-  per chunk. Use it for a longer partner (past the 600000ms per-call ceiling) or
-  to fan the same ask out to several models at once.
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## Quick single-shot (`agent run`)
 
@@ -100,13 +87,11 @@ cat > "$PROMPT" <<'EOF'
 EOF
 ```
 
-**2. Start the partner detached.** `start` is **idempotent by slug** — it writes
-durable per-slug state at `~/.local/state/keeper/panels/<slug>/`, launches the
-leg(s), writes `<dir>/manifest.json`, prints it, and **exits 0 immediately** (it
-never blocks). Re-issuing the same `start --slug <slug>` with the same prompt
-reconciles the existing run (reuse terminal legs, leave running ones, relaunch
-no-result ones) instead of re-fanning-out; a colliding prompt or member-set exits
-2:
+**2. Start the partner detached.** Choose a required, short kebab-case slug.
+`start` exits immediately with the manifest; re-issuing that slug reconciles its
+durable run rather than creating another fan-out:
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ```bash
 MANIFEST=$(keeper agent panel start "$PROMPT" --slug oauth-review --cli pi --read-only)
@@ -132,23 +117,11 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   panel, a malformed triple, a non-pairable harness, or an unreadable prompt exits
   2 with no leg launched.
 
-**3. Wait token-free (re-issue loop).** Each `wait` call blocks ONE `--chunk`
-window (default 540s = 9 min), then exits: **0** = every leg terminal (verdict
-JSON on stdout), **124** = the chunk elapsed (re-issue it), **2** = a
-missing/corrupt manifest or bad flags. Issue every `wait` invocation with the
-Bash tool's `timeout` parameter set explicitly to `600000` — the tool's
-*default* foreground window is only `120000`ms, well short of a 540s chunk, and
-a call that outruns its window auto-backgrounds instead of returning 124,
-silently ending the wait rather than raising it. The explicit `600000`ms
-ceiling leaves ~60s of headroom over the 540s chunk.
+**3. Wait token-free (re-issue loop).** Use the chunked-wait contract: issue
+one explicitly timed Bash call per chunk, re-issuing it in a new tool call only
+on exit `124`, and stop at the backstop. Never put the re-issue loop in the shell:
 
-A multi-chunk wait is **one explicitly-timed Bash call per chunk, re-issued
-across separate calls — never a shell loop inside one call**: a `while` that
-re-issues `wait` on exit 124 cannot complete inside a single Bash call even at
-the 600000ms ceiling (six chunks alone is ~54 min), and shell state (loop
-counters, captured output) does not survive between separate Bash calls
-anyway. Track the re-issue count yourself and stop once it hits a backstop, so
-a wedged leg never loops forever:
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ```bash
 # Issue as its own Bash call, timeout: 600000:
@@ -159,15 +132,8 @@ WAIT_RC=$?
 # exit 2   → a failure; stop and surface it
 ```
 
-Re-issue the identical command, one Bash call per chunk (`timeout: 600000`
-every time), until it returns 0 or 2, or until you've issued it `BACKSTOP`
-times — 6 re-issues ≈ 54 min of 9-min chunks; a leg still running this late is
-wedged, so treat it as a failure in step 4.
-
-Each `wait` is a single blocking Bash call — token-free while it blocks; the
-subcommand polls internally on a `Date.now()` deadline, so you never re-invoke
-yourself between chunks. Never poll at the model level (re-invoking yourself every
-few seconds) — that is the one thing that actually burns tokens.
+Do not inspect an answer before the terminal verdict. The wait command polls
+internally while its Bash call blocks, so never model-poll it between chunks.
 
 **4. Read the verdict, then each answer.** On exit 0, `VERDICT` is
 `{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
@@ -238,27 +204,12 @@ keeper agent run pi "now check the error-handling paths too" \
 
 ## Reading the answer
 
-Each partner's `--output` (or a panel member's `yaml`) is the uniform
-schema-versioned JSON envelope. The fields:
+Each partner's `--output` (or a panel member's `yaml`) is the uniform answer
+envelope. Read `message` as the answer after a terminal result; inspect the
+transcript only when the conclusion alone is insufficient, and surface a
+non-usable `outcome` rather than a stale answer.
 
-- `message` — the partner's final assistant message. This is the answer (empty
-  string on a tool-only/refusal turn). For a claude partner, capture reads this
-  from the **settled stop** — the transcript stop marker capture accepts as
-  terminal because no background agent the partner launched is still live at
-  that point — so a partner that ends a turn early while a background agent is
-  still working never gets captured mid-flight. Pi has no
-  background-agent concept, so its capture is a plain final-message read.
-- `message_found` — whether a final message was present.
-- `transcript_path` — the partner's per-backend transcript JSONL, the drill-down
-  for the FULL conversation when `message` alone isn't enough. Read it only if you
-  need the partner's reasoning/steps, not just its conclusion.
-- `handle` / `resume_target` — the `keeper agent` launch handle + the native
-  id `--resume` would need to continue this exact session (prefer resuming by
-  the `--name` you gave the partner instead — a name outlives any one id).
-- `elapsed_seconds` — wall time of the partner's turn.
-- `outcome` — `completed` / `no_message` (success), or `timed_out` /
-  `no_transcript` / `launch_failed` / `bad_args` (no usable answer — surface it to
-  the human).
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## Choosing the partner
 
@@ -315,16 +266,10 @@ know the guarantee is best-effort.
 
 ## Final-message contract (always on)
 
-Every `agent run` prompt — every partner, every posture, with or without
-`--read-only` — carries a final-message directive ahead of the task text: the
-partner's final message is the captured deliverable, so it must be one
-complete, self-contained answer, never a back-reference to an earlier message
-or an answer-then-follow-up delta. The directive also tells the partner to
-avoid background agents and background tasks, and to fold any already-running
-one's results into that one final message before ending its turn. `agent run`
-injects this directive automatically as a single always-on prompt block — it
-is the sole place this contract is injected, so nothing here or in a prompt
-you write needs to (or should) restate it.
+`agent run` supplies the final-message deliverable directive. Do not add a
+second copy when composing a partner prompt.
+
+Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
 
 ## What NOT to do
 
