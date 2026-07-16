@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Run-control artifact allowlist rejection covered in agent-run-capture suite; operator re-run 83/0; landed via plain-git escape (live-leg claim wedge, leg 6922fe55 discharged) as e134b8fc on the epic lane",
+      "input_hash": "0afb497cec83b8d433ad235fde1a0a132ca8cb98f649849e4eeebd44c6ec622d",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 2009,
+      "spec_md": "## Description\n\nAdds the missing negative coverage for finding F1: the security guard\n`isRunControlArtifact` in `src/agent/run-capture.ts` (the `kill_window_command`\ncommand-tail allowlist \u2014 `/(?:^|\\/)tmux$/` argv[0], even/odd `-L`/`-S` socket\npairing, `kill-window` / `-t` / `@[0-9]+` tail). Evidence path from the audit:\nthe guard has no direct test, and the sole `malformed_control` case in\n`test/agent-run-capture.test.ts` (`readArtifact: () => ({ nope: true })`, ~L935)\nfails at the earlier `schema_version` check and never exercises the command-tail\nbranch \u2014 so a loosened allowlist would ship green while the panel consumer\nexecutes `kill_window_command` verbatim via `runTmuxCommand`.\n\nAdd negative cases (a `test.each` matrix is a good fit) covering a control\nwhose owner tuple matches but whose `kill_window_command` is a well-formed\nobject with a hostile/mis-shaped command, e.g. `[\"tmux\",\"kill-server\"]`,\n`[\"rm\",\"-rf\",\"/\"]`, `[\"tmux\",\"kill-window\",\"-t\",\"not-a-window\"]`, and an\nodd-length socket-arg run. Assert both `isRunControlArtifact(...) === false`\ndirectly AND that `cancelOwnedRunFromControlArtifact` returns\n`malformed_control` with no tmux command executed.\n\nFiles: `test/agent-run-capture.test.ts` (assertions), `src/agent/run-capture.ts`\n(guard under test \u2014 no source change expected unless a genuine gap surfaces).\n\n## Acceptance\n\n- [ ] `isRunControlArtifact` returns false for each hostile/mis-shaped `kill_window_command` shape (wrong verb, non-`@N` target, odd socket-arg run, non-`tmux` argv[0])\n- [ ] `cancelOwnedRunFromControlArtifact` yields `malformed_control` for those shapes and issues zero tmux commands\n- [ ] the targeted suite and typecheck/lint pass\n\n## Done summary\nRun-control artifact allowlist rejection covered in agent-run-capture suite; operator re-run 83/0; landed via plain-git escape (live-leg claim wedge, leg 6922fe55 discharged) as e134b8fc on the epic lane\n## Evidence\n- Commits: e134b8fc\n- Tests: bun test agent-run-capture 83/0 (operator re-run in lane)",
+      "task_id": "fn-1294-cover-run-control-artifact-allowlist.1",
+      "tier": "medium",
+      "title": "Test control allowlist rejection"
+    }
+  ],
+  "created_at": "2026-07-16T21:59:05.889000Z",
+  "epic_id": "fn-1294-cover-run-control-artifact-allowlist",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "0afb497cec83b8d433ad235fde1a0a132ca8cb98f649849e4eeebd44c6ec622d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
