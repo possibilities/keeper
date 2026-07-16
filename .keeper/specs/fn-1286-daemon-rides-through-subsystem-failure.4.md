@@ -1,11 +1,15 @@
 ## Description
-
 **Size:** S
 **Files:** src/readiness.ts, src/readiness-client.ts, src/await-conditions.ts, test/board.test.ts
 
 ### Approach
 
 The `running:sub-agent-stale` hold is an open `subagent_invocations` row whose SubagentStop never landed — by design, so fan-in never fires while a worker might still write. But when the owning pid is PROVEN dead and the worker phase is done, the hold can never release on its own: the process that would emit the terminal event no longer exists. Add the escape valve ADR 0060 specifies: the readiness completion predicate discounts an open sub-agent invocation when the owning session's pid is proven dead AND worker_phase is done. This is a pure computation change consuming already-plumbed liveness facts — no schema change, no fold change, no new RPC. The discount applies ONLY to the done phase: a working-phase orphan stays held (that is phantom-working territory with its own machinery). Trace exactly which liveness facts reach the readiness computation (proven-dead evidence lives in the autopilot reconcile snapshot; readiness is computed client-side with an injected clock) — plumbing a proven-dead fact through to the predicate, if absent, is in scope; inventing a new liveness probe is not.
+
+### Scope boundary (operator-verified against main before dispatch)
+
+- The sibling failure mode — a CLOSED child invocation row (`status='ok'`, non-null `duration_ms`) misreading `unknown:child-evidence-incomplete` — is already fixed on main: `SUBAGENT_INVOCATIONS_DESCRIPTOR` now serves `updated_at`, with a regression test in test/collections.test.ts through the descriptor→loadReadinessInputs→deriveHarnessActivities path (commit b5f7c9ea). Do not re-fix the closed-row path; this task's valve is ONLY for the genuinely-open row whose owner pid is proven dead.
+- `provenDeadJobIds` exists ONLY in the autopilot slot-reclaim path (src/autopilot-worker.ts ~8768 → src/reconcile-core.ts ~1996): it frees dispatch slots by reaping proven-dead sessions' panes, and never reaches the readiness completion predicate. src/readiness.ts and src/session-activity.ts carry no pid/proven-dead fact today. Treat the slot-reclaim path as the fact-source precedent the Approach names, not as existing coverage.
 
 ### Investigation targets
 
@@ -30,7 +34,6 @@ The `running:sub-agent-stale` hold is an open `subagent_invocations` row whose S
 ### Test notes
 
 Truth-table: done + open invocation + pid proven dead → completed; done + open invocation + pid alive → running:sub-agent-stale (unchanged); working + open invocation + pid dead → held (unchanged, not this valve's business). Extend the existing readiness/board suites; register any new file with the fn-1281 gate manifest.
-
 ## Acceptance
 
 - [ ] A done-stamped task whose owning session pid is proven dead completes despite an open sub-agent invocation; dependent tasks unblock.
