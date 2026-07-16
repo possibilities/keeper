@@ -270,6 +270,12 @@ const WRAPPERS = new Set([
  *  shell / interpreter reopens an exec context the classifier cannot see into.
  *  `bun` is NOT here — its test runner and named package-script surface are
  *  conditionally allowed, with eval flags and path-shaped run targets denied. */
+/** System temp roots a `mktemp -d` handoff dir may sit under. `os.tmpdir()` is
+ *  the process's own resolution (the launchd `/var/folders/.../T` on macOS); the
+ *  literals cover the roots a wrapped worker's shell can name directly when its
+ *  env carries a different or absent `TMPDIR`. `pathInside` rejects any escape. */
+const SYSTEM_TMP_ROOTS: readonly string[] = [tmpdir(), "/tmp", "/private/tmp"];
+
 const INTERPRETER_EXECUTABLES = new Set([
   "python",
   "python2",
@@ -809,7 +815,12 @@ function classifyWrappedExecutable(
       tokens[1] === "-d" &&
       template !== undefined &&
       isAbsolute(template) &&
-      pathInside(tmpdir(), template) &&
+      // A wrapped worker cannot discover the hook's own `os.tmpdir()` value (the
+      // per-process launchd `/var/folders/.../T` on macOS), so accept any
+      // recognized system-temp root it CAN name — the `keeper-wrapped-*XXXXXX`
+      // basename below is the security boundary, not the specific temp root, and
+      // `pathInside` still rejects any `..` escape out of the accepted root.
+      SYSTEM_TMP_ROOTS.some((root) => pathInside(root, template)) &&
       /^keeper-wrapped-[A-Za-z0-9._-]*X{6,}$/.test(basename(template))
     ) {
       return null;

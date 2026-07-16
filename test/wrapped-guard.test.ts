@@ -54,6 +54,11 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "keeper agent show-last-message leg-fn-1-x.2",
     "keeper agent providers resolve gpt-5 high",
     `mktemp -d ${join(tmpdir(), "keeper-wrapped-XXXXXX")}`,
+    // a wrapped worker whose env resolves a different/absent TMPDIR must be able
+    // to name a system-temp root directly — the keeper-wrapped basename is the boundary
+    "mktemp -d /tmp/keeper-wrapped-XXXXXX",
+    "mktemp -d /private/tmp/keeper-wrapped-XXXXXX",
+    "mktemp -d /private/tmp/claude-501/keeper-wrapped-XXXXXX",
     // close-out surface
     "keeper commit-work --task-id fn-1-x.2 'feat(scope): implement X'",
     "keeper plan done fn-1-x.2 --summary 'done'",
@@ -125,6 +130,11 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
     "bun run",
     "mktemp -d /tmp/arbitrary-XXXXXX",
     "mktemp /tmp/keeper-wrapped-XXXXXX",
+    // a keeper-wrapped basename OUTSIDE every system-temp root is still denied
+    "mktemp -d /home/mike/keeper-wrapped-XXXXXX",
+    "mktemp -d /etc/keeper-wrapped-XXXXXX",
+    // a `..` escape out of an accepted temp root is still denied
+    "mktemp -d /tmp/../etc/keeper-wrapped-XXXXXX",
     // --- in-tree write vectors: redirect / heredoc / here-string / tee / sed -i ---
     "echo hacked > src/x.ts",
     "echo more >> src/x.ts",
