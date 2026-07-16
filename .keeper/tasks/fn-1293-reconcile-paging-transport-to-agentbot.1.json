@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Rename botctl paging to agentbot",
-  "updated_at": "2026-07-16T20:33:15.722000Z"
+  "updated_at": "2026-07-16T20:37:59.125000Z",
+  "worker_done_at": "2026-07-16T20:37:59.125000Z"
 }

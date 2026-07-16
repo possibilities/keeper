@@ -25,5 +25,5 @@ Files to change:
 - [ ] The paging truth-table tests in test/daemon.test.ts pass under the renamed symbols
 
 ## Done summary
-
+Verified acceptance already holds: src/, cli/, docs/, and test/ carry zero botctl/Botctl references — every daemon page spawn already uses the agentbot binary (livePage/liveIntegrityProbeDeps in src/integrity-probe.ts, 7 call sites in src/daemon.ts). No source change was needed; test/daemon.test.ts paging truth-table passes (386 pass, 0 fail).
 ## Evidence
