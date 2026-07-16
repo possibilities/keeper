@@ -1,7 +1,7 @@
 # 63. Explicit work adoption and atomic isolated-index publication
 
 ## Status
-Accepted. Extends the shared-checkout safety model and wrapped-worker contract in [ADR 0050](0050-wrapped-delegation-guard.md).
+Accepted. Extends the shared-checkout safety model and wrapped-worker contract in [ADR 0050](0050-wrapped-delegation-guard.md). Amended by [ADR 0068](0068-commit-work-vacated-claims-and-honest-drift.md): terminal-evidence soundness, vacated claims, the receipts-pending outcome, and selection-scoped publication CAS.
 
 ## Context
 A dirty path is not necessarily authored by the committing session. Tool, Plan, Bash, package-manager,
