@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Emit capture envelope from worker",
-  "updated_at": "2026-07-14T00:21:20.669000Z"
+  "updated_at": "2026-07-16T22:18:06.186000Z",
+  "worker_done_at": "2026-07-16T22:18:06.186000Z"
 }

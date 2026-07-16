@@ -37,5 +37,7 @@ Pure tests: capture row → spec carries triple + env carrier + autonomous frami
 - [ ] The prompt-cap pinning test passes with the new framing constant
 
 ## Done summary
-
+Handoff worker emits the capture envelope at delegate completion (exec-backend + handoff-worker surfaces); operator re-run 120/0 exec-backend+handoff-worker and 140/0 board; landed via plain-git escape (leg cd143fc3 claims never reaching terminal liveness) as 8a72c59c on the .3 task lane
 ## Evidence
+- Commits: 8a72c59c
+- Tests: bun test exec-backend+handoff-worker 120/0 (operator re-run in lane), bun test board 140/0
