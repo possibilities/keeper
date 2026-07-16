@@ -218,6 +218,9 @@ codexbar_legacy_cli_bin="${codexbar_cli_dir}/CodexBarCLI"
 codexbar_legacy_provenance="${codexbar_cli_dir}/PROVENANCE"
 codexbar_cli_link="${HOME}/.local/bin/codexbar"
 codexbar_cli_link_target="${codexbar_cli_dir}/current/CodexBarCLI"
+codexbar_signing_identity="B1AD266E854C4E845AA7EC456955D881AE9D5F47"
+codexbar_signing_identifier="com.arthack.keeper.codexbar-cli"
+codexbar_signing_requirement='identifier "com.arthack.keeper.codexbar-cli" and certificate leaf = H"b1ad266e854c4e845aa7ec456955d881ae9d5f47"'
 codexbar_source_state=""
 
 codexbar_notify() {
@@ -359,21 +362,45 @@ codexbar_provenance_value() {
     "${codexbar_provenance}"
 }
 
-# A resolved fork/upstream pair has a deterministic prior outcome. Trust a
-# complete managed record for that exact pair and mode only after hashing the
-# published executable, so damage never turns an unchanged-input check into a
-# false success. This latches every resolved-pair unrebased success, including a
-# rebased-build fallback, until either authoritative main tip changes.
-codexbar_provenance_matches() {
-  local fork_sha upstream_sha mode built_sha built_tree_sha
-  local expected_binary_sha actual_binary_sha architecture swift_version
-  fork_sha="$1"
-  upstream_sha="$2"
-  mode="$3"
+# Validate the installed artifact independently of mutable source refs. A local
+# certificate stabilizes its trusted-application requirement, but macOS assigns
+# non-Apple code a cdhash Keychain partition. Keep that CodeDirectory frozen
+# unless the operator explicitly requests an update.
+codexbar_signed_generation_valid() {
+  local expected_binary_sha actual_binary_sha architecture
+  local signing_identity signing_identifier signing_requirement
   [ -L "${codexbar_cli_current}" ] || return 1
   [ -x "${codexbar_cli_bin}" ] || return 1
   [ -L "${codexbar_cli_link}" ] || return 1
   [ "$(readlink "${codexbar_cli_link}" 2>/dev/null || true)" = "${codexbar_cli_link_target}" ] || return 1
+  architecture="$(codexbar_provenance_value architecture 2>/dev/null || true)"
+  signing_identity="$(codexbar_provenance_value signing_identity 2>/dev/null || true)"
+  signing_identifier="$(codexbar_provenance_value signing_identifier 2>/dev/null || true)"
+  signing_requirement="$(codexbar_provenance_value signing_requirement 2>/dev/null || true)"
+  expected_binary_sha="$(codexbar_provenance_value binary_sha256 2>/dev/null || true)"
+  [ "${architecture}" = "$(uname -m)" ] || return 1
+  [ "${signing_identity}" = "${codexbar_signing_identity}" ] || return 1
+  [ "${signing_identifier}" = "${codexbar_signing_identifier}" ] || return 1
+  [ "${signing_requirement}" = "${codexbar_signing_requirement}" ] || return 1
+  [[ "${expected_binary_sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  codesign --verify --strict \
+    --test-requirement "=${codexbar_signing_requirement}" \
+    "${codexbar_cli_bin}" >/dev/null 2>&1 || return 1
+  actual_binary_sha="$(shasum -a 256 "${codexbar_cli_bin}" 2>/dev/null \
+    | awk 'NR == 1 { print $1 }')"
+  [ "${actual_binary_sha}" = "${expected_binary_sha}" ]
+}
+
+# A resolved fork/upstream pair has a deterministic prior outcome. Trust a
+# complete managed record for that exact pair and mode only after validating the
+# published signed generation. Explicit update requests still skip a rebuild
+# when both source authorities are unchanged.
+codexbar_provenance_matches() {
+  local fork_sha upstream_sha mode built_sha built_tree_sha swift_version
+  fork_sha="$1"
+  upstream_sha="$2"
+  mode="$3"
+  codexbar_signed_generation_valid || return 1
   [ "$(codexbar_provenance_value fork_url 2>/dev/null || true)" = "${codexbar_fork_url}" ] || return 1
   [ "$(codexbar_provenance_value fork_ref 2>/dev/null || true)" = "${codexbar_fork_ref}" ] || return 1
   [ "$(codexbar_provenance_value fork_sha 2>/dev/null || true)" = "${fork_sha}" ] || return 1
@@ -383,17 +410,10 @@ codexbar_provenance_matches() {
   [ "$(codexbar_provenance_value mode 2>/dev/null || true)" = "${mode}" ] || return 1
   built_sha="$(codexbar_provenance_value built_sha 2>/dev/null || true)"
   built_tree_sha="$(codexbar_provenance_value built_tree_sha 2>/dev/null || true)"
-  architecture="$(codexbar_provenance_value architecture 2>/dev/null || true)"
   swift_version="$(codexbar_provenance_value swift_toolchain_version 2>/dev/null || true)"
-  expected_binary_sha="$(codexbar_provenance_value binary_sha256 2>/dev/null || true)"
   [[ "${built_sha}" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "${built_tree_sha}" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [ "${architecture}" = "$(uname -m)" ] || return 1
-  [ -n "${swift_version}" ] || return 1
-  [[ "${expected_binary_sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  actual_binary_sha="$(shasum -a 256 "${codexbar_cli_bin}" 2>/dev/null \
-    | awk 'NR == 1 { print $1 }')"
-  [ "${actual_binary_sha}" = "${expected_binary_sha}" ]
+  [ -n "${swift_version}" ]
 }
 
 # Remove every trace of a failed/superseded rebase worktree before constructing
@@ -575,6 +595,14 @@ codexbar_atomic_install() (
   fi
 
   install -m 755 "${built_binary}" "${install_stage}/CodexBarCLI" || exit 1
+  codesign --force \
+    --sign "${codexbar_signing_identity}" \
+    --identifier "${codexbar_signing_identifier}" \
+    --requirements "=designated => ${codexbar_signing_requirement}" \
+    "${install_stage}/CodexBarCLI" >/dev/null || exit 1
+  codesign --verify --strict \
+    --test-requirement "=${codexbar_signing_requirement}" \
+    "${install_stage}/CodexBarCLI" >/dev/null 2>&1 || exit 1
   binary_sha="$(shasum -a 256 "${install_stage}/CodexBarCLI" \
     | awk 'NR == 1 { print $1 }')"
   [[ "${binary_sha}" =~ ^[0-9a-f]{64}$ ]] || exit 1
@@ -591,6 +619,9 @@ codexbar_atomic_install() (
     "binary_sha256=${binary_sha}" \
     "architecture=${architecture}" \
     "swift_toolchain_version=${swift_version}" \
+    "signing_identity=${codexbar_signing_identity}" \
+    "signing_identifier=${codexbar_signing_identifier}" \
+    "signing_requirement=${codexbar_signing_requirement}" \
     >"${install_stage}/PROVENANCE" || exit 1
   chmod 555 "${install_stage}/CodexBarCLI" || exit 1
   chmod 444 "${install_stage}/PROVENANCE" || exit 1
@@ -707,6 +738,13 @@ codexbar_cli_install() (
   fi
   if ! codexbar_prepare_startup_link; then
     codexbar_notify "could not repair the CodexBar CLI startup link; the previous binary was retained"
+    return 0
+  fi
+  if [ "${KEEPER_CODEXBAR_UPDATE:-0}" != "1" ] \
+    && codexbar_signed_generation_valid; then
+    echo "install: CodexBar CLI signed generation pinned; set KEEPER_CODEXBAR_UPDATE=1 to check for updates"
+    codexbar_remove_cask \
+      || echo "install: Homebrew CodexBar cask removal failed (non-fatal)" >&2
     return 0
   fi
   if ! source_state="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar-source.XXXXXX")"; then

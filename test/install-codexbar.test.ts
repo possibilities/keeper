@@ -48,6 +48,11 @@ const STARTUP_LINK = between(
   "codexbar_prepare_startup_link() {",
   "codexbar_provenance_value() {",
 );
+const SIGNED_GENERATION = between(
+  SECTION,
+  "codexbar_signed_generation_valid() {",
+  "codexbar_provenance_matches() {",
+);
 const PROVENANCE_MATCH = between(
   SECTION,
   "codexbar_provenance_matches() {",
@@ -319,6 +324,62 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     );
   });
 
+  test("signs the staged CLI with a stable certificate identity before hashing and publication", () => {
+    expect(SECTION).toContain(
+      'codexbar_signing_identity="B1AD266E854C4E845AA7EC456955D881AE9D5F47"',
+    );
+    expect(SECTION).toContain(
+      'codexbar_signing_identifier="com.arthack.keeper.codexbar-cli"',
+    );
+    expect(SECTION).toContain(
+      'certificate leaf = H"b1ad266e854c4e845aa7ec456955d881ae9d5f47"',
+    );
+
+    const stagedCopy = ATOMIC_INSTALL.indexOf(
+      `install -m 755 "\${built_binary}" "\${install_stage}/CodexBarCLI"`,
+    );
+    const sign = ATOMIC_INSTALL.indexOf("codesign --force", stagedCopy);
+    const embeddedRequirement = ATOMIC_INSTALL.indexOf(
+      `--requirements "=designated => \${codexbar_signing_requirement}"`,
+      sign,
+    );
+    const verify = ATOMIC_INSTALL.indexOf("codesign --verify --strict", sign);
+    const testedRequirement = ATOMIC_INSTALL.indexOf(
+      `--test-requirement "=\${codexbar_signing_requirement}"`,
+      verify,
+    );
+    const hash = ATOMIC_INSTALL.indexOf(
+      `binary_sha="$(shasum -a 256`,
+      testedRequirement,
+    );
+
+    expect(stagedCopy).toBeGreaterThan(0);
+    expect(sign).toBeGreaterThan(stagedCopy);
+    expect(embeddedRequirement).toBeGreaterThan(sign);
+    expect(verify).toBeGreaterThan(embeddedRequirement);
+    expect(testedRequirement).toBeGreaterThan(verify);
+    expect(hash).toBeGreaterThan(testedRequirement);
+    expect(ATOMIC_INSTALL).toContain(`--sign "\${codexbar_signing_identity}"`);
+    expect(ATOMIC_INSTALL).toContain(
+      `--identifier "\${codexbar_signing_identifier}"`,
+    );
+    expect(ATOMIC_INSTALL).toContain(
+      `"signing_identity=\${codexbar_signing_identity}"`,
+    );
+    expect(ATOMIC_INSTALL).toContain(
+      `"signing_identifier=\${codexbar_signing_identifier}"`,
+    );
+    expect(ATOMIC_INSTALL).toContain(
+      `"signing_requirement=\${codexbar_signing_requirement}"`,
+    );
+
+    expect(SIGNED_GENERATION).toContain("codesign --verify --strict");
+    expect(SIGNED_GENERATION).toContain(
+      `--test-requirement "=\${codexbar_signing_requirement}"`,
+    );
+    expect(SIGNED_GENERATION).toContain(`"\${codexbar_cli_bin}"`);
+  });
+
   test("cleans crash residue and retains the current and prior generation", () => {
     for (const residue of [
       `"\${codexbar_cli_dir}"/.staging.*`,
@@ -399,18 +460,41 @@ describe("scripts/install.sh managed CodexBar fork", () => {
       "binary_sha256",
       "architecture",
       "swift_toolchain_version",
+      "signing_identity",
+      "signing_identifier",
+      "signing_requirement",
     ]) {
       expect(ATOMIC_INSTALL).toMatch(new RegExp(`"${field}=\\$\\{`));
     }
-    expect(PROVENANCE_MATCH).toContain(
+    expect(SIGNED_GENERATION).toContain(
       `expected_binary_sha="$(codexbar_provenance_value binary_sha256`,
     );
-    expect(PROVENANCE_MATCH).toContain(`shasum -a 256 "\${codexbar_cli_bin}"`);
-    expect(PROVENANCE_MATCH).toContain(
+    expect(SIGNED_GENERATION).toContain(`shasum -a 256 "\${codexbar_cli_bin}"`);
+    expect(SIGNED_GENERATION).toContain(
       `[ "\${actual_binary_sha}" = "\${expected_binary_sha}" ]`,
     );
+    expect(PROVENANCE_MATCH).toContain("codexbar_signed_generation_valid");
     expect(ORCHESTRATION.indexOf("codexbar_provenance_matches")).toBeLessThan(
       ORCHESTRATION.indexOf("CodexBar CLI inputs unchanged; no rebuild"),
+    );
+  });
+
+  test("pins a valid signed generation unless an update is explicitly requested", () => {
+    const repair = ORCHESTRATION.indexOf("codexbar_prepare_startup_link");
+    const pin = ORCHESTRATION.indexOf(
+      `[ "\${KEEPER_CODEXBAR_UPDATE:-0}" != "1" ]`,
+    );
+    const sourceState = ORCHESTRATION.indexOf(
+      `mktemp -d "\${TMPDIR:-/tmp}/keeper-codexbar-source.XXXXXX"`,
+    );
+    const fetch = ORCHESTRATION.indexOf("fetch --quiet --no-tags");
+
+    expect(pin).toBeGreaterThan(repair);
+    expect(pin).toBeLessThan(sourceState);
+    expect(pin).toBeLessThan(fetch);
+    expect(ORCHESTRATION).toContain("codexbar_signed_generation_valid");
+    expect(ORCHESTRATION).toContain(
+      "CodexBar CLI signed generation pinned; set KEEPER_CODEXBAR_UPDATE=1 to check for updates",
     );
   });
 

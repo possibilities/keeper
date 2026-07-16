@@ -51,14 +51,20 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 Claude account routing is optional and fails open to the native default account when either integration
 is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: it resolves the
-trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable source state,
-attempts a sealed noninteractive rebase with merge topology preserved, and builds the exact fork tip when
-upstream cannot be resolved, the rebase conflicts, or the rebased build fails. Each immutable generation
+trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable source state
+on first install or an explicit `KEEPER_CODEXBAR_UPDATE=1 bash scripts/install.sh`, attempts a sealed
+noninteractive rebase with merge topology preserved, and builds the exact fork tip when upstream cannot
+be resolved, the rebase conflicts, or the rebased build fails. Each immutable generation
 under `~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic `current`
 symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and interactive-shell
-path. Provenance records source and tree SHAs, mode, architecture, Swift toolchain, and the verified binary
-SHA-256. A failed build or publication retains the previous artifact, successful resolved-pair fallbacks
-are reused until either tip changes, and the Homebrew cask is removed only after publication succeeds.
+path. Before publication, Keeper signs the staged executable with its pinned, certificate-backed local
+identity and verifies the exact designated requirement; the private key remains in the login Keychain.
+Because macOS gives non-Apple-signed code a content-hash Keychain partition, a validated signed generation
+stays pinned across normal Keeper installs. An explicit update changes that partition and can require one
+“Always Allow” authorization for each existing CodexBar cache item. Provenance records source and tree
+SHAs, mode, architecture, Swift toolchain, signing identity and requirement, and the verified binary
+SHA-256. A failed build, signing, or publication retains the previous artifact, and the Homebrew cask is
+removed only after publication succeeds.
 Keeper forces `CODEXBAR_DISABLE_KEYCHAIN_ACCESS=1` for the daemon and every observer subprocess: an
 unattended capacity poll must never request a macOS password or read CodexBar's credential/cookie cache.
 When ambient Claude capacity exists only in Keychain, that gate reports unavailable and routing safely
