@@ -28,5 +28,7 @@ Files: `test/agent-run-capture.test.ts` (assertions), `src/agent/run-capture.ts`
 - [ ] the targeted suite and typecheck/lint pass
 
 ## Done summary
-
+Run-control artifact allowlist rejection covered in agent-run-capture suite; operator re-run 83/0; landed via plain-git escape (live-leg claim wedge, leg 6922fe55 discharged) as e134b8fc on the epic lane
 ## Evidence
+- Commits: e134b8fc
+- Tests: bun test agent-run-capture 83/0 (operator re-run in lane)

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Test control allowlist rejection",
-  "updated_at": "2026-07-16T21:08:12.662000Z"
+  "updated_at": "2026-07-16T21:42:11.613000Z",
+  "worker_done_at": "2026-07-16T21:42:11.613000Z"
 }
