@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Epic's early-proof soundness task: relaxing tail equality while preserving byte-for-byte fail-closed for live/ambiguous claimants is a subtle correctness invariant (resume-after-terminal, cursor-freshness, per-session scoping) that hard-gates opus, at the contract-shaped xhigh band.",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Bounded, well-specified extension atop task 1's landed classification \u2014 adds a typed outcome variant and narrows ownership_conflict \u2014 but it touches the CommitWorkOutcome union callers switch on and requires honest stalled-ingester judgment, so sonnet at the contract-touching xhigh band rather than opus.",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Combines a security/correctness liveness invariant (pid+start-time gone-witness must never classify a suspended/unreadable process as gone, fail-closed) with a destructive identity-rechecked TERM-then-KILL operator verb and a judgment-heavy CONTEXT.md prune across many files \u2014 a clear opus gate at xhigh.",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Publication CAS with selection-scoped drift exclusion carries a subtle security invariant (excluded-prefix exemption must not smuggle tracked mutations past the freeze) plus concurrency-shaped bounded rebase-retry over a moving ref \u2014 an intelligence-bound correctness case gating opus at the contract xhigh band.",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-16T23:16:13.106000Z",
+  "epic_id": "fn-1295-honest-commit-work-adoption-and-drift",
+  "input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1520618765,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1295-honest-commit-work-adoption-and-drift.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Epic's early-proof soundness task: relaxing tail equality while preserving byte-for-byte fail-closed for live/ambiguous claimants is a subtle correctness invariant (resume-after-terminal, cursor-freshness, per-session scoping) that hard-gates opus, at the contract-shaped xhigh band.\",\"confidence\":0.86},{\"task_id\":\"fn-1295-honest-commit-work-adoption-and-drift.2\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Bounded, well-specified extension atop task 1's landed classification \u2014 adds a typed outcome variant and narrows ownership_conflict \u2014 but it touches the CommitWorkOutcome union callers switch on and requires honest stalled-ingester judgment, so sonnet at the contract-touching xhigh band rather than opus.\",\"confidence\":0.7},{\"task_id\":\"fn-1295-honest-commit-work-adoption-and-drift.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Combines a security/correctness liveness invariant (pid+start-time gone-witness must never classify a suspended/unreadable process as gone, fail-closed) with a destructive identity-rechecked TERM-then-KILL operator verb and a judgment-heavy CONTEXT.md prune across many files \u2014 a clear opus gate at xhigh.\",\"confidence\":0.85},{\"task_id\":\"fn-1295-honest-commit-work-adoption-and-drift.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Publication CAS with selection-scoped drift exclusion carries a subtle security invariant (excluded-prefix exemption must not smuggle tracked mutations past the freeze) plus concurrency-shaped bounded rebase-retry over a moving ref \u2014 an intelligence-bound correctness case gating opus at the contract xhigh band.\",\"confidence\":0.83}]}\n"
+}
