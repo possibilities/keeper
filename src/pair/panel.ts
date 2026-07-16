@@ -20,8 +20,9 @@
  *     dir; `--run-dir` wins if both are given.
  *   - `status (--slug <slug> | --run-dir <d>)` prints a read-only, non-blocking per-leg
  *     snapshot (completed|running|failed|absent); exit 2 on a missing manifest.
- *   - `prune` GCs abandoned run dirs under the durable panels root — lock-free AND
- *     no live leg pid AND past the started-at TTL, via a TOCTOU-safe rename-to-trash.
+ *   - `prune` GCs abandoned run dirs under the durable panels root — cleanup
+ *     settled AND lock-free AND no live leg pid AND past the started-at TTL, via a
+ *     TOCTOU-safe rename-to-trash.
  *
  * CONTENT-BLIND: `wait` reads each leg's result file only for its `outcome`
  * (`completed` → ok; every other outcome → fail, `reason=<outcome>`) — NEVER a
@@ -47,7 +48,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { uptime } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   ConfigError,
@@ -60,6 +61,13 @@ import {
   resolvePreset,
 } from "../agent/config";
 import { type AgentCli, loadRolePrompt } from "../agent/launch-config";
+import {
+  cancelOwnedRunFromControlArtifact,
+  type RunControlArtifact,
+  type RunControlOwner,
+  type TmuxTeardownCommandResult,
+} from "../agent/run-capture";
+import { defaultTmuxCommandRunner } from "../agent/tmux-launch";
 import {
   formatTriple,
   parseTriple,
@@ -110,6 +118,8 @@ export const PANEL_PRUNE_TTL_MS = 3 * 24 * 60 * 60 * 1000;
  *  reclaimable dir is swept promptly, matching the sibling backup interval
  *  (`BACKUP_INTERVAL_MS`, src/backup.ts). */
 export const PANEL_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** Retry cadence for cancellation cleanup that outlives the initiating client. */
+export const PANEL_CLEANUP_INTERVAL_MS = 60 * 1000;
 /** The run-birth sentinel basename — written once at fresh start, never on a
  *  reconcile, so its mtime anchors `panel prune`'s age check to the run's original
  *  start instant. */
@@ -122,6 +132,11 @@ const PANEL_TRASH_DIR = ".gc";
 export const MAX_PANEL_MEMBER_ATTEMPTS = 2;
 /** Bounded cancellation cleanup window. */
 const DEFAULT_CANCEL_CLEANUP_MS = 5_000;
+/** Per-control ceiling for a maintenance pass that does not poll wrappers. */
+const MAINTENANCE_CONTROL_TIMEOUT_MS = 1_000;
+/** Wall-clock budget checked between panel runs in one maintenance tick. */
+const PANEL_CLEANUP_PASS_BUDGET_MS = 5_000;
+let panelCleanupCursor: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -170,6 +185,13 @@ export type PanelAttemptState =
   | "cancelled"
   | "cleanup_failed";
 
+export type PanelCleanupStatus = "pending" | "failed" | "settled";
+
+/** The pre-registered location and owner tuple for one canonical control. */
+export interface PanelControlAssociation extends RunControlOwner {
+  path: string;
+}
+
 /** One durably registered launch attempt. Attempts are append-only; the member's
  * legacy path fields mirror the newest entry for compatible inspection. */
 export interface PanelMemberAttempt {
@@ -179,6 +201,9 @@ export interface PanelMemberAttempt {
   startfile: string | null;
   launched_at: number | null;
   state: PanelAttemptState;
+  control?: PanelControlAssociation | null;
+  wrapper_termination_requested_at?: number | null;
+  cleanup_error?: string | null;
 }
 
 export interface PanelManifestMember {
@@ -219,7 +244,9 @@ export interface PanelManifest {
   state?: PanelRequestState;
   normal_fanout_started?: boolean;
   cancellation_requested_at?: number | null;
+  cleanup_status?: PanelCleanupStatus;
   unresolved_cleanup?: string[];
+  cleanup_settled_at?: number | null;
   boot_epoch_ms?: number;
   generation?: number;
   members: PanelManifestMember[];
@@ -267,6 +294,8 @@ export interface PanelStatus {
   request_id?: string;
   argument_digest?: string;
   state: PanelRequestState;
+  cleanup_status?: PanelCleanupStatus;
+  unresolved_cleanup?: string[];
   generation: number;
   all_terminal: boolean;
   members: PanelStatusMember[];
@@ -344,6 +373,11 @@ export interface PanelDeps {
   randomUuid?: () => string;
   /** Exact, injected process signal seam used only after pid + start-time match. */
   terminatePid?: (pid: number) => void;
+  /** Execute one canonical socket-qualified tmux control argv. */
+  runTmuxCommand?: (
+    command: string[],
+    timeoutMs?: number,
+  ) => TmuxTeardownCommandResult;
 }
 
 /** Discriminated member-resolution result. */
@@ -579,6 +613,7 @@ export function buildPanelLegArgv(opts: {
   slug: string;
   yamlPath: string;
   stopTimeoutMs: number;
+  control?: PanelControlAssociation;
 }): string[] {
   const m = opts.member;
   const postureFlags: string[] = [];
@@ -615,6 +650,18 @@ export function buildPanelLegArgv(opts: {
     `${opts.stopTimeoutMs}ms`,
     "--name",
     `panel::${opts.slug}::${m.name}`,
+    ...(opts.control === undefined
+      ? []
+      : [
+          "--control",
+          opts.control.path,
+          "--control-owner",
+          JSON.stringify({
+            request_id: opts.control.request_id,
+            member: opts.control.member,
+            attempt: opts.control.attempt,
+          }),
+        ]),
     // Panel legs are one-shot by design (the judge reads answer FILES, never a
     // live leg), so every leg tears its own window down once its result lands —
     // a panel never accumulates resident harness processes.
@@ -1003,6 +1050,40 @@ export function panelArgumentDigest(args: {
     .digest("hex");
 }
 
+function validControlAssociation(
+  value: unknown,
+): value is PanelControlAssociation {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const control = value as Record<string, unknown>;
+  return (
+    typeof control.path === "string" &&
+    control.path !== "" &&
+    typeof control.request_id === "string" &&
+    control.request_id !== "" &&
+    typeof control.member === "string" &&
+    control.member !== "" &&
+    Number.isInteger(control.attempt) &&
+    (control.attempt as number) > 0
+  );
+}
+
+function panelControlAssociation(args: {
+  dir: string;
+  base: string;
+  requestId: string;
+  member: string;
+  attempt: number;
+}): PanelControlAssociation {
+  return {
+    path: join(args.dir, `${args.base}.control.json`),
+    request_id: args.requestId,
+    member: args.member,
+    attempt: args.attempt,
+  };
+}
+
 function currentAttempt(member: PanelManifestMember): PanelMemberAttempt {
   const existing = member.attempts?.at(-1);
   if (existing !== undefined) return existing;
@@ -1059,6 +1140,21 @@ export function parseManifest(
   if (obj.generation !== undefined && typeof obj.generation !== "number") {
     return { ok: false, error: "manifest.generation is not a number" };
   }
+  if (
+    obj.cleanup_status !== undefined &&
+    obj.cleanup_status !== "pending" &&
+    obj.cleanup_status !== "failed" &&
+    obj.cleanup_status !== "settled"
+  ) {
+    return { ok: false, error: "manifest.cleanup_status is malformed" };
+  }
+  if (
+    obj.cleanup_settled_at !== undefined &&
+    obj.cleanup_settled_at !== null &&
+    typeof obj.cleanup_settled_at !== "number"
+  ) {
+    return { ok: false, error: "manifest.cleanup_settled_at is malformed" };
+  }
   if (!Array.isArray(obj.members)) {
     return { ok: false, error: "manifest.members missing or not an array" };
   }
@@ -1114,10 +1210,19 @@ export function parseManifest(
             "lost",
             "cancelled",
             "cleanup_failed",
-          ].includes(String(a.state))
+          ].includes(String(a.state)) ||
+          (a.wrapper_termination_requested_at !== undefined &&
+            a.wrapper_termination_requested_at !== null &&
+            typeof a.wrapper_termination_requested_at !== "number") ||
+          (a.cleanup_error !== undefined &&
+            a.cleanup_error !== null &&
+            typeof a.cleanup_error !== "string")
         ) {
           return { ok: false, error: "manifest member attempt is malformed" };
         }
+        // `control` is intentionally retained without shape rejection. A missing,
+        // malformed, or legacy association is an attempt-scoped cleanup failure,
+        // not a corrupt whole manifest that hides every other owned resource.
         attempts.push(a as unknown as PanelMemberAttempt);
       }
     }
@@ -1158,11 +1263,25 @@ export function parseManifest(
         typeof obj.cancellation_requested_at === "number"
           ? obj.cancellation_requested_at
           : null,
+      cleanup_status:
+        obj.cleanup_status === "pending" ||
+        obj.cleanup_status === "failed" ||
+        obj.cleanup_status === "settled"
+          ? obj.cleanup_status
+          : obj.state === "cleanup_failed"
+            ? "failed"
+            : obj.state === "cancelled"
+              ? "settled"
+              : undefined,
       unresolved_cleanup: Array.isArray(obj.unresolved_cleanup)
         ? obj.unresolved_cleanup.filter(
             (v): v is string => typeof v === "string",
           )
         : undefined,
+      cleanup_settled_at:
+        typeof obj.cleanup_settled_at === "number"
+          ? obj.cleanup_settled_at
+          : null,
       boot_epoch_ms:
         typeof obj.boot_epoch_ms === "number" ? obj.boot_epoch_ms : undefined,
       generation: typeof obj.generation === "number" ? obj.generation : 1,
@@ -1405,6 +1524,13 @@ async function panelLaunch(
             startfile: join(dir, `${base}.starttime`),
             launched_at: null,
             state: "reserved",
+            control: panelControlAssociation({
+              dir,
+              base,
+              requestId,
+              member: member.name,
+              attempt: 1,
+            }),
           };
           return {
             name: member.name,
@@ -1512,13 +1638,21 @@ async function panelLaunch(
           }
           previousAttempt.state = "lost";
           const base = legBaseName(member.name, newGeneration);
+          const attemptNumber = attempts.length + 1;
           const attempt: PanelMemberAttempt = {
-            attempt: attempts.length + 1,
+            attempt: attemptNumber,
             yaml: join(dir, `${base}.yaml`),
             pidfile: join(dir, `${base}.pidfile`),
             startfile: join(dir, `${base}.starttime`),
             launched_at: null,
             state: "reserved",
+            control: panelControlAssociation({
+              dir,
+              base,
+              requestId: manifest.request_id ?? manifest.slug,
+              member: member.name,
+              attempt: attemptNumber,
+            }),
           };
           attempts.push(attempt);
           syncMemberFromAttempt(member, attempt);
@@ -1565,6 +1699,7 @@ async function panelLaunch(
       // The wrapper writes the leg's OS start-time here (the recycle-guard anchor),
       // beside the pidfile in the same run dir.
       const startfilePath = entry.startfile as string;
+      const launchAttempt = currentAttempt(entry);
       const legArgv = buildPanelLegArgv({
         keeperBin: deps.keeperBin,
         keeperAgentPath: deps.keeperAgentPath,
@@ -1573,6 +1708,9 @@ async function panelLaunch(
         slug: args.slug,
         yamlPath: entry.yaml,
         stopTimeoutMs,
+        control: validControlAssociation(launchAttempt.control)
+          ? launchAttempt.control
+          : undefined,
       });
       try {
         deps.spawn(buildDetachWrapperArgv(legArgv), {
@@ -1642,9 +1780,418 @@ export interface PanelCancelResult {
   unresolved: string[];
 }
 
+export type PanelCleanupReconcileResult =
+  | { kind: "settled"; dir: string; unresolved: [] }
+  | { kind: "unresolved"; dir: string; unresolved: string[] }
+  | { kind: "locked" | "ineligible" | "invalid"; dir: string; error?: string };
+
+export interface PanelCleanupMaintenanceResult {
+  root: string;
+  settled: string[];
+  unresolved: Array<{ dir: string; identities: string[] }>;
+  skipped: string[];
+  errors: Array<{ dir: string; error: string }>;
+}
+
+type PanelCleanupTarget = {
+  id: string;
+  member: PanelManifestMember;
+  attempt: PanelMemberAttempt;
+};
+
+function cleanupTargetIdentities(manifest: PanelManifest): string[] {
+  return manifest.members
+    .flatMap((member) =>
+      (member.attempts ?? [currentAttempt(member)]).map(
+        (attempt) => `${member.name}#${attempt.attempt}`,
+      ),
+    )
+    .sort();
+}
+
+function cleanupTargets(manifest: PanelManifest): PanelCleanupTarget[] {
+  const targets: PanelCleanupTarget[] = [];
+  for (const member of manifest.members) {
+    const attempts = member.attempts ?? [currentAttempt(member)];
+    member.attempts = attempts;
+    for (const attempt of attempts) {
+      targets.push({
+        id: `${member.name}#${attempt.attempt}`,
+        member,
+        attempt,
+      });
+    }
+  }
+  return targets.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+async function reconcileCleanupManifest(args: {
+  dir: string;
+  cleanupMs: number;
+  manifest: PanelManifest;
+  deps: PanelDeps;
+  persist: () => void;
+}): Promise<PanelCleanupReconcileResult> {
+  const { dir, manifest, deps, persist } = args;
+  const requestId = manifest.request_id ?? manifest.slug;
+  manifest.state = "cancelled";
+  manifest.cancellation_requested_at ??= deps.now();
+  const targets = cleanupTargets(manifest);
+  const deadline = deps.now() + Math.max(0, args.cleanupMs);
+  const settled = new Set<string>();
+  const hardFailures = new Set<string>();
+  const runTmuxCommand = deps.runTmuxCommand ?? defaultTmuxCommandRunner;
+
+  const ownedLivePid = (target: PanelCleanupTarget): number | null => {
+    const pidfile = target.attempt.pidfile;
+    const pid = pidfile === null ? null : readPid(pidfile);
+    if (pid === null || !deps.pidAlive(pid)) return null;
+    const view: PanelManifestMember = {
+      ...target.member,
+      yaml: target.attempt.yaml,
+      pidfile,
+      startfile: target.attempt.startfile,
+      launched_at: target.attempt.launched_at,
+    };
+    return legIdentityHolds(view, pid, deps) ? pid : null;
+  };
+
+  const cleanupError = (category: string, detail?: string): string =>
+    (detail === undefined || detail.trim() === ""
+      ? category
+      : `${category}: ${detail.trim()}`
+    ).slice(0, 512);
+
+  const consumeExactControl = (
+    target: PanelCleanupTarget,
+  ): { kind: "settled" | "retry" | "failed"; error?: string } => {
+    const association = target.attempt.control;
+    if (
+      !validControlAssociation(association) ||
+      association.request_id !== requestId ||
+      association.member !== target.member.name ||
+      association.attempt !== target.attempt.attempt
+    ) {
+      return {
+        kind: "failed",
+        error: cleanupError("control_association_invalid"),
+      };
+    }
+    try {
+      const result = cancelOwnedRunFromControlArtifact({
+        path: association.path,
+        expectedOwner: {
+          request_id: association.request_id,
+          member: association.member,
+          attempt: association.attempt,
+        },
+        readArtifact: (path) =>
+          JSON.parse(readFileSync(path, "utf8")) as unknown,
+        writeArtifact: (path, artifact: RunControlArtifact) =>
+          writeFileAtomic(dirname(path), path, `${JSON.stringify(artifact)}\n`),
+        runTmuxCommand,
+        timeoutMs:
+          args.cleanupMs > 0
+            ? Math.max(1, deadline - deps.now())
+            : MAINTENANCE_CONTROL_TIMEOUT_MS,
+      });
+      if (
+        result.kind === "cancelled" ||
+        result.kind === "already_gone" ||
+        result.kind === "already_terminal"
+      ) {
+        return { kind: "settled" };
+      }
+      return {
+        kind: "failed",
+        error: cleanupError(
+          result.kind,
+          result.kind === "unresolved_teardown_error"
+            ? result.error
+            : undefined,
+        ),
+      };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === "ENOENT" && deps.now() < deadline
+        ? { kind: "retry", error: cleanupError("control_not_published") }
+        : {
+            kind: "failed",
+            error: cleanupError(
+              "control_read_failed",
+              err instanceof Error ? err.message : String(err),
+            ),
+          };
+    }
+  };
+
+  for (;;) {
+    let retryable = false;
+    for (const target of targets) {
+      if (settled.has(target.id) || hardFailures.has(target.id)) continue;
+
+      if (
+        target.attempt.launched_at === null &&
+        target.attempt.state === "launch_failed"
+      ) {
+        target.attempt.state = "cancelled";
+        settled.add(target.id);
+        continue;
+      }
+
+      const control = consumeExactControl(target);
+      if (control.kind === "retry") {
+        target.attempt.cleanup_error = control.error ?? null;
+        retryable = true;
+        continue;
+      }
+      if (control.kind === "failed") {
+        target.attempt.cleanup_error = control.error ?? null;
+        hardFailures.add(target.id);
+        continue;
+      }
+      target.attempt.cleanup_error = null;
+
+      const pidfile = target.attempt.pidfile;
+      const rawPid = pidfile === null ? null : readPid(pidfile);
+      const ownedPid = ownedLivePid(target);
+      if (ownedPid !== null) {
+        if (target.attempt.wrapper_termination_requested_at == null) {
+          try {
+            (
+              deps.terminatePid ??
+              ((pid: number) => process.kill(pid, "SIGTERM"))
+            )(ownedPid);
+            target.attempt.wrapper_termination_requested_at = deps.now();
+            persist();
+          } catch (err) {
+            target.attempt.cleanup_error = cleanupError(
+              "wrapper_termination_failed",
+              err instanceof Error ? err.message : String(err),
+            );
+            hardFailures.add(target.id);
+            continue;
+          }
+        }
+        if (ownedLivePid(target) !== null) {
+          target.attempt.cleanup_error = cleanupError("wrapper_still_alive");
+          retryable = true;
+          continue;
+        }
+      } else if (
+        rawPid === null &&
+        pidfile !== null &&
+        target.attempt.state !== "launch_failed"
+      ) {
+        target.attempt.cleanup_error = cleanupError(
+          "wrapper_identity_unpublished",
+        );
+        retryable = true;
+        continue;
+      }
+
+      target.attempt.cleanup_error = null;
+      target.attempt.state = "cancelled";
+      settled.add(target.id);
+    }
+
+    if (
+      settled.size + hardFailures.size === targets.length ||
+      !retryable ||
+      deps.now() >= deadline
+    ) {
+      break;
+    }
+    await deps.sleep(
+      Math.min(deps.pollIntervalMs ?? 50, Math.max(1, deadline - deps.now())),
+    );
+  }
+
+  const unresolved = targets
+    .filter((target) => !settled.has(target.id))
+    .map((target) => target.id)
+    .sort();
+  for (const target of targets) {
+    const didSettle = settled.has(target.id);
+    target.attempt.state = didSettle ? "cancelled" : "cleanup_failed";
+    if (didSettle) target.attempt.cleanup_error = null;
+  }
+  manifest.cleanup_status = unresolved.length === 0 ? "settled" : "failed";
+  manifest.unresolved_cleanup = unresolved;
+  if (unresolved.length === 0) {
+    manifest.cleanup_settled_at ??= deps.now();
+  }
+  for (const member of manifest.members) {
+    syncMemberFromAttempt(member, currentAttempt(member));
+  }
+  persist();
+  return unresolved.length === 0
+    ? { kind: "settled", dir, unresolved: [] }
+    : { kind: "unresolved", dir, unresolved };
+}
+
+async function reconcileLockedPanelCleanup(args: {
+  dir: string;
+  cleanupMs: number;
+  deps: PanelDeps;
+  manifest: PanelManifest;
+}): Promise<PanelCleanupReconcileResult> {
+  const manifestPath = join(args.dir, "manifest.json");
+  const persist = (): void => {
+    writeFileAtomic(
+      args.dir,
+      manifestPath,
+      `${JSON.stringify(args.manifest, null, 2)}\n`,
+    );
+  };
+  return reconcileCleanupManifest({ ...args, persist });
+}
+
+/** Reconcile one already-cancelled run without deriving any teardown identity. */
+export async function panelReconcileCleanup(
+  args: PanelCancelArgs,
+  deps: PanelDeps,
+): Promise<PanelCleanupReconcileResult> {
+  const lock =
+    deps.lock?.(join(args.dir, ".lock")) ??
+    (deps.lock === undefined ? { release: (): void => {} } : null);
+  if (lock === null) return { kind: "locked", dir: args.dir };
+  try {
+    const manifestPath = join(args.dir, "manifest.json");
+    let parsed: ReturnType<typeof parseManifest>;
+    try {
+      parsed = parseManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
+    } catch (err) {
+      return {
+        kind: "invalid",
+        dir: args.dir,
+        error: (err as Error).message,
+      };
+    }
+    if (!parsed.ok) {
+      return { kind: "invalid", dir: args.dir, error: parsed.error };
+    }
+    const manifest = parsed.manifest;
+    if (manifest.cleanup_status === "settled") {
+      return { kind: "settled", dir: args.dir, unresolved: [] };
+    }
+    if (
+      manifest.cleanup_status !== "pending" &&
+      manifest.cleanup_status !== "failed"
+    ) {
+      return { kind: "ineligible", dir: args.dir };
+    }
+    return reconcileLockedPanelCleanup({
+      dir: args.dir,
+      cleanupMs: args.cleanupMs ?? 0,
+      deps,
+      manifest,
+    });
+  } finally {
+    lock.release();
+  }
+}
+
+/** Discover and retry every durable pending/failed cleanup in stable run order. */
+export async function panelCleanupMaintenance(
+  deps: PanelDeps,
+): Promise<PanelCleanupMaintenanceResult> {
+  const root = join(keeperStateDir(), "panels");
+  const result: PanelCleanupMaintenanceResult = {
+    root,
+    settled: [],
+    unresolved: [],
+    skipped: [],
+    errors: [],
+  };
+  let names: string[];
+  try {
+    names = readdirSync(root).sort();
+  } catch {
+    return result;
+  }
+  const visibleNames = names.filter((name) => name !== PANEL_TRASH_DIR);
+  const cursor = panelCleanupCursor;
+  const startIndex =
+    cursor === null ? 0 : visibleNames.findIndex((name) => name > cursor);
+  const orderedNames =
+    startIndex <= 0
+      ? visibleNames
+      : [
+          ...visibleNames.slice(startIndex),
+          ...visibleNames.slice(0, startIndex),
+        ];
+  const passDeadline = deps.now() + PANEL_CLEANUP_PASS_BUDGET_MS;
+  let inspected = 0;
+  for (const name of orderedNames) {
+    if (inspected > 0 && deps.now() >= passDeadline) break;
+    panelCleanupCursor = name;
+    inspected += 1;
+    const dir = join(root, name);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch (err) {
+      result.errors.push({ dir, error: (err as Error).message });
+      continue;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
+    } catch (err) {
+      result.errors.push({ dir, error: (err as Error).message });
+      continue;
+    }
+    const record =
+      raw !== null && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : null;
+    const cleanupCandidate =
+      record?.cleanup_status === "pending" ||
+      record?.cleanup_status === "failed" ||
+      record?.state === "cleanup_failed";
+    if (!cleanupCandidate) continue;
+    const parsed = parseManifest(raw);
+    if (!parsed.ok) {
+      result.errors.push({ dir, error: parsed.error });
+      continue;
+    }
+    if (
+      parsed.manifest.cleanup_status !== "pending" &&
+      parsed.manifest.cleanup_status !== "failed"
+    ) {
+      continue;
+    }
+    try {
+      const reconciled = await panelReconcileCleanup(
+        { dir, cleanupMs: 0 },
+        deps,
+      );
+      if (reconciled.kind === "settled") {
+        result.settled.push(dir);
+      } else if (reconciled.kind === "unresolved") {
+        result.unresolved.push({
+          dir,
+          identities: [...reconciled.unresolved],
+        });
+      } else if (reconciled.kind === "locked") {
+        result.skipped.push(dir);
+      } else if (reconciled.kind === "invalid") {
+        result.errors.push({
+          dir,
+          error: reconciled.error ?? "invalid manifest",
+        });
+      }
+    } catch (err) {
+      result.errors.push({ dir, error: (err as Error).message });
+    }
+  }
+  if (inspected === orderedNames.length) panelCleanupCursor = null;
+  return result;
+}
+
 /**
- * Persist the cancellation tombstone before signalling any exact registered
- * process identity. The bounded cleanup pass reports every still-live attempt.
+ * Persist the monotonic cancellation outcome before one bounded exact cleanup
+ * pass. Later maintenance retries any unresolved obligations.
  */
 export async function panelCancel(
   args: PanelCancelArgs,
@@ -1673,129 +2220,40 @@ export async function panelCancel(
       return 2;
     }
     const manifest = parsed.manifest;
-    if (
-      (manifest.state === "cancelled" || manifest.state === "cleanup_failed") &&
-      manifest.request_id !== undefined
-    ) {
-      const unresolved = manifest.unresolved_cleanup ?? [];
-      deps.write(
-        `${JSON.stringify({ dir: manifest.dir, request_id: manifest.request_id, state: manifest.state, unresolved })}\n`,
-      );
-      return manifest.state === "cancelled" ? 0 : 1;
-    }
-    manifest.state = "cancelling";
-    manifest.cancellation_requested_at ??= deps.now();
-    writeFileAtomic(
-      args.dir,
-      manifestPath,
-      `${JSON.stringify(manifest, null, 2)}\n`,
-    );
-
-    const targets: {
-      id: string;
-      member: PanelManifestMember;
-      attempt: PanelMemberAttempt;
-    }[] = [];
-    for (const member of manifest.members) {
-      const attempts = member.attempts ?? [currentAttempt(member)];
-      member.attempts = attempts;
-      for (const attempt of attempts) {
-        if (
-          existsSync(attempt.yaml) ||
-          attempt.state === "launch_failed" ||
-          attempt.state === "lost"
-        ) {
-          continue;
-        }
-        targets.push({
-          id: `${member.name}#${attempt.attempt}`,
-          member,
-          attempt,
-        });
+    const requestId = manifest.request_id ?? manifest.slug;
+    if (manifest.cleanup_status !== "settled") {
+      manifest.state = "cancelled";
+      manifest.cancellation_requested_at ??= deps.now();
+      manifest.cleanup_status ??= "pending";
+      if ((manifest.unresolved_cleanup?.length ?? 0) === 0) {
+        manifest.unresolved_cleanup = cleanupTargetIdentities(manifest);
       }
-    }
-
-    const deadline = deps.now() + (args.cleanupMs ?? DEFAULT_CANCEL_CLEANUP_MS);
-    const unresolved = new Set<string>();
-    const signalled = new Set<string>();
-    const ownedLivePid = (target: (typeof targets)[number]): number | null => {
-      const pid =
-        target.attempt.pidfile === null
-          ? null
-          : readPid(target.attempt.pidfile);
-      if (pid === null || !deps.pidAlive(pid)) return null;
-      const view: PanelManifestMember = {
-        ...target.member,
-        yaml: target.attempt.yaml,
-        pidfile: target.attempt.pidfile,
-        startfile: target.attempt.startfile,
-        launched_at: target.attempt.launched_at,
-      };
-      return legIdentityHolds(view, pid, deps) ? pid : null;
-    };
-
-    for (;;) {
-      let awaitingCleanup = false;
-      for (const target of targets) {
-        if (unresolved.has(target.id)) continue;
-        const pid = ownedLivePid(target);
-        if (pid === null) {
-          const pidMissing =
-            target.attempt.pidfile !== null &&
-            readPid(target.attempt.pidfile) === null &&
-            target.attempt.launched_at !== null;
-          if (pidMissing) {
-            if (deps.now() < deadline) awaitingCleanup = true;
-            else {
-              unresolved.add(target.id);
-              target.attempt.state = "cleanup_failed";
-            }
-          } else target.attempt.state = "cancelled";
-          continue;
-        }
-        awaitingCleanup = true;
-        if (!signalled.has(target.id)) {
-          try {
-            (
-              deps.terminatePid ??
-              ((ownedPid: number) => process.kill(ownedPid, "SIGTERM"))
-            )(pid);
-            signalled.add(target.id);
-          } catch {
-            unresolved.add(target.id);
-          }
-        }
-      }
-      if (!awaitingCleanup || deps.now() >= deadline) break;
-      await deps.sleep(
-        Math.min(deps.pollIntervalMs ?? 50, Math.max(1, deadline - deps.now())),
+      writeFileAtomic(
+        args.dir,
+        manifestPath,
+        `${JSON.stringify(manifest, null, 2)}\n`,
       );
     }
-    for (const target of targets) {
-      if (ownedLivePid(target) !== null || unresolved.has(target.id)) {
-        unresolved.add(target.id);
-        target.attempt.state = "cleanup_failed";
-      }
-    }
-    const unresolvedList = [...unresolved].sort();
-    manifest.state =
-      unresolvedList.length === 0 ? "cancelled" : "cleanup_failed";
-    manifest.unresolved_cleanup = unresolvedList;
-    for (const member of manifest.members)
-      syncMemberFromAttempt(member, currentAttempt(member));
-    writeFileAtomic(
-      args.dir,
-      manifestPath,
-      `${JSON.stringify(manifest, null, 2)}\n`,
-    );
+
+    const reconciled =
+      manifest.cleanup_status === "settled"
+        ? ({ kind: "settled", dir: args.dir, unresolved: [] } as const)
+        : await reconcileLockedPanelCleanup({
+            dir: args.dir,
+            cleanupMs: args.cleanupMs ?? DEFAULT_CANCEL_CLEANUP_MS,
+            deps,
+            manifest,
+          });
+    const unresolved =
+      reconciled.kind === "unresolved" ? reconciled.unresolved : [];
     const result: PanelCancelResult = {
       dir: manifest.dir,
-      request_id: manifest.request_id ?? manifest.slug,
-      state: manifest.state,
-      unresolved: unresolvedList,
+      request_id: requestId,
+      state: unresolved.length === 0 ? "cancelled" : "cleanup_failed",
+      unresolved,
     };
     deps.write(`${JSON.stringify(result)}\n`);
-    return unresolvedList.length === 0 ? 0 : 1;
+    return unresolved.length === 0 ? 0 : 1;
   } finally {
     lock.release();
   }
@@ -1863,7 +2321,9 @@ export async function panelWait(
     parsed.manifest.state === "cleanup_failed"
   ) {
     const reason =
-      parsed.manifest.state === "cleanup_failed"
+      parsed.manifest.state === "cleanup_failed" ||
+      (parsed.manifest.state === "cancelled" &&
+        parsed.manifest.cleanup_status !== "settled")
         ? "cleanup_failed"
         : "cancelled";
     deps.write(
@@ -1973,21 +2433,34 @@ export function panelStatus(args: PanelStatusArgs, deps: PanelDeps): number {
   const allTerminal = out.every((m) => m.status !== "running");
   const storedState = parsed.manifest.state ?? "running";
   const state: PanelRequestState =
-    storedState === "cancelling" ||
-    storedState === "cancelled" ||
-    storedState === "cleanup_failed"
-      ? storedState
-      : allTerminal
-        ? out.every((m) => m.status === "completed")
-          ? "completed"
-          : "failed"
-        : storedState;
+    (storedState === "cleanup_failed" || storedState === "cancelled") &&
+    parsed.manifest.cleanup_status !== "settled"
+      ? "cleanup_failed"
+      : storedState === "cleanup_failed"
+        ? "cancelled"
+        : storedState === "cancelling" || storedState === "cancelled"
+          ? storedState
+          : allTerminal
+            ? out.every((m) => m.status === "completed")
+              ? "completed"
+              : "failed"
+            : storedState;
+  const persistedUnresolved = parsed.manifest.unresolved_cleanup ?? [];
+  const cleanupIsUnsettled =
+    parsed.manifest.cleanup_status === "pending" ||
+    parsed.manifest.cleanup_status === "failed";
+  const unresolvedCleanup =
+    cleanupIsUnsettled && persistedUnresolved.length === 0
+      ? cleanupTargetIdentities(parsed.manifest)
+      : [...persistedUnresolved].sort();
   const snapshot: PanelStatus = {
     dir,
     slug,
     request_id: parsed.manifest.request_id,
     argument_digest: parsed.manifest.argument_digest,
     state,
+    cleanup_status: parsed.manifest.cleanup_status,
+    unresolved_cleanup: unresolvedCleanup,
     generation: generation ?? 1,
     all_terminal: allTerminal,
     members: out,
@@ -2001,6 +2474,23 @@ export function panelStatus(args: PanelStatusArgs, deps: PanelDeps): number {
  *  `prune`). A running detached leg is lock-free, so this pid probe — not the
  *  advisory lock — is what protects a live run from `prune`. A missing/corrupt
  *  manifest proves no live leg. */
+function hasUnsettledCleanup(slugDir: string): boolean {
+  try {
+    const parsed = parseManifest(
+      JSON.parse(readFileSync(join(slugDir, "manifest.json"), "utf8")),
+    );
+    if (!parsed.ok) return true;
+    const manifest = parsed.manifest;
+    return (
+      manifest.cleanup_status === "pending" ||
+      manifest.cleanup_status === "failed"
+    );
+  } catch {
+    // An unreadable run cannot prove that it owns no unsettled exact controls.
+    return true;
+  }
+}
+
 function hasLiveLeg(slugDir: string, deps: PanelDeps): boolean {
   let raw: unknown;
   try {
@@ -2065,11 +2555,11 @@ export interface PanelPruneArgs {
 
 /**
  * `prune`: GC abandoned durable panel run dirs under
- * `~/.local/state/keeper/panels/`. A slug dir is reclaimed ONLY when all three
- * hold — (a) its per-slug advisory lock is free (no `start`/reconcile mid-flight),
- * (b) NO manifest leg pid is live (a live detached run is lock-free, so this veto,
- * not the lock, is the liveness guard), and (c) its `started-at` sentinel mtime is
- * older than the TTL. Deletion is TOCTOU-safe (rename-to-trash then recursive
+ * `~/.local/state/keeper/panels/`. A slug dir is reclaimed ONLY when cleanup has
+ * no unsettled controls, (a) its per-slug advisory lock is free (no
+ * `start`/reconcile mid-flight), (b) NO manifest leg pid is live (a live detached
+ * run is lock-free, so this veto, not the lock, is the liveness guard), and (c)
+ * its `started-at` sentinel mtime is older than the TTL. Deletion is TOCTOU-safe (rename-to-trash then recursive
  * remove). Fail-open throughout — an un-ageable (sentinel-less) or in-use dir is
  * kept, never force-deleted. Prints the {@link PanelPruneResult}; returns 0.
  */
@@ -2123,6 +2613,11 @@ export function panelPrune(args: PanelPruneArgs, deps: PanelDeps): number {
       continue;
     }
     try {
+      // Unsettled exact controls are finalizer-protected from age/count GC.
+      if (hasUnsettledCleanup(slugDir)) {
+        kept.push(name);
+        continue;
+      }
       // (b) A live leg pid vetoes deletion regardless of age.
       if (hasLiveLeg(slugDir, deps)) {
         kept.push(name);
@@ -2203,6 +2698,7 @@ export function buildPanelDeps(): PanelDeps {
     sleep: (ms) => Bun.sleep(ms),
     pidAlive,
     readStartTime: readPanelStartTime,
+    runTmuxCommand: defaultTmuxCommandRunner,
     // Sleep-proof, kernel-derived boot instant — start + wait share it so a mid-run
     // sleep never false-trips the reboot guard.
     bootEpochMs: () => readBootEpochMs(() => Date.now()),
@@ -2234,21 +2730,24 @@ start  atomically reserves one opaque panel request and immutable argument diges
        mutually exclusive.
 resume verifies the original request digest and may replace positively dead
        nonterminal attempts without changing the run identity.
-cancel writes its tombstone before identity-checked signalling, waits a bounded
-       cleanup window, and reports exact unresolved member-attempt identities.
+cancel records its monotonic outcome plus pending cleanup before consuming every
+       caller-owned exact control, terminates wrappers only after positive absence,
+       and reports exact unresolved member-attempt identities.
 wait   re-reads the manifest (by --slug or --run-dir) and blocks ONE --chunk window
        polling each leg. Exit 0 + verdict JSON {dir, ok, members:[…]} when all legs
        are terminal; exit 124 when the chunk elapses (re-issue it); exit 2 on a
        missing/corrupt manifest (an unknown/pruned slug) or bad flags. Exit 0 means
        ALL-TERMINAL, not all-success — key off the verdict's 'ok' flag.
 status read-only, non-blocking per-leg snapshot {dir, slug, request_id, state,
-       generation, all_terminal, members:[{name,harness,status,yaml,reason}]} where status is
+       cleanup_status, unresolved_cleanup, generation, all_terminal,
+       members:[{name,harness,status,yaml,reason}]} where status is
        completed|running|failed|absent (a dead no-result leg reads failed/absent,
        never a phantom 'running'). Exit 0; exit 2 on a missing/corrupt manifest.
 prune  GC abandoned run dirs under ~/.local/state/keeper/panels/. Reclaims a slug
-       dir ONLY when its lock is free AND no leg pid is live AND its started-at
-       sentinel is older than the ${PANEL_PRUNE_TTL_MS / 86_400_000}-day TTL; a
-       live or in-reconcile run is always kept. Prints {root, pruned, kept}.
+       dir ONLY when cleanup is settled, its lock is free, no leg pid is live, and
+       its started-at sentinel is older than the ${PANEL_PRUNE_TTL_MS / 86_400_000}-day TTL;
+       an unsettled, live, or in-reconcile run is always kept. Prints
+       {root, pruned, kept}.
 
 Options:
   --slug <slug>     start: REQUIRED run id (each leg launches as

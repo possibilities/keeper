@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { isRunControlArtifact } from "../src/agent/run-capture";
 import { keeperStateDir } from "../src/keeper-state-dir";
 import type { PanelManifest } from "../src/pair/panel";
 
@@ -154,6 +155,73 @@ function isAlive(pid: number): boolean {
   }
 }
 
+function inspectExactControls(manifest: PanelManifest | null): {
+  unresolved: string[];
+  liveWindows: string[];
+} {
+  const unresolved: string[] = [];
+  const liveWindows: string[] = [];
+  const requestId = manifest?.request_id ?? manifest?.slug;
+  for (const member of manifest?.members ?? []) {
+    for (const attempt of member.attempts ?? []) {
+      if (attempt.launched_at === null) continue;
+      const id = `${member.name}#${attempt.attempt}`;
+      const association = attempt.control;
+      let artifact: unknown;
+      try {
+        artifact =
+          association == null
+            ? null
+            : JSON.parse(readFileSync(association.path, "utf8"));
+      } catch {
+        artifact = null;
+      }
+      if (
+        association == null ||
+        association.request_id !== requestId ||
+        association.member !== member.name ||
+        association.attempt !== attempt.attempt ||
+        !isRunControlArtifact(artifact) ||
+        artifact.owner?.request_id !== requestId ||
+        artifact.owner.member !== member.name ||
+        artifact.owner.attempt !== attempt.attempt
+      ) {
+        unresolved.push(id);
+        continue;
+      }
+      if (artifact.status !== "terminal") unresolved.push(id);
+      const exactWindow = artifact.kill_window_command.at(-1) as string;
+      const probe = Bun.spawnSync(
+        [
+          ...artifact.kill_window_command.slice(0, -3),
+          "display-message",
+          "-p",
+          "-t",
+          exactWindow,
+          "#{window_id}",
+        ],
+        { stdout: "pipe", stderr: "pipe", timeout: 2_000 },
+      );
+      const observed = new TextDecoder().decode(probe.stdout).trim();
+      if (
+        probe.exitedDueToTimeout ||
+        probe.exitCode === null ||
+        (probe.exitCode === 0 && observed === exactWindow) ||
+        (probe.exitCode !== 0 &&
+          !/(?:can't find (?:window|session)|no server running|no sessions|session not found|window not found)/i.test(
+            new TextDecoder().decode(probe.stderr),
+          ))
+      ) {
+        liveWindows.push(id);
+      }
+    }
+  }
+  return {
+    unresolved: [...new Set(unresolved)].sort(),
+    liveWindows: [...new Set(liveWindows)].sort(),
+  };
+}
+
 let start: CommandResult | null = null;
 let terminal: unknown = null;
 let cancellation: unknown = null;
@@ -245,9 +313,10 @@ const finalManifest = readManifest();
 const launches = (finalManifest?.members ?? []).flatMap((member) =>
   (member.attempts ?? []).filter((attempt) => attempt.launched_at !== null),
 ).length;
-const survivors = registeredPids(finalManifest).filter(({ pid }) =>
+const wrapperSurvivors = registeredPids(finalManifest).filter(({ pid }) =>
   isAlive(pid),
 );
+const exactControls = inspectExactControls(finalManifest);
 const terminalOutcomes =
   terminal ??
   (finalManifest === null
@@ -272,9 +341,28 @@ const report = {
   terminal_outcomes: terminalOutcomes,
   aborted,
   cancellation_settlement: cancellation,
-  exact_survivor_count: survivors.length,
-  exact_survivors: survivors.map(({ id }) => id),
+  wrapper_survivor_count: wrapperSurvivors.length,
+  wrapper_survivors: wrapperSurvivors.map(({ id }) => id),
+  unresolved_control_count: exactControls.unresolved.length,
+  unresolved_controls: exactControls.unresolved,
+  exact_window_survivor_count: exactControls.liveWindows.length,
+  exact_window_survivors: exactControls.liveWindows,
+  exact_survivor_count:
+    wrapperSurvivors.length +
+    exactControls.unresolved.length +
+    exactControls.liveWindows.length,
+  exact_survivors: [
+    ...wrapperSurvivors.map(({ id }) => `wrapper:${id}`),
+    ...exactControls.unresolved.map((id) => `control:${id}`),
+    ...exactControls.liveWindows.map((id) => `window:${id}`),
+  ],
   failure,
 };
 process.stdout.write(`${JSON.stringify(report)}\n`);
-process.exit(failure === null && survivors.length === 0 ? 0 : 1);
+process.exit(
+  failure === null &&
+    finalManifest?.cleanup_status === "settled" &&
+    report.exact_survivor_count === 0
+    ? 0
+    : 1,
+);

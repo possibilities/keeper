@@ -18,7 +18,7 @@
  * move is exactly that bun:sqlite is synchronous and blocks main's loop
  * regardless of which connection it uses.
  *
- * Four schedules:
+ * Five schedules:
  * - (a) the verified backup interval (`BACKUP_INTERVAL_MS`; `runBackupPass` →
  *       `backupDb(dbPath)`), relocated from main (daemon.ts),
  * - (b) the fn-753 boot-time catch-up one-shot (`isCatchUpDue` ⇒ a delayed
@@ -35,6 +35,9 @@
  *       it onto a schedule. Its own leftover-trash sweep (`.gc/`, cleared at the
  *       top of every `panelPrune` call) now also runs automatically, so the trash
  *       stays bounded instead of only clearing on the next manual `prune`.
+ * - (e) the one-minute Panel cleanup reconciler (`runPanelCleanupPass`), run once
+ *       at worker boot and then on cadence so pending/failed exact teardown
+ *       resumes after daemon restart without polling inside a pass.
  *
  * ## Side effects stay main-side (the relay)
  *
@@ -99,9 +102,12 @@ import {
 } from "./integrity-probe";
 import {
   buildPanelDeps,
+  PANEL_CLEANUP_INTERVAL_MS,
   PANEL_PRUNE_INTERVAL_MS,
+  type PanelCleanupMaintenanceResult,
   type PanelDeps,
   type PanelPruneResult,
+  panelCleanupMaintenance,
   panelPrune,
 } from "./pair/panel";
 
@@ -243,7 +249,6 @@ export function runPanelPrunePass(
   try {
     result = JSON.parse(captured) as PanelPruneResult;
   } catch {
-    // Malformed capture — non-fatal; the next interval retries.
     return;
   }
   if (result.pruned.length > 0) {
@@ -254,9 +259,49 @@ export function runPanelPrunePass(
   }
 }
 
+/** Retry every durable pending/failed Panel cleanup once, without polling. */
+export async function runPanelCleanupPass(
+  post: (msg: MaintenanceMessage) => void,
+  isShuttingDown: () => boolean,
+  deps: PanelDeps = buildPanelDeps(),
+  execute: (
+    panelDeps: PanelDeps,
+  ) => Promise<PanelCleanupMaintenanceResult> = panelCleanupMaintenance,
+): Promise<void> {
+  if (isShuttingDown()) return;
+  try {
+    const result = await execute(deps);
+    if (result.settled.length > 0) {
+      post({
+        kind: "maintenance-log",
+        message: `[panel-cleanup] settled ${result.settled.length} panel run(s): ${result.settled.join(", ")}`,
+      });
+    }
+    if (result.errors.length > 0) {
+      const diagnostics = result.errors
+        .slice(0, 5)
+        .map(
+          ({ dir, error }) =>
+            `${dir}: ${error.replace(/\s+/g, " ").slice(0, 256)}`,
+        )
+        .join("; ");
+      const omitted = Math.max(0, result.errors.length - 5);
+      post({
+        kind: "maintenance-log",
+        message: `[panel-cleanup] ${result.errors.length} run(s) could not be reconciled: ${diagnostics}${omitted === 0 ? "" : `; ${omitted} more`}`,
+      });
+    }
+  } catch (err) {
+    post({
+      kind: "maintenance-log",
+      message: `[panel-cleanup] pass failed: ${(err as Error).message}`,
+    });
+  }
+}
+
 /**
- * Worker entrypoint. Wires the shutdown message, schedules the backup +
- * integrity-probe + panel-prune intervals, evaluates the fn-753 boot catch-up
+ * Worker entrypoint. Wires the shutdown message, schedules backup, integrity,
+ * panel cleanup, and panel-prune maintenance, evaluates the backup catch-up
  * one-shot once on start, and posts pass outcomes to main. Owns no long-lived
  * resource beyond the timers, which the shutdown handler clears before exiting
  * clean.
@@ -299,6 +344,20 @@ function main(): void {
     runPanelPrunePass(post, isShuttingDown);
   }, PANEL_PRUNE_INTERVAL_MS);
 
+  let panelCleanupRunning = false;
+  const reconcilePanelCleanup = (): void => {
+    if (panelCleanupRunning || isShuttingDown()) return;
+    panelCleanupRunning = true;
+    void runPanelCleanupPass(post, isShuttingDown).finally(() => {
+      panelCleanupRunning = false;
+    });
+  };
+  reconcilePanelCleanup();
+  const panelCleanupTimer = setInterval(
+    reconcilePanelCleanup,
+    PANEL_CLEANUP_INTERVAL_MS,
+  );
+
   // fn-753 boot-time catch-up: the regular interval resets on every daemon boot,
   // so a keeperd that restarts more often than BACKUP_INTERVAL_MS would never
   // reach its first fire. If the newest snapshot is overdue (or none exists),
@@ -323,6 +382,7 @@ function main(): void {
       clearInterval(backupTimer);
       clearInterval(probeTimer);
       clearInterval(panelPruneTimer);
+      clearInterval(panelCleanupTimer);
       if (backupCatchUpTimer !== null) {
         clearTimeout(backupCatchUpTimer);
         backupCatchUpTimer = null;

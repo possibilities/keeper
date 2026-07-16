@@ -206,13 +206,11 @@ const NATIVE_ARGS_BUILDERS: Record<
  * cwd-confirm prompt; `--x-tmux-detached` creates the window without
  * stealing focus, so the orchestrating session keeps control.
  *
- * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for the
- * CLAUDE path only (mirroring `buildKeeperAgentLaunchArgv` in
- * `src/exec-backend.ts`): it is the binding carrier that lands the partner in
- * the `jobs` projection as a tracked job — the launcher injects it into the pane
- * env via tmux `-e`, so the SessionStart hook stamps the session name as the
- * partner's birth session (`plan_verb` NULL — a tracked-but-non-plan job). The carrier needs a session to name, so it is added only when
- * `session` is present.
+ * `--x-tmux-env KEEPER_TMUX_SESSION=<session>` is injected for every harness
+ * with an explicit session. It lands the launch in `jobs` as a tracked job with
+ * a birth session: claude stamps it through the SessionStart hook, while Pi's
+ * birth-record path reads it through `birthBackendCoordsFromEnv` and
+ * `armBirthRecord` for daemon autoclose corroboration.
  *
  * A RESUME launch ({@link AgentLaunchOpts.resumeTarget} set) drops the
  * unconditional trailing `prompt` positional this function otherwise
@@ -235,9 +233,7 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   }
   if (opts.session !== undefined && opts.session !== "") {
     wrapperFlags.push("--x-tmux-session", opts.session);
-    if (opts.cli === "claude") {
-      wrapperFlags.push("--x-tmux-env", `KEEPER_TMUX_SESSION=${opts.session}`);
-    }
+    wrapperFlags.push("--x-tmux-env", `KEEPER_TMUX_SESSION=${opts.session}`);
   }
   // The name lands on the tmux window name UNIFORMLY (every harness) via the
   // launcher's window-name knob; the harness-native `--name` (claude/pi) is added

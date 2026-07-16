@@ -178,9 +178,12 @@ agent-template or extension changes, then use the rendered-agent parity tests be
 
 Panel retries are identity-sensitive: repeat `wait` after exit 124 against the same run directory, use
 `resume` only for its bounded positively-dead recovery, and never rerun `start` under a fresh slug as an
-error handler. `cleanup_failed` withholds success and names exact `member#attempt` survivors; inspect
-those identities and their exported `tmux-runs/<run-id>/control.json` commands instead of using
-session-wide tmux cleanup or process-name matching. Detailed states are in
+error handler. `cleanup_failed` withholds success and names exact `member#attempt` obligations while
+daemon maintenance retries their canonical controls after client exit or restart. Persistent missing,
+malformed, ownership-mismatched, inaccessible, or teardown-failing controls retain a bounded
+per-attempt `cleanup_error` in the manifest for inspection; never replace
+them with session-wide tmux cleanup, process-name matching, or a target derived from display metadata.
+Detailed states are in
 [problem-codes.md](./problem-codes.md#panel-run-lifecycle).
 
 After installing agent-template or extension changes, run the repository correctness gate:
@@ -198,8 +201,10 @@ bun scripts/panel-smoke.ts --panel <small-panel> --outer-timeout 120 --abort-aft
 ```
 
 Inspect each smoke report for `launch_count` equal to the configured member count exactly once,
-settled cancellation, and `exact_survivor_count: 0`. A `cleanup_failed` report names the exact
-identities for operator reconciliation. The canonical test commands and budget policy are in
+settled cancellation, `wrapper_survivor_count: 0`, `unresolved_control_count: 0`,
+`exact_window_survivor_count: 0`, and aggregate `exact_survivor_count: 0`. A `cleanup_failed` report
+names the exact identities maintenance continues to reconcile; operator action is reserved for a
+persistent fail-closed control diagnosis. The canonical test commands and budget policy are in
 [docs/testing.md](./testing.md).
 
 Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which derives

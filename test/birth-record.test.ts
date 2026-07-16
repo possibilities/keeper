@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildAgentLaunchArgv } from "../src/agent/launch-config";
 import { main } from "../src/agent/main";
 import {
   BIRTH_INTENT_SCHEMA_VERSION,
@@ -289,6 +290,46 @@ describe("env-derived coords / worktree / draft", () => {
         KEEPER_TMUX_SESSION: "pair",
       }),
     ).toEqual({ type: "tmux", sessionId: "pair", paneId: "%8" });
+  });
+
+  test("Pi launch carrier stamps the birth session and stays absent without an explicit session", () => {
+    const argv = buildAgentLaunchArgv({
+      launcherArgvPrefix: ["/abs/bun", "/abs/cli/keeper.ts", "agent"],
+      cli: "pi",
+      prompt: "p",
+      session: "panels",
+    });
+    const envIndex = argv.indexOf("--x-tmux-env");
+    expect(envIndex).toBeGreaterThanOrEqual(0);
+    const carrier = argv[envIndex + 1];
+    if (!carrier?.startsWith("KEEPER_TMUX_SESSION=")) {
+      throw new Error("Pi launch is missing its tmux session carrier");
+    }
+    const sessionId = carrier.slice("KEEPER_TMUX_SESSION=".length);
+    const env = {
+      TMUX: "/tmp/tmux-x/default,1,0",
+      TMUX_PANE: "%3",
+      KEEPER_TMUX_SESSION: sessionId,
+    };
+    expect(birthBackendCoordsFromEnv(env).sessionId).toBe("panels");
+    expect(
+      buildBirthDraft(env, {
+        session_id: "j-pi-panel",
+        harness: "pi",
+        cwd: "/c",
+        spawn_name: "panel::pi::q1",
+        config_dir: null,
+        resume_target: null,
+        launch_ts: "2026-07-03T00:00:00.000Z",
+      }).backend_exec_session_id,
+    ).toBe("panels");
+
+    const sessionless = buildAgentLaunchArgv({
+      launcherArgvPrefix: ["/abs/bun", "/abs/cli/keeper.ts", "agent"],
+      cli: "pi",
+      prompt: "p",
+    });
+    expect(sessionless).not.toContain("--x-tmux-env");
   });
 
   test("foreign tmux sockets stamp no coords", () => {

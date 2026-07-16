@@ -44,8 +44,11 @@ import {
   type PanelManifestMember,
   type PanelVerdict,
   panelCancel,
+  panelCleanupMaintenance,
+  panelReconcileCleanup,
   panelResume,
   panelStart,
+  panelStatus,
   panelWait,
   parseManifest,
   resolvePanelMembers,
@@ -120,13 +123,16 @@ function makeDeps(opts: {
   bootEpochMs?: PanelDeps["bootEpochMs"];
   readStartTime?: PanelDeps["readStartTime"];
   lock?: PanelDeps["lock"];
+  runTmuxCommand?: PanelDeps["runTmuxCommand"];
 }): {
   deps: PanelDeps;
   spawns: SpawnCall[];
+  tmuxCommands: string[][];
   stdout: () => string;
   stderr: () => string;
 } {
   const spawns: SpawnCall[] = [];
+  const tmuxCommands: string[][] = [];
   const out: string[] = [];
   const err: string[] = [];
   const clock = opts.clock ?? { ms: 0 };
@@ -160,10 +166,17 @@ function makeDeps(opts: {
     bootEpochMs: opts.bootEpochMs ?? (() => TEST_BOOT_EPOCH_MS),
     readStartTime: opts.readStartTime ?? (() => null),
     lock: opts.lock,
+    runTmuxCommand:
+      opts.runTmuxCommand ??
+      ((command) => {
+        tmuxCommands.push(command);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }),
   };
   return {
     deps,
     spawns,
+    tmuxCommands,
     stdout: () => out.join(""),
     stderr: () => err.join(""),
   };
@@ -200,6 +213,47 @@ function seedPidfile(name: string, pid: number): void {
  *  is exercised). The recycle guard compares this against `deps.readStartTime`. */
 function seedStartfile(name: string, startTime: string): void {
   writeFileSync(join(dir, `${name}.starttime`), `${startTime}    \n`);
+}
+
+function seedControl(
+  name: string,
+  opts: {
+    status?: "running" | "cancelling" | "terminal";
+    owner?: { request_id: string; member: string; attempt: number };
+  } = {},
+): string[] {
+  const manifest = readManifest();
+  const member = manifest.members.find((candidate) => candidate.name === name);
+  const attempt = member?.attempts?.at(-1);
+  if (member === undefined || attempt?.control == null) {
+    throw new Error(`missing control for ${name}`);
+  }
+  const owner = opts.owner ?? {
+    request_id: attempt.control.request_id,
+    member: attempt.control.member,
+    attempt: attempt.control.attempt,
+  };
+  const command = [
+    "/opt/tmux",
+    "-S",
+    `/tmp/${name}.sock`,
+    "kill-window",
+    "-t",
+    `@${attempt.attempt}`,
+  ];
+  writeFileSync(
+    attempt.control.path,
+    `${JSON.stringify({
+      schema_version: 1,
+      run_id: `run-${name}-${attempt.attempt}`,
+      agent: member.harness,
+      started_at_ms: attempt.launched_at,
+      kill_window_command: command,
+      status: opts.status ?? "running",
+      owner,
+    })}\n`,
+  );
+  return command;
 }
 
 function readManifest(): PanelManifest {
@@ -460,15 +514,64 @@ test("start: persists + prints a manifest, launches every leg detached", async (
   expect(persisted.dir).toBe(dir);
   expect(persisted.slug).toBe("my-run");
   const [a, b] = persisted.members;
+  const requestId = persisted.request_id;
+  if (requestId === undefined) throw new Error("missing panel request id");
   expect(a?.name).toMatch(/^claude-opus-high-[0-9a-z]{6}-1$/);
   expect(b?.name).toMatch(/^pi-openai-codex-gpt-5-3-high-[0-9a-z]{6}-1$/);
   // The result-file + pidfile basenames derive from the disambiguated slug.
   expect(a?.yaml).toBe(join(dir, `${a?.name}.yaml`));
   expect(a?.pidfile).toBe(join(dir, `${a?.name}.pidfile`));
+  for (const [index, member] of persisted.members.entries()) {
+    const attempt = member.attempts?.[0];
+    if (attempt?.control == null) throw new Error("missing attempt control");
+    expect(attempt.control).toEqual({
+      path: join(dir, `${member.name}.control.json`),
+      request_id: requestId,
+      member: member.name,
+      attempt: 1,
+    });
+    const leg = spawns[index]?.argv ?? [];
+    const controlIndex = leg.indexOf("--control");
+    const ownerIndex = leg.indexOf("--control-owner");
+    expect(leg[controlIndex + 1]).toBe(attempt.control.path);
+    expect(JSON.parse(leg[ownerIndex + 1] ?? "null")).toEqual({
+      request_id: requestId,
+      member: member.name,
+      attempt: 1,
+    });
+  }
   // Prompt copied into the scratch dir.
   expect(readFileSync(join(dir, "prompt.md"), "utf8")).toBe(
     "what is the best answer?",
   );
+});
+
+test("start pre-registers every control association before the first spawn", async () => {
+  const launched = makeDeps({ selections: DEFAULT_SELECTIONS });
+  let checked = false;
+  launched.deps.spawn = () => {
+    if (checked) return;
+    checked = true;
+    const manifest = readManifest();
+    expect(manifest.members).toHaveLength(2);
+    expect(
+      manifest.members.every((member) => member.attempts?.[0]?.control != null),
+    ).toBe(true);
+  };
+
+  expect(
+    await panelStart(
+      {
+        promptFile: writePrompt("pre-register"),
+        slug: "pre-register",
+        panel: "default",
+        dir,
+        timeoutSeconds: 900,
+      },
+      launched.deps,
+    ),
+  ).toBe(0);
+  expect(checked).toBe(true);
 });
 
 test("start: an absent --panel uses the panel.yaml default, launching each via --preset", async () => {
@@ -1038,17 +1141,24 @@ test("cancel tombstones first, tears down exact live attempts, and is idempotent
   );
   const [name] = memberSlugs() as [string];
   seedPidfile(name, 42);
+  const exactCommand = seedControl(name);
   let alive = true;
   const cancel = makeDeps({ selections, pidAlive: () => alive });
   const signalled: number[] = [];
   cancel.deps.terminatePid = (pid) => {
-    expect(readManifest().state).toBe("cancelling");
+    const tombstone = readManifest();
+    expect(tombstone.state).toBe("cancelled");
+    expect(tombstone.cleanup_status).toBe("pending");
     signalled.push(pid);
     alive = false;
   };
   expect(await panelCancel({ dir, cleanupMs: 10 }, cancel.deps)).toBe(0);
+  expect(cancel.tmuxCommands).toEqual([exactCommand]);
   expect(signalled).toEqual([42]);
-  expect(readManifest().state).toBe("cancelled");
+  expect(readManifest()).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+  });
   expect(await panelCancel({ dir, cleanupMs: 10 }, cancel.deps)).toBe(0);
   expect(signalled).toEqual([42]);
 });
@@ -1072,13 +1182,15 @@ test("cancel reports a launched member with an absent pidfile as unresolved", as
   expect(member?.attempts?.[0]?.launched_at).not.toBeNull();
   expect(member?.pidfile).not.toBeNull();
   expect(existsSync(member?.pidfile ?? "")).toBe(false);
+  seedControl(member?.name ?? "");
 
   const cancel = makeDeps({ selections, pollIntervalMs: 1 });
   expect(await panelCancel({ dir, cleanupMs: 2 }, cancel.deps)).toBe(1);
 
   const cancelled = readManifest();
   const identity = `${cancelled.members[0]?.name}#1`;
-  expect(cancelled.state).toBe("cleanup_failed");
+  expect(cancelled.state).toBe("cancelled");
+  expect(cancelled.cleanup_status).toBe("failed");
   expect(cancelled.unresolved_cleanup).toEqual([identity]);
   expect(cancelled.members[0]?.attempts?.[0]?.state).toBe("cleanup_failed");
 });
@@ -1101,6 +1213,7 @@ test("cancel reports exact unresolved identities and duplicate cancellation does
   );
   const [name] = memberSlugs() as [string];
   seedPidfile(name, 77);
+  seedControl(name);
   const cancel = makeDeps({
     selections,
     pidAlive: (pid) => pid === 77,
@@ -1135,6 +1248,7 @@ test("cancel refuses to signal a recycled pid", async () => {
   const [name] = memberSlugs() as [string];
   seedPidfile(name, 88);
   seedStartfile(name, "ORIGINAL");
+  seedControl(name);
   const cancel = makeDeps({
     selections,
     pidAlive: () => true,
@@ -1146,6 +1260,443 @@ test("cancel refuses to signal a recycled pid", async () => {
   };
   expect(await panelCancel({ dir, cleanupMs: 1 }, cancel.deps)).toBe(0);
   expect(signalled).toBe(false);
+});
+
+test("cancel consumes a result-bearing attempt's exact control", async () => {
+  const selections: PanelSelections = {
+    panels: { one: panelDef([T_CLAUDE]) },
+    default: "one",
+  };
+  await panelStart(
+    {
+      promptFile: writePrompt("result first"),
+      slug: "result-first",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedResult(name, "completed");
+  seedPidfile(name, 101);
+  const exactCommand = seedControl(name);
+  const cancel = makeDeps({ selections, pidAlive: () => false });
+
+  expect(await panelCancel({ dir, cleanupMs: 1 }, cancel.deps)).toBe(0);
+  expect(cancel.tmuxCommands).toEqual([exactCommand]);
+  expect(readManifest().cleanup_status).toBe("settled");
+});
+
+test.each(["missing", "malformed", "ownership-mismatch", "legacy"])(
+  "cancel fails closed for a %s control without derived teardown",
+  async (kind) => {
+    const selections: PanelSelections = {
+      panels: { one: panelDef([T_CLAUDE]) },
+      default: "one",
+    };
+    await panelStart(
+      {
+        promptFile: writePrompt(kind),
+        slug: `bad-${kind}`,
+        panel: "one",
+        dir,
+        timeoutSeconds: 900,
+      },
+      makeDeps({ selections }).deps,
+    );
+    const [name] = memberSlugs() as [string];
+    seedPidfile(name, 202);
+    const manifest = readManifest();
+    const attempt = manifest.members[0]?.attempts?.[0];
+    if (attempt?.control == null) throw new Error("missing fixture control");
+    if (kind === "malformed") {
+      writeFileSync(attempt.control.path, "{}\n");
+    } else if (kind === "ownership-mismatch") {
+      seedControl(name, {
+        owner: {
+          request_id: "foreign-request",
+          member: name,
+          attempt: 1,
+        },
+      });
+    } else if (kind === "legacy") {
+      delete attempt.control;
+      writeFileSync(
+        join(dir, "manifest.json"),
+        `${JSON.stringify(manifest, null, 2)}\n`,
+      );
+    }
+    const cancel = makeDeps({ selections, pidAlive: () => true });
+    let signalled = false;
+    cancel.deps.terminatePid = () => {
+      signalled = true;
+    };
+
+    expect(await panelCancel({ dir, cleanupMs: 0 }, cancel.deps)).toBe(1);
+    expect(cancel.tmuxCommands).toEqual([]);
+    expect(signalled).toBe(false);
+    expect(readManifest()).toMatchObject({
+      state: "cancelled",
+      cleanup_status: "failed",
+      unresolved_cleanup: [`${name}#1`],
+    });
+  },
+);
+
+test("failed exact cleanup remains retryable and converges through already-absent", async () => {
+  const selections: PanelSelections = {
+    panels: { one: panelDef([T_CLAUDE]) },
+    default: "one",
+  };
+  await panelStart(
+    {
+      promptFile: writePrompt("retry cleanup"),
+      slug: "retry-cleanup",
+      panel: "one",
+      dir,
+      timeoutSeconds: 900,
+    },
+    makeDeps({ selections }).deps,
+  );
+  const [name] = memberSlugs() as [string];
+  seedPidfile(name, 303);
+  seedControl(name);
+  const first = makeDeps({
+    selections,
+    pidAlive: () => false,
+    runTmuxCommand: () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "permission denied",
+    }),
+  });
+  expect(await panelCancel({ dir, cleanupMs: 1 }, first.deps)).toBe(1);
+  expect(readManifest().cleanup_status).toBe("failed");
+
+  const second = makeDeps({
+    selections,
+    pidAlive: () => false,
+    runTmuxCommand: () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "can't find window: @1",
+    }),
+  });
+  expect(await panelCancel({ dir, cleanupMs: 1 }, second.deps)).toBe(0);
+  expect(readManifest()).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+    unresolved_cleanup: [],
+  });
+});
+
+function seedMaintenanceCleanupRun(
+  runName: string,
+  attempts: Array<{
+    member: string;
+    control?: "running" | "terminal" | "missing" | "malformed";
+  }>,
+): string {
+  const runDir = join(dir, "panels", runName);
+  mkdirSync(runDir, { recursive: true });
+  const requestId = `request-${runName}`;
+  const members: PanelManifestMember[] = attempts.map((spec, index) => {
+    const pidfile = join(runDir, `${spec.member}.pidfile`);
+    const controlPath = join(runDir, `${spec.member}.control.json`);
+    writeFileSync(pidfile, `${400 + index}\n`);
+    if (spec.control !== "missing") {
+      writeFileSync(
+        controlPath,
+        spec.control === "malformed"
+          ? "{}\n"
+          : `${JSON.stringify({
+              schema_version: 1,
+              run_id: `tmux-${runName}-${index}`,
+              agent: "claude",
+              started_at_ms: 1,
+              kill_window_command: [
+                "/opt/tmux",
+                "-S",
+                `/tmp/${runName}.sock`,
+                "kill-window",
+                "-t",
+                `@${index + 1}`,
+              ],
+              status: spec.control ?? "running",
+              owner: {
+                request_id: requestId,
+                member: spec.member,
+                attempt: 1,
+              },
+            })}\n`,
+      );
+    }
+    return {
+      name: spec.member,
+      harness: "claude",
+      yaml: join(runDir, `${spec.member}.yaml`),
+      pidfile,
+      startfile: null,
+      launched_at: 1,
+      attempts: [
+        {
+          attempt: 1,
+          yaml: join(runDir, `${spec.member}.yaml`),
+          pidfile,
+          startfile: null,
+          launched_at: 1,
+          state: "cleanup_failed",
+          control: {
+            path: controlPath,
+            request_id: requestId,
+            member: spec.member,
+            attempt: 1,
+          },
+        },
+      ],
+    };
+  });
+  writeFileSync(
+    join(runDir, "manifest.json"),
+    `${JSON.stringify({
+      dir: runDir,
+      slug: runName,
+      request_id: requestId,
+      state: "cancelled",
+      cancellation_requested_at: 1,
+      cleanup_status: "failed",
+      unresolved_cleanup: attempts.map((attempt) => `${attempt.member}#1`),
+      members,
+    } satisfies PanelManifest)}\n`,
+  );
+  return runDir;
+}
+
+test("maintenance fails closed across the spawn-to-manifest crash window", async () => {
+  const launched = seedMaintenanceCleanupRun("spawned-before-stamp", [
+    { member: "alpha", control: "running" },
+  ]);
+  const launchedManifest = JSON.parse(
+    readFileSync(join(launched, "manifest.json"), "utf8"),
+  ) as PanelManifest;
+  const launchedAttempt = launchedManifest.members[0]?.attempts?.[0];
+  if (launchedAttempt === undefined) throw new Error("missing fixture attempt");
+  launchedAttempt.launched_at = null;
+  launchedAttempt.state = "reserved";
+  writeFileSync(
+    join(launched, "manifest.json"),
+    JSON.stringify(launchedManifest),
+  );
+
+  const commands: string[] = [];
+  const deps = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      commands.push(command.at(-1) ?? "");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  expect((await panelCleanupMaintenance(deps.deps)).settled).toEqual([
+    launched,
+  ]);
+  expect(commands).toEqual(["@1"]);
+
+  const unpublished = seedMaintenanceCleanupRun("reserved-unpublished", [
+    { member: "alpha", control: "missing" },
+  ]);
+  const unpublishedManifest = JSON.parse(
+    readFileSync(join(unpublished, "manifest.json"), "utf8"),
+  ) as PanelManifest;
+  const unpublishedAttempt = unpublishedManifest.members[0]?.attempts?.[0];
+  if (unpublishedAttempt === undefined)
+    throw new Error("missing fixture attempt");
+  unpublishedAttempt.launched_at = null;
+  unpublishedAttempt.state = "reserved";
+  writeFileSync(unpublishedAttempt.pidfile ?? "", "");
+  writeFileSync(
+    join(unpublished, "manifest.json"),
+    JSON.stringify(unpublishedManifest),
+  );
+  const unresolved = await panelCleanupMaintenance(
+    makeDeps({ pidAlive: () => false }).deps,
+  );
+  expect(unresolved.unresolved).toContainEqual({
+    dir: unpublished,
+    identities: ["alpha#1"],
+  });
+});
+
+test("maintenance resumes failed cleanup after restart and converges an already-gone window", async () => {
+  const runDir = seedMaintenanceCleanupRun("restart", [
+    { member: "alpha", control: "running" },
+  ]);
+  const maintenance = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: () => ({
+      exitCode: 1,
+      stdout: "",
+      stderr: "can't find window: @1",
+    }),
+  });
+
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(pass.settled).toEqual([runDir]);
+  expect(pass.unresolved).toEqual([]);
+  const manifest: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(manifest).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+    unresolved_cleanup: [],
+  });
+  expect(manifest.cleanup_settled_at).toBe(0);
+
+  const status = makeDeps({ pidAlive: () => false });
+  expect(panelStatus({ dir: runDir }, status.deps)).toBe(0);
+  expect(JSON.parse(status.stdout().trim())).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "settled",
+    unresolved_cleanup: [],
+  });
+});
+
+test("maintenance records partial progress in stable order and retries only unresolved work", async () => {
+  const runDir = seedMaintenanceCleanupRun("partial", [
+    { member: "zeta", control: "running" },
+    { member: "alpha", control: "running" },
+  ]);
+  const commands: string[] = [];
+  const first = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      commands.push(command.at(-1) ?? "");
+      return command.at(-1) === "@2"
+        ? { exitCode: 0, stdout: "", stderr: "" }
+        : { exitCode: 1, stdout: "", stderr: "permission denied" };
+    },
+  });
+  const firstPass = await panelCleanupMaintenance(first.deps);
+  expect(commands).toEqual(["@2", "@1"]);
+  expect(firstPass.unresolved).toEqual([
+    { dir: runDir, identities: ["zeta#1"] },
+  ]);
+  const partial: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(partial.cleanup_status).toBe("failed");
+  expect(partial.unresolved_cleanup).toEqual(["zeta#1"]);
+  expect(
+    partial.members.find((member) => member.name === "alpha")?.attempts?.[0]
+      ?.state,
+  ).toBe("cancelled");
+
+  const retryCommands: string[] = [];
+  const second = makeDeps({
+    pidAlive: () => false,
+    runTmuxCommand: (command) => {
+      retryCommands.push(command.at(-1) ?? "");
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: "can't find window: @1",
+      };
+    },
+  });
+  expect((await panelCleanupMaintenance(second.deps)).settled).toEqual([
+    runDir,
+  ]);
+  expect(retryCommands).toEqual(["@1"]);
+});
+
+test("maintenance discovers a legacy cleanup-failed run without a cleanup status", async () => {
+  const runDir = seedMaintenanceCleanupRun("legacy-cleanup", [
+    { member: "legacy", control: "missing" },
+  ]);
+  const manifestPath = join(runDir, "manifest.json");
+  const legacy = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  delete legacy.cleanup_status;
+  legacy.state = "cleanup_failed";
+  writeFileSync(manifestPath, `${JSON.stringify(legacy)}\n`);
+
+  const pass = await panelCleanupMaintenance(
+    makeDeps({ pidAlive: () => false }).deps,
+  );
+  expect(pass.unresolved).toEqual([{ dir: runDir, identities: ["legacy#1"] }]);
+  expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+    state: "cancelled",
+    cleanup_status: "failed",
+    unresolved_cleanup: ["legacy#1"],
+  });
+});
+
+test("maintenance keeps missing and malformed controls exact, visible, and retryable", async () => {
+  const runDir = seedMaintenanceCleanupRun("bad-controls", [
+    { member: "missing", control: "missing" },
+    { member: "malformed", control: "malformed" },
+  ]);
+  const maintenance = makeDeps({ pidAlive: () => false });
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(maintenance.tmuxCommands).toEqual([]);
+  expect(pass.unresolved).toEqual([
+    {
+      dir: runDir,
+      identities: ["malformed#1", "missing#1"],
+    },
+  ]);
+  const manifest: PanelManifest = JSON.parse(
+    readFileSync(join(runDir, "manifest.json"), "utf8"),
+  );
+  expect(manifest.cleanup_status).toBe("failed");
+  expect(manifest.unresolved_cleanup).toEqual(["malformed#1", "missing#1"]);
+  expect(
+    manifest.members.find((member) => member.name === "malformed")
+      ?.attempts?.[0]?.cleanup_error,
+  ).toBe("malformed_control");
+  expect(
+    manifest.members.find((member) => member.name === "missing")?.attempts?.[0]
+      ?.cleanup_error,
+  ).toStartWith("control_read_failed:");
+});
+
+test("maintenance skips a concurrently locked cleanup without blocking other runs", async () => {
+  const locked = seedMaintenanceCleanupRun("locked-cleanup", [
+    { member: "locked", control: "terminal" },
+  ]);
+  const free = seedMaintenanceCleanupRun("free-cleanup", [
+    { member: "free", control: "terminal" },
+  ]);
+  const maintenance = makeDeps({
+    pidAlive: () => false,
+    lock: (path) =>
+      path.includes("locked-cleanup") ? null : { release: () => {} },
+  });
+  const pass = await panelCleanupMaintenance(maintenance.deps);
+  expect(pass.skipped).toEqual([locked]);
+  expect(pass.settled).toEqual([free]);
+  expect(
+    await panelReconcileCleanup(
+      { dir: locked, cleanupMs: 0 },
+      maintenance.deps,
+    ),
+  ).toEqual({ kind: "locked", dir: locked });
+});
+
+test("a terminal control repairs cleanup after an interrupted manifest write", async () => {
+  const runDir = seedMaintenanceCleanupRun("write-interrupted", [
+    { member: "alpha", control: "terminal" },
+  ]);
+  const maintenance = makeDeps({ pidAlive: () => false });
+  expect((await panelCleanupMaintenance(maintenance.deps)).settled).toEqual([
+    runDir,
+  ]);
+  expect(
+    JSON.parse(readFileSync(join(runDir, "manifest.json"), "utf8")),
+  ).toMatchObject({ cleanup_status: "settled", unresolved_cleanup: [] });
 });
 
 test("a marked panel member cannot reserve a nested panel request", async () => {
@@ -1777,6 +2328,38 @@ test("runPanelPrunePass reaps an aged-out lock-free pid-dead dir and relays a lo
   if (msg.kind === "maintenance-log") {
     expect(msg.message).toContain("old-run");
   }
+});
+
+test("runPanelPrunePass preserves an aged run with unsettled exact controls", () => {
+  const root = join(dir, "panels");
+  const d = seedPruneDir(root, "unsettled-run", [
+    {
+      name: "x",
+      harness: "pi",
+      yaml: join(root, "unsettled-run", "x.yaml"),
+      pidfile: null,
+    },
+  ]);
+  const manifestPath = join(d, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      ...manifest,
+      state: "cancelled",
+      cancellation_requested_at: 1,
+      cleanup_status: "failed",
+      unresolved_cleanup: ["x#1"],
+    }),
+  );
+  const msgs: MaintenanceMessage[] = [];
+  runPanelPrunePass(
+    (message) => msgs.push(message),
+    () => false,
+    makePruneDeps({ now: Date.now() + 10 * PRUNE_DAY_MS }),
+  );
+  expect(existsSync(d)).toBe(true);
+  expect(msgs).toEqual([]);
 });
 
 test("runPanelPrunePass preserves a live-pid dir and relays no log (nothing reaped)", () => {

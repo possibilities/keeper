@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { keeperTmuxSessionCwd } from "../tmux-session-cwd";
 import type { AgentKind } from "./dispatch";
+import { isRunControlArtifact } from "./run-capture";
 
 /**
  * Field separator for the `-F` capture format. ASCII SOH (`\x01`) survives a
@@ -480,7 +481,14 @@ export function launchKeeperAgentInTmux(
   // Sweep stale run dirs before creating this launch's dir, so an in-flight run
   // (this one, not yet on disk) is never a sweep candidate.
   if (!req.options.noArtifacts) {
-    sweepRunArtifacts(join(req.stateDir, "tmux-runs"), Date.now());
+    const panelCleanupPins = collectUnsettledPanelRunIds(panelRoot(req.env));
+    if (panelCleanupPins !== null) {
+      sweepRunArtifacts(
+        join(req.stateDir, "tmux-runs"),
+        Date.now(),
+        panelCleanupPins,
+      );
+    }
   }
 
   const { runId, runDir, launchScript, launchCommand } = req.options.noArtifacts
@@ -921,16 +929,153 @@ function parseCreatedTarget(
   return { session: session || fallbackSession, windowId, paneId };
 }
 
+function panelRoot(env: NodeJS.ProcessEnv): string {
+  const override = env.KEEPER_STATE_DIR?.trim();
+  return join(
+    override === undefined || override === ""
+      ? join(homedir(), ".local", "state", "keeper")
+      : override,
+    "panels",
+  );
+}
+
 /**
- * One run-dir candidate for the GC predicate. `pidAlive` is the liveness of the
- * recorded surviving pid: `true`/`false` when knowable, `null` when the dir has
- * no readable marker pid (age-only fallback applies). `mtimeMs` is the dir's
- * effective age clock.
+ * Resolve canonical run ids owned by pending/failed Panel cleanup. `null` means
+ * the inventory was incomplete, so the caller must skip generic run-artifact GC
+ * rather than erase a control it could not inspect.
+ */
+export function collectUnsettledPanelRunIds(root: string): Set<string> | null {
+  const pinned = new Set<string>();
+  let names: string[];
+  try {
+    names = readdirSync(root).sort();
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? pinned : null;
+  }
+  for (const name of names) {
+    if (name === ".gc") continue;
+    const dir = join(root, name);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      return null;
+    }
+    let manifest: Record<string, unknown>;
+    try {
+      const raw = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        return null;
+      }
+      manifest = raw as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    if (
+      manifest.cleanup_status !== "pending" &&
+      manifest.cleanup_status !== "failed" &&
+      manifest.state !== "cleanup_failed"
+    ) {
+      continue;
+    }
+    const requestId =
+      typeof manifest.request_id === "string"
+        ? manifest.request_id
+        : manifest.slug;
+    if (typeof requestId !== "string" || !Array.isArray(manifest.members)) {
+      return null;
+    }
+    const listedUnresolved = new Set(
+      Array.isArray(manifest.unresolved_cleanup)
+        ? manifest.unresolved_cleanup.filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [],
+    );
+    const seenUnresolved = new Set<string>();
+    for (const rawMember of manifest.members) {
+      if (
+        rawMember === null ||
+        typeof rawMember !== "object" ||
+        Array.isArray(rawMember)
+      ) {
+        return null;
+      }
+      const member = rawMember as Record<string, unknown>;
+      if (typeof member.name !== "string" || !Array.isArray(member.attempts)) {
+        return null;
+      }
+      for (const rawAttempt of member.attempts) {
+        if (
+          rawAttempt === null ||
+          typeof rawAttempt !== "object" ||
+          Array.isArray(rawAttempt)
+        ) {
+          return null;
+        }
+        const attempt = rawAttempt as Record<string, unknown>;
+        if (!Number.isInteger(attempt.attempt)) return null;
+        const attemptId = `${member.name}#${String(attempt.attempt)}`;
+        const isUnresolved =
+          listedUnresolved.size > 0
+            ? listedUnresolved.has(attemptId)
+            : attempt.state !== "cancelled";
+        if (!isUnresolved) continue;
+        seenUnresolved.add(attemptId);
+        if (attempt.launched_at === null && attempt.state === "launch_failed") {
+          continue;
+        }
+        const association = attempt.control;
+        if (
+          association === null ||
+          typeof association !== "object" ||
+          Array.isArray(association)
+        ) {
+          return null;
+        }
+        const control = association as Record<string, unknown>;
+        if (
+          typeof control.path !== "string" ||
+          control.request_id !== requestId ||
+          control.member !== member.name ||
+          control.attempt !== attempt.attempt
+        ) {
+          return null;
+        }
+        let artifact: unknown;
+        try {
+          artifact = JSON.parse(readFileSync(control.path, "utf8"));
+        } catch {
+          return null;
+        }
+        if (
+          !isRunControlArtifact(artifact) ||
+          artifact.owner?.request_id !== requestId ||
+          artifact.owner.member !== member.name ||
+          artifact.owner.attempt !== attempt.attempt
+        ) {
+          return null;
+        }
+        pinned.add(artifact.run_id);
+      }
+    }
+    if (
+      [...listedUnresolved].some((identity) => !seenUnresolved.has(identity))
+    ) {
+      return null;
+    }
+  }
+  return pinned;
+}
+
+/**
+ * One run-dir candidate for the GC predicate. A live pid or unresolved Panel
+ * cleanup pin always wins over age and count retention.
  */
 export interface RunDirCandidate {
   name: string;
   mtimeMs: number;
   pidAlive: boolean | null;
+  panelCleanupPinned?: boolean;
 }
 
 /**
@@ -947,12 +1092,13 @@ export function selectRunDirsToSweep(
   ttlMs = RUN_GC_TTL_MS,
   maxKeep = RUN_GC_MAX_KEEP,
 ): string[] {
-  const live = (c: RunDirCandidate) => c.pidAlive === true;
+  const protectedFromGc = (c: RunDirCandidate) =>
+    c.pidAlive === true || c.panelCleanupPinned === true;
   const newestFirst = [...candidates].sort((a, b) => b.mtimeMs - a.mtimeMs);
   const doomed = new Set<string>();
 
   for (const c of newestFirst) {
-    if (!live(c) && c.mtimeMs < nowMs - ttlMs) {
+    if (!protectedFromGc(c) && c.mtimeMs < nowMs - ttlMs) {
       doomed.add(c.name);
     }
   }
@@ -963,7 +1109,7 @@ export function selectRunDirsToSweep(
       continue;
     }
     kept += 1;
-    if (kept > maxKeep && !live(c)) {
+    if (kept > maxKeep && !protectedFromGc(c)) {
       doomed.add(c.name);
     }
   }
@@ -979,7 +1125,11 @@ export function selectRunDirsToSweep(
  * missing root or any per-dir read error is swallowed (GC is best-effort and
  * must never fail a launch). Sweeps synchronously; never `fs.watch`.
  */
-export function sweepRunArtifacts(root: string, nowMs: number): void {
+export function sweepRunArtifacts(
+  root: string,
+  nowMs: number,
+  panelCleanupPins: ReadonlySet<string> = new Set(),
+): void {
   let entries: string[];
   try {
     entries = readdirSync(root);
@@ -1003,7 +1153,12 @@ export function sweepRunArtifacts(root: string, nowMs: number): void {
     } catch {
       continue;
     }
-    candidates.push({ name, mtimeMs, pidAlive: readMarkerPidAlive(dir) });
+    candidates.push({
+      name,
+      mtimeMs,
+      pidAlive: readMarkerPidAlive(dir),
+      panelCleanupPinned: panelCleanupPins.has(name),
+    });
   }
 
   for (const name of selectRunDirsToSweep(candidates, nowMs)) {

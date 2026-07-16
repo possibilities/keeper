@@ -3,6 +3,7 @@ import type { BackupResult } from "../src/backup";
 import {
   type MaintenanceMessage,
   runBackupPass,
+  runPanelCleanupPass,
   runProbePass,
 } from "../src/maintenance-worker";
 
@@ -107,6 +108,67 @@ test("runProbePass shutdown gate avoids touching storage", () => {
     },
   );
   expect(messages).toEqual([]);
+});
+
+test("runPanelCleanupPass relays settled runs and isolates persistent errors", async () => {
+  const messages: MaintenanceMessage[] = [];
+  await runPanelCleanupPass(
+    (message) => messages.push(message),
+    () => false,
+    {} as never,
+    async () => ({
+      root: "/state/panels",
+      settled: ["/state/panels/a"],
+      unresolved: [{ dir: "/state/panels/b", identities: ["x#1"] }],
+      skipped: [],
+      errors: [{ dir: "/state/panels/c", error: "read-only" }],
+    }),
+  );
+  expect(messages).toHaveLength(2);
+  expect(messages.map((message) => message.kind)).toEqual([
+    "maintenance-log",
+    "maintenance-log",
+  ]);
+  expect(
+    messages.every(
+      (message) =>
+        message.kind !== "maintenance-log" || !message.message.includes("x#1"),
+    ),
+  ).toBe(true);
+});
+
+test("runPanelCleanupPass catches a pass failure so other maintenance survives", async () => {
+  const messages: MaintenanceMessage[] = [];
+  await expect(
+    runPanelCleanupPass(
+      (message) => messages.push(message),
+      () => false,
+      {} as never,
+      async () => {
+        throw new Error("panels unavailable");
+      },
+    ),
+  ).resolves.toBeUndefined();
+  expect(messages).toEqual([
+    {
+      kind: "maintenance-log",
+      message: "[panel-cleanup] pass failed: panels unavailable",
+    },
+  ]);
+});
+
+test("runPanelCleanupPass shutdown gate avoids discovery", async () => {
+  let executed = false;
+  await runPanelCleanupPass(
+    () => {},
+    () => true,
+    {} as never,
+    async () => {
+      executed = true;
+      throw new Error("must not execute");
+    },
+  );
+  expect(executed).toBe(false);
 });
 
 test("plain import on the main thread is inert", async () => {

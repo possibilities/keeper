@@ -1226,12 +1226,15 @@ async function runRunCaptureSubcommand(
         onLaunched: (launched) => {
           killWindowCommand = launched.killWindowCommand;
           control = {
-            path: controlPath(deps.launcherStateDir, launched.runId),
+            path:
+              parsed.control?.path ??
+              controlPath(deps.launcherStateDir, launched.runId),
             artifact: buildRunControlArtifact({
               runId: launched.runId,
               agent,
               startedAtMs: launched.handle.startedAtMs,
               killWindowCommand: launched.killWindowCommand,
+              owner: parsed.control?.owner,
             }),
           };
           try {
@@ -1471,12 +1474,15 @@ async function runResumeCaptureSubcommand(
         onLaunched: (launched) => {
           killWindowCommand = launched.killWindowCommand;
           control = {
-            path: controlPath(deps.launcherStateDir, launched.runId),
+            path:
+              parsed.control?.path ??
+              controlPath(deps.launcherStateDir, launched.runId),
             artifact: buildRunControlArtifact({
               runId: launched.runId,
               agent,
               startedAtMs: launched.handle.startedAtMs,
               killWindowCommand: launched.killWindowCommand,
+              owner: parsed.control?.owner,
             }),
           };
           try {

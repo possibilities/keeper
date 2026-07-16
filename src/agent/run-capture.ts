@@ -40,10 +40,19 @@ export const RUN_CONTROL_SCHEMA_VERSION = 1;
 
 export type RunControlStatus = "running" | "cancelling" | "terminal";
 
+/** Positive caller ownership for a Panel member attempt. The tuple is minted and
+ * durably registered before launch, then copied into the canonical control. */
+export interface RunControlOwner {
+  request_id: string;
+  member: string;
+  attempt: number;
+}
+
 /**
  * The deliberately narrow control surface for one launched run. The tmux argv is
  * copied byte-for-byte from the launch result; consumers must never derive a
- * target from a display name or pid.
+ * target from a display name or pid. `owner` is absent for ordinary and legacy
+ * runs; a caller-owned control must match it exactly before teardown.
  */
 export interface RunControlArtifact {
   schema_version: number;
@@ -52,6 +61,7 @@ export interface RunControlArtifact {
   started_at_ms: number;
   kill_window_command: string[];
   status: RunControlStatus;
+  owner?: RunControlOwner;
 }
 
 export interface RunControlIdentity {
@@ -76,7 +86,64 @@ export type CancelRunResult =
   | { kind: "already_gone" }
   | { kind: "already_terminal" }
   | { kind: "identity_mismatch" }
+  | { kind: "ownership_mismatch" }
+  | { kind: "malformed_control" }
   | { kind: "unresolved_teardown_error"; error: string };
+
+function isRunControlOwner(value: unknown): value is RunControlOwner {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const owner = value as Record<string, unknown>;
+  return (
+    typeof owner.request_id === "string" &&
+    owner.request_id !== "" &&
+    typeof owner.member === "string" &&
+    owner.member !== "" &&
+    Number.isInteger(owner.attempt) &&
+    (owner.attempt as number) > 0
+  );
+}
+
+/** Validate an untrusted control before any command from it is executed. */
+export function isRunControlArtifact(
+  value: unknown,
+): value is RunControlArtifact {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const artifact = value as Record<string, unknown>;
+  const command = artifact.kill_window_command;
+  const status = artifact.status;
+  const commandPrefix = Array.isArray(command) ? command.slice(0, -3) : [];
+  const socketArgs = commandPrefix.slice(1);
+  const commandHasExactWindowTail =
+    Array.isArray(command) &&
+    command.length >= 4 &&
+    command.every((token) => typeof token === "string" && token !== "") &&
+    /(?:^|\/)tmux$/.test(String(command[0])) &&
+    socketArgs.length % 2 === 0 &&
+    socketArgs.every(
+      (token, index) => index % 2 === 1 || token === "-L" || token === "-S",
+    ) &&
+    command.at(-3) === "kill-window" &&
+    command.at(-2) === "-t" &&
+    /^@[0-9]+$/.test(String(command.at(-1)));
+  return (
+    artifact.schema_version === RUN_CONTROL_SCHEMA_VERSION &&
+    typeof artifact.run_id === "string" &&
+    artifact.run_id !== "" &&
+    typeof artifact.agent === "string" &&
+    RUN_CAPTURE_AGENTS.has(artifact.agent) &&
+    typeof artifact.started_at_ms === "number" &&
+    Number.isFinite(artifact.started_at_ms) &&
+    commandHasExactWindowTail &&
+    (status === "running" ||
+      status === "cancelling" ||
+      status === "terminal") &&
+    (artifact.owner === undefined || isRunControlOwner(artifact.owner))
+  );
+}
 
 /** Build the running-state record immediately available after a tmux launch. */
 export function buildRunControlArtifact(args: {
@@ -84,6 +151,7 @@ export function buildRunControlArtifact(args: {
   agent: AgentKind;
   startedAtMs: number;
   killWindowCommand: string[];
+  owner?: RunControlOwner;
 }): RunControlArtifact {
   return {
     schema_version: RUN_CONTROL_SCHEMA_VERSION,
@@ -92,6 +160,7 @@ export function buildRunControlArtifact(args: {
     started_at_ms: args.startedAtMs,
     kill_window_command: [...args.killWindowCommand],
     status: "running",
+    ...(args.owner === undefined ? {} : { owner: { ...args.owner } }),
   };
 }
 
@@ -139,6 +208,18 @@ export function createExactRunTeardown(
   };
 }
 
+function sameControlOwner(
+  actual: RunControlOwner | undefined,
+  expected: RunControlOwner,
+): boolean {
+  return (
+    actual !== undefined &&
+    actual.request_id === expected.request_id &&
+    actual.member === expected.member &&
+    actual.attempt === expected.attempt
+  );
+}
+
 function sameControlIdentity(
   artifact: RunControlArtifact,
   claimed: RunControlIdentity,
@@ -158,6 +239,37 @@ function sameControlIdentity(
  * Cancellation entry seam. Storage and tmux are injected so callers can use the
  * same atomic writer and bounded exact teardown as terminal finalization.
  */
+function cancelValidatedRunControl(args: {
+  path: string;
+  artifact: RunControlArtifact;
+  writeArtifact: (path: string, artifact: RunControlArtifact) => void;
+  runTmuxCommand: (
+    command: string[],
+    timeoutMs?: number,
+  ) => TmuxTeardownCommandResult;
+  timeoutMs?: number;
+}): CancelRunResult {
+  if (args.artifact.status === "terminal") {
+    return { kind: "already_terminal" };
+  }
+  args.writeArtifact(args.path, {
+    ...args.artifact,
+    status: "cancelling",
+  });
+  const teardown = createExactRunTeardown(
+    args.artifact.kill_window_command,
+    args.runTmuxCommand,
+    args.timeoutMs,
+  )();
+  if (teardown.kind === "unresolved_teardown_error") {
+    return teardown;
+  }
+  args.writeArtifact(args.path, { ...args.artifact, status: "terminal" });
+  return teardown.kind === "already_gone"
+    ? { kind: "already_gone" }
+    : { kind: "cancelled" };
+}
+
 export function cancelRunFromControlArtifact(args: {
   path: string;
   claimedIdentity: RunControlIdentity;
@@ -170,25 +282,37 @@ export function cancelRunFromControlArtifact(args: {
   timeoutMs?: number;
 }): CancelRunResult {
   const artifact = args.readArtifact(args.path);
+  if (!isRunControlArtifact(artifact)) {
+    return { kind: "malformed_control" };
+  }
   if (!sameControlIdentity(artifact, args.claimedIdentity)) {
     return { kind: "identity_mismatch" };
   }
-  if (artifact.status === "terminal") {
-    return { kind: "already_terminal" };
+  return cancelValidatedRunControl({ ...args, artifact });
+}
+
+/** Cancel one caller-owned run without trusting any identity reconstructed from
+ * Panel display metadata. The canonical control supplies the exact tmux argv;
+ * only its pre-registered owner tuple authorizes consuming it. */
+export function cancelOwnedRunFromControlArtifact(args: {
+  path: string;
+  expectedOwner: RunControlOwner;
+  readArtifact: (path: string) => unknown;
+  writeArtifact: (path: string, artifact: RunControlArtifact) => void;
+  runTmuxCommand: (
+    command: string[],
+    timeoutMs?: number,
+  ) => TmuxTeardownCommandResult;
+  timeoutMs?: number;
+}): CancelRunResult {
+  const artifact = args.readArtifact(args.path);
+  if (!isRunControlArtifact(artifact)) {
+    return { kind: "malformed_control" };
   }
-  args.writeArtifact(args.path, { ...artifact, status: "cancelling" });
-  const teardown = createExactRunTeardown(
-    artifact.kill_window_command,
-    args.runTmuxCommand,
-    args.timeoutMs,
-  )();
-  if (teardown.kind === "unresolved_teardown_error") {
-    return teardown;
+  if (!sameControlOwner(artifact.owner, args.expectedOwner)) {
+    return { kind: "ownership_mismatch" };
   }
-  args.writeArtifact(args.path, { ...artifact, status: "terminal" });
-  return teardown.kind === "already_gone"
-    ? { kind: "already_gone" }
-    : { kind: "cancelled" };
+  return cancelValidatedRunControl({ ...args, artifact });
 }
 
 /**
@@ -326,6 +450,9 @@ export type ParseRunArgsResult =
        *  the string). DISTINCT from `--session`, which merely names the tmux window
        *  GROUPING — `--resume` continues a prior conversation. Null when unset. */
       resume: string | null;
+      /** Caller-owned canonical control publication. Both fields are present or
+       * both null; the owner tuple is parsed from `--control-owner` JSON. */
+      control: { path: string; owner: RunControlOwner } | null;
     }
   | { ok: false; error: string };
 
@@ -341,8 +468,9 @@ export type ParseRunArgsResult =
  * `--system <text>` supply a caller-side `System:`-prepend (mutually exclusive);
  * the parser returns the RAW path/text — the handler reads any file.
  * `--preset <name>` / `--model <m>` / `--effort <e>` / `--session <name>` /
- * `--output <path>` / `--name <n>` / `--resume <name-or-id>` are additive value
- * flags (both split and `=` forms): the parser returns the RAW values (config
+ * `--output <path>` / `--name <n>` / `--resume <name-or-id>` /
+ * `--control <path>` / `--control-owner <json>` are additive value flags (both
+ * split and `=` forms): the parser returns the RAW values (config
  * resolution, the launch-posture overlay, the atomic write, and resume resolution
  * all happen handler-side). `--resume` is DISTINCT from `--session`: `--session`
  * names the tmux window GROUPING, `--resume` continues a prior partner
@@ -366,6 +494,8 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
   let output: string | null = null;
   let name: string | null = null;
   let resume: string | null = null;
+  let controlPath: string | null = null;
+  let controlOwner: RunControlOwner | null = null;
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] as string;
@@ -516,6 +646,46 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       resume = arg.slice("--resume=".length);
       continue;
     }
+    if (arg === "--control") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--control requires a value" };
+      }
+      controlPath = value;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--control=")) {
+      controlPath = arg.slice("--control=".length);
+      continue;
+    }
+    if (arg === "--control-owner") {
+      const value = rest[i + 1];
+      if (value === undefined) {
+        return { ok: false, error: "--control-owner requires a value" };
+      }
+      try {
+        const parsedOwner: unknown = JSON.parse(value);
+        if (!isRunControlOwner(parsedOwner)) throw new Error("invalid owner");
+        controlOwner = parsedOwner;
+      } catch {
+        return { ok: false, error: "--control-owner is malformed" };
+      }
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--control-owner=")) {
+      try {
+        const parsedOwner: unknown = JSON.parse(
+          arg.slice("--control-owner=".length),
+        );
+        if (!isRunControlOwner(parsedOwner)) throw new Error("invalid owner");
+        controlOwner = parsedOwner;
+      } catch {
+        return { ok: false, error: "--control-owner is malformed" };
+      }
+      continue;
+    }
     if (arg.startsWith("--")) {
       return { ok: false, error: `unknown flag: ${arg}` };
     }
@@ -529,6 +699,15 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
       ok: false,
       error: "cannot combine --system-file and --system",
     };
+  }
+  if ((controlPath === null) !== (controlOwner === null)) {
+    return {
+      ok: false,
+      error: "--control and --control-owner must be provided together",
+    };
+  }
+  if (controlPath === "") {
+    return { ok: false, error: "--control requires a non-empty path" };
   }
 
   const cli = positionals[0];
@@ -564,6 +743,10 @@ export function parseRunArgs(rest: string[]): ParseRunArgsResult {
     output,
     name,
     resume,
+    control:
+      controlPath === null || controlOwner === null
+        ? null
+        : { path: controlPath, owner: controlOwner },
   };
 }
 

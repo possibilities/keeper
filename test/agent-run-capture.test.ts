@@ -38,6 +38,7 @@ import type { ResumeDecision } from "../src/agent/resume-policy";
 import {
   buildRunCaptureEnvelope,
   buildRunControlArtifact,
+  cancelOwnedRunFromControlArtifact,
   cancelRunFromControlArtifact,
   captureFromHandle,
   composeRunCapture,
@@ -200,6 +201,7 @@ function okParse(
     output: null,
     name: null,
     resume: null,
+    control: null,
     ...overrides,
   };
 }
@@ -353,6 +355,40 @@ describe("parseRunArgs", () => {
     );
   });
 
+  test("caller-owned control parses only with its exact owner tuple", () => {
+    const owner = { request_id: "req-1", member: "claude#1", attempt: 2 };
+    expect(
+      parseRunArgs([
+        "claude",
+        "p",
+        "--control",
+        "/panel/claude.control.json",
+        "--control-owner",
+        JSON.stringify(owner),
+      ]),
+    ).toEqual(
+      okParse({
+        control: { path: "/panel/claude.control.json", owner },
+      }),
+    );
+    const missingOwner = parseRunArgs([
+      "claude",
+      "p",
+      "--control",
+      "/panel/control.json",
+    ]);
+    expect(missingOwner.ok).toBe(false);
+    const malformedOwner = parseRunArgs([
+      "claude",
+      "p",
+      "--control",
+      "/panel/control.json",
+      "--control-owner",
+      "{}",
+    ]);
+    expect(malformedOwner.ok).toBe(false);
+  });
+
   test("--resume parses as a value flag (split + = forms), distinct from --session", () => {
     expect(parseRunArgs(["claude", "p", "--resume", "reviewer"])).toEqual(
       okParse({ resume: "reviewer" }),
@@ -407,6 +443,8 @@ describe("parseRunArgs", () => {
     [["claude", "p", "--output"], "--output requires a value"],
     [["claude", "p", "--name"], "--name requires a value"],
     [["claude", "p", "--resume"], "--resume requires a value"],
+    [["claude", "p", "--control"], "--control requires a value"],
+    [["claude", "p", "--control-owner"], "--control-owner requires a value"],
   ] as const)("rejects %p", (rest, needle) => {
     const res = parseRunArgs([...rest]);
     expect(res.ok).toBe(false);
@@ -877,6 +915,42 @@ describe("run control — exact, idempotent cancellation", () => {
     expect(calls).toEqual([EXACT_KILL]);
   });
 
+  test("owned cancellation rejects malformed and mismatched controls before tmux", () => {
+    const owner = { request_id: "panel-1", member: "opus-1", attempt: 1 };
+    let calls = 0;
+    const base = {
+      path: "/fake/panel.control.json",
+      expectedOwner: owner,
+      writeArtifact: () => {
+        throw new Error("must not write");
+      },
+      runTmuxCommand: () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+    expect(
+      cancelOwnedRunFromControlArtifact({
+        ...base,
+        readArtifact: () => ({ nope: true }),
+      }),
+    ).toEqual({ kind: "malformed_control" });
+    expect(
+      cancelOwnedRunFromControlArtifact({
+        ...base,
+        readArtifact: () =>
+          buildRunControlArtifact({
+            runId: "run-1",
+            agent: "claude",
+            startedAtMs: 1,
+            killWindowCommand: EXACT_KILL,
+            owner: { ...owner, request_id: "foreign" },
+          }),
+      }),
+    ).toEqual({ kind: "ownership_mismatch" });
+    expect(calls).toBe(0);
+  });
+
   test("already-gone, identity mismatch, terminal, and unresolved errors stay distinct", () => {
     let artifact = control();
     const base = {
@@ -1140,6 +1214,47 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
     });
     return { h, transcriptPath };
   }
+
+  test("caller-owned control publishes the canonical artifact at the registered path", async () => {
+    const controlPath = join(tempDir(), "panel-attempt.control.json");
+    const owner = { request_id: "panel-request", member: "opus-1", attempt: 1 };
+    const { h } = completedRunHarness([
+      "--control",
+      controlPath,
+      "--control-owner",
+      JSON.stringify(owner),
+      "--reap-window-on-terminal",
+    ]);
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(JSON.parse(readFileSync(controlPath, "utf8"))).toMatchObject({
+      schema_version: 1,
+      kill_window_command: ["tmux", "kill-window", "-t", "@1"],
+      status: "terminal",
+      owner,
+    });
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+  });
+
+  test("caller-owned control publication failure tears down the exact launch", async () => {
+    const occupied = join(tempDir(), "occupied");
+    writeFileSync(occupied, "not a directory\n");
+    const owner = { request_id: "panel-request", member: "opus-1", attempt: 1 };
+    const { h } = completedRunHarness([
+      "--control",
+      join(occupied, "control.json"),
+      "--control-owner",
+      JSON.stringify(owner),
+    ]);
+
+    expect(await expectExit(main(h.deps))).toBe(1);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "launch_failed" });
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+  });
 
   test("--name threads end-to-end to the tmux window name (-n)", async () => {
     const { h } = completedRunHarness(["--name", "panel::smoke::opus"]);
