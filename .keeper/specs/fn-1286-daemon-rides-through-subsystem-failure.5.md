@@ -42,5 +42,7 @@ Truth-table the decision seam exhaustively: full conjunction → kill(TERM); TER
 - [ ] CLAUDE.md's reaper count reflects the new producer; the CLAUDE.md lint, the touched suites, and the named gate pass.
 
 ## Done summary
-
+Zombie-session hybrid reaper per ADR 0060 (stopped+done-stamped+alive+silent-past-grace conjunction, identity re-check, TERM-then-KILL, ambiguous pages); operator-verified 689/0 across autopilot-worker+dispatch-failure-key suites and landed via plain-git escape (duplicate-session multi_ambiguous wedge) as e1fe016f on the epic lane
 ## Evidence
+- Commits: e1fe016f
+- Tests: bun test autopilot-worker+dispatch-failure-key 689/0 (operator re-run in lane)

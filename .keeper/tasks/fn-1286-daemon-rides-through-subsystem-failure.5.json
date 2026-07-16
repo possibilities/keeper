@@ -14,5 +14,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Zombie session hybrid reaper",
-  "updated_at": "2026-07-13T21:49:11.119000Z"
+  "updated_at": "2026-07-16T20:10:58.239000Z",
+  "worker_done_at": "2026-07-16T20:10:58.239000Z"
 }
