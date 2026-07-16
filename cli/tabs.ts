@@ -688,6 +688,7 @@ function runDump(
       tmuxSessionCwd: keeperTmuxSessionCwd(process.env),
       sourcePath: dbPath,
       excludedManagedCount: set.excludedManagedCount,
+      unregisteredHarnessSkipCount: set.unregisteredHarnessSkipCount,
     }),
   );
   return process.exit(0);
@@ -808,7 +809,14 @@ async function runRestore(cmd: {
           "# keeper tabs restore: no restore candidates (nothing to restore)\n",
         );
       }
-      process.stdout.write(renderOutcomes(plan, false, 0));
+      process.stdout.write(
+        renderOutcomes(
+          plan,
+          false,
+          0,
+          selection.unregisteredHarnessSkipCount ?? 0,
+        ),
+      );
       return process.exit(0);
     }
     case "gate-blocked": {
@@ -842,6 +850,7 @@ async function runRestore(cmd: {
         selection.pickedGeneration?.generation_id ?? "",
         cmd.force,
         dbPath,
+        selection.unregisteredHarnessSkipCount ?? 0,
       );
     }
     case "apply": {
@@ -851,6 +860,7 @@ async function runRestore(cmd: {
         selection.pickedGeneration?.generation_id ?? "",
         cmd.force,
         dbPath,
+        selection.unregisteredHarnessSkipCount ?? 0,
       );
     }
     default: {
@@ -1020,6 +1030,7 @@ async function runApply(
   generationId: string,
   force: boolean,
   dbPath: string,
+  unregisteredHarnessSkipCount: number,
 ): Promise<never> {
   if (gate === "forced") {
     process.stderr.write(
@@ -1112,7 +1123,9 @@ async function runApply(
         return decision.skip;
       },
     });
-    process.stdout.write(renderOutcomes(outcomes, true, 0));
+    process.stdout.write(
+      renderOutcomes(outcomes, true, 0, unregisteredHarnessSkipCount),
+    );
     const { failed } = countOutcomes(outcomes);
     return process.exit(failed > 0 ? TABS_EXIT_PARTIAL_FAILURE : 0);
   } finally {
