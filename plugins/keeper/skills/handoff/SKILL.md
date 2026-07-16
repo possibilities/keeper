@@ -30,13 +30,20 @@ proposal, awaiting a plain-text greenlight in that window before any code lands.
 A handoff SEEDS a prefix session; it does NOT run the work autonomously. The
 enqueue is event-sourced and durable.
 
-Fire-and-forget describes YOUR posture, not the handoff-ee's: you fire the one
-call and walk away — do NOT use the Agent Bus, do NOT start a Monitor, do NOT
-wait on the handoff-ee. The primed window waits for you whenever you switch to
-it. Run the one call and report. Agent-run and panel mechanics use the shared
-contract; this handoff remains fire-and-forget.
+Fire-and-forget describes YOUR posture, not the handoff-ee's: the default
+handoff parks at its confirm beat and has no deliverable. Fire one call, do NOT
+use the Agent Bus, start a Monitor, or wait on that default handoff-ee. The
+primed window waits for you whenever you switch to it. Use `--capture` only when
+the human asks for a deliverable; its worker acts autonomously and writes the
+standard answer envelope to its durable path.
 
-Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
+A handoff slug is the caller-supplied, host-global event-sourced handle. It is
+the dedup key, never a panel slug: a duplicate is rejected with exit 3 rather
+than merged or re-launched.
+
+Canonical contract: [Chunked wait](../../../../docs/agent-surface-contracts.md#chunked-wait)
+and [Answer envelope](../../../../docs/agent-surface-contracts.md#answer-envelope) — on
+wording disputes the doc wins.
 
 ## When this fires
 
@@ -78,10 +85,10 @@ When the brief depends on the current board — "hand off whatever's stuck", "sp
 
 Assemble these from the conversation:
 
-1. **A slug** (`--slug`, REQUIRED) — a short, human-meaningful, globally-unique
-   id for the handoff (e.g. `investigate-flaky-reaper`). It is slugified to
-   `[a-z0-9-]+`, the worker launches as `handoff::<slug>`, and a slug already in
-   use is REJECTED (exit 3 — pick a new one). Pick one descriptive of the work.
+1. **A slug** (`--slug`, REQUIRED) — the short, human-meaningful,
+   host-global handoff handle (e.g. `investigate-flaky-reaper`). It is slugified
+   to `[a-z0-9-]+`, the worker launches as `handoff::<slug>`, and a duplicate is
+   REJECTED (exit 3 — pick a new handle). Pick one descriptive of the work.
 2. **The doc / brief** — the contextful instructions for the handoff-ee:
    what to investigate or build, plus the surrounding context it needs to start
    cold (paths, findings, constraints). This is the worker's whole world — be
@@ -131,11 +138,35 @@ Flags:
 | `--title <t>` | Human title for the handoff (surfaces on the board). |
 | `--cwd <path>` | Directory the handoff-ee launches in. Default: your cwd. Expands `~`, resolves relatives; bad path → exit 2. |
 | `--session <s>` | Target tmux session. Default: `$KEEPER_TMUX_SESSION` > current > `work`. |
+| `--capture` | Opt in to an autonomous terminal deliverable at the durable envelope path; optional `--preset <triple>` or paired `--model <m> --effort <e>` select its launch. |
 
 On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
 keeperd dispatcher resolves the target session internally; the CLI does not echo
 it. The keeperd dispatcher mints a durable pre-launch marker and launches
 the handoff-ee — a daemon restart mid-dispatch never double-launches.
+
+## Captured handoff — fire, then wait
+
+Choose this only when the human needs the handoff-ee's completed answer. Capture
+is not the default because it spends an autonomous worker turn and retains a
+terminal deliverable; ordinary delegated work should remain a parked handoff.
+
+Request capture, then read the envelope path from the handoff row immediately
+once the request returns:
+
+```bash
+SLUG=investigate-flaky-reaper
+keeper handoff --capture --slug "$SLUG" --prompt "<autonomous brief>" --title "<title>"
+ENVELOPE="$(keeper query handoffs --filter "handoff_id=$SLUG" --format json | jq -er '.data[0].envelope_path')"
+```
+
+Wait against `ENVELOPE` using the [Chunked wait](../../../../docs/agent-surface-contracts.md#chunked-wait)
+contract: issue one bounded Bash tool call per chunk, with its `timeout`
+parameter, to wait for and read that path. If the caller timeout expires, issue
+a fresh bounded Bash tool call against the same path; do not put the re-issue in
+a shell loop. A timeout detaches only this waiter; it neither cancels nor
+re-launches the handoff-ee. The [Answer envelope](../../../../docs/agent-surface-contracts.md#answer-envelope)
+contract defines the terminal JSON to read.
 
 ## Step 3 — Report
 
@@ -149,7 +180,9 @@ Surface to the human:
   `keeper handoff show <slug>` (prints the stored brief — inspection only; the
   handoff-ee already has the brief inline and does not call it).
 
-Then stop. This is fire-and-forget — do not wait on or monitor the handoff-ee.
+Then stop. This is fire-and-forget unless `--capture` was explicitly requested;
+in that case report the durable envelope path and use the captured-handoff wait
+recipe above.
 
 ## Exit taxonomy
 

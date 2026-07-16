@@ -32,15 +32,17 @@ entry states: **fresh-launch** starts a brand-new partner conversation, and
 *Resuming a partner* below). Pi launches with `-na` (`--no-approve`), ignoring the cwd's project-local
 `.pi/` resources so it never stalls on Pi's trust prompt.
 
-**Name your partners.** Pass `--name <n>` on a fresh launch so the partner is
-resumable by name later — an unnamed partner is still resumable by job id, but
-a name is far easier to recall and to hand to a follow-up turn. A `--resume`
-launch ignores `--name`: the resumed partner keeps its original name.
+**Name your partners.** On a fresh launch, `--name <n>` supplies the Partner
+launch handle: partner names are host-global among tracked jobs and are the
+dedup, dead-resume, and live-message routing key. An unnamed partner remains
+resumable by job id, but a name is easier to recall. A `--resume` launch ignores
+`--name`: the resumed partner keeps its original name. A live target always
+refuses resume; send it an Agent Bus message instead.
 
-Use **blocking Bash calls**, never a Monitor. A quick `agent run` call uses
-`timeout: 600000`; detached panel waits use the chunked-wait contract below.
-
-Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
+Use **blocking Bash calls**, never a Monitor. Shared wait and envelope mechanics
+live in the [Chunked wait](../../../../docs/agent-surface-contracts.md#chunked-wait)
+and [Answer envelope](../../../../docs/agent-surface-contracts.md#answer-envelope)
+contracts; on wording disputes those sections win.
 
 ## Quick single-shot (`agent run`)
 
@@ -99,13 +101,14 @@ START_RC=$?
 DIR=$(echo "$MANIFEST" | jq -r '.dir')
 ```
 
-- `--slug` is **required** — a short kebab run id (`[a-z0-9-]`) you auto-derive
-  from the ask (each leg launches as `panel::<slug>::<member>`, keeping the run
-  identifiable in tmux + forensics). Pick a sensible default, don't stall.
-- The manifest is `{"dir":"…","slug":"…","members":[{"name","harness","yaml","pidfile"},…]}`.
-  Capture `DIR`; every `wait`/`status` re-reads it — or address the run by `--slug
-  <slug>`, the durable form that survives a restart. Each member's `yaml` is that
-  leg's answer-envelope path.
+- `--slug` is **required** — a short kebab display/discovery label (`[a-z0-9-]`)
+  you auto-derive from the ask. Each leg launches as `panel::<slug>::<member>`;
+  the manifest's opaque `request_id`, not this slug, is the panel request handle.
+  Pick a sensible default, don't stall.
+- The manifest includes `dir`, `slug`, and `request_id`. Capture `DIR` and
+  `request_id`: `wait`/`status` can rediscover the request by display slug or
+  `DIR`, while the opaque identity owns admission and retries. Each member's
+  `yaml` is that leg's answer-envelope path.
 - Pick the member two ways: compose a launch triple directly when you already know
   harness+model+effort — `--panel <harness::model::effort>` (a single triple is a
   panel of one) — or give a bare `--cli <claude|pi>` (add `--model` /
@@ -117,57 +120,26 @@ DIR=$(echo "$MANIFEST" | jq -r '.dir')
   panel, a malformed triple, a non-pairable harness, or an unreadable prompt exits
   2 with no leg launched.
 
-**3. Wait token-free (re-issue loop).** Use the chunked-wait contract: issue
-one explicitly timed Bash call per chunk, re-issuing it in a new tool call only
-on exit `124`, and stop at the backstop. Never put the re-issue loop in the shell:
+**3. Wait token-free, then read the answer.** Run `keeper agent panel wait
+--run-dir "$DIR" --chunk 540s` under the Chunked wait contract. Once its terminal
+verdict is available, use each successful member's `yaml` path and read the
+standard answer envelope under the Answer envelope contract. Do not inspect an
+answer before the terminal verdict.
 
-Canonical contract: docs/agent-surface-contracts.md — on wording disputes the doc wins.
-
-```bash
-# Issue as its own Bash call, timeout: 600000:
-VERDICT=$(keeper agent panel wait --run-dir "$DIR" --chunk 540s)
-WAIT_RC=$?
-# exit 0   → every leg terminal; $VERDICT is the verdict JSON
-# exit 124 → chunk elapsed; issue the SAME command again as a NEW Bash call
-# exit 2   → a failure; stop and surface it
-```
-
-Do not inspect an answer before the terminal verdict. The wait command polls
-internally while its Bash call blocks, so never model-poll it between chunks.
-
-**4. Read the verdict, then each answer.** On exit 0, `VERDICT` is
-`{"dir":"…","ok":<bool>,"members":[{"name","harness","status":"ok|fail","yaml","reason"},…]}`.
-`wait` **exit 0 means all-terminal, NOT all-success** — key off `ok` (true iff
-every member wrote a `completed` result). The verdict is content-blind (it reads
-each result only for its `outcome`); the actual answer lives in each member's
-`yaml` envelope. For an `ok` verdict, read each member's answer:
-
-```bash
-echo "$VERDICT" | jq -r '.members[].yaml'   # → read + parse each as JSON
-```
-
-On `ok == false` (or a non-124 `wait` exit, or `BACKSTOP` exhausted), surface the
-failing members' `reason` fields (each is that leg's terminal `outcome` —
-`timed_out`, `no_message`, `launch_failed`, `bad_args` — or a corrupt/crashed-leg
-note) to the human rather than reading a stale answer file.
-
-**Re-entry & housekeeping.** The run's state is durable and slug-keyed, so a
-restarted session re-attaches from the slug alone: `keeper agent panel wait --slug
-<slug>` is the preferred re-entry form (no `$DIR` to carry across the restart). If a
-`wait` verdict carries a `machine-rebooted` reason (a reboot killed the legs mid-wait,
-returned promptly instead of spinning), re-issue `keeper agent panel start … --slug
-<slug>` — its idempotent reconcile relaunches the dead legs — then `wait` again. And
-`keeper agent panel status --slug <slug>` is a one-shot NON-blocking snapshot
-(per-leg `completed|running|failed|absent`, no verdict wait). `keeper agent panel
-prune` GCs aged-out terminal run dirs under the panels root — never a live or
-in-reconcile run — for occasional housekeeping.
+**Re-entry & housekeeping.** The request is durable; its display slug rediscovers
+its directory, while its opaque `request_id` remains the true identity. A restarted
+session can use `keeper agent panel wait --slug <slug>` without carrying `$DIR`. If a
+wait reports `machine-rebooted`, re-issue `keeper agent panel start … --slug <slug>`
+to reconcile the existing request, then wait again. `keeper agent panel status --slug
+<slug>` is a non-blocking snapshot, and `keeper agent panel prune` GCs eligible
+terminal run dirs.
 
 ## Resuming a partner
 
-A name is a lookup, never a resume key — `--resume <name-or-id>` (or the
-`resume` verb below) resolves the name against the current job's title, its
-former names, or a job/session-id prefix, and continues that partner's
-conversation rather than starting cold. Resolution rules:
+A name is a partner launch handle — `--resume <name-or-id>` (or the `resume`
+verb below) resolves it against the current job's title, its former names, or a
+job/session-id prefix, and continues a dead partner's conversation rather than
+starting cold. Resolution rules:
 
 - **Current or former name, or id.** A partner renamed mid-conversation is
   still found by any name it has ever carried.
@@ -175,8 +147,8 @@ conversation rather than starting cold. Resolution rules:
   collapse to the most recently updated one; keeper prints which job/harness it
   picked. An exact tie among equally-recent matches is ambiguous — resume by
   the exact job id instead.
-- **A live target refuses, pointing at the bus.** A partner still running is
-  never resumed (that would create two writers on one conversation) — message
+- **A live target refuses, routing to the Agent Bus.** A partner still running
+  is never resumed (that would create two writers on one conversation) — message
   it instead: `keeper bus chat send <name-or-id> "<msg>"`.
 - **Resume is cwd-scoped.** Both supported harnesses launch in the matched
   partner's recorded cwd, preserving the original session's project context.
