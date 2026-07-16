@@ -89,6 +89,7 @@ Usage:
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
                                   [--output <path>] [--resume <name-or-id>]
+                                  [--control <path> --control-owner <json>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
                                     --read-only prepends a directive (prompting-only).
@@ -104,6 +105,9 @@ Usage:
                                     forbids --model/--effort/--preset (the resumed
                                     session owns its config) and refuses a live
                                     target (points at keeper bus chat send).
+                                    --control publishes the canonical exact
+                                    teardown artifact at a caller-owned path and
+                                    requires the matching --control-owner tuple.
                                     --reap-window-on-terminal kills the launched
                                     tmux window once the result file lands (the
                                     one-shot panel-leg posture; a plain run stays
