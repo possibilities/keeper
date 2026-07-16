@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Retired-harness restore rows now skip-and-surface instead of wedging the restore set; operator-verified 231/0 across restore-set/restore-worker/tabs suites and landed via plain-git escape (orphaned leg claims 571e6310/b03e75f9/893e19cc unadoptable) as 67b1f187 on the epic lane",
+      "input_hash": "6247b5b7538938e07b5728e2925e341ba01517058b7d26920057ddac59d301dd",
+      "model": "gpt-5.5",
+      "spec_chars": 2668,
+      "spec_md": "## Description\n\nFindings F1 (Should fix) and F2 (Consider), bundled: both concern the\n`harnessOrClaude` throw-on-unknown contract this epic introduced, and land\nas one commit across `src/agent/harness.ts` and its batch-restore consumers.\n\nF1 \u2014 the whole-batch derivations reject the entire set when any single\nunregistered-harness row is present:\n- `src/restore-worker.ts:423` (`buildRestoreTier`)\n- `src/restore-set.ts:605` (`deriveRestoreSet`)\n- `src/tabs-core.ts:179` (`assertSupportedCandidateHarnesses`)\nEach loops over the live session set and calls `harnessOrClaude`, which\nthrows at `src/agent/harness.ts:240`. The pulses catch the throw\n(`src/restore-worker.ts:1146` / `:1161`) so the daemon does not crash, but\n`restore.json` / `revive.sh` go stale for every healthy Claude/Pi session\nwhile one live legacy Codex/Hermes session (`working`/`stopped`) persists.\nRework these three surfaces to skip-and-surface an unregistered-harness row\n(mirroring the visible-skip `adoptedCoordlessSkipCount` pattern already in\n`src/restore-set.ts`) instead of throwing the whole derivation, so a lone\nretired row cannot blank the mirror for healthy sessions. Apply the same\ntreatment to the `keeper tabs restore` / `dump` CLI path so it degrades to a\nsurfaced skip rather than one loud whole-batch failure.\n\nF2 \u2014 the `harnessOrClaude` docstring at `src/agent/harness.ts:229-233` still\nreads \"defaulting a NULL/empty/unknown tag to claude\" while the body throws\non an unknown non-empty value. Correct it to match the implementation (NULL/\nempty defaults to claude; an unknown non-empty harness throws), consistent\nwith the already-correct `buildHarnessResumeArgv` docstring below it.\n\nFiles: src/restore-worker.ts, src/restore-set.ts, src/tabs-core.ts,\nsrc/agent/harness.ts\n\n## Acceptance\n\n- [ ] Each batch derivation skips-and-surfaces an unregistered-harness row\n      and still emits a complete restore set for the healthy sessions.\n- [ ] `keeper tabs restore` / `dump` degrade to a surfaced skip, not a\n      whole-batch throw.\n- [ ] The `harnessOrClaude` docstring states the throw-on-unknown contract.\n- [ ] Coverage asserts a mixed set (one retired row + healthy Claude/Pi rows)\n      yields the healthy sessions plus a surfaced skip, not an empty/frozen set.\n\n## Done summary\nRetired-harness restore rows now skip-and-surface instead of wedging the restore set; operator-verified 231/0 across restore-set/restore-worker/tabs suites and landed via plain-git escape (orphaned leg claims 571e6310/b03e75f9/893e19cc unadoptable) as 67b1f187 on the epic lane\n## Evidence\n- Commits: 67b1f187\n- Tests: bun test restore-set+restore-worker+tabs 231/0 (operator re-run in lane)",
+      "task_id": "fn-1291-harden-unregistered-harness-restore.1",
+      "tier": "high",
+      "title": "Skip-and-surface retired restore rows"
+    }
+  ],
+  "created_at": "2026-07-16T20:22:16.461000Z",
+  "epic_id": "fn-1291-harden-unregistered-harness-restore",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "6247b5b7538938e07b5728e2925e341ba01517058b7d26920057ddac59d301dd",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
