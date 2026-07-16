@@ -97,6 +97,11 @@ export const SPILL_MAX_AGE_MS = 3 * 86400 * 1000;
 /** How long a one-shot op waits for its ack after connect (ms). */
 export const BUS_RESPONSE_TIMEOUT_MS = 5000;
 
+export const WATCH_BACKOFF_MIN_MS = 250;
+export const WATCH_BACKOFF_MAX_MS = 5000;
+export const WATCH_BACKOFF_RESET_AFTER_MS = 5000;
+export const WATCH_BACKOFF_JITTER_RATIO = 0.2;
+
 const HELP = `keeper bus — Agent Bus command surface
 
 Usage:
@@ -1152,28 +1157,64 @@ function spillBody(
   }
 }
 
+/** A server refusal that must stop, rather than reconnect, this watch process. */
+export class WatchTerminalError extends Error {}
+
+/**
+ * Compute one reconnect delay. Short-lived sessions retain and grow the prior
+ * backoff; only a sustained session resets it. Jitter prevents peers from
+ * retrying in lockstep.
+ */
+export function watchReconnectDecision(
+  backoffMs: number,
+  sessionDurationMs: number,
+  random: () => number = Math.random,
+): { delayMs: number; nextBackoffMs: number } {
+  const base =
+    sessionDurationMs >= WATCH_BACKOFF_RESET_AFTER_MS
+      ? WATCH_BACKOFF_MIN_MS
+      : Math.min(
+          Math.max(backoffMs, WATCH_BACKOFF_MIN_MS),
+          WATCH_BACKOFF_MAX_MS,
+        );
+  const sample = Math.min(1, Math.max(0, random()));
+  const delayMs = Math.round(
+    base *
+      (1 -
+        WATCH_BACKOFF_JITTER_RATIO +
+        2 * WATCH_BACKOFF_JITTER_RATIO * sample),
+  );
+  return {
+    delayMs,
+    nextBackoffMs: Math.min(base * 2, WATCH_BACKOFF_MAX_MS),
+  };
+}
+
 /**
  * Run the long-lived watch subscriber. Prunes stale spills, connects, registers +
  * subscribes (all namespaces by default), and streams each inbound message through
- * {@link emitMessage}. On disconnect it reconnects with a bounded backoff — a watch
- * must survive a daemon bounce. Never returns (the Monitor command runs forever).
+ * {@link emitMessage}. On disconnect it reconnects with bounded, jittered backoff.
+ * Never returns (the Monitor command runs forever).
  */
 async function runWatch(sockPath: string, json = false): Promise<never> {
   const inboxDir = resolveInboxDir();
   pruneInbox(inboxDir);
   const emit = json ? emitJsonMessage : emitMessage;
 
-  // Reconnect forever — a watch outlives daemon bounces. Bounded backoff.
-  let backoffMs = 250;
+  let backoffMs = WATCH_BACKOFF_MIN_MS;
   for (;;) {
+    const startedAt = Date.now();
     try {
       await watchOnce(sockPath, inboxDir, emit);
-      backoffMs = 250; // a clean session resets the backoff
-    } catch {
-      // connect/transport fault — fall through to backoff + retry.
+    } catch (err) {
+      if (err instanceof WatchTerminalError) {
+        process.stderr.write(`keeper bus: ${err.message}\n`);
+        process.exit(1);
+      }
     }
-    await Bun.sleep(backoffMs);
-    backoffMs = Math.min(backoffMs * 2, 5000);
+    const reconnect = watchReconnectDecision(backoffMs, Date.now() - startedAt);
+    await Bun.sleep(reconnect.delayMs);
+    backoffMs = reconnect.nextBackoffMs;
   }
 }
 
@@ -1220,7 +1261,11 @@ function watchOnce(
             } catch {
               continue;
             }
-            handleWatchFrame(s, f, inboxDir, emit);
+            const terminal = handleWatchFrame(s, f, inboxDir, emit);
+            if (terminal !== null) {
+              done(terminal);
+              return;
+            }
           }
         },
         close() {
@@ -1240,16 +1285,22 @@ export function handleWatchFrame(
   f: Record<string, unknown>,
   inboxDir: string,
   emit: (msg: InboundMessage, inboxDir: string) => void = emitMessage,
-): void {
+): WatchTerminalError | null {
+  if (f.type === "error" && f.code === "duplicate_subscriber") {
+    return new WatchTerminalError(
+      "duplicate_subscriber: only one watcher per session is allowed",
+    );
+  }
   if (f.type === "ack" && f.op === "register") {
     s.write(`${JSON.stringify({ op: "subscribe" })}\n`);
-    return;
+    return null;
   }
   // A delivered event envelope (server → subscriber). Control-namespace lifecycle
   // events (join/part/reap/takeover) are not inter-agent messages — skip them.
   if (f.event === "message" && f.namespace !== "bus" && isInbound(f)) {
     emit(toInbound(f), inboxDir);
   }
+  return null;
 }
 
 /** Narrow a wire frame to a deliverable inbound message shape. */
