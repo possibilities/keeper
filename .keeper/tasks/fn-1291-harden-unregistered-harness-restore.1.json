@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Skip-and-surface retired restore rows",
-  "updated_at": "2026-07-16T08:22:31.135000Z"
+  "updated_at": "2026-07-16T20:10:10.254000Z",
+  "worker_done_at": "2026-07-16T20:10:10.254000Z"
 }

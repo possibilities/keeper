@@ -41,5 +41,7 @@ src/agent/harness.ts
       yields the healthy sessions plus a surfaced skip, not an empty/frozen set.
 
 ## Done summary
-
+Retired-harness restore rows now skip-and-surface instead of wedging the restore set; operator-verified 231/0 across restore-set/restore-worker/tabs suites and landed via plain-git escape (orphaned leg claims 571e6310/b03e75f9/893e19cc unadoptable) as 67b1f187 on the epic lane
 ## Evidence
+- Commits: 67b1f187
+- Tests: bun test restore-set+restore-worker+tabs 231/0 (operator re-run in lane)
