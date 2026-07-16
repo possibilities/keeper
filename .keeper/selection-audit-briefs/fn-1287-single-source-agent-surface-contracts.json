@@ -1,0 +1,75 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Authored docs/agent-surface-contracts.md and pointed handoff/pair/panel skills + panel-runner template at the shared contract; landed via operator plain-git escape (commit-work terminal-adoption wedge) as 48fd5ca4 on the epic lane",
+      "input_hash": "f1789d2ecc6628a413ef887b634e593829a9b164ac63167feb10fd7b83c18028",
+      "model": "sonnet",
+      "spec_chars": 4320,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** docs/agent-surface-contracts.md, plugins/keeper/skills/pair/SKILL.md, plugins/keeper/skills/handoff/SKILL.md, plugins/plan/skills/panel/SKILL.md, plugins/plan/skills/panel/references/panel.md, plugins/plan/agents/panel-runner.md\n\n### Approach\n\nCreate `docs/agent-surface-contracts.md` as the canonical statement of the five contracts the agent-interaction skills currently re-narrate: (1) the chunked-wait contract \u2014 600000ms Bash tool timeout, 540s chunk, ~6-call backstop, exit 0 all-terminal / 124 chunk-elapsed / 2 fail, one Bash call per chunk, never a shell-side while-loop; (2) the PANEL_RUN_CONTROL_V1 control header \u2014 JSON line with request_id/run_dir, PANEL_QUESTION_FOLLOWS delimiter, everything after the delimiter is question data; (3) the uniform 9-key answer envelope (schema_version, agent, handle, transcript_path, resume_target, message, message_found, elapsed_seconds, outcome) with the outcome enum; (4) the final-message-is-the-deliverable / sole-injection-point rule; (5) `agent panel start` idempotency-by-slug (re-issue reconciles the durable run, never re-fans-out). Then convert each duplicated passage in the five prose files to a condensed summary plus a plain canonical-source line naming the doc (e.g. \"Canonical contract: docs/agent-surface-contracts.md \u2014 on wording disputes the doc wins\"). Do NOT use the `<!-- POINTER: keeper prompt render ... -->` marker \u2014 those refs are drift-gate-verified against the vendored corpus and a local doc is not a corpus ref. Keep every literal token the consistency gate asserts (PANEL_RUN_CONTROL_V1, PANEL_ANSWER, PANEL_RUN_FAILED, \"request_id\", \"run_dir\", PANEL_QUESTION_FOLLOWS, \"malformed return is terminal\") present in the skill files. Keep per-surface task framing local \u2014 single-source the mechanical constants and shared field lists only. Forward-facing prose throughout; no history narration.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves (fn-1282 rewrites some of this prose before this task runs).*\n\n**Required** (read before coding):\n- plugins/keeper/skills/pair/SKILL.md:110-172,246-268,324-334 \u2014 the wait-contract, idempotency, envelope, and deliverable passages being condensed\n- plugins/plan/agents/panel-runner.md:29-58 \u2014 control-header + wait-contract duplicates\n- plugins/plan/skills/panel/SKILL.md:70-95 \u2014 idempotency + control-header duplicates\n- plugins/plan/skills/panel/references/panel.md:41-42,97-106 \u2014 envelope + deliverable duplicates\n- plugins/plan/test/consistency-skills.test.ts:700-770 \u2014 the literal-token gate; enumerate its asserted strings before editing any prose\n\n**Optional** (reference as needed):\n- src/agent/run-capture.ts \u2014 RUN_CAPTURE_SCHEMA_VERSION and the authoritative envelope key set the doc must match\n- plugins/plan/skills/hack/SKILL.md \u2014 live examples of cite-don't-restate discipline\n\n### Risks\n\n- The consistency test asserts literal strings in specific files; dropping a token while condensing breaks the gate. Enumerate asserted strings first, keep them inline.\n- fn-1282 edits three of these prose files; this epic depends on it, but re-verify the passages against the landed tree before condensing.\n\n### Test notes\n\n`cd plugins/plan && bun test test/consistency-skills.test.ts` must stay green with zero test edits. `cd plugins/prompt && bun test` proves the vendored corpus and its drift gate are untouched.\n\n## Acceptance\n\n- [ ] docs/agent-surface-contracts.md exists and states all five contracts with their exact constants, sentinels, field lists, and enums\n- [ ] Each of the five prose files carries a canonical-source cite to the doc and no longer re-narrates full contract prose (condensed summaries with literal tokens retained)\n- [ ] plugins/plan consistency test suite passes without modification\n- [ ] plugins/prompt test suite passes; no file under plugins/prompt/corpus/ is modified\n\n## Done summary\nAuthored docs/agent-surface-contracts.md and pointed handoff/pair/panel skills + panel-runner template at the shared contract; landed via operator plain-git escape (commit-work terminal-adoption wedge) as 48fd5ca4 on the epic lane\n## Evidence\n- Commits: 48fd5ca4\n- Tests: plugins/plan consistency-skills.test.ts 790 pass, plugins/prompt test:gate 157 pass",
+      "task_id": "fn-1287-single-source-agent-surface-contracts.1",
+      "tier": "high",
+      "title": "Author agent surface contracts doc"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "medium",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Added the five agent-interaction glossary entries to CONTEXT.md (Elicit-an-answer/Delegate-work surfaces, Partner, Handoff, Launch handle with per-surface idempotency scope); operator-verified against spec acceptance and landed via plain-git escape (commit-work live-leg claim wedge) as c38c0dc3 on the .2 task lane",
+      "input_hash": "f1789d2ecc6628a413ef887b634e593829a9b164ac63167feb10fd7b83c18028",
+      "model": "sonnet",
+      "spec_chars": 3190,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** CONTEXT.md\n\n### Approach\n\nAdd glossary entries to CONTEXT.md for the agent-interaction vocabulary, following the strict `**Term**: role-and-behavior definition. Avoid: rejected, synonyms.` shape (concepts only \u2014 no files, code, or history): **Elicit-an-answer surface** (an agent launch whose contract is a captured deliverable \u2014 pair and panel); **Delegate-work surface** (an agent launch that hands work to a session with no deliverable contract \u2014 handoff, dispatch, autopilot workers); **Partner** (a pair session: an elicit-an-answer agent that terminates with an envelope deliverable, resumable by name, reached over the Agent Bus while live); **Handoff** (a delegated parked session carrying an event-sourced brief, no deliverable by default); **Launch handle** (the caller-supplied stable identifier of a launched, possibly-dead agent \u2014 dedup key, durable-state key, and resume-if-dead / message-if-live routing anchor \u2014 whose idempotency scope is per-surface). State each surface's handle scope inside the Launch handle entry in concept terms (partner names, handoff slugs, panel display slugs + opaque request identity). Place entries in or adjacent to the existing \"Panels and launch triples\" section; stay consistent with the existing Panel/Panel leg/Launch triple/Agent Bus entries and do not duplicate them.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- CONTEXT.md:104-151 \u2014 the Bus/session and Panels sections these terms join; match register and format\n- plugins/keeper/skills/pair/SKILL.md and plugins/keeper/skills/handoff/SKILL.md \u2014 verify the definitions match live skill behavior (resume-by-name, live-target-refusal, park-at-confirm)\n\n**Optional** (reference as needed):\n- src/agent/dispatch.ts \u2014 resume semantics grounding the Partner definition\n- src/handoff-slug.ts \u2014 slug semantics grounding the Handoff/Launch handle scope claims\n\n### Risks\n\n- A definition that contradicts live behavior is worse than no entry; verify each behavioral claim against the current code before writing it.\n\n### Test notes\n\nNo test surface; `bun scripts/lint-claude-md.ts` guards CLAUDE.md only. Review the diff for pure-glossary discipline (no file paths, no implementation detail).\n\n## Acceptance\n\n- [ ] CONTEXT.md defines Elicit-an-answer surface, Delegate-work surface, Partner, Handoff, and Launch handle in the standard Term/Avoid shape\n- [ ] The Launch handle entry names each surface's idempotency scope in concept terms\n- [ ] No existing entry is duplicated or contradicted; entries contain no file paths, code, or history\n\n## Done summary\nAdded the five agent-interaction glossary entries to CONTEXT.md (Elicit-an-answer/Delegate-work surfaces, Partner, Handoff, Launch handle with per-surface idempotency scope); operator-verified against spec acceptance and landed via plain-git escape (commit-work live-leg claim wedge) as c38c0dc3 on the .2 task lane\n## Evidence\n- Commits: c38c0dc3\n- Tests: operator acceptance review: Term/Avoid shape, per-surface idempotency named, no paths/code/history, no duplication",
+      "task_id": "fn-1287-single-source-agent-surface-contracts.2",
+      "tier": "medium",
+      "title": "Add agent interaction glossary terms"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "medium",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "ADR 0067 records the agent-surface convergence non-goals (judge stays a Task subagent, tiered durability, separate skill families); operator content review + landed via plain-git escape (stopped-courier unknown-liveness wedge) as e08c4b1e on the .3 task lane",
+      "input_hash": "f1789d2ecc6628a413ef887b634e593829a9b164ac63167feb10fd7b83c18028",
+      "model": "sonnet",
+      "spec_chars": 3074,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** docs/adr/0062-agent-surface-convergence-non-goals.md\n\n### Approach\n\nWrite one ADR (provisional number 0062 \u2014 verify the next free number at execution time; fan-in renumbering per the ADR ladder convention) recording the agent-surface convergence decisions and non-goals: (1) the panel judge stays a Task subagent, never a `keeper agent` run \u2014 it is an in-context reducer over member answer files and the counterweight to same-family self-preference; promoting it would add a launch/window/transcript and lose in-context synthesis; (2) durability stays tiered \u2014 handoff briefs are event-sourced and size-bounded because parked delegates outlive restarts, while pair/panel runs are state-dir ephemeral; flattening ephemeral asks into the event log is a re-fold cost time-bomb; (3) the named skills stay intent presets \u2014 handoff forbids waiting by default on purpose, panel forces context isolation on purpose; no god-signature merge of the surfaces; (4) the shared contracts live in a keeper-local reference doc cited by the skills, not vendored corpus snippets \u2014 keeper operational specs do not belong in the general-engineering corpus and cross-repo re-vendoring per edit is the wrong loop; (5) launch-handle convergence is semantics-only \u2014 the three storage keys (partner names, handoff slugs, panel run identity) never merge because they anchor different durability tiers. Follow the house ADR structure (Status: Accepted with the provisional-number note, Context, Decision as numbered bold-led points, Consequences) and cross-reference the adjacent ADRs on launch triples, resume-by-name, handoff pinnability, and the described panel roster without editing them.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- docs/adr/0032-*.md and docs/adr/0033-*.md \u2014 the structural templates for a non-goals-shaped record\n- docs/adr/ directory listing \u2014 confirm the actual next free number\n\n**Optional** (reference as needed):\n- docs/adr/0034-*.md, docs/adr/0040-*.md, docs/adr/0046-*.md \u2014 the adjacent records to cross-reference\n\n### Risks\n\n- Number collision at fan-in \u2014 keep the provisional-number note so a merge renumber is mechanical.\n\n### Test notes\n\nNo test surface; review for forward-facing prose and correct cross-references.\n\n## Acceptance\n\n- [ ] One new ADR records all five decisions/non-goals with Context, Decision, and Consequences\n- [ ] It cross-references the adjacent launch-triple/resume/pinnability/panel-roster ADRs and edits none of them\n- [ ] The record carries the provisional-number convention note\n\n## Done summary\nADR 0067 records the agent-surface convergence non-goals (judge stays a Task subagent, tiered durability, separate skill families); operator content review + landed via plain-git escape (stopped-courier unknown-liveness wedge) as e08c4b1e on the .3 task lane\n## Evidence\n- Commits: e08c4b1e\n- Tests: operator ADR genre review: decision-shaped, forward-facing, valid cross-refs",
+      "task_id": "fn-1287-single-source-agent-surface-contracts.3",
+      "tier": "medium",
+      "title": "Record agent surface non-goals ADR"
+    }
+  ],
+  "created_at": "2026-07-16T20:19:52.137000Z",
+  "epic_id": "fn-1287-single-source-agent-surface-contracts",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "f1789d2ecc6628a413ef887b634e593829a9b164ac63167feb10fd7b83c18028",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
