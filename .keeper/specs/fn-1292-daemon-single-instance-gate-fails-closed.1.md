@@ -43,5 +43,7 @@ Extend `test/single-instance-lock.test.ts` (root-phase, auto-discovered — no m
 - [ ] No source comment or ADR 0030 decision text still describes the degraded/inconclusive outcome as intended fail-open; ADR 0030 reflects fail-closed and the widened dual-writer-window-closed consequence.
 
 ## Done summary
-
+Single-instance gate fails CLOSED on a degraded/thrown lock (distinct exit code before openDb, ADR 0030 revised, outcome seam tested); operator re-run 17/0 on single-instance-lock suite; landed via plain-git escape (terminal-leg claims never settling adoptable) as 9df7fe32 on the epic lane
 ## Evidence
+- Commits: 9df7fe32
+- Tests: bun test single-instance-lock 17/0 (operator re-run in lane)

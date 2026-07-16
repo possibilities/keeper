@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Fail closed on inconclusive lock",
-  "updated_at": "2026-07-16T08:45:16.894000Z"
+  "updated_at": "2026-07-16T21:12:51.675000Z",
+  "worker_done_at": "2026-07-16T21:12:51.675000Z"
 }
