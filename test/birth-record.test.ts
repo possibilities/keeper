@@ -17,16 +17,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/agent/main";
 import {
+  BIRTH_INTENT_SCHEMA_VERSION,
   BIRTH_RECORD_SCHEMA_VERSION,
   type BirthRecord,
+  type BirthRecordDraft,
   birthBackendCoordsFromEnv,
   birthWorktreeFromEnv,
   buildBirthDraft,
   darwinLstartToStartTime,
   linuxStatToStartTime,
+  parseBirthIntent,
   parseBirthRecord,
+  publishBirthIntent,
   resolveBirthDir,
+  serializeBirthIntent,
   serializeBirthRecord,
+  writeBirthIntent,
   writeBirthRecord,
 } from "../src/birth-record";
 import {
@@ -55,6 +61,22 @@ const FULL: BirthRecord = {
   launch_ts: "2026-07-03T12:00:00.000Z",
   resume_target: null,
   dispatch_attempt_id: null,
+};
+
+const DRAFT: BirthRecordDraft = {
+  schema_version: FULL.schema_version,
+  session_id: FULL.session_id,
+  harness: FULL.harness,
+  cwd: FULL.cwd,
+  spawn_name: FULL.spawn_name,
+  config_dir: FULL.config_dir,
+  backend_exec_type: FULL.backend_exec_type,
+  backend_exec_session_id: FULL.backend_exec_session_id,
+  backend_exec_pane_id: FULL.backend_exec_pane_id,
+  worktree: FULL.worktree,
+  launch_ts: FULL.launch_ts,
+  resume_target: FULL.resume_target,
+  dispatch_attempt_id: FULL.dispatch_attempt_id,
 };
 
 describe("serialize / parse round-trip", () => {
@@ -140,6 +162,42 @@ describe("parse rejects torn / malformed records", () => {
         }),
       ),
     ).toBeNull();
+  });
+});
+
+describe("pre-spawn birth intent", () => {
+  test("round-trips the bounded intent contract", () => {
+    const intent = {
+      schema_version: BIRTH_INTENT_SCHEMA_VERSION,
+      session_id: FULL.session_id,
+      harness: "pi" as const,
+      launcher_pid: 777,
+      launch_ts: FULL.launch_ts,
+    };
+    expect(parseBirthIntent(serializeBirthIntent(intent))).toEqual(intent);
+    expect(parseBirthIntent('{"schema_version":1}')).toBeNull();
+  });
+
+  test("is visible before spawn and atomically promotes to a full birth", () => {
+    const dir = tempDir();
+    try {
+      const intentPath = writeBirthIntent(dir, DRAFT, 777);
+      expect(parseBirthIntent(readFileSync(intentPath, "utf8"))).toMatchObject({
+        session_id: FULL.session_id,
+        launcher_pid: 777,
+      });
+      publishBirthIntent(intentPath, FULL);
+      expect(readdirSync(join(dir, "pending"))).toEqual([]);
+      const names = readdirSync(join(dir, "new"));
+      expect(names).toHaveLength(1);
+      expect(
+        parseBirthRecord(
+          readFileSync(join(dir, "new", names[0] ?? ""), "utf8"),
+        ),
+      ).toEqual(FULL);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -345,8 +403,11 @@ describe("main() emits birth records for Pi launches", () => {
   test("pi interactive → one record, pinned session id = job id = resume target", async () => {
     const h = harness("pi", ["--x-no-confirm", "hi"]);
     await runAndCapture(h, main);
+    expect(h.birthIntents).toHaveLength(1);
     expect(h.birthRecords).toHaveLength(1);
-    const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
+    const { draft, intentPath } = h
+      .birthRecords[0] as (typeof h.birthRecords)[number];
+    expect(intentPath).toBe("/fake-births/pending/intent.json");
     expect(draft.harness).toBe("pi");
     expect(draft.session_id).toBe(UUID);
     expect(draft.resume_target).toBe(UUID);
@@ -357,6 +418,7 @@ describe("main() emits birth records for Pi launches", () => {
   test("claude launch emits NO birth record and sets no job-id env", async () => {
     const h = harness("claude", ["--x-no-confirm", "hi"]);
     await runAndCapture(h, main);
+    expect(h.birthIntents).toEqual([]);
     expect(h.birthRecords).toEqual([]);
     expect(h.deps.env.KEEPER_JOB_ID).toBeUndefined();
   });
@@ -373,6 +435,7 @@ describe("main() emits birth records for Pi launches", () => {
       env: { KEEPER_JOB_ID: "45f94c4d-orig" },
     });
     await runAndCapture(h, main);
+    expect(h.birthIntents).toHaveLength(1);
     expect(h.birthRecords).toHaveLength(1);
     const { draft } = h.birthRecords[0] as (typeof h.birthRecords)[number];
     expect(draft.harness).toBe("pi");

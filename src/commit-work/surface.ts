@@ -19,6 +19,11 @@ import {
   sep,
 } from "node:path";
 import {
+  defaultBirthDir,
+  parseBirthIntent,
+  parseBirthRecord,
+} from "../birth-record";
+import {
   defaultDbPath,
   defaultDeadLetterDir,
   defaultEventsLogDir,
@@ -42,6 +47,8 @@ export interface OwnershipClaim {
   oid?: string | null;
   mode?: string | null;
   source?: string | null;
+  /** Same-snapshot terminal lifecycle event proven later than this mutation. */
+  orderedTerminalProof?: true;
 }
 
 /**
@@ -135,6 +142,8 @@ export interface OwnershipClaimsReadTestHooks {
   eventsLogDir?: string;
   /** Isolated dead-letter tree; production uses the fixed recovery directory. */
   deadLetterDir?: string;
+  /** Isolated Pi birth tree; production uses the fixed per-user maildir. */
+  birthDir?: string;
   /** Test-only seam for a dead-letter append at the final source handoff. */
   afterDeadLetterRead?: () => void;
   /** Test-only seam for a daemon import during a dead-letter disk scan. */
@@ -147,6 +156,8 @@ const PENDING_DIRECT_CLAIM_LIMIT = 10_000;
 const RECEIPT_FILE_LIMIT = 1_024;
 const RECEIPT_RECORD_LIMIT = 10_000;
 const RECEIPT_BYTE_LIMIT = 8 * 1_048_576;
+// Node's fs constants omit O_CLOEXEC; keep descriptor inheritance atomic.
+const O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
 
 function canonicalMutationPath(
   worktree: string,
@@ -239,6 +250,8 @@ function receiptCanonicalizationUnavailable(
  */
 interface ReceiptClaimsSnapshot {
   claims: OwnershipClaim[];
+  /** Sessions with any un-ingested event whose DB ordering is not yet known. */
+  unorderedSessions: ReadonlySet<string>;
   /** Exact descriptor/directory identity recheck after the DB snapshot closes. */
   stillStable: () => boolean;
 }
@@ -267,6 +280,7 @@ function readReceiptClaims(
   const stateStmt = db.query("SELECT state FROM jobs WHERE job_id = ?");
   const stateBySession = new Map<string, string | null>();
   const claims: OwnershipClaim[] = [];
+  const unorderedSessions = new Set<string>();
   const identities = new Map<
     string,
     {
@@ -350,13 +364,18 @@ function readReceiptClaims(
         if (totalRecords > RECEIPT_RECORD_LIMIT) return null;
         const record = parseEventLogLine(line);
         if (record === null) return null;
-        if (receiptCanonicalizationUnavailable(record.bindings)) return null;
-        const mutationPath = mutationPathFromReceipt(record.bindings);
-        if (mutationPath === null) continue;
         const sessionId = record.bindings.session_id;
         if (typeof sessionId !== "string" || sessionId.length === 0) {
           return null;
         }
+        // Receipt order relative to a folded terminal event is unknowable until
+        // ingestion assigns an event id. Any unread lifecycle, prompt, tool, or
+        // other session event therefore keeps every claim non-terminal. This
+        // catches a resume receipt even when it carries no mutation path.
+        unorderedSessions.add(sessionId);
+        if (receiptCanonicalizationUnavailable(record.bindings)) return null;
+        const mutationPath = mutationPathFromReceipt(record.bindings);
+        if (mutationPath === null) continue;
         const path = canonicalMutationPath(worktree, mutationPath);
         if (path === null) continue;
         if (!stateBySession.has(sessionId)) {
@@ -426,71 +445,201 @@ function readReceiptClaims(
     }
     return true;
   };
-  return stillStable() ? { claims, stillStable } : null;
+  return stillStable() ? { claims, unorderedSessions, stillStable } : null;
+}
+
+interface BirthSessionsSnapshot {
+  sessions: ReadonlySet<string>;
+  stillStable: () => boolean;
+}
+
+export function defaultCommitWorkBirthDir(): string {
+  return defaultBirthDir();
+}
+
+/** Descriptor-stable snapshot of launcher births not yet ordered in SQLite. */
+function readBirthSessions(dir: string): BirthSessionsSnapshot | null {
+  interface BirthFile {
+    key: string;
+    full: string;
+  }
+  // `pending/` is published before spawn and remains visible until the complete
+  // birth atomically reaches `new/`; `tmp/` covers the legacy writer's stage.
+  const list = (): BirthFile[] | null => {
+    const files: BirthFile[] = [];
+    for (const bucket of ["pending", "tmp", "new"] as const) {
+      const bucketDir = join(dir, bucket);
+      let names: string[];
+      try {
+        names = readdirSync(bucketDir).filter((name) => name.endsWith(".json"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return null;
+      }
+      for (const name of names) {
+        files.push({ key: `${bucket}/${name}`, full: join(bucketDir, name) });
+      }
+    }
+    files.sort((left, right) => left.key.localeCompare(right.key));
+    return files.length <= RECEIPT_FILE_LIMIT ? files : null;
+  };
+  const beforeFiles = list();
+  if (beforeFiles === null) return null;
+
+  const sessions = new Set<string>();
+  const identities = new Map<string, string>();
+  let totalBytes = 0;
+  for (const file of beforeFiles) {
+    const { full, key } = file;
+    let fd: number;
+    try {
+      fd = openSync(
+        full,
+        constants.O_RDONLY |
+          constants.O_NONBLOCK |
+          constants.O_NOFOLLOW |
+          O_CLOEXEC,
+      );
+    } catch {
+      return null;
+    }
+    try {
+      const before = fstatSync(fd);
+      if (!before.isFile() || !Number.isSafeInteger(before.size)) return null;
+      totalBytes += before.size;
+      if (totalBytes > RECEIPT_BYTE_LIMIT) return null;
+      const bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        const count = readSync(
+          fd,
+          bytes,
+          offset,
+          bytes.length - offset,
+          offset,
+        );
+        if (count <= 0) return null;
+        offset += count;
+      }
+      const after = fstatSync(fd);
+      const identity = `${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}`;
+      if (
+        !after.isFile() ||
+        before.dev !== after.dev ||
+        before.ino !== after.ino ||
+        before.size !== after.size ||
+        before.mtimeMs !== after.mtimeMs ||
+        before.ctimeMs !== after.ctimeMs
+      ) {
+        return null;
+      }
+      identities.set(key, identity);
+      const body = bytes.toString("utf8");
+      const record = key.startsWith("pending/")
+        ? (parseBirthIntent(body) ?? parseBirthRecord(body))
+        : parseBirthRecord(body);
+      if (record === null) return null;
+      sessions.add(record.session_id);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  const stillStable = (): boolean => {
+    const afterFiles = list();
+    if (
+      afterFiles === null ||
+      afterFiles.length !== beforeFiles.length ||
+      afterFiles.some((file, index) => file.key !== beforeFiles[index]?.key)
+    ) {
+      return false;
+    }
+    for (const file of afterFiles) {
+      let stats: ReturnType<typeof lstatSync>;
+      try {
+        stats = lstatSync(file.full);
+      } catch {
+        return false;
+      }
+      if (
+        !stats.isFile() ||
+        identities.get(file.key) !==
+          `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return stillStable() ? { sessions, stillStable } : null;
 }
 
 interface DeadLetterImportState {
-  total: number;
-  waiting: number;
-  replayHead: number;
+  dataVersion: number;
 }
 
 function deadLetterImportState(db: Database): DeadLetterImportState | null {
-  const row = db
-    .query(
-      `SELECT COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0) AS waiting,
-              COALESCE(MAX(replayed_event_id), 0) AS replay_head
-         FROM dead_letters`,
-    )
-    .get() as { total: unknown; waiting: unknown; replay_head: unknown } | null;
+  const row = db.query("PRAGMA data_version").get() as {
+    data_version: unknown;
+  } | null;
   if (
-    typeof row?.total !== "number" ||
-    !Number.isSafeInteger(row.total) ||
-    row.total < 0 ||
-    typeof row.waiting !== "number" ||
-    !Number.isSafeInteger(row.waiting) ||
-    row.waiting < 0 ||
-    typeof row.replay_head !== "number" ||
-    !Number.isSafeInteger(row.replay_head) ||
-    row.replay_head < 0
+    typeof row?.data_version !== "number" ||
+    !Number.isSafeInteger(row.data_version) ||
+    row.data_version < 0
   ) {
     return null;
   }
-  return {
-    total: row.total,
-    waiting: row.waiting,
-    replayHead: row.replay_head,
-  };
+  return { dataVersion: row.data_version };
 }
 
 function sameDeadLetterImportState(
   left: DeadLetterImportState,
   right: DeadLetterImportState,
 ): boolean {
-  return (
-    left.total === right.total &&
-    left.waiting === right.waiting &&
-    left.replayHead === right.replayHead
-  );
+  return left.dataVersion === right.dataVersion;
 }
 
-function unresolvedMutationDeadLetter(
+interface DeadLetterEvidence {
+  blockingMutation: boolean;
+  unorderedSessions: ReadonlySet<string>;
+}
+
+function unresolvedDeadLetterEvidence(
   worktree: string,
   dbPath: string,
   dir: string,
   duringRead?: () => void,
-): boolean | null {
-  const relevant = (
+): DeadLetterEvidence | null {
+  let blockingMutation = false;
+  const unorderedSessions = new Set<string>();
+  const observe = (
     bindings: Record<string, string | number | boolean | null>,
-  ) => {
-    if (receiptCanonicalizationUnavailable(bindings)) return true;
+    fallbackSession: string | null,
+  ): void => {
+    const boundSession = bindings.session_id;
+    const sessionId =
+      typeof boundSession === "string" && boundSession.length > 0
+        ? boundSession
+        : fallbackSession;
+    if (sessionId !== null && sessionId.length > 0) {
+      unorderedSessions.add(sessionId);
+    }
+    if (receiptCanonicalizationUnavailable(bindings)) {
+      blockingMutation = true;
+      return;
+    }
     const mutationPath = mutationPathFromReceipt(bindings);
-    return (
+    if (
       mutationPath !== null &&
       canonicalMutationPath(worktree, mutationPath) !== null
-    );
+    ) {
+      blockingMutation = true;
+    }
   };
+  const evidence = (): DeadLetterEvidence => ({
+    blockingMutation,
+    unorderedSessions,
+  });
   try {
     const { db } = openDb(dbPath, { readonly: true });
     try {
@@ -498,14 +647,26 @@ function unresolvedMutationDeadLetter(
       if (importBefore === null) return null;
       const unresolved = db
         .query(
-          `SELECT bindings
+          `SELECT bindings, session_id, status
              FROM dead_letters
             WHERE status != 'recovered'
             LIMIT ?`,
         )
-        .all(RECEIPT_RECORD_LIMIT + 1) as Array<{ bindings: unknown }>;
+        .all(RECEIPT_RECORD_LIMIT + 1) as Array<{
+        bindings: unknown;
+        session_id: unknown;
+        status: unknown;
+      }>;
       if (unresolved.length > RECEIPT_RECORD_LIMIT) return null;
       for (const row of unresolved) {
+        // Poison means the original event could not be classified at all. Its
+        // parked `{raw,…}` envelope cannot prove which session/path it touched,
+        // so terminal adoption must fail closed globally until an operator
+        // resolves or removes the poison evidence.
+        if (row.status !== "waiting") {
+          blockingMutation = true;
+          continue;
+        }
         if (typeof row.bindings !== "string") return null;
         let parsed: unknown;
         try {
@@ -520,11 +681,10 @@ function unresolvedMutationDeadLetter(
         ) {
           return null;
         }
-        if (
-          relevant(parsed as Record<string, string | number | boolean | null>)
-        ) {
-          return true;
-        }
+        observe(
+          parsed as Record<string, string | number | boolean | null>,
+          typeof row.session_id === "string" ? row.session_id : null,
+        );
       }
 
       duringRead?.();
@@ -538,7 +698,7 @@ function unresolvedMutationDeadLetter(
         const importAfter = deadLetterImportState(db);
         return importAfter !== null &&
           sameDeadLetterImportState(importBefore, importAfter)
-          ? false
+          ? evidence()
           : null;
       }
       if (names.length > RECEIPT_FILE_LIMIT) return null;
@@ -590,18 +750,19 @@ function unresolvedMutationDeadLetter(
             if (totalRecords > RECEIPT_RECORD_LIMIT) return null;
             const record = parseDeadLetterLine(line);
             if (record === null) return null;
-            if (!relevant(record.bindings)) continue;
             const row = status.get(record.dl_id) as {
               status: unknown;
               replayed_event_id: unknown;
             } | null;
-            if (
-              row?.status !== "recovered" ||
-              typeof row.replayed_event_id !== "number" ||
-              !Number.isSafeInteger(row.replayed_event_id)
-            ) {
-              return true;
+            const recovered =
+              row?.status === "recovered" &&
+              typeof row.replayed_event_id === "number" &&
+              Number.isSafeInteger(row.replayed_event_id);
+            if (row !== null && !recovered && row.status !== "waiting") {
+              blockingMutation = true;
+              continue;
             }
+            if (!recovered) observe(record.bindings, record.session_id);
           }
         } finally {
           closeSync(fd);
@@ -635,7 +796,7 @@ function unresolvedMutationDeadLetter(
       const importAfter = deadLetterImportState(db);
       return importAfter !== null &&
         sameDeadLetterImportState(importMiddle, importAfter)
-        ? false
+        ? evidence()
         : null;
     } finally {
       db.close();
@@ -643,6 +804,28 @@ function unresolvedMutationDeadLetter(
   } catch {
     return null;
   }
+}
+
+interface OrderedTerminalProofInput {
+  mutationEventId: number | null;
+  sessionId: string;
+  state: string | null;
+  terminalEventId: number | null;
+  terminalSessionId: string | null;
+  terminalHookEvent: string | null;
+  sessionTailEventId: number | null;
+}
+
+function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
+  return (
+    row.mutationEventId !== null &&
+    row.terminalEventId !== null &&
+    row.terminalEventId > row.mutationEventId &&
+    row.terminalEventId === row.sessionTailEventId &&
+    row.terminalSessionId === row.sessionId &&
+    ((row.state === "ended" && row.terminalHookEvent === "SessionEnd") ||
+      (row.state === "killed" && row.terminalHookEvent === "Killed"))
+  );
 }
 
 /**
@@ -670,9 +853,16 @@ export function readOwnershipClaims(
       const durable = db
         .query(
           `SELECT fa.file_path, fa.session_id, fa.worktree_oid, fa.worktree_mode,
-                  fa.source, j.state
+                  fa.source, fa.last_event_id AS mutation_event_id, j.state,
+                  j.last_event_id AS terminal_event_id,
+                  terminal.session_id AS terminal_session_id,
+                  terminal.hook_event AS terminal_hook_event,
+                  (SELECT MAX(tail.id)
+                     FROM events tail
+                    WHERE tail.session_id = fa.session_id) AS session_tail_event_id
              FROM file_attributions fa
              LEFT JOIN jobs j ON j.job_id = fa.session_id
+             LEFT JOIN events terminal ON terminal.id = j.last_event_id
             WHERE fa.project_dir = ?
               AND fa.last_mutation_at > COALESCE(fa.last_commit_at, 0)
             ORDER BY fa.file_path, fa.session_id
@@ -684,7 +874,12 @@ export function readOwnershipClaims(
         worktree_oid: string | null;
         worktree_mode: string | null;
         source: string | null;
+        mutation_event_id: number | null;
         state: string | null;
+        terminal_event_id: number | null;
+        terminal_session_id: string | null;
+        terminal_hook_event: string | null;
+        session_tail_event_id: number | null;
       }>;
       if (durable.length > DURABLE_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -745,9 +940,16 @@ export function readOwnershipClaims(
       // tool path may name this same worktree through a symlink/case/root alias.
       const pending = db
         .query(
-          `SELECT e.mutation_path, e.session_id, j.state
+          `SELECT e.id AS event_id, e.mutation_path, e.session_id, j.state,
+                  j.last_event_id AS terminal_event_id,
+                  terminal.session_id AS terminal_session_id,
+                  terminal.hook_event AS terminal_hook_event,
+                  (SELECT MAX(tail.id)
+                     FROM events tail
+                    WHERE tail.session_id = e.session_id) AS session_tail_event_id
              FROM events e
              LEFT JOIN jobs j ON j.job_id = e.session_id
+             LEFT JOIN events terminal ON terminal.id = j.last_event_id
             WHERE e.id > ?
               AND e.id <= ?
               AND (
@@ -761,9 +963,14 @@ export function readOwnershipClaims(
             LIMIT ?`,
         )
         .all(floor, head, PENDING_DIRECT_CLAIM_LIMIT + 1) as Array<{
+        event_id: number;
         mutation_path: string | null;
         session_id: string;
         state: string | null;
+        terminal_event_id: number | null;
+        terminal_session_id: string | null;
+        terminal_hook_event: string | null;
+        session_tail_event_id: number | null;
       }>;
       if (pending.length > PENDING_DIRECT_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -771,15 +978,29 @@ export function readOwnershipClaims(
         return null;
       }
 
-      const claims: OwnershipClaim[] = durable.map((row) => ({
-        path: row.file_path,
-        sessionId: row.session_id,
-        liveness: defaultClaimLiveness({ state: row.state } as OwnershipClaim),
-        state: row.state,
-        oid: row.worktree_oid,
-        mode: row.worktree_mode,
-        source: row.source,
-      }));
+      const claims: OwnershipClaim[] = durable.map((row) => {
+        const orderedTerminalProof = hasOrderedTerminalProof({
+          mutationEventId: row.mutation_event_id,
+          sessionId: row.session_id,
+          state: row.state,
+          terminalEventId: row.terminal_event_id,
+          terminalSessionId: row.terminal_session_id,
+          terminalHookEvent: row.terminal_hook_event,
+          sessionTailEventId: row.session_tail_event_id,
+        });
+        const claim: OwnershipClaim = {
+          path: row.file_path,
+          sessionId: row.session_id,
+          liveness: row.state === "working" ? "live" : "unknown",
+          state: row.state,
+          oid: row.worktree_oid,
+          mode: row.worktree_mode,
+          source: row.source,
+          ...(orderedTerminalProof ? { orderedTerminalProof: true } : {}),
+        };
+        claim.liveness = defaultClaimLiveness(claim);
+        return claim;
+      });
       for (const row of pending) {
         if (row.mutation_path === null) {
           // A successful mutator with no canonical path is unavailable evidence,
@@ -790,17 +1011,35 @@ export function readOwnershipClaims(
         }
         const relativePath = canonicalMutationPath(worktree, row.mutation_path);
         if (relativePath === null) continue;
+        const terminalAfterMutation = hasOrderedTerminalProof({
+          mutationEventId: row.event_id,
+          sessionId: row.session_id,
+          state: row.state,
+          terminalEventId: row.terminal_event_id,
+          terminalSessionId: row.terminal_session_id,
+          terminalHookEvent: row.terminal_hook_event,
+          sessionTailEventId: row.session_tail_event_id,
+        });
         claims.push({
           path: relativePath,
           sessionId: row.session_id,
-          // Pending exact evidence can be newer than jobs.state. Only a working
-          // projection proves live; every other state stays unknown, never
-          // positively terminal/adoptable, until a consistent fold observes it.
-          liveness: row.state === "working" ? "live" : "unknown",
+          // A pending mutation can be newer than jobs.state, so a bare
+          // non-working projection is never terminal proof. The job reducer's
+          // exact last_event_id is sufficient only when it names a matching
+          // terminal lifecycle event ordered after this mutation and remains
+          // the same session's event-log tail in this SQLite snapshot. That
+          // tail check also catches a resume event ingested ahead of its fold.
+          liveness:
+            row.state === "working"
+              ? "live"
+              : terminalAfterMutation
+                ? "terminal"
+                : "unknown",
           state: row.state,
           oid: null,
           mode: null,
           source: "direct",
+          ...(terminalAfterMutation ? { orderedTerminalProof: true } : {}),
         });
       }
 
@@ -814,7 +1053,25 @@ export function readOwnershipClaims(
         transactionOpen = false;
         return null;
       }
+      for (const claim of claims) {
+        if (!receiptSnapshot.unorderedSessions.has(claim.sessionId)) continue;
+        claim.liveness = claim.state === "working" ? "live" : "unknown";
+        delete claim.orderedTerminalProof;
+      }
       claims.push(...receiptSnapshot.claims);
+      const birthSnapshot = readBirthSessions(
+        testHooks.birthDir ?? defaultCommitWorkBirthDir(),
+      );
+      if (birthSnapshot === null) {
+        db.run("ROLLBACK");
+        transactionOpen = false;
+        return null;
+      }
+      for (const claim of claims) {
+        if (!birthSnapshot.sessions.has(claim.sessionId)) continue;
+        claim.liveness = claim.state === "working" ? "live" : "unknown";
+        delete claim.orderedTerminalProof;
+      }
       testHooks.afterReceiptRead?.();
       db.run("COMMIT");
       transactionOpen = false;
@@ -837,17 +1094,20 @@ export function readOwnershipClaims(
         !Number.isSafeInteger(freshHead) ||
         freshHead < 0 ||
         freshHead !== head ||
-        !receiptSnapshot.stillStable()
+        !receiptSnapshot.stillStable() ||
+        !birthSnapshot.stillStable()
       ) {
         return null;
       }
-      const deadLetterState = unresolvedMutationDeadLetter(
+      const deadLetterEvidence = unresolvedDeadLetterEvidence(
         worktree,
         dbPath,
         testHooks.deadLetterDir ?? defaultDeadLetterDir(),
         testHooks.duringDeadLetterRead,
       );
-      if (deadLetterState !== false) return null;
+      if (deadLetterEvidence === null || deadLetterEvidence.blockingMutation) {
+        return null;
+      }
       testHooks.afterDeadLetterRead?.();
       const postDeadLetterHead =
         (
@@ -855,7 +1115,7 @@ export function readOwnershipClaims(
             max_id: unknown;
           } | null
         )?.max_id ?? 0;
-      const finalDeadLetterState = unresolvedMutationDeadLetter(
+      const finalDeadLetterEvidence = unresolvedDeadLetterEvidence(
         worktree,
         dbPath,
         testHooks.deadLetterDir ?? defaultDeadLetterDir(),
@@ -871,9 +1131,20 @@ export function readOwnershipClaims(
         postDeadLetterHead !== head ||
         finalEventHead !== head ||
         !receiptSnapshot.stillStable() ||
-        finalDeadLetterState !== false
+        !birthSnapshot.stillStable() ||
+        finalDeadLetterEvidence === null ||
+        finalDeadLetterEvidence.blockingMutation
       ) {
         return null;
+      }
+      const deadLetterSessions = new Set([
+        ...deadLetterEvidence.unorderedSessions,
+        ...finalDeadLetterEvidence.unorderedSessions,
+      ]);
+      for (const claim of claims) {
+        if (!deadLetterSessions.has(claim.sessionId)) continue;
+        claim.liveness = claim.state === "working" ? "live" : "unknown";
+        delete claim.orderedTerminalProof;
       }
       return claims;
     } finally {
@@ -896,15 +1167,20 @@ function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
 }
 
 function defaultClaimLiveness(claim: OwnershipClaim): ClaimLiveness {
-  if (claim.source === "direct" && claim.state !== undefined) {
-    return claim.state === "working" ? "live" : "unknown";
+  if (claim.state !== undefined) {
+    if (claim.state === "working") return "live";
+    if (
+      claim.orderedTerminalProof === true &&
+      (claim.state === "ended" || claim.state === "killed")
+    ) {
+      return "terminal";
+    }
+    // A bare missing/stopped/terminal projection can lag an ingested resume.
+    // Only the same-snapshot event ordering proof above makes it terminal.
+    return "unknown";
   }
-  if (claim.state === "working") return "live";
-  if (claim.state === "ended" || claim.state === "killed") return "terminal";
-  // A durable row with a missing/stopped/unrecognized job state is not positive
-  // terminal evidence. Direct evidence omits `state` and carries its already-
-  // observed liveness explicitly.
-  if (claim.state !== undefined) return "unknown";
+  // Injected exact evidence without a jobs row carries its own already-observed
+  // verdict. Production DB/receipt claims always include `state` (possibly null).
   return claim.liveness ?? "unknown";
 }
 

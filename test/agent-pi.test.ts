@@ -179,7 +179,17 @@ describe("Pi prompt-artifact preflight", () => {
 
     expect(h.piPromptArtifactsCalls).toHaveLength(1);
     expect(h.piStateSharingCalls).toHaveLength(1);
-    expect(h.piLaunchOrder).toEqual(["preflight", "state", "spawn"]);
+    expect(h.piLaunchOrder).toEqual(["preflight", "state", "intent", "spawn"]);
+  });
+
+  test("a birth-intent failure aborts before Pi spawn", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"]);
+    h.deps.writeBirthIntent = () => {
+      throw new Error("birth intent unavailable");
+    };
+
+    await expect(main(h.deps)).rejects.toThrow("birth intent unavailable");
+    expect(h.spawned).toEqual([]);
   });
 
   test("a preflight failure exits before Pi state discovery or spawn", async () => {

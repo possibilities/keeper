@@ -26,7 +26,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   piEventBindings,
@@ -34,12 +34,19 @@ import {
   serializePiLine,
 } from "../plugins/keeper/pi-extension/keeper-events";
 import {
+  serializeBirthIntent,
+  serializeBirthRecord,
+} from "../src/birth-record";
+import {
   discoverSessionFiles,
   getSessionDirtyFiles,
 } from "../src/commit-work/attribution";
 import { CommitWorkLock, FLOCK_CONSTANTS } from "../src/commit-work/flock";
 import { resolveSessionId } from "../src/commit-work/session-id";
-import { readOwnershipClaims } from "../src/commit-work/surface";
+import {
+  defaultCommitWorkBirthDir,
+  readOwnershipClaims,
+} from "../src/commit-work/surface";
 import { openDb } from "../src/db";
 import {
   serializeDeadLetterRecord,
@@ -55,14 +62,17 @@ let tmpDir: string;
 let dbPath: string;
 let eventsLogDir: string;
 let deadLetterDir: string;
+let birthDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-commit-work-"));
   dbPath = join(tmpDir, "keeper.db");
   eventsLogDir = join(tmpDir, "events-log");
   deadLetterDir = join(tmpDir, "dead-letters");
+  birthDir = join(tmpDir, "births");
   mkdirSync(eventsLogDir);
   mkdirSync(deadLetterDir);
+  mkdirSync(join(birthDir, "new"), { recursive: true });
   // fn-769 file variant: seeds and the attribution reader open this SAME path
   // across separate connections, so the migrated schema must live on disk.
   // Pre-write the template image once (skipping the ladder); later opens pass
@@ -128,6 +138,7 @@ function readClaims(
   return readOwnershipClaims(worktree, dbPath, {
     eventsLogDir,
     deadLetterDir,
+    birthDir,
     ...hooks,
   });
 }
@@ -160,6 +171,12 @@ function seedAttribution(opts: {
 }
 
 describe("readOwnershipClaims", () => {
+  test("uses the OS account home for the authority-sensitive birth tree", () => {
+    expect(defaultCommitWorkBirthDir()).toBe(
+      join(userInfo().homedir, ".local", "state", "keeper", "births"),
+    );
+  });
+
   test("includes exact tool mutations above the root's pre-read Git watermark", () => {
     const { db } = openDb(dbPath, { migrate: false });
     db.run(
@@ -435,6 +452,422 @@ describe("readOwnershipClaims", () => {
         source: "direct",
       }),
     ]);
+  });
+
+  test("pending mutations accept a later folded terminal lifecycle proof", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, state, updated_at)
+       VALUES ('ended-after', 1, 'ended', 1),
+              ('killed-after', 1, 'killed', 1),
+              ('ended-before', 1, 'ended', 1),
+              ('resume-pending', 1, 'ended', 1),
+              ('receipt-pending', 1, 'ended', 1)`,
+    );
+
+    const endedMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (1, 'ended-after', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', '{}', '/repo/ended-after.ts')`,
+    );
+    const endedEvent = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (2, 'ended-after', 'SessionEnd', 'session_end', '/repo', '{}')`,
+    );
+    db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = 'ended-after'", [
+      endedEvent.lastInsertRowid,
+    ]);
+
+    const killedMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (3, 'killed-after', 'PostToolUse', 'post_tool_use', 'Edit',
+               '/repo', '{}', '/repo/killed-after.ts')`,
+    );
+    const killedEvent = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (4, 'killed-after', 'Killed', 'killed', '/repo', '{}')`,
+    );
+    db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = 'killed-after'", [
+      killedEvent.lastInsertRowid,
+    ]);
+
+    const endedBefore = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (5, 'ended-before', 'SessionEnd', 'session_end', '/repo', '{}')`,
+    );
+    const lateMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (6, 'ended-before', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', '{}', '/repo/ended-before.ts')`,
+    );
+    db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = 'ended-before'", [
+      endedBefore.lastInsertRowid,
+    ]);
+
+    const resumeMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (7, 'resume-pending', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', '{}', '/repo/resume-pending.ts')`,
+    );
+    const resumeTerminal = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (8, 'resume-pending', 'SessionEnd', 'session_end', '/repo', '{}')`,
+    );
+    const queuedResume = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (9, 'resume-pending', 'UserPromptSubmit', 'user_prompt_submit',
+               '/repo', '{}')`,
+    );
+    db.run(
+      "UPDATE jobs SET last_event_id = ? WHERE job_id = 'resume-pending'",
+      [resumeTerminal.lastInsertRowid],
+    );
+
+    const receiptMutation = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (10, 'receipt-pending', 'PostToolUse', 'post_tool_use', 'Write',
+               '/repo', '{}', '/repo/receipt-pending.ts')`,
+    );
+    const receiptTerminal = db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (11, 'receipt-pending', 'SessionEnd', 'session_end', '/repo', '{}')`,
+    );
+    db.run(
+      "UPDATE jobs SET last_event_id = ? WHERE job_id = 'receipt-pending'",
+      [receiptTerminal.lastInsertRowid],
+    );
+    db.close();
+    writeFileSync(
+      join(eventsLogDir, "resume-receipt.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "receipt-pending",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          mutation_path: "/other/resumed.ts",
+        },
+      }),
+    );
+
+    expect(Number(endedEvent.lastInsertRowid)).toBeGreaterThan(
+      Number(endedMutation.lastInsertRowid),
+    );
+    expect(Number(killedEvent.lastInsertRowid)).toBeGreaterThan(
+      Number(killedMutation.lastInsertRowid),
+    );
+    expect(Number(endedBefore.lastInsertRowid)).toBeLessThan(
+      Number(lateMutation.lastInsertRowid),
+    );
+    expect(Number(resumeTerminal.lastInsertRowid)).toBeGreaterThan(
+      Number(resumeMutation.lastInsertRowid),
+    );
+    expect(Number(queuedResume.lastInsertRowid)).toBeGreaterThan(
+      Number(resumeTerminal.lastInsertRowid),
+    );
+    expect(Number(receiptTerminal.lastInsertRowid)).toBeGreaterThan(
+      Number(receiptMutation.lastInsertRowid),
+    );
+    expect(readClaims()).toEqual([
+      expect.objectContaining({
+        path: "ended-after.ts",
+        sessionId: "ended-after",
+        liveness: "terminal",
+        state: "ended",
+        source: "direct",
+      }),
+      expect.objectContaining({
+        path: "killed-after.ts",
+        sessionId: "killed-after",
+        liveness: "terminal",
+        state: "killed",
+        source: "direct",
+      }),
+      expect.objectContaining({
+        path: "ended-before.ts",
+        sessionId: "ended-before",
+        liveness: "unknown",
+        state: "ended",
+        source: "direct",
+      }),
+      expect.objectContaining({
+        path: "resume-pending.ts",
+        sessionId: "resume-pending",
+        liveness: "unknown",
+        state: "ended",
+        source: "direct",
+      }),
+      expect.objectContaining({
+        path: "receipt-pending.ts",
+        sessionId: "receipt-pending",
+        liveness: "unknown",
+        state: "ended",
+        source: "direct",
+      }),
+    ]);
+  });
+
+  test("durable terminal claims require the same session's event-log tail", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, state, updated_at)
+       VALUES ('durable-terminal', 1, 'ended', 1),
+              ('durable-resume', 1, 'ended', 1),
+              ('durable-cross-repo', 1, 'ended', 1),
+              ('durable-receipt', 1, 'ended', 1),
+              ('durable-birth', 1, 'ended', 1)`,
+    );
+
+    let ts = 1;
+    const seedDurable = (sessionId: string, path: string) => {
+      const mutation = db.run(
+        `INSERT INTO events
+           (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+            mutation_path)
+         VALUES (?, ?, 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', ?)`,
+        [ts++, sessionId, `/repo/${path}`],
+      );
+      const terminal = db.run(
+        `INSERT INTO events
+           (ts, session_id, hook_event, event_type, cwd, data)
+         VALUES (?, ?, 'SessionEnd', 'session_end', '/repo', '{}')`,
+        [ts++, sessionId],
+      );
+      db.run(
+        `INSERT INTO file_attributions
+           (project_dir, session_id, file_path, last_mutation_at, op, source,
+            last_event_id, updated_at)
+         VALUES ('/repo', ?, ?, 1, 'Write', 'tool', ?, 1)`,
+        [sessionId, path, mutation.lastInsertRowid],
+      );
+      db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = ?", [
+        terminal.lastInsertRowid,
+        sessionId,
+      ]);
+      return terminal;
+    };
+
+    seedDurable("durable-terminal", "durable-terminal.ts");
+    seedDurable("durable-resume", "durable-resume.ts");
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (?, 'durable-resume', 'UserPromptSubmit', 'user_prompt_submit',
+               '/repo', '{}')`,
+      [ts++],
+    );
+    seedDurable("durable-cross-repo", "durable-cross-repo.ts");
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+          mutation_path)
+       VALUES (?, 'durable-cross-repo', 'PostToolUse', 'post_tool_use', 'Edit',
+               '/other', '{}', '/other/new.ts')`,
+      [ts++],
+    );
+    seedDurable("durable-receipt", "durable-receipt.ts");
+    seedDurable("durable-birth", "durable-birth.ts");
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       SELECT '/repo', 1, MAX(id) FROM events`,
+    );
+    db.close();
+    mkdirSync(join(birthDir, "pending"));
+    writeFileSync(
+      join(birthDir, "pending", "777.intent.json"),
+      serializeBirthIntent({
+        schema_version: 1,
+        session_id: "durable-birth",
+        harness: "pi",
+        launcher_pid: 777,
+        launch_ts: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    writeFileSync(
+      join(birthDir, "new", "123.darwin-test.json"),
+      serializeBirthRecord({
+        schema_version: 1,
+        session_id: "durable-birth",
+        harness: "pi",
+        pid: 123,
+        start_time: "darwin:test",
+        cwd: "/repo",
+        spawn_name: null,
+        config_dir: null,
+        backend_exec_type: null,
+        backend_exec_session_id: null,
+        backend_exec_pane_id: null,
+        worktree: null,
+        launch_ts: "2026-01-01T00:00:00.000Z",
+        resume_target: null,
+        dispatch_attempt_id: null,
+      }),
+    );
+    writeFileSync(
+      join(eventsLogDir, "resume-lifecycle.ndjson"),
+      serializeEventLogRecord({
+        bindings: {
+          session_id: "durable-receipt",
+          hook_event: "SessionStart",
+        },
+      }),
+    );
+
+    const claims = readClaims();
+    expect(claims).toHaveLength(5);
+    expect(claims).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "durable-terminal.ts",
+          sessionId: "durable-terminal",
+          liveness: "terminal",
+          state: "ended",
+          source: "tool",
+        }),
+        expect.objectContaining({
+          path: "durable-resume.ts",
+          sessionId: "durable-resume",
+          liveness: "unknown",
+          state: "ended",
+          source: "tool",
+        }),
+        expect.objectContaining({
+          path: "durable-cross-repo.ts",
+          sessionId: "durable-cross-repo",
+          liveness: "unknown",
+          state: "ended",
+          source: "tool",
+        }),
+        expect.objectContaining({
+          path: "durable-receipt.ts",
+          sessionId: "durable-receipt",
+          liveness: "unknown",
+          state: "ended",
+          source: "tool",
+        }),
+        expect.objectContaining({
+          path: "durable-birth.ts",
+          sessionId: "durable-birth",
+          liveness: "unknown",
+          state: "ended",
+          source: "tool",
+        }),
+      ]),
+    );
+  });
+
+  test("unresolved same-session dead letters invalidate terminal proof", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, state, updated_at)
+       VALUES ('dead-lifecycle', 1, 'ended', 1),
+              ('dead-cross-repo', 1, 'ended', 1)`,
+    );
+    let ts = 1;
+    for (const sessionId of ["dead-lifecycle", "dead-cross-repo"]) {
+      const path = `${sessionId}.ts`;
+      const mutation = db.run(
+        `INSERT INTO events
+           (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+            mutation_path)
+         VALUES (?, ?, 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', ?)`,
+        [ts++, sessionId, `/repo/${path}`],
+      );
+      const terminal = db.run(
+        `INSERT INTO events
+           (ts, session_id, hook_event, event_type, cwd, data)
+         VALUES (?, ?, 'SessionEnd', 'session_end', '/repo', '{}')`,
+        [ts++, sessionId],
+      );
+      db.run(
+        `INSERT INTO file_attributions
+           (project_dir, session_id, file_path, last_mutation_at, op, source,
+            last_event_id, updated_at)
+         VALUES ('/repo', ?, ?, 1, 'Write', 'tool', ?, 1)`,
+        [sessionId, path, mutation.lastInsertRowid],
+      );
+      db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = ?", [
+        terminal.lastInsertRowid,
+        sessionId,
+      ]);
+    }
+    db.run(
+      `INSERT INTO git_status
+         (project_dir, updated_at, attribution_event_id)
+       SELECT '/repo', 1, MAX(id) FROM events`,
+    );
+    db.close();
+
+    writeFileSync(
+      join(deadLetterDir, "444.ndjson"),
+      serializeDeadLetterRecord({
+        dl_id: "dead-lifecycle-resume",
+        session_id: "dead-lifecycle",
+        hook_event: "SessionStart",
+        ts: 10,
+        dl_written_at: 11,
+        pid: 444,
+        bindings: {
+          session_id: "dead-lifecycle",
+          hook_event: "SessionStart",
+        },
+      }) +
+        serializeDeadLetterRecord({
+          dl_id: "dead-cross-repo-mutation",
+          session_id: "dead-cross-repo",
+          hook_event: "PostToolUse",
+          ts: 12,
+          dl_written_at: 13,
+          pid: 444,
+          bindings: {
+            session_id: "dead-cross-repo",
+            hook_event: "PostToolUse",
+            tool_name: "Edit",
+            mutation_path: "/other/new.ts",
+          },
+        }),
+    );
+
+    expect(readClaims()).toEqual([
+      expect.objectContaining({
+        path: "dead-cross-repo.ts",
+        sessionId: "dead-cross-repo",
+        liveness: "unknown",
+      }),
+      expect.objectContaining({
+        path: "dead-lifecycle.ts",
+        sessionId: "dead-lifecycle",
+        liveness: "unknown",
+      }),
+    ]);
+  });
+
+  test("fails closed on unclassifiable poison dead-letter evidence", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+       VALUES ('poison-event', 'poison', 'PoisonEventLogRecord', 1, 2, 444,
+               '{"raw":"unclassifiable"}', 'poison')`,
+    );
+    db.close();
+    expect(readClaims()).toBeNull();
   });
 
   test("fails closed while an exact mutation waits in the dead-letter channel", () => {

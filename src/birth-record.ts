@@ -20,6 +20,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
@@ -27,10 +28,11 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { userInfo } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   DISPATCH_ATTEMPT_ENV,
   parseDispatchAttemptCarrier,
@@ -86,6 +88,54 @@ export interface BirthRecord {
 /** The record MINUS the two post-spawn fields the launcher cannot know until it
  *  has the child: everything the launcher assembles up front. */
 export type BirthRecordDraft = Omit<BirthRecord, "pid" | "start_time">;
+
+export const BIRTH_INTENT_SCHEMA_VERSION = 1;
+
+/** Pre-spawn presence marker. It is published before a Pi child can exist. */
+export interface BirthIntent {
+  schema_version: number;
+  session_id: string;
+  harness: "pi";
+  launcher_pid: number;
+  launch_ts: string;
+}
+
+export function serializeBirthIntent(intent: BirthIntent): string {
+  return `${JSON.stringify(intent)}\n`;
+}
+
+export function parseBirthIntent(body: string): BirthIntent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.trim());
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const value = parsed as Record<string, unknown>;
+  if (
+    value.schema_version !== BIRTH_INTENT_SCHEMA_VERSION ||
+    typeof value.session_id !== "string" ||
+    value.session_id.length === 0 ||
+    value.harness !== "pi" ||
+    typeof value.launcher_pid !== "number" ||
+    !Number.isSafeInteger(value.launcher_pid) ||
+    value.launcher_pid <= 0 ||
+    typeof value.launch_ts !== "string" ||
+    value.launch_ts.length === 0
+  ) {
+    return null;
+  }
+  return {
+    schema_version: BIRTH_INTENT_SCHEMA_VERSION,
+    session_id: value.session_id,
+    harness: "pi",
+    launcher_pid: value.launcher_pid,
+    launch_ts: value.launch_ts,
+  };
+}
 
 /**
  * Serialize one record to a single NDJSON line terminated by `\n`. Pure: same
@@ -169,17 +219,15 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   };
 }
 
-/**
- * The births tree: `KEEPER_BIRTH_DIR` when set (tests sandbox it via
- * `sandboxEnv`), else `~/.local/state/keeper/births`. The maildir `tmp/` + `new/`
- * subdirs live under it.
- */
+/** Fixed per-user birth tree used by production launch, ingest, and authority reads. */
+export function defaultBirthDir(): string {
+  return join(userInfo().homedir, ".local", "state", "keeper", "births");
+}
+
+/** Explicit configuration/test resolver; authority-sensitive callers use the fixed default. */
 export function resolveBirthDir(env: NodeJS.ProcessEnv): string {
   const override = (env.KEEPER_BIRTH_DIR ?? "").trim();
-  if (override !== "") {
-    return override;
-  }
-  return join(homedir(), ".local", "state", "keeper", "births");
+  return override !== "" ? override : defaultBirthDir();
 }
 
 /** Filesystem-safe token for the (pid, start_time) idempotency key. */
@@ -211,6 +259,78 @@ export function writeBirthRecord(dir: string, record: BirthRecord): void {
     closeSync(fd);
   }
   renameSync(tmpPath, join(newDir, name));
+}
+
+/**
+ * Publish a pre-spawn marker before the Pi child can exist. A stale intent is
+ * deliberately fail-closed: only successful birth publication consumes it.
+ */
+export function writeBirthIntent(
+  dir: string,
+  draft: BirthRecordDraft,
+  launcherPid: number = process.pid,
+): string {
+  const pendingDir = join(dir, "pending");
+  mkdirSync(pendingDir, { recursive: true });
+  const name = `${launcherPid}.${randomUUID()}.json`;
+  const staged = join(pendingDir, `.${name}.tmp`);
+  const published = join(pendingDir, name);
+  const content = serializeBirthIntent({
+    schema_version: BIRTH_INTENT_SCHEMA_VERSION,
+    session_id: draft.session_id,
+    harness: "pi",
+    launcher_pid: launcherPid,
+    launch_ts: draft.launch_ts,
+  });
+  const fd = openSync(staged, "wx", 0o600);
+  try {
+    writeSync(fd, content);
+    fsyncSync(fd);
+  } catch (error) {
+    try {
+      unlinkSync(staged);
+    } catch {
+      // best effort; the non-.json stage is never authority-visible
+    }
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(staged, published);
+  return published;
+}
+
+/** Replace an intent atomically with the complete birth, then publish to new/. */
+export function publishBirthIntent(
+  intentPath: string,
+  record: BirthRecord,
+): void {
+  const pendingDir = dirname(intentPath);
+  const root = dirname(pendingDir);
+  const newDir = join(root, "new");
+  mkdirSync(newDir, { recursive: true });
+  const staged = join(
+    pendingDir,
+    `.${basename(intentPath)}.${randomUUID()}.tmp`,
+  );
+  const fd = openSync(staged, "wx", 0o600);
+  try {
+    writeSync(fd, serializeBirthRecord(record));
+    fsyncSync(fd);
+  } catch (error) {
+    try {
+      unlinkSync(staged);
+    } catch {
+      // best effort; the original intent remains authoritative
+    }
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+  // Every crash point remains visible: intent before the first rename, a full
+  // birth under pending/ between renames, then the consumer-owned new/ record.
+  renameSync(staged, intentPath);
+  renameSync(intentPath, join(newDir, basename(intentPath)));
 }
 
 // ---------------------------------------------------------------------------
@@ -402,12 +522,18 @@ export function emitBirthRecord(
   env: NodeJS.ProcessEnv,
   draft: BirthRecordDraft,
   pid: number,
+  intentPath?: string,
 ): void {
   try {
     const dir = resolveBirthDir(env);
-    const start_time = probeChildStartTime(pid);
-    writeBirthRecord(dir, { ...draft, pid, start_time });
+    const record = { ...draft, pid, start_time: probeChildStartTime(pid) };
+    if (intentPath === undefined) {
+      writeBirthRecord(dir, record);
+    } else {
+      publishBirthIntent(intentPath, record);
+    }
   } catch {
-    // Presence-only degrade — never surface a birth-record failure to the launch.
+    // Presence-only degrade. A pre-spawn intent, when armed, remains visible and
+    // keeps terminal adoption fail-closed until an operator resolves it.
   }
 }

@@ -34,7 +34,9 @@ import {
 import {
   type BirthRecordDraft,
   buildBirthDraft,
+  defaultBirthDir,
   emitBirthRecord,
+  writeBirthIntent,
 } from "../birth-record";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
@@ -259,14 +261,18 @@ export interface MainDeps {
    */
   providerReachableFn: (harness: HarnessName) => boolean;
   /**
-   * Emit a birth record for a freshly-spawned Pi child: probe the child's platform-tagged start_time and atomically
-   * write the maildir record the ingest worker turns into a synthetic
-   * SessionStart. Fail-open — a write failure degrades to presence-only. Injected
-   * so the launcher wiring is testable without a real fs write or `ps` fork;
-   * `realDeps()` binds the real {@link emitBirthRecord}. Claude launches never
-   * call it (its hook SessionStart is the authoritative presence + resume seed).
+   * Publish the authority-visible Pi intent before spawn. A failure aborts the
+   * launch rather than creating an invisible live process. The post-spawn birth
+   * atomically replaces this intent; a publication failure leaves it behind so
+   * terminal adoption remains fail-closed. Both seams keep tests off the real
+   * birth maildir and `ps`; Claude uses its hook SessionStart instead.
    */
-  emitBirthRecord: (draft: BirthRecordDraft, pid: number) => void;
+  writeBirthIntent: (draft: BirthRecordDraft) => string;
+  emitBirthRecord: (
+    draft: BirthRecordDraft,
+    pid: number,
+    intentPath: string,
+  ) => void;
   tmuxBin: string;
   /**
    * The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>,
@@ -413,7 +419,9 @@ export function realDeps(): MainDeps {
         readYamlFileIfPresent(panelConfigPath()),
       ),
     providerReachableFn: (harness) => isBinaryReachable(bins[harness]),
-    emitBirthRecord: (draft, pid) => emitBirthRecord(process.env, draft, pid),
+    writeBirthIntent: (draft) => writeBirthIntent(defaultBirthDir(), draft),
+    emitBirthRecord: (draft, pid, intentPath) =>
+      emitBirthRecord({}, draft, pid, intentPath),
     tmuxBin: resolveTmuxBin(process.env),
     launcherArgvPrefix,
     launcherStateDir: defaultKeeperAgentStateDir(process.env),
@@ -2956,7 +2964,10 @@ function armBirthRecord(
     resume_target: resumeTarget,
     launch_ts: new Date(deps.now()).toISOString(),
   });
-  return (pid: number) => deps.emitBirthRecord(draft, pid);
+  // Authority-visible BEFORE spawn. If publication later fails, the intent
+  // deliberately remains and terminal adoption stays fail-closed.
+  const intentPath = deps.writeBirthIntent(draft);
+  return (pid: number) => deps.emitBirthRecord(draft, pid, intentPath);
 }
 
 /**

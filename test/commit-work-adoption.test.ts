@@ -116,7 +116,14 @@ describe("commit-work foreign claim adoption", () => {
       git: surfaceGit(),
       deps: {
         readClaims: () => [
-          { path: "a.txt", sessionId: OTHER, liveness: "terminal" },
+          {
+            path: "a.txt",
+            sessionId: OTHER,
+            liveness: "terminal",
+            state: "ended",
+            source: "direct",
+            orderedTerminalProof: true,
+          },
         ],
       },
     });

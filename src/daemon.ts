@@ -94,8 +94,8 @@ import type {
 } from "./birth-ingest-worker";
 import {
   type BirthRecord,
+  defaultBirthDir,
   parseBirthRecord,
-  resolveBirthDir,
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
@@ -7152,7 +7152,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // (@parcel/watcher's `subscribe` requires one) regardless of deploy ordering.
   // Reuses the same backstop sink as the events-log scan (a distinct
   // `birth-ingest-poison` counter). DIRECT write on `db` (main's writer conn).
-  const birthDir = resolveBirthDir(process.env);
+  const birthDir = defaultBirthDir();
   mkdirSync(join(birthDir, "new"), { recursive: true });
   scanBirthDir(db, birthDir, eventsIngestCtx);
 

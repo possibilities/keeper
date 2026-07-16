@@ -54,7 +54,7 @@
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { harnessOrClaude } from "../src/agent/harness";
-import { resolveBirthDir } from "../src/birth-record";
+import { defaultBirthDir } from "../src/birth-record";
 import { resolveDbPath, resolveEventsLogDir } from "../src/db";
 import {
   buildKeeperAgentLaunchArgv,
@@ -971,7 +971,7 @@ function probeSessionPaneLiveness(session: string): PaneLiveness {
  *  real `isPidAlive` + `readOsStartTime`). */
 function makeAttachVerify(dbPath: string): AttachVerifyFn {
   const eventsDir = resolveEventsLogDir();
-  const birthDir = resolveBirthDir(process.env);
+  const birthDir = defaultBirthDir();
   const probeDeps = { isPidAlive, readStartTime: readOsStartTime };
   return (candidate, launchStartMs): Promise<AttachVerifyResult> => {
     const harness = harnessOrClaude(candidate.harness);

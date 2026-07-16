@@ -1,38 +1,35 @@
 # 63. Explicit work adoption and atomic isolated-index publication
 
 ## Status
-Accepted. Extends the shared-checkout safety model and the wrapped-worker contract in
-[ADR 0050](0050-wrapped-delegation-guard.md).
+Accepted. Extends the shared-checkout safety model and wrapped-worker contract in [ADR 0050](0050-wrapped-delegation-guard.md).
 
 ## Context
-A dirty path is not necessarily authored by the committing session. Tool, Plan, Bash,
-package-manager, code-generation, daemon-ingest, and Git observations arrive on different
-clocks. Publication also crosses executable clean filters, linters, hooks, signers, and
-remote transport. Selection must fail closed without turning observation into ownership,
-and the selected bytes must remain fixed until one ref compare-and-swap.
+A dirty path is not necessarily authored by the committing session. Tool, Plan, Bash, package-manager,
+code-generation, daemon-ingest, and Git observations arrive on different clocks. Publication also crosses
+executable filters, linters, hooks, signers, and remote transport. Selection must fail closed without turning
+observation into ownership, and selected bytes must remain fixed until one ref compare-and-swap.
 
 ## Decision
 ### Authority and ownership
-Every invocation binds to a currently working tracked Claude or Pi job. A UUID or environment
-carrier is only a hint: the job's exact `(pid,start_time)` must occur on the caller's bounded OS
-ancestry chain. Equal full authority rows sandwich that walk, and unsupported/NULL harness or
-pid-only rows fail closed. A requested task must equal that work job's task. Authority is sampled
-again after each final ownership scan immediately before publication.
+Every invocation binds to a currently working tracked Claude or Pi job. A UUID or environment carrier is only
+a hint: the job's exact `(pid,start_time)` must occur on the caller's bounded OS ancestry chain. Equal full
+authority rows sandwich that walk; unsupported/NULL harness or pid-only rows fail closed. A requested task
+must equal that work job's task. Authority is sampled again after each final ownership scan before publication.
 
 Automatic selection admits only exclusive tool/Plan/direct claims belonging to that identity.
 Bash, inferred, package-manager, and codegen evidence is observation only. Missing or ambiguous
 evidence fails closed. `--adopt` and bounded descriptor-read manifests name exact paths for one
 invocation and create no durable ownership. Live or unknown foreign exclusive claims block;
-only positively terminal claims are adoptable. If durable evidence is unavailable, complete
-synchronous overlap evidence is required. Fresh pending/receipt mutations use projected
-`working` only as positive live evidence; every other projected state remains unknown until fold.
+only positively terminal claims are adoptable. If durable evidence is unavailable, complete synchronous
+overlap evidence is required. A terminal verdict requires the claim's mutation to precede a matching
+`SessionEnd`/`Killed` that remains the same session's SQLite event tail. Any later DB event or unordered
+receipt, dead letter, or Pi birth keeps its claims unknown; unclassifiable poison evidence fails closed.
 
-One SQLite snapshot reads durable claims, root watermarks, event head, and pending rows under hard
-row/byte caps. Authority readers and hook producers use fixed OS-user receipt/dead-letter stores;
-environment overrides cannot hide evidence. Receipt and dead-letter tails use stable bounded
-regular descriptors, with event heads and monotonic dead-letter import state sandwiching source
-handoffs. Canonical aliases and legacy paths relative to their recorded cwd are normalized before
-overlap classification.
+One SQLite snapshot reads durable claims, root watermarks, event head, and pending rows under hard caps.
+Authority readers and producers use fixed OS-user receipt, dead-letter, and birth stores; environment
+cannot hide evidence. Pi publishes an authority-visible intent before spawn and atomically promotes it.
+These trees use stable bounded regular descriptors, with event heads and SQLite data-version checks
+sandwiching handoffs. Canonical aliases and recorded-cwd legacy paths normalize before classification.
 
 ### Observation-bound attribution
 Immediately before each Git read, producers capture inclusive `MAX(events.id)`. Reducers admit
@@ -47,8 +44,7 @@ reads and fall back to a parent-canonical lexical leaf on any swap. Pi adapts su
 Under a close-on-exec worktree flock, Keeper captures branch/parent (including an unborn branch)
 and constructs a private index from exactly the sorted selected path/kind/mode/blob set, including
 deletions and both rename halves. The resulting tree is immutable. Ambient staged carryover
-refuses unless the narrow
-override losslessly restores exact base entries. Unmerged paths, operations, jams, mass reversion,
+refuses unless the narrow override losslessly restores exact base entries. Unmerged paths, operations, jams, mass reversion,
 stale indexes, and compare-and-swap conflicts retain typed refusals.
 
 Before executable filters, Keeper captures dirty, untracked, and individually enumerated ignored

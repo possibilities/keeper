@@ -100,10 +100,16 @@ export interface Harness {
   piPromptArtifactsCalls: string[][];
   /** Environment snapshots at each Pi preflight boundary. */
   piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[];
-  /** Pi preflight/state/spawn ordering recorder. */
+  /** Pi preflight/state/intent/spawn ordering recorder. */
   piLaunchOrder: string[];
-  /** Every birth record the launcher emitted (draft + child pid), in order. */
-  birthRecords: { draft: BirthRecordDraft; pid: number }[];
+  /** Every pre-spawn birth intent, in order. */
+  birthIntents: BirthRecordDraft[];
+  /** Every birth record the launcher emitted, in order. */
+  birthRecords: {
+    draft: BirthRecordDraft;
+    pid: number;
+    intentPath: string;
+  }[];
   /** Every tmux command handed to the tmux seam, in order. */
   tmuxCommands: string[][];
   /** Call count for the injected automatic account router. */
@@ -199,7 +205,12 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const piPromptArtifactsCalls: string[][] = [];
   const piPromptArtifactEnvSnapshots: NodeJS.ProcessEnv[] = [];
   const piLaunchOrder: string[] = [];
-  const birthRecords: { draft: BirthRecordDraft; pid: number }[] = [];
+  const birthIntents: BirthRecordDraft[] = [];
+  const birthRecords: {
+    draft: BirthRecordDraft;
+    pid: number;
+    intentPath: string;
+  }[] = [];
   const tmuxCommands: string[][] = [];
   let routerCalls = 0;
   const requestedAccountOrdinals: number[] = [];
@@ -274,8 +285,17 @@ export function makeHarness(opts: HarnessOptions): Harness {
       return opts.matrix;
     },
     providerReachableFn: opts.providerReachable ?? (() => true),
-    emitBirthRecord: (draft: BirthRecordDraft, pid: number) => {
-      birthRecords.push({ draft, pid });
+    writeBirthIntent: (draft: BirthRecordDraft) => {
+      birthIntents.push(draft);
+      piLaunchOrder.push("intent");
+      return "/fake-births/pending/intent.json";
+    },
+    emitBirthRecord: (
+      draft: BirthRecordDraft,
+      pid: number,
+      intentPath: string,
+    ) => {
+      birthRecords.push({ draft, pid, intentPath });
     },
     tmuxBin: opts.tmuxBin ?? "tmux",
     launcherArgvPrefix: opts.launcherArgvPrefix ?? [
@@ -351,6 +371,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     piPromptArtifactsCalls,
     piPromptArtifactEnvSnapshots,
     piLaunchOrder,
+    birthIntents,
     birthRecords,
     tmuxCommands,
     routerCalls: () => routerCalls,
