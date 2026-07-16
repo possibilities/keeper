@@ -42,5 +42,5 @@ Extend the existing truth-table: bus-streak-at-cap with green server → degrade
 - [ ] CLAUDE.md's serve-liveness guardrail line reflects the scoped fatal triggers; the CLAUDE.md lint and the touched suites pass.
 
 ## Done summary
-
+Serve-liveness watchdog gains a degrade verdict for accept-stall-bus: a sustained bus-only stall no longer fatalExits the daemon, instead minting one idempotent, paged, level-cleared bus-degraded distress row while the READ server keeps serving; server-stall triggers (including both-dead) still fatalExit unchanged. CLAUDE.md's serve-liveness bullet and docs/problem-codes.md carry the correction.
 ## Evidence

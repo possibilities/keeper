@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Watchdog degrades bus-only stall",
-  "updated_at": "2026-07-13T21:49:11.119000Z"
+  "updated_at": "2026-07-16T16:29:34.481000Z",
+  "worker_done_at": "2026-07-16T16:29:34.481000Z"
 }
