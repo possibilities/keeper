@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "low",
+      "config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Restored the reread-timer unref in tmux-control-worker; operator-verified 72/0 across both tmux-control suites and landed via plain-git escape (terminal leg 3d9c2f17 claim unadoptable) as cbf6f5da on the epic lane",
+      "input_hash": "2f446dabc6ce2145ab86323247dc6d20bec96b0e173166749e9460ae76b2935d",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1393,
+      "spec_md": "## Description\n\nFinding F2 (audit of fn-1281-radical-deterministic-test-gate). The epic's\nseam extraction in `src/tmux-control-worker.ts` left the production\n`realRereadScheduler.setTimer` as a bare `setTimeout(callback, ms)` (line\n~406), dropping the `.unref?.()` the pre-epic code applied right after the\n`setTimeout` (present at `7ac85888~8:src/tmux-control-worker.ts:867`). The\nsibling timers in the same file (`livenessTimer` and the debounced timer at\n~526/~534) still call `.unref?.()`, so the reread seam is the lone divergence\nand a pending 50ms debounce can hold the worker's event loop alive.\n\nFiles: `src/tmux-control-worker.ts` \u2014 `realRereadScheduler.setTimer`.\n\nFix: build the timer, call `.unref?.()` on it, and return it, e.g.\n`const h = setTimeout(callback, ms); (h as any).unref?.(); return h;`.\n\n## Acceptance\n\n- [ ] `realRereadScheduler.setTimer` applies `.unref?.()` to the timer before returning it.\n- [ ] Behavior matches the pre-epic reread path; no change to the debounce interval or the `RereadScheduler` interface.\n\n## Done summary\nRestored the reread-timer unref in tmux-control-worker; operator-verified 72/0 across both tmux-control suites and landed via plain-git escape (terminal leg 3d9c2f17 claim unadoptable) as cbf6f5da on the epic lane\n## Evidence\n- Commits: cbf6f5da\n- Tests: bun test tmux-control-worker+tmux-control-parser 72/0 (operator re-run in lane)",
+      "task_id": "fn-1289-restore-unref-on-tmux-reread-timer.1",
+      "tier": "low",
+      "title": "Restore reread-timer unref"
+    }
+  ],
+  "created_at": "2026-07-16T20:22:04.273000Z",
+  "epic_id": "fn-1289-restore-unref-on-tmux-reread-timer",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "7e253528b11babcf4d57c49e9916cae562644b764da5453fbf3ac160d205fce3",
+  "selection_input_hash": "2f446dabc6ce2145ab86323247dc6d20bec96b0e173166749e9460ae76b2935d",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
