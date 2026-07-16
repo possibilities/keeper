@@ -721,9 +721,9 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
     return `git '${sub.name}' is a mutating/off-list git subcommand, denied for the diagnosis role '${cfg.role}'`;
   }
 
-  // `botctl` is external; its only observed call shape is `send-message --topic`,
+  // `agentbot` is external; its only observed call shape is `send-message --topic`,
   // and no exec or file-write flag is known to exist on it.
-  if (exe === "botctl") return null;
+  if (exe === "agentbot") return null;
 
   if (exe === "bun") {
     const sub = tokens[1];

@@ -38,7 +38,7 @@ remit (security-critical code, incompatible business logic, intents that cannot 
 Transcripts enter the session as labeled untrusted data under a least-privilege tool
 allowlist — a cheaper model means a tighter allowlist, not a looser one.
 
-The human is notified exactly once, via botctl, and only at a terminal outcome: when an
+The human is notified exactly once, via agentbot, and only at a terminal outcome: when an
 escalation session itself declines or dies. Two categories never escalate at all —
 `TOOLING_FAILURE` and an absent or unparseable category are a surface-and-stop that mints
 a silent, operator-visible sticky suppression instead of dispatching.

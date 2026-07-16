@@ -43,7 +43,7 @@ hand had no board verb to clear the row and re-arm the route.
   `worktree-recover*` exclusion is untouched and prefix-disjoint.
 - **Page once per row instance.** A page-once sweep rides the 60s repair-escalation heartbeat
   and its gating (autopilot wanted, not paused): each OPEN row with `human_notified_at IS NULL`
-  gets ONE botctl page, then the once-marker is stamped through a new
+  gets ONE agentbot page, then the once-marker is stamped through a new
   `SharedCheckoutHumanNotified` event whose fold mirrors the verb-parameterized human-notify
   latch (stamp on terminal `notified`, gated `IS NULL`; a `notify_failed` re-sweeps). The stamp
   round-trips through the event and the fold reads only payload + `event.ts`, so re-fold

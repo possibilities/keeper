@@ -5923,7 +5923,7 @@ function sharedCheckoutRow(
  * not-yet-paged working set the daemon reader returns; a terminal `notified` mint
  * models the fold stamping `human_notified_at` (the row drops out of `IS NULL`
  * selection), while a `notify_failed` mint is a no-op (the row stays live and
- * re-sweeps). No real daemon / botctl / DB.
+ * re-sweeps). No real daemon / agentbot / DB.
  */
 function fakeSharedCheckoutPageDeps(opts: {
   rows?: SharedCheckoutPageRow[];
@@ -5991,7 +5991,7 @@ test("runSharedCheckoutPageSweep: a notify_failed leaves the row unpaged (re-swe
     rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
     notify: async () => (++attempt === 1 ? "notify_failed" : "notified"),
   });
-  // Tick 1: the botctl send FAILS → non-terminal, marker stays NULL.
+  // Tick 1: the agentbot send FAILS → non-terminal, marker stays NULL.
   await runSharedCheckoutPageSweep(deps);
   expect(pages).toEqual(["shared-checkout-dirty:abc"]);
   expect(mints).toEqual([
@@ -6039,7 +6039,7 @@ test("runSharedCheckoutPageSweep: a throwing notify degrades to notify_failed (f
   const { deps, mints, notes } = fakeSharedCheckoutPageDeps({
     rows: [sharedCheckoutRow("shared-checkout-dirty:abc")],
     notify: async () => {
-      throw new Error("botctl spawn boom");
+      throw new Error("agentbot spawn boom");
     },
   });
   await runSharedCheckoutPageSweep(deps);
@@ -6853,7 +6853,7 @@ test("runBlockHumanNotifySweep: a THROWING notify never aborts the sweep (record
   const { deps, mints } = fakeBlockHumanNotifySweepDeps({
     pending: blockNotifyPending(),
     notify: async () => {
-      throw new Error("botctl boom");
+      throw new Error("agentbot boom");
     },
   });
   await runBlockHumanNotifySweep(deps);
@@ -8676,7 +8676,7 @@ test("runDeconflictHumanNotifySweep: a THROWING notify never aborts the sweep (r
   const { deps, mints } = fakeHumanNotifySweepDeps({
     pending: humanNotifyPending(),
     notify: async () => {
-      throw new Error("botctl boom");
+      throw new Error("agentbot boom");
     },
   });
   await runDeconflictHumanNotifySweep(deps);
@@ -9010,7 +9010,7 @@ test("buildWorkMergeHumanNotifyBody: a null/empty lane degrades to `?` (never th
   expect(body).toContain("Lane: ?");
 });
 
-test("buildWorkMergeHumanNotifyBody: a pathological reason is size-bounded (no unbounded botctl arg)", () => {
+test("buildWorkMergeHumanNotifyBody: a pathological reason is size-bounded (no unbounded agentbot arg)", () => {
   const hugeStderr = "CONFLICT ".repeat(500); // ~4.5k chars
   const body = buildWorkMergeHumanNotifyBody({
     taskId: "fn-1-foo.2",
@@ -9163,7 +9163,7 @@ test("runWorkMergeHumanNotifySweep: a THROWING notifier never aborts the sweep (
   const { deps, mints } = fakeWorkMergeSweepDeps({
     pending: workMergePending(),
     notify: async () => {
-      throw new Error("botctl boom");
+      throw new Error("agentbot boom");
     },
   });
   await runWorkMergeHumanNotifySweep(deps);

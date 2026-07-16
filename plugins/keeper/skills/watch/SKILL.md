@@ -283,7 +283,7 @@ fan-in conflicts alike. Verify via sanctioned reads and NEVER double-handle:
 - **Respect the sequencing invariant, same for both verbs:** the autonomous
   `resolve::<epic>`/`resolve::<taskId>` merge-resolver goes FIRST; the
   `deconflict::<epic>`/`deconflict::<taskId>` session is gated behind that
-  resolver's TERMINAL verdict; the human page (botctl) is gated behind the
+  resolver's TERMINAL verdict; the human page (agentbot) is gated behind the
   deconflict session's OWN terminal decline/death. Never act as if a later stage
   fired while an earlier one is still live or undispatched.
 

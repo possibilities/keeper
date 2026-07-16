@@ -100,7 +100,7 @@ export const BACKUP_INTERVAL_MS = 172_800_000;
 export const KEEPER_TOPIC = "Keeper";
 
 /**
- * Production page sink for a BACKUP FAILURE — shell out to botctl (Telegram
+ * Production page sink for a BACKUP FAILURE — shell out to agentbot (Telegram
  * only; best-effort). A failed backup means recovery is degraded (no fresh
  * verified snapshot), which the operator should know about; mirrors the
  * integrity probe's `livePage`. A SUCCESSFUL backup is silent (no all-clear
@@ -110,11 +110,11 @@ export function liveBackupPage(): (message: string) => void {
   return (message) => {
     try {
       Bun.spawnSync(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, message],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, message],
         { stdout: "ignore", stderr: "ignore" },
       );
     } catch {
-      // Best-effort: a missing/failed botctl must not crash the daemon's
+      // Best-effort: a missing/failed agentbot must not crash the daemon's
       // never-throw heartbeat.
     }
   };

@@ -8,7 +8,7 @@ description: >-
   autopilot `deconflict::<epic>` or `deconflict::<taskId>` escalation session
   boots.
 argument-hint: "<epic_id|task_id> [instructions]"
-allowed-tools: Bash(keeper escalation-brief:*), Bash(keeper history:*), Bash(keeper transcript:*), Bash(keeper session summary:*), Bash(keeper plan:*), Bash(keeper query:*), Bash(keeper autopilot retry:*), Bash(botctl:*), Bash(git:*), Bash(bun:*), Bash(pnpm:*), Bash(npm:*), Bash(uv:*), Bash(cargo:*), Bash(zig:*), Bash(make:*), Read, Edit, Write
+allowed-tools: Bash(keeper escalation-brief:*), Bash(keeper history:*), Bash(keeper transcript:*), Bash(keeper session summary:*), Bash(keeper plan:*), Bash(keeper query:*), Bash(keeper autopilot retry:*), Bash(agentbot:*), Bash(git:*), Bash(bun:*), Bash(pnpm:*), Bash(npm:*), Bash(uv:*), Bash(cargo:*), Bash(zig:*), Bash(make:*), Read, Edit, Write
 disallowed-tools: NotebookEdit, TodoWrite, Task
 disable-model-invocation: true
 ---
@@ -26,7 +26,7 @@ The first token of `$ARGUMENTS` is the `<epic_id>` or `<task_id>` (an epic-form 
 - **Bounded attempts (~3), then decline.** If the conflict does not yield to a few focused passes, stop and decline.
 - **Never fall back to Bash writes.** You hold real Edit/Write for the worktree from Phase 2, so a fix always goes through those tools — never a heredoc, redirect, or interpreter one-liner. If a fix genuinely needs writes outside that worktree, that is out of bounds here: direct the lane-owning worker over the bus, never a Bash workaround into someone else's tree.
 - **Never write in another task's lane.** For a close-verb ref (`deconflict::<epic>`), you operate only in the base worktree checking out `base_branch` — never inside a task-owned `keeper/epic/<id>--<task>` lane. For a work-verb ref (`deconflict::<taskId>`), the conflict lives IN that task's own lane (`incident.conflict.repo_dir`) — operate there, since it is the one lane this escalation is scoped to, but never in any OTHER task's lane. A conflict resolution that requires touching a different task's lane belongs to that task's worker, not you.
-- **On decline, page the human once and stop.** Send one structured playback via `botctl send-message --topic Keeper "<what you found / what you tried / why you stopped>"`, then stop. Leave the close stuck and operator-visible.
+- **On decline, page the human once and stop.** Send one structured playback via `agentbot send-message --topic Keeper "<what you found / what you tried / why you stopped>"`, then stop. Leave the close stuck and operator-visible.
 - **Out of bounds:** no `keeper autopilot pause`/`play`, no force-push, no hand-editing schema or migration files, no dispatching further escalation sessions, no editing this skill or its config. A schema-version COLLISION (two lanes' `SCHEMA_STEPS` bump the same version) is the one schema-shaped conflict a tier-1 resolver can already clear mechanically by running `bun scripts/rebase-schema-migration.ts` (exit 0 = clear); you only ever see this class of conflict when that tool refused or the collision is a schema SHAPE decision (what a column means, whether a rewind is right, a CREATE-literal conflict) — never resolve those by hand, decline and page the human as usual.
 
 ## Phase 1 — Load the brief
@@ -98,7 +98,7 @@ Confirm the retry envelope reports success. Do not run `keeper autopilot play` �
 When the conflict is not mechanically clear, hits a decline condition, or resists ~3 passes, first preserve any foreign staged work — `git restore --staged` every staged path (`git diff --cached --name-only`) NOT in `git diff --name-only HEAD MERGE_HEAD`, leaving it in the tree so the abort cannot destroy a concurrent commit's files — then abort the merge (`git merge --abort`) so the worktree is left clean, then page the human once and stop:
 
 ```bash
-botctl send-message --topic Keeper "deconflict::<ref> declined — FOUND: <the conflict, which paths>. TRIED: <the reconciliation you attempted>. STOPPED: <why merging both sides is unsafe here>."
+agentbot send-message --topic Keeper "deconflict::<ref> declined — FOUND: <the conflict, which paths>. TRIED: <the reconciliation you attempted>. STOPPED: <why merging both sides is unsafe here>."
 ```
 
 Leave the sticky row operator-visible; do not force a merge you are not sure of. A confident-but-wrong merge is worse than a stuck close or task.

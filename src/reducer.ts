@@ -5605,7 +5605,7 @@ function extractMergeHumanNotifiedPayload(
  * Fold one synthetic `MergeHumanNotified` event — the terminal "human notified"
  * once-latch of a `worktree-merge-conflict` escalation path, sibling to {@link
  * foldMergeEscalationAttempted} and {@link foldResolverDispatchAttempted}. For the
- * TERMINAL `notified` outcome (the daemon delivered the one botctl notification —
+ * TERMINAL `notified` outcome (the daemon delivered the one agentbot notification —
  * about a declined/dead `deconflict::<epic>` session on the close path, or straight
  * away for a stuck `work::<taskId>` fan-in conflict on the work path) it stamps
  * `human_notified_at = event.ts` on the sticky row identified by the payload's
@@ -5859,7 +5859,7 @@ function extractBlockHumanNotifiedPayload(
  * Fold one synthetic `BlockHumanNotified` event — the terminal "human notified"
  * once-latch of the UNBLOCK path on the `block_escalations` latch, sibling in
  * discipline to {@link foldMergeHumanNotified}. For the TERMINAL `notified`
- * outcome (the daemon delivered the one botctl notification about a declined/dead
+ * outcome (the daemon delivered the one agentbot notification about a declined/dead
  * `unblock::<task>` session) it stamps `human_notified_at = event.ts` on the
  * `(epic_id, task_id)` latch row, gated `human_notified_at IS NULL` so the first
  * observation wins and a re-fold reproduces it byte-identically. Every other

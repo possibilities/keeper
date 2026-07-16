@@ -7,7 +7,7 @@ description: >-
   `/plan:unblock <task_id> [instructions]`; also the skill an autopilot
   `unblock::<task>` escalation session boots.
 argument-hint: "<task_id> [instructions]"
-allowed-tools: Bash(keeper escalation-brief:*), Bash(keeper history:*), Bash(keeper transcript:*), Bash(keeper session summary:*), Bash(keeper plan:*), Bash(keeper query:*), Bash(keeper bus:*), Bash(keeper dispatch:*), Bash(botctl:*), Read
+allowed-tools: Bash(keeper escalation-brief:*), Bash(keeper history:*), Bash(keeper transcript:*), Bash(keeper session summary:*), Bash(keeper plan:*), Bash(keeper query:*), Bash(keeper bus:*), Bash(keeper dispatch:*), Bash(agentbot:*), Read
 disallowed-tools: Edit, Write, NotebookEdit, TodoWrite, Task
 disable-model-invocation: true
 ---
@@ -25,7 +25,7 @@ The first token of `$ARGUMENTS` is the `<task_id>`; capture anything after it ve
 - **Bounded attempts (~3), then decline.** If three focused attempts do not clear the blocker, stop and decline — do not keep guessing.
 - **Never fall back to Bash writes.** Edit/Write are denied for a reason — if clearing a blocker genuinely needs source writes, do NOT reach for a heredoc, redirect, or interpreter one-liner to route around the deny. Direct the lane-owning worker over the bus instead (Phase 3), or — for a shared-base breakage — decline naming the repair route (see `SHARED_BASE_BROKEN` below).
 - **Never write in another task's lane.** You operate on plan/board state and read-only inspection only; a fix that requires touching a task's own worktree belongs to that task's worker, not you.
-- **On decline, page the human once and stop.** Send one structured playback via `botctl send-message --topic Keeper "<what you found / what you tried / why you stopped>"`, then stop. Never guess past a decline.
+- **On decline, page the human once and stop.** Send one structured playback via `agentbot send-message --topic Keeper "<what you found / what you tried / why you stopped>"`, then stop. Never guess past a decline.
 - **Out of bounds:** no `keeper autopilot pause`/`play`, no force-push, no schema or migration edits, no dispatching further escalation sessions, no editing this skill or its config.
 
 ## Phase 1 — Load the brief
@@ -88,7 +88,7 @@ Confirm the dispatch envelope reports success; a failed dispatch is a decline, n
 When the blocker resists ~3 attempts, or the category is unresolvable from here, page the human once and stop:
 
 ```bash
-botctl send-message --topic Keeper "unblock::<task_id> declined — FOUND: <blocked reason + category>. TRIED: <the moves you made>. STOPPED: <why it is not mechanically resolvable>."
+agentbot send-message --topic Keeper "unblock::<task_id> declined — FOUND: <blocked reason + category>. TRIED: <the moves you made>. STOPPED: <why it is not mechanically resolvable>."
 ```
 
 Leave the task blocked and operator-visible; do not unblock it, do not dispatch, do not guess.

@@ -4,7 +4,7 @@
 
 Proposed. ADR number PROVISIONAL — assigned at merge (renumber if a sibling epic lands
 one first). Amends 0007: extends its close-scoped escalation pipeline (resolver →
-deconflict → one terminal botctl page) to the `work` verb's fan-in conflicts. 0007's
+deconflict → one terminal agentbot page) to the `work` verb's fan-in conflicts. 0007's
 dispatch-once latching and single-page discipline, and 0017's turn-active lifecycle,
 stand unchanged and are reused here.
 
@@ -35,7 +35,7 @@ the task + dependents) yet clears on `retry_dispatch`. Incident: `fn-1237-…-co
 `[failed:merge-conflict]` (all three latch columns NULL), wedged epic fn-1238, cleared only via
 `keeper autopilot retry work::…5` — retryable + sticky, not the un-retryable `worktree-lane-wedge`.
 
-**`worktree-lane-wedge` does NOT actively page.** Active botctl paging lives only in the
+**`worktree-lane-wedge` does NOT actively page.** Active agentbot paging lives only in the
 close-scoped notify sweeps (`unblock::`/`repair::`/`deconflict::`, gated on a session's
 terminal decline/death via `human_notified_at`). The `daemon`-verb lane-wedge distress is
 a board `needs_human` surface only — re-routing there would not page for free; a dedicated

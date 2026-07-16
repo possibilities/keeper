@@ -47,7 +47,7 @@
  * mints no synthetic event, and touches no reducer state — so re-fold
  * determinism, the cursor+projection single-transaction, and the sole-writer
  * rules are all untouched. Its only side effect is an out-of-band page
- * (botctl Telegram, the "Keeper" topic — the same sink the sitter dead-man
+ * (agentbot Telegram, the "Keeper" topic — the same sink the sitter dead-man
  * uses). Mirrors the never-throw posture of the compaction / checkpoint timers:
  * a probe hiccup (file gone mid-open, transient lock) logs and the next
  * heartbeat retries; it never wedges the daemon.
@@ -153,7 +153,7 @@ export interface IntegrityProbeDeps {
    * throwing) without a real DB.
    */
   quickCheck: () => string[];
-  /** Page sink (botctl Telegram, "Keeper" topic). Best-effort. */
+  /** Page sink (agentbot Telegram, "Keeper" topic). Best-effort. */
   page: (message: string) => void;
   /** Structured logger (daemon uses `console.error`). */
   log: (message: string) => void;
@@ -194,16 +194,16 @@ export function liveQuickCheck(dbPath: string): () => string[] {
   };
 }
 
-/** Production page sink: shell out to botctl (Telegram only; best-effort). */
+/** Production page sink: shell out to agentbot (Telegram only; best-effort). */
 export function livePage(): (message: string) => void {
   return (message) => {
     try {
       Bun.spawnSync(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, message],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, message],
         { stdout: "ignore", stderr: "ignore" },
       );
     } catch {
-      // Best-effort: a missing/failed botctl must not crash the daemon's
+      // Best-effort: a missing/failed agentbot must not crash the daemon's
       // never-throw heartbeat.
     }
   };
@@ -222,7 +222,7 @@ export function liveIntegrityProbeDeps(dbPath: string): IntegrityProbeDeps {
  * Run one integrity probe: read `quick_check`, decide, and on failure page the
  * operator. Returns the decision for tests + the caller's logging. ALWAYS
  * degrades to no-throw — a probe failure (file gone mid-open, transient lock,
- * botctl missing) logs and lets the next heartbeat retry; it never wedges the
+ * agentbot missing) logs and lets the next heartbeat retry; it never wedges the
  * daemon's always-running-writer posture.
  *
  * A healthy probe is SILENT (no page, no "all clear" spam — corruption is the

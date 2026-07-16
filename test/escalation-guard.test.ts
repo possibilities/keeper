@@ -45,8 +45,8 @@ describe("evaluateEscalationCommand — diagnosis role (unblock/resolve)", () =>
     "keeper dispatch work::fn-1-x.3",
     // `keeper autopilot retry` is the one autopilot verb on the allowlist
     "keeper autopilot retry work::fn-1-x.3",
-    // botctl (paging)
-    "botctl send-message --topic Keeper hello",
+    // agentbot (paging)
+    "agentbot send-message --topic Keeper hello",
     // read-only git
     "git log --oneline",
     "git show HEAD",

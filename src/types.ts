@@ -1200,7 +1200,7 @@ export interface BlockEscalationAttemptedPayload {
  * Pre-flattened `BlockHumanNotified` synthetic event payload — the terminal
  * "human notified" stage of the UNBLOCK escalation path. The daemon sweep mints
  * it after it observes the `unblock::<task>` escalation session reach a terminal
- * decline/death and sends the one structured botctl notification, stamping the
+ * decline/death and sends the one structured agentbot notification, stamping the
  * `block_escalations.human_notified_at` once-marker so the human is notified
  * exactly once. Keyed `(epic_id, task_id)` — the latch pk. The TERMINAL
  * `notified` outcome (the notification was delivered) stamps
@@ -1281,7 +1281,7 @@ export interface ResolverDispatchAttemptedPayload {
  * The DECONFLICT (`close`) path mints it after it observes the `deconflict::<epic>`
  * session reach a terminal decline/death; the WORK fan-in path mints it straight
  * away for a stuck `work::<taskId>` conflict (no session to sequence behind in the
- * page-only tier). Either way it sends the one structured botctl notification and
+ * page-only tier). Either way it sends the one structured agentbot notification and
  * stamps the `dispatch_failures.human_notified_at` once-marker so the human is
  * notified exactly once. `verb` selects WHICH row the marker stamps (`close` or
  * `work`); it is OPTIONAL on the wire and defaults to `close` when absent, so a
@@ -1333,7 +1333,7 @@ export interface RepairDispatchedPayload {
  * notified" stage of the REPAIR escalation path, sibling to `MergeHumanNotified` but
  * on the `repair::<repo-token>` sticky row. The daemon sweep mints it after it
  * observes the `repair::<token>` session reach a terminal decline/death and sends the
- * one structured botctl notification, stamping the `dispatch_failures.human_notified_at`
+ * one structured agentbot notification, stamping the `dispatch_failures.human_notified_at`
  * once-marker so the human is paged exactly once. Keyed by the repair-row `id` (the
  * repo token; verb is always `repair`). The TERMINAL `notified` outcome stamps
  * `human_notified_at = event.ts` (gated `IS NULL`); any other outcome (`notify_failed`

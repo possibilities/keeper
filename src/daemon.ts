@@ -1315,7 +1315,7 @@ export async function runBlockEscalationSweep(
 // The TERMINAL stage of the block/unblock escalation path, sibling to the
 // deconflict human-notify sweep. Where stage 2 (`runBlockEscalationSweep`)
 // DISPATCHES an `unblock::<task>` session, this sweep fires the ONE human
-// notification — via botctl — only once that session ALSO declines or dies. A
+// notification — via agentbot — only once that session ALSO declines or dies. A
 // SUCCESSFUL unblock flips the task out of `blocked`, which DELETEs the latch via
 // the leave-blocked `TaskSnapshot` fold, so this sweep never sees a resolved block.
 
@@ -1358,7 +1358,7 @@ export type BlockHumanNotifiedOutcome = "notified" | "notify_failed";
 
 /**
  * Build the ONE structured operator notification the unblock human-notify sweep
- * sends over botctl when an `unblock::<task>` session DECLINES (stamped BLOCKED) or
+ * sends over agentbot when an `unblock::<task>` session DECLINES (stamped BLOCKED) or
  * DIES. Short by design — the blocked task already carries the full context on the
  * board (`keeper status` / `keeper plan show`); this is the courtesy ping that names
  * the task, the verdict, and the unstick command. Pure.
@@ -1384,7 +1384,7 @@ export function buildBlockHumanNotifyBody(args: {
 
 /**
  * Build the ONE structured operator page the repair human-notify sweep sends over
- * botctl when a `repair::<repo-token>` session DECLINES or DIES. Short by design — the
+ * agentbot when a `repair::<repo-token>` session DECLINES or DIES. Short by design — the
  * sticky repair row + every affected task carry the full context on the board; this is
  * the courtesy page that names the repo, the verdict, and the re-arm command. Pure.
  */
@@ -1410,7 +1410,7 @@ export function buildRepairHumanNotifyBody(args: {
 
 /**
  * Build the ONE structured operator page the shared-checkout page-once sweep sends over
- * botctl when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
+ * agentbot when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
  * past its producer's grace watermark. Short by design — the sticky distress row carries
  * the full context on the board; this is the courtesy page that names the repo, the
  * hazard, and how the row clears. The `id` prefix picks dirty-vs-desync wording. Pure —
@@ -1478,7 +1478,7 @@ export interface BlockHumanNotifySweepDeps {
    *  is live or its job has not folded yet it returns `{terminal:false}` and the
    *  sweep skips the row (a successful unblock clears the latch before this runs). */
   readonly unblockOutcome: (taskId: string) => ResolverOutcome;
-  /** Send the ONE botctl notification about the declined/dead unblock session.
+  /** Send the ONE agentbot notification about the declined/dead unblock session.
    *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
    *  (the block stays operator-visible meanwhile), never a wedge or a silent drop. */
   readonly notifyHuman: (
@@ -1501,12 +1501,12 @@ export interface BlockHumanNotifySweepDeps {
  * Run one daemon unblock human-notify sweep (stage 3) — the terminal "notify the
  * human ONCE" half of the block/unblock escalation path. Walk the dispatched-but-
  * not-notified latch rows, re-read that each is STILL pending, sequence behind the
- * `unblock::<task>` session's TERMINAL decline/death, send ONE botctl notification,
+ * `unblock::<task>` session's TERMINAL decline/death, send ONE agentbot notification,
  * then mint `BlockHumanNotified{outcome}`.
  *
  * NOTIFIES ONCE — the sweep NEVER clears the latch; only the leave-blocked DELETE
  * does. A TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next
- * sweep's selector drops the row; a `notify_failed` (botctl absent / failed) leaves
+ * sweep's selector drops the row; a `notify_failed` (agentbot absent / failed) leaves
  * the marker NULL so the row re-sweeps and the notification is never lost (the block
  * is operator-visible the whole time). NEVER throws — every helper edge degrades to a
  * recorded outcome (mirrors {@link runDeconflictHumanNotifySweep}). The spawn lives
@@ -1973,7 +1973,7 @@ export interface RepairEscalationSweepDeps {
    *  existing `repair_dispatched_at` marker; no second timestamp/column is needed. */
   readonly nowSec: () => number;
   readonly terminalGraceSec: number;
-  /** Send the ONE botctl page about a declined/dead `repair::<token>` session. Async +
+  /** Send the ONE agentbot page about a declined/dead `repair::<token>` session. Async +
    *  fail-open — every error degrades to `notify_failed` so the row re-sweeps. */
   readonly notifyHuman: (
     row: PendingRepairRow,
@@ -2262,13 +2262,13 @@ export type SharedCheckoutNotifiedOutcome = "notified" | "notify_failed";
 /**
  * Injectable dependency surface for {@link runSharedCheckoutPageSweep}. Same fail-open
  * injectable-deps discipline as {@link RepairEscalationSweepDeps} — every seam is a pure
- * function so a fixture pins the page-once contract with no real daemon / botctl / DB.
+ * function so a fixture pins the page-once contract with no real daemon / agentbot / DB.
  */
 export interface SharedCheckoutPageSweepDeps {
   /** The OPEN daemon-verb `shared-checkout-{dirty,desync}` rows not yet paged
    *  (`human_notified_at IS NULL`) — the current-state working set. */
   readonly selectUnpaged: () => SharedCheckoutPageRow[];
-  /** Send the ONE botctl page about a live dirty/desync distress row. Async + fail-open —
+  /** Send the ONE agentbot page about a live dirty/desync distress row. Async + fail-open —
    *  every error degrades to `notify_failed` so the row re-sweeps (it stays
    *  operator-visible meanwhile), never a wedge or a silent drop. */
   readonly notifyHuman: (
@@ -2291,7 +2291,7 @@ export interface SharedCheckoutPageSweepDeps {
  * about a live `shared-checkout-dirty` / `shared-checkout-desync` distress row so it can
  * never sit advisory-and-ignored again. Rides the repair-escalation heartbeat and its
  * gating (autopilot wanted, not paused) rather than a timer of its own, so a paused board
- * defers the page until play. For each OPEN, not-yet-paged row it sends ONE botctl page
+ * defers the page until play. For each OPEN, not-yet-paged row it sends ONE agentbot page
  * and mints `SharedCheckoutHumanNotified{outcome}`; the fold stamps `human_notified_at`
  * ONLY on the terminal `notified`, so a `notify_failed` leaves the marker NULL and the row
  * re-sweeps next heartbeat (the page is never lost). It pages on ROW PRESENCE past the
@@ -2367,7 +2367,7 @@ export interface PendingMergeEscalation {
 export type MergeEscalationOutcome = "dispatched" | "dispatch_failed";
 
 /** The outcome the deconflict human-notify sweep (stage 3) records on the
- *  `MergeHumanNotified` event. The TERMINAL `notified` (the one botctl notification
+ *  `MergeHumanNotified` event. The TERMINAL `notified` (the one agentbot notification
  *  was delivered) stamps the `human_notified_at` once-marker; `notify_failed` is
  *  NON-terminal — the row stays re-sweepable so the next tick retries. */
 export type MergeHumanNotifiedOutcome = "notified" | "notify_failed";
@@ -2665,7 +2665,7 @@ export async function runMergeEscalationSweep(
 // The TERMINAL stage of the deconflict escalation path. Where stage 2
 // (`runMergeEscalationSweep`) DISPATCHES a `deconflict::<epic>` session once its
 // tier-1 resolver declined/died, this sweep fires the ONE human notification — via
-// botctl — only once that deconflict session ALSO declines or dies. A successful
+// agentbot — only once that deconflict session ALSO declines or dies. A successful
 // deconflict ends with its own `keeper autopilot retry close::<epic>`, which drops the
 // sticky row and every marker with it, so this sweep never sees a resolved close.
 
@@ -2697,11 +2697,11 @@ export function selectPendingHumanNotifications(
 
 /**
  * Build the ONE structured operator notification the deconflict human-notify sweep
- * sends over botctl when a `deconflict::<epic>` session DECLINES (stamped BLOCKED) or
+ * sends over agentbot when a `deconflict::<epic>` session DECLINES (stamped BLOCKED) or
  * DIES. Short by design — the sticky close row already carries the full context on the
  * board (`keeper status`); this is the courtesy ping that names the epic, the verdict,
  * and the single unstick command. The free-text reason is trimmed onto its own line
- * (it rides as a botctl argv element via an array-form spawn, never a shell string, so
+ * (it rides as a agentbot argv element via an array-form spawn, never a shell string, so
  * no interpolation fires). Pure.
  */
 export function buildDeconflictHumanNotifyBody(args: {
@@ -2745,7 +2745,7 @@ export interface DeconflictHumanNotifySweepDeps {
    *  session is live or its job has not folded yet it returns `{terminal:false}` and the
    *  sweep skips the row (a successful deconflict clears the sticky before this runs). */
   readonly deconflictOutcome: (id: string) => ResolverOutcome;
-  /** Send the ONE botctl notification about the declined/dead deconflict session.
+  /** Send the ONE agentbot notification about the declined/dead deconflict session.
    *  Async + fail-open — every error degrades to `notify_failed` so the row re-sweeps
    *  (the sticky stays operator-visible meanwhile), never a wedge or a silent drop. */
   readonly notifyHuman: (
@@ -2769,12 +2769,12 @@ export interface DeconflictHumanNotifySweepDeps {
  * `worktree-merge-conflict` close rows whose deconflict session was dispatched but
  * whose human is not yet notified, gate each by {@link shouldEscalateMergeConflict}
  * (defense-in-depth), re-read that the row is STILL pending, sequence behind the
- * deconflict session's TERMINAL decline/death, send ONE botctl notification, then mint
+ * deconflict session's TERMINAL decline/death, send ONE agentbot notification, then mint
  * `MergeHumanNotified{outcome}`.
  *
  * NOTIFIES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
  * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
- * selector drops the row; a `notify_failed` (botctl absent / failed) leaves the marker
+ * selector drops the row; a `notify_failed` (agentbot absent / failed) leaves the marker
  * NULL so the row re-sweeps and the notification is never lost (the sticky is
  * operator-visible the whole time). NEVER throws — every helper edge degrades to a
  * recorded outcome. The spawn lives ONLY here in the producer, never reachable from
@@ -2839,7 +2839,7 @@ export async function runDeconflictHumanNotifySweep(
 // `work::<taskId>` `worktree-merge-conflict` row (via `provision()`'s pre-merge in
 // autopilot-worker.ts). Its tier-1 `resolve::<taskId>` resolver ran and DECLINED, then a
 // `deconflict::<taskId>` escalation session was dispatched (stamping `merge_escalated_at`)
-// and it TOO declined/died — only THEN does this sweep fire the one botctl page. It pages
+// and it TOO declined/died — only THEN does this sweep fire the one agentbot page. It pages
 // ONCE per conflict identity — the `(work, taskId)` PK — via the `human_notified_at`
 // once-marker, re-arming when `retry_dispatch` drops the row so a genuine re-conflict
 // re-pages. Gated on `merge_escalated_at IS NOT NULL` (the deconflict was dispatched) AND
@@ -2889,18 +2889,18 @@ export function selectPendingWorkMergeNotifications(
 }
 
 /** Cap the conflict reason carried into the page body so a pathological git stderr
- *  (many conflicting files) can never bloat the botctl arg. The array-form spawn
+ *  (many conflicting files) can never bloat the agentbot arg. The array-form spawn
  *  already blocks shell interpolation of a hunk; this bounds size. */
 const WORK_MERGE_NOTIFY_REASON_CAP = 600;
 
 /**
  * Build the ONE structured operator page the work-verb fan-in notify sweep sends over
- * botctl once a stuck `work::<taskId>` merge conflict's autonomous resolver AND its
+ * agentbot once a stuck `work::<taskId>` merge conflict's autonomous resolver AND its
  * deconflict escalation session both gave up. Short by design — the sticky work row
  * already carries the full context on the board (`keeper status`); this is the terminal
  * page that names the task, the verdict, its lane worktree, the conflicting file set (the
  * git stderr carried on the reason, size-bounded), and the single unstick command. The
- * free-text reason rides as a literal botctl argv element via an array-form spawn (never
+ * free-text reason rides as a literal agentbot argv element via an array-form spawn (never
  * a shell string, so no hunk interpolates). Pure.
  */
 export function buildWorkMergeHumanNotifyBody(args: {
@@ -2951,7 +2951,7 @@ export interface WorkMergeHumanNotifySweepDeps {
    *  session is live or its job has not folded yet it returns `{terminal:false}` and the
    *  sweep skips the row (a successful deconflict clears the sticky before this runs). */
   readonly deconflictOutcome: (id: string) => ResolverOutcome;
-  /** Send the ONE botctl page about the declined/dead deconflict session. Async +
+  /** Send the ONE agentbot page about the declined/dead deconflict session. Async +
    *  fail-open — every error degrades to `notify_failed` so the row re-sweeps (the sticky
    *  stays operator-visible meanwhile), never a wedge or a silent drop. */
   readonly notifyHuman: (
@@ -2976,12 +2976,12 @@ export interface WorkMergeHumanNotifySweepDeps {
  * dispatched but whose human is not yet paged, gate each by {@link
  * shouldEscalateMergeConflict} (defense-in-depth over the selector's SQL token filter),
  * re-read that the row is STILL pending, sequence behind the deconflict session's TERMINAL
- * decline/death, send ONE botctl page, then mint `MergeHumanNotified{verb:"work",
+ * decline/death, send ONE agentbot page, then mint `MergeHumanNotified{verb:"work",
  * outcome}`.
  *
  * PAGES ONCE — the sweep NEVER clears the sticky row; only `retry_dispatch` does. A
  * TERMINAL `notified` stamps the `human_notified_at` once-marker, so the next sweep's
- * selector drops the row; a `notify_failed` (botctl absent / failed) leaves the marker
+ * selector drops the row; a `notify_failed` (agentbot absent / failed) leaves the marker
  * NULL so the row re-sweeps and the page is never lost (the sticky is operator-visible
  * the whole time). While the deconflict session is live — or its job has not folded yet —
  * the sweep skips the row without minting (a CLEAR deconflict fires `retry_dispatch`,
@@ -11365,10 +11365,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Send the ONE botctl notification about a declined/dead `deconflict::<epic>` session
+  // Send the ONE agentbot notification about a declined/dead `deconflict::<epic>` session
   // (stage 3). ASYNC spawn (never `spawnSync` — that would block the main loop), array
   // form so the free-text body rides as a literal argv element (no shell interpolation).
-  // A non-zero exit OR a missing botctl maps to `notify_failed` — NON-terminal, so the
+  // A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal, so the
   // marker stays NULL and the row re-sweeps: the notification is never lost, and the
   // sticky close row stays operator-visible via `keeper status` throughout, so it never
   // goes silent.
@@ -11383,7 +11383,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
     try {
       const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
         {
           stdin: "ignore",
           stdout: "ignore",
@@ -11506,7 +11506,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Producer-side deconflict human-notify sweep (fn-1129 stage 3). Each heartbeat tick
   // walks the sticky closes whose deconflict session was dispatched but whose human is
-  // not yet notified, and sends ONE botctl notification once that session reaches a
+  // not yet notified, and sends ONE agentbot notification once that session reaches a
   // TERMINAL decline/death — then mints `MergeHumanNotified{outcome}`. A terminal
   // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE;
   // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
@@ -11633,11 +11633,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Send the ONE botctl page about a stuck `work::<taskId>` fan-in merge conflict whose
+  // Send the ONE agentbot page about a stuck `work::<taskId>` fan-in merge conflict whose
   // resolver AND deconflict session both declined/died (tier-2 stage 3). ASYNC spawn
   // (never `spawnSync` — that would block the main loop), array form so the free-text body
   // rides as a literal argv element (no shell interpolation of a hunk). A non-zero exit OR
-  // a missing botctl maps to `notify_failed` — NON-terminal, so the marker stays NULL and
+  // a missing agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and
   // the row re-sweeps: the page is never lost, and the sticky work row stays
   // operator-visible via `keeper status` throughout.
   async function notifyHumanOfWorkMergeConflict(
@@ -11652,7 +11652,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
     try {
       const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
         {
           stdin: "ignore",
           stdout: "ignore",
@@ -11675,7 +11675,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Producer-side work-verb fan-in merge-conflict TERMINAL page sweep (fn-1240 tier-2
   // stage 3), the analog of `runDeconflictHumanNotifySweepTick`. Each heartbeat tick walks
   // the sticky `work::<taskId>` rows whose deconflict was dispatched but whose human is not
-  // yet paged, and sends ONE botctl page once that deconflict session reaches a TERMINAL
+  // yet paged, and sends ONE agentbot page once that deconflict session reaches a TERMINAL
   // decline/death — then mints `MergeHumanNotified{verb:"work", outcome}`. A terminal
   // `notified` stamps the `human_notified_at` once-marker so the human is paged ONCE; a
   // `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
@@ -11935,10 +11935,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return epicHasLiveUnblock(jobs, epicId);
   }
 
-  // Send the ONE botctl notification about a declined/dead `unblock::<task>` session
+  // Send the ONE agentbot notification about a declined/dead `unblock::<task>` session
   // (stage 3). Sibling of `notifyHumanOfDeconflict`: ASYNC spawn, array form so the body
   // rides as a literal argv element (no shell interpolation). A non-zero exit OR a missing
-  // botctl maps to `notify_failed` — NON-terminal, so the marker stays NULL and the row
+  // agentbot maps to `notify_failed` — NON-terminal, so the marker stays NULL and the row
   // re-sweeps: the notification is never lost, and the blocked task stays operator-visible
   // on the board throughout.
   async function notifyHumanOfBlock(
@@ -11952,7 +11952,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
     try {
       const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
         {
           stdin: "ignore",
           stdout: "ignore",
@@ -12120,7 +12120,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Producer-side unblock human-notify sweep (fn-1129 stage 3). Each heartbeat tick walks
   // the block latches whose `unblock::<task>` session was dispatched but whose human is
-  // not yet notified, and sends ONE botctl notification once that session reaches a
+  // not yet notified, and sends ONE agentbot notification once that session reaches a
   // TERMINAL decline/death — then mints `BlockHumanNotified{outcome}`. A terminal
   // `notified` stamps the `human_notified_at` once-marker so the human is notified ONCE; a
   // `notify_failed` re-sweeps. A successful unblock takes the task out of `blocked`,
@@ -12351,9 +12351,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return liveStartTime === writer.start_time ? "live" : "dead";
   }
 
-  // Send the ONE botctl page about a live shared-checkout dirty/desync distress row.
+  // Send the ONE agentbot page about a live shared-checkout dirty/desync distress row.
   // Sibling of `notifyHumanOfRepair`: ASYNC spawn, array form so the body rides as a
-  // literal argv element. A non-zero exit OR a missing botctl maps to `notify_failed` —
+  // literal argv element. A non-zero exit OR a missing agentbot maps to `notify_failed` —
   // NON-terminal, so the marker stays NULL and the row re-sweeps: the page is never lost,
   // and the distress row stays operator-visible on the board throughout.
   async function notifyHumanOfSharedCheckout(
@@ -12362,7 +12362,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     const body = buildSharedCheckoutPageBody(row);
     try {
       const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
         {
           stdin: "ignore",
           stdout: "ignore",
@@ -12398,9 +12398,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Send the ONE botctl page about a declined/dead `repair::<token>` session. Sibling of
+  // Send the ONE agentbot page about a declined/dead `repair::<token>` session. Sibling of
   // `notifyHumanOfBlock`: ASYNC spawn, array form so the body rides as a literal argv
-  // element. A non-zero exit OR a missing botctl maps to `notify_failed` — NON-terminal,
+  // element. A non-zero exit OR a missing agentbot maps to `notify_failed` — NON-terminal,
   // so the marker stays NULL and the row re-sweeps: the page is never lost, and the sticky
   // repair row stays operator-visible on the board throughout.
   async function notifyHumanOfRepair(
@@ -12414,7 +12414,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
     try {
       const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
+        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
         {
           stdin: "ignore",
           stdout: "ignore",
@@ -13140,7 +13140,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // side effects stay on main, driven by relayed outcomes. Compaction + the
   // WAL-checkpoint timers above STAY on main (sole-writer rule).
 
-  // Shared botctl/Telegram page sink for relayed maintenance pages. Best-effort:
+  // Shared agentbot/Telegram page sink for relayed maintenance pages. Best-effort:
   // `livePage` swallows a notifier failure so a relayed page can never crash main.
   const maintenancePage = livePage();
   const backupFailurePage = liveBackupPage();
@@ -13213,7 +13213,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // Worker → main: relayed maintenance outcomes. A backup-result drives main's
     // existing success-log / failure-log+page branch; a maintenance-log line is
     // `console.error`d (the probe's log sink); a maintenance-page is routed to
-    // the botctl/Telegram page sink (the probe's page sink). Every handler is
+    // the agentbot/Telegram page sink (the probe's page sink). Every handler is
     // non-throwing — a relay never crashes main.
     mw.onmessage = (
       ev: MessageEvent<

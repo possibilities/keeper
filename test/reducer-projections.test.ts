@@ -2018,7 +2018,7 @@ test("BlockHumanNotified stamps the latch human_notified_at on terminal notified
   drainAll();
   expect(getBlockLatch("fn-be-3", "fn-be-3.1")?.human_notified_at).toBeNull();
 
-  // A botctl failure is non-terminal — marker stays NULL, re-sweepable.
+  // A agentbot failure is non-terminal — marker stays NULL, re-sweepable.
   blockHumanNotifiedEvent("fn-be-3", "fn-be-3.1", "notify_failed", 1810);
   drainAll();
   expect(getBlockLatch("fn-be-3", "fn-be-3.1")?.human_notified_at).toBeNull();

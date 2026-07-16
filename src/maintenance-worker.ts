@@ -38,9 +38,9 @@
  *
  * ## Side effects stay main-side (the relay)
  *
- * Logging + the botctl/Telegram page on a backup FAILURE or a probe corruption
+ * Logging + the agentbot/Telegram page on a backup FAILURE or a probe corruption
  * verdict stay on MAIN, driven by a relayed outcome — the worker carries no
- * botctl spawn, no `console.error` for those paths. The worker posts:
+ * agentbot spawn, no `console.error` for those paths. The worker posts:
  * - `{kind:"backup-result", result}` after every backup pass — main runs the
  *   identical success-log / failure-log+page branch it ran inline before.
  * - `{kind:"maintenance-log", message}` and `{kind:"maintenance-page", message}`
@@ -127,7 +127,7 @@ export interface MaintenanceLogMessage {
   message: string;
 }
 
-/** Worker→main: a botctl/Telegram page request (the probe's page sink). */
+/** Worker→main: a agentbot/Telegram page request (the probe's page sink). */
 export interface MaintenancePageMessage {
   kind: "maintenance-page";
   message: string;
