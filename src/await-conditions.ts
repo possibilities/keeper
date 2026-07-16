@@ -92,6 +92,7 @@ import {
   WORKTREE_FINALIZE_NON_FF_REASON,
   WORKTREE_FINALIZE_SUITE_RED_REASON,
   WORKTREE_RECOVER_REASON_PREFIX,
+  ZOMBIE_SESSION_DISTRESS_REASON,
 } from "./dispatch-failure-key";
 // Type-only import — the shared needs-human projector ({@link projectNeedsHuman})
 // already imports `isJamReason` from THIS module for its jam classification, so a
@@ -855,9 +856,10 @@ function evaluateTaskAwait(
     // === "done"` AND the session idle (no embedded job working, no running
     // sub-agent, no held monitor lease) — NOT the raw `worker_phase` pop-off
     // that can race ahead of the worker winding down. A done-but-live task reads
-    // `running:*` and stays `waiting` here (a done task whose sub-agent died
-    // without SubagentStop is `running:sub-agent-stale` by design, so `complete`
-    // holds `waiting` until an operator clears it). Undefined-guard mirrors the
+    // `running:*` and stays `waiting` here. A missing SubagentStop normally
+    // remains `running:sub-agent-stale`; the readiness pass may complete a done
+    // task only when its owning worker is independently proven dead.
+    // Undefined-guard mirrors the
     // unblocked path: a present task with no verdict reads `waiting`.
     const v = inputs.snapshot.perTask.get(target.id);
     if (v === undefined) {
@@ -1318,6 +1320,7 @@ export function isJamReason(reason: string): boolean {
     reason.startsWith(SHARED_DIRTY_DISTRESS_REASON) ||
     reason.startsWith(SHARED_DESYNC_DISTRESS_REASON) ||
     reason.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_REASON) ||
+    reason.startsWith(ZOMBIE_SESSION_DISTRESS_REASON) ||
     reason.startsWith(LANE_TEARDOWN_DISTRESS_REASON) ||
     reason.startsWith(LANE_BACKUP_DISTRESS_REASON)
   );

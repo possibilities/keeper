@@ -23,6 +23,14 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  handleWatchFrame,
+  WATCH_BACKOFF_JITTER_RATIO,
+  WATCH_BACKOFF_MIN_MS,
+  WATCH_BACKOFF_RESET_AFTER_MS,
+  WatchTerminalError,
+  watchReconnectDecision,
+} from "../cli/bus";
 import { encodeBusArtifactRef, publishBusArtifact } from "../src/bus-artifact";
 import {
   appendMessage,
@@ -40,6 +48,7 @@ import {
   channelPruneDecision,
   cleanupBusArtifacts,
   closeOwnsBinding,
+  duplicateRegistrationDecision,
   enrichPeerFromJobs,
   HARNESS_WALK_MAX_DEPTH,
   type JobIdentity,
@@ -88,6 +97,7 @@ function makeEntry(
   return {
     channel,
     namespaces: channel.namespaces,
+    connection: FAKE_SOCK,
     // Default to CONNECTED (a bound socket) so fan-out selection includes the
     // entry; a disconnected case overrides `sock: null`.
     sock: FAKE_SOCK,
@@ -255,6 +265,87 @@ test("takeoverVictim ignores the new channel itself (no self-takeover)", () => {
     start_time: "tA",
   });
   expect(takeoverVictim([self], 5000, "tA", "ch-new")).toBeNull();
+});
+
+test("duplicate registration rejects a live predecessor without disturbing it", () => {
+  const prior = makeEntry({
+    channel_id: "ch-live",
+    pid: 5000,
+    start_time: "tA",
+  });
+  expect(
+    duplicateRegistrationDecision([prior], 5000, "tA", "ch-new", () => true),
+  ).toEqual({ kind: "reject", code: "duplicate_subscriber" });
+  expect(prior.channel.channel_id).toBe("ch-live");
+});
+
+test("duplicate registration evicts a dead predecessor and admits distinct identities", () => {
+  const prior = makeEntry({
+    channel_id: "ch-dead",
+    pid: 5000,
+    start_time: "tA",
+  });
+  expect(
+    duplicateRegistrationDecision([prior], 5000, "tA", "ch-new", () => false),
+  ).toEqual({ kind: "evict", victim: "ch-dead" });
+  expect(
+    duplicateRegistrationDecision([prior], 5000, "tB", "ch-new", () => true),
+  ).toEqual({ kind: "admit" });
+});
+
+test("send-only registration bypasses duplicate presence handling", () => {
+  const prior = makeEntry({ pid: 5000, start_time: "tA" });
+  expect(
+    duplicateRegistrationDecision(
+      [prior],
+      5000,
+      "tA",
+      "ch-send",
+      () => true,
+      true,
+    ),
+  ).toEqual({ kind: "admit" });
+});
+
+// ---------------------------------------------------------------------------
+// watch client — terminal duplicate rejection and reconnect backoff
+// ---------------------------------------------------------------------------
+
+test("duplicate_subscriber is terminal and names the one-watcher contract", () => {
+  const writes: string[] = [];
+  const outcome = handleWatchFrame(
+    {
+      write(frame) {
+        writes.push(frame);
+        return frame.length;
+      },
+    },
+    { type: "error", code: "duplicate_subscriber" },
+    "/tmp/ignored",
+  );
+  expect(outcome).toBeInstanceOf(WatchTerminalError);
+  expect(outcome?.message).toContain("one watcher per session");
+  expect(writes).toEqual([]);
+});
+
+test("short watch sessions grow jittered reconnect backoff before reset", () => {
+  const first = watchReconnectDecision(WATCH_BACKOFF_MIN_MS, 1, () => 0);
+  const second = watchReconnectDecision(first.nextBackoffMs, 1, () => 1);
+  expect(first.nextBackoffMs).toBe(WATCH_BACKOFF_MIN_MS * 2);
+  expect(second.nextBackoffMs).toBe(WATCH_BACKOFF_MIN_MS * 4);
+  expect(first.delayMs).toBe(
+    Math.round(WATCH_BACKOFF_MIN_MS * (1 - WATCH_BACKOFF_JITTER_RATIO)),
+  );
+  expect(second.delayMs).toBe(
+    Math.round(WATCH_BACKOFF_MIN_MS * 2 * (1 + WATCH_BACKOFF_JITTER_RATIO)),
+  );
+  const reset = watchReconnectDecision(
+    second.nextBackoffMs,
+    WATCH_BACKOFF_RESET_AFTER_MS,
+    () => 0.5,
+  );
+  expect(reset.delayMs).toBe(WATCH_BACKOFF_MIN_MS);
+  expect(reset.nextBackoffMs).toBe(WATCH_BACKOFF_MIN_MS * 2);
 });
 
 // ---------------------------------------------------------------------------

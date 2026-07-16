@@ -78,7 +78,7 @@ import {
   type BackstopRecord,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import { type BackupResult, liveBackupPage } from "./backup";
+import type { BackupResult } from "./backup";
 import {
   type BaselineResult,
   baselineKey,
@@ -150,21 +150,30 @@ import {
   isRetryableDispatchKey,
 } from "./dispatch-command";
 import {
+  BUS_DEGRADED_DISTRESS_ID,
+  BUS_DEGRADED_DISTRESS_REASON,
+  BUS_DEGRADED_DISTRESS_VERB,
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  isBusDegradedDistressKey,
   isDupEpicNumberDistressKey,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isMonitorSlotWedgeDistressKey,
+  isPagingChannelDownDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
+  isZombieSessionDistressKey,
   LANE_BACKUP_DISTRESS_ID_PREFIX,
   LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  PAGING_CHANNEL_DOWN_DISTRESS_ID,
+  PAGING_CHANNEL_DOWN_DISTRESS_REASON,
+  PAGING_CHANNEL_DOWN_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -172,6 +181,7 @@ import {
   SHARED_WEDGE_DISTRESS_VERB,
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
+  ZOMBIE_SESSION_DISTRESS_ID_PREFIX,
 } from "./dispatch-failure-key";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import type {
@@ -207,7 +217,7 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
-import { KEEPER_TOPIC, livePage } from "./integrity-probe";
+import { type AgentbotPageOutcome, sendAgentbotPage } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import type {
   BackupResultMessage,
@@ -490,6 +500,19 @@ export function gcUnretryableDispatchFailures(
     if (isMonitorSlotWedgeDistressKey(row.verb, row.id)) {
       continue;
     }
+    if (isZombieSessionDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // A bus-only serve degradation is producer-owned and clears only after its
+    // independently-armed probe proves recovery.
+    if (isBusDegradedDistressKey(row.verb, row.id)) {
+      continue;
+    }
+    // A missing agentbot channel is producer-owned and clears only after a page
+    // succeeds, never through the retry-dispatch wire.
+    if (isPagingChannelDownDistressKey(row.verb, row.id)) {
+      continue;
+    }
     // And the per-(project,number) duplicate-epic-number distress row — a LIVE producer
     // (the once-per-cycle mint-guard probe) owns it: its own `dup-epic-number:` id prefix
     // rides the synthetic `daemon` verb, and the probe's level-trigger (the duplicate no
@@ -515,6 +538,23 @@ export function gcUnretryableDispatchFailures(
     swept++;
   }
   return swept;
+}
+
+/** The producer action for the paging-channel distress row. */
+export type PagingChannelDistressAction = "mint" | "clear" | "none";
+
+/**
+ * Decide the idempotent, level-triggered paging-channel transition. A transient
+ * agentbot exit deliberately leaves the current row untouched: only a spawn failure
+ * proves the local pager is absent, and only a delivered page proves recovery.
+ */
+export function decidePagingChannelDistress(
+  outcome: AgentbotPageOutcome,
+  isOpen: boolean,
+): PagingChannelDistressAction {
+  if (outcome === "permanent_failure") return isOpen ? "none" : "mint";
+  if (outcome === "notified") return isOpen ? "clear" : "none";
+  return "none";
 }
 
 /**
@@ -1412,10 +1452,10 @@ export function buildRepairHumanNotifyBody(args: {
  * Build the ONE structured operator page the shared-checkout page-once sweep sends over
  * agentbot when a `shared-checkout-{dirty,desync}:<repoHash>` distress row has stayed live
  * past its producer's grace watermark. Short by design — the sticky distress row carries
- * the full context on the board; this is the courtesy page that names the repo, the
- * hazard, and how the row clears. The `id` prefix picks dirty-vs-desync wording. Pure —
- * no clock/fs/spawn. The dirty/desync rows clear EXCLUSIVELY via their producer
- * level-trigger (never `keeper autopilot retry`), so the page names no re-arm command.
+ * the full context on the board; this is the courtesy page that names the affected
+ * subsystem, hazard, and clear evidence. The `id` picks bus/dirty/desync wording. Pure —
+ * no clock/fs/spawn. These rows clear EXCLUSIVELY via their producer level-trigger
+ * (never `keeper autopilot retry`), so the page names no re-arm command.
  */
 export function buildSharedCheckoutPageBody(row: {
   id: string;
@@ -1423,6 +1463,16 @@ export function buildSharedCheckoutPageBody(row: {
   reason: string;
 }): string {
   const repo = row.dir != null && row.dir !== "" ? row.dir : "?";
+  if (row.id === BUS_DEGRADED_DISTRESS_ID) {
+    return [
+      `🔴 keeper: ${row.id} needs you — the Agent Bus accept path is not`,
+      `answering probes while Keeper's critical READ server remains healthy.`,
+      `The daemon is staying up so the board keeps serving.`,
+      ``,
+      `Inspect bus clients and subscriber pressure, then bounce keeperd only if`,
+      `the bus remains internally wedged. The row clears when a bus probe answers.`,
+    ].join("\n");
+  }
   if (row.id.startsWith(MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX)) {
     return [
       `🔴 keeper: ${row.id} needs you — dispatch root ${repo} is wedged by a`,
@@ -1431,6 +1481,16 @@ export function buildSharedCheckoutPageBody(row: {
       ``,
       `Inspect or settle that session. Keeper will not release or kill it based on`,
       `age; the row clears only after active, exited, or cleared-monitor evidence.`,
+    ].join("\n");
+  }
+  if (row.id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)) {
+    return [
+      `🔴 keeper: ${row.id} needs you — a stopped, done-stamped session in ${repo}`,
+      `could not be safely reaped. No signal was sent to an unverified process.`,
+      row.reason,
+      ``,
+      `Inspect the recorded pid, start time, and command ownership. The row clears`,
+      `after the session exits or positive harness activity resumes.`,
     ].join("\n");
   }
   if (
@@ -4259,7 +4319,26 @@ export type ServeLivenessTrigger =
 
 export type ServeLivenessVerdict =
   | { kind: "ok" }
+  | { kind: "degrade"; trigger: "accept-stall-bus" }
   | { kind: "escalate"; trigger: ServeLivenessTrigger };
+
+/** Producer transition for the level-triggered bus-degraded distress row. */
+export type ServeBusDistressAction = "mint" | "clear" | "none";
+
+/**
+ * Convert the pure watchdog verdict plus positive probe evidence into one
+ * idempotent distress-row transition. A live probe clears even after a prior
+ * degraded episode; a persistent degrade mints only while no row is open.
+ */
+export function decideServeBusDistress(
+  verdict: ServeLivenessVerdict,
+  busProbe: ProbeTickOutcome,
+  isOpen: boolean,
+): ServeBusDistressAction {
+  if (busProbe === "live") return isOpen ? "clear" : "none";
+  if (verdict.kind === "degrade") return isOpen ? "none" : "mint";
+  return "none";
+}
 
 /**
  * This tick's settled outcome for one socket's real-read probe: `"live"` (the
@@ -4316,8 +4395,9 @@ function nextProbeFailStreak(prev: number, outcome: ProbeTickOutcome): number {
  * clock-jump reset, arrival-baseline tracking) is unit-testable with a synthetic
  * clock and zero real sockets.
  *
- * Trigger set, escalated straight to `fatalExit` (LaunchAgent restart — never an
- * in-process respawn), in the deterministic order they are checked:
+ * Trigger set, in the deterministic order checked. Every trigger escalates
+ * straight to `fatalExit` except a bus-only accept stall, which degrades visibly
+ * in place while its independently-armed probe keeps observing recovery:
  *   - `accept-stall-server` / `accept-stall-bus`: a socket's real-read probe failed
  *     `maxProbeFailStreak` attempts in a row (send path alive, reads dark).
  *   - `busy-lag`: MAIN's event-loop-delay p99 breached for `maxLagBreachStreak`
@@ -4462,7 +4542,7 @@ export function decideServeLivenessWatchdog(inputs: {
   }
   if (busProbeFailStreak >= maxProbeFailStreak) {
     return {
-      verdict: { kind: "escalate", trigger: "accept-stall-bus" },
+      verdict: { kind: "degrade", trigger: "accept-stall-bus" },
       state,
     };
   }
@@ -7306,6 +7386,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let prevWatchdogCpuUsage: ReturnType<typeof process.cpuUsage> | null = null;
   let serveLivenessWatchdogTimer: ReturnType<typeof setInterval> | null = null;
   let serveLagHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null;
+  // Includes a successfully inserted event that has not folded yet. The fixed key
+  // plus this latch suppresses event churn while a bus-only degradation persists.
+  let serveBusDistressPending = false;
+  let serveBusPageSweepInFlight = false;
 
   // Autopilot in-memory paused flag. Initialized PAUSED (safety default), then
   // re-seeded from the durable `autopilot_state.paused` column after the boot
@@ -7379,6 +7463,68 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       throw err;
     }
+  }
+
+  /**
+   * Mint or clear the fixed bus-degraded distress row through the recoverable
+   * event path. A transient writer lock drops this attempt and the armed probe's
+   * next tick retries; no watchdog tick writes the projection directly.
+   */
+  function mintRecoverableServeBusDistressEvent(
+    action: "mint" | "clear",
+  ): boolean {
+    const tsSec = Date.now() / 1000;
+    const minted = mintRecoverableSnapshotEvent({
+      $ts: tsSec,
+      $session_id: `${BUS_DEGRADED_DISTRESS_VERB}::${BUS_DEGRADED_DISTRESS_ID}`,
+      $pid: null,
+      $hook_event: action === "mint" ? "DispatchFailed" : "DispatchCleared",
+      $event_type: "dispatch_failures",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify(
+        action === "mint"
+          ? {
+              verb: BUS_DEGRADED_DISTRESS_VERB,
+              id: BUS_DEGRADED_DISTRESS_ID,
+              reason: BUS_DEGRADED_DISTRESS_REASON,
+              dir: null,
+              ts: tsSec,
+            }
+          : {
+              verb: BUS_DEGRADED_DISTRESS_VERB,
+              id: BUS_DEGRADED_DISTRESS_ID,
+            },
+      ),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+    });
+    if (minted) {
+      wakePending = true;
+      pumpWakes();
+    }
+    return minted;
   }
 
   /**
@@ -11111,6 +11257,125 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // Includes a just-inserted, not-yet-folded mint so a recovery page cannot
+  // miss the clear while the projection is still catching up.
+  let pagingChannelDistressPending = false;
+
+  /**
+   * Mint the fixed producer-owned paging-channel-down distress row through the
+   * ordinary synthetic DispatchFailed path. The reducer UPSERT makes repeated
+   * absence observations idempotent; only a later successful page clears it.
+   */
+  function mintPagingChannelDownDistress(): boolean {
+    const tsSec = Date.now() / 1000;
+    try {
+      stmts.insertEvent.run({
+        $ts: tsSec,
+        $session_id: `${PAGING_CHANNEL_DOWN_DISTRESS_VERB}::${PAGING_CHANNEL_DOWN_DISTRESS_ID}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+          id: PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          reason: PAGING_CHANNEL_DOWN_DISTRESS_REASON,
+          dir: null,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return true;
+    } catch (err) {
+      console.error(
+        `[keeperd] paging-channel-down distress mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Route every daemon operator page through one transport and maintain the
+   * paging-channel distress row from its captured outcome. A page failure still
+   * returns `notify_failed`, preserving every existing re-sweep contract.
+   */
+  async function notifyHuman(
+    message: string,
+  ): Promise<"notified" | "notify_failed"> {
+    const outcome = await sendAgentbotPage(message);
+    let isOpen = false;
+    try {
+      isOpen =
+        pagingChannelDistressPending ||
+        db
+          .query(
+            "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(
+            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+            PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          ) != null;
+    } catch (err) {
+      // An unreadable projection must not mint or clear on incomplete evidence.
+      console.error(
+        `[keeperd] paging-channel distress read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return outcome === "notified" ? "notified" : "notify_failed";
+    }
+    switch (decidePagingChannelDistress(outcome, isOpen)) {
+      case "mint":
+        pagingChannelDistressPending = mintPagingChannelDownDistress();
+        break;
+      case "clear":
+        try {
+          mintDispatchClearedEvent(
+            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+            PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          );
+          pagingChannelDistressPending = false;
+        } catch (err) {
+          console.error(
+            `[keeperd] paging-channel-down distress clear threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        break;
+      case "none":
+        break;
+    }
+    return outcome === "notified" ? "notified" : "notify_failed";
+  }
+
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -11381,26 +11646,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       reason: row.reason,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] deconflict human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side deconflict-dispatch sweep (fn-1129 stage 2), the rewired successor to
@@ -11650,26 +11896,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       reason: row.reason,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] work fan-in human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side work-verb fan-in merge-conflict TERMINAL page sweep (fn-1240 tier-2
@@ -11950,26 +12177,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       taskId: row.task_id,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] unblock human-notify spawn threw for ${row.task_id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side block/unblock-dispatch sweep (fn-1129 stage 2), the rewired successor to
@@ -12293,11 +12501,26 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // The OPEN, not-yet-paged shared-checkout hygiene distress rows — daemon-verb
-  // `shared-checkout-{dirty,desync}:<repoHash>` stickies with `human_notified_at IS NULL`
-  // — the page-once sweep's current-state working set. Both families share the daemon
-  // distress verb; the two id prefixes are disjoint. A read failure degrades to an empty
-  // set (the next tick re-reads).
+  // The fixed bus-degraded row stays pageable until the notification fold stamps
+  // its once-marker. A read failure skips this tick; the armed watchdog retries.
+  function selectUnpagedServeBusRows(): SharedCheckoutPageRow[] {
+    try {
+      return db
+        .query(
+          `SELECT id, dir, reason FROM dispatch_failures
+             WHERE verb = ? AND id = ? AND human_notified_at IS NULL`,
+        )
+        .all(
+          BUS_DEGRADED_DISTRESS_VERB,
+          BUS_DEGRADED_DISTRESS_ID,
+        ) as SharedCheckoutPageRow[];
+    } catch {
+      return [];
+    }
+  }
+
+  // OPEN, not-yet-paged shared-checkout hygiene rows. The live producer for each
+  // family owns its clear; this reader only feeds their page-once promotion.
   function selectUnpagedSharedCheckoutRows(
     excludeIds: ReadonlySet<string> = new Set(),
   ): SharedCheckoutPageRow[] {
@@ -12306,7 +12529,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         db
           .query(
             `SELECT id, dir, reason FROM dispatch_failures
-               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
+               WHERE verb = ? AND (id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ? OR id LIKE ?)
                  AND human_notified_at IS NULL`,
           )
           .all(
@@ -12316,6 +12539,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}%`,
             `${LANE_BACKUP_DISTRESS_ID_PREFIX}%`,
             `${MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX}%`,
+            `${ZOMBIE_SESSION_DISTRESS_ID_PREFIX}%`,
           ) as SharedCheckoutPageRow[]
       ).filter((row) => !excludeIds.has(row.id));
     } catch {
@@ -12360,26 +12584,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     row: SharedCheckoutPageRow,
   ): Promise<SharedCheckoutNotifiedOutcome> {
     const body = buildSharedCheckoutPageBody(row);
-    try {
-      const proc = Bun.spawn(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] shared-checkout human-page spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
+  }
+
+  function scheduleServeBusPageSweep(): void {
+    if (serveBusPageSweepInFlight) return;
+    serveBusPageSweepInFlight = true;
+    void runSharedCheckoutPageSweep({
+      selectUnpaged: selectUnpagedServeBusRows,
+      notifyHuman: notifyHumanOfSharedCheckout,
+      mintNotified: mintSharedCheckoutHumanNotifiedEvent,
+      noteLine: (line) => console.error(line),
+    }).finally(() => {
+      serveBusPageSweepInFlight = false;
+    });
   }
 
   // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
@@ -12412,26 +12630,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       repoDir: row.dir,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] repair human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
@@ -13140,11 +13339,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // side effects stay on main, driven by relayed outcomes. Compaction + the
   // WAL-checkpoint timers above STAY on main (sole-writer rule).
 
-  // Shared agentbot/Telegram page sink for relayed maintenance pages. Best-effort:
-  // `livePage` swallows a notifier failure so a relayed page can never crash main.
-  const maintenancePage = livePage();
-  const backupFailurePage = liveBackupPage();
-
   // Run the success-log / failure-log+page branch from a relayed `BackupResult`.
   // The `backupDb` call runs worker-side; this is the formatting + logging +
   // paging only.
@@ -13161,13 +13355,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } else {
       const detail = result.error ?? "unknown error";
       console.error(`[keeperd] backup FAILED: ${detail}`);
-      try {
-        backupFailurePage(
-          `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+      void notifyHuman(
+        `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+      ).catch((err) => {
+        console.error(
+          `[keeperd] backup page threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
         );
-      } catch {
-        // Page is best-effort; a notifier failure must not crash main.
-      }
+      });
     }
   }
 
@@ -13230,11 +13426,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } else if (msg.kind === "maintenance-log") {
         console.error(msg.message);
       } else if (msg.kind === "maintenance-page") {
-        try {
-          maintenancePage(msg.message);
-        } catch {
-          // Page is best-effort; a notifier failure must not crash main.
-        }
+        void notifyHuman(msg.message).catch((err) => {
+          console.error(
+            `[keeperd] maintenance page threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
       }
     };
 
@@ -13750,9 +13948,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // guards never see. This timer runs a REAL bounded-timeout read on each served
   // socket from MAIN (each socket is served by a DISTINCT worker thread, so a
   // self-probe from main is sound: a wedged serve loop cannot answer main's read)
-  // plus a main-loop lag histogram, feeds them to the verdict
-  // ({@link decideServeLivenessWatchdog}), and escalates a detected wedge straight
-  // to `fatalExit` (LaunchAgent restart — the sole recovery path; never a respawn).
+  // plus a main-loop lag histogram and feeds them to the verdict
+  // ({@link decideServeLivenessWatchdog}). Critical-path wedges escalate straight
+  // to `fatalExit`; a bus-only accept stall stays up behind a paged, level-cleared
+  // distress row. No worker is respawned in process.
   // Gated on actually serving a socket + out of the in-process tier.
   if ((serverWorker || busWorker) && !opts.disableNativeWatcher) {
     const busSockPath = resolveBusSockPath();
@@ -13872,6 +14071,54 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
       });
       serveWatchdogState = state;
+
+      // The bus-only degradation is a producer-owned level trigger. Read-before-
+      // mint plus the pending latch makes a persistent outage one row, while a
+      // live probe clears it immediately. Both transitions use the recoverable
+      // event path so transient SQLITE_BUSY contention cannot crash the daemon.
+      let busDistressOpen: boolean | null = null;
+      try {
+        busDistressOpen =
+          serveBusDistressPending ||
+          db
+            .query(
+              "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+            )
+            .get(BUS_DEGRADED_DISTRESS_VERB, BUS_DEGRADED_DISTRESS_ID) != null;
+      } catch (err) {
+        console.error(
+          `[keeperd] bus-degraded distress read threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+
+      if (busDistressOpen != null) {
+        switch (decideServeBusDistress(verdict, busProbe, busDistressOpen)) {
+          case "mint":
+            serveBusDistressPending =
+              mintRecoverableServeBusDistressEvent("mint");
+            busDistressOpen = serveBusDistressPending;
+            break;
+          case "clear":
+            if (mintRecoverableServeBusDistressEvent("clear")) {
+              serveBusDistressPending = false;
+              busDistressOpen = false;
+            }
+            break;
+          case "none":
+            break;
+        }
+      }
+
+      if (verdict.kind === "degrade") {
+        if (busDistressOpen) scheduleServeBusPageSweep();
+        console.error(
+          "[keeperd] serve-liveness watchdog: accept-stall-bus — " +
+            "Agent Bus degraded; READ server remains live and daemon stays up",
+        );
+        return;
+      }
 
       if (verdict.kind === "escalate") {
         // Name the trigger + carry every streak and the report age so the

@@ -96,30 +96,6 @@ export const INTEGRITY_CHECK_OK = "ok";
  */
 export const BACKUP_INTERVAL_MS = 172_800_000;
 
-/** The Telegram topic every keeper page routes to (matches the integrity probe). */
-export const KEEPER_TOPIC = "Keeper";
-
-/**
- * Production page sink for a BACKUP FAILURE — shell out to agentbot (Telegram
- * only; best-effort). A failed backup means recovery is degraded (no fresh
- * verified snapshot), which the operator should know about; mirrors the
- * integrity probe's `livePage`. A SUCCESSFUL backup is silent (no all-clear
- * spam — only a failure is worth a ping).
- */
-export function liveBackupPage(): (message: string) => void {
-  return (message) => {
-    try {
-      Bun.spawnSync(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, message],
-        { stdout: "ignore", stderr: "ignore" },
-      );
-    } catch {
-      // Best-effort: a missing/failed agentbot must not crash the daemon's
-      // never-throw heartbeat.
-    }
-  };
-}
-
 /**
  * Default backup directory, a sibling of the live DB under the state dir
  * (`~/.local/state/keeper/backups/`). Resolved from the live DB path so a

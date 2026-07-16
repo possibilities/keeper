@@ -62,6 +62,7 @@ import {
   computeReadiness,
   type EpicDepResolution,
   formatPill,
+  type PendingDispatch,
   type Verdict,
 } from "../src/readiness";
 import { collapseSubagentsByName, projectRows } from "../src/readiness-client";
@@ -166,6 +167,76 @@ function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
     ...overrides,
   };
 }
+
+// A proven-dead worker can no longer land SubagentStop, so its open invocation
+// must not keep done work (or a dependent) held forever. The fact is injected;
+// readiness itself never probes process liveness.
+test("readiness discounts only a done proven-dead worker's open invocation", () => {
+  const upstream = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "dead-worker" })],
+  });
+  const dependent = makeTask({
+    task_id: "fn-1-foo.2",
+    task_number: 2,
+    depends_on: [upstream.task_id],
+  });
+  const epic = makeEpic({ tasks: [upstream, dependent] });
+  const openInvocation = makeSub({
+    job_id: "dead-worker",
+    status: "running",
+    duration_ms: null,
+    ts: 0,
+  });
+  const inputs = [
+    [epic],
+    new Map<string, Job>(),
+    [openInvocation],
+    new Map<string, { dirty_count: number; unattributed_to_live_count: number }>(),
+    121,
+    [] as PendingDispatch[],
+    undefined,
+    new Set<string>(),
+    1,
+    new Map<string, string>(),
+  ] as const;
+
+  const dead = computeReadiness(...inputs, new Set(["dead-worker"]));
+  expect(dead.perTask.get(upstream.task_id)).toEqual({ tag: "completed" });
+  expect(dead.perTask.get(dependent.task_id)).toEqual({ tag: "ready" });
+
+  const alive = computeReadiness(...inputs, new Set<string>());
+  expect(alive.perTask.get(upstream.task_id)).toEqual({
+    tag: "running",
+    reason: { kind: "sub-agent-stale" },
+  });
+  expect(alive.perTask.get(dependent.task_id)).toEqual({
+    tag: "blocked",
+    reason: { kind: "dep-on-task", upstream: upstream.task_id },
+  });
+
+  const working = makeTask({
+    worker_phase: "open",
+    jobs: [makeEmbeddedJob({ job_id: "dead-worker" })],
+  });
+  const workingVerdict = computeReadiness(
+    [makeEpic({ tasks: [working] })],
+    new Map<string, Job>(),
+    [openInvocation],
+    new Map(),
+    121,
+    [],
+    undefined,
+    new Set<string>(),
+    1,
+    new Map<string, string>(),
+    new Set(["dead-worker"]),
+  );
+  expect(workingVerdict.perTask.get(working.task_id)).toEqual({
+    tag: "running",
+    reason: { kind: "sub-agent-stale" },
+  });
+});
 
 // ---------------------------------------------------------------------------
 // fn-1161: frames state-sidecar enrichment — the subagent index serialized in

@@ -143,6 +143,43 @@ export const CRASH_LOOP_DISTRESS_ID = "crash-loop";
 export const CRASH_LOOP_DISTRESS_REASON = "daemon-crash-loop";
 
 /**
+ * The synthetic daemon distress signal that the agentbot paging channel itself is
+ * unavailable. It is minted only for a spawn failure (not a non-zero agentbot
+ * exit), then level-cleared by the next successful page. The fixed, un-retryable
+ * key keeps the alarm visible without entering any real dispatch queue.
+ */
+export const PAGING_CHANNEL_DOWN_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const PAGING_CHANNEL_DOWN_DISTRESS_ID = "paging-channel-down";
+export const PAGING_CHANNEL_DOWN_DISTRESS_REASON = "paging-channel-down";
+
+/**
+ * The fixed, producer-owned distress signal for an Agent Bus accept path that
+ * stays dark while the critical READ server remains live. The serve-liveness
+ * watchdog keeps the daemon up, mints this row once, and level-clears it only
+ * after a later bus probe proves recovery. The synthetic daemon verb keeps it
+ * outside dispatch suppression and the retry wire.
+ */
+export const BUS_DEGRADED_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const BUS_DEGRADED_DISTRESS_ID = "bus-degraded";
+export const BUS_DEGRADED_DISTRESS_REASON = "bus-degraded";
+
+/** True iff `(verb, id)` is the producer-owned bus-degraded distress key. */
+export function isBusDegradedDistressKey(verb: string, id: string): boolean {
+  return verb === BUS_DEGRADED_DISTRESS_VERB && id === BUS_DEGRADED_DISTRESS_ID;
+}
+
+/** True iff `(verb, id)` is the producer-owned paging-channel distress key. */
+export function isPagingChannelDownDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === PAGING_CHANNEL_DOWN_DISTRESS_VERB &&
+    id === PAGING_CHANNEL_DOWN_DISTRESS_ID
+  );
+}
+
+/**
  * The synthetic PER-REPO distress signal for a shared MAIN checkout stuck mid-merge
  * (MERGE_HEAD + unresolved paths) past the recover grace watermark — the escalation
  * layer ON TOP of the immediate per-epic `worktree-recover-mid-merge` /
@@ -461,6 +498,30 @@ export function monitorSlotWedgeJobId(id: string): string | null {
 }
 
 /**
+ * A stopped, done-stamped plan worker that remained pid-alive with canonical
+ * resource evidence stale past the reaper horizon, but could not be safely
+ * signalled. The synthetic per-session row is producer-owned and level-clears
+ * only after positive settle/exit evidence. It never enters dispatch suppression
+ * or the retry wire.
+ */
+export const ZOMBIE_SESSION_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const ZOMBIE_SESSION_DISTRESS_ID_PREFIX = "zombie-session:";
+export const ZOMBIE_SESSION_DISTRESS_REASON = "zombie-session";
+
+export function isZombieSessionDistressKey(verb: string, id: string): boolean {
+  return (
+    verb === ZOMBIE_SESSION_DISTRESS_VERB &&
+    id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)
+  );
+}
+
+export function zombieSessionJobId(id: string): string | null {
+  return id.startsWith(ZOMBIE_SESSION_DISTRESS_ID_PREFIX)
+    ? id.slice(ZOMBIE_SESSION_DISTRESS_ID_PREFIX.length)
+    : null;
+}
+
+/**
  * The stuck-state-sentinel anomaly distress signal (ADR 0013 layer 3) — the
  * PER-SESSION sticky the producer mints when the board says `working` but the
  * session is demonstrably idle (a worker-done-but-working contradiction, or a
@@ -530,6 +591,7 @@ export type DispatchFailureDisplayKind =
   | "shared-dirty"
   | "shared-desync"
   | "monitor-slot-wedge"
+  | "zombie-session"
   | "lane-premerge"
   | "lane-wedge"
   | "stale-base"
@@ -566,6 +628,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   // grouped with the shared-checkout family for readability.
   { prefix: SHARED_DESYNC_DISTRESS_REASON, kind: "shared-desync" },
   { prefix: MONITOR_SLOT_WEDGE_DISTRESS_REASON, kind: "monitor-slot-wedge" },
+  { prefix: ZOMBIE_SESSION_DISTRESS_REASON, kind: "zombie-session" },
   // MOST-SPECIFIC-FIRST: the lane WEDGE distress prefix (`worktree-lane-wedge`)
   // must precede the lane PREMERGE prefix (`worktree-lane-premerge`) — neither is a
   // prefix of the other, but ordering keeps the table's stated invariant true even

@@ -493,12 +493,9 @@ export function offlineSendPersist(
 }
 
 /**
- * Duplicate-watcher / takeover decision keyed on the STABLE `(pid, start_time)`
- * identity. A new register for an identity that already has a live channel is a
- * TAKEOVER: the old channel is superseded (its watcher reconnected, or a stale
- * one lingers). Returns the channel_id to evict (the prior holder), or null when
- * this is a fresh identity. Keyed on `(pid, start_time)` so OS pid-reuse never
- * collapses two distinct agents. Pure.
+ * Duplicate-watcher identity match keyed on stable `(pid, start_time)`. Returns
+ * the prior holder's channel id, or null for a distinct identity. Keying on both
+ * fields keeps OS pid reuse from collapsing distinct agents. Pure.
  */
 export function takeoverVictim(
   registry: RegistryEntry[],
@@ -516,6 +513,37 @@ export function takeoverVictim(
     }
   }
   return null;
+}
+
+/** The duplicate-registration outcome after probing the predecessor binding. */
+export type DuplicateRegistrationDecision =
+  | { kind: "admit" }
+  | { kind: "evict"; victim: string }
+  | { kind: "reject"; code: "duplicate_subscriber" };
+
+/**
+ * Decide whether a registration may take over its same-identity predecessor.
+ * A live predecessor retains its channel; only a dead binding is evicted. The
+ * injected liveness probe keeps the identity and liveness truth table pure.
+ */
+export function duplicateRegistrationDecision(
+  registry: RegistryEntry[],
+  pid: number,
+  startTime: string,
+  newChannelId: string,
+  isLive: (entry: RegistryEntry) => boolean,
+  sendOnly = false,
+): DuplicateRegistrationDecision {
+  if (sendOnly) return { kind: "admit" };
+  const victim = takeoverVictim(registry, pid, startTime, newChannelId);
+  if (victim === null) return { kind: "admit" };
+  const predecessor = registry.find(
+    (entry) => entry.channel.channel_id === victim,
+  );
+  if (predecessor !== undefined && isLive(predecessor)) {
+    return { kind: "reject", code: "duplicate_subscriber" };
+  }
+  return { kind: "evict", victim };
 }
 
 /**
@@ -581,8 +609,8 @@ export function channelPruneDecision(
 
 /**
  * One live registry entry: the channel identity, the namespaces it subscribes
- * to, the bound socket (null until `subscribe`, null again on close), the
- * bounded outbound queue, and the binding generation token.
+ * to, the registration connection, the subscribed delivery socket, the bounded
+ * outbound queue, and the binding generation token.
  *
  * Peer death is socket-close: there is NO heartbeat stamp and no reaper. A live
  * entry's presence is exactly `sock !== null`.
@@ -590,6 +618,8 @@ export function channelPruneDecision(
 export interface RegistryEntry {
   channel: ChannelRow;
   namespaces: string[];
+  /** The registered connection, retained to probe duplicate registrations. */
+  connection: Writable | null;
   /** The subscribed socket; null until a `subscribe` op binds it, null on close. */
   sock: Writable | null;
   /**
@@ -921,6 +951,7 @@ export function startBusServer(
     registry.set(row.channel_id, {
       channel: row,
       namespaces: row.namespaces,
+      connection: null,
       sock: null,
       queue: [],
       generation: 0,
@@ -1033,7 +1064,8 @@ export function startBusServer(
     } catch {
       // best-effort cache delete
     }
-    const sock = entry.sock;
+    const sock = entry.connection ?? entry.sock;
+    entry.connection = null;
     entry.sock = null;
     entry.queue = [];
     if (sock) {
@@ -1138,28 +1170,40 @@ export function startBusServer(
     const channelId = `ch-${crypto.randomUUID()}`;
     const sendOnly = op.send_only === true;
 
-    // Takeover: a prior live channel for the SAME (pid, start_time) is
-    // superseded. A send-only registration NEVER takes over — a transient send
-    // shares the agent's `(pid, start_time)` identity, so taking over here would
-    // evict its live `watch` channel (the reachability regression this guards).
-    if (!sendOnly) {
-      const victim = takeoverVictim(
-        registryList(),
-        identityPid,
-        startTime,
-        channelId,
+    // A send-only registration never joins or takes over a watch channel.
+    const decision = duplicateRegistrationDecision(
+      registryList(),
+      identityPid,
+      startTime,
+      channelId,
+      (entry) => {
+        const state = (
+          entry.connection as unknown as { readyState?: unknown } | null
+        )?.readyState;
+        return (
+          entry.connection !== null && state !== "closed" && state !== "closing"
+        );
+      },
+      sendOnly,
+    );
+    if (decision.kind === "reject") {
+      sendError(
+        sock,
+        decision.code,
+        "duplicate bus subscriber: only one watcher per session is allowed",
       );
-      if (victim !== null) {
-        const v = registry.get(victim);
-        if (v) {
-          publishControl(
-            busDb,
-            "takeover",
-            v.channel,
-            namespaces[0] ?? DEFAULT_NAMESPACE,
-          );
-          evict(v, "takeover");
-        }
+      return;
+    }
+    if (decision.kind === "evict") {
+      const v = registry.get(decision.victim);
+      if (v) {
+        publishControl(
+          busDb,
+          "takeover",
+          v.channel,
+          namespaces[0] ?? DEFAULT_NAMESPACE,
+        );
+        evict(v, "takeover");
       }
     }
 
@@ -1177,6 +1221,7 @@ export function startBusServer(
     const entry: RegistryEntry = {
       channel,
       namespaces,
+      connection: sock,
       sock: null,
       queue: [],
       generation: 0,
@@ -1568,6 +1613,9 @@ export function startBusServer(
         // registration (checked after the ancestry walk resolves).
         if (conn) conn.closed = true;
         const entry = conn?.entry;
+        if (entry?.connection === (socket as unknown as Writable)) {
+          entry.connection = null;
+        }
         if (entry && closeOwnsBinding(conn.boundGeneration, entry.generation)) {
           entry.sock = null;
           entry.queue = [];

@@ -194,28 +194,75 @@ export function liveQuickCheck(dbPath: string): () => string[] {
   };
 }
 
-/** Production page sink: shell out to agentbot (Telegram only; best-effort). */
-export function livePage(): (message: string) => void {
-  return (message) => {
-    try {
-      Bun.spawnSync(
-        ["agentbot", "send-message", "--topic", KEEPER_TOPIC, message],
-        { stdout: "ignore", stderr: "ignore" },
-      );
-    } catch {
-      // Best-effort: a missing/failed agentbot must not crash the daemon's
-      // never-throw heartbeat.
-    }
-  };
+/** The observable completion shape of one array-form agentbot spawn. */
+export type AgentbotPageSpawnOutcome =
+  | { kind: "exited"; exitCode: number }
+  | { kind: "spawn_threw" }
+  | { kind: "exit_threw" };
+
+/** A delivered page, a retryable pager failure, or a missing-pager failure. */
+export type AgentbotPageOutcome =
+  | "notified"
+  | "transient_failure"
+  | "permanent_failure";
+
+/** Injectable asynchronous process shape for {@link sendAgentbotPage}. */
+export type AgentbotPageSpawn = (argv: string[]) => {
+  readonly exited: Promise<number>;
+};
+
+/**
+ * Classify the page transport outcome without treating a non-zero agentbot exit as
+ * proof that the binary is gone. Only a failed spawn is absence-shaped; non-zero
+ * exits remain retryable so an unhealthy remote does not mint a new distress row
+ * on every page sweep.
+ */
+export function classifyAgentbotPageOutcome(
+  outcome: AgentbotPageSpawnOutcome,
+): AgentbotPageOutcome {
+  if (outcome.kind === "spawn_threw") return "permanent_failure";
+  if (outcome.kind === "exit_threw") return "transient_failure";
+  return outcome.exitCode === 0 ? "notified" : "transient_failure";
 }
 
-/** Production deps for the daemon's heartbeat. */
-export function liveIntegrityProbeDeps(dbPath: string): IntegrityProbeDeps {
-  return {
-    quickCheck: liveQuickCheck(dbPath),
-    page: livePage(),
-    log: (message) => console.error(message),
-  };
+/**
+ * Send one agentbot page and capture its launch/exit outcome. The array-form argv
+ * keeps message content literal; callers decide whether a permanent failure should
+ * surface a producer-owned distress row.
+ */
+export async function sendAgentbotPage(
+  message: string,
+  deps: { topic?: string; spawn?: AgentbotPageSpawn } = {},
+): Promise<AgentbotPageOutcome> {
+  const spawn: AgentbotPageSpawn =
+    deps.spawn ??
+    ((argv) =>
+      Bun.spawn(argv, {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        env: process.env as Record<string, string | undefined>,
+      }));
+  let proc: ReturnType<AgentbotPageSpawn>;
+  try {
+    proc = spawn([
+      "agentbot",
+      "send-message",
+      "--topic",
+      deps.topic ?? KEEPER_TOPIC,
+      message,
+    ]);
+  } catch {
+    return classifyAgentbotPageOutcome({ kind: "spawn_threw" });
+  }
+  try {
+    return classifyAgentbotPageOutcome({
+      kind: "exited",
+      exitCode: await proc.exited,
+    });
+  } catch {
+    return classifyAgentbotPageOutcome({ kind: "exit_threw" });
+  }
 }
 
 /**
