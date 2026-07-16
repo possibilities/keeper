@@ -63,5 +63,7 @@ New tracked Pi launches with explicit sessions become autoclose-eligible when ev
 - [ ] Claude launch behavior and unrelated non-Pi launch behavior remain unchanged.
 
 ## Done summary
-
+Stamp tracked Pi birth sessions through launch config, capture goldens, autoclose, and birth records; operator-verified 125/0 across the four touched suites and landed via plain-git escape (stale orphan claim 740a0846 unclearable by design) as f48fd4d7 on the .3 task lane
 ## Evidence
+- Commits: f48fd4d7
+- Tests: bun test agent-launch-config+agent-run-capture-golden+autoclose-worker+birth-record 125/0 (operator re-run in lane)
