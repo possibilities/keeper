@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Record agent surface non-goals ADR",
-  "updated_at": "2026-07-14T00:20:48.432000Z"
+  "updated_at": "2026-07-16T20:11:38.303000Z",
+  "worker_done_at": "2026-07-16T20:11:38.303000Z"
 }

@@ -33,5 +33,7 @@ No test surface; review for forward-facing prose and correct cross-references.
 - [ ] The record carries the provisional-number convention note
 
 ## Done summary
-
+ADR 0067 records the agent-surface convergence non-goals (judge stays a Task subagent, tiered durability, separate skill families); operator content review + landed via plain-git escape (stopped-courier unknown-liveness wedge) as e08c4b1e on the .3 task lane
 ## Evidence
+- Commits: e08c4b1e
+- Tests: operator ADR genre review: decision-shaped, forward-facing, valid cross-refs
