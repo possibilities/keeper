@@ -39,5 +39,5 @@ Truth-table the registration decision as a pure seam: duplicate + dead predecess
 - [ ] An eviction war can no longer be sustained by two live subscribers; the touched suites and the named gate pass.
 
 ## Done summary
-
+Duplicate live bus subscribers under the same (pid,start_time) identity are now rejected with a typed duplicate_subscriber error instead of eviction-warring; the client treats it as terminal and its reconnect backoff builds with jitter under repeated short sessions instead of resetting to the floor. Dead-predecessor takeover is unchanged.
 ## Evidence

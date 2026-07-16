@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Bus rejects duplicate live subscriber",
-  "updated_at": "2026-07-13T21:49:11.119000Z"
+  "updated_at": "2026-07-16T17:09:15.157000Z",
+  "worker_done_at": "2026-07-16T17:09:15.157000Z"
 }
