@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Verified acceptance already holds: src/, cli/, docs/, and test/ carry zero botctl/Botctl references \u2014 every daemon page spawn already uses the agentbot binary (livePage/liveIntegrityProbeDeps in src/integrity-probe.ts, 7 call sites in src/daemon.ts). No source change was needed; test/daemon.test.ts paging truth-table passes (386 pass, 0 fail).",
+      "input_hash": "74287a73c274e3a0e6faaccf174f69c09bb76d0df6a35dc392f755974e28ee6e",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1631,
+      "spec_md": "## Description\n\nOriginating finding F1 (Critical). Evidence: `src/integrity-probe.ts:249`\nspawns the literal `\"botctl\"` inside `sendBotctlPage`, and the symbols\n`sendBotctlPage` / `BotctlPageOutcome` / `classifyBotctlPageOutcome`\n(src/integrity-probe.ts:204-256, imported at src/daemon.ts:220) all carry\nthe stale `Botctl` vocabulary. Mainline commit `d19e9d9e` renamed every\npage spawn to `\"agentbot\"` (now 7 sites in main: src/daemon.ts x5,\nsrc/backup.ts, src/integrity-probe.ts). Because the epic MOVED the spawn\nlogic into a new helper while main renamed the old inline sites, a\nthree-way merge can auto-resolve with no conflict and silently keep the\ndead `botctl` literal.\n\nFiles to change:\n- `src/integrity-probe.ts` \u2014 the `\"botctl\"` spawn literal and the\n  `sendBotctlPage` / `BotctlPageOutcome` / `BotctlPageSpawn` /\n  `classifyBotctlPageOutcome` symbols \u2192 `agentbot` vocabulary.\n- `src/daemon.ts` \u2014 the import and call sites (:220, :552, :11332).\n- Sweep `docs/problem-codes.md` and any comments for stale `botctl` references.\n\n## Acceptance\n\n- [ ] `grep -rn '\"botctl\"\\|Botctl' src/ cli/` returns nothing\n- [ ] Every daemon page spawns the `agentbot` binary\n- [ ] The paging truth-table tests in test/daemon.test.ts pass under the renamed symbols\n\n## Done summary\nVerified acceptance already holds: src/, cli/, docs/, and test/ carry zero botctl/Botctl references \u2014 every daemon page spawn already uses the agentbot binary (livePage/liveIntegrityProbeDeps in src/integrity-probe.ts, 7 call sites in src/daemon.ts). No source change was needed; test/daemon.test.ts paging truth-table passes (386 pass, 0 fail).\n## Evidence\n",
+      "task_id": "fn-1293-reconcile-paging-transport-to-agentbot.1",
+      "tier": "medium",
+      "title": "Rename botctl paging to agentbot"
+    }
+  ],
+  "created_at": "2026-07-16T20:39:17.099000Z",
+  "epic_id": "fn-1293-reconcile-paging-transport-to-agentbot",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "74287a73c274e3a0e6faaccf174f69c09bb76d0df6a35dc392f755974e28ee6e",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
