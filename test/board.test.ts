@@ -192,7 +192,10 @@ test("readiness discounts only a done proven-dead worker's open invocation", () 
     [epic],
     new Map<string, Job>(),
     [openInvocation],
-    new Map<string, { dirty_count: number; unattributed_to_live_count: number }>(),
+    new Map<
+      string,
+      { dirty_count: number; unattributed_to_live_count: number }
+    >(),
     121,
     [] as PendingDispatch[],
     undefined,

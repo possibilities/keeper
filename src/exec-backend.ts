@@ -185,6 +185,13 @@ export interface LaunchSpec {
    */
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
+  /**
+   * Handoff-ee result-envelope path. The launch ALWAYS emits the
+   * `KEEPER_HANDOFF_ENVELOPE` carrier (EMPTY when absent) so a reused tmux
+   * session cannot inherit a stale capture destination. Only the handoff-ee's
+   * autonomous prompt writes this path; the launcher only carries it.
+   */
+  readonly handoffEnvelope?: string;
   /** Exact Dispatch-attempt identity admitted before this launch. Present only
    *  for reconciler-managed dispatch; manual and legacy launches omit it. */
   readonly dispatchAttemptId?: number;
@@ -1123,7 +1130,7 @@ export interface KeeperAgentLaunchOpts {
   readonly dispatchedTier?: string;
   readonly dispatchConstraint?: string;
   /**
-   * The wrapped-cell guard marker (task .1). ALWAYS emitted as the two trailing
+   * The wrapped-cell guard marker (task .1). ALWAYS emitted as the adjacent
    * repeated `--x-tmux-env KEEPER_WRAPPED_CELL` / `KEEPER_WRAPPED_ENVELOPE`
    * carriers (`?? ""`), mirroring the {@link worktreeBranch} always-emit discipline:
    * a reused tmux session OVERWRITES any stale marker a prior wrapped launch left,
@@ -1133,6 +1140,12 @@ export interface KeeperAgentLaunchOpts {
    */
   readonly wrappedCell?: string;
   readonly wrappedEnvelope?: string;
+  /**
+   * Handoff-ee result-envelope path. ALWAYS emitted as the trailing
+   * `KEEPER_HANDOFF_ENVELOPE` carrier (`?? ""`) to overwrite a stale capture
+   * destination in a reused tmux session. The launcher never writes this path.
+   */
+  readonly handoffEnvelope?: string;
   /** Exact Dispatch-attempt identity carried as generic launch metadata. */
   readonly dispatchAttemptId?: number;
 }
@@ -1297,6 +1310,11 @@ export function buildKeeperAgentLaunchArgv(
     `KEEPER_WRAPPED_CELL=${opts.wrappedCell ?? ""}`,
     "--x-tmux-env",
     `KEEPER_WRAPPED_ENVELOPE=${opts.wrappedEnvelope ?? ""}`,
+    // Handoff capture carrier — ALWAYS emitted after the wrapped pair so a reused
+    // tmux session OVERWRITES any stale capture destination. The handoff-ee alone
+    // writes the envelope; this launcher merely transports its durable path.
+    "--x-tmux-env",
+    `KEEPER_HANDOFF_ENVELOPE=${opts.handoffEnvelope ?? ""}`,
     // Exact Dispatch attempt metadata is capability-gated by the descriptor.
     // It is a standalone argv element, never shell interpolation or display data.
     ...dispatchAttemptCarrier,
@@ -1540,6 +1558,9 @@ export async function keeperAgentLaunch(
         : {}),
       ...(deps.spec.wrappedEnvelope !== undefined
         ? { wrappedEnvelope: deps.spec.wrappedEnvelope }
+        : {}),
+      ...(deps.spec.handoffEnvelope !== undefined
+        ? { handoffEnvelope: deps.spec.handoffEnvelope }
         : {}),
       ...(deps.spec.dispatchAttemptId !== undefined
         ? { dispatchAttemptId: deps.spec.dispatchAttemptId }

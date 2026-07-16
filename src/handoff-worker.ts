@@ -43,6 +43,7 @@
 
 import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { parseTriple } from "./agent/triple";
 import { openDb } from "./db";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
@@ -106,6 +107,15 @@ export interface HandoffDispatchRow {
   /** Unix-seconds the dispatcher stamped on its last `HandoffDispatching`. */
   claimed_at: number | null;
   never_bound_count: number;
+  /** Capture contract requested by the handoff caller (SQLite INTEGER boolean). */
+  capture: number;
+  /** Direct launch-config overrides (both present together when validated). */
+  model: string | null;
+  effort: string | null;
+  /** Serialized `harness::model::effort` launch triple request. */
+  preset: string | null;
+  /** Durable result-envelope path the handoff-ee alone writes when capturing. */
+  envelope_path: string | null;
 }
 
 /** The action the decision table picks for one handoff row. */
@@ -206,13 +216,17 @@ export interface HandoffDispatchDeps {
   launch(session: string, cwd: string, spec: LaunchSpec): Promise<LaunchResult>;
   /** Mint a terminal `HandoffLaunchFailed` event + a dead-letter (permanent). */
   emitLaunchFailed(payload: HandoffLaunchFailedPayload): void;
-  /** The launch prompt = `handoffPromptPrefix` + the framing + the inline brief. */
-  buildPrompt(doc: string): string;
+  /** The launch prompt = `handoffPromptPrefix` + the selected framing + inline brief. */
+  buildPrompt(doc: string, capture: boolean): string;
   /** Resolve the `dispatch.handoff` launch pin (ADR 0040). Returns `{}` when the
    *  row is absent — handoff carries NO compiled default, so an absent row yields a
    *  flagless launch (byte-identical to the prior behavior); a present row makes
    *  handoff pinnable. Production: {@link resolveDispatchLaunchConfig}("handoff"). */
-  resolveDispatchConfig(): { model?: string; effort?: string };
+  resolveDispatchConfig(): {
+    harness?: string;
+    model?: string;
+    effort?: string;
+  };
 }
 
 /** Outcome of {@link dispatchOneHandoff}, for the cycle log + tests. */
@@ -279,15 +293,29 @@ export async function dispatchOneHandoff(
   // Handoff becomes pinnable (ADR 0040): a present `dispatch.handoff` row adds
   // --model/--effort to the spec; an absent row resolves to `{}` and the launch
   // stays flagless (the prior default — LaunchSpec omits the flags when undefined).
-  const handoffLaunch = deps.resolveDispatchConfig();
+  const handoffLaunch = resolveHandoffLaunchConfig(
+    row,
+    deps.resolveDispatchConfig(),
+  );
+  const capture = Boolean(row.capture);
   const spec: LaunchSpec = {
-    prompt: deps.buildPrompt(row.doc),
+    prompt: deps.buildPrompt(row.doc, capture),
     claudeName: `handoff::${row.handoff_id}`,
+    // Handoff historically ignores a dispatch-table harness pin (only its
+    // model/effort flow onto the default Claude launch). Preserve that exact
+    // non-capture surface; capture is the new autonomous result contract that
+    // can honor a resolved launch triple's harness.
+    ...(capture && handoffLaunch.harness !== undefined
+      ? { harness: handoffLaunch.harness }
+      : {}),
     ...(handoffLaunch.model !== undefined
       ? { model: handoffLaunch.model }
       : {}),
     ...(handoffLaunch.effort !== undefined
       ? { effort: handoffLaunch.effort }
+      : {}),
+    ...(capture && row.envelope_path != null && row.envelope_path !== ""
+      ? { handoffEnvelope: row.envelope_path }
       : {}),
   };
   // PER-ROW launch cwd: the handoff's resolved `--cwd` (an absolute path the CLI
@@ -336,25 +364,72 @@ export const HANDOFF_PROMPT_FRAMING =
   "The text below is your brief for this session — your REQUEST, NOT a pre-approved order to execute. Handle it under your normal workflow: investigate first, then confirm before any code lands.";
 
 /**
+ * Autonomous capture framing for a handoff-ee with a durable deliverable. No
+ * self-reporting CLI exists for an already-running detached session: `agent run`
+ * would launch a nested leg and `agent wait` requires launch metadata this surface
+ * does not mint. The handoff-ee therefore writes its own single JSON envelope.
+ */
+export const HANDOFF_CAPTURE_PROMPT_FRAMING =
+  "The text below is your autonomous brief. Investigate and act within it without parking for a confirm beat. Finish your turn with the answer. As your final tool action, write exactly one UTF-8 JSON object (no markdown or extra text) to $KEEPER_HANDOFF_ENVELOPE. The serialized object must stay at or below 65536 bytes and have exactly these keys: schema_version (1), agent (claude, pi, or null), handle (string or null), transcript_path (string or null), resume_target (string or null), message (your final answer or null), message_found (boolean), elapsed_seconds (number or null), outcome (completed, no_message, timed_out, no_transcript, transcript_ambiguous, launch_failed, or bad_args). Use null for unavailable values.";
+
+/**
  * Compose the launch prompt: the configured `handoff_prompt_prefix` (e.g.
- * `/hack`, so the handoff-ee boots into the skill), the investigate-then-confirm
- * {@link HANDOFF_PROMPT_FRAMING}, and the full brief INLINE — the handoff-ee gets
- * its whole world directly in the launch prompt, no `keeper handoff show` pointer
- * round-trip. The doc is capped CLI-side at 64KB and the framing+prefix are a
- * small constant, so `prefix + framing + doc` stays under the 96KB argv cap
- * (`PROMPT_MAX_BYTES`) — the two caps are now COUPLED (a coupled-cap test pins
- * it). `keeper handoff show <slug>` remains an inspection-only verb. Pure;
- * exported for tests.
+ * `/hack`, so the handoff-ee boots into the skill), selected framing, and full
+ * brief INLINE — the handoff-ee gets its whole world directly in the launch
+ * prompt, no `keeper handoff show` pointer round-trip. The doc is capped CLI-side
+ * at 64KB and the framing+prefix stay below the 96KB argv cap (`PROMPT_MAX_BYTES`)
+ * — the caps are coupled and pinned by tests. `keeper handoff show <slug>` remains
+ * inspection-only. `capture:false` is byte-identical to the pre-capture prompt.
+ * Pure; exported for tests.
  */
 export function buildHandoffPrompt(
   doc: string,
   promptPrefix: string | undefined,
+  capture = false,
 ): string {
-  const body = `${HANDOFF_PROMPT_FRAMING}\n\n${doc}`;
+  const framing = capture
+    ? HANDOFF_CAPTURE_PROMPT_FRAMING
+    : HANDOFF_PROMPT_FRAMING;
+  const body = `${framing}\n\n${doc}`;
   if (promptPrefix !== undefined && promptPrefix !== "") {
     return `${promptPrefix} ${body}`;
   }
   return body;
+}
+
+/**
+ * Resolve the handoff launch triple without trusting its read-only projection:
+ * a valid row triple wins over the dispatch-table pin, direct model/effort wins
+ * when both are present, and malformed/partial row values safely fall through.
+ * Pure and NEVER throws so a corrupt row cannot crash the dispatch cycle.
+ */
+export function resolveHandoffLaunchConfig(
+  row: Pick<HandoffDispatchRow, "preset" | "model" | "effort">,
+  dispatchConfig: { harness?: string; model?: string; effort?: string },
+): { harness?: string; model?: string; effort?: string } {
+  if (row.preset != null && row.preset !== "") {
+    const parsed = parseTriple(row.preset);
+    if (parsed.ok) {
+      return {
+        harness: parsed.triple.harness,
+        model: parsed.triple.model,
+        effort: parsed.triple.effort,
+      };
+    }
+  }
+  if (
+    row.model != null &&
+    row.model !== "" &&
+    row.effort != null &&
+    row.effort !== ""
+  ) {
+    return {
+      ...dispatchConfig,
+      model: row.model,
+      effort: row.effort,
+    };
+  }
+  return { ...dispatchConfig };
 }
 
 /**
@@ -366,7 +441,8 @@ export function buildHandoffPrompt(
 export function selectActionableHandoffs(db: Database): HandoffDispatchRow[] {
   return db
     .query(
-      `SELECT handoff_id, status, doc, target_session, target_dir, claimed_at, never_bound_count
+      `SELECT handoff_id, status, doc, target_session, target_dir, claimed_at, never_bound_count,
+              capture, model, effort, preset, envelope_path
          FROM handoffs
         WHERE status IN ('requested', 'dispatching')
         ORDER BY handoff_id ASC`,
@@ -560,7 +636,8 @@ function main(): void {
         payload,
       } satisfies HandoffLaunchFailedMessage);
     },
-    buildPrompt: (doc) => buildHandoffPrompt(doc, promptPrefix),
+    buildPrompt: (doc, capture) =>
+      buildHandoffPrompt(doc, promptPrefix, capture),
     resolveDispatchConfig: () => resolveDispatchLaunchConfig("handoff"),
   };
 
