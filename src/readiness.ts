@@ -9,7 +9,9 @@
  * reordering silently breaks autopilot dispatch:
  *   1.   terminal-completed       — task: (worker_phase==="done" OR the task's
  *                                   OWN epic is status==="done") AND no embedded
- *                                   job working AND no running sub-agent. A done
+ *                                   job working AND no running sub-agent, except
+ *                                   a proven-dead worker's orphaned invocation.
+ *                                   A done
  *                                   epic is ABSORBING: every task under it reads
  *                                   completed even with an unstamped per-task
  *                                   flag, so the reconciler never re-dispatches

@@ -855,9 +855,10 @@ function evaluateTaskAwait(
     // === "done"` AND the session idle (no embedded job working, no running
     // sub-agent, no held monitor lease) — NOT the raw `worker_phase` pop-off
     // that can race ahead of the worker winding down. A done-but-live task reads
-    // `running:*` and stays `waiting` here (a done task whose sub-agent died
-    // without SubagentStop is `running:sub-agent-stale` by design, so `complete`
-    // holds `waiting` until an operator clears it). Undefined-guard mirrors the
+    // `running:*` and stays `waiting` here. A missing SubagentStop normally
+    // remains `running:sub-agent-stale`; the readiness pass may complete a done
+    // task only when its owning worker is independently proven dead.
+    // Undefined-guard mirrors the
     // unblocked path: a present task with no verdict reads `waiting`.
     const v = inputs.snapshot.perTask.get(target.id);
     if (v === undefined) {

@@ -2345,6 +2345,9 @@ export function subscribeReadiness(
       }
       eligibleEpicIds = computeEligibleEpics(armedIds, epicById);
     }
+    // This client has no pid probe: only the reconcile snapshot injects its
+    // proven-dead worker facts. Leaving that argument absent keeps an ambiguous
+    // board session conservatively held rather than treating stopped as dead.
     const readiness = computeReadiness(
       epicsTyped,
       jobsTyped,
