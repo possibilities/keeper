@@ -79,6 +79,7 @@ import {
   decideCrashLoop,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
+  decideServeBusDistress,
   decideServeLivenessWatchdog,
   dispatchEscalationSession,
   drainToCompletion,
@@ -202,6 +203,9 @@ import {
 } from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
 import {
+  BUS_DEGRADED_DISTRESS_ID,
+  BUS_DEGRADED_DISTRESS_REASON,
+  BUS_DEGRADED_DISTRESS_VERB,
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
@@ -542,6 +546,25 @@ test("gcUnretryableDispatchFailures: the paging-channel distress row is EXEMPT u
     `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
        VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
   ).run("daemon", "paging-channel-down", "paging-channel-down");
+
+  const cleared: { verb: string; id: string }[] = [];
+  expect(
+    gcUnretryableDispatchFailures(db, (verb, id) => cleared.push({ verb, id })),
+  ).toBe(0);
+  expect(cleared).toEqual([]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: bus-degraded is producer-owned until its probe level-clears it", () => {
+  const { db } = freshMemDb();
+  db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
+  ).run(
+    BUS_DEGRADED_DISTRESS_VERB,
+    BUS_DEGRADED_DISTRESS_ID,
+    BUS_DEGRADED_DISTRESS_REASON,
+  );
 
   const cleared: { verb: string; id: string }[] = [];
   expect(
@@ -1440,13 +1463,24 @@ test("decideServeLivenessWatchdog: an unarmed socket never accumulates a fail st
   expect(r.state.serverProbeFailStreak).toBe(0);
 });
 
-test("decideServeLivenessWatchdog: accept-stall-bus — the bus fail streak reaches the cap", () => {
-  expect(
-    swd(
-      { busProbe: "dead" },
-      { busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
-    ).verdict,
-  ).toEqual({ kind: "escalate", trigger: "accept-stall-bus" });
+test("decideServeLivenessWatchdog: accept-stall-bus — a bus-only fail streak at cap degrades in place", () => {
+  const verdict = swd(
+    { busProbe: "dead" },
+    { busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK - 1 },
+  ).verdict;
+  expect(verdict).toEqual({ kind: "degrade", trigger: "accept-stall-bus" });
+  expect(decideServeBusDistress(verdict, "dead", false)).toBe("mint");
+  expect(decideServeBusDistress(verdict, "dead", true)).toBe("none");
+});
+
+test("decideServeLivenessWatchdog: a live bus probe after degradation returns ok and level-clears its distress", () => {
+  const verdict = swd(
+    { busProbe: "live" },
+    { busProbeFailStreak: SERVE_PROBE_MAX_FAIL_STREAK },
+  ).verdict;
+  expect(verdict).toEqual({ kind: "ok" });
+  expect(decideServeBusDistress(verdict, "live", true)).toBe("clear");
+  expect(decideServeBusDistress(verdict, "live", false)).toBe("none");
 });
 
 test("decideServeLivenessWatchdog: both sockets stalled → server trigger wins (deterministic)", () => {
@@ -6176,6 +6210,14 @@ test("buildSharedCheckoutPageBody: names the repo and picks dirty-vs-desync word
   });
   expect(monitorSlot).toContain("dispatch root /repo");
   expect(monitorSlot).toContain("will not release or kill");
+
+  const busDegraded = buildSharedCheckoutPageBody({
+    id: BUS_DEGRADED_DISTRESS_ID,
+    dir: null,
+    reason: BUS_DEGRADED_DISTRESS_REASON,
+  });
+  expect(busDegraded).toContain("Agent Bus accept path");
+  expect(busDegraded).toContain("daemon is staying up");
 
   // A null dir renders a placeholder, never the literal "null".
   const noDir = buildSharedCheckoutPageBody({

@@ -152,6 +152,22 @@ export const PAGING_CHANNEL_DOWN_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
 export const PAGING_CHANNEL_DOWN_DISTRESS_ID = "paging-channel-down";
 export const PAGING_CHANNEL_DOWN_DISTRESS_REASON = "paging-channel-down";
 
+/**
+ * The fixed, producer-owned distress signal for an Agent Bus accept path that
+ * stays dark while the critical READ server remains live. The serve-liveness
+ * watchdog keeps the daemon up, mints this row once, and level-clears it only
+ * after a later bus probe proves recovery. The synthetic daemon verb keeps it
+ * outside dispatch suppression and the retry wire.
+ */
+export const BUS_DEGRADED_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const BUS_DEGRADED_DISTRESS_ID = "bus-degraded";
+export const BUS_DEGRADED_DISTRESS_REASON = "bus-degraded";
+
+/** True iff `(verb, id)` is the producer-owned bus-degraded distress key. */
+export function isBusDegradedDistressKey(verb: string, id: string): boolean {
+  return verb === BUS_DEGRADED_DISTRESS_VERB && id === BUS_DEGRADED_DISTRESS_ID;
+}
+
 /** True iff `(verb, id)` is the producer-owned paging-channel distress key. */
 export function isPagingChannelDownDistressKey(
   verb: string,

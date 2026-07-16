@@ -73,9 +73,9 @@ file is imperative guardrails only.
 - **No in-process self-heal.** Any unrecoverable error `fatalExit`s (non-zero exit; LaunchAgent
   respawn is sole recovery); never respawn a worker in-process (carve-outs: closing a stale/EPIPE
   UDS client, the git seed-liveness watchdog's capped boot-seed re-run before `fatalExit`, and the
-  serve-liveness watchdog `fatalExit`ing a wedged serve path on a named trigger: accept-stall,
-  busy-lag, serve-report-mute, serve-starvation; main clocks arrival, clock-jump guard resets on
-  suspend/resume). A crash-loop is loud: main appends each boot to an append-only, boot_id-keyed
+  serve-liveness watchdog `fatalExit`ing critical-path wedges (accept-stall-server, busy-lag,
+  serve-report-mute, serve-starvation) while a bus-only accept stall degrades visibly in place;
+  main clocks arrival, clock-jump guard resets on suspend/resume). A crash-loop is loud: main appends each boot to an append-only, boot_id-keyed
   NDJSON restart ledger (sidecar, NOT a fold; runtime-qualified count), minting ONE sticky
   distress row cleared once the boot rate recovers.
 - **A `flock` single-instance gate tops `startDaemon()`** before `openDb`/`migrate`; its `FD_CLOEXEC` lock fd never leaves main.

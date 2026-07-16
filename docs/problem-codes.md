@@ -370,12 +370,13 @@ see their `README.md` entries for that shared vocabulary's meaning and recovery.
 ## Operator paging
 
 Operator pages use the local `botctl` transport. A non-zero botctl exit is retried
-without creating a new alarm; only an absent or unlaunchable pager surfaces this
-producer-owned distress row. It clears automatically after the next delivered page.
+without creating a new alarm; an absent pager and a degraded Agent Bus surface as
+producer-owned distress rows that clear only on positive recovery evidence.
 
 | code | meaning | recovery | retry-safe |
 | ---- | ------- | -------- | ---------- |
 | `paging-channel-down` | Keeper could not spawn the local paging transport, so operator notifications cannot be delivered. | Restore `botctl` on PATH and verify a subsequent page can be delivered; Keeper clears the row on that positive evidence. | automatic after repair |
+| `bus-degraded` | The Agent Bus accept path stopped answering sustained probes while Keeper's critical READ server remained healthy, so the daemon stayed up in degraded mode. | Inspect bus clients and subscriber pressure; bounce keeperd only for a persistent internal bus wedge. The row clears when the armed bus probe answers again. | automatic after recovery |
 
 ## keeper commit-work
 
