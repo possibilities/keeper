@@ -42,5 +42,7 @@ Truth-table: done + open invocation + pid proven dead → completed; done + open
 - [ ] The touched suites and the named gate pass.
 
 ## Done summary
-
+Readiness completion predicate discounts an open sub-agent invocation when the owning pid is proven dead AND worker_phase is done (ADR 0060 valve); landed via operator plain-git escape (commit-work terminal-adoption wedge vs dead leg 7e1fc767) as a166f79d on the .4 task lane
 ## Evidence
+- Commits: a166f79d
+- Tests: bun test ./test/board.test.ts 140/0 (operator re-run in lane)

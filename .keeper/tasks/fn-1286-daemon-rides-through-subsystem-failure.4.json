@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Readiness discounts dead-pid orphan invocation",
-  "updated_at": "2026-07-16T16:27:37.824000Z"
+  "updated_at": "2026-07-16T18:28:04.643000Z",
+  "worker_done_at": "2026-07-16T18:28:04.643000Z"
 }
