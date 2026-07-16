@@ -78,7 +78,7 @@ import {
   type BackstopRecord,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import { type BackupResult, liveBackupPage } from "./backup";
+import type { BackupResult } from "./backup";
 import {
   type BaselineResult,
   baselineKey,
@@ -158,6 +158,7 @@ import {
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
   isMonitorSlotWedgeDistressKey,
+  isPagingChannelDownDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
@@ -165,6 +166,9 @@ import {
   LANE_TEARDOWN_DISTRESS_ID_PREFIX,
   MERGE_ESCALATION_REASON_TOKEN,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
+  PAGING_CHANNEL_DOWN_DISTRESS_ID,
+  PAGING_CHANNEL_DOWN_DISTRESS_REASON,
+  PAGING_CHANNEL_DOWN_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -207,7 +211,7 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
-import { KEEPER_TOPIC, livePage } from "./integrity-probe";
+import { type BotctlPageOutcome, sendBotctlPage } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import type {
   BackupResultMessage,
@@ -490,6 +494,11 @@ export function gcUnretryableDispatchFailures(
     if (isMonitorSlotWedgeDistressKey(row.verb, row.id)) {
       continue;
     }
+    // A missing botctl channel is producer-owned and clears only after a page
+    // succeeds, never through the retry-dispatch wire.
+    if (isPagingChannelDownDistressKey(row.verb, row.id)) {
+      continue;
+    }
     // And the per-(project,number) duplicate-epic-number distress row — a LIVE producer
     // (the once-per-cycle mint-guard probe) owns it: its own `dup-epic-number:` id prefix
     // rides the synthetic `daemon` verb, and the probe's level-trigger (the duplicate no
@@ -515,6 +524,23 @@ export function gcUnretryableDispatchFailures(
     swept++;
   }
   return swept;
+}
+
+/** The producer action for the paging-channel distress row. */
+export type PagingChannelDistressAction = "mint" | "clear" | "none";
+
+/**
+ * Decide the idempotent, level-triggered paging-channel transition. A transient
+ * botctl exit deliberately leaves the current row untouched: only a spawn failure
+ * proves the local pager is absent, and only a delivered page proves recovery.
+ */
+export function decidePagingChannelDistress(
+  outcome: BotctlPageOutcome,
+  isOpen: boolean,
+): PagingChannelDistressAction {
+  if (outcome === "permanent_failure") return isOpen ? "none" : "mint";
+  if (outcome === "notified") return isOpen ? "clear" : "none";
+  return "none";
 }
 
 /**
@@ -11111,6 +11137,125 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  // Includes a just-inserted, not-yet-folded mint so a recovery page cannot
+  // miss the clear while the projection is still catching up.
+  let pagingChannelDistressPending = false;
+
+  /**
+   * Mint the fixed producer-owned paging-channel-down distress row through the
+   * ordinary synthetic DispatchFailed path. The reducer UPSERT makes repeated
+   * absence observations idempotent; only a later successful page clears it.
+   */
+  function mintPagingChannelDownDistress(): boolean {
+    const tsSec = Date.now() / 1000;
+    try {
+      stmts.insertEvent.run({
+        $ts: tsSec,
+        $session_id: `${PAGING_CHANNEL_DOWN_DISTRESS_VERB}::${PAGING_CHANNEL_DOWN_DISTRESS_ID}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+          id: PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          reason: PAGING_CHANNEL_DOWN_DISTRESS_REASON,
+          dir: null,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+      wakePending = true;
+      pumpWakes();
+      return true;
+    } catch (err) {
+      console.error(
+        `[keeperd] paging-channel-down distress mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Route every daemon operator page through one transport and maintain the
+   * paging-channel distress row from its captured outcome. A page failure still
+   * returns `notify_failed`, preserving every existing re-sweep contract.
+   */
+  async function notifyHuman(
+    message: string,
+  ): Promise<"notified" | "notify_failed"> {
+    const outcome = await sendBotctlPage(message);
+    let isOpen = false;
+    try {
+      isOpen =
+        pagingChannelDistressPending ||
+        db
+          .query(
+            "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(
+            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+            PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          ) != null;
+    } catch (err) {
+      // An unreadable projection must not mint or clear on incomplete evidence.
+      console.error(
+        `[keeperd] paging-channel distress read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return outcome === "notified" ? "notified" : "notify_failed";
+    }
+    switch (decidePagingChannelDistress(outcome, isOpen)) {
+      case "mint":
+        pagingChannelDistressPending = mintPagingChannelDownDistress();
+        break;
+      case "clear":
+        try {
+          mintDispatchClearedEvent(
+            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+            PAGING_CHANNEL_DOWN_DISTRESS_ID,
+          );
+          pagingChannelDistressPending = false;
+        } catch (err) {
+          console.error(
+            `[keeperd] paging-channel-down distress clear threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        break;
+      case "none":
+        break;
+    }
+    return outcome === "notified" ? "notified" : "notify_failed";
+  }
+
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
   // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
   // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
@@ -11381,26 +11526,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       reason: row.reason,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] deconflict human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side deconflict-dispatch sweep (fn-1129 stage 2), the rewired successor to
@@ -11650,26 +11776,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       reason: row.reason,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] work fan-in human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side work-verb fan-in merge-conflict TERMINAL page sweep (fn-1240 tier-2
@@ -11950,26 +12057,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       taskId: row.task_id,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] unblock human-notify spawn threw for ${row.task_id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Producer-side block/unblock-dispatch sweep (fn-1129 stage 2), the rewired successor to
@@ -12360,26 +12448,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     row: SharedCheckoutPageRow,
   ): Promise<SharedCheckoutNotifiedOutcome> {
     const body = buildSharedCheckoutPageBody(row);
-    try {
-      const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] shared-checkout human-page spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Launch ONE `repair::<repo-token>` escalation session. cwd = the repo's SHARED
@@ -12412,26 +12481,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       repoDir: row.dir,
       verdict,
     });
-    try {
-      const proc = Bun.spawn(
-        ["botctl", "send-message", "--topic", KEEPER_TOPIC, body],
-        {
-          stdin: "ignore",
-          stdout: "ignore",
-          stderr: "ignore",
-          env: process.env as Record<string, string | undefined>,
-        },
-      );
-      const exitCode = await proc.exited;
-      return exitCode === 0 ? "notified" : "notify_failed";
-    } catch (err) {
-      console.error(
-        `[keeperd] repair human-notify spawn threw for ${row.id} (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return "notify_failed";
-    }
+    return notifyHuman(body);
   }
 
   // Fail-safe turn-activity probe for the producer-local terminal grace. A transient DB
@@ -13140,11 +13190,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // side effects stay on main, driven by relayed outcomes. Compaction + the
   // WAL-checkpoint timers above STAY on main (sole-writer rule).
 
-  // Shared botctl/Telegram page sink for relayed maintenance pages. Best-effort:
-  // `livePage` swallows a notifier failure so a relayed page can never crash main.
-  const maintenancePage = livePage();
-  const backupFailurePage = liveBackupPage();
-
   // Run the success-log / failure-log+page branch from a relayed `BackupResult`.
   // The `backupDb` call runs worker-side; this is the formatting + logging +
   // paging only.
@@ -13161,13 +13206,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } else {
       const detail = result.error ?? "unknown error";
       console.error(`[keeperd] backup FAILED: ${detail}`);
-      try {
-        backupFailurePage(
-          `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+      void notifyHuman(
+        `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+      ).catch((err) => {
+        console.error(
+          `[keeperd] backup page threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
         );
-      } catch {
-        // Page is best-effort; a notifier failure must not crash main.
-      }
+      });
     }
   }
 
@@ -13230,11 +13277,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } else if (msg.kind === "maintenance-log") {
         console.error(msg.message);
       } else if (msg.kind === "maintenance-page") {
-        try {
-          maintenancePage(msg.message);
-        } catch {
-          // Page is best-effort; a notifier failure must not crash main.
-        }
+        void notifyHuman(msg.message).catch((err) => {
+          console.error(
+            `[keeperd] maintenance page threw (non-fatal): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
       }
     };
 

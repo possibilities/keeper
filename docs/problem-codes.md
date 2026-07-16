@@ -367,6 +367,16 @@ Both verbs also share `BAD_TASK_ID | NOT_A_PROJECT | TASK_NOT_FOUND | AMBIGUOUS_
 with the other task-scoped read verbs (`reconcile`, `resolve-task`, `find-task-commit`) —
 see their `README.md` entries for that shared vocabulary's meaning and recovery.
 
+## Operator paging
+
+Operator pages use the local `botctl` transport. A non-zero botctl exit is retried
+without creating a new alarm; only an absent or unlaunchable pager surfaces this
+producer-owned distress row. It clears automatically after the next delivered page.
+
+| code | meaning | recovery | retry-safe |
+| ---- | ------- | -------- | ---------- |
+| `paging-channel-down` | Keeper could not spawn the local paging transport, so operator notifications cannot be delivered. | Restore `botctl` on PATH and verify a subsequent page can be delivered; Keeper clears the row on that positive evidence. | automatic after repair |
+
 ## keeper commit-work
 
 Every invocation emits exactly one line with

@@ -143,6 +143,27 @@ export const CRASH_LOOP_DISTRESS_ID = "crash-loop";
 export const CRASH_LOOP_DISTRESS_REASON = "daemon-crash-loop";
 
 /**
+ * The synthetic daemon distress signal that the botctl paging channel itself is
+ * unavailable. It is minted only for a spawn failure (not a non-zero botctl
+ * exit), then level-cleared by the next successful page. The fixed, un-retryable
+ * key keeps the alarm visible without entering any real dispatch queue.
+ */
+export const PAGING_CHANNEL_DOWN_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const PAGING_CHANNEL_DOWN_DISTRESS_ID = "paging-channel-down";
+export const PAGING_CHANNEL_DOWN_DISTRESS_REASON = "paging-channel-down";
+
+/** True iff `(verb, id)` is the producer-owned paging-channel distress key. */
+export function isPagingChannelDownDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === PAGING_CHANNEL_DOWN_DISTRESS_VERB &&
+    id === PAGING_CHANNEL_DOWN_DISTRESS_ID
+  );
+}
+
+/**
  * The synthetic PER-REPO distress signal for a shared MAIN checkout stuck mid-merge
  * (MERGE_HEAD + unresolved paths) past the recover grace watermark — the escalation
  * layer ON TOP of the immediate per-epic `worktree-recover-mid-merge` /
