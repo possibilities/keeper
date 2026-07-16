@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified multi-file (4-file) rework that mirrors a named existing skip-and-surface pattern across three batch surfaces plus a docstring fix \u2014 GPT-first correctness-against-acceptance work with a clear path, sized for the substantial-well-specified GPT workhorse at the model-default band.",
+      "task_id": "fn-1291-harden-unregistered-harness-restore.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-16T08:22:31.579000Z",
+  "epic_id": "fn-1291-harden-unregistered-harness-restore",
+  "input_hash": "6247b5b7538938e07b5728e2925e341ba01517058b7d26920057ddac59d301dd",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1648866743,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified multi-file (4-file) rework that mirrors a named existing skip-and-surface pattern across three batch surfaces plus a docstring fix \u2014 GPT-first correctness-against-acceptance work with a clear path, sized for the substantial-well-specified GPT workhorse at the model-default band.\",\"confidence\":0.79}]}\n"
+}
