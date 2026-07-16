@@ -34,7 +34,10 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<!-- ~/.local/bin carries the operator paging binaries (agentbot,
+		  notifyctl); without it every daemon page spawn fails ENOENT and the
+		  paging-channel-down probe latches. -->
+		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 		<!--
 		  Verbose server-worker diagnostic logging. Default `0` (off) writes
 		  only the rare `[server-worker]` error class to server.stderr. Flip
