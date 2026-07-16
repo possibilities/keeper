@@ -7,6 +7,7 @@
 
 import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { buildAgentLaunchArgv } from "../src/agent/launch-config";
 import {
   AUTOCLOSE_IDLE_MS,
   AUTOCLOSE_MAX_KILLS_PER_PULSE,
@@ -355,6 +356,45 @@ test("IN: panel leg, stopped past grace → reaped (no verdict needed)", () => {
   });
   expect(reaps).toHaveLength(1);
   expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::claude::q1" });
+});
+
+test("IN: Pi panel launch carrier survives birth provenance and is reaped", () => {
+  const argv = buildAgentLaunchArgv({
+    launcherArgvPrefix: ["/abs/bun", "/abs/cli/keeper.ts", "agent"],
+    cli: "pi",
+    prompt: "p",
+    session: "panels",
+  });
+  const envIndex = argv.indexOf("--x-tmux-env");
+  expect(envIndex).toBeGreaterThanOrEqual(0);
+  const carrier = argv[envIndex + 1];
+  if (!carrier?.startsWith("KEEPER_TMUX_SESSION=")) {
+    throw new Error("Pi panel launch is missing its tmux session carrier");
+  }
+  const birthSessionId = carrier.slice("KEEPER_TMUX_SESSION=".length);
+  expect(birthSessionId).toBe("panels");
+
+  const { reaps } = run({
+    jobs: [
+      panelLeg({
+        title: "panel::pi::q1",
+        backend_exec_birth_session_id: birthSessionId,
+      }),
+    ],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [
+      pane({
+        tmuxGenerationId: "103:1003",
+        paneId: "%3",
+        windowId: "@3",
+        sessionName: "panels",
+        windowName: "panel::pi::q1",
+      }),
+    ],
+    graceMap: elapsed("j-panel"),
+  });
+  expect(reaps).toHaveLength(1);
+  expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::pi::q1" });
 });
 
 test("IN: wrapped provider leg with bare task-id title targets its exact pane identity", () => {

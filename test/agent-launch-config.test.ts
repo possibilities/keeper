@@ -380,7 +380,7 @@ test("buildAgentLaunchArgv: claude with session injects the KEEPER_TMUX_SESSION 
   expect(argv[sessIdx + 1]).toBe("panels");
 });
 
-test("buildAgentLaunchArgv: pi routes to nativePiArgs — never codex/claude flags, no strip, no carrier, prompt last", () => {
+test("buildAgentLaunchArgv: pi routes to nativePiArgs — native flags, birth carrier, prompt last", () => {
   const argv = buildAgentLaunchArgv({
     launcherArgvPrefix: LAP,
     cli: "pi",
@@ -397,11 +397,13 @@ test("buildAgentLaunchArgv: pi routes to nativePiArgs — never codex/claude fla
   expect(argv).not.toContain("--dangerously-bypass-approvals-and-sandbox");
   expect(argv).not.toContain("--permission-mode");
   expect(argv).not.toContain("--disallowed-tools");
-  // Interactive tracked-job shape is claude-only — never the headless --print.
+  // Interactive tracked-job shape never uses the headless --print.
   expect(argv).not.toContain("--print");
-  // pi fires no keeper hooks → never a tracked job → no KEEPER_TMUX_SESSION carrier,
-  // even with a session named for the window.
-  expect(argv).not.toContain("--x-tmux-env");
+  // An explicit session gives Pi the birth-record carrier without requiring a hook.
+  expect(argv).toContain("--x-tmux-env");
+  expect(argv[argv.indexOf("--x-tmux-env") + 1]).toBe(
+    "KEEPER_TMUX_SESSION=panels",
+  );
   expect(argv).toContain("--x-tmux-session");
   // The prompt is ALWAYS the final positional element.
   expect(argv.at(-1)).toBe("THE PI PROMPT");
@@ -561,6 +563,8 @@ test("buildAgentLaunchArgv: pi resume keeps shared wrapped presentation while pr
     "--x-no-confirm",
     "--x-tmux-session",
     "wrapped",
+    "--x-tmux-env",
+    "KEEPER_TMUX_SESSION=wrapped",
     "--x-tmux-window-name",
     "fn-1277.2",
     "-na",
@@ -587,6 +591,8 @@ test("buildAgentLaunchArgv: fresh launch is unaffected when resumeTarget is abse
     expect(argv).not.toContain("resume");
     expect(argv).not.toContain("--session-id");
     expect(argv).not.toContain("--fork-session");
+    // Sessionless launches stay prospective and carry no birth-session stamp.
+    expect(argv).not.toContain("--x-tmux-env");
   }
 });
 
