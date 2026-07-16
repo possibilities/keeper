@@ -43,6 +43,7 @@
  */
 
 import { isAbsolute } from "node:path";
+import { parseTriple } from "./agent/triple";
 import {
   parseDispatchKey as parseDispatchKeyResult,
   type RetryDispatchVerb,
@@ -608,6 +609,13 @@ export interface RequestHandoffParams {
   /** Raw initiator coords — always carried even when the pane isn't yet folded. */
   initiator_session: string | null;
   initiator_pane: string | null;
+  /** Whether the handoff worker must produce a terminal answer envelope. */
+  capture: boolean;
+  /** Optional explicit launch-cell override. Both fields are present together. */
+  model: string | null;
+  effort: string | null;
+  /** Optional raw launch triple, mutually exclusive with model/effort. */
+  preset: string | null;
 }
 
 /** Successful return shape for `request_handoff`. `handoff_id` carries the
@@ -667,6 +675,53 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
   }
   const initiator_session = optStr(obj.initiator_session, "initiator_session");
   const initiator_pane = optStr(obj.initiator_pane, "initiator_pane");
+  const capture = obj.capture === undefined ? false : obj.capture;
+  if (typeof capture !== "boolean") {
+    throw new BadParamsError(
+      "request_handoff: `capture` must be a boolean when present",
+    );
+  }
+  const model = optStr(obj.model, "model");
+  const effort = optStr(obj.effort, "effort");
+  const preset = optStr(obj.preset, "preset");
+  for (const [field, value] of [
+    ["model", model],
+    ["effort", effort],
+    ["preset", preset],
+  ] as const) {
+    if (value === "") {
+      throw new BadParamsError(
+        `request_handoff: \`${field}\` must be non-empty when present`,
+      );
+    }
+  }
+  if (!capture && (model !== null || effort !== null || preset !== null)) {
+    throw new BadParamsError(
+      "request_handoff: `model`, `effort`, and `preset` require `capture: true`",
+    );
+  }
+  if (preset !== null && (model !== null || effort !== null)) {
+    throw new BadParamsError(
+      "request_handoff: `preset` is mutually exclusive with `model`/`effort`",
+    );
+  }
+  if ((model === null) !== (effort === null)) {
+    throw new BadParamsError(
+      "request_handoff: `model` and `effort` must be supplied together",
+    );
+  }
+  if (preset !== null) {
+    const parsed = parseTriple(preset);
+    if (!parsed.ok) {
+      throw new BadParamsError(`request_handoff: ${parsed.error}`);
+    }
+  }
+  if (model !== null && effort !== null) {
+    const parsed = parseTriple(`claude::${model}::${effort}`);
+    if (!parsed.ok) {
+      throw new BadParamsError(`request_handoff: ${parsed.error}`);
+    }
+  }
   return {
     desired_slug: obj.desired_slug as string,
     doc_path: obj.doc_path,
@@ -675,6 +730,10 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
     target_dir,
     initiator_session,
     initiator_pane,
+    capture,
+    model,
+    effort,
+    preset,
   };
 }
 

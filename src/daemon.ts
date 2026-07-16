@@ -219,6 +219,7 @@ import type {
 } from "./handoff-worker";
 import { type AgentbotPageOutcome, sendAgentbotPage } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
+import { keeperStateDir } from "./keeper-state-dir";
 import type {
   BackupResultMessage,
   MaintenanceLogMessage,
@@ -8202,6 +8203,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             });
             return;
           }
+          const envelopePath = msg.capture
+            ? join(
+                keeperStateDir(),
+                "handoff-envelopes",
+                `${msg.desired_slug}.json`,
+              )
+            : null;
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
             // The resolved slug is frozen as the entity-key overload so a re-fold
@@ -8226,6 +8234,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               initiator_session: msg.initiator_session,
               initiator_pane: msg.initiator_pane,
               initiator_job_id: initiatorJobId,
+              capture: msg.capture,
+              model: msg.model,
+              effort: msg.effort,
+              preset: msg.preset,
+              envelope_path: envelopePath,
             }),
             $subagent_agent_id: null,
             $spawn_name: null,

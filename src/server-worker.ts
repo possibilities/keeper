@@ -338,6 +338,10 @@ export interface RequestHandoffRequestMessage {
   target_dir: string | null;
   initiator_session: string | null;
   initiator_pane: string | null;
+  capture: boolean;
+  model: string | null;
+  effort: string | null;
+  preset: string | null;
 }
 
 /** Main→worker reply paired with {@link RequestHandoffRequestMessage}. */
@@ -1647,6 +1651,10 @@ export interface ReplayBridge {
     target_dir: string | null;
     initiator_session: string | null;
     initiator_pane: string | null;
+    capture: boolean;
+    model: string | null;
+    effort: string | null;
+    preset: string | null;
   }): Promise<{
     ok: boolean;
     error?: string;
@@ -4007,6 +4015,10 @@ function main(): void {
           target_dir: req.target_dir,
           initiator_session: req.initiator_session,
           initiator_pane: req.initiator_pane,
+          capture: req.capture,
+          model: req.model,
+          effort: req.effort,
+          preset: req.preset,
         } satisfies RequestHandoffRequestMessage);
       });
     },

@@ -224,6 +224,10 @@ function autopilotStubBridge(opts: {
       target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
+      capture: boolean;
+      model: string | null;
+      effort: string | null;
+      preset: string | null;
     }>;
     requestAwaitCalls: unknown[];
   };
@@ -247,6 +251,10 @@ function autopilotStubBridge(opts: {
       target_dir: string | null;
       initiator_session: string | null;
       initiator_pane: string | null;
+      capture: boolean;
+      model: string | null;
+      effort: string | null;
+      preset: string | null;
     }>,
     requestAwaitCalls: [] as unknown[],
   };
@@ -775,6 +783,10 @@ test("request_handoff forwards the validated request to the bridge and returns o
       target_dir: "/Users/dev/code/other",
       initiator_session: "dash",
       initiator_pane: "%3",
+      capture: false,
+      model: null,
+      effort: null,
+      preset: null,
     },
   ]);
 });
@@ -799,6 +811,10 @@ test("request_handoff coerces absent optional coords to null", async () => {
       target_dir: null,
       initiator_session: null,
       initiator_pane: null,
+      capture: false,
+      model: null,
+      effort: null,
+      preset: null,
     },
   ]);
 });

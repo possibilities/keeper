@@ -4215,7 +4215,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // the Git attribution observation watermark, and v129 rebuilds
   // `autopilot_state` without its retired rollout-only adoption column while
   // preserving every surviving setting.
-  expect(SCHEMA_VERSION).toBe(129);
+  expect(SCHEMA_VERSION).toBe(130);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
