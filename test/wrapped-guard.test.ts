@@ -472,6 +472,41 @@ describe("decideWrappedGuard — total edit-denial for a marked subagent", () =>
     }
   });
 
+  test("ALLOWS a handoff Write into a /private/tmp keeper-wrapped dir (temp-root reconciliation)", () => {
+    const root = mkdtempSync(join("/private/tmp", "keeper-wrapped-privtmp-"));
+    try {
+      // a wrapped worker's handoff dir may sit under /private/tmp (not the
+      // launchd tmpdir); the inert .json write into it is allowed
+      expect(
+        decideWrappedGuard(
+          {
+            tool_name: "Write",
+            agent_id: "agent-7",
+            cwd: root,
+            tool_input: { file_path: join(root, "handoff.json") },
+          },
+          MARKED,
+          fsProbe(),
+        ),
+      ).toBeNull();
+      // ...but a non-inert (executable-shaped) extension in the same dir is still denied
+      expect(
+        decideWrappedGuard(
+          {
+            tool_name: "Write",
+            agent_id: "agent-7",
+            cwd: root,
+            tool_input: { file_path: join(root, "gen.ts") },
+          },
+          MARKED,
+          fsProbe(),
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("atomic handoff creation is exclusive and never follows a hardlink", () => {
     const root = mkdtempSync(join(tmpdir(), "keeper-wrapped-atomic-"));
     try {

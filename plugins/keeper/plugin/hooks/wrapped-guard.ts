@@ -967,8 +967,17 @@ function scratchWriteAllowed(
 ): boolean {
   const abs = isAbsolute(raw) ? raw : resolve(cwd, raw);
   const target = probe.realpath(abs);
-  const scratch = probe.realpath(tmpdir());
-  if (target === null || scratch === null || !pathInside(scratch, target)) {
+  if (target === null) {
+    return false;
+  }
+  // Accept a handoff write under ANY recognized system-temp root (realpath-
+  // normalized, so `/tmp`→`/private/tmp` and the launchd `/var/folders/.../T`
+  // all reconcile) — the `.json|.txt|.md` + `scratchFileSafe` gates below, not
+  // the specific temp root, are the security boundary. Mirrors the mktemp check.
+  const scratchRoots = SYSTEM_TMP_ROOTS.map((r) => probe.realpath(r)).filter(
+    (r): r is string => r !== null,
+  );
+  if (!scratchRoots.some((root) => pathInside(root, target))) {
     return false;
   }
   // Wrapped scratch files are inert handoff data only. Executable/script-shaped
