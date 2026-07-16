@@ -43,10 +43,12 @@ import {
   captureFromHandle,
   composeRunCapture,
   createExactRunTeardown,
+  isRunControlArtifact,
   parseRunArgs,
   RUN_CAPTURE_SCHEMA_VERSION,
   type RunCaptureDeps,
   type RunControlArtifact,
+  type RunControlOwner,
   type RunLaunchResult,
   runCaptureExitCode,
 } from "../src/agent/run-capture";
@@ -890,6 +892,11 @@ describe("run control — exact, idempotent cancellation", () => {
     "-t",
     "@77",
   ];
+  const OWNER: RunControlOwner = {
+    request_id: "panel-1",
+    member: "opus-1",
+    attempt: 1,
+  };
 
   function control(status: RunControlArtifact["status"] = "running") {
     return {
@@ -898,10 +905,50 @@ describe("run control — exact, idempotent cancellation", () => {
         agent: "claude",
         startedAtMs: 12_345,
         killWindowCommand: EXACT_KILL,
+        owner: OWNER,
       }),
       status,
     };
   }
+
+  test.each([
+    ["wrong verb", ["tmux", "kill-server"]],
+    ["non-@N target", ["tmux", "kill-window", "-t", "not-a-window"]],
+    [
+      "odd socket-arg run",
+      ["tmux", "-L", "sock", "-S", "kill-window", "-t", "@77"],
+    ],
+    ["non-tmux argv0", ["rm", "-rf", "/", "kill-window", "-t", "@77"]],
+  ] as const)(
+    "rejects %s as a run-control kill_window_command tail",
+    (_label, killWindowCommand) => {
+      const artifact = buildRunControlArtifact({
+        runId: "tmux-owned-77",
+        agent: "claude",
+        startedAtMs: 12_345,
+        killWindowCommand: [...killWindowCommand],
+        owner: OWNER,
+      });
+      let tmuxCalls = 0;
+
+      expect(isRunControlArtifact(artifact)).toBe(false);
+      expect(
+        cancelOwnedRunFromControlArtifact({
+          path: "/fake/panel.control.json",
+          expectedOwner: OWNER,
+          readArtifact: () => artifact,
+          writeArtifact: () => {
+            throw new Error("must not write");
+          },
+          runTmuxCommand: () => {
+            tmuxCalls += 1;
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+        }),
+      ).toEqual({ kind: "malformed_control" });
+      expect(tmuxCalls).toBe(0);
+    },
+  );
 
   test("exact teardown is single-shot and preserves the socket-qualified target", () => {
     const calls: string[][] = [];
@@ -916,11 +963,10 @@ describe("run control — exact, idempotent cancellation", () => {
   });
 
   test("owned cancellation rejects malformed and mismatched controls before tmux", () => {
-    const owner = { request_id: "panel-1", member: "opus-1", attempt: 1 };
     let calls = 0;
     const base = {
       path: "/fake/panel.control.json",
-      expectedOwner: owner,
+      expectedOwner: OWNER,
       writeArtifact: () => {
         throw new Error("must not write");
       },
@@ -944,7 +990,7 @@ describe("run control — exact, idempotent cancellation", () => {
             agent: "claude",
             startedAtMs: 1,
             killWindowCommand: EXACT_KILL,
-            owner: { ...owner, request_id: "foreign" },
+            owner: { ...OWNER, request_id: "foreign" },
           }),
       }),
     ).toEqual({ kind: "ownership_mismatch" });
