@@ -403,7 +403,11 @@ export interface RereadScheduler {
 }
 
 const realRereadScheduler: RereadScheduler = {
-  setTimer: (callback, ms) => setTimeout(callback, ms),
+  setTimer: (callback, ms) => {
+    const timer = setTimeout(callback, ms);
+    timer.unref?.();
+    return timer;
+  },
   clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
