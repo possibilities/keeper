@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-luna",
+      "rationale": "Tiny, fully-specified single-file comment reword with a lint/test acceptance and no design or correctness judgment, so the lowest band on a light GPT tier fits.",
+      "task_id": "fn-1308-reframe-restart-budget-comments-to.1",
+      "tier": "low"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T10:07:44.519000Z",
+  "epic_id": "fn-1308-reframe-restart-budget-comments-to",
+  "input_hash": "ec101591520db4f3696a2de4c3875aacd59f94d940070f1ff321a42c9c62b2c7",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3960477073,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"low\",\"model\":\"gpt-5.6-luna\",\"rationale\":\"Tiny, fully-specified single-file comment reword with a lint/test acceptance and no design or correctness judgment, so the lowest band on a light GPT tier fits.\",\"confidence\":0.83}]}\n"
+}
