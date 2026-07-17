@@ -71,5 +71,5 @@ The additive schema/fold task is safe before producer activation. Existing live 
 - [ ] The additive migration, schema fingerprint, descriptor surface, malformed payload matrix, targeted fold tests, and re-fold suite pass without a production rewind.
 
 ## Done summary
-
+Extended DispatchCleared with explicit expected_attempt_id and expected_instance_event_id fences; each Fold effect (claim, pending, mint gate, failure) is now an independent exact compare-and-clear. Added nullable attempt ownership to dispatch_failures and dispatch_mint_gate, removed breaker streak deletion from clear, and kept tokenless legacy events bounded to deterministic legacy-unfenced compatibility with a new additive migration step and re-pinned schema fingerprint.
 ## Evidence
