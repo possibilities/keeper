@@ -66,5 +66,5 @@ idempotent controller start, all in-process through the existing fakes.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Added a day-scale age-out arm to channelPruneDecision so a socketless row with an unverifiable identity probe prunes past CHANNEL_PRESENCE_HORIZON_MS instead of accumulating forever, keeping the fail-safe keep inside the horizon and never reaping a live-socket row; pinned the pre-existing duplicate-registration reject/evict/send-only arms and the Pi inbox lease's double-claim/release-reclaim idempotency with no arming production change.
 ## Evidence
