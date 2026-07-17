@@ -30,6 +30,7 @@ import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 import type { PartnerLifecycle } from "../../src/agent/transcript-watch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
+import type { CodexBarAuthorizationResult } from "../../src/codexbar-authorization";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -188,6 +189,8 @@ export interface HarnessOptions {
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
+  /** Foreground CodexBar authorization seam; never invokes a real provider. */
+  authorizeCodexBar?: () => Promise<CodexBarAuthorizationResult>;
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
@@ -359,6 +362,17 @@ export function makeHarness(opts: HarnessOptions): Harness {
           reason: "no-observation",
         },
         candidates: [],
+      })),
+    authorizeCodexBarFn:
+      opts.authorizeCodexBar ??
+      (async () => ({
+        schema_version: 1,
+        binary_sha256: "a".repeat(64),
+        providers: {
+          claude: { authorized: true, health: "ok", failure: null },
+          codex: { authorized: true, health: "ok", failure: null },
+        },
+        ok: true,
       })),
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),

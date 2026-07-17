@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { queryCollection } from "../../cli/control-rpc";
+import { makeBoundedRunner } from "../account-observation-refresh";
 import {
   inspectRouting,
   type RequestedRouteResolution,
@@ -30,6 +31,8 @@ import {
 import {
   KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
+  resolveAccountRoutingRoot,
+  resolveCodexBarCommand,
   resolveCswapCommand,
 } from "../account-routing-config";
 import {
@@ -39,6 +42,11 @@ import {
   emitBirthRecord,
   writeBirthIntent,
 } from "../birth-record";
+import {
+  authorizeCodexBar,
+  CODEXBAR_AUTHORIZATION_TIMEOUT_MS,
+  type CodexBarAuthorizationResult,
+} from "../codexbar-authorization";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import {
@@ -343,6 +351,12 @@ export interface MainDeps {
    * {@link inspectRouting}.
    */
   inspectRoutingFn: () => RoutingInspection;
+  /**
+   * Deliberately authorize the current CodexBar generation. The production
+   * binding runs exact provider checks serially and persists only a PII-free
+   * receipt; tests inject a result and never touch a provider or Keychain.
+   */
+  authorizeCodexBarFn: () => Promise<CodexBarAuthorizationResult>;
   /** Read one exact jobs row through the daemon. Transport uncertainty remains
    *  unknown and can never be promoted to partner death. */
   probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
@@ -448,6 +462,12 @@ export function realDeps(): MainDeps {
     selectAccountRouteByOrdinalFn: (ordinal) =>
       selectRouteByAccountOrdinal(ordinal),
     inspectRoutingFn: () => inspectRouting(),
+    authorizeCodexBarFn: () =>
+      authorizeCodexBar({
+        stateDir: resolveAccountRoutingRoot(),
+        codexbarBin: resolveCodexBarCommand(),
+        runner: makeBoundedRunner(CODEXBAR_AUTHORIZATION_TIMEOUT_MS),
+      }),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin: resolveCswapCommand(),
@@ -2102,6 +2122,41 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
   return deps.exit(0);
 }
 
+/** Deliberately authorize one exact CodexBar generation for observer use. */
+async function runAccountsAuthorizeCodexBar(deps: MainDeps): Promise<never> {
+  let result: CodexBarAuthorizationResult;
+  try {
+    result = await deps.authorizeCodexBarFn();
+  } catch {
+    deps.writeErr(
+      "CodexBar authorization failed before completion; no raw provider or filesystem details were emitted.\n",
+    );
+    return deps.exit(1);
+  }
+
+  const digest = result.binary_sha256?.slice(0, 12) ?? "unavailable";
+  deps.write(`CodexBar authorization generation: ${digest}\n`);
+  for (const provider of ["claude", "codex"] as const) {
+    const providerResult = result.providers[provider];
+    deps.write(
+      `  ${provider}: ${providerResult.authorized ? "authorized" : "blocked"}` +
+        ` (health=${providerResult.health}` +
+        `${providerResult.failure ? `, failure=${providerResult.failure}` : ""})\n`,
+    );
+  }
+  if (!result.ok) {
+    deps.writeErr(
+      "Unsuccessful providers remain blocked from unattended observation; " +
+        "fix the provider and run this command again.\n",
+    );
+    return deps.exit(1);
+  }
+  deps.writeErr(
+    "CodexBar is authorized for unattended Keychain-backed observation.\n",
+  );
+  return deps.exit(0);
+}
+
 /**
  * `resume <name-or-id> [prompt...]`: the harness-agnostic re-attach verb.
  * Resolves `target` through the resume-policy module (via the
@@ -2377,6 +2432,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "accounts-check") {
     return runAccountsCheck(deps, dispatch.json);
+  }
+  if (dispatch.kind === "accounts-authorize-codexbar") {
+    return runAccountsAuthorizeCodexBar(deps);
   }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);

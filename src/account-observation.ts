@@ -102,6 +102,8 @@ export type ObservationHealth =
  */
 export interface Observation {
   schema_version: number;
+  /** Exact CodexBar generation used for this observation, or null when unknown. */
+  codexbar_binary_sha256: string | null;
   /** Epoch ms the observer produced this observation. Drives the staleness gate. */
   observed_at_ms: number;
   /** The Claude CodexBar gate. Selection is disabled unless this is `"ok"`. */
@@ -141,9 +143,15 @@ export interface ClaudeAccountDisplay {
  * spawn failure, or a deadline force-kill); otherwise the process exit code.
  * `stdout` is the captured, byte-capped standard output.
  */
+export type ProviderRunFailure = "timeout" | "spawn" | "authorization-required";
+
 export interface ProviderRunOutcome {
   code: number | null;
   stdout: string;
+  /** PII-free process classification; parsers continue to key on code/stdout. */
+  failure?: ProviderRunFailure;
+  /** Exact executable digest when a generation-binding runner supplied it. */
+  binary_sha256?: string;
 }
 
 /** One normalized CodexBar provider result. */
@@ -665,6 +673,7 @@ function boundNotes(notes: string[]): string[] {
  */
 export function buildObservation(input: {
   observedAtMs: number;
+  codexbarBinarySha256?: string | null;
   /** Claude provider result retained under the legacy name for compatibility. */
   codex: CodexBarObservation;
   codexCapacity?: CodexCapacityObservation;
@@ -696,6 +705,7 @@ export function buildObservation(input: {
   }
   return {
     schema_version: OBSERVATION_SCHEMA_VERSION,
+    codexbar_binary_sha256: input.codexbarBinarySha256 ?? null,
     observed_at_ms: observedAtMs,
     health: codex.health,
     codex: {
@@ -771,6 +781,9 @@ export function validateObservation(data: unknown): Observation | null {
     return null;
   }
   if (
+    (data.codexbar_binary_sha256 !== null &&
+      (typeof data.codexbar_binary_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(data.codexbar_binary_sha256))) ||
     typeof data.observed_at_ms !== "number" ||
     !Number.isFinite(data.observed_at_ms)
   ) {
@@ -803,6 +816,7 @@ export function validateObservation(data: unknown): Observation | null {
     : [];
   return {
     schema_version: OBSERVATION_SCHEMA_VERSION,
+    codexbar_binary_sha256: data.codexbar_binary_sha256,
     observed_at_ms: data.observed_at_ms,
     health: data.health,
     codex,

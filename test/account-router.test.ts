@@ -29,6 +29,7 @@ import {
   writeObservationSidecar,
 } from "../src/account-observation";
 import {
+  type SelectRouteDeps,
   selectRoute,
   selectRouteByAccountOrdinal,
 } from "../src/account-router";
@@ -40,6 +41,15 @@ import {
 } from "../src/account-routing-config";
 
 const NOW_MS = Date.UTC(2026, 5, 1, 12, 0, 0);
+const TEST_CODEXBAR_SHA256 = "a".repeat(64);
+
+function routeDeps(stateDir: string, nowMs: number = NOW_MS): SelectRouteDeps {
+  return {
+    stateDir,
+    nowMs,
+    codexbarObservationAuthorized: (sha) => sha === TEST_CODEXBAR_SHA256,
+  };
+}
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "acct-router-"));
@@ -84,7 +94,8 @@ function seedObservation(
   } = {},
 ): void {
   const obs: Observation = {
-    schema_version: 2,
+    schema_version: 3,
+    codexbar_binary_sha256: TEST_CODEXBAR_SHA256,
     observed_at_ms: opts.observedAtMs ?? NOW_MS,
     health: opts.health ?? "ok",
     codex: {
@@ -116,7 +127,7 @@ describe("selectRoute — fail-open disable gates", () => {
   test("no observation → native default", () => {
     const dir = tmp();
     try {
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel).toEqual({
         id: NATIVE_ROUTE_ID,
         kind: "native",
@@ -141,9 +152,27 @@ describe("selectRoute — fail-open disable gates", () => {
           observedAtMs: NOW_MS - 60 * 60_000, // an hour old — well past the ceiling
         },
       );
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe(NATIVE_ROUTE_ID);
       expect(sel.reason).toBe("stale-observation");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("fresh capacity from an unauthorized generation fails open", () => {
+    const dir = tmp();
+    try {
+      seedObservation(dir, [
+        nativeRoute(win("session", 0.9)),
+        managedRoute(3, win("session", 0.01)),
+      ]);
+      const sel = selectRoute({
+        ...routeDeps(dir),
+        codexbarObservationAuthorized: () => false,
+      });
+      expect(sel.id).toBe(NATIVE_ROUTE_ID);
+      expect(sel.reason).toBe("authorization-required");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -160,7 +189,7 @@ describe("selectRoute — fail-open disable gates", () => {
           health: "absent",
         },
       );
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe(NATIVE_ROUTE_ID);
       expect(sel.reason).toBe("disabled-absent");
     } finally {
@@ -172,7 +201,7 @@ describe("selectRoute — fail-open disable gates", () => {
     const dir = tmp();
     try {
       writeFileSync(observationSidecarPath(dir), "{ not json");
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe(NATIVE_ROUTE_ID);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -345,9 +374,7 @@ describe("selectRoute — account display ordinal", () => {
       seedObservation(dir, [nativeRoute(win("session", 0.2))], {
         accountOrdinals: { default: 0, "claude-swap:7": 0 },
       });
-      expect(
-        selectRoute({ stateDir: dir, nowMs: NOW_MS }).accountOrdinal,
-      ).toBeUndefined();
+      expect(selectRoute(routeDeps(dir)).accountOrdinal).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -370,7 +397,7 @@ describe("selectRoute — account display ordinal", () => {
           },
         },
       );
-      const selected = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const selected = selectRoute(routeDeps(dir));
       expect(selected.id).toBe("claude-swap:9");
       expect(selected.accountOrdinal).toBe(1);
     } finally {
@@ -386,7 +413,7 @@ describe("selectRoute — greatest worst-window headroom", () => {
     const dir = tmp();
     try {
       seedObservation(dir, [nativeRoute(win("session", 0.4))]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel).toMatchObject({
         id: NATIVE_ROUTE_ID,
         kind: "native",
@@ -405,7 +432,7 @@ describe("selectRoute — greatest worst-window headroom", () => {
         nativeRoute(win("session", 0.5)),
         managedRoute(3, win("session", 0.2)),
       ]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel).toMatchObject({
         id: "claude-swap:3",
         kind: "managed",
@@ -425,7 +452,7 @@ describe("selectRoute — greatest worst-window headroom", () => {
         managedRoute(1, win("session", 0.1), win("week", 0.8)),
         managedRoute(2, win("session", 0.5), win("week", 0.5)),
       ]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe("claude-swap:2");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -438,7 +465,7 @@ describe("selectRoute — greatest worst-window headroom", () => {
       // managed:9 has NO windows (unknown). Even though "0 usage" would look best,
       // it must be excluded — native (with windows) is the only candidate.
       seedObservation(dir, [nativeRoute(win("session", 0.9)), managedRoute(9)]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe(NATIVE_ROUTE_ID);
       expect(sel.reason).toBe("sole-candidate");
     } finally {
@@ -456,7 +483,7 @@ describe("selectRoute — greatest worst-window headroom", () => {
         nativeRoute(win("session", 0.5)),
         managedRoute(3, win("session", 0.9, pastReset)),
       ]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe("claude-swap:3");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -476,7 +503,7 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
         nativeRoute(win("session", 0.3)),
         managedRoute(3, win("session", 0.3)),
       ]);
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       expect(sel.id).toBe("claude-swap:3");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -493,8 +520,8 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
       // Two launches at the SAME instant: the first pick's reservation shifts the
       // second to the other route. Pick 1 = claude-swap:3 (id tie); pick 2's
       // reservation pressure (0.30 + 0.05 = 0.35) makes native (0.30) win.
-      const first = selectRoute({ stateDir: dir, nowMs: NOW_MS });
-      const second = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const first = selectRoute(routeDeps(dir));
+      const second = selectRoute(routeDeps(dir));
       expect(first.id).toBe("claude-swap:3");
       expect(second.id).toBe(NATIVE_ROUTE_ID);
       expect(first.id).not.toBe(second.id);
@@ -510,8 +537,8 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
         nativeRoute(win("session", 0.3)),
         managedRoute(3, win("session", 0.3)),
       ]);
-      selectRoute({ stateDir: dir, nowMs: NOW_MS });
-      selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      selectRoute(routeDeps(dir));
+      selectRoute(routeDeps(dir));
       const ledger = JSON.parse(readFileSync(ledgerPath(dir), "utf8"));
       // Exactly one reservation each, in the single shared ledger.
       expect(ledger.routes["claude-swap:3"].reservations).toHaveLength(1);
@@ -531,20 +558,14 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
         managedRoute(3, win("session", 0.2)),
       ]);
       for (let i = 0; i < 6; i++) {
-        expect(selectRoute({ stateDir: dir, nowMs: NOW_MS }).id).toBe(
-          "claude-swap:3",
-        );
+        expect(selectRoute(routeDeps(dir)).id).toBe("claude-swap:3");
       }
       // Pressure now equal → native wins the tie (LRU: never selected).
-      expect(selectRoute({ stateDir: dir, nowMs: NOW_MS }).id).toBe(
-        NATIVE_ROUTE_ID,
-      );
+      expect(selectRoute(routeDeps(dir)).id).toBe(NATIVE_ROUTE_ID);
       // Advance past the reservation TTL: the pile of reservations lapses and
       // managed:3's real 0.20 headroom is restored — it is re-selectable.
       const later = NOW_MS + RESERVATION_TTL_MS + 1;
-      expect(selectRoute({ stateDir: dir, nowMs: later }).id).toBe(
-        "claude-swap:3",
-      );
+      expect(selectRoute(routeDeps(dir, later)).id).toBe("claude-swap:3");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -558,15 +579,11 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
         managedRoute(3, win("session", 0.3)),
       ]);
       // Pick 1 at t0 → claude-swap:3 (id tie), stamping its last_selected_at.
-      expect(selectRoute({ stateDir: dir, nowMs: NOW_MS }).id).toBe(
-        "claude-swap:3",
-      );
+      expect(selectRoute(routeDeps(dir)).id).toBe("claude-swap:3");
       // Past the TTL the reservation is gone, so pressure is equal again — but LRU
       // now favors native (never selected) over the recently-used managed:3.
       const later = NOW_MS + RESERVATION_TTL_MS + 1;
-      expect(selectRoute({ stateDir: dir, nowMs: later }).id).toBe(
-        NATIVE_ROUTE_ID,
-      );
+      expect(selectRoute(routeDeps(dir, later)).id).toBe(NATIVE_ROUTE_ID);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -580,7 +597,7 @@ describe("selectRoute — tie-breaks and reservation pressure", () => {
         managedRoute(3, win("session", 0.2)),
       ]);
       writeFileSync(ledgerPath(dir), "{ not json");
-      const sel = selectRoute({ stateDir: dir, nowMs: NOW_MS });
+      const sel = selectRoute(routeDeps(dir));
       // Corrupt ledger → treated as empty → managed:3 still wins on headroom.
       expect(sel.id).toBe("claude-swap:3");
     } finally {

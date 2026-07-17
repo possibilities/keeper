@@ -59,6 +59,7 @@ import {
   RESERVATION_UTILIZATION_STEP,
   resolveAccountRoutingRoot,
 } from "./account-routing-config";
+import { isCodexBarObservationAuthorized } from "./codexbar-authorization";
 import { FileLock } from "./file-lock";
 
 /** Upper bound on distinct route entries retained in the ledger. */
@@ -89,6 +90,8 @@ export interface SelectRouteDeps {
   stateDir?: string;
   /** The selection instant (epoch ms). Defaults to `Date.now()`. */
   nowMs?: number;
+  /** Test seam; production validates the sidecar against current authorization. */
+  codexbarObservationAuthorized?: (binarySha256: string | null) => boolean;
 }
 
 /** Return a display ordinal only when claude-swap reports multiple accounts. */
@@ -238,6 +241,21 @@ function doSelectRouteByAccountOrdinal(
   };
 }
 
+function observationAuthorized(
+  deps: SelectRouteDeps,
+  stateDir: string,
+  binarySha256: string | null,
+): boolean {
+  return (
+    deps.codexbarObservationAuthorized?.(binarySha256) ??
+    isCodexBarObservationAuthorized({
+      stateDir,
+      binarySha256,
+      provider: "claude",
+    })
+  );
+}
+
 function doSelectRoute(deps: SelectRouteDeps): RouteSelection {
   const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
   const nowMs = deps.nowMs ?? Date.now();
@@ -250,6 +268,9 @@ function doSelectRoute(deps: SelectRouteDeps): RouteSelection {
   }
   if (!isObservationFresh(obs, nowMs)) {
     return nativeSelection("stale-observation");
+  }
+  if (!observationAuthorized(deps, stateDir, obs.codexbar_binary_sha256)) {
+    return nativeSelection("authorization-required", obs);
   }
   if (obs.health !== "ok") {
     // CodexBar gate closed — automatic balancing disabled. The fresh cswap
@@ -369,6 +390,14 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       ...base,
       enabled: false,
       would_choose: nativeSelection("stale-observation"),
+      candidates: [],
+    };
+  }
+  if (!observationAuthorized(deps, stateDir, obs.codexbar_binary_sha256)) {
+    return {
+      ...base,
+      enabled: false,
+      would_choose: nativeSelection("authorization-required", obs),
       candidates: [],
     };
   }

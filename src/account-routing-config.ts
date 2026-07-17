@@ -27,7 +27,7 @@ import { join } from "node:path";
  * as absent (start fresh) rather than migrated — the router fails open to the
  * native default, costing at most one stale-read.
  */
-export const OBSERVATION_SCHEMA_VERSION = 2;
+export const OBSERVATION_SCHEMA_VERSION = 3;
 
 /** The reservation-ledger schema. A mismatch discards the ledger (fail-open). */
 export const LEDGER_SCHEMA_VERSION = 1;

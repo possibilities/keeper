@@ -19,6 +19,7 @@ import {
   codexUsageResetCommandLockPath,
   codexUsageResetLatchPath,
   resolveAccountRoutingRoot,
+  resolveCodexBarCommand,
 } from "./account-routing-config";
 import {
   type CodexResetCommandResult,
@@ -29,6 +30,10 @@ import {
   type CodexResetTerminal,
   runCodexResetTui,
 } from "./codex-reset-tui";
+import {
+  isCodexBarObservationCurrent,
+  makeGenerationBoundCodexBarRunner,
+} from "./codexbar-authorization";
 import { FileLock } from "./file-lock";
 
 export const DEFAULT_CODEX_RESET_CHECK_EVERY_MS = 30_000;
@@ -804,7 +809,11 @@ export function buildProductionCodexUsageResetDeps(input: {
   readonly stateDir?: string;
 }): CodexUsageResetDeps {
   const stateDir = input.stateDir ?? resolveAccountRoutingRoot();
-  const runner = makeBoundedRunner();
+  const codexbarBin = resolveCodexBarCommand();
+  const runner = makeGenerationBoundCodexBarRunner({
+    codexbarBin,
+    runner: makeBoundedRunner(),
+  });
   return {
     stateDir,
     signal: input.signal,
@@ -815,6 +824,11 @@ export function buildProductionCodexUsageResetDeps(input: {
         maxAgeMs,
         runner,
         nowMs: () => Date.now(),
+        acceptObservation: (observation) =>
+          isCodexBarObservationCurrent({
+            binarySha256: observation.codexbar_binary_sha256,
+            codexbarBin,
+          }),
       }),
     tryAcquireCommandLock: (path) => FileLock.tryAcquire(path),
     createTerminal: () =>

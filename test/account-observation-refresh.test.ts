@@ -22,6 +22,7 @@ import {
 } from "../src/account-routing-config";
 
 const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+const TEST_CODEXBAR_SHA256 = "e".repeat(64);
 
 function providerOutcome(argv: string[]): ProviderRunOutcome {
   const providerIndex = argv.indexOf("--provider");
@@ -29,6 +30,7 @@ function providerOutcome(argv: string[]): ProviderRunOutcome {
   if (provider === "claude") {
     return {
       code: 0,
+      binary_sha256: TEST_CODEXBAR_SHA256,
       stdout: JSON.stringify([
         {
           provider: "claude",
@@ -43,6 +45,7 @@ function providerOutcome(argv: string[]): ProviderRunOutcome {
   if (provider === "codex") {
     return {
       code: 0,
+      binary_sha256: TEST_CODEXBAR_SHA256,
       stdout: JSON.stringify([
         {
           provider: "codex",
@@ -73,7 +76,8 @@ function recordingRunner(): { runner: ExactArgvRunner; calls: string[][] } {
 
 function observation(observedAtMs: number): Observation {
   return {
-    schema_version: 2,
+    schema_version: 3,
+    codexbar_binary_sha256: null,
     observed_at_ms: observedAtMs,
     health: "ok",
     codex: {
@@ -109,6 +113,7 @@ describe("observeOnce", () => {
       cswapListArgv(),
     ]);
     expect(result.health).toBe("ok");
+    expect(result.codexbar_binary_sha256).toBe(TEST_CODEXBAR_SHA256);
     expect(result.codex).toEqual({
       health: "ok",
       windows: [{ key: "week", utilization: 0.4, resetsAt: null }],
@@ -141,6 +146,48 @@ describe("refreshObservationIfStale", () => {
       expect(result?.observed_at_ms).toBe(NOW - 10);
       expect(lockAttempts).toBe(0);
       expect(calls).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a fresh sidecar rejected by the generation gate refreshes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      writeObservationSidecar(observationSidecarPath(dir), observation(NOW));
+      const { runner, calls } = recordingRunner();
+      const result = await refreshObservationIfStale({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        acceptObservation: (candidate) =>
+          candidate.codexbar_binary_sha256 === TEST_CODEXBAR_SHA256,
+        tryAcquireLock: () => held(),
+      });
+      expect(calls).toHaveLength(3);
+      expect(result?.observed_at_ms).toBe(NOW);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a newly produced superseded generation is neither published nor returned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      const { runner, calls } = recordingRunner();
+      const result = await refreshObservationIfStale({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        acceptObservation: (candidate) =>
+          candidate.codexbar_binary_sha256 === "f".repeat(64),
+        tryAcquireLock: () => held(),
+      });
+      expect(calls).toHaveLength(3);
+      expect(result).toBeNull();
+      expect(readObservationSidecar(observationSidecarPath(dir))).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

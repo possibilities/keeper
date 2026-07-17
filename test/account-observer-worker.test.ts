@@ -80,7 +80,7 @@ function fakeLock(): { release(): void } {
 }
 
 describe("AccountObserver", () => {
-  test("one cycle uses the shared three-provider refresher and publishes v2", async () => {
+  test("one cycle uses the shared three-provider refresher and publishes v3", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
     try {
       const { runner, calls } = runnerWithCalls();
@@ -98,7 +98,7 @@ describe("AccountObserver", () => {
 
       expect(calls).toEqual([CLAUDE_ARGV, CODEX_ARGV, CSWAP_ARGV]);
       const observation = readObservationSidecar(observationSidecarPath(dir));
-      expect(observation?.schema_version).toBe(2);
+      expect(observation?.schema_version).toBe(3);
       expect(observation?.routes.map((route) => route.id)).toEqual([
         NATIVE_ROUTE_ID,
         "claude-swap:3",
@@ -175,15 +175,14 @@ describe("AccountObserver", () => {
 });
 
 describe("provider subprocess environment", () => {
-  test("forces CodexBar keychain access off without mutating input", () => {
+  test("removes the retired disable flag without mutating input", () => {
     const inherited = {
       PATH: "/test/bin",
-      CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "0",
-    };
-    expect(providerSubprocessEnvironment(inherited)).toEqual({
-      PATH: "/test/bin",
       CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "1",
-    });
-    expect(inherited.CODEXBAR_DISABLE_KEYCHAIN_ACCESS).toBe("0");
+    };
+    const environment = providerSubprocessEnvironment(inherited);
+    expect(environment).toEqual({ PATH: "/test/bin" });
+    expect(environment).not.toBe(inherited);
+    expect(inherited.CODEXBAR_DISABLE_KEYCHAIN_ACCESS).toBe("1");
   });
 });

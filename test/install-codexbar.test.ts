@@ -479,23 +479,33 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     );
   });
 
-  test("pins a valid signed generation unless an update is explicitly requested", () => {
+  test("checks source authorities automatically while unchanged inputs stay idempotent", () => {
     const repair = ORCHESTRATION.indexOf("codexbar_prepare_startup_link");
-    const pin = ORCHESTRATION.indexOf(
-      `[ "\${KEEPER_CODEXBAR_UPDATE:-0}" != "1" ]`,
-    );
     const sourceState = ORCHESTRATION.indexOf(
       `mktemp -d "\${TMPDIR:-/tmp}/keeper-codexbar-source.XXXXXX"`,
     );
     const fetch = ORCHESTRATION.indexOf("fetch --quiet --no-tags");
-
-    expect(pin).toBeGreaterThan(repair);
-    expect(pin).toBeLessThan(sourceState);
-    expect(pin).toBeLessThan(fetch);
-    expect(ORCHESTRATION).toContain("codexbar_signed_generation_valid");
-    expect(ORCHESTRATION).toContain(
-      "CodexBar CLI signed generation pinned; set KEEPER_CODEXBAR_UPDATE=1 to check for updates",
+    const provenance = ORCHESTRATION.indexOf("codexbar_provenance_matches");
+    const unchanged = ORCHESTRATION.indexOf(
+      "CodexBar CLI inputs unchanged; no rebuild",
     );
+
+    expect(sourceState).toBeGreaterThan(repair);
+    expect(fetch).toBeGreaterThan(sourceState);
+    expect(provenance).toBeGreaterThan(fetch);
+    expect(unchanged).toBeGreaterThan(provenance);
+    expect(SECTION).not.toContain("KEEPER_CODEXBAR_UPDATE");
+  });
+
+  test("a published generation requests deliberate foreground authorization", () => {
+    expect(SECTION).not.toContain("--provider");
+    expect(PUBLISH).toContain(
+      "keeper agent accounts authorize-codexbar to authorize unattended Keychain-backed observation",
+    );
+    const install = PUBLISH.indexOf("codexbar_atomic_install");
+    expect(
+      PUBLISH.indexOf('codexbar_notify "installed', install),
+    ).toBeGreaterThan(install);
   });
 
   test("uses provenance for stable resolved inputs but retries unavailable upstream", () => {
@@ -525,13 +535,10 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     expect(SECTION).toContain("the previous binary was retained");
   });
 
-  test("pins keeperd to the stable home path with headless Keychain access disabled", () => {
+  test("pins keeperd to the stable home path without disabling Keychain access", () => {
     expect(PLIST).toContain("<key>KEEPER_CODEXBAR_BIN</key>");
     expect(PLIST).toContain("<string>/Users/mike/.local/bin/codexbar</string>");
-    expect(PLIST).toContain("<key>CODEXBAR_DISABLE_KEYCHAIN_ACCESS</key>");
-    expect(PLIST).toMatch(
-      /<key>CODEXBAR_DISABLE_KEYCHAIN_ACCESS<\/key>\s*<string>1<\/string>/,
-    );
+    expect(PLIST).not.toContain("CODEXBAR_DISABLE_KEYCHAIN_ACCESS");
     expect(PLIST).not.toContain(
       "<string>/Users/mike/.local/share/keeper/codexbar/CodexBarCLI</string>",
     );

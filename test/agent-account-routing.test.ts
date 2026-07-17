@@ -325,6 +325,68 @@ describe("keeper agent accounts check", () => {
     expect(text).toContain("claude-swap:2 [managed]");
   });
 });
+
+describe("keeper agent accounts authorize-codexbar", () => {
+  test("runs the foreground authorization seam without launching an agent", async () => {
+    let calls = 0;
+    const h = makeHarness({
+      argv: ["accounts", "authorize-codexbar"],
+      rawArgv: true,
+      authorizeCodexBar: async () => {
+        calls += 1;
+        return {
+          schema_version: 1,
+          binary_sha256: "b".repeat(64),
+          providers: {
+            claude: { authorized: true, health: "ok", failure: null },
+            codex: { authorized: true, health: "ok", failure: null },
+          },
+          ok: true,
+        };
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(0);
+    expect(calls).toBe(1);
+    expect(h.spawned).toEqual([]);
+    expect(h.out.join("")).toContain("claude: authorized");
+    expect(h.out.join("")).toContain("codex: authorized");
+  });
+
+  test("redacts filesystem details from authorization faults", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "authorize-codexbar"],
+      rawArgv: true,
+      authorizeCodexBar: async () => {
+        throw new Error("/Users/private/.local/state/receipt failed");
+      },
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(1);
+    expect(h.err.join("")).toContain("failed before completion");
+    expect(h.err.join("")).not.toContain("/Users/private");
+  });
+
+  test("keeps an unsuccessful provider blocked and exits nonzero", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "authorize-codexbar"],
+      rawArgv: true,
+      authorizeCodexBar: async () => ({
+        schema_version: 1,
+        binary_sha256: "c".repeat(64),
+        providers: {
+          claude: { authorized: true, health: "ok", failure: null },
+          codex: { authorized: false, health: "error", failure: "timeout" },
+        },
+        ok: false,
+      }),
+    });
+    const code = await expectExit(main(h.deps));
+    expect(code).toBe(1);
+    expect(h.out.join("")).toContain("codex: blocked");
+    expect(h.err.join("")).toContain("remain blocked");
+  });
+});
 // ---------------------------------------------------------------------------
 // inspectRouting — read-only snapshot over a real sidecar fixture
 // ---------------------------------------------------------------------------
@@ -336,9 +398,11 @@ function win(
   return { key, utilization, resetsAt };
 }
 const NOW = Date.UTC(2026, 5, 1, 12, 0, 0);
+const TEST_CODEXBAR_SHA256 = "d".repeat(64);
 function seed(stateDir: string, routes: Route[]): void {
   const obs: Observation = {
-    schema_version: 2,
+    schema_version: 3,
+    codexbar_binary_sha256: TEST_CODEXBAR_SHA256,
     observed_at_ms: NOW,
     health: "ok",
     codex: {
@@ -372,7 +436,11 @@ describe("inspectRouting is read-only", () => {
           measuredAtMs: NOW,
         },
       ]);
-      const result = inspectRouting({ stateDir: dir, nowMs: NOW });
+      const result = inspectRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        codexbarObservationAuthorized: (sha) => sha === TEST_CODEXBAR_SHA256,
+      });
       expect(result.health).toBe("ok");
       expect(result.enabled).toBe(true);
       // Greatest worst-window headroom: 0.2 < 0.8 → the managed slot wins.

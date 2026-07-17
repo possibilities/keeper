@@ -113,7 +113,9 @@ fi
 if [ -d "${pi_subagents_fork}/.git" ]; then
   # Register the checkout as pi's package source (never-clobber: adds the
   # local-path entry only when absent; drops a redundant npm registry entry
-  # for the same package so pi never double-loads it).
+  # for the same package so pi never double-loads it). JavaScript reads its
+  # values from the environment; shell expansion inside the program is unsafe.
+  # shellcheck disable=SC2016
   ( cd "${repo_root}" && PI_SUBAGENTS_FORK="${pi_subagents_fork}" bun -e '
     const { readFileSync, writeFileSync, mkdirSync, existsSync } = require("node:fs");
     const { join } = require("node:path");
@@ -363,9 +365,8 @@ codexbar_provenance_value() {
 }
 
 # Validate the installed artifact independently of mutable source refs. A local
-# certificate stabilizes its trusted-application requirement, but macOS assigns
-# non-Apple code a cdhash Keychain partition. Keep that CodeDirectory frozen
-# unless the operator explicitly requests an update.
+# certificate stabilizes its trusted-application requirement, while the binary
+# digest lets Keeper detect an automatic update that needs fresh authorization.
 codexbar_signed_generation_valid() {
   local expected_binary_sha actual_binary_sha architecture
   local signing_identity signing_identifier signing_requirement
@@ -393,8 +394,8 @@ codexbar_signed_generation_valid() {
 
 # A resolved fork/upstream pair has a deterministic prior outcome. Trust a
 # complete managed record for that exact pair and mode only after validating the
-# published signed generation. Explicit update requests still skip a rebuild
-# when both source authorities are unchanged.
+# published signed generation. Every install checks the authorities; unchanged
+# inputs remain an idempotent no-op.
 codexbar_provenance_matches() {
   local fork_sha upstream_sha mode built_sha built_tree_sha swift_version
   fork_sha="$1"
@@ -675,6 +676,7 @@ codexbar_remove_cask() {
 
 codexbar_publish_build() {
   local source fork_sha upstream_sha mode built_sha fallback_reason cask_failed
+  local authorization_note
   source="$1"
   fork_sha="$2"
   upstream_sha="$3"
@@ -682,6 +684,7 @@ codexbar_publish_build() {
   built_sha="$5"
   fallback_reason="$6"
   cask_failed=0
+  authorization_note="run keeper agent accounts authorize-codexbar to authorize unattended Keychain-backed observation"
 
   if ! codexbar_atomic_install "${source}/.build/release/CodexBarCLI" \
     "${fork_sha}" \
@@ -706,12 +709,14 @@ codexbar_publish_build() {
   fi
   if [ -n "${fallback_reason}" ]; then
     if [ "${cask_failed}" -ne 0 ]; then
-      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}; Homebrew cask removal failed"
+      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}; Homebrew cask removal failed; ${authorization_note}"
     else
-      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}"
+      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}; ${authorization_note}"
     fi
   elif [ "${cask_failed}" -ne 0 ]; then
-    codexbar_notify "installed the rebased CLI, but Homebrew cask removal failed"
+    codexbar_notify "installed the rebased CLI, but Homebrew cask removal failed; ${authorization_note}"
+  else
+    codexbar_notify "installed the rebased CLI at ${built_sha:0:10}; ${authorization_note}"
   fi
   echo "install: installed CodexBar CLI (${mode}, ${built_sha:0:10})"
 }
@@ -738,13 +743,6 @@ codexbar_cli_install() (
   fi
   if ! codexbar_prepare_startup_link; then
     codexbar_notify "could not repair the CodexBar CLI startup link; the previous binary was retained"
-    return 0
-  fi
-  if [ "${KEEPER_CODEXBAR_UPDATE:-0}" != "1" ] \
-    && codexbar_signed_generation_valid; then
-    echo "install: CodexBar CLI signed generation pinned; set KEEPER_CODEXBAR_UPDATE=1 to check for updates"
-    codexbar_remove_cask \
-      || echo "install: Homebrew CodexBar cask removal failed (non-fatal)" >&2
     return 0
   fi
   if ! source_state="$(mktemp -d "${TMPDIR:-/tmp}/keeper-codexbar-source.XXXXXX")"; then

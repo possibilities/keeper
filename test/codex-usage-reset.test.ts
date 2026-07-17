@@ -38,7 +38,8 @@ function observation(
   } = {},
 ): Observation {
   return {
-    schema_version: 2,
+    schema_version: 3,
+    codexbar_binary_sha256: null,
     observed_at_ms: nowMs,
     health: "ok",
     codex: {

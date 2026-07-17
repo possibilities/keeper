@@ -54,8 +54,14 @@ export async function observeOnce(deps: ObserveDeps): Promise<Observation> {
     deps.runner(cswapArgv),
   ]);
   const observedAtMs = deps.nowMs();
+  const codexbarBinarySha256 =
+    claudeOutcome.binary_sha256 !== undefined &&
+    claudeOutcome.binary_sha256 === codexOutcome.binary_sha256
+      ? claudeOutcome.binary_sha256
+      : null;
   return buildObservation({
     observedAtMs,
+    codexbarBinarySha256,
     codex: parseCodexBar(claudeOutcome),
     codexCapacity: parseCodexBarCodex(codexOutcome),
     cswap: parseCswapList(
@@ -89,6 +95,8 @@ export interface RefreshObservationDeps extends ObserveDeps {
   contentionWaitMs?: number;
   /** Total time allowed for another refresher to publish. */
   contentionTimeoutMs?: number;
+  /** Reject existing or newly produced state from a superseded generation. */
+  acceptObservation?: (observation: Observation) => boolean;
 }
 
 const DEFAULT_CONTENTION_WAIT_MS = 100;
@@ -112,7 +120,8 @@ export async function refreshObservationIfStale(
   const freshSidecar = (): Observation | null => {
     const observation = readObservationSidecar(sidecar);
     return observation &&
-      isObservationFresh(observation, deps.nowMs(), deps.maxAgeMs)
+      isObservationFresh(observation, deps.nowMs(), deps.maxAgeMs) &&
+      (deps.acceptObservation?.(observation) ?? true)
       ? observation
       : null;
   };
@@ -141,13 +150,19 @@ export async function refreshObservationIfStale(
     lock = acquire(lockPath);
   }
   if (lock === null) {
-    return readObservationSidecar(sidecar);
+    const observation = readObservationSidecar(sidecar);
+    return observation && (deps.acceptObservation?.(observation) ?? true)
+      ? observation
+      : null;
   }
 
   try {
     const underLock = freshSidecar();
     if (underLock) return underLock;
     const observation = await observeOnce(deps);
+    if (!(deps.acceptObservation?.(observation) ?? true)) {
+      return null;
+    }
     publishObservation(deps.stateDir, observation);
     return observation;
   } finally {
@@ -155,16 +170,13 @@ export async function refreshObservationIfStale(
   }
 }
 
-const CODEXBAR_DISABLE_KEYCHAIN_ACCESS = "CODEXBAR_DISABLE_KEYCHAIN_ACCESS";
-
-/** Force headless CodexBar operation for every provider child. */
+/** Build the provider environment without Keeper's retired disable flag. */
 export function providerSubprocessEnvironment(
   inherited: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, string | undefined> {
-  return {
-    ...inherited,
-    [CODEXBAR_DISABLE_KEYCHAIN_ACCESS]: "1",
-  };
+  const environment = { ...inherited };
+  delete environment.CODEXBAR_DISABLE_KEYCHAIN_ACCESS;
+  return environment;
 }
 
 /** Build the no-shell, output-capped, deadline-bounded production runner. */
@@ -213,11 +225,11 @@ export function makeBoundedRunner(
             // best effort; the caller still receives an unavailable outcome
           }
         }
-        return { code: null, stdout: "" };
+        return { code: null, stdout: "", failure: "timeout" };
       }
       return { code: race, stdout: await drain };
     } catch {
-      return { code: null, stdout: "" };
+      return { code: null, stdout: "", failure: "spawn" };
     }
   };
 }

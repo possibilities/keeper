@@ -579,7 +579,7 @@ describe("buildObservation", () => {
       codexCapacity,
       cswap,
     });
-    expect(obs.schema_version).toBe(2);
+    expect(obs.schema_version).toBe(3);
     expect(obs.codex.resetCreditsAvailableCount).toBe(3);
     const serialized = JSON.stringify(obs);
     expect(serialized).not.toContain("@");
@@ -612,7 +612,8 @@ describe("observation sidecar", () => {
     try {
       const path = join(dir, "observation.json");
       const obs: Observation = {
-        schema_version: 2,
+        schema_version: 3,
+        codexbar_binary_sha256: null,
         observed_at_ms: NOW_MS,
         health: "ok",
         codex: {
@@ -681,7 +682,8 @@ describe("observation sidecar", () => {
       writeFileSync(
         path,
         JSON.stringify({
-          schema_version: 2,
+          schema_version: 3,
+          codexbar_binary_sha256: null,
           observed_at_ms: NOW_MS,
           health: "ok",
           codex: {
@@ -717,7 +719,8 @@ describe("observation sidecar", () => {
         writeFileSync(
           path,
           JSON.stringify({
-            schema_version: 2,
+            schema_version: 3,
+            codexbar_binary_sha256: null,
             observed_at_ms: NOW_MS,
             health: "ok",
             codex: {
@@ -743,7 +746,8 @@ describe("observation sidecar", () => {
     try {
       const path = join(dir, "observation.json");
       writeObservationSidecar(path, {
-        schema_version: 2,
+        schema_version: 3,
+        codexbar_binary_sha256: null,
         observed_at_ms: NOW_MS,
         health: "ok",
         codex: {
@@ -764,7 +768,8 @@ describe("observation sidecar", () => {
 
   test("freshness gate: within the ceiling is fresh, past it is stale", () => {
     const obs: Observation = {
-      schema_version: 2,
+      schema_version: 3,
+      codexbar_binary_sha256: null,
       observed_at_ms: NOW_MS,
       health: "ok",
       codex: {

@@ -31,10 +31,11 @@ export type Dispatch =
   // reachability drift.
   | { kind: "providers-resolve"; model: string; effort: string }
   | { kind: "providers-check" }
-  // The read-only account-routing diagnostic: `accounts check [--json]` reports
-  // integration health, snapshot age, PII-free candidates, and the route policy
-  // would choose — WITHOUT reserving a route.
+  // Account-routing diagnostics and deliberate CodexBar authorization. The
+  // check path is read-only; authorization runs exact provider probes and writes
+  // only a generation-bound, PII-free receipt.
   | { kind: "accounts-check"; json: boolean }
+  | { kind: "accounts-authorize-codexbar" }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
   // in one process; `wait-capture` runs wait→show on an already-launched handle.
@@ -77,6 +78,9 @@ Usage:
   keeper agent presets list [--json]   List configured presets + panels.
   keeper agent accounts check [--json] Report account-routing health + the route
                                     the policy would choose (read-only).
+  keeper agent accounts authorize-codexbar
+                                    Deliberately authorize the current signed CLI
+                                    for unattended Keychain-backed observation.
   keeper agent providers resolve <model> <effort>
                                     Emit the cost-ordered serving candidates for a
                                     model from the host matrix (no_route exit 3 for
@@ -209,6 +213,11 @@ Account routing:
                                     PII-free candidates, and the route the
                                     policy would choose for the next Claude
                                     launch — read-only, reserves nothing.
+  keeper agent accounts authorize-codexbar
+                                    Run the Claude and Codex provider checks
+                                    serially in the foreground, allow deliberate
+                                    macOS authorization, and authorize only the
+                                    providers that return valid capacity.
 
 tmux transport flags (any one implies tmux mode):
   --x-tmux                  Open the invocation in a new tmux window.
@@ -410,6 +419,9 @@ export function splitSubcommand(argv: string[]): Dispatch {
   if (head === "accounts") {
     if (argv[1] === "check") {
       return { kind: "accounts-check", json: argv.slice(2).includes("--json") };
+    }
+    if (argv[1] === "authorize-codexbar" && argv.length === 2) {
+      return { kind: "accounts-authorize-codexbar" };
     }
     return { kind: "usage", unknown: `accounts ${argv[1] ?? ""}`.trim() };
   }
