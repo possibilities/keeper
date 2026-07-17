@@ -7,7 +7,7 @@
     "fn-1301-honest-daemon-restart-verdict"
   ],
   "id": "fn-1302-harden-restart-verb-ledger-read",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T04:22:14.049000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T04:22:13.497000Z"
+  "updated_at": "2026-07-17T04:22:14.049000Z"
 }
