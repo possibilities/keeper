@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Honest daemon restart verdict",
-  "updated_at": "2026-07-17T03:59:34.627000Z"
+  "updated_at": "2026-07-17T04:10:34.122000Z",
+  "worker_done_at": "2026-07-17T04:10:34.122000Z"
 }

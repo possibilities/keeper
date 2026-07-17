@@ -25,5 +25,5 @@ Make the restart verdict evidence-based: capture bounded stdout/stderr from the 
 - [ ] The focused test covers all three outcomes through injected kickstart/ledger/probe seams with no real daemon or launchctl
 
 ## Done summary
-
+Restart verdict now requires fresh ledger-boot evidence alongside healthy probes; a nonzero kickstart that reaches a fresh healthy boot succeeds with a bounded kickstart_warning, while kickstart-failed is reserved for no fresh boot by the deadline and retains the bounded output.
 ## Evidence
