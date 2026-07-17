@@ -7,11 +7,11 @@
   ],
   "epic": "fn-1313-bounded-epic-index-fold-and-honest",
   "id": "fn-1313-bounded-epic-index-fold-and-honest.3",
-  "model": "gpt-5.5",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fold-cost bench gate",
-  "updated_at": "2026-07-17T17:14:21.373000Z"
+  "updated_at": "2026-07-17T17:53:10.939000Z"
 }
