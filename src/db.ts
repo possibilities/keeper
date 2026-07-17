@@ -5084,7 +5084,8 @@ export function resolveBackstopLogPath(): string {
  * The durable crash-loop restart ledger: main appends each boot's timestamp here so a
  * self-restart storm is detectable from the NEXT boot. Deliberately a plain state-dir
  * sidecar, NOT keeper.db and NOT a fold — it must survive the very crash it measures.
- * Main is the SOLE reader/writer; never touches a projection or the reducer. Pure.
+ * Main is the SOLE writer; the keeper daemon restart CLI reader shares this path
+ * resolution as a second reader; never touches a projection or the reducer. Pure.
  */
 export function resolveRestartLedgerPath(): string {
   const override = process.env.KEEPER_RESTART_LEDGER;

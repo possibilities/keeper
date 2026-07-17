@@ -6,6 +6,7 @@ import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { resolveRestartLedgerPath } from "../src/db";
 import { parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
@@ -237,13 +238,10 @@ function isFreshBoot(
   );
 }
 
-async function readLatestBoot(): Promise<RestartBootMarker | null> {
+export async function readLatestBoot(): Promise<RestartBootMarker | null> {
   let raw: string;
   try {
-    raw = await readFile(
-      join(homedir(), ".local", "state", "keeper", "restart-ledger.json"),
-      "utf8",
-    );
+    raw = await readFile(resolveRestartLedgerPath(), "utf8");
   } catch {
     return null;
   }
