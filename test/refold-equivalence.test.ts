@@ -860,6 +860,81 @@ test("charter excludes the EPHEMERAL projections — no ephemeral table leaks in
   }
 });
 
+test("attempt- and incident-fenced DispatchCleared history re-folds byte-identically", () => {
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "work::fn-fenced-refold.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-fenced-refold.1",
+      dir: "/repo",
+      ts: 1700,
+      attempt_id: 700,
+      expected_attempt_id: null,
+    }),
+  });
+  const firstIncident = insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "work::fn-fenced-refold.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-fenced-refold.1",
+      reason: "first",
+      dir: "/repo",
+      ts: 1710,
+      attempt_id: 700,
+    }),
+  });
+  insertEvent({
+    hook_event: "DispatchCleared",
+    session_id: "work::fn-fenced-refold.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-fenced-refold.1",
+      expected_attempt_id: 699,
+      expected_instance_event_id: firstIncident,
+    }),
+  });
+  insertEvent({
+    hook_event: "DispatchFailed",
+    session_id: "work::fn-fenced-refold.1",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-fenced-refold.1",
+      reason: "second",
+      dir: "/repo",
+      ts: 1720,
+      attempt_id: 700,
+    }),
+  });
+  drainAll();
+
+  const failuresBefore = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all();
+  const claimsBefore = db
+    .query("SELECT * FROM dispatch_claims ORDER BY verb, id")
+    .all();
+  expect(failuresBefore).toHaveLength(1);
+  expect(failuresBefore[0]).toMatchObject({
+    attempt_id: 700,
+    reason: "second",
+  });
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM dispatch_claims");
+  db.run("DELETE FROM pending_dispatches");
+  drainAll();
+
+  expect(
+    db.query("SELECT * FROM dispatch_failures ORDER BY verb, id").all(),
+  ).toEqual(failuresBefore);
+  expect(
+    db.query("SELECT * FROM dispatch_claims ORDER BY verb, id").all(),
+  ).toEqual(claimsBefore);
+});
+
 test("resurrection regression: a full re-fold over historical Dispatched events leaves pending_dispatches empty at serve; dispatch_failures + dispatch_never_bound survive", () => {
   // Seed the EXACT shape that jammed dispatch in v76→v79: historical `Dispatched`
   // events that fold into open `pending_dispatches` rows (no discharge), plus a

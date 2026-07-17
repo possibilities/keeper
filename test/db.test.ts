@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AWAITS_DESCRIPTOR,
+  DISPATCH_FAILURES_DESCRIPTOR,
   JOBS_DESCRIPTOR,
   selectByIds,
 } from "../src/collections";
@@ -623,6 +624,54 @@ test("openDb adds nullable escalation_instance to jobs + instance_event_id to di
         .get() as { instance_event_id: number | null }
     ).instance_event_id,
   ).toBeNull();
+  db.close();
+});
+
+test("openDb adds nullable Dispatch attempt owners to failures and mint gates", () => {
+  expect(DISPATCH_FAILURES_DESCRIPTOR.columns).toContain("attempt_id");
+  expect(DISPATCH_FAILURES_DESCRIPTOR.columns).toContain("instance_event_id");
+  const { db } = openDb(":memory:");
+  for (const table of ["dispatch_failures", "dispatch_mint_gate"] as const) {
+    const owner = (
+      db.prepare(`PRAGMA table_info(${table})`).all() as {
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+        cid: number;
+        pk: number;
+      }[]
+    ).find((column) => column.name === "attempt_id");
+    expect(owner).toEqual({
+      name: "attempt_id",
+      type: "INTEGER",
+      notnull: 0,
+      dflt_value: null,
+      pk: 0,
+      cid: expect.any(Number),
+    });
+  }
+
+  db.prepare(
+    "INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at) VALUES ('work', 'legacy', 'r', 1, 1, 1, 1)",
+  ).run();
+  db.prepare(
+    "INSERT INTO dispatch_mint_gate (dispatch_key, minted_at) VALUES ('work::legacy', 1)",
+  ).run();
+  expect(
+    db
+      .prepare(
+        "SELECT attempt_id FROM dispatch_failures WHERE verb = 'work' AND id = 'legacy'",
+      )
+      .get(),
+  ).toEqual({ attempt_id: null });
+  expect(
+    db
+      .prepare(
+        "SELECT attempt_id FROM dispatch_mint_gate WHERE dispatch_key = 'work::legacy'",
+      )
+      .get(),
+  ).toEqual({ attempt_id: null });
   db.close();
 });
 
@@ -3169,7 +3218,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v122 backfills the `autopilot_state.worker_provider` family-label value
   // 'codex' → 'gpt' (docs/adr/0047 amendment) — a pure data UPDATE that does
   // not touch the epics table SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(130);
+  expect(SCHEMA_VERSION).toBe(131);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

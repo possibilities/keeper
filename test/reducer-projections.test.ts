@@ -585,11 +585,19 @@ function dispatchFailedEvent(
   dir: string | null,
   ts: number,
   sessionId = "reconciler",
+  attemptId?: number | null,
 ): number {
   return insertEvent({
     hook_event: "DispatchFailed",
     session_id: sessionId,
-    data: JSON.stringify({ verb, id, reason, dir, ts }),
+    data: JSON.stringify({
+      verb,
+      id,
+      reason,
+      dir,
+      ts,
+      ...(attemptId === undefined ? {} : { attempt_id: attemptId }),
+    }),
   });
 }
 
@@ -597,11 +605,24 @@ function dispatchClearedEvent(
   verb: string,
   id: string,
   sessionId = "reconciler",
+  fences?: {
+    expectedAttemptId?: unknown;
+    expectedInstanceEventId?: unknown;
+  },
 ): number {
   return insertEvent({
     hook_event: "DispatchCleared",
     session_id: sessionId,
-    data: JSON.stringify({ verb, id }),
+    data: JSON.stringify({
+      verb,
+      id,
+      ...(fences != null && Object.hasOwn(fences, "expectedAttemptId")
+        ? { expected_attempt_id: fences.expectedAttemptId }
+        : {}),
+      ...(fences != null && Object.hasOwn(fences, "expectedInstanceEventId")
+        ? { expected_instance_event_id: fences.expectedInstanceEventId }
+        : {}),
+    }),
   });
 }
 
@@ -617,6 +638,8 @@ function getDispatchFailure(verb: string, id: string) {
     last_event_id: number;
     created_at: number;
     updated_at: number;
+    instance_event_id: number | null;
+    attempt_id: number | null;
   } | null;
 }
 
@@ -679,6 +702,38 @@ test("DispatchFailed UPSERT preserves created_at but updates reason / dir / ts /
   expect(after?.last_event_id).toBeGreaterThan(firstId);
 });
 
+test("DispatchFailed tracks the latest informational attempt while preserving the incident fence", () => {
+  const first = dispatchFailedEvent(
+    "work",
+    "fn-owner.1",
+    "first",
+    "/repo",
+    1600,
+    "reconciler",
+    10,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-owner.1")).toMatchObject({
+    instance_event_id: first,
+    attempt_id: 10,
+  });
+
+  dispatchFailedEvent(
+    "work",
+    "fn-owner.1",
+    "again",
+    "/repo",
+    1650,
+    "reconciler",
+    11,
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-owner.1")).toMatchObject({
+    instance_event_id: first,
+    attempt_id: 11,
+  });
+});
+
 test("DispatchFailed with a null/missing dir folds dir to NULL", () => {
   dispatchFailedEvent("plan-plan", "fn-Y.1", "confirm_timeout", null, 1700);
   drainAll();
@@ -703,6 +758,45 @@ test("DispatchCleared on a non-existent (verb, id) is a safe no-op (cursor still
   expect(drainAll()).toBe(1);
   expect(getDispatchFailure("plan-plan", "fn-never-failed.1")).toBeNull();
   expect(getCursor()).toBe(id);
+});
+
+test("malformed DispatchCleared payloads are safe no-ops with Cursor advance", () => {
+  dispatchFailedEvent("work", "fn-clear-malformed.1", "failed", null, 1700);
+  drainAll();
+  const incident = getDispatchFailure(
+    "work",
+    "fn-clear-malformed.1",
+  )?.instance_event_id;
+  const malformed = [
+    "{",
+    JSON.stringify({ id: "fn-clear-malformed.1" }),
+    JSON.stringify({ verb: "work", id: "" }),
+    JSON.stringify({
+      verb: "work",
+      id: "fn-clear-malformed.1",
+      expected_attempt_id: 0,
+      expected_instance_event_id: "bad",
+    }),
+    JSON.stringify({
+      verb: "work",
+      id: "fn-clear-malformed.1",
+      expected_attempt_id: null,
+      expected_instance_event_id: null,
+    }),
+  ];
+  let lastId = 0;
+  for (const data of malformed) {
+    lastId = insertEvent({
+      hook_event: "DispatchCleared",
+      session_id: "reconciler",
+      data,
+    });
+  }
+  expect(() => drainAll()).not.toThrow();
+  expect(
+    getDispatchFailure("work", "fn-clear-malformed.1")?.instance_event_id,
+  ).toBe(incident);
+  expect(getCursor()).toBe(lastId);
 });
 
 test("Distinct (verb, id) pairs coexist as separate rows", () => {
@@ -2843,6 +2937,234 @@ test("concurrent acquisition and supersession preserve the current attempt fence
   expect(getCursor()).toBe(reused);
 });
 
+test("DispatchCleared independently fences a stale incident from newer attempt-owned state", () => {
+  const verb = "work";
+  const id = "fn-clear-fence.1";
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb,
+    id,
+    attempt_id: 100,
+    expected_attempt_id: null,
+  });
+  const incidentA = dispatchFailedEvent(
+    verb,
+    id,
+    "launch-failed",
+    "/repo",
+    1700,
+    "reconciler",
+    100,
+  );
+  dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb,
+    id,
+    expected_attempt_id: 100,
+    next_attempt_id: 200,
+  });
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1800,
+      attempt_id: 200,
+      expected_attempt_id: 100,
+    }),
+  });
+  drainAll();
+  db.run(
+    "INSERT INTO dispatch_mint_gate (dispatch_key, minted_at, attempt_id) VALUES (?, ?, ?)",
+    [`${verb}::${id}`, 1800, 200],
+  );
+
+  dispatchClearedEvent(verb, id, "reconciler", {
+    expectedAttemptId: 100,
+    expectedInstanceEventId: incidentA,
+  });
+  dispatchClearedEvent(verb, id, "reconciler", {
+    expectedAttemptId: 100,
+    expectedInstanceEventId: incidentA,
+  });
+  drainAll();
+
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: 200,
+    state: "acquired",
+  });
+  expect(getPendingDispatch(verb, id)?.attempt_id).toBe(200);
+  expect(
+    db
+      .query("SELECT attempt_id FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get(`${verb}::${id}`),
+  ).toEqual({ attempt_id: 200 });
+
+  dispatchClearedEvent(verb, id, "reconciler", {
+    expectedAttemptId: 200,
+    expectedInstanceEventId: null,
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: 200,
+    state: "released",
+  });
+  expect(getPendingDispatch(verb, id)).toBeNull();
+  expect(
+    db
+      .query("SELECT * FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get(`${verb}::${id}`),
+  ).toBeNull();
+});
+
+test("claimless incident clear cannot release a Dispatch claim", () => {
+  const verb = "close";
+  const id = "fn-claimless-clear";
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb,
+    id,
+    attempt_id: 300,
+    expected_attempt_id: null,
+  });
+  const incident = dispatchFailedEvent(
+    verb,
+    id,
+    "shared-checkout-desync",
+    "/repo",
+    1900,
+  );
+  drainAll();
+
+  dispatchClearedEvent(verb, id, "reconciler", {
+    expectedAttemptId: null,
+    expectedInstanceEventId: incident,
+  });
+  drainAll();
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: 300,
+    state: "acquired",
+  });
+});
+
+test("tokenless and partial DispatchCleared payloads allocate no modern wildcard authority", () => {
+  const seed = (id: string, attemptId: number): number => {
+    dispatchClaimEvent("DispatchClaimAcquired", {
+      verb: "work",
+      id,
+      attempt_id: attemptId,
+      expected_attempt_id: null,
+    });
+    insertEvent({
+      hook_event: "Dispatched",
+      session_id: "reconciler",
+      data: JSON.stringify({
+        verb: "work",
+        id,
+        dir: "/repo",
+        ts: 2000,
+        attempt_id: attemptId,
+        expected_attempt_id: null,
+      }),
+    });
+    return dispatchFailedEvent(
+      "work",
+      id,
+      "failed",
+      "/repo",
+      2001,
+      "reconciler",
+      attemptId,
+    );
+  };
+
+  seed("fn-tokenless-modern.1", 400);
+  const validIncident = seed("fn-partial-incident.1", 401);
+  const malformedIncident = seed("fn-partial-attempt.1", 402);
+  drainAll();
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-tokenless-modern.1",
+      dir: "/repo",
+      ts: 2002,
+      attempt_id: 400,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  db.run(
+    "INSERT INTO dispatch_mint_gate (dispatch_key, minted_at, attempt_id) VALUES (?, ?, ?)",
+    ["work::fn-tokenless-modern.1", 2002, 400],
+  );
+
+  dispatchClearedEvent("work", "fn-tokenless-modern.1");
+  dispatchClearedEvent("work", "fn-partial-incident.1", "reconciler", {
+    expectedAttemptId: "bad",
+    expectedInstanceEventId: validIncident,
+  });
+  dispatchClearedEvent("work", "fn-partial-attempt.1", "reconciler", {
+    expectedAttemptId: 402,
+    expectedInstanceEventId: "bad",
+  });
+  drainAll();
+
+  expect(getDispatchFailure("work", "fn-tokenless-modern.1")).toBeNull();
+  expect(getDispatchClaim("work", "fn-tokenless-modern.1")?.state).toBe(
+    "acquired",
+  );
+  expect(getPendingDispatch("work", "fn-tokenless-modern.1")?.attempt_id).toBe(
+    400,
+  );
+  expect(
+    db
+      .query("SELECT attempt_id FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get("work::fn-tokenless-modern.1"),
+  ).toEqual({ attempt_id: 400 });
+
+  expect(getDispatchFailure("work", "fn-partial-incident.1")).toBeNull();
+  expect(getDispatchClaim("work", "fn-partial-incident.1")?.state).toBe(
+    "acquired",
+  );
+
+  expect(
+    getDispatchFailure("work", "fn-partial-attempt.1")?.instance_event_id,
+  ).toBe(malformedIncident);
+  expect(getDispatchClaim("work", "fn-partial-attempt.1")?.state).toBe(
+    "released",
+  );
+});
+
+test("tokenless DispatchCleared remains bounded to legacy-unfenced rows", () => {
+  const verb = "work";
+  const id = "fn-legacy-clear.1";
+  dispatchedEvent(verb, id, "/repo", 2100);
+  const incident = dispatchFailedEvent(verb, id, "legacy", "/repo", 2101);
+  dispatchedEvent(verb, id, "/repo", 2102);
+  drainAll();
+  db.run(
+    "INSERT INTO dispatch_mint_gate (dispatch_key, minted_at, attempt_id) VALUES (?, ?, NULL)",
+    [`${verb}::${id}`, 2102],
+  );
+  expect(getDispatchFailure(verb, id)?.instance_event_id).toBe(incident);
+  expect(getDispatchClaim(verb, id)?.legacy_unfenced).toBe(1);
+  expect(getPendingDispatch(verb, id)?.attempt_id).toBeNull();
+
+  dispatchClearedEvent(verb, id);
+  drainAll();
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getPendingDispatch(verb, id)).toBeNull();
+  expect(getDispatchClaim(verb, id)?.state).toBe("released");
+  expect(
+    db
+      .query("SELECT * FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get(`${verb}::${id}`),
+  ).toBeNull();
+});
+
 test("malformed Dispatch claim Events are safe no-ops with Cursor advance", () => {
   const events = [
     { hook_event: "DispatchClaimAcquired", data: "{" },
@@ -3526,7 +3848,7 @@ function getNeverBoundCounter(verb: string, id: string) {
   } | null;
 }
 
-test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-bound) and clears the counter (fn-846)", () => {
+test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-bound) and preserves the threshold", () => {
   // Each expire bumps the counter; the failure does NOT exist until the
   // K-th expire trips the breaker.
   dispatchExpiredEvent("work", "fn-846-loop.1");
@@ -3543,8 +3865,7 @@ test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-
   ).toBe(2);
   expect(getDispatchFailure("work", "fn-846-loop.1")).toBeNull();
 
-  // The K-th (3rd) expire trips the breaker: a sticky never-bound failure is
-  // minted AND the counter is cleared (so a post-retry re-arm starts at zero).
+  // The K-th (3rd) expire trips the breaker and preserves the threshold evidence.
   const tripId = dispatchExpiredEvent("work", "fn-846-loop.1");
   drainAll();
   const failure = getDispatchFailure("work", "fn-846-loop.1");
@@ -3552,7 +3873,9 @@ test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-
   expect(failure?.reason).toBe("never-bound");
   expect(failure?.dir).toBeNull();
   expect(failure?.last_event_id).toBe(tripId);
-  expect(getNeverBoundCounter("work", "fn-846-loop.1")).toBeNull();
+  expect(
+    getNeverBoundCounter("work", "fn-846-loop.1")?.consecutive_expired,
+  ).toBe(3);
 });
 
 test("a successful bind between expires resets the counter to 0 — the breaker never trips (fn-846)", () => {
@@ -3604,10 +3927,9 @@ test("bound-then-died does NOT trip the breaker — a single bind clears any pri
   expect(getDispatchFailure("work", "fn-846-died.1")).toBeNull();
 });
 
-test("DispatchCleared (keeper autopilot retry) clears BOTH the never-bound failure and the counter (fn-846)", () => {
-  // Trip the breaker, then retry. The clear path must DELETE the
-  // dispatch_failures row (so failedKeys stops suppressing) AND zero the
-  // counter (so the next dispatch cycle re-arms from 0, not from K).
+test("DispatchCleared preserves never-bound streak evidence and a broken retry re-trips", () => {
+  // Trip the breaker, then clear only its exact incident. The threshold streak
+  // survives so another expiry immediately proves the target is still broken.
   dispatchExpiredEvent("work", "fn-846-retry.1");
   dispatchExpiredEvent("work", "fn-846-retry.1");
   dispatchExpiredEvent("work", "fn-846-retry.1");
@@ -3619,16 +3941,26 @@ test("DispatchCleared (keeper autopilot retry) clears BOTH the never-bound failu
   dispatchClearedEvent("work", "fn-846-retry.1");
   drainAll();
   expect(getDispatchFailure("work", "fn-846-retry.1")).toBeNull();
-  expect(getNeverBoundCounter("work", "fn-846-retry.1")).toBeNull();
+  expect(
+    getNeverBoundCounter("work", "fn-846-retry.1")?.consecutive_expired,
+  ).toBe(3);
 
-  // Re-armed from zero: a single post-retry expire is far below K — no
-  // immediate re-trip.
   dispatchExpiredEvent("work", "fn-846-retry.1");
   drainAll();
   expect(
     getNeverBoundCounter("work", "fn-846-retry.1")?.consecutive_expired,
-  ).toBe(1);
-  expect(getDispatchFailure("work", "fn-846-retry.1")).toBeNull();
+  ).toBe(3);
+  expect(getDispatchFailure("work", "fn-846-retry.1")?.reason).toBe(
+    "never-bound",
+  );
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-846-recovered",
+    spawn_name: "work::fn-846-retry.1",
+  });
+  drainAll();
+  expect(getNeverBoundCounter("work", "fn-846-retry.1")).toBeNull();
 });
 
 test("a Dispatched re-dispatch between expires PRESERVES the counter — the loop still trips at K (fn-846)", () => {
@@ -3656,7 +3988,7 @@ test("an expiry of an already-failed key does NOT re-trip the breaker — no cou
   // but NOT bump the never-bound counter (which would re-trip the breaker and
   // churn last_event_id on an already-failed key).
   //
-  // Trip the breaker (K=3 expires → sticky never-bound failure, counter cleared).
+  // Trip the breaker (K=3 expires → sticky failure and preserved threshold).
   dispatchExpiredEvent("work", "fn-870-already-failed.1");
   dispatchExpiredEvent("work", "fn-870-already-failed.1");
   dispatchExpiredEvent("work", "fn-870-already-failed.1");
@@ -3664,7 +3996,10 @@ test("an expiry of an already-failed key does NOT re-trip the breaker — no cou
   expect(getDispatchFailure("work", "fn-870-already-failed.1")?.reason).toBe(
     "never-bound",
   );
-  expect(getNeverBoundCounter("work", "fn-870-already-failed.1")).toBeNull();
+  expect(
+    getNeverBoundCounter("work", "fn-870-already-failed.1")
+      ?.consecutive_expired,
+  ).toBe(3);
 
   // Re-dispatch (the slow re-arm), then the widened sweep expires it again while
   // the sticky failure still stands. The expiry must NOT create a new counter row.
@@ -3674,9 +4009,12 @@ test("an expiry of an already-failed key does NOT re-trip the breaker — no cou
 
   dispatchExpiredEvent("work", "fn-870-already-failed.1");
   drainAll();
-  // Slot released, breaker NOT re-armed: pending gone, no counter, failure intact.
+  // Slot released, breaker evidence unchanged, failure intact.
   expect(getPendingDispatch("work", "fn-870-already-failed.1")).toBeNull();
-  expect(getNeverBoundCounter("work", "fn-870-already-failed.1")).toBeNull();
+  expect(
+    getNeverBoundCounter("work", "fn-870-already-failed.1")
+      ?.consecutive_expired,
+  ).toBe(3);
   expect(getDispatchFailure("work", "fn-870-already-failed.1")?.reason).toBe(
     "never-bound",
   );
@@ -3719,8 +4057,8 @@ test("from-scratch re-fold reproduces dispatch_never_bound + the never-bound fai
   // A representative sequence exercising every counter arm:
   // - increment below K (a key that never trips)
   // - bind reset (a key whose count zeroes mid-stream)
-  // - K-th expire mint + counter clear (a key that trips)
-  // - retry clear (a tripped key cleared, then re-armed)
+  // - K-th expire mint with preserved threshold evidence
+  // - incident clear followed by an immediate re-trip
   dispatchExpiredEvent("work", "fn-846-rf-a.1"); // a: 1
   dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b: 1
   dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b: 2
@@ -3731,9 +4069,9 @@ test("from-scratch re-fold reproduces dispatch_never_bound + the never-bound fai
   }); // b: reset (gone)
   dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 1
   dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 2
-  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 3 → trip + clear counter
-  dispatchClearedEvent("work", "fn-846-rf-c.1"); // c: failure + counter cleared
-  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: re-armed → 1
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 3 → trip, threshold retained
+  dispatchClearedEvent("work", "fn-846-rf-c.1"); // c: incident cleared only
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: immediate re-trip
   dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b (post-reset): 1
   drainAll();
 
@@ -3826,7 +4164,7 @@ function bindThenTerminate(
   });
 }
 
-test("K=3 consecutive instant post-bind deaths mint DispatchFailed(instant-death-breaker) and clear the counter (fn-1086)", () => {
+test("K=3 consecutive instant post-bind deaths mint a failure and preserve the threshold", () => {
   // Each sub-minute bind-then-Killed bumps the counter; the sticky does NOT
   // exist until the K-th death trips the breaker. Every death carries its own
   // successful bind — proving a bind does NOT reset this counter (unlike
@@ -3853,8 +4191,10 @@ test("K=3 consecutive instant post-bind deaths mint DispatchFailed(instant-death
   expect(failure?.dir).toBeNull();
   expect(failure?.last_event_id).toBe(tripId);
   expect(failure?.ts).toBe(300_010);
-  // Counter cleared on trip — a post-retry re-arm starts at zero.
-  expect(getInstantDeathCounter("work", "fn-1086-loop.1")).toBeNull();
+  // Threshold evidence remains until a positive survival terminal resets it.
+  expect(
+    getInstantDeathCounter("work", "fn-1086-loop.1")?.consecutive_deaths,
+  ).toBe(3);
 });
 
 test("a fast SUCCESSFUL task (clean SessionEnd, sub-minute) NEVER trips — no increment (fn-1086)", () => {
@@ -3942,7 +4282,7 @@ test("a bind alone does NOT reset the counter — the count survives re-dispatch
   ).toBe(2);
 });
 
-test("DispatchCleared (keeper autopilot retry) clears BOTH the instant-death failure and the counter (fn-1086)", () => {
+test("DispatchCleared preserves instant-death streak evidence and a broken retry re-trips", () => {
   bindThenTerminate("fn-1086-retry.1", 100_000, 100_010, "kill");
   bindThenTerminate("fn-1086-retry.1", 200_000, 200_010, "kill");
   bindThenTerminate("fn-1086-retry.1", 300_000, 300_010, "kill");
@@ -3954,15 +4294,22 @@ test("DispatchCleared (keeper autopilot retry) clears BOTH the instant-death fai
   dispatchClearedEvent("work", "fn-1086-retry.1");
   drainAll();
   expect(getDispatchFailure("work", "fn-1086-retry.1")).toBeNull();
-  expect(getInstantDeathCounter("work", "fn-1086-retry.1")).toBeNull();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-retry.1")?.consecutive_deaths,
+  ).toBe(3);
 
-  // Re-armed from zero: a single post-retry instant death is below K.
   bindThenTerminate("fn-1086-retry.1", 400_000, 400_010, "kill");
   drainAll();
   expect(
     getInstantDeathCounter("work", "fn-1086-retry.1")?.consecutive_deaths,
-  ).toBe(1);
-  expect(getDispatchFailure("work", "fn-1086-retry.1")).toBeNull();
+  ).toBe(3);
+  expect(getDispatchFailure("work", "fn-1086-retry.1")?.reason).toBe(
+    "instant-death-breaker",
+  );
+
+  bindThenTerminate("fn-1086-retry.1", 500_000, 500_600, "kill");
+  drainAll();
+  expect(getInstantDeathCounter("work", "fn-1086-retry.1")).toBeNull();
 });
 
 test("an instant death on an ALREADY-failed key does NOT re-trip or churn the counter (fn-1086)", () => {
@@ -3980,13 +4327,17 @@ test("an instant death on an ALREADY-failed key does NOT re-trip or churn the co
   expect(getDispatchFailure("work", "fn-1086-already.1")?.reason).toBe(
     "instant-death-breaker",
   );
-  expect(getInstantDeathCounter("work", "fn-1086-already.1")).toBeNull();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-already.1")?.consecutive_deaths,
+  ).toBe(3);
 
-  // A further instant death while the sticky stands: no counter row, failure
-  // unchanged (its last_event_id is still the trip's, not the late death's).
+  // A further instant death while the sticky stands leaves the threshold and
+  // failure unchanged (its last_event_id is still the trip's).
   bindThenTerminate("fn-1086-already.1", 400_000, 400_010, "kill");
   drainAll();
-  expect(getInstantDeathCounter("work", "fn-1086-already.1")).toBeNull();
+  expect(
+    getInstantDeathCounter("work", "fn-1086-already.1")?.consecutive_deaths,
+  ).toBe(3);
   expect(getDispatchFailure("work", "fn-1086-already.1")?.last_event_id).toBe(
     tripId,
   );
@@ -4027,17 +4378,17 @@ test("zero-event projection: a fresh DB has zero dispatch_instant_death rows (fn
 
 test("from-scratch re-fold reproduces dispatch_instant_death + the instant-death failure byte-identically (fn-1086)", () => {
   // A representative sequence exercising every arm: a below-K key, a key reset by
-  // a clean SessionEnd mid-streak, a key that trips + clears its counter, and a
-  // retry-cleared-then-re-armed key.
+  // a clean SessionEnd mid-streak, and a key whose cleared incident immediately
+  // re-trips from preserved threshold evidence.
   bindThenTerminate("fn-1086-rf-a.1", 100_000, 100_010, "kill"); // a: 1
   bindThenTerminate("fn-1086-rf-b.1", 110_000, 110_010, "kill"); // b: 1
   bindThenTerminate("fn-1086-rf-b.1", 120_000, 120_005, "end"); // b: reset (gone)
   bindThenTerminate("fn-1086-rf-c.1", 130_000, 130_010, "kill"); // c: 1
   bindThenTerminate("fn-1086-rf-c.1", 140_000, 140_010, "kill"); // c: 2
-  bindThenTerminate("fn-1086-rf-c.1", 150_000, 150_010, "kill"); // c: 3 → trip + clear
+  bindThenTerminate("fn-1086-rf-c.1", 150_000, 150_010, "kill"); // c: 3 → trip
   drainAll();
-  dispatchClearedEvent("work", "fn-1086-rf-c.1"); // c: failure + counter cleared
-  bindThenTerminate("fn-1086-rf-c.1", 160_000, 160_010, "kill"); // c: re-armed → 1
+  dispatchClearedEvent("work", "fn-1086-rf-c.1"); // c: incident cleared only
+  bindThenTerminate("fn-1086-rf-c.1", 160_000, 160_010, "kill"); // c: immediate re-trip
   drainAll();
 
   const counterBefore = db
