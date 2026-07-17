@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Fully-specified single-surface routing fix (move channels index to strict db.run, keep messages fail-open) plus two straightforward tests, with the correctness rationale already diagnosed in the spec, so no intelligence-bound reason exists \u2014 everyday well-specified GPT tier at the bounded do-exactly-this band.",
+      "task_id": "fn-1316-scope-bus-db-fail-open-index-creation.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T18:30:12.701000Z",
+  "epic_id": "fn-1316-scope-bus-db-fail-open-index-creation",
+  "input_hash": "fd1303765f856e3f4d99953248aca613a1a670236dec8a95ee4cac6068af29c0",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4245881718,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Fully-specified single-surface routing fix (move channels index to strict db.run, keep messages fail-open) plus two straightforward tests, with the correctness rationale already diagnosed in the spec, so no intelligence-bound reason exists \u2014 everyday well-specified GPT tier at the bounded do-exactly-this band.\",\"confidence\":0.83}]}\n"
+}
