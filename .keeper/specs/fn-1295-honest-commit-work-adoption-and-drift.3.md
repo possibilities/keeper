@@ -62,5 +62,7 @@ directly.
 - [ ] The touched suites pass plus the fast gate
 
 ## Done summary
-
+Implemented vacated-claim liveness and guarded session termination; operator landed the verified diff through the documented exact-path plain-git escape after commit-work rejected the terminated provider-leg claims.
 ## Evidence
+- Commits: a68dee59dd82c4e1366cc7f4f58ffa7cd46a1150
+- Tests: bun test ./test/commit-work-adoption.test.ts ./test/commit-work-process-identity.test.ts ./test/keeper-cli.test.ts — 228 pass, 0 fail, git diff --check — clean, scanContextDoc(CONTEXT.md) — zero findings at 135 lines, provider-leg PIDs 83761 and 54666 absent before exact-path commit
