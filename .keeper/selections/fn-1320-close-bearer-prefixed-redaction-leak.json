@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Secret-redaction fix in a fail-toward-more-redaction module where a wrong regex boundary re-opens a token leak into persisted death-capture \u2014 a subtle security/correctness invariant that hits the hard opus gate regardless of the small, well-specified diff, at the model-default high band since the root cause and two-file path are named.",
+      "task_id": "fn-1320-close-bearer-prefixed-redaction-leak.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T22:44:46.828000Z",
+  "epic_id": "fn-1320-close-bearer-prefixed-redaction-leak",
+  "input_hash": "07f70068fa3d9dd6c933ed132bc6362b5dea6e755d029531934c6f205e494958",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 133628008,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"Secret-redaction fix in a fail-toward-more-redaction module where a wrong regex boundary re-opens a token leak into persisted death-capture \u2014 a subtle security/correctness invariant that hits the hard opus gate regardless of the small, well-specified diff, at the model-default high band since the root cause and two-file path are named.\",\"confidence\":0.7}]}\n"
+}
