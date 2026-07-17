@@ -94,6 +94,17 @@ test("descriptor: --probe is declared (task 3)", () => {
   expect(flag?.type).toBe("boolean");
 });
 
+test("descriptor: the cancel subcommand is declared with a --force override flag", () => {
+  const descriptor = nativeDescriptor("await");
+  const cancel = descriptor?.verbs?.find((v) => v.name === "cancel");
+  expect(cancel).toBeDefined();
+  expect(cancel?.mutates).toBe(true);
+  expect(cancel?.requires_daemon).toBe(true);
+  const force = cancel?.flags.find((f) => f.name === "force");
+  expect(force).toBeDefined();
+  expect(force?.type).toBe("boolean");
+});
+
 test("exit-code registry lockstep: await's descriptor mirror agrees with the central EXIT_CODES table (task 3, incl. the new 9)", async () => {
   const { EXIT_CODES } = await import("../cli/keeper");
   const descriptor = nativeDescriptor("await");

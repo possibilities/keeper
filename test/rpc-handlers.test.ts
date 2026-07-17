@@ -36,7 +36,9 @@ import {
   setEpicArmedHandler,
 } from "../src/rpc-handlers";
 import {
+  AWAIT_NOT_CANCELLABLE_MESSAGE,
   BadParamsError,
+  decideAwaitCancel,
   type ReplayBridge,
   SlugConflictError,
 } from "../src/server-worker";
@@ -981,6 +983,114 @@ test("request_await forwards the cancel variant", async () => {
   expect(state.requestAwaitCalls).toEqual([
     { op: "cancel", await_id: "land-epic" },
   ]);
+});
+
+test("request_await forwards the cancel variant's caller_session + force (owner fence inputs)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await requestAwaitHandler(
+    {
+      op: "cancel",
+      await_id: "land-epic",
+      caller_session: "work",
+      force: true,
+    },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, op: "cancel", await_id: "land-epic" });
+  // Both fence inputs ride through to main untouched — the handler shapes them
+  // but does NOT read the DB (the fence is producer-side).
+  expect(state.requestAwaitCalls).toEqual([
+    {
+      op: "cancel",
+      await_id: "land-epic",
+      caller_session: "work",
+      force: true,
+    },
+  ]);
+});
+
+test("request_await cancel accepts a null caller_session and rejects malformed fence fields", async () => {
+  const { bridge } = autopilotStubBridge({});
+  // null is a valid (unauthenticated) caller — deny-by-default is enforced main-side.
+  await expect(
+    requestAwaitHandler(
+      { op: "cancel", await_id: "land-epic", caller_session: null },
+      bridge,
+    ),
+  ).resolves.toMatchObject({ ok: true, op: "cancel" });
+  for (const bad of [
+    { op: "cancel", await_id: "land-epic", caller_session: 7 },
+    { op: "cancel", await_id: "land-epic", force: "yes" },
+  ]) {
+    await expect(requestAwaitHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// `decideAwaitCancel` — the producer-side owner fence (ADR 0072). Pure: main
+// reads the committed row, then this decides. Foreign / absent / terminal
+// collapse to ONE uniform refusal (no existence oracle); the arming session
+// or an audited --force succeeds; a re-cancel is an idempotent no-op.
+// ---------------------------------------------------------------------------
+
+const WAITING_ROW = { target_session: "work", status: "waiting" } as const;
+
+test("decideAwaitCancel: the arming session cancels its own waiting await", () => {
+  expect(decideAwaitCancel(WAITING_ROW, "work", false)).toEqual({
+    kind: "append",
+    forcedBy: null,
+  });
+});
+
+test("decideAwaitCancel: foreign, absent, and terminal all refuse uniformly", () => {
+  // Foreign session against a live waiting row.
+  expect(decideAwaitCancel(WAITING_ROW, "other", false)).toEqual({
+    kind: "refuse",
+  });
+  // Absent row (no --force → deny by default).
+  expect(decideAwaitCancel(undefined, "work", false)).toEqual({
+    kind: "refuse",
+  });
+  // Terminal non-cancelled row, even for the arming session.
+  for (const status of ["done", "failed", "timed_out"]) {
+    expect(
+      decideAwaitCancel({ target_session: "work", status }, "work", false),
+    ).toEqual({ kind: "refuse" });
+  }
+  // A missing/empty caller identity grants no authority.
+  expect(decideAwaitCancel(WAITING_ROW, null, false)).toEqual({
+    kind: "refuse",
+  });
+});
+
+test("decideAwaitCancel: re-cancelling a cancelled row is a no-op success for the owner, refusal for a stranger", () => {
+  const cancelled = { target_session: "work", status: "cancelled" } as const;
+  expect(decideAwaitCancel(cancelled, "work", false)).toEqual({ kind: "noop" });
+  // A foreign caller still cannot distinguish a cancelled row from any other.
+  expect(decideAwaitCancel(cancelled, "other", false)).toEqual({
+    kind: "refuse",
+  });
+});
+
+test("decideAwaitCancel: --force overrides the owner match and stamps the acting identity", () => {
+  // Force cancels a foreign session's waiting await, recording who overrode.
+  expect(decideAwaitCancel(WAITING_ROW, "operator", true)).toEqual({
+    kind: "append",
+    forcedBy: "operator",
+  });
+  // Force does NOT resurrect a settled or absent await.
+  expect(
+    decideAwaitCancel({ target_session: "x", status: "done" }, "op", true),
+  ).toEqual({ kind: "refuse" });
+  expect(decideAwaitCancel(undefined, "op", true)).toEqual({ kind: "refuse" });
+});
+
+test("AWAIT_NOT_CANCELLABLE_MESSAGE reveals nothing about which refusal case fired", () => {
+  // One constant string for foreign/absent/terminal — no existence oracle.
+  expect(AWAIT_NOT_CANCELLABLE_MESSAGE).not.toContain("foreign");
+  expect(AWAIT_NOT_CANCELLABLE_MESSAGE.length).toBeGreaterThan(0);
 });
 
 test("request_await rejects unknown and session-local condition kinds loudly", async () => {

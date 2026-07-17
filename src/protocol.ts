@@ -333,7 +333,16 @@ export type RequestAwaitRpcParams =
       target_dir?: string | null;
       timeout_ms?: number | null;
     }
-  | { op: "cancel"; await_id: string };
+  | {
+      op: "cancel";
+      await_id: string;
+      /** The caller's resolved session, compared producer-side to the row's
+       *  recorded arming session; omitted or empty grants no authority. */
+      caller_session?: string | null;
+      /** Audited operator override: bypass the owner match and stamp the acting
+       *  identity into the folded cancel event. */
+      force?: boolean;
+    };
 
 /**
  * Client → server: invoke a registered RPC handler. The server looks up

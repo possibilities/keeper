@@ -476,3 +476,31 @@ test("firing is durably acknowledged before the fresh launch", async () => {
   );
   expect(order).toEqual(["firing", "launch:await::a-ack"]);
 });
+
+test("a firing ack of ok:false (cancel folded first) aborts pre-launch — the follow-up never fires", () => {
+  // Main's AwaitFiring mint acks the fold's compare-and-set outcome: a cancel
+  // that folded first leaves the row cancelled, so main acks ok:false. The
+  // worker must abort BEFORE launching — that is what makes cancel binding
+  // rather than advisory (ADR 0072).
+  let launched = false;
+  const terminals: string[] = [];
+  const deps: AwaitDispatchDeps = {
+    emitFiring: async () => ({ ok: false }),
+    emitTerminal: (kind) => terminals.push(kind),
+    launch: async (): Promise<LaunchResult> => {
+      launched = true;
+      return { ok: true };
+    },
+  };
+  return dispatchOneAwait(
+    row({ await_id: "a-cancelled" }),
+    "/repo",
+    new AbortController().signal,
+    deps,
+  ).then((outcome) => {
+    expect(outcome).toBe("aborted-prelaunch");
+    expect(launched).toBe(false);
+    // No terminal is minted either — the row is already terminal (cancelled).
+    expect(terminals).toEqual([]);
+  });
+});

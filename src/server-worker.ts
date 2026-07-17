@@ -372,6 +372,49 @@ export interface RequestAwaitResultMessage {
 }
 
 /**
+ * The one not-cancellable refusal (ADR 0072): a foreign caller, an absent row,
+ * and an already-settled row all collapse to this identical message so the
+ * cancel path never becomes an existence oracle. Its wording enumerates the
+ * possibilities without revealing which one applies.
+ */
+export const AWAIT_NOT_CANCELLABLE_MESSAGE =
+  "await is not cancellable (unknown id, already settled, or not the arming session)";
+
+/** The producer's verdict for one durable-await cancel request. `append` mints
+ *  the compensating event (owner-blind fold does the status CAS); `noop`
+ *  succeeds without a write (re-cancel of an already-cancelled row); `refuse`
+ *  returns the uniform not-cancellable message. */
+export type AwaitCancelDecision =
+  | { kind: "append"; forcedBy: string | null }
+  | { kind: "noop" }
+  | { kind: "refuse" };
+
+/**
+ * Owner fence for a durable-await cancel (ADR 0072), enforced producer-side.
+ * Pure: main reads the committed `awaits` row, then this decides. Authority is
+ * the row's recorded arming session — never the caller's claim — OR an audited
+ * `force` override; deny by default. Foreign caller, absent row, and terminal
+ * (done/failed/timed_out) collapse to one uniform refusal; an already-cancelled
+ * row is an idempotent no-op success for an authorized caller. A `force` cancel
+ * stamps the acting identity so the compensating event records who overrode.
+ */
+export function decideAwaitCancel(
+  row: { target_session: string | null; status: string } | undefined,
+  callerSession: string | null,
+  force: boolean,
+): AwaitCancelDecision {
+  const authorized =
+    force ||
+    (callerSession !== null &&
+      row !== undefined &&
+      row.target_session === callerSession);
+  if (!authorized || row === undefined) return { kind: "refuse" };
+  if (row.status === "cancelled") return { kind: "noop" };
+  if (row.status !== "waiting") return { kind: "refuse" };
+  return { kind: "append", forcedBy: force ? callerSession : null };
+}
+
+/**
  * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
  * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
  * burning a core.

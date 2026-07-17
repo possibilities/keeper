@@ -292,10 +292,22 @@ Reasons + exit codes:
 The `armed` line is information only — proceed past it. The first
 `met` / `failed` line is terminal; act on it.
 
+**`armed` is lifecycle state, not just a printed line.** Arming latches the
+armed state regardless of `--no-armed-line`; that flag governs ONLY whether the
+initial `[keeper-await] armed …` line is printed (its shape is unchanged when
+it is). Everything else keyed on being armed engages the same either way:
+`--require-transition` edge suppression, the `--json` envelope's `armed:true`,
+the reconnect-blip swallow, and progress heartbeats. So
+`--no-armed-line --require-transition` still suppresses a condition already true
+at arm time and fires only on a genuine later edge — the flag never re-opens
+the false-immediate-fire path.
+
 **Already-satisfied-at-arm fires immediately.** If every condition
 already holds at arm time (a clean repo, no other agents, a complete
 target), `keeper await` emits `armed` and then `met` in quick
-succession. That's correct behavior — run the follow-up.
+succession. That's correct behavior — run the follow-up. (Add
+`--require-transition` to wait for a real edge instead; it holds under
+`--no-armed-line` too.)
 
 ## Step 4 — Run the follow-up
 
@@ -321,6 +333,24 @@ wake-up of the CURRENT session — a supervisor wanting to be re-entered when a
 condition holds — wire the Monitor per Step 2 instead: each fired durable
 await costs a full worker spawn, and the spawn acts on its own rather than
 waking you.
+
+**Inspect and cancel.** `keeper await list` prints the durable-await rows as
+JSON (`await_id`, condition, status). To retire a still-`waiting` await before
+it fires:
+
+```
+keeper await cancel <await-id>          # the arming session cancels its own
+keeper await cancel <await-id> --force  # audited operator override
+```
+
+A cancelled await never fires its follow-up — even against a fire already
+racing the cancel: whichever event folds first wins, so a cancel that lands
+first suppresses the launch and a launch that lands first makes the cancel a
+no-op. Only the ARMING session may cancel its own await; `--force` is the
+audited override that cancels another session's await (it records the acting
+identity). An unknown id, an already-settled await, and another session's
+await all return the SAME not-cancellable refusal (exit 1) — the path is not an
+existence oracle. Re-cancelling an already-cancelled await is a no-op success.
 
 ## One-shot check (`--probe`)
 

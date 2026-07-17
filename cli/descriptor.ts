@@ -956,6 +956,27 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       { name: "json", type: "boolean", summary: "Emit the JSON envelope" },
       FLAG_SOCK,
     ],
+    verbs: [
+      {
+        name: "cancel",
+        summary:
+          "Retire a waiting durable await by id (arming session, or --force override)",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: true,
+        requires_tty: false,
+        flags: [
+          FLAG_HELP,
+          {
+            name: "force",
+            type: "boolean",
+            summary:
+              "Operator override: cancel an await this session did not arm (audited)",
+          },
+          FLAG_SOCK,
+        ],
+      },
+    ],
   },
   {
     name: "commit-work",
