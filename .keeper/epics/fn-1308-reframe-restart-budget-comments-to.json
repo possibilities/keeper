@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-17T10:07:44.336000Z",
+  "created_by_close_of": "fn-1307-fit-restart-wait-to-real-boots",
+  "depends_on_epics": [
+    "fn-1307-fit-restart-wait-to-real-boots"
+  ],
+  "id": "fn-1308-reframe-restart-budget-comments-to",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Reframe restart-budget comments to current behavior",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-17T10:07:44.336000Z"
+}
