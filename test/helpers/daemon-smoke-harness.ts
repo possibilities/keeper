@@ -125,31 +125,38 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** The two state paths every sandbox tmpdir carries, derived deterministically
+ *  from the tmpdir so a {@link respawnSandboxedDaemon} successor lands on the
+ *  exact paths a fresh {@link spawnSandboxedDaemon} would have picked. */
+function sandboxPaths(tmpDir: string): { dbPath: string; sockPath: string } {
+  return {
+    dbPath: join(tmpDir, "keeper.db"),
+    // Short leaf: a UDS path must fit the ~104-byte sun_path limit, and the OS
+    // tmpdir base is already long.
+    sockPath: join(tmpDir, "d.sock"),
+  };
+}
+
 /**
- * Boot a real keeperd subprocess with every state class sandboxed under a fresh
- * per-run tmpdir — the DB, sockets, ledgers, spools, and config redirected by
- * {@link sandboxEnv}, PLUS `KEEPER_SOCK` (the serve socket, which sandboxEnv does
- * not own) pointed under the tmpdir so the daemon never binds the host socket or
- * touches the host daemon. Detached so its pid is a process-group leader the
- * teardown can tree-kill.
+ * Spawn one real keeperd subprocess pointed at the given sandbox paths, every
+ * state class sandboxed under `tmpDir` — the DB, sockets, ledgers, spools, and
+ * config redirected by {@link sandboxEnv}, PLUS `KEEPER_SOCK` (the serve
+ * socket, which sandboxEnv does not own) pointed under the tmpdir so the
+ * daemon never binds the host socket or touches the host daemon. Detached so
+ * its pid is a process-group leader the teardown/kill can tree-kill. Shared by
+ * a fresh {@link spawnSandboxedDaemon} boot and a {@link respawnSandboxedDaemon}
+ * successor reusing an existing sandbox — neither creates nor removes `tmpDir`.
  */
-export function spawnSandboxedDaemon(
-  opts: SpawnSandboxedDaemonOptions = {},
+function spawnDaemonAt(
+  tmpDir: string,
+  dbPath: string,
+  sockPath: string,
+  extraEnv?: Record<string, string | undefined>,
 ): SandboxedDaemon {
-  const tmpDir = mkdtempSync(join(tmpdir(), "keeper-daemon-smoke-"));
-  const dbPath = join(tmpDir, "keeper.db");
-  // Short leaf: a UDS path must fit the ~104-byte sun_path limit, and the OS
-  // tmpdir base is already long.
-  const sockPath = join(tmpDir, "d.sock");
-
-  if (opts.seedEvents && opts.seedEvents > 0) {
-    seedEvents(dbPath, opts.seedEvents);
-  }
-
   const env = sandboxEnv({
     tmpDir,
     dbPath,
-    extra: { ...opts.extraEnv, KEEPER_SOCK: sockPath },
+    extra: { ...extraEnv, KEEPER_SOCK: sockPath },
   });
 
   const child: ChildProcess = spawn(process.execPath, [DAEMON_ENTRY], {
@@ -206,6 +213,163 @@ export function spawnSandboxedDaemon(
     exited,
     stderrTail: () => stderrBuf,
     teardown,
+  };
+}
+
+/**
+ * Boot a real keeperd subprocess with every state class sandboxed under a fresh
+ * per-run tmpdir. See {@link spawnDaemonAt} for the sandboxing detail.
+ */
+export function spawnSandboxedDaemon(
+  opts: SpawnSandboxedDaemonOptions = {},
+): SandboxedDaemon {
+  const tmpDir = mkdtempSync(join(tmpdir(), "keeper-daemon-smoke-"));
+  const { dbPath, sockPath } = sandboxPaths(tmpDir);
+
+  if (opts.seedEvents && opts.seedEvents > 0) {
+    seedEvents(dbPath, opts.seedEvents);
+  }
+
+  return spawnDaemonAt(tmpDir, dbPath, sockPath, opts.extraEnv);
+}
+
+/**
+ * Boot a successor keeperd into an EXISTING sandbox `tmpDir` — the same DB,
+ * socket, restart-ledger, and lock paths a predecessor (now dead — see
+ * {@link killDaemonProcess}) already established. This is the harness's
+ * stand-in for `launchctl kickstart -k`'s kill-and-respawn: the daemon's own
+ * boot path runs for real (real kernel-flock reclaim, real stale-socket-lock
+ * reclaim, real restart-ledger boot line), only the OS-level respawn TRIGGER
+ * is test-driven. The caller owns tearing the successor down — its
+ * `teardown()` removes the same `tmpDir` a predecessor's `teardown()` would
+ * (idempotent either order), so prefer {@link killDaemonProcess} on a
+ * successor whose tmpDir a caller still needs to inspect afterward.
+ */
+export function respawnSandboxedDaemon(
+  tmpDir: string,
+  extraEnv?: Record<string, string | undefined>,
+): SandboxedDaemon {
+  const { dbPath, sockPath } = sandboxPaths(tmpDir);
+  return spawnDaemonAt(tmpDir, dbPath, sockPath, extraEnv);
+}
+
+/**
+ * SIGKILL `daemon`'s whole process tree and wait (bounded) for the reap —
+ * exactly {@link SandboxedDaemon.teardown}'s kill step, WITHOUT removing the
+ * sandbox tmpDir. The worker-kill and restart-verdict scenarios need the
+ * on-disk state (DB, restart ledger, lock files, socket file) to survive the
+ * kill so a successor can reclaim it, or a caller can read the ledger
+ * directly. Best-effort and safe to call on an already-dead process.
+ */
+export async function killDaemonProcess(
+  daemon: SandboxedDaemon,
+): Promise<void> {
+  if (daemon.pid > 1) {
+    try {
+      process.kill(-daemon.pid, "SIGKILL");
+    } catch {
+      // group already gone
+    }
+    try {
+      process.kill(daemon.pid, "SIGKILL");
+    } catch {
+      // leader already gone
+    }
+  }
+  // Bounded reap wait — see spawnDaemonAt's teardown for why this matters: the
+  // kernel releases every fd (flock included) at termination, but a caller
+  // checking liveness or reclaiming a lock right after `kill()` returns would
+  // otherwise race a not-yet-reaped zombie.
+  await Promise.race([daemon.exited, new Promise((r) => setTimeout(r, 5_000))]);
+}
+
+/** A live connection left open past its first reply — see
+ *  {@link openWatchConnection}. */
+export interface WatchConnection {
+  /** The first served reply, or `null` on a transport error/timeout. */
+  firstReply: Promise<ServeFrame | null>;
+  /** Resolves `"closed"` once the socket observably closes/errors, or
+   *  `"timeout"` if it hasn't by `timeoutMs` — never hangs a caller. */
+  awaitClose(timeoutMs: number): Promise<"closed" | "timeout">;
+  /** Best-effort local close, for a path that never reaches the daemon kill. */
+  destroy(): void;
+}
+
+/**
+ * Open a query connection and leave it open past its first reply. The served
+ * protocol subscribes ANY `type:"query"` connection to its collection (see
+ * `server-worker.ts`'s query handler) — so this is a genuine live watcher
+ * subscription, not a synthetic stand-in. {@link WatchConnection.awaitClose}
+ * lets a caller prove that subscription tears down boundedly (rather than
+ * hanging silently) once its daemon dies.
+ */
+export function openWatchConnection(sockPath: string): WatchConnection {
+  const socket = new Socket();
+  let closed = false;
+  const closeWaiters: Array<() => void> = [];
+  const noteClosed = (): void => {
+    if (closed) return;
+    closed = true;
+    for (const waiter of closeWaiters.splice(0)) waiter();
+  };
+  socket.on("close", noteClosed);
+  socket.on("error", () => {
+    // Swallowed here — `close` still follows for a `net.Socket`, so
+    // `noteClosed` fires there. Never let an unhandled 'error' throw.
+  });
+
+  const firstReply = new Promise<ServeFrame | null>((resolve) => {
+    let settled = false;
+    let buffered = "";
+    const finish = (value: ServeFrame | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    socket.on("data", (chunk: Buffer) => {
+      buffered += chunk.toString("utf8");
+      const newline = buffered.indexOf("\n");
+      if (newline === -1) return;
+      try {
+        finish(JSON.parse(buffered.slice(0, newline)) as ServeFrame);
+      } catch {
+        finish(null);
+      }
+    });
+    socket.once("error", () => finish(null));
+    socket.once("connect", () => {
+      socket.write(
+        `${JSON.stringify({ type: "query", collection: "jobs", limit: 1 })}\n`,
+      );
+    });
+    try {
+      socket.connect({ path: sockPath });
+    } catch {
+      finish(null);
+    }
+  });
+
+  return {
+    firstReply,
+    awaitClose: (timeoutMs: number) =>
+      new Promise((resolve) => {
+        if (closed) {
+          resolve("closed");
+          return;
+        }
+        const timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        closeWaiters.push(() => {
+          clearTimeout(timer);
+          resolve("closed");
+        });
+      }),
+    destroy: () => {
+      try {
+        socket.destroy();
+      } catch {
+        // already gone
+      }
+    },
   };
 }
 

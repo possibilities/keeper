@@ -1,7 +1,10 @@
 /**
- * Sandboxed real-daemon smoke tier (ADR 0073) — scenario (a): boot → catch-up →
- * the served frame/probe contract, plus the harness's own deadline/tree-kill
- * guarantee.
+ * Sandboxed real-daemon smoke tier (ADR 0073) — the three enumerated scenarios:
+ * (a) boot → catch-up → the served frame/probe contract, plus the harness's own
+ * deadline/tree-kill guarantee; (b) killing a real worker and proving the
+ * supervision contract (bounded teardown, ledger evidence); (c) the restart
+ * CLI's evidence verdict end-to-end against the sandboxed daemon, with only the
+ * launchctl seam injected.
  *
  * This is the slow-tier answer to a blind spot the correctness gates cannot cover:
  * a defect in the CONTRACT between a live serve frame and its live consumer. The
@@ -11,24 +14,66 @@
  * So here nothing is a fixture: a real keeperd boots fully sandboxed, and the
  * shipped {@link isCaughtUpFrame} (imported from the restart CLI, the exact
  * consumer) is asserted to AGREE with both live frame shapes off the real wire.
+ * Scenarios (b) and (c) go further and run the shipped {@link runRestart} itself
+ * against a REAL sandboxed daemon — only `runLaunchctl` (the launchctl seam) is
+ * test-driven, kill-and-respawning the sandboxed process the way `launchctl
+ * kickstart -k` respawns the real LaunchAgent job; `probeHealth` and
+ * `readLatestBoot` are the shipped functions, unmodified.
  *
  * Runs behind the `slow-daemon` named gate only (`bun run test:slow-daemon`);
  * never a correctness gate. See `test/helpers/daemon-smoke-harness.ts`.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isCaughtUpFrame } from "../../cli/restart";
+import {
+  isCaughtUpFrame,
+  probeSocketHealth,
+  type RestartDeps,
+  readLatestBoot,
+  runRestart,
+} from "../../cli/restart";
 import {
   isProcessAlive,
+  killDaemonProcess,
+  openWatchConnection,
   pollUntilCaughtUp,
   probeServeFrame,
+  respawnSandboxedDaemon,
   runScenario,
   type SandboxedDaemon,
   type ServeFrame,
 } from "../helpers/daemon-smoke-harness";
 import { retryUntil } from "../helpers/retry-until";
+
+/** Thrown by a test's `exit` dep so `emitEnvelope`'s `never`-typed call site
+ *  unwinds into a catchable value instead of actually exiting the test worker
+ *  — the same pattern `test/restart-cli.test.ts` uses against the fixture. */
+class ExitError extends Error {
+  constructor(
+    readonly code: number,
+    readonly output: string,
+  ) {
+    super(`exit ${code}`);
+  }
+}
+
+/** Run `runRestart` and capture its terminal `exit` call as a value. Throws
+ *  (never resolves to null) if `runRestart` returns without exiting — a real
+ *  contract violation, not a valid outcome to swallow. */
+async function restartAndCapture(
+  args: { sock: string; timeoutMs: number },
+  deps: RestartDeps,
+): Promise<ExitError> {
+  try {
+    await runRestart(args, deps);
+  } catch (error) {
+    if (error instanceof ExitError) return error;
+    throw error;
+  }
+  throw new Error("restart did not exit");
+}
 
 // A seed large enough that the from-scratch boot re-fold PACES for seconds — far
 // longer than the ~150ms a client needs to connect — so the transient
@@ -168,4 +213,222 @@ describe("harness deadline ownership", () => {
       }
     }
   });
+});
+
+// Every worker crash in `src/daemon.ts` routes through `fatalExit` (bare, or
+// with a reason) — a `Worker` is a THREAD sharing the daemon's one pid (no
+// in-process self-heal; see CLAUDE.md), so from outside the process a worker
+// dying and the daemon process dying are the same observable event. SIGKILLing
+// the sandboxed leader is therefore the faithful black-box stand-in for
+// "a real spawned worker died": it is exactly as abrupt as `fatalExit`'s own
+// `process.exit(1)`, and every resource claim these assertions exercise
+// (the kernel single-instance flock, the server-worker's socket-ownership lock
+// file, the bound UDS) is released by the OS at process death regardless of
+// which internal path triggered it.
+describe("worker-kill supervision contract", () => {
+  test("killing the sandboxed daemon boundedly tears down its lock/socket/watcher and the ledger records the restart", async () => {
+    const verdict = await runScenario(
+      async (daemon: SandboxedDaemon) => {
+        await pollUntilCaughtUp(daemon.sockPath, 8_000);
+
+        // A live watcher subscription (any `type:"query"` conn subscribes —
+        // see server-worker.ts) opened BEFORE the kill, so its teardown is
+        // observable from the client side.
+        const watcher = openWatchConnection(daemon.sockPath);
+        let watcherClosed: "closed" | "timeout";
+        try {
+          const firstReply = await watcher.firstReply;
+          if (firstReply === null) {
+            throw new Error("watcher connection never got its first reply");
+          }
+
+          await killDaemonProcess(daemon);
+
+          // Watcher teardown: the live subscription's socket closes boundedly
+          // rather than hanging silently past its daemon's death.
+          watcherClosed = await watcher.awaitClose(5_000);
+        } finally {
+          watcher.destroy();
+        }
+
+        // Process absence: bounded — killDaemonProcess already awaited the reap.
+        const processGone = !isProcessAlive(daemon.pid);
+        // Socket state: the dead listener refuses new connections.
+        const postKillProbe = await probeServeFrame(daemon.sockPath, 2_000);
+
+        // Lock + socket reclaim: a successor booting into the SAME sandbox
+        // must acquire the (now-stale) single-instance flock and the
+        // server-worker's socket-ownership lock file cleanly, then reach
+        // caught-up — real production reclaim code, not a fixture.
+        const successor = respawnSandboxedDaemon(daemon.tmpDir);
+        try {
+          await pollUntilCaughtUp(successor.sockPath, 8_000);
+        } finally {
+          await killDaemonProcess(successor);
+        }
+
+        // Ledger evidence: the sandboxed restart-ledger now carries two
+        // DISTINCT `boot` lines — the original's own boot record plus the
+        // successor's — durable proof a daemon-level exit-and-restart
+        // happened in between.
+        const ledgerRaw = readFileSync(
+          join(daemon.tmpDir, "restart-ledger.json"),
+          "utf8",
+        );
+        const bootIds = ledgerRaw
+          .trim()
+          .split("\n")
+          .filter((line) => line.length > 0)
+          .map(
+            (line) => JSON.parse(line) as { kind?: string; boot_id?: string },
+          )
+          .filter((line) => line.kind === "boot")
+          .map((line) => line.boot_id);
+
+        return { processGone, postKillProbe, watcherClosed, bootIds };
+      },
+      { deadlineMs: 40_000, retries: 1 },
+    );
+    if (verdict.kind !== "ok") {
+      throw new Error(
+        `worker-kill scenario did not succeed: ${JSON.stringify(verdict)}`,
+      );
+    }
+
+    expect(verdict.value.processGone).toBe(true);
+    expect(verdict.value.postKillProbe).toBeNull();
+    expect(verdict.value.watcherClosed).toBe("closed");
+    expect(verdict.value.bootIds.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(verdict.value.bootIds).size).toBe(
+      verdict.value.bootIds.length,
+    );
+  }, 100_000);
+});
+
+describe("restart CLI evidence verdict against the sandboxed daemon", () => {
+  test("returns a true success once the launchctl-seam respawn reaches health", async () => {
+    const verdict = await runScenario(
+      async (daemon: SandboxedDaemon) => {
+        await pollUntilCaughtUp(daemon.sockPath, 8_000);
+
+        let current = daemon;
+        const stdout: string[] = [];
+        const savedLedgerEnv = process.env.KEEPER_RESTART_LEDGER;
+        process.env.KEEPER_RESTART_LEDGER = join(
+          daemon.tmpDir,
+          "restart-ledger.json",
+        );
+        try {
+          const deps: RestartDeps = {
+            runLaunchctl: async (args) => {
+              if (args[0] !== "kickstart") {
+                return { exitCode: 0, stdout: "state = running", stderr: "" };
+              }
+              // The launchctl seam: real kill + real respawn into the SAME
+              // sandbox, mirroring `launchctl kickstart -k`. Everything else
+              // (the socket, the ledger, the health probe below) is real.
+              await killDaemonProcess(current);
+              current = respawnSandboxedDaemon(current.tmpDir);
+              return { exitCode: 0, stdout: "", stderr: "" };
+            },
+            // The shipped consumer, unmodified — it hits the real sandbox
+            // socket.
+            probeHealth: probeSocketHealth,
+            // The shipped consumer, unmodified — it reads
+            // `KEEPER_RESTART_LEDGER`, pointed above at the sandbox ledger.
+            readLatestBoot,
+            sleep: (ms) => Bun.sleep(ms),
+            now: () => Date.now(),
+            random: () => Math.random(),
+            uid: () => 501,
+            writeStdout: (text) => stdout.push(text),
+            writeStderr: () => {},
+            exit: (code): never => {
+              throw new ExitError(code, stdout.join(""));
+            },
+          };
+
+          const exit = await restartAndCapture(
+            { sock: daemon.sockPath, timeoutMs: 20_000 },
+            deps,
+          );
+          return { exit, finalPid: current.pid };
+        } finally {
+          process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+          await killDaemonProcess(current);
+        }
+      },
+      { deadlineMs: 35_000, retries: 1 },
+    );
+    if (verdict.kind !== "ok") {
+      throw new Error(
+        `restart-verdict success scenario did not succeed: ${JSON.stringify(verdict)}`,
+      );
+    }
+
+    const { exit } = verdict.value;
+    expect(exit.code).toBe(0);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data.healthy_probes).toBeGreaterThanOrEqual(3);
+  }, 90_000);
+
+  test("returns the honest failure when the sandboxed daemon never returns", async () => {
+    const verdict = await runScenario(
+      async (daemon: SandboxedDaemon) => {
+        await pollUntilCaughtUp(daemon.sockPath, 8_000);
+
+        const stdout: string[] = [];
+        const savedLedgerEnv = process.env.KEEPER_RESTART_LEDGER;
+        process.env.KEEPER_RESTART_LEDGER = join(
+          daemon.tmpDir,
+          "restart-ledger.json",
+        );
+        try {
+          const deps: RestartDeps = {
+            runLaunchctl: async (args) => {
+              if (args[0] !== "kickstart") {
+                return { exitCode: 0, stdout: "state = running", stderr: "" };
+              }
+              // Kill and deliberately never respawn — the daemon that never
+              // returns; kickstart itself still reports success (an honest
+              // launchctl would too — the respawn just never lands).
+              await killDaemonProcess(daemon);
+              return { exitCode: 0, stdout: "", stderr: "" };
+            },
+            probeHealth: probeSocketHealth,
+            readLatestBoot,
+            sleep: (ms) => Bun.sleep(ms),
+            now: () => Date.now(),
+            random: () => Math.random(),
+            uid: () => 501,
+            writeStdout: (text) => stdout.push(text),
+            writeStderr: () => {},
+            exit: (code): never => {
+              throw new ExitError(code, stdout.join(""));
+            },
+          };
+
+          return await restartAndCapture(
+            { sock: daemon.sockPath, timeoutMs: 4_000 },
+            deps,
+          );
+        } finally {
+          process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+        }
+      },
+      { deadlineMs: 18_000, retries: 1 },
+    );
+    if (verdict.kind !== "ok") {
+      throw new Error(
+        `restart-verdict failure scenario did not succeed: ${JSON.stringify(verdict)}`,
+      );
+    }
+
+    const exit = verdict.value;
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error.code).toBe("health-timeout");
+  }, 50_000);
 });
