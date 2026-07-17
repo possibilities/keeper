@@ -4,7 +4,8 @@
 
 Accepted (number PROVISIONAL until landed; fan-in renumber per ADR 0020/0022). Supersedes the
 message-body transport portion of ADR 0043; its session-scoped Pi watcher lifecycle remains
-accepted.
+accepted. The retention scan shape is superseded by ADR 0076 (retention advances past
+age-immune rows); the horizons and row-first artifact coupling recorded here stand.
 
 ## Context
 
