@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T23:24:02.305000Z",
+  "depends_on": [],
+  "epic": "fn-1322-cooperative-claim-release-rail",
+  "id": "fn-1322-cooperative-claim-release-rail.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Release record and self-fence",
+  "updated_at": "2026-07-17T23:24:02.305000Z"
+}

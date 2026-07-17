@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-17T23:24:02.305000Z",
+  "depends_on_epics": [],
+  "id": "fn-1322-cooperative-claim-release-rail",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Cooperative claim release rail",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-17T23:24:02.305000Z"
+}
