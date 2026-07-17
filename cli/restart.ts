@@ -12,8 +12,16 @@ import { parseDuration } from "./duration";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
 
 export const RESTART_SCHEMA_VERSION = 1;
-export const DEFAULT_RESTART_TIMEOUT_MS = 30_000;
+// Observed post-boot catch-up on a loaded event store can run the full 30s
+// this used to allow without ever reporting caught-up; 150s (2.5m) gives
+// margin over that observed shape while `--timeout` still overrides.
+export const DEFAULT_RESTART_TIMEOUT_MS = 150_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
+// `launchctl kickstart -k` does a real kill-and-respawn, not an instant call;
+// a 1s subprocess budget TERM-kills it mid-work on every invocation. 15s
+// fits the observed shape with margin while still bounding a genuinely wedged
+// launchctl.
+export const KICKSTART_TIMEOUT_MS = 15_000;
 export const REQUIRED_HEALTHY_PROBES = 3;
 export const INITIAL_BACKOFF_MS = 100;
 export const MAX_BACKOFF_MS = 1_500;
@@ -40,7 +48,7 @@ The wait is bounded; a refused socket while the old daemon releases its flock is
 transient. A launchd throttle is reported separately from a slow boot.
 
 Flags:
-  --timeout <duration>  Overall wait bound (default 30s; e.g. 10s, 2m)
+  --timeout <duration>  Overall wait bound (default 2m30s; e.g. 10s, 2m)
   --sock <path>         Daemon socket override ($KEEPER_SOCK / default)
   --help, -h            Show this help
 
@@ -347,7 +355,7 @@ export async function runRestart(
   try {
     kickstart = await deps.runLaunchctl(
       ["kickstart", "-k", domain],
-      Math.min(DEFAULT_PROBE_TIMEOUT_MS, args.timeoutMs),
+      Math.min(KICKSTART_TIMEOUT_MS, args.timeoutMs),
     );
   } catch {
     failure("kickstart-failed", deps);
