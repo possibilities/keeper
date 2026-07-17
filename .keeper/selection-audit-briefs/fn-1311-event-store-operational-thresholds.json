@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 12,
+        "files_changed": 8,
+        "insertions": 448
+      },
+      "done_summary": "Added event_store block to keeper status --json: event count, DB bytes, and boot-catchup/full-replay duration projections derived from a new durable boot_catchup_stats singleton (never wall-clock at query time).",
+      "input_hash": "b6624ab46c0f52b4940c36caab807b265323395379c62968cf32079045ad346b",
+      "model": "sonnet",
+      "spec_chars": 1841,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/server-worker.ts, cli/status.ts, test/status.test.ts\n\n### Approach\n\nAdd an event-store block to the status surface: total event count and DB byte size (cheap queries), plus projected boot catch-up and full-replay durations derived from durable observations \u2014 the natural source is the measured duration of the most recent boot catch-up (the boot gate already knows when it started and when it reached ready) scaled by event growth, with an honest null when no measurement exists yet. Compute daemon-side where the DB connection and boot gate live; render in the status CLI's JSON (and a compact human line if the board header has a natural home). No thresholds are enforced and no behavior changes \u2014 this is the measurement substrate the checkpoint design consumes.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required** (read before coding):\n- src/server-worker.ts \u2014 the boot gate and boot-status computation (where catch-up start/ready are already known) and the status frame assembly\n- cli/status.ts:158-233 \u2014 the status data surface the new block joins\n\n### Risks\n\n- The projection must never read wall-clock inside a fold or projection path \u2014 producer/serve-side derivation only, from recorded timestamps.\n\n## Acceptance\n\n- [ ] `keeper status --json` carries event count, DB bytes, and projected catch-up/replay durations (null-honest before first measurement)\n- [ ] The catch-up projection is derived from a recorded boot measurement, verified by a test over injected observations\n- [ ] Focused suite green; no behavior beyond measurement\n\n## Done summary\nAdded event_store block to keeper status --json: event count, DB bytes, and boot-catchup/full-replay duration projections derived from a new durable boot_catchup_stats singleton (never wall-clock at query time).\n## Evidence\n",
+      "task_id": "fn-1311-event-store-operational-thresholds.1",
+      "tier": "high",
+      "title": "Expose event-store thresholds in status"
+    }
+  ],
+  "created_at": "2026-07-17T13:22:02.340000Z",
+  "epic_id": "fn-1311-event-store-operational-thresholds",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "b6624ab46c0f52b4940c36caab807b265323395379c62968cf32079045ad346b",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
