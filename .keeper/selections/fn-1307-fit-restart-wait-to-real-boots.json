@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified two-constant calibration with the chosen budgets named in the spec, explicit file targets, and a concrete test-fixture acceptance; decision logic is left intact, so it routes GPT-first to the everyday terra tier at a bounded single-surface medium band.",
+      "task_id": "fn-1307-fit-restart-wait-to-real-boots.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T09:49:16.556000Z",
+  "epic_id": "fn-1307-fit-restart-wait-to-real-boots",
+  "input_hash": "df4b109e9912e655473fca63f1a960dc0fdd5554668771be36532af9fc5daa17",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3746238622,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1307-fit-restart-wait-to-real-boots.1\", \"tier\": \"medium\", \"model\": \"gpt-5.6-terra\", \"rationale\": \"Well-specified two-constant calibration with the chosen budgets named in the spec, explicit file targets, and a concrete test-fixture acceptance; decision logic is left intact, so it routes GPT-first to the everyday terra tier at a bounded single-surface medium band.\", \"confidence\": 0.72}]}\n"
+}
