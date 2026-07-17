@@ -15,11 +15,13 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -5924,6 +5926,122 @@ function completeSparseEventBindings(bindings: Record<string, unknown>): void {
 }
 
 /**
+ * Injectable `node:fs` seam for {@link readEventLogUnreadRange} — the real
+ * syscalls in production; a test substitutes it to force a short read, a read
+ * failure (the fd must still close), and a stat→open inode mismatch without
+ * racing the real filesystem.
+ */
+export interface EventLogReadFs {
+  openSync: (path: string, flags: string) => number;
+  fstatSync: (fd: number) => { ino: number; size: number };
+  readSync: (
+    fd: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number,
+  ) => number;
+  closeSync: (fd: number) => void;
+}
+
+const REAL_EVENT_LOG_READ_FS: EventLogReadFs = {
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+};
+
+/**
+ * Discriminated result of a positioned unread-range read. `read` carries the
+ * unread bytes plus the effective start offset (reset to 0 when the open fd's
+ * size is below the stored offset — a truncation caught in the stat→open race).
+ * `skip` means the caller MUST NOT advance the offset: the fd is a replaced
+ * inode, or the open/read failed.
+ */
+export type EventLogUnreadRead =
+  | { kind: "read"; bytes: Buffer; startOffset: number }
+  | { kind: "skip"; reason: string };
+
+/**
+ * Positioned read of ONLY a file's unread `[storedOffset, fstat size)` byte
+ * range for the events-log ingester. The per-pid NDJSON file is an append-only
+ * log that grows unbounded over a long session, so a whole-file read is O(file)
+ * every tick; this reads just the tail.
+ *
+ * Opens the file, fstats the OPEN fd, and reconciles that fd's inode against the
+ * `expectedInode` the offset row is keyed on — a path replaced between the outer
+ * stat and this open points our fd at a DIFFERENT inode, and attributing its
+ * bytes to the old inode's offset would corrupt an unrelated row; that case
+ * `skip`s and the next tick re-stats onto a fresh row at offset 0. Caps the read
+ * at the fstat'd size (growth after fstat is caught next tick, keeping torn-tail
+ * evaluation consistent with the read boundary), LOOPS short reads until the
+ * range is complete or EOF (a concurrent shrink) ends it, and closes the fd in a
+ * `finally`. Byte offsets throughout — never string length.
+ */
+export function readEventLogUnreadRange(
+  full: string,
+  storedOffset: number,
+  expectedInode: number,
+  fs: EventLogReadFs = REAL_EVENT_LOG_READ_FS,
+): EventLogUnreadRead {
+  let fd: number;
+  try {
+    fd = fs.openSync(full, "r");
+  } catch (err) {
+    return {
+      kind: "skip",
+      reason: `open failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  try {
+    const fst = fs.fstatSync(fd);
+    if (fst.ino !== expectedInode) {
+      return {
+        kind: "skip",
+        reason: `inode changed between stat and open (${expectedInode} → ${fst.ino}); deferring to next tick`,
+      };
+    }
+    let startOffset = storedOffset;
+    // Truncation caught in the stat→open race: the fd is smaller than our stored
+    // offset, so it was wiped/replaced in place — re-read from the top.
+    if (fst.size < startOffset) {
+      startOffset = 0;
+    }
+    const readLen = fst.size - startOffset;
+    if (readLen <= 0) {
+      return { kind: "read", bytes: Buffer.alloc(0), startOffset };
+    }
+    const buf = Buffer.allocUnsafe(readLen);
+    let filled = 0;
+    while (filled < readLen) {
+      const got = fs.readSync(
+        fd,
+        buf,
+        filled,
+        readLen - filled,
+        startOffset + filled,
+      );
+      if (got <= 0) {
+        break; // EOF (a concurrent shrink) — process the whole lines we have.
+      }
+      filled += got;
+    }
+    return { kind: "read", bytes: buf.subarray(0, filled), startOffset };
+  } catch (err) {
+    return {
+      kind: "skip",
+      reason: `read failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // best-effort: a double-close / already-invalid fd must not wedge the scan.
+    }
+  }
+}
+
+/**
  * Ingest the per-pid NDJSON events-log files — the lock-free events path's
  * analogue of {@link scanDeadLetterDir}. For each `<pid>.ndjson` file, scan FROM
  * ITS DURABLE BYTE-OFFSET, parse each COMPLETE line, and `INSERT INTO events`
@@ -5940,9 +6058,14 @@ function completeSparseEventBindings(bindings: Record<string, unknown>): void {
  * partial trailing line is NOT folded and NOT skipped past.
  *
  * INODE / OFFSET SAFETY: keyed on `(path, inode)`, so a recycled pid reusing a
- * filename gets a fresh row at offset 0. `stat().size < storedOffset` ⇒ the file
- * was truncated/replaced ⇒ fall the offset to 0 and re-read from the top. Main
- * ALWAYS re-reads from the durable offset, NEVER byte 0 unless size proves a reset.
+ * filename gets a fresh row at offset 0 (a known inode-reuse limitation — no
+ * content fingerprinting). `stat().size < storedOffset` ⇒ the file was
+ * truncated/replaced ⇒ fall the offset to 0 and re-read from the top. The unread
+ * tail is read POSITIONED from the durable offset (never a whole-file read), and
+ * the OPEN fd's inode is reconciled with the offset row's inode so a path swapped
+ * between the outer stat and the open never attributes new bytes to the old
+ * inode's row. Main ALWAYS re-reads from the durable offset, NEVER byte 0 unless
+ * size proves a reset.
  *
  * POISON-LINE POLICY: a `parseEventLogLine` → null line inside the
  * newline-terminated loop is BLANK (advance silently) or POISON (unparseable, a
@@ -6045,24 +6168,23 @@ export function scanEventsLogDir(
 
     let newOffset = startOffset;
     if (size > startOffset) {
-      let text: string;
-      try {
-        // Read the whole file; slice the unread tail. (bun:sqlite + Node fs
-        // have no cheap pread-from-offset; the file is one writer's append log
-        // and a long session is bounded by the session's own event count.)
-        text = readFileSync(full, "utf8");
-      } catch (err) {
+      // Positioned read of ONLY the unread tail — the append-only file grows
+      // unbounded over a long session, so a whole-file read is O(file) each tick.
+      // The helper reconciles the open fd's inode against the offset row's inode
+      // and closes the fd in a finally; a `skip` means DO NOT advance the offset.
+      const read = readEventLogUnreadRange(full, startOffset, inode);
+      if (read.kind === "skip") {
         console.error(
-          `[keeperd] events-log scan read failed for ${full}: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `[keeperd] events-log scan read skipped for ${full}: ${read.reason}`,
         );
         continue;
       }
-      // Operate on the byte view so the offset is a true byte count (UTF-8
-      // multibyte chars must not skew `\n` byte positions).
-      const bytes = Buffer.from(text, "utf8");
-      const unread = bytes.subarray(startOffset);
+      // The helper may have reset the start offset to 0 (truncation caught in the
+      // stat→open race); adopt it so the offset math + poison spans stay correct.
+      startOffset = read.startOffset;
+      // The unread range is already a byte view, so the offset stays a true byte
+      // count (UTF-8 multibyte chars never skew `\n` byte positions).
+      const unread = read.bytes;
 
       const records: ReturnType<typeof parseEventLogLine>[] = [];
       // Poison lines parked in `dead_letters` (status='poison') inside the SAME
