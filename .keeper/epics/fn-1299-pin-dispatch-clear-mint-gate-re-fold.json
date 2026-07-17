@@ -7,7 +7,7 @@
     "fn-1297-fence-dispatch-clears-by-attempt"
   ],
   "id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T02:10:12.028000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T02:10:08.827000Z"
+  "updated_at": "2026-07-17T02:10:12.028000Z"
 }
