@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 3,
+        "insertions": 58
+      },
+      "done_summary": "Routed cli/restart.ts's readLatestBoot through resolveRestartLedgerPath() so a KEEPER_RESTART_LEDGER override reaches both writer and reader; corrected the stale sole-reader/writer comment in src/db.ts; added a real-ledger-parse test (torn line, interleaved non-boot lines, last-valid-boot-wins) and a healthy-probes-but-stale-boot -> health-timeout test.",
+      "input_hash": "03e6af77fbcd316fc8c0bb783786a14b9d55032338cb993f2584ba7b398fc4a9",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2943,
+      "spec_md": "## Description\n\nThree related defects in the daemon-restart honest-verdict CLI, all in\n`cli/restart.ts` and its test suite, landing as one commit.\n\nF1 (bug): `readLatestBoot` at `cli/restart.ts:240` hardcodes\n`join(homedir(), \".local\",\"state\",\"keeper\",\"restart-ledger.json\")`\n(line 244), bypassing `resolveRestartLedgerPath()` at `src/db.ts:5089`,\nwhich the daemon writer uses and which honors the `KEEPER_RESTART_LEDGER`\noverride (also set by the test sandbox, `test/helpers/sandbox-env.ts:132`).\nUnder the override the reader looks at the default-home ledger, never sees\nthe fresh boot, and reports `kickstart-failed`/`health-timeout` on an\nactually-successful restart \u2014 the inverse of the honest-verdict goal.\nRoute the reader through the canonical resolution (import\n`resolveRestartLedgerPath()` or a shared pure copy) so writer and reader\nagree. The `Main is the SOLE reader/writer` comment at `src/db.ts:5087` is\nnow false (the CLI is a second reader); update it to reflect the shared\npath.\n\nF5 (test gap): every test injects `readLatestBoot` via deps, so the real\nfile read + per-line parse + `kind`/`boot_id`/`ts` filtering + torn-tail\n`catch` + last-valid-boot-wins (`cli/restart.ts:240-268`) is never\nexercised. A parse bug here silently produces a wrong verdict. Add a unit\ntest over the real parse with a malformed/torn trailing line and\ninterleaved non-`boot` lines, asserting the last valid boot wins.\n\nF6 (test gap): the exit-0 + healthy-probes + never-fresh-boot path that\nresolves to `health-timeout` (`cli/restart.ts:376-422`) is untested \u2014 the\nexisting `health-timeout` test uses probes that are never healthy, so the\n\"healthy but stale daemon must not be reported as success\" branch (the\nepic's core promise) is unexercised. Add a case: kickstart exit 0, probes\nhealthy, boot stays stale -> `code: \"health-timeout\"`.\n\nFiles: `cli/restart.ts`, `src/db.ts` (comment), `test/restart-cli.test.ts`\nand/or `test/restart-verb.test.ts`.\n\n## Acceptance\n\n- [ ] `readLatestBoot` resolves the ledger path through the same\n      override-honoring resolution the daemon writer uses; a set\n      `KEEPER_RESTART_LEDGER` points reader and writer at the same file.\n- [ ] `src/db.ts:5087` no longer claims a sole reader/writer; it reflects\n      the CLI reader on the shared path.\n- [ ] A unit test exercises the real ledger parse (torn trailing line,\n      interleaved non-boot lines, last-valid-boot-wins).\n- [ ] A test asserts exit-0 kickstart + healthy probes + never-fresh boot\n      -> `health-timeout`.\n- [ ] Existing restart-verb tests stay green.\n\n## Done summary\nRouted cli/restart.ts's readLatestBoot through resolveRestartLedgerPath() so a KEEPER_RESTART_LEDGER override reaches both writer and reader; corrected the stale sole-reader/writer comment in src/db.ts; added a real-ledger-parse test (torn line, interleaved non-boot lines, last-valid-boot-wins) and a healthy-probes-but-stale-boot -> health-timeout test.\n## Evidence\n",
+      "task_id": "fn-1302-harden-restart-verb-ledger-read.1",
+      "tier": "high",
+      "title": "Fix ledger path, cover verdict"
+    }
+  ],
+  "created_at": "2026-07-17T04:49:44.463000Z",
+  "epic_id": "fn-1302-harden-restart-verb-ledger-read",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "03e6af77fbcd316fc8c0bb783786a14b9d55032338cb993f2584ba7b398fc4a9",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
