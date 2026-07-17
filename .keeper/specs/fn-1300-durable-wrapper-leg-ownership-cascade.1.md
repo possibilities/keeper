@@ -40,5 +40,5 @@ Extend refold-equivalence over the new step; pure fixtures for transfer fencing 
 - [ ] Deterministic re-fold equivalence holds; schema fingerprint re-pinned
 
 ## Done summary
-
+Landed ADR 0071's durable layer inert: birth-record schema v2 owner tuple + version-based legacy classification, the provider_leg_ownership registry + provider_leg_cascades incident projections with their folds, the fenced ownership transfer, and an owned-leg release gate on DispatchClaimReleased; schema step v132, fingerprint re-pinned, re-fold equivalence proven.
 ## Evidence
