@@ -736,7 +736,12 @@ export interface ConfirmRunningDeps {
    * drives, but the ONLY caller is the recover pass's level-trigger — the distress
    * is never operator-clearable. OPTIONAL — a no-op when absent.
    */
-  clearSharedWedgeDistress?(payload: { id: string; dir: string }): void;
+  clearSharedWedgeDistress?(payload: {
+    id: string;
+    dir: string;
+    expected_attempt_id: null;
+    expected_instance_event_id: number | null;
+  }): void;
   /**
    * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
    * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
@@ -1133,6 +1138,52 @@ export interface DispatchFailedPayload {
 export interface DispatchClearedPayload {
   verb: Verb;
   id: string;
+  expected_attempt_id: number | null;
+  expected_instance_event_id: number | null;
+}
+
+export interface DispatchFailureFence {
+  attempt_id: number | null;
+  instance_event_id: number | null;
+}
+
+export type DispatchFailureFenceMap = ReadonlyMap<
+  DispatchKey,
+  DispatchFailureFence
+>;
+
+function dispatchClearedPayload(
+  fences: DispatchFailureFenceMap | undefined,
+  verb: Verb,
+  id: string,
+  claimless = false,
+): DispatchClearedPayload {
+  const fence = fences?.get(dispatchKey(verb, id));
+  return {
+    verb,
+    id,
+    expected_attempt_id: claimless ? null : (fence?.attempt_id ?? null),
+    expected_instance_event_id: fence?.instance_event_id ?? null,
+  };
+}
+
+function claimlessDistressClear(
+  fences: DispatchFailureFenceMap,
+  id: string,
+  dir: string,
+): {
+  id: string;
+  dir: string;
+  expected_attempt_id: null;
+  expected_instance_event_id: number | null;
+} {
+  const fence = fences.get(`daemon::${id}` as DispatchKey);
+  return {
+    id,
+    dir,
+    expected_attempt_id: null,
+    expected_instance_event_id: fence?.instance_event_id ?? null,
+  };
 }
 
 /**
@@ -1155,8 +1206,8 @@ export const DISPATCH_FAILED_WATERMARK_SEC = 15 * 60;
  *  - a still-unchanged condition re-announces at most once per
  *    {@link DISPATCH_FAILED_WATERMARK_SEC} (the producer `ts` is the clock) as a
  *    bounded liveness watermark.
- * A DispatchCleared resets the gate (via {@link DispatchFailedGate.noteClear}) so
- * the next failure of that `(verb, id)` re-emits immediately.
+ * A DispatchCleared resets the gate only after a later projection acknowledges
+ * that exact incident disappeared, so a dropped or stale clear cannot re-arm it.
  *
  * In-worker memory only, mirroring the `lastWorktreeStatusKey` change-gate. Two
  * ACCEPTED, BOUNDED degradations: (1) a daemon restart empties the gate and
@@ -1169,8 +1220,10 @@ export const DISPATCH_FAILED_WATERMARK_SEC = 15 * 60;
 export interface DispatchFailedGate {
   /** True → post this event; false → suppress an identical re-emit. */
   shouldEmit(payload: DispatchFailedPayload): boolean;
-  /** Reset the `(verb, id)` gate on its DispatchCleared, so a re-failure re-emits. */
-  noteClear(verb: Verb, id: string): void;
+  /** Remember a posted clear; projection acknowledgement performs the reset. */
+  noteClear(payload: DispatchClearedPayload): void;
+  /** Reset only after the exact observed incident disappears; a replacement is stale. */
+  observeProjection(fences: DispatchFailureFenceMap): void;
 }
 
 /**
@@ -1186,6 +1239,10 @@ export function createDispatchFailedGate(
   // NUL), the same composite-key discipline the provision fan-in set uses.
   const keyOf = (verb: string, id: string): string => `${verb}\u0000${id}`;
   const lastEmitted = new Map<string, { reason: string; ts: number }>();
+  const pendingClear = new Map<
+    string,
+    { verb: Verb; id: string; instanceEventId: number }
+  >();
   return {
     shouldEmit(payload) {
       const key = keyOf(payload.verb, payload.id);
@@ -1202,8 +1259,21 @@ export function createDispatchFailedGate(
       }
       return false;
     },
-    noteClear(verb, id) {
-      lastEmitted.delete(keyOf(verb, id));
+    noteClear(payload) {
+      if (payload.expected_instance_event_id == null) return;
+      pendingClear.set(keyOf(payload.verb, payload.id), {
+        verb: payload.verb,
+        id: payload.id,
+        instanceEventId: payload.expected_instance_event_id,
+      });
+    },
+    observeProjection(fences) {
+      for (const [key, pending] of pendingClear) {
+        const current = fences.get(dispatchKey(pending.verb, pending.id));
+        if (current?.instance_event_id === pending.instanceEventId) continue;
+        pendingClear.delete(key);
+        if (current === undefined) lastEmitted.delete(key);
+      }
     },
   };
 }
@@ -4590,6 +4660,7 @@ export async function runReconcileCycle(
     string,
     ReadonlySet<string>
   > | null = null,
+  dispatchFailureFences?: DispatchFailureFenceMap,
 ): Promise<void> {
   // Realpath-normalize the worktree lane before it rides the launch as the
   // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
@@ -4669,7 +4740,9 @@ export async function runReconcileCycle(
     if (signal.aborted) {
       return;
     }
-    deps.emitDispatchCleared({ verb: clr.verb, id: clr.id });
+    deps.emitDispatchCleared(
+      dispatchClearedPayload(dispatchFailureFences, clr.verb, clr.id),
+    );
   }
   // Refresh drifted bases before dispatching new work. This is a producer sibling
   // of recover/finalize: it mutates only the lane's own linked worktree and never
@@ -5230,7 +5303,9 @@ export async function runReconcileCycle(
     // block, and a still-failing group's sticky row is preserved.
     for (const id of decision.finalizeFailureIds) {
       if (finalizedClean.has(id)) {
-        deps.emitDispatchCleared({ verb: "close", id });
+        deps.emitDispatchCleared(
+          dispatchClearedPayload(dispatchFailureFences, "close", id),
+        );
       }
     }
   }
@@ -8392,16 +8467,23 @@ export interface DispatchClearedMessage {
  * `daemon`, outside the strict `DispatchFailedPayload` union — the same reason the
  * crash-loop distress mints through a main-side thin closure.
  */
-export interface SharedWedgeDistressMessage {
-  kind: "shared-wedge-distress";
-  action: "mint" | "clear";
-  id: string;
-  dir: string;
-  /** Present on `mint` only — starts with the shared-wedge display prefix. */
-  reason?: string;
-  /** Present on `mint` only — the producer-stamped seconds for re-fold determinism. */
-  ts?: number;
-}
+export type SharedWedgeDistressMessage =
+  | {
+      kind: "shared-wedge-distress";
+      action: "mint";
+      id: string;
+      dir: string;
+      reason: string;
+      ts: number;
+    }
+  | {
+      kind: "shared-wedge-distress";
+      action: "clear";
+      id: string;
+      dir: string;
+      expected_attempt_id: null;
+      expected_instance_event_id: number | null;
+    };
 
 /**
  * Worker → main: Dispatched mint request (id-correlated + durable-acked). Main
@@ -8619,6 +8701,11 @@ export function deriveResourceHoldObservations(
  * rows projected through {@link projectGitStatusByProjectDir}; `failedKeys` the
  * open `dispatch_failures` set (sticky until a `retry_dispatch` clears it).
  */
+export type FencedReconcileSnapshot = ReconcileSnapshot &
+  ZombieReaperSnapshot & {
+    dispatchFailureFences: Map<DispatchKey, DispatchFailureFence>;
+  };
+
 export async function loadReconcileSnapshot(
   db: Parameters<typeof runQuery>[0],
   // Read-time tmux liveness probe (the pane-ops `listPanes` seam) — assembles
@@ -8637,7 +8724,7 @@ export async function loadReconcileSnapshot(
   pidAlive: (pid: number) => boolean = isPidAlive,
   readinessQuery: ReadinessQuery = runQuery,
   nowSec: number = Math.floor(Date.now() / 1000),
-): Promise<ReconcileSnapshot & ZombieReaperSnapshot> {
+): Promise<FencedReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
       type: "query" as const,
@@ -8693,6 +8780,7 @@ export async function loadReconcileSnapshot(
   }
 
   const failedKeys = new Set<DispatchKey>();
+  const dispatchFailureFences = new Map<DispatchKey, DispatchFailureFence>();
   const recoverFailureIds = new Set<string>();
   const finalizeFailureIds = new Set<string>();
   const slotOccupancyFailures: { verb: Verb; id: string }[] = [];
@@ -8744,7 +8832,21 @@ export async function loadReconcileSnapshot(
     const verb = (row as { verb?: unknown }).verb;
     const id = (row as { id?: unknown }).id;
     if (typeof verb === "string" && typeof id === "string") {
-      failedKeys.add(dispatchKey(verb as Verb, id));
+      const key = dispatchKey(verb as Verb, id);
+      failedKeys.add(key);
+      const rawAttempt = (row as { attempt_id?: unknown }).attempt_id;
+      const rawInstance = (row as { instance_event_id?: unknown })
+        .instance_event_id;
+      dispatchFailureFences.set(key, {
+        attempt_id:
+          typeof rawAttempt === "number" && Number.isSafeInteger(rawAttempt)
+            ? rawAttempt
+            : null,
+        instance_event_id:
+          typeof rawInstance === "number" && Number.isSafeInteger(rawInstance)
+            ? rawInstance
+            : null,
+      });
       const reason = (row as { reason?: unknown }).reason;
       const reasonStr = typeof reason === "string" ? reason : "";
       if (isSharedWedgeDistressKey(verb, id)) {
@@ -9317,6 +9419,7 @@ export async function loadReconcileSnapshot(
     subagentInvocations,
     gitStatusByProjectDir,
     failedKeys,
+    dispatchFailureFences,
     recoverFailureIds,
     finalizeFailureIds,
     slotOccupancyFailures,
@@ -9467,7 +9570,7 @@ function main(): void {
   // re-derives every failure from live git each cycle, so an unconditional emit
   // mints one event per cycle for a persistently-stuck condition. Emits on first
   // appearance + reason-change + a bounded still-stuck watermark, suppresses
-  // identical re-emits; a DispatchCleared resets it. In-worker memory only.
+  // identical re-emits; an acknowledged DispatchCleared resets it. In-worker memory only.
   const dispatchFailedGate = createDispatchFailedGate();
   // Per-repo grace tracker escalating a SHARED-checkout mid-merge wedge that
   // outlives the recover pass's self-heal window into a visible distress row. In-
@@ -9661,9 +9764,9 @@ function main(): void {
       } satisfies DispatchFailedMessage);
     },
     emitDispatchCleared: (payload) => {
-      // Resolution resets the gate so a re-failure of this `(verb, id)` re-emits
-      // immediately rather than being folded into a stale suppression window.
-      dispatchFailedGate.noteClear(payload.verb, payload.id);
+      // Keep suppression armed until a later projection proves this exact
+      // incident disappeared. A dropped or stale message must not re-arm it.
+      dispatchFailedGate.noteClear(payload);
       parentPort?.postMessage({
         kind: "dispatch-cleared",
         payload,
@@ -9687,6 +9790,8 @@ function main(): void {
         action: "clear",
         id: payload.id,
         dir: payload.dir,
+        expected_attempt_id: null,
+        expected_instance_event_id: payload.expected_instance_event_id,
       } satisfies SharedWedgeDistressMessage);
     },
     reclaimSlotPane: async (paneId) => {
@@ -9862,6 +9967,7 @@ function main(): void {
         if (snapshot.readinessDegraded) {
           continue;
         }
+        dispatchFailedGate.observeProjection(snapshot.dispatchFailureFences);
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
         // operator projection. Once per cycle, regardless of paused/playing (the
         // verdict is observational, not a dispatch action); the dep dedupes so a
@@ -9980,10 +10086,13 @@ function main(): void {
             }
             for (const action of snapshot.monitorSlotWedgeActions?.clear ??
               []) {
-              deps.clearSharedWedgeDistress?.({
-                id: action.id,
-                dir: action.dir,
-              });
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  action.id,
+                  action.dir,
+                ),
+              );
             }
           } catch (err) {
             console.error(
@@ -10008,7 +10117,13 @@ function main(): void {
               if (!candidateIds.has(jobId)) zombieKillSent.delete(jobId);
             }
             for (const action of snapshot.zombieSessionClearActions) {
-              deps.clearSharedWedgeDistress?.(action);
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  action.id,
+                  action.dir,
+                ),
+              );
             }
             for (const candidate of snapshot.zombieSessionCandidates) {
               const job = snapshot.jobs.get(candidate.jobId);
@@ -10154,10 +10269,13 @@ function main(): void {
                   ts: deps.now(),
                 });
               } else {
-                deps.clearSharedWedgeDistress?.({
-                  id: action.id,
-                  dir: action.dir,
-                });
+                deps.clearSharedWedgeDistress?.(
+                  claimlessDistressClear(
+                    snapshot.dispatchFailureFences,
+                    action.id,
+                    action.dir,
+                  ),
+                );
               }
             }
             for (const f of failures) {
@@ -10205,7 +10323,13 @@ function main(): void {
               failures,
               resolved,
             )) {
-              deps.emitDispatchCleared({ verb: "close", id });
+              deps.emitDispatchCleared(
+                dispatchClearedPayload(
+                  snapshot.dispatchFailureFences,
+                  "close",
+                  id,
+                ),
+              );
             }
             // Sustained mid-merge WEDGE escalation NEUTERED: a mid-merge SHARED checkout
             // no longer blocks the base merge — it lands via the working-tree-free
@@ -10233,7 +10357,13 @@ function main(): void {
               });
             }
             for (const c of wedgeDecision.clear) {
-              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  c.id,
+                  c.dir,
+                ),
+              );
             }
             // Fan-in LANE pre-merge arm (fn-1123.2): the recover pass re-probed each
             // surviving keeper lane's base readiness. Normalize both sides to the ONE
@@ -10265,7 +10395,13 @@ function main(): void {
               wedgedLaneKeys,
               resolvedLanes,
             )) {
-              deps.emitDispatchCleared({ verb: c.verb, id: c.id });
+              deps.emitDispatchCleared(
+                dispatchClearedPayload(
+                  snapshot.dispatchFailureFences,
+                  c.verb,
+                  c.id,
+                ),
+              );
             }
             const laneDecision = laneWedgeTracker.step({
               wedged: wedgedLanes,
@@ -10285,7 +10421,13 @@ function main(): void {
               });
             }
             for (const c of laneDecision.clear) {
-              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  c.id,
+                  c.dir,
+                ),
+              );
             }
           } catch (err) {
             console.error(
@@ -10339,7 +10481,13 @@ function main(): void {
               });
             }
             for (const c of staleDecision.clear) {
-              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  c.id,
+                  c.dir,
+                ),
+              );
             }
           } catch (err) {
             console.error(
@@ -10384,7 +10532,13 @@ function main(): void {
               });
             }
             for (const c of dupDecision.clear) {
-              deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  c.id,
+                  c.dir,
+                ),
+              );
             }
           } catch (err) {
             console.error(
@@ -10439,7 +10593,13 @@ function main(): void {
                 });
               }
               for (const c of desyncDecision.clear) {
-                deps.clearSharedWedgeDistress?.({ id: c.id, dir: c.dir });
+                deps.clearSharedWedgeDistress?.(
+                  claimlessDistressClear(
+                    snapshot.dispatchFailureFences,
+                    c.id,
+                    c.dir,
+                  ),
+                );
               }
             }
           } catch (err) {
@@ -10464,13 +10624,21 @@ function main(): void {
         if (!state.paused) {
           try {
             const openSentinelIds = new Set<string>();
+            const sentinelFences = new Map<string, DispatchFailureFence>();
             for (const row of db
-              .query("SELECT id FROM dispatch_failures WHERE verb = ?")
-              .all(STUCK_SENTINEL_DISTRESS_VERB) as { id: string }[]) {
+              .query(
+                "SELECT id, attempt_id, instance_event_id FROM dispatch_failures WHERE verb = ?",
+              )
+              .all(STUCK_SENTINEL_DISTRESS_VERB) as {
+              id: string;
+              attempt_id: number | null;
+              instance_event_id: number | null;
+            }[]) {
               if (
                 isStuckSentinelDistressKey(STUCK_SENTINEL_DISTRESS_VERB, row.id)
               ) {
                 openSentinelIds.add(row.id);
+                sentinelFences.set(row.id, row);
               }
             }
             if (openSentinelIds.size > 0) {
@@ -10489,9 +10657,12 @@ function main(): void {
                     stuckSentinelJobId(id) ?? id
                   } absent from the jobs table (evidence preserved in this trace line)`,
                 );
+                const fence = sentinelFences.get(id);
                 deps.emitDispatchCleared({
                   verb: STUCK_SENTINEL_DISTRESS_VERB,
                   id,
+                  expected_attempt_id: null,
+                  expected_instance_event_id: fence?.instance_event_id ?? null,
                 });
               }
             }
@@ -10532,6 +10703,7 @@ function main(): void {
           // into every `provision` so the fan-in pre-merge clean never discards dirt a
           // running worker owns; `null` (a failed read) → do-not-discard.
           snapshot.liveAttributedDirtyByWorktree ?? null,
+          snapshot.dispatchFailureFences,
         );
       } while (wakePending && !shutdown);
     } catch (err) {

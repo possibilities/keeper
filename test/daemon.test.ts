@@ -4,6 +4,12 @@
  * directly against a tmp DB (no Worker spawned — `daemon.ts` is import-safe
  * behind its `import.meta.main` guard). The full wake-worker → reducer
  * round-trip is covered by the end-to-end integration test.
+ *
+ * Dispatch-clear producer coverage: retry binds at append; boot orphan GC,
+ * crash-loop, bus, and paging recovery carry decision-point episodes; worker
+ * generic/distress messages preserve their immutable fences; repair and shared
+ * dirty positive-evidence clears retain pre-await owners. The common-helper tests
+ * pin matching, stale, claimless, and failed-append behavior for every route.
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -38,6 +44,7 @@ import {
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
   AutocloseHintSet,
+  appendFencedDispatchClear,
   appendRestartLedgerLine,
   auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
@@ -81,6 +88,7 @@ import {
   decidePagingChannelDistress,
   decideServeBusDistress,
   decideServeLivenessWatchdog,
+  dispatchClearFencesAtAppend,
   dispatchEscalationSession,
   drainToCompletion,
   type EscalationDispatchDeps,
@@ -502,16 +510,30 @@ test("gcUnretryableDispatchFailures: sweeps only the rows the retry wire path ca
     "/Users/mike/code/arthack",
     12,
   );
+  db.query(
+    `UPDATE dispatch_failures SET attempt_id = 41, instance_event_id = 51
+      WHERE verb = 'close' AND id = 'worktree-recover:/Users/mike/code/arthack'`,
+  ).run();
 
-  const cleared: { verb: string; id: string }[] = [];
-  const swept = gcUnretryableDispatchFailures(db, (verb, id) =>
-    cleared.push({ verb, id }),
+  const cleared: Array<{
+    verb: string;
+    id: string;
+    expected_attempt_id: number | null;
+    expected_instance_event_id: number | null;
+  }> = [];
+  const swept = gcUnretryableDispatchFailures(db, (verb, id, fences) =>
+    cleared.push({ verb, id, ...fences }),
   );
 
-  // Only the raw-path orphan is swept; the two clearable rows are left alone.
+  // Only the raw-path orphan is swept; its decision-point owners ride intact.
   expect(swept).toBe(1);
   expect(cleared).toEqual([
-    { verb: "close", id: "worktree-recover:/Users/mike/code/arthack" },
+    {
+      verb: "close",
+      id: "worktree-recover:/Users/mike/code/arthack",
+      expected_attempt_id: 41,
+      expected_instance_event_id: 51,
+    },
   ]);
   db.close();
 });
@@ -4215,7 +4237,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // the Git attribution observation watermark, and v129 rebuilds
   // `autopilot_state` without its retired rollout-only adoption column while
   // preserving every surviving setting.
-  expect(SCHEMA_VERSION).toBe(130);
+  expect(SCHEMA_VERSION).toBe(131);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -4523,16 +4545,126 @@ test("the dispatch_mint_gate survives a daemon restart within the window (durabl
   }
 });
 
-test("clearDispatchMintGate: clearing a key (the retry_dispatch fast path) lets an immediate re-mint pass", () => {
+test("fenced DispatchCleared append: matching authority clears only its exact gate; stale, claimless, and failed appends preserve newer ownership", () => {
+  const { db } = freshMemDb();
+  const verb = "close";
+  const id = "fn-1-foo";
+  const key = `${verb}::${id}`;
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES (?, ?, 'failure', '/repo', 1, 51, 1, 1, 41, 51)`,
+  ).run(verb, id);
+  upsertDispatchMintGate(db, key, 1, 41);
+
+  let appends = 0;
+  expect(
+    appendFencedDispatchClear({
+      db,
+      verb,
+      id,
+      fences: {
+        expected_attempt_id: 41,
+        expected_instance_event_id: 51,
+      },
+      append: () => {
+        appends++;
+      },
+    }),
+  ).toBe(true);
+  expect(appends).toBe(1);
+  expect(readDispatchMintGate(db, key)).toBeNull();
+
+  // A delayed worker message cannot rebind itself to the newer attempt.
+  upsertDispatchMintGate(db, key, 2, 61);
+  const notes: string[] = [];
+  expect(
+    appendFencedDispatchClear({
+      db,
+      verb,
+      id,
+      fences: {
+        expected_attempt_id: 41,
+        expected_instance_event_id: 51,
+      },
+      append: () => {
+        appends++;
+      },
+      noteLine: (line) => notes.push(line),
+    }),
+  ).toBe(false);
+  expect(appends).toBe(1);
+  expect(readDispatchMintGate(db, key)).toBe(2);
+  expect(notes).toHaveLength(1);
+  expect(notes[0]).toContain(`key=${key} attempt=41 incident=51`);
+  expect(notes[0]).not.toContain("61");
+
+  // A claimless incident clear carries no attempt authority and cannot release
+  // the unrelated exact gate even though its incident fence is current.
+  expect(
+    appendFencedDispatchClear({
+      db,
+      verb,
+      id,
+      fences: {
+        expected_attempt_id: null,
+        expected_instance_event_id: 51,
+      },
+      append: () => {
+        appends++;
+      },
+    }),
+  ).toBe(true);
+  expect(appends).toBe(2);
+  expect(readDispatchMintGate(db, key)).toBe(2);
+
+  // Append failure propagates but never consumes the newer durable gate.
+  expect(() =>
+    appendFencedDispatchClear({
+      db,
+      verb,
+      id,
+      fences: {
+        expected_attempt_id: 61,
+        expected_instance_event_id: 51,
+      },
+      append: () => {
+        throw new Error("event insert failed");
+      },
+    }),
+  ).toThrow("event insert failed");
+  expect(readDispatchMintGate(db, key)).toBe(2);
+  db.close();
+});
+
+test("retry_dispatch append-point snapshot binds the current incident and newest exact attempt without changing its id-only wire", () => {
+  const { db } = freshMemDb();
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES ('work', 'fn-1-foo.1', 'failure', '/repo', 1, 71, 1, 1, 61, 71)`,
+  ).run();
+  upsertDispatchMintGate(db, "work::fn-1-foo.1", 2, 81);
+  expect(dispatchClearFencesAtAppend(db, "work", "fn-1-foo.1")).toEqual({
+    expected_attempt_id: 81,
+    expected_instance_event_id: 71,
+  });
+  db.close();
+});
+
+test("clearDispatchMintGate: the low-level key-wide helper still removes its target row", () => {
   const { db } = freshMemDb();
   const key = "close::fn-1-foo";
   const t0 = 1_700_000_000_000;
 
   runDispatchMintGate(db, key, t0, DISPATCH_MINT_GATE_WINDOW_MS, () => {});
-  // A human retry clears the gate row...
+  // Production fenced clears use appendFencedDispatchClear; this low-level DB
+  // helper remains pinned independently for callers that intentionally own a key.
   clearDispatchMintGate(db, key);
   expect(readDispatchMintGate(db, key)).toBeNull();
-  // ...so an immediate re-mint (well inside the window) is NOT suppressed.
+  // A subsequent mint inside the old window is no longer suppressed.
   const { suppressed } = runDispatchMintGate(
     db,
     key,
@@ -5601,6 +5733,8 @@ function repairRow(
     dir: "/repo",
     repair_dispatched_at: null,
     human_notified_at: null,
+    attempt_id: 41,
+    instance_event_id: 51,
     ...overrides,
   };
 }
@@ -5673,7 +5807,7 @@ function fakeRepairSweepDeps(opts: {
       mints.push({ kind: "dispatched", token, outcome }),
     mintNotified: (token, outcome) =>
       mints.push({ kind: "notified", token, outcome }),
-    clearRow: (token) => mints.push({ kind: "clear", token }),
+    clearRow: (row) => mints.push({ kind: "clear", token: row.id }),
   };
   return { deps, mints, dispatches, notifies, notes };
 }

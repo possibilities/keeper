@@ -4118,6 +4118,9 @@ interface DispatchFailedPayload {
 interface DispatchClearedPayload {
   verb: string;
   id: string;
+  legacyUnfenced: boolean;
+  expectedAttemptId: number | null | undefined;
+  expectedInstanceEventId: number | null | undefined;
 }
 
 /**
@@ -4181,10 +4184,9 @@ function extractDispatchFailedPayload(
 }
 
 /**
- * Parse a `DispatchCleared` event payload. Mirrors
- * {@link extractDispatchFailedPayload}'s defensive shape — only `verb` +
- * `id` required (the clear arm is keyed-by-pk only); anything missing
- * folds to a safe no-op.
+ * Parse a `DispatchCleared` event payload. Tokenless events take the bounded
+ * legacy-unfenced branch. Once either fence field is present, each field is
+ * parsed independently and an omitted or malformed fence grants no authority.
  */
 function extractDispatchClearedPayload(
   event: Event,
@@ -4193,14 +4195,38 @@ function extractDispatchClearedPayload(
     return null;
   }
   try {
-    const parsed = JSON.parse(event.data) as Partial<DispatchClearedPayload>;
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
     if (typeof parsed.verb !== "string" || parsed.verb.length === 0) {
       return null;
     }
     if (typeof parsed.id !== "string" || parsed.id.length === 0) {
       return null;
     }
-    return { verb: parsed.verb, id: parsed.id };
+    const hasAttemptFence = Object.hasOwn(parsed, "expected_attempt_id");
+    const hasIncidentFence = Object.hasOwn(
+      parsed,
+      "expected_instance_event_id",
+    );
+    if (!hasAttemptFence && !hasIncidentFence) {
+      return {
+        verb: parsed.verb,
+        id: parsed.id,
+        legacyUnfenced: true,
+        expectedAttemptId: null,
+        expectedInstanceEventId: null,
+      };
+    }
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      legacyUnfenced: false,
+      expectedAttemptId: hasAttemptFence
+        ? parseDispatchAttempt(parsed.expected_attempt_id)
+        : undefined,
+      expectedInstanceEventId: hasIncidentFence
+        ? parseDispatchAttempt(parsed.expected_instance_event_id)
+        : undefined,
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse DispatchCleared payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -4226,14 +4252,15 @@ function foldDispatchFailed(db: Database, event: Event): void {
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, conflicted_files, ts, last_event_id, created_at,
        updated_at, merge_escalated_at, resolver_dispatched_at,
-       human_notified_at, instance_event_id, repair_dispatched_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)
+       human_notified_at, instance_event_id, repair_dispatched_at, attempt_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
        reason = excluded.reason,
        dir = excluded.dir,
        conflicted_files = excluded.conflicted_files,
        ts = excluded.ts,
        last_event_id = excluded.last_event_id,
+       attempt_id = excluded.attempt_id,
        -- created_at preserved through UPSERT: the row's "sticky since"
        -- view is the FIRST observation of this failure, never the latest.
        -- merge_escalated_at + resolver_dispatched_at + human_notified_at +
@@ -4263,6 +4290,7 @@ function foldDispatchFailed(db: Database, event: Event): void {
       payload.ts,
       event.ts,
       event.id,
+      payload.attemptId,
     ],
   );
   // A `DispatchFailed` also discharges any in-flight `pending_dispatches` row
@@ -4283,45 +4311,71 @@ function foldDispatchFailed(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `DispatchCleared` event. Idempotent DELETE on `(verb, id)`
- * — the ONLY legal clear path (a direct DELETE outside the fold arm would break
- * re-fold determinism). Clears the sticky `dispatch_failures` row, the never-bound
- * `dispatch_never_bound` counter (so a `keeper autopilot retry` re-arms the breaker
- * from zero — a residual count would re-trip after one expire instead of K), the
- * instant-death `dispatch_instant_death` counter (same re-arm-from-zero rationale
- * for its sibling breaker), AND the in-flight `pending_dispatches` row (fn-870 BUG
- * fix: an operator clear must immediately free the launch-window slot + per-root
- * mutex; clearing only the failure + counter left a stale pending stranding the
- * slot until the TTL sweep). All DELETEs are idempotent no-ops on a missing row.
- * Malformed/missing payload → safe no-op.
+ * Fold one synthetic `DispatchCleared` event as independent exact
+ * compare-and-clear effects. Modern attempt and incident fences never alias
+ * NULL. Tokenless history clears the incident present at that replay point but
+ * touches only legacy-unfenced attempt rows. Breaker streaks are cross-attempt
+ * evidence and are reset only by their positive recovery folds.
  */
 function foldDispatchCleared(db: Database, event: Event): void {
   const payload = extractDispatchClearedPayload(event);
   if (payload == null) {
     return;
   }
-  db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
-  db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
-  db.run("DELETE FROM dispatch_instant_death WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
-  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
-    payload.verb,
-    payload.id,
-  ]);
-  db.run(
-    `UPDATE dispatch_claims
-        SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
-      WHERE verb = ? AND id = ? AND state != 'released'`,
-    [event.ts, event.id, event.ts, payload.verb, payload.id],
-  );
+  const dispatchKey = `${payload.verb}::${payload.id}`;
+  if (payload.legacyUnfenced) {
+    db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
+      payload.verb,
+      payload.id,
+    ]);
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
+      [payload.verb, payload.id],
+    );
+    db.run(
+      "DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id IS NULL",
+      [dispatchKey],
+    );
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id IS NULL
+          AND legacy_unfenced = 1 AND state != 'released'`,
+      [event.ts, event.id, event.ts, payload.verb, payload.id],
+    );
+    return;
+  }
+  if (payload.expectedInstanceEventId != null) {
+    db.run(
+      `DELETE FROM dispatch_failures
+        WHERE verb = ? AND id = ? AND instance_event_id = ?`,
+      [payload.verb, payload.id, payload.expectedInstanceEventId],
+    );
+  }
+  if (payload.expectedAttemptId != null) {
+    db.run(
+      "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
+      [payload.verb, payload.id, payload.expectedAttemptId],
+    );
+    db.run(
+      "DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id = ?",
+      [dispatchKey, payload.expectedAttemptId],
+    );
+    db.run(
+      `UPDATE dispatch_claims
+          SET state = 'released', released_at = ?, last_event_id = ?, updated_at = ?
+        WHERE verb = ? AND id = ? AND attempt_id = ?
+          AND legacy_unfenced = 0 AND state != 'released'`,
+      [
+        event.ts,
+        event.id,
+        event.ts,
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+      ],
+    );
+  }
 }
 
 /**
@@ -5015,9 +5069,8 @@ function foldDispatched(db: Database, event: Event): void {
  * Never-bound circuit-breaker threshold: after K CONSECUTIVE
  * `DispatchExpired`-without-bind events for one `(verb, id)`, the fold mints a
  * sticky `dispatch_failures(reason='never-bound')` the existing `failedKeys` arm
- * suppresses. A successful bind (or a `retry_dispatch` clear) resets the count,
- * so a worker that binds even once never trips it ("bound-then-died" is the
- * exit-watcher's path, not this). Tunable: 2 = more aggressive.
+ * suppresses. A successful bind resets the count; incident clearing preserves
+ * the streak so a still-broken retry trips again immediately. Tunable: 3.
  */
 const NEVER_BOUND_EXPIRE_THRESHOLD = 3;
 
@@ -5041,9 +5094,9 @@ const NEVER_BOUND_REASON = "never-bound";
  *     `dispatch_failures(reason='never-bound')` via the same UPSERT shape as
  *     {@link foldDispatchFailed}, which the `failedKeys` arm suppresses. The mint
  *     is keyed-by-pk with `created_at`/`ts` lifted from `event.ts` (re-fold
- *     deterministic), and ALSO clears the counter so a post-retry re-arm starts
- *     fresh. The counter resets to zero (DELETE) on a successful bind (the
- *     SessionStart discharge-on-bind gate) and on `DispatchCleared`.
+ *     deterministic). The counter remains pinned at threshold after tripping and
+ *     resets to zero (DELETE) only on a successful bind (the SessionStart
+ *     discharge-on-bind gate).
  *
  *     Breaker-loop safety (fn-870): the counter arm is SKIPPED when the key
  *     ALREADY has a `dispatch_failures` row. The TTL sweep now expires aged
@@ -5091,7 +5144,10 @@ function foldDispatchExpired(db: Database, event: Event): void {
     `INSERT INTO dispatch_never_bound (verb, id, consecutive_expired, last_event_id)
        VALUES (?, ?, 1, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
-       consecutive_expired = dispatch_never_bound.consecutive_expired + 1,
+       consecutive_expired = MIN(
+         dispatch_never_bound.consecutive_expired + 1,
+         ${NEVER_BOUND_EXPIRE_THRESHOLD}
+       ),
        last_event_id = excluded.last_event_id`,
     [payload.verb, payload.id, event.id],
   );
@@ -5114,13 +5170,14 @@ function foldDispatchExpired(db: Database, event: Event): void {
     db.run(
       `INSERT INTO dispatch_failures (
          verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
-         instance_event_id
-       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
+         instance_event_id, attempt_id
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(verb, id) DO UPDATE SET
          reason = excluded.reason,
          dir = excluded.dir,
          ts = excluded.ts,
          last_event_id = excluded.last_event_id,
+         attempt_id = excluded.attempt_id,
          updated_at = excluded.updated_at`,
       [
         payload.verb,
@@ -5131,15 +5188,9 @@ function foldDispatchExpired(db: Database, event: Event): void {
         event.ts,
         event.ts,
         event.id,
+        payload.attemptId,
       ],
     );
-    // Clear the counter: the breaker has tripped and the sticky failure now owns
-    // suppression. A `retry_dispatch` (`DispatchCleared`) clears the failure; the
-    // counter must start fresh on the next dispatch cycle, not at the threshold.
-    db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
-      payload.verb,
-      payload.id,
-    ]);
   }
 }
 
@@ -5196,8 +5247,8 @@ const INSTANT_DEATH_THRESHOLD = 3;
  * re-dispatch's bind. Breaker-loop safety mirrors never-bound's `alreadyFailed`
  * guard: once the key holds a sticky `dispatch_failures` row, a late in-flight
  * terminal is a slot release, not a fresh trip (no bump, no re-mint, no
- * `last_event_id` churn). Change-gate-equivalent by construction: the sticky is
- * minted EXACTLY once at K (the mint then clears the counter), never per-event.
+ * `last_event_id` churn). The streak remains pinned at K after the sticky mints,
+ * so clearing only the incident cannot erase the evidence.
  *
  * Pure over the persisted row + `event.ts`/`event.id` (no wall-clock/fs/liveness),
  * so re-fold is byte-deterministic. A non-plan-keyed job (`plan_verb`/`plan_ref`
@@ -5249,7 +5300,10 @@ function foldInstantDeathTerminal(
     `INSERT INTO dispatch_instant_death (verb, id, consecutive_deaths, last_event_id)
        VALUES (?, ?, 1, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
-       consecutive_deaths = dispatch_instant_death.consecutive_deaths + 1,
+       consecutive_deaths = MIN(
+         dispatch_instant_death.consecutive_deaths + 1,
+         ${INSTANT_DEATH_THRESHOLD}
+       ),
        last_event_id = excluded.last_event_id`,
     [verb, id, event.id],
   );
@@ -5266,6 +5320,7 @@ function foldInstantDeathTerminal(
     // (dir unknown at kill time → NULL; `ts`/`created_at`/`updated_at` all from
     // `event.ts`, keeping the fold re-fold-deterministic). The `failedKeys` arm
     // suppresses re-dispatch of the key until `retry_dispatch` clears it.
+    // The preserved threshold streak makes a still-broken retry trip immediately.
     // `instance_event_id = event.id` stamps the row's first-appearance incident
     // id (preserved on conflict, same as `created_at`).
     db.run(
@@ -5290,13 +5345,8 @@ function foldInstantDeathTerminal(
         event.id,
       ],
     );
-    // Clear the counter: the breaker tripped and the sticky now owns suppression;
-    // a post-retry re-arm starts fresh (a residual count would re-trip after one
-    // death instead of K).
-    db.run("DELETE FROM dispatch_instant_death WHERE verb = ? AND id = ?", [
-      verb,
-      id,
-    ]);
+    // The threshold evidence remains until a positive survival terminal resets
+    // it; clearing the incident alone must not make a still-broken target fresh.
   }
 }
 

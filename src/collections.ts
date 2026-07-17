@@ -646,6 +646,8 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
     "merge_escalated_at",
     "resolver_dispatched_at",
     "human_notified_at",
+    "instance_event_id",
+    "attempt_id",
   ],
   pk: "verb",
   liveKeyColumns: ["verb", "id"],

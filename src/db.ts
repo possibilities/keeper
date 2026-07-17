@@ -4385,6 +4385,14 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "handoffs", "envelope_path", "TEXT");
     },
   },
+  {
+    version: 131,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(ctx.db, "dispatch_failures", "attempt_id", "INTEGER");
+      addColumnIfMissing(ctx.db, "dispatch_mint_gate", "attempt_id", "INTEGER");
+    },
+  },
 ];
 
 /**
@@ -4405,7 +4413,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v130:d18242e710c53bcbd3f3b7664cd53ebf49238a703bfbbe54a591f2d79b77c948";
+  "v131:a3b477d907d6c98e6819447897476624a490069f2df51c2a72e7cdabc8f5b073";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5787,10 +5795,10 @@ const CREATE_DISPATCH_CLAIMS_INDEXES = [
  * the count CANNOT live on that deleted row), and at K mints a sticky
  * `dispatch_failures(reason='never-bound')` the existing `failedKeys` arm
  * suppresses. RESET to zero (DELETE) on a successful bind (the SessionStart
- * discharge-on-bind gate) and on `DispatchCleared` (the `keeper autopilot retry`
- * clear path) — so a bind between expires never trips the breaker, and a retry
- * clears both the failure and the count. A reducer projection (re-fold reset
- * DELETE list); `last_event_id` is an event id, never wallclock, so the fold is
+ * discharge-on-bind gate). A clear removes only the exact incident and preserves
+ * the threshold streak, so a still-broken retry trips again immediately. A
+ * reducer projection (re-fold reset DELETE list); `last_event_id` is an event id,
+ * never wallclock, so the fold is
  * re-fold-deterministic. Row PRESENCE is incidental — the count is the signal.
  */
 const CREATE_DISPATCH_NEVER_BOUND = `
@@ -5817,9 +5825,10 @@ CREATE TABLE IF NOT EXISTS dispatch_never_bound (
  * parsing, no `close_kind`/`kill_reason` filter). RESET to zero (DELETE) on any
  * NON-instant terminal for the key (a clean `SessionEnd`, or a long-lived
  * `Killed` — the worker did real work, the consecutive-fast-death streak is
- * broken) and on `DispatchCleared` (the retry clear path). A worker's SUCCESSFUL
- * bind is NOT a reset (unlike never-bound): the whole signal IS bind-then-die, so
- * the count must persist across the re-dispatch's bind. A reducer projection
+ * broken). Incident clearing preserves the threshold streak. A worker's
+ * SUCCESSFUL bind is NOT a reset (unlike never-bound): the whole signal IS
+ * bind-then-die, so the count must persist across the re-dispatch's bind. A
+ * reducer projection
  * (re-fold reset DELETE list); `last_event_id` is an event id, never wall-clock,
  * so the fold is re-fold-deterministic. Row PRESENCE is incidental — the count is
  * the signal.
@@ -5885,12 +5894,15 @@ export function upsertDispatchMintGate(
   db: Database,
   dispatchKey: string,
   mintedAtSec: number,
+  attemptId: number | null = null,
 ): void {
   db.query(
-    `INSERT INTO dispatch_mint_gate (dispatch_key, minted_at)
-     VALUES (?, ?)
-     ON CONFLICT(dispatch_key) DO UPDATE SET minted_at = excluded.minted_at`,
-  ).run(dispatchKey, mintedAtSec);
+    `INSERT INTO dispatch_mint_gate (dispatch_key, minted_at, attempt_id)
+     VALUES (?, ?, ?)
+     ON CONFLICT(dispatch_key) DO UPDATE SET
+       minted_at = excluded.minted_at,
+       attempt_id = excluded.attempt_id`,
+  ).run(dispatchKey, mintedAtSec, attemptId);
 }
 
 /**
@@ -5937,6 +5949,7 @@ export function runDispatchMintGate(
   nowMs: number,
   windowMs: number,
   onFreshMint: () => void,
+  attemptId: number | null = null,
 ): { suppressed: boolean } {
   let suppressed = false;
   db.transaction(() => {
@@ -5945,7 +5958,7 @@ export function runDispatchMintGate(
       suppressed = true;
       return;
     }
-    upsertDispatchMintGate(db, dispatchKey, nowMs / 1000);
+    upsertDispatchMintGate(db, dispatchKey, nowMs / 1000, attemptId);
     onFreshMint();
   }).immediate();
   return { suppressed };

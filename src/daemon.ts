@@ -111,7 +111,6 @@ import {
   retainColdPayloads,
 } from "./compaction";
 import {
-  clearDispatchMintGate,
   evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
@@ -423,6 +422,116 @@ export function drainToCompletion(
   }
 }
 
+export interface DispatchClearFences {
+  expected_attempt_id: number | null;
+  expected_instance_event_id: number | null;
+}
+
+interface DispatchClearOwnerSnapshot {
+  instanceEventId: number | null;
+  activeAttemptId: number | null;
+}
+
+/** Bounded producer snapshot for one clear target. Attempt-owned surfaces may
+ * briefly disagree while the fold catches up; the newest exact attempt is the
+ * only one a single clear event can authorize. */
+export function snapshotDispatchClearOwners(
+  db: Database,
+  verb: string,
+  id: string,
+): DispatchClearOwnerSnapshot {
+  const failure = db
+    .query(
+      "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { instance_event_id: number | null } | null;
+  const claim = db
+    .query(
+      "SELECT attempt_id FROM dispatch_claims WHERE verb = ? AND id = ? AND state != 'released'",
+    )
+    .get(verb, id) as { attempt_id: number | null } | null;
+  const pending = db
+    .query(
+      "SELECT attempt_id FROM pending_dispatches WHERE verb = ? AND id = ?",
+    )
+    .get(verb, id) as { attempt_id: number | null } | null;
+  const gate = db
+    .query("SELECT attempt_id FROM dispatch_mint_gate WHERE dispatch_key = ?")
+    .get(`${verb}::${id}`) as { attempt_id: number | null } | null;
+  const attempts = [
+    claim?.attempt_id,
+    pending?.attempt_id,
+    gate?.attempt_id,
+  ].filter((value): value is number => value != null);
+  return {
+    instanceEventId: failure?.instance_event_id ?? null,
+    activeAttemptId: attempts.length === 0 ? null : Math.max(...attempts),
+  };
+}
+
+export function dispatchClearFencesAtAppend(
+  db: Database,
+  verb: string,
+  id: string,
+): DispatchClearFences {
+  const snapshot = snapshotDispatchClearOwners(db, verb, id);
+  return {
+    expected_attempt_id: snapshot.activeAttemptId,
+    expected_instance_event_id: snapshot.instanceEventId,
+  };
+}
+
+/** Revalidate immutable producer authority, append, then release only the gate
+ * owned by that exact attempt. A stale clear is a fail-closed no-op. */
+export function appendFencedDispatchClear(args: {
+  db: Database;
+  verb: string;
+  id: string;
+  fences: DispatchClearFences;
+  append: () => unknown;
+  noteLine?: (line: string) => void;
+  allowUnfoldedIncident?: boolean;
+}): boolean {
+  const current = snapshotDispatchClearOwners(args.db, args.verb, args.id);
+  const unfoldedIncidentMatches =
+    args.allowUnfoldedIncident === true &&
+    current.instanceEventId == null &&
+    args.fences.expected_instance_event_id != null &&
+    args.db
+      .query(
+        "SELECT 1 FROM events WHERE id = ? AND session_id = ? AND hook_event = 'DispatchFailed'",
+      )
+      .get(
+        args.fences.expected_instance_event_id,
+        `${args.verb}::${args.id}`,
+      ) != null;
+  const incidentMismatch =
+    args.fences.expected_instance_event_id != null &&
+    current.instanceEventId !== args.fences.expected_instance_event_id &&
+    !unfoldedIncidentMatches;
+  const attemptMismatch =
+    args.fences.expected_attempt_id != null &&
+    current.activeAttemptId != null &&
+    current.activeAttemptId !== args.fences.expected_attempt_id;
+  if (incidentMismatch || attemptMismatch) {
+    args.noteLine?.(
+      `[keeperd] DispatchCleared fence mismatch key=${args.verb}::${args.id} ` +
+        `attempt=${args.fences.expected_attempt_id ?? "null"} ` +
+        `incident=${args.fences.expected_instance_event_id ?? "null"}`,
+    );
+    return false;
+  }
+  if (args.append() === false) return false;
+  if (args.fences.expected_attempt_id != null) {
+    args.db
+      .query(
+        "DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id = ?",
+      )
+      .run(`${args.verb}::${args.id}`, args.fences.expected_attempt_id);
+  }
+  return true;
+}
+
 /**
  * One-shot GC for orphaned `dispatch_failures` rows. A row whose composite
  * `${verb}::${id}` the `retry_dispatch` wire validator would reject is UN-retryable
@@ -459,11 +568,17 @@ export function drainToCompletion(
  */
 export function gcUnretryableDispatchFailures(
   db: Database,
-  mintClear: (verb: string, id: string) => void,
+  mintClear: (verb: string, id: string, fences: DispatchClearFences) => void,
 ): number {
-  const rows = db.query("SELECT verb, id FROM dispatch_failures").all() as {
+  const rows = db
+    .query(
+      "SELECT verb, id, attempt_id, instance_event_id FROM dispatch_failures",
+    )
+    .all() as {
     verb: string;
     id: string;
+    attempt_id: number | null;
+    instance_event_id: number | null;
   }[];
   let swept = 0;
   for (const row of rows) {
@@ -547,7 +662,10 @@ export function gcUnretryableDispatchFailures(
     if (row.verb === "repair") {
       continue;
     }
-    mintClear(row.verb, row.id);
+    mintClear(row.verb, row.id, {
+      expected_attempt_id: row.verb === "daemon" ? null : row.attempt_id,
+      expected_instance_event_id: row.instance_event_id,
+    });
     swept++;
   }
   return swept;
@@ -1710,6 +1828,8 @@ export interface PendingRepairRow {
   repair_dispatched_at: number | null;
   /** The page-once marker (stamped by `RepairHumanNotified`). */
   human_notified_at: number | null;
+  attempt_id: number | null;
+  instance_event_id: number | null;
 }
 
 /**
@@ -2070,7 +2190,7 @@ export interface RepairEscalationSweepDeps {
   ) => void;
   /** Mint a `DispatchCleared{verb:'repair', id:token}` — the positive-evidence clear.
    *  Drops the row + every marker so a fresh breakage re-arms at NULL. */
-  readonly clearRow: (repoToken: string) => void;
+  readonly clearRow: (row: PendingRepairRow) => void;
   /** Warn sink for non-fatal diagnostics. */
   readonly noteLine?: (line: string) => void;
 }
@@ -2304,7 +2424,7 @@ export async function runRepairEscalationSweep(
   for (const row of rows) {
     if (groups.has(row.id)) continue; // still broken → owned by the dispatch/notify pass
     if (!deps.isBaseGreen(row.dir ?? "")) continue; // retained on no report / red base
-    deps.clearRow(row.id);
+    deps.clearRow(row);
   }
 }
 
@@ -7451,6 +7571,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Includes a successfully inserted event that has not folded yet. The fixed key
   // plus this latch suppresses event churn while a bus-only degradation persists.
   let serveBusDistressPending = false;
+  let serveBusDistressPendingInstanceEventId: number | null = null;
   let serveBusPageSweepInFlight = false;
 
   // Autopilot in-memory paused flag. Initialized PAUSED (safety default), then
@@ -7646,9 +7767,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    */
   function mintRecoverableSnapshotEvent(
     params: Parameters<typeof stmts.insertEvent.run>[0],
+    onInserted?: (eventId: number) => void,
   ): boolean {
     try {
-      stmts.insertEvent.run(params);
+      const inserted = stmts.insertEvent.run(params);
+      onInserted?.(Number(inserted.lastInsertRowid));
       return true;
     } catch (err) {
       if (isTransientBusyError(err)) {
@@ -7670,54 +7793,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    */
   function mintRecoverableServeBusDistressEvent(
     action: "mint" | "clear",
+    clearFences?: DispatchClearFences,
   ): boolean {
+    if (action === "clear") {
+      return mintDispatchClearedEvent(
+        BUS_DEGRADED_DISTRESS_VERB,
+        BUS_DEGRADED_DISTRESS_ID,
+        clearFences ?? {
+          expected_attempt_id: null,
+          expected_instance_event_id: null,
+        },
+        true,
+        serveBusDistressPending,
+      );
+    }
     const tsSec = Date.now() / 1000;
-    const minted = mintRecoverableSnapshotEvent({
-      $ts: tsSec,
-      $session_id: `${BUS_DEGRADED_DISTRESS_VERB}::${BUS_DEGRADED_DISTRESS_ID}`,
-      $pid: null,
-      $hook_event: action === "mint" ? "DispatchFailed" : "DispatchCleared",
-      $event_type: "dispatch_failures",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: JSON.stringify(
-        action === "mint"
-          ? {
-              verb: BUS_DEGRADED_DISTRESS_VERB,
-              id: BUS_DEGRADED_DISTRESS_ID,
-              reason: BUS_DEGRADED_DISTRESS_REASON,
-              dir: null,
-              ts: tsSec,
-            }
-          : {
-              verb: BUS_DEGRADED_DISTRESS_VERB,
-              id: BUS_DEGRADED_DISTRESS_ID,
-            },
-      ),
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $plan_op: null,
-      $plan_target: null,
-      $plan_epic_id: null,
-      $plan_task_id: null,
-      $plan_subject_present: null,
-      $config_dir: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $plan_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
-      $worktree: null,
-    });
+    const minted = mintRecoverableSnapshotEvent(
+      {
+        $ts: tsSec,
+        $session_id: `${BUS_DEGRADED_DISTRESS_VERB}::${BUS_DEGRADED_DISTRESS_ID}`,
+        $pid: null,
+        $hook_event: "DispatchFailed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: BUS_DEGRADED_DISTRESS_VERB,
+          id: BUS_DEGRADED_DISTRESS_ID,
+          reason: BUS_DEGRADED_DISTRESS_REASON,
+          dir: null,
+          ts: tsSec,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      },
+      (eventId) => {
+        serveBusDistressPendingInstanceEventId = eventId;
+      },
+    );
     if (minted) {
       wakePending = true;
       pumpWakes();
@@ -7731,12 +7865,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * rides as the entity-key (`session_id`) overload so a re-fold correlates the clear
    * to its row without re-parsing the data blob. Caller sets `wakePending` + pumps.
    *
-   * ALSO clears the durable `dispatch_mint_gate` row for the key — the single choke
-   * point every `DispatchCleared` mint flows through (the `retry_dispatch` RPC fast
-   * path and the recover auto-clear), so a human retry or a recover-cleared failure
-   * re-dispatches IMMEDIATELY instead of waiting out the mint-gate window. The gate
-   * DELETE is a direct producer write (the gate is NOT a projection), idempotent,
-   * and runs before the event insert so a clear is never swallowed.
+   * The durable `dispatch_mint_gate` fast-path runs only after the event append and
+   * compares the exact attempt owner. A stale clear or failed append therefore leaves
+   * a newer gate intact; the fold repeats the same comparison authoritatively.
    */
   /**
    * Mint ONE `ResumeTargetResolved` synthetic event that repairs a job's
@@ -7785,40 +7916,57 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  function mintDispatchClearedEvent(verb: string, id: string): void {
-    clearDispatchMintGate(db, `${verb}::${id}`);
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000,
-      $session_id: `${verb}::${id}`,
-      $pid: null,
-      $hook_event: "DispatchCleared",
-      $event_type: "dispatch_failures",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: JSON.stringify({ verb, id }),
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $plan_op: null,
-      $plan_target: null,
-      $plan_epic_id: null,
-      $plan_task_id: null,
-      $plan_subject_present: null,
-      $config_dir: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $plan_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
-      $worktree: null,
+  function mintDispatchClearedEvent(
+    verb: string,
+    id: string,
+    fences: DispatchClearFences,
+    recoverable = false,
+    allowUnfoldedIncident = false,
+  ): boolean {
+    return appendFencedDispatchClear({
+      db,
+      verb,
+      id,
+      fences,
+      noteLine: (line) => console.error(line),
+      allowUnfoldedIncident,
+      append: () => {
+        const params = {
+          $ts: Date.now() / 1000,
+          $session_id: `${verb}::${id}`,
+          $pid: null,
+          $hook_event: "DispatchCleared",
+          $event_type: "dispatch_failures",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({ verb, id, ...fences }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $plan_op: null,
+          $plan_target: null,
+          $plan_epic_id: null,
+          $plan_task_id: null,
+          $plan_subject_present: null,
+          $config_dir: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $plan_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+          $worktree: null,
+        };
+        if (recoverable) return mintRecoverableSnapshotEvent(params);
+        stmts.insertEvent.run(params);
+      },
     });
   }
 
@@ -8565,7 +8713,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         try {
           // The wire `verb` / `dispatch_id` are validated handler-side; main treats
           // both as opaque payload tokens.
-          mintDispatchClearedEvent(msg.verb, msg.dispatch_id);
+          mintDispatchClearedEvent(
+            msg.verb,
+            msg.dispatch_id,
+            dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+          );
           wakePending = true;
           pumpWakes();
           reply = { type: "retry-dispatch-result", id, ok: true };
@@ -8660,12 +8812,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       threshold: CRASH_LOOP_THRESHOLD,
       windowMs: CRASH_LOOP_WINDOW_MS,
     });
-    const distressPresent =
-      db
-        .query(
-          "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
-        )
-        .get(CRASH_LOOP_DISTRESS_VERB, CRASH_LOOP_DISTRESS_ID) != null;
+    const distressRow = db
+      .query(
+        "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+      )
+      .get(CRASH_LOOP_DISTRESS_VERB, CRASH_LOOP_DISTRESS_ID) as {
+      instance_event_id: number | null;
+    } | null;
+    const distressPresent = distressRow != null;
     const windowMin = Math.round(CRASH_LOOP_WINDOW_MS / 60_000);
     if (verdict.crashLoop && !distressPresent) {
       console.error(
@@ -8682,6 +8836,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       mintDispatchClearedEvent(
         CRASH_LOOP_DISTRESS_VERB,
         CRASH_LOOP_DISTRESS_ID,
+        {
+          expected_attempt_id: null,
+          expected_instance_event_id: distressRow.instance_event_id,
+        },
       );
       wakePending = true;
       pumpWakes();
@@ -9940,7 +10098,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             msg.dir,
           );
         } else {
-          mintDispatchClearedEvent(SHARED_WEDGE_DISTRESS_VERB, msg.id);
+          mintDispatchClearedEvent(SHARED_WEDGE_DISTRESS_VERB, msg.id, {
+            expected_attempt_id: msg.expected_attempt_id ?? null,
+            expected_instance_event_id: msg.expected_instance_event_id ?? null,
+          });
         }
       } else if (msg.kind === "dispatched-request") {
         // Durable mint-before-launch: insert the `Dispatched` event, then reply
@@ -10684,7 +10845,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     payload: DispatchClearedMessage["payload"],
   ): void {
     try {
-      mintDispatchClearedEvent(payload.verb, payload.id);
+      mintDispatchClearedEvent(payload.verb, payload.id, {
+        expected_attempt_id: payload.expected_attempt_id,
+        expected_instance_event_id: payload.expected_instance_event_id,
+      });
       wakePending = true;
       pumpWakes();
     } catch (err) {
@@ -10786,6 +10950,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           if (!Number.isSafeInteger(insertedId) || insertedId <= 0) {
             throw new Error("Dispatched insert returned an invalid event id");
           }
+          // The gate is stamped before this callback so the event insert and its
+          // exact owner remain one transaction. Fill the event-derived attempt
+          // before commit; a throw rolls both writes back.
+          db.query(
+            "UPDATE dispatch_mint_gate SET attempt_id = ? WHERE dispatch_key = ?",
+          ).run(insertedId, dispatchKey);
           // The immutable Event id is the exact attempt fence. The reducer
           // derives the same value from the marker in `data`; the ack carries it
           // into the launch metadata envelope before any backend execution.
@@ -11471,6 +11641,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Includes a just-inserted, not-yet-folded mint so a recovery page cannot
   // miss the clear while the projection is still catching up.
   let pagingChannelDistressPending = false;
+  let pagingChannelDistressPendingInstanceEventId: number | null = null;
 
   /**
    * Mint the fixed producer-owned paging-channel-down distress row through the
@@ -11480,7 +11651,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   function mintPagingChannelDownDistress(): boolean {
     const tsSec = Date.now() / 1000;
     try {
-      stmts.insertEvent.run({
+      const inserted = stmts.insertEvent.run({
         $ts: tsSec,
         $session_id: `${PAGING_CHANNEL_DOWN_DISTRESS_VERB}::${PAGING_CHANNEL_DOWN_DISTRESS_ID}`,
         $pid: null,
@@ -11519,6 +11690,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_pane_id: null,
         $worktree: null,
       });
+      pagingChannelDistressPendingInstanceEventId = Number(
+        inserted.lastInsertRowid,
+      );
       wakePending = true;
       pumpWakes();
       return true;
@@ -11542,17 +11716,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   ): Promise<"notified" | "notify_failed"> {
     const outcome = await sendAgentbotPage(message);
     let isOpen = false;
+    let incidentEventId: number | null = null;
     try {
-      isOpen =
-        pagingChannelDistressPending ||
-        db
-          .query(
-            "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
-          )
-          .get(
-            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
-            PAGING_CHANNEL_DOWN_DISTRESS_ID,
-          ) != null;
+      const row = db
+        .query(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+        )
+        .get(
+          PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+          PAGING_CHANNEL_DOWN_DISTRESS_ID,
+        ) as { instance_event_id: number | null } | null;
+      incidentEventId =
+        row?.instance_event_id ?? pagingChannelDistressPendingInstanceEventId;
+      isOpen = pagingChannelDistressPending || row != null;
     } catch (err) {
       // An unreadable projection must not mint or clear on incomplete evidence.
       console.error(
@@ -11568,11 +11744,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         break;
       case "clear":
         try {
-          mintDispatchClearedEvent(
-            PAGING_CHANNEL_DOWN_DISTRESS_VERB,
-            PAGING_CHANNEL_DOWN_DISTRESS_ID,
-          );
-          pagingChannelDistressPending = false;
+          if (
+            mintDispatchClearedEvent(
+              PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+              PAGING_CHANNEL_DOWN_DISTRESS_ID,
+              {
+                expected_attempt_id: null,
+                expected_instance_event_id: incidentEventId,
+              },
+              false,
+              pagingChannelDistressPending,
+            )
+          ) {
+            pagingChannelDistressPending = false;
+            pagingChannelDistressPendingInstanceEventId = null;
+          }
         } catch (err) {
           console.error(
             `[keeperd] paging-channel-down distress clear threw (non-fatal): ${
@@ -12674,7 +12860,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     try {
       return db
         .query(
-          "SELECT id, reason, dir, repair_dispatched_at, human_notified_at FROM dispatch_failures WHERE verb = 'repair'",
+          "SELECT id, reason, dir, repair_dispatched_at, human_notified_at, attempt_id, instance_event_id FROM dispatch_failures WHERE verb = 'repair'",
         )
         .all() as PendingRepairRow[];
     } catch {
@@ -12693,19 +12879,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // The OPEN `shared-checkout-dirty` distress rows (per-repo `daemon`-verb) — the grace
   // tracker's clear surface + the id the repair-defer diagnostic names. A read failure
   // degrades to an empty set (the next tick re-reads).
-  function selectOpenSharedDirtyRows(): { id: string; dir: string }[] {
+  function selectOpenSharedDirtyRows(): Array<{
+    id: string;
+    dir: string;
+    attempt_id: number | null;
+    instance_event_id: number | null;
+  }> {
     try {
       return (
         db
           .query(
-            "SELECT id, dir FROM dispatch_failures WHERE verb = ? AND id LIKE ?",
+            "SELECT id, dir, attempt_id, instance_event_id FROM dispatch_failures WHERE verb = ? AND id LIKE ?",
           )
           .all(
             SHARED_DIRTY_DISTRESS_VERB,
             `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
-          ) as { id: string; dir: string | null }[]
+          ) as {
+          id: string;
+          dir: string | null;
+          attempt_id: number | null;
+          instance_event_id: number | null;
+        }[]
       )
-        .map((r) => ({ id: r.id, dir: r.dir ?? "" }))
+        .map((r) => ({ ...r, dir: r.dir ?? "" }))
         .filter((r) => r.dir !== "");
     } catch {
       return [];
@@ -12962,6 +13158,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!openDirtyIds.has(id)) sharedDirtyCleanedAwaitingClear.delete(id);
     }
     const openDirtyById = new Map(openDirty.map((r) => [r.dir, r.id]));
+    const openDirtyFencesById = new Map(
+      openDirty.map((r) => [
+        r.id,
+        {
+          expected_attempt_id: null,
+          expected_instance_event_id: r.instance_event_id,
+        } satisfies DispatchClearFences,
+      ]),
+    );
     const deadWriterOutcomes = await runDeadWriterCheckoutSweep({
       rows: openDirty.filter(
         (row) => !sharedDirtyCleanedAwaitingClear.has(row.id),
@@ -13023,7 +13228,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         mintRepairDispatchedEvent(token, outcome),
       mintNotified: (token, outcome) =>
         mintRepairHumanNotifiedEvent(token, outcome),
-      clearRow: (token) => mintDispatchClearedEvent("repair", token),
+      clearRow: (row) =>
+        mintDispatchClearedEvent("repair", row.id, {
+          expected_attempt_id: row.attempt_id,
+          expected_instance_event_id: row.instance_event_id,
+        }),
       noteLine: note,
     });
 
@@ -13050,7 +13259,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
     }
     for (const c of decision.clear) {
-      mintDispatchClearedEvent(SHARED_DIRTY_DISTRESS_VERB, c.id);
+      const fences = openDirtyFencesById.get(c.id);
+      if (fences !== undefined) {
+        mintDispatchClearedEvent(SHARED_DIRTY_DISTRESS_VERB, c.id, fences);
+      }
     }
 
     // Page-once step — the shared-checkout hygiene distress promotion. Runs AFTER the
@@ -14289,14 +14501,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // live probe clears it immediately. Both transitions use the recoverable
       // event path so transient SQLITE_BUSY contention cannot crash the daemon.
       let busDistressOpen: boolean | null = null;
+      let busDistressInstanceEventId: number | null = null;
       try {
-        busDistressOpen =
-          serveBusDistressPending ||
-          db
-            .query(
-              "SELECT 1 FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
-            )
-            .get(BUS_DEGRADED_DISTRESS_VERB, BUS_DEGRADED_DISTRESS_ID) != null;
+        const row = db
+          .query(
+            "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(BUS_DEGRADED_DISTRESS_VERB, BUS_DEGRADED_DISTRESS_ID) as {
+          instance_event_id: number | null;
+        } | null;
+        busDistressInstanceEventId =
+          row?.instance_event_id ?? serveBusDistressPendingInstanceEventId;
+        busDistressOpen = serveBusDistressPending || row != null;
       } catch (err) {
         console.error(
           `[keeperd] bus-degraded distress read threw (non-fatal): ${
@@ -14313,8 +14529,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             busDistressOpen = serveBusDistressPending;
             break;
           case "clear":
-            if (mintRecoverableServeBusDistressEvent("clear")) {
+            if (
+              mintRecoverableServeBusDistressEvent("clear", {
+                expected_attempt_id: null,
+                expected_instance_event_id: busDistressInstanceEventId,
+              })
+            ) {
               serveBusDistressPending = false;
+              serveBusDistressPendingInstanceEventId = null;
               busDistressOpen = false;
             }
             break;
