@@ -18,6 +18,7 @@ import {
 import {
   buildStatusEnvelope,
   buildStatusErrorEnvelope,
+  countLegacyWrappedProviderLegs,
   DEFAULT_CONNECT_DEADLINE_MS,
   type ParsedStatusArgs,
   parseStatusArgs,
@@ -67,6 +68,8 @@ interface FixtureJob {
   state: string;
   jobId?: string;
   dispatchOrigin?: string | null;
+  title?: string | null;
+  birthSession?: string | null;
 }
 
 interface SnapOverrides {
@@ -90,12 +93,19 @@ interface SnapOverrides {
   worktreeMode?: boolean;
   worktreeMultiRepo?: boolean;
   landedEpicIds?: string[];
+  providerLegOwnership?: Row[];
 }
 
 function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
   const jobs = new Map<
     string,
-    { state: string; job_id?: string; dispatch_origin?: string | null }
+    {
+      state: string;
+      job_id?: string;
+      dispatch_origin?: string | null;
+      title?: string | null;
+      backend_exec_birth_session_id?: string | null;
+    }
   >();
   (o.jobsByState ?? []).forEach((state, i) => {
     jobs.set(`job-${i}`, { state });
@@ -106,6 +116,8 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
       state: j.state,
       job_id: jobId,
       dispatch_origin: j.dispatchOrigin ?? null,
+      title: j.title ?? null,
+      backend_exec_birth_session_id: j.birthSession ?? null,
     });
   });
   const toMap = (
@@ -145,6 +157,9 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
     ...(o.landedEpicIds === undefined
       ? {}
       : { landedEpicIds: o.landedEpicIds }),
+    ...(o.providerLegOwnership === undefined
+      ? {}
+      : { providerLegOwnership: o.providerLegOwnership }),
     readiness: {
       perTask: toMap(o.perTask),
       perCloseRow: toMap(o.perCloseRow),
@@ -161,8 +176,8 @@ const BOOT: StatusBootInfo = { rev: 4242, catching_up: false };
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version is v10", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(10);
+  test("status schema version is v11", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(11);
   });
 
   test("envelope carries every documented field", () => {
@@ -230,6 +245,7 @@ describe("buildStatusEnvelope shape", () => {
     expect(d.counts.tasks.ready).toBe(1);
     expect(typeof d.drained).toBe("boolean");
     expect(typeof d.jammed).toBe("boolean");
+    expect(d.drain).toEqual({ legacy_wrapped_provider_legs: 0 });
     expect(d.in_flight).toEqual({
       pending_dispatches: 0,
       running_jobs: 0,
@@ -608,6 +624,34 @@ describe("buildStatusEnvelope drained/jammed", () => {
     ).toBe(0);
   });
 
+  test("legacy wrapped Provider-leg gauge excludes durable ownership and never jams", () => {
+    const snap = makeSnap({
+      jobsDetailed: [
+        {
+          state: "stopped",
+          jobId: "legacy-leg",
+          title: "fn-1300-cascade.4",
+          birthSession: "wrapped",
+        },
+        {
+          state: "stopped",
+          jobId: "owned-leg",
+          title: "fn-1300-cascade.4",
+          birthSession: "wrapped",
+        },
+      ],
+      providerLegOwnership: [
+        { leg_launch_id: "launch-owned", leg_session_id: "owned-leg" },
+      ],
+    });
+    expect(countLegacyWrappedProviderLegs(snap)).toBe(1);
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.drain.legacy_wrapped_provider_legs).toBe(1);
+    expect(d?.needs_human.total).toBe(0);
+    expect(d?.jammed).toBe(false);
+    expect(d?.drained).toBe(true);
+  });
+
   test("in-flight counts pending dispatches + working jobs", () => {
     const snap = makeSnap({
       pendingDispatches: 2,
@@ -708,7 +752,7 @@ function makeStatusMockConnect(): {
 }
 
 /** The eleven base readiness collections + `epics_recent_done`/`lane_merged`
- *  landed-set opt-in + the `dispatch_failures`/`epics_pinned` opt-ins, as one
+ *  landed-set opt-in + status's failure, ownership, and pin opt-ins, as one
  *  result batch. Routed by collection, so no idPrefix bookkeeping. */
 function statusReadinessFrames(
   dispatchFailures: Record<string, unknown>[],
@@ -752,6 +796,7 @@ function statusReadinessFrames(
       total: dispatchFailures.length,
       rows: dispatchFailures,
     },
+    empty("provider_leg_ownership"),
     {
       type: "result",
       id: "epics_pinned",
@@ -813,6 +858,7 @@ describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
     // The one subscribe carries dispatch_failures — the rows arrive on the SAME
     // snapshot, so there is no out-of-band queryCollection.
     expect(collections).toContain("dispatch_failures");
+    expect(collections).toContain("provider_leg_ownership");
 
     // A jam sticky delivered on the snapshot flows into the envelope's
     // needs-human / jammed math (board otherwise at rest).

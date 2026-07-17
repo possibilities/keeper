@@ -138,6 +138,7 @@ const LANE_MERGED_PAGE_LIMIT = 0;
 // instant-death-wall threshold, so a silent page-cap truncation is the worse
 // failure than an unbounded small collection (ADR 0011).
 const DISPATCH_FAILURES_PAGE_LIMIT = 0;
+const PROVIDER_LEG_OWNERSHIP_PAGE_LIMIT = 0;
 export const POLL_MS = 500;
 /**
  * Adaptive idle-poll growth factor + cap (steady-state level-triggered
@@ -328,6 +329,9 @@ export interface ReadinessClientSnapshot {
   // (limit 0) so the wall-threshold counts are exact; the shared projector owns
   // the reason classification so status/watch/await never drift on "stuck".
   readonly dispatchFailures?: readonly Row[];
+  // ADR 0071 OPT-IN: durable Provider-leg ownership rows used by status to
+  // exclude owned legs from the display-only legacy drain gauge.
+  readonly providerLegOwnership?: readonly Row[];
   // ADR 0018 OPT-IN: the PINNED epics — every epic a live close/work
   // `dispatch_failures` row keys to, ANY status (the display-only pinned board
   // collection). Present ONLY under the `includePinnedEpics` opt-in — ABSENT (not
@@ -1875,6 +1879,8 @@ export interface SubscribeOptions {
    * BYTE-IDENTICAL. Default `false`.
    */
   readonly includeDispatchFailures?: boolean;
+  /** Also subscribe durable Provider-leg ownership for status drain gauges. */
+  readonly includeProviderLegOwnership?: boolean;
   /**
    * ADR 0018 OPT-IN: also subscribe the `epics_pinned` collection (UNBOUNDED —
    * `limit: 0`, a pin nags until its `dispatch_failures` row clears) and (1)
@@ -2116,6 +2122,21 @@ export function subscribeReadiness(
   // stay byte-identical. Reuses `EPICS_PAGE_LIMIT` (0 = unbounded; the pin set is
   // bounded by the `dispatch_failures` table, so no page cap — a pin nags until
   // its row clears).
+  const providerLegOwnershipSubId = `${idPrefix}-provider-leg-ownership`;
+  const providerLegOwnership =
+    opts.includeProviderLegOwnership === true
+      ? makeState(
+          "provider_leg_ownership",
+          providerLegOwnershipSubId,
+          "leg_launch_id",
+          {
+            type: "query",
+            collection: "provider_leg_ownership",
+            id: providerLegOwnershipSubId,
+            limit: PROVIDER_LEG_OWNERSHIP_PAGE_LIMIT,
+          },
+        )
+      : null;
   const epicsPinnedSubId = `${idPrefix}-epics-pinned`;
   const epicsPinned =
     opts.includePinnedEpics === true
@@ -2147,6 +2168,9 @@ export function subscribeReadiness(
   }
   if (dispatchFailures !== null) {
     states.push(dispatchFailures);
+  }
+  if (providerLegOwnership !== null) {
+    states.push(providerLegOwnership);
   }
   if (epicsPinned !== null) {
     states.push(epicsPinned);
@@ -2192,6 +2216,7 @@ export function subscribeReadiness(
       // failure can never read as "no jam". Empty produces a `result` with
       // `rows: []`, so it clears.
       (dispatchFailures !== null && !dispatchFailures.gotResult) ||
+      (providerLegOwnership !== null && !providerLegOwnership.gotResult) ||
       // ADR 0018 OPT-IN: gate on the pinned epics ONLY when opted in (`null`
       // otherwise — board/dash never wait on it). Empty produces a `result` with
       // `rows: []`, so it clears.
@@ -2414,6 +2439,10 @@ export function subscribeReadiness(
       dispatchFailures === null
         ? undefined
         : projectRows<Row>(dispatchFailures);
+    const providerLegOwnershipTyped =
+      providerLegOwnership === null
+        ? undefined
+        : projectRows<Row>(providerLegOwnership);
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -2441,6 +2470,9 @@ export function subscribeReadiness(
       ...(dispatchFailuresTyped === undefined
         ? {}
         : { dispatchFailures: dispatchFailuresTyped }),
+      ...(providerLegOwnershipTyped === undefined
+        ? {}
+        : { providerLegOwnership: providerLegOwnershipTyped }),
       // ADR 0018 OPT-IN: the pinned epics as the distinct pinned-identity member
       // (they ALSO ride merged into `epics` above). `null` when un-opted so the
       // member is ABSENT for board/dash — byte-identical to the pre-opt-in shape.

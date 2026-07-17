@@ -200,10 +200,15 @@ import type {
 } from "./events-ingest-worker";
 import {
   classifyCloseKind,
+  compareCanonicalGeneration,
+  createTmuxPaneOps,
   type KillReason,
   keeperAgentLaunch,
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
+  type PaneInfo,
+  type TmuxPaneOps,
+  WRAPPED_EXEC_SESSION,
 } from "./exec-backend";
 import type {
   ExitWatcherOutbound,
@@ -6826,6 +6831,8 @@ export interface ProviderLegCascadeDeps {
   nowSec(): number;
   probe(pid: number, startTime: string): HarnessProcessObservation;
   signal(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
+  listPanes: TmuxPaneOps["listPanes"];
+  killWindow: TmuxPaneOps["killWindow"];
   currentPaneGeneration?(paneId: string): string | number | null;
   notify?(message: string): boolean | Promise<boolean>;
   afterMint?(): void;
@@ -6848,6 +6855,8 @@ type ProviderLegCascadeRow = {
   leg_start_time: string | null;
   pane_id: string | null;
   pane_generation: string | number | null;
+  backend_exec_type: string | null;
+  backend_exec_session_id: string | null;
   ownership_state: string;
   harness: HarnessProcess | null;
   leg_state: string | null;
@@ -6873,6 +6882,59 @@ type ProviderLegProbeVerdict =
   | "gone"
   | "identity-unknown"
   | "command-unowned";
+
+export type ProviderLegWindowTeardownDecision = "kill" | "converged" | "defer";
+
+/**
+ * Classify an owned Provider leg's birth-captured window against one live tmux
+ * sweep. Only a live, one-pane window in the wrapped session with the exact
+ * canonical generation may be killed. An absent pane or a generation mismatch
+ * proves the birth coordinate no longer names this leg; degraded or ambiguous
+ * evidence defers without targeting anything.
+ */
+export function classifyProviderLegWindowTeardown(
+  row: Pick<
+    ProviderLegCascadeRow,
+    | "pane_id"
+    | "pane_generation"
+    | "backend_exec_type"
+    | "backend_exec_session_id"
+  > & { current_pane_generation?: string | null },
+  panes: readonly PaneInfo[] | null,
+): ProviderLegWindowTeardownDecision {
+  if (
+    row.backend_exec_type !== "tmux" ||
+    row.backend_exec_session_id !== WRAPPED_EXEC_SESSION ||
+    row.pane_id == null ||
+    row.pane_id === ""
+  ) {
+    return "converged";
+  }
+  if (panes == null || panes.length === 0) return "defer";
+  const pane = panes.find((candidate) => candidate.paneId === row.pane_id);
+  if (pane === undefined) return "converged";
+  const generation = compareCanonicalGeneration(
+    row.pane_generation == null ? null : String(row.pane_generation),
+    pane.tmuxGenerationId,
+  );
+  if (generation === "mismatch") return "converged";
+  if (generation !== "match") return "defer";
+  if (row.current_pane_generation != null) {
+    const projectedGeneration = compareCanonicalGeneration(
+      row.current_pane_generation,
+      pane.tmuxGenerationId,
+    );
+    if (projectedGeneration === "mismatch") return "converged";
+    if (projectedGeneration !== "match") return "defer";
+  }
+  if (pane.paneDead !== "0" || pane.sessionName !== WRAPPED_EXEC_SESSION) {
+    return "defer";
+  }
+  const panesInWindow = panes.filter(
+    (candidate) => candidate.windowId === pane.windowId,
+  ).length;
+  return panesInWindow === 1 ? "kill" : "defer";
+}
 
 /** Pure signal/exit boundary, including the close-recycle corroboration rule. */
 export function classifyProviderLegProbe(
@@ -6975,11 +7037,24 @@ function providerLegProbeVerdict(
   });
 }
 
-function settleProviderLeg(
+async function teardownProviderLegWindow(
+  deps: ProviderLegCascadeDeps,
+  row: ProviderLegCascadeRow,
+  panes: readonly PaneInfo[] | null,
+): Promise<boolean> {
+  const decision = classifyProviderLegWindowTeardown(row, panes);
+  if (decision === "converged") return true;
+  if (decision === "defer") return false;
+  const killed = await deps.killWindow(row.pane_id as string);
+  return killed.ok;
+}
+
+async function settleProviderLeg(
   db: Database,
   deps: ProviderLegCascadeDeps,
   row: ProviderLegCascadeRow,
-): void {
+  panes: readonly PaneInfo[] | null,
+): Promise<boolean> {
   if (row.ownership_state === "live") {
     mintProviderLegCascadeEvent(
       db,
@@ -6994,6 +7069,7 @@ function settleProviderLeg(
       },
     );
   }
+  if (!(await teardownProviderLegWindow(deps, row, panes))) return false;
   if (row.cascade_state !== "confirmed") {
     mintProviderLegCascadeEvent(
       db,
@@ -7003,6 +7079,7 @@ function settleProviderLeg(
       cascadeProgressData(row, "confirmed"),
     );
   }
+  return true;
 }
 
 async function blockProviderLegCascade(
@@ -7052,7 +7129,8 @@ function selectProviderLegCascadeRows(
       `SELECT o.leg_launch_id, o.wrapper_job_id,
               o.wrapper_dispatch_attempt_id, o.ownership_epoch_event_id,
               o.leg_session_id, o.leg_pid, o.leg_start_time, o.pane_id,
-              o.pane_generation, o.state AS ownership_state,
+              o.pane_generation, o.backend_exec_type,
+              o.backend_exec_session_id, o.state AS ownership_state,
               lj.harness, lj.state AS leg_state,
               lj.backend_exec_generation_id AS current_pane_generation,
               w.state AS wrapper_state, w.plan_verb, w.plan_ref,
@@ -7094,6 +7172,9 @@ function selectProviderLegCascadeRows(
              ))
             OR (dc.legacy_unfenced = 0 AND
                 dc.attempt_id > o.wrapper_dispatch_attempt_id)
+            OR (o.state = 'live' AND lj.state = 'stopped'
+                AND o.backend_exec_type = 'tmux'
+                AND o.backend_exec_session_id = 'wrapped')
           )
         ORDER BY o.wrapper_dispatch_attempt_id, o.leg_launch_id
         LIMIT ?`,
@@ -7185,7 +7266,34 @@ export async function runProviderLegCascadeSweep(
   );
   let acted = false;
   let nextDeadline = Number.POSITIVE_INFINITY;
+  let paneSweep: readonly PaneInfo[] | null = null;
+  let paneSweepLoaded = false;
+  const loadPaneSweep = async (): Promise<readonly PaneInfo[] | null> => {
+    if (!paneSweepLoaded) {
+      paneSweep = await deps.listPanes();
+      paneSweepLoaded = true;
+    }
+    return paneSweep;
+  };
   for (const row of rows) {
+    const ownerTerminalOrSuperseded =
+      row.wrapper_state === "ended" ||
+      row.wrapper_state === "killed" ||
+      (row.claim_attempt_id != null &&
+        row.claim_attempt_id > row.wrapper_dispatch_attempt_id);
+    if (
+      !ownerTerminalOrSuperseded &&
+      row.ownership_state === "live" &&
+      row.leg_state === "stopped"
+    ) {
+      const panes = await loadPaneSweep();
+      const decision = classifyProviderLegWindowTeardown(row, panes);
+      if (decision === "kill") {
+        const killed = await deps.killWindow(row.pane_id as string);
+        acted = acted || killed.ok;
+      }
+      continue;
+    }
     if (row.cascade_state == null) {
       const now = deps.nowSec();
       mintProviderLegCascadeEvent(
@@ -7205,8 +7313,9 @@ export async function runProviderLegCascadeSweep(
       continue;
     }
     if (row.leg_state === "ended" || row.leg_state === "killed") {
-      settleProviderLeg(db, deps, row);
-      acted = true;
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
       continue;
     }
     if (row.ownership_state !== "live" && row.cascade_state === "confirmed") {
@@ -7215,8 +7324,9 @@ export async function runProviderLegCascadeSweep(
 
     const verdict = providerLegProbeVerdict(row, deps);
     if (verdict === "gone") {
-      settleProviderLeg(db, deps, row);
-      acted = true;
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
       continue;
     }
     if (verdict !== "target") {
@@ -7292,7 +7402,9 @@ export async function runProviderLegCascadeSweep(
     acted = true;
     const adjacent = providerLegProbeVerdict(row, deps);
     if (adjacent === "gone") {
-      settleProviderLeg(db, deps, row);
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
       continue;
     }
     if (adjacent !== "target") {
@@ -8087,6 +8199,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let providerLegCascadeTimer: ReturnType<typeof setTimeout> | null = null;
   let providerLegCascadeSweepInFlight = false;
   let providerLegCascadeRerunRequested = false;
+  const providerLegPaneOps = createTmuxPaneOps({
+    noteLine: (line) => console.error(`[keeperd] Provider-leg window: ${line}`),
+  });
 
   function serveBootDrain(): void {
     withBootDrainCheckpointTuning(db, () => {
@@ -8310,9 +8425,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
                 j.last_lifecycle_ts AS last_lifecycle_at,
                 j.close_kind,
                 j.kill_reason,
-                j.backend_exec_birth_session_id
+                j.backend_exec_birth_session_id,
+                o.leg_launch_id,
+                o.wrapper_job_id,
+                o.wrapper_dispatch_attempt_id,
+                o.ownership_epoch_event_id,
+                pc.human_notified_at AS cascade_human_notified_at
            FROM events e
            JOIN jobs j ON j.job_id = e.session_id
+           LEFT JOIN provider_leg_ownership o ON o.leg_session_id = j.job_id
+           LEFT JOIN provider_leg_cascades pc
+             ON pc.leg_launch_id = o.leg_launch_id
+            AND pc.ownership_epoch_event_id = o.ownership_epoch_event_id
           WHERE e.id > ?
             AND ((j.state = 'ended' AND e.hook_event = 'SessionEnd')
               OR (j.state = 'killed' AND e.hook_event = 'Killed'))
@@ -8458,6 +8582,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         nowSec: () => Date.now() / 1000,
         probe: (pid, startTime) => probeHarnessProcess(pid, startTime),
         signal: (pid, signal) => process.kill(pid, signal),
+        listPanes: () => providerLegPaneOps.listPanes(),
+        killWindow: (paneId) => providerLegPaneOps.killWindow(paneId),
         notify: async (message) => (await notifyHuman(message)) === "notified",
         afterMint: () => {
           wakePending = true;

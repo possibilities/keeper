@@ -34,6 +34,11 @@ export interface ProviderLegTerminalRow {
   close_kind: string | null;
   kill_reason: string | null;
   backend_exec_birth_session_id: string | null;
+  leg_launch_id: string | null;
+  wrapper_job_id: string | null;
+  wrapper_dispatch_attempt_id: number | null;
+  ownership_epoch_event_id: number | null;
+  cascade_human_notified_at: number | null;
 }
 
 export interface ProviderLegDeathCandidate {
@@ -44,6 +49,11 @@ export interface ProviderLegDeathCandidate {
   terminalKind: ProviderLegTerminalKind;
   terminalEventId: number;
   failureDetail: string | null;
+  legLaunchId: string | null;
+  wrapperJobId: string | null;
+  wrapperDispatchAttemptId: number | null;
+  ownershipEpochEventId: number | null;
+  cascadeHumanNotifiedAt: number | null;
 }
 
 export interface WrapperAttemptRow {
@@ -195,6 +205,15 @@ export function terminalRowToCandidate(
   const detailParts = [row.close_kind, row.kill_reason].filter(
     (part): part is string => part != null && part.length > 0,
   );
+  const ownerFields = [
+    row.leg_launch_id,
+    row.wrapper_job_id,
+    row.wrapper_dispatch_attempt_id,
+    row.ownership_epoch_event_id,
+  ];
+  const ownerPresent = ownerFields.every((value) => value != null);
+  const ownerAbsent = ownerFields.every((value) => value == null);
+  if (!ownerPresent && !ownerAbsent) return null;
   return {
     providerLegJobId: row.provider_leg_job_id,
     providerLegCreatedAt: row.provider_leg_created_at,
@@ -203,6 +222,11 @@ export function terminalRowToCandidate(
     terminalKind: row.terminal_kind === "ended" ? "ended" : "killed",
     terminalEventId: row.terminal_event_id,
     failureDetail: detailParts.length === 0 ? null : detailParts.join(": "),
+    legLaunchId: row.leg_launch_id,
+    wrapperJobId: row.wrapper_job_id,
+    wrapperDispatchAttemptId: row.wrapper_dispatch_attempt_id,
+    ownershipEpochEventId: row.ownership_epoch_event_id,
+    cascadeHumanNotifiedAt: row.cascade_human_notified_at,
   };
 }
 
@@ -210,11 +234,19 @@ export function resolveUniqueEligibleWrapper(
   candidate: ProviderLegDeathCandidate,
   rows: readonly WrapperAttemptRow[],
 ): string | null {
+  const durableOwner =
+    candidate.legLaunchId != null &&
+    candidate.wrapperJobId != null &&
+    candidate.wrapperDispatchAttemptId != null &&
+    candidate.ownershipEpochEventId != null;
   const eligible = new Set<string>();
   for (const row of rows) {
     if (
       row.planVerb !== "work" ||
-      row.planRef !== candidate.taskId ||
+      (!durableOwner && row.planRef !== candidate.taskId) ||
+      (durableOwner &&
+        (row.jobId !== candidate.wrapperJobId ||
+          row.attemptId !== candidate.wrapperDispatchAttemptId)) ||
       row.dispatchOrigin !== "autopilot" ||
       row.state === "ended" ||
       row.state === "killed" ||
@@ -412,6 +444,15 @@ export async function runProviderLegDeathNoticeSweep(
   }
 
   for (const candidate of dueProviderLegDeathNotices(state, now)) {
+    if (candidate.cascadeHumanNotifiedAt != null) {
+      recordProviderLegNoticeResult(
+        state,
+        candidate.terminalEventId,
+        { kind: "drop", detail: "cascade incident already paged" },
+        deps.nowMs(),
+      );
+      continue;
+    }
     let wrapperJobId: string | null = null;
     try {
       wrapperJobId = resolveUniqueEligibleWrapper(

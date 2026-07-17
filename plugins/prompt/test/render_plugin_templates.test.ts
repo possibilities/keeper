@@ -433,6 +433,8 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
         "Job-Id:",
         "keeper commit-work",
         '--output "$KEEPER_WRAPPED_ENVELOPE"',
+        "fenced transfer transition",
+        "never transfers ownership",
       ]) {
         expect(wrapped).toContain(required);
       }

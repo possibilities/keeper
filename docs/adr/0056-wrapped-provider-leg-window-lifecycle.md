@@ -29,18 +29,20 @@ window whenever capture returns.
 ## Decision
 
 The `wrapped` Tmux session is the explicit lifecycle boundary for provider-leg
-windows. The autoclose worker gains a wrapped bucket that admits only stopped,
-live-topology-resolved jobs born in that session whose title matches a provider
-leg task id. The existing grace, exact pane identity, generation checks, prompt
-rails, blast cap, config off-switch, and autopilot pause apply unchanged. The
-bucket also recognizes the prefixed title form so stopped windows created by an
-older launch contract converge without a migration.
+windows. For durable owned legs, ADR 0071's leg cascade is the sole teardown
+authority: it targets birth-captured pane and generation coordinates after an
+exact live-topology check, never a task title. It also converges an owned
+idle-stopped window while the owner remains live. A wrapper change preserves
+ownership only through the fenced transfer transition.
 
-A stopped provider-leg turn is sufficient for cleanup; the provider leg owns no
-Plan row whose readiness must complete first. The daemon targets only the exact
-resolved window identity and treats an already-absent window as convergence.
-Cleanup failure never rewrites or invalidates a captured provider result: the
-level-triggered worker retries while positive eligibility remains.
+The autoclose worker's wrapped bucket remains only for the pre-ownership,
+ownerless cohort. It admits stopped, live-topology-resolved jobs born in the
+`wrapped` session whose title matches a Provider-leg task id and for which no
+`provider_leg_ownership` row exists. The existing grace, exact pane identity,
+generation checks, prompt rails, blast cap, config off-switch, and autopilot
+pause apply unchanged. The bucket recognizes the prefixed title form so legacy
+windows converge without a migration. A display-only status gauge tracks this
+cohort until it reaches zero; it is not a needs-human signal or Operator jam.
 
 Provider-leg titles are bare task ids inside `wrapped`. The title remains display
 metadata and a convenience lookup, never teardown or Harness identity. Waiting
@@ -57,8 +59,8 @@ recreates it on demand.
 
 ## Consequences
 
-- Stopped provider-leg windows converge even when the original wrapper process
-  disappears before performing cleanup.
+- Owned Provider-leg windows converge through the durable leg cascade; the
+  autoclose path serves only the draining ownerless cohort.
 - Running provider legs and chunk-level timeouts remain untouched; autoclose
   continues to require positive stopped state.
 - Manual callers that deliberately launch a task-shaped window into `wrapped`

@@ -164,6 +164,18 @@ function deps(overrides: Partial<ProviderLegCascadeDeps> = {}) {
     nowSec: () => now,
     probe: () => matching,
     signal: (pid, signal) => signals.push({ pid, signal }),
+    listPanes: async () => [
+      {
+        tmuxGenerationId: "999:9999",
+        paneId: "%unrelated",
+        windowId: "@unrelated",
+        currentCommand: "zsh",
+        paneDead: "0",
+        sessionName: "manual",
+        windowName: "unrelated",
+      },
+    ],
+    killWindow: async () => ({ ok: true }),
     notify: (message) => {
       pages.push(message);
       return true;

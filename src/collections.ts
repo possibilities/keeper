@@ -804,6 +804,41 @@ export const DISPATCH_CLAIMS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/** Durable Provider-leg ownership rows used by opt-in status drain gauges. */
+export const PROVIDER_LEG_OWNERSHIP_DESCRIPTOR: CollectionDescriptor = {
+  name: "provider_leg_ownership",
+  table: "provider_leg_ownership",
+  columns: [
+    "leg_launch_id",
+    "leg_session_id",
+    "wrapper_job_id",
+    "wrapper_dispatch_attempt_id",
+    "state",
+    "last_event_id",
+  ],
+  pk: "leg_launch_id",
+  version: "last_event_id",
+  sortable: new Set([
+    "leg_launch_id",
+    "wrapper_job_id",
+    "wrapper_dispatch_attempt_id",
+    "state",
+    "last_event_id",
+  ]),
+  defaultSort: { column: "leg_launch_id", dir: "asc" },
+  filters: {
+    leg_launch_id: "leg_launch_id",
+    leg_session_id: "leg_session_id",
+    wrapper_job_id: "wrapper_job_id",
+    state: "state",
+  },
+  defaultClause: {
+    sql: "leg_session_id IN (SELECT job_id FROM jobs WHERE state IN ('working', 'stopped'))",
+    params: [],
+  },
+  jsonColumns: new Set(),
+};
+
 /**
  * The `builds` descriptor — one row per registered buildbot builder, keyed by
  * builder NAME (`project`). A reducer projection produced by synthetic
@@ -1049,6 +1084,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
   [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],
   [DISPATCH_CLAIMS_DESCRIPTOR.name, DISPATCH_CLAIMS_DESCRIPTOR],
+  [PROVIDER_LEG_OWNERSHIP_DESCRIPTOR.name, PROVIDER_LEG_OWNERSHIP_DESCRIPTOR],
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
   [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],

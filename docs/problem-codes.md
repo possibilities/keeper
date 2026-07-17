@@ -266,6 +266,27 @@ or title alone.
 | provisional or absent cut/clean settlement                                             | Provider transcript evidence has not crossed its terminal settlement boundary. An intermediate cut cannot stop the parent or unlock lifecycle consumers.                                            | Preserve the complete transcript tail and restore the transcript worker/read path. A later clean terminal record settles the same invocation; a torn partial line is ignored rather than repaired by hand.                                      |
 | `legacy-unfenced`                                                                      | The session has no exact Dispatch attempt identity. It may still carry Harness activity and a Resource hold, but cannot acquire or consume a newer exact Dispatch claim.                            | Let the session reach a positive terminal boundary. Use a fresh exact attempt for later dispatch; do not assign a guessed attempt id to the legacy row.                                                                                         |
 
+## Provider-leg cascade diagnostics
+
+The durable leg cascade parks an owned Provider leg and retains its wrapper
+attempt's exact Dispatch claim when termination cannot be proved safe or
+complete. These `blocked_reason` values are Operator jams with a page-once
+incident marker; a later positive probe can clear a recoverable block without
+releasing first.
+
+| blocked reason | meaning | recovery | retry-safe |
+| --- | --- | --- | --- |
+| `identity-unknown` | The recorded pid/start-time identity or close-recycle corroboration is incomplete. | Restore process and tmux probe health, then let the level-triggered cascade re-probe; never signal or release from partial identity. | yes (automatic read retry) |
+| `command-unowned` | The identity-matching pid no longer runs the recorded Provider harness command. | Inspect the exact leg identity and launcher evidence; do not signal the replacement process or force-release its claim. | no until reconciled |
+| `kill-unconfirmed` | The bounded KILL attempt cap was reached without the leg's folded terminal event or a recycle-safe gone observation. | Restore terminal-event/process evidence and let the cascade confirm exit; there is no force-release path. | conditional |
+| `signal-failed` | TERM or KILL failed after the adjacent exact-identity recheck. | Check same-user permissions and process state; the next level-triggered pass re-probes before any further signal. | conditional |
+
+A degraded, empty, generation-unknown, moved, split, or dead-pane tmux sweep
+defers owned window cleanup without targeting a title. A positively absent pane
+or canonical generation mismatch converges without touching the replacement.
+The claim remains held until the birth-captured coordinate either passes every
+destructive gate or is positively absent/recycled.
+
 ## Resource cleanup diagnostics
 
 Autoclose and worktree teardown fail closed when exact Resource hold identity cannot be re-proved. These

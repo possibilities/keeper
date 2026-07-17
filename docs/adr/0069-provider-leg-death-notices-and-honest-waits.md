@@ -15,9 +15,11 @@ already died. The wrapper also receives no immediate signal when the folded job
 transition proves that leg ended or was killed.
 
 The Agent Bus is a low-latency same-host rail, not durable lifecycle truth. A
-Provider-leg title identifies its Plan Task scope but is not ownership identity,
-and the durable wrapper-attempt-to-leg edge belongs to separate lifecycle work.
-Side effects and process evidence cannot enter a deterministic Fold.
+Provider-leg title identifies its Plan Task scope but is not ownership identity.
+[ADR 0071](0071-durable-wrapper-leg-ownership-and-terminal-cascade.md) defines
+the durable wrapper-attempt-to-leg relation, fenced transfer, teardown, and
+claim-release authority. Side effects and process evidence cannot enter a
+deterministic Fold.
 
 ## Decision
 
@@ -45,12 +47,15 @@ Side effects and process evidence cannot enter a deterministic Fold.
    transcript path when known, and bounded failure detail. Ordinary transcript
    Stop is not death, and launch failure before a job exists remains the
    synchronous `launch_failed` capture outcome.
-5. **Delivery is owner-only and fail-safe.** The interim resolver uses the
-   existing wrapped task linkage only to find one live `work::<task>` wrapper
-   whose Dispatch-attempt window — claim bind through attempt terminal or
-   superseded — encloses the leg's birth; process lifetime never counts. Zero or
-   multiple candidates means no delivery. `send_only` never creates Presence,
-   takes over a watch channel, or queues for an offline or replacement wrapper.
+5. **Delivery is owner-only and fail-safe.** For an owned leg, the resolver uses
+   ADR 0071's durable `(wrapper_job_id, wrapper_dispatch_attempt_id)` tuple and
+   rechecks the exact live claim before delivery. The task-linkage resolver
+   remains only for legacy ownerless legs. Zero or multiple eligible candidates
+   means no delivery. If the same ownership-epoch cascade incident already
+   stamped its operator page-once marker, the death notice is suppressed rather
+   than paging the incident again. `send_only` never creates Presence, takes over
+   a watch channel, or queues for an offline or replacement wrapper. A title
+   never transfers ownership or selects a replacement wrapper.
 6. **Best-effort means at-least-once while live.** A bounded producer retry may
    duplicate an ambiguously acknowledged send, so the terminal event id is the
    idempotency key. A boot event-id fence prevents historical replay. Boot-seeded
@@ -70,5 +75,5 @@ Side effects and process evidence cannot enter a deterministic Fold.
   reconciliation tick, while bus outages degrade to the durable pull contract.
 - Clean completion and abrupt death stay distinguishable without coupling the
   wrapper's lifetime to the Provider leg.
-- The notice rail does not authorize teardown, transfer ownership, release a
-  Dispatch claim, or replace the later durable ownership-and-cascade design.
+- The notice rail does not authorize teardown, transfer ownership, or release a
+  Dispatch claim; ADR 0071's durable registry and leg cascade own those effects.
