@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 2,
+        "insertions": 125
+      },
+      "done_summary": "Made the fold-side eventTsToIso conversion total: NaN, non-finite, and out-of-range event timestamps now yield a deterministic invalid-ts marker instead of throwing a RangeError inside the fold, while valid timestamps stay byte-identical. Added focused fold-totality and byte-identity tests.",
+      "input_hash": "bd6e7172e03ea841791c9ddcfb068128d42d0f00584a417db8534bc652a989d2",
+      "model": "opus",
+      "spec_chars": 2043,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/reducer.ts, test/reducer-projections.test.ts\n\n### Approach\n\nMake the fold-side timestamp-to-ISO helper total: guard the conversion so NaN, non-finite, negative-beyond-epoch-range, and otherwise invalid event timestamps produce a deterministic fallback (derived only from the input value, never wall-clock) instead of throwing RangeError inside a fold. Every fold-side caller keeps its current output byte-identically for valid inputs \u2014 re-fold determinism is sacred, so the change is purely additive on the invalid domain. Audit the helper's callers to confirm all are fold-side and none needs throwing semantics.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/reducer.ts:9589 \u2014 the unguarded conversion helper\n- src/reducer.ts:9688, 9751 \u2014 fold-side callers observed at authoring time; enumerate any others before changing the contract\n\n### Risks\n\n- The fallback string must be deterministic from the input alone; any wall-clock or locale dependence breaks re-fold equivalence.\n\n### Test notes\n\nTable-drive the invalid domain (NaN, Infinity, -Infinity, out-of-range magnitudes, non-number data reaching the helper) through a real fold via freshMemDb; assert the cursor advances and the projection carries the fallback. Assert byte-identical output for a valid-timestamp corpus.\n\n## Acceptance\n\n- [ ] Folding an event with each class of invalid timestamp completes, advances the cursor, and never dead-letters on conversion\n- [ ] A valid-timestamp corpus converts byte-identically to the prior behavior\n- [ ] Focused fold tests cover the full invalid-domain table\n\n## Done summary\nMade the fold-side eventTsToIso conversion total: NaN, non-finite, and out-of-range event timestamps now yield a deterministic invalid-ts marker instead of throwing a RangeError inside the fold, while valid timestamps stay byte-identical. Added focused fold-totality and byte-identity tests.\n## Evidence\n",
+      "task_id": "fn-1306-total-fold-timestamp-conversion.1",
+      "tier": "xhigh",
+      "title": "Total fold timestamp conversion"
+    }
+  ],
+  "created_at": "2026-07-17T09:33:38.050000Z",
+  "epic_id": "fn-1306-total-fold-timestamp-conversion",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "bd6e7172e03ea841791c9ddcfb068128d42d0f00584a417db8534bc652a989d2",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
