@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-17T23:24:02.305000Z",
   "depends_on": [
@@ -6,11 +7,11 @@
   ],
   "epic": "fn-1322-cooperative-claim-release-rail",
   "id": "fn-1322-cooperative-claim-release-rail.3",
-  "model": "opus",
+  "model": "sonnet",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Guidance, policy, and glossary",
-  "updated_at": "2026-07-17T23:24:02.305000Z"
+  "updated_at": "2026-07-17T23:25:28.574000Z"
 }
