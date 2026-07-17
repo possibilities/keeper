@@ -31,5 +31,5 @@ Files: `src/provider-leg-death-notice.ts` and its redaction test.
 - [ ] A new regression test directly exercises the opaque-bearer path
 
 ## Done summary
-
+Excluded the bare Bearer scheme word from SENSITIVE_KEY_RE's value capture so the AUTH key arm no longer eats 'Bearer', letting BEARER_RE redact an opaque non-JWT token on an Authorization header while the scheme survives. Added an end-to-end regression test.
 ## Evidence

@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix opaque-bearer redaction leak",
-  "updated_at": "2026-07-17T22:32:54.178000Z"
+  "updated_at": "2026-07-17T22:38:16.229000Z",
+  "worker_done_at": "2026-07-17T22:38:16.229000Z"
 }
