@@ -27,5 +27,5 @@ Extract the lane dependency-symlink provisioning into one exported seam in the w
 - [ ] The seam exposes its planted-artifact definition for the identity test
 
 ## Done summary
-
+Extracted the lane-only node_modules symlink into ensureWorktreeDepLink (worktree-git.ts), a universal seam covering task lanes, epic bases, and the baseline runner's scratch worktrees; baseline-worker now provisions via this seam instead of a per-worktree frozen-lockfile install, and exposes WORKTREE_DEP_LINK_NAME/worktreeDepLinkTarget as the planted-artifact definition for the teardown identity test.
 ## Evidence
