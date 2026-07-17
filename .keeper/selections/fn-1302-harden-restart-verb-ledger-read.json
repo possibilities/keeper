@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified fix with a fully-diagnosed root cause (route the reader through the existing resolveRestartLedgerPath), a one-line comment correction, and two test additions with explicit assertions \u2014 bounded, mostly-single-surface work with a clear path across a few files, routing GPT-first at the everyday tier and effort band rather than escalating for a fix whose correctness invariant is already named and mechanical.",
+      "task_id": "fn-1302-harden-restart-verb-ledger-read.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T04:22:13.836000Z",
+  "epic_id": "fn-1302-harden-restart-verb-ledger-read",
+  "input_hash": "03e6af77fbcd316fc8c0bb783786a14b9d55032338cb993f2584ba7b398fc4a9",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 65449847,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified fix with a fully-diagnosed root cause (route the reader through the existing resolveRestartLedgerPath), a one-line comment correction, and two test additions with explicit assertions \u2014 bounded, mostly-single-surface work with a clear path across a few files, routing GPT-first at the everyday tier and effort band rather than escalating for a fix whose correctness invariant is already named and mechanical.\",\"confidence\":0.79}]}\n"
+}
