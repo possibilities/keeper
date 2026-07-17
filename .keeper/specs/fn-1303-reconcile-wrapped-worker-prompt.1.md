@@ -27,5 +27,5 @@ add fn-ids; forward-facing guidance only.
 - [ ] bun scripts/lint-claude-md.ts stays green if touched; no provenance leakage introduced
 
 ## Done summary
-
+Reconciled the 'Wait in chunks' paragraph in worker-implement-wrapped.md to key retries on the captured run handle or a fenced transfer, never on discovering a same-name leg by title.
 ## Evidence
