@@ -201,33 +201,37 @@ describe("computeEventStoreStatus", () => {
     });
   });
 
-  test("a recorded measurement projects both durations from the observed rate", () => {
-    // Observed: 500 events folded in 10_000ms → 20ms/event. 100 events have
-    // accumulated since that boot's end cursor (head 1100 vs end 1000), and
-    // the current total is 2000 events.
+  test("catch-up projects from the wall-clock rate, full-replay from the pace-free work rate (the two rates differ)", () => {
+    // Wall-clock: 500 events folded in 10_000ms → 20ms/event (catch-up rate).
+    // Fold-work: 5_000ms over the SAME 500 events → 10ms/event (replay rate),
+    // half the wall-clock rate with the pacing sleep excluded. 100 events have
+    // accumulated since that boot's end cursor (head 1100 vs end 1000), and the
+    // current total is 2000 events.
     const stats = {
       startedAtMs: 0,
       completedAtMs: 10_000,
       startEventId: 500,
       endEventId: 1000,
+      workMs: 5_000,
     };
     const out = computeEventStoreStatus(stats, 2000, 999_999, 1100);
     expect(out.last_boot_catchup).toEqual({
       duration_ms: 10_000,
       events_folded: 500,
     });
-    // 20ms/event * 100 pending events
+    // 20ms/event (wall-clock) * 100 pending events
     expect(out.projected_catchup_duration_ms).toBe(2000);
-    // 20ms/event * 2000 current total events
-    expect(out.projected_full_replay_duration_ms).toBe(40_000);
+    // 10ms/event (pace-free work) * 2000 current total events
+    expect(out.projected_full_replay_duration_ms).toBe(20_000);
   });
 
-  test("zero events folded (a boot that caught up nothing) leaves the rate undefined — projections null, observation still surfaced", () => {
+  test("zero events folded (a boot that caught up nothing) leaves both rates undefined — projections null, observation still surfaced", () => {
     const stats = {
       startedAtMs: 0,
       completedAtMs: 5000,
       startEventId: 42,
       endEventId: 42,
+      workMs: 1000,
     };
     const out = computeEventStoreStatus(stats, 42, 4096, 42);
     expect(out.last_boot_catchup).toEqual({
@@ -244,12 +248,72 @@ describe("computeEventStoreStatus", () => {
       completedAtMs: 4000,
       startEventId: 0,
       endEventId: 400,
+      workMs: 800,
     };
     // head == the recorded end cursor: nothing pending right now.
     const out = computeEventStoreStatus(stats, 400, 8192, 400);
     expect(out.projected_catchup_duration_ms).toBe(0);
-    // 10ms/event * 400 current total events
-    expect(out.projected_full_replay_duration_ms).toBe(4000);
+    // 2ms/event (pace-free work 800/400) * 400 current total events
+    expect(out.projected_full_replay_duration_ms).toBe(800);
+  });
+
+  test("null work measurement → full-replay null-honest while catch-up still projects from wall-clock", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 10_000,
+      startEventId: 0,
+      endEventId: 1000,
+      workMs: null,
+    };
+    const out = computeEventStoreStatus(stats, 5000, 4096, 1500);
+    // 10ms/event wall-clock (10_000/1000) * 500 pending (head 1500 − end 1000)
+    expect(out.projected_catchup_duration_ms).toBe(5000);
+    // work unmeasured → null, never 0, never the wall-clock extrapolation
+    expect(out.projected_full_replay_duration_ms).toBeNull();
+  });
+
+  test("zero work measurement reads as not-measured → full-replay null, never an instant-rebuild 0", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 8000,
+      startEventId: 0,
+      endEventId: 800,
+      workMs: 0,
+    };
+    const out = computeEventStoreStatus(stats, 800, 4096, 800);
+    expect(out.projected_full_replay_duration_ms).toBeNull();
+    // catch-up leg unaffected: 10ms/event (8000/800) * 0 pending = 0
+    expect(out.projected_catchup_duration_ms).toBe(0);
+  });
+
+  test("negative work measurement (a torn/malformed delta) → full-replay null; catch-up still projects", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 8000,
+      startEventId: 0,
+      endEventId: 800,
+      workMs: -50,
+    };
+    const out = computeEventStoreStatus(stats, 800, 4096, 900);
+    expect(out.projected_full_replay_duration_ms).toBeNull();
+    // catch-up still projects from wall-clock: 10ms/event * 100 pending
+    expect(out.projected_catchup_duration_ms).toBe(1000);
+  });
+
+  test("a non-positive wall-clock window nulls only the catch-up leg — full-replay still projects from work", () => {
+    // Degenerate torn row: completed == started (0ms wall-clock), yet a real
+    // positive fold-work measurement survives. The two legs are independent.
+    const stats = {
+      startedAtMs: 5000,
+      completedAtMs: 5000,
+      startEventId: 0,
+      endEventId: 1000,
+      workMs: 2000,
+    };
+    const out = computeEventStoreStatus(stats, 3000, 4096, 1200);
+    expect(out.projected_catchup_duration_ms).toBeNull();
+    // 2ms/event (work 2000/1000) * 3000 current events
+    expect(out.projected_full_replay_duration_ms).toBe(6000);
   });
 });
 
@@ -292,6 +356,7 @@ describe("readEventStoreStatus wiring", () => {
       completedAtMs: 1000,
       startEventId: 0,
       endEventId: 3,
+      workMs: 600,
     });
     const eventStore = readEventStoreStatus(db);
     expect(eventStore.event_count).toBe(3);
@@ -299,10 +364,40 @@ describe("readEventStoreStatus wiring", () => {
       duration_ms: 1000,
       events_folded: 3,
     });
-    // ~333.33ms/event * 3 current events, rounded.
-    expect(eventStore.projected_full_replay_duration_ms).toBe(1000);
+    // 200ms/event pace-free work (600/3) * 3 current events.
+    expect(eventStore.projected_full_replay_duration_ms).toBe(600);
     // Nothing pending beyond the recorded end cursor (head == 3 == end_event_id).
     expect(eventStore.projected_catchup_duration_ms).toBe(0);
+  });
+
+  test("a boot measurement recorded with no fold-work → full-replay null-honest end-to-end, catch-up still projects", () => {
+    const { db } = freshMemDb();
+    for (let i = 0; i < 4; i++) {
+      db.run(
+        "INSERT INTO events (ts, session_id, hook_event, event_type) VALUES (?, ?, ?, ?)",
+        [
+          1000 + i,
+          "01234567-89ab-cdef-0123-456789abcdef",
+          "SessionStart",
+          "SessionStart",
+        ],
+      );
+    }
+    // No workMs argument → the nullable fold_work_ms column persists NULL, the
+    // "recorded before the work column existed" case that must read as
+    // not-measured rather than an instant-rebuild 0.
+    recordBootCatchupStats(db, {
+      startedAtMs: 0,
+      completedAtMs: 2000,
+      startEventId: 0,
+      endEventId: 2,
+    });
+    const eventStore = readEventStoreStatus(db);
+    // full-replay unmeasured → null, never a paced-rate extrapolation.
+    expect(eventStore.projected_full_replay_duration_ms).toBeNull();
+    // catch-up still projects from wall-clock: 1000ms/event (2000/2) * 2 pending
+    // (head 4 − end 2).
+    expect(eventStore.projected_catchup_duration_ms).toBe(2000);
   });
 });
 

@@ -135,10 +135,12 @@ export interface BootStatus {
 
 /**
  * The most recent boot's measured catch-up window (fn-1311): how long it took
- * and how many events it folded, as durably recorded by main right before it
- * posts `boot-complete`. `null` before any boot has ever recorded one (a fresh
- * DB, or a binary upgrade mid-flight) — the null-honest "no measurement yet"
- * case; `event_store`'s two projected-duration fields are `null` in lockstep.
+ * (wall-clock) and how many events it folded, as durably recorded by main right
+ * before it posts `boot-complete`. `null` before any boot has ever recorded one
+ * (a fresh DB, or a binary upgrade mid-flight) — the null-honest "no
+ * measurement yet" case; `event_store`'s projected-duration fields go `null` in
+ * lockstep. The pace-free fold-work total that feeds the full-replay rate is
+ * held on the durable row, not surfaced on the wire here.
  */
 export interface EventStoreLastBootCatchup {
   duration_ms: number;
@@ -146,19 +148,29 @@ export interface EventStoreLastBootCatchup {
 }
 
 /**
- * The event store's operational-threshold measurements (fn-1311) — total
- * event count, DB byte size, and durations projected from the most recent
- * boot's measured catch-up rate, displayed against the ratified SLOs (boot
- * catch-up ≤60s, full disaster rebuild ≤15min; backlog #11). Measurement
- * only — nothing here enforces a threshold or changes behavior.
+ * The event store's operational-threshold measurements (fn-1311, fn-1313) —
+ * total event count, DB byte size, and two durations projected from the most
+ * recent boot, displayed against the ratified SLOs (boot catch-up ≤60s, full
+ * disaster rebuild ≤15min; backlog #11). Measurement only — nothing here
+ * enforces a threshold or changes behavior.
  *
- * `projected_catchup_duration_ms` scales the measured per-event rate by the
- * events accumulated since the last boot completed (`head_event_id -
+ * The two projections derive from DIFFERENT rates (ADR 0075):
+ *
+ * `projected_catchup_duration_ms` scales the WALL-CLOCK catch-up rate
+ * (`last_boot_catchup.duration_ms / events_folded`) by the events accumulated
+ * since the last boot completed (`head_event_id -
  * last_boot_catchup.end_event_id`) — "if the daemon restarted right now, how
- * long would catch-up take." `projected_full_replay_duration_ms` scales the
- * SAME rate by the CURRENT total `event_count` — "how long a from-scratch
- * disaster rebuild would take." Both are `null` when `last_boot_catchup` is
- * `null` or its `events_folded` is 0 (an undefined rate).
+ * long would catch-up take." Pacing is real experienced catch-up latency, so
+ * the wall-clock rate is the honest one here. `null` when `last_boot_catchup`
+ * is `null`, its `events_folded` is 0, or its `duration_ms` is non-positive.
+ *
+ * `projected_full_replay_duration_ms` is an ESTIMATOR, not a rebuild promise:
+ * the last boot's UNPACED fold-work rate times the current `event_count` — "how
+ * long a from-scratch disaster rebuild would take, folding unpaced." It derives
+ * only from accumulated pace-free fold-work time (NOT the wall-clock rate,
+ * which the boot drain's per-fold pacing sleep inflates by ~two orders of
+ * magnitude). `null` unless that boot recorded a positive fold-work
+ * measurement — "not measured", never a zero or the paced-rate extrapolation.
  */
 export interface EventStoreStatus {
   event_count: number;

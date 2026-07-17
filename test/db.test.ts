@@ -442,6 +442,66 @@ test("the v104 question + v117 blocks_closing_of are the byte-identical epics ta
   migrated.close();
 });
 
+test("boot_catchup_stats.fold_work_ms is the nullable tail on fresh vs migrated (fn-1313)", () => {
+  // `fold_work_ms` is declared LAST in the `CREATE_BOOT_CATCHUP_STATS` literal
+  // AND appended by an idempotent `ALTER TABLE ADD COLUMN` migration step, so it
+  // must land as the SAME trailing column of the operational singleton on both
+  // the fresh CREATE path and a stepped upgrade from a DB whose
+  // boot_catchup_stats predates the column. It MUST be nullable (no NOT NULL, no
+  // DEFAULT) so a pre-migration or never-recorded row reads as "not measured",
+  // never as an instant-rebuild 0.
+  const colsOf = (
+    database: Database,
+  ): { name: string; notnull: number; dflt_value: unknown }[] =>
+    database.prepare("PRAGMA table_info(boot_catchup_stats)").all() as {
+      name: string;
+      notnull: number;
+      dflt_value: unknown;
+    }[];
+  const tailOf = (
+    cols: { name: string; notnull: number; dflt_value: unknown }[],
+  ): { name: string; notnull: number; dflt_value: unknown } =>
+    cols[cols.length - 1];
+
+  const { db: fresh } = openDb(":memory:");
+  const freshCols = colsOf(fresh);
+  const freshTail = tailOf(freshCols);
+  expect(freshTail.name).toBe("fold_work_ms");
+  expect(freshTail.notnull).toBe(0);
+  expect(freshTail.dflt_value).toBeNull();
+  fresh.close();
+
+  // A pre-v133-shaped DB has no boot_catchup_stats at all; hand-seed the legacy
+  // 6-column shape (the column set before fold_work_ms) so migrate()'s additive
+  // step ALTER-appends the column rather than the CREATE literal materializing
+  // it. Stamped v5 like the epics-tail convergence gate above, so migrate walks
+  // the full ladder over the legacy table.
+  const old = new Database(dbPath, { create: true });
+  old.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  old.run("INSERT INTO meta (key, value) VALUES ('schema_version', '5')");
+  old.run(
+    `CREATE TABLE boot_catchup_stats (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        started_at REAL NOT NULL,
+        completed_at REAL NOT NULL,
+        start_event_id INTEGER NOT NULL,
+        end_event_id INTEGER NOT NULL,
+        updated_at REAL NOT NULL
+      )`,
+  );
+  old.close();
+
+  const { db: migrated } = openDb(dbPath);
+  const migratedCols = colsOf(migrated);
+  const migratedTail = tailOf(migratedCols);
+  expect(migratedTail.name).toBe("fold_work_ms");
+  expect(migratedTail.notnull).toBe(0);
+  expect(migratedTail.dflt_value).toBeNull();
+  // Fresh and stepped-upgrade converge on the same singleton column order.
+  expect(migratedCols.map((c) => c.name)).toEqual(freshCols.map((c) => c.name));
+  migrated.close();
+});
+
 test("SCHEMA_FINGERPRINT pins the fully-migrated schema shape — re-pin it with EVERY schema change", () => {
   // The pinned constant is the schema's lock file: any schema change (new
   // migration block, CREATE-literal edit, bare version bump) moves the live
@@ -3223,7 +3283,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // this test pins.
   // v133 adds the fn-1311 `boot_catchup_stats` OPERATIONAL singleton — a new
   // standalone table, not a touch of the epics SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(133);
+  // v134 appends the nullable `boot_catchup_stats.fold_work_ms` column (the
+  // pace-free fold-work rate the full-replay projection derives from) — an
+  // additive ALTER on that operational singleton, not a touch of the epics
+  // SHAPE this test pins.
+  expect(SCHEMA_VERSION).toBe(134);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

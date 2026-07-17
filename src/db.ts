@@ -4429,6 +4429,21 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       ctx.db.run(CREATE_BOOT_CATCHUP_STATS);
     },
   },
+  {
+    // fn-1313 — the NULLABLE fold-work column on the boot-catchup singleton (see
+    // `CREATE_BOOT_CATCHUP_STATS`'s doc comment). The full-replay projection
+    // derives its rate from this pace-free fold-work total; nullable so a row
+    // recorded before this column existed reads as "not measured" rather than an
+    // instant-rebuild 0. Appended LAST in the CREATE literal too, so a fresh
+    // bootstrap and this idempotent ALTER converge on the same singleton shape.
+    // The singleton is a non-fold OPERATIONAL sidecar — no rewind needed.
+    // Provisional version per ADR 0020 — renumbered at fan-in, never hardcoded.
+    version: 134,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(ctx.db, "boot_catchup_stats", "fold_work_ms", "REAL");
+    },
+  },
 ];
 
 /**
@@ -4449,7 +4464,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v133:425c4e1869270a9ab71cb3588bcf8996b6f39f962c52fa39fc96887876221968";
+  "v134:88b29e5b5b658893ee08bdfb358920bb47df75b391f27849651140698227f5a8";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6546,12 +6561,21 @@ CREATE TABLE IF NOT EXISTS tmux_client_focus (
  * (a producer) around the boot drain — never inside a fold. `start_event_id`/
  * `end_event_id` are `reducer_state.last_event_id` samples taken at the same
  * two points, so `end_event_id - start_event_id` is exactly how many events
- * this boot folded. The status surface (`readBootStatus` in
+ * this boot folded. `fold_work_ms` is the pace-free fold-work delta over that
+ * SAME window (the reducer's monotonic work accumulator, end minus start),
+ * feeding the full-replay projection's honest rate — NULLABLE so a
+ * pre-migration or never-recorded row reads as "not measured", never as an
+ * instant-rebuild 0. The status surface (`readBootStatus` in
  * `server-worker.ts`) reads this ONE row and does pure arithmetic against it
  * at query time — no wall-clock probe on the read path, honoring "durable
  * observations, not wall-clock guesses at query time." Absent row (fresh DB,
  * or a binary that predates this table) is the null-honest "no measurement
  * yet" case.
+ *
+ * `fold_work_ms` is appended LAST in this literal so a fresh bootstrap
+ * (CREATE with the column) and a stepped upgrade (the additive
+ * `addColumnIfMissing` step, which ALTER-appends it) converge on the same
+ * column order.
  */
 const CREATE_BOOT_CATCHUP_STATS = `
 CREATE TABLE IF NOT EXISTS boot_catchup_stats (
@@ -6560,7 +6584,8 @@ CREATE TABLE IF NOT EXISTS boot_catchup_stats (
     completed_at REAL NOT NULL,
     start_event_id INTEGER NOT NULL,
     end_event_id INTEGER NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    fold_work_ms REAL
 )
 `;
 
@@ -7467,8 +7492,9 @@ export function selectWorldRev(stmts: Stmts): number {
  * singleton (fn-1311; see {@link CREATE_BOOT_CATCHUP_STATS}'s doc comment).
  * Called ONCE per boot by `daemon.ts`, right before it posts `boot-complete`,
  * with wall-clock + fold-cursor samples it took around the boot drain — a
- * producer write, never a fold. `INSERT OR REPLACE` so the singleton always
- * reflects only the MOST RECENT boot.
+ * producer write, never a fold. `workMs` is the pace-free fold-work delta over
+ * the same window (fn-1313), or `null` when unmeasured. `INSERT OR REPLACE` so
+ * the singleton always reflects only the MOST RECENT boot.
  */
 export function recordBootCatchupStats(
   db: Database,
@@ -7477,17 +7503,19 @@ export function recordBootCatchupStats(
     completedAtMs: number;
     startEventId: number;
     endEventId: number;
+    workMs?: number | null;
   },
 ): void {
   db.run(
     `INSERT OR REPLACE INTO boot_catchup_stats
-       (id, started_at, completed_at, start_event_id, end_event_id, updated_at)
-     VALUES (1, ?, ?, ?, ?, unixepoch('now', 'subsec'))`,
+       (id, started_at, completed_at, start_event_id, end_event_id, fold_work_ms, updated_at)
+     VALUES (1, ?, ?, ?, ?, ?, unixepoch('now', 'subsec'))`,
     [
       stats.startedAtMs,
       stats.completedAtMs,
       stats.startEventId,
       stats.endEventId,
+      stats.workMs ?? null,
     ],
   );
 }

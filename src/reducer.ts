@@ -11554,6 +11554,34 @@ function computeMonitors(
 let _foldLockWaitMs = 0;
 let _foldWorkMs = 0;
 
+/**
+ * Monotonic sum of every fold's pace-free `work_ms` (the companion per-fold
+ * stamp above), across every {@link applyEvent} call this process makes. The
+ * full-replay projection derives its rate from this accumulator, NOT the
+ * boot-catchup wall-clock: the wall-clock rate is dominated by `drain`'s
+ * per-fold pacing sleep (which lands AFTER `applyEvent` returns and so is
+ * excluded from `work_ms`), while a real disaster rebuild folds unpaced. The
+ * daemon delta-samples this at the SAME two points it samples the boot-catchup
+ * start/end cursor, so the work numerator and the folded-event denominator
+ * cover the identical event window by construction.
+ *
+ * Never reset by any caller — a monotonic accumulator; the delta between two
+ * reads is the work of the folds between them. Pure instrumentation, exactly
+ * like `_foldWorkMs`: never read into a projection write, so it does not touch
+ * re-fold determinism.
+ */
+let _foldWorkMsAccum = 0;
+
+/**
+ * Read the monotonic accumulated fold-work total (ms) — the sum of every
+ * fold's pace-free `work_ms` so far. The daemon reads this before the boot
+ * drain and again at the boot-catchup record point; the delta is that boot's
+ * unpaced fold-work numerator. See {@link _foldWorkMsAccum}.
+ */
+export function readFoldWorkMsAccum(): number {
+  return _foldWorkMsAccum;
+}
+
 export function applyEvent(
   db: Database,
   event: Event,
@@ -11871,6 +11899,9 @@ export function applyEvent(
   // never reaches here anyway, so this is defense-in-depth.
   _foldLockWaitMs = _foldT1 - _foldT0;
   _foldWorkMs = performance.now() - _foldT1;
+  // Sum this fold's pace-free work into the monotonic accumulator the
+  // full-replay projection's rate derives from (see {@link _foldWorkMsAccum}).
+  _foldWorkMsAccum += _foldWorkMs;
 }
 
 /**
