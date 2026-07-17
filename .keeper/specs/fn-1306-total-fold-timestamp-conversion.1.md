@@ -30,5 +30,5 @@ Table-drive the invalid domain (NaN, Infinity, -Infinity, out-of-range magnitude
 - [ ] Focused fold tests cover the full invalid-domain table
 
 ## Done summary
-
+Made the fold-side eventTsToIso conversion total: NaN, non-finite, and out-of-range event timestamps now yield a deterministic invalid-ts marker instead of throwing a RangeError inside the fold, while valid timestamps stay byte-identical. Added focused fold-totality and byte-identity tests.
 ## Evidence
