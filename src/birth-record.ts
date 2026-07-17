@@ -39,9 +39,29 @@ import {
 } from "./dispatch-command";
 import { execBackendEnvMeta, isDefaultTmuxEnvValue } from "./exec-backend";
 
-/** Bumped only on an incompatible birth-record shape change; the ingest worker
- *  rejects an unknown version rather than mis-folding it. */
-export const BIRTH_RECORD_SCHEMA_VERSION = 1;
+/** The current birth-record protocol version the launcher emits. Bumped on an
+ *  incompatible shape change; the ingest worker rejects an UNKNOWN version
+ *  (outside {@link SUPPORTED_BIRTH_RECORD_VERSIONS}) rather than mis-folding it. */
+export const BIRTH_RECORD_SCHEMA_VERSION = 2;
+
+/**
+ * The protocol version at which a birth record may carry the durable wrapper→leg
+ * owner tuple (ADR 0071). A record BELOW this version is legacy and is never
+ * enrolled into `provider_leg_ownership`; the classification is by protocol
+ * version alone, never inferred from which owner fields happen to be null.
+ */
+export const OWNED_LEG_BIRTH_PROTOCOL_VERSION = 2;
+
+/**
+ * Every birth-record protocol version the ingest worker still accepts. Legacy v1
+ * records remain ingestible (they mint the presence SessionStart and drain via
+ * the old autoclose path) but classify as ownerless; the current-cohort v2 adds
+ * the owner tuple. A version outside this set is rejected, not mis-folded.
+ */
+export const SUPPORTED_BIRTH_RECORD_VERSIONS: ReadonlySet<number> = new Set([
+  1,
+  OWNED_LEG_BIRTH_PROTOCOL_VERSION,
+]);
 
 /**
  * One harness birth: the launcher's snapshot of a freshly-spawned Pi
@@ -83,6 +103,25 @@ export interface BirthRecord {
   /** Exact Dispatch attempt carried by a capable lifecycle adapter, or null for
    *  manual, legacy, malformed, and capability-absent launches. */
   dispatch_attempt_id: number | null;
+  /**
+   * Immutable identity of this Provider-leg launch (ADR 0071). Present only on a
+   * v2 owned-leg birth; the ownership registry's idempotency key core. ABSENT
+   * (not null) on a legacy v1 record and on a non-wrapped v2 launch — a legacy
+   * record is classified by protocol version, never by this field's presence.
+   */
+  leg_launch_id?: string;
+  /** Owner tuple part 1: the keeper job id of the wrapper attempt that launched
+   *  this leg. Present only alongside {@link leg_launch_id} on a v2 owned leg. */
+  wrapper_job_id?: string;
+  /** Owner tuple part 2: the wrapper's exact Dispatch-attempt id. Present only
+   *  alongside {@link leg_launch_id} on a v2 owned leg. */
+  wrapper_dispatch_attempt_id?: number;
+  /** The launcher process's own pid (distinct from the spawned leg's {@link pid}).
+   *  Present only on a v2 owned-leg birth. */
+  launcher_pid?: number;
+  /** The launcher process's platform-tagged start_time (recycle-safe identity of
+   *  the launcher, distinct from the leg's {@link start_time}). v2 owned legs. */
+  launcher_start_time?: string;
 }
 
 /** The record MINUS the two post-spawn fields the launcher cannot know until it
@@ -174,7 +213,7 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   if (
     typeof o.schema_version !== "number" ||
     !Number.isInteger(o.schema_version) ||
-    o.schema_version !== BIRTH_RECORD_SCHEMA_VERSION ||
+    !SUPPORTED_BIRTH_RECORD_VERSIONS.has(o.schema_version) ||
     !isStr(o.session_id) ||
     o.session_id === "" ||
     o.harness !== "pi" ||
@@ -193,8 +232,10 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   ) {
     return null;
   }
-  return {
-    schema_version: BIRTH_RECORD_SCHEMA_VERSION,
+  const record: BirthRecord = {
+    // Preserve the PARSED version, not the current constant: a legacy v1 record
+    // stays v1 so the ownership classifier can key on protocol version.
+    schema_version: o.schema_version,
     session_id: o.session_id,
     harness: o.harness,
     pid: o.pid,
@@ -216,6 +257,80 @@ export function parseBirthRecord(line: string): BirthRecord | null {
       o.dispatch_attempt_id > 0
         ? o.dispatch_attempt_id
         : null,
+  };
+  // Owner tuple + launcher identity (ADR 0071) is read ONLY at the owned-leg
+  // protocol version. A legacy record never carries it — the leg-ownership
+  // classification is by version, never by a field being present, so a v1 body
+  // that happens to include these keys is still treated as legacy/ownerless.
+  if (o.schema_version >= OWNED_LEG_BIRTH_PROTOCOL_VERSION) {
+    if (isStr(o.leg_launch_id) && o.leg_launch_id.length > 0) {
+      record.leg_launch_id = o.leg_launch_id;
+    }
+    if (isStr(o.wrapper_job_id) && o.wrapper_job_id.length > 0) {
+      record.wrapper_job_id = o.wrapper_job_id;
+    }
+    if (
+      typeof o.wrapper_dispatch_attempt_id === "number" &&
+      Number.isSafeInteger(o.wrapper_dispatch_attempt_id) &&
+      o.wrapper_dispatch_attempt_id > 0
+    ) {
+      record.wrapper_dispatch_attempt_id = o.wrapper_dispatch_attempt_id;
+    }
+    if (
+      typeof o.launcher_pid === "number" &&
+      Number.isSafeInteger(o.launcher_pid) &&
+      o.launcher_pid > 0
+    ) {
+      record.launcher_pid = o.launcher_pid;
+    }
+    if (isStr(o.launcher_start_time) && o.launcher_start_time.length > 0) {
+      record.launcher_start_time = o.launcher_start_time;
+    }
+  }
+  return record;
+}
+
+/**
+ * The durable owner tuple (ADR 0071) — the exact wrapper Dispatch attempt that
+ * launched a Provider leg, plus that leg's immutable launch id. Returned only for
+ * a fully-formed OWNED-leg birth; a legacy or ownerless record yields null and is
+ * never enrolled into the ownership registry.
+ */
+export interface BirthOwnerTuple {
+  leg_launch_id: string;
+  wrapper_job_id: string;
+  wrapper_dispatch_attempt_id: number;
+}
+
+/**
+ * True when `record` is a legacy (pre-owned-leg) protocol birth. Classified by
+ * protocol version ALONE — the ADR 0071 rule that legacy is never inferred from
+ * null owner fields.
+ */
+export function birthRecordIsLegacyProtocol(record: BirthRecord): boolean {
+  return record.schema_version < OWNED_LEG_BIRTH_PROTOCOL_VERSION;
+}
+
+/**
+ * The owner tuple to enroll for `record`, or null. Non-null ONLY for a v2 record
+ * carrying a complete tuple: a legacy v1 record, or a v2 non-wrapped launch with
+ * no tuple, both yield null and stay off the cascade.
+ */
+export function ownerTupleFromBirthRecord(
+  record: BirthRecord,
+): BirthOwnerTuple | null {
+  if (
+    record.schema_version < OWNED_LEG_BIRTH_PROTOCOL_VERSION ||
+    record.leg_launch_id === undefined ||
+    record.wrapper_job_id === undefined ||
+    record.wrapper_dispatch_attempt_id === undefined
+  ) {
+    return null;
+  }
+  return {
+    leg_launch_id: record.leg_launch_id,
+    wrapper_job_id: record.wrapper_job_id,
+    wrapper_dispatch_attempt_id: record.wrapper_dispatch_attempt_id,
   };
 }
 

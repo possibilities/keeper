@@ -800,6 +800,17 @@ function snapshotProjections() {
     autopilot_state: db
       .query("SELECT * FROM autopilot_state ORDER BY id")
       .all(),
+    // ADR 0071 — the durable wrapper→Provider-leg projections are
+    // DETERMINISTIC-replayed (every timestamp is event.ts, every id an event
+    // id), so they belong in the byte-identical charter.
+    provider_leg_ownership: db
+      .query("SELECT * FROM provider_leg_ownership ORDER BY leg_launch_id")
+      .all(),
+    provider_leg_cascades: db
+      .query(
+        "SELECT * FROM provider_leg_cascades ORDER BY leg_launch_id, ownership_epoch_event_id",
+      )
+      .all(),
   };
 }
 
@@ -832,6 +843,8 @@ function rewindAndWipeProjections(): void {
   db.run("DELETE FROM subagent_invocations");
   db.run("DELETE FROM commit_trailer_facts");
   db.run("DELETE FROM autopilot_state");
+  db.run("DELETE FROM provider_leg_ownership");
+  db.run("DELETE FROM provider_leg_cascades");
   // Reset the LIVE-ONLY git skip-floor to 0 alongside the cursor rewind. In
   // PRODUCTION the git surface (`git_status`/`file_attributions`/the 3 jobs
   // git-counters) is live-only and a rewind leaves it to the boot-seed — but
@@ -933,6 +946,127 @@ test("attempt- and incident-fenced DispatchCleared history re-folds byte-identic
   expect(
     db.query("SELECT * FROM dispatch_claims ORDER BY verb, id").all(),
   ).toEqual(claimsBefore);
+});
+
+test("ADR 0071 wrapper→leg ownership + cascade projections re-fold byte-identically across the new step", () => {
+  // A leg is born, transferred once (epoch advances), its cascade is armed +
+  // signalled + settled — a full lifecycle exercising set-once inserts, the
+  // fenced transfer, COALESCE timestamps, and MAX attempt counts.
+  const bornA = insertEvent({
+    hook_event: "ProviderLegBorn",
+    session_id: "leg-refold-a",
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-a",
+      wrapper_job_id: "work::fn-rf.1",
+      wrapper_dispatch_attempt_id: 11,
+      leg_pid: 4001,
+      leg_start_time: "darwin:refold",
+      pane_id: "%3",
+      pane_generation: 2,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegOwnershipTransferred",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-a",
+      from_wrapper_job_id: "work::fn-rf.1",
+      from_wrapper_dispatch_attempt_id: 11,
+      to_wrapper_job_id: "work::fn-rf.2",
+      to_wrapper_dispatch_attempt_id: 12,
+    }),
+  });
+  // A SECOND leg whose cascade is armed then blocked (page-once) — never settled,
+  // so it exercises the blocked branch's persisted reason + notify timestamp.
+  const bornB = insertEvent({
+    hook_event: "ProviderLegBorn",
+    session_id: "leg-refold-b",
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-b",
+      wrapper_job_id: "work::fn-rf.9",
+      wrapper_dispatch_attempt_id: 19,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegCascadeArmed",
+    session_id: "reconciler",
+    ts: 9100,
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-b",
+      ownership_epoch_event_id: bornB,
+      wrapper_job_id: "work::fn-rf.9",
+      wrapper_dispatch_attempt_id: 19,
+      kill_not_before: 9600,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "reconciler",
+    ts: 9200,
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-b",
+      ownership_epoch_event_id: bornB,
+      phase: "term_sent",
+      attempt_ordinal: 2,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "reconciler",
+    ts: 9300,
+    data: JSON.stringify({
+      leg_launch_id: "leg-refold-b",
+      ownership_epoch_event_id: bornB,
+      phase: "blocked",
+      reason: "identity-unknown",
+      notified: true,
+    }),
+  });
+  drainAll();
+
+  const ownershipBefore = db
+    .query("SELECT * FROM provider_leg_ownership ORDER BY leg_launch_id")
+    .all() as Record<string, unknown>[];
+  const cascadesBefore = db
+    .query("SELECT * FROM provider_leg_cascades ORDER BY leg_launch_id")
+    .all();
+  // Independent-source sanity anchors: the transfer advanced the epoch off the
+  // birth id, and the blocked incident kept its armed deadline + page timestamp.
+  expect(ownershipBefore).toHaveLength(2);
+  expect(ownershipBefore[1]).toMatchObject({
+    leg_launch_id: "leg-refold-b",
+    ownership_epoch_event_id: bornB,
+  });
+  expect(ownershipBefore[0]).toMatchObject({
+    leg_launch_id: "leg-refold-a",
+    wrapper_dispatch_attempt_id: 12,
+  });
+  expect(ownershipBefore[0].ownership_epoch_event_id).not.toBe(bornA);
+  expect(cascadesBefore).toEqual([
+    expect.objectContaining({
+      state: "blocked",
+      blocked_reason: "identity-unknown",
+      term_armed_at: 9100,
+      term_sent_at: 9200,
+      kill_not_before: 9600,
+      term_attempts: 2,
+      human_notified_at: 9300,
+    }),
+  ]);
+
+  rewindAndWipeProjections();
+  drainAll();
+
+  expect(
+    db
+      .query("SELECT * FROM provider_leg_ownership ORDER BY leg_launch_id")
+      .all(),
+  ).toEqual(ownershipBefore);
+  expect(
+    db
+      .query("SELECT * FROM provider_leg_cascades ORDER BY leg_launch_id")
+      .all(),
+  ).toEqual(cascadesBefore);
 });
 
 test("full cursor=0 replay accepts a historical tokenless DispatchCleared clearing a live legacy mint gate", () => {
