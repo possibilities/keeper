@@ -41,5 +41,5 @@ Injected clock/probe/signal runners; interruption coverage at every boundary (cr
 - [ ] Blocked incidents page exactly once and re-arm only on producer level-clear
 
 ## Done summary
-
+Landed the level-triggered terminal-cascade producer: identity-rechecked TERM->KILL teardown of owned Provider legs with recycle-safe corroboration, restart-safe phase fencing, and exact-tuple claim release only after all owned legs settle; split cli/agent.ts's ladder into reusable mechanics vs operator refusal policy.
 ## Evidence
