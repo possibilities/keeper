@@ -32,5 +32,5 @@ Add a regression that mirrors the live reproduction: kickstart exits 143 with em
 - [ ] Focused suite green through injected seams only
 
 ## Done summary
-
+Root cause: runRestart (cli/restart.ts) evaluated its success verdict (healthyInARow >= REQUIRED_HEALTHY_PROBES && isFreshBoot(...)) ONLY inside the probe loop on a healthy iteration. The fresh-boot ledger row is monotonic, but the in-loop check re-reads it only on a healthy probe; when the new boot landed during the final backoff before the deadline, it was never re-evaluated, and the evidence-blind fall-through 'failure(failedKickstart ? kickstart-failed : health-timeout)' reported the kickstart exit (143 — our own 1s launchctl-kill timeout, a warning) as terminal even though probes were healthy and a fresh boot had landed. Fix: re-check the same evidence once after the loop and emit success-with-warning if it holds; the no-fresh-boot fall-through is unchanged. Added a regression through injected seams mirroring the live shape (exit 143, empty output, delayed fresh boot, healthy probes).
 ## Evidence
