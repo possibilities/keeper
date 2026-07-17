@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 3,
+        "insertions": 268
+      },
+      "done_summary": "Restart verdict now requires fresh ledger-boot evidence alongside healthy probes; a nonzero kickstart that reaches a fresh healthy boot succeeds with a bounded kickstart_warning, while kickstart-failed is reserved for no fresh boot by the deadline and retains the bounded output.",
+      "input_hash": "8842488dacdb1a90f084c7e57729c4f8450b71d11b81c48d7d4e291c816d01b1",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2437,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/restart.ts, test/restart-cli.test.ts\n\n### Approach\n\nMake the restart verdict evidence-based: capture bounded stdout/stderr from the kickstart invocation into the envelope instead of discarding it, and on a nonzero kickstart status fall through to the existing health-probe loop rather than returning terminal `kickstart-failed` immediately. The success decision requires fresh-boot evidence \u2014 the restart ledger's newest boot entry postdating the pre-restart read \u2014 plus the existing consecutive-healthy-probe requirement; when both hold under a nonzero kickstart, return success with a typed kickstart warning in the envelope. `kickstart-failed` remains only for the case where no fresh healthy boot appears by the deadline (alongside the existing `health-timeout` distinction). Verified operator evidence: the ledger recorded healthy launchd boots at 13:49, 21:07, and 23:11 on 07-16 while the CLI reported `kickstart-failed`.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/restart.ts:263-270 \u2014 the kickstart invocation and the early `failure(\"kickstart-failed\", deps)` return this task removes\n- cli/restart.ts:278-299 \u2014 the existing health-probe loop (`healthyInARow`) the nonzero path must fall through to\n- cli/restart.ts:186-199 \u2014 the injected `probeHealth` seam; add a ledger-read seam beside it rather than reading the filesystem inline\n- ~/.local/state/keeper/restart-ledger.json \u2014 append-only boot ledger (`{kind:\"boot\", boot_id, ts, provenance}` NDJSON) that supplies fresh-boot evidence\n\n## Acceptance\n\n- [ ] A nonzero kickstart followed by a fresh healthy boot returns exit 0 with the kickstart warning and bounded output in the envelope\n- [ ] A nonzero kickstart with no fresh boot by the deadline still fails with the retained output\n- [ ] A zero-status kickstart path is behaviorally unchanged aside from the retained output\n- [ ] The focused test covers all three outcomes through injected kickstart/ledger/probe seams with no real daemon or launchctl\n\n## Done summary\nRestart verdict now requires fresh ledger-boot evidence alongside healthy probes; a nonzero kickstart that reaches a fresh healthy boot succeeds with a bounded kickstart_warning, while kickstart-failed is reserved for no fresh boot by the deadline and retains the bounded output.\n## Evidence\n",
+      "task_id": "fn-1301-honest-daemon-restart-verdict.1",
+      "tier": "high",
+      "title": "Honest daemon restart verdict"
+    }
+  ],
+  "created_at": "2026-07-17T04:22:09.761000Z",
+  "epic_id": "fn-1301-honest-daemon-restart-verdict",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "8842488dacdb1a90f084c7e57729c4f8450b71d11b81c48d7d4e291c816d01b1",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
