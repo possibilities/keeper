@@ -279,6 +279,28 @@ describe("launch-time abort capture", () => {
     );
   });
 
+  test("a bearer-prefixed value with a non-space boundary still redacts", () => {
+    // BEARER_RE only reaches a space-separated `bearer <token>`; a glued or
+    // punctuated value that literally begins with `bearer` must stay caught by
+    // the sensitive-key arm, or it leaks into persisted capture.
+    const OPAQUE = "Zx9Kq2Lm7Pw4Rt6Yn1Bv";
+    // Glued, no space after the scheme word.
+    expect(redactAbortEvidence(`Authorization:Bearer${OPAQUE}`)).toBe(
+      "Authorization:[REDACTED]",
+    );
+    // Punctuated `bearer.` prefix on an env-style key.
+    expect(redactAbortEvidence("AUTH_TOKEN=bearer.foo")).toBe(
+      "AUTH_TOKEN=[REDACTED]",
+    );
+    // Hyphen and equals boundaries after the scheme word.
+    expect(redactAbortEvidence("AUTH_TOKEN=bearer-foo")).toBe(
+      "AUTH_TOKEN=[REDACTED]",
+    );
+    expect(redactAbortEvidence("API_KEY: bearer=foo")).toBe(
+      "API_KEY: [REDACTED]",
+    );
+  });
+
   test("exit status discriminates a signal death from a plain exit code", () => {
     expect(parseProviderLegExitStatus("137")).toEqual({
       signal: "SIGKILL",
