@@ -677,8 +677,17 @@ export async function runStatus(
       latestBoot = {
         rev: boot.rev,
         catching_up: boot.catching_up,
-        event_store: boot.event_store ?? null,
+        // fn-1311: the event-store block no longer rides the boot header — it
+        // arrives on the `result` frame via `onEventStore` (the steady-state
+        // channel the header omits). Preserve whatever that callback last set.
+        event_store: latestBoot.event_store,
       };
+    },
+    // fn-1311: capture the event-store block off the `result` frame. This is the
+    // ONLY path that fires against a healthy caught-up daemon, whose memoized
+    // reply carries no boot header.
+    onEventStore: (eventStore: EventStoreStatus): void => {
+      latestBoot.event_store = eventStore;
     },
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.connect === undefined ? {} : { connect: deps.connect }),

@@ -30,6 +30,8 @@ import {
 import { QUERY_READ_ALLOWLIST, REGISTRY } from "../src/collections";
 import { recordBootCatchupStats } from "../src/db";
 import {
+  type BootStatus,
+  type EventStoreStatus,
   encodeFrame,
   type FilterValue,
   type Row,
@@ -42,7 +44,10 @@ import type {
   ReadinessSocket,
   SocketHandlers,
 } from "../src/readiness-client";
-import { computeEventStoreStatus, readBootStatus } from "../src/server-worker";
+import {
+  computeEventStoreStatus,
+  readEventStoreStatus,
+} from "../src/server-worker";
 import { freshMemDb } from "./helpers/template-db";
 
 class ExitError extends Error {
@@ -249,25 +254,27 @@ describe("computeEventStoreStatus", () => {
 });
 
 // ---------------------------------------------------------------------------
-// readBootStatus — the durable `boot_catchup_stats` row flows through the
-// served boot header's `event_store` block end-to-end.
+// readEventStoreStatus — the durable `boot_catchup_stats` row + live counts
+// flow through the served `result` frame's `event_store` field end-to-end. The
+// block rides the frame, NOT the boot header, so a caught-up daemon (whose
+// memoized reply omits the header) still delivers it.
 // ---------------------------------------------------------------------------
 
-describe("readBootStatus event_store wiring", () => {
+describe("readEventStoreStatus wiring", () => {
   test("no boot_catchup_stats row yet → event_store carries live counts with null projections", () => {
     const { db } = freshMemDb();
-    const boot = readBootStatus(db, { ready: true });
-    expect(boot.event_store).toEqual({
+    const eventStore = readEventStoreStatus(db);
+    expect(eventStore).toEqual({
       event_count: 0,
       db_bytes: expect.any(Number),
       last_boot_catchup: null,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
     });
-    expect(boot.event_store?.db_bytes).toBeGreaterThan(0);
+    expect(eventStore.db_bytes).toBeGreaterThan(0);
   });
 
-  test("a recorded boot measurement surfaces on the served header, scaled against live event_count", () => {
+  test("a recorded boot measurement surfaces on the block, scaled against live event_count", () => {
     const { db } = freshMemDb();
     for (let i = 0; i < 3; i++) {
       db.run(
@@ -286,16 +293,16 @@ describe("readBootStatus event_store wiring", () => {
       startEventId: 0,
       endEventId: 3,
     });
-    const boot = readBootStatus(db, { ready: true });
-    expect(boot.event_store?.event_count).toBe(3);
-    expect(boot.event_store?.last_boot_catchup).toEqual({
+    const eventStore = readEventStoreStatus(db);
+    expect(eventStore.event_count).toBe(3);
+    expect(eventStore.last_boot_catchup).toEqual({
       duration_ms: 1000,
       events_folded: 3,
     });
     // ~333.33ms/event * 3 current events, rounded.
-    expect(boot.event_store?.projected_full_replay_duration_ms).toBe(1000);
+    expect(eventStore.projected_full_replay_duration_ms).toBe(1000);
     // Nothing pending beyond the recorded end cursor (head == 3 == end_event_id).
-    expect(boot.event_store?.projected_catchup_duration_ms).toBe(0);
+    expect(eventStore.projected_catchup_duration_ms).toBe(0);
   });
 });
 
@@ -1108,6 +1115,104 @@ describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () =>
     // row the kinds attach to, never the total.
     expect(env.data.needs_human.stuck_dispatches).toBe(1);
     expect(env.data.needs_human.total).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStatus event-store delivery (fn-1312) — the block reaches the envelope
+// through BOTH live `result` frame shapes: the steady-state memoized shape
+// (block top-level, NO boot header — the shape a caught-up daemon serves) and
+// the catch-up shape (block top-level ALONGSIDE the boot header). Each expected
+// block below is a hand-authored constant, never re-derived from the daemon.
+// ---------------------------------------------------------------------------
+
+/** A fixed event-store block for the delivery fixtures. */
+const FIXTURE_EVENT_STORE: EventStoreStatus = {
+  event_count: 4242,
+  db_bytes: 1_048_576,
+  last_boot_catchup: { duration_ms: 3000, events_folded: 600 },
+  projected_catchup_duration_ms: 0,
+  projected_full_replay_duration_ms: 21_210,
+};
+
+/** Stamp `event_store` top-level on every `result` frame (mirroring the live
+ *  serve, which carries it on the memo line + the object frame), plus an
+ *  optional `boot` header — so the fixtures reproduce both real frame shapes. */
+function withEventStore(
+  frames: ServerFrame[],
+  eventStore: EventStoreStatus,
+  boot?: BootStatus,
+): ServerFrame[] {
+  return frames.map((f) =>
+    f.type === "result"
+      ? {
+          ...f,
+          event_store: eventStore,
+          ...(boot === undefined ? {} : { boot }),
+        }
+      : f,
+  );
+}
+
+describe("runStatus event-store delivery (fn-1312)", () => {
+  test("steady-state shape: result frames carry the block top-level with NO boot header, and it reaches the envelope", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    // The caught-up daemon's memoized reply: the block rides the frame, the
+    // boot header is omitted.
+    sock.deliver(
+      withEventStore(statusReadinessFrames([]), FIXTURE_EVENT_STORE),
+    );
+
+    expect(cap.exitCode).toBe(0);
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      data: { event_store: EventStoreStatus | null; catching_up: boolean };
+    };
+    // Delivered end-to-end even though no boot header ever arrived — the exact
+    // gap this fixes: onEventStore is the only firing callback at steady state.
+    expect(env.data.event_store).toEqual(FIXTURE_EVENT_STORE);
+    expect(env.data.catching_up).toBe(false);
+  });
+
+  test("catch-up shape: the block rides the frame ALONGSIDE the boot header, and both flow through", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    const boot: BootStatus = {
+      rev: 7,
+      head_event_id: 9,
+      catching_up: true,
+      git_seed_required: false,
+    };
+    // A booting daemon's object frame stamps BOTH the block and the header.
+    sock.deliver(
+      withEventStore(statusReadinessFrames([]), FIXTURE_EVENT_STORE, boot),
+    );
+
+    expect(cap.exitCode).toBe(0);
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      data: {
+        event_store: EventStoreStatus | null;
+        catching_up: boolean;
+        rev: number | null;
+      };
+    };
+    // The block still lands via onEventStore, and the header still drives
+    // rev/catching_up via onBootStatus — the two callbacks are independent.
+    expect(env.data.event_store).toEqual(FIXTURE_EVENT_STORE);
+    expect(env.data.catching_up).toBe(true);
+    expect(env.data.rev).toBe(7);
   });
 });
 

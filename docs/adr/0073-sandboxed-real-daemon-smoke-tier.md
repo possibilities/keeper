@@ -48,3 +48,18 @@ The finalize suite selection learns the load-surface conditional. Contract
 drift between serve frames and their consumers is now caught at finalize
 rather than by operators; the cost is one bounded slow run per daemon-surface
 epic.
+
+## Amendment — steady-state event-store delivery assertion
+
+Scenario (a), the boot → catch-up → served-frame-contract scenario, gains one
+assertion: the steady-state memoized reply must carry the FULL non-null
+event-store block (event count, DB bytes, last-boot catch-up, both projected
+durations) on the `result` frame itself. The block previously rode the boot
+header, which this same scenario proves the memoized reply omits — so a
+caught-up daemon served `event_store: null` exactly when healthy, a defect of
+the SAME live-only class as the restart-verdict header defect (a consumer
+reading a field off a channel the steady-state serve path deliberately drops).
+Delivering the block off the omitted header onto the always-present `result`
+frame is the fix; asserting it on the real wire here pins the contract so it
+cannot ship blind again. This is a scenario-set growth admitted under the
+"adding a scenario requires amending this ADR" rule above.

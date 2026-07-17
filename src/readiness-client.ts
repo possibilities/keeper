@@ -78,6 +78,7 @@ import { getCollection } from "./collections";
 import { effectivePerRootCap } from "./db";
 import {
   type BootStatus,
+  type EventStoreStatus,
   encodeFrame,
   type FilterValue,
   LineBuffer,
@@ -802,6 +803,13 @@ interface MultiOptions {
    */
   readonly onBootStatus?: (boot: BootStatus) => void;
   /**
+   * fn-1311: invoked with the event-store block carried on every `result` frame
+   * (the always-present steady-state channel the boot header does NOT ride, so
+   * `keeper status` reads the block against a caught-up daemon). Fires
+   * independently of `onBootStatus`. Optional — most callers omit.
+   */
+  readonly onEventStore?: (eventStore: EventStoreStatus) => void;
+  /**
    * Catching-up transition callback (see {@link CatchingUpCallback}). Fired on
    * every latch FLIP, delivering the readiness boolean + freshest header. Drives
    * a display harness's readiness gate; headless callers omit it.
@@ -833,6 +841,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     connect,
     giveUpPolicy,
     onBootStatus,
+    onEventStore,
     onCatchingUp,
   } = opts;
   const now = opts.now ?? Date.now;
@@ -1308,6 +1317,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       // before the per-state handling so a slot evaluating on this same frame sees it.
       if (onBootStatus !== undefined && frame.boot !== undefined) {
         onBootStatus(frame.boot);
+      }
+      // fn-1311: the event-store block rides the `result` frame directly (NOT
+      // the boot header), so it survives the steady-state memo path where the
+      // header is omitted. Fired on every carrying frame; a caught-up daemon's
+      // memoized reply still delivers it.
+      if (onEventStore !== undefined && frame.event_store !== undefined) {
+        onEventStore(frame.event_store);
       }
       // Epoch guard: detect a daemon-generation change across the (re)connect and
       // force re-baseline BEFORE per-state routing re-pages this collection.
@@ -1851,6 +1867,10 @@ export interface SubscribeOptions {
   /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). Fires
    *  independently of `onSnapshot` whenever a `result` frame carries a header. */
   readonly onBootStatus?: (boot: BootStatus) => void;
+  /** fn-1311: event-store block callback (see {@link MultiOptions}). Fires
+   *  independently of `onSnapshot` whenever a `result` frame carries the block —
+   *  including at steady state, where the boot header is omitted. */
+  readonly onEventStore?: (eventStore: EventStoreStatus) => void;
   /**
    * Catching-up transition callback (see {@link CatchingUpCallback}). Fires on
    * the per-connection latch FLIP so a display harness can gate rendering while
@@ -2507,6 +2527,11 @@ export function subscribeReadiness(
       // stored / worktree. The header field is still forwarded verbatim.
       opts.onBootStatus?.(boot);
     },
+    // fn-1311: the event-store block has no latched projection here (unlike the
+    // per-root unseeded set off `onBootStatus`), so it forwards verbatim.
+    ...(opts.onEventStore === undefined
+      ? {}
+      : { onEventStore: opts.onEventStore }),
     // The catching-up latch lives in the shared core; readiness forwards the
     // callback verbatim (no projection to latch, unlike `onBootStatus`).
     ...(opts.onCatchingUp === undefined

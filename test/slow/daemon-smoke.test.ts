@@ -34,6 +34,7 @@ import {
   readLatestBoot,
   runRestart,
 } from "../../cli/restart";
+import type { EventStoreStatus } from "../../src/protocol";
 import {
   isProcessAlive,
   killDaemonProcess,
@@ -160,12 +161,41 @@ describe("sandboxed real-daemon boot + served frame contract", () => {
     const frame = observations.steadyStateFrame;
     expect(frame.type).toBe("result");
     // The memo line is built without a boot header — the exact shape the
-    // restart-verdict defect got wrong. Assert the header is absent from the wire
-    // bytes AND from the parsed frame.
+    // restart-verdict defect got wrong. Assert the header is absent from the
+    // parsed frame AND that the boot-header KEY is absent from the wire bytes.
+    // (A bare "boot" substring check would false-positive on the event-store
+    // block's `last_boot_catchup` field, so match the header key precisely.)
     expect(frame.boot).toBeUndefined();
-    expect(observations.steadyStateRaw).not.toContain("boot");
+    expect(observations.steadyStateRaw).not.toContain('"boot":');
     // The shipped consumer must read a header-less result as caught up.
     expect(isCaughtUpFrame(frame)).toBe(true);
+  });
+
+  // fn-1312 (ADR 0073 amendment): the event-store block rode the boot header,
+  // so a caught-up daemon — whose memoized reply omits the header — served
+  // `event_store: null` exactly when healthy. The block now rides the `result`
+  // frame directly. Assert the live steady-state wire carries the FULL non-null
+  // block, the contract this scenario pins so it can't regress blind again.
+  test("the steady-state reply carries the full event-store block on the frame (delivered off the omitted boot header)", () => {
+    const frame = observations.steadyStateFrame;
+    const eventStore = frame.event_store as EventStoreStatus | undefined;
+    // Present and non-null against a caught-up daemon — the whole point.
+    expect(eventStore).toBeDefined();
+    expect(eventStore).not.toBeNull();
+    if (eventStore === undefined || eventStore === null) {
+      throw new Error("steady-state frame carried no event_store block");
+    }
+    // Live counts: the seeded store folded SEED_EVENTS, so both are positive.
+    expect(typeof eventStore.event_count).toBe("number");
+    expect(eventStore.event_count).toBeGreaterThan(0);
+    expect(typeof eventStore.db_bytes).toBe("number");
+    expect(eventStore.db_bytes).toBeGreaterThan(0);
+    // The boot recorded a real catch-up measurement, so the durable observation
+    // and both projected durations ride through non-null.
+    expect(eventStore.last_boot_catchup).not.toBeNull();
+    expect(eventStore.last_boot_catchup?.events_folded).toBeGreaterThan(0);
+    expect(typeof eventStore.projected_catchup_duration_ms).toBe("number");
+    expect(typeof eventStore.projected_full_replay_duration_ms).toBe("number");
   });
 });
 

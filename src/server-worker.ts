@@ -713,6 +713,14 @@ interface ResultMemoEntry {
 export interface ResultMemo {
   worldRev: number;
   entries: Map<string, ResultMemoEntry>;
+  /**
+   * fn-1311: the event-store block for this `worldRev` window, computed ONCE on
+   * the reset that stamps the window (not per query) and baked into every memo
+   * line built here — the steady-state delivery channel for the block the boot
+   * header omits. Block-global at a world-rev, so one read serves every
+   * connection's cached line. `null` only on the fresh `-1` sentinel window.
+   */
+  eventStore: EventStoreStatus | null;
 }
 
 /** Distinct-signature cap per worldRev window (fn-698). */
@@ -723,7 +731,7 @@ export function newResultMemo(): ResultMemo {
   // worldRev: -1 — a real `reducer_state.last_event_id` is always >= 0, so the
   // first query always trips the replace-on-mismatch reset and stamps the live
   // rev. Avoids a special-case "empty memo" branch.
-  return { worldRev: -1, entries: new Map() };
+  return { worldRev: -1, entries: new Map(), eventStore: null };
 }
 
 /**
@@ -856,6 +864,10 @@ function serveFromMemo(
   if (memo.worldRev !== worldRev) {
     memo.entries = new Map();
     memo.worldRev = worldRev;
+    // fn-1311: refresh the window's event-store block once per rev (not per
+    // query), so every memo line built below carries the steady-state block the
+    // boot header omits without paying a `COUNT(*)` on each memo hit.
+    memo.eventStore = readEventStoreStatus(db);
   }
 
   // Resolve the filter the same way runQuery does (cheap map lookup, no SELECT)
@@ -925,13 +937,15 @@ function serveFromMemo(
   );
 
   // Per-conn pre-serialized line: the result envelope concatenated around the
-  // ONE shared `rowsJson` — byte-identical to `encodeFrame(runQuery(...))`.
+  // ONE shared `rowsJson`, plus the window's event-store block (fn-1311) — the
+  // steady-state delivery channel for what the omitted boot header would carry.
   const line = buildResultLine(
     frame.id,
     descriptor.name,
     worldRev,
     entry.total,
     entry.rowsJson,
+    memo.eventStore,
   );
   return [{ __line: line }];
 }
@@ -951,14 +965,22 @@ function buildResultLine(
   rev: number,
   total: number,
   rowsJson: string,
+  eventStore: EventStoreStatus | null,
 ): string {
   const idSeg = id !== undefined ? `,"id":${JSON.stringify(id)}` : "";
+  // fn-1311: the event-store block trails the rows, mirroring the object-frame
+  // key order `stampEventStore` produces (it stamps `event_store` before the
+  // boot header), so the memo line stays byte-identical to the un-memoized
+  // object frame modulo that steady-state-omitted header. Omitted only on the
+  // `-1` sentinel window (never a live serve).
+  const esSeg =
+    eventStore !== null ? `,"event_store":${JSON.stringify(eventStore)}` : "";
   return (
     `{"type":"result"${idSeg}` +
     `,"collection":${JSON.stringify(collection)}` +
     `,"rev":${rev}` +
     `,"total":${total}` +
-    `,"rows":${rowsJson}}\n`
+    `,"rows":${rowsJson}${esSeg}}\n`
   );
 }
 
@@ -2316,44 +2338,6 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
       unseededRoots = [];
     }
   }
-  // fn-1311: event count + DB byte size are cheap live reads; the two
-  // projected durations are pure arithmetic over the durable
-  // `boot_catchup_stats` observation — never a wall-clock probe here. Each
-  // sub-read is independently defended so a missing/corrupt piece degrades to
-  // the null-honest shape rather than throwing into the no-self-heal serve path.
-  let eventCount = 0;
-  try {
-    const c = db.query("SELECT COUNT(*) AS n FROM events").get() as {
-      n: number;
-    } | null;
-    eventCount = c ? c.n : 0;
-  } catch {
-    eventCount = 0;
-  }
-  let dbBytes = 0;
-  try {
-    const pc = db.query("PRAGMA page_count").get() as {
-      page_count: number;
-    } | null;
-    const ps = db.query("PRAGMA page_size").get() as {
-      page_size: number;
-    } | null;
-    dbBytes = (pc?.page_count ?? 0) * (ps?.page_size ?? 0);
-  } catch {
-    dbBytes = 0;
-  }
-  let catchupStats: BootCatchupStats | null = null;
-  try {
-    catchupStats = readBootCatchupStats(db);
-  } catch {
-    catchupStats = null;
-  }
-  const eventStore = computeEventStoreStatus(
-    catchupStats,
-    eventCount,
-    dbBytes,
-    head,
-  );
   return {
     rev,
     head_event_id: head,
@@ -2374,8 +2358,6 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // carries none — e.g. a unit gate — so the client keeps its always-
     // re-baseline-on-reconnect fallback).
     ...(gate.generation === undefined ? {} : { generation: gate.generation }),
-    // fn-1311: the event store's growth measurements (see `EventStoreStatus`).
-    event_store: eventStore,
   };
 }
 
@@ -2479,6 +2461,56 @@ export function computeEventStoreStatus(
   };
 }
 
+/**
+ * Read the live {@link EventStoreStatus} block (fn-1311) — event count + DB
+ * byte size are cheap live reads; the head cursor and durable `boot_catchup_stats`
+ * observation feed the two pure projected durations via
+ * {@link computeEventStoreStatus}. Delivered on the `result` frame's
+ * `event_store` field (NOT the boot header), so a caught-up daemon whose
+ * memoized reply omits the header still serves the block. Each sub-read is
+ * independently defended so a missing/corrupt piece degrades to the null-honest
+ * shape rather than throwing into the no-self-heal serve path.
+ */
+export function readEventStoreStatus(db: Database): EventStoreStatus {
+  let head = 0;
+  try {
+    const h = db.prepare("SELECT MAX(id) AS head FROM events").get() as {
+      head: number | null;
+    } | null;
+    head = h && h.head !== null ? h.head : 0;
+  } catch {
+    head = 0;
+  }
+  let eventCount = 0;
+  try {
+    const c = db.query("SELECT COUNT(*) AS n FROM events").get() as {
+      n: number;
+    } | null;
+    eventCount = c ? c.n : 0;
+  } catch {
+    eventCount = 0;
+  }
+  let dbBytes = 0;
+  try {
+    const pc = db.query("PRAGMA page_count").get() as {
+      page_count: number;
+    } | null;
+    const ps = db.query("PRAGMA page_size").get() as {
+      page_size: number;
+    } | null;
+    dbBytes = (pc?.page_count ?? 0) * (ps?.page_size ?? 0);
+  } catch {
+    dbBytes = 0;
+  }
+  let catchupStats: BootCatchupStats | null = null;
+  try {
+    catchupStats = readBootCatchupStats(db);
+  } catch {
+    catchupStats = null;
+  }
+  return computeEventStoreStatus(catchupStats, eventCount, dbBytes, head);
+}
+
 /** Mutating RPC methods (fn-897 B1) — the state-changing async handlers, gated
  *  behind boot-complete so a consumer never acts on partial state. A read RPC
  *  (none today) would NOT appear here. Kept in sync with `installRpcHandlers()`
@@ -2518,6 +2550,35 @@ function stampBootStatus(
     }
     if (f.type === "result" || f.type === "rpc_result" || f.type === "error") {
       f.boot = boot;
+    }
+  }
+  return frames;
+}
+
+/**
+ * Stamp the event-store block (fn-1311) onto every object-form `result` frame in
+ * place — the catch-up-path sibling of the memo line's baked block (see
+ * {@link buildResultLine}), so a steady-state consumer reads the SAME field
+ * whether its reply rode the memo or the un-memoized object path. A
+ * {@link PreSerialized} memo line already carries its own block and is skipped.
+ * The (`COUNT(*)` + `PRAGMA`) read fires ONCE per call and ONLY when there is an
+ * object `result` frame to carry it — a batch of memo lines pays nothing. Ride
+ * the `result` frame only; `rpc_result` / `error` are not snapshot surfaces.
+ */
+function stampEventStore(
+  db: Database,
+  frames: (ServerFrame | PreSerialized)[],
+): (ServerFrame | PreSerialized)[] {
+  let eventStore: EventStoreStatus | null = null;
+  for (const f of frames) {
+    if (isPreSerialized(f)) {
+      continue;
+    }
+    if (f.type === "result") {
+      if (eventStore === null) {
+        eventStore = readEventStoreStatus(db);
+      }
+      f.event_store = eventStore;
     }
   }
   return frames;
@@ -3878,6 +3939,12 @@ function handleData(
         },
       ];
     }
+    // fn-1311: stamp the event-store block on any object `result` frame BEFORE
+    // the boot header (so `event_store` precedes `boot` in key order, matching
+    // the memo line). A PreSerialized memo line already bakes its own block and
+    // is skipped; only the un-memoized (catch-up, or steady cap-skip) object
+    // path pays the read here.
+    stampEventStore(db, frames);
     // fn-897 B1: stamp the boot-status header on the synchronous reply set (the
     // memo path is bypassed during catch-up, so any PreSerialized line here only
     // rides at steady state and stamps nothing).
