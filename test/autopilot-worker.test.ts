@@ -9519,6 +9519,11 @@ interface MergeGitOpts {
   // fn-1204 merge-suite gate: `git diff --name-only <defaultTip> <merged> -- plugins/plan`
   // stdout — non-empty drives the gate's runsPlanSuite=true. Default "" (root only).
   planDiff?: string;
+  // fn-1309 merge-suite gate: `git diff --name-only <defaultTip> <merged> -- <roots>`
+  // against the daemon Load-surface roots — non-empty drives runsSmokeGate=true.
+  // Distinguished from planDiff by the `bun.lock` root marker (a load-surface-only
+  // pathspec token). Default "" (no smoke gate).
+  loadSurfaceDiff?: string;
 }
 
 function makeMergeGit(opts: MergeGitOpts = {}): {
@@ -9704,7 +9709,13 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
       return { code: 0, stdout: `origin/${def}\n`, stderr: "" };
     }
     if (args[0] === "diff") {
-      // fn-1204 merge-suite gate's plan-touch probe (`diff --name-only … -- plugins/plan`).
+      // fn-1309 merge-suite gate's Load-surface-touch probe (`diff --name-only … --
+      // bun.lock package.json … src`) is distinguished from the fn-1204 plan-touch
+      // probe (`diff --name-only … -- plugins/plan`) by the `bun.lock` root marker,
+      // present ONLY in the Load-surface pathspec.
+      if (args.includes("bun.lock")) {
+        return { code: 0, stdout: opts.loadSurfaceDiff ?? "", stderr: "" };
+      }
       return { code: 0, stdout: opts.planDiff ?? "", stderr: "" };
     }
     if (joined.startsWith("for-each-ref") && joined.includes("keeper/epic")) {
@@ -14331,6 +14342,98 @@ test("fn-1204 finalizeEpic gate: OMITTING the probe skips the gate entirely — 
   expect(cmds.some((c) => c === "push origin main")).toBe(true);
 });
 
+// ── fn-1309 (ADR 0073) — the finalize smoke-gate conditional: `runsSmokeGate` is
+// driven by a diff against the REAL checked-in scripts/daemon-load-roots.txt (the
+// SAME manifest the install reload fingerprint hashes), so these tests point
+// `repoDir` at the real repo root rather than the "/repo" fake used above.
+
+const REAL_REPO_ROOT = join(import.meta.dirname, "..");
+
+test("fn-1309 finalizeEpic gate: a merge touching the daemon Load surface drives runsSmokeGate=true", async () => {
+  const { run } = makeMergeGit({ loadSurfaceDiff: "src/example.ts\n" });
+  const calls: {
+    runsPlanSuite: boolean;
+    runsSmokeGate: boolean | undefined;
+  }[] = [];
+  const probe: MergeSuiteProbe = async (a) => {
+    calls.push({
+      runsPlanSuite: a.runsPlanSuite,
+      runsSmokeGate: a.runsSmokeGate,
+    });
+    return { kind: "green" };
+  };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(
+    { ...makeFinalizeInfo(), repoDir: REAL_REPO_ROOT },
+    async () => true,
+    probe,
+  );
+  expect(res).toEqual({ ok: true });
+  expect(calls).toEqual([{ runsPlanSuite: false, runsSmokeGate: true }]);
+});
+
+test("fn-1309 finalizeEpic gate: a merge NOT touching the daemon Load surface drives runsSmokeGate=false — byte-identical to the pre-existing gate", async () => {
+  const { run } = makeMergeGit({ loadSurfaceDiff: "" });
+  const calls: { runsSmokeGate: boolean | undefined }[] = [];
+  const probe: MergeSuiteProbe = async (a) => {
+    calls.push({ runsSmokeGate: a.runsSmokeGate });
+    return { kind: "green" };
+  };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(
+    { ...makeFinalizeInfo(), repoDir: REAL_REPO_ROOT },
+    async () => true,
+    probe,
+  );
+  expect(res).toEqual({ ok: true });
+  expect(calls).toEqual([{ runsSmokeGate: false }]);
+});
+
+test("fn-1309 finalizeEpic gate: a repo carrying no daemon-load-roots manifest never runs the smoke gate, regardless of diff content", async () => {
+  // The "/repo" fake path carries no scripts/daemon-load-roots.txt — the
+  // non-keeper-repo case (or an older keeper commit before ADR 0073). A diff that
+  // WOULD otherwise look like a Load-surface touch must still resolve to false.
+  const { run } = makeMergeGit({ loadSurfaceDiff: "src/example.ts\n" });
+  const calls: { runsSmokeGate: boolean | undefined }[] = [];
+  const probe: MergeSuiteProbe = async (a) => {
+    calls.push({ runsSmokeGate: a.runsSmokeGate });
+    return { kind: "green" };
+  };
+  await createWorktreeDriver(run, () => ({ release() {} })).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    probe,
+  );
+  expect(calls).toEqual([{ runsSmokeGate: false }]);
+});
+
+test("fn-1309 finalizeEpic gate: a RED smoke-gate verdict parks the SAME finalize-suite-red sticky as a red root/plan suite", async () => {
+  const { run, cmds } = makeMergeGit({ loadSurfaceDiff: "src/example.ts\n" });
+  const probe: MergeSuiteProbe = async (a) =>
+    a.runsSmokeGate
+      ? { kind: "red", detail: "smoke: boot never reached catch-up" }
+      : { kind: "green" };
+  const res = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).finalizeEpic(
+    { ...makeFinalizeInfo(), repoDir: REAL_REPO_ROOT },
+    async () => true,
+    probe,
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.retry).not.toBe(true);
+    expect(
+      res.reason.startsWith(`${WORKTREE_FINALIZE_SUITE_RED_REASON}:`),
+    ).toBe(true);
+    expect(res.reason).toContain("boot never reached catch-up");
+  }
+  expect(cmds.some((c) => c.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("push origin"))).toBe(false);
+});
+
 // ── fn-1213 — runMergeSuiteGate / runPackageSuiteGate verdict-mapping coverage ──
 // The 8 fn-1204 tests above exercise finalize's REACTION to an injected verdict,
 // never how the PRODUCTION probe maps a real install+suite run to one. These
@@ -14618,6 +14721,87 @@ test("fn-1213 runMergeSuiteGate: root green + runsPlanSuite=true chains the plan
   expect(calls.length).toBe(4); // root install+gate, THEN plan install+gate
   expect(calls[2]?.cwd.endsWith("plugins/plan")).toBe(true);
   expect(calls[3]?.cwd.endsWith("plugins/plan")).toBe(true);
+  rmSync(worktreesRoot, { recursive: true, force: true });
+});
+
+test("fn-1309 runMergeSuiteGate: root green + runsSmokeGate=true chains the named smoke gate (bun run test:slow-daemon) in the SAME scratch checkout, no re-install", async () => {
+  const { run } = makeMergeSuiteGit();
+  const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-smoke-"));
+  const { spawnFn, calls } = makeQueuedSpawn([
+    resolved(0), // root install
+    resolved(0, "1 pass\n0 fail\n"), // root gate: clean
+    resolved(0, "1 pass\n0 fail\n"), // smoke gate: clean — no second install call
+  ]);
+  const verdict = await runMergeSuiteGate(
+    {
+      repoDir: "/repo",
+      mergedCommit: MG_SHA,
+      runsPlanSuite: false,
+      runsSmokeGate: true,
+    },
+    {
+      run,
+      worktreesRoot,
+      installTimeoutMs: 2_000,
+      suiteDeadlineMs: 2_000,
+      spawnFn,
+    },
+  );
+  expect(verdict).toEqual({ kind: "green" });
+  expect(calls.length).toBe(3); // root install+gate, THEN the smoke command only
+  expect(calls[2]?.args).toEqual(["-c", "bun run test:slow-daemon"]);
+  rmSync(worktreesRoot, { recursive: true, force: true });
+});
+
+test("fn-1309 runMergeSuiteGate: a RED smoke gate short-circuits BEFORE the plan suite ever runs", async () => {
+  const { run } = makeMergeSuiteGit({
+    planPkgJson: { scripts: { "test:gate": "true" } },
+  });
+  const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-smoke-red-"));
+  const { spawnFn, calls } = makeQueuedSpawn([
+    resolved(0), // root install
+    resolved(0, "1 pass\n0 fail\n"), // root gate: clean
+    resolved(1, "no failing-test signal at all"), // smoke gate: crashed → red
+  ]);
+  const verdict = await runMergeSuiteGate(
+    {
+      repoDir: "/repo",
+      mergedCommit: MG_SHA,
+      runsPlanSuite: true,
+      runsSmokeGate: true,
+    },
+    {
+      run,
+      worktreesRoot,
+      installTimeoutMs: 2_000,
+      suiteDeadlineMs: 2_000,
+      spawnFn,
+    },
+  );
+  expect(verdict.kind).toBe("red");
+  expect(calls.length).toBe(3); // the plan install/gate never fired
+  rmSync(worktreesRoot, { recursive: true, force: true });
+});
+
+test("fn-1309 runMergeSuiteGate: OMITTING runsSmokeGate (undefined) never runs the smoke gate — byte-identical to the pre-existing root+plan chain", async () => {
+  const { run } = makeMergeSuiteGit();
+  const worktreesRoot = mkdtempSync(join(tmpdir(), "keeper-mg-smoke-omit-"));
+  const { spawnFn, calls } = makeQueuedSpawn([
+    resolved(0), // root install
+    resolved(0, "1 pass\n0 fail\n"), // root gate: clean
+  ]);
+  const verdict = await runMergeSuiteGate(
+    { repoDir: "/repo", mergedCommit: MG_SHA, runsPlanSuite: false },
+    {
+      run,
+      worktreesRoot,
+      installTimeoutMs: 2_000,
+      suiteDeadlineMs: 2_000,
+      spawnFn,
+    },
+  );
+  expect(verdict).toEqual({ kind: "green" });
+  expect(calls.length).toBe(2); // no smoke-gate call at all
   rmSync(worktreesRoot, { recursive: true, force: true });
 });
 
