@@ -34,9 +34,10 @@ import {
   serializePiLine,
 } from "../plugins/keeper/pi-extension/keeper-events";
 import { BackstopCounters } from "../src/backstop-telemetry";
-import type { EventsIngestContext } from "../src/daemon";
+import type { EventLogReadFs, EventsIngestContext } from "../src/daemon";
 import {
   INGEST_EVENTS_COLUMNS,
+  readEventLogUnreadRange,
   recoverOneDeadLetter,
   scanEventsLogDir,
 } from "../src/daemon";
@@ -1150,5 +1151,200 @@ test("scanEventsLogDir: a pre-deriver line with a path-less payload recomputes t
   expect(() => scanEventsLogDir(db, eventsLogDir)).not.toThrow();
 
   expect(readMutationPath(db, "nopath")).toBeNull();
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-1321 — positioned unread-range reads. The ingester reads ONLY the unread
+// byte range of each per-pid file per tick (never a whole-file read). The
+// integrated cases above already exercise the new path end-to-end; these
+// target the `readEventLogUnreadRange` seam directly for the edge cases a
+// small integrated file cannot force deterministically: short-read looping,
+// fd-lifetime on a read failure, and a stat→open inode mismatch.
+// ---------------------------------------------------------------------------
+
+const FAKE_FD = 777;
+
+/**
+ * An injectable `EventLogReadFs` backed by an in-memory buffer, so a test can
+ * force short reads (`maxChunk`), a read failure (`readThrows`), and an
+ * inode mismatch (`ino` ≠ the caller's expected inode) without racing the real
+ * filesystem. Tracks open/close counts to assert the fd never leaks.
+ */
+function fakeReadFs(opts: {
+  content: Buffer;
+  ino: number;
+  maxChunk?: number;
+  readThrows?: boolean;
+  sizeOverride?: number;
+}): { fs: EventLogReadFs; state: { opened: number; closed: number[] } } {
+  const state = { opened: 0, closed: [] as number[] };
+  const fs: EventLogReadFs = {
+    openSync: () => {
+      state.opened++;
+      return FAKE_FD;
+    },
+    fstatSync: () => ({
+      ino: opts.ino,
+      size: opts.sizeOverride ?? opts.content.length,
+    }),
+    readSync: (_fd, buffer, offset, length, position) => {
+      if (opts.readThrows) throw new Error("injected read failure");
+      const remaining = opts.content.length - position;
+      if (remaining <= 0) return 0;
+      const n = Math.min(length, opts.maxChunk ?? length, remaining);
+      opts.content.copy(buffer, offset, position, position + n);
+      return n;
+    },
+    closeSync: (fd) => {
+      state.closed.push(fd);
+    },
+  };
+  return { fs, state };
+}
+
+test("readEventLogUnreadRange loops short reads to assemble the full unread range", () => {
+  const content = Buffer.from(
+    "hello world — this is a longer buffer for chunking",
+    "utf8",
+  );
+  // maxChunk 3 forces many partial reads; the loop must reassemble the whole
+  // range or the ingester would truncate mid-line and stall.
+  const { fs, state } = fakeReadFs({ content, ino: 12_345, maxChunk: 3 });
+  const result = readEventLogUnreadRange("/fake/path", 0, 12_345, fs);
+  expect(result.kind).toBe("read");
+  if (result.kind !== "read") throw new Error("expected a read result");
+  expect(result.bytes.equals(content)).toBe(true);
+  expect(result.startOffset).toBe(0);
+  // Opened once, closed once — no descriptor leak.
+  expect(state.opened).toBe(1);
+  expect(state.closed).toEqual([FAKE_FD]);
+});
+
+test("readEventLogUnreadRange reads only the positioned tail from a non-zero offset", () => {
+  const content = Buffer.from("AAAABBBBCCCC", "utf8");
+  const { fs } = fakeReadFs({ content, ino: 1, maxChunk: 2 });
+  const result = readEventLogUnreadRange("/fake", 4, 1, fs);
+  expect(result.kind).toBe("read");
+  if (result.kind !== "read") throw new Error("expected a read result");
+  // Only the [4, EOF) range, assembled across the short reads.
+  expect(result.bytes.toString("utf8")).toBe("BBBBCCCC");
+  expect(result.startOffset).toBe(4);
+});
+
+test("readEventLogUnreadRange closes the fd even when the read throws (no descriptor leak)", () => {
+  const { fs, state } = fakeReadFs({
+    content: Buffer.from("data"),
+    ino: 9,
+    readThrows: true,
+  });
+  const result = readEventLogUnreadRange("/fake", 0, 9, fs);
+  expect(result.kind).toBe("skip");
+  if (result.kind !== "skip") throw new Error("expected a skip result");
+  expect(result.reason).toContain("read failed");
+  // The finally-close fired despite the read failure — the caller will NOT
+  // advance the offset on a skip.
+  expect(state.closed).toEqual([FAKE_FD]);
+});
+
+test("readEventLogUnreadRange skips (and still closes) when the open fd's inode differs from the offset row's", () => {
+  // fstat reports inode 555, but the offset row is keyed on 111 — a path
+  // replaced between the outer stat and this open. Attributing the new file's
+  // bytes to the old inode's offset would corrupt it, so the helper skips.
+  const { fs, state } = fakeReadFs({
+    content: Buffer.from("bytes of an unrelated, newer file"),
+    ino: 555,
+  });
+  const result = readEventLogUnreadRange("/fake", 8, 111, fs);
+  expect(result.kind).toBe("skip");
+  if (result.kind !== "skip") throw new Error("expected a skip result");
+  expect(result.reason).toContain("inode changed");
+  // No bytes attributed to the old row; the fd is still closed.
+  expect(state.closed).toEqual([FAKE_FD]);
+});
+
+test("readEventLogUnreadRange resets to offset 0 when the fd is smaller than the stored offset (truncation in the race)", () => {
+  const content = Buffer.from("short", "utf8"); // 5 bytes
+  const { fs } = fakeReadFs({ content, ino: 7 });
+  // Stored offset 100 > fstat size 5 → the file was truncated/replaced between
+  // the outer stat and the open → re-read from the top.
+  const result = readEventLogUnreadRange("/fake", 100, 7, fs);
+  expect(result.kind).toBe("read");
+  if (result.kind !== "read") throw new Error("expected a read result");
+  expect(result.startOffset).toBe(0);
+  expect(result.bytes.toString("utf8")).toBe("short");
+});
+
+test("readEventLogUnreadRange returns an empty read (no readSync) when the offset is already at EOF", () => {
+  let reads = 0;
+  const fs: EventLogReadFs = {
+    openSync: () => FAKE_FD,
+    fstatSync: () => ({ ino: 3, size: 20 }),
+    readSync: () => {
+      reads++;
+      return 0;
+    },
+    closeSync: () => {},
+  };
+  const result = readEventLogUnreadRange("/fake", 20, 3, fs);
+  expect(result.kind).toBe("read");
+  if (result.kind !== "read") throw new Error("expected a read result");
+  expect(result.bytes.length).toBe(0);
+  expect(reads).toBe(0);
+});
+
+test("readEventLogUnreadRange skips when the open fails (no throw out of the scan)", () => {
+  const fs: EventLogReadFs = {
+    openSync: () => {
+      throw new Error("ENOENT injected");
+    },
+    fstatSync: () => ({ ino: 0, size: 0 }),
+    readSync: () => 0,
+    closeSync: () => {
+      throw new Error("must not close an unopened fd");
+    },
+  };
+  const result = readEventLogUnreadRange("/gone", 0, 1, fs);
+  expect(result.kind).toBe("skip");
+  if (result.kind !== "skip") throw new Error("expected a skip result");
+  expect(result.reason).toContain("open failed");
+});
+
+test("scanEventsLogDir positioned read advances by BYTES over a multibyte line, not string length", () => {
+  const { db } = freshMemDb();
+  mkdirSync(eventsLogDir, { recursive: true });
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+
+  // A first line whose session_id carries multibyte UTF-8 — its byte length
+  // exceeds its string length, so an offset advanced by string length would
+  // misalign the positioned read of the appended tail.
+  const first = makeRecord("café-日本-☕");
+  writeFileSync(file, serializeEventLogRecord(first));
+  scanEventsLogDir(db, eventsLogDir);
+
+  const offRow = db
+    .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+    .get(file) as { offset: number };
+  expect(offRow.offset).toBe(
+    Buffer.byteLength(serializeEventLogRecord(first), "utf8"),
+  );
+
+  // Append an ASCII record. The positioned read starts at the multibyte BYTE
+  // offset and folds ONLY the appended line — no re-read, no misalignment.
+  writeFileSync(
+    file,
+    serializeEventLogRecord(first) +
+      serializeEventLogRecord(makeRecord("ascii-second")),
+  );
+  scanEventsLogDir(db, eventsLogDir);
+
+  const rows = db
+    .query("SELECT session_id FROM events ORDER BY id ASC")
+    .all() as { session_id: string }[];
+  expect(rows.map((r) => r.session_id)).toEqual([
+    "café-日本-☕",
+    "ascii-second",
+  ]);
+
   db.close();
 });
