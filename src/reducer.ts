@@ -4944,11 +4944,10 @@ function foldDispatchClaimSuperseded(db: Database, event: Event): void {
 // ---------------------------------------------------------------------------
 // Durable wrapper→Provider-leg ownership registry + terminal cascade (ADR 0071).
 //
-// All transitions ride NEW synthetic events, so the existing lifecycle folds are
-// untouched and — because no producer mints these events yet — the whole layer
-// lands INERT. Every timestamp comes from `event.ts` or an event-payload number,
-// every id is an event id, and each fold is a safe no-op on malformed data, so
-// the two projections stay DETERMINISTIC and re-fold byte-identically.
+// All transitions ride dedicated synthetic events, so the existing lifecycle
+// folds stay untouched. Every timestamp comes from `event.ts` or an event-payload
+// number, every id is an event id, and each fold is a safe no-op on malformed
+// data, so the two projections stay DETERMINISTIC and re-fold byte-identically.
 // ---------------------------------------------------------------------------
 
 /** Non-empty-string field, else null. */
@@ -4979,7 +4978,7 @@ interface ProviderLegBornPayload {
   launcherPid: number | null;
   launcherStartTime: string | null;
   paneId: string | null;
-  paneGeneration: number | null;
+  paneGeneration: string | number | null;
   backendExecType: string | null;
   backendExecSessionId: string | null;
 }
@@ -5012,7 +5011,8 @@ function extractProviderLegBornPayload(
       launcherPid: optPosInt(p.launcher_pid),
       launcherStartTime: optStr(p.launcher_start_time),
       paneId: optStr(p.pane_id),
-      paneGeneration: optFiniteNum(p.pane_generation),
+      paneGeneration:
+        optStr(p.pane_generation) ?? optFiniteNum(p.pane_generation),
       backendExecType: optStr(p.backend_exec_type),
       backendExecSessionId: optStr(p.backend_exec_session_id),
     };
@@ -5070,17 +5070,45 @@ function foldProviderLegBorn(db: Database, event: Event): void {
  * arriving after a transfer/abort, is an idempotent no-op.
  */
 function foldProviderLegExitConfirmed(db: Database, event: Event): void {
-  if (event.data == null || event.data.length === 0) {
-    return;
-  }
-  let legLaunchId: string | null;
+  if (event.data == null || event.data.length === 0) return;
+  let p: Record<string, unknown>;
   try {
-    const p = JSON.parse(event.data) as Record<string, unknown>;
-    legLaunchId = optStr(p.leg_launch_id);
+    p = JSON.parse(event.data) as Record<string, unknown>;
   } catch {
     return;
   }
-  if (legLaunchId == null) {
+  const legLaunchId = optStr(p.leg_launch_id);
+  if (legLaunchId == null) return;
+  const hasFence =
+    Object.hasOwn(p, "ownership_epoch_event_id") ||
+    Object.hasOwn(p, "wrapper_job_id") ||
+    Object.hasOwn(p, "wrapper_dispatch_attempt_id");
+  const epoch = optPosInt(p.ownership_epoch_event_id);
+  const wrapperJobId = optStr(p.wrapper_job_id);
+  const attemptId = optPosInt(p.wrapper_dispatch_attempt_id);
+  if (
+    hasFence &&
+    (epoch == null || wrapperJobId == null || attemptId == null)
+  ) {
+    return;
+  }
+  if (hasFence) {
+    db.run(
+      `UPDATE provider_leg_ownership
+          SET state = 'terminal', settled_event_id = ?, last_event_id = ?, updated_at = ?
+        WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?
+          AND wrapper_job_id = ? AND wrapper_dispatch_attempt_id = ?
+          AND state = 'live'`,
+      [
+        event.id,
+        event.id,
+        event.ts,
+        legLaunchId,
+        epoch as number,
+        wrapperJobId as string,
+        attemptId as number,
+      ],
+    );
     return;
   }
   db.run(
@@ -5253,7 +5281,12 @@ function foldProviderLegCascadeArmed(db: Database, event: Event): void {
        wrapper_dispatch_attempt_id, term_armed_at, term_sent_at, kill_not_before,
        kill_armed_at, kill_sent_at, term_attempts, kill_attempts, blocked_reason,
        human_notified_at, confirmed_at, state, last_event_id, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL, 0, 0, NULL, NULL, NULL, 'armed', ?, ?, ?)
+     ) SELECT ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, 0, 0, NULL, NULL, NULL, 'armed', ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM provider_leg_ownership
+          WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?
+            AND wrapper_job_id = ? AND wrapper_dispatch_attempt_id = ?
+       )
      ON CONFLICT(leg_launch_id, ownership_epoch_event_id) DO NOTHING`,
     [
       p.legLaunchId,
@@ -5265,6 +5298,10 @@ function foldProviderLegCascadeArmed(db: Database, event: Event): void {
       event.id,
       event.ts,
       event.ts,
+      p.legLaunchId,
+      p.ownershipEpochEventId,
+      p.wrapperJobId,
+      p.wrapperDispatchAttemptId,
     ],
   );
 }
@@ -5272,7 +5309,13 @@ function foldProviderLegCascadeArmed(db: Database, event: Event): void {
 interface ProviderLegCascadeProgressPayload {
   legLaunchId: string;
   ownershipEpochEventId: number;
-  phase: "term_sent" | "kill_armed" | "kill_sent" | "blocked" | "confirmed";
+  phase:
+    | "term_sent"
+    | "kill_armed"
+    | "kill_sent"
+    | "blocked"
+    | "cleared"
+    | "confirmed";
   attemptOrdinal: number | null;
   reason: string | null;
   notified: boolean;
@@ -5283,6 +5326,7 @@ const CASCADE_PHASES = new Set([
   "kill_armed",
   "kill_sent",
   "blocked",
+  "cleared",
   "confirmed",
 ]);
 
@@ -5377,6 +5421,19 @@ function foldProviderLegCascadeProgressed(db: Database, event: Event): void {
                 last_event_id = ?, updated_at = ?
           WHERE ${tail}`,
         [p.reason, p.notified ? 1 : 0, event.ts, event.id, event.ts, ...key],
+      );
+      break;
+    case "cleared":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET state = CASE
+                  WHEN kill_sent_at IS NOT NULL OR kill_armed_at IS NOT NULL THEN 'killing'
+                  WHEN term_sent_at IS NOT NULL THEN 'terming'
+                  ELSE 'armed' END,
+                blocked_reason = NULL, human_notified_at = NULL,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail} AND state = 'blocked'`,
+        [event.id, event.ts, ...key],
       );
       break;
     case "confirmed":
@@ -11413,7 +11470,7 @@ export function applyEvent(
       // ADR 0071 — enroll a launched Provider leg into the ownership registry.
       // A dedicated arm (never the final `else` → projectJobsRow): these
       // synthetic events carry a leg id in their session_id, so routing them into
-      // the jobs projection would corrupt it. Inert until a producer mints them.
+      // the jobs projection would corrupt it.
       foldProviderLegBorn(db, event);
     } else if (event.hook_event === "ProviderLegExitConfirmed") {
       foldProviderLegExitConfirmed(db, event);

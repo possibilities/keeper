@@ -3379,6 +3379,71 @@ test("Dispatch claim projection and Cursor roll back together", () => {
   expect(getCursor()).toBe(eventId);
 });
 
+test("Provider-leg cascade level-clear re-arms blocked incident paging", () => {
+  const bornId = insertEvent({
+    hook_event: "ProviderLegBorn",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      wrapper_job_id: "work::fn-1300-level-clear.1",
+      wrapper_dispatch_attempt_id: 54,
+    }),
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "ProviderLegCascadeArmed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      wrapper_job_id: "work::fn-1300-level-clear.1",
+      wrapper_dispatch_attempt_id: 54,
+      kill_not_before: 2_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      phase: "blocked",
+      reason: "identity-unknown",
+      notified: true,
+    }),
+  });
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT state, blocked_reason, human_notified_at FROM provider_leg_cascades WHERE leg_launch_id = ?",
+      )
+      .get("leg-level-clear"),
+  ).toMatchObject({
+    state: "blocked",
+    blocked_reason: "identity-unknown",
+    human_notified_at: expect.any(Number),
+  });
+
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      phase: "cleared",
+    }),
+  });
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT state, blocked_reason, human_notified_at FROM provider_leg_cascades WHERE leg_launch_id = ?",
+      )
+      .get("leg-level-clear"),
+  ).toEqual({ state: "armed", blocked_reason: null, human_notified_at: null });
+});
+
 test("ADR 0071 release gate: an owned live leg holds the claim; exit proof releases it", () => {
   // A wrapper attempt binds its claim, then owns a Provider leg.
   dispatchClaimEvent("DispatchClaimAcquired", {

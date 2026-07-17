@@ -1,13 +1,11 @@
 /**
  * Durable wrapper→Provider-leg ownership registry, terminal cascade, fenced
- * transfer, and release-fold self-verification (ADR 0071, task 1 — the inert
- * schema + projection + fold layer).
+ * transfer, and release-fold self-verification.
  *
  * Each test clones the migrated `:memory:` template (`freshMemDb`), seeds raw
- * `events` rows for the NEW synthetic kinds, drives the reducer, and asserts the
+ * `events` rows for the synthetic kinds, drives the reducer, and asserts the
  * `provider_leg_ownership` / `provider_leg_cascades` projections plus the release
- * gate on `dispatch_claims`. No producer mints these events in production yet;
- * this proves the fold layer folds them deterministically and idempotently.
+ * gate on `dispatch_claims` fold deterministically and idempotently.
  */
 
 import type { Database } from "bun:sqlite";
@@ -660,6 +658,7 @@ test("release is blocked while a cascade intent is unresolved, and proceeds once
   bindClaim("work", "fn-9.2", 600);
   const bornId = bornEvent({
     leg_launch_id: "leg-92",
+    wrapper_job_id: "work::fn-9.2",
     wrapper_dispatch_attempt_id: 600,
   });
   drainAll();
