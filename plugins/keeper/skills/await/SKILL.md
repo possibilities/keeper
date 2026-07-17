@@ -316,25 +316,11 @@ re-orients and acts independently — it is NOT a notification to the arming
 session.
 
 Use `--durable` only when the follow-up is genuine fire-and-forget WORK a
-fresh session should own (a review, a next planning round). Do NOT use it as
-a milestone wake-up for a supervising session: each fired await costs a full
-worker spawn, and the spawn acts on its own rather than waking you.
-
-**Supervisor self-wake pattern** (zero spawns — the right shape when a
-long-lived session wants to be re-entered on a condition, and the only shape
-for a Pi session, whose harness lacks background-completion callbacks): run a
-plain blocking await in a detached tmux window and bus-message your own
-session on met — your open bus inbox delivers the wake into your existing
-context:
-
-```bash
-tmux new-window -d "keeper await complete fn-12-add-oauth.3 --timeout 24h \
-  && keeper bus chat send <your-session-name> 'AWAIT MET: fn-12.3 complete — re-orient'"
-```
-
-One tiny process per condition; the window exits after the send. A Claude
-session may instead run the same blocking await via Bash `run_in_background`
-and let the harness completion callback re-invoke it.
+fresh session should own (a review, a next planning round). For a milestone
+wake-up of the CURRENT session — a supervisor wanting to be re-entered when a
+condition holds — wire the Monitor per Step 2 instead: each fired durable
+await costs a full worker spawn, and the spawn acts on its own rather than
+waking you.
 
 ## One-shot check (`--probe`)
 
