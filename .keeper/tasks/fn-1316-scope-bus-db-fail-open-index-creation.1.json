@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Scope fail-open index creation",
-  "updated_at": "2026-07-17T18:30:12.212000Z"
+  "updated_at": "2026-07-17T19:35:22.742000Z",
+  "worker_done_at": "2026-07-17T19:35:22.742000Z"
 }

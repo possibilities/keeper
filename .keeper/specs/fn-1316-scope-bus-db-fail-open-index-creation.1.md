@@ -31,5 +31,5 @@ Files: `src/bus-db.ts`, `test/bus-db.test.ts`.
 - [ ] A test asserts a failing channels UNIQUE-index create surfaces (throws), and a test asserts a rejected messages index degrades non-fatally and migrate still commits `user_version`.
 
 ## Done summary
-
+Scoped createIndexFailOpen to the messages optimization indexes only; the channels UNIQUE index now runs on the strict throwing db.run path so a failed create surfaces loudly at boot. Added tests for both semantics.
 ## Evidence
