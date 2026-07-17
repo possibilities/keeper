@@ -30,6 +30,7 @@ import {
   GIT_SPAWN_TIMEOUT_CODE,
   type GitRunner,
 } from "./git-exec";
+import { EXCLUDED_PREFIX } from "./surface";
 
 export const MAX_COMMIT_MESSAGE_BYTES = 65_536;
 const MAX_RENDERED_COMMIT_MESSAGE_BYTES = MAX_COMMIT_MESSAGE_BYTES + 4_096;
@@ -66,8 +67,10 @@ export interface FrozenPrivateIndex {
   tree: string;
   entries: GitPathEntry[];
   paths: string[];
-  /** Complete pre-lint publication context; refreshed after intentional unstage. */
+  /** Selection-scoped pre-lint context; Excluded-prefix runtime churn is omitted. */
   worktreeBaseline: string;
+  /** Whole-tree context captured immediately before executable publication hooks. */
+  worktreeHookBaseline: string;
   targetIndexPath: string;
   targetIndexBaseline: string;
   gitConfigBaseline: string;
@@ -105,6 +108,7 @@ export class PrivateIndexError extends Error {
   readonly committed: boolean;
   readonly indeterminate: boolean;
   readonly paths?: string[];
+  readonly attempts?: number;
 
   constructor(
     code: PrivateIndexErrorCode,
@@ -115,6 +119,7 @@ export class PrivateIndexError extends Error {
       committed?: boolean;
       indeterminate?: boolean;
       paths?: string[];
+      attempts?: number;
     } = {},
   ) {
     super(code);
@@ -126,6 +131,7 @@ export class PrivateIndexError extends Error {
     this.committed = details.committed ?? false;
     this.indeterminate = details.indeterminate ?? false;
     this.paths = details.paths;
+    this.attempts = details.attempts;
   }
 }
 
@@ -724,6 +730,7 @@ export async function createFrozenPrivateIndex(
       entries: [],
       paths: selectedPaths,
       worktreeBaseline: "",
+      worktreeHookBaseline: "",
       targetIndexPath: "",
       targetIndexBaseline: "",
       gitConfigBaseline: "",
@@ -953,6 +960,68 @@ async function currentRef(
   git: GitRunner,
 ): Promise<string | null> {
   return await capturedHead(frozen.branchRef, worktree, git);
+}
+
+export interface FrozenHeadAdvance {
+  kind: "non_overlapping" | "overlapping" | "not_advance" | "unchanged";
+  head: string | null;
+}
+
+export async function classifyFrozenHeadAdvance(
+  frozen: Pick<FrozenPrivateIndex, "branchRef" | "expectedHead" | "paths">,
+  worktree: string,
+  git: GitRunner,
+): Promise<FrozenHeadAdvance> {
+  const head = await currentRef(frozen, worktree, git);
+  if (head === frozen.expectedHead) return { kind: "unchanged", head };
+  if (head === null || frozen.expectedHead === null) {
+    return { kind: "not_advance", head };
+  }
+  const ancestor = await git(
+    ["merge-base", "--is-ancestor", frozen.expectedHead, head],
+    { cwd: worktree, env: { GIT_NO_REPLACE_OBJECTS: "1" } },
+  );
+  if (ancestor.code !== 0) return { kind: "not_advance", head };
+  const delta = await git(
+    [
+      "diff",
+      "--name-only",
+      "-z",
+      "--no-renames",
+      "--diff-filter=ACDMRT",
+      frozen.expectedHead,
+      head,
+      "--",
+      ...frozen.paths,
+    ],
+    {
+      cwd: worktree,
+      env: { GIT_LITERAL_PATHSPECS: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+    },
+  );
+  if (delta.code !== 0) return { kind: "not_advance", head };
+  return {
+    kind: delta.stdout.split("\0").some(Boolean)
+      ? "overlapping"
+      : "non_overlapping",
+    head,
+  };
+}
+
+export function sameFrozenSelectedIdentity(
+  left: Pick<FrozenPrivateIndex, "entries">,
+  right: Pick<FrozenPrivateIndex, "entries">,
+): boolean {
+  const identity = (entry: GitPathEntry) => [
+    entry.path,
+    entry.kind,
+    entry.oid,
+    entry.mode,
+  ];
+  return (
+    JSON.stringify(left.entries.map(identity)) ===
+    JSON.stringify(right.entries.map(identity))
+  );
 }
 
 interface ParsedCommit {
@@ -1294,7 +1363,16 @@ function rawPathSetFingerprint(
   return `paths:${paths.length}:bytes:${totalBytes}:sha256:${hash.digest("hex")}`;
 }
 
-function worktreeStatusSnapshot(raw: string): {
+function isExcludedRuntimePath(path: string): boolean {
+  return (
+    path === EXCLUDED_PREFIX.slice(0, -1) || path.startsWith(EXCLUDED_PREFIX)
+  );
+}
+
+function worktreeStatusSnapshot(
+  raw: string,
+  excludeRuntimePaths: boolean,
+): {
   identity: string[];
   paths: string[];
 } {
@@ -1330,7 +1408,7 @@ function worktreeStatusSnapshot(raw: string): {
       }
     } else if (tag === "?" || tag === "!") {
       const path = record.slice(2);
-      if (path) {
+      if (path && !(excludeRuntimePaths && isExcludedRuntimePath(path))) {
         paths.add(path);
         identity.push(`${tag}\0${path}`);
       }
@@ -1344,6 +1422,8 @@ async function worktreeSnapshot(
   worktree: string,
   git: GitRunner,
   fs: PrivateIndexFs,
+  excludeRuntimePaths: boolean,
+  captureWhole?: (snapshot: string) => void,
 ): Promise<string> {
   const readStatus = () =>
     git(
@@ -1374,19 +1454,44 @@ async function worktreeSnapshot(
   // --untracked-files=all. Normalize away the index-vs-HEAD X column: the raw
   // target-index fingerprint already owns staged identity, and a competing ref
   // advance must reach the CAS rather than masquerade as a worktree mutation.
-  const status = worktreeStatusSnapshot(before.stdout);
+  const status = worktreeStatusSnapshot(before.stdout, excludeRuntimePaths);
   const paths = [...new Set([...frozen.paths, ...status.paths])].sort();
   const raw = rawPathSetFingerprint(worktree, paths, fs);
+  const wholeStatus = captureWhole
+    ? worktreeStatusSnapshot(before.stdout, false)
+    : null;
+  const wholeRaw = wholeStatus
+    ? JSON.stringify(wholeStatus) === JSON.stringify(status)
+      ? raw
+      : rawPathSetFingerprint(
+          worktree,
+          [...new Set([...frozen.paths, ...wholeStatus.paths])].sort(),
+          fs,
+        )
+    : null;
   const after = await readStatus();
   if (after.code !== 0) {
     throw new PrivateIndexError("commit_failed", after.stderr);
   }
-  const afterStatus = worktreeStatusSnapshot(after.stdout);
+  const afterStatus = worktreeStatusSnapshot(after.stdout, excludeRuntimePaths);
   if (
     JSON.stringify(afterStatus.identity) !== JSON.stringify(status.identity) ||
     !samePathSet(afterStatus.paths, status.paths)
   ) {
     throw new Error("worktree status changed while fingerprinted");
+  }
+  if (captureWhole && wholeStatus && wholeRaw) {
+    const afterWhole = worktreeStatusSnapshot(after.stdout, false);
+    if (
+      JSON.stringify(afterWhole.identity) !==
+        JSON.stringify(wholeStatus.identity) ||
+      !samePathSet(afterWhole.paths, wholeStatus.paths)
+    ) {
+      throw new Error("worktree status changed while fingerprinted");
+    }
+    captureWhole(
+      JSON.stringify({ status: afterWhole.identity, raw: wholeRaw }),
+    );
   }
   return JSON.stringify({ status: afterStatus.identity, raw });
 }
@@ -1956,7 +2061,14 @@ export async function refreshFrozenPublicationBaseline(
     git,
     fs,
   );
-  frozen.worktreeBaseline = await worktreeSnapshot(frozen, worktree, git, fs);
+  frozen.worktreeBaseline = await worktreeSnapshot(
+    frozen,
+    worktree,
+    git,
+    fs,
+    true,
+  );
+  frozen.worktreeHookBaseline = "";
   const configBeforeSigning = await gitConfigFingerprint(worktree, git, env);
   frozen.signing = await signingArgs(worktree, git, env);
   const configAfterSigning = await gitConfigFingerprint(worktree, git, env);
@@ -2030,13 +2142,29 @@ async function requireFrozenPublicationBaseline(
   fs: PrivateIndexFs,
   code: "surface_changed" | "commit_hook_mutated",
   commitSha?: string,
+  excludeRuntimePaths = code === "surface_changed",
+  captureWholeBaseline = false,
 ): Promise<void> {
   try {
     const env = targetGitEnvironment(frozen);
     const changed: string[] = [];
+    const expectedWorktree = excludeRuntimePaths
+      ? frozen.worktreeBaseline
+      : frozen.worktreeHookBaseline;
+    let wholeBaseline: string | undefined;
     if (
-      (await worktreeSnapshot(frozen, worktree, git, fs)) !==
-      frozen.worktreeBaseline
+      (await worktreeSnapshot(
+        frozen,
+        worktree,
+        git,
+        fs,
+        excludeRuntimePaths,
+        captureWholeBaseline
+          ? (snapshot) => {
+              wholeBaseline = snapshot;
+            }
+          : undefined,
+      )) !== expectedWorktree
     ) {
       changed.push("worktree");
     }
@@ -2064,6 +2192,9 @@ async function requireFrozenPublicationBaseline(
     }
     if (changed.length > 0) {
       throw new Error(`${changed.join(", ")} changed`);
+    }
+    if (wholeBaseline !== undefined) {
+      frozen.worktreeHookBaseline = wholeBaseline;
     }
   } catch (error) {
     if (error instanceof PrivateIndexError && error.code === code) throw error;
@@ -2220,6 +2351,16 @@ export async function commitFrozenPrivateIndex(
     throw new PrivateIndexError("operation_in_progress", "", { operation });
   }
   await verifyFrozenSurface(frozen, worktree, git, fs);
+  await requireFrozenPublicationBaseline(
+    frozen,
+    worktree,
+    git,
+    fs,
+    "commit_hook_mutated",
+    undefined,
+    true,
+    true,
+  );
   const marker = `keeper-commit-work:${(fs.commitMarker ?? randomUUID)()}`;
   const expectedTasks = messageTrailers(message).tasks;
   const completeMessage = await completeCommitMessage(
@@ -2253,14 +2394,6 @@ export async function commitFrozenPrivateIndex(
         "executable reference-transaction hooks are unsupported by atomic commit-work publication",
       );
     }
-    await requireFrozenPublicationBaseline(
-      frozen,
-      worktree,
-      git,
-      fs,
-      "commit_hook_mutated",
-    );
-
     await runCommitHook("pre-commit", [], hookEnv, frozen, worktree, git, fs);
 
     await runCommitHook(

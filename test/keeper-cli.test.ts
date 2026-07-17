@@ -316,12 +316,13 @@ describe("cli/keeper dispatch", () => {
     expect(h.calls).toEqual([
       { sub: "session", argv: ["summary", "abc", "--max-snippet", "9"] },
     ]);
-    // The four session-scoped reads are the group's published verbs.
+    // Session reads and the process-only termination control are published.
     expect(SUBCOMMAND_META.session.verbs).toEqual([
       "state",
       "files",
       "events",
       "summary",
+      "terminate",
     ]);
   });
 
@@ -517,7 +518,7 @@ describe("cli/keeper Clerc proxy routing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// cli/session group dispatcher — `keeper session <state|files|events|summary>`
+// cli/session group dispatcher — grouped Session reads and process control
 // maps each verb to its leaf main (session-state / show-session-files /
 // show-session-events / session-summary), preserving that leaf's flags,
 // envelope, and exit codes; only the invocation spelling is the group. These
@@ -570,14 +571,16 @@ describe("cli/session group dispatcher", () => {
   test("bare `keeper session` prints pure group help, no exit", async () => {
     const r = await runSession([]);
     expect(r.code).toBeNull();
-    expect(r.out).toContain("keeper session <state|files|events|summary>");
+    expect(r.out).toContain(
+      "keeper session <state|files|events|summary|terminate>",
+    );
     expect(r.err).toBe("");
   });
 
   test("`keeper session --help` lists every verb, no exit", async () => {
     const r = await runSession(["--help"]);
     expect(r.code).toBeNull();
-    for (const verb of ["state", "files", "events", "summary"]) {
+    for (const verb of ["state", "files", "events", "summary", "terminate"]) {
       expect(r.out).toContain(verb);
     }
   });
@@ -596,6 +599,9 @@ describe("cli/session group dispatcher", () => {
     );
     expect((await runSession(["summary", "--help"])).out).toContain(
       "keeper session summary",
+    );
+    expect((await runSession(["terminate", "--help"])).out).toContain(
+      "keeper session terminate",
     );
   });
 

@@ -45,6 +45,7 @@ import {
 import {
   detectInProgressOperation,
   isReversionExcluded,
+  sharedCheckoutJam,
   sharedCheckoutJamActive,
 } from "../src/commit-work/repo-state";
 import {
@@ -1138,6 +1139,53 @@ describe("commit-work: adoption manifests", () => {
 });
 
 // ---------------------------------------------------------------------------
+// receipts-pending ownership outcome
+// ---------------------------------------------------------------------------
+
+describe("commit-work: receipts pending", () => {
+  for (const stalledIngester of [false, true]) {
+    test(`reports bounded ingest lag with stalled_ingester=${stalledIngester}`, async () => {
+      const { d } = deps({
+        files: ["a.txt"],
+        rules: [
+          {
+            when: (a) => argvStartsWith(a, "check-ignore"),
+            result: { exitCode: 1 },
+          },
+        ],
+      });
+      const { code, stdout } = await runForTest(
+        ["feat: adopt", "--session-id", "s1", "--adopt", "a.txt"],
+        {
+          ...d,
+          readClaims: () => [
+            {
+              path: "a.txt",
+              sessionId: "22222222-2222-4222-8222-222222222222",
+              liveness: "unknown",
+              receiptsPending: {
+                events: 3,
+                seconds: 12,
+                stalledIngester,
+                otherwiseTerminal: true,
+              },
+            },
+          ],
+        },
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout)).toMatchObject({
+        outcome: "receipts_pending",
+        error: "receipts_pending",
+        ingest_lag_events: 3,
+        ingest_lag_seconds: 12,
+        stalled_ingester: stalledIngester,
+      });
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // no upstream (first push sets it)
 // ---------------------------------------------------------------------------
 
@@ -2120,7 +2168,11 @@ describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
     const { d, calls } = deps({
       files: ["a.txt"],
       rules: successRules({ stagedNames: ["a.txt"] }),
-      checkSharedCheckoutJam: () => true,
+      checkSharedCheckoutJam: () => ({
+        distressRowId: "shared-checkout-dirty:repo123",
+        clearCondition:
+          "the producer repair sweep observes the shared checkout clean",
+      }),
     });
     const { code, stdout } = await runForTest(
       ["feat: jammed", "--session-id", "s1"],
@@ -2130,7 +2182,11 @@ describe("commit-work: shared_checkout_jam gate (pipeline)", () => {
     const parsed = JSON.parse(stdout);
     expect(parsed.success).toBe(false);
     expect(parsed.error).toBe("shared_checkout_jam");
-    expect(typeof parsed.recovery).toBe("string");
+    expect(parsed.distress_row_id).toBe("shared-checkout-dirty:repo123");
+    expect(parsed.clear_condition).toBe(
+      "the producer repair sweep observes the shared checkout clean",
+    );
+    expect(parsed.recovery).toContain("shared-checkout-dirty:repo123");
     expect(parsed.recovery).toContain("--override-jam");
     expect(calls.some((c) => argvStartsWith(c.args, "commit", "-F", "-"))).toBe(
       false,
@@ -2225,6 +2281,11 @@ describe("sharedCheckoutJamActive: real-DB provenance parity + fail-open", () =>
       producerDir,
     );
     expect(sharedCheckoutJamActive(worktree, dbPath)).toBe(true);
+    expect(sharedCheckoutJam(worktree, dbPath)).toEqual({
+      distressRowId: `${SHARED_DIRTY_DISTRESS_ID_PREFIX}abc123`,
+      clearCondition:
+        "the producer repair sweep observes the shared checkout clean",
+    });
   });
 
   test("a desync row for this repo also fires the gate", () => {
@@ -2234,6 +2295,11 @@ describe("sharedCheckoutJamActive: real-DB provenance parity + fail-open", () =>
       tmpDir,
     );
     expect(sharedCheckoutJamActive(realpathSync(tmpDir), dbPath)).toBe(true);
+    expect(sharedCheckoutJam(realpathSync(tmpDir), dbPath)).toEqual({
+      distressRowId: `${SHARED_DESYNC_DISTRESS_ID_PREFIX}def456`,
+      clearCondition:
+        "the producer content probe observes both the index and worktree at the default tip",
+    });
   });
 
   test("a row naming a DIFFERENT repo does not fire", () => {

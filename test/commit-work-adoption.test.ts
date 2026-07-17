@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -25,12 +26,17 @@ import {
   MAX_COMMIT_MESSAGE_BYTES,
   type PrivateIndexError,
 } from "../src/commit-work/private-index";
-import { discoverCommitWorkSurface } from "../src/commit-work/surface";
+import {
+  discoverCommitWorkSurface,
+  readOwnershipClaims,
+} from "../src/commit-work/surface";
 import {
   COMMIT_WORK_TELEMETRY_DATA_LIMIT,
   emitCommitWorkOutcome,
 } from "../src/commit-work/telemetry";
-import { parseEventLogLine } from "../src/dead-letter";
+import { openDb } from "../src/db";
+import { parseEventLogLine, serializeEventLogRecord } from "../src/dead-letter";
+import { freshDbFile } from "./helpers/template-db";
 
 const ID = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
@@ -128,6 +134,234 @@ describe("commit-work foreign claim adoption", () => {
       },
     });
     expect(terminal.adopted).toEqual(["a.txt"]);
+  });
+
+  test("vacated claimant witness makes only gone-proven paths adoptable", async () => {
+    const cases = [
+      { name: "pid absent", verdict: "gone", adopted: true },
+      { name: "start-time mismatch", verdict: "gone", adopted: true },
+      { name: "matching resident", verdict: "matching", adopted: false },
+      { name: "witness read failure", verdict: "inconclusive", adopted: false },
+    ] as const;
+
+    for (const entry of cases) {
+      const dir = mkdtempSync(join(tmpdir(), "keeper-adoption-vacated-"));
+      const dbPath = join(dir, "keeper.db");
+      const eventsLogDir = join(dir, "events-log");
+      const deadLetterDir = join(dir, "dead-letters");
+      const birthDir = join(dir, "births");
+      mkdirSync(eventsLogDir);
+      mkdirSync(deadLetterDir);
+      mkdirSync(join(birthDir, "new"), { recursive: true });
+      freshDbFile(dbPath).db.close();
+      try {
+        const { db } = openDb(dbPath, { migrate: false });
+        db.run(
+          `INSERT INTO jobs
+             (job_id, created_at, state, updated_at, pid, start_time)
+           VALUES (?, 1, 'stopped', 1, 4242, 'linux:100')`,
+          [OTHER],
+        );
+        const mutation = db.run(
+          `INSERT INTO events
+             (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+              mutation_path)
+           VALUES (1, ?, 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/a.txt')`,
+          [OTHER],
+        );
+        db.run(
+          `INSERT INTO file_attributions
+             (project_dir, session_id, file_path, last_mutation_at, op, source,
+              last_event_id, updated_at)
+           VALUES ('/repo', ?, 'a.txt', 1, 'Write', 'tool', ?, 1)`,
+          [OTHER, mutation.lastInsertRowid],
+        );
+        db.run(
+          "INSERT INTO git_status (project_dir, updated_at, attribution_event_id) VALUES ('/repo', 1, ?)",
+          [mutation.lastInsertRowid],
+        );
+        db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [
+          mutation.lastInsertRowid,
+        ]);
+        db.close();
+
+        const claims = readOwnershipClaims("/repo", dbPath, {
+          eventsLogDir,
+          deadLetterDir,
+          birthDir,
+          processIdentity: () => entry.verdict,
+        });
+        const target = claims?.find((claim) => claim.sessionId === OTHER);
+        expect(target?.liveness, entry.name).toBe(
+          entry.adopted ? "terminal" : "unknown",
+        );
+        const surface = await discoverCommitWorkSurface({
+          worktree: "/repo",
+          identity: ID,
+          adoptedPaths: ["a.txt"],
+          git: surfaceGit(),
+          deps: { readClaims: () => claims },
+        });
+        expect(surface.adopted, entry.name).toEqual(
+          entry.adopted ? ["a.txt"] : [],
+        );
+        if (!entry.adopted) {
+          expect(surface.rejections[0]?.code, entry.name).toBe(
+            "ownership_conflict",
+          );
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("terminal adoption uses per-session cursor-fresh evidence", async () => {
+    const cases: Array<{
+      name: string;
+      laterDbSession?: string;
+      laterDbHook?: string;
+      receiptSession?: string;
+      cursor: "head" | "mutation";
+      expected: "terminal" | "unknown";
+      rejection?: "receipts_pending";
+    }> = [
+      {
+        name: "later unrelated event and another session receipt",
+        laterDbSession: "unrelated",
+        receiptSession: "receipt-other",
+        cursor: "head",
+        expected: "terminal",
+      },
+      {
+        name: "own pending receipt",
+        receiptSession: OTHER,
+        cursor: "head",
+        expected: "unknown",
+        rejection: "receipts_pending",
+      },
+      {
+        name: "cursor behind terminal event",
+        cursor: "mutation",
+        expected: "unknown",
+      },
+      {
+        name: "same-session lifecycle after terminal",
+        laterDbSession: OTHER,
+        laterDbHook: "UserPromptSubmit",
+        cursor: "head",
+        expected: "unknown",
+      },
+    ];
+
+    for (const entry of cases) {
+      const dir = mkdtempSync(join(tmpdir(), "keeper-adoption-terminal-"));
+      const dbPath = join(dir, "keeper.db");
+      const eventsLogDir = join(dir, "events-log");
+      const deadLetterDir = join(dir, "dead-letters");
+      const birthDir = join(dir, "births");
+      mkdirSync(eventsLogDir);
+      mkdirSync(deadLetterDir);
+      mkdirSync(join(birthDir, "new"), { recursive: true });
+      freshDbFile(dbPath).db.close();
+      try {
+        const { db } = openDb(dbPath, { migrate: false });
+        db.run(
+          "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES (?, 1, 'ended', 1)",
+          [OTHER],
+        );
+        const mutation = db.run(
+          `INSERT INTO events
+             (ts, session_id, hook_event, event_type, tool_name, cwd, data,
+              mutation_path)
+           VALUES (1, ?, 'PostToolUse', 'post_tool_use', 'Write', '/repo', '{}', '/repo/a.txt')`,
+          [OTHER],
+        );
+        const terminal = db.run(
+          `INSERT INTO events
+             (ts, session_id, hook_event, event_type, cwd, data)
+           VALUES (2, ?, 'SessionEnd', 'session_end', '/repo', '{}')`,
+          [OTHER],
+        );
+        db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = ?", [
+          terminal.lastInsertRowid,
+          OTHER,
+        ]);
+        if (entry.laterDbSession !== undefined) {
+          db.run(
+            `INSERT INTO events
+               (ts, session_id, hook_event, event_type, cwd, data)
+             VALUES (3, ?, ?, 'user_prompt_submit', '/repo', '{}')`,
+            [entry.laterDbSession, entry.laterDbHook ?? "UserPromptSubmit"],
+          );
+        }
+        const head = (
+          db.query("SELECT MAX(id) AS max_id FROM events").get() as {
+            max_id: number;
+          }
+        ).max_id;
+        db.run(
+          `INSERT INTO file_attributions
+             (project_dir, session_id, file_path, last_mutation_at, op, source,
+              last_event_id, updated_at)
+           VALUES ('/repo', ?, 'a.txt', 1, 'Write', 'tool', ?, 1)`,
+          [OTHER, mutation.lastInsertRowid],
+        );
+        db.run(
+          "INSERT INTO git_status (project_dir, updated_at, attribution_event_id) VALUES ('/repo', 1, ?)",
+          [head],
+        );
+        db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [
+          entry.cursor === "mutation" ? mutation.lastInsertRowid : head,
+        ]);
+        db.close();
+
+        if (entry.receiptSession !== undefined) {
+          writeFileSync(
+            join(eventsLogDir, "pending.ndjson"),
+            serializeEventLogRecord({
+              bindings: {
+                session_id: entry.receiptSession,
+                hook_event: "PostToolUse",
+                tool_name: "Write",
+                mutation_path: "/other/resumed.ts",
+              },
+            }),
+          );
+        }
+
+        const claims = readOwnershipClaims("/repo", dbPath, {
+          eventsLogDir,
+          deadLetterDir,
+          birthDir,
+        });
+        expect(claims).not.toBeNull();
+        const target = claims?.find((claim) => claim.sessionId === OTHER);
+        expect(target).toMatchObject({
+          path: "a.txt",
+          liveness: entry.expected,
+        });
+
+        const surface = await discoverCommitWorkSurface({
+          worktree: "/repo",
+          identity: ID,
+          adoptedPaths: ["a.txt"],
+          git: surfaceGit(),
+          deps: { readClaims: () => claims },
+        });
+        if (entry.expected === "terminal") {
+          expect(surface.adopted).toEqual(["a.txt"]);
+          expect(surface.rejections).toEqual([]);
+        } else {
+          expect(surface.adopted).toEqual([]);
+          expect(surface.rejections[0]?.code).toBe(
+            entry.rejection ?? "ownership_conflict",
+          );
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
   });
 
   test("adoption reports outside, excluded, ignored, and clean paths separately", async () => {

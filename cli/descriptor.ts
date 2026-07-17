@@ -1140,10 +1140,9 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     // Their established `--session-id` spelling remains a compatibility alias
     // that enters the same resolver and has no id-only path.
     name: "session",
-    summary:
-      "Session-reference reads: `keeper session <state|files|events|summary>`",
+    summary: "Session-reference reads and identity-checked process termination",
     visibility: "public",
-    mutates: false,
+    mutates: true,
     requires_daemon: false,
     requires_tty: false,
     flags: [],
@@ -1256,6 +1255,16 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             summary: "Per-prompt snippet cap in chars (positive int)",
           },
         ],
+      },
+      {
+        name: "terminate",
+        summary: "TERM-then-KILL an identity-confirmed non-working Session",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [FLAG_HELP],
       },
     ],
   },

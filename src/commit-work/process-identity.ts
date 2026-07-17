@@ -22,6 +22,16 @@ export type ProcessIdentityReader = (
   | null
   | Promise<ProcessIdentityObservation | null>;
 
+export type RecordedProcessIdentityVerdict =
+  | "matching"
+  | "gone"
+  | "inconclusive";
+
+export interface RecordedProcessIdentityDeps {
+  signalZero?: (pid: number) => void;
+  read?: (pid: number) => ProcessIdentityObservation | null;
+}
+
 function parsePositivePid(raw: string | undefined): number | null {
   if (raw === undefined || !/^\d+$/.test(raw)) return null;
   const value = Number(raw);
@@ -117,6 +127,47 @@ export function readProcessIdentity(
     }
   }
   return null;
+}
+
+/**
+ * Classify one recorded pid-and-start-time witness. ESRCH and a mismatched
+ * resident identity prove the recorded claimant gone; every unreadable or
+ * unsupported observation remains inconclusive.
+ */
+export function recordedProcessIdentity(
+  pid: number,
+  startTime: string,
+  deps: RecordedProcessIdentityDeps = {},
+): RecordedProcessIdentityVerdict {
+  if (!Number.isSafeInteger(pid) || pid <= 1 || startTime.length === 0) {
+    return "inconclusive";
+  }
+  const signalZero =
+    deps.signalZero ?? ((target: number) => process.kill(target, 0));
+  try {
+    signalZero(pid);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "gone";
+    if (code !== "EPERM") return "inconclusive";
+  }
+  let observed: ProcessIdentityObservation | null;
+  try {
+    observed = (deps.read ?? readProcessIdentity)(pid);
+  } catch {
+    return "inconclusive";
+  }
+  if (observed === null) {
+    // Close the existence/read race without treating a parser or permission
+    // failure as death.
+    try {
+      signalZero(pid);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return "gone";
+    }
+    return "inconclusive";
+  }
+  return observed.startTime === startTime ? "matching" : "gone";
 }
 
 /**
