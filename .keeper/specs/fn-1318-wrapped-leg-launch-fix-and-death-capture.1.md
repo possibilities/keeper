@@ -72,5 +72,5 @@ pane-fate facts, and the before/after component behavior.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Root cause: a born provider leg folded without a working lifecycle state, so the ownership cascade saw no live leg and tore it down 2-4s post-launch pre-transcript. Fix seeds a born leg as working in the reducer so teardown waits for a real stop; pinned with an in-process regression test.
 ## Evidence
