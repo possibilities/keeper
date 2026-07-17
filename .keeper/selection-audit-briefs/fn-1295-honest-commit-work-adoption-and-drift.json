@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Made terminal claim evidence per-session and cursor-fresh; unrelated later events and other sessions' pending receipts no longer block safe adoption. Updated the direct ownership matrices and isolated the pre-existing tabs handoff-envelope golden repair.",
+      "input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+      "model": "opus",
+      "spec_chars": 3615,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/commit-work/surface.ts, test/commit-work-adoption.test.ts\n\n### Approach\n\nMake positively-terminal evidence reachable on a busy board while\npreserving fail-closed for live/ambiguous claimants (ADR 0068 decision 1).\nA claim is positively terminal when a terminal event for its session is\ningested at id E, the ingestion cursor has passed E, and no un-ingested\nreceipt tail exists for THAT session. Two behavior changes: the ordered\nproof no longer requires the terminal event to BE the session tail\n(unrelated later events must not displace it \u2014 the terminal event must\ninstead be that session's last lifecycle word), and un-ingested receipts\ndemote only their OWN session's claims instead of every claim. The\nclassifier runs producer-side on a read-only snapshot, so cursor and\nliveness reads are legal; keep every new read inside the existing shared\nsnapshot to avoid torn reads.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/commit-work/surface.ts:819-829 \u2014 hasOrderedTerminalProof; the sessionTailEventId equality to relax\n- src/commit-work/surface.ts:361-400 \u2014 readReceiptClaims; the unorderedSessions global demotion to scope per-session\n- src/commit-work/surface.ts:1056-1074 \u2014 the demotion loop consuming unorderedSessions\n- src/commit-work/surface.ts:1086-1091 \u2014 the head read; where a cursor-freshness read joins the snapshot\n- src/commit-work/surface.ts:1169-1185 \u2014 defaultClaimLiveness; terminal requires ordered proof + ended/killed\n\n**Optional** (reference as needed):\n- src/commit-work/surface.ts:660-669 \u2014 the dead-letter fail-closed sink; must stay untouched\n- docs/adr/0068-commit-work-vacated-claims-and-honest-drift.md \u2014 decision 1 rationale\n\n### Risks\n\n- Relaxing the tail equality must not let a terminal event followed by a LATER resume/mutation of the SAME session read terminal \u2014 the per-session tail check is the guard; enumerate resume-after-terminal in the matrix.\n- The host-global unorderedSessions demotion also protects the caller's own claims from ordering races; scope the change to foreign-terminal classification only.\n\n### Test notes\n\nExtend the table-driven matrix in test/commit-work-adoption.test.ts:\nterminal event + later unrelated event \u2192 adoptable; terminal event +\nlater SAME-session receipt \u2192 not terminal; other session's pending\nreceipt \u2192 no effect; cursor behind E \u2192 not yet terminal; live/unknown\nrows byte-identical to today. Target the file directly; bare `bun test`\nis rejected.\n\n## Acceptance\n\n- [ ] A foreign claim with ingested terminal evidence classifies terminal despite later unrelated events and other sessions' pending receipts\n- [ ] A claim whose own session has an un-ingested receipt tail or a cursor-unreached terminal event does not classify terminal\n- [ ] Every live/ambiguous row of the existing adoption matrix is unchanged\n- [ ] The touched suite passes plus the fast gate\n\n## Done summary\nMade terminal claim evidence per-session and cursor-fresh; unrelated later events and other sessions' pending receipts no longer block safe adoption. Updated the direct ownership matrices and isolated the pre-existing tabs handoff-envelope golden repair.\n## Evidence\n- Commits: 964f5ec43527f44908ed7a087768f07f01f882ad, 52da8b212467988d87fa6757df2ba8886b07401f\n- Tests: bun test ./test/commit-work-adoption.test.ts ./test/commit-work-foundation.test.ts ./test/tabs.test.ts \u2014 165 pass, 0 fail, git diff --check \u2014 clean, worker full gate: bun run test:gate \u2014 9184 pass, 2 skip, 0 fail",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.1",
+      "tier": "xhigh",
+      "title": "Per-session cursor-fresh terminal evidence"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 52,
+        "files_changed": 5,
+        "insertions": 364
+      },
+      "done_summary": "Typed receipts_pending outcome distinguishes adoptions blocked solely by un-ingested receipts (with ingest lag + stalled-ingester flag) from genuinely live/unknown owners; ownership_conflict narrowed accordingly; problem-codes documents the new row.",
+      "input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+      "model": "sonnet",
+      "spec_chars": 2860,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/commit-work/surface.ts, cli/commit-work.ts, test/commit-work-adoption.test.ts, test/commit-work.test.ts, docs/problem-codes.md\n\n### Approach\n\nWhen un-ingested receipts are the ONLY thing blocking an otherwise\nterminal foreign adoption, commit-work returns a typed\n`receipts_pending` outcome instead of ownership_conflict (ADR 0068\ndecision 4). The envelope carries the ingest lag (events and seconds)\nand an honest stalled-ingester flag derived from daemon liveness, so a\ndead ingester reads as a named stall rather than an infinitely\nretriable refusal. ownership_conflict correspondingly narrows to\ngenuinely live or unknown owners. The invoking worker owns bounded\njittered retry \u2014 document the recovery in the outcome row; commit-work\nitself does not sleep.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/commit-work.ts:408-449 \u2014 the CommitWorkOutcome union + result() builder the new outcome extends\n- src/commit-work/surface.ts:1372-1391 \u2014 unsafeForeignSessions; where pending-receipt-only refusals must be distinguished from live/unknown\n- docs/problem-codes.md \u2014 the `## keeper commit-work` table shape (outcome/meaning/recovery/retry-safe) and exit-code preamble\n\n**Optional** (reference as needed):\n- task 1's landed per-session tail machinery \u2014 the classification this outcome names\n- docs/adr/0068-commit-work-vacated-claims-and-honest-drift.md \u2014 decision 4\n\n### Risks\n\n- The outcome must never fire for the caller's own paths or when the claimant is genuinely live \u2014 precondition is pending-receipts-blocking-an-otherwise-terminal-foreign adoption only.\n- Do not weaken the dead-letter host-wide fail-closed sink; a poison dead-letter still refuses adoption with its existing story.\n\n### Test notes\n\nEnvelope-shape tests in test/commit-work.test.ts (lag fields, stalled\nflag both ways); matrix rows in test/commit-work-adoption.test.ts for\npending-receipt-only vs live vs unknown claimants. problem-codes row\nadded with retry-safe semantics.\n\n## Acceptance\n\n- [ ] An adoption blocked solely by the claimant's un-ingested receipts returns receipts_pending with ingest lag and stalled-ingester honesty, and is retry-safe\n- [ ] ownership_conflict no longer names sessions whose only blocker is pending ingestion\n- [ ] The problem-codes commit-work table documents the new outcome and the narrowed ownership_conflict in the existing four-column shape\n- [ ] The touched suites pass plus the fast gate\n\n## Done summary\nTyped receipts_pending outcome distinguishes adoptions blocked solely by un-ingested receipts (with ingest lag + stalled-ingester flag) from genuinely live/unknown owners; ownership_conflict narrowed accordingly; problem-codes documents the new row.\n## Evidence\n",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.2",
+      "tier": "xhigh",
+      "title": "Typed receipts-pending outcome"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 61,
+        "files_changed": 10,
+        "insertions": 665
+      },
+      "done_summary": "Implemented vacated-claim liveness and guarded session termination; operator landed the verified diff through the documented exact-path plain-git escape after commit-work rejected the terminated provider-leg claims.",
+      "input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+      "model": "opus",
+      "spec_chars": 4148,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/commit-work/surface.ts, cli/commit-work.ts, cli/descriptor.ts, cli/agent.ts, CONTEXT.md, docs/problem-codes.md, test/commit-work-adoption.test.ts, test/commit-work-process-identity.test.ts\n\n### Approach\n\nTwo halves of ADR 0068 decisions 2-3. First, vacated claims: a foreign\nclaimant proven gone by the pid-and-start-time witness (pid absent, or\nstart time mismatched via the existing dep-free src/proc-starttime.ts\nseam) classifies its claims adoptable, read-side only \u2014 no new RPC, no\nschema step, the durable record persists. A witness read failure fails\nclosed to the existing refusal. A stopped-but-resident claimant with a\nmatching start time is never auto-vacated. Second, the sanctioned\noperator verb `keeper session terminate <session-reference>`: resolve\nthe session, re-check identity as (pid, start_time) plus a\nclaude/pi-command check, TERM then bounded KILL \u2014 a process signal\nonly, never a DB write; terminal evidence folds from the exit like any\ndeath. Refuse a working session. Also land the glossary: add Vacated\nclaim + Receipts-pending to CONTEXT.md's commit-ownership section\n(definitions in ADR 0068) TOGETHER WITH the prune that brings\nCONTEXT.md under the domain-docs lint's 140-line cap \u2014 consolidate\nper rule #0, judgment required, deletions must not orphan terms other\ndocs reference.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/commit-work/surface.ts:1169-1185 \u2014 defaultClaimLiveness; where the gone-witness verdict joins\n- src/proc-starttime.ts \u2014 the (pid, start_time) witness seam\n- cli/descriptor.ts:988-1019 \u2014 flag/verb descriptor pattern for the new session verb\n- src/commit-work/domain-docs-lint.ts \u2014 the 140-line CONTEXT.md cap + entry-shape rules the glossary edit must satisfy\n- test/commit-work-process-identity.test.ts \u2014 the existing identity-witness test surface\n\n**Optional** (reference as needed):\n- docs/adr/0060-zombie-session-hybrid-reaper.md \u2014 the identity-recheck TERM-then-KILL discipline to mirror\n- docs/adr/0068-commit-work-vacated-claims-and-honest-drift.md \u2014 decisions 2-3\n\n### Risks\n\n- The gone-witness must never classify a merely-suspended or briefly-unreadable process as gone; any inconclusive witness read stays fail-closed.\n- The terminate verb is operator-facing power: identity re-check at signal time (pid recycled between resolve and kill) is mandatory; mirror the reaper's discipline.\n- The CONTEXT.md prune is editorial: prefer consolidating verbose entries and merging near-duplicates over deleting load-bearing terms.\n\n### Test notes\n\nMatrix rows: pid absent \u2192 adoptable; start-time mismatch \u2192 adoptable;\nmatching start-time resident \u2192 refused; witness error \u2192 refused.\nTerminate verb: pure seam tests for the identity-recheck decision\n(no real processes in the fast tier). Glossary: the domain-docs lint\npassing IS the check \u2014 run a commit-work preview or the lint arm\ndirectly.\n\n## Acceptance\n\n- [ ] A gone-proven claimant's paths adopt without operator intervention; a matching-start-time resident claimant still refuses\n- [ ] An inconclusive liveness witness leaves the refusal in place\n- [ ] `keeper session terminate` TERM-then-KILLs only an identity-confirmed non-working claimant session and never writes the DB\n- [ ] CONTEXT.md carries both new terms, passes the domain-docs lint including the line cap, and no removed term is referenced elsewhere in docs\n- [ ] The touched suites pass plus the fast gate\n\n## Done summary\nImplemented vacated-claim liveness and guarded session termination; operator landed the verified diff through the documented exact-path plain-git escape after commit-work rejected the terminated provider-leg claims.\n## Evidence\n- Commits: a68dee59dd82c4e1366cc7f4f58ffa7cd46a1150\n- Tests: bun test ./test/commit-work-adoption.test.ts ./test/commit-work-process-identity.test.ts ./test/keeper-cli.test.ts \u2014 228 pass, 0 fail, git diff --check \u2014 clean, scanContextDoc(CONTEXT.md) \u2014 zero findings at 135 lines, provider-leg PIDs 83761 and 54666 absent before exact-path commit",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.3",
+      "tier": "xhigh",
+      "title": "Vacated claims and session terminate"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 258,
+        "files_changed": 7,
+        "insertions": 686
+      },
+      "done_summary": "Implemented selection-scoped publication CAS retries, excluded-prefix drift tolerance, whole-tree hook guards, and actionable jam diagnostics. Operator landed the verified seven-path diff through the exact-path plain-git escape after commit-work rejected a killed provider-leg claim.",
+      "input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+      "model": "opus",
+      "spec_chars": 3581,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/commit-work/private-index.ts, src/commit-work/repo-state.ts, cli/commit-work.ts, docs/problem-codes.md, test/commit-work.test.ts, test/slow/commit-work-publication-realgit.test.ts\n\n### Approach\n\nADR 0068 decision 5. The private-index publication compare ignores\nexactly the classifier's excluded prefix (.keeper) so runtime state\nchurn cannot trip surface_changed \u2014 while the whole-tree hook/config\nmutation defense stays intact. A HEAD advance whose delta does not\nintersect the frozen selection triggers a bounded internal\nre-freeze-and-retry on the moved tip (jittered, capped, then the\nexisting typed refusal); the moved ref is never rolled back, and a\ngenuine selection overlap refuses exactly as today. The shared-checkout\njam gate stays repo-scoped; its refusal envelope gains concrete\nrecovery hints (the distress row id and its clear condition).\nReconcile the problem-codes wording for surface_changed, ref_conflict,\nand commit_state_indeterminate with the new semantics.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/commit-work/private-index.ts:762,800-824 \u2014 the whole-tree compare + verifyFrozenSelectedSurface; where selection scoping lands\n- src/commit-work/surface.ts:153 \u2014 EXCLUDED_PREFIX; mirror, do not fork\n- src/commit-work/repo-state.ts:139-168 \u2014 sharedCheckoutJamActive; envelope hints, not path-scoping\n- test/slow/commit-work-publication-realgit.test.ts \u2014 the real-git publication proof surface for retry-under-drift\n\n**Optional** (reference as needed):\n- docs/adr/0063 \u2014 \"a ref race refuses rather than rolls another writer back\" + the commit_hook_mutated defense both stay whole\n- docs/adr/0068-commit-work-vacated-claims-and-honest-drift.md \u2014 decision 5\n\n### Risks\n\n- The .keeper exemption must not create a lane for smuggling tracked-file mutations past the freeze \u2014 exempt by prefix on UNTRACKED runtime paths, never weaken the frozen selected-set verification.\n- Retry-under-contention can thrash: bound retries with jitter and surface the final refusal with the attempt count.\n\n### Test notes\n\nReal-git slow tests: HEAD advanced by a non-overlapping commit \u2192\npublish succeeds on retry; overlapping commit \u2192 typed refusal;\n.keeper churn during lint \u2192 no surface_changed. Fast tests for the\nenvelope hint fields. problem-codes rows reconciled.\n\n## Acceptance\n\n- [ ] Excluded-prefix churn during the critical section no longer produces surface_changed\n- [ ] A non-overlapping HEAD advance publishes via bounded internal retry without rolling back any ref; genuine overlap still refuses with the attempt count\n- [ ] The jam refusal envelope names the blocking distress row and its clear condition\n- [ ] problem-codes wording matches the new CAS semantics and the touched suites pass plus the fast gate\n\n## Done summary\nImplemented selection-scoped publication CAS retries, excluded-prefix drift tolerance, whole-tree hook guards, and actionable jam diagnostics. Operator landed the verified seven-path diff through the exact-path plain-git escape after commit-work rejected a killed provider-leg claim.\n## Evidence\n- Commits: e3930aa7254e77b671e03f4434dd91f795b006f1\n- Tests: bun test ./test/commit-work.test.ts \u2014 92 pass, 0 fail, bun test ./test/slow/commit-work-publication-realgit.test.ts --timeout 15000 \u2014 51 pass, 0 fail, bun run test:gate \u2014 9194 pass, 2 skip, 0 fail, git diff --check \u2014 clean, provider leg e33892ac folded killed and pid 6011 absent before exact-path commit",
+      "task_id": "fn-1295-honest-commit-work-adoption-and-drift.4",
+      "tier": "xhigh",
+      "title": "Selection-scoped publication CAS"
+    }
+  ],
+  "created_at": "2026-07-17T01:57:53.655000Z",
+  "epic_id": "fn-1295-honest-commit-work-adoption-and-drift",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "5aa2cd0d971e532a55989a1233cb5d5ea20579dc2a184e5775a34b86ac6ad587",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
