@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Single-file docs reconciliation of one paragraph with a fully-specified acceptance and a named target phrasing to mirror, so it routes GPT-first at the everyday tier and a medium band for the bounded single-surface consistency edit.",
+      "task_id": "fn-1303-reconcile-wrapped-worker-prompt.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T05:20:30.082000Z",
+  "epic_id": "fn-1303-reconcile-wrapped-worker-prompt",
+  "input_hash": "529765a604a7f97347989e9871a78c0d6902da0c5171597c01f550bf1818420f",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1385653670,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Single-file docs reconciliation of one paragraph with a fully-specified acceptance and a named target phrasing to mirror, so it routes GPT-first at the everyday tier and a medium band for the bounded single-surface consistency edit.\",\"confidence\":0.78}]}\n"
+}
