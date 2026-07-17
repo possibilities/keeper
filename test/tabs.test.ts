@@ -428,10 +428,11 @@ test("renderSnapshotScript is byte-aligned with what --apply spawns (bare keeper
       "'--x-tmux-env' 'KEEPER_PLAN_DISPATCHED_MODEL=' " +
       "'--x-tmux-env' 'KEEPER_PLAN_DISPATCHED_TIER=' " +
       "'--x-tmux-env' 'KEEPER_PLAN_DISPATCH_CONSTRAINT=' " +
-      // The two always-present wrapped-cell guard carriers (task .1), EMPTY on a
-      // resume line (byte-aligned with what --apply spawns).
+      // The always-present wrapped/handoff guard carriers, EMPTY on a resume
+      // line (byte-aligned with what --apply spawns).
       "'--x-tmux-env' 'KEEPER_WRAPPED_CELL=' " +
       "'--x-tmux-env' 'KEEPER_WRAPPED_ENVELOPE=' " +
+      "'--x-tmux-env' 'KEEPER_HANDOFF_ENVELOPE=' " +
       "'--permission-mode' 'acceptEdits' '--dangerously-skip-permissions' " +
       "'--x-no-confirm' '--resume' 'name'",
   );
