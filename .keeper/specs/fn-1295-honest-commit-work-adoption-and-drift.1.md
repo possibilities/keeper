@@ -55,5 +55,7 @@ is rejected.
 - [ ] The touched suite passes plus the fast gate
 
 ## Done summary
-
+Made terminal claim evidence per-session and cursor-fresh; unrelated later events and other sessions' pending receipts no longer block safe adoption. Updated the direct ownership matrices and isolated the pre-existing tabs handoff-envelope golden repair.
 ## Evidence
+- Commits: 964f5ec43527f44908ed7a087768f07f01f882ad, 52da8b212467988d87fa6757df2ba8886b07401f
+- Tests: bun test ./test/commit-work-adoption.test.ts ./test/commit-work-foundation.test.ts ./test/tabs.test.ts — 165 pass, 0 fail, git diff --check — clean, worker full gate: bun run test:gate — 9184 pass, 2 skip, 0 fail
