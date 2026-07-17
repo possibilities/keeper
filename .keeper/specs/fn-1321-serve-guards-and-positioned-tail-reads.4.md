@@ -62,5 +62,5 @@ existing teardown helper.
 - [ ] The ADR documenting the prior pill behavior carries the supersession note; the full fast correctness gates stay green
 
 ## Done summary
-
+Grace expiry now composes an unmistakable DISCONNECTED token (red SGR + plain-text fallback) into the body indicator line and banner pill, guarded from spinner ticks and transient flashes; ADR 0019 carries the supersession note.
 ## Evidence
