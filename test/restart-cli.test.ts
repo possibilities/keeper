@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   type CommandResult,
   type RestartBootMarker,
   type RestartDeps,
+  readLatestBoot,
   runRestart,
 } from "../cli/restart";
 
@@ -66,6 +70,40 @@ async function restartAndCapture(
   }
   throw new Error("restart did not exit");
 }
+
+describe("readLatestBoot", () => {
+  const KEY = "KEEPER_RESTART_LEDGER";
+
+  test("uses the override, skips non-boots and torn lines, and returns the last valid boot", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "keeper-restart-cli-ledger-"));
+    const saved = process.env[KEY];
+    const ledgerPath = join(tempDir, "restart-ledger.json");
+    process.env[KEY] = ledgerPath;
+    try {
+      writeFileSync(
+        ledgerPath,
+        [
+          JSON.stringify({ kind: "boot", boot_id: "boot-first", ts: 100 }),
+          JSON.stringify({ kind: "death", boot_id: "boot-ignored", ts: 150 }),
+          JSON.stringify({ kind: "boot", boot_id: "boot-second", ts: 200 }),
+          '{"kind":"boot","boot_id":"torn',
+        ].join("\n"),
+      );
+
+      await expect(readLatestBoot()).resolves.toEqual({
+        boot_id: "boot-second",
+        ts: 200,
+      });
+
+      process.env[KEY] = join(tempDir, "missing-restart-ledger.json");
+      await expect(readLatestBoot()).resolves.toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("keeper daemon restart evidence verdict", () => {
   test("accepts a fresh healthy boot after a nonzero kickstart and reports its warning", async () => {
@@ -133,6 +171,21 @@ describe("keeper daemon restart evidence verdict", () => {
       },
       data: null,
     });
+  });
+
+  test("reports a health timeout when a successful kickstart has no fresh boot", async () => {
+    const h = restartHarness({
+      kickstart: { exitCode: 0, stdout: "", stderr: "" },
+      latestBoot: { boot_id: "boot-before", ts: 100 },
+      timeoutMs: 400,
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(h.stdout.join(""));
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error.code).toBe("health-timeout");
   });
 
   test("keeps a zero-status kickstart success free of a warning", async () => {
