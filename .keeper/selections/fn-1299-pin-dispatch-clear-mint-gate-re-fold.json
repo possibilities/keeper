@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified two-file change (a fold comment plus a re-fold test) whose correctness invariant is already spelled out in the spec and can mirror the existing refold-equivalence harness, so it routes GPT-first at the multi-file model-default band rather than the opus gate, since there is no behavior change and no invariant to derive.",
+      "task_id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T02:10:10.762000Z",
+  "epic_id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold",
+  "input_hash": "a502e0480f57a13e5e1fea75e563afd1d9150efac4863a3a7a2f85dee5a4d549",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2768429128,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified two-file change (a fold comment plus a re-fold test) whose correctness invariant is already spelled out in the spec and can mirror the existing refold-equivalence harness, so it routes GPT-first at the multi-file model-default band rather than the opus gate, since there is no behavior change and no invariant to derive.\",\"confidence\":0.72}]}\n"
+}
