@@ -17,6 +17,7 @@
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
+  __resetEpicIndexMemoForTest,
   __resetGitAttribMemoForTest,
   applyEvent,
   drain,
@@ -2639,6 +2640,100 @@ test("fn-892 incremental pass-1 memo: warm-cache fold equals a cold full rescan 
     .all();
 
   // Byte-identical: the incremental append equals the full scan.
+  expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
+});
+
+test("fn-1313 epic-index memo: warm-cache folds equal a cold full-scan rebuild byte-for-byte", () => {
+  // The fold-time all-epics dep index is memoized per `Database` (fn-1313): the
+  // first index read seeds one full scan, then every fold PATCHES the memo in
+  // place on an index-relevant `epics` write. This proves the WARM path (memo
+  // seeded early, then patched across several drains that each interleave a
+  // number change / delete / re-create) reproduces the SAME `resolved_epic_deps`
+  // + `epic_dep_edges` as a COLD rebuild (memo forced cold, one drain seeds a
+  // full scan). Unlike the append-only watermark memos, this one mirrors a
+  // MUTABLE table, so the cold leg wipes the projection AND resets the memo.
+  const epicSnapshot = (epicId: string, snapshot: Record<string, unknown>) =>
+    insertEvent({
+      hook_event: "EpicSnapshot",
+      session_id: epicId,
+      data: JSON.stringify(snapshot),
+    });
+  const epicDeleted = (epicId: string) =>
+    insertEvent({
+      hook_event: "EpicDeleted",
+      session_id: epicId,
+      data: JSON.stringify({ epic_id: epicId }),
+    });
+
+  // WARM: drain after EACH round so the memo accumulates its patches
+  // incrementally (not just on the first fold).
+  epicSnapshot("fn-1-up", {
+    epic_number: 1,
+    project_dir: "/r",
+    status: "open",
+  });
+  epicSnapshot("fn-2-cons", {
+    epic_number: 2,
+    project_dir: "/r",
+    status: "open",
+    depends_on_epics: ["fn-1", "fn-1-up"],
+  });
+  drainAll();
+  // Number change: fn-1-up 1 → 7 (bucket move); fn-2-cons's bare `fn-1` now
+  // dangles while its full-id dep still resolves.
+  epicSnapshot("fn-1-up", {
+    epic_number: 7,
+    project_dir: "/r",
+    status: "open",
+  });
+  epicSnapshot("fn-2-cons", {
+    epic_number: 2,
+    project_dir: "/r",
+    status: "open",
+    depends_on_epics: ["fn-1", "fn-1-up"],
+  });
+  drainAll();
+  // Delete then re-create fn-1-up (tombstone cleared on re-snapshot, now done).
+  epicDeleted("fn-1-up");
+  drainAll();
+  epicSnapshot("fn-1-up", {
+    epic_number: 7,
+    project_dir: "/r",
+    status: "done",
+  });
+  epicSnapshot("fn-2-cons", {
+    epic_number: 2,
+    project_dir: "/r",
+    status: "open",
+    depends_on_epics: ["fn-1", "fn-1-up"],
+  });
+  drainAll();
+
+  const snapshotEpics = () => ({
+    epics: db
+      .query(
+        "SELECT epic_id, epic_number, project_dir, status, resolved_epic_deps FROM epics ORDER BY epic_id",
+      )
+      .all(),
+    epic_dep_edges: db
+      .query(
+        "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
+      )
+      .all(),
+  });
+  const warm = snapshotEpics();
+  // Non-vacuous: fn-2-cons resolved its full-id dep against the churned index.
+  expect(warm.epic_dep_edges.length).toBeGreaterThan(0);
+
+  // COLD: wipe the projection, rewind the cursor, FORCE the memo cold, then
+  // re-drain the whole log in one pass — the memo does a single full scan.
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_dep_edges");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetEpicIndexMemoForTest(db);
+  drainAll();
+  const cold = snapshotEpics();
+
   expect(JSON.stringify(warm)).toBe(JSON.stringify(cold));
 });
 

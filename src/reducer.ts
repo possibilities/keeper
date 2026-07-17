@@ -665,6 +665,10 @@ function insertEpicShellIfNotTombstoned(
     return;
   }
   db.run(sql, params);
+  // The shell insert added a new epic row (epic_number/project_dir/status all
+  // NULL) — patch the index memo so a warm connection sees it. Runs ONLY on the
+  // landed branch (a tombstone-suppressed insert patches nothing).
+  patchEpicIndexMemo(db, epicId);
 }
 
 function projectPlanRow(db: Database, event: Event): void {
@@ -724,6 +728,10 @@ function projectPlanRow(db: Database, event: Event): void {
         ts,
       ],
     );
+    // The upsert settled THIS epic's index-relevant columns — patch the memo
+    // BEFORE the index read below (the fold writes its own row, then reads the
+    // index against it), so the warm read sees this write.
+    patchEpicIndexMemo(db, entityId);
 
     // Forward stamp + reverse fan-out for `resolved_epic_deps` +
     // `epic_dep_edges`. The all-epics index is built ONCE and shared across
@@ -732,7 +740,7 @@ function projectPlanRow(db: Database, event: Event): void {
     // `depends_on_epics` token matches this epic's full or bare id) against
     // that settled state, so an upstream state flip propagates in lockstep.
     {
-      const index = buildEpicIndex(db);
+      const index = readEpicIndex(db);
       syncEpicDepsForward(
         db,
         entityId,
@@ -952,6 +960,10 @@ function retractPlanRow(db: Database, event: Event): void {
       .query("SELECT epic_number FROM epics WHERE epic_id = ?")
       .get(entityId) as { epic_number: number | null } | null;
     db.run("DELETE FROM epics WHERE epic_id = ?", [entityId]);
+    // The row is gone — patch the memo so the reverse fan-out's index read below
+    // (and every later fold) no longer sees this epic. A cold memo re-seeds off
+    // the already-deleted table; either way the resolver observes the miss.
+    patchEpicIndexMemo(db, entityId);
     // Drop the upstream's OWN edges row — its consumer→token index is gone with
     // the row.
     db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [entityId]);
@@ -970,7 +982,7 @@ function retractPlanRow(db: Database, event: Event): void {
     // upstream now misses and the entry flips to `dangling`. DELETE FIRST so
     // the resolver observes the missing row; fan-out SECOND.
     if (pre != null) {
-      const index = buildEpicIndex(db);
+      const index = readEpicIndex(db);
       syncEpicDepsReverse(
         db,
         entityId,
@@ -9036,6 +9048,9 @@ function syncJobLinksOnJobWrite(
          ) VALUES (?, NULL, NULL, NULL, NULL, ?, ?, '[]', '[]', ?)`,
         [epicId, eventId, ts, jobLinksJson],
       );
+      // Direct shell insert (not via the tombstone helper) — patch the memo so a
+      // warm connection sees the new epic row.
+      patchEpicIndexMemo(db, epicId);
     }
   }
 }
@@ -9519,6 +9534,136 @@ function buildEpicIndex(db: Database): {
     );
   }
   return { epicById, epicsByNumber };
+}
+
+/**
+ * Per-`Database` in-place memo of the {@link buildEpicIndex} scan. Seeded ONCE
+ * with a full scan on the first index read of a connection, then PATCHED in
+ * place by every fold that mutates an index-relevant `epics` column (`epic_id`,
+ * `epic_number`, `project_dir`, `status`), so the per-fold index cost is
+ * independent of board size. `seeded` gates the one-time scan; the two maps
+ * hold the SAME shared {@link Epic} reference for a given id (an id in
+ * `epicById` whose `epic_number` is non-null also sits in its `epicsByNumber`
+ * bucket), exactly as the scan returns them.
+ *
+ * This mirrors a MUTABLE table, so — unlike the append-only watermark memos —
+ * it MUST be reset whenever the `epics` projection is wiped on a reused
+ * connection (see {@link __resetEpicIndexMemoForTest} and the refold harness).
+ */
+interface EpicIndexMemo {
+  seeded: boolean;
+  epicById: Map<string, Epic>;
+  epicsByNumber: Map<number, Epic[]>;
+}
+
+const epicIndexMemos = new WeakMap<Database, EpicIndexMemo>();
+
+function epicIndexMemoFor(db: Database): EpicIndexMemo {
+  let memo = epicIndexMemos.get(db);
+  if (memo == null) {
+    memo = { seeded: false, epicById: new Map(), epicsByNumber: new Map() };
+    epicIndexMemos.set(db, memo);
+  }
+  return memo;
+}
+
+/**
+ * Test-only: drop the per-`Database` epic-index memo so the NEXT index read on
+ * this connection re-seeds with a full scan. Because the memo mirrors the
+ * MUTABLE `epics` table (not an append-only watermark), the refold harness must
+ * call this WHEREVER it wipes the `epics` projection on a reused connection —
+ * otherwise a stale pre-wipe memo would serve the post-wipe re-fold. Production
+ * never calls this — the WeakMap collects a dropped connection's memo on its own
+ * and a fresh-DB-per-test is cold by construction.
+ */
+export function __resetEpicIndexMemoForTest(db: Database): void {
+  epicIndexMemos.delete(db);
+}
+
+/**
+ * Serve the all-epics index the {@link resolveEpicDep} resolver reads against,
+ * from the per-`Database` memo. On a cold connection the first call pays exactly
+ * ONE {@link buildEpicIndex} full scan and seeds the memo; every later call
+ * returns the in-place-maintained memo (no per-fold scan). The returned maps ARE
+ * the memo's live maps — read-only for callers; membership is maintained solely
+ * through {@link patchEpicIndexMemo} on the fold's own writes.
+ */
+function readEpicIndex(db: Database): {
+  epicById: Map<string, Epic>;
+  epicsByNumber: Map<number, Epic[]>;
+} {
+  const memo = epicIndexMemoFor(db);
+  if (!memo.seeded) {
+    const scan = buildEpicIndex(db);
+    memo.epicById = scan.epicById;
+    memo.epicsByNumber = scan.epicsByNumber;
+    memo.seeded = true;
+  }
+  return { epicById: memo.epicById, epicsByNumber: memo.epicsByNumber };
+}
+
+/**
+ * Patch the memo for ONE epic id after a fold has written an index-relevant
+ * column, keeping it byte-identical to a fresh scan. Total (never throws) and
+ * reads no wall-clock / env / fs — only the just-written `epics` row.
+ *
+ * A cold (unseeded) memo is left untouched: the next read seeds a full scan that
+ * already reflects this write, so an early partial would be redundant. Otherwise
+ * the existing entry is removed from BOTH maps (its `epicsByNumber` bucket is
+ * keyed off the OLD `epic_number` the memo still holds), then the single row is
+ * re-SELECTed through the SAME column set + {@link epicLiteToEpic} helper the
+ * scan uses (NULL-coalescing parity) and re-inserted. An ABSENT row means the
+ * write was a delete or a tombstone-suppressed shell insert — the removal is the
+ * whole patch, so this is correct precisely BECAUSE it reads the landed DB state
+ * rather than the intended write. Each `epicsByNumber` bucket stays sorted by
+ * `epic_id` (an `epic_number` change drops from the old bucket, inserts sorted
+ * into the new one), matching the scan's per-bucket sort.
+ */
+function patchEpicIndexMemo(db: Database, epicId: string): void {
+  const memo = epicIndexMemos.get(db);
+  if (memo == null || !memo.seeded) {
+    return;
+  }
+
+  const prior = memo.epicById.get(epicId);
+  if (prior != null) {
+    memo.epicById.delete(epicId);
+    if (prior.epic_number != null) {
+      const bucket = memo.epicsByNumber.get(prior.epic_number);
+      if (bucket != null) {
+        const next = bucket.filter((e) => e.epic_id !== epicId);
+        if (next.length === 0) {
+          memo.epicsByNumber.delete(prior.epic_number);
+        } else {
+          memo.epicsByNumber.set(prior.epic_number, next);
+        }
+      }
+    }
+  }
+
+  const row = db
+    .query(
+      `SELECT epic_id, epic_number, project_dir, status
+         FROM epics
+        WHERE epic_id = ?`,
+    )
+    .get(epicId) as EpicLite | null;
+  if (row == null) {
+    return;
+  }
+  const epic = epicLiteToEpic(row);
+  memo.epicById.set(epicId, epic);
+  if (row.epic_number != null) {
+    const bucket = memo.epicsByNumber.get(row.epic_number);
+    if (bucket == null) {
+      memo.epicsByNumber.set(row.epic_number, [epic]);
+    } else {
+      bucket.push(epic);
+      bucket.sort((a, b) =>
+        a.epic_id < b.epic_id ? -1 : a.epic_id > b.epic_id ? 1 : 0,
+      );
+    }
+  }
 }
 
 /**
