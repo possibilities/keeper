@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T00:44:21.130000Z",
+  "depends_on": [],
+  "epic": "fn-1297-fence-dispatch-clears-by-attempt",
+  "id": "fn-1297-fence-dispatch-clears-by-attempt.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Fence dispatch-clear projection effects",
+  "updated_at": "2026-07-17T00:44:21.130000Z"
+}
