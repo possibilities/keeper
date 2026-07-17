@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-17T18:30:12.212000Z",
+  "created_by_close_of": "fn-1314-bounded-bus-retention-and-presence",
+  "depends_on_epics": [
+    "fn-1314-bounded-bus-retention-and-presence"
+  ],
+  "id": "fn-1316-scope-bus-db-fail-open-index-creation",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Scope bus-db fail-open index creation to non-unique indexes",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-17T18:30:12.212000Z"
+}
