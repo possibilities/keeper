@@ -1,0 +1,39 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [
+      "fn-1318-wrapped-leg-launch-fix-and-death-capture.1"
+    ],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Open-hypothesis empirical bisection of a 2-4s launch-path death with no named root cause, requiring signal-vs-code forensics and a fix that must not violate the ownership-cascade correctness invariant.",
+      "task_id": "fn-1318-wrapped-leg-launch-fix-and-death-capture.1",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped notice-schema/wire bump carrying a security redaction invariant (credential-leak risk) plus a terminal-event/re-fold determinism invariant that must never block or drop the Killed mint.",
+      "task_id": "fn-1318-wrapped-leg-launch-fix-and-death-capture.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T20:13:34.125000Z",
+  "epic_id": "fn-1318-wrapped-leg-launch-fix-and-death-capture",
+  "input_hash": "4c564a95df0473764f1e45d440ae02e4f7fcb92dcbdb1123cc3451d16140ebb0",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1280723605,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1318-wrapped-leg-launch-fix-and-death-capture.1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Open-hypothesis empirical bisection of a 2-4s launch-path death with no named root cause, requiring signal-vs-code forensics and a fix that must not violate the ownership-cascade correctness invariant.\",\"confidence\":0.8},{\"task_id\":\"fn-1318-wrapped-leg-launch-fix-and-death-capture.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped notice-schema/wire bump carrying a security redaction invariant (credential-leak risk) plus a terminal-event/re-fold determinism invariant that must never block or drop the Killed mint.\",\"confidence\":0.78}]}\n"
+}
