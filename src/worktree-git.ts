@@ -1511,26 +1511,55 @@ export async function enumerateEpicLaneBranches(
   return { ok: true, branches };
 }
 
-export interface LaneNodeModulesLinkFs {
+export interface WorktreeDepLinkFs {
   lstat(path: string): Promise<{ isSymbolicLink(): boolean }>;
   realpath(path: string): Promise<string>;
   symlink(target: string, path: string, type: "dir"): Promise<void>;
   unlink(path: string): Promise<void>;
 }
 
-const laneNodeModulesLinkFs: LaneNodeModulesLinkFs = {
+const worktreeDepLinkFs: WorktreeDepLinkFs = {
   lstat,
   realpath,
   symlink,
   unlink,
 };
 
-export async function ensureLaneNodeModulesLink(
+/**
+ * The basename of the one dependency artifact the universal provisioning seam
+ * (docs/adr/0074) plants into every keeper-created worktree.
+ */
+export const WORKTREE_DEP_LINK_NAME = "node_modules";
+
+/**
+ * The exact symlink target {@link ensureWorktreeDepLink} plants at
+ * `<worktreePath>/${WORKTREE_DEP_LINK_NAME}` for a given `sourceCheckout` — the
+ * planted-artifact definition a teardown residue classifier (docs/adr/0074)
+ * compares an untracked entry's raw link target against for byte-identity.
+ * Never a resolved realpath: identity is what the seam LITERALLY wrote, not
+ * where it eventually points (a real, non-symlinked `node_modules` is never
+ * byte-identical, however it resolves).
+ */
+export function worktreeDepLinkTarget(sourceCheckout: string): string {
+  return resolve(sourceCheckout, WORKTREE_DEP_LINK_NAME);
+}
+
+/**
+ * Universal dependency-symlink provisioning (docs/adr/0074): plant a
+ * `node_modules` symlink at `worktreePath` pointing at `sourceCheckout`'s real
+ * store, so every keeper-created worktree — task lane, epic base,
+ * baseline/recovery scratch checkout — shares one host's install instead of a
+ * slow, per-worktree install. Idempotent + safe: a no-op when the link is
+ * already correct, silently skipped when the source has no `node_modules`
+ * (nothing to share), and a real (non-symlink) `node_modules` at the target is
+ * left untouched (never clobbers real work).
+ */
+export async function ensureWorktreeDepLink(
   sourceCheckout: string,
-  lanePath: string,
-  fs: LaneNodeModulesLinkFs = laneNodeModulesLinkFs,
+  worktreePath: string,
+  fs: WorktreeDepLinkFs = worktreeDepLinkFs,
 ): Promise<void> {
-  const sourceNodeModules = resolve(sourceCheckout, "node_modules");
+  const sourceNodeModules = worktreeDepLinkTarget(sourceCheckout);
   let sourceRealPath: string;
   try {
     sourceRealPath = await fs.realpath(sourceNodeModules);
@@ -1541,29 +1570,29 @@ export async function ensureLaneNodeModulesLink(
     throw err;
   }
 
-  const laneNodeModules = resolve(lanePath, "node_modules");
-  let laneEntry: { isSymbolicLink(): boolean } | null;
+  const worktreeNodeModules = resolve(worktreePath, WORKTREE_DEP_LINK_NAME);
+  let entry: { isSymbolicLink(): boolean } | null;
   try {
-    laneEntry = await fs.lstat(laneNodeModules);
+    entry = await fs.lstat(worktreeNodeModules);
   } catch (err) {
     if (!isEnoent(err)) throw err;
-    laneEntry = null;
+    entry = null;
   }
 
-  if (laneEntry !== null && !laneEntry.isSymbolicLink()) {
+  if (entry !== null && !entry.isSymbolicLink()) {
     return;
   }
-  if (laneEntry !== null) {
+  if (entry !== null) {
     try {
-      if ((await fs.realpath(laneNodeModules)) === sourceRealPath) {
+      if ((await fs.realpath(worktreeNodeModules)) === sourceRealPath) {
         return;
       }
     } catch (err) {
       if (!isEnoent(err)) throw err;
     }
-    await fs.unlink(laneNodeModules);
+    await fs.unlink(worktreeNodeModules);
   }
-  await fs.symlink(sourceNodeModules, laneNodeModules, "dir");
+  await fs.symlink(sourceNodeModules, worktreeNodeModules, "dir");
 }
 
 /**

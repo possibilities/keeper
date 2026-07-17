@@ -226,8 +226,8 @@ import {
   commitWorkLockPath as gitCommitWorkLockPath,
   currentBranch as gitCurrentBranch,
   deleteBranch as gitDeleteBranch,
-  ensureLaneNodeModulesLink as gitEnsureLaneNodeModulesLink,
   ensureWorktree as gitEnsureWorktree,
+  ensureWorktreeDepLink as gitEnsureWorktreeDepLink,
   enumerateEpicLaneBranches as gitEnumerateEpicLaneBranches,
   isAncestorOf as gitIsAncestorOf,
   laneDirtSnapshotId as gitLaneDirtSnapshotId,
@@ -5526,7 +5526,7 @@ export function createWorktreeDriver(
         // `isResidueOnlyDir` vetoes husk sweeping on any symlink, so these lanes
         // rely on bounded-teardown force removal. Sharing this mutable store is
         // deliberate: source and lane are on one host and filesystem.
-        await gitEnsureLaneNodeModulesLink(repoDir, worktreePath);
+        await gitEnsureWorktreeDepLink(repoDir, worktreePath);
         // Run the fan-in pre-merges in order — sequential pairwise, each taking the
         // shared commit-work flock. A content conflict aborts + fails loud + stops;
         // a `missing-source` phantom lane (a branch never created because its task's
