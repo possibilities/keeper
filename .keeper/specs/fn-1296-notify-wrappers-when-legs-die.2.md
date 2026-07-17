@@ -71,5 +71,5 @@ The new producer starts with a boot fence and no historical replay. After finali
 - [ ] Delivery failure is fail-open for the daemon, bounded ambiguous retry is deduplicable by terminal event id, and all named producer/Bus/autoclose tests pass.
 
 ## Done summary
-
+Added a daemon-side Provider-leg death-notice producer: boot-fenced authoritative ended/killed selection, unique Dispatch-attempt wrapper resolution, bounded per-tick sweep with retry/dedup by terminal event id, and a bounded versioned JSON notice sent through the Agent Bus send_only path (no Presence/join/channel persistence). Shared the wrapped-task parser and Bus send transport with the CLI.
 ## Evidence
