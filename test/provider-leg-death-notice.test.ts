@@ -270,6 +270,15 @@ describe("launch-time abort capture", () => {
     expect(redacted).toContain("[REDACTED]");
   });
 
+  test("an opaque non-JWT bearer token is redacted, the scheme word survives", () => {
+    // No token-shape arm matches this value, so only the bearer path can redact
+    // it — the regression guard for the AUTH key arm eating `Bearer`.
+    const OPAQUE = "Zx9Kq2Lm7Pw4Rt6Yn1Bv";
+    expect(redactAbortEvidence(`Authorization: Bearer ${OPAQUE}`)).toBe(
+      "Authorization: Bearer [REDACTED]",
+    );
+  });
+
   test("exit status discriminates a signal death from a plain exit code", () => {
     expect(parseProviderLegExitStatus("137")).toEqual({
       signal: "SIGKILL",
