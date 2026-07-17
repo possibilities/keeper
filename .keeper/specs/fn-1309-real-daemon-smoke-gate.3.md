@@ -27,5 +27,5 @@ Make the smoke gate authoritative where ADR 0073 places it: epic close-finalize 
 - [ ] docs/testing.md documents the gate, conditional, and retry policy
 
 ## Done summary
-
+Wired the named test:slow-daemon smoke gate (ADR 0073) into epic close-finalize's merge-suite gate: it runs, chained after a green root suite, only when the landed diff touches the daemon Load surface per the checked-in scripts/daemon-load-roots.txt manifest (the same seam the reload fingerprint hashes); a non-daemon epic's finalize is byte-identical, and a smoke failure surfaces through the existing finalize-suite-red operator path. docs/testing.md now documents the slow tier, its finalize conditional, and the one-retry policy.
 ## Evidence
