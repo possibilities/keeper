@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-luna",
+      "assigned_tier": "low",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 7,
+        "files_changed": 1,
+        "insertions": 7
+      },
+      "done_summary": "Reframed DEFAULT_RESTART_TIMEOUT_MS and KICKSTART_TIMEOUT_MS comments in cli/restart.ts to state current behavior only, dropping past-tense provenance and the stale 1s-kickstart reference while retaining the why-this-number margin rationale.",
+      "input_hash": "ec101591520db4f3696a2de4c3875aacd59f94d940070f1ff321a42c9c62b2c7",
+      "model": "gpt-5.6-luna",
+      "spec_chars": 1507,
+      "spec_md": "## Description\n\nFinding F1 (kept). Evidence: `cli/restart.ts:15-24` as of commit\n381292a4 introduced two constant comments that violate CLAUDE.md rule #0:\n\n- Above `DEFAULT_RESTART_TIMEOUT_MS = 150_000`: \"...can run the full 30s\n  this used to allow...\" \u2014 past-tense provenance.\n- Above `KICKSTART_TIMEOUT_MS = 15_000`: \"...a 1s subprocess budget\n  TERM-kills it mid-work on every invocation...\" \u2014 present-tense narration\n  of a 1s kickstart budget that no longer exists on this path (now 15s),\n  which misleads the next reader.\n\nFiles: `cli/restart.ts`. Reframe both comments to state current behavior\nonly, preserving the why-this-number rationale (why the 150s deadline and\nthe 15s kickstart budget are sized as they are). The 30s\u2192150s and 1s\u219215s\nhistory belongs to the commit message, not the code.\n\n## Acceptance\n\n- [ ] Neither comment references a retired value (\"used to allow\", \"1s\n      subprocess budget\") as history or as if live; both read forward-facing.\n- [ ] The margin rationale (post-boot catch-up can run tens of seconds; a\n      real kill-and-respawn needs a multi-second budget while still bounding\n      a wedged launchctl) is retained.\n- [ ] `bun scripts/lint-claude-md.ts` green; existing restart CLI tests pass.\n\n## Done summary\nReframed DEFAULT_RESTART_TIMEOUT_MS and KICKSTART_TIMEOUT_MS comments in cli/restart.ts to state current behavior only, dropping past-tense provenance and the stale 1s-kickstart reference while retaining the why-this-number margin rationale.\n## Evidence\n",
+      "task_id": "fn-1308-reframe-restart-budget-comments-to.1",
+      "tier": "low",
+      "title": "Reframe restart-budget comments"
+    }
+  ],
+  "created_at": "2026-07-17T10:09:55.997000Z",
+  "epic_id": "fn-1308-reframe-restart-budget-comments-to",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "ec101591520db4f3696a2de4c3875aacd59f94d940070f1ff321a42c9c62b2c7",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
