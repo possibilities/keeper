@@ -21,6 +21,13 @@
  *     two-launch reconcile awaits the first confirm before starting
  *     the second.
  *
+ * Dispatch-clear producer coverage: slot occupancy and finalize clears run through
+ * `runReconcileCycle`; recover, lane-premerge, and stuck-sentinel clears use the
+ * owner-bearing snapshot; monitor-slot, zombie-session, lane teardown/backup,
+ * shared-wedge, lane-wedge, stale-base, duplicate-number, and shared-desync clears
+ * use the claimless distress channel. The fence and delayed-ack gate tests below
+ * pin the shared carriage contract used by every class.
+ *
  * No real worker spawn anywhere. The `isMainThread` guard in the
  * worker module makes a plain `import` inert; we drive the pure
  * `reconcile` / `confirmRunning` / `runReconcileCycle` symbols
@@ -8181,10 +8188,24 @@ test("fn-1034 runReconcileCycle: a repo whose OPEN finalize row finalizes CLEAN 
     "/bin/zsh",
     new AbortController().signal,
     deps,
+    null,
+    new Map([
+      [
+        `close::${bKey}` as DispatchKey,
+        { attempt_id: 41, instance_event_id: 51 },
+      ],
+    ]),
   );
-  // /repo-b finalized clean → its OPEN row auto-clears. /repo-a also finalized clean
-  // but never had a row (not in the open set), so it is NOT spuriously cleared.
-  expect(depsLog.clears).toEqual([{ verb: "close", id: bKey }]);
+  // /repo-b finalized clean → its OPEN row auto-clears with the immutable
+  // pre-finalize owners. /repo-a had no row, so it is not spuriously cleared.
+  expect(depsLog.clears).toEqual([
+    {
+      verb: "close",
+      id: bKey,
+      expected_attempt_id: 41,
+      expected_instance_event_id: 51,
+    },
+  ]);
   expect(depsLog.emissions).toEqual([]);
 });
 
@@ -17336,13 +17357,48 @@ test("createDispatchFailedGate: a still-unchanged condition re-announces on the 
   expect(gate.shouldEmit(failedPayload({ ts: 2800 }))).toBe(true);
 });
 
-test("createDispatchFailedGate: noteClear resets the gate so a re-failure re-emits immediately", () => {
+test("createDispatchFailedGate: a posted clear resets only after matching projection evidence disappears", () => {
   const gate = createDispatchFailedGate(900);
+  const id = "worktree-recover:fn-1-foo-abc123";
+  const key = `close::${id}` as DispatchKey;
   expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
   expect(gate.shouldEmit(failedPayload({ ts: 1001 }))).toBe(false);
-  gate.noteClear("close", "worktree-recover:fn-1-foo-abc123");
-  // Resolution dropped the row — the very next failure of this (verb,id) is new.
-  expect(gate.shouldEmit(failedPayload({ ts: 1002 }))).toBe(true);
+  gate.noteClear({
+    verb: "close",
+    id,
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+  });
+  // Posting and delayed projection visibility leave suppression armed.
+  expect(gate.shouldEmit(failedPayload({ ts: 1002 }))).toBe(false);
+  gate.observeProjection(
+    new Map([[key, { attempt_id: 41, instance_event_id: 51 }]]),
+  );
+  expect(gate.shouldEmit(failedPayload({ ts: 1003 }))).toBe(false);
+  // Absence after the exact observed episode is the acknowledgement.
+  gate.observeProjection(new Map());
+  expect(gate.shouldEmit(failedPayload({ ts: 1004 }))).toBe(true);
+});
+
+test("createDispatchFailedGate: a replacement incident never acknowledges a stale clear", () => {
+  const gate = createDispatchFailedGate(900);
+  const id = "worktree-recover:fn-1-foo-abc123";
+  expect(gate.shouldEmit(failedPayload({ ts: 1000 }))).toBe(true);
+  gate.noteClear({
+    verb: "close",
+    id,
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+  });
+  gate.observeProjection(
+    new Map([
+      [
+        `close::${id}` as DispatchKey,
+        { attempt_id: 61, instance_event_id: 71 },
+      ],
+    ]),
+  );
+  expect(gate.shouldEmit(failedPayload({ ts: 1001 }))).toBe(false);
 });
 
 test("createDispatchFailedGate: a slot occupied→reclaimed reason change emits, then collapses (O(1) per condition)", () => {
@@ -17366,8 +17422,14 @@ test("createDispatchFailedGate: a slot occupied→reclaimed reason change emits,
   expect(gate.shouldEmit({ ...occupied, ts: 1002 })).toBe(false); // stable → collapse
   expect(gate.shouldEmit(reclaimed)).toBe(true); // occupied→reclaimed → emit
   expect(gate.shouldEmit({ ...reclaimed, ts: 1003 })).toBe(false); // new baseline
-  gate.noteClear("close", "fn-1-foo");
-  expect(gate.shouldEmit({ ...occupied, ts: 1004 })).toBe(true); // reset → re-signal
+  gate.noteClear({
+    verb: "close",
+    id: "fn-1-foo",
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+  });
+  gate.observeProjection(new Map());
+  expect(gate.shouldEmit({ ...occupied, ts: 1004 })).toBe(true); // ack → re-signal
 });
 
 test("createDispatchFailedGate: distinct (verb,id) conditions are gated independently", () => {
