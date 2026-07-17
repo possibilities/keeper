@@ -236,6 +236,7 @@ import { MAX_LINE_LENGTH } from "../src/protocol";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
 import {
+  __resetEpicIndexMemoForTest,
   drain,
   extractSessionTelemetry,
   GIT_STATUS_DIRTY_FILES_WIRE_CAP,
@@ -3338,6 +3339,7 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainToCompletion(db);
 
   const dlAfter = db

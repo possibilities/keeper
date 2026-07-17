@@ -18,6 +18,7 @@ import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { raiseTmuxProjectionFloor } from "../src/db";
 import {
+  __resetEpicIndexMemoForTest,
   applyEvent,
   type BuildSnapshotPayload,
   drain,
@@ -3931,6 +3932,7 @@ test("from-scratch re-fold reproduces the escalation_instance stamps and misses 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM block_escalations");
   db.run("DELETE FROM dispatch_failures");
   db.run("DELETE FROM pending_dispatches");
@@ -5854,6 +5856,7 @@ test("from-scratch re-fold over [EpicArmed X true, EpicSnapshot X done] leaves z
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM armed_epics");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   drainAll();
   const armedAfter = db
@@ -5916,6 +5919,7 @@ test("from-scratch re-fold reproduces epics.question byte-identically (fn-1083.2
     .all();
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   drainAll();
   const after = db
@@ -6002,6 +6006,7 @@ test("from-scratch re-fold reproduces epics.blocks_closing_of byte-identically (
     .all();
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   drainAll();
   const after = db
@@ -6065,6 +6070,7 @@ test("a historical EpicSnapshot carrying a retired selection_review key folds sa
   // reproduces the projection byte-identically.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   drainAll();
   const after = db
@@ -6545,6 +6551,7 @@ test("plan mint: re-fold determinism — cursor=0 reproduces byte-identical file
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM file_attributions");
   drainAll();
@@ -7856,6 +7863,7 @@ test("fn-670 T2: cursor=0 re-fold reproduces byte-identical epics rows over a mi
   // Rewind cursor + DELETE the projection, then re-drain.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
   const after = db
     .query("SELECT * FROM epics ORDER BY epic_id ASC")
@@ -8420,6 +8428,7 @@ test("v59 monitor fact: cursor=0 re-fold reproduces byte-identical epics rows (f
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM subagent_invocations");
   db.run("DELETE FROM epic_tombstones");
   drainAll();
@@ -8590,6 +8599,7 @@ test("blob-driven projections: cursor=0 re-fold is byte-identical (post-shed, bo
   db.run("DELETE FROM file_attributions");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   expect(snapshotBlobDrivenProjections()).toEqual(live);
