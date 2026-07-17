@@ -279,7 +279,9 @@ import { nodeResumeResolveFs } from "./resume-resolve";
 import { perRootStoredWhileOffNote } from "./rpc-handlers";
 import { readOsStartTime, seedKilledSweep } from "./seed-sweep";
 import {
+  AWAIT_NOT_CANCELLABLE_MESSAGE,
   type BootCompleteMessage,
+  decideAwaitCancel,
   isPidAlive,
   type KickMessage,
   type ReplayRequestMessage,
@@ -9476,7 +9478,47 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           const ts = Date.now() / 1000;
           let data: Record<string, unknown>;
           if (request.op === "cancel") {
-            data = { op: "cancel", await_id: request.await_id };
+            // Producer-side owner fence (ADR 0072): authorize against the
+            // committed arming session, deny by default. Foreign/absent/terminal
+            // return one uniform refusal (no existence oracle); a re-cancel of an
+            // already-cancelled row is an idempotent no-op success. The fold
+            // stays owner-blind, so historical tokenless cancels replay identically.
+            const row = db
+              .query(
+                "SELECT target_session, status FROM awaits WHERE await_id = ?",
+              )
+              .get(request.await_id) as
+              | { target_session: string | null; status: string }
+              | undefined;
+            const callerSession =
+              typeof request.caller_session === "string" &&
+              request.caller_session.length > 0
+                ? request.caller_session
+                : null;
+            const decision = decideAwaitCancel(
+              row,
+              callerSession,
+              request.force === true,
+            );
+            if (decision.kind !== "append") {
+              sw.postMessage({
+                type: "request-await-result",
+                id,
+                ok: decision.kind === "noop",
+                ...(decision.kind === "refuse"
+                  ? { error: AWAIT_NOT_CANCELLABLE_MESSAGE }
+                  : {}),
+              } satisfies RequestAwaitResultMessage);
+              return;
+            }
+            data =
+              decision.forcedBy !== null
+                ? {
+                    op: "cancel",
+                    await_id: request.await_id,
+                    forced_by: decision.forcedBy,
+                  }
+                : { op: "cancel", await_id: request.await_id };
           } else {
             const document = readSpillDocument(
               "await",
@@ -11101,6 +11143,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       });
       wakePending = true;
       pumpWakes();
+      if (hookEvent === "AwaitFiring") {
+        // Fence the follow-up launch on the fold's compare-and-set (ADR 0072).
+        // `pumpWakes` folded synchronously, so the committed row now reflects
+        // the emitting transaction: the fire is valid only if it left the row
+        // `firing`. A cancel that folded first leaves it `cancelled`, so this
+        // acks false and the worker aborts pre-launch — the follow-up never
+        // fires. A fire that folds first leaves a later cancel an idempotent
+        // no-op. Without this, the fold guards the projection but the worker
+        // still launches, so cancel would be advisory.
+        const row = db
+          .query("SELECT status FROM awaits WHERE await_id = ?")
+          .get(payload.await_id) as { status: string } | undefined;
+        return row?.status === "firing";
+      }
       return true;
     } catch (err) {
       console.error(

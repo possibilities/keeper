@@ -9141,6 +9141,75 @@ test("AwaitRequested cancel folds a waiting row to cancelled", () => {
   ]);
 });
 
+/** Insert one AwaitFiring lifecycle marker (the worker's fire round-trip). */
+function awaitFiringEvent(awaitId: string): number {
+  return insertEvent({
+    hook_event: "AwaitFiring",
+    event_type: "awaits",
+    session_id: awaitId,
+    data: JSON.stringify({ await_id: awaitId }),
+  });
+}
+
+function awaitCancelEvent(
+  awaitId: string,
+  extra: Record<string, unknown> = {},
+): number {
+  return insertEvent({
+    hook_event: "AwaitRequested",
+    event_type: "awaits",
+    session_id: awaitId,
+    data: JSON.stringify({ op: "cancel", await_id: awaitId, ...extra }),
+  });
+}
+
+test("cancel-then-fire: a cancel that folds first suppresses the follow-up fire (fold-level fence)", () => {
+  awaitRequestedEvent("await-ctf");
+  drainAll();
+  awaitCancelEvent("await-ctf");
+  drainAll();
+  // The fire event arrives AFTER the cancel folded; the AwaitFiring CAS
+  // (status IN waiting|firing) finds a cancelled row and no-ops.
+  awaitFiringEvent("await-ctf");
+  drainAll();
+  expect(getAwaits()).toMatchObject([
+    { await_id: "await-ctf", status: "cancelled", claimed_at: null },
+  ]);
+});
+
+test("fire-then-cancel: a fire that folds first leaves a later cancel an idempotent no-op", () => {
+  awaitRequestedEvent("await-ftc");
+  drainAll();
+  awaitFiringEvent("await-ftc");
+  drainAll();
+  expect(getAwaits()).toMatchObject([
+    { await_id: "await-ftc", status: "firing" },
+  ]);
+  // The cancel CAS (status = 'waiting') finds a firing row and no-ops.
+  awaitCancelEvent("await-ftc");
+  drainAll();
+  expect(getAwaits()).toMatchObject([
+    { await_id: "await-ftc", status: "firing" },
+  ]);
+});
+
+test("a --force cancel's forced_by marker folds owner-blind (identical to a tokenless cancel)", () => {
+  awaitRequestedEvent("await-forced");
+  drainAll();
+  const eventId = awaitCancelEvent("await-forced", { forced_by: "operator-9" });
+  drainAll();
+  // The fold ignores the audit marker — same cancelled row a tokenless cancel
+  // yields, so historical cancel events replay identically.
+  expect(getAwaits()).toMatchObject([
+    {
+      await_id: "await-forced",
+      status: "cancelled",
+      claimed_at: null,
+      last_event_id: eventId,
+    },
+  ]);
+});
+
 test("malformed AwaitRequested is a safe no-op while the Cursor advances", () => {
   const malformedId = insertEvent({
     hook_event: "AwaitRequested",

@@ -1028,7 +1028,7 @@ export interface RunDeps {
  * the caller's captured state.
  */
 export interface RunResult {
-  /** Was the armed line emitted? */
+  /** Did the await latch armed? Latches regardless of `--no-armed-line`. */
   armed: boolean;
   /** Terminal line text (post-sanitize), or null if none emitted yet. */
   terminalLine: string | null;
@@ -1565,11 +1565,19 @@ export async function runAwait(
   };
 
   const emitArmed = (initials: AwaitState[]): void => {
-    if (args.noArmedLine || state.armed) {
+    if (state.armed) {
       return;
     }
+    // Latch the armed state on the first arming tick regardless of
+    // `--no-armed-line` — the flag suppresses only the printed line below,
+    // never the lifecycle flip. This keeps the JSON envelope's `armed`
+    // truthful and lets the require-transition edge guard, the reconnect-blip
+    // swallow, and progress logging engage exactly as they do without the flag.
     state.armed = true;
     state.result.armed = true;
+    if (args.noArmedLine) {
+      return;
+    }
     let fields: Record<string, string>;
     if (single && slots[0]?.kind === "plan") {
       // Byte-identical single-plan line shape (external contract).
@@ -2418,11 +2426,10 @@ export async function runAwait(
       }
       emitArmed(evals.map((e) => e ?? { kind: "waiting" }));
       justArmed = state.armed;
-      // Task 2: arm the heartbeat once we've passed every synchronous refusal
-      // above — regardless of `--no-armed-line` (which only suppresses the
-      // line `emitArmed` itself would print, never `state.armed`'s flip; see
-      // that function). Idempotent, so this re-running every tick under
-      // `--no-armed-line` (state.armed never flips there) is harmless.
+      // Arm the heartbeat once we've passed every synchronous refusal above.
+      // `state.armed` latches here regardless of `--no-armed-line` (which
+      // suppresses only the printed line), so this block runs once and the
+      // timer is armed once.
       ensureHeartbeatTimer();
     }
 
@@ -3135,11 +3142,91 @@ async function listDurableAwaits(sock: string): Promise<void> {
   process.stdout.write(`${JSON.stringify(rows)}\n`);
 }
 
+const CANCEL_HELP = `keeper await cancel <await-id> [--force]
+
+Retire a WAITING durable await so its follow-up never fires. Only the arming
+session may cancel its own await; --force is an audited operator override that
+cancels another session's await and records the acting identity. An unknown id,
+an already-settled await, and a foreign await all return one uniform
+not-cancellable refusal (exit 1); re-cancelling an already-cancelled await is a
+no-op success.
+
+  --force        Operator override: cancel an await this session did not arm
+  --sock <path>  Socket override ($KEEPER_SOCK / default)
+  --help         Show this help
+`;
+
+/**
+ * `keeper await cancel <await-id>` — send `request_await` `op:'cancel'` with the
+ * caller's resolved arming identity so main's producer-side owner fence can
+ * authorize it. `--force` requests the audited operator override.
+ */
+async function cancelDurableAwait(rest: string[]): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: rest,
+    options: {
+      force: { type: "boolean" },
+      sock: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
+    allowPositionals: true,
+  });
+  if (values.help === true) {
+    process.stdout.write(CANCEL_HELP);
+    return;
+  }
+  const awaitId = positionals[0];
+  if (awaitId === undefined || positionals.length !== 1) {
+    process.stderr.write(
+      "keeper await cancel: exactly one <await-id> is required\n\n",
+    );
+    process.stderr.write(CANCEL_HELP);
+    process.exit(EXIT_USAGE);
+  }
+  const sock = values.sock ?? resolveSockPath();
+  const { session } = resolveSession({ sessionFlag: undefined });
+  const rpcId = crypto.randomUUID();
+  try {
+    const response = await roundTrip(
+      sock,
+      {
+        type: "rpc",
+        id: rpcId,
+        method: "request_await",
+        params: {
+          op: "cancel",
+          await_id: awaitId,
+          caller_session: session,
+          ...(values.force === true ? { force: true } : {}),
+        },
+      },
+      rpcId,
+    );
+    if (response.type !== "rpc_result")
+      throw new Error(
+        response.type === "error" ? response.message : "unexpected response",
+      );
+    process.stdout.write(`${JSON.stringify(response.value)}\n`);
+    return;
+  } catch (err) {
+    process.stderr.write(
+      `keeper await: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  }
+}
+
 export async function main(argv: string[]): Promise<void> {
   // `list` is a read-only durable-intent surface, intentionally outside the
   // in-process condition grammar.
   if (argv[0] === "list" || (argv[0] === "--durable" && argv[1] === "list")) {
     await listDurableAwaits(resolveSockPath());
+    return;
+  }
+  // `cancel <await-id>` retires a waiting durable await — likewise outside the
+  // condition grammar. The owner fence is enforced producer-side.
+  if (argv[0] === "cancel") {
+    await cancelDurableAwait(argv.slice(1));
     return;
   }
   const parsed = parseAwaitArgs(argv);

@@ -849,7 +849,7 @@ function validateRequestAwaitParams(params: unknown): RequestAwaitParams {
   const await_id = validateAwaitId(obj.await_id);
   const known =
     obj.op === "cancel"
-      ? new Set(["op", "await_id"])
+      ? new Set(["op", "await_id", "caller_session", "force"])
       : new Set([
           "op",
           "await_id",
@@ -866,7 +866,28 @@ function validateRequestAwaitParams(params: unknown): RequestAwaitParams {
     );
   }
   if (obj.op === "cancel") {
-    return { op: "cancel", await_id };
+    // The owner fence itself is producer-side (main reads the DB); the handler
+    // only shapes and forwards the caller-supplied identity + override.
+    const caller_session = obj.caller_session;
+    if (
+      caller_session !== undefined &&
+      caller_session !== null &&
+      typeof caller_session !== "string"
+    ) {
+      throw new BadParamsError(
+        "request_await: `caller_session` must be a string or null",
+      );
+    }
+    const force = obj.force;
+    if (force !== undefined && typeof force !== "boolean") {
+      throw new BadParamsError("request_await: `force` must be a boolean");
+    }
+    return {
+      op: "cancel",
+      await_id,
+      ...(caller_session !== undefined ? { caller_session } : {}),
+      ...(force !== undefined ? { force } : {}),
+    };
   }
   const condition_spec = validateDurableConditionSpec(obj.condition_spec);
   if (typeof obj.doc_path !== "string" || obj.doc_path.length === 0) {
