@@ -47,5 +47,5 @@ Extend fake Pi API tests to assert registration only for tracked sessions, autom
 - [ ] Focused extension, projection, and refold suites pass.
 
 ## Done summary
-
+Wired the shared command-mode Monitor into the tracked Pi extension: fail-open registration, automated batch/terminal notifications via steer delivery, task-id provenance threaded into PostToolUse:Monitor, Stop snapshot union of live monitors (kind:monitor) and the Agent Bus child (kind:ambient), and shutdown fencing that stops every live monitor before teardown.
 ## Evidence
