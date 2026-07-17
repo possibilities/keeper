@@ -52,5 +52,7 @@ envelope hint fields. problem-codes rows reconciled.
 - [ ] problem-codes wording matches the new CAS semantics and the touched suites pass plus the fast gate
 
 ## Done summary
-
+Implemented selection-scoped publication CAS retries, excluded-prefix drift tolerance, whole-tree hook guards, and actionable jam diagnostics. Operator landed the verified seven-path diff through the exact-path plain-git escape after commit-work rejected a killed provider-leg claim.
 ## Evidence
+- Commits: e3930aa7254e77b671e03f4434dd91f795b006f1
+- Tests: bun test ./test/commit-work.test.ts — 92 pass, 0 fail, bun test ./test/slow/commit-work-publication-realgit.test.ts --timeout 15000 — 51 pass, 0 fail, bun run test:gate — 9194 pass, 2 skip, 0 fail, git diff --check — clean, provider leg e33892ac folded killed and pid 6011 absent before exact-path commit
