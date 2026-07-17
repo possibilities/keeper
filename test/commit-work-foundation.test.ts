@@ -552,6 +552,9 @@ describe("readOwnershipClaims", () => {
       "UPDATE jobs SET last_event_id = ? WHERE job_id = 'receipt-pending'",
       [receiptTerminal.lastInsertRowid],
     );
+    db.run(
+      "UPDATE reducer_state SET last_event_id = (SELECT MAX(id) FROM events) WHERE id = 1",
+    );
     db.close();
     writeFileSync(
       join(eventsLogDir, "resume-receipt.ndjson"),
@@ -622,7 +625,7 @@ describe("readOwnershipClaims", () => {
     ]);
   });
 
-  test("durable terminal claims require the same session's event-log tail", () => {
+  test("durable terminal claims require cursor-fresh lifecycle evidence", () => {
     const { db } = openDb(dbPath, { migrate: false });
     db.run(
       `INSERT INTO jobs (job_id, created_at, state, updated_at)
@@ -687,6 +690,9 @@ describe("readOwnershipClaims", () => {
          (project_dir, updated_at, attribution_event_id)
        SELECT '/repo', 1, MAX(id) FROM events`,
     );
+    db.run(
+      "UPDATE reducer_state SET last_event_id = (SELECT MAX(id) FROM events) WHERE id = 1",
+    );
     db.close();
     mkdirSync(join(birthDir, "pending"));
     writeFileSync(
@@ -750,7 +756,7 @@ describe("readOwnershipClaims", () => {
         expect.objectContaining({
           path: "durable-cross-repo.ts",
           sessionId: "durable-cross-repo",
-          liveness: "unknown",
+          liveness: "terminal",
           state: "ended",
           source: "tool",
         }),
@@ -811,6 +817,9 @@ describe("readOwnershipClaims", () => {
       `INSERT INTO git_status
          (project_dir, updated_at, attribution_event_id)
        SELECT '/repo', 1, MAX(id) FROM events`,
+    );
+    db.run(
+      "UPDATE reducer_state SET last_event_id = (SELECT MAX(id) FROM events) WHERE id = 1",
     );
     db.close();
 

@@ -370,8 +370,8 @@ function readReceiptClaims(
         }
         // Receipt order relative to a folded terminal event is unknowable until
         // ingestion assigns an event id. Any unread lifecycle, prompt, tool, or
-        // other session event therefore keeps every claim non-terminal. This
-        // catches a resume receipt even when it carries no mutation path.
+        // other session event therefore keeps that session's claims non-terminal.
+        // This catches a resume receipt even when it carries no mutation path.
         unorderedSessions.add(sessionId);
         if (receiptCanonicalizationUnavailable(record.bindings)) return null;
         const mutationPath = mutationPathFromReceipt(record.bindings);
@@ -806,6 +806,9 @@ function unresolvedDeadLetterEvidence(
   }
 }
 
+const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
+  "'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest', 'Notification'";
+
 interface OrderedTerminalProofInput {
   mutationEventId: number | null;
   sessionId: string;
@@ -813,7 +816,8 @@ interface OrderedTerminalProofInput {
   terminalEventId: number | null;
   terminalSessionId: string | null;
   terminalHookEvent: string | null;
-  sessionTailEventId: number | null;
+  sessionLifecycleTailEventId: number | null;
+  reducerCursorEventId: number;
 }
 
 function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
@@ -821,7 +825,8 @@ function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
     row.mutationEventId !== null &&
     row.terminalEventId !== null &&
     row.terminalEventId > row.mutationEventId &&
-    row.terminalEventId === row.sessionTailEventId &&
+    row.reducerCursorEventId >= row.terminalEventId &&
+    row.terminalEventId === row.sessionLifecycleTailEventId &&
     row.terminalSessionId === row.sessionId &&
     ((row.state === "ended" && row.terminalHookEvent === "SessionEnd") ||
       (row.state === "killed" && row.terminalHookEvent === "Killed"))
@@ -859,7 +864,8 @@ export function readOwnershipClaims(
                   terminal.hook_event AS terminal_hook_event,
                   (SELECT MAX(tail.id)
                      FROM events tail
-                    WHERE tail.session_id = fa.session_id) AS session_tail_event_id
+                    WHERE tail.session_id = fa.session_id
+                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id
              FROM file_attributions fa
              LEFT JOIN jobs j ON j.job_id = fa.session_id
              LEFT JOIN events terminal ON terminal.id = j.last_event_id
@@ -879,7 +885,7 @@ export function readOwnershipClaims(
         terminal_event_id: number | null;
         terminal_session_id: string | null;
         terminal_hook_event: string | null;
-        session_tail_event_id: number | null;
+        session_lifecycle_tail_event_id: number | null;
       }>;
       if (durable.length > DURABLE_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -922,6 +928,12 @@ export function readOwnershipClaims(
         } | null
       )?.max_id;
       const head = headValue ?? 0;
+      const reducerCursorValue = (
+        db
+          .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+          .get() as { last_event_id: unknown } | null
+      )?.last_event_id;
+      const reducerCursor = reducerCursorValue ?? 0;
       if (
         typeof floor !== "number" ||
         !Number.isSafeInteger(floor) ||
@@ -929,6 +941,10 @@ export function readOwnershipClaims(
         typeof head !== "number" ||
         !Number.isSafeInteger(head) ||
         head < 0 ||
+        typeof reducerCursor !== "number" ||
+        !Number.isSafeInteger(reducerCursor) ||
+        reducerCursor < 0 ||
+        reducerCursor > head ||
         floor > head
       ) {
         db.run("ROLLBACK");
@@ -946,7 +962,8 @@ export function readOwnershipClaims(
                   terminal.hook_event AS terminal_hook_event,
                   (SELECT MAX(tail.id)
                      FROM events tail
-                    WHERE tail.session_id = e.session_id) AS session_tail_event_id
+                    WHERE tail.session_id = e.session_id
+                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id
              FROM events e
              LEFT JOIN jobs j ON j.job_id = e.session_id
              LEFT JOIN events terminal ON terminal.id = j.last_event_id
@@ -970,7 +987,7 @@ export function readOwnershipClaims(
         terminal_event_id: number | null;
         terminal_session_id: string | null;
         terminal_hook_event: string | null;
-        session_tail_event_id: number | null;
+        session_lifecycle_tail_event_id: number | null;
       }>;
       if (pending.length > PENDING_DIRECT_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -986,7 +1003,8 @@ export function readOwnershipClaims(
           terminalEventId: row.terminal_event_id,
           terminalSessionId: row.terminal_session_id,
           terminalHookEvent: row.terminal_hook_event,
-          sessionTailEventId: row.session_tail_event_id,
+          sessionLifecycleTailEventId: row.session_lifecycle_tail_event_id,
+          reducerCursorEventId: reducerCursor,
         });
         const claim: OwnershipClaim = {
           path: row.file_path,
@@ -1018,7 +1036,8 @@ export function readOwnershipClaims(
           terminalEventId: row.terminal_event_id,
           terminalSessionId: row.terminal_session_id,
           terminalHookEvent: row.terminal_hook_event,
-          sessionTailEventId: row.session_tail_event_id,
+          sessionLifecycleTailEventId: row.session_lifecycle_tail_event_id,
+          reducerCursorEventId: reducerCursor,
         });
         claims.push({
           path: relativePath,
@@ -1026,9 +1045,8 @@ export function readOwnershipClaims(
           // A pending mutation can be newer than jobs.state, so a bare
           // non-working projection is never terminal proof. The job reducer's
           // exact last_event_id is sufficient only when it names a matching
-          // terminal lifecycle event ordered after this mutation and remains
-          // the same session's event-log tail in this SQLite snapshot. That
-          // tail check also catches a resume event ingested ahead of its fold.
+          // terminal lifecycle event ordered after this mutation, folded by the
+          // reducer cursor, and still the same session's last lifecycle word.
           liveness:
             row.state === "working"
               ? "live"
