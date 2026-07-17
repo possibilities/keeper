@@ -69,5 +69,5 @@ test.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Pre-boot wrapped-leg deaths are now attributable: a producer-side, best-effort pane capture at the Killed mint (gated to wrapped legs) rides redacted, byte-bounded abort evidence + a structured exit signal/code on the schema-v2 death notice via the immutable event payload (no fold change, no migration), degrading to a typed capture-unavailable marker. ADR 0077, contract prose, and the glossary record where the evidence lives.
 ## Evidence
