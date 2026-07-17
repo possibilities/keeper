@@ -1028,7 +1028,7 @@ export interface RunDeps {
  * the caller's captured state.
  */
 export interface RunResult {
-  /** Was the armed line emitted? */
+  /** Did the await latch armed? Latches regardless of `--no-armed-line`. */
   armed: boolean;
   /** Terminal line text (post-sanitize), or null if none emitted yet. */
   terminalLine: string | null;
@@ -1565,11 +1565,19 @@ export async function runAwait(
   };
 
   const emitArmed = (initials: AwaitState[]): void => {
-    if (args.noArmedLine || state.armed) {
+    if (state.armed) {
       return;
     }
+    // Latch the armed state on the first arming tick regardless of
+    // `--no-armed-line` — the flag suppresses only the printed line below,
+    // never the lifecycle flip. This keeps the JSON envelope's `armed`
+    // truthful and lets the require-transition edge guard, the reconnect-blip
+    // swallow, and progress logging engage exactly as they do without the flag.
     state.armed = true;
     state.result.armed = true;
+    if (args.noArmedLine) {
+      return;
+    }
     let fields: Record<string, string>;
     if (single && slots[0]?.kind === "plan") {
       // Byte-identical single-plan line shape (external contract).
@@ -2418,11 +2426,10 @@ export async function runAwait(
       }
       emitArmed(evals.map((e) => e ?? { kind: "waiting" }));
       justArmed = state.armed;
-      // Task 2: arm the heartbeat once we've passed every synchronous refusal
-      // above — regardless of `--no-armed-line` (which only suppresses the
-      // line `emitArmed` itself would print, never `state.armed`'s flip; see
-      // that function). Idempotent, so this re-running every tick under
-      // `--no-armed-line` (state.armed never flips there) is harmless.
+      // Arm the heartbeat once we've passed every synchronous refusal above.
+      // `state.armed` latches here regardless of `--no-armed-line` (which
+      // suppresses only the printed line), so this block runs once and the
+      // timer is armed once.
       ensureHeartbeatTimer();
     }
 

@@ -1949,6 +1949,59 @@ test("--require-transition: skip already-true first paint, fire on next snapshot
 });
 
 // ---------------------------------------------------------------------------
+// --no-armed-line + --require-transition combined: the armed latch is truthful
+// even with the printed line suppressed, so an already-met condition does not
+// fire at the arm tick and a genuine later edge still fires.
+// ---------------------------------------------------------------------------
+
+test("--no-armed-line + --require-transition: no arm-tick fire, fires on a later edge, armed latches truthfully", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  const result = await runAwait(
+    singleArgs("started", "fn-1-foo.1", "task", {
+      noArmedLine: true,
+      requireTransition: true,
+    }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: the task is ALREADY started (an instant `met`, no dwell). The
+  // armed state latches despite --no-armed-line (so no line is printed), and
+  // that latch is what lets --require-transition suppress the arm-tick fire.
+  // Without the latch fix the guard never engages and met fires here — the bug.
+  const taskRan = makeTaskRow({
+    runtime_status: "in_progress",
+    jobs: [{ job_id: "s1", plan_verb: "work", state: "working" }],
+  });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskRan] }));
+  expect(h.stdout).toHaveLength(0);
+  expect(h.exitCode).toBeNull();
+  // The JSON envelope reports the armed state truthfully under the flag.
+  expect(result.armed).toBe(true);
+
+  // A genuine later edge (the next snapshot after arm) fires met.
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ tasks: [taskRan] })],
+      2,
+    ),
+  ]);
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
 // Drop + re-query hit → met (epic complete, popped off the board).
 // ---------------------------------------------------------------------------
 
