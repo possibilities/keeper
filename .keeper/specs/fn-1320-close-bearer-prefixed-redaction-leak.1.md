@@ -24,5 +24,5 @@ Files:
       least one punctuated form (e.g. `AUTH_TOKEN=bearer.foo`) redact.
 
 ## Done summary
-
+Tightened SENSITIVE_KEY_RE's Bearer lookahead from (?!bearer\b) to (?!bearer\s) so glued/punctuated bearer-prefixed sensitive-key values (Authorization:Bearer<tok>, AUTH_TOKEN=bearer.foo) redact again; space-separated 'Bearer <token>' still defers to BEARER_RE. Added regression coverage.
 ## Evidence

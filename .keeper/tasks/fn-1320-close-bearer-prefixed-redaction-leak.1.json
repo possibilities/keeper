@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Tighten bearer-prefix redaction lookahead",
-  "updated_at": "2026-07-17T22:44:46.492000Z"
+  "updated_at": "2026-07-17T22:48:48.713000Z",
+  "worker_done_at": "2026-07-17T22:48:48.713000Z"
 }
