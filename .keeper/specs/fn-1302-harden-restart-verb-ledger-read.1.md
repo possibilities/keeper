@@ -48,5 +48,5 @@ and/or `test/restart-verb.test.ts`.
 - [ ] Existing restart-verb tests stay green.
 
 ## Done summary
-
+Routed cli/restart.ts's readLatestBoot through resolveRestartLedgerPath() so a KEEPER_RESTART_LEDGER override reaches both writer and reader; corrected the stale sole-reader/writer comment in src/db.ts; added a real-ledger-parse test (torn line, interleaved non-boot lines, last-valid-boot-wins) and a healthy-probes-but-stale-boot -> health-timeout test.
 ## Evidence
