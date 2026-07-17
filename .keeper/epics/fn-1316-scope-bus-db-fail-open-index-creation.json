@@ -7,7 +7,7 @@
     "fn-1314-bounded-bus-retention-and-presence"
   ],
   "id": "fn-1316-scope-bus-db-fail-open-index-creation",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T18:30:13.096000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T18:30:12.212000Z"
+  "updated_at": "2026-07-17T18:30:13.096000Z"
 }
