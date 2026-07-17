@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 15
+      },
+      "done_summary": "Excluded the bare Bearer scheme word from SENSITIVE_KEY_RE's value capture so the AUTH key arm no longer eats 'Bearer', letting BEARER_RE redact an opaque non-JWT token on an Authorization header while the scheme survives. Added an end-to-end regression test.",
+      "input_hash": "6e2b39568acba7ed7941b416ee36daf7941d1567e22ff0d64a73874e7f9eb59e",
+      "model": "opus",
+      "spec_chars": 1854,
+      "spec_md": "## Description\n\nFixes F1 (merges F4). In `src/provider-leg-death-notice.ts`,\n`redactAbortEvidence` (function at ~:263, regexes `SENSITIVE_KEY_RE` ~:235\nand `BEARER_RE` ~:239) leaks an opaque bearer token: on\n`Authorization: Bearer <token>`, `SENSITIVE_KEY_RE`'s `AUTH` key arm matches\nthe `Authorization` key and captures `Bearer` (the `\\S+` value) for\nredaction, leaving `<token>` and destroying the `Bearer ` prefix that\n`BEARER_RE` (which runs next) needs \u2014 so a non-JWT opaque token survives.\nEvidence path: read `redactAbortEvidence` and trace\n`Authorization: Bearer <opaque-token>` through the three redaction arms in\norder.\n\nFix (pick the cleanest): run `BEARER_RE` before `SENSITIVE_KEY_RE`, or drop\nthe `AUTH` arm from `SENSITIVE_KEY_RE` (the bearer arm already covers\nAuthorization headers), or exclude scheme keywords from the key regex's\n`\\S+` value capture. Keep the \"fails toward more redaction\" intent \u2014 do not\nweaken existing key/JWT/token coverage, and keep SHAs and UUIDs preserved as\nforensic correlators.\n\nF4 (merged): add the currently-missing regression test in the\n`redactAbortEvidence` test file covering\n`Authorization: Bearer <opaque-non-JWT-token>` end to end.\n\nFiles: `src/provider-leg-death-notice.ts` and its redaction test.\n\n## Acceptance\n\n- [ ] `Authorization: Bearer <opaque-non-JWT-token>` redacts the token, leaving the scheme/key structure intact\n- [ ] JWT-shaped bearer, key-denylist `KEY=value`, and token-shape cases still redact; SHAs/UUIDs still survive\n- [ ] A new regression test directly exercises the opaque-bearer path\n\n## Done summary\nExcluded the bare Bearer scheme word from SENSITIVE_KEY_RE's value capture so the AUTH key arm no longer eats 'Bearer', letting BEARER_RE redact an opaque non-JWT token on an Authorization header while the scheme survives. Added an end-to-end regression test.\n## Evidence\n",
+      "task_id": "fn-1319-fix-bearer-token-redaction-ordering-in.1",
+      "tier": "high",
+      "title": "Fix opaque-bearer redaction leak"
+    }
+  ],
+  "created_at": "2026-07-17T22:44:42.073000Z",
+  "epic_id": "fn-1319-fix-bearer-token-redaction-ordering-in",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "6e2b39568acba7ed7941b416ee36daf7941d1567e22ff0d64a73874e7f9eb59e",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
