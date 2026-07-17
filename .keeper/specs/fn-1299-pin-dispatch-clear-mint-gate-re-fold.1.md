@@ -19,5 +19,5 @@ Files: `src/reducer.ts` (fold comment), the reducer re-fold / `refold-equivalenc
 - [ ] No production behavior change; existing tests stay green.
 
 ## Done summary
-
+Documented the exact-attempt-vs-legacy-null re-fold safety rationale at both dispatch_mint_gate DELETE sites in foldDispatchCleared and added a re-fold test pinning the legacy-null gate-row behavior under a full cursor=0 replay.
 ## Evidence
