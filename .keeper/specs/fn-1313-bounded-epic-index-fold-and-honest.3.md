@@ -67,5 +67,5 @@ file is not collected.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Added the bench-folds named opt-in gate (test/slow/fold-cost-bench.test.ts, bun run test:bench-folds), pinning the epic-fold memoized index-serving path as flat and the syncPlanLinks commit-trailer prefix cost inside a regression band, with manifest/gate-runner/package.json registration and revised docs/testing.md slow-tier framing.
 ## Evidence
