@@ -307,6 +307,35 @@ shell command, run it via Bash.
 On any `failed`, surface the terminal line to the user verbatim and ask
 how they want to proceed — do NOT silently run the follow-up.
 
+## Durable awaits (`--durable`) — a spawned session, not a self-wake
+
+`keeper await <condition…> --durable` persists a server-evaluable wait and
+returns immediately; when the condition is met, **keeperd dispatches a fresh
+worker session** carrying the recorded follow-up prompt. That spawned session
+re-orients and acts independently — it is NOT a notification to the arming
+session.
+
+Use `--durable` only when the follow-up is genuine fire-and-forget WORK a
+fresh session should own (a review, a next planning round). Do NOT use it as
+a milestone wake-up for a supervising session: each fired await costs a full
+worker spawn, and the spawn acts on its own rather than waking you.
+
+**Supervisor self-wake pattern** (zero spawns — the right shape when a
+long-lived session wants to be re-entered on a condition, and the only shape
+for a Pi session, whose harness lacks background-completion callbacks): run a
+plain blocking await in a detached tmux window and bus-message your own
+session on met — your open bus inbox delivers the wake into your existing
+context:
+
+```bash
+tmux new-window -d "keeper await complete fn-12-add-oauth.3 --timeout 24h \
+  && keeper bus chat send <your-session-name> 'AWAIT MET: fn-12.3 complete — re-orient'"
+```
+
+One tiny process per condition; the window exits after the send. A Claude
+session may instead run the same blocking await via Bash `run_in_background`
+and let the harness completion callback re-invoke it.
+
 ## One-shot check (`--probe`)
 
 For "would this fire right now, and if not, why?" without blocking — a
