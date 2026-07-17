@@ -41,8 +41,8 @@ import {
   detectInProgressOperation,
   type InProgressOperation,
   isMassReversion,
-  sharedCheckoutJam,
   type SharedCheckoutJam,
+  sharedCheckoutJam,
 } from "../src/commit-work/repo-state";
 import {
   type ClaimLiveness,
@@ -925,7 +925,9 @@ interface CommitWorkAuthorityRow {
 }
 
 export type CommitWorkAuthorityVerdict =
-  "ok" | "identity_untrusted" | "task_unbound";
+  | "ok"
+  | "identity_untrusted"
+  | "task_unbound";
 
 function readCommitWorkAuthorityRow(
   identity: string,
