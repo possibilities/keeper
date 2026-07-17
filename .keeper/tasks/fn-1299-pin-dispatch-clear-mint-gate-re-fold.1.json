@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T02:10:08.827000Z",
+  "depends_on": [],
+  "epic": "fn-1299-pin-dispatch-clear-mint-gate-re-fold",
+  "id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold.1",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Document and test mint-gate re-fold safety",
+  "updated_at": "2026-07-17T02:10:08.827000Z"
+}
