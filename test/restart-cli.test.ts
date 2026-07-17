@@ -5,12 +5,43 @@ import { join } from "node:path";
 import {
   type CommandResult,
   DEFAULT_RESTART_TIMEOUT_MS,
+  isCaughtUpFrame,
   KICKSTART_TIMEOUT_MS,
   type RestartBootMarker,
   type RestartDeps,
   readLatestBoot,
   runRestart,
 } from "../cli/restart";
+
+describe("isCaughtUpFrame", () => {
+  test("a steady-state memo result frame with no boot header is caught up", () => {
+    // The live serve shape: pre-serialized memo lines carry no boot header and
+    // ride only at steady state.
+    expect(
+      isCaughtUpFrame({
+        type: "result",
+        // biome-ignore lint/suspicious/noExplicitAny: mirrors the wire frame's extra keys
+      } as any),
+    ).toBe(true);
+  });
+
+  test("a result frame positively catching up is not caught up", () => {
+    expect(
+      isCaughtUpFrame({ type: "result", boot: { catching_up: true } }),
+    ).toBe(false);
+  });
+
+  test("a result frame with catching_up false is caught up", () => {
+    expect(
+      isCaughtUpFrame({ type: "result", boot: { catching_up: false } }),
+    ).toBe(true);
+  });
+
+  test("a non-result frame never reads caught up", () => {
+    expect(isCaughtUpFrame({ type: "error" })).toBe(false);
+    expect(isCaughtUpFrame({})).toBe(false);
+  });
+});
 
 class ExitError extends Error {
   constructor(

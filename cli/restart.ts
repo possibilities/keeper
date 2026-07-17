@@ -274,6 +274,20 @@ export async function readLatestBoot(): Promise<RestartBootMarker | null> {
   return latest;
 }
 
+/**
+ * Caught-up verdict for one served reply frame. The serve worker stamps a
+ * `boot` header onto object-form frames while any catch-up state holds, and a
+ * pre-serialized memo line rides ONLY at steady state — so an absent header on
+ * a `result` frame is itself caught-up evidence, and only a positive
+ * `catching_up: true` reads as still booting.
+ */
+export function isCaughtUpFrame(frame: {
+  type?: unknown;
+  boot?: { catching_up?: unknown };
+}): boolean {
+  return frame.type === "result" && frame.boot?.catching_up !== true;
+}
+
 /** One bounded healthy attempt. Connection refusal is simply `false`, never fatal. */
 export async function probeSocketHealth(
   sockPath: string,
@@ -301,7 +315,7 @@ export async function probeSocketHealth(
           type?: unknown;
           boot?: { catching_up?: unknown };
         };
-        finish(frame.type === "result" && frame.boot?.catching_up === false);
+        finish(isCaughtUpFrame(frame));
       } catch {
         finish(false);
       }
