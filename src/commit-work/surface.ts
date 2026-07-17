@@ -6,6 +6,7 @@ import {
   lstatSync,
   openSync,
   readdirSync,
+  readFileSync,
   readSync,
   realpathSync,
 } from "node:fs";
@@ -28,6 +29,7 @@ import {
   defaultDeadLetterDir,
   defaultEventsLogDir,
   openDb,
+  resolveSockPath,
 } from "../db";
 import { parseDeadLetterLine, parseEventLogLine } from "../dead-letter";
 import { extractMutationPath } from "../derivers";
@@ -49,6 +51,16 @@ export interface OwnershipClaim {
   source?: string | null;
   /** Same-snapshot terminal lifecycle event proven later than this mutation. */
   orderedTerminalProof?: true;
+  /** Un-ingested receipts temporarily obscure otherwise-terminal evidence. */
+  receiptsPending?: ReceiptPendingEvidence;
+}
+
+export interface ReceiptPendingEvidence {
+  events: number;
+  seconds: number;
+  stalledIngester: boolean;
+  /** This claim was terminal before its receipt tail made ordering unknown. */
+  otherwiseTerminal?: true;
 }
 
 /**
@@ -95,6 +107,7 @@ export type AdoptionRejectionCode =
   | "clean"
   | "unknown_path"
   | "ownership_conflict"
+  | "receipts_pending"
   | "ownership_unavailable";
 
 export interface AdoptionRejection {
@@ -102,6 +115,7 @@ export interface AdoptionRejection {
   path?: string;
   code: AdoptionRejectionCode;
   conflicting_sessions?: string[];
+  pending_sessions?: string[];
 }
 
 export interface SurfaceDiscoveryResult {
@@ -148,6 +162,10 @@ export interface OwnershipClaimsReadTestHooks {
   afterDeadLetterRead?: () => void;
   /** Test-only seam for a daemon import during a dead-letter disk scan. */
   duringDeadLetterRead?: () => void;
+  /** Test-only daemon liveness probe for receipts-pending diagnostics. */
+  daemonAlive?: () => boolean;
+  /** Test-only clock for receipts-pending lag diagnostics (Unix seconds). */
+  nowSeconds?: () => number;
 }
 
 const EXCLUDED_PREFIX = ".keeper/";
@@ -252,8 +270,28 @@ interface ReceiptClaimsSnapshot {
   claims: OwnershipClaim[];
   /** Sessions with any un-ingested event whose DB ordering is not yet known. */
   unorderedSessions: ReadonlySet<string>;
+  pendingBySession: ReadonlyMap<string, { events: number; oldest: number }>;
   /** Exact descriptor/directory identity recheck after the DB snapshot closes. */
   stillStable: () => boolean;
+}
+
+/** The server worker's ownership lock is the daemon liveness witness. */
+function daemonAlive(): boolean {
+  try {
+    const pid = Number.parseInt(
+      readFileSync(`${resolveSockPath()}.lock`, "utf8").trim(),
+      10,
+    );
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  } catch {
+    return false;
+  }
 }
 
 function readReceiptClaims(
@@ -281,6 +319,10 @@ function readReceiptClaims(
   const stateBySession = new Map<string, string | null>();
   const claims: OwnershipClaim[] = [];
   const unorderedSessions = new Set<string>();
+  const pendingBySession = new Map<
+    string,
+    { events: number; oldest: number }
+  >();
   const identities = new Map<
     string,
     {
@@ -373,6 +415,16 @@ function readReceiptClaims(
         // other session event therefore keeps that session's claims non-terminal.
         // This catches a resume receipt even when it carries no mutation path.
         unorderedSessions.add(sessionId);
+        const timestamp =
+          typeof record.bindings.ts === "number" &&
+          Number.isFinite(record.bindings.ts)
+            ? record.bindings.ts
+            : before.mtimeMs / 1000;
+        const pending = pendingBySession.get(sessionId);
+        pendingBySession.set(sessionId, {
+          events: (pending?.events ?? 0) + 1,
+          oldest: Math.min(pending?.oldest ?? timestamp, timestamp),
+        });
         if (receiptCanonicalizationUnavailable(record.bindings)) return null;
         const mutationPath = mutationPathFromReceipt(record.bindings);
         if (mutationPath === null) continue;
@@ -445,7 +497,9 @@ function readReceiptClaims(
     }
     return true;
   };
-  return stillStable() ? { claims, unorderedSessions, stillStable } : null;
+  return stillStable()
+    ? { claims, unorderedSessions, pendingBySession, stillStable }
+    : null;
 }
 
 interface BirthSessionsSnapshot {
@@ -1071,11 +1125,38 @@ export function readOwnershipClaims(
         transactionOpen = false;
         return null;
       }
+      const now = testHooks.nowSeconds?.() ?? Date.now() / 1000;
+      const observedNow = Number.isFinite(now) ? now : Date.now() / 1000;
+      let ingesterLive = false;
+      try {
+        ingesterLive = testHooks.daemonAlive?.() ?? daemonAlive();
+      } catch {
+        // A liveness probe failure cannot honestly claim an active ingester.
+      }
+      const pendingEvidence = (sessionId: string): ReceiptPendingEvidence => {
+        const pending = receiptSnapshot.pendingBySession.get(sessionId);
+        // `unorderedSessions` is populated from the same records as this map.
+        // Keep the fallback defensive so a malformed future reader fails closed.
+        const oldest = pending?.oldest ?? observedNow;
+        return {
+          events: pending?.events ?? 0,
+          seconds: Math.max(0, observedNow - oldest),
+          stalledIngester: !ingesterLive,
+        };
+      };
       for (const claim of claims) {
         if (!receiptSnapshot.unorderedSessions.has(claim.sessionId)) continue;
+        const otherwiseTerminal = claim.orderedTerminalProof === true;
         claim.liveness = claim.state === "working" ? "live" : "unknown";
+        claim.receiptsPending = {
+          ...pendingEvidence(claim.sessionId),
+          ...(otherwiseTerminal ? { otherwiseTerminal: true } : {}),
+        };
         delete claim.orderedTerminalProof;
       }
+      // A receipt-only mutation is never otherwise-terminal evidence. When it
+      // overlaps a durable terminal claim, mergeClaims preserves that claim's
+      // receipt-pending annotation; a new direct claim remains unknown.
       claims.push(...receiptSnapshot.claims);
       const birthSnapshot = readBirthSessions(
         testHooks.birthDir ?? defaultCommitWorkBirthDir(),
@@ -1089,6 +1170,7 @@ export function readOwnershipClaims(
         if (!birthSnapshot.sessions.has(claim.sessionId)) continue;
         claim.liveness = claim.state === "working" ? "live" : "unknown";
         delete claim.orderedTerminalProof;
+        delete claim.receiptsPending;
       }
       testHooks.afterReceiptRead?.();
       db.run("COMMIT");
@@ -1163,6 +1245,7 @@ export function readOwnershipClaims(
         if (!deadLetterSessions.has(claim.sessionId)) continue;
         claim.liveness = claim.state === "working" ? "live" : "unknown";
         delete claim.orderedTerminalProof;
+        delete claim.receiptsPending;
       }
       return claims;
     } finally {
@@ -1368,11 +1451,21 @@ function mergeClaims(
       // Direct observations are added after durable rows. Preserve any exact
       // component the newer observation omits, but let its non-null OID/mode
       // replace a null or stale durable identity.
+      const receiptsPending =
+        normalized.receiptsPending === undefined
+          ? previous.receiptsPending
+          : {
+              ...normalized.receiptsPending,
+              ...(previous.receiptsPending?.otherwiseTerminal === true
+                ? { otherwiseTerminal: true as const }
+                : {}),
+            };
       bucket[duplicateAt] = {
         ...previous,
         ...normalized,
         oid: normalized.oid ?? previous.oid,
         mode: normalized.mode ?? previous.mode,
+        ...(receiptsPending === undefined ? {} : { receiptsPending }),
       };
     }
     map.set(claim.path, bucket);
@@ -1387,25 +1480,87 @@ function mergeClaims(
   return map;
 }
 
-function unsafeForeignSessions(
+export interface PendingReceiptBlock {
+  sessionId: string;
+  events: number;
+  seconds: number;
+  stalledIngester: boolean;
+}
+
+export interface ForeignOwnershipBlocks {
+  conflicts: string[];
+  receiptsPending: PendingReceiptBlock[];
+}
+
+/**
+ * Separate live/unknown ownership from the narrow case where an otherwise
+ * terminal foreign claim is blocked only until its own receipts are ingested.
+ */
+export function unsafeForeignSessions(
   claims: OwnershipClaim[],
   identity: string | null,
-): string[] {
-  // Adoption needs positive terminal evidence for every foreign claimant.
-  // Missing job rows, stopped rows, classifier failures, and any other unknown
-  // verdict remain conflicts rather than being interpreted as abandonment.
-  return [
-    ...new Set(
-      claims
-        .filter(
-          (claim) =>
-            claimIsExclusiveOwnership(claim) &&
-            claim.sessionId !== identity &&
-            claim.liveness !== "terminal",
-        )
-        .map((claim) => claim.sessionId),
+): ForeignOwnershipBlocks {
+  const bySession = new Map<string, OwnershipClaim[]>();
+  for (const claim of claims) {
+    if (
+      !claimIsExclusiveOwnership(claim) ||
+      claim.sessionId === identity ||
+      claim.liveness === "terminal"
+    ) {
+      continue;
+    }
+    const sessionClaims = bySession.get(claim.sessionId) ?? [];
+    sessionClaims.push(claim);
+    bySession.set(claim.sessionId, sessionClaims);
+  }
+
+  const conflicts: string[] = [];
+  const receiptsPending: PendingReceiptBlock[] = [];
+  for (const [sessionId, sessionClaims] of bySession) {
+    const receipts = sessionClaims.map((claim) => claim.receiptsPending);
+    const pendingOnly =
+      !sessionClaims.some((claim) => claim.liveness === "live") &&
+      receipts.every((receipt) => receipt?.otherwiseTerminal === true);
+    if (!pendingOnly) {
+      conflicts.push(sessionId);
+      continue;
+    }
+    const receipt = receipts.find(
+      (candidate): candidate is ReceiptPendingEvidence =>
+        candidate !== undefined,
+    );
+    if (receipt === undefined) {
+      conflicts.push(sessionId);
+      continue;
+    }
+    receiptsPending.push({
+      sessionId,
+      events: receipt.events,
+      seconds: receipt.seconds,
+      stalledIngester: receipt.stalledIngester,
+    });
+  }
+  return {
+    conflicts: conflicts.sort(),
+    receiptsPending: receiptsPending.sort((left, right) =>
+      left.sessionId.localeCompare(right.sessionId),
     ),
-  ].sort();
+  };
+}
+
+export function summarizeReceiptLag(receipts: readonly PendingReceiptBlock[]): {
+  events: number;
+  seconds: number;
+  stalledIngester: boolean;
+} {
+  return {
+    events: receipts.reduce((total, receipt) => total + receipt.events, 0),
+    seconds: receipts.reduce(
+      (oldest, receipt) => Math.max(oldest, receipt.seconds),
+      0,
+    ),
+    stalledIngester: receipts.some((receipt) => receipt.stalledIngester),
+  };
 }
 
 async function ignoredPaths(
@@ -1574,16 +1729,27 @@ export async function discoverCommitWorkSurface(
       rejections.push({ input, path, code: "ownership_unavailable" });
       continue;
     }
-    const conflicts = unsafeForeignSessions(
+    const blockers = unsafeForeignSessions(
       claimsByPath.get(path) ?? [],
       identity,
     );
-    if (conflicts.length > 0) {
+    if (blockers.conflicts.length > 0) {
       rejections.push({
         input,
         path,
         code: "ownership_conflict",
-        conflicting_sessions: conflicts.slice(0, limit),
+        conflicting_sessions: blockers.conflicts.slice(0, limit),
+      });
+      continue;
+    }
+    if (blockers.receiptsPending.length > 0) {
+      rejections.push({
+        input,
+        path,
+        code: "receipts_pending",
+        pending_sessions: blockers.receiptsPending
+          .map((receipt) => receipt.sessionId)
+          .slice(0, limit),
       });
       continue;
     }
@@ -1595,17 +1761,27 @@ export async function discoverCommitWorkSurface(
         rejections.push({ input, path: peer, code: "excluded" });
         continue;
       }
-      const peerConflicts = unsafeForeignSessions(
+      const peerBlockers = unsafeForeignSessions(
         claimsByPath.get(peer) ?? [],
         identity,
       );
-      if (peerConflicts.length > 0) {
+      if (peerBlockers.conflicts.length > 0) {
         adopted.delete(path);
         rejections.push({
           input,
           path: peer,
           code: "ownership_conflict",
-          conflicting_sessions: peerConflicts.slice(0, limit),
+          conflicting_sessions: peerBlockers.conflicts.slice(0, limit),
+        });
+      } else if (peerBlockers.receiptsPending.length > 0) {
+        adopted.delete(path);
+        rejections.push({
+          input,
+          path: peer,
+          code: "receipts_pending",
+          pending_sessions: peerBlockers.receiptsPending
+            .map((receipt) => receipt.sessionId)
+            .slice(0, limit),
         });
       } else {
         adopted.add(peer);

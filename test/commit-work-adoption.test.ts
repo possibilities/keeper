@@ -137,7 +137,15 @@ describe("commit-work foreign claim adoption", () => {
   });
 
   test("terminal adoption uses per-session cursor-fresh evidence", async () => {
-    const cases = [
+    const cases: Array<{
+      name: string;
+      laterDbSession?: string;
+      laterDbHook?: string;
+      receiptSession?: string;
+      cursor: "head" | "mutation";
+      expected: "terminal" | "unknown";
+      rejection?: "receipts_pending";
+    }> = [
       {
         name: "later unrelated event and another session receipt",
         laterDbSession: "unrelated",
@@ -150,6 +158,7 @@ describe("commit-work foreign claim adoption", () => {
         receiptSession: OTHER,
         cursor: "head",
         expected: "unknown",
+        rejection: "receipts_pending",
       },
       {
         name: "cursor behind terminal event",
@@ -163,7 +172,7 @@ describe("commit-work foreign claim adoption", () => {
         cursor: "head",
         expected: "unknown",
       },
-    ] as const;
+    ];
 
     for (const entry of cases) {
       const dir = mkdtempSync(join(tmpdir(), "keeper-adoption-terminal-"));
@@ -265,7 +274,9 @@ describe("commit-work foreign claim adoption", () => {
           expect(surface.rejections).toEqual([]);
         } else {
           expect(surface.adopted).toEqual([]);
-          expect(surface.rejections[0]?.code).toBe("ownership_conflict");
+          expect(surface.rejections[0]?.code).toBe(
+            entry.rejection ?? "ownership_conflict",
+          );
         }
       } finally {
         rmSync(dir, { recursive: true, force: true });

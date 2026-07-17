@@ -1138,6 +1138,53 @@ describe("commit-work: adoption manifests", () => {
 });
 
 // ---------------------------------------------------------------------------
+// receipts-pending ownership outcome
+// ---------------------------------------------------------------------------
+
+describe("commit-work: receipts pending", () => {
+  for (const stalledIngester of [false, true]) {
+    test(`reports bounded ingest lag with stalled_ingester=${stalledIngester}`, async () => {
+      const { d } = deps({
+        files: ["a.txt"],
+        rules: [
+          {
+            when: (a) => argvStartsWith(a, "check-ignore"),
+            result: { exitCode: 1 },
+          },
+        ],
+      });
+      const { code, stdout } = await runForTest(
+        ["feat: adopt", "--session-id", "s1", "--adopt", "a.txt"],
+        {
+          ...d,
+          readClaims: () => [
+            {
+              path: "a.txt",
+              sessionId: "22222222-2222-4222-8222-222222222222",
+              liveness: "unknown",
+              receiptsPending: {
+                events: 3,
+                seconds: 12,
+                stalledIngester,
+                otherwiseTerminal: true,
+              },
+            },
+          ],
+        },
+      );
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout)).toMatchObject({
+        outcome: "receipts_pending",
+        error: "receipts_pending",
+        ingest_lag_events: 3,
+        ingest_lag_seconds: 12,
+        stalled_ingester: stalledIngester,
+      });
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // no upstream (first push sets it)
 // ---------------------------------------------------------------------------
 

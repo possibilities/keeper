@@ -50,6 +50,8 @@ import {
   type OwnershipClaim,
   type SurfaceDiscoveryDeps,
   type SurfaceDiscoveryResult,
+  summarizeReceiptLag,
+  unsafeForeignSessions,
 } from "../src/commit-work/surface";
 import { emitCommitWorkOutcome } from "../src/commit-work/telemetry";
 import { defaultDbPath, openDb } from "../src/db";
@@ -417,6 +419,7 @@ export type CommitWorkOutcome =
   | "identity_untrusted"
   | "task_unbound"
   | "surface_unavailable"
+  | "receipts_pending"
   | "ownership_conflict"
   | "ownership_ambiguous"
   | "adoption_rejected"
@@ -536,6 +539,9 @@ function selectionEnvelope(
       input: rejection.input.slice(0, 1024),
       path: rejection.path?.slice(0, 1024),
       conflicting_sessions: rejection.conflicting_sessions?.map((session) =>
+        session.slice(0, 256),
+      ),
+      pending_sessions: rejection.pending_sessions?.map((session) =>
         session.slice(0, 256),
       ),
     })),
@@ -688,26 +694,63 @@ function selectedForeignConflicts(
   surface: SurfaceDiscoveryResult,
   selected: string[],
   identity: string | null,
-): Array<{ path: string; sessions: string[] }> {
+): {
+  conflicts: Array<{ path: string; sessions: string[] }>;
+  receiptsPending: ReturnType<typeof summarizeReceiptLag>;
+  pending: boolean;
+} {
   const conflicts: Array<{ path: string; sessions: string[] }> = [];
+  const receipts = new Map<
+    string,
+    Parameters<typeof summarizeReceiptLag>[0][number]
+  >();
   for (const path of selected) {
-    const sessions = [
-      ...new Set(
-        (surface.claimsByPath.get(path) ?? [])
-          .filter(
-            (claim) =>
-              claimIsExclusiveOwnership(claim) &&
-              claim.sessionId !== identity &&
-              claim.liveness !== "terminal",
-          )
-          .map((claim) => claim.sessionId),
-      ),
-    ].sort();
-    if (sessions.length > 0) {
-      conflicts.push({ path, sessions: sessions.slice(0, SAMPLE_LIMIT) });
+    const blockers = unsafeForeignSessions(
+      surface.claimsByPath.get(path) ?? [],
+      identity,
+    );
+    if (blockers.conflicts.length > 0) {
+      conflicts.push({
+        path,
+        sessions: blockers.conflicts.slice(0, SAMPLE_LIMIT),
+      });
+    }
+    for (const receipt of blockers.receiptsPending) {
+      receipts.set(receipt.sessionId, receipt);
     }
   }
-  return conflicts;
+  return {
+    conflicts,
+    receiptsPending: summarizeReceiptLag([...receipts.values()]),
+    pending: receipts.size > 0,
+  };
+}
+
+function receiptsPendingFields(
+  surface: SurfaceDiscoveryResult,
+  identity: string | null,
+): Record<string, unknown> {
+  const receipts = new Map<
+    string,
+    Parameters<typeof summarizeReceiptLag>[0][number]
+  >();
+  for (const rejection of surface.rejections) {
+    if (rejection.code !== "receipts_pending" || rejection.path === undefined) {
+      continue;
+    }
+    for (const receipt of unsafeForeignSessions(
+      surface.claimsByPath.get(rejection.path) ?? [],
+      identity,
+    ).receiptsPending) {
+      receipts.set(receipt.sessionId, receipt);
+    }
+  }
+  const lag = summarizeReceiptLag([...receipts.values()]);
+  return {
+    ingest_lag_events: lag.events,
+    ingest_lag_seconds: lag.seconds,
+    stalled_ingester: lag.stalledIngester,
+  };
 }
 
 function surfaceFailure(
@@ -724,6 +767,9 @@ function surfaceFailure(
   const conflict = surface.rejections.some(
     (rejection) => rejection.code === "ownership_conflict",
   );
+  const receiptsPending = surface.rejections.some(
+    (rejection) => rejection.code === "receipts_pending",
+  );
   const unavailable = surface.rejections.some(
     (rejection) => rejection.code === "ownership_unavailable",
   );
@@ -732,12 +778,15 @@ function surfaceFailure(
       "commit-work-result",
       conflict
         ? "ownership_conflict"
-        : unavailable
-          ? "ownership_ambiguous"
-          : "adoption_rejected",
+        : receiptsPending
+          ? "receipts_pending"
+          : unavailable
+            ? "ownership_ambiguous"
+            : "adoption_rejected",
       false,
       {
         identity,
+        ...(receiptsPending ? receiptsPendingFields(surface, identity) : {}),
         selection: selectionEnvelope(surface, identity),
         surface: surface.summary,
       },
@@ -766,12 +815,24 @@ function finalOwnershipFailure(
   if (invalid) return invalid;
 
   const foreign = selectedForeignConflicts(current, frozen.paths, identity);
-  if (foreign.length > 0) {
+  if (foreign.conflicts.length > 0) {
     return result("commit-work-result", "ownership_conflict", false, {
       identity,
       reason: "foreign_claim_before_publication",
-      count: foreign.length,
-      sample: foreign.slice(0, SAMPLE_LIMIT),
+      count: foreign.conflicts.length,
+      sample: foreign.conflicts.slice(0, SAMPLE_LIMIT),
+      ...resultFileFields(frozen.paths),
+      selection: selectionEnvelope(current, identity),
+      surface: current.summary,
+    });
+  }
+  if (foreign.pending) {
+    return result("commit-work-result", "receipts_pending", false, {
+      identity,
+      reason: "foreign_receipts_before_publication",
+      ingest_lag_events: foreign.receiptsPending.events,
+      ingest_lag_seconds: foreign.receiptsPending.seconds,
+      stalled_ingester: foreign.receiptsPending.stalledIngester,
       ...resultFileFields(frozen.paths),
       selection: selectionEnvelope(current, identity),
       surface: current.summary,
@@ -1478,15 +1539,31 @@ async function runAttempt(
       surface.selected,
       identity,
     );
-    if (foreignAfterLint.length > 0) {
+    if (foreignAfterLint.conflicts.length > 0) {
       return {
         code: 1,
         identity,
         result: result("commit-work-result", "ownership_conflict", false, {
           identity,
           reason: "foreign_claim_after_lint",
-          count: foreignAfterLint.length,
-          sample: foreignAfterLint.slice(0, SAMPLE_LIMIT),
+          count: foreignAfterLint.conflicts.length,
+          sample: foreignAfterLint.conflicts.slice(0, SAMPLE_LIMIT),
+          ...resultFileFields(surface.selected),
+          selection: selectionEnvelope(postLintSurface, identity),
+          surface: postLintSurface.summary,
+        }),
+      };
+    }
+    if (foreignAfterLint.pending) {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "receipts_pending", false, {
+          identity,
+          reason: "foreign_receipts_after_lint",
+          ingest_lag_events: foreignAfterLint.receiptsPending.events,
+          ingest_lag_seconds: foreignAfterLint.receiptsPending.seconds,
+          stalled_ingester: foreignAfterLint.receiptsPending.stalledIngester,
           ...resultFileFields(surface.selected),
           selection: selectionEnvelope(postLintSurface, identity),
           surface: postLintSurface.summary,
