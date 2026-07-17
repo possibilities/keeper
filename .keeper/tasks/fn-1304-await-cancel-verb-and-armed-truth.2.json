@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Owner-fenced await cancel verb",
-  "updated_at": "2026-07-17T08:21:44.233000Z"
+  "updated_at": "2026-07-17T08:51:55.599000Z",
+  "worker_done_at": "2026-07-17T08:51:55.599000Z"
 }

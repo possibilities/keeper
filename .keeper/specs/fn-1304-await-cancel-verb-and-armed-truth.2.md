@@ -41,5 +41,5 @@ Deterministic seams only. Cover: same-session cancel succeeds; foreign session d
 - [ ] The await skill doc documents the cancel verb and the consolidated armed-line semantics
 
 ## Done summary
-
+Surfaced the owner-fenced durable-await cancel verb (keeper await cancel <id>, --force override) enforced producer-side in main against the row's arming session, with one uniform not-cancellable refusal; fenced the follow-up fire on the AwaitFiring fold's CAS so a cancel binds rather than advises. Fold stays owner-blind; docs updated.
 ## Evidence
