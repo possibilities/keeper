@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-17T18:27:44.681000Z",
+  "created_by_close_of": "fn-1313-bounded-epic-index-fold-and-honest",
+  "depends_on_epics": [
+    "fn-1313-bounded-epic-index-fold-and-honest"
+  ],
+  "id": "fn-1315-enforce-epic-index-memo-reset-at-test",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Enforce epic-index memo reset at test wipe sites",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-17T18:27:44.681000Z"
+}
