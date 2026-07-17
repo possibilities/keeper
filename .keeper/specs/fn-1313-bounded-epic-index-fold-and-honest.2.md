@@ -70,5 +70,5 @@ to the correctness tier for it.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Full-replay projection now derives from the reducer's monotonic pace-free fold-work accumulator (delta-sampled by the daemon over the boot-catchup window and persisted to a nullable boot_catchup_stats.fold_work_ms column), null-honest when unmeasured; the catch-up projection stays on the wall-clock rate. Adds the additive v134 schema step + fingerprint re-pin and states the two-rate/estimator contract in the protocol docstrings.
 ## Evidence
