@@ -817,6 +817,9 @@ interface ViewerState {
   // The durable worktree-mode toggle, sourced from the `autopilot_state`
   // singleton's `worktree_mode` column. `false` (OFF) is the default.
   worktreeMode: boolean;
+  // The work-dispatch provider pin, sourced from the `autopilot_state`
+  // singleton's `worker_provider` column. `null` (no pin) is the default.
+  workerProvider: "claude" | "gpt" | null;
   // The explicitly-armed epic ids, sourced from the `armed_epics` presence
   // table.
   armedEpics: string[];
@@ -851,6 +854,10 @@ export function autopilotBannerLabel(state: {
   mode: "yolo" | "armed";
   armedCount: number;
   worktreeMode: boolean;
+  // The work-dispatch provider pin from the `autopilot_state` singleton.
+  // `null` = no pin (each task dispatches on its assigned cell); a value names
+  // the pinned provider family. Omitted suppresses the segment entirely.
+  workerProvider?: "claude" | "gpt" | null;
   // Count of host-level `daemon`-verb distress rows (shared-checkout dirty/wedge,
   // lane wedge) that have no epic/task home and so carry no `[failed:]` pill.
   // Omitted or 0 suppresses the segment; > 0 surfaces the board-global signal.
@@ -881,7 +888,14 @@ export function autopilotBannerLabel(state: {
   // Worktree segment renders for BOTH states (terse `worktree:on`/`worktree:off`)
   // so the live durable toggle is always visible at a glance.
   const worktreeSeg = state.worktreeMode ? " · worktree:on" : " · worktree:off";
-  return `${pill}${needsHumanSeg} · ${state.mode}${armedSeg} · max ${cap}${perRootSeg}${worktreeSeg}`;
+  // Provider segment renders for BOTH states when supplied — `provider:cell`
+  // (no pin; the assigned cell decides) or the pinned family — so a quota
+  // cutover pin is always visible at a glance.
+  const providerSeg =
+    state.workerProvider === undefined
+      ? ""
+      : ` · provider:${state.workerProvider ?? "cell"}`;
+  return `${pill}${needsHumanSeg} · ${state.mode}${armedSeg} · max ${cap}${perRootSeg}${worktreeSeg}${providerSeg}`;
 }
 
 /** Data-frame bound + `--prev-frame` seed for `keeper frames --view autopilot`. */
@@ -945,6 +959,8 @@ async function runViewer(
     mode: "yolo",
     // Seed `false` (OFF, the default) until the `autopilot_state` edge lands it.
     worktreeMode: false,
+    // Seed `null` (no pin, the default) until the `autopilot_state` edge lands it.
+    workerProvider: null,
     // Seed empty until the `armed_epics` subscribe edge lands.
     armedEpics: [],
     // Seed empty until the `worktree_repo_status` subscribe edge lands (or stays
@@ -1022,6 +1038,7 @@ async function runViewer(
     mode: "yolo" | "armed";
     armedCount: number;
     worktreeMode: boolean;
+    workerProvider: "claude" | "gpt" | null;
   } => ({
     paused: state.paused,
     maxConcurrentJobs: state.maxConcurrentJobs,
@@ -1032,6 +1049,7 @@ async function runViewer(
     mode: state.mode,
     armedCount: state.armedEpics.length,
     worktreeMode: state.worktreeMode,
+    workerProvider: state.workerProvider,
   });
 
   // Seed the banner immediately so the human sees `[paused] · yolo · max ∞`
@@ -1113,6 +1131,7 @@ async function runViewer(
       state.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       state.mode = projectAutopilotMode(rows) ?? "yolo";
       state.worktreeMode = projectWorktreeMode(rows) ?? false;
+      state.workerProvider = projectWorkerProvider(rows);
       view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
       view.emit(state);
     },

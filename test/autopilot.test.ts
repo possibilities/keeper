@@ -1062,6 +1062,27 @@ test("autopilotBannerLabel — yolo mode + finite cap renders `[playing] · yolo
   ).toBe("[playing] · yolo · max 3 · per-root 2 · worktree:off");
 });
 
+test("autopilotBannerLabel — provider segment renders the pin, `provider:cell` when unpinned, absent when omitted", () => {
+  const base = {
+    paused: false,
+    maxConcurrentJobs: 3,
+    maxConcurrentPerRoot: 2,
+    mode: "yolo" as const,
+    armedCount: 0,
+    worktreeMode: false,
+  };
+  expect(autopilotBannerLabel({ ...base, workerProvider: "claude" })).toBe(
+    "[playing] · yolo · max 3 · per-root 2 · worktree:off · provider:claude",
+  );
+  expect(autopilotBannerLabel({ ...base, workerProvider: null })).toBe(
+    "[playing] · yolo · max 3 · per-root 2 · worktree:off · provider:cell",
+  );
+  // Omitted entirely — the caller supplied no pin state; no segment renders.
+  expect(autopilotBannerLabel(base)).toBe(
+    "[playing] · yolo · max 3 · per-root 2 · worktree:off",
+  );
+});
+
 test("autopilotBannerLabel — yolo mode never shows an armed count even with a nonzero count (fn-751)", () => {
   // yolo dispatches everything — the armed set is irrelevant, so the count is
   // suppressed regardless of what `armed_epics` happens to contain.

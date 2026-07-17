@@ -104,6 +104,7 @@ import {
   projectAutopilotPaused,
   projectMaxConcurrentJobs,
   projectMaxConcurrentPerRoot,
+  projectWorkerProvider,
   projectWorktreeMode,
 } from "./autopilot";
 import { buildParseOptions, VIEWER_FLAGS } from "./descriptor";
@@ -821,6 +822,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     maxConcurrentPerRootStored: DEFAULT_MAX_CONCURRENT_PER_ROOT,
     mode: "yolo" as "yolo" | "armed",
     worktreeMode: false,
+    workerProvider: null as "claude" | "gpt" | null,
   };
   const apBanner = (): string =>
     autopilotBannerLabel({
@@ -833,6 +835,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       mode: apState.mode,
       armedCount: armedSet.size,
       worktreeMode: apState.worktreeMode,
+      workerProvider: apState.workerProvider,
       needsHumanCount,
     });
 
@@ -1286,6 +1289,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       apState.maxConcurrentPerRootStored = projectMaxConcurrentPerRoot(rows);
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
+      apState.workerProvider = projectWorkerProvider(rows);
       view.liveShell.setStatus(apBanner());
     },
     onLifecycle: view.emitLifecycle,
