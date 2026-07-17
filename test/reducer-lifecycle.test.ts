@@ -453,6 +453,7 @@ test("fn-690 re-fold determinism: same event log → byte-identical projections 
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  __resetEpicIndexMemoForTest(db);
   expect(drainAll()).toBeGreaterThan(0);
 
   expect(getCursor()).toBe(cursor1);
@@ -5070,6 +5071,7 @@ test("GitSnapshot re-fold determinism over a full attribution lifecycle", () => 
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const afterAttribs = db
@@ -5425,6 +5427,7 @@ test("from-scratch re-fold reproduces the GitSnapshot fan-out byte-identically",
   db.run("DELETE FROM epics");
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM file_attributions");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const afterJobs = db.query("SELECT * FROM jobs ORDER BY job_id").all();
