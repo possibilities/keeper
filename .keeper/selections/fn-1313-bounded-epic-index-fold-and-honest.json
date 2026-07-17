@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in the sacred deterministic re-fold class: byte-identity of resolved_epic_deps across warm/cold/fresh-scan over ~7 index-relevant writer sites, where any patch/scan drift silently diverges and a throw violates never-throw \u2014 a nameable intelligence-bound opus gate.",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped schema-ladder migration (nullable column, fingerprint re-pin, fresh-vs-upgrade convergence) plus wire docstrings and a subtle null-honest/window-mismatch estimator invariant where the failure biases toward a reassuring lie \u2014 schema/migration/correctness reasons that clear the opus bar.",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.74,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified substantial multi-file work mirroring the existing slow-gate pattern (manifest/runner/script/docs) plus a fully-prescribed deterministic bench with named stability methodology (ratio bands, warmup, median) \u2014 test-only blast radius with no production correctness invariant, so GPT-first at the workhorse tier.",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.3",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T17:14:21.373000Z",
+  "epic_id": "fn-1313-bounded-epic-index-fold-and-honest",
+  "input_hash": "13593ff97ee95e634748b0294ffbd9a6a74858d64ae8e63fb43198adf05cfbdc",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 324616185,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1313-bounded-epic-index-fold-and-honest.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant in the sacred deterministic re-fold class: byte-identity of resolved_epic_deps across warm/cold/fresh-scan over ~7 index-relevant writer sites, where any patch/scan drift silently diverges and a throw violates never-throw \u2014 a nameable intelligence-bound opus gate.\",\"confidence\":0.86},{\"task_id\":\"fn-1313-bounded-epic-index-fold-and-honest.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped schema-ladder migration (nullable column, fingerprint re-pin, fresh-vs-upgrade convergence) plus wire docstrings and a subtle null-honest/window-mismatch estimator invariant where the failure biases toward a reassuring lie \u2014 schema/migration/correctness reasons that clear the opus bar.\",\"confidence\":0.72},{\"task_id\":\"fn-1313-bounded-epic-index-fold-and-honest.3\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified substantial multi-file work mirroring the existing slow-gate pattern (manifest/runner/script/docs) plus a fully-prescribed deterministic bench with named stability methodology (ratio bands, warmup, median) \u2014 test-only blast radius with no production correctness invariant, so GPT-first at the workhorse tier.\",\"confidence\":0.74}]}\n"
+}
