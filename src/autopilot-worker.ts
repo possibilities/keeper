@@ -926,13 +926,19 @@ export type MergeSuiteVerdict =
  * out in a scratch worktree of `repoDir`. `runsPlanSuite` is true when the merge
  * introduces changes under `plugins/plan` (the merged packages the gate must cover:
  * the root fast suite always, plus the plan suite when the plan plugin is touched).
- * Injected so the fast tier drives the three verdicts purely; production wires the
- * real scratch-provision-plus-suite-run ({@link runMergeSuiteGate}).
+ * `runsSmokeGate` (ADR 0073, fn-1309) is true when the merge touches the daemon Load
+ * surface (per `scripts/daemon-load-roots.txt`) — the named `test:slow-daemon` gate
+ * then runs, chained after a green root suite and before any plan suite, so its
+ * failure surfaces through the SAME {@link WORKTREE_FINALIZE_SUITE_RED_REASON} path.
+ * Optional and defaulted `false` so an existing caller/fake omitting it is
+ * unaffected. Injected so the fast tier drives the verdicts purely; production
+ * wires the real scratch-provision-plus-suite-run ({@link runMergeSuiteGate}).
  */
 export type MergeSuiteProbe = (args: {
   repoDir: string;
   mergedCommit: string;
   runsPlanSuite: boolean;
+  runsSmokeGate?: boolean;
 }) => Promise<MergeSuiteVerdict>;
 
 /**
@@ -5731,8 +5737,16 @@ export function createWorktreeDriver(
             let verdict = mergeSuiteMemo.get(prospect.newValue);
             if (verdict === undefined) {
               // Merged packages the gate must cover: the root fast suite always, plus
-              // the plan suite when the merge introduces changes under `plugins/plan`.
+              // the plan suite when the merge introduces changes under `plugins/plan`,
+              // plus the named daemon smoke gate (ADR 0073, fn-1309) when the merge
+              // touches the daemon Load surface.
               const runsPlanSuite = await mergeIntroducesPlanChange(
+                repoDir,
+                prospect.defaultTip,
+                prospect.newValue,
+                run,
+              );
+              const runsSmokeGate = await mergeIntroducesLoadSurfaceChange(
                 repoDir,
                 prospect.defaultTip,
                 prospect.newValue,
@@ -5742,6 +5756,7 @@ export function createWorktreeDriver(
                 repoDir,
                 mergedCommit: prospect.newValue,
                 runsPlanSuite,
+                runsSmokeGate,
               });
               // Cache only a TERMINAL verdict — a cannot-run is transient (a scratch
               // hiccup) and MUST recompute next cycle, never latch a parked epic.
@@ -6498,6 +6513,73 @@ async function mergeIntroducesPlanChange(
   return diff.stdout.trim().length > 0;
 }
 
+/**
+ * The daemon Load-surface roots manifest (ADR 0073, fn-1309) — the SAME checked-in
+ * file `scripts/daemon-fingerprint.ts` hashes for the install reload gate, read
+ * directly rather than imported: `scripts/` sits OUTSIDE the declared Load surface
+ * (see `scripts/daemon-load-roots.txt`), so a relative import from this module would
+ * pull `scripts/daemon-fingerprint.ts` into the daemon's own transitive closure and
+ * trip `test/daemon-load-surface.test.ts`'s boundary check. The manifest FILE — not
+ * the parser — is the one seam shared by the hashed and the gated boundary; the
+ * parse below mirrors `parseRootsManifest` exactly (one path per line, `#`
+ * full-line comments and blanks skipped, trimmed).
+ */
+const DAEMON_LOAD_ROOTS_MANIFEST_REL = "scripts/daemon-load-roots.txt";
+
+function loadDaemonLoadRoots(repoDir: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(join(repoDir, DAEMON_LOAD_ROOTS_MANIFEST_REL), "utf8");
+  } catch {
+    return []; // no manifest in this repo — no Load-surface concept here
+  }
+  const roots: string[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    roots.push(line);
+  }
+  return roots;
+}
+
+/**
+ * Does the prospective merge INTRODUCE any change under a declared daemon Load-
+ * surface root (relative to the current default tip)? Decides whether the
+ * finalize merge-suite gate also runs the named `test:slow-daemon` smoke gate
+ * (ADR 0073, fn-1309). A repo carrying no roots manifest has no Load-surface
+ * concept and never gates (`false`); once the manifest exists, a non-zero / timed-
+ * out diff is treated as "yes" — conservatively cover the smoke gate rather than
+ * skip it on an unclear diff, mirroring {@link mergeIntroducesPlanChange}. Pure
+ * git via the runner (the manifest read is the only fs access).
+ */
+async function mergeIntroducesLoadSurfaceChange(
+  repo: string,
+  defaultTip: string,
+  mergedCommit: string,
+  run: WorktreeGitRunner,
+): Promise<boolean> {
+  const roots = loadDaemonLoadRoots(repo);
+  if (roots.length === 0) {
+    return false;
+  }
+  const diff = await run(
+    [
+      "diff",
+      "--name-only",
+      "--end-of-options",
+      defaultTip,
+      mergedCommit,
+      "--",
+      ...roots,
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (diff.code !== 0) {
+    return true; // manifest exists but the diff is unclear → cover the smoke gate
+  }
+  return diff.stdout.trim().length > 0;
+}
+
 /** Deadlines for the finalize merge-suite gate's inline scratch suite run — a hung
  *  install/suite is group-killed at the deadline and degrades to `cannot-run`. */
 const MERGE_GATE_INSTALL_TIMEOUT_MS = 10 * 60_000;
@@ -6519,6 +6601,11 @@ const MERGE_GATE_MAX_FAILING_NAMES = 8;
  *
  * `opts.spawnFn` and `opts.killGraceMs` are injectable seams so tests can replace
  * subprocesses and settle timeout paths without the production kill grace.
+ * `opts.command` overrides the `test:gate` package-script lookup with an explicit
+ * shell command — the finalize smoke gate (ADR 0073, fn-1309) reuses this runner to
+ * invoke the named `test:slow-daemon` gate rather than the fast `test:gate` script.
+ * `opts.skipInstall` skips the frozen-lockfile install — the smoke gate shares
+ * `pkgDir` with the root fast-suite pass that already installed it there.
  */
 export async function runPackageSuiteGate(
   pkgDir: string,
@@ -6527,28 +6614,32 @@ export async function runPackageSuiteGate(
     suiteDeadlineMs: number;
     spawnFn?: SpawnFn;
     killGraceMs?: number;
+    command?: string;
+    skipInstall?: boolean;
   },
 ): Promise<MergeSuiteVerdict> {
-  const install = await runDetached(
-    "bun",
-    ["install", "--frozen-lockfile"],
-    pkgDir,
-    opts.installTimeoutMs,
-    { spawnFn: opts.spawnFn, killGraceMs: opts.killGraceMs },
-  );
-  if (install.timedOut) {
-    return {
-      kind: "cannot-run",
-      detail: `frozen-lockfile install timed out in ${pkgDir}`,
-    };
+  if (!opts.skipInstall) {
+    const install = await runDetached(
+      "bun",
+      ["install", "--frozen-lockfile"],
+      pkgDir,
+      opts.installTimeoutMs,
+      { spawnFn: opts.spawnFn, killGraceMs: opts.killGraceMs },
+    );
+    if (install.timedOut) {
+      return {
+        kind: "cannot-run",
+        detail: `frozen-lockfile install timed out in ${pkgDir}`,
+      };
+    }
+    if (install.exitCode !== 0) {
+      return {
+        kind: "cannot-run",
+        detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
+      };
+    }
   }
-  if (install.exitCode !== 0) {
-    return {
-      kind: "cannot-run",
-      detail: `frozen-lockfile install failed in ${pkgDir} (exit ${install.exitCode})`,
-    };
-  }
-  const gateCmd = readTestGateCommand(pkgDir);
+  const gateCmd = opts.command ?? readTestGateCommand(pkgDir);
   if (gateCmd === null) {
     return {
       kind: "cannot-run",
@@ -6589,20 +6680,33 @@ export async function runPackageSuiteGate(
   };
 }
 
+/** The named smoke gate (ADR 0073, fn-1309) the finalize merge-suite gate chains in
+ *  after a green root suite when the merge touches the daemon Load surface. Runs in
+ *  the SAME scratch checkout as the root suite (`skipInstall`), never a second
+ *  frozen-lockfile install. */
+const MERGE_GATE_SMOKE_COMMAND = "bun run test:slow-daemon";
+
 /**
  * The production {@link MergeSuiteProbe}: provision a detached scratch worktree at the
- * prospective merged commit, run the root fast suite there (plus the plan suite when
- * the merge touches `plugins/plan`), and classify green / red / cannot-run. Runs
- * INLINE on the single-flight reconcile drive (a producer git+suite side effect,
- * never a fold) — an accepted, bounded tradeoff for a default-OFF feature, with the
- * full rationale at the `runMergeSuite` dep wiring (the `ConfirmRunningDeps` object). The
- * scratch worktree is reaped on EVERY path. NEVER throws — any unexpected error
- * folds to `cannot-run` (a retry-skip), never a silent push. `run`/`worktreesRoot`/
- * `spawnFn`/`killGraceMs` are injectable seams; production passes `gitExec`, the
- * default root, the real `spawn`, and the bounded default kill grace.
+ * prospective merged commit, run the root fast suite there (plus the named daemon
+ * smoke gate when the merge touches the daemon Load surface, plus the plan suite
+ * when the merge touches `plugins/plan`), and classify green / red / cannot-run.
+ * Runs INLINE on the single-flight reconcile drive (a producer git+suite side
+ * effect, never a fold) — an accepted, bounded tradeoff for a default-OFF feature,
+ * with the full rationale at the `runMergeSuite` dep wiring (the
+ * `ConfirmRunningDeps` object). The scratch worktree is reaped on EVERY path.
+ * NEVER throws — any unexpected error folds to `cannot-run` (a retry-skip), never a
+ * silent push. `run`/`worktreesRoot`/`spawnFn`/`killGraceMs` are injectable seams;
+ * production passes `gitExec`, the default root, the real `spawn`, and the bounded
+ * default kill grace.
  */
 export async function runMergeSuiteGate(
-  args: { repoDir: string; mergedCommit: string; runsPlanSuite: boolean },
+  args: {
+    repoDir: string;
+    mergedCommit: string;
+    runsPlanSuite: boolean;
+    runsSmokeGate?: boolean;
+  },
   opts: {
     run?: WorktreeGitRunner;
     worktreesRoot?: string;
@@ -6640,7 +6744,26 @@ export async function runMergeSuiteGate(
       spawnFn: opts.spawnFn,
       killGraceMs: opts.killGraceMs,
     });
-    if (rootVerdict.kind !== "green" || !args.runsPlanSuite) {
+    if (rootVerdict.kind !== "green") {
+      return rootVerdict;
+    }
+    if (args.runsSmokeGate) {
+      // The merge touched the daemon Load surface — chain the named smoke gate
+      // BEFORE the plan suite, in the SAME scratch checkout (no re-install). Its
+      // red/cannot-run short-circuits exactly like the root suite's own verdict.
+      const smokeVerdict = await runPackageSuiteGate(scratchPath, {
+        installTimeoutMs,
+        suiteDeadlineMs,
+        spawnFn: opts.spawnFn,
+        killGraceMs: opts.killGraceMs,
+        command: MERGE_GATE_SMOKE_COMMAND,
+        skipInstall: true,
+      });
+      if (smokeVerdict.kind !== "green") {
+        return smokeVerdict;
+      }
+    }
+    if (!args.runsPlanSuite) {
       return rootVerdict;
     }
     // The merge touched plugins/plan — cover its own suite too (git's merge-tree
