@@ -42,5 +42,7 @@ Use fake children, timers, artifact writers, and delivery callbacks. Pin schema 
 - [ ] The focused monitor-runtime suite passes without starting a real subprocess.
 
 ## Done summary
-
+Built the isolated Pi command-monitor controller and strict tool schema with bounded stdout batching, durable stderr/stdout artifacts, exact-id lifecycle controls, terminal-race fencing, and bounded TERM-to-KILL teardown. Operator landed the independently reviewed two-file diff after the wrapped resume budget exhausted.
 ## Evidence
+- Commits: 7fecc083e3f0a819e7b2f832e61860f89002bb75
+- Tests: bun test ./test/pi-monitor-facade.test.ts — 15 pass, 0 fail, bunx biome check plugins/keeper/pi-extension/monitor-facade.ts test/pi-monitor-facade.test.ts — clean, focused tsc --noEmit with existing LiquidJS workspace types — pass, main bun run typecheck — pass, git diff --cached --check — clean, independent blocker review — PASS, provider pids 46894, 12372, 41086 and wrapper pid 38024 absent before exact-path commit
