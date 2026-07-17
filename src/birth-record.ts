@@ -39,9 +39,29 @@ import {
 } from "./dispatch-command";
 import { execBackendEnvMeta, isDefaultTmuxEnvValue } from "./exec-backend";
 
-/** Bumped only on an incompatible birth-record shape change; the ingest worker
- *  rejects an unknown version rather than mis-folding it. */
-export const BIRTH_RECORD_SCHEMA_VERSION = 1;
+/** The current birth-record protocol version the launcher emits. Bumped on an
+ *  incompatible shape change; the ingest worker rejects an UNKNOWN version
+ *  (outside {@link SUPPORTED_BIRTH_RECORD_VERSIONS}) rather than mis-folding it. */
+export const BIRTH_RECORD_SCHEMA_VERSION = 2;
+
+/**
+ * The protocol version at which a birth record may carry the durable wrapper→leg
+ * owner tuple (ADR 0071). A record BELOW this version is legacy and is never
+ * enrolled into `provider_leg_ownership`; the classification is by protocol
+ * version alone, never inferred from which owner fields happen to be null.
+ */
+export const OWNED_LEG_BIRTH_PROTOCOL_VERSION = 2;
+
+/**
+ * Every birth-record protocol version the ingest worker still accepts. Legacy v1
+ * records remain ingestible (they mint the presence SessionStart and drain via
+ * the old autoclose path) but classify as ownerless; the current-cohort v2 adds
+ * the owner tuple. A version outside this set is rejected, not mis-folded.
+ */
+export const SUPPORTED_BIRTH_RECORD_VERSIONS: ReadonlySet<number> = new Set([
+  1,
+  OWNED_LEG_BIRTH_PROTOCOL_VERSION,
+]);
 
 /**
  * One harness birth: the launcher's snapshot of a freshly-spawned Pi
@@ -83,6 +103,25 @@ export interface BirthRecord {
   /** Exact Dispatch attempt carried by a capable lifecycle adapter, or null for
    *  manual, legacy, malformed, and capability-absent launches. */
   dispatch_attempt_id: number | null;
+  /**
+   * Immutable identity of this Provider-leg launch (ADR 0071). Present only on a
+   * v2 owned-leg birth; the ownership registry's idempotency key core. ABSENT
+   * (not null) on a legacy v1 record and on a non-wrapped v2 launch — a legacy
+   * record is classified by protocol version, never by this field's presence.
+   */
+  leg_launch_id?: string;
+  /** Owner tuple part 1: the keeper job id of the wrapper attempt that launched
+   *  this leg. Present only alongside {@link leg_launch_id} on a v2 owned leg. */
+  wrapper_job_id?: string;
+  /** Owner tuple part 2: the wrapper's exact Dispatch-attempt id. Present only
+   *  alongside {@link leg_launch_id} on a v2 owned leg. */
+  wrapper_dispatch_attempt_id?: number;
+  /** The launcher process's own pid (distinct from the spawned leg's {@link pid}).
+   *  Present only on a v2 owned-leg birth. */
+  launcher_pid?: number;
+  /** The launcher process's platform-tagged start_time (recycle-safe identity of
+   *  the launcher, distinct from the leg's {@link start_time}). v2 owned legs. */
+  launcher_start_time?: string;
 }
 
 /** The record MINUS the two post-spawn fields the launcher cannot know until it
@@ -90,6 +129,76 @@ export interface BirthRecord {
 export type BirthRecordDraft = Omit<BirthRecord, "pid" | "start_time">;
 
 export const BIRTH_INTENT_SCHEMA_VERSION = 1;
+
+export const PROVIDER_LEG_GATE_ENV = "KEEPER_AGENT_PROVIDER_LEG_GATE";
+export const PROVIDER_LEG_LAUNCH_ID_ENV = "KEEPER_AGENT_PROVIDER_LEG_LAUNCH_ID";
+export const PROVIDER_LEG_WRAPPER_JOB_ID_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_WRAPPER_JOB_ID";
+export const PROVIDER_LEG_WRAPPER_ATTEMPT_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_WRAPPER_ATTEMPT_ID";
+export const PROVIDER_LEG_LAUNCHER_PID_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_LAUNCHER_PID";
+export const PROVIDER_LEG_LAUNCHER_START_TIME_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_LAUNCHER_START_TIME";
+export const PROVIDER_LEG_SHIM_PROCESS_TITLE = "keeper-provider-leg-shim";
+export const PROVIDER_LEG_GRANT_TIMEOUT_MS = 30_000;
+export const PROVIDER_LEG_GRANT_POLL_MS = 50;
+
+export interface ProviderLegLaunchCarrier extends BirthOwnerTuple {
+  launcher_pid: number;
+  launcher_start_time: string;
+}
+
+export type ProviderLegLaunchCarrierResult =
+  | { kind: "absent" }
+  | { kind: "invalid" }
+  | { kind: "valid"; carrier: ProviderLegLaunchCarrier };
+
+/** Parse the complete, bounded shim carrier. A gate marker is fail-closed: once
+ * present, every identity field must be valid before a provider may execute. */
+export function parseProviderLegLaunchCarrier(
+  env: NodeJS.ProcessEnv,
+): ProviderLegLaunchCarrierResult {
+  if ((env[PROVIDER_LEG_GATE_ENV] ?? "") === "") {
+    return { kind: "absent" };
+  }
+  const legLaunchId = (env[PROVIDER_LEG_LAUNCH_ID_ENV] ?? "").trim();
+  const wrapperJobId = (env[PROVIDER_LEG_WRAPPER_JOB_ID_ENV] ?? "").trim();
+  const wrapperAttemptId = parseDispatchAttemptCarrier(
+    env[PROVIDER_LEG_WRAPPER_ATTEMPT_ENV],
+  );
+  const launcherPidRaw = env[PROVIDER_LEG_LAUNCHER_PID_ENV];
+  const launcherPid =
+    launcherPidRaw !== undefined && /^[1-9]\d{0,15}$/.test(launcherPidRaw)
+      ? Number(launcherPidRaw)
+      : null;
+  const launcherStartTime = (
+    env[PROVIDER_LEG_LAUNCHER_START_TIME_ENV] ?? ""
+  ).trim();
+  if (
+    legLaunchId === "" ||
+    legLaunchId.length > 256 ||
+    wrapperJobId === "" ||
+    wrapperJobId.length > 256 ||
+    wrapperAttemptId === null ||
+    launcherPid === null ||
+    !Number.isSafeInteger(launcherPid) ||
+    launcherStartTime === "" ||
+    launcherStartTime.length > 256
+  ) {
+    return { kind: "invalid" };
+  }
+  return {
+    kind: "valid",
+    carrier: {
+      leg_launch_id: legLaunchId,
+      wrapper_job_id: wrapperJobId,
+      wrapper_dispatch_attempt_id: wrapperAttemptId,
+      launcher_pid: launcherPid,
+      launcher_start_time: launcherStartTime,
+    },
+  };
+}
 
 /** Pre-spawn presence marker. It is published before a Pi child can exist. */
 export interface BirthIntent {
@@ -174,12 +283,13 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   if (
     typeof o.schema_version !== "number" ||
     !Number.isInteger(o.schema_version) ||
-    o.schema_version !== BIRTH_RECORD_SCHEMA_VERSION ||
+    !SUPPORTED_BIRTH_RECORD_VERSIONS.has(o.schema_version) ||
     !isStr(o.session_id) ||
     o.session_id === "" ||
     o.harness !== "pi" ||
     typeof o.pid !== "number" ||
-    !Number.isInteger(o.pid) ||
+    !Number.isSafeInteger(o.pid) ||
+    o.pid <= 0 ||
     !isStrOrNull(o.start_time) ||
     !isStr(o.cwd) ||
     !isStrOrNull(o.spawn_name) ||
@@ -193,8 +303,10 @@ export function parseBirthRecord(line: string): BirthRecord | null {
   ) {
     return null;
   }
-  return {
-    schema_version: BIRTH_RECORD_SCHEMA_VERSION,
+  const record: BirthRecord = {
+    // Preserve the PARSED version, not the current constant: a legacy v1 record
+    // stays v1 so the ownership classifier can key on protocol version.
+    schema_version: o.schema_version,
     session_id: o.session_id,
     harness: o.harness,
     pid: o.pid,
@@ -216,6 +328,80 @@ export function parseBirthRecord(line: string): BirthRecord | null {
       o.dispatch_attempt_id > 0
         ? o.dispatch_attempt_id
         : null,
+  };
+  // Owner tuple + launcher identity (ADR 0071) is read ONLY at the owned-leg
+  // protocol version. A legacy record never carries it — the leg-ownership
+  // classification is by version, never by a field being present, so a v1 body
+  // that happens to include these keys is still treated as legacy/ownerless.
+  if (o.schema_version >= OWNED_LEG_BIRTH_PROTOCOL_VERSION) {
+    if (isStr(o.leg_launch_id) && o.leg_launch_id.length > 0) {
+      record.leg_launch_id = o.leg_launch_id;
+    }
+    if (isStr(o.wrapper_job_id) && o.wrapper_job_id.length > 0) {
+      record.wrapper_job_id = o.wrapper_job_id;
+    }
+    if (
+      typeof o.wrapper_dispatch_attempt_id === "number" &&
+      Number.isSafeInteger(o.wrapper_dispatch_attempt_id) &&
+      o.wrapper_dispatch_attempt_id > 0
+    ) {
+      record.wrapper_dispatch_attempt_id = o.wrapper_dispatch_attempt_id;
+    }
+    if (
+      typeof o.launcher_pid === "number" &&
+      Number.isSafeInteger(o.launcher_pid) &&
+      o.launcher_pid > 0
+    ) {
+      record.launcher_pid = o.launcher_pid;
+    }
+    if (isStr(o.launcher_start_time) && o.launcher_start_time.length > 0) {
+      record.launcher_start_time = o.launcher_start_time;
+    }
+  }
+  return record;
+}
+
+/**
+ * The durable owner tuple (ADR 0071) — the exact wrapper Dispatch attempt that
+ * launched a Provider leg, plus that leg's immutable launch id. Returned only for
+ * a fully-formed OWNED-leg birth; a legacy or ownerless record yields null and is
+ * never enrolled into the ownership registry.
+ */
+export interface BirthOwnerTuple {
+  leg_launch_id: string;
+  wrapper_job_id: string;
+  wrapper_dispatch_attempt_id: number;
+}
+
+/**
+ * True when `record` is a legacy (pre-owned-leg) protocol birth. Classified by
+ * protocol version ALONE — the ADR 0071 rule that legacy is never inferred from
+ * null owner fields.
+ */
+export function birthRecordIsLegacyProtocol(record: BirthRecord): boolean {
+  return record.schema_version < OWNED_LEG_BIRTH_PROTOCOL_VERSION;
+}
+
+/**
+ * The owner tuple to enroll for `record`, or null. Non-null ONLY for a v2 record
+ * carrying a complete tuple: a legacy v1 record, or a v2 non-wrapped launch with
+ * no tuple, both yield null and stay off the cascade.
+ */
+export function ownerTupleFromBirthRecord(
+  record: BirthRecord,
+): BirthOwnerTuple | null {
+  if (
+    record.schema_version < OWNED_LEG_BIRTH_PROTOCOL_VERSION ||
+    record.leg_launch_id === undefined ||
+    record.wrapper_job_id === undefined ||
+    record.wrapper_dispatch_attempt_id === undefined
+  ) {
+    return null;
+  }
+  return {
+    leg_launch_id: record.leg_launch_id,
+    wrapper_job_id: record.wrapper_job_id,
+    wrapper_dispatch_attempt_id: record.wrapper_dispatch_attempt_id,
   };
 }
 
@@ -300,15 +486,12 @@ export function writeBirthIntent(
   return published;
 }
 
-/** Replace an intent atomically with the complete birth, then publish to new/. */
-export function publishBirthIntent(
+/** Atomically replace an intent with its complete promoted birth in pending/. */
+export function promoteBirthIntent(
   intentPath: string,
   record: BirthRecord,
 ): void {
   const pendingDir = dirname(intentPath);
-  const root = dirname(pendingDir);
-  const newDir = join(root, "new");
-  mkdirSync(newDir, { recursive: true });
   const staged = join(
     pendingDir,
     `.${basename(intentPath)}.${randomUUID()}.tmp`,
@@ -327,10 +510,123 @@ export function publishBirthIntent(
   } finally {
     closeSync(fd);
   }
+  renameSync(staged, intentPath);
+}
+
+/** Replace an intent atomically with the complete birth, then publish to new/. */
+export function publishBirthIntent(
+  intentPath: string,
+  record: BirthRecord,
+): void {
+  const pendingDir = dirname(intentPath);
+  const root = dirname(pendingDir);
+  const newDir = join(root, "new");
+  mkdirSync(newDir, { recursive: true });
   // Every crash point remains visible: intent before the first rename, a full
   // birth under pending/ between renames, then the consumer-owned new/ record.
-  renameSync(staged, intentPath);
+  promoteBirthIntent(intentPath, record);
   renameSync(intentPath, join(newDir, basename(intentPath)));
+}
+
+export interface ProviderLegGrant extends BirthOwnerTuple {
+  schema_version: 1;
+}
+
+function providerLegGrantPath(dir: string, legLaunchId: string): string {
+  const token = Buffer.from(legLaunchId, "utf8").toString("base64url");
+  return join(dir, "grants", `${token}.json`);
+}
+
+/** Publish a one-use pre-exec grant after daemon-side owner revalidation. */
+export function writeProviderLegGrant(
+  dir: string,
+  owner: BirthOwnerTuple,
+): void {
+  const grantDir = join(dir, "grants");
+  mkdirSync(grantDir, { recursive: true });
+  const target = providerLegGrantPath(dir, owner.leg_launch_id);
+  const staged = join(grantDir, `.${basename(target)}.${randomUUID()}.tmp`);
+  const fd = openSync(staged, "wx", 0o600);
+  try {
+    writeSync(
+      fd,
+      `${JSON.stringify({ schema_version: 1, ...owner } satisfies ProviderLegGrant)}\n`,
+    );
+    fsyncSync(fd);
+  } catch (error) {
+    try {
+      unlinkSync(staged);
+    } catch {
+      // best effort
+    }
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(staged, target);
+}
+
+/** Consume only a grant matching the exact immutable owner tuple. */
+export function consumeProviderLegGrant(
+  dir: string,
+  owner: BirthOwnerTuple,
+): boolean {
+  const path = providerLegGrantPath(dir, owner.leg_launch_id);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+  const grant = parsed as Record<string, unknown>;
+  if (
+    grant.schema_version !== 1 ||
+    grant.leg_launch_id !== owner.leg_launch_id ||
+    grant.wrapper_job_id !== owner.wrapper_job_id ||
+    grant.wrapper_dispatch_attempt_id !== owner.wrapper_dispatch_attempt_id
+  ) {
+    return false;
+  }
+  try {
+    unlinkSync(path);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+export interface ProviderLegGrantWaitDeps {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  consume: () => boolean;
+}
+
+/** Hold the inert shim until one exact grant appears or the bounded timeout ends. */
+export async function awaitProviderLegGrant(
+  deps: ProviderLegGrantWaitDeps,
+  timeoutMs = PROVIDER_LEG_GRANT_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = deps.now() + timeoutMs;
+  while (deps.now() < deadline) {
+    if (deps.consume()) {
+      return true;
+    }
+    await deps.sleep(PROVIDER_LEG_GRANT_POLL_MS);
+  }
+  return deps.consume();
+}
+
+export function birthRootFromIntentPath(intentPath: string): string {
+  return dirname(dirname(intentPath));
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +710,7 @@ export function buildBirthDraft(
   inputs: BirthDraftInputs,
 ): BirthRecordDraft {
   const coords = birthBackendCoordsFromEnv(env);
-  return {
+  const draft: BirthRecordDraft = {
     schema_version: BIRTH_RECORD_SCHEMA_VERSION,
     session_id: inputs.session_id,
     harness: inputs.harness,
@@ -429,6 +725,14 @@ export function buildBirthDraft(
     resume_target: inputs.resume_target,
     dispatch_attempt_id: parseDispatchAttemptCarrier(env[DISPATCH_ATTEMPT_ENV]),
   };
+  const gate = parseProviderLegLaunchCarrier(env);
+  if (gate.kind === "valid") {
+    // The wrapper's Dispatch claim owns this leg. The provider SessionStart must
+    // not independently bind or discharge that same claim.
+    draft.dispatch_attempt_id = null;
+    Object.assign(draft, gate.carrier);
+  }
+  return draft;
 }
 
 // ---------------------------------------------------------------------------
@@ -513,10 +817,9 @@ export function probeChildStartTime(pid: number): string | null {
 
 /**
  * The production birth-record emit: probe the child's start_time and atomically
- * write the maildir record. FAIL-OPEN — any error (probe, mkdir, write) is
- * swallowed so a birth-record failure degrades the session to presence-only,
- * never crashing the human's launch. The launcher injects this behind a seam so
- * its wiring is testable without a real fs write or ps fork.
+ * write the maildir record. Ordinary presence records fail open; an owned-leg
+ * promotion throws so the inert shim exits before paid work. The launcher
+ * injects this behind a seam so its wiring is testable without real fs or ps.
  */
 export function emitBirthRecord(
   env: NodeJS.ProcessEnv,
@@ -524,15 +827,30 @@ export function emitBirthRecord(
   pid: number,
   intentPath?: string,
 ): void {
+  const owned =
+    draft.leg_launch_id !== undefined &&
+    draft.wrapper_job_id !== undefined &&
+    draft.wrapper_dispatch_attempt_id !== undefined;
   try {
     const dir = resolveBirthDir(env);
-    const record = { ...draft, pid, start_time: probeChildStartTime(pid) };
+    const startTime = probeChildStartTime(pid);
+    if (owned && startTime === null) {
+      throw new Error("provider-leg shim start time is unavailable");
+    }
+    const record = { ...draft, pid, start_time: startTime };
     if (intentPath === undefined) {
       writeBirthRecord(dir, record);
+    } else if (owned) {
+      // The promoted shim identity remains pending until the daemon validates
+      // its owner and issues the one-use pre-exec grant.
+      promoteBirthIntent(intentPath, record);
     } else {
       publishBirthIntent(intentPath, record);
     }
-  } catch {
+  } catch (error) {
+    if (owned) {
+      throw error;
+    }
     // Presence-only degrade. A pre-spawn intent, when armed, remains visible and
     // keeps terminal adoption fail-closed until an operator resolves it.
   }

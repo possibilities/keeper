@@ -4803,6 +4803,21 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
+  // ADR 0071 release re-verification: a wrapper attempt that owns Provider legs
+  // may not release its claims until every owned leg is settled AND no cascade
+  // intent for it is still unresolved — "signal-sent is not exited", so an
+  // in-flight or blocked teardown holds the claim visibly rather than releasing.
+  // The fold re-checks the condition itself (never trusting the producer) and,
+  // when unmet, no-ops so the claim stays held; a later release event re-checks.
+  // Gated on an exact attempt id (a legacy-unfenced release owns no legs) and
+  // vacuously passes for every non-owning attempt, so existing corpora with no
+  // ownership rows keep their exact prior behavior and re-fold byte-identically.
+  if (
+    payload.expectedAttemptId != null &&
+    dispatchAttemptReleaseBlockedByLegs(db, payload.expectedAttemptId)
+  ) {
+    return;
+  }
   const sessionClause = payload.sessionId == null ? "" : " AND session_id = ?";
   const bindings: Array<string | number> = [
     event.ts,
@@ -4924,6 +4939,541 @@ function foldDispatchClaimSuperseded(db: Database, event: Event): void {
       commonBindings,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Durable wrapper→Provider-leg ownership registry + terminal cascade (ADR 0071).
+//
+// All transitions ride dedicated synthetic events, so the existing lifecycle
+// folds stay untouched. Every timestamp comes from `event.ts` or an event-payload
+// number, every id is an event id, and each fold is a safe no-op on malformed
+// data, so the two projections stay DETERMINISTIC and re-fold byte-identically.
+// ---------------------------------------------------------------------------
+
+/** Non-empty-string field, else null. */
+function optStr(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** Positive safe-integer field, else null. */
+function optPosInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null;
+}
+
+/** Finite number field (may be zero/negative — a deadline is an absolute ts),
+ *  else null. */
+function optFiniteNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+interface ProviderLegBornPayload {
+  legLaunchId: string;
+  wrapperJobId: string;
+  wrapperDispatchAttemptId: number;
+  legSessionId: string | null;
+  legPid: number | null;
+  legStartTime: string | null;
+  launcherPid: number | null;
+  launcherStartTime: string | null;
+  paneId: string | null;
+  paneGeneration: string | number | null;
+  backendExecType: string | null;
+  backendExecSessionId: string | null;
+}
+
+function extractProviderLegBornPayload(
+  event: Event,
+): ProviderLegBornPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const p = JSON.parse(event.data) as Record<string, unknown>;
+    const legLaunchId = optStr(p.leg_launch_id);
+    const wrapperJobId = optStr(p.wrapper_job_id);
+    const wrapperDispatchAttemptId = optPosInt(p.wrapper_dispatch_attempt_id);
+    if (
+      legLaunchId == null ||
+      wrapperJobId == null ||
+      wrapperDispatchAttemptId == null
+    ) {
+      return null;
+    }
+    return {
+      legLaunchId,
+      wrapperJobId,
+      wrapperDispatchAttemptId,
+      legSessionId: optStr(p.leg_session_id),
+      legPid: optPosInt(p.leg_pid),
+      legStartTime: optStr(p.leg_start_time),
+      launcherPid: optPosInt(p.launcher_pid),
+      launcherStartTime: optStr(p.launcher_start_time),
+      paneId: optStr(p.pane_id),
+      paneGeneration:
+        optStr(p.pane_generation) ?? optFiniteNum(p.pane_generation),
+      backendExecType: optStr(p.backend_exec_type),
+      backendExecSessionId: optStr(p.backend_exec_session_id),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Enroll a freshly-launched Provider leg into the ownership registry. SET-ONCE
+ * on `leg_launch_id` (`ON CONFLICT DO NOTHING`) — a re-announce of the same
+ * immutable id is idempotent, and the ownership epoch is this birth's event id.
+ * A malformed or ownerless payload no-ops (legacy births never reach here — they
+ * carry no owner tuple and mint no ProviderLegBorn).
+ */
+function foldProviderLegBorn(db: Database, event: Event): void {
+  const p = extractProviderLegBornPayload(event);
+  if (p == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO provider_leg_ownership (
+       leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+       ownership_epoch_event_id, leg_session_id, leg_pid, leg_start_time,
+       launcher_pid, launcher_start_time, pane_id, pane_generation,
+       backend_exec_type, backend_exec_session_id, state, settled_event_id,
+       last_event_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', NULL, ?, ?, ?)
+     ON CONFLICT(leg_launch_id) DO NOTHING`,
+    [
+      p.legLaunchId,
+      p.wrapperJobId,
+      p.wrapperDispatchAttemptId,
+      event.id,
+      p.legSessionId,
+      p.legPid,
+      p.legStartTime,
+      p.launcherPid,
+      p.launcherStartTime,
+      p.paneId,
+      p.paneGeneration,
+      p.backendExecType,
+      p.backendExecSessionId,
+      event.id,
+      event.ts,
+      event.ts,
+    ],
+  );
+}
+
+/**
+ * Settle a leg to `terminal` on folded exit proof — the leg's own terminal fold
+ * observed by the producer, minted as a fresh event carrying the leg id. Only a
+ * `live` row settles (`state = 'live'` guard), so a duplicate exit event, or one
+ * arriving after a transfer/abort, is an idempotent no-op.
+ */
+function foldProviderLegExitConfirmed(db: Database, event: Event): void {
+  if (event.data == null || event.data.length === 0) return;
+  let p: Record<string, unknown>;
+  try {
+    p = JSON.parse(event.data) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  const legLaunchId = optStr(p.leg_launch_id);
+  if (legLaunchId == null) return;
+  const hasFence =
+    Object.hasOwn(p, "ownership_epoch_event_id") ||
+    Object.hasOwn(p, "wrapper_job_id") ||
+    Object.hasOwn(p, "wrapper_dispatch_attempt_id");
+  const epoch = optPosInt(p.ownership_epoch_event_id);
+  const wrapperJobId = optStr(p.wrapper_job_id);
+  const attemptId = optPosInt(p.wrapper_dispatch_attempt_id);
+  if (
+    hasFence &&
+    (epoch == null || wrapperJobId == null || attemptId == null)
+  ) {
+    return;
+  }
+  if (hasFence) {
+    db.run(
+      `UPDATE provider_leg_ownership
+          SET state = 'terminal', settled_event_id = ?, last_event_id = ?, updated_at = ?
+        WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?
+          AND wrapper_job_id = ? AND wrapper_dispatch_attempt_id = ?
+          AND state = 'live'`,
+      [
+        event.id,
+        event.id,
+        event.ts,
+        legLaunchId,
+        epoch as number,
+        wrapperJobId as string,
+        attemptId as number,
+      ],
+    );
+    return;
+  }
+  db.run(
+    `UPDATE provider_leg_ownership
+        SET state = 'terminal', settled_event_id = ?, last_event_id = ?, updated_at = ?
+      WHERE leg_launch_id = ? AND state = 'live'`,
+    [event.id, event.id, event.ts, legLaunchId],
+  );
+}
+
+interface ProviderLegTransferPayload {
+  legLaunchId: string;
+  fromWrapperJobId: string;
+  fromAttemptId: number;
+  toWrapperJobId: string;
+  toAttemptId: number;
+}
+
+function extractProviderLegTransferPayload(
+  event: Event,
+): ProviderLegTransferPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const p = JSON.parse(event.data) as Record<string, unknown>;
+    const legLaunchId = optStr(p.leg_launch_id);
+    const fromWrapperJobId = optStr(p.from_wrapper_job_id);
+    const fromAttemptId = optPosInt(p.from_wrapper_dispatch_attempt_id);
+    const toWrapperJobId = optStr(p.to_wrapper_job_id);
+    const toAttemptId = optPosInt(p.to_wrapper_dispatch_attempt_id);
+    if (
+      legLaunchId == null ||
+      fromWrapperJobId == null ||
+      fromAttemptId == null ||
+      toWrapperJobId == null ||
+      toAttemptId == null
+    ) {
+      return null;
+    }
+    return {
+      legLaunchId,
+      fromWrapperJobId,
+      fromAttemptId,
+      toWrapperJobId,
+      toAttemptId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One fenced old→new ownership transition. REFUSED (no-op) once terminal proof
+ * exists (row not `live`) or TERM is armed for the current epoch's incident;
+ * STALE transfers — whose `from` tuple no longer matches the current owner —
+ * no-op deterministically. On success the owner tuple moves and the ownership
+ * epoch advances to this event's id, so a fresh incident keys off the new epoch.
+ * Exclusive file claims never ride this transfer (they are a separate concern).
+ */
+function foldProviderLegOwnershipTransferred(db: Database, event: Event): void {
+  const p = extractProviderLegTransferPayload(event);
+  if (p == null) {
+    return;
+  }
+  const row = db
+    .query(
+      `SELECT wrapper_job_id, wrapper_dispatch_attempt_id, ownership_epoch_event_id, state
+         FROM provider_leg_ownership WHERE leg_launch_id = ?`,
+    )
+    .get(p.legLaunchId) as {
+    wrapper_job_id: string;
+    wrapper_dispatch_attempt_id: number;
+    ownership_epoch_event_id: number;
+    state: string;
+  } | null;
+  // Refuse once terminal proof exists: only a still-live leg transfers.
+  if (row == null || row.state !== "live") {
+    return;
+  }
+  // Stale transfer: the `from` tuple must be the CURRENT owner, else no-op.
+  if (
+    row.wrapper_job_id !== p.fromWrapperJobId ||
+    row.wrapper_dispatch_attempt_id !== p.fromAttemptId
+  ) {
+    return;
+  }
+  // Refuse once TERM is armed for this leg's current-epoch incident — a cascade
+  // that has begun signalling owns the teardown; ownership can no longer move.
+  const termArmed = db
+    .query(
+      `SELECT 1 FROM provider_leg_cascades
+        WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?
+          AND term_armed_at IS NOT NULL LIMIT 1`,
+    )
+    .get(p.legLaunchId, row.ownership_epoch_event_id) as unknown;
+  if (termArmed != null) {
+    return;
+  }
+  db.run(
+    `UPDATE provider_leg_ownership
+        SET wrapper_job_id = ?, wrapper_dispatch_attempt_id = ?,
+            ownership_epoch_event_id = ?, last_event_id = ?, updated_at = ?
+      WHERE leg_launch_id = ? AND state = 'live'`,
+    [
+      p.toWrapperJobId,
+      p.toAttemptId,
+      event.id,
+      event.id,
+      event.ts,
+      p.legLaunchId,
+    ],
+  );
+}
+
+interface ProviderLegCascadeArmedPayload {
+  legLaunchId: string;
+  ownershipEpochEventId: number;
+  wrapperJobId: string;
+  wrapperDispatchAttemptId: number;
+  killNotBefore: number | null;
+}
+
+function extractCascadeArmedPayload(
+  event: Event,
+): ProviderLegCascadeArmedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const p = JSON.parse(event.data) as Record<string, unknown>;
+    const legLaunchId = optStr(p.leg_launch_id);
+    const ownershipEpochEventId = optPosInt(p.ownership_epoch_event_id);
+    const wrapperJobId = optStr(p.wrapper_job_id);
+    const wrapperDispatchAttemptId = optPosInt(p.wrapper_dispatch_attempt_id);
+    if (
+      legLaunchId == null ||
+      ownershipEpochEventId == null ||
+      wrapperJobId == null ||
+      wrapperDispatchAttemptId == null
+    ) {
+      return null;
+    }
+    return {
+      legLaunchId,
+      ownershipEpochEventId,
+      wrapperJobId,
+      wrapperDispatchAttemptId,
+      killNotBefore: optFiniteNum(p.kill_not_before),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open a cascade incident for `(leg_launch_id, ownership_epoch_event_id)` — TERM
+ * armed at this event's ts, with the explicitly stored `kill_not_before`
+ * deadline. SET-ONCE per key (`ON CONFLICT DO NOTHING`), so re-arming a live
+ * incident is idempotent and a re-fold reproduces the same armed timeline.
+ */
+function foldProviderLegCascadeArmed(db: Database, event: Event): void {
+  const p = extractCascadeArmedPayload(event);
+  if (p == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO provider_leg_cascades (
+       leg_launch_id, ownership_epoch_event_id, wrapper_job_id,
+       wrapper_dispatch_attempt_id, term_armed_at, term_sent_at, kill_not_before,
+       kill_armed_at, kill_sent_at, term_attempts, kill_attempts, blocked_reason,
+       human_notified_at, confirmed_at, state, last_event_id, created_at, updated_at
+     ) SELECT ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, 0, 0, NULL, NULL, NULL, 'armed', ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM provider_leg_ownership
+          WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?
+            AND wrapper_job_id = ? AND wrapper_dispatch_attempt_id = ?
+       )
+     ON CONFLICT(leg_launch_id, ownership_epoch_event_id) DO NOTHING`,
+    [
+      p.legLaunchId,
+      p.ownershipEpochEventId,
+      p.wrapperJobId,
+      p.wrapperDispatchAttemptId,
+      event.ts,
+      p.killNotBefore,
+      event.id,
+      event.ts,
+      event.ts,
+      p.legLaunchId,
+      p.ownershipEpochEventId,
+      p.wrapperJobId,
+      p.wrapperDispatchAttemptId,
+    ],
+  );
+}
+
+interface ProviderLegCascadeProgressPayload {
+  legLaunchId: string;
+  ownershipEpochEventId: number;
+  phase:
+    | "term_sent"
+    | "kill_armed"
+    | "kill_sent"
+    | "blocked"
+    | "cleared"
+    | "confirmed";
+  attemptOrdinal: number | null;
+  reason: string | null;
+  notified: boolean;
+}
+
+const CASCADE_PHASES = new Set([
+  "term_sent",
+  "kill_armed",
+  "kill_sent",
+  "blocked",
+  "cleared",
+  "confirmed",
+]);
+
+function extractCascadeProgressPayload(
+  event: Event,
+): ProviderLegCascadeProgressPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const p = JSON.parse(event.data) as Record<string, unknown>;
+    const legLaunchId = optStr(p.leg_launch_id);
+    const ownershipEpochEventId = optPosInt(p.ownership_epoch_event_id);
+    const phase = optStr(p.phase);
+    if (
+      legLaunchId == null ||
+      ownershipEpochEventId == null ||
+      phase == null ||
+      !CASCADE_PHASES.has(phase)
+    ) {
+      return null;
+    }
+    return {
+      legLaunchId,
+      ownershipEpochEventId,
+      phase: phase as ProviderLegCascadeProgressPayload["phase"],
+      attemptOrdinal: optPosInt(p.attempt_ordinal),
+      reason: optStr(p.reason),
+      notified: p.notified === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Advance an existing cascade incident by one staged-shutdown phase. Signal
+ * timestamps are first-write-wins (`COALESCE`) and attempt counts converge under
+ * `MAX(current, attempt_ordinal)` — both idempotent AND re-fold-deterministic, so
+ * the persisted deadlines/attempts survive a from-scratch replay. `blocked` sets
+ * the terminal reason and pages the human at most once (`human_notified_at` fills
+ * only from NULL); `confirmed` clears the blocked reason and settles the incident.
+ * No-op when the incident does not exist (the armed event opens it).
+ */
+function foldProviderLegCascadeProgressed(db: Database, event: Event): void {
+  const p = extractCascadeProgressPayload(event);
+  if (p == null) {
+    return;
+  }
+  const key: [string, number] = [p.legLaunchId, p.ownershipEpochEventId];
+  const tail = "leg_launch_id = ? AND ownership_epoch_event_id = ?";
+  switch (p.phase) {
+    case "term_sent":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET term_sent_at = COALESCE(term_sent_at, ?),
+                term_attempts = MAX(term_attempts, ?),
+                state = CASE WHEN state = 'armed' THEN 'terming' ELSE state END,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail}`,
+        [event.ts, p.attemptOrdinal ?? 0, event.id, event.ts, ...key],
+      );
+      break;
+    case "kill_armed":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET kill_armed_at = COALESCE(kill_armed_at, ?),
+                state = CASE WHEN state IN ('armed', 'terming') THEN 'killing' ELSE state END,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail}`,
+        [event.ts, event.id, event.ts, ...key],
+      );
+      break;
+    case "kill_sent":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET kill_sent_at = COALESCE(kill_sent_at, ?),
+                kill_attempts = MAX(kill_attempts, ?),
+                state = CASE WHEN state IN ('armed', 'terming') THEN 'killing' ELSE state END,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail}`,
+        [event.ts, p.attemptOrdinal ?? 0, event.id, event.ts, ...key],
+      );
+      break;
+    case "blocked":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET state = 'blocked', blocked_reason = ?,
+                human_notified_at = CASE
+                  WHEN ? = 1 AND human_notified_at IS NULL THEN ?
+                  ELSE human_notified_at END,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail}`,
+        [p.reason, p.notified ? 1 : 0, event.ts, event.id, event.ts, ...key],
+      );
+      break;
+    case "cleared":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET state = CASE
+                  WHEN kill_sent_at IS NOT NULL OR kill_armed_at IS NOT NULL THEN 'killing'
+                  WHEN term_sent_at IS NOT NULL THEN 'terming'
+                  ELSE 'armed' END,
+                blocked_reason = NULL, human_notified_at = NULL,
+                last_event_id = ?, updated_at = ?
+          WHERE ${tail} AND state = 'blocked'`,
+        [event.id, event.ts, ...key],
+      );
+      break;
+    case "confirmed":
+      db.run(
+        `UPDATE provider_leg_cascades
+            SET state = 'confirmed', confirmed_at = COALESCE(confirmed_at, ?),
+                blocked_reason = NULL, last_event_id = ?, updated_at = ?
+          WHERE ${tail} AND state != 'confirmed'`,
+        [event.ts, event.id, event.ts, ...key],
+      );
+      break;
+  }
+}
+
+/**
+ * The release-fold's ADR 0071 gate: TRUE when a wrapper attempt still has an
+ * owned leg that is not settled, OR a cascade incident that is not yet confirmed
+ * — either is an unmet release precondition. Vacuously FALSE for any attempt with
+ * no ownership/cascade rows, so a normal (non-wrapping) release is unaffected.
+ */
+function dispatchAttemptReleaseBlockedByLegs(
+  db: Database,
+  attemptId: number,
+): boolean {
+  const liveLeg = db
+    .query(
+      `SELECT 1 FROM provider_leg_ownership
+        WHERE wrapper_dispatch_attempt_id = ? AND state = 'live' LIMIT 1`,
+    )
+    .get(attemptId) as unknown;
+  if (liveLeg != null) {
+    return true;
+  }
+  const unresolvedCascade = db
+    .query(
+      `SELECT 1 FROM provider_leg_cascades
+        WHERE wrapper_dispatch_attempt_id = ? AND state != 'confirmed' LIMIT 1`,
+    )
+    .get(attemptId) as unknown;
+  return unresolvedCascade != null;
 }
 
 /**
@@ -10916,6 +11466,20 @@ export function applyEvent(
       foldDispatchClaimReleased(db, event);
     } else if (event.hook_event === "DispatchClaimSuperseded") {
       foldDispatchClaimSuperseded(db, event);
+    } else if (event.hook_event === "ProviderLegBorn") {
+      // ADR 0071 — enroll a launched Provider leg into the ownership registry.
+      // A dedicated arm (never the final `else` → projectJobsRow): these
+      // synthetic events carry a leg id in their session_id, so routing them into
+      // the jobs projection would corrupt it.
+      foldProviderLegBorn(db, event);
+    } else if (event.hook_event === "ProviderLegExitConfirmed") {
+      foldProviderLegExitConfirmed(db, event);
+    } else if (event.hook_event === "ProviderLegOwnershipTransferred") {
+      foldProviderLegOwnershipTransferred(db, event);
+    } else if (event.hook_event === "ProviderLegCascadeArmed") {
+      foldProviderLegCascadeArmed(db, event);
+    } else if (event.hook_event === "ProviderLegCascadeProgressed") {
+      foldProviderLegCascadeProgressed(db, event);
     } else if (event.hook_event === "BlockEscalationRequested") {
       foldBlockEscalationRequested(db, event);
     } else if (event.hook_event === "BlockEscalationAttempted") {

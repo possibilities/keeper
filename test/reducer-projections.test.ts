@@ -3379,6 +3379,124 @@ test("Dispatch claim projection and Cursor roll back together", () => {
   expect(getCursor()).toBe(eventId);
 });
 
+test("Provider-leg cascade level-clear re-arms blocked incident paging", () => {
+  const bornId = insertEvent({
+    hook_event: "ProviderLegBorn",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      wrapper_job_id: "work::fn-1300-level-clear.1",
+      wrapper_dispatch_attempt_id: 54,
+    }),
+  });
+  drainAll();
+  insertEvent({
+    hook_event: "ProviderLegCascadeArmed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      wrapper_job_id: "work::fn-1300-level-clear.1",
+      wrapper_dispatch_attempt_id: 54,
+      kill_not_before: 2_000,
+    }),
+  });
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      phase: "blocked",
+      reason: "identity-unknown",
+      notified: true,
+    }),
+  });
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT state, blocked_reason, human_notified_at FROM provider_leg_cascades WHERE leg_launch_id = ?",
+      )
+      .get("leg-level-clear"),
+  ).toMatchObject({
+    state: "blocked",
+    blocked_reason: "identity-unknown",
+    human_notified_at: expect.any(Number),
+  });
+
+  insertEvent({
+    hook_event: "ProviderLegCascadeProgressed",
+    session_id: "leg-level-clear",
+    data: JSON.stringify({
+      leg_launch_id: "leg-level-clear",
+      ownership_epoch_event_id: bornId,
+      phase: "cleared",
+    }),
+  });
+  drainAll();
+  expect(
+    db
+      .query(
+        "SELECT state, blocked_reason, human_notified_at FROM provider_leg_cascades WHERE leg_launch_id = ?",
+      )
+      .get("leg-level-clear"),
+  ).toEqual({ state: "armed", blocked_reason: null, human_notified_at: null });
+});
+
+test("ADR 0071 release gate: an owned live leg holds the claim; exit proof releases it", () => {
+  // A wrapper attempt binds its claim, then owns a Provider leg.
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb: "work",
+    id: "fn-owned.1",
+    attempt_id: 55,
+    expected_attempt_id: null,
+    dir: "/repo",
+  });
+  dispatchClaimEvent("DispatchClaimBound", {
+    verb: "work",
+    id: "fn-owned.1",
+    expected_attempt_id: 55,
+    session_id: "wrapper-55",
+  });
+  insertEvent({
+    hook_event: "ProviderLegBorn",
+    session_id: "leg-owned-1",
+    data: JSON.stringify({
+      leg_launch_id: "leg-owned-1",
+      wrapper_job_id: "work::fn-owned.1",
+      wrapper_dispatch_attempt_id: 55,
+    }),
+  });
+  drainAll();
+
+  // Release-first is refused while the owned leg is still live.
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb: "work",
+    id: "fn-owned.1",
+    expected_attempt_id: 55,
+    session_id: "wrapper-55",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-owned.1")?.state).toBe("bound");
+
+  // Folded exit proof settles the leg; the next release proceeds.
+  insertEvent({
+    hook_event: "ProviderLegExitConfirmed",
+    session_id: "leg-owned-1",
+    data: JSON.stringify({ leg_launch_id: "leg-owned-1" }),
+  });
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb: "work",
+    id: "fn-owned.1",
+    expected_attempt_id: 55,
+    session_id: "wrapper-55",
+  });
+  drainAll();
+  expect(getDispatchClaim("work", "fn-owned.1")?.state).toBe("released");
+  expect(getPendingDispatch("work", "fn-owned.1")).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // Schema v107 (fn-1107 task .1) — `jobs.dispatch_origin` provenance stamp. The
 // SessionStart discharge-on-bind seam stamps `'autopilot'` ONLY when the

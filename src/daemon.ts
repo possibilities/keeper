@@ -96,10 +96,20 @@ import type {
 import {
   type BirthRecord,
   defaultBirthDir,
+  ownerTupleFromBirthRecord,
+  parseBirthIntent,
   parseBirthRecord,
+  writeProviderLegGrant,
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
+import {
+  type HarnessProcess,
+  type HarnessProcessObservation,
+  isHarnessProcessCommand,
+  probeHarnessProcess,
+  processStartTimesWithinOneSecond,
+} from "./commit-work/process-identity";
 import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
@@ -190,10 +200,15 @@ import type {
 } from "./events-ingest-worker";
 import {
   classifyCloseKind,
+  compareCanonicalGeneration,
+  createTmuxPaneOps,
   type KillReason,
   keeperAgentLaunch,
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
+  type PaneInfo,
+  type TmuxPaneOps,
+  WRAPPED_EXEC_SESSION,
 } from "./exec-backend";
 import type {
   ExitWatcherOutbound,
@@ -6354,7 +6369,114 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
   );
 }
 
-/** Retire a processed / parked birth record — delete it from `new/`. An ENOENT
+type ProviderLegGrantStatus = "grant" | "wait" | "deny";
+
+function providerLegGrantStatus(
+  db: Database,
+  record: BirthRecord,
+): ProviderLegGrantStatus {
+  const owner = ownerTupleFromBirthRecord(record);
+  if (
+    owner === null ||
+    record.start_time === null ||
+    record.launcher_pid === undefined ||
+    record.launcher_start_time === undefined
+  ) {
+    return "deny";
+  }
+  const row = db
+    .query(
+      `SELECT j.state AS wrapper_state, c.state AS claim_state,
+              c.session_id, c.legacy_unfenced
+         FROM dispatch_claims c
+         JOIN jobs j ON j.job_id = ?
+        WHERE c.attempt_id = ?`,
+    )
+    .get(owner.wrapper_job_id, owner.wrapper_dispatch_attempt_id) as {
+    wrapper_state: string;
+    claim_state: string;
+    session_id: string | null;
+    legacy_unfenced: number;
+  } | null;
+  // The wrapper SessionStart and claim bind can still be behind the birth scan;
+  // a superseded exact attempt is equally non-authoritative and remains inert.
+  if (row === null) {
+    return "wait";
+  }
+  if (
+    row.wrapper_state === "ended" ||
+    row.wrapper_state === "killed" ||
+    row.legacy_unfenced !== 0
+  ) {
+    return "deny";
+  }
+  if (row.claim_state === "acquired") {
+    return "wait";
+  }
+  return row.claim_state === "bound" && row.session_id === owner.wrapper_job_id
+    ? "grant"
+    : "deny";
+}
+
+function providerLegBirthAlreadyMinted(
+  db: Database,
+  legLaunchId: string,
+): boolean {
+  return (
+    db
+      .query(
+        `SELECT 1 AS present FROM events
+          WHERE hook_event = 'ProviderLegBorn'
+            AND json_valid(data)
+            AND json_extract(data, '$.leg_launch_id') = ?
+          LIMIT 1`,
+      )
+      .get(legLaunchId) !== null
+  );
+}
+
+function insertProviderLegBorn(db: Database, record: BirthRecord): void {
+  const owner = ownerTupleFromBirthRecord(record);
+  if (owner === null) {
+    return;
+  }
+  const paneGeneration =
+    record.backend_exec_type === "tmux"
+      ? ((
+          db
+            .query(
+              `SELECT tmux_generation_id AS generation_id
+               FROM events
+              WHERE hook_event = 'TmuxTopologySnapshot'
+                AND tmux_generation_id IS NOT NULL
+              ORDER BY id DESC LIMIT 1`,
+            )
+            .get() as { generation_id: string } | null
+        )?.generation_id ?? null)
+      : null;
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'ProviderLegBorn', 'provider_leg_born', ?)`,
+    [
+      birthEventTs(record),
+      record.session_id,
+      JSON.stringify({
+        ...owner,
+        leg_session_id: record.session_id,
+        leg_pid: record.pid,
+        leg_start_time: record.start_time,
+        launcher_pid: record.launcher_pid ?? null,
+        launcher_start_time: record.launcher_start_time ?? null,
+        pane_id: record.backend_exec_pane_id,
+        pane_generation: paneGeneration,
+        backend_exec_type: record.backend_exec_type,
+        backend_exec_session_id: record.backend_exec_session_id,
+      }),
+    ],
+  );
+}
+
+/** Retire a processed / parked birth record — delete it from its maildir. An ENOENT
  *  retire race (already gone) is a non-fatal no-op; the tree stays bounded. */
 function retireBirthFile(full: string): void {
   try {
@@ -6561,19 +6683,18 @@ function gcStuckBirthRecord(
 /**
  * Ingest the births maildir — the non-hook presence channel's analogue of
  * {@link scanEventsLogDir}, but PROCESS-THEN-RETIRE (births are one-record files,
- * not append logs, so there is no byte-offset cursor). For each record under
- * `<dir>/new/`:
+ * not append logs, so there is no byte-offset cursor). Scanning both `pending/`
+ * and `new/` recovers a complete record stranded between publication renames.
  *
  *  - PARSE ({@link parseBirthRecord}): a torn/partial file never reaches `new/`
  *    (the launcher writes tmp→fsync→rename, an atomic move-in), so a null parse
  *    is a genuinely malformed COMPLETE record — POISON. Park it (idempotent
  *    dl_id) and retire, so one bad record never wedges the scan.
- *  - MINT + RETIRE: a valid record mints ONE synthetic SessionStart
- *    ({@link insertBirthSessionStart}) inside a `BEGIN IMMEDIATE`, then — after
- *    the durable COMMIT — retires the file. A crash in the tiny commit→unlink
- *    window re-mints on the next scan, which is HARMLESS: a duplicate
- *    SessionStart folds idempotently (a resume). At-least-once + idempotent fold
- *    = exactly-once observable, without an fs op inside the SQL transaction.
+ *  - MINT + RETIRE: a valid ordinary record mints SessionStart inside a
+ *    `BEGIN IMMEDIATE`. An owned record first rechecks its exact live claim,
+ *    mints SessionStart + ProviderLegBorn set-once by `leg_launch_id`, commits,
+ *    then publishes the one-use grant. A repeated owned delivery reissues only
+ *    the grant and never duplicates either synthetic event.
  *  - INSERT-THROW: rolls the transaction back and LEAVES the file (retry next
  *    scan); {@link gcStuckBirthRecord} bounds the tree if it never recovers.
  *
@@ -6588,71 +6709,726 @@ export function scanBirthDir(
   dir: string,
   ctx?: EventsIngestContext,
 ): void {
-  const newDir = join(dir, "new");
-  if (!existsSync(newDir)) {
-    return;
-  }
-  let names: string[];
-  try {
-    names = readdirSync(newDir);
-  } catch (err) {
-    console.error(
-      `[keeperd] births scan failed to readdir ${newDir}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".json")) {
-      // The launcher writes `<pid>.<start-time>.json`; ignore anything else.
+  for (const bucket of ["pending", "new"] as const) {
+    const bucketDir = join(dir, bucket);
+    if (!existsSync(bucketDir)) {
       continue;
     }
-    const full = join(newDir, name);
-    let body: string;
+    let names: string[];
     try {
-      body = readFileSync(full, "utf8");
-    } catch {
-      // Read-vs-retire race (file vanished between readdir and read): skip,
-      // never park — a maildir move-in is atomic, so a present file is complete.
-      continue;
-    }
-    const record = parseBirthRecord(body);
-    if (record === null) {
-      // POISON: a complete-but-malformed record. Park + retire so it can never
-      // re-poison a later scan. Leave it only on a transient park failure.
-      if (parkPoisonBirth(db, full, body, null, ctx)) {
-        retireBirthFile(full);
-      }
-      continue;
-    }
-    // Valid record: mint the synthetic SessionStart atomically, COMMIT, then
-    // retire. A crash in the commit→unlink window re-mints harmlessly.
-    let committed = false;
-    db.run("BEGIN IMMEDIATE");
-    try {
-      insertBirthSessionStart(db, record);
-      db.run("COMMIT");
-      committed = true;
+      names = readdirSync(bucketDir);
     } catch (err) {
-      try {
-        db.run("ROLLBACK");
-      } catch {
-        // best-effort
-      }
       console.error(
-        `[keeperd] births mint failed for ${full} (leaving for retry): ${
+        `[keeperd] births scan failed to readdir ${bucketDir}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-    }
-    if (committed) {
-      retireBirthFile(full);
       continue;
     }
-    // Mint kept failing — bound the tree against a permanently-stuck record.
-    gcStuckBirthRecord(db, full, record, ctx);
+    for (const name of names) {
+      if (!name.endsWith(".json")) {
+        continue;
+      }
+      const full = join(bucketDir, name);
+      let body: string;
+      try {
+        body = readFileSync(full, "utf8");
+      } catch {
+        continue;
+      }
+      const record = parseBirthRecord(body);
+      if (record === null) {
+        // A valid pending intent is deliberately retained until its launcher
+        // promotes it. It is not a poison birth record.
+        if (bucket === "pending" && parseBirthIntent(body) !== null) {
+          continue;
+        }
+        if (parkPoisonBirth(db, full, body, null, ctx)) {
+          retireBirthFile(full);
+        }
+        continue;
+      }
+
+      const owner = ownerTupleFromBirthRecord(record);
+      let committed = false;
+      let shouldIssueGrant = false;
+      let grantStatus: ProviderLegGrantStatus | null = null;
+      db.run("BEGIN IMMEDIATE");
+      try {
+        grantStatus =
+          owner === null ? null : providerLegGrantStatus(db, record);
+        if (grantStatus === "wait" || grantStatus === "deny") {
+          db.run("ROLLBACK");
+        } else {
+          const duplicateOwnedBirth =
+            owner !== null &&
+            providerLegBirthAlreadyMinted(db, owner.leg_launch_id);
+          if (!duplicateOwnedBirth) {
+            insertBirthSessionStart(db, record);
+            insertProviderLegBorn(db, record);
+          }
+          // A crash after the durable mint but before grant publication leaves
+          // the same complete pending record. Re-issue for that one shim while
+          // keeping the synthetic events set-once on leg_launch_id.
+          shouldIssueGrant = owner !== null;
+          db.run("COMMIT");
+          committed = true;
+        }
+      } catch (err) {
+        try {
+          db.run("ROLLBACK");
+        } catch {
+          // best-effort
+        }
+        console.error(
+          `[keeperd] births mint failed for ${full} (leaving for retry): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      if (grantStatus === "wait") {
+        // The owner fold may still be catching up. Keep the promoted identity
+        // visible so a later scan can recheck it without launching paid work.
+        gcStuckBirthRecord(db, full, record, ctx);
+        continue;
+      }
+      if (grantStatus === "deny") {
+        // Keep the promoted identity as fail-closed evidence. A terminal or
+        // superseded owner can never become grantable, and the dead-shim GC
+        // eventually bounds the stranded record without creating authority.
+        gcStuckBirthRecord(db, full, record, ctx);
+        continue;
+      }
+      if (committed && owner !== null && shouldIssueGrant) {
+        try {
+          // The transaction lock made the owner recheck and ownership mint one
+          // serial writer step. Publish only after its durable commit.
+          writeProviderLegGrant(dir, owner);
+        } catch (err) {
+          console.error(
+            `[keeperd] provider-leg grant failed for ${full} (leaving for retry): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+      }
+      if (committed) {
+        retireBirthFile(full);
+        continue;
+      }
+      gcStuckBirthRecord(db, full, record, ctx);
+    }
   }
+}
+
+export const PROVIDER_LEG_CASCADE_SCAN_CAP = 32;
+export const PROVIDER_LEG_TERM_GRACE_SEC = 2;
+export const PROVIDER_LEG_KILL_ATTEMPT_CAP = 3;
+export const PROVIDER_LEG_CASCADE_POLL_MS = 250;
+
+export interface ProviderLegCascadeDeps {
+  nowSec(): number;
+  probe(pid: number, startTime: string): HarnessProcessObservation;
+  signal(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
+  listPanes: TmuxPaneOps["listPanes"];
+  killWindow: TmuxPaneOps["killWindow"];
+  currentPaneGeneration?(paneId: string): string | number | null;
+  notify?(message: string): boolean | Promise<boolean>;
+  afterMint?(): void;
+  scanCap?: number;
+}
+
+export interface ProviderLegCascadeSweepResult {
+  acted: boolean;
+  pending: boolean;
+  nextDelayMs: number | null;
+}
+
+type ProviderLegCascadeRow = {
+  leg_launch_id: string;
+  wrapper_job_id: string;
+  wrapper_dispatch_attempt_id: number;
+  ownership_epoch_event_id: number;
+  leg_session_id: string | null;
+  leg_pid: number | null;
+  leg_start_time: string | null;
+  pane_id: string | null;
+  pane_generation: string | number | null;
+  backend_exec_type: string | null;
+  backend_exec_session_id: string | null;
+  ownership_state: string;
+  harness: HarnessProcess | null;
+  leg_state: string | null;
+  current_pane_generation: string | null;
+  wrapper_state: string;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  claim_attempt_id: number | null;
+  claim_state: string | null;
+  claim_session_id: string | null;
+  cascade_state: string | null;
+  term_sent_at: number | null;
+  kill_not_before: number | null;
+  kill_armed_at: number | null;
+  term_attempts: number;
+  kill_attempts: number;
+  blocked_reason: string | null;
+  human_notified_at: number | null;
+};
+
+type ProviderLegProbeVerdict =
+  | "target"
+  | "gone"
+  | "identity-unknown"
+  | "command-unowned";
+
+export type ProviderLegWindowTeardownDecision = "kill" | "converged" | "defer";
+
+/**
+ * Classify an owned Provider leg's birth-captured window against one live tmux
+ * sweep. Only a live, one-pane window in the wrapped session with the exact
+ * canonical generation may be killed. An absent pane or a generation mismatch
+ * proves the birth coordinate no longer names this leg; degraded or ambiguous
+ * evidence defers without targeting anything.
+ */
+export function classifyProviderLegWindowTeardown(
+  row: Pick<
+    ProviderLegCascadeRow,
+    | "pane_id"
+    | "pane_generation"
+    | "backend_exec_type"
+    | "backend_exec_session_id"
+  > & { current_pane_generation?: string | null },
+  panes: readonly PaneInfo[] | null,
+): ProviderLegWindowTeardownDecision {
+  if (
+    row.backend_exec_type !== "tmux" ||
+    row.backend_exec_session_id !== WRAPPED_EXEC_SESSION ||
+    row.pane_id == null ||
+    row.pane_id === ""
+  ) {
+    return "converged";
+  }
+  if (panes == null || panes.length === 0) return "defer";
+  const pane = panes.find((candidate) => candidate.paneId === row.pane_id);
+  if (pane === undefined) return "converged";
+  const generation = compareCanonicalGeneration(
+    row.pane_generation == null ? null : String(row.pane_generation),
+    pane.tmuxGenerationId,
+  );
+  if (generation === "mismatch") return "converged";
+  if (generation !== "match") return "defer";
+  if (row.current_pane_generation != null) {
+    const projectedGeneration = compareCanonicalGeneration(
+      row.current_pane_generation,
+      pane.tmuxGenerationId,
+    );
+    if (projectedGeneration === "mismatch") return "converged";
+    if (projectedGeneration !== "match") return "defer";
+  }
+  if (pane.paneDead !== "0" || pane.sessionName !== WRAPPED_EXEC_SESSION) {
+    return "defer";
+  }
+  const panesInWindow = panes.filter(
+    (candidate) => candidate.windowId === pane.windowId,
+  ).length;
+  return panesInWindow === 1 ? "kill" : "defer";
+}
+
+/** Pure signal/exit boundary, including the close-recycle corroboration rule. */
+export function classifyProviderLegProbe(
+  observation: HarnessProcessObservation,
+  input: {
+    harness: HarnessProcess;
+    recordedStartTime: string;
+    recordedPaneGeneration: string | number | null;
+    currentPaneGeneration: string | number | null;
+  },
+): ProviderLegProbeVerdict {
+  if (observation.identity === "inconclusive") return "identity-unknown";
+  if (observation.identity === "matching") {
+    return observation.command != null &&
+      isHarnessProcessCommand(observation.command, input.harness)
+      ? "target"
+      : "command-unowned";
+  }
+  if (observation.identityReason === "esrch") return "gone";
+  const nearRecycle =
+    observation.observedStartTime == null ||
+    processStartTimesWithinOneSecond(
+      input.recordedStartTime,
+      observation.observedStartTime,
+    );
+  if (!nearRecycle) return "gone";
+  const commandMismatch =
+    observation.command != null &&
+    !isHarnessProcessCommand(observation.command, input.harness);
+  const paneChanged =
+    input.recordedPaneGeneration != null &&
+    input.currentPaneGeneration != null &&
+    String(input.recordedPaneGeneration) !==
+      String(input.currentPaneGeneration);
+  return commandMismatch || paneChanged ? "gone" : "identity-unknown";
+}
+
+function mintProviderLegCascadeEvent(
+  db: Database,
+  deps: ProviderLegCascadeDeps,
+  hookEvent: string,
+  sessionId: string,
+  data: Record<string, unknown>,
+): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, ?, 'provider_leg_cascade', ?)`,
+    [deps.nowSec(), sessionId, hookEvent, JSON.stringify(data)],
+  );
+  deps.afterMint?.();
+}
+
+function cascadeProgressData(
+  row: ProviderLegCascadeRow,
+  phase: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    leg_launch_id: row.leg_launch_id,
+    ownership_epoch_event_id: row.ownership_epoch_event_id,
+    wrapper_job_id: row.wrapper_job_id,
+    wrapper_dispatch_attempt_id: row.wrapper_dispatch_attempt_id,
+    phase,
+    ...extra,
+  };
+}
+
+function currentPaneGeneration(
+  row: ProviderLegCascadeRow,
+  deps: ProviderLegCascadeDeps,
+): string | number | null {
+  if (row.pane_id == null) return null;
+  return (
+    deps.currentPaneGeneration?.(row.pane_id) ?? row.current_pane_generation
+  );
+}
+
+function providerLegProbeVerdict(
+  row: ProviderLegCascadeRow,
+  deps: ProviderLegCascadeDeps,
+): ProviderLegProbeVerdict {
+  if (
+    row.leg_pid == null ||
+    row.leg_start_time == null ||
+    row.harness == null
+  ) {
+    return "identity-unknown";
+  }
+  let observation: HarnessProcessObservation;
+  try {
+    observation = deps.probe(row.leg_pid, row.leg_start_time);
+  } catch {
+    return "identity-unknown";
+  }
+  return classifyProviderLegProbe(observation, {
+    harness: row.harness,
+    recordedStartTime: row.leg_start_time,
+    recordedPaneGeneration: row.pane_generation,
+    currentPaneGeneration: currentPaneGeneration(row, deps),
+  });
+}
+
+async function teardownProviderLegWindow(
+  deps: ProviderLegCascadeDeps,
+  row: ProviderLegCascadeRow,
+  panes: readonly PaneInfo[] | null,
+): Promise<boolean> {
+  const decision = classifyProviderLegWindowTeardown(row, panes);
+  if (decision === "converged") return true;
+  if (decision === "defer") return false;
+  const killed = await deps.killWindow(row.pane_id as string);
+  return killed.ok;
+}
+
+async function settleProviderLeg(
+  db: Database,
+  deps: ProviderLegCascadeDeps,
+  row: ProviderLegCascadeRow,
+  panes: readonly PaneInfo[] | null,
+): Promise<boolean> {
+  if (row.ownership_state === "live") {
+    mintProviderLegCascadeEvent(
+      db,
+      deps,
+      "ProviderLegExitConfirmed",
+      row.leg_session_id ?? row.leg_launch_id,
+      {
+        leg_launch_id: row.leg_launch_id,
+        ownership_epoch_event_id: row.ownership_epoch_event_id,
+        wrapper_job_id: row.wrapper_job_id,
+        wrapper_dispatch_attempt_id: row.wrapper_dispatch_attempt_id,
+      },
+    );
+  }
+  if (!(await teardownProviderLegWindow(deps, row, panes))) return false;
+  if (row.cascade_state !== "confirmed") {
+    mintProviderLegCascadeEvent(
+      db,
+      deps,
+      "ProviderLegCascadeProgressed",
+      row.leg_launch_id,
+      cascadeProgressData(row, "confirmed"),
+    );
+  }
+  return true;
+}
+
+async function blockProviderLegCascade(
+  db: Database,
+  deps: ProviderLegCascadeDeps,
+  row: ProviderLegCascadeRow,
+  reason: string,
+): Promise<void> {
+  if (row.cascade_state !== "blocked" || row.blocked_reason !== reason) {
+    mintProviderLegCascadeEvent(
+      db,
+      deps,
+      "ProviderLegCascadeProgressed",
+      row.leg_launch_id,
+      cascadeProgressData(row, "blocked", { reason, notified: false }),
+    );
+  }
+  const incident = db
+    .query(
+      `SELECT human_notified_at
+         FROM provider_leg_cascades
+        WHERE leg_launch_id = ? AND ownership_epoch_event_id = ?`,
+    )
+    .get(row.leg_launch_id, row.ownership_epoch_event_id) as {
+    human_notified_at: number | null;
+  } | null;
+  if (incident?.human_notified_at != null || deps.notify == null) return;
+  const notified = await deps.notify(
+    `Provider leg ${row.leg_launch_id} owned by ${row.wrapper_job_id} attempt ${row.wrapper_dispatch_attempt_id} is blocked: ${reason}. Claims remain held.`,
+  );
+  if (!notified) return;
+  mintProviderLegCascadeEvent(
+    db,
+    deps,
+    "ProviderLegCascadeProgressed",
+    row.leg_launch_id,
+    cascadeProgressData(row, "blocked", { reason, notified: true }),
+  );
+}
+
+function selectProviderLegCascadeRows(
+  db: Database,
+  limit: number,
+): ProviderLegCascadeRow[] {
+  return db
+    .query(
+      `SELECT o.leg_launch_id, o.wrapper_job_id,
+              o.wrapper_dispatch_attempt_id, o.ownership_epoch_event_id,
+              o.leg_session_id, o.leg_pid, o.leg_start_time, o.pane_id,
+              o.pane_generation, o.backend_exec_type,
+              o.backend_exec_session_id, o.state AS ownership_state,
+              lj.harness, lj.state AS leg_state,
+              lj.backend_exec_generation_id AS current_pane_generation,
+              w.state AS wrapper_state, w.plan_verb, w.plan_ref,
+              dc.attempt_id AS claim_attempt_id, dc.state AS claim_state,
+              dc.session_id AS claim_session_id,
+              pc.state AS cascade_state, pc.term_sent_at, pc.kill_not_before,
+              pc.kill_armed_at, COALESCE(pc.term_attempts, 0) AS term_attempts,
+              COALESCE(pc.kill_attempts, 0) AS kill_attempts,
+              pc.blocked_reason, pc.human_notified_at
+         FROM provider_leg_ownership o
+         JOIN jobs w ON w.job_id = o.wrapper_job_id
+         LEFT JOIN jobs lj ON lj.job_id = o.leg_session_id
+         LEFT JOIN dispatch_claims dc
+           ON dc.verb = w.plan_verb AND dc.id = w.plan_ref
+         LEFT JOIN provider_leg_cascades pc
+           ON pc.leg_launch_id = o.leg_launch_id
+          AND pc.ownership_epoch_event_id = o.ownership_epoch_event_id
+        WHERE (
+            o.state = 'live'
+            OR (pc.state IS NOT NULL AND pc.state != 'confirmed')
+            OR (pc.state = 'confirmed' AND dc.legacy_unfenced = 0
+                AND dc.attempt_id = o.wrapper_dispatch_attempt_id
+                AND dc.session_id = o.wrapper_job_id
+                AND dc.state != 'released')
+          )
+          AND (
+            (w.state IN ('ended', 'killed') AND
+             o.wrapper_dispatch_attempt_id = (
+               SELECT COALESCE(
+                 json_extract(ss.data, '$.dispatch_attempt_id'),
+                 json_extract(ss.data, '$.attempt_id'),
+                 json_extract(ss.data, '$.dispatch.attempt_id')
+               )
+                 FROM events ss
+                WHERE ss.session_id = o.wrapper_job_id
+                  AND ss.hook_event = 'SessionStart'
+                  AND json_valid(ss.data)
+                ORDER BY ss.id DESC LIMIT 1
+             ))
+            OR (dc.legacy_unfenced = 0 AND
+                dc.attempt_id > o.wrapper_dispatch_attempt_id)
+            OR (o.state = 'live' AND lj.state = 'stopped'
+                AND o.backend_exec_type = 'tmux'
+                AND o.backend_exec_session_id = 'wrapped')
+          )
+        ORDER BY o.wrapper_dispatch_attempt_id, o.leg_launch_id
+        LIMIT ?`,
+    )
+    .all(Math.max(1, limit)) as ProviderLegCascadeRow[];
+}
+
+function releaseSettledProviderLegAttempts(
+  db: Database,
+  deps: ProviderLegCascadeDeps,
+  rows: readonly ProviderLegCascadeRow[],
+): boolean {
+  let acted = false;
+  const owners = new Map<string, ProviderLegCascadeRow>();
+  for (const row of rows) {
+    owners.set(
+      `${row.wrapper_job_id}\0${row.wrapper_dispatch_attempt_id}`,
+      row,
+    );
+  }
+  for (const row of owners.values()) {
+    const unsettled = db
+      .query(
+        `SELECT 1
+           FROM provider_leg_ownership o
+           LEFT JOIN provider_leg_cascades pc
+             ON pc.leg_launch_id = o.leg_launch_id
+            AND pc.ownership_epoch_event_id = o.ownership_epoch_event_id
+          WHERE o.wrapper_job_id = ?
+            AND o.wrapper_dispatch_attempt_id = ?
+            AND (o.state = 'live' OR pc.state IS NULL OR pc.state != 'confirmed')
+          LIMIT 1`,
+      )
+      .get(row.wrapper_job_id, row.wrapper_dispatch_attempt_id);
+    if (unsettled != null || row.plan_verb == null || row.plan_ref == null) {
+      continue;
+    }
+    const claim = db
+      .query(
+        `SELECT attempt_id, state, session_id, legacy_unfenced
+           FROM dispatch_claims WHERE verb = ? AND id = ?`,
+      )
+      .get(row.plan_verb, row.plan_ref) as {
+      attempt_id: number | null;
+      state: string;
+      session_id: string | null;
+      legacy_unfenced: number;
+    } | null;
+    // A supersede moved the claim tuple. Never let the old owner's release touch
+    // the newer attempt; its old claim has already ceased to exist.
+    if (
+      claim == null ||
+      claim.attempt_id !== row.wrapper_dispatch_attempt_id ||
+      claim.legacy_unfenced !== 0 ||
+      claim.state === "released" ||
+      claim.session_id !== row.wrapper_job_id
+    ) {
+      continue;
+    }
+    mintProviderLegCascadeEvent(
+      db,
+      deps,
+      "DispatchClaimReleased",
+      row.wrapper_job_id,
+      {
+        verb: row.plan_verb,
+        id: row.plan_ref,
+        expected_attempt_id: row.wrapper_dispatch_attempt_id,
+        session_id: row.wrapper_job_id,
+      },
+    );
+    acted = true;
+  }
+  return acted;
+}
+
+/**
+ * Reconcile a bounded slice of owned Provider legs. Every signal attempt is
+ * durably written and folded before the exact identity is re-probed and the
+ * syscall runs, so a restart resumes from the incident ordinal and deadline.
+ */
+export async function runProviderLegCascadeSweep(
+  db: Database,
+  deps: ProviderLegCascadeDeps,
+): Promise<ProviderLegCascadeSweepResult> {
+  const rows = selectProviderLegCascadeRows(
+    db,
+    deps.scanCap ?? PROVIDER_LEG_CASCADE_SCAN_CAP,
+  );
+  let acted = false;
+  let nextDeadline = Number.POSITIVE_INFINITY;
+  let paneSweep: readonly PaneInfo[] | null = null;
+  let paneSweepLoaded = false;
+  const loadPaneSweep = async (): Promise<readonly PaneInfo[] | null> => {
+    if (!paneSweepLoaded) {
+      paneSweep = await deps.listPanes();
+      paneSweepLoaded = true;
+    }
+    return paneSweep;
+  };
+  for (const row of rows) {
+    const ownerTerminalOrSuperseded =
+      row.wrapper_state === "ended" ||
+      row.wrapper_state === "killed" ||
+      (row.claim_attempt_id != null &&
+        row.claim_attempt_id > row.wrapper_dispatch_attempt_id);
+    if (
+      !ownerTerminalOrSuperseded &&
+      row.ownership_state === "live" &&
+      row.leg_state === "stopped"
+    ) {
+      const panes = await loadPaneSweep();
+      const decision = classifyProviderLegWindowTeardown(row, panes);
+      if (decision === "kill") {
+        const killed = await deps.killWindow(row.pane_id as string);
+        acted = acted || killed.ok;
+      }
+      continue;
+    }
+    if (row.cascade_state == null) {
+      const now = deps.nowSec();
+      mintProviderLegCascadeEvent(
+        db,
+        deps,
+        "ProviderLegCascadeArmed",
+        row.leg_launch_id,
+        {
+          leg_launch_id: row.leg_launch_id,
+          ownership_epoch_event_id: row.ownership_epoch_event_id,
+          wrapper_job_id: row.wrapper_job_id,
+          wrapper_dispatch_attempt_id: row.wrapper_dispatch_attempt_id,
+          kill_not_before: now + PROVIDER_LEG_TERM_GRACE_SEC,
+        },
+      );
+      acted = true;
+      continue;
+    }
+    if (row.leg_state === "ended" || row.leg_state === "killed") {
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
+      continue;
+    }
+    if (row.ownership_state !== "live" && row.cascade_state === "confirmed") {
+      continue;
+    }
+
+    const verdict = providerLegProbeVerdict(row, deps);
+    if (verdict === "gone") {
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
+      continue;
+    }
+    if (verdict !== "target") {
+      await blockProviderLegCascade(db, deps, row, verdict);
+      acted = true;
+      continue;
+    }
+    if (row.cascade_state === "blocked") {
+      if (row.blocked_reason === "kill-unconfirmed") {
+        await blockProviderLegCascade(db, deps, row, "kill-unconfirmed");
+        acted = true;
+        continue;
+      }
+      mintProviderLegCascadeEvent(
+        db,
+        deps,
+        "ProviderLegCascadeProgressed",
+        row.leg_launch_id,
+        cascadeProgressData(row, "cleared"),
+      );
+      acted = true;
+      continue;
+    }
+
+    let signal: "SIGTERM" | "SIGKILL";
+    let phase: "term_sent" | "kill_sent";
+    let ordinal: number;
+    if (row.term_attempts === 0) {
+      signal = "SIGTERM";
+      phase = "term_sent";
+      ordinal = 1;
+    } else {
+      const deadline = row.kill_not_before;
+      if (deadline == null) {
+        await blockProviderLegCascade(db, deps, row, "identity-unknown");
+        acted = true;
+        continue;
+      }
+      if (deps.nowSec() < deadline) {
+        nextDeadline = Math.min(nextDeadline, deadline);
+        continue;
+      }
+      if (row.kill_armed_at == null) {
+        mintProviderLegCascadeEvent(
+          db,
+          deps,
+          "ProviderLegCascadeProgressed",
+          row.leg_launch_id,
+          cascadeProgressData(row, "kill_armed"),
+        );
+        acted = true;
+        continue;
+      }
+      if (row.kill_attempts >= PROVIDER_LEG_KILL_ATTEMPT_CAP) {
+        await blockProviderLegCascade(db, deps, row, "kill-unconfirmed");
+        acted = true;
+        continue;
+      }
+      signal = "SIGKILL";
+      phase = "kill_sent";
+      ordinal = row.kill_attempts + 1;
+    }
+
+    // Write-ahead first. The post-write probe is the authority adjacent to the
+    // syscall; an earlier selection probe never grants signal authority.
+    mintProviderLegCascadeEvent(
+      db,
+      deps,
+      "ProviderLegCascadeProgressed",
+      row.leg_launch_id,
+      cascadeProgressData(row, phase, { attempt_ordinal: ordinal }),
+    );
+    acted = true;
+    const adjacent = providerLegProbeVerdict(row, deps);
+    if (adjacent === "gone") {
+      acted =
+        (await settleProviderLeg(db, deps, row, await loadPaneSweep())) ||
+        acted;
+      continue;
+    }
+    if (adjacent !== "target") {
+      await blockProviderLegCascade(db, deps, row, adjacent);
+      continue;
+    }
+    try {
+      deps.signal(row.leg_pid as number, signal);
+    } catch {
+      await blockProviderLegCascade(db, deps, row, "signal-failed");
+    }
+  }
+
+  if (releaseSettledProviderLegAttempts(db, deps, rows)) acted = true;
+  const now = deps.nowSec();
+  return {
+    acted,
+    pending: rows.length > 0,
+    nextDelayMs: Number.isFinite(nextDeadline)
+      ? Math.max(0, Math.ceil((nextDeadline - now) * 1_000))
+      : rows.length > 0
+        ? PROVIDER_LEG_CASCADE_POLL_MS
+        : null,
+  };
 }
 
 /**
@@ -7420,6 +8196,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let providerLegDeathNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   let providerLegDeathNoticeSweepInFlight = false;
   let providerLegDeathNoticeRerunRequested = false;
+  let providerLegCascadeTimer: ReturnType<typeof setTimeout> | null = null;
+  let providerLegCascadeSweepInFlight = false;
+  let providerLegCascadeRerunRequested = false;
+  const providerLegPaneOps = createTmuxPaneOps({
+    noteLine: (line) => console.error(`[keeperd] Provider-leg window: ${line}`),
+  });
 
   function serveBootDrain(): void {
     withBootDrainCheckpointTuning(db, () => {
@@ -7622,6 +8404,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (folded && !shuttingDown) {
       serverWorker?.postMessage({ type: "kick" } satisfies KickMessage);
       scheduleProviderLegDeathNoticeSweep();
+      scheduleProviderLegCascadeSweep();
     }
   }
 
@@ -7642,9 +8425,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
                 j.last_lifecycle_ts AS last_lifecycle_at,
                 j.close_kind,
                 j.kill_reason,
-                j.backend_exec_birth_session_id
+                j.backend_exec_birth_session_id,
+                o.leg_launch_id,
+                o.wrapper_job_id,
+                o.wrapper_dispatch_attempt_id,
+                o.ownership_epoch_event_id,
+                pc.human_notified_at AS cascade_human_notified_at
            FROM events e
            JOIN jobs j ON j.job_id = e.session_id
+           LEFT JOIN provider_leg_ownership o ON o.leg_session_id = j.job_id
+           LEFT JOIN provider_leg_cascades pc
+             ON pc.leg_launch_id = o.leg_launch_id
+            AND pc.ownership_epoch_event_id = o.ownership_epoch_event_id
           WHERE e.id > ?
             AND ((j.state = 'ended' AND e.hook_event = 'SessionEnd')
               OR (j.state = 'killed' AND e.hook_event = 'Killed'))
@@ -7755,6 +8547,64 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           );
           if (retryDelay != null)
             scheduleProviderLegDeathNoticeSweep(retryDelay);
+        }
+      }
+    }
+  }
+
+  function scheduleProviderLegCascadeSweep(delayMs = 0): void {
+    if (shuttingDown) return;
+    if (providerLegCascadeSweepInFlight) {
+      providerLegCascadeRerunRequested = true;
+      return;
+    }
+    if (providerLegCascadeTimer != null) {
+      if (delayMs > 0) return;
+      clearTimeout(providerLegCascadeTimer);
+    }
+    providerLegCascadeTimer = setTimeout(
+      () => {
+        providerLegCascadeTimer = null;
+        void runProviderLegCascadeSweepTick();
+      },
+      Math.max(0, delayMs),
+    );
+    providerLegCascadeTimer.unref?.();
+  }
+
+  async function runProviderLegCascadeSweepTick(): Promise<void> {
+    if (shuttingDown || providerLegCascadeSweepInFlight) return;
+    providerLegCascadeSweepInFlight = true;
+    providerLegCascadeRerunRequested = false;
+    let nextDelayMs: number | null = null;
+    try {
+      const result = await runProviderLegCascadeSweep(db, {
+        nowSec: () => Date.now() / 1000,
+        probe: (pid, startTime) => probeHarnessProcess(pid, startTime),
+        signal: (pid, signal) => process.kill(pid, signal),
+        listPanes: () => providerLegPaneOps.listPanes(),
+        killWindow: (paneId) => providerLegPaneOps.killWindow(paneId),
+        notify: async (message) => (await notifyHuman(message)) === "notified",
+        afterMint: () => {
+          wakePending = true;
+          pumpWakes();
+        },
+      });
+      nextDelayMs = result.nextDelayMs;
+    } catch (err) {
+      console.error(
+        `[keeperd] Provider-leg cascade sweep threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    } finally {
+      providerLegCascadeSweepInFlight = false;
+      if (!shuttingDown) {
+        if (providerLegCascadeRerunRequested) {
+          providerLegCascadeRerunRequested = false;
+          scheduleProviderLegCascadeSweep();
+        } else if (nextDelayMs != null) {
+          scheduleProviderLegCascadeSweep(nextDelayMs);
         }
       }
     }
@@ -8762,6 +9612,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // space on the next cadence — an accepted, documented degrade.
   serveBootDrain();
   scheduleProviderLegDeathNoticeSweep();
+  scheduleProviderLegCascadeSweep();
 
   // One-shot GC for orphaned dispatch_failures. The drain above folded the
   // projection to head, so any UN-retryable row (a key the operator surface can
@@ -14652,6 +15503,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (providerLegDeathNoticeTimer !== null) {
       clearTimeout(providerLegDeathNoticeTimer);
       providerLegDeathNoticeTimer = null;
+    }
+    if (providerLegCascadeTimer !== null) {
+      clearTimeout(providerLegCascadeTimer);
+      providerLegCascadeTimer = null;
     }
     if (blockEscalationSweepTimer !== null) {
       clearInterval(blockEscalationSweepTimer);

@@ -2,8 +2,8 @@
  * autoclose worker. A daemon Bun Worker thread that force-closes
  * the tmux window of a done-and-idle agent keeper itself dispatched — an
  * autopilot `work::`/`close::` worker whose plan row reached a `completed`
- * verdict, a finished claude `/plan:panel` leg, a stopped wrapped provider leg,
- * or an `unblock::`/`deconflict::`/`resolve::` escalation session whose
+ * verdict, a finished claude `/plan:panel` leg, a stopped legacy ownerless
+ * wrapped Provider leg, or an `unblock::`/`deconflict::`/`resolve::` escalation session whose
  * block/conflict INSTANCE is provably resolved — ~grace after it is provably
  * done. Every other
  * window (a manual session, a hand-run `keeper dispatch`, a handoff, a pair
@@ -21,12 +21,12 @@
  * that release folds it sends the pre-kill intent hint
  * ({@link AutocloseIntentMessage}) so main owns `kill_reason: 'autoclosed'`.
  *
- * Ownership is proven by POSITIVE provenance, never a tmux/name heuristic: the
- * autopilot bucket keys on `jobs.dispatch_origin === 'autopilot'` (stamped only
- * when a SessionStart discharged a real `pending_dispatches` row), the panel
- * bucket on the `panels` birth-session + the `panel::x::y` name shape, the
- * wrapped bucket on the `wrapped` birth-session + a bare or legacy-prefixed Plan
- * task-id title, and the escalation bucket on
+ * Managed membership is proven by projection evidence: the autopilot bucket
+ * keys on `jobs.dispatch_origin === 'autopilot'` (stamped only when a
+ * SessionStart discharged a real `pending_dispatches` row), the panel bucket on
+ * the `panels` birth-session + the `panel::x::y` name shape, the legacy wrapped
+ * bucket on the `wrapped` birth-session + task-id title plus the positive absence
+ * of a durable ownership row, and the escalation bucket on
  * `jobs.dispatch_origin === 'escalation'` + one of the three escalation verbs +
  * a non-null `escalation_instance` stamp (never the window title). The autopilot
  * bucket's `completed` verdict is read through the SHARED
@@ -147,8 +147,8 @@ export type AutocloseWorkerMessage =
   | AutocloseIntentMessage
   | AutocloseClaimReleaseMessage;
 
-/** Which ownership bucket a reap belongs to — the four positively-owned window
- *  classes. */
+/** Which managed cleanup bucket a reap belongs to. The wrapped member is the
+ *  legacy ownerless cohort; durable owned legs never enter this worker. */
 export type AutocloseBucket = "autopilot" | "panel" | "wrapped" | "escalation";
 
 /**
@@ -156,8 +156,8 @@ export type AutocloseBucket = "autopilot" | "panel" | "wrapped" | "escalation";
  * the full {@link import("./types").Job}: it carries the airtight
  * autopilot-vs-manual `dispatch_origin` discriminator plus
  * `backend_exec_generation_id` (the live-pane-resolved marker the shared jobs
- * descriptor omits), so the pulse reads it via a direct SELECT rather than the
- * descriptor read path.
+ * descriptor omits) and durable Provider-leg ownership membership, so the pulse
+ * reads it via a direct SELECT rather than the descriptor read path.
  */
 export interface AutocloseJob {
   job_id: string;
@@ -172,6 +172,9 @@ export interface AutocloseJob {
   backend_exec_pane_id: string | null;
   backend_exec_birth_session_id: string | null;
   backend_exec_generation_id: string | null;
+  /** Whether this job has a durable Provider-leg ownership row. The wrapped
+   *  bucket admits only the legacy ownerless cohort. */
+  provider_leg_owned: number;
   last_input_request_at: number | null;
   last_permission_prompt_at: number | null;
   /** The block-instance id an escalation session is bound to (`unblock` →
@@ -355,6 +358,7 @@ function classifyEligible(
     ref = job.title;
   } else if (
     job.backend_exec_birth_session_id === WRAPPED_EXEC_SESSION &&
+    job.provider_leg_owned === 0 &&
     parseWrappedProviderTaskId(job.title) != null
   ) {
     // Wrapped provider legs own no Plan readiness row: their positive stopped
@@ -602,18 +606,25 @@ function readAutopilotPaused(db: Database): boolean {
 
 /** Read the stopped candidate rows via a direct SELECT — `backend_exec_generation_id`
  *  (the live-pane-resolved marker) is omitted from the shared jobs descriptor, so
- *  the descriptor read path can't surface it. Only `state = 'stopped'` rows are
- *  ever candidates; a resumed row simply vanishes from this set and its grace
- *  entry is pruned by absence. */
+ *  the descriptor read path can't surface it. The correlated ownership membership
+ *  keeps every owned Provider leg out of the legacy wrapped bucket. Only `state =
+ *  'stopped'` rows are ever candidates; a resumed row simply vanishes from this
+ *  set and its grace entry is pruned by absence. */
 function readAutocloseJobs(db: Database): AutocloseJob[] {
   return db
     .prepare(
-      `SELECT job_id, state, pid, start_time, plan_verb, plan_ref, title,
-              dispatch_origin, backend_exec_type, backend_exec_pane_id,
-              backend_exec_birth_session_id, backend_exec_generation_id,
-              last_input_request_at, last_permission_prompt_at, escalation_instance
-         FROM jobs
-        WHERE state = 'stopped'`,
+      `SELECT j.job_id, j.state, j.pid, j.start_time, j.plan_verb, j.plan_ref,
+              j.title, j.dispatch_origin, j.backend_exec_type,
+              j.backend_exec_pane_id, j.backend_exec_birth_session_id,
+              j.backend_exec_generation_id,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM provider_leg_ownership o
+                 WHERE o.leg_session_id = j.job_id
+              ) THEN 1 ELSE 0 END AS provider_leg_owned,
+              j.last_input_request_at, j.last_permission_prompt_at,
+              j.escalation_instance
+         FROM jobs j
+        WHERE j.state = 'stopped'`,
     )
     .all() as AutocloseJob[];
 }

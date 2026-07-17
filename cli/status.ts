@@ -33,12 +33,14 @@
  */
 
 import { parseArgs } from "node:util";
+import { parseWrappedProviderTaskId } from "../src/autoclose-worker";
 import { isBoardWorkJob } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
 import {
   classifyDispatchFailure,
   resolveFailureTarget,
 } from "../src/dispatch-failure-pill";
+import { WRAPPED_EXEC_SESSION } from "../src/exec-backend";
 import { projectNeedsHuman } from "../src/needs-human";
 import type { BootStatus, Row } from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
@@ -72,8 +74,9 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * v9 adds the additive `in_flight.board_work_jobs` count — working Board-work
  * sessions only (autopilot/escalation dispatches), excluding the caller's own
  * session, distinct from `running_jobs` (every working job, supervising
- * session included); v10 adds display-only `needs_human.finalize_pending`. */
-export const STATUS_SCHEMA_VERSION = 10;
+ * session included); v10 adds display-only `needs_human.finalize_pending`; v11
+ * adds the display-only legacy Provider-leg drain gauge. */
+export const STATUS_SCHEMA_VERSION = 11;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -89,7 +92,8 @@ Usage:
 
 Prints ONE {schema_version, ok, error, data} envelope: autopilot config, the
 per-epic/-task/-close-row readiness verdicts, aggregate counts, drained/jammed
-booleans, in-flight launches, needs-human signals, and {rev, catching_up}. Each
+booleans, the display-only legacy Provider-leg drain gauge, in-flight launches,
+needs-human signals, and {rev, catching_up}. Each
 task + close view also carries dispatch_failure: string[] — the sticky
 dispatch_failures block KINDS (multi-repo / merge-conflict / dirty-tree / non-ff)
 readiness can't see; [] when clean.
@@ -183,6 +187,11 @@ export interface StatusData {
   };
   drained: boolean;
   jammed: boolean;
+  drain: {
+    // Live wrapped Provider legs without a durable ownership row. Display-only:
+    // this cohort never contributes to needs-human, jammed, or drained.
+    legacy_wrapped_provider_legs: number;
+  };
   in_flight: {
     pending_dispatches: number;
     running_jobs: number;
@@ -232,6 +241,30 @@ export interface StatusData {
 }
 
 export type StatusEnvelope = Envelope<StatusData>;
+
+export function countLegacyWrappedProviderLegs(
+  snap: ReadinessClientSnapshot,
+): number {
+  const ownedSessions = new Set(
+    (snap.providerLegOwnership ?? [])
+      .map((row) => row.leg_session_id)
+      .filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0,
+      ),
+  );
+  let count = 0;
+  for (const [jobId, job] of snap.jobs) {
+    if (
+      job.backend_exec_birth_session_id === WRAPPED_EXEC_SESSION &&
+      parseWrappedProviderTaskId(job.title) != null &&
+      !ownedSessions.has(jobId)
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
 
 /** Render one (possibly absent) verdict to its JSON view. A miss renders the
  *  same inert `[blocked:unknown]` the board uses (visible bug indicator, never
@@ -408,6 +441,9 @@ export function buildStatusEnvelope(
     },
     drained,
     jammed,
+    drain: {
+      legacy_wrapped_provider_legs: countLegacyWrappedProviderLegs(snap),
+    },
     in_flight: {
       pending_dispatches: pendingDispatches,
       running_jobs: runningJobs,
@@ -607,6 +643,7 @@ export async function runStatus(
     // query. The gate holds first paint until the collection paints, so a
     // painted snapshot always carries the real jam rows.
     includeDispatchFailures: true,
+    includeProviderLegOwnership: true,
     // ADR 0018: opt into the pinned-epics window too — a plan-closed epic with
     // a live close/work dispatch failure merges open-wins into `epics`, so
     // `board.epics` (built off `snap.epics`) carries its close verdict and

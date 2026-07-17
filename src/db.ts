@@ -4393,6 +4393,28 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "dispatch_mint_gate", "attempt_id", "INTEGER");
     },
   },
+  {
+    // ADR 0071 — the durable wrapper→Provider-leg ownership registry and the
+    // per-incident cascade projection land here, additive and inert (no producer
+    // mints their events yet). Both are new empty tables at the zero-event shape,
+    // DETERMINISTIC-replayed, so a from-scratch re-fold reproduces byte-identical
+    // rows and NO cursor rewind is needed. Declared in the steady-state bootstrap
+    // block too, so a fresh 0→head walk and an upgrade converge on the same shape.
+    // Provisional version per ADR 0020 — renumbered at fan-in, never hardcoded.
+    version: 132,
+    kind: "additive",
+    apply: (ctx) => {
+      const { db } = ctx;
+      db.run(CREATE_PROVIDER_LEG_OWNERSHIP);
+      for (const sql of CREATE_PROVIDER_LEG_OWNERSHIP_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_PROVIDER_LEG_CASCADES);
+      for (const sql of CREATE_PROVIDER_LEG_CASCADES_INDEXES) {
+        db.run(sql);
+      }
+    },
+  },
 ];
 
 /**
@@ -4413,7 +4435,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v131:a3b477d907d6c98e6819447897476624a490069f2df51c2a72e7cdabc8f5b073";
+  "v132:62a151022657f28781891f7be9798f2d466ed03b191a3d61611ec9efd03ee56c";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5966,6 +5988,100 @@ export function runDispatchMintGate(
 }
 
 /**
+ * `provider_leg_ownership` projection table — the durable wrapper→Provider-leg
+ * ownership registry (ADR 0071). One row per launched leg, keyed by the immutable
+ * `leg_launch_id`. The owner tuple `(wrapper_job_id, wrapper_dispatch_attempt_id)`
+ * binds the leg to the exact wrapper Dispatch attempt that launched it, and
+ * `ownership_epoch_event_id` is the event id that established the CURRENT owner
+ * (birth, or the last fenced transfer) — the epoch half of the cascade
+ * idempotency key. The captured process identity (`leg_pid` + `leg_start_time`)
+ * and pane/generation coords are the recycle-safe exit-proof data a terminal-row
+ * pane-null cannot supply later; the launcher identity distinguishes who spawned
+ * the leg. `state` settles `live → terminal | transferred | aborted`, with
+ * `settled_event_id` the settling event.
+ *
+ * A DETERMINISTIC-replayed reducer projection: every timestamp is `event.ts` and
+ * every id is an event id (never wall-clock), so a from-scratch re-fold
+ * reproduces byte-identical rows. Bounded per-leg (idempotent set-once birth +
+ * in-place settle), so settled rows never accumulate unbounded history.
+ */
+const CREATE_PROVIDER_LEG_OWNERSHIP = `
+CREATE TABLE IF NOT EXISTS provider_leg_ownership (
+    leg_launch_id TEXT NOT NULL PRIMARY KEY,
+    wrapper_job_id TEXT NOT NULL,
+    wrapper_dispatch_attempt_id INTEGER NOT NULL,
+    ownership_epoch_event_id INTEGER NOT NULL,
+    leg_session_id TEXT,
+    leg_pid INTEGER,
+    leg_start_time TEXT,
+    launcher_pid INTEGER,
+    launcher_start_time TEXT,
+    pane_id TEXT,
+    pane_generation INTEGER,
+    backend_exec_type TEXT,
+    backend_exec_session_id TEXT,
+    state TEXT NOT NULL,
+    settled_event_id INTEGER,
+    last_event_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+)
+`;
+
+const CREATE_PROVIDER_LEG_OWNERSHIP_INDEXES = [
+  // Answers the cascade's core query — "all legs owned by attempt X" — and backs
+  // the release fold's owned-leg-settled gate.
+  "CREATE INDEX IF NOT EXISTS idx_provider_leg_ownership_attempt ON provider_leg_ownership(wrapper_dispatch_attempt_id)",
+];
+
+/**
+ * `provider_leg_cascades` projection table — the per-incident teardown progress
+ * for the leg cascade (ADR 0071). One row per `(leg_launch_id,
+ * ownership_epoch_event_id)`: a fresh owner epoch is a fresh incident, so a
+ * transferred-then-re-torn leg never reuses a stale incident's deadlines. Records
+ * the staged-shutdown timeline — TERM armed/sent, an EXPLICITLY stored
+ * `kill_not_before` deadline, KILL armed/sent — plus per-phase attempt counts,
+ * the terminal `blocked_reason` (identity-unknown / kill-unconfirmed /
+ * promotion-failed), and a page-once `human_notified_at`. `state` advances
+ * `armed → terming → killing → confirmed`, or `→ blocked`.
+ *
+ * A DETERMINISTIC-replayed reducer projection: signal timestamps are `event.ts`
+ * or event-payload numbers and attempt counts converge under `MAX(current,
+ * ordinal)`, so a from-scratch re-fold reproduces byte-identical rows and the
+ * stored deadlines/attempts survive re-fold. Bounded per-incident (idempotent
+ * per-key replace-merge), never a growing history.
+ */
+const CREATE_PROVIDER_LEG_CASCADES = `
+CREATE TABLE IF NOT EXISTS provider_leg_cascades (
+    leg_launch_id TEXT NOT NULL,
+    ownership_epoch_event_id INTEGER NOT NULL,
+    wrapper_job_id TEXT NOT NULL,
+    wrapper_dispatch_attempt_id INTEGER NOT NULL,
+    term_armed_at REAL,
+    term_sent_at REAL,
+    kill_not_before REAL,
+    kill_armed_at REAL,
+    kill_sent_at REAL,
+    term_attempts INTEGER NOT NULL DEFAULT 0,
+    kill_attempts INTEGER NOT NULL DEFAULT 0,
+    blocked_reason TEXT,
+    human_notified_at REAL,
+    confirmed_at REAL,
+    state TEXT NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (leg_launch_id, ownership_epoch_event_id)
+)
+`;
+
+const CREATE_PROVIDER_LEG_CASCADES_INDEXES = [
+  // Backs the release fold's zero-unresolved-intents gate ("any unconfirmed
+  // cascade for attempt X").
+  "CREATE INDEX IF NOT EXISTS idx_provider_leg_cascades_attempt ON provider_leg_cascades(wrapper_dispatch_attempt_id)",
+];
+
+/**
  * `block_escalations` projection table — the escalate-once LATCH for the daemon
  * block-escalation producer. A row exists for as long as a plan task is in
  * `runtime_status='blocked'`: the `TaskSnapshot` fold INSERTs the latch
@@ -7181,6 +7297,14 @@ function migrate(db: Database): void {
       db.run(CREATE_DISPATCH_NEVER_BOUND);
       db.run(CREATE_DISPATCH_INSTANT_DEATH);
       db.run(CREATE_DISPATCH_MINT_GATE);
+      db.run(CREATE_PROVIDER_LEG_OWNERSHIP);
+      for (const sql of CREATE_PROVIDER_LEG_OWNERSHIP_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_PROVIDER_LEG_CASCADES);
+      for (const sql of CREATE_PROVIDER_LEG_CASCADES_INDEXES) {
+        db.run(sql);
+      }
       db.run(CREATE_BLOCK_ESCALATIONS);
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_HANDOFFS);

@@ -33,6 +33,11 @@ const terminalRow = (
   close_kind: "pane_closed",
   kill_reason: "exit_watched",
   backend_exec_birth_session_id: "wrapped",
+  leg_launch_id: null,
+  wrapper_job_id: null,
+  wrapper_dispatch_attempt_id: null,
+  ownership_epoch_event_id: null,
+  cascade_human_notified_at: null,
   ...over,
 });
 
@@ -46,6 +51,11 @@ const candidate = (
   terminalKind: "killed",
   terminalEventId: 101,
   failureDetail: "pane_closed: exit_watched",
+  legLaunchId: null,
+  wrapperJobId: null,
+  wrapperDispatchAttemptId: null,
+  ownershipEpochEventId: null,
+  cascadeHumanNotifiedAt: null,
   ...over,
 });
 
@@ -124,6 +134,21 @@ describe("unique live Dispatch-attempt owner", () => {
     ]) {
       expect(resolveUniqueEligibleWrapper(candidate(), [row])).toBeNull();
     }
+  });
+
+  test("durable ownership selects only the exact wrapper attempt, never a title peer", () => {
+    const owned = candidate({
+      legLaunchId: "leg-1",
+      wrapperJobId: "wrapper-2",
+      wrapperDispatchAttemptId: 8,
+      ownershipEpochEventId: 99,
+    });
+    expect(
+      resolveUniqueEligibleWrapper(owned, [
+        wrapper(),
+        wrapper({ jobId: "wrapper-2", attemptId: 8, planRef: "other-task" }),
+      ]),
+    ).toBe("wrapper-2");
   });
 
   test("zero or multiple eligible wrappers fail closed", () => {
@@ -274,6 +299,30 @@ describe("bounded sweep and retry memo", () => {
     });
     expect(sent).toEqual([101, 101, 101]);
     expect(state.pending.size).toBe(0);
+    expect(state.recentTerminalEventIds.get(101)).toBe("dropped");
+  });
+
+  test("a cascade-paged incident never sends a second death notice", async () => {
+    const state = createProviderLegDeathNoticeState(100);
+    let sends = 0;
+    await runProviderLegDeathNoticeSweep(state, {
+      selectTerminalRows: () => [
+        terminalRow({
+          leg_launch_id: "leg-1",
+          wrapper_job_id: "wrapper-1",
+          wrapper_dispatch_attempt_id: 7,
+          ownership_epoch_event_id: 90,
+          cascade_human_notified_at: 99,
+        }),
+      ],
+      selectWrapperAttempts: () => [wrapper()],
+      send: async () => {
+        sends += 1;
+        return { kind: "delivered" };
+      },
+      nowMs: () => 1_000,
+    });
+    expect(sends).toBe(0);
     expect(state.recentTerminalEventIds.get(101)).toBe("dropped");
   });
 

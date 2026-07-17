@@ -48,6 +48,7 @@ const autopilotWork = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_pane_id: "%1",
   backend_exec_birth_session_id: "autopilot",
   backend_exec_generation_id: "101:1001",
+  provider_leg_owned: 0,
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -79,6 +80,7 @@ const panelLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_pane_id: "%3",
   backend_exec_birth_session_id: "panels",
   backend_exec_generation_id: "103:1003",
+  provider_leg_owned: 0,
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -100,6 +102,7 @@ const wrappedLeg = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_pane_id: "%5",
   backend_exec_birth_session_id: WRAPPED_EXEC_SESSION,
   backend_exec_generation_id: "105:1005",
+  provider_leg_owned: 0,
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: null,
@@ -135,6 +138,7 @@ const escalationSession = (over: Partial<AutocloseJob> = {}): AutocloseJob => ({
   backend_exec_pane_id: "%4",
   backend_exec_birth_session_id: "autopilot",
   backend_exec_generation_id: "104:1004",
+  provider_leg_owned: 0,
   last_input_request_at: null,
   last_permission_prompt_at: null,
   escalation_instance: 500,
@@ -508,6 +512,17 @@ test("IN: escalation resolve session, resolved instance, past grace → reaped (
 // ---------------------------------------------------------------------------
 // OUT — exclusion classes (never keeper-owned or not done)
 // ---------------------------------------------------------------------------
+
+test("OUT: durable ownership excludes a wrapped Provider leg from the legacy bucket", () => {
+  const { reaps, graceMap } = run({
+    jobs: [wrappedLeg({ provider_leg_owned: 1 })],
+    readiness: { perTask: new Map(), perCloseRow: new Map() },
+    panes: [wrappedPane()],
+    graceMap: elapsed("j-wrapped"),
+  });
+  expect(reaps).toEqual([]);
+  expect(graceMap.has("j-wrapped")).toBe(false);
+});
 
 test("OUT: wrapped provider-leg ownership and live-topology rails fail closed", () => {
   const cases: Array<{
@@ -1164,6 +1179,60 @@ test("autoclosePulse: a due panel leg posts one intent hint BEFORE the kill", as
     ref: "panel::claude::q1",
   });
 
+  db.close();
+});
+
+test("autoclosePulse: a durable ownership row excludes the wrapped leg from the legacy bucket", async () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at)
+       VALUES (1, 0, 0, 0, 0)`,
+  );
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, title, plan_verb, plan_ref,
+        dispatch_origin, backend_exec_type, backend_exec_pane_id,
+        backend_exec_birth_session_id, backend_exec_generation_id,
+        last_input_request_at, last_permission_prompt_at, pid, start_time)
+     VALUES
+       ('ownedwrapped', 1, 1, 'stopped', 'fn-1300-cascade.4', NULL, NULL,
+        NULL, 'tmux', '%5', 'wrapped', '105:1005', NULL, NULL, 444, '400')`,
+  );
+  db.run(
+    `INSERT INTO provider_leg_ownership
+       (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+        ownership_epoch_event_id, leg_session_id, pane_id, pane_generation,
+        backend_exec_type, backend_exec_session_id, state, last_event_id,
+        created_at, updated_at)
+     VALUES
+       ('launch-owned', 'wrapper', 7, 9, 'ownedwrapped', '%5', '105:1005',
+        'tmux', 'wrapped', 'live', 9, 1, 1)`,
+  );
+
+  const killed: string[] = [];
+  const state: AutoclosePulseState = {
+    graceMap: new Map([["ownedwrapped", 1]]),
+  };
+  await autoclosePulse(
+    db,
+    {
+      listPanes: async () => [wrappedPane()],
+      killWindow: async (paneId) => {
+        killed.push(paneId);
+        return { ok: true };
+      },
+    },
+    state,
+    {
+      resolveConfig: () => CONFIG,
+      now: () => 1_000,
+      postIntent: () => {},
+      noteLine: () => {},
+      isPidAlive: () => false,
+    },
+  );
+  expect(killed).toEqual([]);
+  expect(state.graceMap.has("ownedwrapped")).toBe(false);
   db.close();
 });
 

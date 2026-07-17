@@ -34,6 +34,9 @@ import { BackstopCounters } from "../src/backstop-telemetry";
 import {
   BIRTH_RECORD_SCHEMA_VERSION,
   type BirthRecord,
+  consumeProviderLegGrant,
+  promoteBirthIntent,
+  writeBirthIntent,
   writeBirthRecord,
 } from "../src/birth-record";
 import type { EventsIngestContext } from "../src/daemon";
@@ -242,6 +245,259 @@ test("a Pi birth binds only the exact current Dispatch claim", () => {
     .query("SELECT dispatch_origin FROM jobs WHERE job_id = 'pi-exact'")
     .get() as { dispatch_origin: string | null };
   expect(job.dispatch_origin).toBe("autopilot");
+  db.close();
+});
+
+test("a stranded pending owned birth is granted and ingested once by leg_launch_id", () => {
+  const { db } = freshMemDb();
+  const wrapper = makeBirthRecord({
+    session_id: "wrapper-owned-1",
+    spawn_name: "work::fn-1300-durable-wrapper-leg-ownership-cascade.2",
+    dispatch_attempt_id: 42,
+  });
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'Dispatched', 'pending_dispatches', ?)`,
+    [
+      1_700_000_000,
+      wrapper.session_id,
+      JSON.stringify({
+        verb: "work",
+        id: "fn-1300-durable-wrapper-leg-ownership-cascade.2",
+        dir: "/repo",
+        ts: 1_700_000_000,
+        attempt_id: 42,
+        expected_attempt_id: null,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  writeBirthRecord(birthDir, wrapper);
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+  expect(
+    db
+      .query(
+        "SELECT attempt_id, state, session_id FROM dispatch_claims WHERE attempt_id = 42",
+      )
+      .get(),
+  ).toEqual({
+    attempt_id: 42,
+    state: "bound",
+    session_id: wrapper.session_id,
+  });
+  expect(
+    db.query("SELECT state FROM jobs WHERE job_id = ?").get(wrapper.session_id),
+  ).toEqual({ state: "stopped" });
+
+  const owned = makeBirthRecord({
+    session_id: "provider-leg-session",
+    spawn_name: "fn-1300-durable-wrapper-leg-ownership-cascade.2",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-pending-1",
+    wrapper_job_id: wrapper.session_id,
+    wrapper_dispatch_attempt_id: 42,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:100",
+  });
+  const draft = { ...owned } as Record<string, unknown>;
+  delete draft.pid;
+  delete draft.start_time;
+  const intentPath = writeBirthIntent(
+    birthDir,
+    draft as unknown as Parameters<typeof writeBirthIntent>[1],
+    LIVE_PID,
+  );
+  promoteBirthIntent(intentPath, owned);
+
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+  expect(sessionStartCount(db, owned.session_id)).toBe(1);
+  expect(
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM provider_leg_ownership WHERE leg_launch_id = ?",
+      )
+      .get("leg-pending-1"),
+  ).toEqual({ n: 1 });
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-pending-1",
+      wrapper_job_id: wrapper.session_id,
+      wrapper_dispatch_attempt_id: 42,
+    }),
+  ).toBe(true);
+
+  // Recreate the same crash-stranded full pending record. Both synthetic events
+  // remain set-once on leg_launch_id even though the maildir delivery repeats.
+  const replayIntent = writeBirthIntent(
+    birthDir,
+    draft as unknown as Parameters<typeof writeBirthIntent>[1],
+    LIVE_PID,
+  );
+  promoteBirthIntent(replayIntent, owned);
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+  expect(sessionStartCount(db, owned.session_id)).toBe(1);
+  expect(
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE hook_event = 'ProviderLegBorn'
+            AND json_extract(data, '$.leg_launch_id') = 'leg-pending-1'`,
+      )
+      .get(),
+  ).toEqual({ n: 1 });
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-pending-1",
+      wrapper_job_id: wrapper.session_id,
+      wrapper_dispatch_attempt_id: 42,
+    }),
+  ).toBe(true);
+  db.close();
+});
+
+test("terminal owner between promotion and grant withholds paid-process authority", () => {
+  const { db } = freshMemDb();
+  const wrapper = makeBirthRecord({
+    session_id: "wrapper-terminal-1",
+    spawn_name: "work::fn-1300-durable-wrapper-leg-ownership-cascade.3",
+    dispatch_attempt_id: 77,
+  });
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'Dispatched', 'pending_dispatches', ?)`,
+    [
+      1_700_000_000,
+      wrapper.session_id,
+      JSON.stringify({
+        verb: "work",
+        id: "fn-1300-durable-wrapper-leg-ownership-cascade.3",
+        dir: "/repo",
+        ts: 1_700_000_000,
+        attempt_id: 77,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  writeBirthRecord(birthDir, wrapper);
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+  // Producer-side pre-exec validation reads the current projections. Seed the
+  // exact between-promotion-and-grant terminal observation directly.
+  db.run("UPDATE jobs SET state = 'ended' WHERE job_id = ?", [
+    wrapper.session_id,
+  ]);
+
+  const owned = makeBirthRecord({
+    session_id: "withheld-provider",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-withheld-1",
+    wrapper_job_id: wrapper.session_id,
+    wrapper_dispatch_attempt_id: 77,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:200",
+  });
+  const draft = { ...owned } as Record<string, unknown>;
+  delete draft.pid;
+  delete draft.start_time;
+  const intentPath = writeBirthIntent(
+    birthDir,
+    draft as unknown as Parameters<typeof writeBirthIntent>[1],
+    LIVE_PID,
+  );
+  promoteBirthIntent(intentPath, owned);
+  scanBirthDir(db, birthDir);
+
+  expect(sessionStartCount(db, owned.session_id)).toBe(0);
+  expect(existsSync(intentPath)).toBe(true);
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-withheld-1",
+      wrapper_job_id: wrapper.session_id,
+      wrapper_dispatch_attempt_id: 77,
+    }),
+  ).toBe(false);
+  db.close();
+});
+
+test("a superseded exact owner never receives a provider grant", () => {
+  const { db } = freshMemDb();
+  const taskId = "fn-1300-durable-wrapper-leg-ownership-cascade.4";
+  const wrapper = makeBirthRecord({
+    session_id: "wrapper-superseded-1",
+    spawn_name: `work::${taskId}`,
+    dispatch_attempt_id: 88,
+  });
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'Dispatched', 'pending_dispatches', ?)`,
+    [
+      1_700_000_000,
+      wrapper.session_id,
+      JSON.stringify({
+        verb: "work",
+        id: taskId,
+        dir: "/repo",
+        ts: 1_700_000_000,
+        attempt_id: 88,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  writeBirthRecord(birthDir, wrapper);
+  scanBirthDir(db, birthDir);
+  drainToCompletion(db);
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'DispatchClaimSuperseded', 'dispatch_claim_superseded', ?)`,
+    [
+      1_700_000_100,
+      "reconciler",
+      JSON.stringify({
+        verb: "work",
+        id: taskId,
+        dir: "/repo",
+        expected_attempt_id: 88,
+        next_attempt_id: 89,
+      }),
+    ],
+  );
+  drainToCompletion(db);
+  expect(
+    db.query("SELECT attempt_id FROM dispatch_claims WHERE id = ?").get(taskId),
+  ).toEqual({ attempt_id: 89 });
+
+  const owned = makeBirthRecord({
+    session_id: "superseded-provider",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-superseded-1",
+    wrapper_job_id: wrapper.session_id,
+    wrapper_dispatch_attempt_id: 88,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:300",
+  });
+  const draft = { ...owned } as Record<string, unknown>;
+  delete draft.pid;
+  delete draft.start_time;
+  const intentPath = writeBirthIntent(
+    birthDir,
+    draft as unknown as Parameters<typeof writeBirthIntent>[1],
+    LIVE_PID,
+  );
+  promoteBirthIntent(intentPath, owned);
+  scanBirthDir(db, birthDir);
+
+  expect(sessionStartCount(db, owned.session_id)).toBe(0);
+  expect(existsSync(intentPath)).toBe(true);
+  expect(
+    consumeProviderLegGrant(birthDir, {
+      leg_launch_id: "leg-superseded-1",
+      wrapper_job_id: wrapper.session_id,
+      wrapper_dispatch_attempt_id: 88,
+    }),
+  ).toBe(false);
   db.close();
 });
 

@@ -14,17 +14,27 @@ bash scripts/install.sh          # deps -> bun link -> keeperd bootstrap
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
 owned by you and mode `644` or macOS silently ignores it. Optional account-routing integrations are
-discovered through their CLIs; there is no keeper config map to author for them. The autoclose worker
-force-closes the tmux window of a done-and-quiescent keeper-dispatched agent (an autopilot
-`work::`/`close::` worker, a finished claude panel leg, or a wrapped provider leg in the shared
-`wrapped` tmux session) after a grace. It cancels the grace on
-renewed Harness activity or a parked prompt and acts only after an exact Dispatch claim release plus canonical
-tmux-generation and recycle-safe process checks. `autoclose_enabled` (default `true`; set
-`false`/`off`/`no`/`0` to disable — re-read every pulse, so a flip needs no daemon restart) and
-`autoclose_grace_seconds` (default `30`) govern it. A finished `unblock`/`deconflict`/`resolve`
-escalation window is reaped under the same knobs once its block or conflict instance is resolved.
-Wrapped provider-leg titles are bare task IDs for display; resume and cleanup continue by the captured
-harness resume target and exact tmux identity, not by title.
+discovered through their CLIs; there is no keeper config map to author for them.
+
+The autoclose worker force-closes the tmux window of a done-and-quiescent
+keeper-dispatched agent (an autopilot `work::`/`close::` worker, a finished
+claude panel leg, or a legacy ownerless Provider leg in the shared `wrapped`
+tmux session) after a grace. It cancels the grace on renewed Harness activity or
+a parked prompt and acts only after an exact Dispatch claim release plus
+canonical tmux-generation and recycle-safe process checks. `autoclose_enabled`
+(default `true`; set `false`/`off`/`no`/`0` to disable — re-read every pulse, so
+a flip needs no daemon restart) and `autoclose_grace_seconds` (default `30`)
+govern it. A finished `unblock`/`deconflict`/`resolve` escalation window is
+reaped under the same knobs once its block or conflict instance is resolved.
+
+Owned Provider legs use the durable leg cascade instead. It proves the exact
+wrapper Dispatch attempt, confirms leg exit, and tears down only the
+birth-captured pane under canonical generation, wrapped-session, and one-pane
+checks before releasing that attempt's exact claim. An owned idle-stopped window
+uses the same actuator. Provider-leg titles are display-only: resume uses the
+captured Harness resume target, and ownership can move only through a fenced
+transfer transition. `keeper status` reports the remaining legacy ownerless
+cohort as a display-only drain count; it never jams the board.
 Logical worktree merge may land while that inspection window remains open; lane/worktree/cwd removal
 waits until the exact Resource hold clears. A generation mismatch, recycled pid, reused lane path, or
 failed probe defers cleanup rather than targeting a replacement owner. Generic Restore excludes

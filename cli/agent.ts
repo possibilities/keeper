@@ -52,8 +52,6 @@
  * dependency.
  */
 
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import {
   KEEPER_AGENT_HELP,
   KEEPER_AGENT_RUNBOOK,
@@ -66,7 +64,10 @@ import {
   type MainDeps,
   realDeps,
 } from "../src/agent/main";
-import { recordedProcessIdentity } from "../src/commit-work/process-identity";
+import {
+  probeHarnessProcess,
+  isHarnessProcessCommand as sharedIsHarnessProcessCommand,
+} from "../src/commit-work/process-identity";
 
 export type TerminableHarness = "claude" | "pi";
 
@@ -103,58 +104,14 @@ export interface SessionTerminationDeps {
   pollMs?: number;
 }
 
-/** Match a direct harness executable or its bounded node/bun launcher form. */
-export function isHarnessProcessCommand(
-  command: string,
-  harness: TerminableHarness,
-): boolean {
-  const argv = command.includes("\0")
-    ? command.split("\0").filter(Boolean)
-    : command.trim().split(/\s+/).filter(Boolean);
-  if (basename(argv[0] ?? "") === harness) return true;
-  const launcher = basename(argv[0] ?? "");
-  if (!new Set(["env", "node", "nodejs", "bun"]).has(launcher)) return false;
-  const bounded = argv.slice(1, 4);
-  if (bounded.some((token) => basename(token) === harness)) return true;
-  const packageMarker =
-    harness === "pi" ? "/pi-coding-agent/" : "/claude-code/";
-  return bounded.some((token) => token.includes(packageMarker));
-}
+export const isHarnessProcessCommand = sharedIsHarnessProcessCommand;
 
 function productionTerminationProbe(
   pid: number,
   startTime: string,
 ): TerminationProcessObservation {
-  const identity = recordedProcessIdentity(pid, startTime);
-  if (identity !== "matching") return { identity, command: null };
-  try {
-    if (process.platform === "linux") {
-      const command = readFileSync(`/proc/${pid}/cmdline`, "utf8");
-      const finalIdentity = recordedProcessIdentity(pid, startTime);
-      return {
-        identity: finalIdentity,
-        command: finalIdentity === "matching" ? command : null,
-      };
-    }
-    if (process.platform === "darwin") {
-      const result = Bun.spawnSync(
-        ["/bin/ps", "-ww", "-p", String(pid), "-o", "args="],
-        { timeout: 500, stdout: "pipe", stderr: "ignore" },
-      );
-      if (!result.success || result.exitCode !== 0) {
-        return { identity: "inconclusive", command: null };
-      }
-      const command = result.stdout.toString();
-      const finalIdentity = recordedProcessIdentity(pid, startTime);
-      return {
-        identity: finalIdentity,
-        command: finalIdentity === "matching" ? command : null,
-      };
-    }
-  } catch {
-    return { identity: "inconclusive", command: null };
-  }
-  return { identity: "inconclusive", command: null };
+  const observation = probeHarnessProcess(pid, startTime);
+  return { identity: observation.identity, command: observation.command };
 }
 
 export const realSessionTerminationDeps: SessionTerminationDeps = {
