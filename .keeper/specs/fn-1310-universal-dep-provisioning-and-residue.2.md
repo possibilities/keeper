@@ -26,5 +26,5 @@ Teach teardown and the lane dirt spool the ADR 0074 classification: before snaps
 - [ ] Both suites green; no second planted-artifact definition exists
 
 ## Done summary
-
+Teardown now classifies lane residue by dep-plant byte-identity (ADR 0074): snapshotCheckoutDirt drops keeper-planted node_modules symlinks (raw target == worktreeDepLinkTarget) before spooling, so a plant is never spooled, never counted as dirt, and never trips the out-of-root guard into a backup-failure page; a plant-only lane elides the snapshot entirely. Foreign files and replaced plants keep the exact spool-first path. One seam (isWorktreeDepPlant beside the provisioning code) owns both provisioning and the identity test.
 ## Evidence
