@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 export type FastPhase = "root" | "plan" | "prompt";
-export type GatePhase = FastPhase | "slow-git" | "slow-daemon";
+export type GatePhase = FastPhase | "slow-git" | "slow-daemon" | "bench-folds";
 export type TestClass = GatePhase | "opentui";
 
 export type PackageSpec = {
@@ -20,6 +20,7 @@ export type TestManifest = {
   openTuiFiles: readonly string[];
   slowGitFiles: readonly string[];
   slowDaemonFiles: readonly string[];
+  benchFoldFiles: readonly string[];
 };
 
 export const OPEN_TUI_FILES = [
@@ -35,6 +36,8 @@ export const SLOW_GIT_FILES = [
 ] as const;
 
 export const SLOW_DAEMON_FILES = ["test/slow/daemon-smoke.test.ts"] as const;
+
+export const BENCH_FOLD_FILES = ["test/slow/fold-cost-bench.test.ts"] as const;
 
 export const TEST_PACKAGES: readonly PackageSpec[] = [
   {
@@ -65,6 +68,7 @@ export const TEST_MANIFEST: TestManifest = {
   openTuiFiles: OPEN_TUI_FILES,
   slowGitFiles: SLOW_GIT_FILES,
   slowDaemonFiles: SLOW_DAEMON_FILES,
+  benchFoldFiles: BENCH_FOLD_FILES,
 };
 
 export type ManifestAudit = {
@@ -129,6 +133,9 @@ export function classifyTestFile(
   if (manifest.slowDaemonFiles.includes(normalized)) {
     classes.push("slow-daemon");
   }
+  if (manifest.benchFoldFiles.includes(normalized)) {
+    classes.push("bench-folds");
+  }
   for (const pkg of manifest.packages) {
     const prefix = `${posix(pkg.testDir).replace(/\/$/, "")}/`;
     if (normalized.startsWith(prefix)) classes.push(pkg.phase);
@@ -150,6 +157,7 @@ export function auditTestManifest(
     "opentui",
     "slow-git",
     "slow-daemon",
+    "bench-folds",
   ];
   const files: Record<TestClass, string[]> = {
     root: [],
@@ -158,6 +166,7 @@ export function auditTestManifest(
     opentui: [],
     "slow-git": [],
     "slow-daemon": [],
+    "bench-folds": [],
   };
   const requiredFiles: Array<{
     label: string;
@@ -166,6 +175,7 @@ export function auditTestManifest(
     { label: "OpenTUI", paths: manifest.openTuiFiles },
     { label: "slow Git", paths: manifest.slowGitFiles },
     { label: "slow daemon", paths: manifest.slowDaemonFiles },
+    { label: "fold-cost bench", paths: manifest.benchFoldFiles },
   ];
   for (const required of requiredFiles) {
     for (const expected of required.paths) {
@@ -181,13 +191,15 @@ export function auditTestManifest(
     if (
       classes.includes("opentui") ||
       classes.includes("slow-git") ||
-      classes.includes("slow-daemon")
+      classes.includes("slow-daemon") ||
+      classes.includes("bench-folds")
     ) {
       classes = classes.filter(
         (classification) =>
           classification === "opentui" ||
           classification === "slow-git" ||
-          classification === "slow-daemon",
+          classification === "slow-daemon" ||
+          classification === "bench-folds",
       );
     }
     if (classes.length === 0)
