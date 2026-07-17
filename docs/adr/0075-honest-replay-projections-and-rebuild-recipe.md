@@ -37,8 +37,11 @@ to the fresh scan.
   full-replay projection derives only from accumulated per-fold work time
   (stamped after the write lock is held, pace-free), sampled over exactly the
   same event window as the folded-event count. A missing or non-positive
-  work measurement makes the full-replay projection null — "not measured" —
-  never a zero or a paced-rate extrapolation.
+  work measurement, or `events_folded < 1000`, makes the full-replay
+  projection null — "not measured" — never a zero or a paced-rate
+  extrapolation. The floor applies only to full replay: its total-event-count
+  multiplier can amplify a small sample's noise without bound, while the
+  catch-up projection's pending-events multiplier is small and bounded.
 - **The full-replay projection is an estimator, not a promise.** It is the
   last boot's unpaced fold rate times the current event count. The sanctioned
   disaster-rebuild recipe is: bulk-load the log in one transaction, run

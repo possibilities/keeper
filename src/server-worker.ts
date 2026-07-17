@@ -2433,7 +2433,10 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
  *     `eventCount`: an estimator of a from-scratch rebuild, whose folds run
  *     unpaced. It is `null` unless `workMs` is a positive measurement — a
  *     missing, zero, or negative `workMs` reads as "not measured", NEVER a
- *     zero or the paced-rate extrapolation.
+ *     zero or the paced-rate extrapolation. It is also `null` when
+ *     `events_folded < 1000`: the total-event-count multiplier can amplify a
+ *     small sample's noise without bound. Catch-up has no floor because its
+ *     pending-events multiplier is small and bounded.
  *
  * `stats` absent, or its `events_folded` non-positive (a boot that folded zero
  * or a negative/malformed delta — defensive against a torn row), leaves both
@@ -2476,10 +2479,10 @@ export function computeEventStoreStatus(
     durationMs > 0
       ? Math.round((durationMs / eventsFolded) * pendingSinceLastBoot)
       : null;
-  // Full-replay: pace-free fold-work rate only. Null-honest unless workMs is a
-  // positive measurement — never a zero, never the wall-clock extrapolation.
+  // Full-replay: pace-free fold-work rate only. Null-honest below the 1000-event
+  // sample floor or without positive work — never a paced-rate extrapolation.
   const projectedFullReplayMs =
-    stats.workMs !== null && stats.workMs > 0
+    stats.workMs !== null && stats.workMs > 0 && eventsFolded >= 1000
       ? Math.round((stats.workMs / eventsFolded) * eventCount)
       : null;
   return {

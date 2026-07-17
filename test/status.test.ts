@@ -202,27 +202,41 @@ describe("computeEventStoreStatus", () => {
   });
 
   test("catch-up projects from the wall-clock rate, full-replay from the pace-free work rate (the two rates differ)", () => {
-    // Wall-clock: 500 events folded in 10_000ms → 20ms/event (catch-up rate).
-    // Fold-work: 5_000ms over the SAME 500 events → 10ms/event (replay rate),
+    // Wall-clock: 1000 events folded in 20_000ms → 20ms/event (catch-up rate).
+    // Fold-work: 10_000ms over the SAME 1000 events → 10ms/event (replay rate),
     // half the wall-clock rate with the pacing sleep excluded. 100 events have
     // accumulated since that boot's end cursor (head 1100 vs end 1000), and the
     // current total is 2000 events.
     const stats = {
       startedAtMs: 0,
-      completedAtMs: 10_000,
-      startEventId: 500,
+      completedAtMs: 20_000,
+      startEventId: 0,
       endEventId: 1000,
-      workMs: 5_000,
+      workMs: 10_000,
     };
     const out = computeEventStoreStatus(stats, 2000, 999_999, 1100);
     expect(out.last_boot_catchup).toEqual({
-      duration_ms: 10_000,
-      events_folded: 500,
+      duration_ms: 20_000,
+      events_folded: 1000,
     });
     // 20ms/event (wall-clock) * 100 pending events
     expect(out.projected_catchup_duration_ms).toBe(2000);
     // 10ms/event (pace-free work) * 2000 current total events
     expect(out.projected_full_replay_duration_ms).toBe(20_000);
+  });
+
+  test("below the 1000-event full-replay floor leaves replay null while catch-up still projects", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 9990,
+      startEventId: 0,
+      endEventId: 999,
+      workMs: 1998,
+    };
+    const out = computeEventStoreStatus(stats, 1998, 4096, 1099);
+    // 10ms/event wall-clock * 100 pending events
+    expect(out.projected_catchup_duration_ms).toBe(1000);
+    expect(out.projected_full_replay_duration_ms).toBeNull();
   });
 
   test("zero events folded (a boot that caught up nothing) leaves both rates undefined — projections null, observation still surfaced", () => {
@@ -245,16 +259,16 @@ describe("computeEventStoreStatus", () => {
   test("no events have accumulated since the recorded boot → catch-up projection is 0, not null", () => {
     const stats = {
       startedAtMs: 0,
-      completedAtMs: 4000,
+      completedAtMs: 10_000,
       startEventId: 0,
-      endEventId: 400,
-      workMs: 800,
+      endEventId: 1000,
+      workMs: 2000,
     };
     // head == the recorded end cursor: nothing pending right now.
-    const out = computeEventStoreStatus(stats, 400, 8192, 400);
+    const out = computeEventStoreStatus(stats, 1000, 8192, 1000);
     expect(out.projected_catchup_duration_ms).toBe(0);
-    // 2ms/event (pace-free work 800/400) * 400 current total events
-    expect(out.projected_full_replay_duration_ms).toBe(800);
+    // 2ms/event (pace-free work 2000/1000) * 1000 current total events
+    expect(out.projected_full_replay_duration_ms).toBe(2000);
   });
 
   test("null work measurement → full-replay null-honest while catch-up still projects from wall-clock", () => {
@@ -364,8 +378,8 @@ describe("readEventStoreStatus wiring", () => {
       duration_ms: 1000,
       events_folded: 3,
     });
-    // 200ms/event pace-free work (600/3) * 3 current events.
-    expect(eventStore.projected_full_replay_duration_ms).toBe(600);
+    // The three-event sample is below the 1000-event full-replay floor.
+    expect(eventStore.projected_full_replay_duration_ms).toBeNull();
     // Nothing pending beyond the recorded end cursor (head == 3 == end_event_id).
     expect(eventStore.projected_catchup_duration_ms).toBe(0);
   });
