@@ -1596,6 +1596,29 @@ export async function ensureWorktreeDepLink(
 }
 
 /**
+ * The teardown residue classifier (docs/adr/0074): true iff an untracked entry at
+ * `relativePath` is EXACTLY what {@link ensureWorktreeDepLink} plants for
+ * `sourceCheckout` — the top-level {@link WORKTREE_DEP_LINK_NAME} symlink whose RAW
+ * link target is {@link worktreeDepLinkTarget}. Such a match is keeper's own residue:
+ * teardown deletes it freely, never spooling it as work product. Classification is by
+ * byte-identity, never by name: a replaced plant — a link retargeted elsewhere, or a
+ * real file/dir at the path (`linkTarget === undefined`) — is NOT identical and stays
+ * work product that spools. This is the SOLE definition of "what keeper plants" the
+ * teardown side reads; it shares the provisioning seam's constants so the two cannot
+ * drift.
+ */
+export function isWorktreeDepPlant(
+  sourceCheckout: string,
+  relativePath: string,
+  linkTarget: string | undefined,
+): boolean {
+  if (linkTarget === undefined) return false;
+  if (relativePath.replaceAll("\\", "/") !== WORKTREE_DEP_LINK_NAME)
+    return false;
+  return linkTarget === worktreeDepLinkTarget(sourceCheckout);
+}
+
+/**
  * Ensure a worktree exists at `path` on `branch`, forked off `commitish` (the
  * parent lane's committed tip, or the base branch for a root). Idempotent + crash-
  * recoverable:
@@ -1963,9 +1986,9 @@ export function resolveLaneDirtSpoolDir(): string {
 }
 
 export type BackupForceRemoveResult =
-  | { kind: "removed"; snapshotDir: string }
+  | { kind: "removed"; snapshotDir: string | null }
   | { kind: "backup-failed"; detail: string }
-  | { kind: "remove-failed"; detail: string; snapshotDir: string };
+  | { kind: "remove-failed"; detail: string; snapshotDir: string | null };
 
 export interface BackupForceRemoveOptions {
   spoolDir?: string;
@@ -1981,11 +2004,25 @@ interface DirtSnapshotInput {
   snapshotIdPrefix?: string;
   spoolDir: string;
   createdAtMs: number;
+  /**
+   * When set, the source checkout whose {@link ensureWorktreeDepLink} plant a
+   * byte-identical untracked entry in `checkoutPath` is (docs/adr/0074): such an
+   * entry is keeper residue, dropped from the snapshot rather than spooled. Absent
+   * for a checkout keeper never dep-link provisions (e.g. a shared checkout), which
+   * classifies nothing and snapshots every untracked entry as before.
+   */
+  depLinkSource?: string;
 }
 
 type DirtSnapshotResult =
   | { kind: "snapshotted"; snapshotDir: string }
-  | { kind: "backup-failed"; detail: string };
+  | { kind: "backup-failed"; detail: string }
+  /**
+   * Every dirt class was empty once byte-identical dep-link plants were dropped —
+   * there is nothing to spool, so no snapshot dir or index record is written and the
+   * caller may destroy the checkout directly. Only reachable with `depLinkSource`.
+   */
+  | { kind: "nothing-to-spool" };
 
 async function snapshotCheckoutDirt(
   input: DirtSnapshotInput,
@@ -2038,7 +2075,7 @@ async function snapshotCheckoutDirt(
     if (staged.code !== 0 || unstaged.code !== 0 || untracked.code !== 0) {
       return { kind: "backup-failed", detail: "git dirt probe failed" };
     }
-    const untrackedPaths = untracked.stdout
+    let untrackedPaths = untracked.stdout
       .split("\0")
       .filter((p) => p.length > 0);
     for (const relativePath of untrackedPaths) {
@@ -2047,6 +2084,42 @@ async function snapshotCheckoutDirt(
           kind: "backup-failed",
           detail: `unsafe untracked path ${JSON.stringify(relativePath)}`,
         };
+      }
+    }
+    // Drop keeper's own dep-link plants (docs/adr/0074) BEFORE any node is read: a
+    // byte-identical plant is residue, never work product, so it is neither spooled
+    // nor counted as dirt. Filtering here also keeps a plant's out-of-root link
+    // target away from `snapshotUntrackedNode`'s in-root guard, so it never fails the
+    // backup (the dirt-page noise this classification ends). Non-plants — foreign
+    // files, and a replaced plant no longer byte-identical — flow through unchanged.
+    if (input.depLinkSource !== undefined) {
+      const depLinkSource = input.depLinkSource;
+      const kept: string[] = [];
+      let droppedPlant = false;
+      for (const relativePath of untrackedPaths) {
+        if (
+          await untrackedIsDepPlant(
+            input.checkoutPath,
+            depLinkSource,
+            relativePath,
+          )
+        ) {
+          droppedPlant = true;
+          continue;
+        }
+        kept.push(relativePath);
+      }
+      untrackedPaths = kept;
+      // Only-residue dirt (a plant was dropped and nothing real remains) → no spool
+      // entry. A checkout with no dirt at all drops no plant and keeps the existing
+      // snapshot path, so an empty-but-present snapshot is unchanged.
+      if (
+        droppedPlant &&
+        staged.stdout.length === 0 &&
+        unstaged.stdout.length === 0 &&
+        untrackedPaths.length === 0
+      ) {
+        return { kind: "nothing-to-spool" };
       }
     }
     if (snapshotId === null) {
@@ -2128,10 +2201,16 @@ export async function backupThenForceRemoveWorktree(
       snapshotId: options.snapshotId?.() ?? laneDirtSnapshotId(entry.path),
       spoolDir: options.spoolDir ?? resolveLaneDirtSpoolDir(),
       createdAtMs: options.nowMs?.() ?? Date.now(),
+      // A lane always links to its own repo checkout's store, so `repoCwd` IS the
+      // provisioning source: a byte-identical plant is keeper residue, elided here.
+      depLinkSource: repoCwd,
     },
     run,
   );
   if (snapshot.kind === "backup-failed") return snapshot;
+  // `nothing-to-spool` → only-residue dirt was dropped; no spool entry was written.
+  const snapshotDir =
+    snapshot.kind === "snapshotted" ? snapshot.snapshotDir : null;
 
   const removed = await run(["worktree", "remove", "--force", entry.path], {
     cwd: repoCwd,
@@ -2141,11 +2220,11 @@ export async function backupThenForceRemoveWorktree(
     return {
       kind: "remove-failed",
       detail: (removed.stdout + removed.stderr).trim(),
-      snapshotDir: snapshot.snapshotDir,
+      snapshotDir,
     };
   }
   await pruneWorktrees(repoCwd, run);
-  return { kind: "removed", snapshotDir: snapshot.snapshotDir };
+  return { kind: "removed", snapshotDir };
 }
 
 export type BackupCleanSharedCheckoutResult =
@@ -2174,6 +2253,11 @@ export async function backupThenCleanSharedCheckout(
     run,
   );
   if (snapshot.kind === "backup-failed") return snapshot;
+  // A shared checkout is never dep-link provisioned, so its snapshot is taken WITHOUT
+  // a `depLinkSource` and always materializes — the `nothing-to-spool` plant-elision
+  // is unreachable here, but narrow it out so the snapshot dir stays a plain string.
+  const snapshotDir =
+    snapshot.kind === "snapshotted" ? snapshot.snapshotDir : "";
 
   const reset = await run(["reset", "--hard", "HEAD"], {
     cwd: checkoutPath,
@@ -2183,7 +2267,7 @@ export async function backupThenCleanSharedCheckout(
     return {
       kind: "clean-failed",
       detail: (reset.stdout + reset.stderr).trim(),
-      snapshotDir: snapshot.snapshotDir,
+      snapshotDir,
     };
   }
   const clean = await run(["clean", "-f", "-d"], {
@@ -2194,10 +2278,10 @@ export async function backupThenCleanSharedCheckout(
     return {
       kind: "clean-failed",
       detail: (clean.stdout + clean.stderr).trim(),
-      snapshotDir: snapshot.snapshotDir,
+      snapshotDir,
     };
   }
-  return { kind: "cleaned", snapshotDir: snapshot.snapshotDir };
+  return { kind: "cleaned", snapshotDir };
 }
 
 function isSafeLaneRelativePath(path: string): boolean {
@@ -2242,6 +2326,31 @@ async function safeUntrackedNode(
   }
   if (!st?.isFile()) throw new Error(`unsupported untracked node: ${source}`);
   return { source, kind: "file" };
+}
+
+/**
+ * Read one untracked entry's raw link target and hand it to {@link isWorktreeDepPlant}
+ * — the fs side of the teardown residue classifier (docs/adr/0074). Only the top-level
+ * {@link WORKTREE_DEP_LINK_NAME} entry can be a plant, so anything else skips the fs
+ * probe. A vanished / unreadable / non-symlink entry is NOT a plant: it falls through
+ * to the normal spool path. `isWorktreeDepPlant` stays the single identity definition.
+ */
+async function untrackedIsDepPlant(
+  checkoutPath: string,
+  depLinkSource: string,
+  relativePath: string,
+): Promise<boolean> {
+  if (relativePath.replaceAll("\\", "/") !== WORKTREE_DEP_LINK_NAME)
+    return false;
+  const candidate = resolve(checkoutPath, relativePath);
+  let linkTarget: string;
+  try {
+    if (!(await lstat(candidate)).isSymbolicLink()) return false;
+    linkTarget = await readlink(candidate);
+  } catch {
+    return false;
+  }
+  return isWorktreeDepPlant(depLinkSource, relativePath, linkTarget);
 }
 
 async function updateUntrackedNodeDigest(
