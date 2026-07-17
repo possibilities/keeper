@@ -140,7 +140,8 @@ export function parseGateArgs(argv: readonly string[]): {
         value !== "root" &&
         value !== "plan" &&
         value !== "prompt" &&
-        value !== "slow-git"
+        value !== "slow-git" &&
+        value !== "slow-daemon"
       ) {
         throw new Error(`unknown test phase: ${value}`);
       }
@@ -156,7 +157,9 @@ export function phaseTargets(
 ): { cwd: string; files: string[] } {
   const audit = loadTestManifest(repoRoot);
   const cwd =
-    phase === "root" || phase === "slow-git" ? "." : `plugins/${phase}`;
+    phase === "root" || phase === "slow-git" || phase === "slow-daemon"
+      ? "."
+      : `plugins/${phase}`;
   return {
     cwd,
     files: audit.files[phase].map((file) =>

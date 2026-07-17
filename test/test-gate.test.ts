@@ -40,6 +40,10 @@ describe("named phase arguments", () => {
       phase: "slow-git",
       forwarded: ["--timeout=60000"],
     });
+    expect(parseGateArgs(["--phase=slow-daemon", "--timeout=60000"])).toEqual({
+      phase: "slow-daemon",
+      forwarded: ["--timeout=60000"],
+    });
     expect(() => parseGateArgs(["--phase=slow"])).toThrow("unknown test phase");
   });
 });
