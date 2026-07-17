@@ -138,6 +138,64 @@ describe("keeper daemon restart evidence verdict", () => {
     });
   });
 
+  test("accepts a fresh boot that lands after the healthy-probe window, near the deadline", async () => {
+    // Live reproduction: kickstart exits 143 (our own launchctl-kill timeout,
+    // empty output), probes are healthy throughout, but the fresh boot row
+    // lands only after the three-consecutive-healthy window — during the final
+    // backoff before the deadline. The in-loop success check reads the ledger
+    // only on a healthy probe, so it never sees the boot; the verdict must
+    // still fall through to the final evidence re-check and report success.
+    let now = 0;
+    const stdout: string[] = [];
+    // Boot lands at t=400: after the third healthy probe's ledger read (t=300)
+    // but before the t=500 deadline — the exact gap the in-loop check misses.
+    const bootLandsAt = 400;
+    const deps: RestartDeps = {
+      runLaunchctl: async (args) =>
+        args[0] === "kickstart"
+          ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
+          : { exitCode: 0, stdout: "state = running", stderr: "" },
+      probeHealth: async () => true,
+      readLatestBoot: async () =>
+        now >= bootLandsAt
+          ? { boot_id: "boot-after", ts: 200 }
+          : { boot_id: "boot-before", ts: 100 },
+      sleep: async (ms) => {
+        now += ms;
+      },
+      now: () => now,
+      random: () => 0.5,
+      uid: () => 501,
+      writeStdout: (text) => stdout.push(text),
+      writeStderr: () => {},
+      exit: (code): never => {
+        throw new ExitError(code, stdout.join(""));
+      },
+    };
+
+    const exit = await restartAndCapture(
+      { sock: "/tmp/keeperd.sock", timeoutMs: 500 },
+      deps,
+    );
+
+    expect(exit.code).toBe(0);
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      schema_version: 1,
+      ok: true,
+      error: null,
+      data: {
+        domain: "gui/501/arthack.keeperd",
+        healthy_probes: 3,
+        kickstart_warning: {
+          exit_code: 143,
+          stdout: "",
+          stderr: "",
+          timed_out: true,
+        },
+      },
+    });
+  });
+
   test("retains failed kickstart output when no fresh boot appears by the deadline", async () => {
     const h = restartHarness({
       kickstart: {
