@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A security-correctness redaction leak (opaque bearer token surviving into a persisted notice) is a hard opus gate per hand_tuned, and the fully-diagnosed root cause with a named fix and single-file+test blast radius fits the high band rather than an xhigh caution upgrade.",
+      "task_id": "fn-1319-fix-bearer-token-redaction-ordering-in.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T22:32:54.671000Z",
+  "epic_id": "fn-1319-fix-bearer-token-redaction-ordering-in",
+  "input_hash": "6e2b39568acba7ed7941b416ee36daf7941d1567e22ff0d64a73874e7f9eb59e",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1848326486,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"A security-correctness redaction leak (opaque bearer token surviving into a persisted notice) is a hard opus gate per hand_tuned, and the fully-diagnosed root cause with a named fix and single-file+test blast radius fits the high band rather than an xhigh caution upgrade.\",\"confidence\":0.8}]}\n"
+}
