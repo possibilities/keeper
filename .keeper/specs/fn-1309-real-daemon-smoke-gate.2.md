@@ -27,5 +27,5 @@ The two remaining ADR 0073 scenarios atop the task-1 harness. Worker-kill: with 
 - [ ] Both scenarios run under the named gate with full sandbox teardown
 
 ## Done summary
-
+Added scenarios (b) worker-kill supervision (bounded process/socket/lock teardown + watcher close + restart-ledger evidence via a real successor boot) and (c) restart-verdict (runRestart end-to-end against the sandboxed daemon, launchctl seam only) to test/slow/daemon-smoke.test.ts, extending the harness with killDaemonProcess/respawnSandboxedDaemon/openWatchConnection.
 ## Evidence
