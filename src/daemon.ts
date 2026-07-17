@@ -201,6 +201,7 @@ import type {
   EventsLogChangedMessage,
 } from "./events-ingest-worker";
 import {
+  captureWrappedLegAbortEvidence,
   classifyCloseKind,
   compareCanonicalGeneration,
   createTmuxPaneOps,
@@ -250,6 +251,7 @@ import type {
   RecheckPendingMessage,
 } from "./plan-worker";
 import {
+  assembleWrappedLegAbortPayload,
   createProviderLegDeathNoticeState,
   nextProviderLegNoticeRetryDelayMs,
   type ProviderLegDeathCandidate,
@@ -8431,6 +8433,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
                 j.close_kind,
                 j.kill_reason,
                 j.backend_exec_birth_session_id,
+                e.data AS terminal_event_data,
                 o.leg_launch_id,
                 o.wrapper_job_id,
                 o.wrapper_dispatch_attempt_id,
@@ -10263,13 +10266,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // (and the new process is presumably alive) — skip silently.
       const row = db
         .query(
-          "SELECT pid, start_time, state, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+          "SELECT pid, start_time, state, backend_exec_pane_id, backend_exec_birth_session_id FROM jobs WHERE job_id = ?",
         )
         .get(msg.jobId) as {
         pid: number | null;
         start_time: string | null;
         state: string;
         backend_exec_pane_id: string | null;
+        backend_exec_birth_session_id: string | null;
       } | null;
       if (row == null) {
         // Row vanished — nothing to fold against.
@@ -10324,6 +10328,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       )
         ? "autoclosed"
         : "exit_watched";
+      // Producer-side abort capture for a WRAPPED provider leg only: a leg that
+      // dies pre-transcript leaves no result envelope, so capture its (dead or
+      // idle) pane's scrollback + exit status ONCE, here, redacted and bounded,
+      // and ride it on this immutable Killed payload for the death-notice sweep
+      // to read back deterministically (the evidence lives on the event — a fold
+      // never re-probes). Strictly best-effort: any failure degrades to a typed
+      // capture-unavailable marker and NEVER blocks or drops the terminal mint.
+      const abortCapture =
+        row.backend_exec_birth_session_id === WRAPPED_EXEC_SESSION
+          ? assembleWrappedLegAbortPayload(
+              captureWrappedLegAbortEvidence(row.backend_exec_pane_id),
+            )
+          : null;
       stmts.insertEvent.run({
         $ts: Date.now() / 1000, // unix seconds as REAL
         $session_id: msg.jobId, // == job_id
@@ -10342,6 +10359,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           start_time: msg.startTime,
           close_kind: closeKind,
           reason: killReason,
+          ...(abortCapture == null ? {} : { abort_capture: abortCapture }),
         }),
         $subagent_agent_id: null,
         $spawn_name: null,

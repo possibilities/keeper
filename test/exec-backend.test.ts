@@ -27,14 +27,17 @@ import {
   AGENTBUS_EXEC_SESSION,
   buildGenerationId,
   buildKeeperAgentLaunchArgv,
+  buildTmuxCapturePaneArgs,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
   buildTmuxListPanesArgs,
   buildTmuxNewSessionArgs,
+  buildTmuxPaneDeadStatusArgs,
   buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
   buildTmuxServerGenerationArgs,
+  captureWrappedLegAbortEvidence,
   classifyCloseKind,
   classifyProcessIdentity,
   compareCanonicalGeneration,
@@ -1908,4 +1911,144 @@ test("classifyCloseKind: null stdout on a zero exit → no panes, pane absent �
   expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
     "window_gone_server_alive",
   );
+});
+
+// ---------------------------------------------------------------------------
+// captureWrappedLegAbortEvidence — the producer-side, best-effort pane capture
+// for a wrapped leg dying pre-transcript. Injected canned tmux output; no real
+// fork. Pane-capture MECHANICS against a live pane are proven by recorded
+// evidence, not a correctness-tier tmux test — these cover the pure control flow.
+// ---------------------------------------------------------------------------
+
+/** A `SyncProbeFn` routing per-verb: capture-pane vs display-message, recording
+ *  argv so the test asserts the exact builders + degrade paths. */
+function makeCaptureProbe(table: {
+  capture?: { success?: boolean; exitCode?: number; stdout?: string | null };
+  status?: { success?: boolean; exitCode?: number; stdout?: string | null };
+}): { probe: SyncProbeFn; calls: string[][] } {
+  const calls: string[][] = [];
+  const probe: SyncProbeFn = (args) => {
+    calls.push([...args]);
+    const canned = args[1] === "capture-pane" ? table.capture : table.status;
+    const c = canned ?? {};
+    return {
+      success: c.success ?? true,
+      exitCode: c.exitCode ?? 0,
+      stdout: c.stdout === null ? null : { toString: () => c.stdout ?? "" },
+    };
+  };
+  return { probe, calls };
+}
+
+test("buildTmuxCapturePaneArgs: full-history, joined, escapes preserved", () => {
+  expect(buildTmuxCapturePaneArgs("%5")).toEqual([
+    "tmux",
+    "capture-pane",
+    "-p",
+    "-J",
+    "-e",
+    "-S",
+    "-",
+    "-t",
+    "%5",
+  ]);
+});
+
+test("buildTmuxPaneDeadStatusArgs: reads the dead flag + wait status", () => {
+  expect(buildTmuxPaneDeadStatusArgs("%5")).toEqual([
+    "tmux",
+    "display-message",
+    "-p",
+    "-t",
+    "%5",
+    "#{pane_dead}:#{pane_dead_status}",
+  ]);
+});
+
+test("captureWrappedLegAbortEvidence: no recorded pane → unavailable, no spawn", () => {
+  const { probe, calls } = makeCaptureProbe({});
+  for (const paneId of [null, ""]) {
+    expect(
+      captureWrappedLegAbortEvidence(paneId, { spawnSync: probe }),
+    ).toEqual({ status: "unavailable", reason: "no recorded pane" });
+  }
+  expect(calls).toHaveLength(0);
+});
+
+test("captureWrappedLegAbortEvidence: dead pane → captured text + dead status", () => {
+  const { probe, calls } = makeCaptureProbe({
+    capture: { stdout: "pi: boot aborted\n" },
+    status: { stdout: "1:137" },
+  });
+  expect(captureWrappedLegAbortEvidence("%5", { spawnSync: probe })).toEqual({
+    status: "captured",
+    rawText: "pi: boot aborted\n",
+    paneDead: true,
+    deadStatus: "137",
+  });
+  expect(calls[0]).toEqual(buildTmuxCapturePaneArgs("%5"));
+  expect(calls[1]).toEqual(buildTmuxPaneDeadStatusArgs("%5"));
+});
+
+test("captureWrappedLegAbortEvidence: live backstop pane (not dead, no status)", () => {
+  const { probe } = makeCaptureProbe({
+    capture: { stdout: "$ \n" },
+    status: { stdout: "0:" },
+  });
+  expect(captureWrappedLegAbortEvidence("%5", { spawnSync: probe })).toEqual({
+    status: "captured",
+    rawText: "$ \n",
+    paneDead: false,
+    deadStatus: null,
+  });
+});
+
+test("captureWrappedLegAbortEvidence: pane gone (capture non-zero) → unavailable", () => {
+  const { probe, calls } = makeCaptureProbe({
+    capture: { success: false, exitCode: 1 },
+  });
+  expect(captureWrappedLegAbortEvidence("%5", { spawnSync: probe })).toEqual({
+    status: "unavailable",
+    reason: "pane absent or capture failed",
+  });
+  // Degrades after the single capture-pane probe — no status probe follows.
+  expect(calls).toHaveLength(1);
+});
+
+test("captureWrappedLegAbortEvidence: capture spawn throws → unavailable, never throws", () => {
+  const probe: SyncProbeFn = () => {
+    throw new Error("ENOENT");
+  };
+  expect(captureWrappedLegAbortEvidence("%5", { spawnSync: probe })).toEqual({
+    status: "unavailable",
+    reason: "capture-pane spawn failed",
+  });
+});
+
+test("captureWrappedLegAbortEvidence: caps raw text at the source", () => {
+  const { probe } = makeCaptureProbe({
+    capture: { stdout: "x".repeat(50_000) },
+    status: { stdout: "1:1" },
+  });
+  const result = captureWrappedLegAbortEvidence("%5", {
+    spawnSync: probe,
+    maxBytes: 128,
+  });
+  expect(result.status).toBe("captured");
+  if (result.status === "captured") {
+    expect(Buffer.byteLength(result.rawText, "utf8")).toBeLessThanOrEqual(128);
+  }
+});
+
+test("captureWrappedLegAbortEvidence: a failed status probe still returns the text", () => {
+  const { probe } = makeCaptureProbe({
+    capture: { stdout: "boom\n" },
+    status: { success: false, exitCode: 1 },
+  });
+  expect(captureWrappedLegAbortEvidence("%5", { spawnSync: probe })).toEqual({
+    status: "captured",
+    rawText: "boom\n",
+    paneDead: false,
+    deadStatus: null,
+  });
 });

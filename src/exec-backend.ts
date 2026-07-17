@@ -791,6 +791,123 @@ export function classifyCloseKind(
 }
 
 /**
+ * Producer-side ceiling on the pane scrollback the wrapped-leg abort capture
+ * reads before redaction + the notice byte-caps bound it further. A generous cap
+ * so a large boot spew is truncated at the SOURCE, never streamed unbounded into
+ * an event payload an attacker-influenceable process could inflate.
+ */
+export const WRAPPED_LEG_ABORT_CAPTURE_MAX_BYTES = 8192;
+
+/**
+ * Build the `tmux capture-pane -p -J -e -S - -t <paneId>` argv. Pure — exported
+ * for tests. `-p` prints the content to stdout, `-J` joins wrapped lines so a
+ * soft-wrapped error is one line, `-e` preserves the pane's escape sequences
+ * (faithful forensics), and `-S -` starts at the top of the scrollback so the
+ * FULL boot history — not just the visible viewport — is captured.
+ */
+export function buildTmuxCapturePaneArgs(paneId: string): string[] {
+  return ["tmux", "capture-pane", "-p", "-J", "-e", "-S", "-", "-t", paneId];
+}
+
+/**
+ * Build the `tmux display-message -p -t <paneId> '#{pane_dead}:#{pane_dead_status}'`
+ * argv. Pure — exported for tests. Reads the pane's dead flag plus the wait
+ * status tmux stamped when its process exited; `pane_dead_status` is only
+ * populated for a `remain-on-exit` dead pane, so an empty field is the normal,
+ * expected result for a live login-shell backstop pane.
+ */
+export function buildTmuxPaneDeadStatusArgs(paneId: string): string[] {
+  return [
+    "tmux",
+    "display-message",
+    "-p",
+    "-t",
+    paneId,
+    "#{pane_dead}:#{pane_dead_status}",
+  ];
+}
+
+/**
+ * The result of a best-effort wrapped-leg abort capture. `captured` carries the
+ * raw (UNREDACTED) pane scrollback plus the dead-pane exit status; the caller
+ * MUST redact before persisting. `unavailable` is the typed degrade marker — the
+ * pane was already gone (remain-on-exit off), the probe failed, or there was no
+ * recorded pane — carrying a short human reason, never raw text.
+ */
+export type WrappedLegAbortCapture =
+  | {
+      status: "captured";
+      rawText: string;
+      paneDead: boolean;
+      deadStatus: string | null;
+    }
+  | { status: "unavailable"; reason: string };
+
+/**
+ * Capture a dying WRAPPED provider leg's pane scrollback + exit status at the
+ * producer moment (the synthetic `Killed` mint), so a leg that dies before it
+ * writes a transcript still leaves attributable evidence. Best-effort by
+ * construction: NEVER throws, and any failure (pane already gone, tmux
+ * unreachable, spawn error) degrades to the typed `unavailable` marker so the
+ * Killed mint is never blocked or dropped. Synchronous (`Bun.spawnSync`) and
+ * bounded, mirroring {@link classifyCloseKind}; the locale-defaulted env is
+ * load-bearing (a C-locale tmux client mangles `-F`/content output). The raw
+ * text is capped at the source; the caller redacts and re-bounds it before it
+ * reaches any durable store.
+ */
+export function captureWrappedLegAbortEvidence(
+  paneId: string | null,
+  opts?: { timeoutMs?: number; maxBytes?: number; spawnSync?: SyncProbeFn },
+): WrappedLegAbortCapture {
+  if (paneId == null || paneId === "") {
+    return { status: "unavailable", reason: "no recorded pane" };
+  }
+  const timeout = opts?.timeoutMs ?? 1000;
+  const maxBytes = opts?.maxBytes ?? WRAPPED_LEG_ABORT_CAPTURE_MAX_BYTES;
+  const probe: SyncProbeFn =
+    opts?.spawnSync ??
+    ((args) =>
+      Bun.spawnSync(args, {
+        timeout,
+        env: localeDefaultedEnv(
+          process.env as Record<string, string | undefined>,
+        ),
+      }));
+  let capture: SyncProbeResult;
+  try {
+    capture = probe(buildTmuxCapturePaneArgs(paneId));
+  } catch {
+    return { status: "unavailable", reason: "capture-pane spawn failed" };
+  }
+  // A non-zero exit means the pane no longer exists (remain-on-exit off, the
+  // pane closed on process exit) or the server is unreachable — either way there
+  // is nothing to capture.
+  if (!capture.success || capture.exitCode !== 0) {
+    return { status: "unavailable", reason: "pane absent or capture failed" };
+  }
+  const source = Buffer.from(capture.stdout?.toString() ?? "", "utf8");
+  const rawText = source.subarray(0, maxBytes).toString("utf8");
+  // The dead flag + wait status is a best-effort enrichment: absence (a live
+  // backstop pane, or an older tmux) leaves the structured exit fields null and
+  // the exit code readable in the captured text instead.
+  let paneDead = false;
+  let deadStatus: string | null = null;
+  try {
+    const status = probe(buildTmuxPaneDeadStatusArgs(paneId));
+    if (status.success && status.exitCode === 0) {
+      const line = (status.stdout?.toString() ?? "").trim();
+      const colon = line.indexOf(":");
+      paneDead = (colon < 0 ? line : line.slice(0, colon)) === "1";
+      const raw = colon < 0 ? "" : line.slice(colon + 1).trim();
+      deadStatus = raw === "" ? null : raw;
+    }
+  } catch {
+    // best-effort — leave paneDead/deadStatus at their defaults.
+  }
+  return { status: "captured", rawText, paneDead, deadStatus };
+}
+
+/**
  * Build the tmux `rename-window -t <windowId> -- <name>` argv. Pure — exported
  * for tests. Targets by WINDOW id (`@N`, server-global durable handle) — never
  * name-based, since colons in names break target parsing. The `--` is
