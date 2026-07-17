@@ -12,10 +12,11 @@ import { parseDuration } from "./duration";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
 
 export const RESTART_SCHEMA_VERSION = 1;
-// Post-boot catch-up on a loaded event store can run tens of seconds before
-// ever reporting caught-up; 150s (2.5m) gives margin over that shape while
-// `--timeout` still overrides.
-export const DEFAULT_RESTART_TIMEOUT_MS = 150_000;
+// Post-boot catch-up on a loaded event store runs minutes before reporting
+// caught-up, and lengthens as the store grows; the default waits generously
+// for a genuinely-booting daemon (a healthy boot returns at the third clean
+// probe, well before this bound) while `--timeout` still overrides.
+export const DEFAULT_RESTART_TIMEOUT_MS = 600_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
 // `launchctl kickstart -k` does a real kill-and-respawn, not an instant call,
 // so it needs a multi-second budget to complete without being TERM-killed
