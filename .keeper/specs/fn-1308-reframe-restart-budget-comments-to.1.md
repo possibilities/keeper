@@ -25,5 +25,5 @@ history belongs to the commit message, not the code.
 - [ ] `bun scripts/lint-claude-md.ts` green; existing restart CLI tests pass.
 
 ## Done summary
-
+Reframed DEFAULT_RESTART_TIMEOUT_MS and KICKSTART_TIMEOUT_MS comments in cli/restart.ts to state current behavior only, dropping past-tense provenance and the stale 1s-kickstart reference while retaining the why-this-number margin rationale.
 ## Evidence
