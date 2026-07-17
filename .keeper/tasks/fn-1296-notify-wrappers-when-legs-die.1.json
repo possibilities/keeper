@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T00:05:35.664000Z",
+  "depends_on": [],
+  "epic": "fn-1296-notify-wrappers-when-legs-die",
+  "id": "fn-1296-notify-wrappers-when-legs-die.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Make agent waits death-honest",
+  "updated_at": "2026-07-17T00:05:35.664000Z"
+}
