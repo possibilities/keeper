@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-17T03:58:40.250000Z",
   "depends_on": [],
   "epic": "fn-1301-honest-daemon-restart-verdict",
   "id": "fn-1301-honest-daemon-restart-verdict.1",
-  "model": "opus",
+  "model": "gpt-5.6-terra",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Honest daemon restart verdict",
-  "updated_at": "2026-07-17T03:58:40.250000Z"
+  "updated_at": "2026-07-17T03:59:34.627000Z"
 }
