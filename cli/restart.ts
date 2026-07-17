@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /** `keeper daemon restart` — restart the LaunchAgent and wait for a caught-up serve. */
 
+import { readFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
 export const REQUIRED_HEALTHY_PROBES = 3;
 export const INITIAL_BACKOFF_MS = 100;
 export const MAX_BACKOFF_MS = 1_500;
+export const MAX_KICKSTART_OUTPUT_CHARS = 4_096;
 
 export const DAEMON_HELP = `keeper daemon — daemon lifecycle operations
 
@@ -132,6 +134,18 @@ export interface CommandResult {
   timedOut?: boolean;
 }
 
+export interface RestartBootMarker {
+  boot_id: string;
+  ts: number;
+}
+
+export interface KickstartWarning {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  timed_out: boolean;
+}
+
 export interface RestartDeps {
   readonly runLaunchctl: (
     args: string[],
@@ -139,6 +153,8 @@ export interface RestartDeps {
   ) => Promise<CommandResult>;
   /** True only when the socket served a reply with `boot.catching_up === false`. */
   readonly probeHealth: (sock: string, timeoutMs: number) => Promise<boolean>;
+  /** Reads the newest boot ledger entry so health cannot be attributed to a stale daemon. */
+  readonly readLatestBoot: () => Promise<RestartBootMarker | null>;
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
   readonly random: () => number;
@@ -155,7 +171,11 @@ export function isThrottledLaunchctlState(output: string): boolean {
   );
 }
 
-function failure(code: RestartProblemCode, deps: RestartDeps): void {
+function failure(
+  code: RestartProblemCode,
+  deps: RestartDeps,
+  kickstartWarning?: KickstartWarning,
+): void {
   const details: Record<
     RestartProblemCode,
     { message: string; recovery: string }
@@ -178,9 +198,73 @@ function failure(code: RestartProblemCode, deps: RestartDeps): void {
     },
   };
   emitEnvelope(
-    errorEnvelope(RESTART_SCHEMA_VERSION, { code, ...details[code] }),
+    errorEnvelope(RESTART_SCHEMA_VERSION, {
+      code,
+      ...details[code],
+      ...(kickstartWarning === undefined
+        ? {}
+        : { details: { kickstart_warning: kickstartWarning } }),
+    }),
     deps,
   );
+}
+
+function boundKickstartOutput(output: string): string {
+  const trimmed = output.trim();
+  if (trimmed.length <= MAX_KICKSTART_OUTPUT_CHARS) return trimmed;
+  const suffix = "…[truncated]";
+  return `${trimmed.slice(0, MAX_KICKSTART_OUTPUT_CHARS - suffix.length)}${suffix}`;
+}
+
+function kickstartWarning(result: CommandResult): KickstartWarning {
+  return {
+    exit_code: result.exitCode,
+    stdout: boundKickstartOutput(result.stdout),
+    stderr: boundKickstartOutput(result.stderr),
+    timed_out: result.timedOut === true,
+  };
+}
+
+function isFreshBoot(
+  before: RestartBootMarker | null,
+  current: RestartBootMarker | null,
+): boolean {
+  if (current === null) return false;
+  return (
+    before === null ||
+    current.boot_id !== before.boot_id ||
+    current.ts > before.ts
+  );
+}
+
+async function readLatestBoot(): Promise<RestartBootMarker | null> {
+  let raw: string;
+  try {
+    raw = await readFile(
+      join(homedir(), ".local", "state", "keeper", "restart-ledger.json"),
+      "utf8",
+    );
+  } catch {
+    return null;
+  }
+  let latest: RestartBootMarker | null = null;
+  for (const line of raw.split("\n")) {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (
+        parsed.kind === "boot" &&
+        typeof parsed.boot_id === "string" &&
+        parsed.boot_id.length > 0 &&
+        typeof parsed.ts === "number" &&
+        Number.isFinite(parsed.ts)
+      ) {
+        latest = { boot_id: parsed.boot_id, ts: parsed.ts };
+      }
+    } catch {
+      // A torn append must not prevent reading the preceding boot.
+    }
+  }
+  return latest;
 }
 
 /** One bounded healthy attempt. Connection refusal is simply `false`, never fatal. */
@@ -260,6 +344,7 @@ export async function runRestart(
   const startedAt = deps.now();
   const deadline = startedAt + args.timeoutMs;
   const domain = launchctlDomain(deps.uid());
+  const preRestartBoot = await deps.readLatestBoot();
   let kickstart: CommandResult;
   try {
     kickstart = await deps.runLaunchctl(
@@ -270,10 +355,12 @@ export async function runRestart(
     failure("kickstart-failed", deps);
     return;
   }
-  if (kickstart.exitCode !== 0 || kickstart.timedOut === true) {
-    failure("kickstart-failed", deps);
-    return;
-  }
+  const failedKickstart =
+    kickstart.exitCode !== 0 || kickstart.timedOut === true;
+  const retainedKickstart = kickstartWarning(kickstart);
+  const retainedKickstartWarning = failedKickstart
+    ? retainedKickstart
+    : undefined;
 
   let healthyInARow = 0;
   let backoffMs = INITIAL_BACKOFF_MS;
@@ -285,11 +372,17 @@ export async function runRestart(
     );
     if (healthy) {
       healthyInARow += 1;
-      if (healthyInARow >= REQUIRED_HEALTHY_PROBES) {
+      if (
+        healthyInARow >= REQUIRED_HEALTHY_PROBES &&
+        isFreshBoot(preRestartBoot, await deps.readLatestBoot())
+      ) {
         emitEnvelope(
           successEnvelope(RESTART_SCHEMA_VERSION, {
             domain,
             healthy_probes: healthyInARow,
+            ...(retainedKickstartWarning === undefined
+              ? {}
+              : { kickstart_warning: retainedKickstartWarning }),
           }),
           deps,
         );
@@ -325,7 +418,11 @@ export async function runRestart(
     await deps.sleep(waitMs);
     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
   }
-  failure("health-timeout", deps);
+  failure(
+    failedKickstart ? "kickstart-failed" : "health-timeout",
+    deps,
+    retainedKickstartWarning,
+  );
 }
 
 export async function main(argv: string[]): Promise<void> {
@@ -345,6 +442,7 @@ export async function main(argv: string[]): Promise<void> {
   await runRestart(parsed.args, {
     runLaunchctl,
     probeHealth: probeSocketHealth,
+    readLatestBoot,
     sleep: (ms) => Bun.sleep(ms),
     now: () => Date.now(),
     random: () => Math.random(),

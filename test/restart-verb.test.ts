@@ -27,6 +27,7 @@ function harness(inputs: {
   const calls: string[][] = [];
   let probeIndex = 0;
   let printIndex = 0;
+  let bootReadCount = 0;
   const deps: RestartDeps = {
     runLaunchctl: async (args) => {
       calls.push(args);
@@ -41,6 +42,10 @@ function harness(inputs: {
       );
     },
     probeHealth: async () => inputs.probes[probeIndex++] ?? false,
+    readLatestBoot: async () =>
+      bootReadCount++ === 0
+        ? { boot_id: "before-restart", ts: 1 }
+        : { boot_id: "after-restart", ts: 2 },
     sleep: async (ms) => {
       now += ms;
     },
