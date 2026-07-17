@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 4,
+        "files_changed": 5,
+        "insertions": 51
+      },
+      "done_summary": "Documented the exact-attempt-vs-legacy-null re-fold safety rationale at both dispatch_mint_gate DELETE sites in foldDispatchCleared and added a re-fold test pinning the legacy-null gate-row behavior under a full cursor=0 replay.",
+      "input_hash": "a502e0480f57a13e5e1fea75e563afd1d9150efac4863a3a7a2f85dee5a4d549",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1913,
+      "spec_md": "## Description\n\nFrom audit findings F2 (kept) and F4 (merged into F2), same root cause: the\n`dispatch_mint_gate` DELETE inside `foldDispatchCleared`.\n\nEvidence path (audited commit f6c264a8):\n- `src/reducer.ts` `foldDispatchCleared` \u2014 line 4336 (`DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id IS NULL`, legacy branch) and line 4361 (`... AND attempt_id = ?`, exact-attempt branch). The fold mutates a producer-owned durable table that the `refold-equivalence` test deliberately neither wipes nor asserts.\n\nTwo deliverables, one commit:\n1. Add a comment at the fold's `dispatch_mint_gate` DELETE stating WHY the exact-attempt DELETE is re-fold-safe (attempt id is the unique `Dispatched` event id, so a historical clear's attempt id can never equal a currently-live gate row's) and WHY the legacy-null DELETE is bounded-acceptable (transitional; worst case one un-suppressed re-mint, which `evictStaleDispatchMintGate` reaps).\n2. Add a re-fold test (alongside the existing `refold-equivalence` coverage) pinning that a live `attempt_id IS NULL` gate row is NOT clobbered by an unrelated historical tokenless `DispatchCleared` for the same `dispatch_key` \u2014 or, if that exposure is intentionally accepted, a test documenting it explicitly.\n\nFiles: `src/reducer.ts` (fold comment), the reducer re-fold / `refold-equivalence` test file (new assertion).\n\n## Acceptance\n\n- [ ] The mint-gate DELETE in `foldDispatchCleared` carries the re-fold-safety comment (both branches explained).\n- [ ] A re-fold test pins the legacy-null gate-row behavior under a full cursor=0 replay.\n- [ ] No production behavior change; existing tests stay green.\n\n## Done summary\nDocumented the exact-attempt-vs-legacy-null re-fold safety rationale at both dispatch_mint_gate DELETE sites in foldDispatchCleared and added a re-fold test pinning the legacy-null gate-row behavior under a full cursor=0 replay.\n## Evidence\n",
+      "task_id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold.1",
+      "tier": "high",
+      "title": "Document and test mint-gate re-fold safety"
+    }
+  ],
+  "created_at": "2026-07-17T02:54:58.203000Z",
+  "epic_id": "fn-1299-pin-dispatch-clear-mint-gate-re-fold",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "a502e0480f57a13e5e1fea75e563afd1d9150efac4863a3a7a2f85dee5a4d549",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
