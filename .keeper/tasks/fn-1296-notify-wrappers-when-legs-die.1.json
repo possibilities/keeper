@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Make agent waits death-honest",
-  "updated_at": "2026-07-17T00:06:01.359000Z"
+  "updated_at": "2026-07-17T00:25:14.611000Z",
+  "worker_done_at": "2026-07-17T00:25:14.611000Z"
 }

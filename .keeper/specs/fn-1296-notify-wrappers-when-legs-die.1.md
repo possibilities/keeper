@@ -70,5 +70,5 @@ No migration is required. Existing run artifacts without the new optional identi
 - [ ] The capture dependency graph stays DB-free and all named agent capture, transcript, metadata, and golden suites pass.
 
 ## Done summary
-
+Add lifecycle-aware transcript waits: run-id handles carry exact Keeper job identity and a persisted invocation freshness boundary, an injectable tri-state probe checks folded job state during transcript-path discovery and stop polling, and agent run/wait/wait-for-stop return a typed partner_died (retryable exit 4) when a partner is confirmed terminal with no fresh stop, while a fresh settled stop always wins over later teardown; nine-key envelope and direct-path behavior unchanged.
 ## Evidence
