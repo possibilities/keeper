@@ -17,6 +17,7 @@ import {
   autoclosePulse,
   type ComputeAutocloseReapsArgs,
   computeAutocloseReaps,
+  parseWrappedProviderTaskId,
 } from "../src/autoclose-worker";
 import {
   type LaunchResult,
@@ -395,6 +396,16 @@ test("IN: Pi panel launch carrier survives birth provenance and is reaped", () =
   });
   expect(reaps).toHaveLength(1);
   expect(reaps[0]).toMatchObject({ bucket: "panel", ref: "panel::pi::q1" });
+});
+
+test("wrapped Provider-leg title parser canonicalizes bare and legacy task ids", () => {
+  const taskId = "fn-1277-autoclose-wrapped-provider-legs.1";
+  expect(parseWrappedProviderTaskId(taskId)).toBe(taskId);
+  expect(parseWrappedProviderTaskId(`wrapped::${taskId}`)).toBe(taskId);
+  expect(
+    parseWrappedProviderTaskId("fn-1277-autoclose-wrapped-provider-legs"),
+  ).toBeNull();
+  expect(parseWrappedProviderTaskId(null)).toBeNull();
 });
 
 test("IN: wrapped provider leg with bare task-id title targets its exact pane identity", () => {

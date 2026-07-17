@@ -58,6 +58,7 @@ import {
   payloadFromMessage,
   publishOutcome,
   type RegistryEntry,
+  registrationPresenceEffects,
   requeueTail,
   resolveHarnessIdentity,
   selectFanoutTargets,
@@ -305,6 +306,18 @@ test("send-only registration bypasses duplicate presence handling", () => {
       true,
     ),
   ).toEqual({ kind: "admit" });
+  expect(registrationPresenceEffects(true)).toEqual({
+    joinRegistry: false,
+    persistChannel: false,
+    emitJoin: false,
+    removeOnClose: false,
+  });
+  expect(registrationPresenceEffects(false)).toEqual({
+    joinRegistry: true,
+    persistChannel: true,
+    emitJoin: true,
+    removeOnClose: true,
+  });
 });
 
 // ---------------------------------------------------------------------------
