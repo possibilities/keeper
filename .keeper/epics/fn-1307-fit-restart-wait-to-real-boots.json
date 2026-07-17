@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-17T09:48:29.450000Z",
+  "depends_on_epics": [],
+  "id": "fn-1307-fit-restart-wait-to-real-boots",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fit restart wait to real boots",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-17T09:48:29.450000Z"
+}
