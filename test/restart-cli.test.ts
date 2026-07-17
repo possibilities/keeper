@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type CommandResult,
+  DEFAULT_RESTART_TIMEOUT_MS,
+  KICKSTART_TIMEOUT_MS,
   type RestartBootMarker,
   type RestartDeps,
   readLatestBoot,
@@ -264,5 +266,159 @@ describe("keeper daemon restart evidence verdict", () => {
         healthy_probes: 3,
       },
     });
+  });
+
+  test("gives kickstart its own multi-second subprocess budget, not the 1s probe budget", async () => {
+    let capturedKickstartTimeout: number | null = null;
+    let bootReads = 0;
+    const deps: RestartDeps = {
+      runLaunchctl: async (args, timeoutMs) => {
+        if (args[0] === "kickstart") {
+          capturedKickstartTimeout = timeoutMs;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "state = running", stderr: "" };
+      },
+      probeHealth: async () => true,
+      readLatestBoot: async () => {
+        bootReads += 1;
+        return bootReads === 1
+          ? { boot_id: "boot-before", ts: 100 }
+          : { boot_id: "boot-after", ts: 200 };
+      },
+      sleep: async () => {},
+      now: () => 0,
+      random: () => 0.5,
+      uid: () => 501,
+      writeStdout: () => {},
+      writeStderr: () => {},
+      exit: (code): never => {
+        throw new ExitError(code, "");
+      },
+    };
+
+    await restartAndCapture(
+      { sock: "/tmp/keeperd.sock", timeoutMs: DEFAULT_RESTART_TIMEOUT_MS },
+      deps,
+    );
+
+    expect(capturedKickstartTimeout).not.toBeNull();
+    expect(capturedKickstartTimeout ?? -1).toBe(KICKSTART_TIMEOUT_MS);
+    expect(KICKSTART_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
+    expect(KICKSTART_TIMEOUT_MS).toBeLessThanOrEqual(15_000);
+  });
+
+  test("a healthy restart shape with a multi-second kickstart and sub-2-minute catch-up succeeds without a kickstart warning", async () => {
+    let now = 0;
+    let bootReads = 0;
+    const stdout: string[] = [];
+    // A real kill-and-respawn: kickstart itself takes 12s (well inside the
+    // 15s KICKSTART_TIMEOUT_MS budget), then the daemon reports catching_up
+    // for 90s of post-boot catch-up (well inside the 150s default deadline
+    // and under the acceptance's 2-minute bar).
+    const kickstartDurationMs = 12_000;
+    const caughtUpAtMs = 90_000;
+    const deps: RestartDeps = {
+      runLaunchctl: async (args, timeoutMs) => {
+        if (args[0] === "kickstart") {
+          now += kickstartDurationMs;
+          const timedOut = kickstartDurationMs > timeoutMs;
+          return {
+            exitCode: timedOut ? 143 : 0,
+            stdout: "",
+            stderr: "",
+            timedOut,
+          };
+        }
+        return { exitCode: 0, stdout: "state = running", stderr: "" };
+      },
+      probeHealth: async () => now >= caughtUpAtMs,
+      readLatestBoot: async () => {
+        bootReads += 1;
+        return bootReads === 1
+          ? { boot_id: "boot-before", ts: 100 }
+          : { boot_id: "boot-after", ts: 200 };
+      },
+      sleep: async (ms) => {
+        now += ms;
+      },
+      now: () => now,
+      random: () => 0.5,
+      uid: () => 501,
+      writeStdout: (text) => stdout.push(text),
+      writeStderr: () => {},
+      exit: (code): never => {
+        throw new ExitError(code, stdout.join(""));
+      },
+    };
+
+    const exit = await restartAndCapture(
+      { sock: "/tmp/keeperd.sock", timeoutMs: DEFAULT_RESTART_TIMEOUT_MS },
+      deps,
+    );
+
+    expect(exit.code).toBe(0);
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      schema_version: 1,
+      ok: true,
+      error: null,
+      data: {
+        domain: "gui/501/arthack.keeperd",
+        healthy_probes: 3,
+      },
+    });
+  });
+
+  test("the same slow-catch-up boot still fails under an explicit short --timeout", async () => {
+    let now = 0;
+    let bootReads = 0;
+    const stdout: string[] = [];
+    const kickstartDurationMs = 12_000;
+    const caughtUpAtMs = 90_000;
+    const deps: RestartDeps = {
+      runLaunchctl: async (args, timeoutMs) => {
+        if (args[0] === "kickstart") {
+          now += kickstartDurationMs;
+          const timedOut = kickstartDurationMs > timeoutMs;
+          return {
+            exitCode: timedOut ? 143 : 0,
+            stdout: "",
+            stderr: "",
+            timedOut,
+          };
+        }
+        return { exitCode: 0, stdout: "state = running", stderr: "" };
+      },
+      probeHealth: async () => now >= caughtUpAtMs,
+      readLatestBoot: async () => {
+        bootReads += 1;
+        return bootReads === 1
+          ? { boot_id: "boot-before", ts: 100 }
+          : { boot_id: "boot-after", ts: 200 };
+      },
+      sleep: async (ms) => {
+        now += ms;
+      },
+      now: () => now,
+      random: () => 0.5,
+      uid: () => 501,
+      writeStdout: (text) => stdout.push(text),
+      writeStderr: () => {},
+      exit: (code): never => {
+        throw new ExitError(code, stdout.join(""));
+      },
+    };
+
+    const exit = await restartAndCapture(
+      { sock: "/tmp/keeperd.sock", timeoutMs: 10_000 },
+      deps,
+    );
+
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(stdout.join(""));
+    expect(envelope.ok).toBe(false);
+    expect(["kickstart-failed", "health-timeout"]).toContain(
+      envelope.error.code,
+    );
   });
 });
