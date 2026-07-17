@@ -1,0 +1,60 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 24,
+        "files_changed": 2,
+        "insertions": 451
+      },
+      "done_summary": "Added scenarios (b) worker-kill supervision (bounded process/socket/lock teardown + watcher close + restart-ledger evidence via a real successor boot) and (c) restart-verdict (runRestart end-to-end against the sandboxed daemon, launchctl seam only) to test/slow/daemon-smoke.test.ts, extending the harness with killDaemonProcess/respawnSandboxedDaemon/openWatchConnection.",
+      "input_hash": "875c564b256d0017b5aecc802c22a19eda3365a34e276cb8f3dfc53cffc58c52",
+      "model": "sonnet",
+      "spec_chars": 2229,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** test/slow/daemon-smoke.test.ts, test/helpers/daemon-smoke-harness.ts\n\n### Approach\n\nThe two remaining ADR 0073 scenarios atop the task-1 harness. Worker-kill: with the sandboxed daemon steady, kill one of its real spawned workers and prove the supervision contract \u2014 main's fatal path or supervised respawn per the worker contract, bounded teardown of the dead worker's owned resources (locks, sockets, watcher subscriptions), and the restart ledger recording any daemon-level exit \u2014 using only observable evidence (ledger rows, socket state, process absence) under the parent deadline. Restart-verdict: run the actual restart CLI flow end-to-end against the sandboxed daemon with ONLY the launchctl seam injected (the sandbox has no LaunchAgent; the seam kills and respawns the sandboxed keeperd), proving the evidence verdict returns success on a healthy respawn and the honest failure on a daemon that never returns.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required** (read before coding):\n- test/helpers/daemon-smoke-harness.ts \u2014 the task-1 harness this extends\n- src/daemon.ts fatalExit + the restart ledger writer \u2014 the observable evidence the worker-kill scenario asserts\n- cli/restart.ts runRestart deps seam \u2014 where the launchctl injection lands while everything else runs real\n\n### Risks\n\n- The worker-kill scenario must assert the CONTRACT (bounded teardown, ledger evidence), not incidental timing; keep assertions on durable observables.\n\n## Acceptance\n\n- [ ] Killing a real worker yields the contracted teardown and ledger evidence within the deadline\n- [ ] The restart CLI returns a true success against a healthy sandboxed respawn and a true failure against a never-returning daemon\n- [ ] Both scenarios run under the named gate with full sandbox teardown\n\n## Done summary\nAdded scenarios (b) worker-kill supervision (bounded process/socket/lock teardown + watcher close + restart-ledger evidence via a real successor boot) and (c) restart-verdict (runRestart end-to-end against the sandboxed daemon, launchctl seam only) to test/slow/daemon-smoke.test.ts, extending the harness with killDaemonProcess/respawnSandboxedDaemon/openWatchConnection.\n## Evidence\n",
+      "task_id": "fn-1309-real-daemon-smoke-gate.2",
+      "tier": "xhigh",
+      "title": "Worker-kill and restart-verdict scenarios"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 35,
+        "files_changed": 3,
+        "insertions": 369
+      },
+      "done_summary": "Wired the named test:slow-daemon smoke gate (ADR 0073) into epic close-finalize's merge-suite gate: it runs, chained after a green root suite, only when the landed diff touches the daemon Load surface per the checked-in scripts/daemon-load-roots.txt manifest (the same seam the reload fingerprint hashes); a non-daemon epic's finalize is byte-identical, and a smoke failure surfaces through the existing finalize-suite-red operator path. docs/testing.md now documents the slow tier, its finalize conditional, and the one-retry policy.",
+      "input_hash": "875c564b256d0017b5aecc802c22a19eda3365a34e276cb8f3dfc53cffc58c52",
+      "model": "sonnet",
+      "spec_chars": 2162,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/autopilot-worker.ts, docs/testing.md, scripts/test-gate.ts\n\n### Approach\n\nMake the smoke gate authoritative where ADR 0073 places it: epic close-finalize runs the named smoke gate when the epic's landed diff touches the daemon Load surface \u2014 membership decided by the checked-in roots manifest the reload fingerprint already uses, through one seam, so the gated and hashed boundaries cannot disagree. A non-daemon epic's finalize is unchanged. A smoke failure surfaces through the existing finalize-suite-red path (same operator visibility), never as a silent skip. Document the gate, its conditional, and the one-retry policy in docs/testing.md, replacing (not appending beside) any wording the carve-out supersedes.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required** (read before coding):\n- src/autopilot-worker.ts \u2014 the close-finalize suite selection and the finalize-suite-red surfacing path\n- src/ (roots manifest consumer) \u2014 the Load-surface membership seam the conditional must reuse, never a second path list\n- docs/testing.md \u2014 the section the carve-out revises\n\n### Risks\n\n- The load-surface test must read the same manifest seam as the reload fingerprint; a second hand-maintained list is the drift this repo's rules exist to prevent.\n\n## Acceptance\n\n- [ ] A finalize whose landed diff touches the Load surface runs the smoke gate; one that does not is byte-identically unchanged\n- [ ] A smoke failure surfaces through the finalize-suite-red operator path\n- [ ] docs/testing.md documents the gate, conditional, and retry policy\n\n## Done summary\nWired the named test:slow-daemon smoke gate (ADR 0073) into epic close-finalize's merge-suite gate: it runs, chained after a green root suite, only when the landed diff touches the daemon Load surface per the checked-in scripts/daemon-load-roots.txt manifest (the same seam the reload fingerprint hashes); a non-daemon epic's finalize is byte-identical, and a smoke failure surfaces through the existing finalize-suite-red operator path. docs/testing.md now documents the slow tier, its finalize conditional, and the one-retry policy.\n## Evidence\n",
+      "task_id": "fn-1309-real-daemon-smoke-gate.3",
+      "tier": "high",
+      "title": "Finalize gate wiring for daemon epics"
+    }
+  ],
+  "created_at": "2026-07-17T13:03:20.531000Z",
+  "epic_id": "fn-1309-real-daemon-smoke-gate",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1309-real-daemon-smoke-gate.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "875c564b256d0017b5aecc802c22a19eda3365a34e276cb8f3dfc53cffc58c52",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
