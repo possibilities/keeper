@@ -118,6 +118,45 @@ test("migrateBusDb is idempotent across re-runs (no duplicate-column / table thr
   db.close();
 });
 
+test("migrateBusDb throws when the channels UNIQUE index create fails (loud, not swallowed)", () => {
+  const db = new Database(":memory:");
+  const origRun = db.run.bind(db);
+  db.run = ((sql: string) => {
+    if (sql.includes("idx_channels_pid_start")) {
+      throw new Error("simulated channels index create failure");
+    }
+    return origRun(sql);
+  }) as typeof db.run;
+  expect(() => migrateBusDb(db)).toThrow(
+    /simulated channels index create failure/,
+  );
+  db.close();
+});
+
+test("migrateBusDb degrades a rejected messages index without wedging migrate", () => {
+  const db = new Database(":memory:");
+  const origRun = db.run.bind(db);
+  db.run = ((sql: string) => {
+    if (sql.includes("idx_messages_ns_id")) {
+      throw new Error("simulated messages index create failure");
+    }
+    return origRun(sql);
+  }) as typeof db.run;
+  expect(() => migrateBusDb(db)).not.toThrow();
+  expect(
+    (db.prepare("PRAGMA user_version").get() as { user_version: number })
+      .user_version,
+  ).toBe(BUS_SCHEMA_VERSION);
+  const tables = (
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as {
+      name: string;
+    }[]
+  ).map((r) => r.name);
+  expect(tables).not.toContain("idx_messages_ns_id");
+  expect(tables).toContain("idx_channels_pid_start");
+  db.close();
+});
+
 test("migrateBusDb refuses to downgrade a newer bus.db", () => {
   const db = new Database(":memory:");
   db.run(`PRAGMA user_version = ${BUS_SCHEMA_VERSION + 5}`);

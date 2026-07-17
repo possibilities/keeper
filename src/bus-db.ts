@@ -149,7 +149,7 @@ export function migrateBusDb(db: Database): void {
   }
   db.transaction(() => {
     db.run(CREATE_CHANNELS);
-    for (const ddl of CREATE_CHANNELS_INDEXES) createIndexFailOpen(db, ddl);
+    for (const ddl of CREATE_CHANNELS_INDEXES) db.run(ddl);
     db.run(CREATE_MESSAGES);
     for (const ddl of CREATE_MESSAGES_INDEXES) createIndexFailOpen(db, ddl);
     if (stored < 2) {
