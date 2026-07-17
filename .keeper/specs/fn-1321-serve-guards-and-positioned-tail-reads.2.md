@@ -52,5 +52,5 @@ re-authored scaled fixtures keep their hand-computed expectations.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Added a 1000-folded-event floor to the pure computeEventStoreStatus full-replay projection (null below the floor, unchanged at/above it, catch-up unfloored); re-authored the two pinned suite fixtures at/above the floor, added a below-floor test case, and amended ADR 0075's null-condition bullet in place.
 ## Evidence
