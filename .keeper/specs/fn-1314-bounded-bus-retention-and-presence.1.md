@@ -69,5 +69,5 @@ eligible rows. Existing exact-id assertions stay green.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Retention now prunes eligible (aged, non-queued_for_wake) rows through an immune head of any size, served by a fail-open partial index idx_messages_prune; the batch counts eligible rows and the returned-set stays exactly the deleted rows' newly-unreferenced artifacts. Control-namespace prune shares the eligible-row shape; no bus schema bump.
 ## Evidence
