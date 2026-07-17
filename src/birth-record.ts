@@ -130,6 +130,76 @@ export type BirthRecordDraft = Omit<BirthRecord, "pid" | "start_time">;
 
 export const BIRTH_INTENT_SCHEMA_VERSION = 1;
 
+export const PROVIDER_LEG_GATE_ENV = "KEEPER_AGENT_PROVIDER_LEG_GATE";
+export const PROVIDER_LEG_LAUNCH_ID_ENV = "KEEPER_AGENT_PROVIDER_LEG_LAUNCH_ID";
+export const PROVIDER_LEG_WRAPPER_JOB_ID_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_WRAPPER_JOB_ID";
+export const PROVIDER_LEG_WRAPPER_ATTEMPT_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_WRAPPER_ATTEMPT_ID";
+export const PROVIDER_LEG_LAUNCHER_PID_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_LAUNCHER_PID";
+export const PROVIDER_LEG_LAUNCHER_START_TIME_ENV =
+  "KEEPER_AGENT_PROVIDER_LEG_LAUNCHER_START_TIME";
+export const PROVIDER_LEG_SHIM_PROCESS_TITLE = "keeper-provider-leg-shim";
+export const PROVIDER_LEG_GRANT_TIMEOUT_MS = 30_000;
+export const PROVIDER_LEG_GRANT_POLL_MS = 50;
+
+export interface ProviderLegLaunchCarrier extends BirthOwnerTuple {
+  launcher_pid: number;
+  launcher_start_time: string;
+}
+
+export type ProviderLegLaunchCarrierResult =
+  | { kind: "absent" }
+  | { kind: "invalid" }
+  | { kind: "valid"; carrier: ProviderLegLaunchCarrier };
+
+/** Parse the complete, bounded shim carrier. A gate marker is fail-closed: once
+ * present, every identity field must be valid before a provider may execute. */
+export function parseProviderLegLaunchCarrier(
+  env: NodeJS.ProcessEnv,
+): ProviderLegLaunchCarrierResult {
+  if ((env[PROVIDER_LEG_GATE_ENV] ?? "") === "") {
+    return { kind: "absent" };
+  }
+  const legLaunchId = (env[PROVIDER_LEG_LAUNCH_ID_ENV] ?? "").trim();
+  const wrapperJobId = (env[PROVIDER_LEG_WRAPPER_JOB_ID_ENV] ?? "").trim();
+  const wrapperAttemptId = parseDispatchAttemptCarrier(
+    env[PROVIDER_LEG_WRAPPER_ATTEMPT_ENV],
+  );
+  const launcherPidRaw = env[PROVIDER_LEG_LAUNCHER_PID_ENV];
+  const launcherPid =
+    launcherPidRaw !== undefined && /^[1-9]\d{0,15}$/.test(launcherPidRaw)
+      ? Number(launcherPidRaw)
+      : null;
+  const launcherStartTime = (
+    env[PROVIDER_LEG_LAUNCHER_START_TIME_ENV] ?? ""
+  ).trim();
+  if (
+    legLaunchId === "" ||
+    legLaunchId.length > 256 ||
+    wrapperJobId === "" ||
+    wrapperJobId.length > 256 ||
+    wrapperAttemptId === null ||
+    launcherPid === null ||
+    !Number.isSafeInteger(launcherPid) ||
+    launcherStartTime === "" ||
+    launcherStartTime.length > 256
+  ) {
+    return { kind: "invalid" };
+  }
+  return {
+    kind: "valid",
+    carrier: {
+      leg_launch_id: legLaunchId,
+      wrapper_job_id: wrapperJobId,
+      wrapper_dispatch_attempt_id: wrapperAttemptId,
+      launcher_pid: launcherPid,
+      launcher_start_time: launcherStartTime,
+    },
+  };
+}
+
 /** Pre-spawn presence marker. It is published before a Pi child can exist. */
 export interface BirthIntent {
   schema_version: number;
@@ -218,7 +288,8 @@ export function parseBirthRecord(line: string): BirthRecord | null {
     o.session_id === "" ||
     o.harness !== "pi" ||
     typeof o.pid !== "number" ||
-    !Number.isInteger(o.pid) ||
+    !Number.isSafeInteger(o.pid) ||
+    o.pid <= 0 ||
     !isStrOrNull(o.start_time) ||
     !isStr(o.cwd) ||
     !isStrOrNull(o.spawn_name) ||
@@ -415,15 +486,12 @@ export function writeBirthIntent(
   return published;
 }
 
-/** Replace an intent atomically with the complete birth, then publish to new/. */
-export function publishBirthIntent(
+/** Atomically replace an intent with its complete promoted birth in pending/. */
+export function promoteBirthIntent(
   intentPath: string,
   record: BirthRecord,
 ): void {
   const pendingDir = dirname(intentPath);
-  const root = dirname(pendingDir);
-  const newDir = join(root, "new");
-  mkdirSync(newDir, { recursive: true });
   const staged = join(
     pendingDir,
     `.${basename(intentPath)}.${randomUUID()}.tmp`,
@@ -442,10 +510,123 @@ export function publishBirthIntent(
   } finally {
     closeSync(fd);
   }
+  renameSync(staged, intentPath);
+}
+
+/** Replace an intent atomically with the complete birth, then publish to new/. */
+export function publishBirthIntent(
+  intentPath: string,
+  record: BirthRecord,
+): void {
+  const pendingDir = dirname(intentPath);
+  const root = dirname(pendingDir);
+  const newDir = join(root, "new");
+  mkdirSync(newDir, { recursive: true });
   // Every crash point remains visible: intent before the first rename, a full
   // birth under pending/ between renames, then the consumer-owned new/ record.
-  renameSync(staged, intentPath);
+  promoteBirthIntent(intentPath, record);
   renameSync(intentPath, join(newDir, basename(intentPath)));
+}
+
+export interface ProviderLegGrant extends BirthOwnerTuple {
+  schema_version: 1;
+}
+
+function providerLegGrantPath(dir: string, legLaunchId: string): string {
+  const token = Buffer.from(legLaunchId, "utf8").toString("base64url");
+  return join(dir, "grants", `${token}.json`);
+}
+
+/** Publish a one-use pre-exec grant after daemon-side owner revalidation. */
+export function writeProviderLegGrant(
+  dir: string,
+  owner: BirthOwnerTuple,
+): void {
+  const grantDir = join(dir, "grants");
+  mkdirSync(grantDir, { recursive: true });
+  const target = providerLegGrantPath(dir, owner.leg_launch_id);
+  const staged = join(grantDir, `.${basename(target)}.${randomUUID()}.tmp`);
+  const fd = openSync(staged, "wx", 0o600);
+  try {
+    writeSync(
+      fd,
+      `${JSON.stringify({ schema_version: 1, ...owner } satisfies ProviderLegGrant)}\n`,
+    );
+    fsyncSync(fd);
+  } catch (error) {
+    try {
+      unlinkSync(staged);
+    } catch {
+      // best effort
+    }
+    throw error;
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(staged, target);
+}
+
+/** Consume only a grant matching the exact immutable owner tuple. */
+export function consumeProviderLegGrant(
+  dir: string,
+  owner: BirthOwnerTuple,
+): boolean {
+  const path = providerLegGrantPath(dir, owner.leg_launch_id);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return false;
+  }
+  const grant = parsed as Record<string, unknown>;
+  if (
+    grant.schema_version !== 1 ||
+    grant.leg_launch_id !== owner.leg_launch_id ||
+    grant.wrapper_job_id !== owner.wrapper_job_id ||
+    grant.wrapper_dispatch_attempt_id !== owner.wrapper_dispatch_attempt_id
+  ) {
+    return false;
+  }
+  try {
+    unlinkSync(path);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+export interface ProviderLegGrantWaitDeps {
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  consume: () => boolean;
+}
+
+/** Hold the inert shim until one exact grant appears or the bounded timeout ends. */
+export async function awaitProviderLegGrant(
+  deps: ProviderLegGrantWaitDeps,
+  timeoutMs = PROVIDER_LEG_GRANT_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = deps.now() + timeoutMs;
+  while (deps.now() < deadline) {
+    if (deps.consume()) {
+      return true;
+    }
+    await deps.sleep(PROVIDER_LEG_GRANT_POLL_MS);
+  }
+  return deps.consume();
+}
+
+export function birthRootFromIntentPath(intentPath: string): string {
+  return dirname(dirname(intentPath));
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +710,7 @@ export function buildBirthDraft(
   inputs: BirthDraftInputs,
 ): BirthRecordDraft {
   const coords = birthBackendCoordsFromEnv(env);
-  return {
+  const draft: BirthRecordDraft = {
     schema_version: BIRTH_RECORD_SCHEMA_VERSION,
     session_id: inputs.session_id,
     harness: inputs.harness,
@@ -544,6 +725,14 @@ export function buildBirthDraft(
     resume_target: inputs.resume_target,
     dispatch_attempt_id: parseDispatchAttemptCarrier(env[DISPATCH_ATTEMPT_ENV]),
   };
+  const gate = parseProviderLegLaunchCarrier(env);
+  if (gate.kind === "valid") {
+    // The wrapper's Dispatch claim owns this leg. The provider SessionStart must
+    // not independently bind or discharge that same claim.
+    draft.dispatch_attempt_id = null;
+    Object.assign(draft, gate.carrier);
+  }
+  return draft;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,10 +817,9 @@ export function probeChildStartTime(pid: number): string | null {
 
 /**
  * The production birth-record emit: probe the child's start_time and atomically
- * write the maildir record. FAIL-OPEN — any error (probe, mkdir, write) is
- * swallowed so a birth-record failure degrades the session to presence-only,
- * never crashing the human's launch. The launcher injects this behind a seam so
- * its wiring is testable without a real fs write or ps fork.
+ * write the maildir record. Ordinary presence records fail open; an owned-leg
+ * promotion throws so the inert shim exits before paid work. The launcher
+ * injects this behind a seam so its wiring is testable without real fs or ps.
  */
 export function emitBirthRecord(
   env: NodeJS.ProcessEnv,
@@ -639,15 +827,30 @@ export function emitBirthRecord(
   pid: number,
   intentPath?: string,
 ): void {
+  const owned =
+    draft.leg_launch_id !== undefined &&
+    draft.wrapper_job_id !== undefined &&
+    draft.wrapper_dispatch_attempt_id !== undefined;
   try {
     const dir = resolveBirthDir(env);
-    const record = { ...draft, pid, start_time: probeChildStartTime(pid) };
+    const startTime = probeChildStartTime(pid);
+    if (owned && startTime === null) {
+      throw new Error("provider-leg shim start time is unavailable");
+    }
+    const record = { ...draft, pid, start_time: startTime };
     if (intentPath === undefined) {
       writeBirthRecord(dir, record);
+    } else if (owned) {
+      // The promoted shim identity remains pending until the daemon validates
+      // its owner and issues the one-use pre-exec grant.
+      promoteBirthIntent(intentPath, record);
     } else {
       publishBirthIntent(intentPath, record);
     }
-  } catch {
+  } catch (error) {
+    if (owned) {
+      throw error;
+    }
     // Presence-only degrade. A pre-spawn intent, when armed, remains visible and
     // keeps terminal adoption fail-closed until an operator resolves it.
   }

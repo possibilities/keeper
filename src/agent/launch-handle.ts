@@ -20,6 +20,19 @@
  * (pinned by the `agent-launch-handle-depgraph` hygiene test).
  */
 
+import {
+  PROVIDER_LEG_GATE_ENV,
+  PROVIDER_LEG_LAUNCH_ID_ENV,
+  PROVIDER_LEG_LAUNCHER_PID_ENV,
+  PROVIDER_LEG_LAUNCHER_START_TIME_ENV,
+  PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
+  PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
+  probeChildStartTime,
+} from "../birth-record";
+import {
+  DISPATCH_ATTEMPT_ENV,
+  parseDispatchAttemptCarrier,
+} from "../dispatch-command";
 import { parseArgsForAgent } from "./args";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_DESCRIPTORS, ResumeLaunchUnsupportedError } from "./harness";
@@ -111,6 +124,8 @@ export interface LaunchHandleDeps {
   runTmuxCommand: TmuxCommandRunner;
   /** Wall clock (ms), sampled as the handle's `startedAtMs`. */
   now: () => number;
+  /** Recycle-safe launcher identity probe; injectable for gate tests. */
+  probeStartTime?: (pid: number) => string | null;
   writeErr: (s: string) => void;
 }
 
@@ -247,12 +262,71 @@ export function launchToResolvedHandle(
     resume !== undefined && agent === "pi"
       ? deps.randomUuid()
       : discoverySessionId;
-  if (lifecycleJobId !== null) {
-    tmuxLaunch.options.env = [
-      ...tmuxLaunch.options.env.filter(([key]) => key !== "KEEPER_JOB_ID"),
-      ["KEEPER_JOB_ID", lifecycleJobId],
-    ];
+  const wrapped = (deps.env.KEEPER_WRAPPED_CELL ?? "").trim() !== "";
+  const wrapperJobIdRaw =
+    [deps.env.KEEPER_JOB_ID, deps.env.CLAUDE_CODE_SESSION_ID].find(
+      (value) => (value ?? "").trim() !== "",
+    ) ?? "";
+  const wrapperJobId = wrapperJobIdRaw.trim();
+  const wrapperAttemptId = parseDispatchAttemptCarrier(
+    deps.env[DISPATCH_ATTEMPT_ENV],
+  );
+  const validWrapperJobId =
+    wrapperJobId === wrapperJobIdRaw &&
+    /^[A-Za-z0-9:._-]{1,256}$/.test(wrapperJobId);
+  if (
+    wrapped &&
+    (!validWrapperJobId || wrapperAttemptId === null || agent !== "pi")
+  ) {
+    const error = "wrapped provider launch requires an exact owner tuple";
+    deps.writeErr(`agent: ${error}\n`);
+    return { ok: false, error };
   }
+  const paneOwnershipEnv: [string, string][] = [];
+  if (wrapped) {
+    const launcherStartTime = (deps.probeStartTime ?? probeChildStartTime)(
+      process.pid,
+    );
+    if (launcherStartTime === null) {
+      const error = "wrapped provider launch cannot prove launcher identity";
+      deps.writeErr(`agent: ${error}\n`);
+      return { ok: false, error };
+    }
+    paneOwnershipEnv.push(
+      ["KEEPER_WRAPPED_CELL", ""],
+      ["KEEPER_WRAPPED_ENVELOPE", ""],
+      [DISPATCH_ATTEMPT_ENV, ""],
+      [PROVIDER_LEG_GATE_ENV, "1"],
+      [PROVIDER_LEG_LAUNCH_ID_ENV, deps.randomUuid()],
+      [PROVIDER_LEG_WRAPPER_JOB_ID_ENV, wrapperJobId],
+      [PROVIDER_LEG_WRAPPER_ATTEMPT_ENV, String(wrapperAttemptId)],
+      [PROVIDER_LEG_LAUNCHER_PID_ENV, String(process.pid)],
+      [PROVIDER_LEG_LAUNCHER_START_TIME_ENV, launcherStartTime],
+    );
+  }
+  const overwrittenPaneKeys = new Set([
+    "KEEPER_JOB_ID",
+    ...(wrapped
+      ? [
+          "KEEPER_WRAPPED_CELL",
+          "KEEPER_WRAPPED_ENVELOPE",
+          DISPATCH_ATTEMPT_ENV,
+          PROVIDER_LEG_GATE_ENV,
+          PROVIDER_LEG_LAUNCH_ID_ENV,
+          PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
+          PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
+          PROVIDER_LEG_LAUNCHER_PID_ENV,
+          PROVIDER_LEG_LAUNCHER_START_TIME_ENV,
+        ]
+      : []),
+  ]);
+  tmuxLaunch.options.env = [
+    ...tmuxLaunch.options.env.filter(([key]) => !overwrittenPaneKeys.has(key)),
+    ...(lifecycleJobId !== null
+      ? ([["KEEPER_JOB_ID", lifecycleJobId]] as [string, string][])
+      : []),
+    ...paneOwnershipEnv,
+  ];
   const invocationStopFloor =
     resume !== undefined && deps.transcriptHomeDir !== undefined
       ? snapshotInvocationStopFloor({

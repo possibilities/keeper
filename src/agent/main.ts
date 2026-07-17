@@ -36,10 +36,22 @@ import {
   resolveCswapCommand,
 } from "../account-routing-config";
 import {
+  awaitProviderLegGrant,
+  type BirthOwnerTuple,
   type BirthRecordDraft,
+  birthRootFromIntentPath,
   buildBirthDraft,
+  consumeProviderLegGrant,
   defaultBirthDir,
   emitBirthRecord,
+  PROVIDER_LEG_GATE_ENV,
+  PROVIDER_LEG_LAUNCH_ID_ENV,
+  PROVIDER_LEG_LAUNCHER_PID_ENV,
+  PROVIDER_LEG_LAUNCHER_START_TIME_ENV,
+  PROVIDER_LEG_SHIM_PROCESS_TITLE,
+  PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
+  PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
+  parseProviderLegLaunchCarrier,
   writeBirthIntent,
 } from "../birth-record";
 import {
@@ -286,6 +298,13 @@ export interface MainDeps {
     pid: number,
     intentPath: string,
   ) => void;
+  /** Optional deterministic seam for the owned-leg pre-exec grant wait. */
+  awaitProviderLegGrantFn?: (
+    birthRoot: string,
+    owner: BirthOwnerTuple,
+  ) => Promise<boolean>;
+  /** Optional deterministic seam for the final pid-preserving provider exec. */
+  execProviderLegFn?: (command: string[], env: Record<string, string>) => never;
   tmuxBin: string;
   /**
    * The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>,
@@ -3036,10 +3055,22 @@ export async function main(deps: MainDeps): Promise<never> {
     deps.write(`~ launching ${agent}\n`);
   }
 
-  // pi shares this path with claude; only pi gets a birth record (claude's hook
-  // SessionStart is its authoritative presence seed). pi pins its session id, so
-  // the pinned uuid is its job identity + resume target.
-  const onChildSpawned: ChildSpawnedFn | undefined =
+  const providerGate = parseProviderLegLaunchCarrier(deps.env);
+  if (providerGate.kind === "invalid") {
+    deps.writeErr("Error: malformed provider-leg ownership carrier.\n");
+    return deps.exit(2);
+  }
+  if (providerGate.kind === "valid" && agent !== "pi") {
+    deps.writeErr(
+      "Error: owned provider-leg gate requires launcher birth support.\n",
+    );
+    return deps.exit(2);
+  }
+
+  // pi shares this path with claude; only pi gets a launcher birth record.
+  // Claude's SessionStart hook remains presence recording and never authorizes
+  // the paid process.
+  const armedBirth =
     agent === "pi"
       ? armBirthRecord(deps, "pi", {
           spawnName: resolvedSessionName,
@@ -3049,7 +3080,64 @@ export async function main(deps: MainDeps): Promise<never> {
           remainingArgs,
         })
       : undefined;
-  return runWithJobControl(runCmd, deps.spawn, deps.exit, onChildSpawned, {
+
+  if (providerGate.kind === "valid" && armedBirth !== undefined) {
+    process.title = PROVIDER_LEG_SHIM_PROCESS_TITLE;
+    try {
+      armedBirth.publish(process.pid);
+    } catch (error) {
+      deps.writeErr(
+        `Error: provider-leg identity promotion failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return deps.exit(1);
+    }
+    const owner: BirthOwnerTuple = {
+      leg_launch_id: providerGate.carrier.leg_launch_id,
+      wrapper_job_id: providerGate.carrier.wrapper_job_id,
+      wrapper_dispatch_attempt_id:
+        providerGate.carrier.wrapper_dispatch_attempt_id,
+    };
+    const birthRoot = birthRootFromIntentPath(armedBirth.intentPath);
+    const granted = deps.awaitProviderLegGrantFn
+      ? await deps.awaitProviderLegGrantFn(birthRoot, owner)
+      : await awaitProviderLegGrant({
+          now: () => Date.now(),
+          sleep: (ms) => Bun.sleep(ms),
+          consume: () => consumeProviderLegGrant(birthRoot, owner),
+        });
+    if (!granted) {
+      deps.writeErr("Error: provider-leg grant timed out before exec.\n");
+      return deps.exit(1);
+    }
+    for (const key of [
+      PROVIDER_LEG_GATE_ENV,
+      PROVIDER_LEG_LAUNCH_ID_ENV,
+      PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
+      PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
+      PROVIDER_LEG_LAUNCHER_PID_ENV,
+      PROVIDER_LEG_LAUNCHER_START_TIME_ENV,
+    ]) {
+      delete deps.env[key];
+    }
+    const execEnv = Object.fromEntries(
+      Object.entries(deps.env).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      ),
+    );
+    if (deps.execProviderLegFn !== undefined) {
+      return deps.execProviderLegFn(runCmd, execEnv);
+    }
+    if (typeof process.execve !== "function") {
+      deps.writeErr(
+        "Error: provider-leg exec is unavailable on this runtime.\n",
+      );
+      return deps.exit(1);
+    }
+    process.execve("/usr/bin/env", ["env", ...runCmd], execEnv);
+    return deps.exit(1);
+  }
+
+  return runWithJobControl(runCmd, deps.spawn, deps.exit, armedBirth?.publish, {
     env: deps.env,
     cwd: deps.cwd,
   });
@@ -3077,7 +3165,7 @@ function armBirthRecord(
     /** The harness-native argv forwarded to the child. */
     remainingArgs: string[];
   },
-): ChildSpawnedFn {
+): { publish: ChildSpawnedFn; intentPath: string } {
   const carried = (deps.env.KEEPER_JOB_ID ?? "").trim();
   let jobId: string;
   if (opts.hasContinueOrResume && carried !== "") {
@@ -3103,7 +3191,10 @@ function armBirthRecord(
   // Authority-visible BEFORE spawn. If publication later fails, the intent
   // deliberately remains and terminal adoption stays fail-closed.
   const intentPath = deps.writeBirthIntent(draft);
-  return (pid: number) => deps.emitBirthRecord(draft, pid, intentPath);
+  return {
+    intentPath,
+    publish: (pid: number) => deps.emitBirthRecord(draft, pid, intentPath),
+  };
 }
 
 /**

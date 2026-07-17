@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { buildAgentLaunchArgv } from "../src/agent/launch-config";
 import { main } from "../src/agent/main";
 import {
+  awaitProviderLegGrant,
   BIRTH_INTENT_SCHEMA_VERSION,
   BIRTH_RECORD_SCHEMA_VERSION,
   type BirthRecord,
@@ -25,16 +26,26 @@ import {
   birthBackendCoordsFromEnv,
   birthWorktreeFromEnv,
   buildBirthDraft,
+  consumeProviderLegGrant,
   darwinLstartToStartTime,
   linuxStatToStartTime,
+  PROVIDER_LEG_GATE_ENV,
+  PROVIDER_LEG_LAUNCH_ID_ENV,
+  PROVIDER_LEG_LAUNCHER_PID_ENV,
+  PROVIDER_LEG_LAUNCHER_START_TIME_ENV,
+  PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
+  PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
   parseBirthIntent,
   parseBirthRecord,
+  parseProviderLegLaunchCarrier,
+  promoteBirthIntent,
   publishBirthIntent,
   resolveBirthDir,
   serializeBirthIntent,
   serializeBirthRecord,
   writeBirthIntent,
   writeBirthRecord,
+  writeProviderLegGrant,
 } from "../src/birth-record";
 import {
   DARWIN_LSTART_CASES,
@@ -196,6 +207,81 @@ describe("pre-spawn birth intent", () => {
           readFileSync(join(dir, "new", names[0] ?? ""), "utf8"),
         ),
       ).toEqual(FULL);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("owned provider-leg birth gate", () => {
+  const owner = {
+    leg_launch_id: "leg-birth-1",
+    wrapper_job_id: "wrapper-job-1",
+    wrapper_dispatch_attempt_id: 42,
+  };
+
+  test("the carrier is all-or-nothing and bounded", () => {
+    expect(parseProviderLegLaunchCarrier({})).toEqual({ kind: "absent" });
+    expect(
+      parseProviderLegLaunchCarrier({ [PROVIDER_LEG_GATE_ENV]: "1" }),
+    ).toEqual({ kind: "invalid" });
+    expect(
+      parseProviderLegLaunchCarrier({
+        [PROVIDER_LEG_GATE_ENV]: "1",
+        [PROVIDER_LEG_LAUNCH_ID_ENV]: owner.leg_launch_id,
+        [PROVIDER_LEG_WRAPPER_JOB_ID_ENV]: owner.wrapper_job_id,
+        [PROVIDER_LEG_WRAPPER_ATTEMPT_ENV]: "42",
+        [PROVIDER_LEG_LAUNCHER_PID_ENV]: "900",
+        [PROVIDER_LEG_LAUNCHER_START_TIME_ENV]: "linux:100",
+      }),
+    ).toEqual({
+      kind: "valid",
+      carrier: {
+        ...owner,
+        launcher_pid: 900,
+        launcher_start_time: "linux:100",
+      },
+    });
+  });
+
+  test("promotion strands a complete record in pending and a grant is one-use", async () => {
+    const dir = tempDir();
+    try {
+      const ownedDraft: BirthRecordDraft = {
+        ...DRAFT,
+        ...owner,
+        launcher_pid: 900,
+        launcher_start_time: "linux:100",
+      };
+      const ownedRecord: BirthRecord = {
+        ...ownedDraft,
+        pid: 901,
+        start_time: "linux:101",
+      };
+      const intentPath = writeBirthIntent(dir, ownedDraft, 900);
+      promoteBirthIntent(intentPath, ownedRecord);
+      expect(() => readdirSync(join(dir, "new"))).toThrow();
+      expect(parseBirthRecord(readFileSync(intentPath, "utf8"))).toEqual(
+        ownedRecord,
+      );
+
+      writeProviderLegGrant(dir, owner);
+      expect(consumeProviderLegGrant(dir, owner)).toBe(true);
+      expect(consumeProviderLegGrant(dir, owner)).toBe(false);
+
+      let now = 0;
+      expect(
+        await awaitProviderLegGrant(
+          {
+            now: () => now,
+            sleep: async (ms) => {
+              now += ms;
+            },
+            consume: () => false,
+          },
+          75,
+        ),
+      ).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

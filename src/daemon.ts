@@ -96,7 +96,10 @@ import type {
 import {
   type BirthRecord,
   defaultBirthDir,
+  ownerTupleFromBirthRecord,
+  parseBirthIntent,
   parseBirthRecord,
+  writeProviderLegGrant,
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
@@ -6354,7 +6357,100 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
   );
 }
 
-/** Retire a processed / parked birth record — delete it from `new/`. An ENOENT
+type ProviderLegGrantStatus = "grant" | "wait" | "deny";
+
+function providerLegGrantStatus(
+  db: Database,
+  record: BirthRecord,
+): ProviderLegGrantStatus {
+  const owner = ownerTupleFromBirthRecord(record);
+  if (
+    owner === null ||
+    record.start_time === null ||
+    record.launcher_pid === undefined ||
+    record.launcher_start_time === undefined
+  ) {
+    return "deny";
+  }
+  const row = db
+    .query(
+      `SELECT j.state AS wrapper_state, c.state AS claim_state,
+              c.session_id, c.legacy_unfenced
+         FROM dispatch_claims c
+         JOIN jobs j ON j.job_id = ?
+        WHERE c.attempt_id = ?`,
+    )
+    .get(owner.wrapper_job_id, owner.wrapper_dispatch_attempt_id) as {
+    wrapper_state: string;
+    claim_state: string;
+    session_id: string | null;
+    legacy_unfenced: number;
+  } | null;
+  // The wrapper SessionStart and claim bind can still be behind the birth scan;
+  // a superseded exact attempt is equally non-authoritative and remains inert.
+  if (row === null) {
+    return "wait";
+  }
+  if (
+    row.wrapper_state === "ended" ||
+    row.wrapper_state === "killed" ||
+    row.legacy_unfenced !== 0
+  ) {
+    return "deny";
+  }
+  if (row.claim_state === "acquired") {
+    return "wait";
+  }
+  return row.claim_state === "bound" && row.session_id === owner.wrapper_job_id
+    ? "grant"
+    : "deny";
+}
+
+function providerLegBirthAlreadyMinted(
+  db: Database,
+  legLaunchId: string,
+): boolean {
+  return (
+    db
+      .query(
+        `SELECT 1 AS present FROM events
+          WHERE hook_event = 'ProviderLegBorn'
+            AND json_valid(data)
+            AND json_extract(data, '$.leg_launch_id') = ?
+          LIMIT 1`,
+      )
+      .get(legLaunchId) !== null
+  );
+}
+
+function insertProviderLegBorn(db: Database, record: BirthRecord): void {
+  const owner = ownerTupleFromBirthRecord(record);
+  if (owner === null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+     VALUES (?, ?, 'ProviderLegBorn', 'provider_leg_born', ?)`,
+    [
+      birthEventTs(record),
+      record.session_id,
+      JSON.stringify({
+        ...owner,
+        leg_session_id: record.session_id,
+        leg_pid: record.pid,
+        leg_start_time: record.start_time,
+        launcher_pid: record.launcher_pid ?? null,
+        launcher_start_time: record.launcher_start_time ?? null,
+        pane_id: record.backend_exec_pane_id,
+        pane_generation: null,
+        backend_exec_type: record.backend_exec_type,
+        backend_exec_session_id: record.backend_exec_session_id,
+      }),
+    ],
+  );
+}
+
+/** Retire a processed / parked birth record — delete it from its maildir. An ENOENT
  *  retire race (already gone) is a non-fatal no-op; the tree stays bounded. */
 function retireBirthFile(full: string): void {
   try {
@@ -6561,19 +6657,18 @@ function gcStuckBirthRecord(
 /**
  * Ingest the births maildir — the non-hook presence channel's analogue of
  * {@link scanEventsLogDir}, but PROCESS-THEN-RETIRE (births are one-record files,
- * not append logs, so there is no byte-offset cursor). For each record under
- * `<dir>/new/`:
+ * not append logs, so there is no byte-offset cursor). Scanning both `pending/`
+ * and `new/` recovers a complete record stranded between publication renames.
  *
  *  - PARSE ({@link parseBirthRecord}): a torn/partial file never reaches `new/`
  *    (the launcher writes tmp→fsync→rename, an atomic move-in), so a null parse
  *    is a genuinely malformed COMPLETE record — POISON. Park it (idempotent
  *    dl_id) and retire, so one bad record never wedges the scan.
- *  - MINT + RETIRE: a valid record mints ONE synthetic SessionStart
- *    ({@link insertBirthSessionStart}) inside a `BEGIN IMMEDIATE`, then — after
- *    the durable COMMIT — retires the file. A crash in the tiny commit→unlink
- *    window re-mints on the next scan, which is HARMLESS: a duplicate
- *    SessionStart folds idempotently (a resume). At-least-once + idempotent fold
- *    = exactly-once observable, without an fs op inside the SQL transaction.
+ *  - MINT + RETIRE: a valid ordinary record mints SessionStart inside a
+ *    `BEGIN IMMEDIATE`. An owned record first rechecks its exact live claim,
+ *    mints SessionStart + ProviderLegBorn set-once by `leg_launch_id`, commits,
+ *    then publishes the one-use grant. A repeated owned delivery reissues only
+ *    the grant and never duplicates either synthetic event.
  *  - INSERT-THROW: rolls the transaction back and LEAVES the file (retry next
  *    scan); {@link gcStuckBirthRecord} bounds the tree if it never recovers.
  *
@@ -6588,70 +6683,116 @@ export function scanBirthDir(
   dir: string,
   ctx?: EventsIngestContext,
 ): void {
-  const newDir = join(dir, "new");
-  if (!existsSync(newDir)) {
-    return;
-  }
-  let names: string[];
-  try {
-    names = readdirSync(newDir);
-  } catch (err) {
-    console.error(
-      `[keeperd] births scan failed to readdir ${newDir}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".json")) {
-      // The launcher writes `<pid>.<start-time>.json`; ignore anything else.
+  for (const bucket of ["pending", "new"] as const) {
+    const bucketDir = join(dir, bucket);
+    if (!existsSync(bucketDir)) {
       continue;
     }
-    const full = join(newDir, name);
-    let body: string;
+    let names: string[];
     try {
-      body = readFileSync(full, "utf8");
-    } catch {
-      // Read-vs-retire race (file vanished between readdir and read): skip,
-      // never park — a maildir move-in is atomic, so a present file is complete.
-      continue;
-    }
-    const record = parseBirthRecord(body);
-    if (record === null) {
-      // POISON: a complete-but-malformed record. Park + retire so it can never
-      // re-poison a later scan. Leave it only on a transient park failure.
-      if (parkPoisonBirth(db, full, body, null, ctx)) {
-        retireBirthFile(full);
-      }
-      continue;
-    }
-    // Valid record: mint the synthetic SessionStart atomically, COMMIT, then
-    // retire. A crash in the commit→unlink window re-mints harmlessly.
-    let committed = false;
-    db.run("BEGIN IMMEDIATE");
-    try {
-      insertBirthSessionStart(db, record);
-      db.run("COMMIT");
-      committed = true;
+      names = readdirSync(bucketDir);
     } catch (err) {
-      try {
-        db.run("ROLLBACK");
-      } catch {
-        // best-effort
-      }
       console.error(
-        `[keeperd] births mint failed for ${full} (leaving for retry): ${
+        `[keeperd] births scan failed to readdir ${bucketDir}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
-    }
-    if (committed) {
-      retireBirthFile(full);
       continue;
     }
-    // Mint kept failing — bound the tree against a permanently-stuck record.
-    gcStuckBirthRecord(db, full, record, ctx);
+    for (const name of names) {
+      if (!name.endsWith(".json")) {
+        continue;
+      }
+      const full = join(bucketDir, name);
+      let body: string;
+      try {
+        body = readFileSync(full, "utf8");
+      } catch {
+        continue;
+      }
+      const record = parseBirthRecord(body);
+      if (record === null) {
+        // A valid pending intent is deliberately retained until its launcher
+        // promotes it. It is not a poison birth record.
+        if (bucket === "pending" && parseBirthIntent(body) !== null) {
+          continue;
+        }
+        if (parkPoisonBirth(db, full, body, null, ctx)) {
+          retireBirthFile(full);
+        }
+        continue;
+      }
+
+      const owner = ownerTupleFromBirthRecord(record);
+      let committed = false;
+      let shouldIssueGrant = false;
+      let grantStatus: ProviderLegGrantStatus | null = null;
+      db.run("BEGIN IMMEDIATE");
+      try {
+        grantStatus =
+          owner === null ? null : providerLegGrantStatus(db, record);
+        if (grantStatus === "wait" || grantStatus === "deny") {
+          db.run("ROLLBACK");
+        } else {
+          const duplicateOwnedBirth =
+            owner !== null &&
+            providerLegBirthAlreadyMinted(db, owner.leg_launch_id);
+          if (!duplicateOwnedBirth) {
+            insertBirthSessionStart(db, record);
+            insertProviderLegBorn(db, record);
+          }
+          // A crash after the durable mint but before grant publication leaves
+          // the same complete pending record. Re-issue for that one shim while
+          // keeping the synthetic events set-once on leg_launch_id.
+          shouldIssueGrant = owner !== null;
+          db.run("COMMIT");
+          committed = true;
+        }
+      } catch (err) {
+        try {
+          db.run("ROLLBACK");
+        } catch {
+          // best-effort
+        }
+        console.error(
+          `[keeperd] births mint failed for ${full} (leaving for retry): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      if (grantStatus === "wait") {
+        // The owner fold may still be catching up. Keep the promoted identity
+        // visible so a later scan can recheck it without launching paid work.
+        gcStuckBirthRecord(db, full, record, ctx);
+        continue;
+      }
+      if (grantStatus === "deny") {
+        // Keep the promoted identity as fail-closed evidence. A terminal or
+        // superseded owner can never become grantable, and the dead-shim GC
+        // eventually bounds the stranded record without creating authority.
+        gcStuckBirthRecord(db, full, record, ctx);
+        continue;
+      }
+      if (committed && owner !== null && shouldIssueGrant) {
+        try {
+          // The transaction lock made the owner recheck and ownership mint one
+          // serial writer step. Publish only after its durable commit.
+          writeProviderLegGrant(dir, owner);
+        } catch (err) {
+          console.error(
+            `[keeperd] provider-leg grant failed for ${full} (leaving for retry): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+      }
+      if (committed) {
+        retireBirthFile(full);
+        continue;
+      }
+      gcStuckBirthRecord(db, full, record, ctx);
+    }
   }
 }
 
