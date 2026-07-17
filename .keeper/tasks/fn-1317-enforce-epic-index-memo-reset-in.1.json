@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Reset memo at lifecycle wipe sites",
-  "updated_at": "2026-07-17T19:44:50.760000Z"
+  "updated_at": "2026-07-17T19:48:10.245000Z",
+  "worker_done_at": "2026-07-17T19:48:10.245000Z"
 }

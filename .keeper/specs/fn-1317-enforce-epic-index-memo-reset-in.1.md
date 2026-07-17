@@ -19,5 +19,5 @@ Files:
 - [ ] `test/reducer-lifecycle.test.ts` passes under its named test gate.
 
 ## Done summary
-
+Added __resetEpicIndexMemoForTest(db) at the three uncovered wipe-then-refold sites (454, 5072, 5425) in reducer-lifecycle.test.ts, matching the enforced convention; full file passes 208/208.
 ## Evidence
