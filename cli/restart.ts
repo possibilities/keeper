@@ -360,6 +360,19 @@ export async function runRestart(
     ? retainedKickstart
     : undefined;
 
+  const emitSuccess = (healthyProbes: number): void => {
+    emitEnvelope(
+      successEnvelope(RESTART_SCHEMA_VERSION, {
+        domain,
+        healthy_probes: healthyProbes,
+        ...(retainedKickstartWarning === undefined
+          ? {}
+          : { kickstart_warning: retainedKickstartWarning }),
+      }),
+      deps,
+    );
+  };
+
   let healthyInARow = 0;
   let backoffMs = INITIAL_BACKOFF_MS;
   while (deps.now() < deadline) {
@@ -374,16 +387,7 @@ export async function runRestart(
         healthyInARow >= REQUIRED_HEALTHY_PROBES &&
         isFreshBoot(preRestartBoot, await deps.readLatestBoot())
       ) {
-        emitEnvelope(
-          successEnvelope(RESTART_SCHEMA_VERSION, {
-            domain,
-            healthy_probes: healthyInARow,
-            ...(retainedKickstartWarning === undefined
-              ? {}
-              : { kickstart_warning: retainedKickstartWarning }),
-          }),
-          deps,
-        );
+        emitSuccess(healthyInARow);
         return;
       }
     } else {
@@ -415,6 +419,21 @@ export async function runRestart(
     if (waitMs <= 0) break;
     await deps.sleep(waitMs);
     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
+  }
+  // The fresh-boot ledger row is monotonic — once the new boot lands it stays —
+  // but the in-loop check only re-reads it on a healthy probe, so a boot that
+  // lands during the final backoff before the deadline is never re-evaluated.
+  // Re-check the evidence one last time: consecutive healthy probes plus a
+  // landed fresh boot prove the restart succeeded, regardless of the kickstart
+  // exit code (a nonzero/timed-out kickstart is retained as a warning, not a
+  // terminal verdict — exit 143 is our own launchctl-kill timeout, not a failed
+  // restart).
+  if (
+    healthyInARow >= REQUIRED_HEALTHY_PROBES &&
+    isFreshBoot(preRestartBoot, await deps.readLatestBoot())
+  ) {
+    emitSuccess(healthyInARow);
+    return;
   }
   failure(
     failedKickstart ? "kickstart-failed" : "health-timeout",
