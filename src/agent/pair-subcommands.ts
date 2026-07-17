@@ -21,6 +21,8 @@ import {
   DEFAULT_STOP_TIMEOUT_MS,
   defaultTranscriptPathTimeoutMs,
   findLastMessage,
+  type PartnerLifecycle,
+  type PartnerLifecycleTerminal,
   type TranscriptStop,
   type WaitForPathOutcome,
   waitForTranscriptPath,
@@ -49,6 +51,10 @@ export interface ResolvedHandle {
    * launch, byte-unchanged.
    */
   isResume?: boolean;
+  /** Exact Keeper jobs identity. Absent on direct paths and legacy artifacts. */
+  lifecycleJobId?: string | null;
+  /** Pre-launch resumed-transcript structural boundary. */
+  invocationStopFloor?: number | null;
 }
 
 export interface ResolveHandleArgs {
@@ -201,6 +207,15 @@ function resolveRunId(
         typeof parsed.startedAtMs === "number" ? parsed.startedAtMs : 0,
       transcriptPath: null,
       stopTimeoutMs,
+      ...(typeof parsed.lifecycleJobId === "string"
+        ? { lifecycleJobId: parsed.lifecycleJobId }
+        : {}),
+      ...(typeof parsed.invocationStopFloor === "number" &&
+      Number.isInteger(parsed.invocationStopFloor) &&
+      parsed.invocationStopFloor >= 0
+        ? { invocationStopFloor: parsed.invocationStopFloor }
+        : {}),
+      ...(parsed.isResume === true ? { isResume: true } : {}),
     },
   };
 }
@@ -214,6 +229,7 @@ function coerceAgent(value: unknown): AgentKind | null {
 export interface VerbDeps {
   env: NodeJS.ProcessEnv;
   homeDir: string;
+  probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
 }
 
 export type WaitForStopResult =
@@ -221,7 +237,8 @@ export type WaitForStopResult =
   | {
       ok: false;
       error: string;
-      reason?: "timeout" | "ambiguous";
+      reason?: "timeout" | "ambiguous" | "partner_died";
+      terminal?: PartnerLifecycleTerminal;
       /** Set when the transcript path DID resolve and only the stop wait timed
        *  out — the caller reads that known path once instead of re-running
        *  path discovery on a second budget. */
@@ -257,7 +274,9 @@ export async function runWaitForStop(
         );
   const resolved = await resolveTranscriptPath(handle, deps, pathTimeoutMs);
   if (!resolved.ok) {
-    return transcriptPathFailure(resolved.reason);
+    return resolved.reason === "partner_died"
+      ? partnerDiedFailure(resolved.terminal)
+      : transcriptPathFailure(resolved.reason);
   }
   const transcriptPath = resolved.path;
   const outcome = await waitForTranscriptStop({
@@ -268,6 +287,8 @@ export async function runWaitForStop(
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
     isResume: handle.isResume,
+    invocationStopFloor: handle.invocationStopFloor,
+    lifecycleProbe: lifecycleProbe(handle, deps),
     transcriptPath,
     stopTimeoutMs: Math.max(1, deadlineMs - Date.now()),
   });
@@ -276,6 +297,12 @@ export async function runWaitForStop(
   // The error self-reports the effective deadline and its source so the next
   // failure tells us whether the caller's --stop-timeout or the default bit.
   if (!outcome.ok) {
+    if ("partnerDied" in outcome) {
+      return {
+        ...partnerDiedFailure(outcome.terminal),
+        transcriptPath,
+      };
+    }
     const source = handle.stopTimeoutMs !== null ? "caller" : "default";
     return {
       ok: false,
@@ -289,7 +316,11 @@ export async function runWaitForStop(
 
 export type ShowLastMessageResult =
   | { ok: true; transcriptPath: string; text: string | null; found: boolean }
-  | { ok: false; error: string; reason?: "timeout" | "ambiguous" };
+  | {
+      ok: false;
+      error: string;
+      reason?: "timeout" | "ambiguous" | "partner_died";
+    };
 
 /**
  * Resolve the handle's transcript and return the partner's final assistant
@@ -304,11 +335,15 @@ export async function runShowLastMessage(
 ): Promise<ShowLastMessageResult> {
   const resolved = await resolveTranscriptPath(handle, deps);
   if (!resolved.ok) {
-    return transcriptPathFailure(resolved.reason);
+    return resolved.reason === "partner_died"
+      ? partnerDiedFailure(resolved.terminal)
+      : transcriptPathFailure(resolved.reason);
   }
   const transcriptPath = resolved.path;
   const last = findLastMessage(handle.agent, transcriptPath, {
     isResume: handle.isResume,
+    startedAtMs: handle.startedAtMs,
+    invocationStopFloor: handle.invocationStopFloor,
   });
   return {
     ok: true,
@@ -339,6 +374,8 @@ async function resolveTranscriptPath(
     startedAtMs: handle.startedAtMs,
     sessionId: handle.sessionId,
     isResume: handle.isResume,
+    invocationStopFloor: handle.invocationStopFloor,
+    lifecycleProbe: lifecycleProbe(handle, deps),
     pathTimeoutMs,
   });
 }
@@ -346,6 +383,31 @@ async function resolveTranscriptPath(
 /** Map a transcript-path resolution failure to a verb result — carrying the
  *  `reason` so run-capture separates a concurrent-session collision
  *  (`transcript_ambiguous`) from a transcript that never appeared. */
+function lifecycleProbe(
+  handle: ResolvedHandle,
+  deps: VerbDeps,
+): (() => Promise<PartnerLifecycle>) | undefined {
+  const jobId = handle.lifecycleJobId;
+  const probe = deps.probePartnerLifecycle;
+  return typeof jobId === "string" && jobId !== "" && probe !== undefined
+    ? () => probe(jobId)
+    : undefined;
+}
+
+function partnerDiedFailure(terminal: PartnerLifecycleTerminal): {
+  ok: false;
+  error: string;
+  reason: "partner_died";
+  terminal: PartnerLifecycleTerminal;
+} {
+  return {
+    ok: false,
+    reason: "partner_died",
+    terminal,
+    error: `partner died: folded job state is ${terminal.state}${terminal.reason ? ` (${terminal.reason})` : ""}`,
+  };
+}
+
 function transcriptPathFailure(reason: "timeout" | "ambiguous"): {
   ok: false;
   error: string;

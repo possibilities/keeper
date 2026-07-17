@@ -318,8 +318,9 @@ export function cancelOwnedRunFromControlArtifact(args: {
 /**
  * The closed set of terminal outcomes. Each maps to a process exit code via
  * {@link runCaptureExitCode}: completed/no_message succeed (0), timed_out/
- * no_transcript/transcript_ambiguous are retryable (4), launch_failed is internal
- * (1), bad_args is a malformed invocation (2). `transcript_ambiguous` is distinct
+ * no_transcript/transcript_ambiguous/partner_died are retryable (4),
+ * launch_failed is internal (1), bad_args is a malformed invocation (2).
+ * `transcript_ambiguous` is distinct
  * from `no_transcript`: attribution collided, so Keeper refused to guess a
  * foreign answer.
  */
@@ -329,6 +330,7 @@ export type RunCaptureOutcome =
   | "timed_out"
   | "no_transcript"
   | "transcript_ambiguous"
+  | "partner_died"
   | "launch_failed"
   | "bad_args";
 
@@ -357,6 +359,7 @@ const OUTCOME_EXIT_CODE: Record<RunCaptureOutcome, number> = {
   timed_out: 4,
   no_transcript: 4,
   transcript_ambiguous: 4,
+  partner_died: 4,
   launch_failed: 1,
   bad_args: 2,
 };
@@ -810,6 +813,16 @@ export async function captureFromHandle(
 
   const wait = await deps.waitForStop(handle, verbDeps);
   if (!wait.ok) {
+    if (wait.reason === "partner_died") {
+      return buildRunCaptureEnvelope({
+        outcome: "partner_died",
+        agent,
+        handle: handleId,
+        transcriptPath: wait.transcriptPath ?? null,
+        resumeTarget: baseResume,
+        elapsedSeconds: elapsed(),
+      });
+    }
     // The wait did not reach a stop. When the transcript path DID resolve and
     // only the stop wait timed out, read that known path once for a partial
     // capture (timed_out) — never re-run path discovery on a second budget. A

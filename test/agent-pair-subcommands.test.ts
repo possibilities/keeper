@@ -107,6 +107,31 @@ describe("resolveHandle", () => {
       },
     });
   });
+  test("a run id restores optional lifecycle identity and invocation boundary", () => {
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-life", {
+      agent: "pi",
+      cwd: "/work/proj",
+      transcriptSessionId: "pi-session",
+      startedAtMs: 123,
+      lifecycleJobId: "job-exact",
+      invocationStopFloor: 7,
+      isResume: true,
+    });
+    const res = resolveHandle({
+      rest: ["tmux-life"],
+      cwd: "/elsewhere",
+      stateDir,
+    });
+    expect(res).toMatchObject({
+      ok: true,
+      handle: {
+        lifecycleJobId: "job-exact",
+        invocationStopFloor: 7,
+        isResume: true,
+      },
+    });
+  });
   test("a transcript path handle requires --agent", () => {
     const res = resolveHandle({
       rest: ["/tmp/x.jsonl"],
@@ -365,6 +390,87 @@ describe("pinned transcript resolution (decoy collision)", () => {
     expect(resolved).toEqual({ ok: false, reason: "timeout" });
   });
 });
+describe("lifecycle-aware transcript waits", () => {
+  test("terminal before transcript creation returns partner_died immediately", async () => {
+    let sleeps = 0;
+    const outcome = await waitForTranscriptPath({
+      agent: "claude",
+      cwd: "/missing",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 1,
+      sessionId: "missing",
+      pathTimeoutMs: 60_000,
+      lifecycleProbe: async () => ({
+        kind: "terminal",
+        state: "killed",
+        reason: null,
+      }),
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+    expect(outcome).toEqual({
+      ok: false,
+      reason: "partner_died",
+      terminal: { kind: "terminal", state: "killed", reason: null },
+    });
+    expect(sleeps).toBe(0);
+  });
+
+  test("a fresh stop wins over terminal lifecycle evidence", async () => {
+    const home = tempDir();
+    const cwd = "/work/proj";
+    const path = writeClaudeTranscript(home, cwd, "settled", {
+      text: "done before clean teardown",
+    });
+    let probes = 0;
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd,
+      env: {},
+      homeDir: home,
+      startedAtMs: 0,
+      sessionId: "settled",
+      transcriptPath: path,
+      lifecycleProbe: async () => {
+        probes++;
+        return { kind: "terminal", state: "ended", reason: null };
+      },
+    });
+    expect(outcome.ok).toBe(true);
+    expect(probes).toBe(0);
+  });
+
+  test("terminal during stop polling returns without consuming the deadline", async () => {
+    const path = join(tempDir(), "nostop.jsonl");
+    writeFileSync(path, `${JSON.stringify({ type: "thinking" })}\n`);
+    let probes = 0;
+    let sleeps = 0;
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: path,
+      stopTimeoutMs: 60_000,
+      lifecycleProbe: async () => {
+        probes++;
+        return probes === 1
+          ? { kind: "live" }
+          : { kind: "terminal", state: "ended", reason: null };
+      },
+      sleep: async () => {
+        sleeps++;
+      },
+    });
+    expect(outcome).toMatchObject({ ok: false, partnerDied: true });
+    expect(sleeps).toBe(1);
+  });
+});
+
 describe("waitForTranscriptStop is bounded", () => {
   const PINNED_NO_STOP = "33333333-3333-3333-3333-333333333333";
   test("a stop that never appears times out (no unbounded hang)", async () => {
@@ -440,6 +546,35 @@ describe("runWaitForStop forwards --stop-timeout", () => {
     }
   });
 });
+describe("keeper agent wait-for-stop partner death", () => {
+  test("raw wait exposes the partner_died discriminator and exit 4", async () => {
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-dead", {
+      agent: "claude",
+      cwd: "/work/proj",
+      transcriptSessionId: "never-created",
+      startedAtMs: 1,
+      lifecycleJobId: "job-dead",
+    });
+    const h = makeHarness({
+      argv: ["wait-for-stop", "tmux-dead", "--stop-timeout", "1m"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: tempDir(),
+      probePartnerLifecycle: async (jobId) => {
+        expect(jobId).toBe("job-dead");
+        return { kind: "terminal", state: "killed", reason: null };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(4);
+    expect(parseJsonOutput(h.out)).toMatchObject({
+      error: true,
+      reason: "partner_died",
+      exitCode: 4,
+    });
+  });
+});
+
 describe("inner --session-id pin", () => {
   test("the inner claude re-exec pushes --session-id from the pane carrier", async () => {
     // Simulate the pane env the outer launch forwards: the inner re-exec reads

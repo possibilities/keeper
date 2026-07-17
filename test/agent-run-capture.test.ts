@@ -118,6 +118,7 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
       "timed_out",
       "no_transcript",
       "transcript_ambiguous",
+      "partner_died",
       "launch_failed",
       "bad_args",
     ] as const) {
@@ -177,6 +178,7 @@ describe("buildRunCaptureEnvelope — full key set + exit codes", () => {
     expect(runCaptureExitCode("timed_out")).toBe(4);
     expect(runCaptureExitCode("no_transcript")).toBe(4);
     expect(runCaptureExitCode("transcript_ambiguous")).toBe(4);
+    expect(runCaptureExitCode("partner_died")).toBe(4);
     expect(runCaptureExitCode("launch_failed")).toBe(1);
     expect(runCaptureExitCode("bad_args")).toBe(2);
   });
@@ -661,6 +663,43 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
       resume_target: null,
     });
     expect(exitCode).toBe(4);
+  });
+
+  test("proven terminal lifecycle → partner_died with no stale message scan", async () => {
+    let showCalls = 0;
+    const { envelope, exitCode } = await captureFromHandle(
+      {
+        waitForStop: async () => ({
+          ok: false,
+          reason: "partner_died",
+          error: "partner died",
+          transcriptPath: "/t.jsonl",
+          terminal: { kind: "terminal", state: "killed", reason: null },
+        }),
+        showLastMessage: async () => {
+          showCalls++;
+          return {
+            ok: true,
+            transcriptPath: "/t.jsonl",
+            text: "STALE PRIOR TURN",
+            found: true,
+          };
+        },
+        now: () => 500,
+      },
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-dead", agent: "claude", startMs: 0 },
+    );
+    expect(Object.keys(envelope).sort()).toEqual([...ENVELOPE_KEYS]);
+    expect(envelope).toMatchObject({
+      outcome: "partner_died",
+      handle: "tmux-dead",
+      transcript_path: "/t.jsonl",
+      message: null,
+      message_found: false,
+    });
+    expect(exitCode).toBe(4);
+    expect(showCalls).toBe(0);
   });
 
   test("resume_target is null for a Pi handle with no pinned session id", async () => {
