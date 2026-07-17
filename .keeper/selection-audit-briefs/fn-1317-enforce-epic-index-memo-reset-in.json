@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 1,
+        "insertions": 3
+      },
+      "done_summary": "Added __resetEpicIndexMemoForTest(db) at the three uncovered wipe-then-refold sites (454, 5072, 5425) in reducer-lifecycle.test.ts, matching the enforced convention; full file passes 208/208.",
+      "input_hash": "b0d0df4490d134bbb6d97f4605a9825daed1f753eccc7db46fa53deb8b0817ff",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1318,
+      "spec_md": "## Description\n\nFinding F1 (audit of fn-1315). Evidence: `test/reducer-lifecycle.test.ts` has four\n`DELETE FROM epics` wipe-then-refold sites \u2014 line 2730 already resets the epic-index\nmemo (line 2733), but lines 454, 5072, and 5425 do not, despite matching the identical\n`DELETE FROM epics` + `UPDATE reducer_state SET last_event_id = 0` + `drainAll()`\npattern the epic enforces on the reused `freshMemDb`-per-test connection. The file\nalready imports `__resetEpicIndexMemoForTest` (line 20).\n\nFiles:\n- `test/reducer-lifecycle.test.ts` \u2014 add `__resetEpicIndexMemoForTest(db)` after the\n  `DELETE FROM epics` and before the re-fold `drainAll()` at the three sites (454,\n  5072, 5425). Verify each re-fold exercises the epic index before choosing to add the\n  call; if a site provably cannot seed the memo, document the exemption inline instead.\n\n## Acceptance\n\n- [ ] Sites 454, 5072, and 5425 reset the epic-index memo between the epics wipe and the re-fold drain (or carry an inline exemption note if provably unreachable).\n- [ ] `test/reducer-lifecycle.test.ts` passes under its named test gate.\n\n## Done summary\nAdded __resetEpicIndexMemoForTest(db) at the three uncovered wipe-then-refold sites (454, 5072, 5425) in reducer-lifecycle.test.ts, matching the enforced convention; full file passes 208/208.\n## Evidence\n",
+      "task_id": "fn-1317-enforce-epic-index-memo-reset-in.1",
+      "tier": "medium",
+      "title": "Reset memo at lifecycle wipe sites"
+    }
+  ],
+  "created_at": "2026-07-17T19:51:12.797000Z",
+  "epic_id": "fn-1317-enforce-epic-index-memo-reset-in",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "b0d0df4490d134bbb6d97f4605a9825daed1f753eccc7db46fa53deb8b0817ff",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
