@@ -18,6 +18,7 @@ import {
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { queryCollection } from "../../cli/control-rpc";
 import {
   inspectRouting,
   type RequestedRouteResolution,
@@ -169,7 +170,11 @@ import {
   type TmuxCommandRunner,
   TmuxLaunchError,
 } from "./tmux-launch";
-import type { TranscriptStop } from "./transcript-watch";
+import {
+  type PartnerLifecycle,
+  snapshotInvocationStopFloor,
+  type TranscriptStop,
+} from "./transcript-watch";
 import {
   enumerateTriplesV2,
   extractHostTriples,
@@ -338,6 +343,9 @@ export interface MainDeps {
    * {@link inspectRouting}.
    */
   inspectRoutingFn: () => RoutingInspection;
+  /** Read one exact jobs row through the daemon. Transport uncertainty remains
+   *  unknown and can never be promoted to partner death. */
+  probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
   /**
    * The claude-swap executable a MANAGED route wraps the launch through
    * (`cswap run <slot> --share-history -- <Claude argv…>`). `realDeps()` resolves
@@ -440,6 +448,8 @@ export function realDeps(): MainDeps {
     selectAccountRouteByOrdinalFn: (ordinal) =>
       selectRouteByAccountOrdinal(ordinal),
     inspectRoutingFn: () => inspectRouting(),
+    probePartnerLifecycleFn: (jobId) =>
+      probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin: resolveCswapCommand(),
   };
 }
@@ -813,11 +823,15 @@ function tmuxMetadata(args: {
  * mirrors the process exit so a caller binding on stdout never has to read it.
  * Human diagnostics still go to stderr.
  */
-function tmuxErrorJson(exitCode: number, message: string): string {
+function tmuxErrorJson(
+  exitCode: number,
+  message: string,
+  reasonOverride?: string,
+): string {
   return `${JSON.stringify({
     schema_version: TMUX_SCHEMA_VERSION,
     error: true,
-    reason: tmuxErrorReason(exitCode),
+    reason: reasonOverride ?? tmuxErrorReason(exitCode),
     exitCode,
     message,
   })}\n`;
@@ -864,7 +878,13 @@ async function runTranscriptSubcommand(
     const result = await runWaitForStop(resolution.handle, verbDeps);
     if (!result.ok) {
       deps.writeErr(`Error: ${result.error}\n`);
-      deps.write(tmuxErrorJson(TMUX_EXIT.RETRYABLE, result.error));
+      deps.write(
+        tmuxErrorJson(
+          TMUX_EXIT.RETRYABLE,
+          result.error,
+          result.reason === "partner_died" ? "partner_died" : undefined,
+        ),
+      );
       return deps.exit(TMUX_EXIT.RETRYABLE);
     }
     deps.write(
@@ -909,7 +929,36 @@ function makeVerbDeps(deps: MainDeps): VerbDeps {
   return {
     env: deps.env,
     homeDir: deps.transcriptHomeDir,
+    probePartnerLifecycle: deps.probePartnerLifecycleFn,
   };
+}
+
+function resolveAgentSockPath(env: NodeJS.ProcessEnv): string {
+  const override = (env.KEEPER_SOCK ?? "").trim();
+  return override !== ""
+    ? override
+    : join(homedir(), ".local", "state", "keeper", "keeperd.sock");
+}
+
+async function probePartnerLifecycle(
+  sockPath: string,
+  jobId: string,
+): Promise<PartnerLifecycle> {
+  try {
+    const rows = await queryCollection<Record<string, unknown>>(
+      sockPath,
+      "jobs",
+      { job_id: jobId },
+    );
+    const row = rows.find((candidate) => candidate.job_id === jobId);
+    const state = row?.state;
+    if (state === "ended" || state === "killed") {
+      return { kind: "terminal", state, reason: null };
+    }
+    return row === undefined ? { kind: "unknown" } : { kind: "live" };
+  } catch {
+    return { kind: "unknown" };
+  }
 }
 
 /** The wait/show/clock seams the run-capture compose drives, bound to the
@@ -930,6 +979,7 @@ function launchHandleDeps(deps: MainDeps): LaunchHandleDeps {
     cwd: deps.cwd,
     tmuxBin: deps.tmuxBin,
     launcherStateDir: deps.launcherStateDir,
+    transcriptHomeDir: deps.transcriptHomeDir,
     launcherArgvPrefix: deps.launcherArgvPrefix,
     randomUuid: deps.randomUuid,
     runTmuxCommand: deps.runTmuxCommandFn,
@@ -2199,6 +2249,23 @@ function runResumeSubcommand(
     return deps.exit(2);
   }
 
+  const discoverySessionId = resumeSessionId ?? decision.resume_target;
+  const lifecycleJobId =
+    decision.harness === "pi" ? deps.randomUuid() : discoverySessionId;
+  tmuxLaunch.options.env = [
+    ...tmuxLaunch.options.env.filter(([key]) => key !== "KEEPER_JOB_ID"),
+    ["KEEPER_JOB_ID", lifecycleJobId],
+  ];
+  const invocationStopFloor = snapshotInvocationStopFloor({
+    agent: decision.harness,
+    cwd,
+    env: deps.env,
+    homeDir: deps.transcriptHomeDir,
+    startedAtMs: deps.now(),
+    sessionId: discoverySessionId,
+    isResume: true,
+  });
+
   try {
     const result = launchKeeperAgentInTmux({
       agent: decision.harness,
@@ -2207,7 +2274,11 @@ function runResumeSubcommand(
       env: launchEnvForAgent(decision.harness, deps.env),
       cwd,
       transcriptSessionId: null,
+      resolvedTranscriptSessionId: discoverySessionId,
       startedAtMs: deps.now(),
+      lifecycleJobId,
+      invocationStopFloor,
+      isResume: true,
       stateDir: deps.launcherStateDir,
       tmuxBin: deps.tmuxBin,
       launcherArgvPrefix: deps.launcherArgvPrefix,
@@ -2390,6 +2461,7 @@ export async function main(deps: MainDeps): Promise<never> {
         cwd: deps.cwd,
         transcriptSessionId,
         startedAtMs,
+        lifecycleJobId: transcriptSessionId,
         stateDir: deps.launcherStateDir,
         tmuxBin: deps.tmuxBin,
         launcherArgvPrefix: deps.launcherArgvPrefix,

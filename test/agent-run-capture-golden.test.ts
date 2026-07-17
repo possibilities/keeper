@@ -8,6 +8,35 @@
  */
 import { describe, expect, test } from "bun:test";
 import { buildAgentLaunchArgv } from "../src/agent/launch-config";
+import { buildRunCaptureEnvelope } from "../src/agent/run-capture";
+
+describe("golden: partner_died answer envelope", () => {
+  test("keeps the nine-key schema and retryable exit", () => {
+    expect(
+      buildRunCaptureEnvelope({
+        outcome: "partner_died",
+        agent: "claude",
+        handle: "tmux-dead",
+        transcriptPath: "/tmp/dead.jsonl",
+        resumeTarget: "session-id",
+        elapsedSeconds: 1.2,
+      }),
+    ).toEqual({
+      envelope: {
+        schema_version: 1,
+        agent: "claude",
+        handle: "tmux-dead",
+        transcript_path: "/tmp/dead.jsonl",
+        resume_target: "session-id",
+        message: null,
+        message_found: false,
+        elapsed_seconds: 1.2,
+        outcome: "partner_died",
+      },
+      exitCode: 4,
+    });
+  });
+});
 
 const PREFIX = [
   "/fake-home/.bun/bin/bun",

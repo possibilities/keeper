@@ -484,7 +484,11 @@ describe("--x-tmux", () => {
         "utf8",
       ),
     );
-    expect(runJson).toMatchObject({ agent: "claude", cwd });
+    expect(runJson).toMatchObject({
+      agent: "claude",
+      cwd,
+      lifecycleJobId: "abababab-abab-abab-abab-abababababab",
+    });
     expect(typeof runJson.startedAtMs).toBe("number");
   });
 

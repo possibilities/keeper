@@ -146,8 +146,16 @@ export interface TmuxLaunchRequest {
    * `wait-for-stop`/`show-last-message` resolves the right transcript by id.
    */
   transcriptSessionId: string | null;
+  /** Transcript identity recorded for delayed waits when it differs from the
+   *  fresh-session carrier (notably resume launches). */
+  resolvedTranscriptSessionId?: string | null;
   /** Launch wall-clock, recorded so the verbs filter to fresh transcripts. */
   startedAtMs: number;
+  /** Exact jobs projection identity for lifecycle-aware run-id waits. */
+  lifecycleJobId?: string | null;
+  /** Structural stop count captured before a resumed invocation starts. */
+  invocationStopFloor?: number | null;
+  isResume?: boolean;
   stateDir: string;
   /** Absolute `tmux` binary; resolved by the caller so a stripped PATH can't ENOENT it. */
   tmuxBin: string;
@@ -1226,7 +1234,14 @@ function writeRunMetadata(
     pid: null,
     agent: req.agent,
     cwd: req.cwd,
-    transcriptSessionId: req.transcriptSessionId,
+    transcriptSessionId:
+      req.resolvedTranscriptSessionId ?? req.transcriptSessionId,
+    ...(req.lifecycleJobId ? { lifecycleJobId: req.lifecycleJobId } : {}),
+    ...(req.invocationStopFloor !== null &&
+    req.invocationStopFloor !== undefined
+      ? { invocationStopFloor: req.invocationStopFloor }
+      : {}),
+    ...(req.isResume === true ? { isResume: true } : {}),
     command: ["keeper", "agent", req.agent, ...req.innerArgs],
     tmux: {
       command: meta.tmuxBase,

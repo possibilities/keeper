@@ -36,6 +36,7 @@ import {
   type TmuxCommandRunner,
   TmuxLaunchError,
 } from "./tmux-launch";
+import { snapshotInvocationStopFloor } from "./transcript-watch";
 
 function existingSessionId(args: string[]): string | null {
   for (let i = 0; i < args.length; i++) {
@@ -103,6 +104,7 @@ export interface LaunchHandleDeps {
   /** Absolute `tmux` binary; resolved by the caller so a stripped PATH can't ENOENT it. */
   tmuxBin: string;
   launcherStateDir: string;
+  transcriptHomeDir?: string;
   /** The argv PREFIX the detached pane re-execs (`[<abs bun>, <abs cli/keeper.ts>, "agent"]`). */
   launcherArgvPrefix: string[];
   randomUuid: () => string;
@@ -240,6 +242,29 @@ export function launchToResolvedHandle(
   const transcriptSessionId = resume
     ? null
     : tmuxTranscriptSessionId(agent, tmuxLaunch.remainingArgs, deps.randomUuid);
+  const discoverySessionId = resume?.sessionId ?? transcriptSessionId;
+  const lifecycleJobId =
+    resume !== undefined && agent === "pi"
+      ? deps.randomUuid()
+      : discoverySessionId;
+  if (lifecycleJobId !== null) {
+    tmuxLaunch.options.env = [
+      ...tmuxLaunch.options.env.filter(([key]) => key !== "KEEPER_JOB_ID"),
+      ["KEEPER_JOB_ID", lifecycleJobId],
+    ];
+  }
+  const invocationStopFloor =
+    resume !== undefined && deps.transcriptHomeDir !== undefined
+      ? snapshotInvocationStopFloor({
+          agent,
+          cwd: deps.cwd,
+          env: deps.env,
+          homeDir: deps.transcriptHomeDir,
+          startedAtMs,
+          sessionId: discoverySessionId,
+          isResume: true,
+        })
+      : null;
   try {
     const result = launchKeeperAgentInTmux({
       agent,
@@ -248,7 +273,11 @@ export function launchToResolvedHandle(
       env: launchEnvForAgent(agent, deps.env),
       cwd: deps.cwd,
       transcriptSessionId,
+      resolvedTranscriptSessionId: discoverySessionId,
       startedAtMs,
+      lifecycleJobId,
+      invocationStopFloor,
+      isResume: resume !== undefined,
       stateDir: deps.launcherStateDir,
       tmuxBin: deps.tmuxBin,
       launcherArgvPrefix: deps.launcherArgvPrefix,
@@ -258,11 +287,13 @@ export function launchToResolvedHandle(
     const handle: ResolvedHandle = {
       agent,
       cwd: deps.cwd,
-      sessionId: resume ? resume.sessionId : transcriptSessionId,
+      sessionId: discoverySessionId,
       startedAtMs,
       transcriptPath: null,
       stopTimeoutMs,
       isResume: resume !== undefined,
+      ...(lifecycleJobId !== null ? { lifecycleJobId } : {}),
+      ...(invocationStopFloor !== null ? { invocationStopFloor } : {}),
     };
     if (result.killWindowCommand === null) {
       throw new TmuxLaunchError(

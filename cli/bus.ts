@@ -53,7 +53,6 @@ import {
   type BUS_ARTIFACT_REF_VERSION,
   type BusArtifactRef,
   decodeBusArtifactRef,
-  encodeBusArtifactRef,
   type PublishedBusArtifact,
   publishBusArtifact,
   removeBusArtifact,
@@ -80,9 +79,20 @@ import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../src/keeper-agent-path";
+import {
+  BUS_RESPONSE_TIMEOUT_MS,
+  type BusPublishResult,
+  BusSendAttemptError,
+  type BusSendResult,
+  buildBusPublishFrame,
+  buildBusRegisterFrame,
+  busSendTransportIsAmbiguous,
+  CHAT_NAMESPACE,
+  sendBusArtifact,
+} from "../src/provider-leg-death-notice";
 
 /** Reserved tenant namespace handled by the `chat` sub-verb. */
-export const CHAT_NAMESPACE = "chat";
+export { CHAT_NAMESPACE };
 
 /**
  * One-line notification clip budget (chars). The Claude Code Monitor tool clips a
@@ -93,9 +103,6 @@ export const NOTIFY_LINE_BUDGET = 400;
 
 /** Spill files older than this (ms) are pruned at watch startup. */
 export const SPILL_MAX_AGE_MS = 3 * 86400 * 1000;
-
-/** How long a one-shot op waits for its ack after connect (ms). */
-export const BUS_RESPONSE_TIMEOUT_MS = 5000;
 
 export const WATCH_BACKOFF_MIN_MS = 250;
 export const WATCH_BACKOFF_MAX_MS = 5000;
@@ -310,28 +317,11 @@ export interface PublishFrame {
  * (anti-spoof) so we never set one. Pure.
  */
 export function buildPublishFrame(
-  event: "send",
+  _event: "send",
   artifact: PublishedBusArtifact,
   target?: string,
 ): PublishFrame {
-  const encoded = JSON.parse(encodeBusArtifactRef(artifact.ref)) as Pick<
-    ChatPayload,
-    "t" | "v" | "id" | "len" | "sha256"
-  >;
-  const payload: ChatPayload = {
-    media_type: "text/markdown",
-    // The relay validates the artifact reference from payload.text; the typed
-    // mirror fields remain for old readers but are not the authority.
-    text: encodeBusArtifactRef(artifact.ref),
-    ...encoded,
-  };
-  return {
-    op: "publish",
-    event,
-    namespace: CHAT_NAMESPACE,
-    to: target ?? "",
-    payload,
-  };
+  return buildBusPublishFrame(artifact, target ?? "") as PublishFrame;
 }
 
 /** An inbound delivered message as the watcher sees it on the wire. */
@@ -859,48 +849,22 @@ export function registerFrame(
   sendOnly = false,
   env: NodeJS.ProcessEnv = process.env,
 ): object {
-  const sessionId = (env.KEEPER_JOB_ID ?? "").trim();
-  return {
-    op: "register",
-    namespace: CHAT_NAMESPACE,
-    namespaces: [CHAT_NAMESPACE],
-    pid: process.pid,
-    send_only: sendOnly,
-    ...(sessionId === "" ? {} : { session_id: sessionId }),
-  };
+  return buildBusRegisterFrame(sendOnly, env);
 }
 
 /** The synchronous publish result the server replies with (mirrors the server's
  *  `PublishOutcome`). `delivered` is the only success; every other value is a
  *  fail-loud non-delivery the CLI exits 1 on. */
-export type PublishResult =
-  | "delivered"
-  | "queued_for_wake"
-  | "not_connected"
-  | "unknown_target"
-  | "ambiguous_target"
-  | "delivery_failed";
+export type PublishResult = BusPublishResult;
 
 /** The publish ack the server returns: the synchronous outcome + recipient count. */
-export interface SendResult {
-  result: PublishResult;
-  recipients: number;
-}
-
-class SendAttemptError extends Error {
-  constructor(
-    message: string,
-    readonly deliveryAmbiguous: boolean,
-  ) {
-    super(message);
-  }
-}
+export type SendResult = BusSendResult;
 
 export function sendTransportIsAmbiguous(
   publishStarted: boolean,
   serverRejected: boolean,
 ): boolean {
-  return publishStarted && !serverRejected;
+  return busSendTransportIsAmbiguous(publishStarted, serverRejected);
 }
 
 /**
@@ -912,42 +876,11 @@ export function sendTransportIsAmbiguous(
  */
 async function runSend(
   sockPath: string,
-  event: "send",
+  _event: "send",
   artifact: PublishedBusArtifact,
   target?: string,
 ): Promise<SendResult> {
-  let publishStarted = false;
-  let serverRejected = false;
-  try {
-    return await busRoundTrip<SendResult>(
-      sockPath,
-      (send, onFrame, resolve, reject) => {
-        onFrame((f) => {
-          if (f.type === "ack" && f.op === "register") {
-            // Identity bound — publish; the server replies a publish ack we await.
-            publishStarted = true;
-            send(buildPublishFrame(event, artifact, target));
-          } else if (f.type === "ack" && f.op === "publish") {
-            resolve({
-              result: f.result as PublishResult,
-              recipients: typeof f.recipients === "number" ? f.recipients : 0,
-            });
-          } else if (f.type === "error") {
-            serverRejected = true;
-            reject(new Error(`${f.code}: ${f.message}`));
-          }
-        });
-        // Send-only: bind identity for the `from` stamp without joining the
-        // registry or evicting the agent's live `watch` channel.
-        send(registerFrame(true));
-      },
-    );
-  } catch (err) {
-    throw new SendAttemptError(
-      (err as Error).message,
-      sendTransportIsAmbiguous(publishStarted, serverRejected),
-    );
-  }
+  return sendBusArtifact(sockPath, artifact, target ?? "");
 }
 
 /**
@@ -1381,7 +1314,7 @@ export async function main(argv: string[]): Promise<void> {
       try {
         res = await runSend(sockPath, "send", artifact, cmd.target);
       } catch (err) {
-        if (!(err instanceof SendAttemptError) || !err.deliveryAmbiguous) {
+        if (!(err instanceof BusSendAttemptError) || !err.deliveryAmbiguous) {
           removeBusArtifact(artifactRoot, artifact.ref.id);
         }
         // An ACK timeout after publish is ambiguous: retention owns its cleanup.

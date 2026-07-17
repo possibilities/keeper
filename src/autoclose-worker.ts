@@ -92,7 +92,14 @@ const PANEL_TITLE_RE = /^panel::[^:]+::[^:]+$/;
  *  task title. Exact pane identity, not this display string, remains the kill
  *  target. */
 const WRAPPED_PROVIDER_TITLE_RE =
-  /^(?:wrapped::)?fn-\d+(?:-[a-z0-9][a-z0-9-]*[a-z0-9]|-[a-z0-9]{1,3})?\.\d+$/;
+  /^(?:wrapped::)?(fn-\d+(?:-[a-z0-9][a-z0-9-]*[a-z0-9]|-[a-z0-9]{1,3})?\.\d+)$/;
+
+export function parseWrappedProviderTaskId(
+  title: string | null,
+): string | null {
+  if (title == null) return null;
+  return WRAPPED_PROVIDER_TITLE_RE.exec(title)?.[1] ?? null;
+}
 
 /** Data the parent passes via `new Worker(url, { workerData })`. Only the DB
  *  path crosses the boundary — the read-only connection is opened on the worker
@@ -348,8 +355,7 @@ function classifyEligible(
     ref = job.title;
   } else if (
     job.backend_exec_birth_session_id === WRAPPED_EXEC_SESSION &&
-    job.title != null &&
-    WRAPPED_PROVIDER_TITLE_RE.test(job.title)
+    parseWrappedProviderTaskId(job.title) != null
   ) {
     // Wrapped provider legs own no Plan readiness row: their positive stopped
     // state (checked above) is the done signal. Pause suspends cleanup just like

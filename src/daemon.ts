@@ -234,6 +234,17 @@ import type {
   RecheckPendingMessage,
 } from "./plan-worker";
 import {
+  createProviderLegDeathNoticeState,
+  nextProviderLegNoticeRetryDelayMs,
+  type ProviderLegDeathCandidate,
+  type ProviderLegDeathNoticeState,
+  type ProviderLegTerminalRow,
+  resolveUniqueEligibleWrapper,
+  runProviderLegDeathNoticeSweep,
+  sendProviderLegDeathNotice,
+  type WrapperAttemptRow,
+} from "./provider-leg-death-notice";
+import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   isStoppedJobLive,
@@ -7285,10 +7296,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // fn-897 B1: the boot drain + seed + ephemeral-truncate runs in `serveBootDrain`
   // below, INVOKED after the server-worker spawn so the read socket is up during
   // this synchronous catch-up. The sequence is byte-for-byte the pre-fn-897 order.
+  let providerLegDeathNoticeState: ProviderLegDeathNoticeState | null = null;
+  let providerLegDeathNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let providerLegDeathNoticeSweepInFlight = false;
+  let providerLegDeathNoticeRerunRequested = false;
+
   function serveBootDrain(): void {
     withBootDrainCheckpointTuning(db, () => {
       drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
+      const fenceRow = db
+        .query("SELECT MAX(id) AS max_id FROM events")
+        .get() as {
+        max_id: number | null;
+      };
+      providerLegDeathNoticeState = createProviderLegDeathNoticeState(
+        fenceRow.max_id ?? 0,
+      );
       seedKilledSweep(db);
+      drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
       // No autopilot boot-append. The concurrency cap is now RUNTIME-settable via
       // `set_autopilot_config` (→ `AutopilotConfigSet`), not config-file-frozen at
       // boot — so the daemon never mints a synthetic cap event. A fresh board with
@@ -7475,6 +7500,142 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // backstop and the kick is idempotent. Skip a no-op pump and shutdown.
     if (folded && !shuttingDown) {
       serverWorker?.postMessage({ type: "kick" } satisfies KickMessage);
+      scheduleProviderLegDeathNoticeSweep();
+    }
+  }
+
+  function selectProviderLegTerminalRows(
+    afterEventId: number,
+    limit: number,
+  ): ProviderLegTerminalRow[] {
+    return db
+      .query(
+        `SELECT j.job_id AS provider_leg_job_id,
+                j.created_at AS provider_leg_created_at,
+                j.title,
+                j.transcript_path,
+                j.state AS terminal_kind,
+                e.id AS terminal_event_id,
+                e.hook_event AS terminal_event_kind,
+                e.ts AS terminal_event_at,
+                j.last_lifecycle_ts AS last_lifecycle_at,
+                j.close_kind,
+                j.kill_reason,
+                j.backend_exec_birth_session_id
+           FROM events e
+           JOIN jobs j ON j.job_id = e.session_id
+          WHERE e.id > ?
+            AND ((j.state = 'ended' AND e.hook_event = 'SessionEnd')
+              OR (j.state = 'killed' AND e.hook_event = 'Killed'))
+            AND j.last_lifecycle_ts = e.ts
+            AND e.id = (
+              SELECT MIN(e2.id)
+                FROM events e2
+               WHERE e2.session_id = e.session_id
+                 AND e2.hook_event = e.hook_event
+                 AND e2.ts = e.ts
+            )
+            AND j.backend_exec_birth_session_id = 'wrapped'
+          ORDER BY e.id ASC
+          LIMIT ?`,
+      )
+      .all(afterEventId, limit) as ProviderLegTerminalRow[];
+  }
+
+  function selectProviderLegWrapperAttempts(
+    candidate: ProviderLegDeathCandidate,
+  ): WrapperAttemptRow[] {
+    return db
+      .query(
+        `SELECT j.job_id AS jobId,
+                j.state,
+                j.plan_verb AS planVerb,
+                j.plan_ref AS planRef,
+                j.dispatch_origin AS dispatchOrigin,
+                dc.attempt_id AS attemptId,
+                dc.state AS claimState,
+                dc.legacy_unfenced AS legacyUnfenced,
+                dc.bound_at AS boundAt,
+                dc.released_at AS releasedAt
+           FROM jobs j
+           JOIN dispatch_claims dc
+             ON dc.verb = 'work'
+            AND dc.id = ?
+            AND dc.session_id = j.job_id
+          WHERE j.plan_verb = 'work'
+            AND j.plan_ref = ?`,
+      )
+      .all(candidate.taskId, candidate.taskId) as WrapperAttemptRow[];
+  }
+
+  function scheduleProviderLegDeathNoticeSweep(delayMs = 0): void {
+    if (shuttingDown || providerLegDeathNoticeState == null || !want("bus")) {
+      return;
+    }
+    if (providerLegDeathNoticeSweepInFlight) {
+      providerLegDeathNoticeRerunRequested = true;
+      return;
+    }
+    if (providerLegDeathNoticeTimer != null) {
+      if (delayMs > 0) return;
+      clearTimeout(providerLegDeathNoticeTimer);
+    }
+    providerLegDeathNoticeTimer = setTimeout(
+      () => {
+        providerLegDeathNoticeTimer = null;
+        void runProviderLegDeathNoticeSweepTick();
+      },
+      Math.max(0, delayMs),
+    );
+    providerLegDeathNoticeTimer.unref?.();
+  }
+
+  async function runProviderLegDeathNoticeSweepTick(): Promise<void> {
+    const state = providerLegDeathNoticeState;
+    if (shuttingDown || state == null || providerLegDeathNoticeSweepInFlight) {
+      return;
+    }
+    providerLegDeathNoticeSweepInFlight = true;
+    providerLegDeathNoticeRerunRequested = false;
+    try {
+      await runProviderLegDeathNoticeSweep(state, {
+        selectTerminalRows: selectProviderLegTerminalRows,
+        selectWrapperAttempts: selectProviderLegWrapperAttempts,
+        send: (candidate, wrapperJobId) =>
+          sendProviderLegDeathNotice({
+            sockPath: resolveBusSockPath(),
+            candidate,
+            wrapperJobId,
+            stillEligible: () =>
+              resolveUniqueEligibleWrapper(
+                candidate,
+                selectProviderLegWrapperAttempts(candidate),
+              ) === wrapperJobId,
+          }),
+        nowMs: () => Date.now(),
+        noteLine: (line) => console.error(`[keeperd] ${line}`),
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] Provider-leg death-notice sweep threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    } finally {
+      providerLegDeathNoticeSweepInFlight = false;
+      if (!shuttingDown) {
+        if (providerLegDeathNoticeRerunRequested) {
+          providerLegDeathNoticeRerunRequested = false;
+          scheduleProviderLegDeathNoticeSweep();
+        } else {
+          const retryDelay = nextProviderLegNoticeRetryDelayMs(
+            state,
+            Date.now(),
+          );
+          if (retryDelay != null)
+            scheduleProviderLegDeathNoticeSweep(retryDelay);
+        }
+      }
     }
   }
 
@@ -8448,6 +8609,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // busy ROW, never throws) and the steady-state PASSIVE heartbeat reclaims the
   // space on the next cadence — an accepted, documented degrade.
   serveBootDrain();
+  scheduleProviderLegDeathNoticeSweep();
 
   // One-shot GC for orphaned dispatch_failures. The drain above folded the
   // projection to head, so any UN-retryable row (a key the operator surface can
@@ -13716,6 +13878,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         busProbeArmed = true;
         busProbeLive = true;
         lastBusProbeOkAtMs = Date.now();
+        scheduleProviderLegDeathNoticeSweep();
       }
     };
     bw.onerror = (err: ErrorEvent): void => {
@@ -14264,6 +14427,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // integrity-probe + backup + catch-up timers live on the maintenance worker,
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
+    if (providerLegDeathNoticeTimer !== null) {
+      clearTimeout(providerLegDeathNoticeTimer);
+      providerLegDeathNoticeTimer = null;
+    }
     if (blockEscalationSweepTimer !== null) {
       clearInterval(blockEscalationSweepTimer);
     }

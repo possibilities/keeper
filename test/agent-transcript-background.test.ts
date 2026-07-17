@@ -482,6 +482,37 @@ describe("pi resume — stale-answer guard", () => {
       expect(outcome.stop.message).toBe("POST-RESUME ANSWER");
     }
   });
+  test("a delayed resumed wait uses the persisted pre-launch floor", async () => {
+    const path = piResumePath();
+    writePiTranscript(path, [
+      ...PI_COPIED_HISTORY,
+      piAsstStop("POST-RESUME DELAYED ANSWER", PI_NEW_TURN_TS),
+      piTurnCompleted(PI_NEW_TURN_TS),
+    ]);
+    let probes = 0;
+    const outcome = await waitForTranscriptStop(
+      piWaitOpts(path, {
+        isResume: true,
+        invocationStopFloor: 2,
+        lifecycleProbe: async () => {
+          probes++;
+          return { kind: "terminal", state: "ended", reason: null };
+        },
+      }),
+    );
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.stop.message).toBe("POST-RESUME DELAYED ANSWER");
+    }
+    expect(probes).toBe(0);
+    expect(
+      findLastMessage("pi", path, {
+        isResume: true,
+        invocationStopFloor: 2,
+      }).text,
+    ).toBe("POST-RESUME DELAYED ANSWER");
+  });
+
   test("a FRESH pi wait (isResume false) is byte-identical: first in-window stop", async () => {
     // The SAME re-stamped file, but a fresh launch — the plain first-stop scan is
     // exactly today's behavior, proving the watermark is gated on resume alone.

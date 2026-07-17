@@ -28,6 +28,11 @@ export interface LastMessage {
   found: boolean;
 }
 
+export type PartnerLifecycle =
+  | { kind: "live" }
+  | { kind: "terminal"; state: "ended" | "killed"; reason: string | null }
+  | { kind: "unknown" };
+
 export interface TranscriptWatchOptions {
   agent: AgentKind;
   cwd: string;
@@ -38,6 +43,13 @@ export interface TranscriptWatchOptions {
   pollIntervalMs?: number;
   pathTimeoutMs?: number;
   stopTimeoutMs?: number;
+  /** Persisted before launch for a resumed transcript whose timestamps are not
+   *  an invocation boundary. Missing keeps legacy late-sampled behavior. */
+  invocationStopFloor?: number | null;
+  /** Exact folded-job probe. Omitted for direct paths and legacy run artifacts. */
+  lifecycleProbe?: () => Promise<PartnerLifecycle>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   /**
    * Resume marker: when true, transcript DISCOVERY resolves a PRE-EXISTING
    * session file rather than a fresh one. Claude/Pi are strict-pinned by their
@@ -52,7 +64,13 @@ export interface TranscriptWatchOptions {
 /** A `waitForTranscriptStop` result that timed out before any stop appeared. */
 export type WaitForStopOutcome =
   | { ok: true; stop: TranscriptStop }
-  | { ok: false; timedOut: true };
+  | { ok: false; timedOut: true }
+  | { ok: false; partnerDied: true; terminal: PartnerLifecycleTerminal };
+
+export type PartnerLifecycleTerminal = Extract<
+  PartnerLifecycle,
+  { kind: "terminal" }
+>;
 
 /**
  * A single-tick transcript-path lookup.
@@ -72,7 +90,12 @@ type TranscriptPathLookup =
  *  DISTINCT non-completed outcome rather than the plain path-timeout. */
 export type WaitForPathOutcome =
   | { ok: true; path: string }
-  | { ok: false; reason: "timeout" | "ambiguous" };
+  | { ok: false; reason: "timeout" | "ambiguous" }
+  | {
+      ok: false;
+      reason: "partner_died";
+      terminal: PartnerLifecycleTerminal;
+    };
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const DEFAULT_PATH_TIMEOUT_MS = 30_000;
@@ -99,9 +122,10 @@ export async function waitForTranscriptPath(
   opts: TranscriptWatchOptions,
 ): Promise<WaitForPathOutcome> {
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const now = opts.now ?? Date.now;
+  const wait = opts.sleep ?? sleep;
   const deadline =
-    Date.now() +
-    (opts.pathTimeoutMs ?? defaultTranscriptPathTimeoutMs(opts.agent));
+    now() + (opts.pathTimeoutMs ?? defaultTranscriptPathTimeoutMs(opts.agent));
 
   while (true) {
     const lookup = findTranscriptPath(opts);
@@ -113,10 +137,14 @@ export async function waitForTranscriptPath(
     if (lookup.kind === "ambiguous") {
       return { ok: false, reason: "ambiguous" };
     }
-    if (Date.now() >= deadline) {
+    const terminal = await probeTerminal(opts.lifecycleProbe);
+    if (terminal !== null) {
+      return { ok: false, reason: "partner_died", terminal };
+    }
+    if (now() >= deadline) {
       return { ok: false, reason: "timeout" };
     }
-    await sleep(pollIntervalMs);
+    await wait(pollIntervalMs);
   }
 }
 
@@ -124,17 +152,16 @@ export async function waitForTranscriptStop(
   opts: TranscriptWatchOptions & { transcriptPath: string },
 ): Promise<WaitForStopOutcome> {
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const deadline = Date.now() + (opts.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
+  const now = opts.now ?? Date.now;
+  const wait = opts.sleep ?? sleep;
+  const deadline = now() + (opts.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS);
 
-  // Resumed pi copies the whole prior conversation into the new session file and
-  // RE-STAMPS every entry with resume-time timestamps, so the started-at window
-  // cannot exclude the copied stops. Anchor on a structural watermark instead: the count
-  // of stops already present when the wait begins. Only a STRICTLY newer stop is
-  // the resumed turn's — sampled ONCE here so a stop the turn appends later is
-  // the first past this floor.
+  // Pi re-stamps copied history on resume. New artifacts persist the structural
+  // floor before launch; old callers retain the former wait-entry sampling.
   const resumeStopFloor =
     opts.isResume === true && opts.agent === "pi"
-      ? countTranscriptStops(opts.agent, opts.transcriptPath)
+      ? (opts.invocationStopFloor ??
+        countTranscriptStops(opts.agent, opts.transcriptPath))
       : null;
 
   while (true) {
@@ -145,17 +172,22 @@ export async function waitForTranscriptStop(
     if (stop !== null) {
       return { ok: true, stop };
     }
-    if (Date.now() >= deadline) {
+    const terminal = await probeTerminal(opts.lifecycleProbe);
+    if (terminal !== null) {
+      return { ok: false, partnerDied: true, terminal };
+    }
+    if (now() >= deadline) {
       return { ok: false, timedOut: true };
     }
-    await sleep(pollIntervalMs);
+    await wait(pollIntervalMs);
   }
 }
 
 /**
- * Resolve the partner's final assistant message from a transcript, scanning the
- * WHOLE file (no started-at filter) so it works on a finished OR an in-flight
- * run — `wait-for-stop` is the blocking primitive; this just reads the latest.
+ * Resolve the partner's final assistant message from a transcript. Run handles
+ * restrict the scan to their timestamp or structural invocation boundary;
+ * boundary-free direct paths scan the whole file. `wait-for-stop` is the
+ * blocking primitive; this just reads the latest.
  * Prefers the text carried on the latest stop event; if that stop is tool-only
  * (no text) it falls back to the latest assistant message with readable text.
  * `found:false` means no stop-or-text-bearing assistant turn was observed —
@@ -164,23 +196,28 @@ export async function waitForTranscriptStop(
  * so neither `sawStop` nor `sawAssistant` flips. `text:null` with `found:true`
  * means a turn was observed but carried no readable text.
  *
- * `opts.isResume` cuts the scan for pi: a resumed pi session file copies the
- * whole prior conversation with resume-time timestamps, so a whole-file scan
- * would surface the PRIOR turn's answer as "latest" on the timed-out partial
- * path. The cut starts at the resumed turn's own prompt (the last user-role
- * entry) so only this turn's output is read. Fresh pi and every other harness
- * scan the whole file, byte-unchanged.
+ * A persisted Pi stop floor is the authoritative resume cut. Legacy resumed Pi
+ * handles fall back to the resumed turn's last user-role entry. Direct paths
+ * and handles without a freshness boundary keep whole-file behavior.
  */
 export function findLastMessage(
   agent: AgentKind,
   path: string,
-  opts?: { isResume?: boolean },
+  opts?: {
+    isResume?: boolean;
+    startedAtMs?: number;
+    invocationStopFloor?: number | null;
+  },
 ): LastMessage {
   const lines = readLines(path);
   const start =
-    opts?.isResume === true && agent === "pi"
-      ? lastPiUserPromptIndex(lines)
-      : 0;
+    agent === "pi" &&
+    opts?.invocationStopFloor !== null &&
+    opts?.invocationStopFloor !== undefined
+      ? lineIndexPastStopFloor(lines, agent, opts.invocationStopFloor)
+      : opts?.isResume === true && agent === "pi"
+        ? lastPiUserPromptIndex(lines)
+        : 0;
 
   let latestStopText: string | null = null;
   let sawStop = false;
@@ -190,6 +227,13 @@ export function findLastMessage(
   for (let i = start; i < lines.length; i++) {
     const parsed = parseJsonObject(lines[i] as string);
     if (parsed === null) {
+      continue;
+    }
+    if (
+      opts?.startedAtMs !== undefined &&
+      opts.startedAtMs > 0 &&
+      !withinStartWindow(parsed, opts.startedAtMs)
+    ) {
       continue;
     }
     const stop = stopFromObject(agent, parsed);
@@ -219,6 +263,23 @@ export function findLastMessage(
  * turn's output; everything before is the re-stamped copied history. 0 when no
  * user entry is found, so the scan falls back to the whole file (nothing to cut).
  */
+function lineIndexPastStopFloor(
+  lines: string[],
+  agent: AgentKind,
+  floor: number,
+): number {
+  if (floor <= 0) return 0;
+  let seen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = parseJsonObject(lines[i] as string);
+    if (parsed !== null && stopFromObject(agent, parsed) !== null) {
+      seen++;
+      if (seen === floor) return i + 1;
+    }
+  }
+  return lines.length;
+}
+
 function lastPiUserPromptIndex(lines: string[]): number {
   let idx = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -350,7 +411,7 @@ function findPiTranscriptInFiles(
  * watermark's floor, sampled ONCE as the wait begins. See {@link
  * waitForTranscriptStop}.
  */
-function countTranscriptStops(agent: AgentKind, path: string): number {
+export function countTranscriptStops(agent: AgentKind, path: string): number {
   let count = 0;
   for (const line of readLines(path)) {
     const parsed = parseJsonObject(line);
@@ -389,6 +450,28 @@ function findStopPastFloor(
     return stop;
   }
   return null;
+}
+
+export function snapshotInvocationStopFloor(
+  opts: TranscriptWatchOptions,
+): number | null {
+  if (opts.agent !== "pi" || opts.isResume !== true) return null;
+  const lookup = findTranscriptPath(opts);
+  return lookup.kind === "found"
+    ? countTranscriptStops(opts.agent, lookup.path)
+    : null;
+}
+
+async function probeTerminal(
+  probe: TranscriptWatchOptions["lifecycleProbe"],
+): Promise<PartnerLifecycleTerminal | null> {
+  if (probe === undefined) return null;
+  try {
+    const outcome = await probe();
+    return outcome.kind === "terminal" ? outcome : null;
+  } catch {
+    return null;
+  }
 }
 
 function findTranscriptStop(

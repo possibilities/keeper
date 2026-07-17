@@ -27,6 +27,7 @@ import {
 import type { ResumeDecision } from "../../src/agent/resume-policy";
 import type { SpawnedChild, SpawnFn, SpawnOptions } from "../../src/agent/run";
 import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
+import type { PartnerLifecycle } from "../../src/agent/transcript-watch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
 
@@ -187,6 +188,7 @@ export interface HarnessOptions {
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
+  probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
 }
@@ -358,6 +360,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
         },
         candidates: [],
       })),
+    probePartnerLifecycleFn:
+      opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),
     cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",
   };
 

@@ -37,7 +37,9 @@ elapsed_seconds
 outcome
 ```
 
-`message` is the captured final assistant message, and `message_found` records whether one was present. `outcome` is one of `completed`, `no_message`, `timed_out`, `no_transcript`, `transcript_ambiguous`, `launch_failed`, or `bad_args`.
+`message` is the captured final assistant message, and `message_found` records whether one was present. `outcome` is one of `completed`, `no_message`, `timed_out`, `no_transcript`, `transcript_ambiguous`, `partner_died`, `launch_failed`, or `bad_args`.
+
+A run-id capture rechecks the exact folded job while discovering and polling its transcript. A fresh settled stop for the invocation wins over later terminal lifecycle evidence. Without such a stop, `partner_died` means that exact job reached `ended` or `killed`; it exits `4` so callers resume or relaunch rather than waiting again. Unknown lifecycle evidence remains a normal transcript wait, and direct transcript-path handles never claim partner death. `wait-for-stop` exposes the same condition as error `reason: "partner_died"` with exit `4`.
 
 ## Final-message deliverable
 

@@ -546,6 +546,21 @@ export function duplicateRegistrationDecision(
   return { kind: "evict", victim };
 }
 
+export function registrationPresenceEffects(sendOnly: boolean): {
+  joinRegistry: boolean;
+  persistChannel: boolean;
+  emitJoin: boolean;
+  removeOnClose: boolean;
+} {
+  const establishPresence = !sendOnly;
+  return {
+    joinRegistry: establishPresence,
+    persistChannel: establishPresence,
+    emitJoin: establishPresence,
+    removeOnClose: establishPresence,
+  };
+}
+
 /**
  * Drop dead-IDENTITY channels from a rehydrated channel set — the boot
  * registry-cache pass. A persisted channel is kept only when its stable
@@ -1233,7 +1248,8 @@ export function startBusServer(
     // `sock=null` ghost), writes no `bus.db` cache row, and emits no `join` (a
     // pure send is not a presence event). All other registrations join the
     // registry + persist + announce.
-    if (!sendOnly) {
+    const presenceEffects = registrationPresenceEffects(sendOnly);
+    if (presenceEffects.joinRegistry) {
       registry.set(channelId, entry);
       try {
         upsertChannel(busDb, channel);
@@ -1265,6 +1281,10 @@ export function startBusServer(
       return;
     }
     const entry = conn.entry;
+    if (!registrationPresenceEffects(entry.ephemeral === true).joinRegistry) {
+      sendError(sock, "send_only", "send-only registrations cannot subscribe");
+      return;
+    }
     if (op.namespaces && op.namespaces.length > 0) {
       entry.namespaces = [...new Set(op.namespaces)];
       entry.channel.namespaces = entry.namespaces;
@@ -1511,7 +1531,7 @@ export function startBusServer(
     // cache row; deleting on its behalf would drop the agent's REAL persisted
     // channel (shared `(pid, start_time)` key) and emit a spurious `part`. Just
     // detach the connection.
-    if (entry.ephemeral === true) {
+    if (!registrationPresenceEffects(entry.ephemeral === true).removeOnClose) {
       conn.entry = null;
       return;
     }

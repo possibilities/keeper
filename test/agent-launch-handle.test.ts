@@ -102,6 +102,7 @@ describe("launchToResolvedHandle", () => {
       stopTimeoutMs: 5000,
       // Fresh launch: not a resume, so discovery keeps its strict-pin/floor path.
       isResume: false,
+      lifecycleJobId: SESSION_ID,
     });
     expect(errs).toEqual([]);
   });
@@ -131,6 +132,7 @@ describe("launchToResolvedHandle", () => {
       transcriptPath: null,
       stopTimeoutMs: null,
       isResume: true,
+      lifecycleJobId: "child-uuid",
     });
     expect(errs).toEqual([]);
   });
