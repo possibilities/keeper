@@ -35,5 +35,5 @@ The smoke asserts against the live wire, not fixtures; keep every wait on `retry
 - [ ] The new named gate runs the suite; correctness gates are unchanged
 
 ## Done summary
-
+Built the ADR 0073 sandboxed real-daemon smoke harness (boot a real keeperd fully sandboxed, hard-deadline tree-kill into a bounded red, one disclosed retry) and the first scenario: assert the served frame/probe contract off the live wire — catching-up frames carry boot.catching_up, the steady-state memo reply omits the header, and the shipped isCaughtUpFrame agrees with both. Registered the slow-daemon named gate (test:slow-daemon), never a correctness gate.
 ## Evidence
