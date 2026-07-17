@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Multi-file status-surface work in a known pattern with a prescribed approach, but it needs Claude-tuned idiom matching at the boot-gate/status-frame seam and care to respect the no-wall-clock-in-fold determinism invariant, without a nameable opus-grade reason.",
+      "task_id": "fn-1311-event-store-operational-thresholds.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T12:48:09.677000Z",
+  "epic_id": "fn-1311-event-store-operational-thresholds",
+  "input_hash": "b6624ab46c0f52b4940c36caab807b265323395379c62968cf32079045ad346b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3059894964,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1311-event-store-operational-thresholds.1\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Multi-file status-surface work in a known pattern with a prescribed approach, but it needs Claude-tuned idiom matching at the boot-gate/status-frame seam and care to respect the no-wall-clock-in-fold determinism invariant, without a nameable opus-grade reason.\",\"confidence\":0.72}]}\n"
+}
