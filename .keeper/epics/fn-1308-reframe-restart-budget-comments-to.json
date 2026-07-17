@@ -7,7 +7,7 @@
     "fn-1307-fit-restart-wait-to-real-boots"
   ],
   "id": "fn-1308-reframe-restart-budget-comments-to",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T10:07:44.694000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T10:07:44.336000Z"
+  "updated_at": "2026-07-17T10:07:44.694000Z"
 }
