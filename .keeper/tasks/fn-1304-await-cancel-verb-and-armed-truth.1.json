@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Latch armed state under no-armed-line",
-  "updated_at": "2026-07-17T08:21:44.233000Z"
+  "updated_at": "2026-07-17T08:32:03.933000Z",
+  "worker_done_at": "2026-07-17T08:32:03.933000Z"
 }

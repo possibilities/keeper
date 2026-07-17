@@ -37,5 +37,7 @@ The missing combined case is the centerpiece: `--no-armed-line` + `--require-tra
 - [ ] Existing await suites stay green
 
 ## Done summary
-
+Latched the armed lifecycle state independent of --no-armed-line in emitArmed (cli/await.ts): the flag now suppresses only the printed line, while state.armed/result.armed flip on the first arming tick. This makes the JSON envelope's armed field truthful and lets --require-transition's edge guard, the reconnect-blip swallow, and progress logging engage under the flag. The emitted armed line's byte shape and all descriptor summaries are unchanged.
 ## Evidence
+- Commits: 29383145e42b88dd8fd840f7cd20a5b99f36e803
+- Tests: bun test ./test/await.test.ts (143 pass), bun test ./test/rpc-handlers.test.ts (72 pass), bun run test:gate (9327 pass, 0 fail), new combined regression test verified red-without-fix: met falsely fires at arm tick
