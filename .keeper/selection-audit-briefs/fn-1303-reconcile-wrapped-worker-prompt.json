@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 1,
+        "insertions": 1
+      },
+      "done_summary": "Reconciled the 'Wait in chunks' paragraph in worker-implement-wrapped.md to key retries on the captured run handle or a fenced transfer, never on discovering a same-name leg by title.",
+      "input_hash": "529765a604a7f97347989e9871a78c0d6902da0c5171597c01f550bf1818420f",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1807,
+      "spec_md": "## Description\n\nFinding F1 (evidence: plugins/plan/template/_partials/worker-implement-wrapped.md\nline 37, the \"Wait in chunks\" paragraph). Task .4 sharpened lines 24 and 33 of\nthis partial to the transfer-not-title rule (\"cleanup is daemon-owned by the run\nhandle/window identity, not by a title\"; \"the bare task-ID name is display-only\")\nand rewrote the cold-restart paragraph (line 35) to key on the exact\nshared-session/window identity resolving to a live leg and resume by handle. But\nthe \"Wait in chunks\" paragraph (line 37) still reads \"On a retry that finds a\nstale same-name leg still live in the shared `wrapped` session, take it over by\nits run handle... rather than double-launching a second `<task-id>` leg.\" The\n\"finds a stale same-name leg... take it over\" framing describes the discovery-by-\nname adoption the epic retires, contradicting the strengthened rule.\n\nFiles:\n- plugins/plan/template/_partials/worker-implement-wrapped.md\n\nReconcile that paragraph so takeover keys on the already-captured run handle (or a\nfenced transfer), never on discovering a same-name window \u2014 matching the phrasing\nthe cold-restart paragraph (line 35) already uses. Do not re-narrate history or\nadd fn-ids; forward-facing guidance only.\n\n## Acceptance\n\n- [ ] The \"Wait in chunks\" paragraph no longer frames takeover as discovering/adopting a same-name leg; it keys strictly on the captured handle or a fenced transfer\n- [ ] The partial's transfer-not-title rule reads consistently across all paragraphs\n- [ ] bun scripts/lint-claude-md.ts stays green if touched; no provenance leakage introduced\n\n## Done summary\nReconciled the 'Wait in chunks' paragraph in worker-implement-wrapped.md to key retries on the captured run handle or a fenced transfer, never on discovering a same-name leg by title.\n## Evidence\n",
+      "task_id": "fn-1303-reconcile-wrapped-worker-prompt.1",
+      "tier": "medium",
+      "title": "Reconcile Wait-in-chunks takeover paragraph"
+    }
+  ],
+  "created_at": "2026-07-17T05:46:09.304000Z",
+  "epic_id": "fn-1303-reconcile-wrapped-worker-prompt",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "529765a604a7f97347989e9871a78c0d6902da0c5171597c01f550bf1818420f",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
