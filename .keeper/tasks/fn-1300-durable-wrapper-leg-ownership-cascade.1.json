@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T03:32:24.550000Z",
+  "depends_on": [],
+  "epic": "fn-1300-durable-wrapper-leg-ownership-cascade",
+  "id": "fn-1300-durable-wrapper-leg-ownership-cascade.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Ownership schema, projections, and folds",
+  "updated_at": "2026-07-17T03:32:24.550000Z"
+}
