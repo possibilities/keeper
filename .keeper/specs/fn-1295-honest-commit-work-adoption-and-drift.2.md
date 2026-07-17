@@ -49,5 +49,5 @@ added with retry-safe semantics.
 - [ ] The touched suites pass plus the fast gate
 
 ## Done summary
-
+Typed receipts_pending outcome distinguishes adoptions blocked solely by un-ingested receipts (with ingest lag + stalled-ingester flag) from genuinely live/unknown owners; ownership_conflict narrowed accordingly; problem-codes documents the new row.
 ## Evidence
