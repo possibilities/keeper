@@ -232,13 +232,16 @@ const REDACTION_PLACEHOLDER = "[REDACTED]";
 // segment is replaced. Interim inline list — structured for replacement by the
 // shared secrets pattern list when that ADR ratifies; until then it deliberately
 // over-matches (a bare `AUTH`/`SECRET` substring), failing toward MORE redaction.
-// The value capture excludes a bare `Bearer` scheme word: on
+// The value capture defers ONLY a space-separated `Bearer ` scheme word: on
 // `Authorization: Bearer <token>` the `AUTH` arm would otherwise capture
 // `Bearer` as the value, redacting the scheme word and stripping the prefix
-// BEARER_RE needs to reach the token — leaking an opaque token. Skipping it
-// hands the whole credential to BEARER_RE below.
+// BEARER_RE needs to reach the token — leaking an opaque token. The lookahead
+// requires the space BEARER_RE itself needs (`bearer\s`), so a glued or
+// punctuated `Bearer<token>`/`bearer.foo` value — which BEARER_RE cannot
+// reach — is still captured and redacted here, keeping the fail toward MORE
+// redaction.
 const SENSITIVE_KEY_RE =
-  /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|SESSION_KEY|COOKIE|AUTH)[A-Z0-9_]*)(\s*[=:]\s*)(?!bearer\b)(\S+)/gi;
+  /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|SESSION_KEY|COOKIE|AUTH)[A-Z0-9_]*)(\s*[=:]\s*)(?!bearer\s)(\S+)/gi;
 
 // A `Bearer <token>` credential: the scheme label survives, the token is redacted.
 const BEARER_RE = /\b(bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi;
