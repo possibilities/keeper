@@ -7,7 +7,7 @@
     "fn-1319-fix-bearer-token-redaction-ordering-in"
   ],
   "id": "fn-1320-close-bearer-prefixed-redaction-leak",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T22:44:47.093000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T22:44:46.492000Z"
+  "updated_at": "2026-07-17T22:44:47.093000Z"
 }
