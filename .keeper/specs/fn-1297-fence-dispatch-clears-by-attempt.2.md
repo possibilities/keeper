@@ -74,5 +74,5 @@ This task activates modern fenced events only after task 1's parser/schema lands
 - [ ] Claimless incident clears remain functional but cannot release exact claims/pending rows, and the producer-coverage, daemon, autopilot, RPC, and typecheck suites pass.
 
 ## Done summary
-
+Activated attempt- and incident-fenced DispatchCleared carriage at every daemon and autopilot producer, revalidating fences at append and gating in-memory/durable gate resets on matching accepted evidence.
 ## Evidence
