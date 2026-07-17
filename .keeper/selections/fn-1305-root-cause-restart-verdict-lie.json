@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in a verdict path where existing tests deceptively pass \u2014 a real debugging task whose fix must close a fixture-vs-live-timing gap, a nameable intelligence-bound reason for opus, at the hard-bug xhigh band since three ranked hypotheses exist rather than a hypothesis-free max hunt.",
+      "task_id": "fn-1305-root-cause-restart-verdict-lie.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-17T09:12:48.997000Z",
+  "epic_id": "fn-1305-root-cause-restart-verdict-lie",
+  "input_hash": "b8da9f89655ed882796692d27aa771d6336cd39966f877f866b742beb6ab4ab2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3101335433,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1305-root-cause-restart-verdict-lie.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant in a verdict path where existing tests deceptively pass \u2014 a real debugging task whose fix must close a fixture-vs-live-timing gap, a nameable intelligence-bound reason for opus, at the hard-bug xhigh band since three ranked hypotheses exist rather than a hypothesis-free max hunt.\",\"confidence\":0.76}]}\n"
+}
