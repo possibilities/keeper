@@ -38,14 +38,15 @@ import {
   commitWorkLockPath,
   currentBranch,
   DEFAULT_BRANCH_FALLBACKS,
-  ensureLaneNodeModulesLink,
   ensureWorktree,
+  ensureWorktreeDepLink,
   enumerateEpicLaneBranches,
   epicIdFromKeeperLaneEntry,
   isBaselineScratchPath,
   isKeeperLaneEntry,
   isLinkedWorktree,
   isLinkedWorktreePure,
+  isWorktreeDepPlant,
   LANE_DIRT_INDEX_MAX_BYTES,
   type LockAcquirer,
   listEpicLaneBranches,
@@ -64,7 +65,9 @@ import {
   resolveDefaultBranch,
   resolveDefaultBranchPure,
   sharedCheckoutDirtSnapshotId,
+  WORKTREE_DEP_LINK_NAME,
   type WorktreeEntry,
+  worktreeDepLinkTarget,
 } from "../src/worktree-git";
 import { repoDirHash } from "../src/worktree-plan";
 import {
@@ -701,115 +704,151 @@ test("ensureWorktree: a failing add throws with git stderr", async () => {
   );
 });
 
-type LaneNodeModulesEntry =
+type WorktreeDepEntry =
   | { kind: "dir" }
   | { kind: "symlink"; resolvesTo: string | null }
   | null;
 
-function fakeLaneNodeModulesFs(
+function fakeWorktreeDepLinkFs(
   sourcePresent: boolean,
-  initialLaneEntry: LaneNodeModulesEntry,
+  initialEntry: WorktreeDepEntry,
 ) {
   const source = "/repo/node_modules";
-  const lane = "/repo.worktrees/lane/node_modules";
+  const worktree = "/repo.worktrees/lane/node_modules";
   const sourceReal = "/private/repo/node_modules";
-  let laneEntry = initialLaneEntry;
+  let entry = initialEntry;
   const symlinks: Array<[string, string, string]> = [];
   let unlinks = 0;
   const missing = () => Object.assign(new Error("missing"), { code: "ENOENT" });
   return {
     fs: {
       async lstat(path: string) {
-        expect(path).toBe(lane);
-        if (laneEntry === null) throw missing();
-        return { isSymbolicLink: () => laneEntry?.kind === "symlink" };
+        expect(path).toBe(worktree);
+        if (entry === null) throw missing();
+        return { isSymbolicLink: () => entry?.kind === "symlink" };
       },
       async realpath(path: string) {
         if (path === source) {
           if (!sourcePresent) throw missing();
           return sourceReal;
         }
-        expect(path).toBe(lane);
-        if (laneEntry?.kind !== "symlink" || laneEntry.resolvesTo === null) {
+        expect(path).toBe(worktree);
+        if (entry?.kind !== "symlink" || entry.resolvesTo === null) {
           throw missing();
         }
-        return laneEntry.resolvesTo;
+        return entry.resolvesTo;
       },
       async symlink(target: string, path: string, type: "dir") {
         symlinks.push([target, path, type]);
-        laneEntry = { kind: "symlink", resolvesTo: sourceReal };
+        entry = { kind: "symlink", resolvesTo: sourceReal };
       },
       async unlink(path: string) {
-        expect(path).toBe(lane);
+        expect(path).toBe(worktree);
         unlinks += 1;
-        laneEntry = null;
+        entry = null;
       },
     },
-    laneEntry: () => laneEntry,
+    entry: () => entry,
     symlinks,
     unlinks: () => unlinks,
   };
 }
 
-test("ensureLaneNodeModulesLink: a bare lane links to its source dependency store", async () => {
-  const fake = fakeLaneNodeModulesFs(true, null);
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+test("ensureWorktreeDepLink: a bare worktree links to its source dependency store", async () => {
+  const fake = fakeWorktreeDepLinkFs(true, null);
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([
     ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
   ]);
-  expect(fake.laneEntry()).toEqual({
+  expect(fake.entry()).toEqual({
     kind: "symlink",
     resolvesTo: "/private/repo/node_modules",
   });
 });
 
-test("ensureLaneNodeModulesLink: a correct link is an idempotent no-op", async () => {
-  const fake = fakeLaneNodeModulesFs(true, {
+test("ensureWorktreeDepLink: a correct link is an idempotent no-op", async () => {
+  const fake = fakeWorktreeDepLinkFs(true, {
     kind: "symlink",
     resolvesTo: "/private/repo/node_modules",
   });
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([]);
   expect(fake.unlinks()).toBe(0);
 });
 
-test("ensureLaneNodeModulesLink: a real lane directory is left untouched", async () => {
-  const fake = fakeLaneNodeModulesFs(true, { kind: "dir" });
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
-  expect(fake.laneEntry()).toEqual({ kind: "dir" });
+test("ensureWorktreeDepLink: a real worktree directory is left untouched", async () => {
+  const fake = fakeWorktreeDepLinkFs(true, { kind: "dir" });
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
+  expect(fake.entry()).toEqual({ kind: "dir" });
   expect(fake.symlinks).toEqual([]);
 });
 
-test("ensureLaneNodeModulesLink: a missing source dependency store is skipped", async () => {
-  const fake = fakeLaneNodeModulesFs(false, null);
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+test("ensureWorktreeDepLink: a missing source dependency store is skipped", async () => {
+  const fake = fakeWorktreeDepLinkFs(false, null);
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.symlinks).toEqual([]);
-  expect(fake.laneEntry()).toBeNull();
+  expect(fake.entry()).toBeNull();
 });
 
-test("ensureLaneNodeModulesLink: a broken lane link is replaced", async () => {
-  const fake = fakeLaneNodeModulesFs(true, {
+test("ensureWorktreeDepLink: a broken link is replaced", async () => {
+  const fake = fakeWorktreeDepLinkFs(true, {
     kind: "symlink",
     resolvesTo: null,
   });
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.unlinks()).toBe(1);
   expect(fake.symlinks).toEqual([
     ["/repo/node_modules", "/repo.worktrees/lane/node_modules", "dir"],
   ]);
 });
 
-test("ensureLaneNodeModulesLink: a stale lane link is replaced", async () => {
-  const fake = fakeLaneNodeModulesFs(true, {
+test("ensureWorktreeDepLink: a stale link is replaced", async () => {
+  const fake = fakeWorktreeDepLinkFs(true, {
     kind: "symlink",
     resolvesTo: "/other/node_modules",
   });
-  await ensureLaneNodeModulesLink("/repo", "/repo.worktrees/lane", fake.fs);
+  await ensureWorktreeDepLink("/repo", "/repo.worktrees/lane", fake.fs);
   expect(fake.unlinks()).toBe(1);
-  expect(fake.laneEntry()).toEqual({
+  expect(fake.entry()).toEqual({
     kind: "symlink",
     resolvesTo: "/private/repo/node_modules",
   });
+});
+
+test("worktreeDepLinkTarget: the planted-artifact definition — WORKTREE_DEP_LINK_NAME joined onto the source checkout", () => {
+  expect(worktreeDepLinkTarget("/repo")).toBe(
+    `/repo/${WORKTREE_DEP_LINK_NAME}`,
+  );
+  expect(WORKTREE_DEP_LINK_NAME).toBe("node_modules");
+});
+
+test("isWorktreeDepPlant: byte-identity against the seam's plant, never by name", () => {
+  const target = worktreeDepLinkTarget("/repo");
+  // The exact link the seam plants → keeper residue.
+  expect(isWorktreeDepPlant("/repo", WORKTREE_DEP_LINK_NAME, target)).toBe(
+    true,
+  );
+  // Same name, a retargeted link → replaced plant, work product not residue.
+  expect(
+    isWorktreeDepPlant("/repo", WORKTREE_DEP_LINK_NAME, "/other/node_modules"),
+  ).toBe(false);
+  // A RESOLVED realpath is not the RAW target the seam wrote → not identical.
+  expect(
+    isWorktreeDepPlant(
+      "/repo",
+      WORKTREE_DEP_LINK_NAME,
+      "/private/repo/node_modules",
+    ),
+  ).toBe(false);
+  // A real (non-symlink) entry carries no link target → never a plant.
+  expect(isWorktreeDepPlant("/repo", WORKTREE_DEP_LINK_NAME, undefined)).toBe(
+    false,
+  );
+  // The seam's target under a different name, or nested, is not the one plant.
+  expect(isWorktreeDepPlant("/repo", "vendor", target)).toBe(false);
+  expect(
+    isWorktreeDepPlant("/repo", `sub/${WORKTREE_DEP_LINK_NAME}`, target),
+  ).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -1399,6 +1438,131 @@ test("backupThenForceRemoveWorktree: a failed snapshot never destroys", async ()
     expect(
       calls.some((c) => argvStartsWith(c.args, "worktree", "remove")),
     ).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenForceRemoveWorktree: a byte-identical dep-link plant is dropped — zero spool entries, no backup failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-plant-only-"));
+  const repo = join(root, "repo");
+  const lane = join(root, "lane");
+  const spool = join(root, "spool");
+  mkdirSync(lane, { recursive: true });
+  // Exactly what the provisioning seam plants for this repo checkout — an untracked
+  // symlink whose raw target is `worktreeDepLinkTarget(repo)`, pointing OUT of the lane.
+  symlinkSync(worktreeDepLinkTarget(repo), join(lane, WORKTREE_DEP_LINK_NAME));
+  const { run, calls } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: `${WORKTREE_DEP_LINK_NAME}\0` },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      repo,
+      entry({ path: lane, branch: "refs/heads/keeper/epic/fn-1-foo" }),
+      run,
+      { spoolDir: spool, snapshotId: () => "snap" },
+    );
+    // Residue only → nothing spooled: no snapshot dir, no index record.
+    expect(result).toEqual({ kind: "removed", snapshotDir: null });
+    expect(existsSync(spool)).toBe(false);
+    // The lane is still force-removed and pruned (the plant deleted with it).
+    expect(
+      calls.some((c) =>
+        argvStartsWith(c.args, "worktree", "remove", "--force", lane),
+      ),
+    ).toBe(true);
+    expect(calls.some((c) => argvStartsWith(c.args, "worktree", "prune"))).toBe(
+      true,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenForceRemoveWorktree: a foreign file spools while a byte-identical plant is dropped", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-plant-mixed-"));
+  const repo = join(root, "repo");
+  const lane = join(root, "lane");
+  const spool = join(root, "spool");
+  mkdirSync(lane, { recursive: true });
+  writeFileSync(join(lane, "loose.txt"), "real work\n");
+  symlinkSync(worktreeDepLinkTarget(repo), join(lane, WORKTREE_DEP_LINK_NAME));
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      // git lists both; only the foreign file must reach the spool.
+      result: { stdout: `loose.txt\0${WORKTREE_DEP_LINK_NAME}\0` },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      repo,
+      entry({ path: lane, branch: "refs/heads/keeper/epic/fn-1-foo" }),
+      run,
+      { spoolDir: spool, snapshotId: () => "snap" },
+    );
+    expect(result).toEqual({
+      kind: "removed",
+      snapshotDir: join(spool, "snap"),
+    });
+    // The foreign file spooled; the plant did not.
+    expect(
+      readFileSync(join(spool, "snap", "untracked", "loose.txt"), "utf8"),
+    ).toBe("real work\n");
+    expect(
+      existsSync(join(spool, "snap", "untracked", WORKTREE_DEP_LINK_NAME)),
+    ).toBe(false);
+    const record = JSON.parse(
+      readFileSync(join(spool, "index.ndjson"), "utf8"),
+    );
+    expect(record.untracked_count).toBe(1);
+    expect(record.untracked_paths).toEqual(["loose.txt"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backupThenForceRemoveWorktree: a replaced plant (real file at the dep-link path) spools as before", async () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-lane-plant-replaced-"));
+  const repo = join(root, "repo");
+  const lane = join(root, "lane");
+  const spool = join(root, "spool");
+  mkdirSync(lane, { recursive: true });
+  // The dep-link path holds real content now — no longer byte-identical, so work product.
+  writeFileSync(
+    join(lane, WORKTREE_DEP_LINK_NAME),
+    "replaced with real work\n",
+  );
+  const { run } = fakeAsyncGit([
+    {
+      when: (a) => argvStartsWith(a, "ls-files", "--others"),
+      result: { stdout: `${WORKTREE_DEP_LINK_NAME}\0` },
+    },
+  ]);
+  try {
+    const result = await backupThenForceRemoveWorktree(
+      repo,
+      entry({ path: lane, branch: "refs/heads/keeper/epic/fn-1-foo" }),
+      run,
+      { spoolDir: spool, snapshotId: () => "snap" },
+    );
+    expect(result).toEqual({
+      kind: "removed",
+      snapshotDir: join(spool, "snap"),
+    });
+    expect(
+      readFileSync(
+        join(spool, "snap", "untracked", WORKTREE_DEP_LINK_NAME),
+        "utf8",
+      ),
+    ).toBe("replaced with real work\n");
+    expect(
+      JSON.parse(readFileSync(join(spool, "index.ndjson"), "utf8"))
+        .untracked_count,
+    ).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -26,10 +26,10 @@
  *
  * `setTimeout`-after-completion with an in-flight skip flag (the builds-worker
  * archetype), runner concurrency ONE. EVERY failure — a checkout that cannot
- * resolve the sha, a frozen-lockfile install drift, a crashed or timed-out suite
- * — is caught inside the loop and folded into an infra-error / timeout leaf a
- * reader can never mistake for green. Nothing escapes to main's onerror/fatalExit:
- * a red or flaky suite must never crash-loop the daemon.
+ * resolve the sha, a crashed or timed-out suite — is caught inside the loop and
+ * folded into an infra-error / timeout leaf a reader can never mistake for
+ * green. Nothing escapes to main's onerror/fatalExit: a red or flaky suite must
+ * never crash-loop the daemon.
  *
  * ## Reap on every path; boot prunes orphans
  *
@@ -76,6 +76,7 @@ import {
 import {
   BASELINE_SCRATCH_PREFIX,
   baselineScratchPathFor,
+  ensureWorktreeDepLink,
   provisionScratchWorktree,
   pruneBaselineScratchWorktrees,
   removeScratchWorktree,
@@ -85,8 +86,6 @@ import {
 
 /** Spool poll cadence — fixed, no backoff. Overridable via workerData (tests). */
 const DEFAULT_POLL_MS = 2_000;
-/** Deadline for `bun install --frozen-lockfile` in a scratch worktree. */
-const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60_000;
 /** Deadline for ONE gate-phase suite run; expiry → a timeout leaf. */
 const DEFAULT_SUITE_DEADLINE_MS = 15 * 60_000;
 /** Cap on spool files parsed per tick — a belt against a pathological spool. */
@@ -117,8 +116,6 @@ export interface BaselineWorkerData {
   worktreesRoot?: string;
   /** Poll cadence override (ms). */
   pollMs?: number;
-  /** Install deadline override (ms). */
-  installTimeoutMs?: number;
   /** Suite-run deadline override (ms). */
   suiteDeadlineMs?: number;
 }
@@ -534,13 +531,12 @@ async function computeBaseline(
   opts: {
     stateDir: string | undefined;
     worktreesRoot: string | undefined;
-    installTimeoutMs: number;
     suiteDeadlineMs: number;
     isShuttingDown: () => boolean;
     run: GitRunner;
   },
 ): Promise<boolean> {
-  const { stateDir, worktreesRoot, installTimeoutMs, suiteDeadlineMs } = opts;
+  const { stateDir, worktreesRoot, suiteDeadlineMs } = opts;
   const key = request.key;
   const leaf = leafPath(key, stateDir);
   const scratchPath = baselineScratchPathFor(
@@ -586,26 +582,12 @@ async function computeBaseline(
     }
     if (opts.isShuttingDown()) return false;
 
-    const install = await runDetached(
-      "bun",
-      ["install", "--frozen-lockfile"],
-      scratchPath,
-      installTimeoutMs,
-    );
+    // Universal provisioning (docs/adr/0074): share the source checkout's
+    // already-installed `node_modules` via the same symlink seam every
+    // keeper-created worktree gets, rather than a per-worktree frozen-lockfile
+    // install — the origin of the missing-dependency red-baseline class.
+    await ensureWorktreeDepLink(request.repoDir, scratchPath);
     if (opts.isShuttingDown()) return false;
-    const installReason = installFailureReason(
-      install.exitCode,
-      install.timedOut,
-    );
-    if (installReason !== null) {
-      const t = tail(install.output);
-      writeOutcome({
-        kind: "infra",
-        infra: "install",
-        message: t.length > 0 ? `${installReason}: ${t}` : installReason,
-      });
-      return leafWritten;
-    }
 
     const gateCmd = readTestGateCommand(scratchPath);
     if (gateCmd === null) {
@@ -823,10 +805,6 @@ function main(): void {
     typeof data.pollMs === "number" && data.pollMs > 0
       ? data.pollMs
       : DEFAULT_POLL_MS;
-  const installTimeoutMs =
-    typeof data.installTimeoutMs === "number" && data.installTimeoutMs > 0
-      ? data.installTimeoutMs
-      : DEFAULT_INSTALL_TIMEOUT_MS;
   const suiteDeadlineMs =
     typeof data.suiteDeadlineMs === "number" && data.suiteDeadlineMs > 0
       ? data.suiteDeadlineMs
@@ -859,7 +837,6 @@ function main(): void {
       : await computeBaseline(group.request, {
           stateDir,
           worktreesRoot,
-          installTimeoutMs,
           suiteDeadlineMs,
           isShuttingDown,
           run,
