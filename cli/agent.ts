@@ -52,6 +52,8 @@
  * dependency.
  */
 
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import {
   KEEPER_AGENT_HELP,
   KEEPER_AGENT_RUNBOOK,
@@ -64,6 +66,191 @@ import {
   type MainDeps,
   realDeps,
 } from "../src/agent/main";
+import { recordedProcessIdentity } from "../src/commit-work/process-identity";
+
+export type TerminableHarness = "claude" | "pi";
+
+export interface TerminableSession {
+  jobId: string;
+  state: string | null;
+  harness: TerminableHarness;
+  pid: number | null;
+  startTime: string | null;
+}
+
+export interface TerminationProcessObservation {
+  identity: "matching" | "gone" | "inconclusive";
+  command: string | null;
+}
+
+export type SessionTerminationResult =
+  | { ok: true; signal: "SIGTERM" | "SIGKILL"; exited: boolean }
+  | {
+      ok: false;
+      reason:
+        | "working"
+        | "identity_unproven"
+        | "command_unowned"
+        | "signal_failed";
+    };
+
+export interface SessionTerminationDeps {
+  probe(pid: number, startTime: string): TerminationProcessObservation;
+  signal(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
+  nowMs(): number;
+  sleep(ms: number): Promise<void>;
+  termGraceMs?: number;
+  pollMs?: number;
+}
+
+/** Match a direct harness executable or its bounded node/bun launcher form. */
+export function isHarnessProcessCommand(
+  command: string,
+  harness: TerminableHarness,
+): boolean {
+  const argv = command.includes("\0")
+    ? command.split("\0").filter(Boolean)
+    : command.trim().split(/\s+/).filter(Boolean);
+  if (basename(argv[0] ?? "") === harness) return true;
+  const launcher = basename(argv[0] ?? "");
+  if (!new Set(["env", "node", "nodejs", "bun"]).has(launcher)) return false;
+  const bounded = argv.slice(1, 4);
+  if (bounded.some((token) => basename(token) === harness)) return true;
+  const packageMarker =
+    harness === "pi" ? "/pi-coding-agent/" : "/claude-code/";
+  return bounded.some((token) => token.includes(packageMarker));
+}
+
+function productionTerminationProbe(
+  pid: number,
+  startTime: string,
+): TerminationProcessObservation {
+  const identity = recordedProcessIdentity(pid, startTime);
+  if (identity !== "matching") return { identity, command: null };
+  try {
+    if (process.platform === "linux") {
+      const command = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+      const finalIdentity = recordedProcessIdentity(pid, startTime);
+      return {
+        identity: finalIdentity,
+        command: finalIdentity === "matching" ? command : null,
+      };
+    }
+    if (process.platform === "darwin") {
+      const result = Bun.spawnSync(
+        ["/bin/ps", "-ww", "-p", String(pid), "-o", "args="],
+        { timeout: 500, stdout: "pipe", stderr: "ignore" },
+      );
+      if (!result.success || result.exitCode !== 0) {
+        return { identity: "inconclusive", command: null };
+      }
+      const command = result.stdout.toString();
+      const finalIdentity = recordedProcessIdentity(pid, startTime);
+      return {
+        identity: finalIdentity,
+        command: finalIdentity === "matching" ? command : null,
+      };
+    }
+  } catch {
+    return { identity: "inconclusive", command: null };
+  }
+  return { identity: "inconclusive", command: null };
+}
+
+export const realSessionTerminationDeps: SessionTerminationDeps = {
+  probe: productionTerminationProbe,
+  signal: (pid, signal) => process.kill(pid, signal),
+  nowMs: () => Date.now(),
+  sleep: (ms) => Bun.sleep(ms),
+};
+
+function confirmedTerminationTarget(
+  observation: TerminationProcessObservation,
+  harness: TerminableHarness,
+): "confirmed" | "gone" | "identity_unproven" | "command_unowned" {
+  if (observation.identity === "gone") return "gone";
+  if (observation.identity !== "matching") return "identity_unproven";
+  if (
+    observation.command === null ||
+    !isHarnessProcessCommand(observation.command, harness)
+  ) {
+    return "command_unowned";
+  }
+  return "confirmed";
+}
+
+/** Identity-rechecked process-only TERM-then-KILL ladder for one tracked Session. */
+export async function terminateSessionProcess(
+  session: TerminableSession,
+  deps: SessionTerminationDeps = realSessionTerminationDeps,
+): Promise<SessionTerminationResult> {
+  if (session.state === "working") return { ok: false, reason: "working" };
+  if (
+    typeof session.state !== "string" ||
+    session.state.length === 0 ||
+    session.pid === null ||
+    !Number.isSafeInteger(session.pid) ||
+    session.pid <= 1 ||
+    session.startTime === null ||
+    session.startTime.length === 0
+  ) {
+    return { ok: false, reason: "identity_unproven" };
+  }
+  const pid = session.pid;
+  const startTime = session.startTime;
+  const first = confirmedTerminationTarget(
+    deps.probe(pid, startTime),
+    session.harness,
+  );
+  if (first === "gone") {
+    return { ok: true, signal: "SIGTERM", exited: true };
+  }
+  if (first !== "confirmed") return { ok: false, reason: first };
+  try {
+    deps.signal(pid, "SIGTERM");
+  } catch {
+    return { ok: false, reason: "signal_failed" };
+  }
+
+  const deadline = deps.nowMs() + (deps.termGraceMs ?? 2_000);
+  const pollMs = deps.pollMs ?? 50;
+  while (deps.nowMs() < deadline) {
+    await deps.sleep(Math.min(pollMs, Math.max(0, deadline - deps.nowMs())));
+    const current = confirmedTerminationTarget(
+      deps.probe(pid, startTime),
+      session.harness,
+    );
+    if (current === "gone") {
+      return { ok: true, signal: "SIGTERM", exited: true };
+    }
+    if (current !== "confirmed") {
+      return {
+        ok: false,
+        reason:
+          current === "command_unowned"
+            ? "command_unowned"
+            : "identity_unproven",
+      };
+    }
+  }
+
+  // The final probe is deliberately adjacent to SIGKILL; a recycled pid or
+  // changed command after TERM never inherits kill authority.
+  const final = confirmedTerminationTarget(
+    deps.probe(pid, startTime),
+    session.harness,
+  );
+  if (final === "gone") {
+    return { ok: true, signal: "SIGTERM", exited: true };
+  }
+  if (final !== "confirmed") return { ok: false, reason: final };
+  try {
+    deps.signal(pid, "SIGKILL");
+    return { ok: true, signal: "SIGKILL", exited: false };
+  } catch {
+    return { ok: false, reason: "signal_failed" };
+  }
+}
 
 /** Bun 1.3 throws this shape when posix_spawn cannot resolve the target. */
 function isSpawnNotFound(err: unknown): err is { path: string } {

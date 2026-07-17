@@ -38,6 +38,10 @@ import {
   ATTRIBUTION_FLOOR_SESSION_ID,
 } from "../git-attribution-floor";
 import type { GitRunner } from "./git-exec";
+import {
+  type RecordedProcessIdentityVerdict,
+  recordedProcessIdentity,
+} from "./process-identity";
 
 export type ClaimLiveness = "live" | "terminal" | "unknown";
 
@@ -49,6 +53,10 @@ export interface OwnershipClaim {
   oid?: string | null;
   mode?: string | null;
   source?: string | null;
+  pid?: number | null;
+  startTime?: string | null;
+  /** Snapshot verdict carried forward so later pure classification cannot re-probe. */
+  processIdentityVerdict?: RecordedProcessIdentityVerdict;
   /** Same-snapshot terminal lifecycle event proven later than this mutation. */
   orderedTerminalProof?: true;
   /** Un-ingested receipts temporarily obscure otherwise-terminal evidence. */
@@ -166,6 +174,11 @@ export interface OwnershipClaimsReadTestHooks {
   daemonAlive?: () => boolean;
   /** Test-only clock for receipts-pending lag diagnostics (Unix seconds). */
   nowSeconds?: () => number;
+  /** Test-only pid-and-start-time witness; production probes the live OS. */
+  processIdentity?: (
+    pid: number,
+    startTime: string,
+  ) => RecordedProcessIdentityVerdict;
 }
 
 const EXCLUDED_PREFIX = ".keeper/";
@@ -913,6 +926,7 @@ export function readOwnershipClaims(
         .query(
           `SELECT fa.file_path, fa.session_id, fa.worktree_oid, fa.worktree_mode,
                   fa.source, fa.last_event_id AS mutation_event_id, j.state,
+                  j.pid, j.start_time,
                   j.last_event_id AS terminal_event_id,
                   terminal.session_id AS terminal_session_id,
                   terminal.hook_event AS terminal_hook_event,
@@ -936,6 +950,8 @@ export function readOwnershipClaims(
         source: string | null;
         mutation_event_id: number | null;
         state: string | null;
+        pid: number | null;
+        start_time: string | null;
         terminal_event_id: number | null;
         terminal_session_id: string | null;
         terminal_hook_event: string | null;
@@ -1011,6 +1027,7 @@ export function readOwnershipClaims(
       const pending = db
         .query(
           `SELECT e.id AS event_id, e.mutation_path, e.session_id, j.state,
+                  j.pid, j.start_time,
                   j.last_event_id AS terminal_event_id,
                   terminal.session_id AS terminal_session_id,
                   terminal.hook_event AS terminal_hook_event,
@@ -1038,6 +1055,8 @@ export function readOwnershipClaims(
         mutation_path: string | null;
         session_id: string;
         state: string | null;
+        pid: number | null;
+        start_time: string | null;
         terminal_event_id: number | null;
         terminal_session_id: string | null;
         terminal_hook_event: string | null;
@@ -1068,9 +1087,12 @@ export function readOwnershipClaims(
           oid: row.worktree_oid,
           mode: row.worktree_mode,
           source: row.source,
+          ...(typeof row.pid === "number" && typeof row.start_time === "string"
+            ? { pid: row.pid, startTime: row.start_time }
+            : {}),
           ...(orderedTerminalProof ? { orderedTerminalProof: true } : {}),
         };
-        claim.liveness = defaultClaimLiveness(claim);
+        claim.liveness = defaultClaimLiveness(claim, () => "inconclusive");
         return claim;
       });
       for (const row of pending) {
@@ -1111,6 +1133,9 @@ export function readOwnershipClaims(
           oid: null,
           mode: null,
           source: "direct",
+          ...(typeof row.pid === "number" && typeof row.start_time === "string"
+            ? { pid: row.pid, startTime: row.start_time }
+            : {}),
           ...(terminalAfterMutation ? { orderedTerminalProof: true } : {}),
         });
       }
@@ -1247,6 +1272,31 @@ export function readOwnershipClaims(
         delete claim.orderedTerminalProof;
         delete claim.receiptsPending;
       }
+      const witnessBySession = new Map<
+        string,
+        RecordedProcessIdentityVerdict
+      >();
+      for (const claim of claims) {
+        if (
+          typeof claim.pid === "number" &&
+          typeof claim.startTime === "string"
+        ) {
+          let verdict = witnessBySession.get(claim.sessionId);
+          if (verdict === undefined) {
+            try {
+              verdict = (testHooks.processIdentity ?? recordedProcessIdentity)(
+                claim.pid,
+                claim.startTime,
+              );
+            } catch {
+              verdict = "inconclusive";
+            }
+            witnessBySession.set(claim.sessionId, verdict);
+          }
+          claim.processIdentityVerdict = verdict;
+        }
+        claim.liveness = defaultClaimLiveness(claim);
+      }
       return claims;
     } finally {
       if (transactionOpen) {
@@ -1267,8 +1317,24 @@ function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
   return readOwnershipClaims(worktree);
 }
 
-function defaultClaimLiveness(claim: OwnershipClaim): ClaimLiveness {
+function defaultClaimLiveness(
+  claim: OwnershipClaim,
+  processIdentity: (
+    pid: number,
+    startTime: string,
+  ) => RecordedProcessIdentityVerdict = recordedProcessIdentity,
+): ClaimLiveness {
   if (claim.state !== undefined) {
+    if (typeof claim.pid === "number" && typeof claim.startTime === "string") {
+      try {
+        const verdict =
+          claim.processIdentityVerdict ??
+          processIdentity(claim.pid, claim.startTime);
+        if (verdict === "gone") return "terminal";
+      } catch {
+        // An unreadable witness never relaxes ownership.
+      }
+    }
     if (claim.state === "working") return "live";
     if (
       claim.orderedTerminalProof === true &&

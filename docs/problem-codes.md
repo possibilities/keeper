@@ -61,6 +61,18 @@ ambiguity.
 | `catalog_read_failed`, `keeper_jobs_unavailable`, `session_not_found`, `session_ambiguous`, `not_tracked`, `job_ambiguous` | `show-job <session-reference>` | Catalog or job resolution failed honestly. Follow `error.recovery`; choose a qualified Session reference or exact job id, and use `keeper history show` for native-only history. | yes; read-only |
 | `read_failed`, `not_found`, `ambiguous` | `show-job` | keeper.db could not be read, no job matched, or several job-only candidates remain. Narrow with exact `--job-id`, `--cwd`, or `--pane`; `--latest` applies only to an explicitly job-only query. | yes; read-only |
 
+`keeper session terminate <session-reference>` resolves through the same catalog,
+opens keeper.db read-only, and signals only an exact non-working process identity.
+It never writes the database; each signal is preceded by a fresh pid, start-time,
+and harness-command check.
+
+| code | meaning / recovery | retry-safe |
+| ---- | ------------------ | ---------- |
+| `session_working` | The resolved Session is working. Let it finish or stop; active work is never terminated. | yes after state changes |
+| `session_identity_unproven` | The pid-and-start-time witness is absent, malformed, changed, or unreadable. Refresh Session state; never signal an unconfirmed pid. | yes with fresh evidence |
+| `session_command_unowned` | The identity-matching pid does not run the recorded Claude/Pi harness command. Inspect the stale or recycled record; do not signal it. | no until reconciled |
+| `session_signal_failed` | TERM or KILL failed after the adjacent identity check. Check permissions and resolve the Session afresh before retrying. | conditional |
+
 `keeper resume` returns before launch for `catalog_read_failed`,
 `session_not_found`, `session_ambiguous`, `picker_cancelled`, `picker_invalid`,
 `artifact_ambiguous`, `artifact_missing`, `artifact_unreadable`,
