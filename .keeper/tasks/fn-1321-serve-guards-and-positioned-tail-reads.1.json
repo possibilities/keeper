@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T23:04:52.354000Z",
+  "depends_on": [],
+  "epic": "fn-1321-serve-guards-and-positioned-tail-reads",
+  "id": "fn-1321-serve-guards-and-positioned-tail-reads.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Stateful socket utf8 decode",
+  "updated_at": "2026-07-17T23:04:52.354000Z"
+}
