@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T12:47:09.643000Z",
+  "depends_on": [],
+  "epic": "fn-1311-event-store-operational-thresholds",
+  "id": "fn-1311-event-store-operational-thresholds.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Expose event-store thresholds in status",
+  "updated_at": "2026-07-17T12:47:09.643000Z"
+}
