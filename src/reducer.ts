@@ -4332,6 +4332,8 @@ function foldDispatchCleared(db: Database, event: Event): void {
       "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id IS NULL",
       [payload.verb, payload.id],
     );
+    // Tokenless NULL clears are transitional; their bounded worst case is one
+    // un-suppressed re-mint, whose stale gate row evictStaleDispatchMintGate reaps.
     db.run(
       "DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id IS NULL",
       [dispatchKey],
@@ -4357,6 +4359,8 @@ function foldDispatchCleared(db: Database, event: Event): void {
       "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
       [payload.verb, payload.id, payload.expectedAttemptId],
     );
+    // Exact-attempt clears are re-fold-safe: attempt_id is the unique `Dispatched`
+    // event id, so a historical clear's attempt id cannot equal a live gate row's.
     db.run(
       "DELETE FROM dispatch_mint_gate WHERE dispatch_key = ? AND attempt_id = ?",
       [dispatchKey, payload.expectedAttemptId],
