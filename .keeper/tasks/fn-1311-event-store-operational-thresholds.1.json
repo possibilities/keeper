@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Expose event-store thresholds in status",
-  "updated_at": "2026-07-17T12:48:09.677000Z"
+  "updated_at": "2026-07-17T13:16:05.719000Z",
+  "worker_done_at": "2026-07-17T13:16:05.719000Z"
 }

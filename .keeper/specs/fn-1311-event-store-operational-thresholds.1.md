@@ -26,5 +26,5 @@ Add an event-store block to the status surface: total event count and DB byte si
 - [ ] Focused suite green; no behavior beyond measurement
 
 ## Done summary
-
+Added event_store block to keeper status --json: event count, DB bytes, and boot-catchup/full-replay duration projections derived from a new durable boot_catchup_stats singleton (never wall-clock at query time).
 ## Evidence
