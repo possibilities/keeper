@@ -8,6 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import {
   existsSync,
   mkdirSync,
@@ -32,6 +33,7 @@ import keeperEventsExtension, {
   historyToolResult,
   type PiEventBindings,
   type PiExtensionApi,
+  type PiExtensionRuntimeOptions,
   type PiObservedEvent,
   type PiSessionContext,
   type PiTranslateMeta,
@@ -44,6 +46,10 @@ import keeperEventsExtension, {
   titleEventBindings,
   translatePiEvent,
 } from "../plugins/keeper/pi-extension/keeper-events";
+import type {
+  MonitorArtifact,
+  MonitorChild,
+} from "../plugins/keeper/pi-extension/monitor-facade";
 import {
   buildPiTurnArgv,
   buildRenameInputText,
@@ -67,6 +73,39 @@ import { piExtensionArgs, piExtensionPath } from "../src/agent/launch-config";
 import { parseDeadLetterLine, parseEventLogLine } from "../src/dead-letter";
 import { slugify as canonicalSlugify } from "../src/slug";
 import { retryUntil } from "./helpers/retry-until";
+
+class ExtensionMonitorChild extends EventEmitter implements MonitorChild {
+  pid = 7331;
+  exitCode: number | null = null;
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  signals: NodeJS.Signals[] = [];
+
+  kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
+    this.signals.push(signal);
+    this.close(null, signal);
+    return true;
+  }
+
+  close(code: number | null, signal: NodeJS.Signals | null = null): void {
+    if (this.exitCode !== null) return;
+    this.exitCode = code ?? (signal === null ? 0 : 128);
+    this.emit("exit", code, signal);
+    this.emit("close", code, signal);
+  }
+}
+
+class ExtensionMonitorArtifact implements MonitorArtifact {
+  closed = false;
+
+  constructor(readonly path: string) {}
+
+  write(): void {}
+
+  close(): void {
+    this.closed = true;
+  }
+}
 
 const META: PiTranslateMeta = {
   jobId: "job-1111-2222",
@@ -127,6 +166,7 @@ describe("pi extension — pure translation", () => {
             type: "shell",
             command: "keeper bus watch --json --lifetime-stdin",
             description: "keeper agent bus",
+            kind: "ambient",
           },
         ],
       },
@@ -137,6 +177,7 @@ describe("pi extension — pure translation", () => {
         type: "shell",
         command: "keeper bus watch --json --lifetime-stdin",
         description: "keeper agent bus",
+        kind: "ambient",
       },
     ]);
   });
@@ -176,6 +217,55 @@ describe("pi extension — pure translation", () => {
       tool_input: { path: "failed.ts", file_path: "failed.ts" },
       is_error: true,
     });
+  });
+
+  test("successful Monitor results lift only a plain non-empty details.taskId", () => {
+    const valid = piEventBindings(
+      {
+        type: "tool_result",
+        toolName: "Monitor",
+        isError: false,
+        details: { taskId: "monitor-42" },
+      },
+      META,
+    );
+    expect(JSON.parse(String(valid?.data)).tool_response).toEqual({
+      taskId: "monitor-42",
+    });
+
+    class HostileDetails {
+      taskId = "inherited-or-classed";
+    }
+    for (const event of [
+      {
+        type: "tool_result",
+        toolName: "Monitor",
+        isError: false,
+        details: new HostileDetails(),
+      },
+      {
+        type: "tool_result",
+        toolName: "Monitor",
+        isError: false,
+        details: { taskId: "   " },
+      },
+      {
+        type: "tool_result",
+        toolName: "Monitor",
+        isError: true,
+        details: { taskId: "failed-monitor" },
+      },
+      {
+        type: "tool_result",
+        toolName: "read",
+        isError: false,
+        details: { taskId: "other-tool" },
+      },
+    ] satisfies PiObservedEvent[]) {
+      expect(
+        JSON.parse(String(piEventBindings(event, META)?.data)).tool_response,
+      ).toBeUndefined();
+    }
   });
 
   test("successful Pi write/edit results carry canonical exclusive mutation evidence", () => {
@@ -702,11 +792,14 @@ describe("pi extension — factory arming + fail-open", () => {
   function keeperEvents(
     pi: PiExtensionApi,
     paths = { eventsLogDir: logDir, deadLetterDir },
+    runtimeOptions: PiExtensionRuntimeOptions = {},
   ): void {
-    keeperEventsExtension(pi, paths);
+    keeperEventsExtension(pi, paths, runtimeOptions);
   }
 
-  function fakePi() {
+  function fakePi(
+    options: { sendMessage?: PiExtensionApi["sendMessage"] } = {},
+  ) {
     const handlers = new Map<
       string,
       ((e: PiObservedEvent, context?: PiSessionContext) => void)[]
@@ -714,10 +807,12 @@ describe("pi extension — factory arming + fail-open", () => {
     const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
     const tools = new Map<string, unknown>();
     const commands: Array<{ name: string; source: string }> = [];
+    const sendCalls: Array<{ message: unknown; options: unknown }> = [];
     return {
       handlers,
       tools,
       commands,
+      sendCalls,
       events: {
         on(event: string, handler: (data: unknown) => void) {
           const set = eventHandlers.get(event) ?? new Set();
@@ -741,7 +836,16 @@ describe("pi extension — factory arming + fail-open", () => {
       },
       fire(kind: string, e: PiObservedEvent, context?: PiSessionContext) {
         for (const h of handlers.get(kind) ?? []) {
-          h(e, context);
+          void h(e, context);
+        }
+      },
+      async fireAsync(
+        kind: string,
+        e: PiObservedEvent,
+        context?: PiSessionContext,
+      ) {
+        for (const h of handlers.get(kind) ?? []) {
+          await h(e, context);
         }
       },
       getCommands() {
@@ -751,6 +855,21 @@ describe("pi extension — factory arming + fail-open", () => {
         const name = (tool as { name?: unknown }).name;
         if (typeof name === "string") tools.set(name, tool);
       },
+      ...(options.sendMessage === undefined
+        ? {}
+        : {
+            sendMessage(message: unknown, sendOptions: unknown) {
+              sendCalls.push({ message, options: sendOptions });
+              options.sendMessage?.(
+                message as Parameters<
+                  NonNullable<PiExtensionApi["sendMessage"]>
+                >[0],
+                sendOptions as Parameters<
+                  NonNullable<PiExtensionApi["sendMessage"]>
+                >[1],
+              );
+            },
+          }),
     };
   }
 
@@ -783,9 +902,9 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(existsSync(join(logDir, `${process.pid}.ndjson`))).toBe(false);
   });
 
-  test("with KEEPER_JOB_ID → registers lifecycle and bus observers", () => {
+  test("with KEEPER_JOB_ID → registers lifecycle, bus observers, and Monitor", () => {
     process.env.KEEPER_JOB_ID = "job-abc";
-    const pi = fakePi();
+    const pi = fakePi({ sendMessage() {} });
     keeperEvents(pi);
     expect([...pi.handlers.keys()].sort()).toEqual([
       "agent_end",
@@ -802,6 +921,7 @@ describe("pi extension — factory arming + fail-open", () => {
       "keeper_history",
       "keeper_commit_work",
       "Task",
+      "Monitor",
     ]);
     const history = pi.tools.get("keeper_history") as {
       description: string;
@@ -810,6 +930,254 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(history.description).toContain("Claude/Pi Session history");
     expect(history.description).not.toContain("Claude Code sessions");
     expect(history.promptGuidelines.join(" ")).toContain("cross-harness");
+  });
+
+  test("missing or throwing Monitor APIs fail open without suppressing other registrations", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+
+    const missing = fakePi();
+    expect(() => keeperEvents(missing)).not.toThrow();
+    expect([...missing.tools.keys()]).toEqual([
+      "keeper_history",
+      "keeper_commit_work",
+      "Task",
+    ]);
+    expect(missing.handlers.has("agent_end")).toBe(true);
+
+    const missingRegistration = fakePi({ sendMessage() {} });
+    Object.assign(missingRegistration, { registerTool: undefined });
+    expect(() => keeperEvents(missingRegistration)).not.toThrow();
+    expect(missingRegistration.tools.size).toBe(0);
+    expect(missingRegistration.handlers.has("session_shutdown")).toBe(true);
+
+    const staleDelivery = fakePi({
+      sendMessage() {
+        throw new Error("stale extension");
+      },
+    });
+    expect(() => keeperEvents(staleDelivery)).not.toThrow();
+    expect([...staleDelivery.tools.keys()]).toEqual([
+      "keeper_history",
+      "keeper_commit_work",
+      "Task",
+      "Monitor",
+    ]);
+
+    const rejectingMonitor = fakePi({ sendMessage() {} });
+    const register = rejectingMonitor.registerTool.bind(rejectingMonitor);
+    rejectingMonitor.registerTool = (tool: unknown) => {
+      if ((tool as { name?: unknown }).name === "Monitor") {
+        throw new Error("Monitor unavailable");
+      }
+      register(tool);
+    };
+    expect(() => keeperEvents(rejectingMonitor)).not.toThrow();
+    expect([...rejectingMonitor.tools.keys()]).toEqual([
+      "keeper_history",
+      "keeper_commit_work",
+      "Task",
+    ]);
+    expect(rejectingMonitor.handlers.has("session_shutdown")).toBe(true);
+  });
+
+  test("Monitor notifications, provenance, and Stop snapshot share one task id", async () => {
+    process.env.KEEPER_JOB_ID = "job-monitor";
+    const child = new ExtensionMonitorChild();
+    const artifact = new ExtensionMonitorArtifact(
+      "/private/monitor-stable.log",
+    );
+    let busLive = false;
+    const busInbox = {
+      start() {
+        busLive = true;
+      },
+      ambientTask() {
+        return busLive
+          ? {
+              id: "pi-bus-9001",
+              type: "shell" as const,
+              command: "keeper bus watch --json --lifetime-stdin",
+              description: "keeper agent bus",
+            }
+          : null;
+      },
+      async stop() {
+        busLive = false;
+      },
+    };
+    const pi = fakePi({ sendMessage() {} });
+    keeperEvents(
+      pi,
+      { eventsLogDir: logDir, deadLetterDir },
+      {
+        busInbox,
+        monitor: {
+          spawn: () => child,
+          allocateTaskId: () => "monitor-stable",
+          createArtifact: () => artifact,
+          killTree: (monitorChild, signal) => monitorChild.kill?.(signal),
+          batchWindowMs: 0,
+        },
+      },
+    );
+
+    try {
+      pi.fire("session_start", { type: "session_start" });
+      const monitor = pi.tools.get("Monitor") as {
+        execute(
+          id: string,
+          params: {
+            command: string;
+            description: string;
+            persistent: boolean;
+          },
+        ): Promise<{
+          details: { taskId: string };
+        }>;
+      };
+      const result = await monitor.execute("call-monitor", {
+        command: "printf 'ready\\n'",
+        description: "readiness probe",
+        persistent: true,
+      });
+      expect(result.details.taskId).toBe("monitor-stable");
+
+      child.stdout.emit("data", Buffer.from("ready\n"));
+      const batchCall = await retryUntil(() =>
+        pi.sendCalls.find(
+          ({ message }) =>
+            (message as { customType?: unknown }).customType ===
+            "keeper-monitor-batch",
+        ),
+      );
+      if (batchCall === null) throw new Error("missing Monitor batch delivery");
+      expect(batchCall.options).toEqual({
+        deliverAs: "steer",
+        triggerTurn: true,
+      });
+      expect((batchCall.message as { content: string }).content).toContain(
+        "monitor-stable",
+      );
+      expect((batchCall.message as { content: string }).content).toMatch(
+        /automated.*not a user message/i,
+      );
+
+      pi.fire("tool_result", {
+        type: "tool_result",
+        toolName: "Monitor",
+        isError: false,
+        content: [{ type: "text", text: "Monitor started: monitor-stable" }],
+        details: { taskId: result.details.taskId },
+      });
+      pi.fire("agent_end", { type: "agent_end" });
+
+      const records = readFileSync(
+        join(logDir, `${process.pid}.ndjson`),
+        "utf8",
+      )
+        .trim()
+        .split("\n")
+        .map((line) => parseEventLogLine(line)?.bindings);
+      const launch = records.find(
+        (bindings) => bindings?.hook_event === "PostToolUse",
+      );
+      expect(JSON.parse(String(launch?.data)).tool_response.taskId).toBe(
+        result.details.taskId,
+      );
+      const stop = records.find((bindings) => bindings?.hook_event === "Stop");
+      expect(JSON.parse(String(stop?.data)).background_tasks).toEqual([
+        {
+          id: "monitor-stable",
+          type: "shell",
+          kind: "monitor",
+          command: "printf 'ready\\n'",
+          description: "readiness probe",
+        },
+        {
+          id: "pi-bus-9001",
+          type: "shell",
+          command: "keeper bus watch --json --lifetime-stdin",
+          description: "keeper agent bus",
+          kind: "ambient",
+        },
+      ]);
+
+      child.close(0);
+      const terminalCall = await retryUntil(() =>
+        pi.sendCalls.find(
+          ({ message }) =>
+            (message as { customType?: unknown }).customType ===
+            "keeper-monitor-terminal",
+        ),
+      );
+      if (terminalCall === null) {
+        throw new Error("missing Monitor terminal delivery");
+      }
+      expect(terminalCall.options).toEqual({
+        deliverAs: "steer",
+        triggerTurn: true,
+      });
+      const terminalText = (terminalCall.message as { content: string })
+        .content;
+      expect(terminalText).toContain("monitor-stable");
+      expect(terminalText).toContain("status: exited");
+      expect(terminalText).toContain("exit code: 0");
+      expect(terminalText).toContain("/private/monitor-stable.log");
+      expect(terminalText).toMatch(/automated.*not a user message/i);
+    } finally {
+      await pi.fireAsync("session_shutdown", {
+        type: "session_shutdown",
+        reason: "new",
+      });
+      expect(busLive).toBe(false);
+    }
+  });
+
+  test("session shutdown fences late Monitor delivery and stops every live task", async () => {
+    process.env.KEEPER_JOB_ID = "job-monitor-shutdown";
+    const child = new ExtensionMonitorChild();
+    const pi = fakePi({ sendMessage() {} });
+    keeperEvents(
+      pi,
+      { eventsLogDir: logDir, deadLetterDir },
+      {
+        monitor: {
+          spawn: () => child,
+          allocateTaskId: () => "monitor-shutdown",
+          createArtifact: () =>
+            new ExtensionMonitorArtifact("/private/monitor-shutdown.log"),
+          killTree: (monitorChild, signal) => monitorChild.kill?.(signal),
+        },
+      },
+    );
+    const monitor = pi.tools.get("Monitor") as {
+      execute(
+        id: string,
+        params: {
+          command: string;
+          description: string;
+          persistent: boolean;
+        },
+      ): Promise<unknown>;
+    };
+    await monitor.execute("call-shutdown", {
+      command: "watch",
+      description: "shutdown probe",
+      persistent: true,
+    });
+    const deliveriesBeforeShutdown = pi.sendCalls.length;
+
+    await pi.fireAsync("session_shutdown", {
+      type: "session_shutdown",
+      reason: "resume",
+    });
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(pi.sendCalls).toHaveLength(deliveriesBeforeShutdown);
+
+    child.stdout.emit("data", Buffer.from("late\n"));
+    child.emit("close", 0, null);
+    await Promise.resolve();
+    expect(pi.sendCalls).toHaveLength(deliveriesBeforeShutdown);
   });
 
   test("session start hides skill commands shadowed by extension aliases", () => {

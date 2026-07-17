@@ -74,6 +74,15 @@ import {
   installPiEditorBorder,
   type PiEditorBorderContext,
 } from "./editor-border.ts";
+import {
+  createMonitorFacadeTool,
+  type MonitorLineBatch,
+  type MonitorTaskSnapshot,
+  type MonitorTerminalOutcome,
+  PiMonitorController,
+  type PiMonitorControllerOptions,
+  type PiMonitorToolDefinition,
+} from "./monitor-facade.ts";
 import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import {
   installShadowedSkillAutocomplete,
@@ -142,7 +151,8 @@ export interface PiExtensionApi extends PiSkillAutocompleteApi {
     tool:
       | PiToolDefinition<unknown>
       | PiTaskToolDefinition
-      | PiCommitWorkToolDefinition,
+      | PiCommitWorkToolDefinition
+      | PiMonitorToolDefinition,
   ): void;
   /** Presence-gated: `/rename` registers only when both this and
    *  `setSessionName` exist (see the `registerRenameCommand` call site). The
@@ -212,6 +222,10 @@ interface PiToolDefinition<TParams> {
 // ---------------------------------------------------------------------------
 
 /** The per-launch identity + context every emitted line carries. */
+type PiBackgroundTask =
+  | MonitorTaskSnapshot
+  | (AmbientBusWatchTask & { kind: "ambient" });
+
 export interface PiTranslateMeta {
   /** `KEEPER_JOB_ID` — the join key to the birth-record row (== jobs.job_id). */
   jobId: string;
@@ -225,8 +239,8 @@ export interface PiTranslateMeta {
   /** Exact Dispatch attempt carried by the launch adapter. Omitted for manual,
    *  legacy, or malformed metadata. */
   dispatchAttemptId?: number;
-  /** Harness-armed background resources reflected on Stop as ambient monitors. */
-  backgroundTasks?: AmbientBusWatchTask[];
+  /** Harness-armed background resources reflected on Stop. */
+  backgroundTasks?: PiBackgroundTask[];
 }
 
 /** One bare-column `events` binding map — the payload of an events-log line.
@@ -325,6 +339,24 @@ function piResultText(content: unknown): string | null {
     parts.push(record.text);
   }
   return parts.length === 0 ? null : parts.join("\n");
+}
+
+function piMonitorTaskId(details: unknown): string | null {
+  try {
+    if (
+      details === null ||
+      typeof details !== "object" ||
+      Array.isArray(details)
+    ) {
+      return null;
+    }
+    const prototype = Object.getPrototypeOf(details);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const taskId = (details as Record<string, unknown>).taskId;
+    return typeof taskId === "string" && taskId.trim() !== "" ? taskId : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface PiMutationPathFs {
@@ -565,6 +597,17 @@ export function piEventBindings(
       const stdout = piResultText(event.content);
       const succeeded = event.isError === false;
       const failed = !succeeded;
+      const taskId =
+        succeeded && toolName === "Monitor"
+          ? piMonitorTaskId(event.details)
+          : null;
+      const toolResponse =
+        stdout === null && taskId === null
+          ? null
+          : {
+              ...(stdout === null ? {} : { stdout }),
+              ...(taskId === null ? {} : { taskId }),
+            };
       const hookEvent = failed ? "PostToolUseFailure" : "PostToolUse";
       return {
         ...base(hookEvent, failed ? "post_tool_use_failure" : "post_tool_use"),
@@ -586,7 +629,7 @@ export function piEventBindings(
           tool_name: toolName,
           tool_input: compatiblePiToolInput(toolName, event.input),
           is_error: failed,
-          ...(stdout === null ? {} : { tool_response: { stdout } }),
+          ...(toolResponse === null ? {} : { tool_response: toolResponse }),
         }),
       };
     }
@@ -1296,6 +1339,61 @@ export function sendPiBusMessage(pi: PiExtensionApi, line: string): void {
   }
 }
 
+function sendPiMonitorBatch(pi: PiExtensionApi, batch: MonitorLineBatch): void {
+  try {
+    pi.sendMessage?.(
+      {
+        customType: "keeper-monitor-batch",
+        content: [
+          "[automated monitor update — not a user message]",
+          `task id: ${batch.taskId}`,
+          `description: ${batch.description}`,
+          "stdout:",
+          ...batch.lines,
+        ].join("\n"),
+        display: true,
+      },
+      { deliverAs: "steer", triggerTurn: true },
+    );
+  } catch {
+    // A session replacement invalidates the old extension API.
+  }
+}
+
+function monitorTerminalDetail(outcome: MonitorTerminalOutcome): string {
+  if (outcome.status === "timed_out") return "timeout reached";
+  if (outcome.signal !== null) return `signal: ${outcome.signal}`;
+  if (outcome.exitCode !== null) return `exit code: ${outcome.exitCode}`;
+  return "exit code: unavailable; signal: none";
+}
+
+function sendPiMonitorTerminal(
+  pi: PiExtensionApi,
+  outcome: MonitorTerminalOutcome,
+): void {
+  try {
+    pi.sendMessage?.(
+      {
+        customType: "keeper-monitor-terminal",
+        content: [
+          "[automated monitor finished — not a user message]",
+          `task id: ${outcome.taskId}`,
+          `description: ${outcome.description}`,
+          `status: ${outcome.status}`,
+          monitorTerminalDetail(outcome),
+          `private output artifact: ${outcome.artifactPath ?? "unavailable"}`,
+          ...(outcome.error === undefined ? [] : [`error: ${outcome.error}`]),
+          `suppressed lines: ${outcome.suppressedLines}`,
+        ].join("\n"),
+        display: true,
+      },
+      { deliverAs: "steer", triggerTurn: true },
+    );
+  } catch {
+    // A session replacement invalidates the old extension API.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // extension factory (pi's default-export entry point)
 // ---------------------------------------------------------------------------
@@ -1303,6 +1401,22 @@ export function sendPiBusMessage(pi: PiExtensionApi, line: string): void {
 /** The keeper env marker whose presence arms the extension. Its value is the
  *  keeper job id every emitted line joins on. */
 const KEEPER_JOB_ID_ENV = "KEEPER_JOB_ID";
+
+type PiMonitorRuntimeOptions = Omit<
+  PiMonitorControllerOptions,
+  "deliverBatch" | "deliverTerminal"
+>;
+
+interface PiBusInboxRuntime {
+  start(): void;
+  ambientTask(): AmbientBusWatchTask | null;
+  stop(): Promise<void>;
+}
+
+export interface PiExtensionRuntimeOptions {
+  monitor?: PiMonitorRuntimeOptions;
+  busInbox?: PiBusInboxRuntime;
+}
 
 /**
  * The pi extension entry point. Registers observer handlers that mirror pi's
@@ -1315,6 +1429,7 @@ const KEEPER_JOB_ID_ENV = "KEEPER_JOB_ID";
 export default function keeperEvents(
   pi: PiExtensionApi,
   injectedStorePaths?: PiEventStorePaths,
+  runtimeOptions: PiExtensionRuntimeOptions = {},
 ): void {
   try {
     const jobId = (process.env[KEEPER_JOB_ID_ENV] ?? "").trim();
@@ -1329,12 +1444,15 @@ export default function keeperEvents(
     const dispatchAttemptId = piDispatchAttemptFromEnv(process.env);
     const busInbox =
       typeof pi.sendMessage === "function"
-        ? new PiBusInboxController({
+        ? (runtimeOptions.busInbox ??
+          new PiBusInboxController({
             deliver: (line) => sendPiBusMessage(pi, line),
-          })
+          }))
         : null;
     const busOwnerToken = {};
     let ownsBusInbox = false;
+    let monitorController: PiMonitorController | null = null;
+    let monitorDeliveryFenced = false;
     let refreshStatusFooter = (): void => {};
 
     const emit = (event: PiObservedEvent, context?: PiSessionContext): void => {
@@ -1344,17 +1462,22 @@ export default function keeperEvents(
             ? context.cwd
             : cwd;
         const observed = preparePiMutationEvent(event, eventCwd);
+        const ambientTask =
+          event.type === "agent_end" ? (busInbox?.ambientTask() ?? null) : null;
         const bindings = piEventBindings(observed, {
           jobId,
           pid,
           cwd: eventCwd,
           tsSec: Date.now() / 1000,
           ...(dispatchAttemptId == null ? {} : { dispatchAttemptId }),
-          ...(event.type === "agent_end" && busInbox !== null
+          ...(event.type === "agent_end"
             ? {
-                backgroundTasks: [busInbox.ambientTask()].filter(
-                  (task): task is AmbientBusWatchTask => task !== null,
-                ),
+                backgroundTasks: [
+                  ...(monitorController?.list() ?? []),
+                  ...(ambientTask === null
+                    ? []
+                    : [{ ...ambientTask, kind: "ambient" as const }]),
+                ],
               }
             : {}),
         });
@@ -1416,6 +1539,12 @@ export default function keeperEvents(
       });
     }
     pi.on("session_shutdown", async () => {
+      monitorDeliveryFenced = true;
+      try {
+        await monitorController?.stopAll();
+      } catch {
+        // Session teardown must remain fail-open for every shutdown reason.
+      }
       if (!ownsBusInbox) return;
       ownsBusInbox = false;
       try {
@@ -1427,10 +1556,49 @@ export default function keeperEvents(
       }
     });
     if (typeof pi.registerTool === "function") {
-      pi.registerTool(HISTORY_TOOL);
-      pi.registerTool(createPiCommitWorkTool());
+      try {
+        pi.registerTool(HISTORY_TOOL);
+      } catch {
+        // One unavailable tool must not suppress the rest of the extension.
+      }
+      try {
+        pi.registerTool(createPiCommitWorkTool());
+      } catch {
+        // One unavailable tool must not suppress the rest of the extension.
+      }
       if (pi.events !== undefined) {
-        pi.registerTool(createTaskFacadeTool(pi.events));
+        try {
+          pi.registerTool(createTaskFacadeTool(pi.events));
+        } catch {
+          // One unavailable tool must not suppress the rest of the extension.
+        }
+      }
+      if (typeof pi.sendMessage === "function") {
+        try {
+          const controller = new PiMonitorController({
+            ...runtimeOptions.monitor,
+            deliverBatch: (batch) => {
+              if (monitorDeliveryFenced) return;
+              try {
+                sendPiMonitorBatch(pi, batch);
+              } catch {
+                // Delivery is advisory and may race session replacement.
+              }
+            },
+            deliverTerminal: (outcome) => {
+              if (monitorDeliveryFenced) return;
+              try {
+                sendPiMonitorTerminal(pi, outcome);
+              } catch {
+                // Delivery is advisory and may race session replacement.
+              }
+            },
+          });
+          pi.registerTool(createMonitorFacadeTool(controller));
+          monitorController = controller;
+        } catch {
+          monitorController = null;
+        }
       }
     }
     if (
