@@ -29,5 +29,5 @@ Live evidence: against a healthy caught-up daemon, `keeper status` reads `event_
 - [ ] Focused status fixtures mirror both live frame shapes
 
 ## Done summary
-
+Moved the event-store block off the ephemeral boot header onto the result frame (baked into the memo line at steady state, stamped on the object frame during catch-up), so keeper status delivers count/bytes/last-boot-catchup/projections against a healthy caught-up daemon; boot-header presence semantics unchanged. Grew the ADR 0073 smoke gate to assert steady-state delivery on the real wire; status fixtures mirror both frame shapes.
 ## Evidence
