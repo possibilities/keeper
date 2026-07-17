@@ -988,7 +988,8 @@ function buildResultLine(
  * Per-connection state, carried on `socket.data` (typed via the
  * `Bun.listen<ConnState>` generic).
  *
- * - `buffer` line-buffers inbound chunks until a `\n` lands (NDJSON framing).
+ * - `buffer` line-buffers decoded inbound chunks until a `\n` lands (NDJSON framing).
+ * - `decoder` preserves UTF-8 codepoints split across socket chunks.
  * - `subs` maps the query's `id` (or `null` for the anonymous-sub sentinel
  *   used by legacy single-sub clients) to its `SubState`. A connection may
  *   carry any number of concurrent subscriptions, each with its own
@@ -1012,10 +1013,11 @@ function buildResultLine(
  *   - An `unsubscribe{id}` deletes just that slot (silent no-op when absent
  *     — idempotent, matches HTTP DELETE 404-as-success).
  *   - An `unsubscribe{}` clears the whole map.
- *   - `close` clears the whole map + drops `pending`.
+ *   - `close` clears the whole map, drops `pending`, and discards decoder tail bytes.
  */
 export interface ConnState {
   buffer: LineBuffer;
+  decoder: TextDecoder;
   subs: Map<string | null, SubState>;
   pending: { bytes: Uint8Array; offset: number } | null;
   /**
@@ -1067,10 +1069,11 @@ export interface ConnState {
   id?: number;
 }
 
-function newConnState(): ConnState {
+export function newConnState(): ConnState {
   const now = Date.now();
   return {
     buffer: new LineBuffer(),
+    decoder: new TextDecoder("utf-8", { fatal: false }),
     subs: new Map(),
     pending: null,
     pendingSince: null,
@@ -2767,6 +2770,7 @@ function readWorldRevOnce(db: Database): number {
  */
 export function freeConn(conns: Set<Writable>, sock: Writable): void {
   conns.delete(sock);
+  flushConnDecoder(sock.data);
   sock.data.subs.clear();
   sock.data.pending = null;
   sock.data.pendingSince = null;
@@ -3865,6 +3869,15 @@ export function startServer(
   };
 }
 
+/** Feed an inbound byte chunk through this connection's UTF-8 decoder and line buffer. */
+export function decodeConnChunk(conn: ConnState, chunk: Uint8Array): string[] {
+  return conn.buffer.push(conn.decoder.decode(chunk, { stream: true }));
+}
+
+export function flushConnDecoder(conn: ConnState): void {
+  conn.decoder.decode();
+}
+
 /**
  * Feed an inbound chunk into the connection's line buffer and dispatch each
  * complete line. An oversized line (no `\n` past the 1 MiB cap) is a fatal
@@ -3884,7 +3897,7 @@ function handleData(
   const w = socket as unknown as Writable;
   let lines: string[];
   try {
-    lines = socket.data.buffer.push(chunk.toString("utf8"));
+    lines = decodeConnChunk(socket.data, chunk);
   } catch (err) {
     if (err instanceof OversizedLineError) {
       writeFrames(
