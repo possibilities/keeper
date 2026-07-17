@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { WrappedLegAbortCapture } from "../src/exec-backend";
 import {
+  assembleWrappedLegAbortPayload,
   buildBusPublishFrame,
   buildBusRegisterFrame,
   buildProviderLegDeathNotice,
@@ -7,11 +9,14 @@ import {
   dueProviderLegDeathNotices,
   ingestProviderLegTerminalRows,
   PROVIDER_LEG_DEATH_NOTICE_MAX_BYTES,
+  PROVIDER_LEG_DEATH_NOTICE_MAX_CAPTURE_BYTES,
   PROVIDER_LEG_DEATH_NOTICE_MAX_DETAIL_BYTES,
   PROVIDER_LEG_DEATH_NOTICE_SEND_CAP,
   type ProviderLegDeathCandidate,
   type ProviderLegTerminalRow,
+  parseProviderLegExitStatus,
   recordProviderLegNoticeResult,
+  redactAbortEvidence,
   resolveUniqueEligibleWrapper,
   runProviderLegDeathNoticeSweep,
   terminalRowToCandidate,
@@ -33,6 +38,7 @@ const terminalRow = (
   close_kind: "pane_closed",
   kill_reason: "exit_watched",
   backend_exec_birth_session_id: "wrapped",
+  terminal_event_data: null,
   leg_launch_id: null,
   wrapper_job_id: null,
   wrapper_dispatch_attempt_id: null,
@@ -51,6 +57,11 @@ const candidate = (
   terminalKind: "killed",
   terminalEventId: 101,
   failureDetail: "pane_closed: exit_watched",
+  abortEvidence: {
+    status: "unavailable",
+    detail: null,
+    exit: { signal: null, code: null },
+  },
   legLaunchId: null,
   wrapperJobId: null,
   wrapperDispatchAttemptId: null,
@@ -168,20 +179,32 @@ describe("bounded versioned notice", () => {
       candidate({
         failureDetail: "💀".repeat(2000),
         transcriptPath: `/${"x".repeat(5000)}`,
+        abortEvidence: {
+          status: "captured",
+          detail: "🔥".repeat(2000),
+          exit: { signal: "SIGKILL", code: null },
+        },
       }),
     );
     expect(notice.payload).toMatchObject({
-      schema_version: 1,
+      schema_version: 2,
       kind: "provider_leg_died",
       terminal_event_id: 101,
       provider_leg_job_id: "provider-leg-1",
       task_id: "fn-1296-notify-wrappers-when-legs-die.2",
       terminal_kind: "killed",
+      abort_capture: {
+        status: "captured",
+        exit: { signal: "SIGKILL", code: null },
+      },
       truncated: true,
     });
     expect(
       Buffer.byteLength(notice.payload.failure_detail ?? "", "utf8"),
     ).toBeLessThanOrEqual(PROVIDER_LEG_DEATH_NOTICE_MAX_DETAIL_BYTES);
+    expect(
+      Buffer.byteLength(notice.payload.abort_capture.detail ?? "", "utf8"),
+    ).toBeLessThanOrEqual(PROVIDER_LEG_DEATH_NOTICE_MAX_CAPTURE_BYTES);
     expect(Buffer.byteLength(notice.body, "utf8")).toBeLessThanOrEqual(
       PROVIDER_LEG_DEATH_NOTICE_MAX_BYTES,
     );
@@ -212,6 +235,134 @@ describe("bounded versioned notice", () => {
     expect(frame.to).toBe("wrapper-1");
     expect(frame.payload.media_type).toBe("application/json");
     expect(frame).not.toHaveProperty("from");
+  });
+});
+
+describe("launch-time abort capture", () => {
+  const SHA = "93f1d67eee729503e7779aee4811aa342061803f";
+  const UUID = "0c764f8c-4b33-4891-b041-d1bf3ba3c21a";
+
+  test("redaction removes secret tokens but preserves SHAs and UUIDs", () => {
+    const raw = [
+      `provider leg ${UUID} at commit ${SHA} booting`,
+      "ANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA",
+      "GH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      "aws creds AKIAIOSFODNN7EXAMPLE and",
+      "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abcDEF123456",
+    ].join("\n");
+    const redacted = redactAbortEvidence(raw);
+
+    // Safe forensic correlators survive untouched.
+    expect(redacted).toContain(SHA);
+    expect(redacted).toContain(UUID);
+
+    // Every recognizable secret is gone.
+    for (const secret of [
+      "sk-ant-api03",
+      "ghp_ABCDEFGHIJKLMNOP",
+      "AKIAIOSFODNN7EXAMPLE",
+      "wJalrXUtnFEMI",
+      "eyJhbGciOiJIUzI1NiJ9",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("[REDACTED]");
+  });
+
+  test("exit status discriminates a signal death from a plain exit code", () => {
+    expect(parseProviderLegExitStatus("137")).toEqual({
+      signal: "SIGKILL",
+      code: null,
+    });
+    expect(parseProviderLegExitStatus("134")).toEqual({
+      signal: "SIGABRT",
+      code: null,
+    });
+    expect(parseProviderLegExitStatus("1")).toEqual({
+      signal: null,
+      code: 1,
+    });
+    for (const garbage of [null, "", "not-a-number", "-4", "999"]) {
+      expect(parseProviderLegExitStatus(garbage)).toEqual({
+        signal: null,
+        code: null,
+      });
+    }
+  });
+
+  test("a captured pane redacts, bounds, and structures its exit status", () => {
+    const capture: WrappedLegAbortCapture = {
+      status: "captured",
+      rawText: `boot failed OPENAI_API_KEY=sk-${"A".repeat(40)} at ${SHA}`,
+      paneDead: true,
+      deadStatus: "137",
+    };
+    const evidence = assembleWrappedLegAbortPayload(capture);
+    expect(evidence.status).toBe("captured");
+    expect(evidence.detail).toContain(SHA);
+    expect(evidence.detail).not.toContain("sk-AAAA");
+    expect(evidence.detail).toContain("[REDACTED]");
+    expect(evidence.exit).toEqual({ signal: "SIGKILL", code: null });
+  });
+
+  test("a huge capture is byte-bounded at the source", () => {
+    const evidence = assembleWrappedLegAbortPayload({
+      status: "captured",
+      rawText: "x".repeat(50_000),
+      paneDead: true,
+      deadStatus: "1",
+    });
+    expect(
+      Buffer.byteLength(evidence.detail ?? "", "utf8"),
+    ).toBeLessThanOrEqual(PROVIDER_LEG_DEATH_NOTICE_MAX_CAPTURE_BYTES);
+    expect(evidence.exit).toEqual({ signal: null, code: 1 });
+  });
+
+  test("an unavailable capture degrades to a typed marker, never raw text", () => {
+    const evidence = assembleWrappedLegAbortPayload({
+      status: "unavailable",
+      reason: "pane absent or capture failed",
+    });
+    expect(evidence).toEqual({
+      status: "unavailable",
+      detail: "capture-unavailable: pane absent or capture failed",
+      exit: { signal: null, code: null },
+    });
+  });
+
+  test("the candidate reads abort evidence back off the immutable Killed payload", () => {
+    const abort = assembleWrappedLegAbortPayload({
+      status: "captured",
+      rawText: "pi: boot aborted",
+      paneDead: true,
+      deadStatus: "134",
+    });
+    const withCapture = terminalRowToCandidate(
+      terminalRow({
+        terminal_event_data: JSON.stringify({
+          pid: 4321,
+          start_time: "111",
+          close_kind: "pane_closed",
+          reason: "exit_watched",
+          abort_capture: abort,
+        }),
+      }),
+      100,
+    );
+    expect(withCapture?.abortEvidence).toEqual(abort);
+
+    // A malformed / absent payload folds to the unavailable marker, never throws.
+    for (const data of [null, "not json{", JSON.stringify({ pid: 1 })]) {
+      expect(
+        terminalRowToCandidate(terminalRow({ terminal_event_data: data }), 100)
+          ?.abortEvidence,
+      ).toEqual({
+        status: "unavailable",
+        detail: null,
+        exit: { signal: null, code: null },
+      });
+    }
   });
 });
 
