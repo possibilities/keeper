@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 89,
+        "files_changed": 4,
+        "insertions": 104
+      },
+      "done_summary": "Extracted the lane-only node_modules symlink into ensureWorktreeDepLink (worktree-git.ts), a universal seam covering task lanes, epic bases, and the baseline runner's scratch worktrees; baseline-worker now provisions via this seam instead of a per-worktree frozen-lockfile install, and exposes WORKTREE_DEP_LINK_NAME/worktreeDepLinkTarget as the planted-artifact definition for the teardown identity test.",
+      "input_hash": "27ca7b542dd5a58b5cd639b04b4c37f571d83939685ebfb1d810e2bc342a860f",
+      "model": "sonnet",
+      "spec_chars": 1998,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/worktree-git.ts, src/autopilot-worker.ts, src/baseline-worker.ts, test/worktree-git.test.ts\n\n### Approach\n\nExtract the lane dependency-symlink provisioning into one exported seam in the worktree-git module and invoke it at every site where keeper creates a worktree \u2014 task lanes (already provisioned), epic bases, the baseline worker's fresh worktrees, and the recover pass's worktrees. The seam records exactly what it plants (link path, link type, target) so the teardown task can classify by byte-identity against the same definition. Enumerate the creation sites by finding every worktree-add call path rather than trusting this spec's file list.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/worktree-git.ts:1533-1566 \u2014 the existing lane provisioning to extract into the seam\n- src/baseline-worker.ts \u2014 the baseline worktree creation site missing provisioning (the red-baseline signature's origin)\n- src/autopilot-worker.ts \u2014 base/recovery worktree creation sites\n\n### Risks\n\n- A worktree-creation site with meaningfully different needs (bare repo probe, ephemeral clone) should skip provisioning explicitly, not accidentally.\n\n## Acceptance\n\n- [ ] Every keeper-created worktree that runs suites receives identical provisioning through the one seam\n- [ ] A baseline suite run in a fresh worktree hits no missing-dependency failures\n- [ ] The seam exposes its planted-artifact definition for the identity test\n\n## Done summary\nExtracted the lane-only node_modules symlink into ensureWorktreeDepLink (worktree-git.ts), a universal seam covering task lanes, epic bases, and the baseline runner's scratch worktrees; baseline-worker now provisions via this seam instead of a per-worktree frozen-lockfile install, and exposes WORKTREE_DEP_LINK_NAME/worktreeDepLinkTarget as the planted-artifact definition for the teardown identity test.\n## Evidence\n",
+      "task_id": "fn-1310-universal-dep-provisioning-and-residue.1",
+      "tier": "xhigh",
+      "title": "Provision deps in every worktree"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 2,
+        "insertions": 273
+      },
+      "done_summary": "Teardown now classifies lane residue by dep-plant byte-identity (ADR 0074): snapshotCheckoutDirt drops keeper-planted node_modules symlinks (raw target == worktreeDepLinkTarget) before spooling, so a plant is never spooled, never counted as dirt, and never trips the out-of-root guard into a backup-failure page; a plant-only lane elides the snapshot entirely. Foreign files and replaced plants keep the exact spool-first path. One seam (isWorktreeDepPlant beside the provisioning code) owns both provisioning and the identity test.",
+      "input_hash": "27ca7b542dd5a58b5cd639b04b4c37f571d83939685ebfb1d810e2bc342a860f",
+      "model": "opus",
+      "spec_chars": 2166,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/autopilot-worker.ts, src/worktree-git.ts, test/autopilot-worker.test.ts, test/worktree-git.test.ts\n\n### Approach\n\nTeach teardown and the lane dirt spool the ADR 0074 classification: before snapshotting a dying worktree's untracked entries, test each against the provisioning seam's planted-artifact definition \u2014 same link type, same target, byte-identical. Matches are keeper residue: deleted freely, never spooled, never counted as dirt for the recover pass's grace/page logic. Everything else \u2014 foreign untracked files, and formerly-provisioned paths whose content was replaced \u2014 keeps the exact spool-first path unchanged. The classification consumes the task-1 seam; no second definition of \"what keeper plants\" may exist.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required** (read before coding):\n- src/autopilot-worker.ts \u2014 the recover pass's dirt evaluation and spool-then-force path (the lane dirt spool discipline in CLAUDE.md's worktree section)\n- src/worktree-git.ts \u2014 the task-1 provisioning seam and its planted-artifact definition\n\n### Risks\n\n- The recover pass's dirt count gates paging; misclassifying a plant as dirt re-introduces noise, misclassifying work as plant destroys it \u2014 the byte-identity test must be exact, with any mismatch spooling.\n\n## Acceptance\n\n- [ ] A dying lane whose only untracked entries are keeper plants tears down with zero spool entries and zero dirt-page noise\n- [ ] A replaced plant and a foreign file both spool exactly as before\n- [ ] Both suites green; no second planted-artifact definition exists\n\n## Done summary\nTeardown now classifies lane residue by dep-plant byte-identity (ADR 0074): snapshotCheckoutDirt drops keeper-planted node_modules symlinks (raw target == worktreeDepLinkTarget) before spooling, so a plant is never spooled, never counted as dirt, and never trips the out-of-root guard into a backup-failure page; a plant-only lane elides the snapshot entirely. Foreign files and replaced plants keep the exact spool-first path. One seam (isWorktreeDepPlant beside the provisioning code) owns both provisioning and the identity test.\n## Evidence\n",
+      "task_id": "fn-1310-universal-dep-provisioning-and-residue.2",
+      "tier": "xhigh",
+      "title": "Byte-identity residue classification"
+    }
+  ],
+  "created_at": "2026-07-17T13:48:24.541000Z",
+  "epic_id": "fn-1310-universal-dep-provisioning-and-residue",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "27ca7b542dd5a58b5cd639b04b4c37f571d83939685ebfb1d810e2bc342a860f",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
