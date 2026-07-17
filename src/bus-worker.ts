@@ -150,6 +150,12 @@ export const CHANNEL_PROBE_BOUND = 16;
  *  agent whose liveness probe momentarily races. */
 export const CHANNEL_PRUNE_GRACE_MS = 5 * 60 * 1000;
 
+/** A socketless row whose identity liveness is unverifiable (probe failed or
+ *  never ran) still ages out past this horizon — day-scale so a legitimate
+ *  suspend/resume heartbeat gap never trips it. Inside the horizon the
+ *  fail-safe keep holds; a live-socket row is never reaped at any age. */
+export const CHANNEL_PRESENCE_HORIZON_MS = 3 * 24 * 60 * 60 * 1000;
+
 /** Pages returned to the OS per tick via `incremental_vacuum` (a no-op unless the
  *  bus.db was born `auto_vacuum=INCREMENTAL`). Bounded so the reclaim never
  *  materializes the whole freelist into the WAL. */
@@ -592,14 +598,17 @@ export type ChannelLiveness =
  * feeds it `connected` (a live socket for this identity right now) and
  * `liveness`.
  *
- * Prune ONLY a row that is provably stale:
+ * Prune ONLY a row that is provably stale, or old enough that an unverifiable
+ * identity is no longer worth the fail-safe keep:
  *  - `connected` → keep. A live socket is present regardless of what any probe
  *    says; this also protects a keeper-miss registration whose stored
  *    `start_time` is a synthetic placeholder that no OS probe would match.
  *  - younger than `graceMs` → keep. A just-registered row whose probe raced.
  *  - identity dead (no process on the pid) → prune.
- *  - alive but the probe returned `null` (transient failure) → keep (fail-safe:
- *    never prune on an inconclusive probe).
+ *  - alive but the probe returned `null` (transient failure, or none was
+ *    possible): keep inside `horizonMs` (fail-safe: never prune on an
+ *    inconclusive probe within the horizon); past `horizonMs` → prune (an
+ *    unverifiable-forever row must not accumulate presence indefinitely).
  *  - alive with a start_time that does NOT match the row → prune (the pid was
  *    recycled by a different process, or the stored start_time is unverifiable).
  *  - alive with a matching start_time → keep (the agent's process is still up).
@@ -610,11 +619,14 @@ export function channelPruneDecision(
   graceMs: number,
   connected: boolean,
   liveness: ChannelLiveness,
+  horizonMs: number,
 ): "keep" | "prune" {
   if (connected) return "keep";
   if (rowAgeMs < graceMs) return "keep";
   if (!liveness.alive) return "prune";
-  if (liveness.startTime === null) return "keep";
+  if (liveness.startTime === null) {
+    return rowAgeMs >= horizonMs ? "prune" : "keep";
+  }
   return liveness.startTime === rowStartTime ? "keep" : "prune";
 }
 
@@ -1708,6 +1720,7 @@ export function startBusServer(
           CHANNEL_PRUNE_GRACE_MS,
           connected,
           liveness,
+          CHANNEL_PRESENCE_HORIZON_MS,
         ) !== "prune"
       ) {
         continue;

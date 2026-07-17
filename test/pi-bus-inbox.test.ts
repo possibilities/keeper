@@ -180,6 +180,25 @@ describe("process-global inbox ownership", () => {
     expect(claimBusInboxOwnership(nested)).toBe(true);
     releaseBusInboxOwnership(nested);
   });
+
+  test("double-claiming the SAME token is idempotent (returns the existing ownership, not a rejection)", () => {
+    const token = {};
+    expect(claimBusInboxOwnership(token)).toBe(true);
+    // A second claim from the identical holder is a no-op re-affirmation, not
+    // a distinct owner colliding with itself.
+    expect(claimBusInboxOwnership(token)).toBe(true);
+    expect(claimBusInboxOwnership(token)).toBe(true);
+    releaseBusInboxOwnership(token);
+  });
+
+  test("release then re-claim of the same identity succeeds", () => {
+    const token = {};
+    expect(claimBusInboxOwnership(token)).toBe(true);
+    releaseBusInboxOwnership(token);
+    // The lease is fully vacated — the same token may claim it fresh.
+    expect(claimBusInboxOwnership(token)).toBe(true);
+    releaseBusInboxOwnership(token);
+  });
 });
 
 describe("parseBusWatchRecord", () => {
