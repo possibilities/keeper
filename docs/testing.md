@@ -49,34 +49,43 @@ zero-to-head and latest-transition migration, representative destructive and bac
 behavior, downgrade refusal, reopen and idempotence, deterministic re-fold equivalence,
 retention keep-set safety, and small file-backed SQLite persistence or corruption
 contracts. Correctness gates contain no opt-in slow tier, real-git promotion gate,
-end-to-end journey, tmux, detached-process, production-scale, or wall-clock proof —
-see Slow tier below for the two gates that do.
+end-to-end journey, tmux, detached-process, production-scale, wall-clock, or fold-cost
+growth-curve proof — see Slow tier below for the three gates that do.
 
 ## Slow tier
 
-Two named gates run real processes OUTSIDE the correctness gates — opt-in, never
-part of `test:gate` / `test` / `test:full`, and never lock-free-violating:
+Three named gates run OUTSIDE the correctness gates — opt-in, never part of
+`test:gate` / `test` / `test:full`, and never lock-free-violating. Two boot real
+subprocesses; the third is a pure in-process perf bench that shares the fast gates'
+`freshMemDb` + `drain` path and earns its own gate solely because timing assertions
+are noisier than correctness assertions, not because it touches any real-process
+boundary:
 
 | Gate | Command | Proves |
 | --- | --- | --- |
 | Real-git publication | `bun run test:slow-git` | `commit-work`'s atomic publication against a real git subprocess. |
 | Real-daemon smoke | `bun run test:slow-daemon` | A sandboxed real keeperd boot and catch-up, the served frame/probe contract, killing a real worker, and the restart CLI's evidence verdict, end to end (ADR 0073). |
+| Fold-cost bench | `bun run test:bench-folds` | The reducer's growth curves stay pinned: the epic-fold memoized index-serving path flat in board size, and the `syncPlanLinks` per-session commit-trailer prefix cost inside a documented regression band. |
 
-Both sandbox every state class under a per-run tmpdir and boot real subprocesses (git,
-a keeperd, its workers) — never the host daemon, never host-wide state or locks. Each
-owns a hard parent wall-clock deadline that force-kills a hang into a bounded red
-result rather than a wedge, and absorbs one disclosed retry to cover environment
-noise; a second failure is red.
+The real-git and real-daemon gates sandbox every state class under a per-run tmpdir
+and boot real subprocesses (git, a keeperd, its workers) — never the host daemon,
+never host-wide state or locks. Each owns a hard parent wall-clock deadline that
+force-kills a hang into a bounded red result rather than a wedge, and absorbs one
+disclosed retry to cover environment noise; a second failure is red. The fold-cost
+bench carries no subprocess or sandbox surface at all — it lives entirely inside one
+`bun:sqlite` `:memory:` connection per size step, bounded only by bun test's own
+`--timeout` flag; a flaky ratio-band assertion is widened, never chased by tightening
+the runtime.
 
 Epic close-finalize runs `test:slow-daemon` automatically, but only when the epic's
 landed diff touches the daemon Load surface — membership decided by
 `scripts/daemon-load-roots.txt`, the same manifest the install reload fingerprint
 hashes, so the gated and the hashed boundaries can never disagree. An epic whose diff
-does not touch the Load surface finalizes unchanged; `test:slow-git` carries no
-finalize conditional of its own. A smoke failure surfaces through the same
-finalize-suite-red operator path as a red merge-suite gate — a visible sticky
-`dispatch_failures` row, never a silent skip — which an operator clears with
-`retry_dispatch` once fixed.
+does not touch the Load surface finalizes unchanged; neither `test:slow-git` nor
+`test:bench-folds` carries a finalize conditional of its own. A smoke failure surfaces
+through the same finalize-suite-red operator path as a red merge-suite gate — a
+visible sticky `dispatch_failures` row, never a silent skip — which an operator clears
+with `retry_dispatch` once fixed.
 
 ## Diagnostics and policy checks
 
