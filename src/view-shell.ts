@@ -625,10 +625,16 @@ export function createViewShell<TSnap>(
   // even though a frame is already painted and no catch-up header has arrived.
   let reconnecting = false;
   let graceExpired = false;
-  // Distinct from the 1500ms banner-restore `flashTimer` (a flash restore must
-  // never clobber the reconnecting pill — see `scheduleFlashRestore`).
+  // Distinct from the 1500ms banner-restore `flashTimer` — a flash restore must
+  // never clobber the reconnecting pill or the post-grace DISCONNECTED banner;
+  // see `scheduleFlashRestore` / `bannerSlotHeld`.
   const RECONNECT_GRACE_MS = 1500;
   const RECONNECTING_PILL = "reconnecting…";
+  // Post-grace banner pill + body-indicator token. All-caps, no ellipsis — a
+  // deliberately distinct word from `RECONNECTING_PILL` so a paused-vs-dead
+  // socket never reads as the same state. "reconnect" is a glossary Avoid
+  // synonym; this is the sole user-visible token for the class.
+  const DISCONNECTED_TOKEN = "DISCONNECTED";
   let reconnectGraceTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Connecting/loading-indicator spinner state. A single `setInterval` (~125ms)
@@ -734,7 +740,21 @@ export function createViewShell<TSnap>(
     return `${glyph}  re-folding event log  ${shownPct.toFixed(1)}%  ${counts}`;
   }
 
+  // The loud post-grace signal: red (SGR 31, the shim's recognized "error"
+  // bucket) plus the plain-text `DISCONNECTED_TOKEN` so the word itself
+  // survives a paint path (passthrough, or a color-stripping terminal) that
+  // drops the escape. Never INVERSE/DIM — both are outside the shim's
+  // recognized set and would strip to nothing.
+  function disconnectedToken(): string {
+    return colorEnabled
+      ? `\x1b[31m${DISCONNECTED_TOKEN}\x1b[0m`
+      : DISCONNECTED_TOKEN;
+  }
+
   // Compose the loading-indicator body for the current tick. Branch precedence:
+  //  0. grace expired → the sole DISCONNECTED line (single owner of the slot
+  //     while active — no re-fold %, no "connecting…", so a genuine drop
+  //     never reads as an ordinary cold-start/catch-up state);
   //  1. fold cursor behind head → re-folding % (wire header while connected,
   //     sqlite poller while unreachable);
   //  2. at head with git seed pending → non-spinning "waiting for git seed";
@@ -742,6 +762,9 @@ export function createViewShell<TSnap>(
   // With no wire header (cold start / unreachable) the sqlite poller drives
   // branch 1, else the plain "connecting to keeperd…" line.
   function formatIndicatorLine(glyph: string): string {
+    if (graceExpired) {
+      return `${glyph}  ${disconnectedToken()} — keeperd unreachable`;
+    }
     const boot = latestBoot;
     if (boot !== undefined) {
       if (boot.rev < boot.head_event_id) {
@@ -811,12 +834,16 @@ export function createViewShell<TSnap>(
   }
 
   // Arm the post-paint disconnect grace: after ~1.5s with no reconnect the body
-  // flips from the held last frame to the full loading indicator.
+  // flips from the held last frame to the full loading indicator, and the
+  // banner pill flips from the reconnecting pill to the DISCONNECTED token
+  // (plain text — the banner is a bare TextRenderable, never SGR-parsed, so
+  // no color wrap here; the body indicator carries the styled signal).
   function armReconnectGrace(): void {
     clearReconnectGrace();
     reconnectGraceTimer = setTimeout(() => {
       reconnectGraceTimer = undefined;
       graceExpired = true;
+      liveShell.setStatus(DISCONNECTED_TOKEN);
       syncIndicator();
     }, RECONNECT_GRACE_MS);
   }
@@ -833,11 +860,28 @@ export function createViewShell<TSnap>(
     restoreBanner();
   }
 
+  // Whether the banner's status slot is currently owned by the reconnecting
+  // pill or the post-grace DISCONNECTED token — while either holds, a
+  // transient flash must never touch the slot (see `flashStatus` /
+  // `handleCopyKey`), and a scheduled restore must reassert the held pill
+  // rather than fall through to the persistent banner.
+  function bannerSlotHeld(): boolean {
+    return reconnecting || graceExpired;
+  }
+
   // Shared banner-flash timer. Transient `[copied …]` / caller-driven
   // flashes share one timer so a fresh flash from any source cancels a
   // pending restore from any other — last-flash-wins, no leaked state.
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function restoreBanner(): void {
+    if (graceExpired) {
+      liveShell.setStatus(DISCONNECTED_TOKEN);
+      return;
+    }
+    if (reconnecting) {
+      liveShell.setStatus(RECONNECTING_PILL);
+      return;
+    }
     liveShell.setStatus(persistentBannerPill ? persistentBannerPill() : "");
   }
   function scheduleFlashRestore(): void {
@@ -868,6 +912,11 @@ export function createViewShell<TSnap>(
     });
     const flashed = frameCount;
     void copyToClipboard(payload).then((res) => {
+      // The reconnecting pill / DISCONNECTED token owns the banner slot
+      // while held — a copy flash landing mid-window must not clobber it.
+      if (bannerSlotHeld()) {
+        return;
+      }
       if (res.ok) {
         liveShell.setStatus(`[copied frame ${flashed}]`);
       } else {
@@ -1275,6 +1324,11 @@ export function createViewShell<TSnap>(
   }
 
   function flashStatus(text: string): void {
+    // Same slot-ownership guard as `handleCopyKey` — a caller-driven flash
+    // must not clobber the reconnecting pill / DISCONNECTED token.
+    if (bannerSlotHeld()) {
+      return;
+    }
     liveShell.setStatus(text);
     scheduleFlashRestore();
   }
