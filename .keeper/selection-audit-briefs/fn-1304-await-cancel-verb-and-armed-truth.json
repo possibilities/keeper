@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 7,
+        "files_changed": 2,
+        "insertions": 67
+      },
+      "done_summary": "Latched the armed lifecycle state independent of --no-armed-line in emitArmed (cli/await.ts): the flag now suppresses only the printed line, while state.armed/result.armed flip on the first arming tick. This makes the JSON envelope's armed field truthful and lets --require-transition's edge guard, the reconnect-blip swallow, and progress logging engage under the flag. The emitted armed line's byte shape and all descriptor summaries are unchanged.",
+      "input_hash": "1c650cb3a5be4b9c3d0ffef5d9f74e415b8f4c9a7a3434c485842962f5c7a264",
+      "model": "opus",
+      "spec_chars": 3120,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/await.ts, test/await.test.ts\n\n### Approach\n\nSeparate \"have I armed\" from \"print the armed line\" (ADR 0072): the armed state latches on arm regardless of `--no-armed-line`; the flag suppresses only the initial line's emission, and the printed line's byte shape stays identical where it is emitted. This makes `--require-transition`'s edge suppression work under the flag (an already-met condition no longer fires at the arm tick, a genuine later transition still fires), makes the JSON envelope's `armed` field truthful, and lets the reconnect-blip swallow and progress logging engage exactly as they do without the flag \u2014 all four reader flips are the intended semantics, not side effects.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/await.ts:1567-1583 \u2014 emitArmed's early return before the latch, and the byte-identical armed-line contract below it\n- cli/await.ts:2397-2434 \u2014 the arming block re-entry and the justArmed/--require-transition edge guard\n- cli/await.ts:1961, 2108 \u2014 the reconnect-blip swallow and progress-log gate that begin engaging once armed latches\n\n**Optional:**\n- test/await.test.ts:1868, 1907, 3487, 691-703 \u2014 existing armed/require-transition/no-armed-line coverage to extend\n- test/await.test.ts:75 \u2014 descriptor summary-match assertion that must keep passing\n\n### Risks\n\n- The latch must not wedge the await \"armed forever\" such that a genuine later transition is missed \u2014 the combined regression test is the gate.\n- The arming block's arm-time refusals (not-found/ambiguous) run once post-latch; confirm none can first arise after the arm tick.\n\n### Test notes\n\nThe missing combined case is the centerpiece: `--no-armed-line` + `--require-transition` with the condition already met at arm (no fire) and with a later genuine edge (fires met). Also assert the JSON envelope reports armed truthfully under the flag.\n\n## Acceptance\n\n- [ ] With both flags set and the condition already met at arm time, the await does not fire at arm and fires on a genuine later transition\n- [ ] The JSON envelope reports the armed state truthfully under the suppression flag\n- [ ] The armed line's emitted byte shape and all descriptor summaries are unchanged\n- [ ] Existing await suites stay green\n\n## Done summary\nLatched the armed lifecycle state independent of --no-armed-line in emitArmed (cli/await.ts): the flag now suppresses only the printed line, while state.armed/result.armed flip on the first arming tick. This makes the JSON envelope's armed field truthful and lets --require-transition's edge guard, the reconnect-blip swallow, and progress logging engage under the flag. The emitted armed line's byte shape and all descriptor summaries are unchanged.\n## Evidence\n- Commits: 29383145e42b88dd8fd840f7cd20a5b99f36e803\n- Tests: bun test ./test/await.test.ts (143 pass), bun test ./test/rpc-handlers.test.ts (72 pass), bun run test:gate (9327 pass, 0 fail), new combined regression test verified red-without-fix: met falsely fires at arm tick",
+      "task_id": "fn-1304-await-cancel-verb-and-armed-truth.1",
+      "tier": "high",
+      "title": "Latch armed state under no-armed-line"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 5,
+        "files_changed": 11,
+        "insertions": 483
+      },
+      "done_summary": "Surfaced the owner-fenced durable-await cancel verb (keeper await cancel <id>, --force override) enforced producer-side in main against the row's arming session, with one uniform not-cancellable refusal; fenced the follow-up fire on the AwaitFiring fold's CAS so a cancel binds rather than advises. Fold stays owner-blind; docs updated.",
+      "input_hash": "1c650cb3a5be4b9c3d0ffef5d9f74e415b8f4c9a7a3434c485842962f5c7a264",
+      "model": "opus",
+      "spec_chars": 4039,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/await.ts, cli/descriptor.ts, src/server-worker.ts, src/await-worker.ts, src/rpc-handlers.ts, test/await.test.ts, test/rpc-handlers.test.ts, test/await-worker.test.ts, plugins/keeper/skills/await/SKILL.md\n\n### Approach\n\nSurface and fence the existing cancel op (ADR 0072). FIRST verify the await worker's fire path is fenced on the row being durably `waiting` within the transaction that records the fire \u2014 add the fence if absent; cancel is advisory without it. Then: main's bridge pre-checks a cancel before appending \u2014 the caller's resolved session must equal the row's recorded arming session (`target_session`), or the request carries the explicit `--force` operator override stamped into the event payload as the acting identity; mismatch, absent row, and already-terminal row all return one uniform not-cancellable refusal; re-cancel of a cancelled row is a no-op success. The fold stays owner-blind (status CAS unchanged) \u2014 enforcement is producer-side only, so historical tokenless cancel events replay identically. Add the `cancel` subcommand to the await CLI + descriptor (summary-match test tracks it), and update the await skill doc's durable section and consolidated armed-line description.\n\n### Investigation targets\n\n*Verify before relying \u2014 planner-verified file:line at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/await-worker.ts \u2014 the claim/fire path; the durable `waiting` fence within the fire's emitting transaction is this task's precondition\n- src/reducer.ts:7234-7242 \u2014 the existing cancel fold (status CAS; stays unchanged)\n- src/server-worker.ts:1664-1668 \u2014 the requestAwait bridge where the producer-side owner pre-check lives (main may read the DB; RPC handlers may not)\n- src/rpc-handlers.ts:837-928 \u2014 the cancel branch's key allowlist to widen for the override marker; stray-key rejection tests track it\n- cli/await.ts:3191-3217 \u2014 the durable send path stamping target_session (the arming identity the fence compares against)\n- cli/descriptor.ts:888-959 \u2014 the await command entry gaining its first subcommand\n\n**Optional:**\n- test/rpc-handlers.test.ts:970, 1009 \u2014 existing cancel-variant tests to extend for fencing\n- src/reducer.ts:4186-4340 \u2014 the fence idiom (\"omitted or malformed grants no authority\") the producer check mirrors\n\n### Risks\n\n- The producer pre-check must read committed projection state; a racy snapshot could authorize against a stale owner.\n- The uniform-refusal rule (foreign, absent, terminal \u2192 same code and message) is easy to erode with helpful error detail; keep it uniform.\n\n### Test notes\n\nDeterministic seams only. Cover: same-session cancel succeeds; foreign session denied uniformly with absent and terminal ids; --force override succeeds and stamps the acting identity in the payload; cancel-then-fire and fire-then-cancel orderings each converge (no follow-up after cancel folds first; idempotent no-op after fire folds first); re-cancel no-op success; malformed payload folds safely.\n\n## Acceptance\n\n- [ ] `keeper await cancel` from the arming session retires a waiting row; the follow-up never fires, including against a concurrent claim\n- [ ] A different session's cancel, an absent id, and a terminal id all produce one uniform not-cancellable refusal; `--force` overrides with the acting identity recorded\n- [ ] The fire path is fenced on durable waiting state in its emitting transaction, proven by an ordering test in both directions\n- [ ] The fold and RPC surface list are unchanged; historical cancel events replay identically\n- [ ] The await skill doc documents the cancel verb and the consolidated armed-line semantics\n\n## Done summary\nSurfaced the owner-fenced durable-await cancel verb (keeper await cancel <id>, --force override) enforced producer-side in main against the row's arming session, with one uniform not-cancellable refusal; fenced the follow-up fire on the AwaitFiring fold's CAS so a cancel binds rather than advises. Fold stays owner-blind; docs updated.\n## Evidence\n",
+      "task_id": "fn-1304-await-cancel-verb-and-armed-truth.2",
+      "tier": "xhigh",
+      "title": "Owner-fenced await cancel verb"
+    }
+  ],
+  "created_at": "2026-07-17T08:55:44.190000Z",
+  "epic_id": "fn-1304-await-cancel-verb-and-armed-truth",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "1c650cb3a5be4b9c3d0ffef5d9f74e415b8f4c9a7a3434c485842962f5c7a264",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
