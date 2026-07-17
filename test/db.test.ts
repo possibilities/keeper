@@ -49,7 +49,7 @@ import {
   SCHEMA_VERSION,
   selectWorldRev,
 } from "../src/db";
-import { drain } from "../src/reducer";
+import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import type { Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -4157,6 +4157,7 @@ test("fn-602: `tier` survives a re-fold from the immutable event log (rides FREE
   // does. The event log is immutable; only the projection is rebuilt.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll(db);
 
   // After re-fold: byte-identical tier value, no NULLing, no shape drift.

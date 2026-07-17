@@ -16,7 +16,12 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
+import {
+  __resetEpicIndexMemoForTest,
+  applyEvent,
+  DEFAULT_BATCH_SIZE,
+  drain,
+} from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import type { Event } from "../src/types";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
@@ -1452,6 +1457,7 @@ test("fold is batch-size-invariant — same log, same projection + cursor (fn-74
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   do {
     n = drain(db, 200);
@@ -2349,6 +2355,7 @@ test("fn-637: re-fold determinism — rewind + DELETE epics + DELETE epic_dep_ed
   // must equal byte-for-byte the pre-rewind rows.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_dep_edges");
   drainAll();
 
@@ -2465,6 +2472,7 @@ test("from-scratch re-fold reproduces `last_validated_at` byte-identically", () 
 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const after = db.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -2514,6 +2522,7 @@ test("from-scratch re-fold reproduces byte-identical epics rows (incl. embedded 
   // pure function of the persisted log — the rebuilt rows must be byte-identical.
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -2656,6 +2665,7 @@ test("from-scratch re-fold reproduces the spliced state across a create→delete
 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   drainAll();
 
@@ -2894,6 +2904,7 @@ test("fn-688: from-scratch re-fold reproduces the full delete -> job-fold -> rec
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM epic_tombstones");
   db.run("DELETE FROM subagent_invocations");
   drainAll();

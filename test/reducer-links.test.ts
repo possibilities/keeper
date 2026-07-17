@@ -16,7 +16,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { drain } from "../src/reducer";
+import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import type { Event } from "../src/types";
 import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
@@ -852,6 +852,7 @@ test("from-scratch re-fold reproduces byte-identical embedded jobs arrays", () =
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -1613,6 +1614,7 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
   // Re-fold from cursor=0.
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM file_attributions");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   expect(drainAll()).toBeGreaterThan(0);
@@ -1755,6 +1757,7 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
   // projections byte-for-byte.
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM file_attributions");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   expect(drainAll()).toBeGreaterThan(0);
@@ -1900,6 +1903,7 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
   db.run("DELETE FROM commit_trailer_facts");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM file_attributions");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   expect(drainAll()).toBeGreaterThan(0);
@@ -1955,6 +1959,7 @@ test("syncPlanLinks: re-fold determinism (rewind + DELETE + drain reproduces byt
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const epicsAfter = db.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -2534,6 +2539,7 @@ function foldIncrementalVsBatch(steps: Array<() => void>): {
   };
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM commit_trailer_facts");
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   drainAll();
@@ -3633,6 +3639,7 @@ test("subagent_invocations re-fold is byte-identical with new arms (failed/unkno
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM subagent_invocations");
   drainAll();
   const after = db
@@ -3844,6 +3851,7 @@ test("subagent_invocations re-fold is byte-identical (rewind + DELETE + drain)",
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM subagent_invocations");
   drainAll();
   const after = db
@@ -3905,6 +3913,7 @@ test("subagent_invocations coexists with plan_links fan-out — both projections
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM subagent_invocations");
   drainAll();
   const subagentAfter = db

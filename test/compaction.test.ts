@@ -40,7 +40,7 @@ import {
   reclaimableLogStep,
   retainColdPayloads,
 } from "../src/compaction";
-import { drain } from "../src/reducer";
+import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -530,6 +530,7 @@ test("retention-then-from-scratch-refold reproduces byte-identical projections",
   db.run("DELETE FROM file_attributions");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   drainAll();
 
   const after = projectionSnapshot();
@@ -565,6 +566,7 @@ test("data-loss sentinel: no false alarm on intentional shed NULLs; flags a miss
   db.run("DELETE FROM file_attributions");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   expect(() => drainAll()).not.toThrow();
   expect(readFoldCursor(db)).toBeGreaterThan(0);
 });
@@ -650,6 +652,7 @@ test("data-loss sentinel: a NULLed final-Stop body stays EXEMPT even though its 
   db.run("DELETE FROM file_attributions");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
   expect(() => drainAll()).not.toThrow();
   expect(monitorsForJob(TEST_UUID)).toEqual([]);
 
