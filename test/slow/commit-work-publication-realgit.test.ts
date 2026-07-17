@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { runForTest as runCommitWorkForTest } from "../../cli/commit-work";
 import {
   chmodSync,
   existsSync,
@@ -120,6 +121,40 @@ function installHook(repo: string, name: string, body: string): void {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function runCommitWorkInRepo(
+  repo: string,
+  run: GitRunner,
+  runLint: () => Promise<void> = async () => {},
+): Promise<{ code: number; stdout: string }> {
+  return runCommitWorkForTest(
+    ["feat: selection-scoped publication", "--session-id", JOB_ID],
+    {
+      cwd: repo,
+      env: {},
+      gitRunner: run,
+      directEvidence: () => ({
+        currentSessionPaths: ["selected.txt"],
+        complete: true,
+      }),
+      readClaims: () => [],
+      runLint,
+      acquireLock: () => ({ release: () => {} }),
+      detectInProgress: async () => null,
+      checkSharedCheckoutJam: () => false,
+      validateIdentity: () => true,
+      validateTaskBinding: () => true,
+      publicationRetrySleep: async () => {},
+      publicationRetryRandom: () => 0,
+      push: async () => ({
+        success: true,
+        pushed: false,
+        skipped: "worktree",
+        branch: "main",
+      }),
+    },
+  );
 }
 
 test("commit-work rejects an actual FIFO input without waiting for a writer", async () => {
@@ -694,6 +729,116 @@ describe("commit-work real-git atomic plumbing publication", () => {
         recording.calls.filter((call) => call.args[0] === "update-ref"),
       ).toHaveLength(1);
       expect(await worktreePaths(repo)).toEqual([repo]);
+    } finally {
+      cleanupPrivateIndex(privateIndex);
+    }
+  });
+
+  test("a non-overlapping HEAD advance is re-frozen and published without rollback", async () => {
+    const { repo, expected } = await repoWithBase();
+    await git(repo, ["switch", "-c", "competitor"]);
+    writeFileSync(join(repo, "other.txt"), "competing change\n");
+    await git(repo, ["add", "--", "other.txt"]);
+    await git(repo, ["commit", "-m", "competitor"]);
+    const competitor = await git(repo, ["rev-parse", "HEAD"]);
+    await git(repo, ["switch", "main"]);
+    writeFileSync(join(repo, "selected.txt"), "keeper candidate\n");
+
+    let publishCalls = 0;
+    const run: GitRunner = async (args, options) => {
+      if (args[0] === "update-ref" && args[1] === "-m") {
+        publishCalls += 1;
+        if (publishCalls === 1) {
+          await git(repo, [
+            "update-ref",
+            "refs/heads/main",
+            competitor,
+            expected,
+          ]);
+        }
+      }
+      return gitExec(args, options);
+    };
+    const result = await runCommitWorkInRepo(repo, run);
+    expect(result.code).toBe(0);
+    const envelope = JSON.parse(result.stdout);
+    expect(envelope.outcome).toBe("committed_push_skipped");
+    expect(publishCalls).toBe(2);
+    const landed = await git(repo, ["rev-parse", "refs/heads/main"]);
+    expect(await git(repo, ["show", "-s", "--format=%P", landed])).toBe(
+      competitor,
+    );
+    expect(
+      await git(repo, ["merge-base", "--is-ancestor", competitor, landed]),
+    ).toBe("");
+  }, 15_000);
+
+  test("an overlapping HEAD advance refuses with the publication attempt count", async () => {
+    const { repo, expected } = await repoWithBase();
+    await git(repo, ["switch", "-c", "competitor"]);
+    writeFileSync(join(repo, "selected.txt"), "competing selected change\n");
+    await git(repo, ["add", "--", "selected.txt"]);
+    await git(repo, ["commit", "-m", "competitor overlap"]);
+    const competitor = await git(repo, ["rev-parse", "HEAD"]);
+    await git(repo, ["switch", "main"]);
+    writeFileSync(join(repo, "selected.txt"), "keeper candidate\n");
+
+    let raced = false;
+    const run: GitRunner = async (args, options) => {
+      if (!raced && args[0] === "update-ref" && args[1] === "-m") {
+        raced = true;
+        await git(repo, [
+          "update-ref",
+          "refs/heads/main",
+          competitor,
+          expected,
+        ]);
+      }
+      return gitExec(args, options);
+    };
+    const result = await runCommitWorkInRepo(repo, run);
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      outcome: "ref_conflict",
+      attempts: 1,
+      commit_sha: expect.stringMatching(/^[0-9a-f]{40,64}$/),
+    });
+    expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(competitor);
+  });
+
+  test("Excluded-prefix churn during lint does not change the selected surface", async () => {
+    const { repo } = await repoWithBase();
+    writeFileSync(join(repo, "selected.txt"), "keeper candidate\n");
+    const result = await runCommitWorkInRepo(repo, gitExec, async () => {
+      mkdirSync(join(repo, ".keeper"), { recursive: true });
+      writeFileSync(join(repo, ".keeper", "runtime-state"), "churn\n");
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).outcome).toBe("committed_push_skipped");
+    expect(readFileSync(join(repo, ".keeper", "runtime-state"), "utf8")).toBe(
+      "churn\n",
+    );
+  });
+
+  test("a hook mutation under the Excluded prefix remains whole-tree guarded", async () => {
+    const { repo, expected } = await repoWithBase();
+    writeFileSync(join(repo, "selected.txt"), "keeper candidate\n");
+    installHook(
+      repo,
+      "pre-commit",
+      "mkdir -p .keeper\nprintf hook > .keeper/hook-state",
+    );
+    const privateIndex = await frozen(repo, ["selected.txt"]);
+    try {
+      await expect(
+        commitFrozenPrivateIndex(
+          privateIndex,
+          "test: whole-tree hook defense",
+          repo,
+          gitExec,
+        ),
+      ).rejects.toMatchObject({ code: "commit_hook_mutated" });
+      expect(await git(repo, ["rev-parse", "refs/heads/main"])).toBe(expected);
     } finally {
       cleanupPrivateIndex(privateIndex);
     }

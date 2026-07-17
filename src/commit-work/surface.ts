@@ -181,7 +181,7 @@ export interface OwnershipClaimsReadTestHooks {
   ) => RecordedProcessIdentityVerdict;
 }
 
-const EXCLUDED_PREFIX = ".keeper/";
+export const EXCLUDED_PREFIX = ".keeper/";
 const DURABLE_CLAIM_LIMIT = 10_000;
 const PENDING_DIRECT_CLAIM_LIMIT = 10_000;
 const RECEIPT_FILE_LIMIT = 1_024;

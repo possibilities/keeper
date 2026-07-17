@@ -14,6 +14,7 @@ import {
 } from "../src/commit-work/identity";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
 import {
+  classifyFrozenHeadAdvance,
   cleanupPrivateIndex,
   commitFrozenPrivateIndex,
   createFrozenPrivateIndex,
@@ -26,6 +27,7 @@ import {
   reconcileAmbientAfterPublication,
   reconcileAmbientIndexEntries,
   refreshFrozenPublicationBaseline,
+  sameFrozenSelectedIdentity,
   verifyFrozenPublicationBaseline,
   verifyFrozenSurface,
 } from "../src/commit-work/private-index";
@@ -39,7 +41,8 @@ import {
   detectInProgressOperation,
   type InProgressOperation,
   isMassReversion,
-  sharedCheckoutJamActive,
+  sharedCheckoutJam,
+  type SharedCheckoutJam,
 } from "../src/commit-work/repo-state";
 import {
   type ClaimLiveness,
@@ -108,6 +111,9 @@ const MAX_ADOPTION_MANIFEST_FILES = 32;
 const MAX_ADOPTION_MANIFEST_PATHS = 10_000;
 const MAX_ADOPTION_PATH_BYTES = 4_096;
 const MAX_ADOPTION_TOTAL_PATH_BYTES = 1_048_576;
+const PUBLICATION_MAX_ATTEMPTS = 3;
+const PUBLICATION_RETRY_JITTER_MIN_MS = 10;
+const PUBLICATION_RETRY_JITTER_SPAN_MS = 20;
 /** Atomic nonblocking open: FIFOs/devices cannot hang before descriptor fstat. */
 export const BOUNDED_INPUT_OPEN_FLAGS =
   constants.O_RDONLY | constants.O_NONBLOCK;
@@ -619,7 +625,11 @@ export interface CommitWorkDeps {
     worktree: string,
     git: GitRunner,
   ) => Promise<InProgressOperation | null>;
-  checkSharedCheckoutJam?: (worktree: string) => boolean;
+  checkSharedCheckoutJam?: (
+    worktree: string,
+  ) => boolean | SharedCheckoutJam | null;
+  publicationRetrySleep?: (ms: number) => Promise<void>;
+  publicationRetryRandom?: () => number;
   push?: typeof pushExactCommit;
   privateIndexFs?: PrivateIndexFs;
   emitOutcome?: (result: CommitWorkResult, identity: string | null) => void;
@@ -628,6 +638,36 @@ export interface CommitWorkDeps {
     identity: string,
     taskId: string,
   ) => boolean | Promise<boolean>;
+}
+
+function probeSharedCheckoutJam(
+  worktree: string,
+  deps: CommitWorkDeps,
+): SharedCheckoutJam | null {
+  const observed = deps.checkSharedCheckoutJam
+    ? deps.checkSharedCheckoutJam(worktree)
+    : sharedCheckoutJam(worktree);
+  if (!observed) return null;
+  if (observed === true) {
+    return {
+      distressRowId: "unknown",
+      clearCondition:
+        "the producer level-trigger observes the shared checkout recovered",
+    };
+  }
+  return observed;
+}
+
+function sharedCheckoutJamFields(
+  jam: SharedCheckoutJam,
+): Record<string, unknown> {
+  return {
+    distress_row_id: jam.distressRowId,
+    clear_condition: jam.clearCondition,
+    recovery:
+      `Wait until distress row ${jam.distressRowId} clears when ${jam.clearCondition}, ` +
+      "or use --override-jam only after inspecting it.",
+  };
 }
 
 async function discover(
@@ -885,9 +925,7 @@ interface CommitWorkAuthorityRow {
 }
 
 export type CommitWorkAuthorityVerdict =
-  | "ok"
-  | "identity_untrusted"
-  | "task_unbound";
+  "ok" | "identity_untrusted" | "task_unbound";
 
 function readCommitWorkAuthorityRow(
   identity: string,
@@ -1208,11 +1246,11 @@ async function runAttempt(
     };
   }
   if (!args.overrideJam) {
-    let jam = false;
+    let jam: SharedCheckoutJam | null = null;
     try {
-      jam = (deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive)(worktree);
+      jam = probeSharedCheckoutJam(worktree, deps);
     } catch {
-      jam = false;
+      jam = null;
     }
     if (jam) {
       return {
@@ -1220,8 +1258,7 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "shared_checkout_jam", false, {
           identity,
-          recovery:
-            "Resolve the shared-checkout jam, or use --override-jam only after inspecting it.",
+          ...sharedCheckoutJamFields(jam),
           selection: selectionEnvelope(advisory, identity),
           surface: advisory.summary,
         }),
@@ -1275,13 +1312,11 @@ async function runAttempt(
       };
     }
     if (!args.overrideJam) {
-      let underLockJam = false;
+      let underLockJam: SharedCheckoutJam | null = null;
       try {
-        underLockJam = (deps.checkSharedCheckoutJam ?? sharedCheckoutJamActive)(
-          worktree,
-        );
+        underLockJam = probeSharedCheckoutJam(worktree, deps);
       } catch {
-        underLockJam = false;
+        underLockJam = null;
       }
       if (underLockJam) {
         return {
@@ -1289,8 +1324,7 @@ async function runAttempt(
           identity,
           result: result("commit-work-result", "shared_checkout_jam", false, {
             identity,
-            recovery:
-              "Resolve the shared-checkout jam, or use --override-jam only after inspecting it.",
+            ...sharedCheckoutJamFields(underLockJam),
           }),
         };
       }
@@ -1639,48 +1673,127 @@ async function runAttempt(
       };
     }
 
-    const publicationFrozen = frozen;
     let committed: Awaited<ReturnType<typeof commitFrozenPrivateIndex>>;
+    let publicationAttempts = 0;
     try {
-      committed = await commitFrozenPrivateIndex(
-        publicationFrozen,
-        commitMessage,
-        worktree,
-        git,
-        deps.privateIndexFs,
-        {
-          beforeCommit: async () => await detect(worktree, git),
-          validateOwnership: async () => {
-            const validateAuthority = async (): Promise<void> => {
-              const verdict = await validateInvocationAuthority();
-              if (verdict !== "ok") {
-                throw new PublicationValidationError(
-                  result("commit-work-result", verdict, false, {
-                    identity,
-                    ...(verdict === "task_unbound"
-                      ? { task_id: args.taskId }
-                      : {}),
-                  }),
+      for (;;) {
+        publicationAttempts += 1;
+        const publicationFrozen = frozen;
+        try {
+          committed = await commitFrozenPrivateIndex(
+            publicationFrozen,
+            commitMessage,
+            worktree,
+            git,
+            deps.privateIndexFs,
+            {
+              beforeCommit: async () => await detect(worktree, git),
+              validateOwnership: async () => {
+                const validateAuthority = async (): Promise<void> => {
+                  const verdict = await validateInvocationAuthority();
+                  if (verdict !== "ok") {
+                    throw new PublicationValidationError(
+                      result("commit-work-result", verdict, false, {
+                        identity,
+                        ...(verdict === "task_unbound"
+                          ? { task_id: args.taskId }
+                          : {}),
+                      }),
+                    );
+                  }
+                };
+                await validateAuthority();
+                const current = await discover(
+                  args,
+                  identity,
+                  worktree,
+                  git,
+                  deps,
                 );
-              }
-            };
-            await validateAuthority();
-            const current = await discover(args, identity, worktree, git, deps);
-            const failure = finalOwnershipFailure(
-              surface,
-              current,
-              publicationFrozen,
-              identity,
-            );
-            if (failure) throw new PublicationValidationError(failure);
-            // Discovery includes Git and bounded durable/receipt scans. Rebind
-            // process/task authority after that potentially-long boundary so
-            // only the immediately following CAS remains.
-            await validateAuthority();
-          },
-          jobId: identity,
-        },
-      );
+                const failure = finalOwnershipFailure(
+                  surface,
+                  current,
+                  publicationFrozen,
+                  identity,
+                );
+                if (failure) throw new PublicationValidationError(failure);
+                await validateAuthority();
+              },
+              jobId: identity,
+            },
+          );
+          break;
+        } catch (error) {
+          if (
+            !(error instanceof PrivateIndexError) ||
+            error.code !== "ref_conflict"
+          ) {
+            throw error;
+          }
+          const refusal = () =>
+            new PrivateIndexError("ref_conflict", error.stderr, {
+              commitSha: error.commitSha,
+              attempts: publicationAttempts,
+            });
+          if (publicationAttempts >= PUBLICATION_MAX_ATTEMPTS) throw refusal();
+          const advance = await classifyFrozenHeadAdvance(
+            publicationFrozen,
+            worktree,
+            git,
+          );
+          if (advance.kind !== "non_overlapping") throw refusal();
+
+          const random = Math.min(
+            1,
+            Math.max(0, (deps.publicationRetryRandom ?? Math.random)()),
+          );
+          const delay =
+            PUBLICATION_RETRY_JITTER_MIN_MS +
+            random * PUBLICATION_RETRY_JITTER_SPAN_MS;
+          await (
+            deps.publicationRetrySleep ??
+            ((ms: number) =>
+              new Promise<void>((resolve) => setTimeout(resolve, ms)))
+          )(delay);
+
+          await verifyFrozenSurface(
+            publicationFrozen,
+            worktree,
+            git,
+            deps.privateIndexFs,
+          );
+          await verifyFrozenPublicationBaseline(
+            publicationFrozen,
+            worktree,
+            git,
+            deps.privateIndexFs,
+          );
+          const replacement = await createFrozenPrivateIndex(
+            worktree,
+            publicationFrozen.paths,
+            git,
+            deps.privateIndexFs,
+          );
+          const latestAdvance = await classifyFrozenHeadAdvance(
+            publicationFrozen,
+            worktree,
+            git,
+          );
+          if (
+            latestAdvance.kind !== "non_overlapping" ||
+            latestAdvance.head !== replacement.expectedHead
+          ) {
+            cleanupPrivateIndex(replacement, deps.privateIndexFs);
+            throw refusal();
+          }
+          if (!sameFrozenSelectedIdentity(publicationFrozen, replacement)) {
+            cleanupPrivateIndex(replacement, deps.privateIndexFs);
+            throw new PrivateIndexError("surface_changed");
+          }
+          cleanupPrivateIndex(publicationFrozen, deps.privateIndexFs);
+          frozen = replacement;
+        }
+      }
     } catch (error) {
       if (error instanceof PublicationValidationError) {
         return { code: 1, identity, result: error.result };
@@ -1695,6 +1808,9 @@ async function runAttempt(
           stderr: capStderr(typed?.stderr),
           stderr_sample: capStderr(typed?.stderr),
           commit_sha: typed?.commitSha,
+          attempts:
+            typed?.attempts ??
+            (code === "ref_conflict" ? publicationAttempts : undefined),
           ...resultFileFields(surface.selected),
           affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
           commit: typed?.commitSha ? { sha: typed.commitSha } : undefined,

@@ -37,11 +37,7 @@ import type { GitRunner } from "./git-exec";
 
 /** The sequencer/merge operations a commit must not run on top of. */
 export type InProgressOperation =
-  | "merge"
-  | "cherry-pick"
-  | "revert"
-  | "rebase"
-  | "bisect";
+  "merge" | "cherry-pick" | "revert" | "rebase" | "bisect";
 
 /**
  * The pseudo-refs whose PRESENCE marks a sequencer op in flight, probed by ref
@@ -124,7 +120,7 @@ export function normalizeRepoDir(p: string): string {
 }
 
 /**
- * True iff a LIVE shared-checkout dirty/desync distress row matches this repo —
+ * Return the LIVE shared-checkout dirty/desync distress row matching this repo —
  * an open `dispatch_failures` row with the synthetic `daemon` verb whose id
  * carries the dirty/desync prefix and whose `dir` normalizes to `worktree`. The
  * gate fires on row PRESENCE (independent of any notified marker — presence means
@@ -136,35 +132,57 @@ export function normalizeRepoDir(p: string): string {
  * commit-work keeps working in a repo with no keeper state. `dbPath` is
  * injectable for the parity/no-DB tests.
  */
-export function sharedCheckoutJamActive(
+export interface SharedCheckoutJam {
+  distressRowId: string;
+  clearCondition: string;
+}
+
+export function sharedCheckoutJam(
   worktree: string,
   dbPath: string = defaultDbPath(),
-): boolean {
+): SharedCheckoutJam | null {
   try {
     const { db } = openDb(dbPath, { readonly: true });
-    let rows: Array<{ dir: string | null }>;
+    let rows: Array<{ id: string; dir: string | null }>;
     try {
       rows = db
         .query(
-          "SELECT dir FROM dispatch_failures WHERE verb = ? " +
-            "AND (id LIKE ? OR id LIKE ?)",
+          "SELECT id, dir FROM dispatch_failures WHERE verb = ? " +
+            "AND (id LIKE ? OR id LIKE ?) ORDER BY id",
         )
         .all(
           SHARED_DIRTY_DISTRESS_VERB,
           `${SHARED_DIRTY_DISTRESS_ID_PREFIX}%`,
           `${SHARED_DESYNC_DISTRESS_ID_PREFIX}%`,
-        ) as Array<{ dir: string | null }>;
+        ) as Array<{ id: string; dir: string | null }>;
     } finally {
       db.close();
     }
     const target = normalizeRepoDir(worktree);
-    return rows.some(
-      (r) =>
-        r.dir != null && r.dir !== "" && normalizeRepoDir(r.dir) === target,
+    const row = rows.find(
+      (candidate) =>
+        candidate.dir != null &&
+        candidate.dir !== "" &&
+        normalizeRepoDir(candidate.dir) === target,
     );
+    if (!row) return null;
+    return {
+      distressRowId: row.id,
+      clearCondition: row.id.startsWith(SHARED_DESYNC_DISTRESS_ID_PREFIX)
+        ? "the producer content probe observes both the index and worktree at the default tip"
+        : "the producer repair sweep observes the shared checkout clean",
+    };
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** Boolean compatibility probe for callers that need no recovery detail. */
+export function sharedCheckoutJamActive(
+  worktree: string,
+  dbPath: string = defaultDbPath(),
+): boolean {
+  return sharedCheckoutJam(worktree, dbPath) !== null;
 }
 
 // ---------------------------------------------------------------------------
