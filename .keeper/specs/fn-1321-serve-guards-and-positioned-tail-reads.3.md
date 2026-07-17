@@ -60,5 +60,5 @@ mismatch (replaced file between stat and open → no offset corruption).
 - [ ] Torn-tail, truncation-reset, poison-line, and byte-offset semantics are unchanged; the full fast correctness gates stay green
 
 ## Done summary
-
+Replaced the events-log ingester's per-tick whole-file read with a positioned read of only the unread [storedOffset, fstat size) range via a new readEventLogUnreadRange helper (open, fstat the open fd, reconcile its inode against the offset row's, short-read loop, finally-close). All existing ingest semantics — byte-parity, torn-tail, truncation-reset, poison — stay green; the suite is extended with short-read looping, fd-lifetime, inode-mismatch, and multibyte byte-offset cases.
 ## Evidence

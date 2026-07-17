@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Positioned events-log tail reads",
-  "updated_at": "2026-07-17T23:07:41.275000Z"
+  "updated_at": "2026-07-17T23:22:29.402000Z",
+  "worker_done_at": "2026-07-17T23:22:29.402000Z"
 }
