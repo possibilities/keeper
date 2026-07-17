@@ -16,13 +16,14 @@
  *    registry in the worker is the runtime source of truth. Rehydrated at boot
  *    and pruned in steady state by `(pid, start_time)` IDENTITY liveness (not
  *    pid alone), so an OS-recycled pid can never keep a stale row alive.
- *  - `messages`  — durable forensic log under a RETENTION contract: rows past the
- *    age horizon are pruned in paced micro-batches (never one bulk DELETE), so
- *    the table stays bounded under steady churn. The lone exception is an
- *    UNDELIVERED `queued_for_wake` row — the sole durable consumer
- *    ({@link selectQueuedForWake}) — which survives regardless of age. `id`
- *    autoincrement stays the monotonic cursor: pruning removes only the oldest
- *    tail, never the max id.
+ *  - `messages`  — durable forensic log under a RETENTION contract: rows aged past
+ *    the horizon are pruned in paced micro-batches (never one bulk DELETE), so the
+ *    table stays bounded under steady churn. The prune advances THROUGH an immune
+ *    head — an UNDELIVERED `queued_for_wake` row (the sole durable consumer,
+ *    {@link selectQueuedForWake}) survives regardless of age, but never parks the
+ *    prune behind it: a partial index over the non-immune rows serves the scan in
+ *    O(batch) no matter how long the immune prefix grows. The newest rows sit
+ *    within the horizon, so `id` autoincrement stays the monotonic replay cursor.
  *
  * Sole-writer: the bus worker owns the single writable connection. These helpers
  * are pure over a passed `Database` handle so they unit-test in-process.
@@ -92,7 +93,37 @@ CREATE TABLE IF NOT EXISTS messages (
 
 const CREATE_MESSAGES_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_messages_ns_id ON messages(namespace, id)",
+  // Partial index over the NON-immune rows only — the retention prune walks it in
+  // id order to reach aged eligible rows without scanning the immune head, so a
+  // per-tick prune stays O(batch) regardless of how far the `queued_for_wake`
+  // prefix grows. The predicate matches the prune query's `status IS NOT
+  // 'queued_for_wake'` term verbatim so the planner honors it; `IS NOT` is
+  // NULL-safe, so a plain NULL-status row is indexed (only `queued_for_wake` is
+  // excluded). A row that flips off `queued_for_wake` enters the index on that
+  // UPDATE — no watermark cursor strands it.
+  "CREATE INDEX IF NOT EXISTS idx_messages_prune ON messages(id) WHERE status IS NOT 'queued_for_wake'",
 ];
+
+/**
+ * Create one index fail-open. An index is a pure query optimization — a
+ * create-if-missing the installed SQLite rejects (e.g. a partial-index predicate
+ * on a build older than 3.8.0) must degrade to an unindexed scan, NEVER wedge the
+ * boot-critical migrate. A predicate rejection is a parse error (`SQLITE_ERROR`),
+ * which does not abort the enclosing transaction, so the ladder proceeds and
+ * `PRAGMA user_version` still commits. The retention prune's eligible-row query is
+ * correct with or without its partial index; absent it, the scan degrades to a
+ * documented immune-prefix walk rather than parking.
+ */
+function createIndexFailOpen(db: Database, ddl: string): void {
+  try {
+    db.run(ddl);
+  } catch (err) {
+    console.error(
+      `[bus-db] skipping unsupported index (non-fatal): ${ddl}`,
+      err,
+    );
+  }
+}
 
 /**
  * Run the bus's forward-only migrate ladder against an OPEN connection. Idempotent:
@@ -118,9 +149,9 @@ export function migrateBusDb(db: Database): void {
   }
   db.transaction(() => {
     db.run(CREATE_CHANNELS);
-    for (const ddl of CREATE_CHANNELS_INDEXES) db.run(ddl);
+    for (const ddl of CREATE_CHANNELS_INDEXES) createIndexFailOpen(db, ddl);
     db.run(CREATE_MESSAGES);
-    for (const ddl of CREATE_MESSAGES_INDEXES) db.run(ddl);
+    for (const ddl of CREATE_MESSAGES_INDEXES) createIndexFailOpen(db, ddl);
     if (stored < 2) {
       db.run("ALTER TABLE messages ADD COLUMN payload_media_type TEXT");
       db.run("ALTER TABLE messages ADD COLUMN artifact_id TEXT");
@@ -454,53 +485,62 @@ export function selectQueuedForWake(
 }
 
 /**
- * Age-horizon message retention: delete up to `batchSize` of the OLDEST messages
- * whose delivery time (falling back to `ts`) is strictly before `cutoffTs`,
- * PRESERVING every undelivered `queued_for_wake` row regardless of age. Returns
- * artifact ids that became unreferenced after the row-first transaction.
+ * Age-horizon message retention: delete up to `batchSize` ELIGIBLE messages —
+ * those whose delivery time (falling back to `ts`) is strictly before `cutoffTs`
+ * AND that are not an undelivered `queued_for_wake` row. Returns the artifact ids
+ * that became unreferenced after the row-first transaction.
  *
- * Bounded by construction — it reads exactly the front `batchSize` rows by `id`
- * (id-ascending IS oldest-first: {@link appendMessage} assigns `id` and `ts`
- * monotonically together) and deletes the prunable subset in ONE transaction. A
- * tick therefore touches at most `batchSize` rows and NEVER an unbounded scan, so
- * the paced pass cannot re-park the serve loop the way a bulk DELETE would. Call
- * repeatedly (one batch per timer tick) to drain a backlog gradually.
+ * The scan reaches eligible rows THROUGH the immune head. A partial index over the
+ * non-immune rows ({@link CREATE_MESSAGES_INDEXES}) lets the id-ascending walk skip
+ * the `queued_for_wake` prefix entirely, so per-tick cost is O(batch) no matter how
+ * far that prefix grows — a head block of immune rows can never park the prune the
+ * way the old front-window scan did. The batch bound counts ELIGIBLE rows (not the
+ * front window), so drain throughput is predictable regardless of immune
+ * interleaving. Absent the index (a SQLite too old for the predicate), the same
+ * query stays correct via an unindexed scan. Call repeatedly (one batch per timer
+ * tick) to drain a backlog gradually.
  *
- * Only `queued_for_wake` is age-immune. The namespace reconnect-gap replay
- * ({@link replayFromCursor}) is NOT a live consumer — the `keeper bus watch`
- * client subscribes with NO `after_id` (`cli/bus.ts`) — so retention deliberately
- * protects no replay window; a delivered escalation has already flipped off
- * `queued_for_wake` and ages from its terminal delivery timestamp.
+ * The returned artifact-id set is exactly the deleted rows' newly-unreferenced
+ * artifacts: an artifact still referenced by a surviving row — an immune row
+ * included — is filtered out by {@link artifactRowExists}, so the row-first
+ * artifact GC in {@link cleanupBusArtifacts} never collects a shared file.
+ *
+ * Only `queued_for_wake` is age-immune. A row that flips off it (redelivered,
+ * {@link DELIVERED_AFTER_WAKE}) enters the partial index on that UPDATE and ages
+ * out through the ordinary re-evaluated scan. The namespace reconnect-gap replay
+ * ({@link replayFromCursor}) is NOT a live consumer — the `keeper bus watch` client
+ * subscribes with NO `after_id` (`cli/bus.ts`) — so retention protects no replay
+ * window beyond the wake queue.
  */
 export function pruneMessagesOlderThan(
   db: Database,
   cutoffTs: number,
   batchSize: number,
 ): string[] {
-  const front = db
+  // The `status IS NOT '…'` term is inlined (not a bound `?`) so it matches the
+  // partial index predicate verbatim — that literal match is what lets the planner
+  // serve the scan from `idx_messages_prune` and skip the immune head.
+  const eligible = db
     .prepare(
-      `SELECT id, ts, delivered_at, status, artifact_id
-         FROM messages ORDER BY id ASC LIMIT ?`,
+      `SELECT id, artifact_id
+         FROM messages
+         WHERE status IS NOT '${QUEUED_FOR_WAKE}'
+           AND COALESCE(delivered_at, ts) < ?
+         ORDER BY id ASC LIMIT ?`,
     )
-    .all(batchSize) as {
+    .all(cutoffTs, batchSize) as {
     id: number;
-    ts: number;
-    delivered_at: number | null;
-    status: string | null;
     artifact_id: string | null;
   }[];
-  const prunable = front.filter(
-    (r) => (r.delivered_at ?? r.ts) < cutoffTs && r.status !== QUEUED_FOR_WAKE,
-  );
-  if (prunable.length === 0) return [];
+  if (eligible.length === 0) return [];
   let artifactIds: string[] = [];
   db.transaction(() => {
     db.prepare(
       "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))",
-    ).run(JSON.stringify(prunable.map((r) => r.id)));
+    ).run(JSON.stringify(eligible.map((r) => r.id)));
     artifactIds = [
       ...new Set(
-        prunable.flatMap((r) =>
+        eligible.flatMap((r) =>
           r.artifact_id === null ? [] : [r.artifact_id],
         ),
       ),
@@ -529,11 +569,15 @@ export function markMessageDelivered(
 }
 
 /**
- * Namespace-scoped age-horizon retention for control-style logs. Mirrors
- * {@link pruneMessagesOlderThan}, but its bounded front window is scoped through
+ * Namespace-scoped age-horizon retention for control-style logs. Shares the
+ * eligible-row shape of {@link pruneMessagesOlderThan} — the immune-status
+ * exclusion moves into the SELECT and the batch bound counts ELIGIBLE rows — so a
+ * `queued_for_wake` row is never counted against the batch or deleted, defense in
+ * depth even though control rows are never immune today. The scan is scoped through
  * the existing `(namespace, id)` index, so a large backlog in one namespace can
- * never inflate another namespace's prune work. The same `queued_for_wake`
- * immunity applies regardless of namespace.
+ * never inflate another namespace's prune work; a control-namespace immune head
+ * would likewise be skipped rather than parking the drain. Returns the count of
+ * deleted rows.
  */
 export function pruneControlMessagesOlderThan(
   db: Database,
@@ -541,25 +585,24 @@ export function pruneControlMessagesOlderThan(
   cutoffTs: number,
   batchSize: number,
 ): number {
-  const front = db
-    .prepare(
-      "SELECT id, ts, status FROM messages WHERE namespace = ? ORDER BY id ASC LIMIT ?",
-    )
-    .all(namespace, batchSize) as Array<{
-    id: number;
-    ts: number;
-    status: string | null;
-  }>;
-  const prunable = front
-    .filter((r) => r.ts < cutoffTs && r.status !== QUEUED_FOR_WAKE)
-    .map((r) => r.id);
-  if (prunable.length === 0) return 0;
+  const ids = (
+    db
+      .prepare(
+        `SELECT id FROM messages
+           WHERE namespace = ?
+             AND status IS NOT '${QUEUED_FOR_WAKE}'
+             AND ts < ?
+           ORDER BY id ASC LIMIT ?`,
+      )
+      .all(namespace, cutoffTs, batchSize) as Array<{ id: number }>
+  ).map((r) => r.id);
+  if (ids.length === 0) return 0;
   db.transaction(() => {
     db.prepare(
       "DELETE FROM messages WHERE id IN (SELECT value FROM json_each(?))",
-    ).run(JSON.stringify(prunable));
+    ).run(JSON.stringify(ids));
   }).immediate();
-  return prunable.length;
+  return ids.length;
 }
 
 /**

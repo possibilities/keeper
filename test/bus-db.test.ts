@@ -690,6 +690,187 @@ test("reference retention uses delivery time, preserves queued rows, and returns
   db.close();
 });
 
+test("pruneMessagesOlderThan reaches aged rows behind an immune head that fills the batch window", () => {
+  const db = openBusDb(":memory:");
+  const BATCH = 8;
+  // A head block of immune queued_for_wake rows at the LOWEST ids, exactly filling
+  // the batch window — the total-wedge threshold where the old front-window scan
+  // saw ONLY immune rows and pruned nothing.
+  const immuneHead: number[] = [];
+  for (let i = 0; i < BATCH; i++) {
+    immuneHead.push(queueForWake(db, "creator-a", { ts: 100 }));
+  }
+  // Aged eligible rows sit BEHIND the immune head (higher ids).
+  const aged: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    aged.push(
+      appendMessage(db, {
+        namespace: "chat",
+        event: "message",
+        body: `a${i}`,
+        ts: 100,
+      }),
+    );
+  }
+  // The through-immune scan skips the head and prunes the aged rows behind it.
+  expect(pruneMessagesOlderThan(db, 5000, BATCH)).toEqual([]);
+  expect(idsOf(db)).toEqual(immuneHead);
+  // Every immune row survives and the wake-queue replay returns them in id order,
+  // unchanged by the prune.
+  expect(selectQueuedForWake(db, "creator-a").map((r) => r.id)).toEqual(
+    immuneHead,
+  );
+  db.close();
+});
+
+test("pruneMessagesOlderThan counts the batch in ELIGIBLE rows, skipping interleaved immune rows", () => {
+  const db = openBusDb(":memory:");
+  // Interleave immune and aged-eligible rows so a front-window batch (2 immune +
+  // 2 eligible) and an eligible-count batch (4 eligible) diverge.
+  const eligible: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    queueForWake(db, "creator-a", { ts: 100 });
+    eligible.push(
+      appendMessage(db, {
+        namespace: "chat",
+        event: "message",
+        body: `e${i}`,
+        ts: 100,
+      }),
+    );
+  }
+  // A batch of 4 deletes exactly 4 ELIGIBLE rows, never counting an immune row
+  // against the bound.
+  expect(pruneMessagesOlderThan(db, 5000, 4)).toEqual([]);
+  const remaining = idsOf(db);
+  // 6 immune survive + the 2 youngest eligible rows remain.
+  expect(remaining).toHaveLength(8);
+  expect(eligible.filter((id) => remaining.includes(id))).toEqual(
+    eligible.slice(4),
+  );
+  expect(selectQueuedForWake(db, "creator-a")).toHaveLength(6);
+  db.close();
+});
+
+test("pruneMessagesOlderThan retains an artifact shared with a surviving immune row", () => {
+  const db = openBusDb(":memory:");
+  const shared = artifactRef("f".repeat(32), "shared");
+  // An immune queued_for_wake row holds the artifact...
+  const immune = appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    resolved_session_id: "creator-a",
+    ts: 100,
+    status: QUEUED_FOR_WAKE,
+    artifact_ref: shared,
+  });
+  // ...and an aged eligible row references the SAME artifact id.
+  appendMessage(db, {
+    namespace: "chat",
+    event: "send",
+    ts: 100,
+    status: "delivered",
+    artifact_ref: shared,
+  });
+  // The eligible row is pruned, but its artifact is NOT returned — the surviving
+  // immune row still references it, so the row-first GC never collects the file.
+  expect(pruneMessagesOlderThan(db, 5000, 100)).toEqual([]);
+  expect(idsOf(db)).toEqual([immune]);
+  db.close();
+});
+
+test("pruneMessagesOlderThan leaves the maxMessageId fence unchanged when it prunes behind an immune head", () => {
+  const db = openBusDb(":memory:");
+  for (let i = 0; i < 5; i++) queueForWake(db, "creator-a", { ts: 100 });
+  for (let i = 0; i < 5; i++) {
+    appendMessage(db, {
+      namespace: "chat",
+      event: "message",
+      body: `a${i}`,
+      ts: 100,
+    });
+  }
+  // The newest row is within the horizon, so it holds the max-id subscribe-ack fence.
+  const recent = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "recent",
+    ts: 9000,
+  });
+  expect(maxMessageId(db)).toBe(recent);
+  // Pruning the aged tail behind the immune head must not move the fence.
+  pruneMessagesOlderThan(db, 5000, 100);
+  expect(maxMessageId(db)).toBe(recent);
+  db.close();
+});
+
+test("the retention scan is served by the partial index, and no schema bump lands", () => {
+  const db = openBusDb(":memory:");
+  // The partial index landed in the unconditional create-if-missing block...
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_messages_prune'",
+      )
+      .get(),
+  ).not.toBeNull();
+  // ...WITHOUT bumping the bus schema version.
+  expect(
+    (db.prepare("PRAGMA user_version").get() as { user_version: number })
+      .user_version,
+  ).toBe(BUS_SCHEMA_VERSION);
+  expect(BUS_SCHEMA_VERSION).toBe(2);
+  // The installed SQLite honors the partial-index predicate: the eligible-row scan
+  // walks idx_messages_prune, so per-tick cost is bounded by the batch, never by
+  // the immune-prefix length. `IS NOT '<literal>'` matches the index predicate
+  // verbatim (a bound parameter would not), which is what lets the planner use it.
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+         SELECT id, artifact_id FROM messages
+         WHERE status IS NOT '${QUEUED_FOR_WAKE}' AND COALESCE(delivered_at, ts) < ?
+         ORDER BY id ASC LIMIT ?`,
+    )
+    .all(5000, 100) as { detail: string }[];
+  expect(plan.some((r) => r.detail.includes("idx_messages_prune"))).toBe(true);
+  db.close();
+});
+
+test("pruneControlMessagesOlderThan counts eligible rows and reaches aged rows behind an immune head", () => {
+  const db = openBusDb(":memory:");
+  // Defense in depth: control rows are never immune in production, but the shared
+  // eligible-row shape must still skip a queued_for_wake head rather than park.
+  const immune: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    immune.push(
+      appendMessage(db, {
+        namespace: "bus",
+        event: "send",
+        resolved_session_id: "job-1",
+        body: `wake${i}`,
+        ts: 100,
+        status: QUEUED_FOR_WAKE,
+      }),
+    );
+  }
+  const aged: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    aged.push(
+      appendMessage(db, {
+        namespace: "bus",
+        event: "join",
+        body: `j${i}`,
+        ts: 100,
+      }),
+    );
+  }
+  // Batch smaller than the immune head: the eligible-count batch prunes 2 aged
+  // rows, never counting or deleting an immune row.
+  expect(pruneControlMessagesOlderThan(db, "bus", 5000, 2)).toBe(2);
+  expect(idsOfNamespace(db, "bus")).toEqual([...immune, aged[2]]);
+  db.close();
+});
+
 test("loadOldestChannels returns the oldest channels by last_heartbeat, bounded by the limit", () => {
   const db = openBusDb(":memory:");
   upsertChannel(
