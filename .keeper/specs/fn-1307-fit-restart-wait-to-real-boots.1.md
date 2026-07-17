@@ -32,5 +32,5 @@ Update fixtures for the new defaults; add a case proving a slow-catch-up boot (h
 - [ ] Focused suite green through injected seams
 
 ## Done summary
-
+Split kickstart's subprocess budget from the 1s probe budget into a new 15s KICKSTART_TIMEOUT_MS, and raised the default overall restart deadline from 30s to 150s to fit observed post-boot catch-up, keeping --timeout as an override. Added targeted coverage for both budgets.
 ## Evidence
