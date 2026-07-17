@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 40
+      },
+      "done_summary": "Scoped createIndexFailOpen to the messages optimization indexes only; the channels UNIQUE index now runs on the strict throwing db.run path so a failed create surfaces loudly at boot. Added tests for both semantics.",
+      "input_hash": "fd1303765f856e3f4d99953248aca613a1a670236dec8a95ee4cac6068af29c0",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2184,
+      "spec_md": "## Description\n\nFrom audit finding F1 against `src/bus-db.ts` (commit 32d9267b). At\n`migrateBusDb` (line ~152), the loop\n`for (const ddl of CREATE_CHANNELS_INDEXES) createIndexFailOpen(db, ddl)`\nroutes the channels index list through the fail-open helper. That list's\nsole member is `CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_pid_start ON\nchannels(pid, start_time)` \u2014 the UNIQUE constraint backing the channels\nupsert's `ON CONFLICT(pid, start_time)`. `createIndexFailOpen` is\ndocumented as being for a pure query optimization (a partial-index\npredicate an old SQLite rejects), and it swallows the error to\n`console.error`; that rationale does not hold for a correctness constraint.\nA swallowed UNIQUE-index create silently drops the `(pid, start_time)`\nuniqueness invariant and leaves the daemon booting without the ON CONFLICT\ntarget, so later channel upserts throw a cryptic \"ON CONFLICT clause does\nnot match any PRIMARY KEY or UNIQUE constraint\" at runtime instead of the\nloud, isolated boot failure this file's own `migrateBusDb` doc calls for.\n\nFix: keep `CREATE_CHANNELS_INDEXES` on the strict `db.run(ddl)` (throwing)\npath and apply `createIndexFailOpen` only to `CREATE_MESSAGES_INDEXES`\n(both members \u2014 `idx_messages_ns_id`, `idx_messages_prune` \u2014 are\nnon-unique). The stated intent of the fail-open helper (degrade an\nunsupported partial index) only ever required the messages block.\n\nFiles: `src/bus-db.ts`, `test/bus-db.test.ts`.\n\n## Acceptance\n\n- [ ] The channels UNIQUE index is created via strict `db.run` so a failed create throws (loud, isolated boot failure) rather than being swallowed.\n- [ ] `createIndexFailOpen` still wraps the messages optimization indexes; a rejected messages-index DDL degrades without wedging migrate.\n- [ ] A test asserts a failing channels UNIQUE-index create surfaces (throws), and a test asserts a rejected messages index degrades non-fatally and migrate still commits `user_version`.\n\n## Done summary\nScoped createIndexFailOpen to the messages optimization indexes only; the channels UNIQUE index now runs on the strict throwing db.run path so a failed create surfaces loudly at boot. Added tests for both semantics.\n## Evidence\n",
+      "task_id": "fn-1316-scope-bus-db-fail-open-index-creation.1",
+      "tier": "medium",
+      "title": "Scope fail-open index creation"
+    }
+  ],
+  "created_at": "2026-07-17T19:39:42.168000Z",
+  "epic_id": "fn-1316-scope-bus-db-fail-open-index-creation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "fd1303765f856e3f4d99953248aca613a1a670236dec8a95ee4cac6068af29c0",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
