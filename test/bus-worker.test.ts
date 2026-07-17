@@ -44,6 +44,7 @@ import type { BusResolveResult, ResolvedIdentity } from "../src/bus-identity";
 import {
   authoritativeFrom,
   backpressureDecision,
+  CHANNEL_PRESENCE_HORIZON_MS,
   type ChannelLiveness,
   channelPruneDecision,
   cleanupBusArtifacts,
@@ -399,7 +400,16 @@ const aliveWith = (startTime: string | null): ChannelLiveness => ({
 
 test("channelPruneDecision keeps a connected identity regardless of what the probe says", () => {
   // A live socket is authoritative — even a dead-looking probe cannot prune it.
-  expect(channelPruneDecision("st", 10_000_000, 1000, true, DEAD)).toBe("keep");
+  expect(
+    channelPruneDecision(
+      "st",
+      10_000_000,
+      1000,
+      true,
+      DEAD,
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("keep");
   // Protects a keeper-miss synthetic start_time a real OS probe would never match.
   expect(
     channelPruneDecision(
@@ -408,21 +418,59 @@ test("channelPruneDecision keeps a connected identity regardless of what the pro
       1000,
       true,
       aliveWith("darwin:real"),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("keep");
+  // A live socket survives even PAST the presence horizon — age alone never
+  // reaps a connected identity.
+  expect(
+    channelPruneDecision(
+      "st",
+      CHANNEL_PRESENCE_HORIZON_MS + 1,
+      1000,
+      true,
+      aliveWith(null),
+      CHANNEL_PRESENCE_HORIZON_MS,
     ),
   ).toBe("keep");
 });
 
 test("channelPruneDecision keeps a row younger than the grace age", () => {
-  expect(channelPruneDecision("st", 500, 1000, false, DEAD)).toBe("keep");
+  expect(
+    channelPruneDecision(
+      "st",
+      500,
+      1000,
+      false,
+      DEAD,
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("keep");
 });
 
 test("channelPruneDecision prunes a dead identity once past the grace age", () => {
-  expect(channelPruneDecision("st", 2000, 1000, false, DEAD)).toBe("prune");
+  expect(
+    channelPruneDecision(
+      "st",
+      2000,
+      1000,
+      false,
+      DEAD,
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("prune");
 });
 
 test("channelPruneDecision keeps an alive identity whose start_time still matches", () => {
   expect(
-    channelPruneDecision("darwin:x", 2000, 1000, false, aliveWith("darwin:x")),
+    channelPruneDecision(
+      "darwin:x",
+      2000,
+      1000,
+      false,
+      aliveWith("darwin:x"),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
   ).toBe("keep");
 });
 
@@ -434,14 +482,56 @@ test("channelPruneDecision prunes an alive-but-recycled pid (live start_time dif
       1000,
       false,
       aliveWith("darwin:new"),
+      CHANNEL_PRESENCE_HORIZON_MS,
     ),
   ).toBe("prune");
 });
 
-test("channelPruneDecision keeps on an inconclusive probe (never prune on a null read)", () => {
+test("channelPruneDecision keeps an unverifiable identity inside the presence horizon (never prune on a null read within the fail-safe window)", () => {
   expect(
-    channelPruneDecision("darwin:x", 2000, 1000, false, aliveWith(null)),
+    channelPruneDecision(
+      "darwin:x",
+      2000,
+      1000,
+      false,
+      aliveWith(null),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
   ).toBe("keep");
+  // Still inside the horizon, well past the grace age.
+  expect(
+    channelPruneDecision(
+      "darwin:x",
+      CHANNEL_PRESENCE_HORIZON_MS - 1,
+      1000,
+      false,
+      aliveWith(null),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("keep");
+});
+
+test("channelPruneDecision prunes a socketless unverifiable identity once past the presence horizon", () => {
+  expect(
+    channelPruneDecision(
+      "darwin:x",
+      CHANNEL_PRESENCE_HORIZON_MS,
+      1000,
+      false,
+      aliveWith(null),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("prune");
+  expect(
+    channelPruneDecision(
+      "darwin:x",
+      CHANNEL_PRESENCE_HORIZON_MS + 1,
+      1000,
+      false,
+      aliveWith(null),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("prune");
 });
 
 // ---------------------------------------------------------------------------
