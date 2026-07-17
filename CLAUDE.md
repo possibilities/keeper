@@ -94,7 +94,7 @@ file is imperative guardrails only.
 ## Test isolation
 
 - **Use named test gates.** Bare aggregate `bun test` is rejected; target an individual test only with an explicit `*.test.ts` path. See [docs/testing.md](./docs/testing.md).
-- **Keep correctness tests deterministic and in-process.** Never boot a real daemon, Worker thread, UDS socket, subprocess, git, or tmux; test git-boundary decisions through a pure seam.
+- **Keep correctness tests deterministic and in-process.** Never boot a real daemon, Worker thread, UDS socket, subprocess, git, or tmux; test git-boundary decisions through a pure seam. The slow tier's ONLY sanctioned real-process members — the real-git suite and one sandboxed, parent-deadline-owned real-daemon smoke (ADR 0073, scenario set grows only by ADR amendment) — run behind their own named gates, never in the correctness gates.
 - **Sandbox ALL state classes** under the per-test tmpdir for real-state tests:
   `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_LANE_DIRT_SPOOL_DIR`, `KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`,
   the Agent Bus pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK`, `KEEPER_NOTES_DB`, and `KEEPER_CONFIG_DIR` — never
