@@ -44,7 +44,8 @@ their follow-up actions without a trace.
   documenting that plist changes need bootstrap, not kickstart. It never touches the DB.
 - **Durable awaits follow the handoff template exactly**: an `awaits` deterministic-replayed
   projection (present in every rewind reset), ONE new mutating RPC — the eighth — whose payload
-  also carries the cancel variant, a synthetic event and null-safe fold, and a leased await-worker
+  also carries the cancel variant (owner fencing and the exposing CLI verb are decided in
+  ADR 0072), a synthetic event and null-safe fold, and a leased await-worker
   copying the handoff worker's claim/ack/breaker discipline. Semantics are at-least-once intent
   with idempotent follow-up: the lease covers only the firing phase, a waiting row is unclaimed
   and may wait forever by design (timeout optional). Only server-evaluable condition kinds are
