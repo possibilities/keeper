@@ -21,6 +21,7 @@ import {
   applyEvent,
   type BuildSnapshotPayload,
   drain,
+  eventTsToIso,
   extractBuildSnapshot,
   serializeBuildSnapshot,
 } from "../src/reducer";
@@ -10078,5 +10079,105 @@ test("AutopilotConfigSet present-but-non-positive/non-integer drift thresholds c
       drift_age_threshold_days: 5,
     });
     drainAll();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// fn-1306: total event-ts → ISO conversion. The fold-side helper must never
+// throw a RangeError on a malformed / out-of-range event timestamp (the
+// never-throw-inside-a-fold invariant); a valid ts stays byte-identical.
+// ---------------------------------------------------------------------------
+
+test("fn-1306: eventTsToIso converts a valid unix-seconds ts byte-identically to hand-computed ISO-8601 constants", () => {
+  // Independent source of truth: literal ISO strings, hand-computed, NOT
+  // re-derived by the conversion under test.
+  expect(eventTsToIso(0)).toBe("1970-01-01T00:00:00.000Z");
+  expect(eventTsToIso(1_000_000_000)).toBe("2001-09-09T01:46:40.000Z");
+  expect(eventTsToIso(1_700_000_000)).toBe("2023-11-14T22:13:20.000Z");
+  expect(eventTsToIso(-1)).toBe("1969-12-31T23:59:59.000Z");
+  // Max in-range magnitude (±8.64e15 ms of epoch) — still a valid Date.
+  expect(eventTsToIso(8_640_000_000_000)).toBe("+275760-09-13T00:00:00.000Z");
+});
+
+test("fn-1306: eventTsToIso preserves prior behavior byte-for-byte across a valid-timestamp corpus", () => {
+  // The acceptance's "prior behavior" is `new Date(ts * 1000).toISOString()`;
+  // the guard must be a pure no-op on the valid domain.
+  const corpus = [
+    0, 1, 60, 3600, 86_400, 1_500_000_000, 1_700_000_000, 2_000_000_000, -1,
+    -86_400,
+  ];
+  for (const ts of corpus) {
+    expect(eventTsToIso(ts)).toBe(new Date(ts * 1000).toISOString());
+  }
+});
+
+test("fn-1306: eventTsToIso is total across the invalid-timestamp domain — a deterministic marker, never a throw", () => {
+  // Expected markers are `invalid-ts:<String(input)>`, hand-computed per case.
+  const cases: Array<[unknown, string]> = [
+    [Number.NaN, "invalid-ts:NaN"],
+    [Number.POSITIVE_INFINITY, "invalid-ts:Infinity"],
+    [Number.NEGATIVE_INFINITY, "invalid-ts:-Infinity"],
+    // Finite but out of Date range (magnitude beyond ±8.64e15 ms of epoch).
+    [1e20, "invalid-ts:100000000000000000000"],
+    [-1e20, "invalid-ts:-100000000000000000000"],
+    [8.65e15, "invalid-ts:8650000000000000"],
+    // Non-number data reaching the helper (event.ts is typed `number`, but a
+    // corrupt row could carry anything): coerces to NaN → marker, never a throw.
+    [undefined, "invalid-ts:undefined"],
+    [{}, "invalid-ts:[object Object]"],
+    ["not-a-number", "invalid-ts:not-a-number"],
+  ];
+  for (const [input, expected] of cases) {
+    expect(() => eventTsToIso(input as unknown as number)).not.toThrow();
+    expect(eventTsToIso(input as unknown as number)).toBe(expected);
+  }
+});
+
+test("fn-1306: folding an EpicSnapshot with an out-of-range event ts completes, advances the cursor, and never dead-letters", () => {
+  // Each `ts` survives the events table's REAL NOT NULL column yet drives
+  // `new Date(ts * 1000)` out of the valid Date range — the unguarded
+  // conversion would throw a RangeError inside the open fold transaction,
+  // rolling back the cursor and dead-lettering an event that must fold safely.
+  // (NaN can't be stored in a NOT NULL REAL column, so the DB-reachable
+  // vectors are ±Infinity and finite out-of-range magnitudes.)
+  for (const badTs of [
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    1e20,
+    -1e20,
+  ]) {
+    const epicId = `fn-badts-${badTs}`;
+    const before = getCursor();
+    const id = insertEvent({
+      hook_event: "EpicSnapshot",
+      session_id: epicId,
+      ts: badTs,
+      data: JSON.stringify({
+        epic_number: 1,
+        title: "Bad ts",
+        project_dir: "/repo",
+        status: "open",
+        depends_on_epics: ["fn-99-nonexistent"],
+      }),
+    });
+    expect(() => drainAll()).not.toThrow();
+    // Cursor co-advanced past the event — the fold committed, not rolled back.
+    expect(getCursor()).toBe(id);
+    expect(getCursor()).toBeGreaterThan(before);
+    // The projection was fully stamped: the dep resolved despite the bad ts.
+    const row = db
+      .query("SELECT resolved_epic_deps FROM epics WHERE epic_id = ?")
+      .get(epicId) as { resolved_epic_deps: string | null } | null;
+    expect(row?.resolved_epic_deps).not.toBeNull();
+    expect(JSON.parse(row?.resolved_epic_deps ?? "null")).toEqual([
+      {
+        dep_token: "fn-99-nonexistent",
+        resolved_epic_id: null,
+        epic_number: null,
+        project_basename: null,
+        cross_project: false,
+        state: "dangling",
+      },
+    ]);
   }
 });

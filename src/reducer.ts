@@ -9580,14 +9580,30 @@ function enrichEpicDep(
 }
 
 /**
- * Unix-seconds → ISO-8601 string for the resolver's `now` parameter.
- * Deterministic (a pure function of the event's unix-second integer), so a
- * re-fold reproduces the same diagnostic ts. The resolver's `now` slot is typed
- * as a string for the readiness side's precedent; keeping it stable avoids a
- * `now: string | number` widening.
+ * Unix-seconds → ISO-8601 string for the resolver's `now` parameter. Total: a
+ * NaN, non-finite, or out-of-Date-range `ts` yields a deterministic
+ * `invalid-ts:<value>` marker instead of throwing a RangeError inside the open
+ * fold transaction, honoring the never-throw-inside-a-fold invariant. The
+ * fallback is a pure function of the input alone (never wall-clock or locale),
+ * so re-fold determinism holds and a valid `ts` stays byte-identical to
+ * `new Date(ts * 1000).toISOString()` — the guard is purely additive on the
+ * invalid domain.
+ *
+ * The resolver's `now` slot is typed as a string for the readiness side's
+ * precedent; keeping it stable avoids a `now: string | number` widening.
  */
-function eventTsToIso(ts: number): string {
-  return new Date(ts * 1000).toISOString();
+export function eventTsToIso(ts: number): string {
+  const ms = ts * 1000;
+  // `Number.isFinite` rejects NaN, ±Infinity, and any non-number coercing to
+  // NaN; a finite-but-out-of-range ms still yields an Invalid Date, caught by
+  // the `getTime()` NaN check before `toISOString` can throw.
+  if (Number.isFinite(ms)) {
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toISOString();
+    }
+  }
+  return `invalid-ts:${String(ts)}`;
 }
 
 /**
