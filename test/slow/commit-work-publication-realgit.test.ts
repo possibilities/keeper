@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { runForTest as runCommitWorkForTest } from "../../cli/commit-work";
 import {
   chmodSync,
   existsSync,
@@ -16,6 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { runForTest as runCommitWorkForTest } from "../../cli/commit-work";
 import {
   GIT_OUTPUT_LIMIT_CODE,
   GIT_SPAWN_TIMEOUT_CODE,

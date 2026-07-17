@@ -935,6 +935,43 @@ test("attempt- and incident-fenced DispatchCleared history re-folds byte-identic
   ).toEqual(claimsBefore);
 });
 
+test("full cursor=0 replay accepts a historical tokenless DispatchCleared clearing a live legacy mint gate", () => {
+  const verb = "work";
+  const id = "legacy-mint-gate-refold.1";
+  const dispatchKey = `${verb}::${id}`;
+  insertEvent({
+    hook_event: "DispatchCleared",
+    session_id: "reconciler",
+    data: JSON.stringify({ verb, id }),
+  });
+  drainAll();
+
+  // The producer-owned durable gate is deliberately not wiped by a re-fold.
+  db.run(
+    "INSERT INTO dispatch_mint_gate (dispatch_key, minted_at, attempt_id) VALUES (?, ?, NULL)",
+    [dispatchKey, 1800],
+  );
+  expect(
+    db
+      .query("SELECT attempt_id FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get(dispatchKey),
+  ).toEqual({ attempt_id: null });
+
+  // The transitional tokenless clear can remove this live NULL-owned row. The
+  // bounded exposure is one un-suppressed re-mint before stale-gate eviction.
+  rewindAndWipeProjections();
+  expect(
+    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get(),
+  ).toEqual({ last_event_id: 0 });
+  drainAll();
+
+  expect(
+    db
+      .query("SELECT * FROM dispatch_mint_gate WHERE dispatch_key = ?")
+      .get(dispatchKey),
+  ).toBeNull();
+});
+
 test("resurrection regression: a full re-fold over historical Dispatched events leaves pending_dispatches empty at serve; dispatch_failures + dispatch_never_bound survive", () => {
   // Seed the EXACT shape that jammed dispatch in v76→v79: historical `Dispatched`
   // events that fold into open `pending_dispatches` rows (no discharge), plus a

@@ -37,7 +37,11 @@ import type { GitRunner } from "./git-exec";
 
 /** The sequencer/merge operations a commit must not run on top of. */
 export type InProgressOperation =
-  "merge" | "cherry-pick" | "revert" | "rebase" | "bisect";
+  | "merge"
+  | "cherry-pick"
+  | "revert"
+  | "rebase"
+  | "bisect";
 
 /**
  * The pseudo-refs whose PRESENCE marks a sequencer op in flight, probed by ref
