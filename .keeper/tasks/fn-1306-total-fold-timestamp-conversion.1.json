@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T09:11:29.228000Z",
+  "depends_on": [],
+  "epic": "fn-1306-total-fold-timestamp-conversion",
+  "id": "fn-1306-total-fold-timestamp-conversion.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Total fold timestamp conversion",
+  "updated_at": "2026-07-17T09:11:29.228000Z"
+}
