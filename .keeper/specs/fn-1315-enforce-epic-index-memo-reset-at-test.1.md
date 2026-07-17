@@ -20,5 +20,5 @@ above; optionally a shared test helper for the wipe path.
 - [ ] The named gates covering the touched files remain green.
 
 ## Done summary
-
+Added __resetEpicIndexMemoForTest(db) calls at all 29 epics-wipe-then-refold sites across the 6 gap test files (reducer-projections, db, reducer-plan, compaction, daemon, reducer-links test suites), closing the documented MUST-reset invariant gap.
 ## Evidence
