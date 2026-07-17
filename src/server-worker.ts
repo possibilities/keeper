@@ -74,6 +74,7 @@ import {
   type BootStatus,
   type ClientFrame,
   type ErrorFrame,
+  type EventStoreStatus,
   encodeFrame,
   type FilterValue,
   LineBuffer,
@@ -2315,6 +2316,44 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
       unseededRoots = [];
     }
   }
+  // fn-1311: event count + DB byte size are cheap live reads; the two
+  // projected durations are pure arithmetic over the durable
+  // `boot_catchup_stats` observation — never a wall-clock probe here. Each
+  // sub-read is independently defended so a missing/corrupt piece degrades to
+  // the null-honest shape rather than throwing into the no-self-heal serve path.
+  let eventCount = 0;
+  try {
+    const c = db.query("SELECT COUNT(*) AS n FROM events").get() as {
+      n: number;
+    } | null;
+    eventCount = c ? c.n : 0;
+  } catch {
+    eventCount = 0;
+  }
+  let dbBytes = 0;
+  try {
+    const pc = db.query("PRAGMA page_count").get() as {
+      page_count: number;
+    } | null;
+    const ps = db.query("PRAGMA page_size").get() as {
+      page_size: number;
+    } | null;
+    dbBytes = (pc?.page_count ?? 0) * (ps?.page_size ?? 0);
+  } catch {
+    dbBytes = 0;
+  }
+  let catchupStats: BootCatchupStats | null = null;
+  try {
+    catchupStats = readBootCatchupStats(db);
+  } catch {
+    catchupStats = null;
+  }
+  const eventStore = computeEventStoreStatus(
+    catchupStats,
+    eventCount,
+    dbBytes,
+    head,
+  );
   return {
     rev,
     head_event_id: head,
@@ -2335,6 +2374,108 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
     // carries none — e.g. a unit gate — so the client keeps its always-
     // re-baseline-on-reconnect fallback).
     ...(gate.generation === undefined ? {} : { generation: gate.generation }),
+    // fn-1311: the event store's growth measurements (see `EventStoreStatus`).
+    event_store: eventStore,
+  };
+}
+
+/**
+ * The most recent boot's measured catch-up window, as durably recorded by
+ * `daemon.ts` (a producer) right before it posts `boot-complete`. Mirrors
+ * {@link EventStoreLastBootCatchup} but keeps the raw start/end samples the
+ * daemon wrote, so {@link computeEventStoreStatus} can derive BOTH the observed
+ * duration and a live "since-last-boot" catch-up projection from one row.
+ */
+export interface BootCatchupStats {
+  startedAtMs: number;
+  completedAtMs: number;
+  startEventId: number;
+  endEventId: number;
+}
+
+/**
+ * Read the `boot_catchup_stats` singleton (fn-1311). `null` when the row is
+ * absent — a fresh DB, or a binary that booted before this table existed and
+ * hasn't completed a boot since upgrading. Pure read; never throws (the caller
+ * is no-self-heal), mirroring every other singleton read in
+ * {@link readBootStatus}.
+ */
+function readBootCatchupStats(db: Database): BootCatchupStats | null {
+  const row = db
+    .query(
+      "SELECT started_at, completed_at, start_event_id, end_event_id FROM boot_catchup_stats WHERE id = 1",
+    )
+    .get() as {
+    started_at: number;
+    completed_at: number;
+    start_event_id: number;
+    end_event_id: number;
+  } | null;
+  if (row === null) {
+    return null;
+  }
+  return {
+    startedAtMs: row.started_at,
+    completedAtMs: row.completed_at,
+    startEventId: row.start_event_id,
+    endEventId: row.end_event_id,
+  };
+}
+
+/**
+ * Derive the event-store status block (fn-1311) from a durable boot-catchup
+ * observation plus the current cheap live reads. PURE — no wall-clock probe,
+ * no DB access — so this is the seam `test/status.test.ts` exercises with
+ * injected observations.
+ *
+ * `stats` absent, or its `events_folded` non-positive (a boot that folded zero
+ * or a negative/malformed delta — defensive against a torn row), leaves both
+ * projected durations `null`: the rate is undefined, not zero. Otherwise the
+ * measured `duration_ms / events_folded` rate scales two ways: by the events
+ * accumulated since that boot completed (`headEventId - stats.endEventId`,
+ * floored at 0) for the catch-up projection, and by the CURRENT total
+ * `eventCount` for the full-replay projection.
+ */
+export function computeEventStoreStatus(
+  stats: BootCatchupStats | null,
+  eventCount: number,
+  dbBytes: number,
+  headEventId: number,
+): EventStoreStatus {
+  if (stats === null) {
+    return {
+      event_count: eventCount,
+      db_bytes: dbBytes,
+      last_boot_catchup: null,
+      projected_catchup_duration_ms: null,
+      projected_full_replay_duration_ms: null,
+    };
+  }
+  const durationMs = stats.completedAtMs - stats.startedAtMs;
+  const eventsFolded = stats.endEventId - stats.startEventId;
+  const lastBootCatchup = {
+    duration_ms: durationMs,
+    events_folded: eventsFolded,
+  };
+  if (eventsFolded <= 0 || durationMs <= 0) {
+    return {
+      event_count: eventCount,
+      db_bytes: dbBytes,
+      last_boot_catchup: lastBootCatchup,
+      projected_catchup_duration_ms: null,
+      projected_full_replay_duration_ms: null,
+    };
+  }
+  const msPerEvent = durationMs / eventsFolded;
+  const pendingSinceLastBoot = Math.max(0, headEventId - stats.endEventId);
+  return {
+    event_count: eventCount,
+    db_bytes: dbBytes,
+    last_boot_catchup: lastBootCatchup,
+    projected_catchup_duration_ms: Math.round(
+      msPerEvent * pendingSinceLastBoot,
+    ),
+    projected_full_replay_duration_ms: Math.round(msPerEvent * eventCount),
   };
 }
 

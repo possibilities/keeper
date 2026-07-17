@@ -131,6 +131,49 @@ export interface BootStatus {
    * (the client falls back to the always-re-baseline-on-reconnect contract).
    */
   generation?: string;
+  /**
+   * fn-1311 — the event store's growth measurements: `event_count`/`db_bytes`
+   * are cheap live reads, while the two `projected_*_duration_ms` fields are
+   * pure arithmetic over the durable {@link EventStoreStatus.last_boot_catchup}
+   * observation (never a wall-clock guess at query time). See
+   * {@link EventStoreStatus}. Optional/additive — an older client ignores it.
+   */
+  event_store?: EventStoreStatus;
+}
+
+/**
+ * The most recent boot's measured catch-up window (fn-1311): how long it took
+ * and how many events it folded, as durably recorded by main right before it
+ * posts `boot-complete`. `null` before any boot has ever recorded one (a fresh
+ * DB, or a binary upgrade mid-flight) — the null-honest "no measurement yet"
+ * case; `event_store`'s two projected-duration fields are `null` in lockstep.
+ */
+export interface EventStoreLastBootCatchup {
+  duration_ms: number;
+  events_folded: number;
+}
+
+/**
+ * The event store's operational-threshold measurements (fn-1311) — total
+ * event count, DB byte size, and durations projected from the most recent
+ * boot's measured catch-up rate, displayed against the ratified SLOs (boot
+ * catch-up ≤60s, full disaster rebuild ≤15min; backlog #11). Measurement
+ * only — nothing here enforces a threshold or changes behavior.
+ *
+ * `projected_catchup_duration_ms` scales the measured per-event rate by the
+ * events accumulated since the last boot completed (`head_event_id -
+ * last_boot_catchup.end_event_id`) — "if the daemon restarted right now, how
+ * long would catch-up take." `projected_full_replay_duration_ms` scales the
+ * SAME rate by the CURRENT total `event_count` — "how long a from-scratch
+ * disaster rebuild would take." Both are `null` when `last_boot_catchup` is
+ * `null` or its `events_folded` is 0 (an undefined rate).
+ */
+export interface EventStoreStatus {
+  event_count: number;
+  db_bytes: number;
+  last_boot_catchup: EventStoreLastBootCatchup | null;
+  projected_catchup_duration_ms: number | null;
+  projected_full_replay_duration_ms: number | null;
 }
 
 // ---------------------------------------------------------------------------
