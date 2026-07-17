@@ -54,5 +54,5 @@ double-teardown asserts idempotency.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Gave each connection a stateful streaming UTF-8 decoder beside its line buffer, decoding chunks in stream mode (fatal:false) so multi-byte codepoints split across socket chunks reach the line framer intact; teardown performs an idempotent final flush that discards any buffered partial codepoint.
 ## Evidence

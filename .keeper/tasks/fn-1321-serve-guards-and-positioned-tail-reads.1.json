@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Stateful socket utf8 decode",
-  "updated_at": "2026-07-17T23:07:41.275000Z"
+  "updated_at": "2026-07-17T23:18:21.529000Z",
+  "worker_done_at": "2026-07-17T23:18:21.529000Z"
 }
