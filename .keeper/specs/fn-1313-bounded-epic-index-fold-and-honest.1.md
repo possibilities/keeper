@@ -70,5 +70,5 @@ reducer-lifecycle warm-vs-cold template for the memo lifecycle itself.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Epic-dep fold index now served from a seed-once, patch-in-place per-connection WeakMap memo (byte-identical to a fresh scan warm/cold/per-fold), bounding the epic fold cost independent of board size; charter + lifecycle warm-vs-cold tests added.
 ## Evidence
