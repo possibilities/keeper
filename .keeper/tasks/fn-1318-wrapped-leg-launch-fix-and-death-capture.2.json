@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-17T20:12:46.861000Z",
+  "depends_on": [
+    "fn-1318-wrapped-leg-launch-fix-and-death-capture.1"
+  ],
+  "epic": "fn-1318-wrapped-leg-launch-fix-and-death-capture",
+  "id": "fn-1318-wrapped-leg-launch-fix-and-death-capture.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Pre-boot death capture on the notice rail",
+  "updated_at": "2026-07-17T20:12:46.861000Z"
+}
