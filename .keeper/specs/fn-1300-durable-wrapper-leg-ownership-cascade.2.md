@@ -40,5 +40,5 @@ Deterministic seams: injected grant/probe runners, no real tmux/subprocess. Cove
 - [ ] Existing non-wrapped launch paths are behaviorally unchanged
 
 ## Done summary
-
+Gated wrapped provider launches on durable ownership: launcher spawns an inert shim that promotes identity through the birth intent/promotion protocol and exec's the provider only after a daemon-issued, one-use pre-exec grant; birth ingestion now scans pending/ for stranded records idempotently on leg_launch_id and withholds grants for terminal/superseded owners.
 ## Evidence
