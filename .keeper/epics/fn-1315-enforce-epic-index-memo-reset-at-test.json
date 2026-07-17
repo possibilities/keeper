@@ -7,7 +7,7 @@
     "fn-1313-bounded-epic-index-fold-and-honest"
   ],
   "id": "fn-1315-enforce-epic-index-memo-reset-at-test",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-17T18:27:45.225000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T18:27:44.681000Z"
+  "updated_at": "2026-07-17T18:27:45.225000Z"
 }
