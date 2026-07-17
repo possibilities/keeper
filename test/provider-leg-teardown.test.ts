@@ -180,6 +180,24 @@ test("owned idle-stopped cleanup uses the same leg-keyed birth coordinate withou
   ).toEqual({ state: "bound" });
 });
 
+test("a just-born owned leg is left running, not torn down mid-boot before it works", async () => {
+  // The birth SessionStart seeds the leg at the jobs `state` default 'stopped',
+  // but the leg is still booting its harness — lifting it to 'working' at birth
+  // keeps the owner-alive window-teardown (which keys off leg_state 'stopped')
+  // from killing a leg that has not yet had a chance to run.
+  seedOwnedLeg("working");
+  expect(
+    db.query("SELECT state FROM jobs WHERE job_id = 'leg-session'").get(),
+  ).toEqual({ state: "working" });
+
+  const killed: string[] = [];
+  await runProviderLegCascadeSweep(db, deps(killed, [exactPane()]));
+  expect(killed).toEqual([]);
+  expect(
+    db.query("SELECT state FROM dispatch_claims WHERE attempt_id = 7").get(),
+  ).toEqual({ state: "bound" });
+});
+
 test("window teardown gates birth coordinates on canonical generation, wrapped session, and one pane", () => {
   const row = {
     pane_id: "%5",

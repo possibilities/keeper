@@ -5073,6 +5073,25 @@ function foldProviderLegBorn(db: Database, event: Event): void {
       event.ts,
     ],
   );
+  // A birth SessionStart seeds the leg's jobs row at the `state` column default
+  // 'stopped', but a just-launched leg is booting, not idle: the owned-leg
+  // window-teardown pass keys off `leg_state = 'stopped'`, so a leg left at the
+  // default is torn down mid-boot before its harness ever reports working. Lift
+  // it to 'working' at birth so teardown waits for a genuine Stop; only the
+  // default seed is healed (a leg already advanced past it is untouched, keeping
+  // the fold idempotent under re-announce and re-fold).
+  if (p.legSessionId !== null) {
+    const healed = db.run(
+      `UPDATE jobs SET state = 'working', updated_at = ?
+        WHERE job_id = ? AND state = 'stopped'`,
+      [event.ts, p.legSessionId],
+    );
+    // `state` is an enriched column: re-fan the embedded epics.jobs[] mirror on a
+    // genuine change (a no-op for a leg whose spawn name carries no plan ref).
+    if (healed.changes > 0) {
+      syncIfPlanRef(db, p.legSessionId, event.id, event.ts);
+    }
+  }
 }
 
 /**
