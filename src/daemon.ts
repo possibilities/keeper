@@ -270,6 +270,7 @@ import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
   drain,
+  readFoldWorkMsAccum,
   serializeBuildSnapshot,
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
@@ -9661,6 +9662,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // fold — feeding the status surface's projected-duration math.
   const bootCatchupStartedAtMs = Date.now();
   const bootCatchupStartEventId = selectWorldRev(stmts);
+  // fn-1313: sample the monotonic fold-work accumulator at the SAME point as the
+  // start cursor above. The delta to the end sample (taken at the
+  // `recordBootCatchupStats` call below, alongside the end cursor) is this
+  // boot's pace-free fold-work numerator, covering exactly the events between
+  // the two cursor samples — the honest full-replay rate, free of `drain`'s
+  // pacing sleep. Reads a reducer module-global — never inside a fold.
+  const bootCatchupStartWorkMs = readFoldWorkMsAccum();
   serveBootDrain();
   scheduleProviderLegDeathNoticeSweep();
   scheduleProviderLegCascadeSweep();
@@ -9759,6 +9767,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     completedAtMs: Date.now(),
     startEventId: bootCatchupStartEventId,
     endEventId: selectWorldRev(stmts),
+    // fn-1313: the fold-work delta over this same window (start sample taken
+    // beside `bootCatchupStartEventId`). End-minus-start of a monotonic
+    // accumulator, so it covers the identical event window as
+    // `endEventId - startEventId` — including the post-drain pump folds above.
+    workMs: readFoldWorkMsAccum() - bootCatchupStartWorkMs,
   });
 
   // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.

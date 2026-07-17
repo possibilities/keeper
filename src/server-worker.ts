@@ -2373,6 +2373,13 @@ export interface BootCatchupStats {
   completedAtMs: number;
   startEventId: number;
   endEventId: number;
+  /**
+   * Pace-free accumulated fold-work over this boot's window (fn-1313), or `null`
+   * when the row predates the column or carried no measurement. Feeds the
+   * full-replay projection's rate; the catch-up projection stays on the
+   * wall-clock `completedAtMs - startedAtMs`.
+   */
+  workMs: number | null;
 }
 
 /**
@@ -2385,13 +2392,14 @@ export interface BootCatchupStats {
 function readBootCatchupStats(db: Database): BootCatchupStats | null {
   const row = db
     .query(
-      "SELECT started_at, completed_at, start_event_id, end_event_id FROM boot_catchup_stats WHERE id = 1",
+      "SELECT started_at, completed_at, start_event_id, end_event_id, fold_work_ms FROM boot_catchup_stats WHERE id = 1",
     )
     .get() as {
     started_at: number;
     completed_at: number;
     start_event_id: number;
     end_event_id: number;
+    fold_work_ms: number | null;
   } | null;
   if (row === null) {
     return null;
@@ -2401,22 +2409,33 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
     completedAtMs: row.completed_at,
     startEventId: row.start_event_id,
     endEventId: row.end_event_id,
+    workMs: row.fold_work_ms,
   };
 }
 
 /**
- * Derive the event-store status block (fn-1311) from a durable boot-catchup
- * observation plus the current cheap live reads. PURE — no wall-clock probe,
- * no DB access — so this is the seam `test/status.test.ts` exercises with
- * injected observations.
+ * Derive the event-store status block (fn-1311, fn-1313) from a durable
+ * boot-catchup observation plus the current cheap live reads. PURE — no
+ * wall-clock probe, no DB access — so this is the seam `test/status.test.ts`
+ * exercises with injected observations.
+ *
+ * The two projections derive from DIFFERENT rates (ADR 0075):
+ *
+ *   - The CATCH-UP projection keeps the WALL-CLOCK rate
+ *     (`duration_ms / events_folded`) scaled by the events accumulated since
+ *     that boot completed (`headEventId - stats.endEventId`, floored at 0):
+ *     pacing is real experienced catch-up latency.
+ *   - The FULL-REPLAY projection derives ONLY from the pace-free fold-work
+ *     rate (`stats.workMs / events_folded`) scaled by the CURRENT total
+ *     `eventCount`: an estimator of a from-scratch rebuild, whose folds run
+ *     unpaced. It is `null` unless `workMs` is a positive measurement — a
+ *     missing, zero, or negative `workMs` reads as "not measured", NEVER a
+ *     zero or the paced-rate extrapolation.
  *
  * `stats` absent, or its `events_folded` non-positive (a boot that folded zero
  * or a negative/malformed delta — defensive against a torn row), leaves both
- * projected durations `null`: the rate is undefined, not zero. Otherwise the
- * measured `duration_ms / events_folded` rate scales two ways: by the events
- * accumulated since that boot completed (`headEventId - stats.endEventId`,
- * floored at 0) for the catch-up projection, and by the CURRENT total
- * `eventCount` for the full-replay projection.
+ * projected durations `null`: the shared denominator is undefined. A
+ * non-positive `duration_ms` additionally nulls just the catch-up leg.
  */
 export function computeEventStoreStatus(
   stats: BootCatchupStats | null,
@@ -2439,7 +2458,7 @@ export function computeEventStoreStatus(
     duration_ms: durationMs,
     events_folded: eventsFolded,
   };
-  if (eventsFolded <= 0 || durationMs <= 0) {
+  if (eventsFolded <= 0) {
     return {
       event_count: eventCount,
       db_bytes: dbBytes,
@@ -2448,16 +2467,24 @@ export function computeEventStoreStatus(
       projected_full_replay_duration_ms: null,
     };
   }
-  const msPerEvent = durationMs / eventsFolded;
   const pendingSinceLastBoot = Math.max(0, headEventId - stats.endEventId);
+  // Catch-up: wall-clock rate. Null when the wall-clock window is non-positive.
+  const projectedCatchupMs =
+    durationMs > 0
+      ? Math.round((durationMs / eventsFolded) * pendingSinceLastBoot)
+      : null;
+  // Full-replay: pace-free fold-work rate only. Null-honest unless workMs is a
+  // positive measurement — never a zero, never the wall-clock extrapolation.
+  const projectedFullReplayMs =
+    stats.workMs !== null && stats.workMs > 0
+      ? Math.round((stats.workMs / eventsFolded) * eventCount)
+      : null;
   return {
     event_count: eventCount,
     db_bytes: dbBytes,
     last_boot_catchup: lastBootCatchup,
-    projected_catchup_duration_ms: Math.round(
-      msPerEvent * pendingSinceLastBoot,
-    ),
-    projected_full_replay_duration_ms: Math.round(msPerEvent * eventCount),
+    projected_catchup_duration_ms: projectedCatchupMs,
+    projected_full_replay_duration_ms: projectedFullReplayMs,
   };
 }
 

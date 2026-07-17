@@ -68,7 +68,11 @@ import {
   SCHEMA_VERSION,
 } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
-import { __resetMonitorProvenanceMemoForTest, drain } from "../src/reducer";
+import {
+  __resetEpicIndexMemoForTest,
+  __resetMonitorProvenanceMemoForTest,
+  drain,
+} from "../src/reducer";
 import {
   __resetSubagentPreParseMemoForTest,
   resolveBridgeAgentId,
@@ -840,6 +844,10 @@ function rewindAndWipeProjections(): void {
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
+  // The epic-index memo mirrors the MUTABLE `epics` table, so it must reset with
+  // the wipe (unlike the append-only watermark memos, which survive rewinds) —
+  // otherwise the re-fold would serve a stale pre-wipe index.
+  __resetEpicIndexMemoForTest(db);
   db.run("DELETE FROM subagent_invocations");
   db.run("DELETE FROM commit_trailer_facts");
   db.run("DELETE FROM autopilot_state");
@@ -3496,6 +3504,217 @@ test("merge byte-identity: tombstoned epic WITHOUT live descendants is not resur
   drainAll();
   expect(epicRowExists("fn-5-dead")).toBe(false);
   assertPlanRefoldByteIdentical();
+});
+
+// ---------------------------------------------------------------------------
+// Epic-index memo (fn-1313) — the fold serves the all-epics dep index from a
+// per-`Database` in-place memo (seed-once, patch-on-index-relevant-write). The
+// memo feeds the DETERMINISTIC `resolved_epic_deps` / `epic_dep_edges`
+// projections, so the contract is byte-identity to a fresh scan at every read:
+// a WARM connection (memo patched across many folds) must equal both a COLD
+// from-scratch re-fold (memo seeded once, then patched) AND a per-fold
+// FRESH-SCAN re-fold (memo reset before every single-event fold, so each index
+// read pays a full scan — the pre-memo behavior).
+// ---------------------------------------------------------------------------
+
+function insertEpicSnapshotEvent(
+  epicId: string,
+  snapshot: Record<string, unknown>,
+): number {
+  return insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: epicId,
+    data: JSON.stringify(snapshot),
+  });
+}
+
+function insertEpicDeletedEvent(epicId: string): number {
+  return insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: epicId,
+    data: JSON.stringify({ epic_id: epicId }),
+  });
+}
+
+function insertTaskSnapshotEvent(
+  taskId: string,
+  snapshot: Record<string, unknown>,
+): number {
+  return insertEvent({
+    hook_event: "TaskSnapshot",
+    session_id: taskId,
+    data: JSON.stringify(snapshot),
+  });
+}
+
+/** The two DETERMINISTIC projections the epic-index memo feeds. */
+function epicDepProjection(): {
+  epics: unknown[];
+  epic_dep_edges: unknown[];
+} {
+  return {
+    epics: db
+      .query(
+        `SELECT epic_id, epic_number, project_dir, status,
+                depends_on_epics, resolved_epic_deps
+           FROM epics ORDER BY epic_id`,
+      )
+      .all(),
+    epic_dep_edges: db
+      .query(
+        "SELECT consumer_id, dep_token FROM epic_dep_edges ORDER BY consumer_id, dep_token",
+      )
+      .all(),
+  };
+}
+
+/**
+ * Re-fold the whole event log from cursor 0 after wiping the epic projections.
+ * `perFoldFreshScan` resets the index memo before EVERY single-event fold so
+ * each index read re-seeds via a full scan (the pre-memo path); otherwise one
+ * `drainAll` seeds the memo once and patches the rest (the cold-start path).
+ */
+function refoldEpicsFromScratch(perFoldFreshScan: boolean): void {
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_dep_edges");
+  __resetEpicIndexMemoForTest(db);
+  if (!perFoldFreshScan) {
+    drainAll();
+    return;
+  }
+  let n: number;
+  do {
+    __resetEpicIndexMemoForTest(db);
+    n = drain(db, 1);
+  } while (n > 0);
+}
+
+test("fn-1313 epic-index memo: warm folds equal a cold re-fold AND a per-fold fresh scan over adversarial snapshot/delete/tombstone/number-change churn", () => {
+  const OTHER_REPO = "/other-repo";
+
+  // WARM: drain after each round so the memo is seeded early (round 1's first
+  // index read) and PATCHED across every later fold — the steady-state path.
+
+  // Round 1 — an upstream + a consumer resolving it by bare id and full id.
+  insertEpicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Up",
+    project_dir: PLAN_REPO,
+    status: "open",
+  });
+  insertEpicSnapshotEvent("fn-2-cons", {
+    epic_number: 2,
+    title: "Cons",
+    project_dir: PLAN_REPO,
+    status: "open",
+    depends_on_epics: ["fn-1", "fn-1-up"],
+  });
+  drainAll();
+
+  // Round 2 — a shared epic_number bucket (fn-3-a, fn-4-b both number 5, distinct
+  // projects) and a consumer whose bare `fn-5` disambiguates same-project.
+  insertEpicSnapshotEvent("fn-3-a", {
+    epic_number: 5,
+    project_dir: PLAN_REPO,
+    status: "open",
+  });
+  insertEpicSnapshotEvent("fn-4-b", {
+    epic_number: 5,
+    project_dir: OTHER_REPO,
+    status: "open",
+  });
+  insertEpicSnapshotEvent("fn-5-c", {
+    epic_number: 3,
+    project_dir: PLAN_REPO,
+    status: "open",
+    depends_on_epics: ["fn-5"],
+  });
+  drainAll();
+
+  // Round 3 — epic_number change: fn-3-a moves 5 → 6 (drop from bucket 5, insert
+  // into bucket 6). Bucket 5 now holds only fn-4-b.
+  insertEpicSnapshotEvent("fn-3-a", {
+    epic_number: 6,
+    project_dir: PLAN_REPO,
+    status: "open",
+  });
+  drainAll();
+
+  // Round 4 — a consumer read AFTER the bucket move: `fn-5` → fn-4-b (sole
+  // bucket-5 member, cross-project), `fn-6` → fn-3-a. A stale memo (fn-3-a still
+  // in bucket 5, or absent from bucket 6) would diverge here.
+  insertEpicSnapshotEvent("fn-6-d", {
+    epic_number: 9,
+    project_dir: PLAN_REPO,
+    status: "open",
+    depends_on_epics: ["fn-5", "fn-6"],
+  });
+  drainAll();
+
+  // Round 5 — delete the upstream (fn-2-cons's deps flip to dangling) and a
+  // delete of a NONEXISTENT epic (a total no-op that must patch nothing).
+  insertEpicDeletedEvent("fn-1-up");
+  insertEpicDeletedEvent("fn-99-ghost");
+  drainAll();
+
+  // Round 6 — re-create fn-1-up after its tombstone (cleared + upserted, now
+  // done); a tombstone for an epic with no row; then a tombstone-SUPPRESSED
+  // shell insert (a TaskSnapshot for the tombstoned epic patches nothing).
+  insertEpicSnapshotEvent("fn-1-up", {
+    epic_number: 1,
+    title: "Up",
+    project_dir: PLAN_REPO,
+    status: "done",
+  });
+  insertEpicDeletedEvent("fn-7-dead");
+  insertTaskSnapshotEvent("fn-7-dead.1", {
+    epic_id: "fn-7-dead",
+    task_number: 1,
+    title: "t",
+    runtime_status: "todo",
+  });
+  drainAll();
+
+  // Round 7 — a final consumer reading the fully-churned index: `fn-1` →
+  // satisfied (fn-1-up done), `fn-5` → fn-4-b, `fn-6` → fn-3-a, `fn-7-dead` →
+  // dangling (suppressed, never materialized).
+  insertEpicSnapshotEvent("fn-8-final", {
+    epic_number: 10,
+    project_dir: PLAN_REPO,
+    status: "open",
+    depends_on_epics: ["fn-1", "fn-1-up", "fn-5", "fn-6", "fn-7-dead"],
+  });
+  drainAll();
+
+  const warm = epicDepProjection();
+  const warmJson = JSON.stringify(warm);
+
+  const resolvedDepsRaw = (epicId: string): string =>
+    (
+      db
+        .query("SELECT resolved_epic_deps FROM epics WHERE epic_id = ?")
+        .get(epicId) as { resolved_epic_deps: string | null } | null
+    )?.resolved_epic_deps ?? "";
+
+  // Non-vacuous: the churn produced varied, meaningful resolutions and the
+  // tombstone suppression held — a vacuous (all-empty) projection would pass the
+  // byte-identity comparison below trivially. fn-6-d reads the index AFTER the
+  // fn-3-a bucket move, so these two resolutions prove the memo tracked it.
+  expect(warm.epic_dep_edges.length).toBeGreaterThan(0);
+  expect(resolvedDepsRaw("fn-6-d")).toContain('"resolved_epic_id":"fn-4-b"'); // fn-5
+  expect(resolvedDepsRaw("fn-6-d")).toContain('"resolved_epic_id":"fn-3-a"'); // fn-6
+  expect(resolvedDepsRaw("fn-8-final")).toContain('"state":"satisfied"'); // fn-1 → done
+  expect(resolvedDepsRaw("fn-8-final")).toContain('"state":"dangling"'); // fn-7-dead
+  expect(epicRowExists("fn-7-dead")).toBe(false);
+
+  // COLD: seed once, patch the rest.
+  refoldEpicsFromScratch(false);
+  expect(JSON.stringify(epicDepProjection())).toBe(warmJson);
+
+  // FRESH-SCAN: a full scan per fold (the pre-memo behavior).
+  refoldEpicsFromScratch(true);
+  expect(JSON.stringify(epicDepProjection())).toBe(warmJson);
 });
 
 test("orderless re-fold ignores legacy queue_jump/sort_path envelope signals (byte-identical)", () => {
