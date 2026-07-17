@@ -9,6 +9,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { main as agentCliMain, routeMetaBeforeDeps } from "../cli/agent";
+import { NATIVE_COMMANDS } from "../cli/descriptor";
 import { splitSubcommand } from "../src/agent/dispatch";
 import { main } from "../src/agent/main";
 import {
@@ -32,6 +33,23 @@ function harness(argv: string[]) {
     rawArgv: true,
   });
 }
+test("native descriptor exposes the nested accounts command family", () => {
+  const agent = NATIVE_COMMANDS.find((command) => command.name === "agent");
+  const accounts = agent?.verbs?.find((verb) => verb.name === "accounts");
+  expect(accounts?.mutates).toBe(true);
+  expect(accounts?.verbs?.map((verb) => verb.name)).toEqual([
+    "check",
+    "authorize-codexbar",
+  ]);
+  expect(accounts?.verbs?.find((verb) => verb.name === "check")?.mutates).toBe(
+    false,
+  );
+  expect(
+    accounts?.verbs?.find((verb) => verb.name === "authorize-codexbar")
+      ?.mutates,
+  ).toBe(true);
+});
+
 describe("splitSubcommand", () => {
   test("leading claude runs with the remaining args", () => {
     expect(splitSubcommand(["claude", "--print", "hi"])).toEqual({
@@ -130,6 +148,17 @@ describe("splitSubcommand", () => {
     expect(splitSubcommand(["presets", "frobnicate"])).toEqual({
       kind: "usage",
       unknown: "presets frobnicate",
+    });
+  });
+  test("accounts authorize-codexbar classifies exactly", () => {
+    expect(splitSubcommand(["accounts", "authorize-codexbar"])).toEqual({
+      kind: "accounts-authorize-codexbar",
+    });
+    expect(
+      splitSubcommand(["accounts", "authorize-codexbar", "unexpected"]),
+    ).toEqual({
+      kind: "usage",
+      unknown: "accounts authorize-codexbar",
     });
   });
   // The profile-check command is retired (no Keeper-owned profile farm to

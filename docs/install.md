@@ -50,25 +50,32 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 ### Account routing (optional)
 
 Claude account routing is optional and fails open to the native default account when either integration
-is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: it resolves the
-trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable source state
-on first install or an explicit `KEEPER_CODEXBAR_UPDATE=1 bash scripts/install.sh`, attempts a sealed
-noninteractive rebase with merge topology preserved, and builds the exact fork tip when upstream cannot
-be resolved, the rebase conflicts, or the rebased build fails. Each immutable generation
-under `~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic `current`
-symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and interactive-shell
-path. Before publication, Keeper signs the staged executable with its pinned, certificate-backed local
-identity and verifies the exact designated requirement; the private key remains in the login Keychain.
-Because macOS gives non-Apple-signed code a content-hash Keychain partition, a validated signed generation
-stays pinned across normal Keeper installs. An explicit update changes that partition and can require one
-“Always Allow” authorization for each existing CodexBar cache item. Provenance records source and tree
-SHAs, mode, architecture, Swift toolchain, signing identity and requirement, and the verified binary
-SHA-256. A failed build, signing, or publication retains the previous artifact, and the Homebrew cask is
-removed only after publication succeeds.
-Keeper forces `CODEXBAR_DISABLE_KEYCHAIN_ACCESS=1` for the daemon and every observer subprocess: an
-unattended capacity poll must never request a macOS password or read CodexBar's credential/cookie cache.
-When ambient Claude capacity exists only in Keychain, that gate reports unavailable and routing safely
-uses the native default instead of prompting.
+is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: on every run it
+resolves the trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable
+source state, attempts a sealed noninteractive rebase with merge topology preserved, and builds the exact
+fork tip when upstream cannot be resolved, the rebase conflicts, or the rebased build fails. Unchanged
+source identities are an idempotent no-op; a changed identity updates automatically. Each immutable
+generation under `~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic
+`current` symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and
+interactive-shell path. Before publication, Keeper signs the staged executable with its pinned,
+certificate-backed local identity and verifies the exact designated requirement; the private key remains
+in the login Keychain. Provenance records source and tree SHAs, mode, architecture, Swift toolchain,
+signing identity and requirement, and the verified binary SHA-256. A failed fetch, build, signing, or
+publication retains the previous artifact, and the Homebrew cask is removed only after publication
+succeeds.
+
+The observer may read CodexBar's Keychain-backed cache, but it never attempts a newly installed executable
+unattended. `keeper agent accounts authorize-codexbar` runs the exact Claude and Codex provider checks
+serially in the foreground, then records only the successful provider names, current binary SHA-256,
+a non-repeating generation nonce, per-provider attempt revisions, and timestamps in a private authorization receipt. Before each unattended
+spawn, the observer atomically consumes that provider's authority; only a parseable successful result for
+the same attempt grants it again. Concurrent or stale completions cannot overwrite a newer foreground
+decision. Capacity observations carry the executable digest, and both the worker and launch router reject
+a fresh-looking sidecar that no longer matches the current authorized generation. An automatic update
+therefore pauses CodexBar observation until the command is run again; `cswap` observation continues and
+routing fails open to the native default. A crash, timeout, malformed result, denied prompt, or receipt I/O
+failure cannot become an unattended prompt loop. Raw provider output, identities, and credentials never
+enter the receipt.
 
 | Capability | Public command | Keeper role |
 |---|---|---|

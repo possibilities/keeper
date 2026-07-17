@@ -23,6 +23,7 @@
 
 import { mkdirSync } from "node:fs";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import type { Observation } from "./account-observation";
 import {
   type ExactArgvRunner,
   makeBoundedRunner,
@@ -34,10 +35,17 @@ import {
   type TryAcquireRefreshLock,
 } from "./account-observation-refresh";
 import {
+  codexBarClaudeUsageArgv,
+  codexBarCodexUsageArgv,
   OBSERVE_INTERVAL_MS,
   OBSERVE_JITTER_MS,
   resolveAccountRoutingRoot,
+  resolveCodexBarCommand,
 } from "./account-routing-config";
+import {
+  isCodexBarObservationCurrent,
+  makeAuthorizedCodexBarRunner,
+} from "./codexbar-authorization";
 
 export {
   makeBoundedRunner,
@@ -99,6 +107,8 @@ export interface AccountObserverDeps {
   /** Test seams for bounded refresh-lock contention. */
   contentionWaitMs?: number;
   contentionTimeoutMs?: number;
+  /** Reject sidecar state from a superseded or unauthorized generation. */
+  acceptObservation?: (observation: Observation) => boolean;
 }
 
 /**
@@ -128,6 +138,7 @@ export class AccountObserver {
         tryAcquireLock: this.deps.tryAcquireLock,
         contentionWaitMs: this.deps.contentionWaitMs,
         contentionTimeoutMs: this.deps.contentionTimeoutMs,
+        acceptObservation: this.deps.acceptObservation,
         sleep: (ms) => this.deps.clock.sleep(ms, this.deps.shutdownSignal),
       });
     } catch (err) {
@@ -187,11 +198,30 @@ function main(): void {
   }
 
   const shutdownController = new AbortController();
+  const codexbarBin = resolveCodexBarCommand();
   const observer = new AccountObserver({
     stateDir,
-    runner: makeBoundedRunner(),
+    runner: makeAuthorizedCodexBarRunner({
+      stateDir,
+      codexbarBin,
+      runner: makeBoundedRunner(),
+      onBlocked: (provider, failure) => {
+        console.error(
+          `[account-observer] CodexBar ${provider} authorization blocked after ` +
+            `${failure ?? "provider failure"}; run ` +
+            "keeper agent accounts authorize-codexbar",
+        );
+      },
+    }),
     clock: REAL_OBSERVER_CLOCK,
     shutdownSignal: shutdownController.signal,
+    codexbarArgv: codexBarClaudeUsageArgv(codexbarBin),
+    codexCodexbarArgv: codexBarCodexUsageArgv(codexbarBin),
+    acceptObservation: (observation) =>
+      isCodexBarObservationCurrent({
+        binarySha256: observation.codexbar_binary_sha256,
+        codexbarBin,
+      }),
   });
   // The loop is internally no-throw. Any unexpected settle outside an orderly
   // shutdown is nevertheless fatal so main's worker supervisor owns recovery.
