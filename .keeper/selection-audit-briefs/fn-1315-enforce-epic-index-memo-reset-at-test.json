@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 4,
+        "files_changed": 6,
+        "insertions": 40
+      },
+      "done_summary": "Added __resetEpicIndexMemoForTest(db) calls at all 29 epics-wipe-then-refold sites across the 6 gap test files (reducer-projections, db, reducer-plan, compaction, daemon, reducer-links test suites), closing the documented MUST-reset invariant gap.",
+      "input_hash": "68be4e9e905791a4729294d918614ac2249a9cebccc418c3d125befb59118bbc",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1407,
+      "spec_md": "## Description\n\nTraces to audit finding F1 (evidence: `src/reducer.ts:9570-9578` declares the\nMUST-reset invariant; the memo doc at 9549-9551 restates it). Eight test files\n`DELETE FROM epics` and re-fold on the reused module-level `db`, but only\n`test/refold-equivalence.test.ts` and `test/reducer-lifecycle.test.ts` call\n`__resetEpicIndexMemoForTest`. The six gaps \u2014\n`test/reducer-projections.test.ts` (e.g. the wipe-then-`drainAll` at\n5906-5924), `test/db.test.ts`, `test/reducer-plan.test.ts`,\n`test/compaction.test.ts`, `test/daemon.test.ts`, `test/reducer-links.test.ts`\n\u2014 wipe on a memo-seeded connection without resetting. Fix by calling\n`__resetEpicIndexMemoForTest(db)` at each such wipe site, or by factoring the\nwipe through a shared helper that resets the memo (mirror\n`refold-equivalence`'s `rewindAndWipeProjections`). Files: the six test files\nabove; optionally a shared test helper for the wipe path.\n\n## Acceptance\n\n- [ ] All six identified test files reset the epic-index memo at every `epics`-wipe-and-refold site (inline or via a shared helper).\n- [ ] The named gates covering the touched files remain green.\n\n## Done summary\nAdded __resetEpicIndexMemoForTest(db) calls at all 29 epics-wipe-then-refold sites across the 6 gap test files (reducer-projections, db, reducer-plan, compaction, daemon, reducer-links test suites), closing the documented MUST-reset invariant gap.\n## Evidence\n",
+      "task_id": "fn-1315-enforce-epic-index-memo-reset-at-test.1",
+      "tier": "medium",
+      "title": "Reset memo at epics-wipe test sites"
+    }
+  ],
+  "created_at": "2026-07-17T19:44:47.160000Z",
+  "epic_id": "fn-1315-enforce-epic-index-memo-reset-at-test",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "68be4e9e905791a4729294d918614ac2249a9cebccc418c3d125befb59118bbc",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
