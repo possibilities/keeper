@@ -39,5 +39,5 @@ Cover: reconciler teardown from birth coords after exit-confirm; bucket skips an
 - [ ] ADRs 0056/0069, install.md, and problem-codes reflect the 0071 contract
 
 ## Done summary
-
+Moved owned Provider-leg tmux window teardown into the durable cascade producer using birth-captured pane/generation identity, carved the ADR 0056 autoclose bucket down to legacy ownerless legs with a display-only drain gauge, coordinated one-page-per-incident across death-notice and cascade, updated the wrapped worker prompt partial to the transfer-not-title rule, and revised ADR 0056/0069, install.md, and problem-codes.md.
 ## Evidence
