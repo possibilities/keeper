@@ -3221,7 +3221,9 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // v132 adds the ADR 0071 `provider_leg_ownership` / `provider_leg_cascades`
   // projection tables — new standalone tables, not a touch of the epics SHAPE
   // this test pins.
-  expect(SCHEMA_VERSION).toBe(132);
+  // v133 adds the fn-1311 `boot_catchup_stats` OPERATIONAL singleton — a new
+  // standalone table, not a touch of the epics SHAPE this test pins.
+  expect(SCHEMA_VERSION).toBe(133);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

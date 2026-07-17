@@ -28,6 +28,7 @@ import {
   type StatusBootInfo,
 } from "../cli/status";
 import { QUERY_READ_ALLOWLIST, REGISTRY } from "../src/collections";
+import { recordBootCatchupStats } from "../src/db";
 import {
   encodeFrame,
   type FilterValue,
@@ -41,6 +42,8 @@ import type {
   ReadinessSocket,
   SocketHandlers,
 } from "../src/readiness-client";
+import { computeEventStoreStatus, readBootStatus } from "../src/server-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 class ExitError extends Error {
   readonly code: number;
@@ -169,15 +172,140 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
   } as unknown as ReadinessClientSnapshot;
 }
 
-const BOOT: StatusBootInfo = { rev: 4242, catching_up: false };
+const BOOT: StatusBootInfo = {
+  rev: 4242,
+  catching_up: false,
+  event_store: null,
+};
+
+// ---------------------------------------------------------------------------
+// computeEventStoreStatus (fn-1311) — pure projection math, injected
+// observations. Every expected value below is a hand-computed constant, never
+// re-derived by the function under test.
+// ---------------------------------------------------------------------------
+
+describe("computeEventStoreStatus", () => {
+  test("no recorded boot measurement → null-honest: both projections null, last_boot_catchup null", () => {
+    const out = computeEventStoreStatus(null, 1000, 65536, 1000);
+    expect(out).toEqual({
+      event_count: 1000,
+      db_bytes: 65536,
+      last_boot_catchup: null,
+      projected_catchup_duration_ms: null,
+      projected_full_replay_duration_ms: null,
+    });
+  });
+
+  test("a recorded measurement projects both durations from the observed rate", () => {
+    // Observed: 500 events folded in 10_000ms → 20ms/event. 100 events have
+    // accumulated since that boot's end cursor (head 1100 vs end 1000), and
+    // the current total is 2000 events.
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 10_000,
+      startEventId: 500,
+      endEventId: 1000,
+    };
+    const out = computeEventStoreStatus(stats, 2000, 999_999, 1100);
+    expect(out.last_boot_catchup).toEqual({
+      duration_ms: 10_000,
+      events_folded: 500,
+    });
+    // 20ms/event * 100 pending events
+    expect(out.projected_catchup_duration_ms).toBe(2000);
+    // 20ms/event * 2000 current total events
+    expect(out.projected_full_replay_duration_ms).toBe(40_000);
+  });
+
+  test("zero events folded (a boot that caught up nothing) leaves the rate undefined — projections null, observation still surfaced", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 5000,
+      startEventId: 42,
+      endEventId: 42,
+    };
+    const out = computeEventStoreStatus(stats, 42, 4096, 42);
+    expect(out.last_boot_catchup).toEqual({
+      duration_ms: 5000,
+      events_folded: 0,
+    });
+    expect(out.projected_catchup_duration_ms).toBeNull();
+    expect(out.projected_full_replay_duration_ms).toBeNull();
+  });
+
+  test("no events have accumulated since the recorded boot → catch-up projection is 0, not null", () => {
+    const stats = {
+      startedAtMs: 0,
+      completedAtMs: 4000,
+      startEventId: 0,
+      endEventId: 400,
+    };
+    // head == the recorded end cursor: nothing pending right now.
+    const out = computeEventStoreStatus(stats, 400, 8192, 400);
+    expect(out.projected_catchup_duration_ms).toBe(0);
+    // 10ms/event * 400 current total events
+    expect(out.projected_full_replay_duration_ms).toBe(4000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readBootStatus — the durable `boot_catchup_stats` row flows through the
+// served boot header's `event_store` block end-to-end.
+// ---------------------------------------------------------------------------
+
+describe("readBootStatus event_store wiring", () => {
+  test("no boot_catchup_stats row yet → event_store carries live counts with null projections", () => {
+    const { db } = freshMemDb();
+    const boot = readBootStatus(db, { ready: true });
+    expect(boot.event_store).toEqual({
+      event_count: 0,
+      db_bytes: expect.any(Number),
+      last_boot_catchup: null,
+      projected_catchup_duration_ms: null,
+      projected_full_replay_duration_ms: null,
+    });
+    expect(boot.event_store?.db_bytes).toBeGreaterThan(0);
+  });
+
+  test("a recorded boot measurement surfaces on the served header, scaled against live event_count", () => {
+    const { db } = freshMemDb();
+    for (let i = 0; i < 3; i++) {
+      db.run(
+        "INSERT INTO events (ts, session_id, hook_event, event_type) VALUES (?, ?, ?, ?)",
+        [
+          1000 + i,
+          "01234567-89ab-cdef-0123-456789abcdef",
+          "SessionStart",
+          "SessionStart",
+        ],
+      );
+    }
+    recordBootCatchupStats(db, {
+      startedAtMs: 0,
+      completedAtMs: 1000,
+      startEventId: 0,
+      endEventId: 3,
+    });
+    const boot = readBootStatus(db, { ready: true });
+    expect(boot.event_store?.event_count).toBe(3);
+    expect(boot.event_store?.last_boot_catchup).toEqual({
+      duration_ms: 1000,
+      events_folded: 3,
+    });
+    // ~333.33ms/event * 3 current events, rounded.
+    expect(boot.event_store?.projected_full_replay_duration_ms).toBe(1000);
+    // Nothing pending beyond the recorded end cursor (head == 3 == end_event_id).
+    expect(boot.event_store?.projected_catchup_duration_ms).toBe(0);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // buildStatusEnvelope — envelope shape + field presence
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version is v11", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(11);
+  test("status schema version is v12", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(12);
   });
 
   test("envelope carries every documented field", () => {
@@ -240,6 +368,7 @@ describe("buildStatusEnvelope shape", () => {
     // boot header passthrough
     expect(d.rev).toBe(4242);
     expect(d.catching_up).toBe(false);
+    expect(d.event_store).toBeNull();
     // count + flag + in_flight + needs_human blocks present
     expect(d.counts.epics.total).toBe(1);
     expect(d.counts.tasks.ready).toBe(1);

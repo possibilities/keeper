@@ -4415,6 +4415,20 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       }
     },
   },
+  {
+    // fn-1311 — the boot-catchup-stats OPERATIONAL singleton (see
+    // `CREATE_BOOT_CATCHUP_STATS`'s doc comment). A new empty table, DETERMINISTIC
+    // in the sense that it starts absent and is never fold-touched, so a
+    // from-scratch re-fold reproduces the same (empty until the next real boot)
+    // shape and NO cursor rewind is needed. Declared in the steady-state
+    // bootstrap block too, so a fresh 0→head walk and an upgrade converge on the
+    // same shape.
+    version: 133,
+    kind: "additive",
+    apply: (ctx) => {
+      ctx.db.run(CREATE_BOOT_CATCHUP_STATS);
+    },
+  },
 ];
 
 /**
@@ -4435,7 +4449,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v132:62a151022657f28781891f7be9798f2d466ed03b191a3d61611ec9efd03ee56c";
+  "v133:425c4e1869270a9ab71cb3588bcf8996b6f39f962c52fa39fc96887876221968";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6521,6 +6535,36 @@ CREATE TABLE IF NOT EXISTS tmux_client_focus (
 `;
 
 /**
+ * `boot_catchup_stats` OPERATIONAL sidecar singleton (fn-1311) — the durable
+ * record of the MOST RECENT boot's catch-up window, written once by main right
+ * before it posts `boot-complete` (see `daemon.ts`'s `serveBootDrain` call
+ * site). NOT a reducer projection: no fold ever touches it, so — same class as
+ * `dead_letters` — a from-scratch re-fold MUST NOT touch it and a rewind never
+ * wipes it.
+ *
+ * `started_at`/`completed_at` are wall-clock ms (`Date.now()`), read by main
+ * (a producer) around the boot drain — never inside a fold. `start_event_id`/
+ * `end_event_id` are `reducer_state.last_event_id` samples taken at the same
+ * two points, so `end_event_id - start_event_id` is exactly how many events
+ * this boot folded. The status surface (`readBootStatus` in
+ * `server-worker.ts`) reads this ONE row and does pure arithmetic against it
+ * at query time — no wall-clock probe on the read path, honoring "durable
+ * observations, not wall-clock guesses at query time." Absent row (fresh DB,
+ * or a binary that predates this table) is the null-honest "no measurement
+ * yet" case.
+ */
+const CREATE_BOOT_CATCHUP_STATS = `
+CREATE TABLE IF NOT EXISTS boot_catchup_stats (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    started_at REAL NOT NULL,
+    completed_at REAL NOT NULL,
+    start_event_id INTEGER NOT NULL,
+    end_event_id INTEGER NOT NULL,
+    updated_at REAL NOT NULL
+)
+`;
+
+/**
  * Projection-class taxonomy (Marten's "Live projection lifecycle"). The central
  * source of truth for which projection tables are LIVE-PRODUCER-FED — re-derived
  * by a boot-seed producer + kept current by incremental folds ABOVE a skip-floor,
@@ -7262,6 +7306,7 @@ function migrate(db: Database): void {
       db.run(CREATE_GIT_PROJECTION_STATE);
       db.run(CREATE_TMUX_PROJECTION_STATE);
       db.run(CREATE_TMUX_CLIENT_FOCUS);
+      db.run(CREATE_BOOT_CATCHUP_STATS);
       db.run(CREATE_META);
       db.run(CREATE_SUBAGENT_INVOCATIONS);
       for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
@@ -7415,6 +7460,36 @@ export function prepareStmts(db: Database): Stmts {
 export function selectWorldRev(stmts: Stmts): number {
   const row = stmts.selectWorldRev.get() as { last_event_id: number } | null;
   return row ? row.last_event_id : 0;
+}
+
+/**
+ * Durably record one boot's catch-up window into the `boot_catchup_stats`
+ * singleton (fn-1311; see {@link CREATE_BOOT_CATCHUP_STATS}'s doc comment).
+ * Called ONCE per boot by `daemon.ts`, right before it posts `boot-complete`,
+ * with wall-clock + fold-cursor samples it took around the boot drain — a
+ * producer write, never a fold. `INSERT OR REPLACE` so the singleton always
+ * reflects only the MOST RECENT boot.
+ */
+export function recordBootCatchupStats(
+  db: Database,
+  stats: {
+    startedAtMs: number;
+    completedAtMs: number;
+    startEventId: number;
+    endEventId: number;
+  },
+): void {
+  db.run(
+    `INSERT OR REPLACE INTO boot_catchup_stats
+       (id, started_at, completed_at, start_event_id, end_event_id, updated_at)
+     VALUES (1, ?, ?, ?, ?, unixepoch('now', 'subsec'))`,
+    [
+      stats.startedAtMs,
+      stats.completedAtMs,
+      stats.startEventId,
+      stats.endEventId,
+    ],
+  );
 }
 
 /**

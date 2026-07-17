@@ -42,7 +42,7 @@ import {
 } from "../src/dispatch-failure-pill";
 import { WRAPPED_EXEC_SESSION } from "../src/exec-backend";
 import { projectNeedsHuman } from "../src/needs-human";
-import type { BootStatus, Row } from "../src/protocol";
+import type { BootStatus, EventStoreStatus, Row } from "../src/protocol";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
   type ConnectFactory,
@@ -75,8 +75,10 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * sessions only (autopilot/escalation dispatches), excluding the caller's own
  * session, distinct from `running_jobs` (every working job, supervising
  * session included); v10 adds display-only `needs_human.finalize_pending`; v11
- * adds the display-only legacy Provider-leg drain gauge. */
-export const STATUS_SCHEMA_VERSION = 11;
+ * adds the display-only legacy Provider-leg drain gauge; v12 adds the
+ * display-only `event_store` block — event count, DB bytes, and durations
+ * projected from the most recent boot's measured catch-up rate. */
+export const STATUS_SCHEMA_VERSION = 12;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -132,6 +134,11 @@ export interface VerdictTally {
 export interface StatusBootInfo {
   rev: number | null;
   catching_up: boolean;
+  // fn-1311 — the event store's growth measurements (see `EventStoreStatus`).
+  // `null` only on the pre-first-frame default (`runStatus`'s initial
+  // `latestBoot`); the daemon's `boot` header always carries a real (possibly
+  // null-honest-internally) block once a frame lands.
+  event_store: EventStoreStatus | null;
 }
 
 interface VerdictView {
@@ -238,6 +245,11 @@ export interface StatusData {
   };
   rev: number | null;
   catching_up: boolean;
+  // fn-1311 — total event count, DB byte size, and durations projected from
+  // the most recent boot's measured catch-up rate. `null` only when the
+  // daemon hasn't served a boot header yet (never happens on a real snapshot;
+  // see `StatusBootInfo`).
+  event_store: EventStoreStatus | null;
 }
 
 export type StatusEnvelope = Envelope<StatusData>;
@@ -464,6 +476,7 @@ export function buildStatusEnvelope(
     },
     rev: boot.rev,
     catching_up: boot.catching_up,
+    event_store: boot.event_store,
   });
 }
 
@@ -576,7 +589,11 @@ export async function runStatus(
   args: ParsedStatusArgs,
   deps: RunStatusDeps,
 ): Promise<void> {
-  let latestBoot: StatusBootInfo = { rev: null, catching_up: false };
+  let latestBoot: StatusBootInfo = {
+    rev: null,
+    catching_up: false,
+    event_store: null,
+  };
   let done = false;
   let handle: ReadinessClientHandle | null = null;
 
@@ -657,7 +674,11 @@ export async function runStatus(
     includeRecentDoneEpics: true,
     giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
     onBootStatus: (boot: BootStatus): void => {
-      latestBoot = { rev: boot.rev, catching_up: boot.catching_up };
+      latestBoot = {
+        rev: boot.rev,
+        catching_up: boot.catching_up,
+        event_store: boot.event_store ?? null,
+      };
     },
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.connect === undefined ? {} : { connect: deps.connect }),

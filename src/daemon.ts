@@ -124,6 +124,7 @@ import {
   evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
+  recordBootCatchupStats,
   resolveAwaitSpillDir,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
@@ -141,6 +142,7 @@ import {
   resolveSockPath,
   resolveStatuslineRoot,
   runDispatchMintGate,
+  selectWorldRev,
   truncateEphemeralProjections,
 } from "./db";
 import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
@@ -9652,6 +9654,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // happens to pin a frame, TRUNCATE degrades to busy/PASSIVE semantics (returns a
   // busy ROW, never throws) and the steady-state PASSIVE heartbeat reclaims the
   // space on the next cadence — an accepted, documented degrade.
+  //
+  // fn-1311: sample the wall-clock + fold cursor BEFORE the drain so the
+  // boot-complete hook below can durably record this boot's catch-up window
+  // (`recordBootCatchupStats`). Producer-side wall-clock read — never inside a
+  // fold — feeding the status surface's projected-duration math.
+  const bootCatchupStartedAtMs = Date.now();
+  const bootCatchupStartEventId = selectWorldRev(stmts);
   serveBootDrain();
   scheduleProviderLegDeathNoticeSweep();
   scheduleProviderLegCascadeSweep();
@@ -9738,6 +9747,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       pumpWakes();
     }
   }
+
+  // fn-1311: durably record THIS boot's catch-up window (start/end wall-clock +
+  // fold cursor sampled around the drain above) before flipping the gate, so
+  // the status surface's projected-duration math always has the freshest real
+  // observation the instant clients can read `ready`. Producer-side write —
+  // never inside a fold — to the OPERATIONAL `boot_catchup_stats` singleton
+  // (see its doc comment in `db.ts`); never touched by a fold or a rewind.
+  recordBootCatchupStats(db, {
+    startedAtMs: bootCatchupStartedAtMs,
+    completedAtMs: Date.now(),
+    startEventId: bootCatchupStartEventId,
+    endEventId: selectWorldRev(stmts),
+  });
 
   // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.
   // Flip the server worker's boot gate so mutating RPCs are accepted and the
