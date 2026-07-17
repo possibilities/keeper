@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-17T19:51:15.916000Z",
   "created_at": "2026-07-17T19:44:50.760000Z",
   "created_by_close_of": "fn-1315-enforce-epic-index-memo-reset-at-test",
   "depends_on_epics": [
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-17T19:44:51.424000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Enforce epic-index memo reset in reducer-lifecycle tests",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-17T19:44:51.424000Z"
+  "updated_at": "2026-07-17T19:51:15.916000Z"
 }
