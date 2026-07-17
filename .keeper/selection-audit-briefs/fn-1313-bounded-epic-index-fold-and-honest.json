@@ -1,0 +1,44 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "n/a-operator-manual",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 20,
+        "files_changed": 6,
+        "insertions": 428
+      },
+      "done_summary": "Added the bench-folds named opt-in gate (test/slow/fold-cost-bench.test.ts, bun run test:bench-folds), pinning the epic-fold memoized index-serving path as flat and the syncPlanLinks commit-trailer prefix cost inside a regression band, with manifest/gate-runner/package.json registration and revised docs/testing.md slow-tier framing.",
+      "input_hash": "n/a-operator-manual",
+      "model": "sonnet",
+      "spec_chars": 4477,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** test/slow/fold-cost-bench.test.ts, scripts/test-manifest.ts, scripts/test-gate.ts, package.json, docs/testing.md\n\n### Approach\n\nLand a durable fold-cost benchmark behind its OWN named opt-in gate\n(suggested: `test:bench-folds`) that pins the reducer's growth curves.\nDeterministic synthetic corpora over the in-memory template DB (fixed\nids/ts \u2014 no Date.now/Math.random), folded via the public drain path,\ntimed in BULK (total ms over N folds at each size \u2014 per-fold timing sits\nat clock resolution and flakes). Two curves: (a) epic-fold per-event cost\nacross a pinned board-size ladder (e.g. 500/2000/8000 epics) asserted\nFLAT via adjacent-size ratio bands \u2014 never absolute wall-clock thresholds\n\u2014 with warmup folds before timing and median-of-runs aggregation; scope\nthis assertion to the index-serving path, not the dep reverse fan-out\n(O(consumers), deliberately unbounded here); (b) the syncPlanLinks\nper-session commit-prefix curve pinned as a documented regression band\n(linear allowed \u2014 the bench guards against superlinear regressions, it\ndoes not demand a fix). Report bulk ms/event as output. Register the gate\neverywhere the two existing slow gates are registered: a new phase\nliteral + explicit file allowlist in the test manifest, a --phase branch\nin the gate runner, a package.json script, and a docs/testing.md\nslow-tier row \u2014 and REVISE the slow-tier framing prose (it currently says\nthe tier's gates run real processes; this bench is pure in-process, so\nthe genre sentence needs rewording, not just a row append). The gate\nnever joins test:gate/test/test:full. This bench runs in-process only \u2014\nno daemon, no Worker, no subprocess \u2014 so it needs no ADR 0073 amendment\n(that governs the real-process scenario set).\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- scripts/test-manifest.ts:6-8, :33-37, :121 \u2014 phase literals, slow-gate file allowlists, classifyTestFile; the new gate mirrors SLOW_GIT_FILES/SLOW_DAEMON_FILES\n- scripts/test-gate.ts:129-148 \u2014 --phase parsing; add the new branch + parse guard\n- package.json:20-24 \u2014 the test:slow-* script shape to mirror\n- docs/testing.md:56-79 \u2014 the slow-tier table and the framing prose to revise\n- test/helpers/template-db.ts:113 \u2014 freshMemDb, the per-test migrated template clone the corpora build on\n- src/reducer.ts drain/applyEvent exports \u2014 fold via the public path, byte-faithful to production\n\n**Optional** (reference as needed):\n- test/reducer-plan.test.ts:1517-1544 \u2014 the synthetic EpicSnapshot/TaskSnapshot event construction idiom\n- test/db.test.ts:9686-9714 \u2014 the synthetic Commit-with-plan-trailer payload idiom (for the syncPlanLinks curve corpus)\n\n### Risks\n\n- Timing assertions are the top CI flake source \u2014 ratio bands, warmup, and median aggregation are the mitigations; if a band still flakes, widen the band and document it rather than tightening the runtime\n- A corpus that accidentally reads wall-clock or randomness breaks determinism and reproducibility of the measured curve\n\n### Test notes\n\nThe bench IS the test; its own stability matters more than its precision.\nAssert curve SHAPE (adjacent-size ratios within band), report absolute\nms/event as informational output only. Verify the gate is excluded from\nthe correctness tiers by running the fast gates and confirming the bench\nfile is not collected.\n\n## Acceptance\n\n- [ ] A named opt-in gate runs the fold-cost bench and fails when warm epic-fold per-event cost grows materially with board size (ratio-band assertion); it passes on the memoized reducer\n- [ ] The bench pins the syncPlanLinks per-session prefix curve as a regression band and reports bulk ms/event\n- [ ] The correctness tiers never collect the bench file; the named-gate registration (manifest, runner, script) matches the existing slow-gate pattern\n- [ ] docs/testing.md documents the gate and its framing prose correctly distinguishes real-process gates from this in-process perf bench\n- [ ] The full fast correctness gates stay green\n\n## Done summary\nAdded the bench-folds named opt-in gate (test/slow/fold-cost-bench.test.ts, bun run test:bench-folds), pinning the epic-fold memoized index-serving path as flat and the syncPlanLinks commit-trailer prefix cost inside a regression band, with manifest/gate-runner/package.json registration and revised docs/testing.md slow-tier framing.\n## Evidence\n",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.3",
+      "tier": "high",
+      "title": "Fold-cost bench gate"
+    }
+  ],
+  "created_at": "2026-07-17T18:27:40.442000Z",
+  "epic_id": "fn-1313-bounded-epic-index-fold-and-honest",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1313-bounded-epic-index-fold-and-honest.2"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "n/a-operator-manual",
+  "selection_input_hash": "n/a-operator-manual",
+  "selector": {
+    "harness": "claude",
+    "model": "claude-fable-5"
+  }
+}
