@@ -31,14 +31,17 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
+  ArtifactSchemaTooNewError,
   AUDIT_SCHEMA_VERSION,
   auditsRoot,
   briefPath,
   computeCommitSetHash,
   followupMetaPath,
   followupPath,
+  readArtifactJson,
   reportMetaPath,
   reportPath,
+  setAuditSchemaVersion,
   verdictPath,
   writeArtifact,
 } from "../src/audit_artifacts.ts";
@@ -47,11 +50,13 @@ import {
   findCommitGroups,
   laneBranchFor,
 } from "../src/commit_lookup.ts";
+import { SELECTION_SCHEMA_VERSION } from "../src/selection_sidecar.ts";
 import { resetVcs, setVcs } from "../src/vcs.ts";
 import {
   deriveDepthBand,
   readAuditPolicyDoc,
 } from "../src/verbs/close_preflight.ts";
+import { SELECTION_BRIEF_SCHEMA_VERSION } from "../src/verbs/selection_brief.ts";
 import {
   initRepo as fakeInitRepo,
   fakeVcs,
@@ -285,13 +290,13 @@ function seedSelectionPhase(
   const brief = join(dir, "followup-brief.json");
   const verdict = join(dir, "followup-verdict.json");
   writeJsonArtifact(brief, {
-    schema_version: 1,
+    schema_version: SELECTION_BRIEF_SCHEMA_VERSION,
     epic_id: epicId,
     from_followup: true,
     input_hash: inputHash,
   });
   writeJsonArtifact(verdict, {
-    schema_version: 1,
+    schema_version: SELECTION_SCHEMA_VERSION,
     cells: { "1": { tier: "medium", model: "opus" } },
     selection: {
       harness: "subagent",
@@ -339,6 +344,55 @@ describe("close-preflight durable phase resume", () => {
       followup_present: true,
       selection_verdict_path: selectionVerdict,
     });
+  });
+
+  test("selection artifacts accept their family schema ceilings", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    const followup = seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, {
+      followup: true,
+    }) as string;
+    const verdict = seedSelectionPhase(proj.root, epicId, followup);
+    const brief = join(
+      proj.root,
+      ".keeper",
+      "state",
+      "selections",
+      epicId,
+      "followup-brief.json",
+    );
+    const auditCeiling = AUDIT_SCHEMA_VERSION;
+
+    expect(preflight(proj, epicId).phase_resume?.selection).toBe("satisfied");
+
+    try {
+      setAuditSchemaVersion(0);
+      expect(readArtifactJson(brief, SELECTION_BRIEF_SCHEMA_VERSION)).toEqual({
+        schema_version: SELECTION_BRIEF_SCHEMA_VERSION,
+        epic_id: epicId,
+        from_followup: true,
+        input_hash:
+          "c55d4ed083a013f6038d9447b772f982db45b7ae75190004345544c084bded61",
+      });
+      expect(readArtifactJson(verdict, SELECTION_SCHEMA_VERSION)).toEqual({
+        schema_version: SELECTION_SCHEMA_VERSION,
+        cells: { "1": { tier: "medium", model: "opus" } },
+        selection: {
+          harness: "subagent",
+          model: "plan:model-selector",
+          config_hash: "fixture-config",
+          input_hash:
+            "c55d4ed083a013f6038d9447b772f982db45b7ae75190004345544c084bded61",
+          shuffle_seed: 7,
+          outcome: "completed",
+          verdict_raw: "fixture",
+        },
+      });
+      expect(() => readArtifactJson(brief)).toThrow(ArtifactSchemaTooNewError);
+    } finally {
+      setAuditSchemaVersion(auditCeiling);
+    }
   });
 
   test("selection is unfinished when its input hash does not match the follow-up", () => {
