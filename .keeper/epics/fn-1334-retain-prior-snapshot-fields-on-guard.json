@@ -7,7 +7,7 @@
     "fn-1329-bound-restic-post-backup-stats"
   ],
   "id": "fn-1334-retain-prior-snapshot-fields-on-guard",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T14:28:11.921000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/dotfiles"
   ],
-  "updated_at": "2026-07-18T14:28:11.596000Z"
+  "updated_at": "2026-07-18T14:28:11.921000Z"
 }
