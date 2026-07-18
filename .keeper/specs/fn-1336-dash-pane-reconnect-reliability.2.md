@@ -55,5 +55,5 @@ callback does not kill the loop (bound the blast radius or record why not).
 - [ ] The readiness-client test gate passes
 
 ## Done summary
-
+Reproduced the terminate-without-close and hung-connect-dial wedges under the injected socket seam, then hardened recovery unconditionally: a fallback reconnect kick fires even when close never re-drives, a 5s injected connect-timeout bounds every dial and routes to retry (never fatal), teardown stays hard-destroy, and lifecycle callback exceptions no longer kill the loop. Heartbeat/query-timeout thresholds left unchanged; readiness-client test gate and the flat-RSS soak both pass.
 ## Evidence
