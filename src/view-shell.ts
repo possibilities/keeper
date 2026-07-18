@@ -251,6 +251,8 @@ export interface ViewShellOptions<TSnap> {
    * restores to `""` (no banner).
    */
   persistentBannerPill?: () => string;
+  /** Monotonic clock used for last-good-frame recency. */
+  monotonicNow?: () => number;
   /**
    * Optional poller surfacing the reducer's re-fold progress (fn-691).
    * Defaults to the real {@link createRefoldProgressPoller} bound to
@@ -515,6 +517,7 @@ export function createViewShell<TSnap>(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
   const snapshotEmptyLine =
     opts.snapshotEmptyLine ?? DEFAULT_SNAPSHOT_EMPTY_LINE;
+  const monotonicNow = opts.monotonicNow ?? (() => performance.now());
 
   // Sidecar paths — keyed on `<script>.<pid>` exactly as the pre-factory
   // siblings emitted. Bit-for-bit shape preservation: any consumer that
@@ -617,23 +620,18 @@ export function createViewShell<TSnap>(
   // The freshest rendered composite held while gated (live mode). Retained so
   // the flip to ready paints it immediately; `null` when nothing is held.
   let heldRender: { bodyLines: string[]; stateJson: unknown } | null = null;
-  // ---- post-paint disconnect grace ----
-  // `reconnecting`: a socket drop AFTER a paint — the last frame stays on
-  // screen under a "reconnecting…" pill (no indicator, no gate) until a paint
-  // resumes, the reconnect reports catch-up (immediate flip), or the grace
-  // elapses (`graceExpired`). `graceExpired` forces the full loading indicator
-  // even though a frame is already painted and no catch-up header has arrived.
+  // ---- post-paint disconnect presentation ----
   let reconnecting = false;
   let graceExpired = false;
-  // Distinct from the 1500ms banner-restore `flashTimer` — a flash restore must
-  // never clobber the reconnecting pill or the post-grace DISCONNECTED banner;
-  // see `scheduleFlashRestore` / `bannerSlotHeld`.
+  let lastGoodFrameAt: number | null = null;
+  let waitingRetry: {
+    attempt: number;
+    retryInMs: number;
+    observedAt: number;
+  } | null = null;
   const RECONNECT_GRACE_MS = 1500;
+  const LONG_DEAD_FRAME_AGE_MS = 5000;
   const RECONNECTING_PILL = "reconnecting…";
-  // Post-grace banner pill + body-indicator token. All-caps, no ellipsis — a
-  // deliberately distinct word from `RECONNECTING_PILL` so a paused-vs-dead
-  // socket never reads as the same state. "reconnect" is a glossary Avoid
-  // synonym; this is the sole user-visible token for the class.
   const DISCONNECTED_TOKEN = "DISCONNECTED";
   let reconnectGraceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -693,21 +691,18 @@ export function createViewShell<TSnap>(
     }
   }
 
-  // Whether the loading indicator should currently occupy the body. Live mode
-  // only: gated by an active catch-up latch, before the first paint (cold
-  // start), or once the post-paint disconnect grace has elapsed. The
-  // reconnecting-pill window itself is NOT indicator-gated — the last frame
-  // stays put until the grace expires.
+  // The loading indicator owns the body only before a first frame or while
+  // readiness is gated. A post-paint drop instead keeps that frame visible.
   function shouldShowIndicator(): boolean {
-    if (mode !== "live") {
-      return false;
-    }
-    return catchingUp || frameCount === 0 || graceExpired;
+    return mode === "live" && (catchingUp || frameCount === 0);
   }
 
-  // Arm or stop the animation interval to match the gate. Idempotent both ways.
+  function shouldAnimateConnectionStatus(): boolean {
+    return mode === "live" && (shouldShowIndicator() || graceExpired);
+  }
+
   function syncIndicator(): void {
-    if (shouldShowIndicator()) {
+    if (shouldAnimateConnectionStatus()) {
       armConnectingSpinner();
     } else {
       stopConnectingSpinner();
@@ -751,20 +746,10 @@ export function createViewShell<TSnap>(
       : DISCONNECTED_TOKEN;
   }
 
-  // Compose the loading-indicator body for the current tick. Branch precedence:
-  //  0. grace expired → the sole DISCONNECTED line (single owner of the slot
-  //     while active — no re-fold %, no "connecting…", so a genuine drop
-  //     never reads as an ordinary cold-start/catch-up state);
-  //  1. fold cursor behind head → re-folding % (wire header while connected,
-  //     sqlite poller while unreachable);
-  //  2. at head with git seed pending → non-spinning "waiting for git seed";
-  //  3. residual catching-up window → plain "catching up…".
-  // With no wire header (cold start / unreachable) the sqlite poller drives
-  // branch 1, else the plain "connecting to keeperd…" line.
+  // Compose the loading-indicator body for the current tick. With no wire
+  // header (cold start / unreachable) the sqlite poller drives re-folding
+  // progress; otherwise the plain connecting line is used.
   function formatIndicatorLine(glyph: string): string {
-    if (graceExpired) {
-      return `${glyph}  ${disconnectedToken()} — keeperd unreachable`;
-    }
     const boot = latestBoot;
     if (boot !== undefined) {
       if (boot.rev < boot.head_event_id) {
@@ -795,15 +780,16 @@ export function createViewShell<TSnap>(
   }
 
   function tickConnectingSpinner(): void {
-    // Self-stop the moment the gate says the body should paint data (a frame
-    // has landed with the daemon ready). Belt-and-suspenders with `syncIndicator`
-    // so a stale tick that fires between a flip and its `clearInterval` no-ops.
-    if (!shouldShowIndicator()) {
+    if (!shouldAnimateConnectionStatus()) {
       stopConnectingSpinner();
       return;
     }
     connectingSpinnerIdx =
       (connectingSpinnerIdx + 1) % CONNECTING_SPINNER.length;
+    if (!shouldShowIndicator()) {
+      refreshReconnectPresentation();
+      return;
+    }
     const glyph = CONNECTING_SPINNER[connectingSpinnerIdx];
     // Poll the sqlite re-fold cursor ONLY while unreachable (no fresh wire
     // header) — while connected the header carries the authoritative progress.
@@ -833,24 +819,57 @@ export function createViewShell<TSnap>(
     }
   }
 
-  // Arm the post-paint disconnect grace: after ~1.5s with no reconnect the body
-  // flips from the held last frame to the full loading indicator, and the
-  // banner pill flips from the reconnecting pill to the DISCONNECTED token
-  // (plain text — the banner is a bare TextRenderable, never SGR-parsed, so
-  // no color wrap here; the body indicator carries the styled signal).
+  function frameAgeMs(): number | null {
+    return lastGoodFrameAt === null
+      ? null
+      : Math.max(0, monotonicNow() - lastGoodFrameAt);
+  }
+
+  function formatRetryCountdown(ms: number): string {
+    return `${(Math.ceil(Math.max(0, ms) / 100) / 10).toFixed(1)}s`;
+  }
+
+  function reconnectBanner(): string {
+    if (!graceExpired) {
+      return RECONNECTING_PILL;
+    }
+    const age = frameAgeMs();
+    if (age !== null && age >= LONG_DEAD_FRAME_AGE_MS) {
+      return `${DISCONNECTED_TOKEN} · last good frame ${Math.floor(age / 1000)}s ago`;
+    }
+    if (waitingRetry !== null) {
+      const remaining =
+        waitingRetry.retryInMs - (monotonicNow() - waitingRetry.observedAt);
+      return `retrying · attempt ${waitingRetry.attempt} · retry in ${formatRetryCountdown(remaining)}`;
+    }
+    return "retrying…";
+  }
+
+  function refreshReconnectPresentation(): void {
+    const banner = reconnectBanner();
+    liveShell.setStatus(banner);
+    if (!banner.startsWith(DISCONNECTED_TOKEN) || lastBody === null) {
+      return;
+    }
+    liveShell.refreshLive([
+      ...toShellLines(lastBody.split("\n")),
+      `${disconnectedToken()} — keeperd unreachable`,
+    ]);
+  }
+
   function armReconnectGrace(): void {
     clearReconnectGrace();
     reconnectGraceTimer = setTimeout(() => {
       reconnectGraceTimer = undefined;
       graceExpired = true;
-      liveShell.setStatus(DISCONNECTED_TOKEN);
+      refreshReconnectPresentation();
       syncIndicator();
     }, RECONNECT_GRACE_MS);
   }
 
-  // Leave the reconnecting-pill window: cancel the grace, restore the banner
-  // (clear the pill), and drop the grace-forced gate. Idempotent.
+  // Leave the reconnecting-pill window: cancel the grace and restore the banner.
   function exitReconnecting(): void {
+    waitingRetry = null;
     if (!reconnecting && !graceExpired) {
       return;
     }
@@ -860,11 +879,7 @@ export function createViewShell<TSnap>(
     restoreBanner();
   }
 
-  // Whether the banner's status slot is currently owned by the reconnecting
-  // pill or the post-grace DISCONNECTED token — while either holds, a
-  // transient flash must never touch the slot (see `flashStatus` /
-  // `handleCopyKey`), and a scheduled restore must reassert the held pill
-  // rather than fall through to the persistent banner.
+  // Whether the banner's status slot is currently owned by a connection state.
   function bannerSlotHeld(): boolean {
     return reconnecting || graceExpired;
   }
@@ -874,12 +889,8 @@ export function createViewShell<TSnap>(
   // pending restore from any other — last-flash-wins, no leaked state.
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   function restoreBanner(): void {
-    if (graceExpired) {
-      liveShell.setStatus(DISCONNECTED_TOKEN);
-      return;
-    }
     if (reconnecting) {
-      liveShell.setStatus(RECONNECTING_PILL);
+      liveShell.setStatus(reconnectBanner());
       return;
     }
     liveShell.setStatus(persistentBannerPill ? persistentBannerPill() : "");
@@ -1207,6 +1218,7 @@ export function createViewShell<TSnap>(
       return false;
     }
     lastBody = body;
+    lastGoodFrameAt = monotonicNow();
     frameCount += 1;
     liveShell.pushFrame(toShellLines(bodyLines));
     writeSidecars(stateJson, sidecarFrameText(bodyLines));
@@ -1242,7 +1254,23 @@ export function createViewShell<TSnap>(
     } catch {
       // best-effort
     }
+    if (event === "waiting") {
+      const attempt = detail.attempt;
+      const retryInMs = detail.retry_in_ms;
+      if (
+        typeof attempt === "number" &&
+        Number.isFinite(attempt) &&
+        typeof retryInMs === "number" &&
+        Number.isFinite(retryInMs)
+      ) {
+        waitingRetry = { attempt, retryInMs, observedAt: monotonicNow() };
+        if (graceExpired) {
+          refreshReconnectPresentation();
+        }
+      }
+    }
     if (event === "disconnected") {
+      waitingRetry = null;
       // Frames coverage honesty: a reconnect is the sole gap source the
       // emitter cannot see (its own `seq` stays contiguous), so a disconnect
       // downgrades the trailer's coverage verdict to `gap_possible`.
@@ -1254,10 +1282,8 @@ export function createViewShell<TSnap>(
         // the sqlite poller until fresh headers resume.
         latestBoot = undefined;
         if (frameCount > 0 && !catchingUp && !reconnecting) {
-          // Post-paint disconnect: hold the last frame under a "reconnecting…"
-          // pill and start the grace. Do NOT clear `lastBody` — a byte-identical
-          // frame on reconnect must suppress, not churn-repaint over the held
-          // frame — and do NOT gate to the indicator until the grace elapses.
+          // Hold the last-good frame through the grace; a byte-identical ready
+          // frame resolves the banner without churning the body.
           reconnecting = true;
           liveShell.setStatus(RECONNECTING_PILL);
           armReconnectGrace();
@@ -1276,14 +1302,8 @@ export function createViewShell<TSnap>(
     if (event === "connected") {
       sawConnected = true;
     }
-    // Loading indicator: arm/stop the single ~125ms `setInterval` off the gate
-    // state so it animates smoothly during a multi-minute boot re-fold (the
-    // subscribe socket isn't bound during boot drain — the client sits in
-    // capped-backoff `connecting` / `waiting`). Armed ONLY in live mode — in
-    // snapshot / frames modes the `refreshLive` overlay would corrupt the
-    // single-frame snapshot output / the NDJSON stream. `connected` is skipped:
-    // it lands before the first `result`, and arming just to stop it on that
-    // frame is needless churn (a prior `connecting` already armed the spinner).
+    // The shared cadence drives either the readiness indicator or the
+    // post-grace retry/age presentation. It is inert outside live mode.
     if (mode === "live" && event !== "connected") {
       syncIndicator();
     }
