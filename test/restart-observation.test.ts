@@ -310,6 +310,35 @@ describe("restart identity-capability crossing", () => {
     });
   });
 
+  test("proves an absent successor against a non-empty valid frozen ledger", () => {
+    const verdict = classifyRestartEvidence({
+      pre_restart: {
+        service: { status: "identity-incapable" },
+        ledger: {
+          status: "readable",
+          boots: [ledgerBoot(OLD, 1_699_999_000_000)],
+        },
+      },
+      command: { issued: true, accepted: true },
+      old_process: "unknown",
+      ledger: {
+        status: "readable",
+        boots: [ledgerBoot(NEXT, 1_700_000_001_000)],
+      },
+      health: [health(NEXT, 1_000), health(NEXT, 7_000), health(NEXT, 13_000)],
+      monotonic: {
+        started_at_ms: 0,
+        now_ms: 13_000,
+        deadline_at_ms: 20_000,
+        stabilization_ms: 12_000,
+      },
+      required_healthy_observations: 3,
+    });
+
+    expect(verdict.verdict).toBe("proven");
+    expect(verdict.proof_path).toBe("identity-capability-crossing");
+  });
+
   test.each([
     ["missing", { status: "missing" } as const, "pre-restart-ledger-missing"],
     [
