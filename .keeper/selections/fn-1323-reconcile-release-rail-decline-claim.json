@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified doc reconciliation (mark ADR 0078 decline-recording deferred, add a forward-facing doc-comment, sweep any done-summary drift) with a nameable acceptance and low, reversible blast radius \u2014 GPT-first per hand_tuned, terra for ordinary bounded work, medium because it spans a couple doc surfaces plus a small reconcile sweep rather than a single trivial edit.",
+      "task_id": "fn-1323-reconcile-release-rail-decline-claim.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T01:09:09.510000Z",
+  "epic_id": "fn-1323-reconcile-release-rail-decline-claim",
+  "input_hash": "3248bd96a6b382a3b37c467bbfc3c3dbe58cca5630275f488943f8bd602de242",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 843627926,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified doc reconciliation (mark ADR 0078 decline-recording deferred, add a forward-facing doc-comment, sweep any done-summary drift) with a nameable acceptance and low, reversible blast radius \u2014 GPT-first per hand_tuned, terra for ordinary bounded work, medium because it spans a couple doc surfaces plus a small reconcile sweep rather than a single trivial edit.\",\"confidence\":0.7}]}\n"
+}
