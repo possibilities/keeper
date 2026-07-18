@@ -323,6 +323,7 @@ describe("cli/keeper dispatch", () => {
       "events",
       "summary",
       "terminate",
+      "release",
     ]);
   });
 
@@ -572,7 +573,7 @@ describe("cli/session group dispatcher", () => {
     const r = await runSession([]);
     expect(r.code).toBeNull();
     expect(r.out).toContain(
-      "keeper session <state|files|events|summary|terminate>",
+      "keeper session <state|files|events|summary|terminate|release>",
     );
     expect(r.err).toBe("");
   });
@@ -580,7 +581,14 @@ describe("cli/session group dispatcher", () => {
   test("`keeper session --help` lists every verb, no exit", async () => {
     const r = await runSession(["--help"]);
     expect(r.code).toBeNull();
-    for (const verb of ["state", "files", "events", "summary", "terminate"]) {
+    for (const verb of [
+      "state",
+      "files",
+      "events",
+      "summary",
+      "terminate",
+      "release",
+    ]) {
       expect(r.out).toContain(verb);
     }
   });
@@ -602,6 +610,9 @@ describe("cli/session group dispatcher", () => {
     );
     expect((await runSession(["terminate", "--help"])).out).toContain(
       "keeper session terminate",
+    );
+    expect((await runSession(["release", "--help"])).out).toContain(
+      "keeper session release",
     );
   });
 

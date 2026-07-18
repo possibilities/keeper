@@ -1287,6 +1287,24 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         format_modes: ["json"],
         flags: [FLAG_HELP],
       },
+      {
+        name: "release",
+        summary:
+          "Voluntarily release named paths so a blocked peer can adopt them",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: [
+          FLAG_HELP,
+          {
+            name: "session-id",
+            type: "string",
+            summary: "Releasing session identity (defaults to the env carrier)",
+          },
+        ],
+      },
     ],
   },
   {
