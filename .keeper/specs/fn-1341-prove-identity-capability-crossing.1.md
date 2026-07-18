@@ -46,5 +46,5 @@ Table-test absent boot, boot with Drain and zero identity fields, each partial i
 - [ ] Focused restart tests and typecheck pass without expanding the real-daemon gate
 
 ## Done summary
-
+Added a closed pre-restart identity evidence class (exact identity, positively served identity-incapable, unavailable/ambiguous) so a legacy predecessor can prove an identity-capability crossing to one frozen-ledger-backed, caught-up, stable successor, additive to the unchanged exact-replacement proof path.
 ## Evidence
