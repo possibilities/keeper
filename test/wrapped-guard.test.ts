@@ -653,3 +653,64 @@ describe("decideWrappedGuard — deny-precedence / single-state intent", () => {
     expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Grant override — a validly-granted escalation subagent (a different agent_type
+// than the wrapped work:worker) is exempted from the total edit-denial without
+// weakening the default posture.
+// ---------------------------------------------------------------------------
+
+describe("decideWrappedGuard — escalation grant override", () => {
+  const grantAll: (t: string) => boolean = () => true;
+  const grantNone: (t: string) => boolean = () => false;
+
+  test("a covered Edit is allowed under the grant override", () => {
+    expect(
+      decideWrappedGuard(
+        editPayload("Edit", `${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("a covered in-tree Write is allowed under the grant override", () => {
+    expect(
+      decideWrappedGuard(
+        writePayload(`${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("without the override, Edit and in-tree Write still deny (posture preserved)", () => {
+    expect(
+      decideWrappedGuard(
+        editPayload("Edit", `${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+    expect(
+      decideWrappedGuard(
+        writePayload(`${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+    // The default (no override argument) matches the grant-none posture.
+    expect(
+      decide(editPayload("Edit", `${REPO}/src/x.ts`))?.hookSpecificOutput
+        .permissionDecision,
+    ).toBe("deny");
+  });
+});

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // PreToolUse(Write|Edit|MultiEdit|NotebookEdit|Bash) wrapped-cell total-edit-denial guard.
 //
-// Fourth sibling of branch-guard / escalation-guard / wrong-tree-guard. A WRAPPED
+// Fourth sibling of branch-guard / grant-guard / wrong-tree-guard. A WRAPPED
 // worker cell's `work:worker` is a claude wrapper that delegates ALL implementation
 // (code, tests, lint iteration) to the model's serving provider via `keeper agent
 // run --resume` and owns only the keeper close-out (`commit-work` + `plan done`).
@@ -29,7 +29,7 @@
 // allowed — so in-tree write vectors (redirect/heredoc/tee/sed -i, git apply/am,
 // patch, cp/mv/tar) are all denied as off-list without needing target resolution.
 //
-// Like escalation-guard (the primary template), a MARKED session fails CLOSED
+// Like grant-guard, a MARKED session fails CLOSED
 // (deny) on any command / payload it cannot positively clear, while an unmarked
 // session fails OPEN (silent) so a human is never blocked. Every path exits 0 and
 // emits AT MOST one JSON line (the deny envelope) or nothing.
@@ -62,6 +62,8 @@ import {
   resolve,
   sep,
 } from "node:path";
+
+import { grantCoversWrite } from "../../../../src/grant-leaf.ts";
 
 // ---------------------------------------------------------------------------
 // Payload + envelope types.
@@ -112,11 +114,17 @@ export interface TreeProbe {
 export type LogSink = (record: Record<string, unknown>) => void;
 const NOOP_LOG: LogSink = () => {};
 
+/** A grant-override seam: true when a valid escalation grant authorizes a write
+ *  to this already-canonical target, so the wrapped total-edit denial yields to
+ *  it (an escalation subagent is not the wrapped `work:worker` this guard binds).*/
+export type GrantOverride = (canonicalTarget: string) => boolean;
+const NO_GRANT: GrantOverride = () => false;
+
 // ---------------------------------------------------------------------------
 // Shell lexer — quote-aware, single pass. Splits the command into segments of
 // tokens and denies the structural bypass constructs (redirects, heredocs,
 // command / process substitution) the moment it sees one outside single quotes.
-// Adapted from escalation-guard's proven, CVE-hardened lexer.
+// The shared CVE-hardened quote-aware lexer (mirrored across the Bash guards).
 // ---------------------------------------------------------------------------
 
 type LexResult =
@@ -325,7 +333,7 @@ const WRAPPED_PLAN_VERBS = new Set([
 
 /** Read-only git subcommands allowed for a wrapped worker. Source/index/ref
  *  mutations route through the provider leg or Keeper close-out.
- *  Mirrors escalation-guard's read set minus the ref-mutating `branch`, which a
+ *  Mirrors grant-guard's read set minus the ref-mutating `branch`, which a
  *  wrapped worker never needs. */
 const READONLY_GIT_SUBCOMMANDS = new Set([
   "log",
@@ -1033,6 +1041,7 @@ export function decideWrappedGuard(
   env: Record<string, string | undefined>,
   probe?: TreeProbe,
   log: LogSink = NOOP_LOG,
+  grantOverride: GrantOverride = NO_GRANT,
 ): WrappedGuardDenyEnvelope | null {
   if (!isWrappedMarked(env)) return null; // unmarked → inert, fail open
 
@@ -1047,11 +1056,25 @@ export function decideWrappedGuard(
   if (!p.agent_id && !p.agent_type) return null;
 
   const tool = p.tool_name;
+  const resolvedProbe = probe ?? fsProbe();
 
   if (tool === "Edit" || tool === "MultiEdit" || tool === "NotebookEdit") {
-    // Deny-precedence / single-state: an edit tool is denied REGARDLESS of the
-    // target path (even one outside the tree) — the out-of-tree allowance is
-    // Write's alone, and there is no phase / envelope unlock.
+    // A validly-granted escalation subagent (a different agent_type than the
+    // wrapped work:worker) may edit within its granted checkout — its grant
+    // overrides the total-edit denial; protected paths remain excluded by the
+    // grant itself. Otherwise deny REGARDLESS of the target path.
+    const raw =
+      tool === "NotebookEdit"
+        ? p.tool_input?.notebook_path
+        : p.tool_input?.file_path;
+    if (typeof raw === "string" && raw.length > 0) {
+      const cwd =
+        typeof p.cwd === "string" && p.cwd.length > 0 ? p.cwd : process.cwd();
+      const canonical = resolvedProbe.realpath(
+        isAbsolute(raw) ? raw : resolve(cwd, raw),
+      );
+      if (canonical !== null && grantOverride(canonical)) return null;
+    }
     return denyEnvelope(editToolReason(tool));
   }
 
@@ -1062,7 +1085,6 @@ export function decideWrappedGuard(
     }
     const cwd =
       typeof p.cwd === "string" && p.cwd.length > 0 ? p.cwd : process.cwd();
-    const resolvedProbe = probe ?? fsProbe();
     const inTree = writeTargetInTree(fp, cwd, resolvedProbe, log);
     if (inTree === null) return denyEnvelope(MALFORMED_REASON); // unresolvable → fail closed
     if (!inTree) {
@@ -1072,8 +1094,10 @@ export function decideWrappedGuard(
       );
     }
     const abs = isAbsolute(fp) ? fp : resolve(cwd, fp);
-    const toplevel =
-      resolvedProbe.repoToplevel(resolvedProbe.realpath(abs) ?? abs) ?? "";
+    const canonical = resolvedProbe.realpath(abs);
+    // An escalation grant covering this in-tree target overrides the denial.
+    if (canonical !== null && grantOverride(canonical)) return null;
+    const toplevel = resolvedProbe.repoToplevel(canonical ?? abs) ?? "";
     return denyEnvelope(writeInTreeReason(fp, toplevel));
   }
 
@@ -1317,14 +1341,44 @@ async function main(): Promise<void> {
     // A parse failure under a marker is a malformed payload → decideWrappedGuard
     // fails closed on the non-object; an unmarked session stays silent.
     const candidate = parsed ? payload : null;
+    const now = Date.now();
+    const candidateAgentType =
+      candidate !== null && typeof candidate === "object"
+        ? (candidate as WrappedGuardPayload).agent_type
+        : undefined;
+    const grantOverride = (canonicalTarget: string): boolean =>
+      grantCoversWrite(env, candidateAgentType, canonicalTarget, now);
     const decision = decideWrappedGuard(
       candidate,
       env,
       fsProbe(),
       makeLogSink(env),
+      grantOverride,
     );
+    // A grant-covered Write is a real in-tree source write the guard cleared — it
+    // must reach the host, NOT be diverted into the scratch-handoff suppression.
+    const writeCandidate =
+      candidate !== null && typeof candidate === "object"
+        ? (candidate as WrappedGuardPayload)
+        : null;
+    const writeGrantCovered =
+      writeCandidate?.tool_name === "Write" &&
+      typeof writeCandidate.tool_input?.file_path === "string" &&
+      (() => {
+        const fp = writeCandidate.tool_input.file_path as string;
+        const cwd =
+          typeof writeCandidate.cwd === "string" &&
+          writeCandidate.cwd.length > 0
+            ? writeCandidate.cwd
+            : process.cwd();
+        const canonical = fsProbe().realpath(
+          isAbsolute(fp) ? fp : resolve(cwd, fp),
+        );
+        return canonical !== null && grantOverride(canonical);
+      })();
     if (
       decision === null &&
+      !writeGrantCovered &&
       isWrappedMarked(env) &&
       candidate !== null &&
       typeof candidate === "object" &&

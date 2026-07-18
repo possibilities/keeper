@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 // PreToolUse(Write|Edit|MultiEdit|Bash) wrong-tree write guard.
 //
-// Third sibling of branch-guard and escalation-guard. Where branch-guard hard-
-// denies a subagent's branch mutation and escalation-guard scopes an escalation
-// session's Bash surface, this hook denies a WORKTREE-LANE worker's write that
+// Sibling of branch-guard and grant-guard. Where branch-guard hard-denies a
+// subagent's branch mutation and grant-guard confines an escalation subagent's
+// mutations, this hook denies a WORKTREE-LANE worker's write that
 // lands in a tracked repo working tree that is NOT its own lane — the mechanical
 // half of keeping a shared checkout clean so the repair route stays available.
 // Rationale for why a stray write into the shared checkout matters: docs/adr/0025.
 //
-// Jurisdiction is marker-keyed like escalation-guard, but the marker is the
+// Jurisdiction is marker-keyed on the
 // launch-injected lane PATH `KEEPER_PLAN_WORKTREE` (realpath-normalized at the
 // worker's child boundary, torn down at finalize):
 //   - marker absent / empty (serial launches AND the human's own session) →
@@ -19,8 +19,8 @@
 // This is BEST-EFFORT AUDIT, not a security boundary: the Bash write-vector
 // extraction is string parsing (redirects, heredocs, tee, sed -i), TOCTOU
 // between this check and the write is accepted, and the hook FAILS OPEN on every
-// internal error (mirroring branch-guard, INVERTING escalation-guard's fail-
-// closed). It denies via the PreToolUse JSON envelope and always exits 0; it
+// internal error (mirroring branch-guard, INVERTING grant-guard's in-jurisdiction
+// fail-closed). It denies via the PreToolUse JSON envelope and always exits 0; it
 // NEVER writes host stdout except that one envelope, and logs privately.
 //
 // node:* imports only (no bun:sqlite, no plan plugin). The git-boundary decision
@@ -37,6 +37,8 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import { grantCoversWrite } from "../../../../src/grant-leaf.ts";
+
 // ---------------------------------------------------------------------------
 // Payload + envelope types.
 // ---------------------------------------------------------------------------
@@ -44,6 +46,8 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 /** The PreToolUse hook payload fields the wrong-tree decision reads. */
 export interface WrongTreeGuardPayload {
   tool_name?: string;
+  agent_id?: string;
+  agent_type?: string;
   cwd?: string;
   tool_input?: {
     command?: string;
@@ -51,6 +55,11 @@ export interface WrongTreeGuardPayload {
     notebook_path?: string;
   };
 }
+
+/** A grant-override seam: true when a valid escalation grant authorizes a write
+ *  to this already-canonical target, so the wrong-tree deny yields to it. */
+export type GrantOverride = (canonicalTarget: string) => boolean;
+const NO_GRANT: GrantOverride = () => false;
 
 /** The canonical PreToolUse deny envelope (exit-0 + JSON). */
 export interface WrongTreeGuardDenyEnvelope {
@@ -529,6 +538,7 @@ function classifyTarget(
   laneReal: string,
   probe: TreeProbe,
   log: LogSink,
+  grantOverride: GrantOverride,
 ): string | null {
   const abs = isAbsolute(raw) ? raw : resolve(cwd, raw);
   const resolved = probe.realpath(abs);
@@ -545,6 +555,13 @@ function classifyTarget(
   if (toplevel === null) return null; // outside every tracked repo → allow
   if (isKeeperStatePath(resolved, toplevel)) return null; // plan state → allow
   if (toplevel === laneReal) return null; // own lane → allow
+  // An escalation subagent with a valid grant covering this exact target writes
+  // into the shared checkout legitimately — its grant overrides the wrong-tree
+  // deny (protected paths above are already excluded from any grant).
+  if (grantOverride(resolved)) {
+    log({ event: "grant-allow", target: raw, resolved, toplevel });
+    return null;
+  }
   const reason = wrongTreeReason(raw, toplevel, laneReal);
   log({ event: "deny", kind: "wrong-tree", target: raw, resolved, toplevel });
   return reason;
@@ -560,6 +577,7 @@ export function decideWrongTreeGuard(
   env: Record<string, string | undefined>,
   probe: TreeProbe,
   log: LogSink = NOOP_LOG,
+  grantOverride: GrantOverride = NO_GRANT,
 ): WrongTreeGuardDenyEnvelope | null {
   const lane = (env.KEEPER_PLAN_WORKTREE ?? "").trim();
   if (lane === "") return null; // unmarked (serial / human) → inert-allow
@@ -574,7 +592,14 @@ export function decideWrongTreeGuard(
       ? payload.cwd
       : lane;
   for (const raw of collectTargets(payload)) {
-    const reason = classifyTarget(raw, cwd, laneReal, probe, log);
+    const reason = classifyTarget(
+      raw,
+      cwd,
+      laneReal,
+      probe,
+      log,
+      grantOverride,
+    );
     if (reason !== null) return denyEnvelope(reason);
   }
   return null;
@@ -689,11 +714,14 @@ async function main(): Promise<void> {
     payload = null;
   }
   if (payload === null) return; // malformed → fail open (no output)
+  const now = Date.now();
   const decision = decideWrongTreeGuard(
     payload,
     env,
     fsProbe(),
     makeLogSink(env),
+    (canonicalTarget) =>
+      grantCoversWrite(env, payload?.agent_type, canonicalTarget, now),
   );
   if (decision !== null) {
     process.stdout.write(`${JSON.stringify(decision)}\n`);

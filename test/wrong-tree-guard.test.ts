@@ -411,3 +411,61 @@ describe("fsProbe (real filesystem)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Grant override — a valid escalation grant lifts the wrong-tree deny without
+// weakening the protected-path or no-grant posture.
+// ---------------------------------------------------------------------------
+
+describe("decideWrongTreeGuard — escalation grant override", () => {
+  const grantAll = () => true;
+  const grantNone = () => false;
+
+  test("a covered foreign-tree Write is allowed when the grant override clears it", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("without the override the same foreign-tree Write still denies", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("a protected path denies even when the override would clear it", () => {
+    // Protected paths are checked BEFORE the grant override, so the deny stands.
+    const d = decideWrongTreeGuard(
+      writePayload(`${PRIMARY}/.git/config`),
+      LANE_ENV,
+      fakeProbe(),
+      undefined,
+      grantAll,
+    );
+    expect(d?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "protected",
+    );
+  });
+
+  test("the default (no override) preserves the existing deny posture", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+      ),
+    ).not.toBeNull();
+  });
+});
