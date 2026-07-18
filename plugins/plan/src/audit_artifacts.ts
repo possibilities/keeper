@@ -25,8 +25,10 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { SELECTION_SCHEMA_VERSION } from "./selection_sidecar.ts";
 import { resolveDataDirOrDefault } from "./state_path.ts";
 import { atomicWriteRaw, nowIso, serializeStateJson } from "./store.ts";
+import { SELECTION_BRIEF_SCHEMA_VERSION } from "./verbs/selection_brief.ts";
 
 /** Audit-artifact schema version. Integer, starts at 1; additive-only within a
  * version. computeCommitSetHash folds this in, so a bump invalidates every
@@ -422,8 +424,14 @@ export function closePhaseResume(
     };
   }
 
-  const selectionBriefDoc = safeReadArtifact(selectionBrief);
-  const selectionVerdictDoc = safeReadArtifact(selectionVerdict);
+  const selectionBriefDoc = safeReadArtifact(
+    selectionBrief,
+    SELECTION_BRIEF_SCHEMA_VERSION,
+  );
+  const selectionVerdictDoc = safeReadArtifact(
+    selectionVerdict,
+    SELECTION_SCHEMA_VERSION,
+  );
   const selectionProvenance =
     selectionVerdictDoc?.selection !== null &&
     typeof selectionVerdictDoc?.selection === "object" &&
@@ -431,10 +439,10 @@ export function closePhaseResume(
       ? (selectionVerdictDoc.selection as Record<string, unknown>)
       : null;
   const selectionFresh =
-    artifactHasKnownSchema(selectionBriefDoc) &&
+    artifactHasKnownSchema(selectionBriefDoc, SELECTION_BRIEF_SCHEMA_VERSION) &&
     selectionBriefDoc.from_followup === true &&
     selectionBriefDoc.input_hash === followupInputHash &&
-    artifactHasKnownSchema(selectionVerdictDoc) &&
+    artifactHasKnownSchema(selectionVerdictDoc, SELECTION_SCHEMA_VERSION) &&
     selectionProvenance?.input_hash === followupInputHash;
 
   return {
@@ -448,9 +456,12 @@ export function closePhaseResume(
   };
 }
 
-function safeReadArtifact(path: string): Record<string, unknown> | null {
+function safeReadArtifact(
+  path: string,
+  ceiling = AUDIT_SCHEMA_VERSION,
+): Record<string, unknown> | null {
   try {
-    return readArtifactJson(path);
+    return readArtifactJson(path, ceiling);
   } catch {
     return null;
   }
@@ -458,13 +469,14 @@ function safeReadArtifact(path: string): Record<string, unknown> | null {
 
 function artifactHasKnownSchema(
   artifact: Record<string, unknown> | null,
+  ceiling = AUDIT_SCHEMA_VERSION,
 ): artifact is Record<string, unknown> {
   return (
     artifact !== null &&
     typeof artifact.schema_version === "number" &&
     Number.isInteger(artifact.schema_version) &&
     artifact.schema_version >= 1 &&
-    artifact.schema_version <= AUDIT_SCHEMA_VERSION
+    artifact.schema_version <= ceiling
   );
 }
 
@@ -571,10 +583,13 @@ export function writeBriefArtifact(
   );
 }
 
-/** Read + parse an audit artifact's JSON, hard-failing on a too-new
- * schema_version (ArtifactSchemaTooNewError). Returns null when the file is
- * absent (the reader's missing-artifact path). */
-export function readArtifactJson(path: string): Record<string, unknown> | null {
+/** Read + parse an artifact's JSON, hard-failing on a schema_version above
+ * `ceiling` (ArtifactSchemaTooNewError). Returns null when the file is absent
+ * (the reader's missing-artifact path). */
+export function readArtifactJson(
+  path: string,
+  ceiling = AUDIT_SCHEMA_VERSION,
+): Record<string, unknown> | null {
   if (!existsSync(path)) {
     return null;
   }
@@ -583,8 +598,8 @@ export function readArtifactJson(path: string): Record<string, unknown> | null {
     unknown
   >;
   const found = parsed.schema_version;
-  if (typeof found === "number" && found > AUDIT_SCHEMA_VERSION) {
-    throw new ArtifactSchemaTooNewError(found);
+  if (typeof found === "number" && found > ceiling) {
+    throw new ArtifactSchemaTooNewError(found, ceiling);
   }
   return parsed;
 }
