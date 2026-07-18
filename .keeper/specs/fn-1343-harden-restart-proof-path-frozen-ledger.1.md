@@ -26,5 +26,5 @@ Files: src/restart-observation.ts, test/restart-observation.test.ts
 - [ ] A deterministic test asserts the exact-path-with-invalid-non-marker-boot case proves.
 
 ## Done summary
-
+Scoped the frozenLedgerValid conjunct in the proven gate to the identity-capability crossing path only, restoring the exact-replacement path's parent behavior (an invalid non-marker frozen boot no longer blocks an exact restart from proving). Added a regression test covering an exact restart with a valid marker but an invalid earlier frozen boot.
 ## Evidence

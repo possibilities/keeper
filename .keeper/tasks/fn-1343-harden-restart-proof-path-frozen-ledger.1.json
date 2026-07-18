@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Scope frozen-ledger check to crossing",
-  "updated_at": "2026-07-18T18:50:49.258000Z"
+  "updated_at": "2026-07-18T19:06:24.100000Z",
+  "worker_done_at": "2026-07-18T19:06:24.100000Z"
 }
