@@ -1,0 +1,55 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [
+      "fn-1350-owner-mediated-merge-integration.3"
+    ],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped new claim envelope, synthetic-event fold columns that must preserve re-fold determinism, plus a subtle liveness/exclusion-lock correctness invariant (a claim honored without liveness verification wedges recover forever) \u2014 a nameable correctness-critical intelligence-bound reason gating opus at the contract-touching xhigh band.",
+      "task_id": "fn-1350-owner-mediated-merge-integration.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Architectural inversion removing provision pre-merges with a subtle half-assembled-base invariant (an incomplete fan-in must never present as assembled to finalize) and a byte-equivalence constraint on the no-incident path \u2014 correctness-critical cross-cutting change warranting opus at xhigh.",
+      "task_id": "fn-1350-owner-mediated-merge-integration.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Explicitly the highest-interlock seam in the codebase \u2014 a lease/fencing-token concurrency protocol with a tri-state gate, dead-holder recovery, and every legacy finalize discriminant that must be enumerated and reproduced onto the split; a hard opus correctness gate at the reserved max ceiling.",
+      "task_id": "fn-1350-owner-mediated-merge-integration.3",
+      "tier": "max"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A level-triggered router whose bypass predicate is a sharp subtle-correctness edge (too broad re-fires failed keys into loops, too narrow starves incidents) plus recover/base-freshness re-keying onto claims \u2014 an intelligence-bound invariant gating opus at the contract-shaped xhigh band.",
+      "task_id": "fn-1350-owner-mediated-merge-integration.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T21:11:37.932000Z",
+  "epic_id": "fn-1350-owner-mediated-merge-integration",
+  "input_hash": "e4d120fb5b587e83cdb87327bf87376e8ee7cfdf2dcb5127e4d54c0fc8394c87",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3838910715,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1350-owner-mediated-merge-integration.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped new claim envelope, synthetic-event fold columns that must preserve re-fold determinism, plus a subtle liveness/exclusion-lock correctness invariant (a claim honored without liveness verification wedges recover forever) \u2014 a nameable correctness-critical intelligence-bound reason gating opus at the contract-touching xhigh band.\",\"confidence\":0.8},{\"task_id\":\"fn-1350-owner-mediated-merge-integration.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Architectural inversion removing provision pre-merges with a subtle half-assembled-base invariant (an incomplete fan-in must never present as assembled to finalize) and a byte-equivalence constraint on the no-incident path \u2014 correctness-critical cross-cutting change warranting opus at xhigh.\",\"confidence\":0.78},{\"task_id\":\"fn-1350-owner-mediated-merge-integration.3\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Explicitly the highest-interlock seam in the codebase \u2014 a lease/fencing-token concurrency protocol with a tri-state gate, dead-holder recovery, and every legacy finalize discriminant that must be enumerated and reproduced onto the split; a hard opus correctness gate at the reserved max ceiling.\",\"confidence\":0.82},{\"task_id\":\"fn-1350-owner-mediated-merge-integration.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A level-triggered router whose bypass predicate is a sharp subtle-correctness edge (too broad re-fires failed keys into loops, too narrow starves incidents) plus recover/base-freshness re-keying onto claims \u2014 an intelligence-bound invariant gating opus at the contract-shaped xhigh band.\",\"confidence\":0.76}]}\n"
+}
