@@ -1521,6 +1521,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
   async function connectOnce(): Promise<void> {
     const buffer = new LineBuffer();
+    const decoder = new TextDecoder("utf-8", { fatal: false });
     await connect(sockPath, {
       open(sock) {
         // Do NOT reset `attempt` here — socket `open` means ACCEPTED, not
@@ -1551,10 +1552,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       data(sock, chunk) {
         let lines: string[];
         try {
-          lines = buffer.push(chunk.toString("utf8"));
+          lines = buffer.push(decoder.decode(chunk, { stream: true }));
         } catch (err) {
-          // A protocol-frame parse failure is fatal for this connection but not
-          // the caller's process — surface via lifecycle and HARD-destroy; the
+          // A line-buffer failure is fatal for this connection but not the
+          // caller's process — surface via lifecycle and HARD-destroy; the
           // `close` callback drives the reconnect.
           emit("error", { message: (err as Error).message });
           destroySocket(sock);
@@ -1568,6 +1569,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         }
       },
       close() {
+        decoder.decode();
         if (shuttingDown) {
           return;
         }

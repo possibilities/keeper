@@ -2330,6 +2330,67 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
   handle.dispose();
 });
 
+test("subscribeCollection: preserves split UTF-8 and discards a dead dial's decode tail", async () => {
+  const { factory, sockets } = makeMultiConnect();
+  const rows: Record<string, unknown>[][] = [];
+  const handle = subscribeCollection({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-streaming-decode",
+    collection: "jobs",
+    onRows: (nextRows) => rows.push(nextRows),
+    onFatal: (err) => {
+      throw new Error(`unexpected fatal: ${err.code}`);
+    },
+    connect: factory,
+  });
+  const sock1 = sockets[0];
+  if (!sock1) {
+    throw new Error("mock socket #1 never installed");
+  }
+
+  const snowman = "☃";
+  const expectedSplitRows = [{ job_id: "split", label: "☃" }];
+  const firstFrame: ServerFrame = {
+    type: "result",
+    id: "test-streaming-decode-jobs",
+    collection: "jobs",
+    rev: 1,
+    total: 1,
+    rows: [{ job_id: "split", label: snowman }],
+  };
+  const firstBytes = Buffer.from(encodeFrame(firstFrame), "utf8");
+  const splitAt = firstBytes.indexOf(Buffer.from(snowman, "utf8")) + 2;
+
+  sock1.handlers.data(sock1, firstBytes.subarray(0, splitAt));
+  expect(rows).toEqual([]);
+  sock1.handlers.data(sock1, firstBytes.subarray(splitAt));
+  expect(rows).toEqual([expectedSplitRows]);
+
+  const torn = Buffer.from(`{"type":"result","label":"${snowman}`, "utf8");
+  const tornSplitAt = torn.indexOf(Buffer.from(snowman, "utf8")) + 2;
+  sock1.handlers.data(sock1, torn.subarray(0, tornSplitAt));
+  sock1.closeFromServer();
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+  const sock2 = sockets[1];
+  if (!sock2) {
+    throw new Error("mock socket #2 never installed");
+  }
+  const expectedFreshRows = [{ job_id: "fresh", label: "next dial" }];
+  const freshFrame: ServerFrame = {
+    type: "result",
+    id: "test-streaming-decode-jobs",
+    collection: "jobs",
+    rev: 2,
+    total: 1,
+    rows: [{ job_id: "fresh", label: "next dial" }],
+  };
+  sock2.handlers.data(sock2, Buffer.from(encodeFrame(freshFrame), "utf8"));
+  expect(rows).toEqual([expectedSplitRows, expectedFreshRows]);
+
+  handle.dispose();
+});
+
 test("subscribeReadiness: pollAll no longer schedules per-state refetches — freshness is patch-driven only", () => {
   const harness = installTimerHarness();
   try {
