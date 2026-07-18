@@ -12,21 +12,17 @@
 
 import type { Database } from "bun:sqlite";
 import {
-  appendFileSync,
   closeSync,
   existsSync,
   fstatSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
   realpathSync,
-  renameSync,
   statSync,
   unlinkSync,
-  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -278,6 +274,21 @@ import {
   serializeBuildSnapshot,
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
+import {
+  appendDurableRestartBoot,
+  appendRestartLedgerLine,
+  boundRestartReason,
+  CRASH_LOOP_THRESHOLD,
+  CRASH_LOOP_WINDOW_MS,
+  CRASH_LOOP_YOUNG_RUNTIME_MS,
+  classifyRestartProvenance,
+  collapseRestartLedger,
+  compactRestartLedger,
+  decideCrashLoop,
+  qualifyCrashLoopBootTimestamps,
+  RESTART_LEDGER_CAP,
+  readRestartLedger,
+} from "./restart-ledger";
 import type {
   BackendExecStartMessage,
   RestoreWorkerData,
@@ -4971,507 +4982,40 @@ async function probeSocketRead(
   });
 }
 
-// ── crash-loop distress signal ───────────────────────────────────────────────
-/**
- * How many boots inside {@link CRASH_LOOP_WINDOW_MS} count as a crash-loop. The
- * plist ships `ThrottleInterval 10` + `KeepAlive{SuccessfulExit:false}`, and an
- * observed wedge-restart cycle is ~60-120s, so a healthy daemon never restarts
- * this often — 8 boots inside a half-hour is an unambiguous self-restart storm,
- * while a routine deploy/reboot (one boot) never approaches it.
- */
-export const CRASH_LOOP_THRESHOLD = 8;
-/** Sliding window (ms) the boot count is measured over. */
-export const CRASH_LOOP_WINDOW_MS = 30 * 60_000;
-/**
- * Hard length cap on the restart ledger. Window-aging already bounds it under
- * normal cadence; the cap is the belt against a pathological same-window burst
- * bloating the sidecar. Comfortably above {@link CRASH_LOOP_THRESHOLD} so a real
- * loop still records enough boots to trip.
- */
-export const RESTART_LEDGER_CAP = 64;
-/**
- * Length cap on a persisted `reason` string. A reason is built from error
- * messages / worker names — attacker-influenced in the sense that upstream
- * input can shape it — so it is bounded (silently truncated) before it lands
- * in the ledger, keeping one pathological message from bloating the sidecar.
- * The reason is forensic best-effort, never load-bearing for the count.
- */
-export const RESTART_LEDGER_REASON_MAX_LEN = 300;
-
-/**
- * How long a predecessor daemon must have run before dying for its successor's
- * boot NOT to count toward the crash-loop threshold. A boot whose predecessor
- * died YOUNG (ran at most this long) is loop evidence; a bounce of a daemon that
- * ran longer — a buildbot kick on a green build, an operator restart — is not,
- * no matter who bounced it. ~2 minutes covers the observed wedge-restart cycle
- * (~60-120s) while staying well above launchd's 10s `ThrottleInterval`, so a
- * genuine self-restart storm still qualifies and a healthy bounce never does.
- * The runtime is read as the inter-boot gap frozen into each boot line (see
- * {@link foldBootIntoRestartLedger}), so a throttled restart cadence reads it
- * directly. See docs/adr/0030.
- */
-export const CRASH_LOOP_YOUNG_RUNTIME_MS = 2 * 60_000;
-
-/**
- * The keeperd LaunchAgent's job label. When launchd starts the daemon it stamps
- * this into `XPC_SERVICE_NAME`, which is how {@link classifyRestartProvenance}
- * tells a launchd-managed boot from a stray one. Kept in sync with
- * `plist/arthack.keeperd.plist`'s `Label`.
- */
-export const KEEPERD_LAUNCHD_LABEL = "arthack.keeperd";
-
-/**
- * Forensic provenance of one daemon boot, a tri-state label — NEVER an
- * enforcement input (docs/adr/0030). `launchd`: launchd started us (the normal
- * managed boot). `foreign`: some OTHER launchd/XPC context started us — a stray
- * daemon (a dev pane, a CI-spawned process) whose deaths must never page the
- * human. `unknown`: no usable signal — missing/garbage `XPC_SERVICE_NAME`, or a
- * shell launch; counted toward the loop (fail toward detection).
- */
-export type RestartProvenance = "launchd" | "unknown" | "foreign";
-
-/**
- * Classify a boot's provenance from the `XPC_SERVICE_NAME` heuristic. This is a
- * MUTABLE heuristic (direnv and other tools overwrite the var), so it is a
- * forensic label only, never gates the boot. A value starting with the keeperd
- * launchd label ({@link KEEPERD_LAUNCHD_LABEL}) is a launchd-managed boot;
- * missing / empty / the `"0"` non-service sentinel maps to `unknown`; any other
- * non-trivial service name is a `foreign` context. Pure; NEVER throws.
- */
-export function classifyRestartProvenance(
-  xpcServiceName: string | null | undefined,
-): RestartProvenance {
-  const v = (xpcServiceName ?? "").trim();
-  if (v.length === 0 || v === "0") return "unknown";
-  if (v.startsWith(KEEPERD_LAUNCHD_LABEL)) return "launchd";
-  return "foreign";
-}
-
-function normalizeProvenance(v: unknown): RestartProvenance {
-  return v === "launchd" || v === "foreign" || v === "unknown" ? v : "unknown";
-}
-
-function boundRestartReason(reason: string): string {
-  return reason.length > RESTART_LEDGER_REASON_MAX_LEN
-    ? reason.slice(0, RESTART_LEDGER_REASON_MAX_LEN)
-    : reason;
-}
-
-/**
- * One append-only NDJSON restart-ledger line (docs/adr/0030). A `boot` line is
- * written once per daemon boot; an `enrich` line is appended by {@link fatalExit}
- * carrying the fatal reason, MATCHED to its boot by `boot_id` — never by
- * timestamp, which is what let the legacy replace-in-place erase overlapping
- * newer boots. `prev_runtime_ms` is the inter-boot gap to the predecessor boot,
- * frozen at write time so the runtime qualification survives the predecessor's
- * line being aged out at a later compaction.
- */
-export interface RestartBootLine {
-  kind: "boot";
-  boot_id: string;
-  ts: number;
-  provenance: RestartProvenance;
-  prev_runtime_ms: number | null;
-}
-export interface RestartEnrichLine {
-  kind: "enrich";
-  boot_id: string;
-  ts: number;
-  reason: string;
-}
-export type RestartLedgerLine = RestartBootLine | RestartEnrichLine;
-
-/**
- * One boot collapsed from its `boot` line and any matching `enrich` line —
- * the unit the crash-loop producer counts over. `prev_runtime_ms` is the frozen
- * inter-boot gap (or, for a legacy / orphan record with none, backfilled from
- * the gap to the previous boot in total order by {@link collapseRestartLedger}).
- */
-export interface RestartBoot {
-  boot_id: string;
-  ts: number;
-  provenance: RestartProvenance;
-  prev_runtime_ms: number | null;
-  reason?: string;
-  died_at_ms?: number;
-}
-
-/**
- * Serialize one ledger line to a single NDJSON record terminated by `\n` — the
- * delimiter the line-by-line {@link parseRestartLedger} reader keys off. Pure:
- * same input → same output. Mirrors `serializeEventLogRecord`'s discipline.
- */
-export function serializeRestartLedgerLine(line: RestartLedgerLine): string {
-  return `${JSON.stringify(line)}\n`;
-}
-
-/**
- * Parse one NDJSON line into a {@link RestartLedgerLine}, or `null` if the line
- * is unparseable / partial / malformed — the strict torn-tail contract from
- * {@link parseEventLogLine}: a truncated final line from a killed process folds
- * to nothing rather than corrupting the ledger. `boot_id` must be a non-empty
- * string and `ts` a finite number; a `boot` line's `provenance` folds to
- * `unknown` on garbage and a missing `prev_runtime_ms` to `null`; an `enrich`
- * line requires a string `reason` (bounded). The `\n` terminator is optional on
- * the input. Pure; NEVER throws.
- */
-export function parseRestartLedgerLine(line: string): RestartLedgerLine | null {
-  const trimmed = line.trim();
-  if (trimmed.length === 0) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  const o = parsed as Record<string, unknown>;
-  const bootId = o.boot_id;
-  const ts = o.ts;
-  if (typeof bootId !== "string" || bootId.length === 0) return null;
-  if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
-  if (o.kind === "enrich") {
-    if (typeof o.reason !== "string") return null;
-    return {
-      kind: "enrich",
-      boot_id: bootId,
-      ts,
-      reason: boundRestartReason(o.reason),
-    };
-  }
-  if (o.kind === "boot") {
-    const prev = o.prev_runtime_ms;
-    return {
-      kind: "boot",
-      boot_id: bootId,
-      ts,
-      provenance: normalizeProvenance(o.provenance),
-      prev_runtime_ms:
-        typeof prev === "number" && Number.isFinite(prev) ? prev : null,
-    };
-  }
-  return null;
-}
-
-/**
- * Coerce the LEGACY JSON-array ledger shape (a bare `number` or `{ ts, reason? }`
- * per entry) into NDJSON lines, so the crash-loop count and the forensic record
- * both survive the format flip. Each legacy entry becomes a `boot` line with
- * `unknown` provenance and no frozen `prev_runtime_ms` (collapse backfills it
- * from the gap); a legacy `reason` becomes a matching `enrich` line. Synthetic
- * `boot_id`s keep entries distinct. Pure; NEVER throws.
- */
-function legacyRestartEntriesToLines(items: unknown[]): RestartLedgerLine[] {
-  const out: RestartLedgerLine[] = [];
-  items.forEach((item, i) => {
-    let ts: number | null = null;
-    let reason: string | undefined;
-    if (typeof item === "number" && Number.isFinite(item)) {
-      ts = item;
-    } else if (
-      item !== null &&
-      typeof item === "object" &&
-      !Array.isArray(item)
-    ) {
-      const t = (item as { ts?: unknown }).ts;
-      if (typeof t === "number" && Number.isFinite(t)) {
-        ts = t;
-        const r = (item as { reason?: unknown }).reason;
-        if (typeof r === "string") reason = boundRestartReason(r);
-      }
-    }
-    if (ts === null) return;
-    const bootId = `legacy:${i}:${ts}`;
-    out.push({
-      kind: "boot",
-      boot_id: bootId,
-      ts,
-      provenance: "unknown",
-      prev_runtime_ms: null,
-    });
-    if (reason !== undefined) {
-      out.push({ kind: "enrich", boot_id: bootId, ts, reason });
-    }
-  });
-  return out;
-}
-
-/**
- * Parse a restart-ledger file body into ledger lines. DUAL-READS the shape: a
- * body that whole-parses to a JSON array is the LEGACY format (coerced via
- * {@link legacyRestartEntriesToLines}); anything else is read line-by-line as
- * NDJSON, tolerating a torn trailing line (a killed process's partial append)
- * and skipping any unparseable line. FAIL-OPEN throughout: a corrupt body yields
- * `[]` so a torn ledger becomes an empty one — never new `fatalExit` fuel, never
- * a false crash-loop trip. Pure; NEVER throws.
- */
-export function parseRestartLedger(raw: string): RestartLedgerLine[] {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return [];
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (Array.isArray(parsed)) return legacyRestartEntriesToLines(parsed);
-    } catch {
-      // Not a whole legacy array — fall through to NDJSON line parsing.
-    }
-  }
-  const out: RestartLedgerLine[] = [];
-  for (const line of raw.split("\n")) {
-    const parsed = parseRestartLedgerLine(line);
-    if (parsed !== null) out.push(parsed);
-  }
-  return out;
-}
-
-/**
- * Collapse ledger lines into per-`boot_id` boot records, sorted ascending by
- * `ts`. A `boot` line establishes the record; an `enrich` line attaches its
- * `reason` + death `ts`; an ORPHAN enrichment (its boot line aged out, or a
- * crash before the boot line was written) synthesizes a forensic record so no
- * fatal reason is silently dropped. `prev_runtime_ms` is taken from the frozen
- * boot-line value; where absent (legacy / orphan) it is backfilled from the gap
- * to the previous boot in total order. Pure; NEVER throws.
- */
-export function collapseRestartLedger(
-  lines: RestartLedgerLine[],
-): RestartBoot[] {
-  const boots = new Map<string, RestartBoot>();
-  for (const line of lines) {
-    if (line.kind === "boot") {
-      const existing = boots.get(line.boot_id);
-      boots.set(line.boot_id, {
-        boot_id: line.boot_id,
-        ts: line.ts,
-        provenance: line.provenance,
-        prev_runtime_ms: line.prev_runtime_ms,
-        reason: existing?.reason,
-        died_at_ms: existing?.died_at_ms,
-      });
-    }
-  }
-  for (const line of lines) {
-    if (line.kind === "enrich") {
-      const existing = boots.get(line.boot_id);
-      if (existing) {
-        existing.reason = line.reason;
-        existing.died_at_ms = line.ts;
-      } else {
-        boots.set(line.boot_id, {
-          boot_id: line.boot_id,
-          ts: line.ts,
-          provenance: "unknown",
-          prev_runtime_ms: null,
-          reason: line.reason,
-          died_at_ms: line.ts,
-        });
-      }
-    }
-  }
-  const result = [...boots.values()].sort((a, b) => a.ts - b.ts);
-  for (let i = 1; i < result.length; i++) {
-    if (result[i].prev_runtime_ms === null) {
-      result[i].prev_runtime_ms = result[i].ts - result[i - 1].ts;
-    }
-  }
-  return result;
-}
-
-/**
- * Compact the ledger: collapse to boot records, drop any outside the window
- * (and any future-dated garbage), keep only the most recent `cap`, then flatten
- * back to lines (each boot line followed by its enrichment, if any). Runs ONLY
- * at boot in the process holding the single-instance lock. A legacy / orphan
- * record's backfilled `prev_runtime_ms` is frozen into the rewritten boot line,
- * converting the file to pure NDJSON. Pure; NEVER throws.
- */
-export function compactRestartLedger(
-  lines: RestartLedgerLine[],
-  opts: { nowMs: number; windowMs: number; cap: number },
-): RestartLedgerLine[] {
-  const { nowMs, windowMs, cap } = opts;
-  const cutoff = nowMs - windowMs;
-  const boots = collapseRestartLedger(lines).filter(
-    (b) => Number.isFinite(b.ts) && b.ts >= cutoff && b.ts <= nowMs,
-  );
-  const capped = boots.length > cap ? boots.slice(boots.length - cap) : boots;
-  const out: RestartLedgerLine[] = [];
-  for (const b of capped) {
-    out.push({
-      kind: "boot",
-      boot_id: b.boot_id,
-      ts: b.ts,
-      provenance: b.provenance,
-      prev_runtime_ms: b.prev_runtime_ms,
-    });
-    if (b.reason !== undefined && b.died_at_ms !== undefined) {
-      out.push({
-        kind: "enrich",
-        boot_id: b.boot_id,
-        ts: b.died_at_ms,
-        reason: b.reason,
-      });
-    }
-  }
-  return out;
-}
-
-/**
- * Fold THIS boot into the ledger: measure the inter-boot gap to the most recent
- * prior boot (its predecessor's runtime-before-death, mirroring launchd's
- * throttle model), freeze it into a new `boot` line, append it, and compact.
- * `boot_id` matches the enrichment {@link fatalExit} will later append — no two
- * boots ever share a line, so overlapping boots each retain their own record and
- * a dying boot enriches only its own. Returns the compacted lines to persist and
- * the appended boot line. Pure; NEVER throws.
- */
-export function foldBootIntoRestartLedger(inputs: {
-  existing: RestartLedgerLine[];
-  bootId: string;
-  provenance: RestartProvenance;
-  nowMs: number;
-  windowMs: number;
-  cap: number;
-}): { lines: RestartLedgerLine[]; bootLine: RestartBootLine } {
-  const { existing, bootId, provenance, nowMs, windowMs, cap } = inputs;
-  const priorBoots = collapseRestartLedger(existing).filter(
-    (b) => b.ts <= nowMs,
-  );
-  const predecessor =
-    priorBoots.length > 0 ? priorBoots[priorBoots.length - 1] : null;
-  const bootLine: RestartBootLine = {
-    kind: "boot",
-    boot_id: bootId,
-    ts: nowMs,
-    provenance,
-    prev_runtime_ms: predecessor ? nowMs - predecessor.ts : null,
-  };
-  const lines = compactRestartLedger([...existing, bootLine], {
-    nowMs,
-    windowMs,
-    cap,
-  });
-  return { lines, bootLine };
-}
-
-/**
- * The runtime-qualified crash-loop producer filter (docs/adr/0030): from the
- * collapsed boots, keep only the timestamps that count toward the distress
- * threshold — EXCLUDE `foreign` boots entirely (a stray daemon's deaths never
- * page the human), and count a boot only when its predecessor died YOUNG (its
- * frozen `prev_runtime_ms` is at most `youngRuntimeMs`). A boot with no
- * predecessor (`null`) and a bounce after a healthy long run are both excluded;
- * `unknown` and `launchd` young boots count. Hands {@link decideCrashLoop} bare
- * timestamps, leaving its pure timestamp-counting contract untouched. NEVER
- * throws.
- */
-export function qualifyCrashLoopBootTimestamps(
-  boots: RestartBoot[],
-  youngRuntimeMs: number,
-): number[] {
-  return boots
-    .filter((b) => b.provenance !== "foreign")
-    .filter(
-      (b) => b.prev_runtime_ms !== null && b.prev_runtime_ms <= youngRuntimeMs,
-    )
-    .map((b) => b.ts);
-}
-
-/**
- * Pure crash-loop verdict: how many of `bootTimestamps` fall inside the window
- * ending at `nowMs`, and whether that count reached `threshold`. Windowing here
- * (not just trusting a pre-aged caller) keeps the decision self-contained and
- * unit-testable across the threshold/window/aging axes. Takes bare
- * timestamps, not ledger entries — the decision reads `ts` only; `reason` is
- * forensics, never an input to the counter. NEVER throws.
- */
-export function decideCrashLoop(inputs: {
-  nowMs: number;
-  bootTimestamps: number[];
-  threshold: number;
-  windowMs: number;
-}): { crashLoop: boolean; recentBoots: number } {
-  const { nowMs, bootTimestamps, threshold, windowMs } = inputs;
-  const cutoff = nowMs - windowMs;
-  const recentBoots = bootTimestamps.filter(
-    (t) => Number.isFinite(t) && t >= cutoff && t <= nowMs,
-  ).length;
-  return { crashLoop: recentBoots >= threshold, recentBoots };
-}
-
-/**
- * Read + fail-open-parse the restart ledger at `path`. A missing file (first
- * boot) or any read/parse error yields `[]` — the crash-loop detector must never
- * be the thing that crashes boot. Mirrors {@link parseRestartLedger}'s contract.
- */
-export function readRestartLedger(path: string): RestartLedgerLine[] {
-  try {
-    return parseRestartLedger(readFileSync(path, "utf8"));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Persist the compacted ledger (best-effort) via temp-file + `fsync` + `rename`,
- * so a crash mid-write never leaves a torn file the next boot reads. Runs ONLY
- * at boot in the lock-holding process (the enrichment path uses the append-only
- * {@link appendRestartLedgerLine} instead). A write failure (full disk, ENOENT
- * dir) is swallowed: a lost compaction only defers aging — strictly safer than
- * crashing boot on the write. NEVER throws.
- */
-export function writeRestartLedger(
-  path: string,
-  lines: RestartLedgerLine[],
-): void {
-  try {
-    const content = lines.map(serializeRestartLedgerLine).join("");
-    const dir = dirname(path);
-    const tmp = join(
-      dir,
-      `${basename(path)}.tmp.${process.pid}.${crypto.randomUUID()}`,
-    );
-    let fd: number | null = null;
-    try {
-      fd = openSync(tmp, "w");
-      writeSync(fd, content);
-      fsyncSync(fd);
-    } finally {
-      if (fd !== null) closeSync(fd);
-    }
-    try {
-      renameSync(tmp, path);
-    } catch (err) {
-      try {
-        if (existsSync(tmp)) unlinkSync(tmp);
-      } catch {
-        // swallow — the rename error is what the caller cares about
-      }
-      throw err;
-    }
-  } catch (err) {
-    console.error(
-      `[keeperd] restart-ledger write threw (non-fatal): ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-}
-
-/**
- * Append ONE ledger line with a single `appendFileSync` — the enrichment write
- * {@link fatalExit} makes on the crash path. Bounded (one line) and never
- * read-modify-writes, so it cannot block or corrupt the ledger under a crashing
- * process; the caller wraps it so any throw never escapes the exit path.
- */
-export function appendRestartLedgerLine(
-  path: string,
-  line: RestartLedgerLine,
-): void {
-  appendFileSync(path, serializeRestartLedgerLine(line));
-}
+export type {
+  RestartBoot,
+  RestartBootIdentity,
+  RestartBootLine,
+  RestartEnrichLine,
+  RestartLedgerLine,
+  RestartLedgerSnapshot,
+  RestartProvenance,
+} from "./restart-ledger";
+// Restart-ledger parsing and persistence live in a dependency-free leaf shared
+// with daemon-control readers. Re-export the pure contract for compatibility.
+export {
+  appendDurableRestartBoot,
+  appendRestartLedgerLine,
+  boundRestartReason,
+  CRASH_LOOP_THRESHOLD,
+  CRASH_LOOP_WINDOW_MS,
+  CRASH_LOOP_YOUNG_RUNTIME_MS,
+  classifyRestartProvenance,
+  collapseRestartLedger,
+  compactRestartLedger,
+  decideCrashLoop,
+  foldBootIntoRestartLedger,
+  KEEPERD_LAUNCHD_LABEL,
+  parseRestartLedger,
+  parseRestartLedgerLine,
+  qualifyCrashLoopBootTimestamps,
+  RESTART_LEDGER_CAP,
+  RESTART_LEDGER_REASON_MAX_LEN,
+  readRestartLedger,
+  readRestartLedgerSnapshot,
+  serializeRestartLedgerLine,
+  writeRestartLedger,
+} from "./restart-ledger";
 
 /**
  * Scan the dead-letter dir and import each NDJSON file's records into the
@@ -8190,16 +7734,43 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   if (!opts.disableSingleInstanceLock) {
     acquireSingleInstanceLock();
   }
-  // Restart-ledger boot identity, captured at the EARLIEST boot point
-  // (docs/adr/0030). `restartLedgerBootId` keys this boot's append-only NDJSON
-  // ledger lines: the boot-fold below writes a `boot` line under it, and
-  // `fatalExit` later appends its `enrich` line MATCHED on the same id (never on
-  // timestamp). Provenance is frozen once here from the `XPC_SERVICE_NAME`
-  // heuristic — a forensic label only, never an enforcement input.
+  // Persist the recycle-safe identity immediately after admission. No DB path,
+  // worker, Drain sample, or readiness surface is touched unless this syncs.
   const restartLedgerBootId = crypto.randomUUID();
   const restartBootProvenance = classifyRestartProvenance(
     process.env.XPC_SERVICE_NAME,
   );
+  const restartBootPid = process.pid;
+  const restartBootStartTime = readOsStartTime(restartBootPid);
+  if (restartBootStartTime === null) {
+    console.error(
+      "[keeperd] FATAL: restart-ledger boot identity unavailable: process start_time probe failed",
+    );
+    process.exit(1);
+  }
+  try {
+    appendDurableRestartBoot({
+      path: resolveRestartLedgerPath(),
+      bootId: restartLedgerBootId,
+      pid: restartBootPid,
+      startTime: restartBootStartTime,
+      provenance: restartBootProvenance,
+      nowMs: Date.now(),
+    });
+  } catch (error) {
+    console.error(
+      `[keeperd] FATAL: restart-ledger boot append failed: ${boundRestartReason(
+        error instanceof Error ? error.message : String(error),
+      )}`,
+    );
+    process.exit(1);
+  }
+  const restartBootIdentity = {
+    boot_id: restartLedgerBootId,
+    pid: restartBootPid,
+    start_time: restartBootStartTime,
+  };
+
   // Worker-set selector; omitted → ALL_WORKERS. `want(name)` gates each
   // `new Worker(...)` site below. The fold REDUCER runs on MAIN regardless.
   const selectedWorkers = new Set<WorkerName>(selectWorkerNames(opts.workers));
@@ -9035,7 +8606,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     serverWorker = new Worker(
       new URL("./server-worker.ts", import.meta.url).href,
       {
-        workerData: { dbPath, role: "server" } satisfies ServerWorkerData,
+        workerData: {
+          dbPath,
+          role: "server",
+          bootIdentity: restartBootIdentity,
+        } satisfies ServerWorkerData,
       } as WorkerOptions & { workerData: unknown },
     );
     // A non-null local so the bridge closures don't re-narrow the nullable field.
@@ -9815,29 +9390,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Crash-loop distress signal. Fold this boot into the durable restart ledger (a
-  // state-dir sidecar — NOT keeper.db, NOT a fold — so it survives the very crash
-  // it measures): append one `boot` line keyed on `restartLedgerBootId` with the
-  // frozen inter-boot gap + provenance, compacting the append-only NDJSON at this
-  // one lock-held boot point. Then LEVEL-TRIGGER a sticky `needs_human` distress
-  // row off a RUNTIME-QUALIFIED count — collapse per boot_id, exclude `foreign`,
-  // count only boots whose predecessor died young — so a persistent loop mints ONE
-  // idempotent row while a healthy-daemon bounce or a CI kick never trips it. A
-  // boot whose rate has fallen back under threshold drops the row (the recover-row
-  // idiom, resolved on the NEXT boot as the window ages the ledger). FAIL-OPEN
-  // throughout — a corrupt/torn ledger folds to empty, never new boot-crash fuel.
+  // Crash-loop retention is a read-side projection. The already-synced boot row
+  // and all forensic history remain byte-for-byte append-only on normal boot.
   {
     const nowMs = Date.now();
-    const ledgerPath = resolveRestartLedgerPath();
-    const { lines: ledgerLines } = foldBootIntoRestartLedger({
-      existing: readRestartLedger(ledgerPath),
-      bootId: restartLedgerBootId,
-      provenance: restartBootProvenance,
-      nowMs,
-      windowMs: CRASH_LOOP_WINDOW_MS,
-      cap: RESTART_LEDGER_CAP,
-    });
-    writeRestartLedger(ledgerPath, ledgerLines);
+    const ledgerLines = compactRestartLedger(
+      readRestartLedger(resolveRestartLedgerPath()),
+      {
+        nowMs,
+        windowMs: CRASH_LOOP_WINDOW_MS,
+        cap: RESTART_LEDGER_CAP,
+      },
+    );
     const verdict = decideCrashLoop({
       nowMs,
       bootTimestamps: qualifyCrashLoopBootTimestamps(

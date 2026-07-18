@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveRestartLedgerPath } from "../src/db";
+import { parseRestartLedger } from "../src/restart-ledger";
 import { parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
@@ -254,24 +255,12 @@ export async function readLatestBoot(): Promise<RestartBootMarker | null> {
   } catch {
     return null;
   }
-  let latest: RestartBootMarker | null = null;
-  for (const line of raw.split("\n")) {
-    try {
-      const parsed = JSON.parse(line) as Record<string, unknown>;
-      if (
-        parsed.kind === "boot" &&
-        typeof parsed.boot_id === "string" &&
-        parsed.boot_id.length > 0 &&
-        typeof parsed.ts === "number" &&
-        Number.isFinite(parsed.ts)
-      ) {
-        latest = { boot_id: parsed.boot_id, ts: parsed.ts };
-      }
-    } catch {
-      // A torn append must not prevent reading the preceding boot.
-    }
-  }
-  return latest;
+  const latest = parseRestartLedger(raw)
+    .filter((line) => line.kind === "boot")
+    .at(-1);
+  return latest === undefined
+    ? null
+    : { boot_id: latest.boot_id, ts: latest.ts };
 }
 
 /**

@@ -1,13 +1,11 @@
+import type { RestartBootIdentity } from "./restart-ledger";
+
 export const DEFAULT_RESTART_STABILIZATION_MS = 12_000;
 export const DEFAULT_RESTART_HEALTH_OBSERVATIONS = 3;
 export const MAX_RESTART_EVIDENCE_REASONS = 12;
 export const MAX_RESTART_DIAGNOSTIC_CHARS = 512;
 
-export interface RestartIdentity {
-  boot_id: string;
-  pid: number;
-  start_time: string;
-}
+export type RestartIdentity = RestartBootIdentity;
 
 export interface RestartLedgerBootRecord extends RestartIdentity {
   ts: number;

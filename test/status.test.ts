@@ -334,8 +334,8 @@ describe("computeEventStoreStatus", () => {
 // ---------------------------------------------------------------------------
 // readEventStoreStatus — the durable `boot_catchup_stats` row + live counts
 // flow through the served `result` frame's `event_store` field end-to-end. The
-// block rides the frame, NOT the boot header, so a caught-up daemon (whose
-// memoized reply omits the header) still delivers it.
+// block rides the frame beside the boot header, so memoized steady state and
+// catch-up object replies deliver the same observability fields.
 // ---------------------------------------------------------------------------
 
 describe("readEventStoreStatus wiring", () => {
@@ -1229,10 +1229,9 @@ describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () =>
 
 // ---------------------------------------------------------------------------
 // runStatus event-store delivery (fn-1312) — the block reaches the envelope
-// through BOTH live `result` frame shapes: the steady-state memoized shape
-// (block top-level, NO boot header — the shape a caught-up daemon serves) and
-// the catch-up shape (block top-level ALONGSIDE the boot header). Each expected
-// block below is a hand-authored constant, never re-derived from the daemon.
+// through BOTH live `result` frame shapes. Memoized steady state and catch-up
+// object frames carry the same durable identity and current Drain header. Each
+// expected block below is a hand-authored constant, never re-derived from the daemon.
 // ---------------------------------------------------------------------------
 
 /** A fixed event-store block for the delivery fixtures. */
@@ -1264,7 +1263,7 @@ function withEventStore(
 }
 
 describe("runStatus event-store delivery (fn-1312)", () => {
-  test("steady-state shape: result frames carry the block top-level with NO boot header, and it reaches the envelope", async () => {
+  test("steady-state shape: memoized results carry the block plus durable identity and completed Drain", async () => {
     const { factory, sockets } = makeStatusMockConnect();
     const { deps, cap } = makeStatusDeps(factory);
 
@@ -1273,18 +1272,29 @@ describe("runStatus event-store delivery (fn-1312)", () => {
     if (!sock) {
       throw new Error("mock socket never installed");
     }
-    // The caught-up daemon's memoized reply: the block rides the frame, the
-    // boot header is omitted.
+    const boot: BootStatus = {
+      boot_id: "boot-steady",
+      pid: 4242,
+      start_time: "linux:123456",
+      rev: 1,
+      head_event_id: 1,
+      catching_up: false,
+      git_seed_required: false,
+    };
     sock.deliver(
-      withEventStore(statusReadinessFrames([]), FIXTURE_EVENT_STORE),
+      withEventStore(statusReadinessFrames([]), FIXTURE_EVENT_STORE, boot),
     );
 
     expect(cap.exitCode).toBe(0);
     const env = JSON.parse(cap.stdout[0] ?? "{}") as {
       data: { event_store: EventStoreStatus | null; catching_up: boolean };
     };
-    // Delivered end-to-end even though no boot header ever arrived — the exact
-    // gap this fixes: onEventStore is the only firing callback at steady state.
+    expect(boot).toMatchObject({
+      boot_id: "boot-steady",
+      pid: 4242,
+      start_time: "linux:123456",
+      catching_up: false,
+    });
     expect(env.data.event_store).toEqual(FIXTURE_EVENT_STORE);
     expect(env.data.catching_up).toBe(false);
   });
@@ -1299,6 +1309,9 @@ describe("runStatus event-store delivery (fn-1312)", () => {
       throw new Error("mock socket never installed");
     }
     const boot: BootStatus = {
+      boot_id: "boot-catching-up",
+      pid: 4343,
+      start_time: "linux:654321",
       rev: 7,
       head_event_id: 9,
       catching_up: true,

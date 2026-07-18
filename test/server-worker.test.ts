@@ -15,6 +15,7 @@ import {
   SlugConflictError,
   type Writable,
 } from "../src/server-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 const encoder = new TextEncoder();
 
@@ -142,6 +143,44 @@ describe("server-worker RPC composition", () => {
         message: "handler crashed",
       },
     ]);
+  });
+
+  test("memoized steady-state results carry the durable identity and current Drain state", () => {
+    const { db } = freshMemDb();
+    db.run("UPDATE git_projection_state SET seed_required = 0 WHERE id = 1");
+    const identity = {
+      boot_id: "boot-exact",
+      pid: 4242,
+      start_time: "linux:123456",
+    };
+    const frames = dispatchLine(
+      db,
+      newConnState(),
+      JSON.stringify({ type: "query", id: "q", collection: "jobs" }),
+      undefined,
+      undefined,
+      newResultMemo(),
+      { ready: true, identity, generation: identity.boot_id },
+    );
+
+    expect(frames).toHaveLength(1);
+    const line = (frames[0] as { __line: string }).__line;
+    const result = JSON.parse(line) as {
+      boot: {
+        boot_id: string;
+        pid: number;
+        start_time: string;
+        catching_up: boolean;
+        rev: number;
+        head_event_id: number;
+      };
+    };
+    expect(result.boot).toMatchObject({
+      ...identity,
+      catching_up: false,
+      rev: 0,
+      head_event_id: 0,
+    });
   });
 
   test("boot gating rejects all eight mutating RPCs before invoking handlers", () => {

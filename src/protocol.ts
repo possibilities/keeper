@@ -104,6 +104,10 @@ export type Row = Record<string, unknown>;
  * "unknown frame fields ignored" rule), so adding it is wire-safe.
  */
 export interface BootStatus {
+  /** Durable daemon identity shared with the append-only restart ledger. */
+  boot_id?: string;
+  pid?: number;
+  start_time?: string;
   rev: number;
   head_event_id: number;
   catching_up: boolean;
@@ -120,8 +124,8 @@ export interface BootStatus {
    */
   max_concurrent_per_root?: number;
   /**
-   * Per-daemon-boot nonce, minted once when the server worker spawns. The fold
-   * cursor (`rev`) and `head_event_id` both PERSIST across a plain daemon
+   * Per-daemon-boot nonce, equal to the durable restart-ledger `boot_id`. The
+   * fold cursor (`rev`) and `head_event_id` both persist across a plain daemon
    * restart (the DB is durable), so neither can tell a client its connection
    * now rides a NEW daemon generation. This does: a client that observes a
    * changed generation across a reconnect knows a bounce happened and must

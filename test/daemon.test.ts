@@ -44,6 +44,7 @@ import {
   AUTOCLOSE_HINT_TTL_MS,
   type AuditOrchestratorLiveness,
   AutocloseHintSet,
+  appendDurableRestartBoot,
   appendFencedDispatchClear,
   appendRestartLedgerLine,
   auditReadyEscalationDecision,
@@ -2140,6 +2141,8 @@ function bootLine(
   return {
     kind: "boot",
     boot_id: bootId,
+    pid: null,
+    start_time: null,
     ts,
     provenance,
     prev_runtime_ms: prevRuntimeMs,
@@ -2326,6 +2329,8 @@ test("collapseRestartLedger: a boot line and its enrichment collapse to one reco
   ).toEqual([
     {
       boot_id: "a",
+      pid: null,
+      start_time: null,
       ts: 1000,
       provenance: "launchd",
       prev_runtime_ms: null,
@@ -2343,6 +2348,8 @@ test("collapseRestartLedger: an orphan enrichment synthesizes a forensic record,
   ).toEqual([
     {
       boot_id: "orphan",
+      pid: null,
+      start_time: null,
       ts: 5000,
       provenance: "unknown",
       prev_runtime_ms: null,
@@ -2588,6 +2595,101 @@ test("readRestartLedger: a missing file fails open to empty", () => {
   expect(
     readRestartLedger(join(tmpdir(), "keeper-nonexistent-ledger.json")),
   ).toEqual([]);
+});
+
+test("appendDurableRestartBoot retains old forensic history beyond the read-side cap", () => {
+  const path = join(tmpDir, "restart-ledger.ndjson");
+  const oldLines = Array.from({ length: RESTART_LEDGER_CAP + 7 }, (_, index) =>
+    serializeRestartLedgerLine(
+      bootLine(`old-${index}`, index + 1, "launchd", index === 0 ? null : 1),
+    ),
+  ).join("");
+  writeFileSync(path, oldLines);
+
+  const appended = appendDurableRestartBoot({
+    path,
+    bootId: "current",
+    pid: 4321,
+    startTime: "darwin:Thu Jan  1 00:00:00 1970",
+    provenance: "launchd",
+    nowMs: 99_999,
+  });
+
+  const raw = readFileSync(path, "utf8");
+  expect(raw.startsWith(oldLines)).toBe(true);
+  expect(
+    parseRestartLedger(raw).filter((line) => line.kind === "boot"),
+  ).toHaveLength(RESTART_LEDGER_CAP + 8);
+  expect(appended).toMatchObject({
+    boot_id: "current",
+    pid: 4321,
+    start_time: "darwin:Thu Jan  1 00:00:00 1970",
+  });
+});
+
+test("appendDurableRestartBoot preserves a torn tail and appends a separately parseable boot", () => {
+  const path = join(tmpDir, "restart-ledger.ndjson");
+  const valid = serializeRestartLedgerLine(bootLine("old", 1, "launchd", null));
+  const torn = '{"kind":"boot","boot_id":"torn"';
+  writeFileSync(path, valid + torn);
+
+  appendDurableRestartBoot({
+    path,
+    bootId: "current",
+    pid: 55,
+    startTime: "linux:1234",
+    provenance: "unknown",
+    nowMs: 2,
+  });
+
+  const raw = readFileSync(path, "utf8");
+  expect(raw.startsWith(`${valid + torn}\n`)).toBe(true);
+  expect(parseRestartLedger(raw).map((line) => line.boot_id)).toEqual([
+    "old",
+    "current",
+  ]);
+});
+
+test("appendDurableRestartBoot explicitly converts legacy history without losing a valid record", () => {
+  const path = join(tmpDir, "restart-ledger.json");
+  writeFileSync(path, JSON.stringify([1, { ts: 2, reason: "boom" }, 3]));
+
+  appendDurableRestartBoot({
+    path,
+    bootId: "current",
+    pid: 77,
+    startTime: "linux:5678",
+    provenance: "launchd",
+    nowMs: 4,
+  });
+
+  const raw = readFileSync(path, "utf8");
+  expect(raw.trimStart().startsWith("[")).toBe(false);
+  const lines = parseRestartLedger(raw);
+  expect(lines.map((line) => `${line.kind}:${line.boot_id}`)).toEqual([
+    "boot:legacy:0:1",
+    "boot:legacy:1:2",
+    "enrich:legacy:1:2",
+    "boot:legacy:2:3",
+    "boot:current",
+  ]);
+});
+
+test("appendDurableRestartBoot fails instead of replacing unreadable history with an empty ledger", () => {
+  const path = join(tmpDir, "restart-ledger.json");
+  mkdirSync(path);
+
+  expect(() =>
+    appendDurableRestartBoot({
+      path,
+      bootId: "current",
+      pid: 88,
+      startTime: "linux:9999",
+      provenance: "launchd",
+      nowMs: 5,
+    }),
+  ).toThrow("cannot read existing history");
+  expect(statSync(path).isDirectory()).toBe(true);
 });
 
 test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {
