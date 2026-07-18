@@ -1003,6 +1003,18 @@ async function runViewer(
         armedCount: state.armedEpics.length,
         worktreeMode: state.worktreeMode,
       }),
+    // Paint watchdog (ADR 0088): self-heal a wedge by resubscribing every stream
+    // (the wedge is socket/daemon level). Inert outside live mode; the handles
+    // are initialized below and this thunk only runs on a later trip.
+    watchdog: {
+      resubscribe: (): void => {
+        readinessHandle.reconnect();
+        failuresHandle.reconnect();
+        pausedHandle.reconnect();
+        armedHandle.reconnect();
+        worktreeHandle.reconnect();
+      },
+    },
     renderBody: (snap) => {
       // The view-shell's TSnap is our own `ViewerState` (`snap === state`).
       const current = snap.snap === null ? [] : buildCurrentRows(snap.snap);

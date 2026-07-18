@@ -1152,6 +1152,19 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     // The fixed banner row carries autopilot metadata. Restored here after a
     // copy-key flash expires.
     persistentBannerPill: apBanner,
+    // Paint watchdog (ADR 0088): the shell owns detection + the stale banner off
+    // the injected re-fold poller; the caller owns the self-heal. On a wedge we
+    // force a fresh resubscribe of all four streams (the wedge is socket/daemon
+    // level, so every stream re-baselines). Inert outside live mode. The handles
+    // are initialized below and this thunk only runs on a later trip.
+    watchdog: {
+      resubscribe: (): void => {
+        handle.reconnect();
+        armedHandle.reconnect();
+        autopilotHandle.reconnect();
+        closeFailHandle.reconnect();
+      },
+    },
     renderBody: (snap) => {
       // Per-frame `job_id → invocations` index — re-entrant sub-agents within
       // one session share a bucket, ordered by `turn_seq asc`.

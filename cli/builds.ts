@@ -356,6 +356,13 @@ export async function runBuilds(config: RunBuildsConfig): Promise<void> {
           },
         }
       : {}),
+    // Paint watchdog (ADR 0088): self-heal a wedge by resubscribing the single
+    // builds stream. Inert outside live mode; `handle` is initialized below.
+    watchdog: {
+      resubscribe: (): void => {
+        handle.reconnect();
+      },
+    },
   });
 
   const handle = subscribeCollection({

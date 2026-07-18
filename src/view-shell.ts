@@ -200,6 +200,17 @@ export function armViewerExitTriggers(
  *  `snapshotEmptyLine`. */
 export const DEFAULT_SNAPSHOT_EMPTY_LINE = "(idle — nothing to display)";
 
+/** Default paint-watchdog divergence-poll cadence (ms). */
+export const DEFAULT_WATCHDOG_POLL_MS = 5_000;
+/**
+ * Default paint-watchdog sustained-divergence window (ms). Deliberately ABOVE
+ * the readiness client's `HEARTBEAT_IDLE_MS` (15s) so a healthy socket's idle
+ * heartbeat reply always lands — advancing the accepted-frame observable and
+ * re-baselining the window — before the window elapses; that is what keeps a
+ * legitimately quiet pane from tripping.
+ */
+export const DEFAULT_WATCHDOG_WINDOW_MS = 20_000;
+
 /**
  * Normalize a render's body lines for a SNAPSHOT frame: a render that produced
  * zero lines becomes the honest-empty single line, so a healthy-but-idle daemon
@@ -253,6 +264,20 @@ export interface ViewShellOptions<TSnap> {
   persistentBannerPill?: () => string;
   /** Monotonic clock used for last-good-frame recency. */
   monotonicNow?: () => number;
+  /**
+   * Paint watchdog (ADR 0088). Opt-in per live pane — absent leaves the whole
+   * watchdog inert (no interval armed), so headless / snapshot / frames consumers
+   * and every test that omits it are byte-unchanged. When present AND `mode ===
+   * "live"`, the shell arms a slow divergence poll: it reads the out-of-band
+   * daemon fold cursor off the injected {@link ViewShellOptions.refoldProgressPoller}
+   * (the connected-state read-only progress poll — the ADR's sanctioned rev
+   * source after the idle-heartbeat probe proved in-band with the eviction
+   * freeze) and, when the cursor provably advances while ZERO frames were
+   * accepted across the whole window, trips: it renders the stale banner AND
+   * calls {@link PaintWatchdogConfig.resubscribe} to self-heal (tear down +
+   * resubscribe). A pane with no rev divergence, or an idle daemon, never trips.
+   */
+  watchdog?: PaintWatchdogConfig;
   /**
    * Optional poller surfacing the reducer's re-fold progress (fn-691).
    * Defaults to the real {@link createRefoldProgressPoller} bound to
@@ -370,6 +395,40 @@ export interface FramesRunIo {
    * registered.
    */
   proc?: ViewerExitProc;
+}
+
+/** Injectable interval seam for the paint watchdog (see {@link PaintWatchdogConfig}). */
+export type WatchdogTimer = ReturnType<typeof setInterval> | number;
+
+/**
+ * Paint-watchdog wiring (ADR 0088; see {@link ViewShellOptions.watchdog}).
+ */
+export interface PaintWatchdogConfig {
+  /**
+   * The self-heal action — tear down and resubscribe the pane's subscription(s)
+   * — invoked when the watchdog trips. The shell owns detection + the banner; the
+   * caller owns the resubscribe (it holds the `ReadinessClientHandle`s), wiring
+   * this to `handle.reconnect()`. MUST NOT exit the process or replace the pane.
+   */
+  readonly resubscribe: () => void;
+  /**
+   * Divergence poll cadence (ms). Each tick reads the out-of-band fold cursor.
+   * Default {@link DEFAULT_WATCHDOG_POLL_MS}.
+   */
+  readonly pollMs?: number;
+  /**
+   * The sustained-divergence window (ms): a proven cursor advance with ZERO
+   * accepted frames must persist THIS long before the watchdog trips. Kept
+   * deliberately ABOVE the readiness client's `HEARTBEAT_IDLE_MS` (15s) so a
+   * healthy socket's idle heartbeat reply always resets the window first — that
+   * is what keeps a legitimately quiet pane (e.g. git) from tripping. Default
+   * {@link DEFAULT_WATCHDOG_WINDOW_MS}.
+   */
+  readonly windowMs?: number;
+  /** Injectable interval set (tests drive ticks); default global `setInterval`. */
+  readonly setIntervalFn?: (cb: () => void, ms: number) => WatchdogTimer;
+  /** Injectable interval clear; default global `clearInterval`. */
+  readonly clearIntervalFn?: (handle: WatchdogTimer) => void;
 }
 
 export interface ViewShell<TSnap> {
@@ -504,6 +563,14 @@ export interface ViewShell<TSnap> {
   getLastFrameText: () => string | null;
   /** Current frame index (1-based; 0 before the first emit). */
   getFrameCount: () => number;
+  /**
+   * The accepted-frame observable (ADR 0088) — a monotone count bumped on every
+   * accepted daemon frame in live mode, INCLUDING one the paint layer suppresses
+   * as byte-identical, and NEVER by a local repaint. Exposed so a test can prove
+   * a resumed byte-identical frame still advanced it (the "provable resumption"
+   * the ADR requires). `0` before the first live frame.
+   */
+  getAcceptedFrameSeq: () => number;
 }
 
 export function createViewShell<TSnap>(
@@ -518,6 +585,15 @@ export function createViewShell<TSnap>(
   const snapshotEmptyLine =
     opts.snapshotEmptyLine ?? DEFAULT_SNAPSHOT_EMPTY_LINE;
   const monotonicNow = opts.monotonicNow ?? (() => performance.now());
+  // Paint watchdog (ADR 0088) — inert unless the caller opts in AND we are live.
+  const watchdogCfg = mode === "live" ? (opts.watchdog ?? null) : null;
+  const watchdogPollMs = watchdogCfg?.pollMs ?? DEFAULT_WATCHDOG_POLL_MS;
+  const watchdogWindowMs = watchdogCfg?.windowMs ?? DEFAULT_WATCHDOG_WINDOW_MS;
+  const watchdogSetInterval: (cb: () => void, ms: number) => WatchdogTimer =
+    watchdogCfg?.setIntervalFn ?? ((cb, ms) => setInterval(cb, ms));
+  const watchdogClearInterval: (handle: WatchdogTimer) => void =
+    watchdogCfg?.clearIntervalFn ??
+    ((handle) => clearInterval(handle as Parameters<typeof clearInterval>[0]));
 
   // Sidecar paths — keyed on `<script>.<pid>` exactly as the pre-factory
   // siblings emitted. Bit-for-bit shape preservation: any consumer that
@@ -633,7 +709,32 @@ export function createViewShell<TSnap>(
   const LONG_DEAD_FRAME_AGE_MS = 5000;
   const RECONNECTING_PILL = "reconnecting…";
   const DISCONNECTED_TOKEN = "DISCONNECTED";
+  const STALE_TOKEN = "STALE";
   let reconnectGraceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // ---- freshness axis (ADR 0088): stale banner + paint watchdog ----
+  // The accepted-frame observable. Bumped on EVERY accepted daemon frame in live
+  // mode — BEFORE the byte-compare, so a byte-identical frame the paint layer
+  // suppresses still advances it (the "proven fresh frame" signal). NEVER bumped
+  // by `repaintLocal` (a local interaction repaint is not a daemon frame). The
+  // watchdog compares this against the out-of-band fold cursor to catch the
+  // connected-but-not-painting wedge; a proven fresh frame clears the stale state.
+  let acceptedFrameSeq = 0;
+  // The watchdog-detected stale state (connected but not painting). DISTINCT from
+  // the disconnect-path `graceExpired`: this trips with the socket UP. Both feed
+  // `isStale()`, which drives the body-region stale banner. Cleared by the next
+  // proven fresh frame in `paintLiveFrame`.
+  let watchdogTripped = false;
+  // Watchdog divergence-window baselines (`isStale`-independent). `windowStart`
+  // is the monotonic time the current sustained-divergence window opened;
+  // `revBaseline` the fold cursor then; `acceptedBaseline` the accepted-frame
+  // observable then. ANY accepted frame (data OR a byte-identical heartbeat
+  // reply) since the window opened re-baselines it — that is the false-positive
+  // guard for a legitimately quiet pane. `null` window ⇒ not yet baselined.
+  let watchdogWindowStart: number | null = null;
+  let watchdogRevBaseline: number | null = null;
+  let watchdogAcceptedBaseline = 0;
+  let watchdogInterval: WatchdogTimer | undefined;
 
   // Connecting/loading-indicator spinner state. A single `setInterval` (~125ms)
   // animates the braille dots and (while unreachable) re-polls the re-fold
@@ -698,7 +799,19 @@ export function createViewShell<TSnap>(
   }
 
   function shouldAnimateConnectionStatus(): boolean {
-    return mode === "live" && (shouldShowIndicator() || graceExpired);
+    // Animate while the loading indicator owns the body, OR while the stale
+    // banner is showing (so its age stamp ticks — the spinner discipline). A
+    // watchdog wedge with the socket up is `isStale()` yet not `graceExpired`,
+    // so it must be a distinct disjunct here.
+    return mode === "live" && (shouldShowIndicator() || isStale());
+  }
+
+  // Whether the body-region stale banner is currently showing. Composes the two
+  // freshness triggers: a post-paint drop past the visible-switch debounce
+  // (`graceExpired`) and a watchdog-detected wedge (`watchdogTripped`). The
+  // connection-axis pill (reconnecting / retrying / DISCONNECTED) is separate.
+  function isStale(): boolean {
+    return graceExpired || watchdogTripped;
   }
 
   function syncIndicator(): void {
@@ -735,15 +848,23 @@ export function createViewShell<TSnap>(
     return `${glyph}  re-folding event log  ${shownPct.toFixed(1)}%  ${counts}`;
   }
 
-  // The loud post-grace signal: red (SGR 31, the shim's recognized "error"
-  // bucket) plus the plain-text `DISCONNECTED_TOKEN` so the word itself
-  // survives a paint path (passthrough, or a color-stripping terminal) that
-  // drops the escape. Never INVERSE/DIM — both are outside the shim's
-  // recognized set and would strip to nothing.
-  function disconnectedToken(): string {
-    return colorEnabled
-      ? `\x1b[31m${DISCONNECTED_TOKEN}\x1b[0m`
-      : DISCONNECTED_TOKEN;
+  // The body-region stale banner (ADR 0088): a full-width, unmistakable red
+  // plain-text line carrying the held frame's age. Red SGR 31 only (the shim
+  // strips INVERSE/DIM to nothing) plus the plain `STALE_TOKEN` so the word
+  // survives a color-stripping paint path. Rendered whenever `isStale()`; the
+  // connection-axis pill separately says WHY (unreachable vs. a live wedge).
+  function staleBannerLine(): string {
+    const age = frameAgeMs();
+    const ageStr =
+      age === null ? "" : ` · last good frame ${Math.floor(age / 1000)}s ago`;
+    // `reconnecting`/`graceExpired` ⇒ the socket dropped; `watchdogTripped`
+    // alone ⇒ the socket is up but the daemon stopped painting this pane.
+    const why =
+      reconnecting || graceExpired
+        ? "daemon unreachable"
+        : "daemon not painting";
+    const text = `${STALE_TOKEN} — ${why}, showing held frame${ageStr}`;
+    return colorEnabled ? `\x1b[31m${text}\x1b[0m` : text;
   }
 
   // Compose the loading-indicator body for the current tick. With no wire
@@ -812,6 +933,108 @@ export function createViewShell<TSnap>(
     spinnerInterval = setInterval(tickConnectingSpinner, SPINNER_TICK_MS);
   }
 
+  // ---- paint watchdog (ADR 0088) ----
+  // The only regime the divergence poll evaluates: a pane STEADILY painting a
+  // live connection. Pre-first-paint, catch-up, and an in-flight drop
+  // (reconnecting / graceExpired) are excluded — their own presentations own the
+  // body there, so the poll is inert (window held closed).
+  function watchdogActive(): boolean {
+    return (
+      watchdogCfg !== null &&
+      mode === "live" &&
+      frameCount > 0 &&
+      !catchingUp &&
+      !reconnecting &&
+      !graceExpired
+    );
+  }
+
+  // Clear the watchdog-tripped stale state (a proven fresh frame landed) and
+  // close the divergence window; the next steady tick re-opens it. Idempotent.
+  function clearWatchdogStale(): void {
+    watchdogTripped = false;
+    watchdogWindowStart = null;
+    watchdogRevBaseline = null;
+    watchdogAcceptedBaseline = acceptedFrameSeq;
+  }
+
+  // One divergence poll. Reads the out-of-band fold cursor off the read-only
+  // progress poll (the ADR's sanctioned rev source after the idle-heartbeat probe
+  // proved in-band with the eviction freeze). Trips ONLY on a proven cursor
+  // advance sustained across the whole window with ZERO accepted frames: an idle
+  // daemon (no cursor advance) never trips; ANY accepted frame — data OR a
+  // byte-identical heartbeat reply — since the window opened re-baselines it (the
+  // quiet-pane guard); a null read (DB busy / absent) is inconclusive and defers.
+  function watchdogTick(): void {
+    if (!watchdogActive()) {
+      watchdogWindowStart = null;
+      watchdogRevBaseline = null;
+      return;
+    }
+    const sample = refoldPoller.poll();
+    const rev = sample === null ? null : sample.cursor;
+    const frameAccepted = acceptedFrameSeq !== watchdogAcceptedBaseline;
+    const windowOpen =
+      watchdogWindowStart !== null && watchdogRevBaseline !== null;
+    if (frameAccepted || !windowOpen) {
+      // Healthy (a frame landed) or not yet baselined — (re)open the window. A
+      // null cursor read leaves it half-open; a later readable tick completes it.
+      watchdogAcceptedBaseline = acceptedFrameSeq;
+      watchdogRevBaseline = rev;
+      watchdogWindowStart = rev === null ? null : monotonicNow();
+      return;
+    }
+    if (rev === null) {
+      return; // inconclusive — hold the open window
+    }
+    const advanced = rev > (watchdogRevBaseline as number);
+    const elapsed =
+      monotonicNow() - (watchdogWindowStart as number) >= watchdogWindowMs;
+    if (advanced && elapsed) {
+      tripWatchdog();
+      // Re-baseline so a persistent wedge doesn't re-fire `resubscribe` every
+      // tick; a fresh frame (or the readiness heartbeat backstop) clears it.
+      watchdogAcceptedBaseline = acceptedFrameSeq;
+      watchdogRevBaseline = rev;
+      watchdogWindowStart = monotonicNow();
+    }
+  }
+
+  // Trip: render the stale banner (freshness axis) AND self-heal by resubscribing
+  // (tear down + resubscribe, owned by the caller's `resubscribe`). Purely
+  // in-viewer — an observational sidecar note only, NEVER a synthetic event,
+  // problem code, needs-human row, process exit, or pane replacement.
+  function tripWatchdog(): void {
+    if (watchdogTripped) {
+      return;
+    }
+    watchdogTripped = true;
+    noteLine(
+      `# watchdog: paint wedge — daemon rev advancing with no accepted frame for ${watchdogWindowMs}ms; resubscribing`,
+    );
+    // Arm the spinner cadence so the banner's age stamp ticks, then paint it now.
+    syncIndicator();
+    refreshReconnectPresentation();
+    watchdogCfg?.resubscribe();
+  }
+
+  function armWatchdog(): void {
+    if (watchdogCfg === null || watchdogInterval !== undefined) {
+      return;
+    }
+    watchdogWindowStart = null;
+    watchdogRevBaseline = null;
+    watchdogAcceptedBaseline = acceptedFrameSeq;
+    watchdogInterval = watchdogSetInterval(watchdogTick, watchdogPollMs);
+  }
+
+  function disarmWatchdog(): void {
+    if (watchdogInterval !== undefined) {
+      watchdogClearInterval(watchdogInterval);
+      watchdogInterval = undefined;
+    }
+  }
+
   function clearReconnectGrace(): void {
     if (reconnectGraceTimer !== undefined) {
       clearTimeout(reconnectGraceTimer);
@@ -845,15 +1068,21 @@ export function createViewShell<TSnap>(
     return "retrying…";
   }
 
+  // The SOLE body-repaint-during-drop seam — extended (never paralleled) to also
+  // carry the freshness axis. Sets the connection-axis pill ONLY while a drop is
+  // in flight (`reconnecting`/`graceExpired`), so a watchdog wedge with the
+  // socket up leaves the standing pill untouched. Renders the body-region stale
+  // banner whenever `isStale()` — the held frame plus the aged red banner.
   function refreshReconnectPresentation(): void {
-    const banner = reconnectBanner();
-    liveShell.setStatus(banner);
-    if (!banner.startsWith(DISCONNECTED_TOKEN) || lastBody === null) {
+    if (reconnecting || graceExpired) {
+      liveShell.setStatus(reconnectBanner());
+    }
+    if (!isStale() || lastBody === null) {
       return;
     }
     liveShell.refreshLive([
       ...toShellLines(lastBody.split("\n")),
-      `${disconnectedToken()} — keeperd unreachable`,
+      staleBannerLine(),
     ]);
   }
 
@@ -879,9 +1108,11 @@ export function createViewShell<TSnap>(
     restoreBanner();
   }
 
-  // Whether the banner's status slot is currently owned by a connection state.
+  // Whether the banner slot is currently held by a connection state OR the
+  // freshness stale banner — so a transient copy/caller flash can never clobber
+  // either (the stale banner joins the held-slot predicate per ADR 0088).
   function bannerSlotHeld(): boolean {
-    return reconnecting || graceExpired;
+    return reconnecting || graceExpired || isStale();
   }
 
   // Shared banner-flash timer. Transient `[copied …]` / caller-driven
@@ -1148,9 +1379,17 @@ export function createViewShell<TSnap>(
       });
       return true;
     }
-    // LIVE mode. While the daemon is catching up, HOLD the freshest composite
-    // (retained for an immediate paint on the flip to ready) and mint no history
-    // frame — the loading indicator owns the body via the `refreshLive` overlay.
+    // LIVE mode. Advance the accepted-frame observable FIRST — before the
+    // catch-up hold and the byte-compare — so EVERY accepted daemon frame counts,
+    // including one the paint layer will suppress as byte-identical. This is the
+    // "proven fresh frame" signal the watchdog reads (a healthy socket's idle
+    // heartbeat reply advances it even on a quiet board) and the clear-on-proof
+    // that resolves the stale state. A local repaint (`repaintLocal`) never
+    // reaches here, so it never feeds the observable.
+    acceptedFrameSeq += 1;
+    // While the daemon is catching up, HOLD the freshest composite (retained for
+    // an immediate paint on the flip to ready) and mint no history frame — the
+    // loading indicator owns the body via the `refreshLive` overlay.
     if (catchingUp) {
       heldRender = { bodyLines, stateJson };
       return false;
@@ -1211,10 +1450,16 @@ export function createViewShell<TSnap>(
   // The sole live-paint path — `emit`'s ready branch and the flip-to-ready in
   // `noteCatchingUp` both route through it.
   function paintLiveFrame(bodyLines: string[], stateJson: unknown): boolean {
+    // Capture staleness BEFORE clearing it: this accepted frame is the "proven
+    // fresh frame" that clears the stale state, and it must FORCE a full repaint
+    // even when byte-identical (the witnessed resumed-byte-identical-body case)
+    // so a wedged pane can be proven live again.
+    const wasStale = isStale();
     exitReconnecting();
+    clearWatchdogStale();
     stopConnectingSpinner();
     const body = bodyLines.join("\n");
-    if (body === lastBody) {
+    if (body === lastBody && !wasStale) {
       return false;
     }
     lastBody = body;
@@ -1222,6 +1467,9 @@ export function createViewShell<TSnap>(
     frameCount += 1;
     liveShell.pushFrame(toShellLines(bodyLines));
     writeSidecars(stateJson, sidecarFrameText(bodyLines));
+    // Steady painting resumed — (re-)arm the divergence poll and re-baseline its
+    // window off this fresh frame.
+    armWatchdog();
     return true;
   }
 
@@ -1234,9 +1482,15 @@ export function createViewShell<TSnap>(
     // Adopt the overlay content as the new baseline so a following live
     // `emit` of the same data suppresses instead of re-minting this body as
     // a history frame. No frameCount bump, no sidecar write — selection /
-    // expand churn is ephemeral UI state, not a data frame.
+    // expand churn is ephemeral UI state, not a data frame. A local repaint is
+    // NOT a daemon frame: it must not advance the accepted-frame observable nor
+    // clear the stale state (ADR 0088). While stale, RE-APPEND the stale banner
+    // so a local interaction never silently drops it.
     lastBody = body;
-    liveShell.refreshLive(toShellLines(bodyLines));
+    const shellLines = toShellLines(bodyLines);
+    liveShell.refreshLive(
+      isStale() ? [...shellLines, staleBannerLine()] : shellLines,
+    );
     return true;
   }
 
@@ -1281,6 +1535,10 @@ export function createViewShell<TSnap>(
         // Any header is stale once the socket drops — fall the indicator back to
         // the sqlite poller until fresh headers resume.
         latestBoot = undefined;
+        // A real socket drop supersedes any watchdog wedge: the connection axis
+        // (reconnecting → grace) now owns the freshness banner via `graceExpired`,
+        // so clear the watchdog-tripped flag and close its window.
+        clearWatchdogStale();
         if (frameCount > 0 && !catchingUp && !reconnecting) {
           // Hold the last-good frame through the grace; a byte-identical ready
           // frame resolves the banner without churning the body.
@@ -1379,6 +1637,7 @@ export function createViewShell<TSnap>(
       // `closeRefoldPoller` are idempotent so these paths co-fire safely.
       clearReconnectGrace();
       stopConnectingSpinner();
+      disarmWatchdog();
       closeRefoldPoller();
       liveShell.dispose();
       onDispose();
@@ -1597,5 +1856,6 @@ export function createViewShell<TSnap>(
     reportSnapshotStream,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,
+    getAcceptedFrameSeq: () => acceptedFrameSeq,
   };
 }
