@@ -564,6 +564,36 @@ describe("close skill blocking-follow-up gate contract", () => {
 });
 
 // ---------------------------------------------------------------------------
+// close skill durable phase-resume gate: a hash-fresh typed preflight signal
+// resumes only the first unfinished phase without the coordinator opening an
+// artifact or re-spawning already completed work.
+// ---------------------------------------------------------------------------
+
+describe("close skill durable phase-resume gate contract", () => {
+  const body = () => readFileSync(CLOSE_SKILL, "utf-8");
+
+  test("documents the typed resume field and blocking-followup precedence", () => {
+    const text = body();
+    expect(text).toContain("phase_resume");
+    expect(text).toContain(
+      "`blocking_followup` takes precedence over `phase_resume`",
+    );
+  });
+
+  test("skips satisfied or not_needed phases without agent re-spawns", () => {
+    const text = body();
+    expect(text).toContain("not_needed");
+    expect(text).toContain("without re-spawning agents");
+  });
+
+  test("remains content-blind while switching on the resume field", () => {
+    expect(body()).toContain(
+      "NEVER reads `state/audits` artifacts itself to make this decision",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // close-planner: follow-up template stamps both tier and model, with the
 // full configured axes — derived from the required host matrix so axis drift
 // trips this pin instead of silently rotting the template.
