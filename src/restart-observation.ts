@@ -52,6 +52,7 @@ export interface RestartObservationInput {
   pre_restart: {
     served_identity: RestartIdentity | null;
     ledger_marker: RestartLedgerBootRecord | null;
+    ledger_status?: "readable" | "missing" | "unreadable";
   };
   command?: RestartCommandObservation;
   old_process: RestartProcessIdentityState;
@@ -69,6 +70,8 @@ export interface RestartObservationInput {
 export type RestartEvidenceReasonCode =
   | "command-not-issued"
   | "pre-restart-identity-missing"
+  | "pre-restart-ledger-missing"
+  | "pre-restart-ledger-unreadable"
   | "old-process-still-alive"
   | "old-process-state-unknown"
   | "replacement-not-distinct"
@@ -283,6 +286,15 @@ export function classifyRestartEvidence(
     addReason("command-not-issued", "command");
   }
 
+  const preRestartLedgerStatus =
+    input.pre_restart.ledger_status ??
+    (input.pre_restart.ledger_marker === null ? "missing" : "readable");
+  if (preRestartLedgerStatus === "missing") {
+    addReason("pre-restart-ledger-missing", "durable-boot");
+  } else if (preRestartLedgerStatus === "unreadable") {
+    addReason("pre-restart-ledger-unreadable", "durable-boot");
+  }
+
   const timingValid = timingIsValid(input);
   if (!timingValid) {
     addReason("monotonic-timing-invalid", "stabilization");
@@ -311,7 +323,8 @@ export function classifyRestartEvidence(
     addReason("pre-restart-identity-missing", "replacement");
   } else if (
     candidate !== null &&
-    sameRestartIdentity(candidate, oldIdentity)
+    (sameRestartIdentity(candidate, oldIdentity) ||
+      candidate.boot_id === oldIdentity.boot_id)
   ) {
     replacement = {
       status: "not-distinct",
@@ -351,7 +364,9 @@ export function classifyRestartEvidence(
     );
     const isOld =
       sameRestartIdentity(candidate, oldIdentity) ||
-      sameRestartIdentity(candidate, input.pre_restart.ledger_marker);
+      candidate.boot_id === oldIdentity?.boot_id ||
+      sameRestartIdentity(candidate, input.pre_restart.ledger_marker) ||
+      candidate.boot_id === input.pre_restart.ledger_marker?.boot_id;
     if (exact !== undefined && isOld) {
       durableBoot = { status: "old" };
       addReason("durable-boot-is-old-marker", "durable-boot");
@@ -422,10 +437,10 @@ export function classifyRestartEvidence(
   if (latest !== null && !latest.healthy) {
     addReason("served-health-unhealthy", "health");
   }
+  if (mixedIdentities) {
+    addReason("mixed-served-identities", "health");
+  }
   if (latest?.healthy === true && consecutive < requiredObservations) {
-    if (mixedIdentities) {
-      addReason("mixed-served-identities", "health");
-    }
     addReason("insufficient-healthy-observations", "health");
   }
 
@@ -442,6 +457,9 @@ export function classifyRestartEvidence(
     !stabilizationComplete;
   let stabilization: RestartStabilizationState;
   if (deadlineExceeded) {
+    if (replacedDuringStabilization) {
+      addReason("replacement-during-stabilization", "stabilization");
+    }
     stabilization = {
       status: "deadline-exceeded",
       observed_for_ms: Math.max(0, observedFor),
@@ -478,6 +496,8 @@ export function classifyRestartEvidence(
 
   const proven =
     command.status !== "not-issued" &&
+    preRestartLedgerStatus === "readable" &&
+    input.pre_restart.ledger_marker !== null &&
     timingValid &&
     replacement.status === "replaced" &&
     durableBoot.status === "matched" &&

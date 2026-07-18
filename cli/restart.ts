@@ -1,13 +1,24 @@
 #!/usr/bin/env bun
 /** `keeper daemon restart` — restart the LaunchAgent and wait for a caught-up serve. */
 
-import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveRestartLedgerPath } from "../src/db";
-import { parseRestartLedger } from "../src/restart-ledger";
+import { parseLinuxStarttime, splitArgsLstart } from "../src/proc-starttime";
+import { readRestartLedgerSnapshot } from "../src/restart-ledger";
+import {
+  classifyRestartEvidence,
+  DEFAULT_RESTART_STABILIZATION_MS,
+  MAX_RESTART_DIAGNOSTIC_CHARS,
+  type RestartEvidenceVerdict,
+  type RestartHealthObservation,
+  type RestartIdentity,
+  type RestartLedgerSnapshot,
+  type RestartProcessIdentityState,
+} from "../src/restart-observation";
 import { parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import { emitEnvelope, errorEnvelope, successEnvelope } from "./envelope";
@@ -25,6 +36,7 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
 // genuinely wedged launchctl.
 export const KICKSTART_TIMEOUT_MS = 15_000;
 export const REQUIRED_HEALTHY_PROBES = 3;
+export const RESTART_STABILIZATION_MS = DEFAULT_RESTART_STABILIZATION_MS;
 export const INITIAL_BACKOFF_MS = 100;
 export const MAX_BACKOFF_MS = 1_500;
 export const MAX_KICKSTART_OUTPUT_CHARS = 4_096;
@@ -44,19 +56,19 @@ export const HELP = `keeper daemon restart — restart keeperd and wait for a ca
 Usage:
   keeper daemon restart [--timeout <duration>] [--sock <path>]
 
-Runs \`launchctl kickstart -k gui/$UID/arthack.keeperd\`, then waits for the
-socket to answer a read query whose boot status reports \`catching_up: false\`.
-The wait is bounded; a refused socket while the old daemon releases its flock is
-transient. A launchd throttle is reported separately from a slow boot.
+Runs \`launchctl kickstart -k gui/$UID/arthack.keeperd\` once, then proves the
+old process identity is gone and one different ledger-backed served identity is
+caught up and unchanged for at least 12 seconds. The wait is bounded; refused or
+inconclusive evidence fails honestly and never triggers another kickstart.
 
 Flags:
-  --timeout <duration>  Overall wait bound (default 2m30s; e.g. 10s, 2m)
+  --timeout <duration>  Overall wait bound (default 10m; e.g. 30s, 2m)
   --sock <path>         Daemon socket override ($KEEPER_SOCK / default)
   --help, -h            Show this help
 
 Exit codes:
-  0  daemon answered healthy and caught up
-  1  kickstart failed, launchd throttled respawn, or health wait timed out
+  0  one replacement identity satisfied durability, Drain, health, and stability
+  1  restart evidence remained missing, mismatched, unstable, or inconclusive
   2  usage error
 
 Plist edits need \`launchctl bootout\` plus \`launchctl bootstrap\`; kickstart
@@ -66,6 +78,7 @@ only restarts the already bootstrapped job.
 export type RestartProblemCode =
   | "kickstart-failed"
   | "health-timeout"
+  | "restart-unproven"
   | "throttled-respawn";
 
 export interface ParsedRestartArgs {
@@ -147,6 +160,8 @@ export interface CommandResult {
 
 export interface RestartBootMarker {
   boot_id: string;
+  pid: number;
+  start_time: string;
   ts: number;
 }
 
@@ -157,18 +172,35 @@ export interface KickstartWarning {
   timed_out: boolean;
 }
 
+export type RestartHealthProbe =
+  | {
+      status: "served";
+      identity: RestartIdentity;
+      healthy: boolean;
+      catching_up: boolean;
+    }
+  | {
+      status: "unavailable";
+      diagnostic: string;
+    };
+
 export interface RestartDeps {
   readonly runLaunchctl: (
     args: string[],
     timeoutMs: number,
   ) => Promise<CommandResult>;
-  /** True only when the socket served a reply with `boot.catching_up === false`. */
-  readonly probeHealth: (sock: string, timeoutMs: number) => Promise<boolean>;
-  /** Reads the newest boot ledger entry so health cannot be attributed to a stale daemon. */
-  readonly readLatestBoot: () => Promise<RestartBootMarker | null>;
+  readonly probeHealth: (
+    sock: string,
+    timeoutMs: number,
+  ) => Promise<RestartHealthProbe>;
+  readonly readBootLedger: () => Promise<RestartLedgerSnapshot>;
+  readonly classifyOldProcess: (
+    identity: RestartIdentity,
+  ) => RestartProcessIdentityState | Promise<RestartProcessIdentityState>;
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
   readonly random: () => number;
+  readonly isCancelled?: () => boolean;
   readonly uid: () => number;
   readonly writeStdout: (text: string) => void;
   readonly writeStderr: (text: string) => void;
@@ -182,39 +214,55 @@ export function isThrottledLaunchctlState(output: string): boolean {
   );
 }
 
+interface RestartFailureDiagnostics {
+  evidence: RestartEvidenceVerdict;
+  cancelled: boolean;
+  pre_restart_probe?: string;
+  last_probe?: string;
+  ledger?: string;
+  launchctl_state?: KickstartWarning;
+  kickstart_warning?: KickstartWarning;
+}
+
 function failure(
   code: RestartProblemCode,
   deps: RestartDeps,
-  kickstartWarning?: KickstartWarning,
+  diagnostics: RestartFailureDiagnostics,
 ): void {
   const details: Record<
     RestartProblemCode,
     { message: string; recovery: string }
   > = {
     "kickstart-failed": {
-      message: "launchd could not restart the keeper daemon.",
+      message:
+        "The restart command failed and the replacement evidence remained incomplete.",
       recovery:
-        "Confirm the LaunchAgent is bootstrapped, then retry. Plist edits require launchctl bootout plus bootstrap, not kickstart.",
+        "Inspect the bounded evidence, launchd status, and daemon stderr. Reconcile the current daemon identity before issuing another restart.",
     },
     "health-timeout": {
       message:
-        "The keeper daemon did not become healthy and caught up before the restart deadline.",
+        "The keeper daemon did not prove a stable caught-up replacement before the restart deadline.",
       recovery:
-        "Inspect the daemon's launchd status and server stderr, then retry once the boot fault is fixed.",
+        "Inspect the bounded evidence and daemon stderr, then reconcile the current daemon identity before issuing another restart.",
+    },
+    "restart-unproven": {
+      message:
+        "The restart did not prove one stable ledger-backed replacement identity.",
+      recovery:
+        "Inspect the bounded evidence for missing, mismatched, or unstable identity data. Reconcile the current daemon identity before issuing another restart.",
     },
     "throttled-respawn": {
-      message: "launchd is throttling keeperd after repeated respawns.",
+      message:
+        "The restart remained unproven while launchctl reported a throttled respawn.",
       recovery:
-        "Inspect server stderr for the crash loop, fix the boot fault, then retry the restart.",
+        "Inspect daemon stderr for the crash loop, fix the boot fault, and reconcile the current daemon identity before retrying.",
     },
   };
   emitEnvelope(
     errorEnvelope(RESTART_SCHEMA_VERSION, {
       code,
       ...details[code],
-      ...(kickstartWarning === undefined
-        ? {}
-        : { details: { kickstart_warning: kickstartWarning } }),
+      details: diagnostics,
     }),
     deps,
   );
@@ -236,77 +284,141 @@ function kickstartWarning(result: CommandResult): KickstartWarning {
   };
 }
 
-function isFreshBoot(
-  before: RestartBootMarker | null,
-  current: RestartBootMarker | null,
-): boolean {
-  if (current === null) return false;
-  return (
-    before === null ||
-    current.boot_id !== before.boot_id ||
-    current.ts > before.ts
-  );
+function boundDiagnostic(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length <= MAX_RESTART_DIAGNOSTIC_CHARS
+    ? trimmed
+    : `${trimmed.slice(0, MAX_RESTART_DIAGNOSTIC_CHARS - 12)}…[truncated]`;
+}
+
+export async function readRestartBootLedger(): Promise<RestartLedgerSnapshot> {
+  const snapshot = readRestartLedgerSnapshot(resolveRestartLedgerPath());
+  if (snapshot.status === "missing") return { status: "missing" };
+  if (snapshot.status === "unreadable") {
+    return {
+      status: "unreadable",
+      diagnostic: boundDiagnostic(snapshot.diagnostic),
+    };
+  }
+  return {
+    status: "readable",
+    boots: snapshot.lines.flatMap((line) =>
+      line.kind === "boot" && line.pid !== null && line.start_time !== null
+        ? [
+            {
+              boot_id: line.boot_id,
+              pid: line.pid,
+              start_time: line.start_time,
+              ts: line.ts,
+            },
+          ]
+        : [],
+    ),
+  };
 }
 
 export async function readLatestBoot(): Promise<RestartBootMarker | null> {
-  let raw: string;
-  try {
-    raw = await readFile(resolveRestartLedgerPath(), "utf8");
-  } catch {
-    return null;
+  const snapshot = await readRestartBootLedger();
+  return snapshot.status === "readable"
+    ? (snapshot.boots.at(-1) ?? null)
+    : null;
+}
+
+function validIdentity(value: unknown): value is RestartIdentity {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
   }
-  const latest = parseRestartLedger(raw)
-    .filter((line) => line.kind === "boot")
-    .at(-1);
-  return latest === undefined
-    ? null
-    : { boot_id: latest.boot_id, ts: latest.ts };
+  const identity = value as Record<string, unknown>;
+  return (
+    typeof identity.boot_id === "string" &&
+    identity.boot_id.length > 0 &&
+    typeof identity.pid === "number" &&
+    Number.isInteger(identity.pid) &&
+    identity.pid > 0 &&
+    typeof identity.start_time === "string" &&
+    identity.start_time.length > 0
+  );
 }
 
-/**
- * Caught-up verdict for one served reply frame. The serve worker stamps a
- * `boot` header onto object-form frames while any catch-up state holds, and a
- * pre-serialized memo line rides ONLY at steady state — so an absent header on
- * a `result` frame is itself caught-up evidence, and only a positive
- * `catching_up: true` reads as still booting.
- */
-export function isCaughtUpFrame(frame: {
-  type?: unknown;
-  boot?: { catching_up?: unknown };
-}): boolean {
-  return frame.type === "result" && frame.boot?.catching_up !== true;
+export function parseRestartHealthFrame(frame: unknown): RestartHealthProbe {
+  if (frame === null || typeof frame !== "object" || Array.isArray(frame)) {
+    return { status: "unavailable", diagnostic: "invalid response frame" };
+  }
+  const object = frame as Record<string, unknown>;
+  const boot = object.boot;
+  if (object.type !== "result") {
+    return { status: "unavailable", diagnostic: "non-result response frame" };
+  }
+  if (!validIdentity(boot)) {
+    return {
+      status: "unavailable",
+      diagnostic: "result frame omitted a valid served boot identity",
+    };
+  }
+  const catchingUp = (boot as unknown as Record<string, unknown>).catching_up;
+  if (typeof catchingUp !== "boolean") {
+    return {
+      status: "unavailable",
+      diagnostic: "result frame omitted boolean Drain state",
+    };
+  }
+  return {
+    status: "served",
+    identity: {
+      boot_id: boot.boot_id,
+      pid: boot.pid,
+      start_time: boot.start_time,
+    },
+    healthy: true,
+    catching_up: catchingUp,
+  };
 }
 
-/** One bounded healthy attempt. Connection refusal is simply `false`, never fatal. */
+export function isCaughtUpFrame(frame: unknown): boolean {
+  const observation = parseRestartHealthFrame(frame);
+  return observation.status === "served" && !observation.catching_up;
+}
+
 export async function probeSocketHealth(
   sockPath: string,
   timeoutMs: number,
-): Promise<boolean> {
+): Promise<RestartHealthProbe> {
   return new Promise((resolve) => {
     let settled = false;
     let buffered = "";
-    const finish = (healthy: boolean): void => {
+    const finish = (observation: RestartHealthProbe): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.destroy();
-      resolve(healthy);
+      resolve(observation);
     };
     const socket = createConnection({ path: sockPath });
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    socket.once("error", () => finish(false));
+    const timer = setTimeout(
+      () =>
+        finish({
+          status: "unavailable",
+          diagnostic: "socket probe timed out",
+        }),
+      timeoutMs,
+    );
+    socket.once("error", (error) =>
+      finish({
+        status: "unavailable",
+        diagnostic: boundDiagnostic(error.message),
+      }),
+    );
     socket.on("data", (chunk: Buffer) => {
       buffered += chunk.toString("utf8");
       const newline = buffered.indexOf("\n");
       if (newline === -1) return;
       try {
-        const frame = JSON.parse(buffered.slice(0, newline)) as {
-          type?: unknown;
-          boot?: { catching_up?: unknown };
-        };
-        finish(isCaughtUpFrame(frame));
+        finish(parseRestartHealthFrame(JSON.parse(buffered.slice(0, newline))));
       } catch {
-        finish(false);
+        finish({
+          status: "unavailable",
+          diagnostic: "socket returned malformed JSON",
+        });
       }
     });
     socket.once("connect", () => {
@@ -315,6 +427,42 @@ export async function probeSocketHealth(
       );
     });
   });
+}
+
+function readOsStartTime(pid: number): string | null {
+  try {
+    if (process.platform === "darwin") {
+      const result = Bun.spawnSync(
+        ["ps", "-ww", "-p", String(pid), "-o", "lstart=,args="],
+        { timeout: 500 },
+      );
+      if (!result.success || result.exitCode !== 0) return null;
+      const split = splitArgsLstart(result.stdout?.toString() ?? "");
+      return split === null ? null : `darwin:${split.lstart}`;
+    }
+    if (process.platform === "linux") {
+      const start = parseLinuxStarttime(
+        readFileSync(`/proc/${pid}/stat`, "utf8"),
+      );
+      return start === null ? null : `linux:${start}`;
+    }
+  } catch {}
+  return null;
+}
+
+export function classifyOldProcess(
+  identity: RestartIdentity,
+): RestartProcessIdentityState {
+  try {
+    process.kill(identity.pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
+      ? "dead"
+      : "unknown";
+  }
+  const current = readOsStartTime(identity.pid);
+  if (current === null) return "unknown";
+  return current === identity.start_time ? "alive" : "recycled";
 }
 
 async function runLaunchctl(
@@ -354,76 +502,226 @@ export async function runRestart(
   const startedAt = deps.now();
   const deadline = startedAt + args.timeoutMs;
   const domain = launchctlDomain(deps.uid());
-  const preRestartBoot = await deps.readLatestBoot();
+
+  let preRestartProbe: RestartHealthProbe;
+  try {
+    preRestartProbe = await deps.probeHealth(
+      args.sock,
+      Math.max(1, Math.min(DEFAULT_PROBE_TIMEOUT_MS, args.timeoutMs)),
+    );
+  } catch (error) {
+    preRestartProbe = {
+      status: "unavailable",
+      diagnostic: boundDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      ),
+    };
+  }
+  const preRestartIdentity =
+    preRestartProbe.status === "served" ? preRestartProbe.identity : null;
+
+  let preRestartLedger: RestartLedgerSnapshot;
+  try {
+    preRestartLedger = await deps.readBootLedger();
+  } catch (error) {
+    preRestartLedger = {
+      status: "unreadable",
+      diagnostic: boundDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      ),
+    };
+  }
+  const ledgerMarker =
+    preRestartLedger.status === "readable"
+      ? (preRestartLedger.boots.at(-1) ?? null)
+      : null;
+  const preRestartLedgerStatus =
+    preRestartLedger.status === "readable"
+      ? ledgerMarker === null
+        ? "missing"
+        : "readable"
+      : preRestartLedger.status;
+
   let kickstart: CommandResult;
   try {
     kickstart = await deps.runLaunchctl(
       ["kickstart", "-k", domain],
-      Math.min(KICKSTART_TIMEOUT_MS, args.timeoutMs),
+      Math.max(1, Math.min(KICKSTART_TIMEOUT_MS, args.timeoutMs)),
     );
-  } catch {
-    failure("kickstart-failed", deps);
-    return;
+  } catch (error) {
+    kickstart = {
+      exitCode: -1,
+      stdout: "",
+      stderr: boundDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      ),
+    };
   }
   const failedKickstart =
     kickstart.exitCode !== 0 || kickstart.timedOut === true;
-  const retainedKickstart = kickstartWarning(kickstart);
   const retainedKickstartWarning = failedKickstart
-    ? retainedKickstart
+    ? kickstartWarning(kickstart)
     : undefined;
+  const command = {
+    issued: true,
+    accepted: !failedKickstart,
+    diagnostics: {
+      exit_code: kickstart.exitCode,
+      timed_out: kickstart.timedOut === true,
+      stdout: kickstart.stdout,
+      stderr: kickstart.stderr,
+    },
+  } as const;
 
-  const emitSuccess = (healthyProbes: number): void => {
-    emitEnvelope(
-      successEnvelope(RESTART_SCHEMA_VERSION, {
-        domain,
-        healthy_probes: healthyProbes,
-        ...(retainedKickstartWarning === undefined
-          ? {}
-          : { kickstart_warning: retainedKickstartWarning }),
-      }),
-      deps,
-    );
-  };
-
-  let healthyInARow = 0;
+  let health: RestartHealthObservation[] = [];
+  let ledger = preRestartLedger;
+  let oldProcess: RestartProcessIdentityState =
+    preRestartIdentity === null ? "unknown" : "alive";
   let backoffMs = INITIAL_BACKOFF_MS;
-  while (deps.now() < deadline) {
-    const remaining = deadline - deps.now();
-    const healthy = await deps.probeHealth(
-      args.sock,
-      Math.max(1, Math.min(DEFAULT_PROBE_TIMEOUT_MS, remaining)),
-    );
-    if (healthy) {
-      healthyInARow += 1;
-      if (
-        healthyInARow >= REQUIRED_HEALTHY_PROBES &&
-        isFreshBoot(preRestartBoot, await deps.readLatestBoot())
-      ) {
-        emitSuccess(healthyInARow);
-        return;
-      }
+  let lastProbeDiagnostic: string | undefined;
+  let ledgerDiagnostic: string | undefined =
+    ledger.status === "unreadable"
+      ? boundDiagnostic(ledger.diagnostic ?? "ledger unreadable")
+      : undefined;
+  let launchctlState: KickstartWarning | undefined;
+  let sawThrottledState = false;
+  let cancelled = false;
+  let evidence = classifyRestartEvidence({
+    pre_restart: {
+      served_identity: preRestartIdentity,
+      ledger_marker: ledgerMarker,
+      ledger_status: preRestartLedgerStatus,
+    },
+    command,
+    old_process: oldProcess,
+    ledger,
+    health,
+    monotonic: {
+      started_at_ms: startedAt,
+      now_ms: startedAt,
+      deadline_at_ms: deadline,
+      stabilization_ms: RESTART_STABILIZATION_MS,
+    },
+    required_healthy_observations: REQUIRED_HEALTHY_PROBES,
+  });
+
+  while (deps.now() <= deadline) {
+    if (deps.isCancelled?.() === true) {
+      cancelled = true;
+      break;
+    }
+    const beforeProbe = deps.now();
+    const remaining = deadline - beforeProbe;
+    if (remaining < 0) break;
+
+    let probe: RestartHealthProbe;
+    try {
+      probe = await deps.probeHealth(
+        args.sock,
+        Math.max(1, Math.min(DEFAULT_PROBE_TIMEOUT_MS, remaining)),
+      );
+    } catch (error) {
+      probe = {
+        status: "unavailable",
+        diagnostic: boundDiagnostic(
+          error instanceof Error ? error.message : String(error),
+        ),
+      };
+    }
+    const observedAt = deps.now();
+    if (probe.status === "served") {
+      health.push({
+        identity: probe.identity,
+        observed_at_ms: observedAt,
+        healthy: probe.healthy,
+        catching_up: probe.catching_up,
+      });
+      if (health.length > 64) health = health.slice(-64);
+      lastProbeDiagnostic = undefined;
     } else {
-      healthyInARow = 0;
-      let state: CommandResult | null = null;
+      health = [];
+      lastProbeDiagnostic = boundDiagnostic(probe.diagnostic);
       try {
-        state = await deps.runLaunchctl(
+        const state = await deps.runLaunchctl(
           ["print", domain],
           Math.max(
             1,
             Math.min(DEFAULT_PROBE_TIMEOUT_MS, deadline - deps.now()),
           ),
         );
-      } catch {
-        // A failed state probe cannot make a refused boot terminal.
-      }
-      if (
-        state !== null &&
-        isThrottledLaunchctlState(`${state.stdout}\n${state.stderr}`)
-      ) {
-        failure("throttled-respawn", deps);
-        return;
+        launchctlState = kickstartWarning(state);
+        sawThrottledState ||= isThrottledLaunchctlState(
+          `${state.stdout}\n${state.stderr}`,
+        );
+      } catch (error) {
+        launchctlState = {
+          exit_code: -1,
+          stdout: "",
+          stderr: boundDiagnostic(
+            error instanceof Error ? error.message : String(error),
+          ),
+          timed_out: false,
+        };
       }
     }
+
+    try {
+      ledger = await deps.readBootLedger();
+    } catch (error) {
+      ledger = {
+        status: "unreadable",
+        diagnostic: boundDiagnostic(
+          error instanceof Error ? error.message : String(error),
+        ),
+      };
+    }
+    ledgerDiagnostic =
+      ledger.status === "unreadable"
+        ? boundDiagnostic(ledger.diagnostic ?? "ledger unreadable")
+        : undefined;
+
+    if (preRestartIdentity !== null) {
+      try {
+        oldProcess = await deps.classifyOldProcess(preRestartIdentity);
+      } catch {
+        oldProcess = "unknown";
+      }
+    }
+
+    evidence = classifyRestartEvidence({
+      pre_restart: {
+        served_identity: preRestartIdentity,
+        ledger_marker: ledgerMarker,
+        ledger_status: preRestartLedgerStatus,
+      },
+      command,
+      old_process: oldProcess,
+      ledger,
+      health,
+      monotonic: {
+        started_at_ms: startedAt,
+        now_ms: observedAt,
+        deadline_at_ms: deadline,
+        stabilization_ms: RESTART_STABILIZATION_MS,
+      },
+      required_healthy_observations: REQUIRED_HEALTHY_PROBES,
+    });
+    if (evidence.verdict === "proven" && evidence.identity !== null) {
+      emitEnvelope(
+        successEnvelope(RESTART_SCHEMA_VERSION, {
+          domain,
+          identity: evidence.identity,
+          healthy_probes: evidence.health.consecutive_caught_up_observations,
+          stabilized_for_ms: evidence.stabilization.observed_for_ms,
+          ...(retainedKickstartWarning === undefined
+            ? {}
+            : { kickstart_warning: retainedKickstartWarning }),
+        }),
+        deps,
+      );
+      return;
+    }
+
     const waitMs = Math.min(
       jitteredBackoff(backoffMs, deps.random),
       Math.max(0, deadline - deps.now()),
@@ -432,25 +730,65 @@ export async function runRestart(
     await deps.sleep(waitMs);
     backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
   }
-  // The fresh-boot ledger row is monotonic — once the new boot lands it stays —
-  // but the in-loop check only re-reads it on a healthy probe, so a boot that
-  // lands during the final backoff before the deadline is never re-evaluated.
-  // Re-check the evidence one last time: consecutive healthy probes plus a
-  // landed fresh boot prove the restart succeeded, regardless of the kickstart
-  // exit code (a nonzero/timed-out kickstart is retained as a warning, not a
-  // terminal verdict — exit 143 is our own launchctl-kill timeout, not a failed
-  // restart).
-  if (
-    healthyInARow >= REQUIRED_HEALTHY_PROBES &&
-    isFreshBoot(preRestartBoot, await deps.readLatestBoot())
-  ) {
-    emitSuccess(healthyInARow);
-    return;
-  }
+
+  const now = Math.max(startedAt, deps.now());
+  evidence = classifyRestartEvidence({
+    pre_restart: {
+      served_identity: preRestartIdentity,
+      ledger_marker: ledgerMarker,
+      ledger_status: preRestartLedgerStatus,
+    },
+    command,
+    old_process: oldProcess,
+    ledger,
+    health,
+    monotonic: {
+      started_at_ms: startedAt,
+      now_ms: now,
+      deadline_at_ms: deadline,
+      stabilization_ms: RESTART_STABILIZATION_MS,
+    },
+    required_healthy_observations: REQUIRED_HEALTHY_PROBES,
+  });
+
+  const throttled = sawThrottledState;
   failure(
-    failedKickstart ? "kickstart-failed" : "health-timeout",
+    failedKickstart
+      ? "kickstart-failed"
+      : throttled
+        ? "throttled-respawn"
+        : cancelled ||
+            evidence.reasons.some((reason) =>
+              [
+                "durable-boot-mismatched",
+                "ledger-missing",
+                "ledger-unreadable",
+                "replacement-during-stabilization",
+                "pre-restart-identity-missing",
+                "pre-restart-ledger-missing",
+                "pre-restart-ledger-unreadable",
+              ].includes(reason.code),
+            )
+          ? "restart-unproven"
+          : "health-timeout",
     deps,
-    retainedKickstartWarning,
+    {
+      evidence,
+      cancelled,
+      ...(preRestartProbe.status === "unavailable"
+        ? { pre_restart_probe: boundDiagnostic(preRestartProbe.diagnostic) }
+        : {}),
+      ...(lastProbeDiagnostic === undefined
+        ? {}
+        : { last_probe: lastProbeDiagnostic }),
+      ...(ledgerDiagnostic === undefined ? {} : { ledger: ledgerDiagnostic }),
+      ...(launchctlState === undefined
+        ? {}
+        : { launchctl_state: launchctlState }),
+      ...(retainedKickstartWarning === undefined
+        ? {}
+        : { kickstart_warning: retainedKickstartWarning }),
+    },
   );
 }
 
@@ -471,9 +809,10 @@ export async function main(argv: string[]): Promise<void> {
   await runRestart(parsed.args, {
     runLaunchctl,
     probeHealth: probeSocketHealth,
-    readLatestBoot,
+    readBootLedger: readRestartBootLedger,
+    classifyOldProcess,
     sleep: (ms) => Bun.sleep(ms),
-    now: () => Date.now(),
+    now: () => performance.now(),
     random: () => Math.random(),
     uid: currentUid,
     writeStdout: (text) => process.stdout.write(text),

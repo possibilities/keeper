@@ -95,6 +95,64 @@ describe("restart evidence identity", () => {
     });
   });
 
+  test("a reused boot id cannot present a changed process tuple as a replacement", () => {
+    const corrupt: RestartIdentity = {
+      boot_id: OLD.boot_id,
+      pid: NEXT.pid,
+      start_time: NEXT.start_time,
+    };
+    const verdict = classifyRestartEvidence(
+      exactInput({
+        old_process: "dead",
+        ledger: {
+          status: "readable",
+          boots: [ledgerBoot(OLD), ledgerBoot(corrupt)],
+        },
+        health: [
+          health(corrupt, 1_000),
+          health(corrupt, 7_000),
+          health(corrupt, 13_000),
+        ],
+      }),
+    );
+
+    expect(verdict.replacement.status).toBe("not-distinct");
+    expect(verdict.durable_boot.status).toBe("old");
+    expect(verdict.verdict).toBe("incomplete");
+  });
+
+  test("a missing or unreadable pre-restart marker cannot bless a later distinct row", () => {
+    const missing = classifyRestartEvidence(
+      exactInput({
+        pre_restart: {
+          served_identity: OLD,
+          ledger_marker: null,
+          ledger_status: "missing",
+        },
+      }),
+    );
+    const unreadable = classifyRestartEvidence(
+      exactInput({
+        pre_restart: {
+          served_identity: OLD,
+          ledger_marker: null,
+          ledger_status: "unreadable",
+        },
+      }),
+    );
+
+    expect(missing.verdict).toBe("incomplete");
+    expect(unreadable.verdict).toBe("incomplete");
+    expect(missing.reasons).toContainEqual({
+      code: "pre-restart-ledger-missing",
+      phase: "durable-boot",
+    });
+    expect(unreadable.reasons).toContainEqual({
+      code: "pre-restart-ledger-unreadable",
+      phase: "durable-boot",
+    });
+  });
+
   test("a recycled PID cannot join a new served start time to the old durable row", () => {
     const recycled: RestartIdentity = {
       boot_id: "boot-next",

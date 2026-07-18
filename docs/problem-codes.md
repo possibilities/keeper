@@ -14,17 +14,21 @@ here in the same change that introduces them.
 
 ## Daemon restart (`keeper daemon restart`)
 
-The restart verb asks launchd to restart the already bootstrapped keeperd job, then
-waits for a socket reply whose boot status is caught up. It never opens keeper.db
-or invokes a daemon RPC. A refused socket while the old process releases its flock
-is transient. Plist edits are a different operation: use `launchctl bootout` plus
-`launchctl bootstrap`, not `kickstart`.
+The restart verb snapshots the served process identity and durable ledger marker,
+asks launchd exactly once to restart the already bootstrapped keeperd job, then
+requires one different identity to be ledger-backed, caught up, and unchanged for
+at least twelve monotonic seconds. It never opens keeper.db or invokes a daemon RPC.
+A refused socket while the old process releases its flock is transient; unreadable,
+mismatched, unstable, or inconclusive evidence cannot succeed. Plist edits are a
+different operation: use `launchctl bootout` plus `launchctl bootstrap`, not
+`kickstart`.
 
-| code                | meaning                                                                  | recovery                                                                                             | retry-safe                        |
-| ------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- | --------------------------------- |
-| `kickstart-failed`  | `launchctl kickstart -k` could not ask launchd to restart the job.       | Confirm the LaunchAgent is bootstrapped. For plist edits, bootout then bootstrap it before retrying. | yes (restart request)             |
-| `health-timeout`    | The bounded wait ended before the daemon answered healthy and caught up. | Inspect launchd status and daemon stderr, fix the boot fault, then retry.                            | yes (restart request)             |
-| `throttled-respawn` | launchd is delaying keeperd after repeated respawns.                     | Inspect daemon stderr for the crash loop, fix it, then retry.                                        | yes (after fixing the boot fault) |
+| code | meaning | recovery | retry-safe |
+| --- | --- | --- | --- |
+| `kickstart-failed` | The one kickstart failed or timed out and the stronger replacement proof also remained incomplete. Bounded command and evidence diagnostics are retained. | Inspect launchd status, daemon stderr, and the evidence details. Reconcile the current daemon identity before another restart request. | conditional; reconcile first |
+| `health-timeout` | The deadline ended before one replacement identity completed the full durability, Drain, health, and stabilization proof. | Inspect the evidence details and daemon stderr; fix the boot fault and reconcile the current daemon identity before retrying. | conditional; reconcile first |
+| `restart-unproven` | Identity evidence was missing, unreadable, mismatched, unstable, or cancellation left it inconclusive. | Follow `error.details.evidence` to repair the specific evidence source, then reconcile the current daemon identity before another restart request. | conditional; reconcile first |
+| `throttled-respawn` | The proof remained incomplete and bounded launchctl diagnostics reported throttling; launchctl text alone never proves success. | Inspect daemon stderr for the crash loop, fix it, and reconcile the current daemon identity before retrying. | conditional; fix and reconcile first |
 
 ## Shared-helper family (`keeper status`, `keeper query`)
 

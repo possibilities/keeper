@@ -23,6 +23,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { RestartIdentity } from "../../src/restart-observation";
 import { sandboxEnv } from "./sandbox-env";
 import { freshDbFile } from "./template-db";
 
@@ -35,13 +36,38 @@ const STDERR_TAIL_BYTES = 16 * 1024;
 /**
  * One served reply frame as it arrives on the wire — deliberately loose so the
  * harness asserts the CONTRACT (the presence/shape of `boot`), never a typed
- * projection the daemon and test could drift together. `boot` is absent on a
- * steady-state memoized reply and present with `catching_up` while booting.
+ * projection the daemon and test could drift together.
  */
 export interface ServeFrame {
   type?: unknown;
-  boot?: { catching_up?: unknown };
+  boot?: {
+    boot_id?: unknown;
+    pid?: unknown;
+    start_time?: unknown;
+    catching_up?: unknown;
+  };
   [key: string]: unknown;
+}
+
+export function servedBootIdentity(frame: ServeFrame): RestartIdentity | null {
+  const boot = frame.boot;
+  if (
+    boot === undefined ||
+    typeof boot.boot_id !== "string" ||
+    boot.boot_id.length === 0 ||
+    typeof boot.pid !== "number" ||
+    !Number.isInteger(boot.pid) ||
+    boot.pid <= 0 ||
+    typeof boot.start_time !== "string" ||
+    boot.start_time.length === 0
+  ) {
+    return null;
+  }
+  return {
+    boot_id: boot.boot_id,
+    pid: boot.pid,
+    start_time: boot.start_time,
+  };
 }
 
 /** A handle to a live sandboxed keeperd subprocess. */
@@ -436,7 +462,7 @@ export interface CatchUpObservation {
 /**
  * Poll `sockPath` until a caught-up reply arrives (or `budgetMs` elapses),
  * collecting the catching-up replies seen along the way. A caught-up reply is a
- * `result` frame whose `boot` header is absent or reports `catching_up !== true`
+ * `result` frame whose exact served identity reports `catching_up === false`
  * — deliberately re-derived here rather than importing the consumer, so the test
  * can separately assert the shipped `isCaughtUpFrame` AGREES with what this saw.
  * Throws if the budget elapses without a caught-up reply (a real failure, never a
@@ -454,7 +480,9 @@ export async function pollUntilCaughtUp(
     const reply = await probeServeFrame(sockPath, probeTimeoutMs);
     if (reply) {
       const caughtUp =
-        reply.frame.type === "result" && reply.frame.boot?.catching_up !== true;
+        reply.frame.type === "result" &&
+        servedBootIdentity(reply.frame) !== null &&
+        reply.frame.boot?.catching_up === false;
       if (caughtUp) {
         return { catchingUpFrames, caughtUpFrame: reply.frame };
       }
