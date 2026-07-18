@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T20:56:39.397000Z",
+  "depends_on": [],
+  "epic": "fn-1346-retire-torn-down-lane-git-rows",
+  "id": "fn-1346-retire-torn-down-lane-git-rows.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Vanished lane retire and nudge",
+  "updated_at": "2026-07-18T20:56:39.397000Z"
+}
