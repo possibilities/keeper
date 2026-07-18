@@ -42,5 +42,5 @@ Pin empty plain import, once-only real-role installation, exact eight-method rea
 - [ ] Focused RPC-handler and server-worker tests plus typecheck pass
 
 ## Done summary
-
+Extracted RPC error constructors, contracts, and registry construction into a dependency-neutral src/rpc-runtime.ts leaf; server-worker owns the one mutable registry and installs the authoritative eight handlers atomically before readiness, with duplicate/partial installation boot-fatal and deterministic test reset.
 ## Evidence
