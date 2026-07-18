@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-18T20:56:39.397000Z",
   "depends_on": [],
@@ -10,5 +11,5 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Vanished lane retire and nudge",
-  "updated_at": "2026-07-18T20:56:39.397000Z"
+  "updated_at": "2026-07-18T20:57:52.324000Z"
 }
