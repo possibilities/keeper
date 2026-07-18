@@ -23,5 +23,5 @@ Files: test/restart-observation.test.ts
 - [ ] The assertion checks both `verdict: proven` and `proof_path: identity-capability-crossing`.
 
 ## Done summary
-
+Added a deterministic test proving the identity-capability crossing path against a non-empty valid frozen boot set with a genuinely absent successor, asserting both verdict:proven and proof_path:identity-capability-crossing.
 ## Evidence

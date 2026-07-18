@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Cover crossing against non-empty ledger",
-  "updated_at": "2026-07-18T18:50:49.258000Z"
+  "updated_at": "2026-07-18T19:13:40.902000Z",
+  "worker_done_at": "2026-07-18T19:13:40.902000Z"
 }
