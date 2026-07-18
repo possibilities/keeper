@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The evidence state machine carries subtle identity and temporal correctness invariants whose mistakes could produce false restart success.",
+      "task_id": "fn-1326-repair-restart-observability.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.98,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Durability ordering, lossless legacy conversion, and identity propagation form a cross-cutting architectural cascade with forensic correctness risks.",
+      "task_id": "fn-1326-repair-restart-observability.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The multi-surface restart verdict must preserve subtle same-incarnation and monotonic-stabilization invariants across CLI, ledger, health, and real-daemon tests.",
+      "task_id": "fn-1326-repair-restart-observability.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T05:58:16.686000Z",
+  "epic_id": "fn-1326-repair-restart-observability",
+  "input_hash": "22b1bc6f6a495ba7ff2f7cab2a2ff7200076c755486bd8a3799205dfcf887c64",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 582073455,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1326-repair-restart-observability.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The evidence state machine carries subtle identity and temporal correctness invariants whose mistakes could produce false restart success.\",\"confidence\":0.96},{\"task_id\":\"fn-1326-repair-restart-observability.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Durability ordering, lossless legacy conversion, and identity propagation form a cross-cutting architectural cascade with forensic correctness risks.\",\"confidence\":0.98},{\"task_id\":\"fn-1326-repair-restart-observability.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The multi-surface restart verdict must preserve subtle same-incarnation and monotonic-stabilization invariants across CLI, ledger, health, and real-daemon tests.\",\"confidence\":0.97}]}\n"
+}
