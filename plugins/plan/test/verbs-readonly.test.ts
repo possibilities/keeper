@@ -241,12 +241,17 @@ describe("epics", () => {
   test("ordering json + non-ASCII title byte-for-byte", () => {
     // test_readonly_verbs.py::test_epics_ordering_json
     seedMixed(root);
+    const name = basename(root);
     const r = runCli(["epics"], { cwd: root });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe(
       "{\n" +
         '  "success": true,\n' +
+        '  "project": {\n' +
+        `    "name": "${name}",\n` +
+        `    "path": "${root}"\n` +
+        "  },\n" +
         '  "epics": [\n' +
         "    {\n" +
         '      "id": "fn-1-cafe",\n' +
@@ -273,12 +278,20 @@ describe("epics", () => {
   test("empty project json", () => {
     // test_readonly_verbs.py::test_epics_empty_project_json
     seedEmptyProject(root);
+    const name = basename(root);
     const r = runCli(["epics"], { cwd: root });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe(
-      '{\n  "success": true,\n  "epics": [],\n  "total": 0,\n' +
-        '  "returned": 0,\n  "truncated": false,\n  "hint": null\n}\n',
+      "{\n" +
+        '  "success": true,\n' +
+        '  "project": {\n' +
+        `    "name": "${name}",\n` +
+        `    "path": "${root}"\n` +
+        "  },\n" +
+        '  "epics": [],\n' +
+        '  "total": 0,\n  "returned": 0,\n  "truncated": false,\n' +
+        '  "hint": null\n}\n',
     );
     expect(trailer).toBeNull();
   });
@@ -286,11 +299,13 @@ describe("epics", () => {
   test("--format human table renderer with non-ASCII title", () => {
     // test_readonly_verbs.py::test_epics_human
     seedMixed(root);
+    const name = basename(root);
     const r = runCli(["--format", "human", "epics"], { cwd: root });
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe(
-      "fn-1-cafe  Café résumé ☕  [open]  3 tasks (1 todo, 1 in_progress, 1 done)\n" +
+      `Project: ${name} (${root})\n` +
+        "fn-1-cafe  Café résumé ☕  [open]  3 tasks (1 todo, 1 in_progress, 1 done)\n" +
         "fn-zzz-weird  Weird  [open]  0 tasks\n",
     );
     expect(trailer).toBeNull();
