@@ -4,7 +4,8 @@
   "created_at": "2026-07-18T21:02:25.667000Z",
   "depends_on_epics": [
     "fn-1348-escalation-capabilities-as-plan-agents",
-    "fn-1346-retire-torn-down-lane-git-rows"
+    "fn-1346-retire-torn-down-lane-git-rows",
+    "fn-1353-attribute-native-crashes-at-boot"
   ],
   "id": "fn-1349-in-session-blocked-task-handling",
   "last_validated_at": null,
@@ -15,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:09:09.687000Z"
+  "updated_at": "2026-07-18T21:16:29.005000Z"
 }
