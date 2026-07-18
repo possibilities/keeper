@@ -6,9 +6,10 @@ file is imperative guardrails only.
 
 - **Docs prune, never append-only.** Doc edits consolidate and delete as readily as they add;
   CLAUDE.md gains a line only for a rule an agent would otherwise get wrong.
-  `bun scripts/lint-claude-md.ts` gates its size + bans re-narration — keep it green.
+  `bun scripts/lint-claude-md.ts` gates doc size; `bun scripts/lint-source.ts` gates
+  source comments plus raw NUL bytes — keep both green.
 - **Forward-facing advice only** — state current behavior, never change history: no fn-ids,
-  version numbers, dates, or past-tense provenance in CLAUDE.md, README, `CONTEXT.md`, or code
+  version numbers, dates, or past-tense provenance in CLAUDE.md, README, `CONTEXT.md`, or source
   comments. History and rationale have exactly one home — `docs/adr/`, alongside commit
   messages; vocabulary lives in `CONTEXT.md`.
 

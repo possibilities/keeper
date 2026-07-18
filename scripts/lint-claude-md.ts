@@ -41,7 +41,7 @@ const README_MAX_LINES = 250;
 const README_MAX_BYTES = 24576;
 
 /** Per-line content fingerprints. A match on any FAILs the lint. */
-const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
+export const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
   // Plan ids — provenance that belongs in the commit/diff, not a guardrail.
   { name: "fn-id", re: /\bfn-\d+/ },
   // Lowercase schema/db version numbers (`v74`, `v86`). The `\d{2,}` lower
@@ -53,7 +53,7 @@ const CONTENT_PATTERNS: { name: string; re: RegExp }[] = [
   // is deliberately absent — it states a current hypothetical, not history.
   {
     name: "provenance",
-    re: /\b(formerly|used to|no longer|previously|retired|replaced|removed in)\b/i,
+    re: /\b(formerly|used to|no longer|previously|retired|replaced|removed in|added for|fixed by)\b/i,
   },
 ];
 

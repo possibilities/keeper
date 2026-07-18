@@ -33,6 +33,7 @@
  */
 
 import { appendFileSync } from "node:fs";
+import { COMPOSITE_KEY_SEPARATOR } from "./composite-key";
 
 /**
  * The fire CLASS. A backstop is either a missed-wake rescue (a fast-path
@@ -184,7 +185,7 @@ export type BackstopMessage = {
 
 /** Stable JSON key for a (backstop,class) counter pair. */
 function counterKey(backstop: BackstopName, cls: BackstopClass): string {
-  return `${backstop} ${cls}`;
+  return `${backstop}${COMPOSITE_KEY_SEPARATOR}${cls}`;
 }
 
 /**
@@ -360,7 +361,7 @@ export class BackstopCounters {
   snapshot(ts: number): BackstopRollup[] {
     const out: BackstopRollup[] = [];
     for (const key of [...this.fires.keys()].sort()) {
-      const sep = key.indexOf(" ");
+      const sep = key.indexOf(COMPOSITE_KEY_SEPARATOR);
       const backstop = key.slice(0, sep) as BackstopName;
       const cls = key.slice(sep + 1) as BackstopClass;
       out.push({
