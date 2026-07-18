@@ -6,7 +6,7 @@
     "fn-1355-add-pi-codex-account-pool"
   ],
   "id": "fn-1356-activate-pi-codex-account-pool",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T21:41:38.835000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:41:16.341000Z"
+  "updated_at": "2026-07-18T21:41:38.835000Z"
 }
