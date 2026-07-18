@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical fail-closed grant guard with fencing tokens, anti-TOCTOU reads, whole-tuple validation and bypass-vector defense \u2014 a hard opus gate, at xhigh for the new contract-shaped confinement primitive and its stop-and-surface design judgment.",
+      "task_id": "fn-1347-escalation-grant-confinement-groundwork.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Override ordering into existing guards carries a subtle security bypass invariant (loose match or misordered deny becomes a hole plus protected-path carve-outs), a hard opus gate at xhigh for the load-bearing correctness invariant.",
+      "task_id": "fn-1347-escalation-grant-confinement-groundwork.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T21:11:34.689000Z",
+  "epic_id": "fn-1347-escalation-grant-confinement-groundwork",
+  "input_hash": "b6f863677cb4b884033316442a5bdaf4594654b53dd99cccaa2f09ad81b0b1f5",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3069731687,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1347-escalation-grant-confinement-groundwork.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security-critical fail-closed grant guard with fencing tokens, anti-TOCTOU reads, whole-tuple validation and bypass-vector defense \u2014 a hard opus gate, at xhigh for the new contract-shaped confinement primitive and its stop-and-surface design judgment.\",\"confidence\":0.83},{\"task_id\":\"fn-1347-escalation-grant-confinement-groundwork.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Override ordering into existing guards carries a subtle security bypass invariant (loose match or misordered deny becomes a hole plus protected-path carve-outs), a hard opus gate at xhigh for the load-bearing correctness invariant.\",\"confidence\":0.78}]}\n"
+}
