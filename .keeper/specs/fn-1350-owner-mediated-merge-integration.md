@@ -36,6 +36,8 @@ flowchart LR
 
 ## Rollout
 
+**This epic and its two successors arm only after the operator review gate passes.** The gate convenes when the pre-gate arc (grant confinement groundwork, escalation agents, in-session blocked-task handling) has landed on the default branch. Gate protocol, for whichever session convenes it: (1) assemble the review packet — Done summaries and Evidence for every task of the three landed pre-gate epics via `keeper query tasks`, plus run the guard suites (`bun test test/grant-guard.test.ts test/wrong-tree-guard.test.ts test/wrapped-guard.test.ts test/daemon.test.ts`) on the default branch to confirm the confinement denial evidence live; (2) send the packet summary to `keeper-phase8-handoff-baton` over the Agent Bus (`keeper bus chat send keeper-phase8-handoff-baton "…"`), requesting gate review plus fresh file-disjointness re-checks for this epic and its two successors against whatever is then in flight — the board manager flagged reconcile-core, reducer, and readiness.ts as surfaces their queue also visits; (3) notify the human that the gate is convened and that this epic stays un-armed until both the human and the board manager approve; (4) arm nothing yourself.
+
 Authority flips when this epic lands: provision stops creating resolver-chain trigger rows, so the legacy merge-escalation sweeps idle against a drained input and are physically removed by the retirement epic. Any sticky rows minted before this epic keep their stamped latch markers and drain through the legacy path. The recover pass keeps its backstop role for crash residue and closed-epic bases throughout.
 
 ## References
