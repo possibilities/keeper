@@ -47,5 +47,5 @@ Fast tests inject clock, health identities, ledger snapshots, process classifica
 - [ ] Focused restart tests, the named slow-daemon gate, typecheck, and documentation lint pass
 
 ## Done summary
-
+Replaced boolean restart health with structured served-boot evidence: the CLI now proves the old identity gone, one different ledger-backed served identity, completed Drain, and 12s of stable healthy observations before reporting success; kickstart fires exactly once, and mismatched/unstable/unreadable evidence returns bounded diagnostics without an automatic second kickstart. Strengthened the ADR 0073 sandboxed restart scenario and docs accordingly.
 ## Evidence
