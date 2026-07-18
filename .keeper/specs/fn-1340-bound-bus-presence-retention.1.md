@@ -45,5 +45,5 @@ Deterministically pin the inclusive horizon, live-socket override, expired match
 - [ ] Focused Bus tests and typecheck pass
 
 ## Done summary
-
+channelPruneDecision now expires socketless Presence inclusively at the horizon regardless of matching process identity (no probe spent); channel retention traversal switched from a fixed oldest-head reread to a single-flight, indexed (last_heartbeat, channel_id) keyset sweep with a worker-memory cursor that advances over every examined row, wraps at the tail, and independently bounds scan/probe/delete work. Deletion rechecks the live socket and CAS-matches the observed last_heartbeat so a concurrent refresh/re-subscribe survives; a horizon-expired open-but-unsubscribed registration connection is closed and detached from the registry as part of retirement. Queued-for-wake, takeover, send-only, and watcher-lease behavior are unchanged.
 ## Evidence
