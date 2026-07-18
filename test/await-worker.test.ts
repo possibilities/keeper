@@ -338,6 +338,24 @@ test("evaluateDurableAwaitConditions covers every server-side condition kind", (
   }
 });
 
+test("durable landed consumes the shared completion-backed evidence without lane state", () => {
+  const db = freshAwaitDb();
+  db.run(
+    `INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at, worktree_mode)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    [1, 1, 1, 1, 1, 1],
+  );
+  db.run(
+    `INSERT INTO lane_merged (epic_id, repo_dir, last_event_id, updated_at)
+       VALUES (?, ?, ?, ?)`,
+    ["fn-7-serial", "/repo", 1, 1],
+  );
+
+  expect(evalOne(db, { condition: "landed", target: "fn-7" })).toBe("met");
+  db.run("DELETE FROM lane_merged WHERE epic_id = ?", ["fn-7-serial"]);
+  expect(evalOne(db, { condition: "landed", target: "fn-7" })).toBe("waiting");
+});
+
 test("evaluateDurableAwaitConditions routes dotted targets as tasks and bare targets as epics", () => {
   const db = freshAwaitDb();
   seedEpic(db, {

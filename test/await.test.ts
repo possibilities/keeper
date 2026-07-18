@@ -42,10 +42,16 @@ import { drainMicrotasks } from "./helpers/retry-until";
 // HELP text — drift guard for the two documented-vs-behavior fixes.
 // ---------------------------------------------------------------------------
 
-test("HELP documents complete as done-AND-idle and lists the landed condition", () => {
+test("HELP documents complete and mode-neutral landed semantics", () => {
   expect(AWAIT_HELP).toContain("done-AND-idle");
-  // `landed` is a real parsed condition — it must appear in the conditions list.
   expect(AWAIT_HELP).toContain("landed <epic>");
+  expect(AWAIT_HELP).toContain("completion for a serial fallback");
+  expect(AWAIT_AGENT_HELP).toContain(
+    "finalize merge or completed serial execution",
+  );
+  expect(AWAIT_HELP).not.toContain(
+    "landed <epic>      the epic's worktree lane",
+  );
   const landed = parseAwaitArgs(["landed", "fn-1-foo"]);
   expect(landed.ok).toBe(true);
 });
@@ -3668,7 +3674,7 @@ test("await epic-removed: present-then-absent → met (exit 0)", async () => {
   expect(h.exitCode).toBe(0);
 });
 
-test("await landed (worktree ON): lane absent → waiting, then lane_merged → met (exit 0)", async () => {
+test("await landed (worktree ON): shared landing evidence satisfies lane and no-lane producers", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   const idPrefix = `await-${process.pid}`;
@@ -3710,7 +3716,8 @@ test("await landed (worktree ON): lane absent → waiting, then lane_merged → 
   expect(h.stdout.some((l) => l.includes("armed"))).toBe(true);
   expect(h.exitCode).toBeNull();
 
-  // The lane merges to default → the projection carries fn-1-foo → met.
+  // The shared projection carries producer evidence. The consumer deliberately
+  // cannot tell whether it came from a lane merge or completed serial fallback.
   sock.deliver([
     resultFrame(
       "lane_merged",
@@ -3720,6 +3727,11 @@ test("await landed (worktree ON): lane absent → waiting, then lane_merged → 
     ),
   ]);
   expect(h.stdout.some((l) => l.includes("[keeper-await] met"))).toBe(true);
+  expect(
+    h.stdout.some((l) =>
+      l.includes("detail=work landed on default branch (fn-1-foo)"),
+    ),
+  ).toBe(true);
   expect(h.exitCode).toBe(0);
 });
 

@@ -130,8 +130,8 @@ const BLOCK_ESCALATIONS_PAGE_LIMIT = 0;
 // The `tmux_client_focus` singleton (fn-952) — at most one row (`id = 1`), so
 // unbounded (0) like the other singleton collections.
 const TMUX_CLIENT_FOCUS_PAGE_LIMIT = 0;
-// The `lane_merged` observable — one row per merged-lane epic, bounded
-// by board size, so unbounded (0) like the other epic-keyed collections.
+// The `lane_merged` observable — one row per merge-landed epic, bounded by
+// board size, so unbounded (0) like the other epic-keyed collections.
 const LANE_MERGED_PAGE_LIMIT = 0;
 // The `dispatch_failures` collection — subscribed UNBOUNDED (0 = the no-row-cap
 // sentinel) under the `includeDispatchFailures` opt-in: the collection
@@ -319,13 +319,14 @@ export interface ReadinessClientSnapshot {
   // autopilot show` round-trip every durable knob off ONE snapshot.
   readonly worktreeMultiRepo: boolean;
   // The durable MERGE-LANDED set — epic ids whose work is provably on the
-  // default branch, for `keeper await landed` and `keeper status`. Sorted, stable.
+  // default branch, for `keeper await landed` and `keeper status`. Sorted,
+  // deduplicated, and stable across lane and no-lane execution.
   // Present ONLY under the `includeRecentDoneEpics` opt-in (the OFF degradation
   // reads done epics, which only join `epics` then) — `undefined` for board/dash so
   // their first-paint stays byte-identical (mirrors `autopilotEligibleEpicIds`).
-  // Worktree mode ON: the `lane_merged` projection (an `ok` epic's lane merged into
-  // default, or torn-down). Worktree mode OFF: degrades cleanly to DONE epics (no
-  // lanes exist; merged ⇔ done) — see {@link computeLandedEpicIds}.
+  // Worktree mode ON: the `lane_merged` projection (a lane-capable epic merged or
+  // torn down, or an explicitly serial fallback completed). Worktree mode OFF:
+  // degrades cleanly to DONE epics — see {@link computeLandedEpicIds}.
   readonly landedEpicIds?: readonly string[];
   // ADR 0011 OPT-IN: the sticky `dispatch_failures` rows (verb/id/reason/dir
   // intact off the fold), backing three of the six needs-human signals (stuck
@@ -620,16 +621,16 @@ export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
  * provably on the default branch — degrading cleanly across worktree mode. PURE
  * (no socket, no clock), so the snapshot path and tests share one source of truth.
  *
- *  - Worktree mode ON: the `lane_merged` projection ids (an `ok` epic's lane merged
- *    into LOCAL default, or torn-down after the merge). The producer probes git;
- *    this consumer just reads the durable projection.
+ *  - Worktree mode ON: the `lane_merged` projection ids. The producer proves a
+ *    lane-capable merge with git or an explicit serial fallback with epic
+ *    completion; this consumer just reads the durable projection.
  *  - Worktree mode OFF: there are no lanes, so "merged" degrades to DONE — the work
  *    landed straight on the default branch when the epic finished. Reads each
  *    epic's `status` (the done epics ride `epics` only under the
  *    `includeRecentDoneEpics` opt-in, which is also what gates this whole signal).
  *
- * Returns a fresh sorted array (stable tick-to-tick so a membership-only consumer
- * never sees spurious churn).
+ * Returns a fresh sorted, deduplicated array (stable tick-to-tick so a
+ * membership-only consumer never sees spurious churn).
  */
 export function computeLandedEpicIds(
   worktreeMode: boolean,
@@ -637,10 +638,9 @@ export function computeLandedEpicIds(
   epics: readonly Epic[],
 ): string[] {
   const ids = worktreeMode
-    ? [...mergedLaneEpicIds]
+    ? mergedLaneEpicIds
     : epics.filter((e) => e.status === "done").map((e) => e.epic_id);
-  ids.sort();
-  return ids;
+  return [...new Set(ids)].sort();
 }
 
 /**

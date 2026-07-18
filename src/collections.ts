@@ -1048,10 +1048,11 @@ export const WORKTREE_REPO_STATUS_DESCRIPTOR: CollectionDescriptor = {
 
 /**
  * The `lane_merged` descriptor — the LIVE-ONLY merge-landed observable.
- * One row per epic whose worktree lane branch (`keeper/epic/<id>`) the autopilot
- * reconciler probed as merged into the LOCAL default branch (ancestor-of-default,
- * or torn-down after the merge), folded from a synthetic `LaneMerged` event the
- * worker posts when the merged set changes. Registering it here is what makes the
+ * One row per epic whose work is confirmed on the LOCAL default branch: a
+ * lane-capable path is probed as merged or torn down after merge, while an explicit
+ * whole-epic serial fallback is confirmed by epic completion. Rows are folded from
+ * a synthetic `LaneMerged` event the worker posts when the landed set changes.
+ * Registering it here is what makes the
  * table subscribable over the UDS socket so `keeper await landed` and `keeper
  * status` can read the durable signal; an empty / pre-first-cycle table returns
  * `rows: []`. `version: 'last_event_id'` so the diff fires on every fold. Mirrors
