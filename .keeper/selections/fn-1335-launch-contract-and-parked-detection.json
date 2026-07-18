@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": null,
+      "task_id": "fn-1335-launch-contract-and-parked-detection.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": null,
+      "task_id": "fn-1335-launch-contract-and-parked-detection.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T14:32:03.740000Z",
+  "epic_id": "fn-1335-launch-contract-and-parked-detection",
+  "input_hash": "7e1ec7878e47ab52138d74bf2242cbb6f214e850d4ba77d9b11005bc5cefc642",
+  "outcome": "degraded:arm-before-select ordering slip; task .1 dispatched mid-selection on the stamped default cell identical to the selector verdict (opus/xhigh across all tasks)",
+  "schema_version": 1,
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}
