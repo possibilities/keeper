@@ -99,7 +99,6 @@ import type {
   AttachVerifyResult,
   RestoreIntent,
 } from "./restore-verify";
-import { probeServerGeneration } from "./restore-worker";
 import { buildResumeCommand } from "./resume-descriptor";
 import {
   defaultResumeResolver,
@@ -108,6 +107,7 @@ import {
   type ResumeResolver,
   resolveNonClaudeArtifact,
 } from "./resume-resolve";
+import { probeServerGeneration } from "./server-generation-probe";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 

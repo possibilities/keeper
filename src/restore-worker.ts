@@ -110,15 +110,14 @@ import {
   serializePlanJson,
   sortObjectKeys,
 } from "./db";
-import {
-  buildGenerationId,
-  buildTmuxServerGenerationArgs,
-  DEFAULT_EXEC_BACKEND,
-  localeDefaultedEnv,
-} from "./exec-backend";
+import { DEFAULT_EXEC_BACKEND, localeDefaultedEnv } from "./exec-backend";
 import { compareCandidates, type RestoreCandidate } from "./restore-set";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import type { ResumeResolver } from "./resume-resolve";
+import {
+  probeServerGeneration,
+  type SpawnSyncFn,
+} from "./server-generation-probe";
 import { runQuery } from "./server-worker";
 import { defaultLauncherPrefix, renderSnapshotScript } from "./tabs-core";
 import type { TmuxTopologyPane } from "./tmux-focus-derive";
@@ -199,23 +198,7 @@ export interface BackendExecStartMessage {
  * the shape alongside {@link probeTmuxTopology}.
  */
 export type { TmuxTopologyPane };
-
-/**
- * `Bun.spawnSync`-shaped subset the tmux probes need; injectable so tests drive
- * the parse / classify without a real tmux server. Mirrors the git-worker's
- * `gitOutput` spawnSync shape: `success` + `exitCode` + a stdout `Buffer`.
- * `stderr` is OPTIONAL — {@link probeServerGeneration} collapses every non-zero
- * exit to a degraded-skip and never reads it, but the whole-server topology probe
- * ({@link probeTmuxTopology}, retained for the boot-seed) needs it to tell
- * SERVER-GONE (`no server running` / `failed to connect`) from a TRANSIENT
- * failure (timeout / SIGKILL / EPIPE).
- */
-export type SpawnSyncFn = (cmd: string[]) => {
-  success: boolean;
-  exitCode: number | null;
-  stdout: Buffer;
-  stderr?: Buffer;
-};
+export type { SpawnSyncFn };
 
 const defaultSpawnSync: SpawnSyncFn = (cmd) =>
   Bun.spawnSync(cmd, {
@@ -801,30 +784,6 @@ export function probeTmuxTopology(spawnSync: SpawnSyncFn): TmuxTopologyProbe {
     return { kind: "gone" };
   }
   return { kind: "transient" };
-}
-
-/**
- * Probe the backend's current generation handle via the injected `spawnSync`,
- * minting the id through the sole {@link buildGenerationId} builder so this
- * boundary pulse and every topology emitter share ONE format. Returns the
- * canonical `pid:start_time` STRING; `null` for every degraded case — ENOENT (no
- * tmux binary), a non-zero exit (no running server), or output the builder
- * rejects (garbage / empty / bare-pid). NEVER throws. A `null` means "no
- * generation observed this pulse" and the caller emits nothing — a degraded
- * probe must NOT fire a spurious boundary. Pure relative to the injected
- * `spawnSync`.
- */
-export function probeServerGeneration(spawnSync: SpawnSyncFn): string | null {
-  let res: ReturnType<SpawnSyncFn>;
-  try {
-    res = spawnSync(buildTmuxServerGenerationArgs());
-  } catch {
-    return null;
-  }
-  if (!res.success || res.exitCode !== 0) {
-    return null;
-  }
-  return buildGenerationId(res.stdout.toString());
 }
 
 /**

@@ -59,8 +59,12 @@ import type { Database } from "bun:sqlite";
 import type { Stmts } from "./db";
 import { raiseTmuxProjectionFloor, setTmuxProjectionSeedRequired } from "./db";
 import { localeDefaultedEnv } from "./exec-backend";
-import type { SpawnSyncFn, TmuxTopologyPane } from "./restore-worker";
-import { probeServerGeneration, probeTmuxTopology } from "./restore-worker";
+import type { TmuxTopologyPane } from "./restore-worker";
+import { probeTmuxTopology } from "./restore-worker";
+import {
+  probeServerGeneration,
+  type SpawnSyncFn,
+} from "./server-generation-probe";
 
 /**
  * Upper bound on each tmux probe spawn. A wedged tmux server degrades to a
@@ -135,8 +139,8 @@ const defaultSeedSpawnSync: SpawnSyncFn = (cmd) =>
 /**
  * The default {@link SeedTmuxProjectionOptions.buildSnapshot}: the real producer
  * path. Resolves the server generation (the recycle-guard key) and the
- * whole-server pane topology, reusing the restore-worker's
- * {@link probeServerGeneration} + {@link probeTmuxTopology} (never reimplemented).
+ * whole-server pane topology, reusing the shared {@link probeServerGeneration}
+ * seam + restore-worker's {@link probeTmuxTopology} (never reimplemented).
  * Returns `null` when:
  *   - the generation probe yields no generation (no server / garbage) — we can't
  *     stamp the recycle key, so don't seed an unkeyable topology; OR
