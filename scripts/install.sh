@@ -273,6 +273,27 @@ else
   fi
 fi
 
+# 3e. ripgrep: install or update the stable Homebrew formula on every run.
+#     Search tooling remains non-critical: a missing Homebrew or failed formula
+#     transaction leaves any existing rg installation available.
+if ! command -v brew >/dev/null 2>&1; then
+  echo "install: Homebrew unavailable; leaving ripgrep unchanged (non-fatal)" >&2
+elif brew list --formula ripgrep >/dev/null 2>&1; then
+  echo "install: update ripgrep"
+  if brew upgrade ripgrep; then
+    echo "install: ripgrep updated"
+  else
+    echo "install: ripgrep update failed; leaving existing installation unchanged (non-fatal)" >&2
+  fi
+else
+  echo "install: install ripgrep"
+  if brew install ripgrep; then
+    echo "install: ripgrep installed"
+  else
+    echo "install: ripgrep install failed (non-fatal)" >&2
+  fi
+fi
+
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it
