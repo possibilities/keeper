@@ -54,5 +54,5 @@ Board test already pins the pill contract — keep them consistent.
 - [ ] Named test gates for status and board pass
 
 ## Done summary
-
+Split stale-running from live-running in status counts and per-row JSON views, added last_evidence_at freshness on stale rows, kept running_jobs emitting with a deprecation docstring, and recorded the decision in ADR 0083.
 ## Evidence
