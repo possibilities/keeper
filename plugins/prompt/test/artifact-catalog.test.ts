@@ -72,7 +72,7 @@ describe("strict prompt artifact catalog", () => {
       join(root, "prompt-artifacts.yaml"),
       root,
     );
-    expect(catalog.roles).toHaveLength(12);
+    expect(catalog.roles).toHaveLength(16);
     expect(catalog.roleByName.get("work:worker")).toMatchObject({
       binding: "cell-bound",
       unserved: "wrapped",
@@ -80,6 +80,27 @@ describe("strict prompt artifact catalog", () => {
     for (const bundle of ["plan:plan", "plan:close", "plan:work"]) {
       expect(catalog.bundleByName.get(bundle)?.roles.length).toBeGreaterThan(1);
     }
+  });
+
+  test("accepts static default pins and rejects them on cell-bound roles", () => {
+    const root = planRoot();
+    const doc = validDoc();
+    (doc.roles as Array<Record<string, unknown>>)[0].default_pin = {
+      model: "opus",
+      effort: "high",
+    };
+    expect(
+      parsePromptArtifactCatalog(doc, root).roleByName.get("plan:one"),
+    ).toMatchObject({ defaultPin: { model: "opus", effort: "high" } });
+
+    const invalid = validDoc();
+    (invalid.roles as Array<Record<string, unknown>>)[2].default_pin = {
+      model: "opus",
+      effort: "high",
+    };
+    expect(() => parsePromptArtifactCatalog(invalid, root)).toThrow(
+      "default_pin is allowed only for a static role",
+    );
   });
 
   test("rejects duplicate YAML mapping keys before schema coercion", () => {

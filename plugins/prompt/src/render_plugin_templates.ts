@@ -60,6 +60,10 @@ import {
   hostMatrixPath,
   loadHostMatrixV2,
 } from "../../plan/src/host_matrix.ts";
+import {
+  loadPromptArtifactCatalog,
+  type PromptArtifactDefaultPin,
+} from "./artifact_catalog.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { resolveClaudeCompilerRoots } from "./claude_worker_compiler.ts";
 import { compilePromptArtifacts } from "./prompt_compiler.ts";
@@ -432,6 +436,7 @@ function renderAgents(
   pluginDir: string,
   projectRoot: string,
   matrix: HostMatrixV2,
+  defaultPins: ReadonlyMap<string, PromptArtifactDefaultPin>,
 ): boolean {
   const templatesDir = join(pluginDir, "template", "agents");
   if (!isDir(templatesDir)) {
@@ -452,13 +457,12 @@ function renderAgents(
       continue;
     }
 
-    // A plain-render static agent draws its frontmatter model+effort from the
-    // matrix `agent_pins`; a missing pin fails the render loud, naming the agent.
-    const pin = matrix.agentPins.get(stem);
+    // A catalog default keeps the host's role-specific pin optional.
+    const pin = matrix.agentPins.get(stem) ?? defaultPins.get(stem);
     if (pin === undefined) {
       hadFailures = true;
       process.stderr.write(
-        `✗ no agent_pins entry for '${stem}' in the host matrix — ` +
+        `✗ no agent_pins entry or catalog default_pin for '${stem}' — ` +
           "every static plan agent needs a {model, effort} pin\n",
       );
       continue;
@@ -596,6 +600,38 @@ export function runRenderPluginTemplates(
   }
 
   const pluginDirs = discoverPluginDirs(projectRoot);
+  const defaultPinsByPlugin = new Map<
+    string,
+    ReadonlyMap<string, PromptArtifactDefaultPin>
+  >();
+  try {
+    for (const pluginDir of pluginDirs) {
+      const catalogPath = join(pluginDir, "prompt-artifacts.yaml");
+      if (!isFile(catalogPath)) {
+        defaultPinsByPlugin.set(pluginDir, new Map());
+        continue;
+      }
+      const catalog = loadPromptArtifactCatalog(catalogPath, pluginDir);
+      defaultPinsByPlugin.set(
+        pluginDir,
+        new Map(
+          catalog.roles.flatMap((role) =>
+            role.defaultPin === undefined
+              ? []
+              : [
+                  [
+                    baseName(role.source).slice(0, -TMPL_SUFFIX.length),
+                    role.defaultPin,
+                  ] as const,
+                ],
+          ),
+        ),
+      );
+    }
+  } catch (e) {
+    process.stderr.write(`Error: ${errMsg(e)}\n`);
+    return 1;
+  }
   let hadFailures = false;
 
   // 3-6. Three template kinds → three shapes. Loop ordering mirrors bash: all
@@ -611,7 +647,14 @@ export function runRenderPluginTemplates(
     }
   }
   for (const pluginDir of pluginDirs) {
-    if (renderAgents(pluginDir, projectRoot, matrix)) {
+    if (
+      renderAgents(
+        pluginDir,
+        projectRoot,
+        matrix,
+        defaultPinsByPlugin.get(pluginDir) ?? new Map(),
+      )
+    ) {
       hadFailures = true;
     }
   }

@@ -36,8 +36,7 @@ const LIVE_TEMPLATES_DIR = join(
   "template",
   "agents",
 );
-/** The committed, host-blind fixture matrix `parity.test.ts` also sandboxes —
- *  its `agent_pins` block is the live 11-agent set this gate pins. */
+/** The committed, host-blind fixture matrix `parity.test.ts` also sandboxes. */
 const SANDBOX_CONFIG_DIR = join(HERE, "oracle", "fixtures", "host-matrix");
 const TMPL_SUFFIX = ".md.tmpl";
 
@@ -130,7 +129,7 @@ describe("agent_pins ↔ plain-render template partition (drift gate)", () => {
     expect(stems).toEqual(pinKeys);
   });
 
-  test("an 11th template with no pin violates the partition", () => {
+  test("a template with no pin violates the partition", () => {
     const work = copyTemplatesDir();
     try {
       writeFileSync(
@@ -148,7 +147,7 @@ describe("agent_pins ↔ plain-render template partition (drift gate)", () => {
     }
   });
 
-  test("a 12th pin with no template violates the partition", () => {
+  test("a pin with no template violates the partition", () => {
     const extraPinMatrix = [
       "efforts: [low, medium, high, xhigh, max]",
       "subagent_templates: [template/agents/worker.md.tmpl]",

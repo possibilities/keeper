@@ -278,6 +278,16 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
       expect(existsSync(join(work, "workers", CLAUDE_WORKER_MANIFEST))).toBe(
         true,
       );
+      for (const [agent, effort] of [
+        ["deconflicter", "xhigh"],
+        ["merge-resolver", "high"],
+        ["repairer", "xhigh"],
+        ["unblocker", "high"],
+      ]) {
+        const body = readFileSync(join(work, "agents", `${agent}.md`), "utf-8");
+        expect(body).toContain("model: opus");
+        expect(body).toContain(`effort: "${effort}"`);
+      }
       expect(
         verifyClaudeWorkerCohort({
           repoRoot: work,

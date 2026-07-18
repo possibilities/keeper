@@ -3,7 +3,7 @@
 # as its KEEPER_CONFIG_DIR, so the goldens stay host-blind — no operator
 # ~/.config/keeper/matrix.yaml can leak into a compare. Its cell set (opus/sonnet
 # × the five efforts, all native) is what the render-plugin-templates golden
-# tree pins, and its `agent_pins` (below) drive the 11 static plan agents'
+# tree pins, and its `agent_pins` (below) drive the static plan agents'
 # rendered frontmatter.
 efforts:
   - low
@@ -28,6 +28,9 @@ agent_pins:
   close-planner:
     model: opus
     effort: high
+  deconflicter:
+    model: opus
+    effort: xhigh
   docs-gap-scout:
     model: opus
     effort: medium
@@ -37,6 +40,9 @@ agent_pins:
   gap-analyst:
     model: opus
     effort: xhigh
+  merge-resolver:
+    model: opus
+    effort: high
   model-selector:
     model: opus
     effort: high
@@ -52,9 +58,15 @@ agent_pins:
   quality-auditor:
     model: opus
     effort: high
+  repairer:
+    model: opus
+    effort: xhigh
   repo-scout:
     model: opus
     effort: high
   selection-auditor:
+    model: opus
+    effort: high
+  unblocker:
     model: opus
     effort: high

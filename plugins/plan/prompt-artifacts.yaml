@@ -13,6 +13,11 @@ roles:
     source: template/agents/close-planner.md.tmpl
     binding: static
     unserved: equivalent
+  - role: "plan:deconflicter"
+    source: template/agents/deconflicter.md.tmpl
+    binding: static
+    unserved: equivalent
+    default_pin: {model: opus, effort: xhigh}
   - role: "plan:docs-gap-scout"
     source: template/agents/docs-gap-scout.md.tmpl
     binding: static
@@ -25,6 +30,11 @@ roles:
     source: template/agents/gap-analyst.md.tmpl
     binding: static
     unserved: equivalent
+  - role: "plan:merge-resolver"
+    source: template/agents/merge-resolver.md.tmpl
+    binding: static
+    unserved: equivalent
+    default_pin: {model: opus, effort: high}
   - role: "plan:model-selector"
     source: template/agents/model-selector.md.tmpl
     binding: static
@@ -45,6 +55,11 @@ roles:
     source: template/agents/quality-auditor.md.tmpl
     binding: static
     unserved: equivalent
+  - role: "plan:repairer"
+    source: template/agents/repairer.md.tmpl
+    binding: static
+    unserved: equivalent
+    default_pin: {model: opus, effort: xhigh}
   - role: "plan:repo-scout"
     source: template/agents/repo-scout.md.tmpl
     binding: static
@@ -53,6 +68,11 @@ roles:
     source: template/agents/selection-auditor.md.tmpl
     binding: static
     unserved: equivalent
+  - role: "plan:unblocker"
+    source: template/agents/unblocker.md.tmpl
+    binding: static
+    unserved: equivalent
+    default_pin: {model: opus, effort: high}
   - role: "work:worker"
     source: template/agents/worker.md.tmpl
     binding: cell-bound
@@ -72,10 +92,18 @@ bundles:
       - "plan:quality-auditor"
       - "plan:close-planner"
       - "plan:selection-auditor"
+      - "plan:merge-resolver"
+      - "plan:deconflicter"
+      - "plan:unblocker"
+      - "plan:repairer"
   - bundle: "plan:work"
     roles:
       - "work:worker"
       - "plan:quality-auditor"
+      - "plan:merge-resolver"
+      - "plan:deconflicter"
+      - "plan:unblocker"
+      - "plan:repairer"
   - bundle: "plan:panel"
     roles:
       - "plan:panel-runner"
@@ -83,13 +111,17 @@ bundles:
   - bundle: "plan:static"
     roles:
       - "plan:close-planner"
+      - "plan:deconflicter"
       - "plan:docs-gap-scout"
       - "plan:epic-scout"
       - "plan:gap-analyst"
+      - "plan:merge-resolver"
       - "plan:model-selector"
       - "plan:panel-judge"
       - "plan:panel-runner"
       - "plan:practice-scout"
       - "plan:quality-auditor"
+      - "plan:repairer"
       - "plan:repo-scout"
       - "plan:selection-auditor"
+      - "plan:unblocker"
