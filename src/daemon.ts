@@ -120,6 +120,10 @@ import {
   retainColdPayloads,
 } from "./compaction";
 import {
+  type NativeCrashBootIdentityWindow,
+  scanCrashReports,
+} from "./crash-report-scan";
+import {
   evictStaleDispatchMintGate,
   openDb,
   readGitProjectionSeedRequired,
@@ -174,6 +178,7 @@ import {
   isMergeEscalationReason,
   isMonitorSlotWedgeDistressKey,
   isPagingChannelDownDistressKey,
+  isRepeatedNativeCrashDistressKey,
   isSharedDesyncDistressKey,
   isSharedDirtyDistressKey,
   isStaleBaseDistressKey,
@@ -186,6 +191,9 @@ import {
   PAGING_CHANNEL_DOWN_DISTRESS_REASON,
   PAGING_CHANNEL_DOWN_DISTRESS_VERB,
   PARKED_LAUNCH_REASON_PREFIX,
+  REPEATED_NATIVE_CRASH_DISTRESS_ID,
+  REPEATED_NATIVE_CRASH_DISTRESS_REASON,
+  REPEATED_NATIVE_CRASH_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -292,6 +300,9 @@ import {
   collapseRestartLedger,
   compactRestartLedger,
   decideCrashLoop,
+  decideRepeatedNativeCrash,
+  isNativeCrashAttributed,
+  planNativeCrashEnrichLines,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   readRestartLedger,
@@ -582,7 +593,7 @@ export function appendFencedDispatchClear(args: {
  * `DispatchCleared` for each via `mintClear` (the caller folds + pumps). Returns the
  * count swept (0 on a healthy board). Pure but for the SELECT + the injected mint.
  *
- * EXEMPTS the crash-loop distress key AND every per-lane fan-in wedge ({@link
+ * EXEMPTS the crash-loop and repeated-native-crash distress keys AND every per-lane fan-in wedge ({@link
  * isLaneWedgeDistressKey}) / per-(epic,repo) stale-base-lane ({@link
  * isStaleBaseDistressKey}) / per-repo shared-checkout-desync ({@link
  * isSharedDesyncDistressKey}) distress key: each is un-retryable by the wire validator
@@ -628,8 +639,9 @@ export function gcUnretryableDispatchFailures(
       continue;
     }
     if (
-      row.verb === CRASH_LOOP_DISTRESS_VERB &&
-      row.id === CRASH_LOOP_DISTRESS_ID
+      (row.verb === CRASH_LOOP_DISTRESS_VERB &&
+        row.id === CRASH_LOOP_DISTRESS_ID) ||
+      isRepeatedNativeCrashDistressKey(row.verb, row.id)
     ) {
       continue;
     }
@@ -5258,12 +5270,34 @@ async function probeSocketRead(
 }
 
 export type {
+  NativeCrashBootIdentityWindow,
+  NativeCrashMatch,
+  NativeCrashScanResult,
+  ParsedCrashReport,
+} from "./crash-report-scan";
+export {
+  crashReportTimeToEpochMs,
+  DEFAULT_NATIVE_CRASH_PROCESS_PREFIXES,
+  darwinStartTimeToEpochMs,
+  launchTimesMatch,
+  matchCrashReportToBoot,
+  NATIVE_CRASH_FIELD_MAX_LEN,
+  NATIVE_CRASH_LAUNCH_TOLERANCE_MS,
+  NATIVE_CRASH_SCAN_MAX_FILE_BYTES,
+  NATIVE_CRASH_SCAN_MAX_FILES,
+  NATIVE_CRASH_SCAN_MAX_TOTAL_BYTES,
+  NATIVE_CRASH_SCAN_TIME_BUDGET_MS,
+  parseCrashReportText,
+  scanCrashReports,
+} from "./crash-report-scan";
+export type {
   RestartBoot,
   RestartBootIdentity,
   RestartBootLine,
   RestartEnrichLine,
   RestartLedgerLine,
   RestartLedgerSnapshot,
+  RestartNativeCrashFields,
   RestartProvenance,
 } from "./restart-ledger";
 // Restart-ledger parsing and persistence live in a dependency-free leaf shared
@@ -5279,12 +5313,17 @@ export {
   collapseRestartLedger,
   compactRestartLedger,
   decideCrashLoop,
+  decideRepeatedNativeCrash,
   foldBootIntoRestartLedger,
+  isNativeCrashAttributed,
   KEEPERD_LAUNCHD_LABEL,
   parseRestartLedger,
   parseRestartLedgerLine,
+  planNativeCrashEnrichLines,
   qualifyCrashLoopBootTimestamps,
+  REPEATED_NATIVE_CRASH_THRESHOLD,
   RESTART_LEDGER_CAP,
+  RESTART_LEDGER_NATIVE_FIELD_MAX_LEN,
   RESTART_LEDGER_REASON_MAX_LEN,
   readRestartLedger,
   readRestartLedgerSnapshot,
@@ -8281,6 +8320,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let lastGitProgressAtMs = Date.now();
   let gitSeedReseedAttempts = 0;
   let gitSeedWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  let nativeCrashReprobeTimer: ReturnType<typeof setTimeout> | null = null;
 
   // fn-952 tmux-control liveness watchdog state. The control worker posts a
   // `tmux-control-liveness` pulse on a steady cadence (even during long idle — no
@@ -9699,7 +9739,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       console.error(
         `[keeperd] crash-loop distress: ${verdict.recentBoots} boots within ${windowMin}min (threshold ${CRASH_LOOP_THRESHOLD}) — minting a sticky needs_human signal`,
       );
-      mintCrashLoopDistress(
+      mintDaemonDistress(
+        CRASH_LOOP_DISTRESS_VERB,
+        CRASH_LOOP_DISTRESS_ID,
         `${CRASH_LOOP_DISTRESS_REASON}: ${verdict.recentBoots} daemon boots in ${windowMin}min — the serve/boot path is restart-looping (see server.stderr)`,
         nowMs / 1000,
       );
@@ -9718,6 +9760,130 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       wakePending = true;
       pumpWakes();
     }
+  }
+
+  // DiagnosticReports can land after the successor is already healthy. Keep the
+  // scan bounded and producer-owned; the append-only ledger remains outside folds.
+  if (process.platform === "darwin") {
+    const reportsDir =
+      process.env.KEEPER_CRASH_REPORTS_DIR ??
+      join(homedir(), "Library", "Logs", "DiagnosticReports");
+
+    const decideNativeCrashDistress = (nowMs: number): void => {
+      const ledgerLines = compactRestartLedger(
+        readRestartLedger(resolveRestartLedgerPath()),
+        {
+          nowMs,
+          windowMs: CRASH_LOOP_WINDOW_MS,
+          cap: RESTART_LEDGER_CAP,
+        },
+      );
+      const verdict = decideRepeatedNativeCrash(
+        collapseRestartLedger(ledgerLines),
+      );
+      const distressRow = db
+        .query(
+          "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+        )
+        .get(
+          REPEATED_NATIVE_CRASH_DISTRESS_VERB,
+          REPEATED_NATIVE_CRASH_DISTRESS_ID,
+        ) as { instance_event_id: number | null } | null;
+      if (verdict.repeatedNativeCrash && distressRow === null) {
+        mintDaemonDistress(
+          REPEATED_NATIVE_CRASH_DISTRESS_VERB,
+          REPEATED_NATIVE_CRASH_DISTRESS_ID,
+          `${REPEATED_NATIVE_CRASH_DISTRESS_REASON}: ${verdict.attributedBoots} native-attributed daemon boots in the restart-ledger window`,
+          nowMs / 1000,
+        );
+      } else if (!verdict.repeatedNativeCrash && distressRow !== null) {
+        mintDispatchClearedEvent(
+          REPEATED_NATIVE_CRASH_DISTRESS_VERB,
+          REPEATED_NATIVE_CRASH_DISTRESS_ID,
+          {
+            expected_attempt_id: null,
+            expected_instance_event_id: distressRow.instance_event_id,
+          },
+        );
+        wakePending = true;
+        pumpWakes();
+      }
+    };
+
+    const runNativeCrashProbe = (exhausted: boolean): void => {
+      const nowMs = Date.now();
+      try {
+        const ledgerPath = resolveRestartLedgerPath();
+        const compactLines = compactRestartLedger(
+          readRestartLedger(ledgerPath),
+          {
+            nowMs,
+            windowMs: CRASH_LOOP_WINDOW_MS,
+            cap: RESTART_LEDGER_CAP,
+          },
+        );
+        const boots = collapseRestartLedger(compactLines);
+        const windows: NativeCrashBootIdentityWindow[] = [];
+        for (let index = 0; index + 1 < boots.length; index += 1) {
+          const boot = boots[index];
+          if (
+            isNativeCrashAttributed(boot) ||
+            boot.pid === null ||
+            boot.start_time === null ||
+            !boot.start_time.startsWith("darwin:")
+          ) {
+            continue;
+          }
+          windows.push({
+            boot_id: boot.boot_id,
+            pid: boot.pid,
+            start_time: boot.start_time,
+            started_at_ms: boot.ts,
+            died_at_ms: boots[index + 1].ts,
+          });
+        }
+        const scan = scanCrashReports({
+          directory: reportsDir,
+          boots: windows,
+        });
+        for (const line of planNativeCrashEnrichLines({
+          boots,
+          matches: scan.matches,
+          exhausted,
+          nowMs,
+        })) {
+          appendRestartLedgerLine(ledgerPath, line);
+        }
+      } catch (error) {
+        console.error(
+          `[keeperd] native-crash attribution probe degraded: ${boundRestartReason(
+            error instanceof Error ? error.message : String(error),
+          )}`,
+        );
+      }
+      try {
+        decideNativeCrashDistress(nowMs);
+      } catch (error) {
+        console.error(
+          `[keeperd] repeated-native-crash decision degraded: ${boundRestartReason(
+            error instanceof Error ? error.message : String(error),
+          )}`,
+        );
+      }
+    };
+
+    let reprobesRemaining = 3;
+    const scheduleReprobe = (): void => {
+      nativeCrashReprobeTimer = setTimeout(() => {
+        nativeCrashReprobeTimer = null;
+        if (shuttingDown) return;
+        reprobesRemaining -= 1;
+        runNativeCrashProbe(reprobesRemaining === 0);
+        if (reprobesRemaining > 0) scheduleReprobe();
+      }, 30_000);
+    };
+    runNativeCrashProbe(false);
+    scheduleReprobe();
   }
 
   // fn-1311: durably record THIS boot's catch-up window (start/end wall-clock +
@@ -11415,19 +11581,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  /**
-   * Mint the crash-loop distress `DispatchFailed` on the fixed synthetic key
-   * ({@link CRASH_LOOP_DISTRESS_VERB}::{@link CRASH_LOOP_DISTRESS_ID}) — the
-   * {@link handleDispatchFailedMint} shape, but the synthetic verb is not part of
-   * the strict `DispatchFailedMessage` union so it rides its own thin closure.
-   * `reason` MUST start with {@link CRASH_LOOP_DISTRESS_REASON} so the pill maps.
-   * `ts` is producer-stamped for re-fold determinism. NON-FATAL on insert failure.
-   */
-  function mintCrashLoopDistress(reason: string, tsSec: number): void {
+  /** Mint one fixed-key daemon distress event without entering the retry wire. */
+  function mintDaemonDistress(
+    verb: string,
+    id: string,
+    reason: string,
+    tsSec: number,
+  ): void {
     try {
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
-        $session_id: `${CRASH_LOOP_DISTRESS_VERB}::${CRASH_LOOP_DISTRESS_ID}`,
+        $session_id: `${verb}::${id}`,
         $pid: null,
         $hook_event: "DispatchFailed",
         $event_type: "dispatch_failures",
@@ -11439,8 +11603,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $agent_type: null,
         $stop_hook_active: null,
         $data: JSON.stringify({
-          verb: CRASH_LOOP_DISTRESS_VERB,
-          id: CRASH_LOOP_DISTRESS_ID,
+          verb,
+          id,
           reason,
           dir: null,
           ts: tsSec,
@@ -11468,7 +11632,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       pumpWakes();
     } catch (err) {
       console.error(
-        `[keeperd] crash-loop distress mint threw (non-fatal): ${
+        `[keeperd] daemon distress mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -15698,6 +15862,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     clearInterval(mutationPathBackfillTimer);
     clearInterval(walCheckpointTimer);
     if (gitSeedWatchdogTimer != null) clearInterval(gitSeedWatchdogTimer);
+    if (nativeCrashReprobeTimer != null) clearTimeout(nativeCrashReprobeTimer);
     if (tmuxControlWatchdogTimer != null)
       clearInterval(tmuxControlWatchdogTimer);
     if (serveLivenessWatchdogTimer != null)

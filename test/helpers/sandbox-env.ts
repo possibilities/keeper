@@ -130,6 +130,7 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
   env.KEEPER_RESTART_LEDGER = join(tmpDir, "restart-ledger.json");
+  env.KEEPER_CRASH_REPORTS_DIR = join(tmpDir, "DiagnosticReports");
   // Single-instance gate: the daemon's kernel flock file. A host-wide lock would
   // wedge parallel test runners, so it is sandboxed under tmpDir like every other
   // state path — an in-process daemon boot never touches the real host lock.
