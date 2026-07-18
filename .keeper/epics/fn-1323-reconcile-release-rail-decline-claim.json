@@ -7,7 +7,7 @@
     "fn-1322-cooperative-claim-release-rail"
   ],
   "id": "fn-1323-reconcile-release-rail-decline-claim",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T01:09:10.549000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T01:09:08.116000Z"
+  "updated_at": "2026-07-18T01:09:10.549000Z"
 }
