@@ -55,5 +55,5 @@ stay green; CONTEXT.md within its cap.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Routed ownership_conflict guidance (problem-codes, commit-via-keeper-default snippet, both worker partials) through the request_release rail with a consistent never-signal-a-live-peer stance; added the two CONTEXT.md glossary terms and regenerated the prompt-oracle fixtures + hack skill bake guard.
 ## Evidence
