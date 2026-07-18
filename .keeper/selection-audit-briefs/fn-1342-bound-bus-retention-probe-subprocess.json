@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 18,
+        "files_changed": 2,
+        "insertions": 200
+      },
+      "done_summary": "Bound the ps probe subprocess in startTimeViaPs/ppidViaPs with a kill-on-timeout wrapper returning null (inconclusive, row kept) instead of an unbounded await, and extracted the retention single-flight guard so a stuck probe cannot pin retentionPass forever; added a deterministic ManualScheduler-based test proving a never-resolving probe releases the latch for the next tick.",
+      "input_hash": "73c64c410e34468022bb4c7930555693e990bda08d3b6ae20a9dcc38908083f4",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 2254,
+      "spec_md": "## Description\n\nFinding F1 (evidence: `src/bus-worker.ts:1015` `startTimeViaPs` and the\nsingle-flight guard at `src/bus-worker.ts:~1890`). `startTimeViaPs` does\n`Bun.spawn([\"ps\", ...])` then `await proc.exited` with no timeout, kill, or\nAbortSignal. The retention timer's guard is\n`if (retentionPass !== null) return; retentionPass = runRetentionPass()....finally(() => { retentionPass = null })`\n\u2014 the `.finally` fires only when the pass settles, so a probe that never\nexits pins `retentionPass` non-null forever and every subsequent tick\nearly-returns, permanently and silently wedging `pruneStaleChannels`,\nmessage aging (`cleanupBusArtifacts`), control pruning, and the WAL\ncheckpoint/incremental-vacuum for the worker's life.\n\nBound the probe subprocess so a stuck `ps` cannot starve the single-flight\nloop: add a timeout that kills the spawned process (or drive it via an\nAbortSignal), and treat a timed-out/aborted probe as an inconclusive\nresult returning `null` \u2014 identical to the existing failure contract, so\nthe caller keeps the row and retries on a later pass. Keep the probe\ncap (16/tick) and cursor semantics unchanged. `ppidViaPs` shares the same\nunbounded `await proc.exited` shape; bound it consistently if the fix\ngeneralizes, but the retention-loop wedge is the load-bearing case.\n\n## Acceptance\n\n- [ ] `startTimeViaPs` returns within a bounded wall-clock budget even\n      when the spawned `ps` never exits; the process is killed on timeout.\n- [ ] A timed-out probe returns `null` (inconclusive \u2192 row kept), matching\n      the existing null-on-failure contract; no throw escapes.\n- [ ] A deterministic in-process test proves a never-resolving probe does\n      NOT leave `retentionPass` pinned \u2014 a subsequent tick runs a full\n      pass (no real subprocess/daemon; probe injected via the existing\n      `probeStartTime` seam).\n\n## Done summary\nBound the ps probe subprocess in startTimeViaPs/ppidViaPs with a kill-on-timeout wrapper returning null (inconclusive, row kept) instead of an unbounded await, and extracted the retention single-flight guard so a stuck probe cannot pin retentionPass forever; added a deterministic ManualScheduler-based test proving a never-resolving probe releases the latch for the next tick.\n## Evidence\n",
+      "task_id": "fn-1342-bound-bus-retention-probe-subprocess.1",
+      "tier": "high",
+      "title": "Bound retention probe subprocess"
+    }
+  ],
+  "created_at": "2026-07-18T18:57:19.787000Z",
+  "epic_id": "fn-1342-bound-bus-retention-probe-subprocess",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "73c64c410e34468022bb4c7930555693e990bda08d3b6ae20a9dcc38908083f4",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
