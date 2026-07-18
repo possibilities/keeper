@@ -214,6 +214,7 @@ describe("keeper agent accounts check", () => {
         kind: "managed" as const,
         slot: 2,
         worst_utilization: 0.2,
+        fable_remaining: 0.4,
       },
     ],
   };

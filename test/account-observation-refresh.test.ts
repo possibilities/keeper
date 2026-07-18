@@ -16,6 +16,7 @@ import {
 } from "../src/account-observation-refresh";
 import {
   cswapListArgv,
+  OBSERVATION_SCHEMA_VERSION,
   observationSidecarPath,
 } from "../src/account-routing-config";
 
@@ -32,7 +33,11 @@ function providerOutcome(): ProviderRunOutcome {
           number: 2,
           usageStatus: "ok",
           usageFetchedAt: new Date(NOW - 1_000).toISOString(),
-          usage: { fiveHour: { pct: 20 }, sevenDay: { pct: 30 } },
+          usage: {
+            fiveHour: { pct: 20 },
+            sevenDay: { pct: 30 },
+            scoped: [],
+          },
         },
       ],
     }),
@@ -52,7 +57,7 @@ function recordingRunner(): { runner: ExactArgvRunner; calls: string[][] } {
 
 function observation(observedAtMs: number): Observation {
   return {
-    schema_version: 4,
+    schema_version: OBSERVATION_SCHEMA_VERSION,
     observed_at_ms: observedAtMs,
     health: "ok",
     routes: [

@@ -2123,7 +2123,8 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
   }
   for (const c of inspection.candidates) {
     deps.write(
-      `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)}\n`,
+      `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)} ` +
+        `fable-left=${c.fable_remaining === null ? "none" : c.fable_remaining.toFixed(3)}\n`,
     );
   }
   return deps.exit(0);
@@ -2697,9 +2698,9 @@ export async function main(deps: MainDeps): Promise<never> {
 
   // Resolve the one mandatory Claude route before either the passthrough or
   // configured launch branch. This is the sole process-boundary decision. A
-  // configured launch contributes its effective model so matching scoped quota
-  // (for example Fable) participates in account scoring. Informational
-  // passthrough has no model workload and therefore uses generic windows only.
+  // configured launch contributes its effective model so Fable demand or
+  // non-Fable conservation participates in account scoring. Informational
+  // passthrough has no model workload and follows the non-Fable policy.
   let resolvedClaudeRoute: RouteSelection | null = null;
   if (agent === "claude") {
     const routingModel = shouldPassthrough

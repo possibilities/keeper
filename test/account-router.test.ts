@@ -11,6 +11,7 @@ import {
 } from "../src/account-router";
 import {
   ledgerPath,
+  OBSERVATION_SCHEMA_VERSION,
   observationSidecarPath,
   ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
 } from "../src/account-routing-config";
@@ -33,25 +34,32 @@ function route(slot: number, utilization: number): Route {
     id: `claude-swap:${slot}`,
     kind: "managed",
     slot,
-    windows: [{ key: "week", utilization, resetsAt: null }],
+    windows: [
+      { key: "session", utilization, resetsAt: null },
+      { key: "week", utilization, resetsAt: null },
+    ],
     measuredAtMs: NOW,
   };
 }
 
-function routeWithScopes(
+function routeWithFable(
   slot: number,
-  weekly: number,
-  fable: number,
-  other?: number,
+  baseUtilization: number,
+  fableUtilization: number | null,
 ): Route {
   return {
-    ...route(slot, weekly),
+    ...route(slot, baseUtilization),
     windows: [
-      { key: "week", utilization: weekly, resetsAt: null },
-      { key: "model:Fable", utilization: fable, resetsAt: null },
-      ...(other === undefined
+      ...route(slot, baseUtilization).windows,
+      ...(fableUtilization === null
         ? []
-        : [{ key: "model:Other", utilization: other, resetsAt: null }]),
+        : [
+            {
+              key: "model:Fable",
+              utilization: fableUtilization,
+              resetsAt: null,
+            },
+          ]),
     ],
   };
 }
@@ -72,7 +80,7 @@ function observation(
     ordinals[id] = i;
   }
   return {
-    schema_version: 4,
+    schema_version: OBSERVATION_SCHEMA_VERSION,
     observed_at_ms: options.observedAtMs ?? NOW,
     health: options.health ?? "ok",
     routes,
@@ -155,48 +163,115 @@ describe("mandatory managed account selection", () => {
     });
   });
 
-  test("uses only the matching model scope when balancing a launch", () => {
-    const genericDir = root();
+  test("Fable uses the account with the most Fable quota left", () => {
+    const dir = root();
     publish(
-      genericDir,
+      dir,
       observation([
-        routeWithScopes(1, 0.1, 1),
-        routeWithScopes(2, 0.7, 0.2, 1),
+        routeWithFable(1, 0.8, 0.1),
+        routeWithFable(2, 0.1, 0.8),
+        routeWithFable(3, 0.05, null),
       ]),
     );
-    const generic = selectRoute({ stateDir: genericDir, nowMs: NOW });
-    expect(generic.ok && generic.selection.id).toBe("claude-swap:1");
-
-    const fableDir = root();
-    publish(
-      fableDir,
-      observation([
-        routeWithScopes(1, 0.1, 1),
-        routeWithScopes(2, 0.7, 0.2, 1),
-      ]),
-    );
-    const fable = selectRoute({
-      stateDir: fableDir,
+    const inspection = inspectRouting({
+      stateDir: dir,
       nowMs: NOW,
       model: "fAbLe",
     });
-    expect(fable.ok && fable.selection.id).toBe("claude-swap:2");
-
-    const inspection = inspectRouting({
-      stateDir: fableDir,
-      nowMs: NOW,
+    expect(inspection.model_scope).toBe("fable");
+    expect(inspection.would_choose?.id).toBe("claude-swap:1");
+    expect(
+      inspection.candidates.map(
+        ({ id, worst_utilization, fable_remaining }) => ({
+          id,
+          worst_utilization,
+          fable_remaining,
+        }),
+      ),
+    ).toEqual([
+      {
+        id: "claude-swap:1",
+        worst_utilization: 0.8,
+        fable_remaining: 0.9,
+      },
+      {
+        id: "claude-swap:2",
+        worst_utilization: 0.1,
+        fable_remaining: 0.2,
+      },
+    ]);
+    const first = selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" });
+    const second = selectRoute({
+      stateDir: dir,
+      nowMs: NOW + 1,
       model: "fable",
     });
-    expect(inspection.model_scope).toBe("fable");
-    expect(
-      inspection.candidates.map(({ id, worst_utilization }) => ({
-        id,
-        worst_utilization,
-      })),
-    ).toEqual([
-      { id: "claude-swap:1", worst_utilization: 1 },
-      { id: "claude-swap:2", worst_utilization: 0.75 },
-    ]);
+    expect(first.ok && first.selection.id).toBe("claude-swap:1");
+    expect(second.ok && second.selection.id).toBe("claude-swap:1");
+  });
+
+  test("non-Fable conserves Fable-rich accounts", () => {
+    const noFableDir = root();
+    publish(
+      noFableDir,
+      observation([
+        routeWithFable(1, 0.1, 0.1),
+        routeWithFable(2, 0.8, 0.8),
+        routeWithFable(3, 0.9, null),
+      ]),
+    );
+    const noFable = selectRoute({
+      stateDir: noFableDir,
+      nowMs: NOW,
+      model: "sonnet",
+    });
+    expect(noFable.ok && noFable.selection.id).toBe("claude-swap:3");
+
+    const leastFableDir = root();
+    publish(
+      leastFableDir,
+      observation([routeWithFable(1, 0.1, 0.1), routeWithFable(2, 0.8, 0.8)]),
+    );
+    const leastFable = selectRoute({
+      stateDir: leastFableDir,
+      nowMs: NOW,
+      model: "opus",
+    });
+    expect(leastFable.ok && leastFable.selection.id).toBe("claude-swap:2");
+  });
+
+  test("Fable requires live session, week, and Fable quota", () => {
+    const missingSession = routeWithFable(1, 0.1, 0.1);
+    missingSession.windows = missingSession.windows.filter(
+      (window) => window.key !== "session",
+    );
+    const exhaustedWeek = routeWithFable(2, 0.1, 0.1);
+    exhaustedWeek.windows = exhaustedWeek.windows.map((window) =>
+      window.key === "week" ? { ...window, utilization: 1 } : window,
+    );
+    const exhaustedFable = routeWithFable(3, 0.1, 1);
+    const missingFable = routeWithFable(4, 0.1, null);
+    const ambiguousFable = routeWithFable(5, 0.1, 0.1);
+    ambiguousFable.windows.push({
+      key: "model:Fable",
+      utilization: 1,
+      resetsAt: null,
+    });
+    const valid = routeWithFable(6, 0.9, 0.9);
+    const dir = root();
+    publish(
+      dir,
+      observation([
+        missingSession,
+        exhaustedWeek,
+        exhaustedFable,
+        missingFable,
+        ambiguousFable,
+        valid,
+      ]),
+    );
+    const selected = selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" });
+    expect(selected.ok && selected.selection.id).toBe("claude-swap:6");
   });
 
   test("reservations spread equal concurrent selections", () => {
@@ -219,6 +294,7 @@ describe("mandatory managed account selection", () => {
     const reset: Route = {
       ...route(1, 1),
       windows: [
+        { key: "session", utilization: 0.1, resetsAt: null },
         { key: "week", utilization: 1, resetsAt: "2026-07-17T23:00:00Z" },
       ],
     };
@@ -246,11 +322,11 @@ describe("explicit account resolution", () => {
     });
   });
 
-  test("a depleted model scope never overrides an explicit account", () => {
+  test("a depleted explicit Fable account fails without substitution", () => {
     const dir = root();
     publish(
       dir,
-      observation([routeWithScopes(1, 0.1, 1), routeWithScopes(2, 0.8, 0.1)]),
+      observation([routeWithFable(1, 0.1, 1), routeWithFable(2, 0.8, 0.1)]),
     );
     expect(
       selectRouteByAccountOrdinal(0, {
@@ -258,9 +334,9 @@ describe("explicit account resolution", () => {
         nowMs: NOW,
         model: "fable",
       }),
-    ).toMatchObject({
-      ok: true,
-      selection: { id: "claude-swap:1", slot: 1 },
+    ).toEqual({
+      ok: false,
+      error: "account c0 is known but is not currently routeable",
     });
   });
 

@@ -12,7 +12,10 @@ import {
   type ObserverClock,
   providerSubprocessEnvironment,
 } from "../src/account-observer-worker";
-import { observationSidecarPath } from "../src/account-routing-config";
+import {
+  OBSERVATION_SCHEMA_VERSION,
+  observationSidecarPath,
+} from "../src/account-routing-config";
 
 const NOW_MS = Date.UTC(2026, 5, 1, 12, 0, 0);
 const CSWAP_ARGV = ["CSWAP", "list", "--json"];
@@ -27,7 +30,11 @@ function outcome(): ProviderRunOutcome {
         {
           number: 3,
           usageStatus: "ok",
-          usage: { fiveHour: { pct: 10 }, sevenDay: { pct: 5 } },
+          usage: {
+            fiveHour: { pct: 10 },
+            sevenDay: { pct: 5 },
+            scoped: [],
+          },
           usageAgeSeconds: 15,
         },
       ],
@@ -51,7 +58,7 @@ function fakeLock(): { release(): void } {
 }
 
 describe("AccountObserver", () => {
-  test("one cycle fetches cswap and publishes a managed-only v4 sidecar", async () => {
+  test("one cycle fetches cswap and publishes a managed-only current sidecar", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
     try {
       const { runner, calls } = runnerWithCalls();
@@ -67,7 +74,7 @@ describe("AccountObserver", () => {
 
       expect(calls).toEqual([CSWAP_ARGV]);
       const observation = readObservationSidecar(observationSidecarPath(dir));
-      expect(observation?.schema_version).toBe(4);
+      expect(observation?.schema_version).toBe(OBSERVATION_SCHEMA_VERSION);
       expect(observation?.routes.map((route) => route.id)).toEqual([
         "claude-swap:3",
       ]);

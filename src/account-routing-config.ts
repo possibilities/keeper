@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** Sidecars are transient; an old schema is treated as absent, never migrated. */
-export const OBSERVATION_SCHEMA_VERSION = 4;
+export const OBSERVATION_SCHEMA_VERSION = 5;
 
 /** A version mismatch discards incompatible reservation state. */
 export const LEDGER_SCHEMA_VERSION = 2;

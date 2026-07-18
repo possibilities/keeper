@@ -19,9 +19,9 @@ Claude and Pi remain Keeper's complete Supported harness set. Pi Launch ids may 
 Every Keeper-launched Claude process requires one fresh, routeable claude-swap account:
 
 - the daemon invokes `cswap list --json` through a deadline-bounded, output-capped exact-argv runner and atomically publishes one private Capacity observation;
-- only positive slots with `usageStatus: ok`, an explicit freshness signal, and at least one understood quota window are routeable;
+- only positive slots with `usageStatus: ok`, an explicit freshness signal, and remaining session and weekly quota are routeable; a Fable launch also requires remaining Fable quota;
 - the active claude-swap slot remains an ordinary managed candidate rather than aliasing a native route;
-- every fresh start, resume, and restore selects independently by greatest worst-window headroom after short-lived Launch reservations, with least-recently-used order breaking ties; an effective model supplied by `--model` or a Claude launch triple adds its matching model-scoped quota window while unrelated model scopes are ignored; and
+- every fresh start, resume, and restore selects independently: a Fable launch orders candidates by greatest raw Fable quota remaining, while a non-Fable launch first prefers accounts with no Fable entitlement and otherwise the least Fable quota remaining; generic quota pressure, short-lived Launch reservations, and least-recently-used order break equal conservation scores but never override unequal Fable percentages; and
 - every successful decision executes `cswap run <slot> --share-history -- <claude arguments...>` and records the PII-free `claude-swap:<slot>` Launch attribution.
 
 There is no ambient or native Claude fallback. Missing, stale, malformed, unsupported, or empty inventory fails before Claude process creation. An explicit `--x-account cN` request likewise fails rather than substituting another account.

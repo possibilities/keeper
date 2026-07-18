@@ -235,7 +235,11 @@ function parseCswapAccount(
   if (ageMs < 0 || ageMs > freshnessCeilingMs) {
     return { note: `cswap: slot ${slot} measurement stale` };
   }
-  const windows = parseCswapWindows(row.usage);
+  const parsedWindows = parseCswapWindows(row.usage);
+  if (parsedWindows.scopedMalformed) {
+    return { note: `cswap: slot ${slot} has malformed scoped windows` };
+  }
+  const { windows } = parsedWindows;
   if (windows.length === 0) {
     return { note: `cswap: slot ${slot} has no windows` };
   }
@@ -263,30 +267,49 @@ function cswapMeasuredAtMs(
   return null;
 }
 
-function parseCswapWindows(usage: unknown): NormalizedWindow[] {
-  if (!isRecord(usage)) return [];
-  const out: NormalizedWindow[] = [];
-  const add = (raw: unknown, key: string): void => {
-    if (!isRecord(raw)) return;
+interface ParsedCswapWindows {
+  windows: NormalizedWindow[];
+  scopedMalformed: boolean;
+}
+
+function parseCswapWindows(usage: unknown): ParsedCswapWindows {
+  if (!isRecord(usage)) return { windows: [], scopedMalformed: false };
+  const windows: NormalizedWindow[] = [];
+  const add = (raw: unknown, key: string): boolean => {
+    if (!isRecord(raw)) return false;
     const utilization = utilizationFromPercent(raw.pct);
-    if (utilization === null) return;
-    out.push({ key, utilization, resetsAt: trustworthyResetsAt(raw.resetsAt) });
+    if (utilization === null) return false;
+    windows.push({
+      key,
+      utilization,
+      resetsAt: trustworthyResetsAt(raw.resetsAt),
+    });
+    return true;
   };
   add(usage.fiveHour, "session");
   add(usage.sevenDay, "week");
   add(usage.spend, "spend");
-  if (Array.isArray(usage.scoped)) {
-    for (const entry of usage.scoped) {
-      if (
-        isRecord(entry) &&
-        typeof entry.name === "string" &&
-        entry.name.length > 0
-      ) {
-        add(entry, `model:${entry.name}`);
-      }
-    }
+
+  if (!Object.hasOwn(usage, "scoped") || !Array.isArray(usage.scoped)) {
+    return { windows, scopedMalformed: true };
   }
-  return out;
+  const seenScopes = new Set<string>();
+  for (const entry of usage.scoped) {
+    if (!isRecord(entry) || typeof entry.name !== "string") {
+      return { windows, scopedMalformed: true };
+    }
+    const name = entry.name.trim();
+    const normalizedName = name.toLowerCase();
+    if (
+      normalizedName.length === 0 ||
+      seenScopes.has(normalizedName) ||
+      !add(entry, `model:${name}`)
+    ) {
+      return { windows, scopedMalformed: true };
+    }
+    seenScopes.add(normalizedName);
+  }
+  return { windows, scopedMalformed: false };
 }
 
 function boundNotes(notes: string[]): string[] {

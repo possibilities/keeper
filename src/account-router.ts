@@ -37,6 +37,9 @@ import { FileLock } from "./file-lock";
 
 const MAX_LEDGER_ROUTES = 64;
 const MODEL_WINDOW_PREFIX = "model:";
+const FABLE_MODEL = "fable";
+const SESSION_WINDOW = "session";
+const WEEK_WINDOW = "week";
 
 export interface RouteSelection {
   id: string;
@@ -55,7 +58,7 @@ export type RequestedRouteResolution = RouteResolution;
 export interface SelectRouteDeps {
   stateDir?: string;
   nowMs?: number;
-  /** Effective Claude launch model. Matching scoped quota joins generic quota. */
+  /** Effective Claude launch model. Fable has dedicated conservation policy. */
   model?: string | null;
 }
 
@@ -133,26 +136,65 @@ function normalizedModelName(model: string | null | undefined): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
-function applicableWindows(
-  windows: NormalizedWindow[],
-  model: string | null | undefined,
-): NormalizedWindow[] {
-  const normalizedModel = normalizedModelName(model);
-  return windows.filter((window) => {
-    if (!window.key.startsWith(MODEL_WINDOW_PREFIX)) return true;
-    if (normalizedModel === null) return false;
-    return (
-      normalizedModelName(window.key.slice(MODEL_WINDOW_PREFIX.length)) ===
-      normalizedModel
-    );
-  });
+function isFableRequest(model: string | null | undefined): boolean {
+  return normalizedModelName(model) === FABLE_MODEL;
 }
 
-function routeHasApplicableWindows(
+function effectiveUtilization(window: NormalizedWindow, nowMs: number): number {
+  if (window.resetsAt !== null) {
+    const resetMs = new Date(window.resetsAt).getTime();
+    if (!Number.isNaN(resetMs) && resetMs <= nowMs) return 0;
+  }
+  return window.utilization;
+}
+
+function worstUtilizationForKey(
+  route: Route,
+  key: string,
+  nowMs: number,
+): number | null {
+  let found = false;
+  let worst = 0;
+  for (const window of route.windows) {
+    if (window.key !== key) continue;
+    found = true;
+    worst = Math.max(worst, effectiveUtilization(window, nowMs));
+  }
+  return found ? worst : null;
+}
+
+function fableUtilization(route: Route, nowMs: number): number | null {
+  let found = false;
+  let worst = 0;
+  for (const window of route.windows) {
+    if (
+      !window.key.startsWith(MODEL_WINDOW_PREFIX) ||
+      normalizedModelName(window.key.slice(MODEL_WINDOW_PREFIX.length)) !==
+        FABLE_MODEL
+    ) {
+      continue;
+    }
+    found = true;
+    worst = Math.max(worst, effectiveUtilization(window, nowMs));
+  }
+  return found ? worst : null;
+}
+
+function hasAvailableBaseQuota(route: Route, nowMs: number): boolean {
+  const session = worstUtilizationForKey(route, SESSION_WINDOW, nowMs);
+  const week = worstUtilizationForKey(route, WEEK_WINDOW, nowMs);
+  return session !== null && week !== null && session < 1 && week < 1;
+}
+
+function routeIsEligible(
   route: Route,
   model: string | null | undefined,
+  nowMs: number,
 ): boolean {
-  return applicableWindows(route.windows, model).length > 0;
+  if (!hasAvailableBaseQuota(route, nowMs)) return false;
+  if (!isFableRequest(model)) return true;
+  const fable = fableUtilization(route, nowMs);
+  return fable !== null && fable < 1;
 }
 
 function reserveSelection(
@@ -207,7 +249,7 @@ function doSelectRouteByAccountOrdinal(
       candidate.id === routeId &&
       candidate.slot > 0 &&
       managedRouteId(candidate.slot) === candidate.id &&
-      routeHasApplicableWindows(candidate, deps.model) &&
+      routeIsEligible(candidate, deps.model, nowMs) &&
       isRouteMeasurementFresh(candidate, nowMs),
   );
   if (!route) {
@@ -236,7 +278,7 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
   const observation = fresh.observation;
   const candidates = observation.routes.filter(
     (route) =>
-      routeHasApplicableWindows(route, deps.model) &&
+      routeIsEligible(route, deps.model, nowMs) &&
       isRouteMeasurementFresh(route, nowMs),
   );
   if (candidates.length === 0) {
@@ -270,7 +312,10 @@ export interface RoutingCandidateView {
   id: string;
   kind: "managed";
   slot: number;
+  /** Generic session/week/spend pressure, including launch reservations. */
   worst_utilization: number;
+  /** Remaining Fable fraction, or null when this account has no Fable quota. */
+  fable_remaining: number | null;
 }
 
 export interface RoutingInspection {
@@ -354,7 +399,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   }
   const routeable = observation.routes.filter(
     (route) =>
-      routeHasApplicableWindows(route, deps.model) &&
+      routeIsEligible(route, deps.model, nowMs) &&
       isRouteMeasurementFresh(route, nowMs),
   );
   if (routeable.length === 0) {
@@ -368,16 +413,15 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   const ledger = pruneLedger(loadLedger(stateDir), nowMs);
   const candidates: RoutingCandidateView[] = routeable.map((route) => {
     const entry = ledger.routes[route.id];
+    const pending = entry?.reservations.length ?? 0;
+    const fable = fableUtilization(route, nowMs);
     return {
       id: route.id,
       kind: "managed",
       slot: route.slot,
-      worst_utilization: worstEffectiveUtilization(
-        route.windows,
-        entry?.reservations.length ?? 0,
-        nowMs,
-        deps.model,
-      ),
+      worst_utilization: genericPressure(route, pending, nowMs),
+      fable_remaining:
+        fable === null ? null : Number(Math.max(0, 1 - fable).toFixed(6)),
     };
   });
   const chosen = scoreAndPick(routeable, ledger, nowMs, deps.model);
@@ -398,22 +442,55 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   };
 }
 
-function worstEffectiveUtilization(
-  windows: NormalizedWindow[],
-  pending: number,
-  nowMs: number,
-  model: string | null | undefined,
-): number {
+function genericPressure(route: Route, pending: number, nowMs: number): number {
   let worst = 0;
-  for (const window of applicableWindows(windows, model)) {
-    let utilization = window.utilization;
-    if (window.resetsAt !== null) {
-      const resetMs = new Date(window.resetsAt).getTime();
-      if (!Number.isNaN(resetMs) && resetMs <= nowMs) utilization = 0;
-    }
+  for (const window of route.windows) {
+    if (window.key.startsWith(MODEL_WINDOW_PREFIX)) continue;
+    const utilization = effectiveUtilization(window, nowMs);
     if (utilization > worst) worst = utilization;
   }
   return worst + pending * RESERVATION_UTILIZATION_STEP;
+}
+
+interface RouteScore {
+  fableTier: number;
+  fablePreference: number;
+  genericPressure: number;
+}
+
+function routeScore(
+  route: Route,
+  pending: number,
+  nowMs: number,
+  model: string | null | undefined,
+): RouteScore {
+  const fable = fableUtilization(route, nowMs);
+  const pressure = genericPressure(route, pending, nowMs);
+  if (isFableRequest(model)) {
+    return {
+      fableTier: 0,
+      // Raw Fable percentage is authoritative; reservations and generic
+      // pressure may break only an equal Fable percentage.
+      fablePreference: fable ?? 1,
+      genericPressure: pressure,
+    };
+  }
+  return {
+    // No Fable entitlement is the strongest conservation signal.
+    fableTier: fable === null ? 0 : 1,
+    // Among Fable-bearing accounts, consume generic quota where the least
+    // Fable capacity remains (greatest utilization).
+    fablePreference: fable === null ? 0 : -fable,
+    genericPressure: pressure,
+  };
+}
+
+function compareScores(a: RouteScore, b: RouteScore): number {
+  if (a.fableTier !== b.fableTier) return a.fableTier - b.fableTier;
+  if (a.fablePreference !== b.fablePreference) {
+    return a.fablePreference - b.fablePreference;
+  }
+  return a.genericPressure - b.genericPressure;
 }
 
 function scoreAndPick(
@@ -423,23 +500,20 @@ function scoreAndPick(
   model: string | null | undefined,
 ): Route {
   let best: Route | null = null;
-  let bestScore = Number.POSITIVE_INFINITY;
+  let bestScore: RouteScore | null = null;
   let bestLastSelected = Number.POSITIVE_INFINITY;
   for (const route of candidates) {
     const entry = ledger.routes[route.id];
     const pending = entry?.reservations.length ?? 0;
     const lastSelected = entry?.last_selected_at ?? Number.NEGATIVE_INFINITY;
-    const score = worstEffectiveUtilization(
-      route.windows,
-      pending,
-      nowMs,
-      model,
-    );
+    const score = routeScore(route, pending, nowMs, model);
+    const scoreOrder =
+      bestScore === null ? -1 : compareScores(score, bestScore);
     if (
       best === null ||
-      score < bestScore ||
-      (score === bestScore && lastSelected < bestLastSelected) ||
-      (score === bestScore &&
+      scoreOrder < 0 ||
+      (scoreOrder === 0 && lastSelected < bestLastSelected) ||
+      (scoreOrder === 0 &&
         lastSelected === bestLastSelected &&
         route.id < best.id)
     ) {
