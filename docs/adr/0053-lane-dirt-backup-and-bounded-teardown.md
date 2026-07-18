@@ -63,3 +63,11 @@ destruction. Unmerged lanes of closed epics surface to a human instead of quietl
 being destroyed. The plan CLI carries a small duplicated git-shelling sequence (accepted over a
 cross-boundary import or a widened RPC). The rebase tool now resolves the union-shaped merge
 file mechanically; genuinely ambiguous duplicates still stop for a human.
+
+## Amendment — path-positive absence survives incomplete enumeration
+
+A teardown or backup distress row may clear despite an incomplete repo enumeration only when
+its stored lane path independently resolves as absent (`ENOENT` or `ENOTDIR`). A present path or
+any other probe error remains unknown and retains the row. Complete enumeration remains the
+other positive absence witness, so one unenumerable repo cannot pin a confirmed-gone lane while
+partial evidence can never clear a live lane.
