@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 3,
+        "insertions": 95
+      },
+      "done_summary": "Bound post-backup restic stats/snapshots monitoring in both backup scripts to a 90s perl-alarm guard (with TERM-then-KILL escalation) under nice+taskpolicy throttling, using --no-lock and raw-data mode; retained prior repo size on any non-clean stats exit via a plain else with a one-line timeout log; documented best-effort monitoring in script headers and CLAUDE.md.",
+      "input_hash": "a5e6870f67f702067284b2a040b24de05d45f26406ad25accaf14f9ac53d2e7f",
+      "model": "gpt-5.5",
+      "spec_chars": 4789,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** bin/.local/bin/restic-backup-silverbird, bin/.local/bin/restic-backup\n\n### Approach\n\nIn both backup scripts, the post-backup `restic stats` call becomes: repo-wide\n`--mode raw-data` with `--no-lock` and `--json` (no snapshot argument \u2014 cheap in\nevery repo state, no zero-snapshot error, and the displayed number becomes honest\nphysical repo bytes), wrapped in the repo's `guard` perl-alarm deadline idiom\n(copied inline per the repo's skeleton-duplication convention) under\n`nice -n 20` + `taskpolicy -b -d throttle`, with a `STATS_DEADLINE_SECONDS=90`\nnamed constant at the top of each script. If the child survives alarm expiry, a\nbounded KILL escalation follows. `--no-lock` is the safety keystone: a killed\nstats must never orphan a repo lock that blocks the next backup. The\nretain-prior-size branch changes from `elif [[ \"$LAST_BACKUP_SUCCESS\" == \"false\" ]]`\nto a plain `else` in BOTH scripts so `prev_size` is retained on ANY non-clean\nstats exit \u2014 today a stats timeout after a SUCCESSFUL backup silently loses the\nprior recorded size. The sibling `restic snapshots --json` call gets the same\nguard + `--no-lock` bounding with its existing failure semantics preserved. A\ntimeout logs one line (deadline seconds + retained size) for manual tuning.\n`restic check` stays unbounded by design (plist TimeOut caps the whole run). The\nwhole stats block stays inside an `if` condition so `set -euo pipefail` can never\nabort the script before `exit $backup_exit`. Edit the repo files (stow symlinks\nmake them live); never touch the `~/.local/bin` targets; NEVER stage the\nunrelated dirty `Brewfile`. Update each script's header comment in place to say\nmonitoring is best-effort/bounded, and add the one-line guardrail to the dotfiles\nCLAUDE.md Restic section: post-backup monitoring is best-effort and never blocks\nbackup exit.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- bin/.local/bin/restic-backup-silverbird:168-179 \u2014 the unbounded stats, the `elif` retain-prior bug at :171, write_state at :179; prev_size hydration at :87-98\n- bin/.local/bin/restic-backup:168-203 \u2014 the sibling copy (stats :171-176, elif :174, single write_state :203); the two scripts' structural asymmetry means the diffs are similar, not identical\n- system/yabai-maintain:36-43 \u2014 the `guard SECONDS CMD` perl-alarm idiom (SIGALRM, exit 142) to copy inline\n- bin/.local/bin/backup-monitor:141 \u2014 `format_repo_summary` is the ONLY reader of REPO_SIZE_DISPLAY (display-only; health checks read other fields), so the raw-data meaning change is cosmetic\n\n**Optional** (reference as needed):\n- system/launchagents/Library/LaunchAgents/backup.snapshot-silverbird.plist \u2014 StartInterval 3600 / TimeOut 3300, the outer backstop this change must stay inside\n\n### Test notes\n\nNo shell test harness exists; verification is a scripted manual recipe recorded in\nEvidence: (1) `bash -n` both scripts; (2) run silverbird with\n`STATS_DEADLINE_SECONDS=1` temporarily forced \u2014 prove the restic child dies at the\ndeadline (process-tree check: the guard signal must reach restic through the\nnice\u2192taskpolicy chain, not orphan it), the timeout log line appears, the state\nfile retains the prior size, and the script exits with the backup's own status;\n(3) run with the real deadline \u2014 prove fresh raw-data size lands; (4)\n`backup-monitor` parses every field of both state files afterward; (5)\n`restic unlock` finds nothing to remove (no orphaned locks).\n\n## Acceptance\n\n- [ ] Both backup scripts bound post-backup stats with the guard deadline under nice + taskpolicy background/IO throttle, using no-lock raw-data JSON with no snapshot argument, behind a named deadline constant\n- [ ] The prior recorded size is retained on any non-clean stats exit regardless of backup success, and a timeout emits one log line\n- [ ] The snapshots listing call is bounded and lock-free with its existing failure semantics preserved\n- [ ] A deliberate tiny-deadline run demonstrates the restic child dies at the deadline, no repo lock is orphaned, the script exit code is the backup's own, and backup-monitor parses every state field\n- [ ] Script headers state monitoring is best-effort/bounded and the dotfiles CLAUDE.md carries the one-line guardrail; the dirty Brewfile is never staged\n\n## Done summary\nBound post-backup restic stats/snapshots monitoring in both backup scripts to a 90s perl-alarm guard (with TERM-then-KILL escalation) under nice+taskpolicy throttling, using --no-lock and raw-data mode; retained prior repo size on any non-clean stats exit via a plain else with a one-line timeout log; documented best-effort monitoring in script headers and CLAUDE.md.\n## Evidence\n",
+      "task_id": "fn-1329-bound-restic-post-backup-stats.1",
+      "tier": "high",
+      "title": "Bound and degrade backup stats"
+    }
+  ],
+  "created_at": "2026-07-18T14:28:07.523000Z",
+  "epic_id": "fn-1329-bound-restic-post-backup-stats",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "a5e6870f67f702067284b2a040b24de05d45f26406ad25accaf14f9ac53d2e7f",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
