@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A scoped conjunct fix inside the shared proven/unproven gate for restart identity-capability crossing is a subtle correctness invariant where wrong scoping silently breaks a safety guarantee on either the exact or crossing path \u2014 a hard opus gate despite being well-specified \u2014 but the root cause and fix are named so high suffices.",
+      "task_id": "fn-1343-harden-restart-proof-path-frozen-ledger.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "A single-file, fully-specified deterministic test addition following the existing restart-observation fixture pattern with an explicit assertion contract (verdict/proof_path) \u2014 ordinary well-specified work with no design judgment, routing GPT-first at the straight-test-addition band.",
+      "task_id": "fn-1343-harden-restart-proof-path-frozen-ledger.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T18:50:49.935000Z",
+  "epic_id": "fn-1343-harden-restart-proof-path-frozen-ledger",
+  "input_hash": "265df858fdad7a1890cf79bb87c5923d1b45d65a3ee05eb97427565dd77d19de",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 643692632,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"opus\",\"rationale\":\"A scoped conjunct fix inside the shared proven/unproven gate for restart identity-capability crossing is a subtle correctness invariant where wrong scoping silently breaks a safety guarantee on either the exact or crossing path \u2014 a hard opus gate despite being well-specified \u2014 but the root cause and fix are named so high suffices.\",\"confidence\":0.68},{\"task_id\":\"2\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"A single-file, fully-specified deterministic test addition following the existing restart-observation fixture pattern with an explicit assertion contract (verdict/proof_path) \u2014 ordinary well-specified work with no design judgment, routing GPT-first at the straight-test-addition band.\",\"confidence\":0.8}]}\n"
+}
