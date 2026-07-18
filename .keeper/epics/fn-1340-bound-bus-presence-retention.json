@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-18T18:27:13.636000Z",
   "created_at": "2026-07-18T18:05:23.229000Z",
   "depends_on_epics": [],
   "id": "fn-1340-bound-bus-presence-retention",
   "last_validated_at": "2026-07-18T18:06:12.037000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Bound bus presence retention",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T18:06:12.037000Z"
+  "updated_at": "2026-07-18T18:27:13.636000Z"
 }
