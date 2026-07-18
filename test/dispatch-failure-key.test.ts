@@ -669,6 +669,7 @@ describe("single vocabulary source", () => {
       ["instant-death-breaker", "instant-death"],
       ["parked-launch", "parked-launch"],
       ["daemon-crash-loop", "crash-loop"],
+      ["repeated-native-crash", "native-crash"],
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],
       ["shared-checkout-desync", "shared-desync"],

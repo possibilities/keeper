@@ -159,6 +159,20 @@ export const CRASH_LOOP_DISTRESS_VERB = "daemon";
 export const CRASH_LOOP_DISTRESS_ID = "crash-loop";
 export const CRASH_LOOP_DISTRESS_REASON = "daemon-crash-loop";
 
+export const REPEATED_NATIVE_CRASH_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const REPEATED_NATIVE_CRASH_DISTRESS_ID = "repeated-native-crash";
+export const REPEATED_NATIVE_CRASH_DISTRESS_REASON = "repeated-native-crash";
+
+export function isRepeatedNativeCrashDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === REPEATED_NATIVE_CRASH_DISTRESS_VERB &&
+    id === REPEATED_NATIVE_CRASH_DISTRESS_ID
+  );
+}
+
 /**
  * The synthetic daemon distress signal that the agentbot paging channel itself is
  * unavailable. It is minted only for a spawn failure (not a non-zero agentbot
@@ -605,6 +619,7 @@ export type DispatchFailureDisplayKind =
   | "instant-death"
   | "parked-launch"
   | "crash-loop"
+  | "native-crash"
   | "shared-wedge"
   | "shared-dirty"
   | "shared-desync"
@@ -640,6 +655,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
   { prefix: PARKED_LAUNCH_REASON_PREFIX, kind: "parked-launch" },
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
+  { prefix: REPEATED_NATIVE_CRASH_DISTRESS_REASON, kind: "native-crash" },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
   { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },
   // Prefix-disjoint from the wedge/dirty siblings (`shared-checkout-desync` diverges at

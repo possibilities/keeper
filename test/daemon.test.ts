@@ -87,6 +87,7 @@ import {
   decideCrashLoop,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
+  decideRepeatedNativeCrash,
   decideServeBusDistress,
   decideServeLivenessWatchdog,
   dispatchClearFencesAtAppend,
@@ -104,11 +105,13 @@ import {
   gcUnretryableDispatchFailures,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
+  launchTimesMatch,
   MAX_LIVE_ESCALATION_SESSIONS,
   MERGE_ESCALATION_REASON_TOKEN,
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
+  matchCrashReportToBoot,
   mergeConflictBaseCheckout,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -124,8 +127,10 @@ import {
   type ProbeSettleState,
   type ProbeTickOutcome,
   parseBlockedCategory,
+  parseCrashReportText,
   parseRestartLedger,
   parseRestartLedgerLine,
+  planNativeCrashEnrichLines,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
   probeReplyProvesLife,
@@ -177,6 +182,7 @@ import {
   type SharedCheckoutNotifiedOutcome,
   type SharedCheckoutPageRow,
   type SharedCheckoutPageSweepDeps,
+  scanCrashReports,
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   selectPendingBlockEscalations,
@@ -223,6 +229,9 @@ import {
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
   PAGING_CHANNEL_DOWN_DISTRESS_REASON,
   PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+  REPEATED_NATIVE_CRASH_DISTRESS_ID,
+  REPEATED_NATIVE_CRASH_DISTRESS_REASON,
+  REPEATED_NATIVE_CRASH_DISTRESS_VERB,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DESYNC_DISTRESS_VERB,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -615,6 +624,25 @@ test("gcUnretryableDispatchFailures: the crash-loop distress row is EXEMPT (self
   );
 
   expect(swept).toBe(0);
+  expect(cleared).toEqual([]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: repeated native crashes are producer-owned and EXEMPT", () => {
+  const { db } = freshMemDb();
+  db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
+  ).run(
+    REPEATED_NATIVE_CRASH_DISTRESS_VERB,
+    REPEATED_NATIVE_CRASH_DISTRESS_ID,
+    `${REPEATED_NATIVE_CRASH_DISTRESS_REASON}: 2 native-attributed boots`,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  expect(
+    gcUnretryableDispatchFailures(db, (verb, id) => cleared.push({ verb, id })),
+  ).toBe(0);
   expect(cleared).toEqual([]);
   db.close();
 });
@@ -2247,6 +2275,30 @@ test("serializeRestartLedgerLine / parseRestartLedgerLine: an enrich line round-
   );
 });
 
+test("parseRestartLedgerLine: a native-crash enrich line needs no fatal reason and bounds report text", () => {
+  expect(
+    parseRestartLedgerLine(
+      JSON.stringify({
+        kind: "enrich",
+        boot_id: "abc",
+        ts: 1400,
+        native_crash_signal: "SIGSEGV",
+        native_crash_exception: "x".repeat(1_000),
+        native_crash_report_id: "incident-1",
+        died_at_ms: 1350,
+      }),
+    ),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "abc",
+    ts: 1400,
+    native_crash_signal: "SIGSEGV",
+    native_crash_exception: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+    native_crash_report_id: "incident-1",
+    died_at_ms: 1350,
+  });
+});
+
 test("parseRestartLedgerLine: a torn / partial trailing line folds to null (never corrupts)", () => {
   expect(parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts')).toBeNull();
   expect(parseRestartLedgerLine("")).toBeNull();
@@ -2393,6 +2445,42 @@ test("collapseRestartLedger: a boot line and its enrichment collapse to one reco
       died_at_ms: 1500,
     },
   ]);
+});
+
+test("collapse + compact restart ledger preserve fatal and native-crash enrich fields without clobbering", () => {
+  const lines: RestartLedgerLine[] = [
+    bootLine("mixed", 1000, "launchd", null),
+    { kind: "enrich", boot_id: "mixed", ts: 1200, reason: "watchdog" },
+    {
+      kind: "enrich",
+      boot_id: "mixed",
+      ts: 1400,
+      died_at_ms: 1100,
+      native_crash_signal: "SIGBUS",
+      native_crash_exception: "EXC_BAD_ACCESS",
+      native_crash_report_id: "incident-mixed",
+    },
+  ];
+  const collapsed = collapseRestartLedger(lines);
+  expect(collapsed[0]).toMatchObject({
+    reason: "watchdog",
+    died_at_ms: 1100,
+    native_crash_signal: "SIGBUS",
+    native_crash_exception: "EXC_BAD_ACCESS",
+    native_crash_report_id: "incident-mixed",
+  });
+  expect(
+    collapseRestartLedger(
+      compactRestartLedger(lines, { nowMs: 2000, windowMs: 2000, cap: 10 }),
+    )[0],
+  ).toMatchObject(collapsed[0]);
+  expect(
+    collapseRestartLedger([lines[0], lines[2], lines[1]])[0],
+  ).toMatchObject({
+    reason: "watchdog",
+    died_at_ms: 1100,
+    native_crash_report_id: "incident-mixed",
+  });
 });
 
 test("collapseRestartLedger: an orphan enrichment synthesizes a forensic record, never dropped", () => {
@@ -2594,6 +2682,273 @@ test("qualify + decideCrashLoop: repeated young deaths trip the loop", () => {
       windowMs: CL_WINDOW,
     }),
   ).toEqual({ crashLoop: true, recentBoots: CRASH_LOOP_THRESHOLD });
+});
+
+// ── native-crash attribution ────────────────────────────────────────────────
+
+function crashReportBody(inputs: {
+  pid: number;
+  launchTime: string;
+  crashTime: string;
+  processPath?: string;
+  incident?: string;
+}): string {
+  return `${JSON.stringify({
+    bug_type: "309",
+    timestamp: inputs.crashTime,
+    incident_id: inputs.incident ?? "incident-1",
+  })}\n${JSON.stringify({
+    pid: inputs.pid,
+    procLaunch: inputs.launchTime,
+    captureTime: inputs.crashTime,
+    ...(inputs.processPath === undefined
+      ? {}
+      : { procPath: inputs.processPath }),
+    exception: { type: "EXC_BAD_ACCESS", signal: "SIGSEGV" },
+    faultingThread: 0,
+    threads: [{ frames: [{ imageIndex: 0 }] }],
+    usedImages: [{ path: "/opt/keeper/bin/bun" }],
+  })}`;
+}
+
+test("native-crash launch comparator accepts small skew and rejects recycled-pid launch time", () => {
+  const start = "darwin:Wed Jun 18 11:03:02 2025";
+  const epoch = Date.parse("Wed Jun 18 11:03:02 2025");
+  expect(launchTimesMatch(start, new Date(epoch).toISOString())).toBe(true);
+  expect(launchTimesMatch(start, new Date(epoch + 4_000).toISOString())).toBe(
+    true,
+  );
+  expect(launchTimesMatch(start, new Date(epoch + 6_000).toISOString())).toBe(
+    false,
+  );
+});
+
+test("parseCrashReportText tolerates duplicate candidate keys in the two JSON objects", () => {
+  const launch = Date.parse("Wed Jun 18 11:03:02 2025");
+  const report = parseCrashReportText(
+    `{"bug_type":"0","bug_type":"309","incident_id":"duplicate"}\n` +
+      `{"pid":7,"pid":8,"procLaunch":"${new Date(launch).toISOString()}","captureTime":"${new Date(launch + 1_000).toISOString()}"}`,
+  );
+  expect(report).toMatchObject({
+    bugType: "309",
+    pid: 8,
+    reportId: "duplicate",
+  });
+});
+
+test("parse + match crash report requires pid, launch identity, lifetime, and only optionally a process path", () => {
+  const launch = Date.parse("Wed Jun 18 11:03:02 2025");
+  const report = parseCrashReportText(
+    crashReportBody({
+      pid: 4242,
+      launchTime: new Date(launch + 1_000).toISOString(),
+      crashTime: new Date(launch + 20_000).toISOString(),
+    }),
+  );
+  expect(report).not.toBeNull();
+  if (report === null) throw new Error("synthetic report did not parse");
+  const boot = {
+    boot_id: "dead",
+    pid: 4242,
+    start_time: "darwin:Wed Jun 18 11:03:02 2025",
+    started_at_ms: launch + 2_000,
+    died_at_ms: launch + 30_000,
+  };
+  expect(matchCrashReportToBoot(report, boot)).toBe(true);
+  expect(matchCrashReportToBoot(report, { ...boot, pid: 4243 })).toBe(false);
+  expect(
+    matchCrashReportToBoot(
+      { ...report, launchTimeMs: report.launchTimeMs + 10_000 },
+      boot,
+    ),
+  ).toBe(false);
+  expect(
+    matchCrashReportToBoot(
+      { ...report, processPath: "/usr/bin/unrelated" },
+      boot,
+    ),
+  ).toBe(false);
+});
+
+test("scanCrashReports backfills any matching boot and stays within file/byte caps", () => {
+  const dir = join(tmpDir, "DiagnosticReports");
+  mkdirSync(dir);
+  const launchA = Date.parse("Wed Jun 18 11:03:02 2025");
+  const launchB = launchA + 60_000;
+  writeFileSync(
+    join(dir, "keeperd-2025-06-18-110322.ips"),
+    crashReportBody({
+      pid: 100,
+      launchTime: new Date(launchA).toISOString(),
+      crashTime: new Date(launchA + 20_000).toISOString(),
+      processPath: "/opt/keeper/keeperd",
+      incident: "incident-a",
+    }),
+  );
+  writeFileSync(
+    join(dir, "keeperd-2025-06-18-110422.ips"),
+    crashReportBody({
+      pid: 200,
+      launchTime: new Date(launchB + 20_000).toISOString(),
+      crashTime: new Date(launchB + 30_000).toISOString(),
+      incident: "recycled-pid",
+    }),
+  );
+  const scan = scanCrashReports({
+    directory: dir,
+    boots: [
+      {
+        boot_id: "older-dead-boot",
+        pid: 100,
+        start_time: "darwin:Wed Jun 18 11:03:02 2025",
+        started_at_ms: launchA,
+        died_at_ms: launchA + 30_000,
+      },
+      {
+        boot_id: "newer-dead-boot",
+        pid: 200,
+        start_time: "darwin:Wed Jun 18 11:04:02 2025",
+        started_at_ms: launchB,
+        died_at_ms: launchB + 40_000,
+      },
+    ],
+    maxFiles: 2,
+    maxTotalBytes: 100_000,
+  });
+  expect(scan.matches).toEqual([
+    {
+      boot_id: "older-dead-boot",
+      died_at_ms: launchA + 20_000,
+      native_crash_signal: "SIGSEGV",
+      native_crash_exception: "EXC_BAD_ACCESS",
+      native_crash_faulting_image: "/opt/keeper/bin/bun",
+      native_crash_report_id: "incident-a",
+    },
+  ]);
+  expect(scan.filesInspected).toBeLessThanOrEqual(2);
+  expect(scan.bytesRead).toBeLessThanOrEqual(100_000);
+});
+
+test("planNativeCrashEnrichLines is idempotent, backfills the window, and records no-report once", () => {
+  const boots = collapseRestartLedger([
+    {
+      ...bootLine("old", 1, "launchd", null),
+      pid: 1,
+      start_time: "darwin:Wed Jun 18 11:03:02 2025",
+    },
+    {
+      ...bootLine("recent", 2, "launchd", 1),
+      pid: 2,
+      start_time: "darwin:Wed Jun 18 11:04:02 2025",
+    },
+    {
+      ...bootLine("current", 3, "launchd", 1),
+      pid: 3,
+      start_time: "darwin:Wed Jun 18 11:05:02 2025",
+    },
+  ]);
+  const attribution = planNativeCrashEnrichLines({
+    boots,
+    matches: [
+      {
+        boot_id: "old",
+        native_crash_signal: "SIGSEGV",
+        native_crash_report_id: "report-old",
+        died_at_ms: 1.5,
+      },
+    ],
+    exhausted: false,
+    nowMs: 10,
+  });
+  expect(attribution.map((line) => line.boot_id)).toEqual(["old"]);
+
+  const enriched = collapseRestartLedger([
+    ...boots.map((boot) => ({
+      kind: "boot" as const,
+      boot_id: boot.boot_id,
+      pid: boot.pid,
+      start_time: boot.start_time,
+      ts: boot.ts,
+      provenance: boot.provenance,
+      prev_runtime_ms: boot.prev_runtime_ms,
+    })),
+    ...attribution,
+  ]);
+  expect(
+    planNativeCrashEnrichLines({
+      boots: enriched,
+      matches: [{ boot_id: "old", native_crash_report_id: "report-old" }],
+      exhausted: true,
+      nowMs: 11,
+    }),
+  ).toEqual([
+    {
+      kind: "enrich",
+      boot_id: "recent",
+      ts: 11,
+      native_crash_no_report: true,
+    },
+  ]);
+  const marked = enriched.map((boot) =>
+    boot.boot_id === "recent"
+      ? { ...boot, native_crash_no_report: true as const }
+      : boot,
+  );
+  expect(
+    planNativeCrashEnrichLines({
+      boots: marked,
+      matches: [],
+      exhausted: true,
+      nowMs: 12,
+    }),
+  ).toEqual([]);
+});
+
+test("decideRepeatedNativeCrash mints at two, drains below two, and coexists with crash-loop", () => {
+  const attributed = (
+    id: string,
+    ts: number,
+    prevRuntimeMs = 3_600_000,
+  ): RestartBoot => ({
+    ...collapseRestartLedger([bootLine(id, ts, "launchd", prevRuntimeMs)])[0],
+    native_crash_report_id: `report-${id}`,
+  });
+  expect(decideRepeatedNativeCrash([attributed("a", 1)])).toEqual({
+    repeatedNativeCrash: false,
+    attributedBoots: 1,
+  });
+  const spaced = [attributed("a", 1), attributed("b", 3_600_001)];
+  expect(decideRepeatedNativeCrash(spaced)).toEqual({
+    repeatedNativeCrash: true,
+    attributedBoots: 2,
+  });
+  expect(
+    decideCrashLoop({
+      nowMs: 3_600_001,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        spaced,
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CRASH_LOOP_WINDOW_MS,
+    }).crashLoop,
+  ).toBe(false);
+
+  const rapid = Array.from({ length: CRASH_LOOP_THRESHOLD }, (_, index) =>
+    attributed(`rapid-${index}`, CL_NOW - index * 1_000, 1_000),
+  );
+  expect(decideRepeatedNativeCrash(rapid).repeatedNativeCrash).toBe(true);
+  expect(
+    decideCrashLoop({
+      nowMs: CL_NOW,
+      bootTimestamps: qualifyCrashLoopBootTimestamps(
+        rapid,
+        CRASH_LOOP_YOUNG_RUNTIME_MS,
+      ),
+      threshold: CRASH_LOOP_THRESHOLD,
+      windowMs: CRASH_LOOP_WINDOW_MS,
+    }).crashLoop,
+  ).toBe(true);
 });
 
 // ── file round-trip: NDJSON write / read / append ────────────────────────────

@@ -250,6 +250,13 @@ describe("restart ledger reader", () => {
           }),
           JSON.stringify({ kind: "death", boot_id: "ignored", ts: 150 }),
           JSON.stringify({
+            kind: "enrich",
+            boot_id: OLD.boot_id,
+            ts: 175,
+            native_crash_signal: "SIGSEGV",
+            native_crash_report_id: "incident-old",
+          }),
+          JSON.stringify({
             kind: "boot",
             ...NEXT,
             ts: 200,
