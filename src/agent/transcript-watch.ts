@@ -46,7 +46,7 @@ export interface TranscriptWatchOptions {
   /** Persisted before launch for a resumed transcript whose timestamps are not
    *  an invocation boundary. Missing keeps legacy late-sampled behavior. */
   invocationStopFloor?: number | null;
-  /** Exact Bus artifact path whose injected notification opens response capture. */
+  /** Opaque Bus artifact id whose injected notification opens response capture. */
   injectedMessageMarker?: string | null;
   /** Transcript line count sampled before the matching Bus publish. */
   transcriptLineFloor?: number | null;

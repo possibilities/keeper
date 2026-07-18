@@ -1021,7 +1021,7 @@ export async function captureLivePartnerResponse(
       handle: {
         ...args.handle,
         transcriptPath: boundary.transcriptPath,
-        injectedMessageMarker: artifact.path,
+        injectedMessageMarker: artifact.ref.id,
         transcriptLineFloor: boundary.lineFloor,
       },
     });
