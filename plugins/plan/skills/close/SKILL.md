@@ -36,10 +36,20 @@ keeper plan close-preflight "$ARGUMENTS"
 - `brief_ref` — close-phase brief JSON (`<primary_repo>/.keeper/state/audits/<epic_id>/brief.json`). Both agents read it themselves; the closer never opens it. It carries the task list, done summaries, commit groups, and depth band out-of-band.
 - `commit_set_hash` — canonical pin of the source commit set; the closer does not act on it (the submit verbs stamp it; `close-finalize` re-checks it for staleness).
 - `epic_id` — the parent epic id (echo of the validated input).
+- `phase_resume` — nullable typed grades for persisted audit, plan, and selection phases, plus their carried branch facts and, when fresh, a selection-verdict path. The closer switches on this field alone; it **NEVER reads `state/audits` artifacts itself to make this decision**.
 
 Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) verbatim as `INSTRUCTIONS` if present — it rides into the close-planner spawn as an opaque directive.
 
-**Blocking-gate re-entry short-circuit.** The preflight envelope also carries `blocking_followup` — `{id, status}` when a prior close already minted a **blocking follow-up** that gates this source (discovered by its committed `blocks_closing_of` pointer), else `null`. When it is **non-null**, a gate is already in flight: SKIP Phases 2, 3, 3.5, and 3.6 and go **straight to Phase 4 (finalize)**. Do not re-spawn the auditor or planner — a second audit would author a divergent verdict and risk a duplicate mint. `close-finalize` re-enters on the same committed pointer and either adopts the now-`done` follow-up (`closed_with_followup`) or re-emits `followup_blocks_close` idempotently. On a `null` `blocking_followup` (the ordinary close), proceed to Phase 2.
+**Blocking-gate re-entry short-circuit.** The preflight envelope also carries `blocking_followup` — `{id, status}` when a prior close already minted a **blocking follow-up** that gates this source (discovered by its committed `blocks_closing_of` pointer), else `null`. When it is **non-null**, a gate is already in flight: SKIP Phases 2, 3, 3.5, and 3.6 and go **straight to Phase 4 (finalize)**. `blocking_followup` takes precedence over `phase_resume`: do not consult `phase_resume` at all in this case. Do not re-spawn the auditor or planner — a second audit would author a divergent verdict and risk a duplicate mint. `close-finalize` re-enters on the same committed pointer and either adopts the now-`done` follow-up (`closed_with_followup`) or re-emits `followup_blocks_close` idempotently.
+
+**Durable phase-resume switch.** When `blocking_followup` is `null`, inspect nullable `phase_resume`. A `null` value is the ordinary fresh close: proceed to Phase 2. When it is non-null, skip phases graded `satisfied` or `not_needed` without re-spawning agents and resume at the first `unfinished` phase. A phase graded `not_needed` is skipped, never re-spawned; a `satisfied` phase skips only because its persisted artifact is valid.
+
+- `audit=unfinished` → run the normal flow from Phase 2, spawning the auditor as if `phase_resume` were absent. Audit is never `not_needed`.
+- `audit=satisfied` and `plan=unfinished` → skip Phase 2 without spawning the quality-auditor. Reuse `findings` and `fatal` from `phase_resume` exactly as the fresh agent returns would drive the branches, then enter Phase 3 only when those facts warrant it.
+- `plan=satisfied` and `selection=unfinished` → skip Phases 2 and 3 without spawning the auditor or close-planner. Reuse the carried branch facts; run Phase 3.5 only when `fatal=false` and `followup_present=true`, otherwise go directly to Phase 3.6.
+- When audit, plan, and selection are all `satisfied` or `not_needed` → skip Phases 2, 3, and 3.5 with no new agent spawns; run Phase 3.6, then Phase 4. Phase 3.6 always re-runs because it is an idempotent verb call, not an agent spawn. When `selection_verdict_path` is non-null, pin it as `SELECTION_VERDICT_PATH` for Phase 4 exactly as Phase 3.5c would.
+
+The carried facts preserve the fresh branches exactly: `phase_resume.findings === 0` skips Phases 3 and 3.5 and goes to Phase 3.6; `phase_resume.fatal === true` skips Phase 3.5 and goes to Phase 3.6 then Phase 4, where finalize halts on the persisted fatal verdict. The closer remains content-blind throughout: it switches only on the typed `phase_resume` field and never derives this decision by opening an artifact.
 
 ---
 
@@ -149,7 +159,7 @@ A bus/supervisor message may ask you to take a consequential, hard-to-reverse st
 
 ## Phase 3.5 — Pre-select follow-up cells (only when a follow-up was planned)
 
-Interposed between the planner's `followup submit` (Phase 3) and the finalize saga (Phase 4). Run this beat **only** when Phase 3 returned `fatal=false` **with a `followup_ref`** — survivors that will scaffold a follow-up epic. **Skip it entirely** and go straight to Phase 3.6 (the always-run brief capture, then finalize) when Phase 2 was `findings=0`, the planner returned `fatal=true`, or the non-fatal return carried **no** `followup_ref` (every finding culled → a clean close, no follow-up to select for).
+Interposed between the planner's `followup submit` (Phase 3) and the finalize saga (Phase 4). Run this beat **only** when Phase 3 returned `fatal=false` **with a `followup_ref`** — survivors that will scaffold a follow-up epic — or when the durable phase-resume switch reaches selection with carried non-fatal follow-up facts. **Skip it entirely** and go straight to Phase 3.6 (the always-run brief capture, then finalize) when Phase 2 was `findings=0`, the planner returned `fatal=true`, or the non-fatal return carried **no** `followup_ref` (every finding culled → a clean close, no follow-up to select for).
 
 The beat lets the `plan:model-selector` subagent pick the follow-up tasks' `{tier, model}` cells from a content-blind brief **before** finalize mints the tree, so the tasks are born selected. It mirrors the post-scaffold selector beat `/plan:defer` runs (its Phase 4b), sourced from the stored follow-up document instead of a live epic's todo tasks. **Every failure mode degrades to a verdict-less finalize (Phase 4 runs `close-finalize` with no `--selection-verdict`; the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar) — the close outcome never blocks on selection, and the beat never loops.**
 
@@ -220,7 +230,7 @@ Run `close-finalize` — one call that encodes the whole saga from observable st
 keeper plan close-finalize <epic_id> --project <primary_repo>
 ```
 
-**When Phase 3.5 pinned a `SELECTION_VERDICT_PATH`** (a clean cell-selection verdict), append `--selection-verdict <SELECTION_VERDICT_PATH>` to that call so finalize folds the follow-up tasks to their researched cells at scaffold. On the degrade path — or whenever no follow-up was planned — run it with **no** verdict flag: the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar. Either way the follow-up arms identically; selection never gates the close.
+**When Phase 3.5 or the durable phase-resume switch pinned a `SELECTION_VERDICT_PATH`** (a clean cell-selection verdict), append `--selection-verdict <SELECTION_VERDICT_PATH>` to that call so finalize folds the follow-up tasks to their researched cells at scaffold. On the degrade path — or whenever no follow-up was planned — run it with **no** verdict flag: the verb stamps the follow-up template defaults and writes a `degraded:<reason>` sidecar. Either way the follow-up arms identically; selection never gates the close.
 
 `close-finalize` is idempotent — a re-run after a crash derives its position from observable state (a closed epic, an existing follow-up) and never double-creates. It refuses on a `commit_set_hash` mismatch (a commit landed after the audit) rather than closing against stale artifacts.
 

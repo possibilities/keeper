@@ -117,25 +117,17 @@ describe("buildMessageWithTrailers", () => {
 // no-op paths.
 // ---------------------------------------------------------------------------
 
-
-
 // ---------------------------------------------------------------------------
 // happy path.
 // ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // state_repo / subject fallbacks + failures.
 // ---------------------------------------------------------------------------
 
-
-
 // ---------------------------------------------------------------------------
 // sequential commits + lock-domain retry classification.
 // ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // worktree-lane isolation — the inherited-GIT_* reroute bug + its fix.
@@ -147,8 +139,6 @@ describe("buildMessageWithTrailers", () => {
 // from them and IGNORES the cwd, so a plan-state commit made from inside the lane
 // lands on the MAIN branch. vcs.ts strips those vars so the explicit cwd alone
 // fixes the branch; this asserts the commit stays on the lane.
-
-
 
 // ---------------------------------------------------------------------------
 // Merge-window guard + commit-work serialization (the fn-1193 destruction window).
@@ -570,8 +560,6 @@ describe("mutating verbs roll back on a commit failure", () => {
 // real facade's probe reports the same op the pre-write guard reads.
 // ---------------------------------------------------------------------------
 
-
-
 // ---------------------------------------------------------------------------
 // Commit-failure rollback (real git, slow tier): a real mid-merge partial-commit
 // refusal leaves the verb's pathspec staged; the rollback must unstage it, unlink
@@ -580,5 +568,3 @@ describe("mutating verbs roll back on a commit failure", () => {
 // models no index, so this real `git reset HEAD -- <paths>` mid-merge is the only
 // place the staged-residue half of the contract is observable.
 // ---------------------------------------------------------------------------
-
-
