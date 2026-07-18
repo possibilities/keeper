@@ -4402,7 +4402,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(134);
+  expect(SCHEMA_VERSION).toBe(135);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
