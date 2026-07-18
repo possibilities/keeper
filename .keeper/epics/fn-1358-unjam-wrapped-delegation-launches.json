@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T23:02:53.663000Z",
+  "depends_on_epics": [
+    "fn-1348-escalation-capabilities-as-plan-agents"
+  ],
+  "id": "fn-1358-unjam-wrapped-delegation-launches",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Unjam wrapped delegation launches",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T23:02:53.663000Z"
+}
