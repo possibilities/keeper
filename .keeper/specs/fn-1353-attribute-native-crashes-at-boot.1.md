@@ -97,5 +97,5 @@ plus `bun run typecheck`.
 - [ ] Focused named gates plus typecheck are green.
 
 ## Done summary
-
+Added a dep-free Darwin crash-report scan matching DiagnosticReports .ips files to dead restart-ledger boots by pid and launch-time tolerance, with a bounded boot-time scan plus supervisor-owned ~90s re-probe timer; threaded native-crash enrich fields through parse/collapse/compact so a fatalExit reason and a native attribution coexist per boot; and added the repeated-native-crash distress (mint at 2+ attributed boots, orphan-GC exempt, level-clears on drain, coexists with daemon-crash-loop). Documented in problem-codes.md and CONTEXT.md.
 ## Evidence
