@@ -829,6 +829,20 @@ if ! codexbar_cli_install; then
   echo "install: CodexBar CLI step failed (non-fatal); continuing" >&2
 fi
 
+# 3d. claude-swap CLI: install or update the stable PyPI package through uv.
+#     Account routing remains optional: a missing uv or failed transaction leaves
+#     any existing cswap installation untouched and never blocks Keeper install.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "install: uv unavailable; leaving claude-swap unchanged (non-fatal)" >&2
+else
+  echo "install: install or update claude-swap"
+  if uv tool install --upgrade claude-swap; then
+    echo "install: claude-swap installed"
+  else
+    echo "install: claude-swap install failed; leaving any existing installation unchanged (non-fatal)" >&2
+  fi
+fi
+
 # 4. LaunchAgent reload, LAST — so a mid-step kill still leaves the idempotent
 #    bun steps complete. Gate on content, loaded state, AND source: reload when
 #    the live plist differs from (or is missing against) the repo copy, OR when it

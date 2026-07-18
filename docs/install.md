@@ -60,8 +60,10 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 ### Account routing (optional)
 
 Claude account routing is optional and fails open to the native default account when either integration
-is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: on every run it
-resolves the trusted, mutable `possibilities/CodexBar` `feature/claude-swap-single-account-option` tip and
+is absent or unusable. On every run, the installer updates claude-swap from PyPI through
+`uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal and leaves any
+existing `cswap` installation untouched. It manages the CodexBar CLI, never the app bundle: it resolves
+the trusted, mutable `possibilities/CodexBar` `feature/claude-swap-single-account-option` tip and
 `steipete/CodexBar` `main` tip in disposable source state, then attempts a sealed noninteractive rebase with
 merge topology preserved. Only the successfully rebased tree can replace the managed CLI. An unavailable
 upstream, rebase conflict, or rebased-build failure leaves the previous generation active and sends a
