@@ -22,6 +22,7 @@ import { parseDuration } from "../duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import type {
+  PartnerLiveness,
   ResolvedHandle,
   ShowLastMessageResult,
   VerbDeps,
@@ -351,6 +352,13 @@ export interface RunCaptureEnvelope {
 export interface RunCaptureResult {
   envelope: RunCaptureEnvelope;
   exitCode: number;
+  /**
+   * Present ONLY on a `timed_out` outcome: the Partner's liveness at the
+   * observation deadline (`live` → still running; `unknown` → termination not
+   * observed). It drives the caller's honest timeout guidance and is NEVER part
+   * of the nine-key wire envelope, so the schema is unchanged.
+   */
+  timeoutLiveness?: PartnerLiveness;
 }
 
 const OUTCOME_EXIT_CODE: Record<RunCaptureOutcome, number> = {
@@ -857,16 +865,22 @@ export async function captureFromHandle(
         elapsedSeconds: elapsed(),
       });
     }
-    return buildRunCaptureEnvelope({
-      outcome: "timed_out",
-      agent,
-      handle: handleId,
-      transcriptPath: show.transcriptPath,
-      resumeTarget: baseResume,
-      message: show.text,
-      messageFound: show.found,
-      elapsedSeconds: elapsed(),
-    });
+    // A timeout means only the observation deadline elapsed: preserve the bounded
+    // partial and carry the re-probed liveness so the caller reports honest
+    // guidance. `timeoutLiveness` never touches the nine-key envelope.
+    return {
+      ...buildRunCaptureEnvelope({
+        outcome: "timed_out",
+        agent,
+        handle: handleId,
+        transcriptPath: show.transcriptPath,
+        resumeTarget: baseResume,
+        message: show.text,
+        messageFound: show.found,
+        elapsedSeconds: elapsed(),
+      }),
+      timeoutLiveness: wait.liveness ?? "unknown",
+    };
   }
 
   const show = await deps.showLastMessage(handle, verbDeps);

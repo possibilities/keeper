@@ -232,6 +232,15 @@ export interface VerbDeps {
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
 }
 
+/**
+ * The Partner's lifecycle as re-probed at an observation deadline: positively
+ * `live` (still running) or `unknown` (evidence proves neither live nor dead). A
+ * timeout NEVER reports `terminal` here — a confirmed death is the separate
+ * `partner_died` path observed during polling, so a bounded wait elapsing can
+ * never masquerade as a termination.
+ */
+export type PartnerLiveness = "live" | "unknown";
+
 export type WaitForStopResult =
   | { ok: true; transcriptPath: string; stop: TranscriptStop }
   | {
@@ -243,6 +252,10 @@ export type WaitForStopResult =
        *  out — the caller reads that known path once instead of re-running
        *  path discovery on a second budget. */
       transcriptPath?: string;
+      /** Set on a `timeout` reason: the Partner liveness re-probed at the
+       *  observation deadline, so the caller's guidance separates a positively-
+       *  live Partner from unknown evidence without ever claiming termination. */
+      liveness?: PartnerLiveness;
     };
 
 /**
@@ -303,11 +316,18 @@ export async function runWaitForStop(
         transcriptPath,
       };
     }
+    // The deadline elapsed with no settled stop. Re-probe lifecycle ONCE so the
+    // caller reports honest liveness — positively live vs unknown — without ever
+    // treating the elapsed deadline as a termination.
+    const liveness = await probeLivenessAtDeadline(
+      lifecycleProbe(handle, deps),
+    );
     const source = handle.stopTimeoutMs !== null ? "caller" : "default";
     return {
       ok: false,
       reason: "timeout",
       transcriptPath,
+      liveness,
       error: `timed out waiting for transcript stop after ${totalMs}ms (${source})`,
     };
   }
@@ -392,6 +412,28 @@ function lifecycleProbe(
   return typeof jobId === "string" && jobId !== "" && probe !== undefined
     ? () => probe(jobId)
     : undefined;
+}
+
+/**
+ * Re-probe the Partner lifecycle at the observation deadline, collapsed to the
+ * honest `live` / `unknown` liveness a timeout may report. Only a positively-live
+ * folded state yields `live`; an absent probe, a throw, or ANY non-live result
+ * (including a racing terminal, which the polling loop did not observe as a
+ * settled death) collapses to `unknown`, so a timeout never overclaims the
+ * Partner is alive nor launders itself into a confirmed termination.
+ */
+async function probeLivenessAtDeadline(
+  probe: (() => Promise<PartnerLifecycle>) | undefined,
+): Promise<PartnerLiveness> {
+  if (probe === undefined) {
+    return "unknown";
+  }
+  try {
+    const lifecycle = await probe();
+    return lifecycle.kind === "live" ? "live" : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function partnerDiedFailure(terminal: PartnerLifecycleTerminal): {

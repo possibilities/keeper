@@ -1046,6 +1046,18 @@ function emitRunCapture(
   // --output write. Teardown can never rewrite a viable captured answer.
   deps.write(`${JSON.stringify(emitted.envelope)}\n`);
 
+  // A `timed_out` outcome means ONLY that the caller's observation deadline
+  // elapsed — the Partner's termination is UNCONFIRMED, so it may still be
+  // running. Never reap its window or stamp its control terminal (that would kill
+  // a live Partner and discard a recoverable answer); leave it resident and
+  // resumable, and surface honest liveness guidance. Keyed on the ORIGINAL
+  // outcome so a failed --output write can never retroactively authorize teardown
+  // after a timeout.
+  if (result.envelope.outcome === "timed_out") {
+    emitTimeoutGuidance(deps, result);
+    return deps.exit(emitted.exitCode);
+  }
+
   let teardown: ExactTeardownResult | null = null;
   if (reap !== undefined) {
     if (control !== undefined) {
@@ -1086,6 +1098,43 @@ function emitRunCapture(
     }
   }
   return deps.exit(emitted.exitCode);
+}
+
+/**
+ * Honest stderr guidance after a run-capture observation deadline elapses. The
+ * captured message is a bounded partial, never a final answer, and the Partner
+ * window is left resident. Positive liveness reports the Partner is still
+ * running; unknown evidence says only that termination was not observed — neither
+ * claims the partial is final, and both point at a non-resending recovery path
+ * (`show-last-message`) plus a resumable re-wait.
+ */
+function emitTimeoutGuidance(deps: MainDeps, result: RunCaptureResult): void {
+  const env = result.envelope;
+  const target = env.handle ?? env.transcript_path;
+  const recovery =
+    target !== null
+      ? ` Read its latest without resending via ` +
+        `\`keeper agent show-last-message ${target}\`, or keep waiting with ` +
+        `\`keeper agent wait ${target}\`.`
+      : "";
+  const elapsed =
+    env.elapsed_seconds !== null ? ` after ${env.elapsed_seconds}s` : "";
+  const partner =
+    env.agent !== null ? `${displayAgent(env.agent)} Partner` : "Partner";
+  if (result.timeoutLiveness === "live") {
+    const job = env.resume_target !== null ? ` (job ${env.resume_target})` : "";
+    deps.writeErr(
+      `agent: observation deadline elapsed${elapsed} — the ${partner} is still ` +
+        `running${job}. The captured message is a partial, not a final answer; ` +
+        `the window was left resident.${recovery}\n`,
+    );
+    return;
+  }
+  deps.writeErr(
+    `agent: observation deadline elapsed${elapsed} — termination was not ` +
+      `observed for the ${partner}. The captured message is a partial, not a ` +
+      `final answer; the window was left resident.${recovery}\n`,
+  );
 }
 
 /**

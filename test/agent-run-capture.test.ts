@@ -617,6 +617,68 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     expect(exitCode).toBe(4);
   });
 
+  test("timed_out surfaces 'live' liveness from the wait re-probe (envelope stays nine-key)", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: {
+          ok: false,
+          reason: "timeout",
+          error: "timed out waiting for transcript stop after 50ms (caller)",
+          transcriptPath: "/t.jsonl",
+          liveness: "live",
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "partial so far",
+          found: true,
+        },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-live", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("timed_out");
+    expect(result.timeoutLiveness).toBe("live");
+    // The liveness rides BESIDE the envelope — the wire contract is still 9 keys.
+    expect(Object.keys(result.envelope).sort()).toEqual([...ENVELOPE_KEYS]);
+    expect(result.envelope.message).toBe("partial so far");
+  });
+
+  test("timed_out with no wait liveness defaults timeoutLiveness to 'unknown'", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: {
+          ok: false,
+          error: "timed out waiting for transcript stop after 50ms (caller)",
+          transcriptPath: "/t.jsonl",
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "partial so far",
+          found: true,
+        },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-unk", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("timed_out");
+    expect(result.timeoutLiveness).toBe("unknown");
+  });
+
+  test("a non-timeout outcome carries no timeoutLiveness hint", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: { ok: true, transcriptPath: "/t.jsonl", stop: STOP },
+        show: { ok: true, transcriptPath: "/t.jsonl", text: "x", found: true },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-done", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("completed");
+    expect(result.timeoutLiveness).toBeUndefined();
+  });
+
   test("transcript never appears → no_transcript (exit 4)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
@@ -1158,6 +1220,33 @@ function writeClaudeTranscript(
   return path;
 }
 
+/** A resolvable claude transcript with NO settled stop — a tool_use assistant
+ *  turn carrying readable text. The stop wait times out (tool_use is excluded)
+ *  while show-last-message still recovers the bounded partial. */
+function writeNoStopClaudeTranscript(
+  home: string,
+  cwd: string,
+  sessionId: string,
+  partial: string,
+): string {
+  const dir = join(home, ".claude", "projects", cwd.replace(/\//g, "-"));
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${sessionId}.jsonl`);
+  writeFileSync(
+    path,
+    `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "tool_use",
+        content: [{ type: "text", text: partial }],
+      },
+    })}\n`,
+  );
+  return path;
+}
+
 function writeRunJson(
   stateDir: string,
   runId: string,
@@ -1253,6 +1342,129 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       kill_window_command: ["tmux", "kill-window", "-t", "@1"],
       status: "terminal",
     });
+  });
+
+  test("a timeout leaves the Partner resident: no reap, control stays running, live guidance", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    writeNoStopClaudeTranscript(home, cwd, sessionId, "partial answer so far");
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "think hard",
+        "--stop-timeout",
+        "40ms",
+        "--reap-window-on-terminal",
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+      // The folded job is positively live — an elapsed observation deadline must
+      // never kill it or discard its recoverable answer.
+      probePartnerLifecycle: async () => ({ kind: "live" }),
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(4);
+    expect(parseEnvelope(h.out)).toMatchObject({
+      outcome: "timed_out",
+      message: "partial answer so far",
+      message_found: true,
+    });
+    // NO reap fired — the launched window is left resident for a live Partner.
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [],
+    );
+    // The run control stays `running`, never stamped terminal.
+    const control = JSON.parse(
+      readFileSync(
+        join(stateDir, "tmux-runs", `tmux-${sessionId}`, "control.json"),
+        "utf8",
+      ),
+    );
+    expect(control.status).toBe("running");
+    // Honest live guidance: still running, a non-resending recovery path, and an
+    // explicit "not final" on the partial.
+    const stderr = h.err.join("");
+    expect(stderr).toContain("still running");
+    expect(stderr).toContain("show-last-message");
+    expect(stderr).toContain("not a final answer");
+  });
+
+  test("an unknown-lifecycle timeout says only that termination was not observed, still no reap", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "eeeeeeee-1111-2222-3333-444444444444";
+    writeNoStopClaudeTranscript(home, cwd, sessionId, "partial so far");
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "think hard",
+        "--stop-timeout",
+        "40ms",
+        "--reap-window-on-terminal",
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+      // Default probe returns unknown → no positive liveness evidence.
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(4);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "timed_out" });
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [],
+    );
+    const stderr = h.err.join("");
+    expect(stderr).toContain("termination was not observed");
+    expect(stderr).not.toContain("still running");
+    expect(stderr).toContain("show-last-message");
+  });
+
+  test("a completed run under --reap-window-on-terminal STILL reaps and marks terminal (unchanged)", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "cafecafe-cafe-cafe-cafe-cafecafecafe";
+    writeClaudeTranscript(home, cwd, sessionId, "the final answer");
+    const h = makeHarness({
+      argv: ["run", "claude", "answer", "--reap-window-on-terminal"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "completed" });
+    // A confirmed-terminal outcome reaps exactly its own window and marks control
+    // terminal — the honest-timeout change never weakened this path.
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+    const control = JSON.parse(
+      readFileSync(
+        join(stateDir, "tmux-runs", `tmux-${sessionId}`, "control.json"),
+        "utf8",
+      ),
+    );
+    expect(control.status).toBe("terminal");
   });
 
   test("an unknown <cli> exits bad_args (2) with the uniform envelope", async () => {

@@ -107,9 +107,12 @@ Usage:
                                     teardown artifact at a caller-owned path and
                                     requires the matching --control-owner tuple.
                                     --reap-window-on-terminal kills the launched
-                                    tmux window once the result file lands (the
-                                    one-shot panel-leg posture; a plain run stays
-                                    resident and resumable without it).
+                                    tmux window once a CONFIRMED-terminal result
+                                    lands (completed/no_message/partner_died); a
+                                    timed_out leaves the Partner resident and
+                                    resumable, never reaped. The one-shot
+                                    panel-leg posture; a plain run stays resident
+                                    without it.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -263,6 +266,13 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         (4) / launch_failed (1) / bad_args (2).
                                         the resume_target comes from the pinned session
                                         id or the harness's post-stop attribution.
+                                        A timed_out reports only that the observation
+                                        deadline elapsed: it preserves the bounded
+                                        partial, never reaps or marks the Partner
+                                        terminal, and leaves it resident for
+                                        show-last-message / resume — with stderr
+                                        distinguishing a live Partner from unknown
+                                        lifecycle evidence.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with
