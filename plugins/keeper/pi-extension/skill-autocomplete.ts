@@ -1,8 +1,3 @@
-interface PiCommandSummary {
-  name: string;
-  source: string;
-}
-
 interface PiAutocompleteItem {
   value: string;
   label: string;
@@ -47,10 +42,6 @@ export interface PiAutocompleteProvider {
   ): boolean;
 }
 
-export interface PiSkillAutocompleteApi {
-  getCommands?(): PiCommandSummary[];
-}
-
 export interface PiSkillAutocompleteContext {
   ui: {
     addAutocompleteProvider?(
@@ -59,40 +50,52 @@ export interface PiSkillAutocompleteContext {
   };
 }
 
+export interface PiSkillShorthand {
+  readonly name: string;
+  readonly description: string;
+}
+
 /**
- * Hide native skill commands when an unprefixed extension command owns the same
- * name. This changes discovery only: manually entered `/skill:<name>` commands
- * still reach Pi's native skill expansion path.
+ * Keeper's canonical short aliases for its Hack and Plan Agent Skills. The
+ * name doubles as the native skill it expands to (`/hack` → `/skill:hack`)
+ * and as the directory name under `plugins/plan/skills/` a
+ * `resources_discover` response contributes — one list, three consumers.
  */
-export function installShadowedSkillAutocomplete(
-  pi: PiSkillAutocompleteApi,
+export const SKILL_SHORTHANDS: readonly PiSkillShorthand[] = [
+  { name: "hack", description: "Run the hack skill workflow on a request" },
+  {
+    name: "plan",
+    description: "Run the plan skill workflow on a planning request",
+  },
+];
+
+const SKILL_SHORTHAND_PATTERN = new RegExp(
+  `^/(${SKILL_SHORTHANDS.map((shorthand) => shorthand.name).join("|")})(?=$|\\s)`,
+);
+
+/**
+ * Rewrite a leading complete `/hack` or `/plan` token to its native
+ * `/skill:*` form, preserving the remaining text untouched. Near misses
+ * (`/hacker`, `/hack/path`), leading whitespace, and already-native
+ * `/skill:*` input pass through unchanged so Pi's own skill pipeline stays
+ * the sole authority once expansion begins.
+ */
+export function expandSkillShorthandInput(text: string): string {
+  return text.replace(SKILL_SHORTHAND_PATTERN, "/skill:$1");
+}
+
+/**
+ * Prepend Keeper's short aliases to Pi's slash-command discovery so `/hack`
+ * and `/plan` are offered before the skills they resolve to would otherwise
+ * surface — without registering extension commands (which would bypass
+ * native skill expansion) or depending on a pre-discovery command snapshot.
+ * Delegation to the wrapped provider's own matches, trigger characters, and
+ * completion application is otherwise unchanged.
+ */
+export function installSkillShorthandAutocomplete(
   context: PiSkillAutocompleteContext,
 ): void {
-  if (
-    typeof pi.getCommands !== "function" ||
-    typeof context.ui.addAutocompleteProvider !== "function"
-  ) {
-    return;
-  }
-
-  const commands = pi.getCommands();
-  const extensionNames = new Set(
-    commands
-      .filter((command) => command.source === "extension")
-      .map((command) => command.name),
-  );
-  const hiddenSkillNames = new Set(
-    commands
-      .filter(
-        (command) =>
-          command.source === "skill" &&
-          command.name.startsWith("skill:") &&
-          extensionNames.has(command.name.slice("skill:".length)),
-      )
-      .map((command) => command.name),
-  );
-
-  if (hiddenSkillNames.size === 0) return;
+  if (typeof context.ui.addAutocompleteProvider !== "function") return;
 
   context.ui.addAutocompleteProvider((current) => {
     const shouldTriggerFileCompletion = current.shouldTriggerFileCompletion;
@@ -107,8 +110,6 @@ export function installShadowedSkillAutocomplete(
           cursorCol,
           options,
         );
-        if (suggestions === null) return null;
-
         const textBeforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
         const isCommandDiscovery =
           options.force !== true &&
@@ -116,12 +117,24 @@ export function installShadowedSkillAutocomplete(
           !textBeforeCursor.includes(" ");
         if (!isCommandDiscovery) return suggestions;
 
-        const items = suggestions.items.filter(
-          (item) => !hiddenSkillNames.has(item.value.replace(/^\//, "")),
+        const commandPrefix = textBeforeCursor.slice(1);
+        const aliases = SKILL_SHORTHANDS.filter(({ name }) =>
+          name.startsWith(commandPrefix),
+        ).map(({ name, description }) => ({
+          value: `/${name}`,
+          label: name,
+          description,
+        }));
+        if (aliases.length === 0) return suggestions;
+
+        const seen = new Set(aliases.map(({ value }) => value));
+        const existing = (suggestions?.items ?? []).filter(
+          (item) => !seen.has(item.value),
         );
-        if (items.length === suggestions.items.length) return suggestions;
-        if (items.length === 0) return null;
-        return { ...suggestions, items };
+        return {
+          prefix: suggestions?.prefix ?? textBeforeCursor,
+          items: [...aliases, ...existing],
+        };
       },
       applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
         return current.applyCompletion(

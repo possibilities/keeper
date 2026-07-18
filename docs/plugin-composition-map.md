@@ -134,6 +134,15 @@ mutation receipts (with dead-letter recovery), while authority still requires th
 Pi process generation and task row. Selection, adoption, lint, hooks, signing, CAS, push, and
 bounded result semantics remain the shared commit-work implementation, not extension-local Git.
 
+The same extension also owns `/hack` and `/plan` shorthand and skill discovery for Keeper-launched
+Pi: an `input` handler rewrites a leading complete `/hack` or `/plan` token to `/skill:hack` or
+`/skill:plan` and returns it to Pi's native expansion pipeline, a `resources_discover` handler
+contributes exactly `plugins/plan/skills/hack` and `plugins/plan/skills/plan` (resolved from the
+extension module, never the launch cwd or another repository), and the autocomplete provider
+composition prepends both short aliases to slash-command discovery. No global Pi extension or
+global skill links carry this contract, and no other repository installs it on Keeper's behalf
+([ADR 0091](./adr/0091-keeper-owned-pi-shorthands-and-skill-discovery.md)).
+
 A manual `keeper dispatch work::<id>` while the board runs **worktree mode** ON is
 refused (exit 1) instead of launching worktree-less into the shared checkout —
 autopilot provisions each task's lane, so a hand-fired shared-checkout worker is

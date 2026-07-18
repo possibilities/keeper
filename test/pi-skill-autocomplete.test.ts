@@ -1,51 +1,76 @@
 import { describe, expect, test } from "bun:test";
 import {
-  installShadowedSkillAutocomplete,
+  expandSkillShorthandInput,
+  installSkillShorthandAutocomplete,
   type PiAutocompleteProvider,
+  SKILL_SHORTHANDS,
 } from "../plugins/keeper/pi-extension/skill-autocomplete";
 
 const OPTIONS = { signal: new AbortController().signal };
 
-function captureWrapper(commands: Array<{ name: string; source: string }>) {
+function captureWrapper() {
   let wrapper:
     | ((current: PiAutocompleteProvider) => PiAutocompleteProvider)
     | undefined;
-  installShadowedSkillAutocomplete(
-    { getCommands: () => commands },
-    {
-      ui: {
-        addAutocompleteProvider(next) {
-          wrapper = next;
-        },
+  installSkillShorthandAutocomplete({
+    ui: {
+      addAutocompleteProvider(next) {
+        wrapper = next;
       },
     },
-  );
+  });
   return () => wrapper;
 }
 
-describe("Pi shadowed skill autocomplete", () => {
-  test("hides skills with matching extension aliases and keeps other skills", async () => {
-    const getWrapper = captureWrapper([
-      { name: "hack", source: "extension" },
-      { name: "plan", source: "extension" },
-      { name: "skill:hack", source: "skill" },
-      { name: "skill:plan", source: "skill" },
-      { name: "skill:gmail", source: "skill" },
+describe("Pi skill shorthand input transform", () => {
+  test("rewrites exact slash aliases to native skill commands", () => {
+    expect(expandSkillShorthandInput("/hack")).toBe("/skill:hack");
+    expect(expandSkillShorthandInput("/hack fix this now")).toBe(
+      "/skill:hack fix this now",
+    );
+    expect(expandSkillShorthandInput("/plan\nmake an epic")).toBe(
+      "/skill:plan\nmake an epic",
+    );
+  });
+
+  test("leaves near-misses and native skill commands unchanged", () => {
+    for (const text of [
+      "/hacker",
+      "/hack/path",
+      "/planner",
+      "/skill:hack do it",
+      " /hack do it",
+      "hack do it",
+    ]) {
+      expect(expandSkillShorthandInput(text)).toBe(text);
+    }
+  });
+});
+
+describe("Pi skill shorthand autocomplete", () => {
+  test("names exactly the canonical hack and plan shorthands", () => {
+    expect(SKILL_SHORTHANDS.map((shorthand) => shorthand.name)).toEqual([
+      "hack",
+      "plan",
     ]);
+  });
+
+  test("does not install a wrapper when addAutocompleteProvider is unavailable", () => {
+    expect(() => installSkillShorthandAutocomplete({ ui: {} })).not.toThrow();
+  });
+
+  test("prepends the short aliases ahead of the wrapped provider's own matches", async () => {
+    const getWrapper = captureWrapper();
+    const factory = getWrapper();
+    expect(factory).toBeDefined();
+    if (factory === undefined) throw new Error("autocomplete wrapper missing");
+
     let fileCompletionThis: unknown;
     const completion = { lines: ["/hack"], cursorLine: 0, cursorCol: 5 };
     const base: PiAutocompleteProvider = {
-      triggerCharacters: ["#"],
+      triggerCharacters: ["/"],
       async getSuggestions() {
-        return {
-          prefix: "/",
-          items: [
-            { value: "hack", label: "hack" },
-            { value: "skill:hack", label: "skill:hack" },
-            { value: "/skill:plan", label: "skill:plan" },
-            { value: "skill:gmail", label: "skill:gmail" },
-          ],
-        };
+        return { prefix: "/h", items: [{ value: "/help", label: "help" }] };
       },
       applyCompletion: () => completion,
       shouldTriggerFileCompletion() {
@@ -53,41 +78,72 @@ describe("Pi shadowed skill autocomplete", () => {
         return false;
       },
     };
+    const provider = factory(base);
+    const result = await provider.getSuggestions(["/h"], 0, 2, OPTIONS);
 
-    const wrapper = getWrapper();
-    expect(wrapper).toBeDefined();
-    if (wrapper === undefined) throw new Error("autocomplete wrapper missing");
-    const filtered = wrapper(base);
-    const suggestions = await filtered.getSuggestions(["/"], 0, 1, OPTIONS);
-
-    expect(suggestions).toEqual({
-      prefix: "/",
+    expect(result).toEqual({
+      prefix: "/h",
       items: [
-        { value: "hack", label: "hack" },
-        { value: "skill:gmail", label: "skill:gmail" },
+        {
+          value: "/hack",
+          label: "hack",
+          description: "Run the hack skill workflow on a request",
+        },
+        { value: "/help", label: "help" },
       ],
     });
-    expect(filtered.triggerCharacters).toEqual(["#"]);
+    expect(provider.triggerCharacters).toEqual(["/"]);
     expect(
-      filtered.applyCompletion([], 0, 0, { value: "hack", label: "hack" }, "/"),
+      provider.applyCompletion(
+        [],
+        0,
+        0,
+        { value: "/hack", label: "hack" },
+        "/",
+      ),
     ).toBe(completion);
-    expect(filtered.shouldTriggerFileCompletion?.([], 0, 0)).toBe(false);
+    expect(provider.shouldTriggerFileCompletion?.([], 0, 0)).toBe(false);
     expect(fileCompletionThis).toBe(base);
   });
 
-  test("leaves matching values alone outside command discovery", async () => {
-    const getWrapper = captureWrapper([
-      { name: "hack", source: "extension" },
-      { name: "skill:hack", source: "skill" },
-    ]);
-    const wrapper = getWrapper();
-    expect(wrapper).toBeDefined();
-    if (wrapper === undefined) throw new Error("autocomplete wrapper missing");
+  test("offers aliases when the underlying provider has no matches", async () => {
+    const getWrapper = captureWrapper();
+    const factory = getWrapper();
+    expect(factory).toBeDefined();
+    if (factory === undefined) throw new Error("autocomplete wrapper missing");
+    const provider = factory({
+      async getSuggestions() {
+        return null;
+      },
+      applyCompletion: (lines, cursorLine, cursorCol) => ({
+        lines,
+        cursorLine,
+        cursorCol,
+      }),
+    });
+
+    expect(await provider.getSuggestions(["/p"], 0, 2, OPTIONS)).toEqual({
+      prefix: "/p",
+      items: [
+        {
+          value: "/plan",
+          label: "plan",
+          description: "Run the plan skill workflow on a planning request",
+        },
+      ],
+    });
+  });
+
+  test("leaves suggestions untouched outside command discovery", async () => {
+    const getWrapper = captureWrapper();
+    const factory = getWrapper();
+    expect(factory).toBeDefined();
+    if (factory === undefined) throw new Error("autocomplete wrapper missing");
     const original = {
       prefix: "skill:hack",
       items: [{ value: "skill:hack", label: "skill:hack" }],
     };
-    const filtered = wrapper({
+    const provider = factory({
       async getSuggestions() {
         return original;
       },
@@ -99,7 +155,7 @@ describe("Pi shadowed skill autocomplete", () => {
     });
 
     expect(
-      await filtered.getSuggestions(
+      await provider.getSuggestions(
         ["/hack skill:hack"],
         0,
         "/hack skill:hack".length,
@@ -108,28 +164,18 @@ describe("Pi shadowed skill autocomplete", () => {
     ).toBe(original);
   });
 
-  test("does not install a wrapper without a shadowed skill", () => {
-    const getWrapper = captureWrapper([
-      { name: "hack", source: "extension" },
-      { name: "skill:gmail", source: "skill" },
-    ]);
-    expect(getWrapper()).toBeUndefined();
-  });
-
-  test("returns no suggestions when every result is a shadowed skill", async () => {
-    const getWrapper = captureWrapper([
-      { name: "hack", source: "extension" },
-      { name: "skill:hack", source: "skill" },
-    ]);
-    const wrapper = getWrapper();
-    expect(wrapper).toBeDefined();
-    if (wrapper === undefined) throw new Error("autocomplete wrapper missing");
-    const filtered = wrapper({
+  test("leaves suggestions untouched on a forced (non-command-discovery) request", async () => {
+    const getWrapper = captureWrapper();
+    const factory = getWrapper();
+    expect(factory).toBeDefined();
+    if (factory === undefined) throw new Error("autocomplete wrapper missing");
+    const original = {
+      prefix: "/h",
+      items: [{ value: "/help", label: "help" }],
+    };
+    const provider = factory({
       async getSuggestions() {
-        return {
-          prefix: "/skill:h",
-          items: [{ value: "skill:hack", label: "skill:hack" }],
-        };
+        return original;
       },
       applyCompletion: (lines, cursorLine, cursorCol) => ({
         lines,
@@ -139,7 +185,26 @@ describe("Pi shadowed skill autocomplete", () => {
     });
 
     expect(
-      await filtered.getSuggestions(["/skill:h"], 0, 8, OPTIONS),
-    ).toBeNull();
+      await provider.getSuggestions(["/h"], 0, 2, { ...OPTIONS, force: true }),
+    ).toBe(original);
+  });
+
+  test("returns null suggestions unchanged when nothing matches the prefix", async () => {
+    const getWrapper = captureWrapper();
+    const factory = getWrapper();
+    expect(factory).toBeDefined();
+    if (factory === undefined) throw new Error("autocomplete wrapper missing");
+    const provider = factory({
+      async getSuggestions() {
+        return null;
+      },
+      applyCompletion: (lines, cursorLine, cursorCol) => ({
+        lines,
+        cursorLine,
+        cursorCol,
+      }),
+    });
+
+    expect(await provider.getSuggestions(["/z"], 0, 2, OPTIONS)).toBeNull();
   });
 });
