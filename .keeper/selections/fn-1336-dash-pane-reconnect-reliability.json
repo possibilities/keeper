@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified single-surface data-fidelity fix that mirrors a named existing decoder shape with a port-the-template test, routing to the everyday GPT tier with high band for the multibyte/torn-tail edge cases.",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.1",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle async-lifecycle correctness invariant (latch reset, bounded connect-timeout, hard-destroy teardown for flat RSS) with whole-TUI shared-client blast radius and a faithful terminate-without-close repro seam is a nameable intelligence-bound opus gate at contract-shaped xhigh.",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.76,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy user-facing TUI banner work (three-state transition table, wording, CONTEXT.md naming calls, ADR consolidation) across a shared render surface needs Claude taste and idiom-matching but no opus reason, so sonnet at the multi-file-feature default band.",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.3",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T15:28:50.476000Z",
+  "epic_id": "fn-1336-dash-pane-reconnect-reliability",
+  "input_hash": "cfd269cffd51fdb19a4cdb1598e0a80dc6546ca5f294ecccadeb7837fedeb001",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3486673359,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1336-dash-pane-reconnect-reliability.1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified single-surface data-fidelity fix that mirrors a named existing decoder shape with a port-the-template test, routing to the everyday GPT tier with high band for the multibyte/torn-tail edge cases.\",\"confidence\":0.79},{\"task_id\":\"fn-1336-dash-pane-reconnect-reliability.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle async-lifecycle correctness invariant (latch reset, bounded connect-timeout, hard-destroy teardown for flat RSS) with whole-TUI shared-client blast radius and a faithful terminate-without-close repro seam is a nameable intelligence-bound opus gate at contract-shaped xhigh.\",\"confidence\":0.8},{\"task_id\":\"fn-1336-dash-pane-reconnect-reliability.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy user-facing TUI banner work (three-state transition table, wording, CONTEXT.md naming calls, ADR consolidation) across a shared render surface needs Claude taste and idiom-matching but no opus reason, so sonnet at the multi-file-feature default band.\",\"confidence\":0.76}]}\n"
+}
