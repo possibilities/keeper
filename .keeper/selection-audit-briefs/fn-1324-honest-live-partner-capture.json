@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 13,
+        "files_changed": 7,
+        "insertions": 418
+      },
+      "done_summary": "timed_out now means only that the observation deadline elapsed: run-capture never reaps the window or marks control terminal for a timeout (even under --reap-window-on-terminal), leaving the Partner resident/resumable. runWaitForStop re-probes lifecycle at the deadline and main emits honest 'still running' vs 'termination was not observed' guidance; confirmed-terminal/partner_died paths and the nine-key envelope are unchanged.",
+      "input_hash": "9c8519e1e274743edf2941ed0ff3c69435118dd8a62848c302cb34bcafd96b70",
+      "model": "opus",
+      "spec_chars": 3305,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/agent/main.ts, src/agent/run-capture.ts, src/agent/pair-subcommands.ts, src/agent/dispatch.ts, test/agent-run-capture.test.ts, test/agent-pair-subcommands.test.ts, test/agent-run-capture-golden.test.ts, docs/agent-surface-contracts.md\n\n### Approach\n\nMake `timed_out` mean only that the caller's observation deadline elapsed. Preserve any bounded partial message, distinguish positive Partner liveness from unknown lifecycle evidence, and keep the exact nine-key envelope and exit-code contract. Terminal run-control writes and `--reap-window-on-terminal` must follow confirmed Partner termination rather than capture-command completion, so a timeout leaves the Partner inspectable and resumable.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/agent/run-capture.ts:318-369,805-869 \u2014 exact answer envelope and timed-out partial capture\n- src/agent/main.ts:1026-1090 \u2014 atomic result emission, terminal control marking, and optional reap\n- src/agent/pair-subcommands.ts:248-353 \u2014 shared deadline plus in-flight show-last-message primitive\n- src/agent/transcript-watch.ts:121-180 \u2014 live/terminal/unknown lifecycle evidence and death precedence\n- test/agent-run-capture.test.ts:593-703 \u2014 timeout, partial, ambiguity, and death fixtures\n- test/agent-pair-subcommands.test.ts:393-575 \u2014 bounded wait and partner_died fixtures\n\n**Optional** (reference as needed):\n- test/agent-transcript-background.test.ts:180-213,280-300 \u2014 partial text is retrievable but not a settled final answer\n- test/agent-run-capture-golden.test.ts:13-40 \u2014 exact nine-key fixture\n\n### Risks\n\n- Panel/provider-leg consumers may treat a result file as their invocation's terminal artifact even while the Partner Harness remains live; keep invocation completion distinct from Partner lifecycle\n- Output-write or teardown errors must not retroactively authorize termination after a timeout\n\n### Test notes\n\nPin positive-live timeout, unknown-lifecycle timeout, partial/no-transcript guidance, skipped reap, unchanged terminal reap, and exact envelope shape in deterministic in-process tests.\n\n## Acceptance\n\n- [ ] `timed_out` never marks run control terminal or invokes terminal reap while Partner termination is unconfirmed\n- [ ] Positive liveness yields \u201cPartner still running\u201d guidance; unknown evidence says only that termination was not observed\n- [ ] Timeout output preserves bounded partial text and a usable transcript/show-last-message recovery path without claiming the partial is final\n- [ ] Confirmed terminal and `partner_died` paths retain their existing precedence, exit codes, teardown posture, and exact nine-key envelope\n- [ ] The focused agent capture, pair-subcommand, and golden tests pass\n\n## Done summary\ntimed_out now means only that the observation deadline elapsed: run-capture never reaps the window or marks control terminal for a timeout (even under --reap-window-on-terminal), leaving the Partner resident/resumable. runWaitForStop re-probes lifecycle at the deadline and main emits honest 'still running' vs 'termination was not observed' guidance; confirmed-terminal/partner_died paths and the nine-key envelope are unchanged.\n## Evidence\n",
+      "task_id": "fn-1324-honest-live-partner-capture.1",
+      "tier": "xhigh",
+      "title": "Separate timeout from termination"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 307,
+        "files_changed": 16,
+        "insertions": 1248
+      },
+      "done_summary": "Extended agent run --resume to send a bounded message to an exact live Partner over the existing Bus artifact rail, capturing only the response observed after the injected-message boundary; single-request admission, honest ambiguity/death/timeout distinctions, and non-resending recovery guidance are preserved.",
+      "input_hash": "9c8519e1e274743edf2941ed0ff3c69435118dd8a62848c302cb34bcafd96b70",
+      "model": "opus",
+      "spec_chars": 4296,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/agent/main.ts, src/agent/run-capture.ts, src/agent/resume-policy.ts, src/agent/dispatch.ts, src/agent/transcript-watch.ts, src/bus-artifact.ts, src/provider-leg-death-notice.ts, test/agent-run-capture.test.ts, test/agent-resume-policy.test.ts, test/agent-dispatch.test.ts, test/bus-artifact.test.ts, plugins/keeper/skills/pair/SKILL.md, docs/agent-surface-contracts.md, CONTEXT.md\n\n### Approach\n\nExtend the existing `agent run --resume` live-target branch rather than adding another public verb. Resolve and pin the exact live job identity with Refuse-live, establish a capture boundary before sending a bounded immutable Bus artifact, and accept a response only after the matching injected message is observed in the transcript; the delivery acknowledgement alone is never an answer. Permit one response-bearing request per exact Partner, do not automatically retry ambiguous delivery, and reuse the existing answer envelope, death precedence, timeout budget, and show-last-message recovery.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/agent/main.ts:1395-1469 \u2014 current live-target refusal and detached resume capture\n- src/agent/resume-policy.ts:53-88,166-255 \u2014 exact name/id resolution, pid/start-time identity, ambiguity, and recycled-pid defenses\n- src/agent/run-capture.ts:805-907 \u2014 captureFromHandle reuse boundary\n- src/agent/transcript-watch.ts:31-68,121-180,455-458 \u2014 stop scanner and harness-specific freshness floor\n- src/bus-artifact.ts:1-35,64-87 \u2014 bounded confined immutable message artifacts\n- src/provider-leg-death-notice.ts:181-200,840-890 \u2014 typed honest Agent Bus delivery outcomes\n- src/agent/dispatch.ts:67-150,346-365 \u2014 command routing and current raw-Bus guidance\n- test/agent-run-capture.test.ts:1597-1740 \u2014 resumed capture and current live-target refusal\n\n**Optional** (reference as needed):\n- cli/bus.ts:870-890,1304-1333 \u2014 artifact publication, synchronous delivery ack, and definite-failure cleanup\n- test/helpers/agent-main-harness.ts:1-18,107-190 \u2014 injected command-level effect harness\n- test/agent-run-capture-depgraph.test.ts:1-29 \u2014 DB-free launch-path boundary\n\n### Risks\n\n- The Partner may finish unrelated work before processing the Bus message; no assistant stop may satisfy capture until the injected message boundary is observed\n- Bus Presence and process liveness differ; definite non-delivery, ambiguous delivery, Partner death, and response timeout need distinct existing outcome mappings\n- A second inbox subscriber would violate single-watcher ownership; reuse the existing transport/capture seams without taking over the Partner's Bus watch\n\n### Test notes\n\nCover definite delivery plus answer, delivered timeout plus late transcript recovery, exact death after delivery, ambiguous transport with no resend, pre-existing unrelated stop, concurrent request refusal, identity rename/recycle races, and cleanup on cancellation.\n\n## Acceptance\n\n- [ ] `agent run --resume` sends a bounded message to the exact positively live Partner over the existing Bus artifact rail without starting a second Harness writer\n- [ ] Capture accepts only a response after the matching injected-message boundary; a pre-existing or unrelated assistant stop cannot satisfy it\n- [ ] Only one response-bearing request per exact Partner is admitted; duplicate/concurrent attempts fail closed and all waiters/artifacts clean up on every exit\n- [ ] Delivery acknowledgement, delivery ambiguity, response timeout, and `partner_died` remain distinguishable without changing the exact nine-key answer envelope or automatically retrying a send\n- [ ] A delivered timeout leaves the Partner live and names the existing non-resending transcript/show-last-message recovery path\n- [ ] Focused dispatch, resume-policy, capture, artifact, and dependency-boundary tests pass\n\n## Done summary\nExtended agent run --resume to send a bounded message to an exact live Partner over the existing Bus artifact rail, capturing only the response observed after the injected-message boundary; single-request admission, honest ambiguity/death/timeout distinctions, and non-resending recovery guidance are preserved.\n## Evidence\n",
+      "task_id": "fn-1324-honest-live-partner-capture.2",
+      "tier": "xhigh",
+      "title": "Message and capture live Partner"
+    }
+  ],
+  "created_at": "2026-07-18T08:16:40.135000Z",
+  "epic_id": "fn-1324-honest-live-partner-capture",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "9c8519e1e274743edf2941ed0ff3c69435118dd8a62848c302cb34bcafd96b70",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
