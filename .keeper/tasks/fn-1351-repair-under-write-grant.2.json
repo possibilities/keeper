@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:05:20.141000Z",
+  "depends_on": [
+    "fn-1351-repair-under-write-grant.1"
+  ],
+  "epic": "fn-1351-repair-under-write-grant",
+  "id": "fn-1351-repair-under-write-grant.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Maintenance task fallback",
+  "updated_at": "2026-07-18T21:05:20.141000Z"
+}
