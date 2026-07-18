@@ -43,5 +43,5 @@ Extend the existing fake Pi API so tests can invoke and inspect return-bearing h
 - [ ] The focused Pi extension and autocomplete test files pass under Keeper's named test constraints.
 
 ## Done summary
-
+Extended keeper's Pi extension with input transform and resources_discover contracts so /hack and /plan expand through Pi's native /skill:* pipeline and Keeper's canonical Hack/Plan skill dirs are discoverable without Arthack; replaced the getCommands shadow-hiding autocomplete model with a prepend-based provider wrapper. Updated docs/install.md and docs/plugin-composition-map.md.
 ## Evidence
