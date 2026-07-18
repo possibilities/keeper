@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T21:11:40.199000Z",
+  "depends_on_epics": [
+    "fn-1346-retire-torn-down-lane-git-rows"
+  ],
+  "id": "fn-1353-attribute-native-crashes-at-boot",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Attribute native crashes at boot",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T21:11:40.199000Z"
+}

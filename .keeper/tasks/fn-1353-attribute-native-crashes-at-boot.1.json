@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:11:40.199000Z",
+  "depends_on": [],
+  "epic": "fn-1353-attribute-native-crashes-at-boot",
+  "id": "fn-1353-attribute-native-crashes-at-boot.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Native crash scan and distress",
+  "updated_at": "2026-07-18T21:11:40.199000Z"
+}
