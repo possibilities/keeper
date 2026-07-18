@@ -175,6 +175,8 @@ import {
   recoverFailureDispatchId,
   type StaleBaseLaneEntry,
   type Verb,
+  type WithholdReason,
+  type WithholdReasonCode,
   WORKER_EFFORT,
   WORKER_MODEL,
   type WorktreeLaunchInfo,
@@ -328,6 +330,8 @@ export type {
   SlotOccupancySignal,
   StaleBaseLaneEntry,
   Verb,
+  WithholdReason,
+  WithholdReasonCode,
   WorktreeLaunchInfo,
   WorktreeRecoveryEscalation,
   WorktreeRecoveryFailure,
@@ -394,6 +398,74 @@ export function sweepFinalizerGuard(
     if (now - stampedAt >= FINALIZER_GUARD_S) {
       guard.delete(epicId);
     }
+  }
+}
+
+/** Minimum seconds before the same target/reason pair may log again. */
+export const WITHHOLD_LOG_RATE_LIMIT_S = 5 * 60;
+
+/**
+ * Producer-owned memory for the current machine frame and its stderr change gate.
+ * Both maps are pruned to targets in the latest frame; each nested rate map is
+ * bounded by the finite {@link WithholdReasonCode} vocabulary.
+ */
+export interface WithholdFrameState {
+  current: Map<string, WithholdReason>;
+  lastReasonByTarget: Map<string, WithholdReasonCode>;
+  lastEmittedAtByTarget: Map<string, Map<WithholdReasonCode, number>>;
+}
+
+export function createWithholdFrameState(): WithholdFrameState {
+  return {
+    current: new Map(),
+    lastReasonByTarget: new Map(),
+    lastEmittedAtByTarget: new Map(),
+  };
+}
+
+/**
+ * Replace-merge one reconciler withhold frame and emit only reason transitions.
+ * A fast A→B→A oscillation updates the current frame but the second A is
+ * coalesced until its per-target/per-code rate window elapses.
+ */
+export function updateWithholdFrameState(
+  state: WithholdFrameState,
+  next: ReadonlyMap<string, WithholdReason>,
+  nowSec: number,
+  emit: (line: string) => void = (line) => console.error(line),
+): void {
+  const activeTargets = new Set(next.keys());
+  for (const target of state.lastReasonByTarget.keys()) {
+    if (!activeTargets.has(target)) state.lastReasonByTarget.delete(target);
+  }
+  for (const target of state.lastEmittedAtByTarget.keys()) {
+    if (!activeTargets.has(target)) state.lastEmittedAtByTarget.delete(target);
+  }
+
+  state.current.clear();
+  for (const [target, reason] of [...next.entries()].sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    state.current.set(target, reason);
+    if (state.lastReasonByTarget.get(target) === reason.code) continue;
+
+    let emittedByCode = state.lastEmittedAtByTarget.get(target);
+    if (emittedByCode === undefined) {
+      emittedByCode = new Map();
+      state.lastEmittedAtByTarget.set(target, emittedByCode);
+    }
+    const lastEmittedAt = emittedByCode.get(reason.code);
+    if (
+      lastEmittedAt === undefined ||
+      nowSec - lastEmittedAt >= WITHHOLD_LOG_RATE_LIMIT_S
+    ) {
+      const detail = reason.detail === null ? "" : ` detail=${reason.detail}`;
+      emit(
+        `[autopilot-worker] withhold target=${target} reason=${reason.code} severity=${reason.severity}${detail}`,
+      );
+      emittedByCode.set(reason.code, nowSec);
+    }
+    state.lastReasonByTarget.set(target, reason.code);
   }
 }
 
@@ -9776,6 +9848,7 @@ function main(): void {
   // appearance + reason-change + a bounded still-stuck watermark, suppresses
   // identical re-emits; an acknowledged DispatchCleared resets it. In-worker memory only.
   const dispatchFailedGate = createDispatchFailedGate();
+  const withholdFrameState = createWithholdFrameState();
   // Per-repo grace tracker escalating a SHARED-checkout mid-merge wedge that
   // outlives the recover pass's self-heal window into a visible distress row. In-
   // worker memory only, mirroring `dispatchFailedGate` — a restart re-arms it.
@@ -10894,6 +10967,11 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
+        updateWithholdFrameState(
+          withholdFrameState,
+          decision.withholds,
+          deps.now(),
+        );
         await runReconcileCycle(
           decision,
           state,

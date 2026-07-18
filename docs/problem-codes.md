@@ -139,6 +139,32 @@ CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                                                                                                       | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.                 | Retry; if it persists, confirm the daemon and CLI are the same version.                                                                                                                   | conditional       |
 
+## Autopilot withhold reasons
+
+The reconciler's machine frame carries `withholds`, a replace-merge map keyed by
+task or epic id. Each value is `{code, severity, detail}`. `code` is the stable,
+bounded enum below; `detail` holds optional per-instance facts and is not a match
+key. A target absent from the next map is no longer withheld. Stderr reports only
+code transitions and rate-limits each target/code pair.
+
+| code | meaning |
+| --- | --- |
+| `autopilot-paused` | Autopilot is paused. |
+| `not-armed` | Armed mode excludes the target's epic from the armed dependency closure. |
+| `merge-gate` | A required upstream lane has not landed in the local default branch. |
+| `dispatch-in-flight` | This reconciler already has the same dispatch in flight. |
+| `failed-key` | An open dispatch failure suppresses the target. |
+| `claim-fence` | A durable, unreleased Dispatch claim owns the exact target. |
+| `activity-collision` | Current Harness activity or a legacy occupying job conflicts with the target. |
+| `live-tab` | A live managed tab covers the pre-SessionStart binding window. |
+| `cooldown` | The fold-lag-safe redispatch cooldown is active. |
+| `finalizer-guard` | The epic finalizer guard suppresses a duplicate close. |
+| `data-bug-missing-cwd` | The task or epic has no effective launch cwd. This is the only `error`-severity withhold; repair the Plan's repo coordinates. |
+| `budget-exhausted` | The current global dispatch budget has no remaining capacity. |
+
+These are live decision reasons, not sticky failure codes and not Parked launches.
+They mint no Event or Projection row.
+
 ## Tabs command family (`keeper tabs list|restore|dump`)
 
 Crash-restore of keeper-managed agent windows, every read a daemon-down read-only
@@ -279,7 +305,7 @@ or title alone.
 | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `child-evidence-incomplete`, `resource-evidence-incomplete`, `parent-state-incomplete` | Harness activity is `unknown` because required projected evidence is absent, malformed, or contradictory. Capacity, conflicting dispatch, autoclose, finalize, and destructive cleanup fail closed. | Check projection health and the named session's recent lifecycle events. Repair the producer or replay a dead letter when one is present, then take a fresh snapshot; do not force the session quiescent.                                       |
 | `child-evidence-stale`, `resource-evidence-stale`                                      | An open child or work-bearing resource has not supplied freshness evidence, so elapsed time cannot prove idle.                                                                                      | Confirm the exact child/resource identity. If it is live, restore its event producer; if positively dead, let the normal exit/reconcile path record terminal evidence. Re-run the audit on a fresh snapshot.                                    |
-| `stale_attempts` / `stale-pending`                                                     | An unbound Dispatch attempt has exceeded its launch-window ceiling, either as a surviving pending launch or as an orphaned claim whose pending row did not survive boot. A delayed start has authority only while its exact attempt still owns the current claim. | Inspect the target's `pending_dispatches`, `dispatch_claims`, and dispatch-failure row. Let the pending sweep or orphaned-claim Reaper expire and fence the exact attempt; retry a Sticky only after confirming no current exact claim or live activity owns the target. |
+| `stale_attempts` / `stale-pending`                                                     | An unbound Dispatch attempt exceeded its launch-window ceiling, either as a surviving pending launch or as an orphaned claim whose durable Dispatch claim outlived the ephemeral pending row across a crash. A delayed start gains no authority unless its exact attempt identity still owns the current claim. | Inspect the target's `dispatch_claims`, any surviving `pending_dispatches` row, and its dispatch-failure row. Let the pending sweep or orphaned-claim Reaper expire and fence the exact attempt; retry a Sticky only after confirming no current exact Dispatch claim or live activity owns the target. |
 | provisional or absent cut/clean settlement                                             | Provider transcript evidence has not crossed its terminal settlement boundary. An intermediate cut cannot stop the parent or unlock lifecycle consumers.                                            | Preserve the complete transcript tail and restore the transcript worker/read path. A later clean terminal record settles the same invocation; a torn partial line is ignored rather than repaired by hand.                                      |
 | `legacy-unfenced`                                                                      | The session has no exact Dispatch attempt identity. It may still carry Harness activity and a Resource hold, but cannot acquire or consume a newer exact Dispatch claim.                            | Let the session reach a positive terminal boundary. Use a fresh exact attempt for later dispatch; do not assign a guessed attempt id to the legacy row.                                                                                         |
 
