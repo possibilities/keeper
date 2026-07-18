@@ -9,7 +9,7 @@
       "confidence": 0.97,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Subtle credential-confinement, stream replay, abort, and account-scoped transport invariants make this security- and correctness-critical provider design.",
+      "rationale": "Credential confinement, account-scoped transport reuse, and the no-replay stream cutoff form subtle security and correctness invariants across a new provider boundary.",
       "task_id": "fn-1355-add-pi-codex-account-pool.1",
       "tier": "xhigh"
     },
@@ -17,29 +17,29 @@
       "confidence": 0.95,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Concurrent transient-state coordination, strict schema boundaries, and daemon lifecycle integration create cross-cutting correctness and privacy invariants.",
+      "rationale": "Cross-process locking, transient routing state, strict schemas, and daemon lifecycle integration create a cross-cutting architectural cascade with subtle concurrency invariants.",
       "task_id": "fn-1355-add-pi-codex-account-pool.2",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.92,
+      "confidence": 0.97,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Launcher, installer, diagnostics, and documentation changes form a cross-cutting activation cascade where fail-open and secret-isolation correctness must remain exact.",
+      "rationale": "Atomic proof-gated activation, rollback recovery, launcher wiring, and installer compatibility require security-critical correctness across many coupled surfaces.",
       "task_id": "fn-1355-add-pi-codex-account-pool.3",
       "tier": "xhigh"
     }
   ],
   "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
-  "created_at": "2026-07-18T21:25:54.887000Z",
+  "created_at": "2026-07-18T21:39:22.124000Z",
   "epic_id": "fn-1355-add-pi-codex-account-pool",
-  "input_hash": "a888d65840b8cd89a040fb89f0bd1c525fd02179ea7dc2123e826cf9e0bef7c0",
+  "input_hash": "08e988b8fa3d5285acee27e79ec3547dd0287fe64a690b750cb17a223e7f9c60",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 2827540056,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1355-add-pi-codex-account-pool.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle credential-confinement, stream replay, abort, and account-scoped transport invariants make this security- and correctness-critical provider design.\",\"confidence\":0.97},{\"task_id\":\"fn-1355-add-pi-codex-account-pool.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Concurrent transient-state coordination, strict schema boundaries, and daemon lifecycle integration create cross-cutting correctness and privacy invariants.\",\"confidence\":0.95},{\"task_id\":\"fn-1355-add-pi-codex-account-pool.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Launcher, installer, diagnostics, and documentation changes form a cross-cutting activation cascade where fail-open and secret-isolation correctness must remain exact.\",\"confidence\":0.92}]}\n"
+  "shuffle_seed": 149522616,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1355-add-pi-codex-account-pool.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Credential confinement, account-scoped transport reuse, and the no-replay stream cutoff form subtle security and correctness invariants across a new provider boundary.\",\"confidence\":0.97},{\"task_id\":\"fn-1355-add-pi-codex-account-pool.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-process locking, transient routing state, strict schemas, and daemon lifecycle integration create a cross-cutting architectural cascade with subtle concurrency invariants.\",\"confidence\":0.95},{\"task_id\":\"fn-1355-add-pi-codex-account-pool.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Atomic proof-gated activation, rollback recovery, launcher wiring, and installer compatibility require security-critical correctness across many coupled surfaces.\",\"confidence\":0.97}]}\n"
 }
