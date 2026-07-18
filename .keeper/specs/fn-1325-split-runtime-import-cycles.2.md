@@ -44,5 +44,5 @@ Keep injected spawn tests in-process. Cover all three consumers, canonical valid
 - [ ] Focused restore, tabs, boot-seed tests plus typecheck pass
 
 ## Done summary
-
+Extracted probeServerGeneration and its SpawnSyncFn contract into a dependency-neutral src/server-generation-probe.ts leaf, breaking the tabs-core <-> restore-worker runtime import cycle while preserving every consumer's existing probe classification and worker/render behavior.
 ## Evidence
