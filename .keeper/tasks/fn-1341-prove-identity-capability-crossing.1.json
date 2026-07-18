@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T18:22:54.362000Z",
+  "depends_on": [],
+  "epic": "fn-1341-prove-identity-capability-crossing",
+  "id": "fn-1341-prove-identity-capability-crossing.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Classify restart capability crossing",
+  "updated_at": "2026-07-18T18:22:54.362000Z"
+}
