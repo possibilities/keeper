@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T23:42:35.208000Z",
+  "depends_on": [],
+  "epic": "fn-1360-harden-escalation-plan-agent-migration",
+  "id": "fn-1360-harden-escalation-plan-agent-migration.1",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Fix escalation skill regressions",
+  "updated_at": "2026-07-18T23:42:35.208000Z"
+}

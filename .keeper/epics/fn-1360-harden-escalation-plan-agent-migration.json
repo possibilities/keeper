@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T23:42:35.208000Z",
+  "created_by_close_of": "fn-1348-escalation-capabilities-as-plan-agents",
+  "depends_on_epics": [
+    "fn-1348-escalation-capabilities-as-plan-agents"
+  ],
+  "id": "fn-1360-harden-escalation-plan-agent-migration",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden escalation plan-agent migration",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T23:42:35.208000Z"
+}
