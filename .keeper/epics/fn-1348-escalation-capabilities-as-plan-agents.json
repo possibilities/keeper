@@ -6,7 +6,7 @@
     "fn-1347-escalation-grant-confinement-groundwork"
   ],
   "id": "fn-1348-escalation-capabilities-as-plan-agents",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T21:12:05.125000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:09:04.619000Z"
+  "updated_at": "2026-07-18T21:12:05.125000Z"
 }
