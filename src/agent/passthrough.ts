@@ -291,7 +291,7 @@ const PI_THINKING_TOKENS: ReadonlySet<string> = new Set([
 ]);
 
 /** The value of `--model x` (split) or `--model=x` (joined) before a bare `--`. */
-function piModelArgValue(args: string[]): string | null {
+export function modelArgValue(args: string[]): string | null {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
     if (arg === "--") {
@@ -317,7 +317,7 @@ function piModelArgValue(args: string[]): string | null {
  * yields null.
  */
 export function piModelColonThinking(args: string[]): string | null {
-  const model = piModelArgValue(args);
+  const model = modelArgValue(args);
   if (model === null) {
     return null;
   }

@@ -178,9 +178,12 @@ export interface HarnessOptions {
     | ResumeDecision
     | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
   /** Mandatory managed account result for an unpinned Claude launch. */
-  selectAccountRoute?: () => RouteResolution;
+  selectAccountRoute?: (model: string | null) => RouteResolution;
   /** Exact result for a requested zero-based account ordinal. */
-  selectAccountRouteByOrdinal?: (ordinal: number) => RequestedRouteResolution;
+  selectAccountRouteByOrdinal?: (
+    ordinal: number,
+    model: string | null,
+  ) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
@@ -324,14 +327,14 @@ export function makeHarness(opts: HarnessOptions): Harness {
       }
       return decision ?? { kind: "unknown", target };
     },
-    selectAccountRouteFn: () => {
+    selectAccountRouteFn: (model) => {
       routerCalls += 1;
-      return selectAccountRoute();
+      return selectAccountRoute(model);
     },
-    selectAccountRouteByOrdinalFn: (ordinal) => {
+    selectAccountRouteByOrdinalFn: (ordinal, model) => {
       requestedAccountOrdinals.push(ordinal);
       return (
-        opts.selectAccountRouteByOrdinal?.(ordinal) ?? {
+        opts.selectAccountRouteByOrdinal?.(ordinal, model) ?? {
           ok: true,
           selection: {
             id: "claude-swap:1",
@@ -346,6 +349,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
     inspectRoutingFn:
       opts.inspectRouting ??
       (() => ({
+        model_scope: null,
         health: "no-observation",
         observed_at_ms: null,
         age_ms: null,

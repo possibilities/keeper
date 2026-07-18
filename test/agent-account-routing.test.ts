@@ -60,6 +60,33 @@ describe("mandatory Claude account routing", () => {
     expect(tail).toContain("task");
   });
 
+  test("passes explicit and launch-triple models into account scoring", async () => {
+    const explicitModels: Array<string | null> = [];
+    const explicit = makeHarness({
+      argv: ["claude", "--model=fable", "--effort", "high", "explicit task"],
+      rawArgv: true,
+      selectAccountRoute: (model) => {
+        explicitModels.push(model);
+        return { ok: true, selection: selection(4) };
+      },
+    });
+    await runAndCapture(explicit, main);
+    expect(explicitModels).toEqual(["fable"]);
+
+    const presetModels: Array<string | null> = [];
+    const preset = makeHarness({
+      argv: ["claude", "--x-preset", "claude::fable::medium", "preset task"],
+      rawArgv: true,
+      selectAccountRoute: (model) => {
+        presetModels.push(model);
+        return { ok: true, selection: selection(5) };
+      },
+    });
+    const command = await runAndCapture(preset, main);
+    expect(presetModels).toEqual(["fable"]);
+    expect(command[command.indexOf("--model") + 1]).toBe("fable");
+  });
+
   test("automatic routing failure exits 1 before Claude starts", async () => {
     const h = makeHarness({
       argv: ["claude", "hello"],
@@ -90,17 +117,22 @@ describe("mandatory Claude account routing", () => {
 
 describe("explicit account selection", () => {
   test("the selected active account is still wrapped as a managed route", async () => {
+    const models: Array<string | null> = [];
     const h = makeHarness({
-      argv: ["claude", "--x-account=0", "hello"],
+      argv: ["claude", "--x-account=0", "--model", "fable", "hello"],
       rawArgv: true,
-      selectAccountRouteByOrdinal: (ordinal) => ({
-        ok: true,
-        selection: selection(9, ordinal),
-      }),
+      selectAccountRouteByOrdinal: (ordinal, model) => {
+        models.push(model);
+        return {
+          ok: true,
+          selection: selection(9, ordinal),
+        };
+      },
     });
     const command = await runAndCapture(h, main);
     expect(command.slice(0, 3)).toEqual([CSWAP, "run", "9"]);
     expect(h.requestedAccountOrdinals()).toEqual([0]);
+    expect(models).toEqual(["fable"]);
     expect(h.routerCalls()).toBe(0);
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:9");
   });
@@ -145,10 +177,25 @@ describe("selection remains independent per invocation", () => {
     expect(command[0]).toBe("/fake-home/.local/bin/pi");
     expect(h.routerCalls()).toBe(0);
   });
+
+  test("a Pi triple naming Fable still never consults Claude routing", async () => {
+    const h = makeHarness({
+      argv: ["pi", "--x-preset", "pi::fable::medium", "task"],
+      rawArgv: true,
+      selectAccountRoute: () => {
+        throw new Error("Pi must not route through Claude accounts");
+      },
+    });
+    const command = await runAndCapture(h, main);
+    expect(command[0]).toBe("/fake-home/.local/bin/pi");
+    expect(command[command.indexOf("--model") + 1]).toBe("fable");
+    expect(h.routerCalls()).toBe(0);
+  });
 });
 
 describe("keeper agent accounts check", () => {
   const inspection = {
+    model_scope: null,
     health: "ok" as const,
     observed_at_ms: 1000,
     age_ms: 42,
@@ -191,6 +238,7 @@ describe("keeper agent accounts check", () => {
       argv: ["accounts", "check"],
       rawArgv: true,
       inspectRouting: () => ({
+        model_scope: null,
         health: "no-observation",
         observed_at_ms: null,
         age_ms: null,
@@ -202,6 +250,7 @@ describe("keeper agent accounts check", () => {
       }),
     });
     expect(await expectExit(main(h.deps))).toBe(0);
+    expect(h.out.join("")).toContain("model-scope=generic-only");
     expect(h.out.join("")).toContain("would choose: unavailable");
   });
 });

@@ -76,8 +76,11 @@ a freshness signal, and at least one understood quota window are routeable. Unkn
 signed-out, or otherwise unusable rows are excluded rather than treated as spare capacity.
 
 Every fresh, resumed, or restored Claude process independently selects the route with the greatest
-worst-window headroom after short-lived Launch reservations; least-recently-used order breaks ties. A
-successful decision always executes through:
+worst-window headroom after short-lived Launch reservations; least-recently-used order breaks ties. When
+`--model` or a Claude launch triple resolves a model such as `fable`, the matching model-scoped quota joins
+the generic windows for that decision while scopes for other models are ignored. A model selected later
+inside the interactive Claude session does not reroute the already-running process. A successful decision
+always executes through:
 
 ```sh
 cswap run <slot> --share-history -- <claude arguments...>
@@ -89,7 +92,8 @@ starts. Launch attribution records only the PII-free `claude-swap:<slot>` route 
 affinity for a later process.
 
 `keeper agent accounts check --json` reports observation health, snapshot age, PII-free candidates, and
-the managed route the policy would choose without reserving it. Use `keeper agent claude --x-account cN`
+the generic-window route the policy would choose without reserving it; `model_scope: null` makes that
+model-free diagnostic explicit. Use `keeper agent claude --x-account cN`
 to request one account, where `c0`, `c1`, … are zero-based positions in ordered inventory and match the
 Claude statusline label. An explicit request fails rather than substituting another account.
 

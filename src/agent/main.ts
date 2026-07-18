@@ -127,6 +127,7 @@ import {
   hasExplicitEffortArg,
   hasExplicitModelArg,
   hasExplicitThinkingArg,
+  modelArgValue,
   piModelColonThinking,
   resolveStartupEffortOverride,
   resolveStartupModelOverride,
@@ -346,12 +347,15 @@ export interface MainDeps {
    * independent per start/resume/restore and fails before process creation when
    * no fresh routeable claude-swap account exists.
    */
-  selectAccountRouteFn: () => RouteResolution;
+  selectAccountRouteFn: (model: string | null) => RouteResolution;
   /**
    * Resolve a human-requested zero-based Claude account index exactly. Unlike
    * automatic routing this is fail-loud and never substitutes another account.
    */
-  selectAccountRouteByOrdinalFn: (ordinal: number) => RequestedRouteResolution;
+  selectAccountRouteByOrdinalFn: (
+    ordinal: number,
+    model: string | null,
+  ) => RequestedRouteResolution;
   /**
    * Read-only account-routing diagnostic behind `accounts check` — reports
    * integration health, snapshot age, PII-free candidates, and the route policy
@@ -460,9 +464,9 @@ export function realDeps(): MainDeps {
         target,
         requireHarness,
       ),
-    selectAccountRouteFn: () => selectRoute(),
-    selectAccountRouteByOrdinalFn: (ordinal) =>
-      selectRouteByAccountOrdinal(ordinal),
+    selectAccountRouteFn: (model) => selectRoute({ model }),
+    selectAccountRouteByOrdinalFn: (ordinal, model) =>
+      selectRouteByAccountOrdinal(ordinal, { model }),
     inspectRoutingFn: () => inspectRouting(),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
@@ -2090,8 +2094,8 @@ function runProvidersCheck(deps: MainDeps): never {
 
 /**
  * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
- * integration health, observation age, PII-free candidates, and the route the
- * per-launch policy WOULD pick — WITHOUT recording a reservation or launching
+ * integration health, observation age, PII-free candidates, and the generic-
+ * only route policy WOULD pick — WITHOUT recording a reservation or launching
  * anything. A machine diagnostic (the `--json` snapshot the operator/tests
  * consume), not a replacement usage viewer. Always exits 0: a disabled or absent
  * integration is a reported state, not an error.
@@ -2104,7 +2108,8 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
   }
   deps.write(
     `account routing: health=${inspection.health} ` +
-      `fresh=${inspection.fresh} enabled=${inspection.enabled}\n`,
+      `fresh=${inspection.fresh} enabled=${inspection.enabled} ` +
+      `model-scope=${inspection.model_scope ?? "generic-only"}\n`,
   );
   if (inspection.would_choose === null) {
     deps.write(
@@ -2691,13 +2696,24 @@ export async function main(deps: MainDeps): Promise<never> {
   }
 
   // Resolve the one mandatory Claude route before either the passthrough or
-  // configured launch branch. This is the sole process-boundary decision.
+  // configured launch branch. This is the sole process-boundary decision. A
+  // configured launch contributes its effective model so matching scoped quota
+  // (for example Fable) participates in account scoring. Informational
+  // passthrough has no model workload and therefore uses generic windows only.
   let resolvedClaudeRoute: RouteSelection | null = null;
   if (agent === "claude") {
+    const routingModel = shouldPassthrough
+      ? null
+      : hasExplicitModelArg(remainingArgs)
+        ? modelArgValue(remainingArgs)
+        : (resolvedPreset?.model ?? null);
     const resolution =
       parsed.launcherAccountOrdinal !== null
-        ? deps.selectAccountRouteByOrdinalFn(parsed.launcherAccountOrdinal)
-        : deps.selectAccountRouteFn();
+        ? deps.selectAccountRouteByOrdinalFn(
+            parsed.launcherAccountOrdinal,
+            routingModel,
+          )
+        : deps.selectAccountRouteFn(routingModel);
     if (!resolution.ok) {
       deps.writeErr(`Error: ${resolution.error}.\n`);
       return deps.exit(parsed.launcherAccountOrdinal === null ? 1 : 2);
@@ -2713,6 +2729,9 @@ export async function main(deps: MainDeps): Promise<never> {
     actionLog.push(
       `Resolved account route: ${resolvedClaudeRoute.id} (${resolvedClaudeRoute.reason})`,
     );
+    if (routingModel !== null && routingModel.trim().length > 0) {
+      actionLog.push(`Applied account quota scope for model: ${routingModel}`);
+    }
     note(`route: ${resolvedClaudeRoute.id}`);
   }
 

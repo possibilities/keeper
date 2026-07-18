@@ -38,6 +38,24 @@ function route(slot: number, utilization: number): Route {
   };
 }
 
+function routeWithScopes(
+  slot: number,
+  weekly: number,
+  fable: number,
+  other?: number,
+): Route {
+  return {
+    ...route(slot, weekly),
+    windows: [
+      { key: "week", utilization: weekly, resetsAt: null },
+      { key: "model:Fable", utilization: fable, resetsAt: null },
+      ...(other === undefined
+        ? []
+        : [{ key: "model:Other", utilization: other, resetsAt: null }]),
+    ],
+  };
+}
+
 function observation(
   routes: Route[],
   options: {
@@ -137,6 +155,50 @@ describe("mandatory managed account selection", () => {
     });
   });
 
+  test("uses only the matching model scope when balancing a launch", () => {
+    const genericDir = root();
+    publish(
+      genericDir,
+      observation([
+        routeWithScopes(1, 0.1, 1),
+        routeWithScopes(2, 0.7, 0.2, 1),
+      ]),
+    );
+    const generic = selectRoute({ stateDir: genericDir, nowMs: NOW });
+    expect(generic.ok && generic.selection.id).toBe("claude-swap:1");
+
+    const fableDir = root();
+    publish(
+      fableDir,
+      observation([
+        routeWithScopes(1, 0.1, 1),
+        routeWithScopes(2, 0.7, 0.2, 1),
+      ]),
+    );
+    const fable = selectRoute({
+      stateDir: fableDir,
+      nowMs: NOW,
+      model: "fAbLe",
+    });
+    expect(fable.ok && fable.selection.id).toBe("claude-swap:2");
+
+    const inspection = inspectRouting({
+      stateDir: fableDir,
+      nowMs: NOW,
+      model: "fable",
+    });
+    expect(inspection.model_scope).toBe("fable");
+    expect(
+      inspection.candidates.map(({ id, worst_utilization }) => ({
+        id,
+        worst_utilization,
+      })),
+    ).toEqual([
+      { id: "claude-swap:1", worst_utilization: 1 },
+      { id: "claude-swap:2", worst_utilization: 0.75 },
+    ]);
+  });
+
   test("reservations spread equal concurrent selections", () => {
     const dir = root();
     publish(dir, observation([route(2, 0.2), route(9, 0.2)]));
@@ -181,6 +243,24 @@ describe("explicit account resolution", () => {
         accountOrdinal: 0,
         reason: "requested-account",
       },
+    });
+  });
+
+  test("a depleted model scope never overrides an explicit account", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithScopes(1, 0.1, 1), routeWithScopes(2, 0.8, 0.1)]),
+    );
+    expect(
+      selectRouteByAccountOrdinal(0, {
+        stateDir: dir,
+        nowMs: NOW,
+        model: "fable",
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", slot: 1 },
     });
   });
 

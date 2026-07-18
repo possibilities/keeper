@@ -36,6 +36,7 @@ import {
 import { FileLock } from "./file-lock";
 
 const MAX_LEDGER_ROUTES = 64;
+const MODEL_WINDOW_PREFIX = "model:";
 
 export interface RouteSelection {
   id: string;
@@ -54,6 +55,8 @@ export type RequestedRouteResolution = RouteResolution;
 export interface SelectRouteDeps {
   stateDir?: string;
   nowMs?: number;
+  /** Effective Claude launch model. Matching scoped quota joins generic quota. */
+  model?: string | null;
 }
 
 function displayOrdinal(
@@ -124,6 +127,34 @@ function readFreshObservation(
   return { ok: true, observation };
 }
 
+function normalizedModelName(model: string | null | undefined): string | null {
+  if (typeof model !== "string") return null;
+  const normalized = model.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function applicableWindows(
+  windows: NormalizedWindow[],
+  model: string | null | undefined,
+): NormalizedWindow[] {
+  const normalizedModel = normalizedModelName(model);
+  return windows.filter((window) => {
+    if (!window.key.startsWith(MODEL_WINDOW_PREFIX)) return true;
+    if (normalizedModel === null) return false;
+    return (
+      normalizedModelName(window.key.slice(MODEL_WINDOW_PREFIX.length)) ===
+      normalizedModel
+    );
+  });
+}
+
+function routeHasApplicableWindows(
+  route: Route,
+  model: string | null | undefined,
+): boolean {
+  return applicableWindows(route.windows, model).length > 0;
+}
+
 function reserveSelection(
   stateDir: string,
   nowMs: number,
@@ -176,7 +207,7 @@ function doSelectRouteByAccountOrdinal(
       candidate.id === routeId &&
       candidate.slot > 0 &&
       managedRouteId(candidate.slot) === candidate.id &&
-      candidate.windows.length > 0 &&
+      routeHasApplicableWindows(candidate, deps.model) &&
       isRouteMeasurementFresh(candidate, nowMs),
   );
   if (!route) {
@@ -205,7 +236,8 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
   const observation = fresh.observation;
   const candidates = observation.routes.filter(
     (route) =>
-      route.windows.length > 0 && isRouteMeasurementFresh(route, nowMs),
+      routeHasApplicableWindows(route, deps.model) &&
+      isRouteMeasurementFresh(route, nowMs),
   );
   if (candidates.length === 0) {
     return {
@@ -218,7 +250,7 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
   const lock = FileLock.acquire(ledgerLockPath(stateDir));
   try {
     const ledger = pruneLedger(loadLedger(stateDir), nowMs);
-    const chosen = scoreAndPick(candidates, ledger, nowMs);
+    const chosen = scoreAndPick(candidates, ledger, nowMs, deps.model);
     recordReservation(ledger, chosen.id, nowMs);
     writeLedger(stateDir, ledger);
     return {
@@ -242,6 +274,8 @@ export interface RoutingCandidateView {
 }
 
 export interface RoutingInspection {
+  /** Normalized model scope used for scoring, or null for generic windows only. */
+  model_scope: string | null;
   health: ObservationHealth | "no-observation";
   observed_at_ms: number | null;
   age_ms: number | null;
@@ -256,7 +290,9 @@ export function inspectRouting(deps: SelectRouteDeps = {}): RoutingInspection {
   try {
     return doInspectRouting(deps);
   } catch {
-    return disabledInspection("no-observation", "account inspection failed");
+    return disabledInspection("no-observation", "account inspection failed", {
+      model_scope: normalizedModelName(deps.model),
+    });
   }
 }
 
@@ -264,10 +300,14 @@ function disabledInspection(
   health: ObservationHealth | "no-observation",
   error: string,
   extras: Partial<
-    Pick<RoutingInspection, "observed_at_ms" | "age_ms" | "fresh">
+    Pick<
+      RoutingInspection,
+      "model_scope" | "observed_at_ms" | "age_ms" | "fresh"
+    >
   > = {},
 ): RoutingInspection {
   return {
+    model_scope: extras.model_scope ?? null,
     health,
     observed_at_ms: extras.observed_at_ms ?? null,
     age_ms: extras.age_ms ?? null,
@@ -287,11 +327,13 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     return disabledInspection(
       "no-observation",
       "no claude-swap account inventory is available",
+      { model_scope: normalizedModelName(deps.model) },
     );
   }
   const ageMs = nowMs - observation.observed_at_ms;
   const fresh = isObservationFresh(observation, nowMs);
   const extras = {
+    model_scope: normalizedModelName(deps.model),
     observed_at_ms: observation.observed_at_ms,
     age_ms: ageMs,
     fresh,
@@ -312,7 +354,8 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   }
   const routeable = observation.routes.filter(
     (route) =>
-      route.windows.length > 0 && isRouteMeasurementFresh(route, nowMs),
+      routeHasApplicableWindows(route, deps.model) &&
+      isRouteMeasurementFresh(route, nowMs),
   );
   if (routeable.length === 0) {
     return disabledInspection(
@@ -333,11 +376,13 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
         route.windows,
         entry?.reservations.length ?? 0,
         nowMs,
+        deps.model,
       ),
     };
   });
-  const chosen = scoreAndPick(routeable, ledger, nowMs);
+  const chosen = scoreAndPick(routeable, ledger, nowMs, deps.model);
   return {
+    model_scope: normalizedModelName(deps.model),
     health: observation.health,
     observed_at_ms: observation.observed_at_ms,
     age_ms: ageMs,
@@ -357,9 +402,10 @@ function worstEffectiveUtilization(
   windows: NormalizedWindow[],
   pending: number,
   nowMs: number,
+  model: string | null | undefined,
 ): number {
   let worst = 0;
-  for (const window of windows) {
+  for (const window of applicableWindows(windows, model)) {
     let utilization = window.utilization;
     if (window.resetsAt !== null) {
       const resetMs = new Date(window.resetsAt).getTime();
@@ -374,6 +420,7 @@ function scoreAndPick(
   candidates: Route[],
   ledger: Ledger,
   nowMs: number,
+  model: string | null | undefined,
 ): Route {
   let best: Route | null = null;
   let bestScore = Number.POSITIVE_INFINITY;
@@ -382,7 +429,12 @@ function scoreAndPick(
     const entry = ledger.routes[route.id];
     const pending = entry?.reservations.length ?? 0;
     const lastSelected = entry?.last_selected_at ?? Number.NEGATIVE_INFINITY;
-    const score = worstEffectiveUtilization(route.windows, pending, nowMs);
+    const score = worstEffectiveUtilization(
+      route.windows,
+      pending,
+      nowMs,
+      model,
+    );
     if (
       best === null ||
       score < bestScore ||

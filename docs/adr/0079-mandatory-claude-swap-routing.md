@@ -21,7 +21,7 @@ Every Keeper-launched Claude process requires one fresh, routeable claude-swap a
 - the daemon invokes `cswap list --json` through a deadline-bounded, output-capped exact-argv runner and atomically publishes one private Capacity observation;
 - only positive slots with `usageStatus: ok`, an explicit freshness signal, and at least one understood quota window are routeable;
 - the active claude-swap slot remains an ordinary managed candidate rather than aliasing a native route;
-- every fresh start, resume, and restore selects independently by greatest worst-window headroom after short-lived Launch reservations, with least-recently-used order breaking ties; and
+- every fresh start, resume, and restore selects independently by greatest worst-window headroom after short-lived Launch reservations, with least-recently-used order breaking ties; an effective model supplied by `--model` or a Claude launch triple adds its matching model-scoped quota window while unrelated model scopes are ignored; and
 - every successful decision executes `cswap run <slot> --share-history -- <claude arguments...>` and records the PII-free `claude-swap:<slot>` Launch attribution.
 
 There is no ambient or native Claude fallback. Missing, stale, malformed, unsupported, or empty inventory fails before Claude process creation. An explicit `--x-account cN` request likewise fails rather than substituting another account.
@@ -42,5 +42,6 @@ Keeper does not install, authorize, invoke, or otherwise integrate a second acco
 - Claude cannot launch through Keeper until claude-swap is installed, at least one account is registered, and the observer has published fresh routeable capacity.
 - All Claude process paths share one account inventory, route identity, and execution seam.
 - Cross-account resume remains conversation-correct through shared history, without durable account affinity.
+- Model-aware routing is a launch-time decision; an interactive model change does not move an already-running process to another account.
 - Provider uncertainty is visible and blocks only Claude; Pi and non-Claude Keeper surfaces remain usable.
 - Historical ADRs and event data retain their original terminology as rationale and replay evidence, not live behavior.
