@@ -64,5 +64,5 @@ commit-work suites; no real daemon/git.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Add ADR 0078 cooperative claim release: identity-proven 'keeper session release' verb writing a durable release record; commit-work classifier reads it as a per-path voluntary terminal-witness (foreign paths adoptable, unreleased protected) and self-fences the releaser; recycle-safe pid+start-time binding.
 ## Evidence
