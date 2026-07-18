@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:06:18.861000Z",
+  "depends_on": [
+    "fn-1352-retire-escalation-sessions.1"
+  ],
+  "epic": "fn-1352-retire-escalation-sessions",
+  "id": "fn-1352-retire-escalation-sessions.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Collapse latches into incident projection",
+  "updated_at": "2026-07-18T21:06:18.861000Z"
+}
