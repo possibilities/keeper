@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 86,
+        "files_changed": 6,
+        "insertions": 481
+      },
+      "done_summary": "Added a closed pre-restart identity evidence class (exact identity, positively served identity-incapable, unavailable/ambiguous) so a legacy predecessor can prove an identity-capability crossing to one frozen-ledger-backed, caught-up, stable successor, additive to the unchanged exact-replacement proof path.",
+      "input_hash": "f12d5e5f9f298a7f3a23bc686e450635d8c16d132f15289af326e7f703d3230a",
+      "model": "opus",
+      "spec_chars": 5166,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** cli/restart.ts, src/restart-observation.ts, test/restart-cli.test.ts, test/restart-observation.test.ts, test/restart-verb.test.ts, docs/problem-codes.md\n\n### Approach\n\nReplace nullable pre-restart identity with a closed evidence class: exact identity, positively served identity-incapable result, or unavailable/ambiguous. `parseRestartHealthFrame` recognizes the compatibility class only for a valid `type: result` response with either no boot header or a boot header whose Drain state is boolean and whose `boot_id`/pid/start-time fields are all absent; any partial, empty, wrong-typed, or contradictory tuple remains ambiguous. Freeze that class and a readable pre-ledger set of complete identities before issuing the one kickstart. In `classifyRestartEvidence`, preserve the exact branch byte-for-byte; the crossing branch waives only old-identity disappearance and proves that one complete successor was absent from the frozen set, has an exact durable boot row, completes Drain, and stays healthy under the existing twelve-second same-identity stabilization/reset rules. Short-circuit when proof completes, including success-with-`kickstart_warning`; add `proof_path: exact-replacement | identity-capability-crossing` to successful data. Keep existing top-level problem codes and bound the new reason diagnostics. Update the problem-code contract; do not expand the real-daemon scenario set.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/restart.ts:175-185,327-375 \u2014 current two-state probe union and full-identity parser\n- cli/restart.ts:293-324,506-543 \u2014 bounded ledger read and pre-kickstart snapshots\n- cli/restart.ts:576-731,754-790 \u2014 monotonic polling, proof short-circuit, warning, and final routing\n- src/restart-observation.ts:51-68,174-185,268-505 \u2014 input type, canonical identity equality, and exact classifier\n- docs/adr/0086-positive-legacy-service-restart-crossing.md \u2014 exact crossing boundary and output contract\n- test/restart-cli.test.ts:137-380 \u2014 injected-clock parser, legacy row, warning, and deadline fixtures\n- test/restart-observation.test.ts:79-350 \u2014 fail-closed identity/ledger/stabilization matrix\n\n**Optional** (reference as needed):\n- src/protocol.ts:103-114,273-298 \u2014 optional boot header and identity fields for compatibility\n- docs/problem-codes.md:15-31 \u2014 stable restart failure meanings\n- test/slow/daemon-smoke.test.ts:320-487 \u2014 normal exact proof and negative control, which remain unchanged\n\n### Risks\n\n- Treating any omitted identity as compatibility creates a downgrade-by-outage path; require positive result framing and reject every partial tuple.\n- Looking only at the latest pre-ledger marker can accept a successor already present in history; freeze membership over all valid identities in the readable snapshot.\n- Borrowing pre-identity health or samples across successor identity changes weakens stabilization; begin and reset the existing timer only on complete identity-bearing caught-up observations.\n- Adding a new top-level problem code or real-daemon scenario would widen the contract unnecessarily; keep diagnostics additive inside the existing bounded envelope and correctness suites.\n\n### Test notes\n\nTable-test absent boot, boot with Drain and zero identity fields, each partial identity permutation, malformed/non-result/transport unavailability, readable-empty versus missing/unreadable ledger, successor already in the frozen set, missing/mismatched durable row, Drain, identity churn, health gaps, stabilization, deadline, cancellation, and kickstart-warning precedence. Prove the normal exact branch's deep-equality fixtures remain unchanged except the additive proof path. Use injected clocks/probes/ledger only; no real daemon, UDS, subprocess, sleep, or new slow scenario.\n\n## Acceptance\n\n- [ ] The pre-restart parser emits three unambiguous evidence classes and admits compatibility only for a positively served result with the entire identity tuple absent\n- [ ] A readable pre-ledger snapshot and successor-newness membership proof are mandatory on the crossing branch; missing, unreadable, partial, or reused evidence fails closed\n- [ ] Both proof paths require one exact durable successor identity, completed Drain, uninterrupted health, and the existing stabilization interval; identity or health changes reset evidence\n- [ ] Complete crossing proof returns early and can override kickstart failure only as success-with-warning, matching exact-proof precedence\n- [ ] Successful envelopes carry the stable additive proof path and existing failure problem codes remain unchanged with bounded reasons\n- [ ] Focused restart tests and typecheck pass without expanding the real-daemon gate\n\n## Done summary\nAdded a closed pre-restart identity evidence class (exact identity, positively served identity-incapable, unavailable/ambiguous) so a legacy predecessor can prove an identity-capability crossing to one frozen-ledger-backed, caught-up, stable successor, additive to the unchanged exact-replacement proof path.\n## Evidence\n",
+      "task_id": "fn-1341-prove-identity-capability-crossing.1",
+      "tier": "xhigh",
+      "title": "Classify restart capability crossing"
+    }
+  ],
+  "created_at": "2026-07-18T18:50:43.541000Z",
+  "epic_id": "fn-1341-prove-identity-capability-crossing",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "f12d5e5f9f298a7f3a23bc686e450635d8c16d132f15289af326e7f703d3230a",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
