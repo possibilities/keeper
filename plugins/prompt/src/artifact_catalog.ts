@@ -9,12 +9,18 @@ import {
 export type PromptArtifactBinding = "static" | "cell-bound";
 export type PromptArtifactAdaptation = "equivalent" | "wrapped";
 
+export interface PromptArtifactDefaultPin {
+  readonly model: string;
+  readonly effort: "low" | "medium" | "high" | "xhigh" | "max";
+}
+
 export interface PromptArtifactRole {
   readonly role: string;
   readonly source: string;
   readonly sourcePath: string;
   readonly binding: PromptArtifactBinding;
   readonly unserved: PromptArtifactAdaptation;
+  readonly defaultPin?: PromptArtifactDefaultPin;
 }
 
 export interface PromptArtifactBundle {
@@ -38,6 +44,8 @@ export class PromptArtifactCatalogError extends Error {
 }
 
 const QUALIFIED_NAME_RE = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/;
+const PIN_MODEL_RE = /^[a-z0-9][a-z0-9._-]*$/;
+const PIN_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 function mapping(raw: unknown, label: string): Record<string, unknown> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -159,7 +167,11 @@ export function parsePromptArtifactCatalog(
   for (let index = 0; index < doc.roles.length; index += 1) {
     const label = `roles[${index}]`;
     const rec = mapping(doc.roles[index], label);
-    onlyKeys(rec, ["role", "source", "binding", "unserved"], label);
+    onlyKeys(
+      rec,
+      ["role", "source", "binding", "unserved", "default_pin"],
+      label,
+    );
     const role = qualifiedName(rec.role, `${label}.role`);
     if (roleByName.has(role)) {
       throw new PromptArtifactCatalogError(`duplicate role '${role}'`);
@@ -182,12 +194,37 @@ export function parsePromptArtifactCatalog(
         `${label} has invalid binding/unserved combination '${rec.binding}/${rec.unserved}'`,
       );
     }
+    let defaultPin: PromptArtifactDefaultPin | undefined;
+    if (rec.default_pin !== undefined) {
+      if (rec.binding !== "static") {
+        throw new PromptArtifactCatalogError(
+          `${label}.default_pin is allowed only for a static role`,
+        );
+      }
+      const pin = mapping(rec.default_pin, `${label}.default_pin`);
+      onlyKeys(pin, ["model", "effort"], `${label}.default_pin`);
+      if (typeof pin.model !== "string" || !PIN_MODEL_RE.test(pin.model)) {
+        throw new PromptArtifactCatalogError(
+          `${label}.default_pin.model must be a valid model token`,
+        );
+      }
+      if (typeof pin.effort !== "string" || !PIN_EFFORTS.has(pin.effort)) {
+        throw new PromptArtifactCatalogError(
+          `${label}.default_pin.effort must be low, medium, high, xhigh, or max`,
+        );
+      }
+      defaultPin = {
+        model: pin.model,
+        effort: pin.effort as PromptArtifactDefaultPin["effort"],
+      };
+    }
     const source = sourcePath(rec.source, planRoot, `${label}.source`);
     const entry: PromptArtifactRole = {
       role,
       ...source,
       binding: rec.binding,
       unserved: rec.unserved,
+      ...(defaultPin === undefined ? {} : { defaultPin }),
     };
     roles.push(entry);
     roleByName.set(role, entry);

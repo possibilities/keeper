@@ -1141,20 +1141,24 @@ describe("committed example matrix (anti-rot, v2)", () => {
     expect(m.shadowed).toEqual([]);
   });
 
-  test("the example carries the 11 seeded agent_pins", () => {
+  test("the example carries the seeded agent_pins", () => {
     const m = loadMatrixV2(EXAMPLE_PATH);
     expect(Object.fromEntries(m.agentPins)).toEqual({
       "close-planner": { model: "opus", effort: "high" },
+      deconflicter: { model: "opus", effort: "xhigh" },
       "docs-gap-scout": { model: "opus", effort: "medium" },
       "epic-scout": { model: "opus", effort: "medium" },
       "gap-analyst": { model: "opus", effort: "xhigh" },
+      "merge-resolver": { model: "opus", effort: "high" },
       "model-selector": { model: "opus", effort: "high" },
       "panel-judge": { model: "opus", effort: "xhigh" },
       "panel-runner": { model: "opus", effort: "xhigh" },
       "practice-scout": { model: "opus", effort: "medium" },
       "quality-auditor": { model: "opus", effort: "high" },
+      repairer: { model: "opus", effort: "xhigh" },
       "repo-scout": { model: "opus", effort: "high" },
       "selection-auditor": { model: "opus", effort: "high" },
+      unblocker: { model: "opus", effort: "high" },
     });
   });
 });

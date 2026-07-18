@@ -160,7 +160,7 @@ describe("role-scoped Pi prompt compiler", () => {
     const result = compile(fx);
     expect(result.outcome).toBe("compiled");
     expect(result.ok).toBe(true);
-    expect(result.outputs).toHaveLength(11);
+    expect(result.outputs).toHaveLength(15);
 
     const scout = result.outputs.find(
       (item) => item.role === "plan:repo-scout",
@@ -246,7 +246,7 @@ describe("role-scoped Pi prompt compiler", () => {
       kind: "role",
       name: "plan:repo-scout",
     });
-    expect(roleResult.outputs).toHaveLength(11);
+    expect(roleResult.outputs).toHaveLength(15);
 
     const workflowResult = compilePromptArtifacts({
       request: { target: "pi", bundle: "plan:work" },
@@ -313,9 +313,9 @@ describe("role-scoped Pi prompt compiler", () => {
       renderCanonical: render,
     };
     compilePromptArtifacts(options);
-    expect(renders).toBe(11);
+    expect(renders).toBe(15);
     expect(compilePromptArtifacts(options).outcome).toBe("hit");
-    expect(renders).toBe(11);
+    expect(renders).toBe(15);
   });
 
   test("renders and fingerprints one immutable canonical source snapshot", () => {

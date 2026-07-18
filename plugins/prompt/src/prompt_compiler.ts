@@ -682,10 +682,14 @@ function planRoles(
   fingerprint: string,
 ): PlannedRole[] {
   return roles.map((role) => {
-    const pin = matrix.agentPins.get(localName(role.role));
+    const localRole = localName(role.role);
+    const pin = matrix.agentPins.get(localRole) ?? role.defaultPin;
     if (pin === undefined) {
+      throw new Error(`${role.role}: no agent_pins entry for '${localRole}'`);
+    }
+    if (!matrix.efforts.includes(pin.effort)) {
       throw new Error(
-        `${role.role}: no agent_pins entry for '${localName(role.role)}'`,
+        `${role.role}: default_pin effort '${pin.effort}' is not in the host matrix effort axis`,
       );
     }
     const cells = resolveCell(role, pin, matrix, equivalence);
