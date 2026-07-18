@@ -54,6 +54,14 @@
  */
 
 import { Database } from "bun:sqlite";
+import {
+  accessSync,
+  existsSync,
+  constants as fsConstants,
+  readFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 
 /**
  * Probe cadence (ms). 15 min is slack enough that the bounded structural sweep
@@ -67,6 +75,68 @@ export const INTEGRITY_PROBE_INTERVAL_MS = 900_000;
 
 /** The Telegram topic every keeper page routes to (matches the sitter). */
 export const KEEPER_TOPIC = "Keeper";
+
+/** Config key for the absolute local paging transport binary. */
+export const AGENTBOT_BINARY_CONFIG_KEY = "agentbot_path";
+
+/** The installed absolute location launchd can reach without consulting PATH. */
+export function defaultAgentbotBinaryPath(home: string = homedir()): string {
+  return join(home, ".local", "bin", "agentbot");
+}
+
+/** Resolve the keeper config file path without importing the DB/config module. */
+function resolveAgentbotConfigPath(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  const override = env.KEEPER_CONFIG;
+  return override && override.length > 0
+    ? override
+    : join(home, ".config", "keeper", "config.yaml");
+}
+
+/** Best-effort parser for the optional absolute paging transport path. */
+function readConfiguredAgentbotBinaryPath(
+  path: string,
+  readFile: (path: string) => string,
+): string | null {
+  try {
+    if (!existsSync(path)) return null;
+    const raw = Bun.YAML.parse(readFile(path)) as unknown;
+    if (raw && typeof raw === "object") {
+      const value = (raw as Record<string, unknown>)[
+        AGENTBOT_BINARY_CONFIG_KEY
+      ];
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed.length > 0 && isAbsolute(trimmed)) return trimmed;
+      }
+    }
+  } catch {
+    // A malformed/unreadable config falls back to the installed absolute default.
+  }
+  return null;
+}
+
+/** Resolve the absolute agentbot binary path: config wins over the installed default. */
+export function resolveAgentbotBinaryPath(
+  deps: {
+    configPath?: string;
+    defaultBinaryPath?: string;
+    env?: Record<string, string | undefined>;
+    home?: string;
+    readFile?: (path: string) => string;
+  } = {},
+): string {
+  const readFile = deps.readFile ?? ((path) => readFileSync(path, "utf8"));
+  const configured = readConfiguredAgentbotBinaryPath(
+    deps.configPath ?? resolveAgentbotConfigPath(deps.env, deps.home),
+    readFile,
+  );
+  return (
+    configured ?? deps.defaultBinaryPath ?? defaultAgentbotBinaryPath(deps.home)
+  );
+}
 
 /**
  * The single string `PRAGMA quick_check` returns on a healthy DB. SQLite
@@ -197,6 +267,7 @@ export function liveQuickCheck(dbPath: string): () => string[] {
 /** The observable completion shape of one array-form agentbot spawn. */
 export type AgentbotPageSpawnOutcome =
   | { kind: "exited"; exitCode: number }
+  | { kind: "absent" }
   | { kind: "spawn_threw" }
   | { kind: "exit_threw" };
 
@@ -211,15 +282,50 @@ export type AgentbotPageSpawn = (argv: string[]) => {
   readonly exited: Promise<number>;
 };
 
+/** Process-local log-once latch for a missing paging binary. */
+export interface AgentbotPageAbsenceLogLatch {
+  logged: boolean;
+}
+
+const defaultAgentbotAbsenceLogLatch: AgentbotPageAbsenceLogLatch = {
+  logged: false,
+};
+
+function isExecutable(path: string): boolean {
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function logAgentbotAbsenceOnce(
+  binaryPath: string,
+  deps: {
+    log?: (line: string) => void;
+    absenceLogLatch?: AgentbotPageAbsenceLogLatch;
+  },
+): void {
+  if (!deps.log) return;
+  const latch = deps.absenceLogLatch ?? defaultAgentbotAbsenceLogLatch;
+  if (latch.logged) return;
+  latch.logged = true;
+  deps.log(
+    `[keeperd] paging transport unavailable at ${binaryPath}; operator pages are degraded (non-fatal)`,
+  );
+}
+
 /**
  * Classify the page transport outcome without treating a non-zero agentbot exit as
- * proof that the binary is gone. Only a failed spawn is absence-shaped; non-zero
- * exits remain retryable so an unhealthy remote does not mint a new distress row
- * on every page sweep.
+ * proof that the binary is gone. Only pre-spawn absence or a failed spawn is
+ * absence-shaped; non-zero exits remain retryable so an unhealthy remote does not
+ * mint a new distress row on every page sweep.
  */
 export function classifyAgentbotPageOutcome(
   outcome: AgentbotPageSpawnOutcome,
 ): AgentbotPageOutcome {
+  if (outcome.kind === "absent") return "permanent_failure";
   if (outcome.kind === "spawn_threw") return "permanent_failure";
   if (outcome.kind === "exit_threw") return "transient_failure";
   return outcome.exitCode === 0 ? "notified" : "transient_failure";
@@ -232,7 +338,17 @@ export function classifyAgentbotPageOutcome(
  */
 export async function sendAgentbotPage(
   message: string,
-  deps: { topic?: string; spawn?: AgentbotPageSpawn } = {},
+  deps: {
+    topic?: string;
+    spawn?: AgentbotPageSpawn;
+    binaryPath?: string;
+    configPath?: string;
+    defaultBinaryPath?: string;
+    env?: Record<string, string | undefined>;
+    canExecute?: (path: string) => boolean;
+    log?: (line: string) => void;
+    absenceLogLatch?: AgentbotPageAbsenceLogLatch;
+  } = {},
 ): Promise<AgentbotPageOutcome> {
   const spawn: AgentbotPageSpawn =
     deps.spawn ??
@@ -241,12 +357,24 @@ export async function sendAgentbotPage(
         stdin: "ignore",
         stdout: "ignore",
         stderr: "ignore",
-        env: process.env as Record<string, string | undefined>,
+        env: deps.env ?? (process.env as Record<string, string | undefined>),
       }));
+  const binaryPath =
+    deps.binaryPath ??
+    resolveAgentbotBinaryPath({
+      configPath: deps.configPath,
+      defaultBinaryPath: deps.defaultBinaryPath,
+      env: deps.env,
+    });
+  const canExecute = deps.canExecute ?? isExecutable;
+  if (!canExecute(binaryPath)) {
+    logAgentbotAbsenceOnce(binaryPath, deps);
+    return classifyAgentbotPageOutcome({ kind: "absent" });
+  }
   let proc: ReturnType<AgentbotPageSpawn>;
   try {
     proc = spawn([
-      "agentbot",
+      binaryPath,
       "send-message",
       "--topic",
       deps.topic ?? KEEPER_TOPIC,

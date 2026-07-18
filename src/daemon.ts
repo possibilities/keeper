@@ -237,7 +237,11 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
-import { type AgentbotPageOutcome, sendAgentbotPage } from "./integrity-probe";
+import {
+  type AgentbotPageAbsenceLogLatch,
+  type AgentbotPageOutcome,
+  sendAgentbotPage,
+} from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import { keeperStateDir } from "./keeper-state-dir";
 import type {
@@ -12721,6 +12725,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // miss the clear while the projection is still catching up.
   let pagingChannelDistressPending = false;
   let pagingChannelDistressPendingInstanceEventId: number | null = null;
+  const agentbotPageAbsenceLogLatch: AgentbotPageAbsenceLogLatch = {
+    logged: false,
+  };
 
   /**
    * Mint the fixed producer-owned paging-channel-down distress row through the
@@ -12793,7 +12800,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function notifyHuman(
     message: string,
   ): Promise<"notified" | "notify_failed"> {
-    const outcome = await sendAgentbotPage(message);
+    const outcome = await sendAgentbotPage(message, {
+      log: (line) => console.error(line),
+      absenceLogLatch: agentbotPageAbsenceLogLatch,
+    });
     let isOpen = false;
     let incidentEventId: number | null = null;
     try {
