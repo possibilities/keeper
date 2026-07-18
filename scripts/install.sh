@@ -245,7 +245,7 @@ retire_keeper_codexbar_cli() {
   fi
 
   if [ "${owned}" -eq 1 ]; then
-    if rm -rf "${root}"; then
+    if chmod -R u+w "${root}" 2>/dev/null && rm -rf "${root}"; then
       echo "install: removed retired Keeper CodexBar CLI data"
     else
       echo "install: could not remove retired Keeper CodexBar CLI data (non-fatal)" >&2

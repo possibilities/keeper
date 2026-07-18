@@ -52,6 +52,7 @@ describe("mandatory claude-swap installation", () => {
       "grep -qx 'signing_identifier=com.arthack.keeper.codexbar-cli'",
     );
     expect(RETIRED_CLEANUP).toContain(`if [ "\${owned}" -eq 1 ]; then`);
+    expect(RETIRED_CLEANUP).toContain(`chmod -R u+w "\${root}"`);
     expect(RETIRED_CLEANUP).toContain(`rm -rf "\${root}"`);
     expect(RETIRED_CLEANUP).toContain("preserving foreign codexbar symlink");
     expect(RETIRED_CLEANUP).toContain(
