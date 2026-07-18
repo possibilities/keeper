@@ -6,7 +6,8 @@
     "fn-1348-escalation-capabilities-as-plan-agents",
     "fn-1346-retire-torn-down-lane-git-rows",
     "fn-1353-attribute-native-crashes-at-boot",
-    "fn-1355-add-pi-codex-account-pool"
+    "fn-1355-add-pi-codex-account-pool",
+    "fn-1358-unjam-wrapped-delegation-launches"
   ],
   "id": "fn-1349-in-session-blocked-task-handling",
   "last_validated_at": "2026-07-18T21:16:29.751000Z",
@@ -17,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:25:59.970000Z"
+  "updated_at": "2026-07-18T23:03:07.188000Z"
 }
