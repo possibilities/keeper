@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped daemon work with a subtle correctness invariant (owner-liveness gating every dispatch arm, page-once, double-handling window) plus an additive schema migration on a singleton ladder \u2014 a nameable intelligence-bound reason at the contract-touching band.",
+      "task_id": "fn-1349-in-session-blocked-task-handling.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy skill-template authoring \u2014 prompt wording, delimited untrusted-receipt handling, and loop-termination bounds mirroring the existing audit-gate idiom across a few files in a known pattern, which is sonnet's taste-and-idiom sweet spot at the model-default band.",
+      "task_id": "fn-1349-in-session-blocked-task-handling.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T21:09:09.132000Z",
+  "epic_id": "fn-1349-in-session-blocked-task-handling",
+  "input_hash": "d9e364eb18dd95f2178337b7f9c03681e5cf3b658c19bcdeb7b6e5c3553cbac6",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3655558379,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1349-in-session-blocked-task-handling.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped daemon work with a subtle correctness invariant (owner-liveness gating every dispatch arm, page-once, double-handling window) plus an additive schema migration on a singleton ladder \u2014 a nameable intelligence-bound reason at the contract-touching band.\",\"confidence\":0.85},{\"task_id\":\"fn-1349-in-session-blocked-task-handling.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy skill-template authoring \u2014 prompt wording, delimited untrusted-receipt handling, and loop-termination bounds mirroring the existing audit-gate idiom across a few files in a known pattern, which is sonnet's taste-and-idiom sweet spot at the model-default band.\",\"confidence\":0.72}]}\n"
+}
