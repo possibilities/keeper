@@ -14,8 +14,11 @@ import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
   linkSync,
+  mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +26,7 @@ import { join } from "node:path";
 
 import {
   decideGrantGuard,
+  decideGrantGuardInput,
   evaluateGrantBash,
   type GrantGuardDeps,
   type RoleConfig,
@@ -408,6 +412,24 @@ describe("decideGrantGuard — Bash", () => {
     ).not.toBeNull();
   });
 
+  test("git global path overrides cannot escape the writable root", () => {
+    const commands = [
+      "git -C /foreign/repo commit -m x",
+      "git --work-tree /foreign/repo commit -m x",
+      "git --git-dir=/foreign/repo/.git commit -m x",
+    ];
+    for (const command of commands) {
+      const decision = decideGrantGuard(
+        bashPayload("merge-resolver", command),
+        deps({ grant: validGrant() }),
+      );
+      expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
+        "outside",
+      );
+    }
+  });
+
   test("the unblocker's Bash is diagnosis-only even under a valid grant", () => {
     expect(
       decideGrantGuard(
@@ -576,6 +598,33 @@ test("decideGrantGuard: a non-governed read tool is inert for a confined agent",
   ).toBeNull();
 });
 
+test("decideGrantGuardInput denies a truncated confined payload", () => {
+  const raw = JSON.stringify({
+    tool_name: "Write",
+    agent_id: "a-1",
+    agent_type: "merge-resolver",
+    cwd: ROOT,
+    tool_input: {
+      file_path: `${ROOT}/src/large.ts`,
+      content: "x".repeat(1_100_000),
+    },
+  });
+  const decision = decideGrantGuardInput(raw, deps());
+  expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+  expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
+    "malformed",
+  );
+});
+
+test("decideGrantGuardInput keeps a truncated ordinary-agent payload inert", () => {
+  const raw = JSON.stringify({
+    tool_name: "Write",
+    agent_type: "general-purpose",
+    tool_input: { content: "x".repeat(1_100_000) },
+  });
+  expect(decideGrantGuardInput(raw, deps())).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // Path predicates
 // ---------------------------------------------------------------------------
@@ -655,6 +704,34 @@ describe("readGrantLeaf / writeGrantLeaf verdicts", () => {
       if (v.kind === "valid") {
         expect(v.grant.writable_root).toBe("/repo/checkout");
         expect(v.grant.fencing_token).toBe(7);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the writer canonicalizes a symlinked writable root", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      const actualRoot = join(dir, "actual-checkout");
+      const aliasRoot = join(dir, "alias-checkout");
+      mkdirSync(actualRoot);
+      symlinkSync(actualRoot, aliasRoot, "dir");
+      const canonicalRoot = realpathSync(actualRoot);
+
+      expect(writeGrantLeaf(dir, makeGrant({ writable_root: aliasRoot }))).toBe(
+        true,
+      );
+      const verdict = readGrantLeaf(dir, baseExpectation(), 5_000);
+      expect(verdict.kind).toBe("valid");
+      if (verdict.kind === "valid") {
+        expect(verdict.grant.writable_root).toBe(canonicalRoot);
+        expect(
+          writableRootCovers(
+            verdict.grant.writable_root,
+            join(canonicalRoot, "src", "x.ts"),
+          ),
+        ).toBe(true);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });

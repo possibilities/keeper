@@ -320,7 +320,13 @@ export function writeGrantLeaf(grantsDir: string, grant: GrantLeaf): boolean {
   ) {
     return false;
   }
-  const bytes = Buffer.from(`${JSON.stringify(grant)}\n`, "utf8");
+  const canonicalWritableRoot = realpathNearest(grant.writable_root);
+  if (canonicalWritableRoot === null) return false;
+  const publishedGrant: GrantLeaf = {
+    ...grant,
+    writable_root: canonicalWritableRoot,
+  };
+  const bytes = Buffer.from(`${JSON.stringify(publishedGrant)}\n`, "utf8");
   if (bytes.byteLength > MAX_GRANT_BYTES) return false;
   const finalPath = deriveGrantLeafPath(
     grantsDir,

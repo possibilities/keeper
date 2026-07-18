@@ -247,6 +247,11 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
       "Reviewed schema or file-connection semantics require a real migrated database.",
   },
   {
+    file: "test/grant-guard.test.ts",
+    rule: "production-scale-fixture",
+    reason: "Reviewed byte-limit boundary requires an over-limit payload.",
+  },
+  {
     file: "test/hermes-shim.test.ts",
     rule: "production-scale-fixture",
     reason: "Reviewed byte-limit boundary requires an over-limit payload.",
