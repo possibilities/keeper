@@ -321,6 +321,22 @@ export interface PiStatusFooterDeps {
   probeGit?: typeof probePiFooterGit;
   writeTelemetry?: typeof writeTelemetry;
   version?: string;
+  getMonitorCount?: () => number;
+}
+
+export function renderPiMonitorLine(
+  count: number,
+  theme: PiFooterTheme,
+  width: number,
+): string {
+  const normalized = Number.isFinite(count)
+    ? Math.max(0, Math.floor(count))
+    : 0;
+  if (normalized === 0) return "";
+  return truncateAnsi(
+    theme.fg("dim", `${normalized} monitor${normalized === 1 ? "" : "s"}`),
+    width,
+  );
 }
 
 /** Install keeper's Claude-style statusline as Pi's custom footer. */
@@ -367,7 +383,7 @@ export function installPiStatusFooter(
         dispose: unsubscribe,
         invalidate() {},
         render(width: number): string[] {
-          return [
+          const lines = [
             renderPiStatusFooter(
               {
                 ...state,
@@ -386,6 +402,13 @@ export function installPiStatusFooter(
               width,
             ),
           ];
+          const monitorLine = renderPiMonitorLine(
+            deps.getMonitorCount?.() ?? 0,
+            theme,
+            width,
+          );
+          if (monitorLine !== "") lines.push(monitorLine);
+          return lines;
         },
       };
     });

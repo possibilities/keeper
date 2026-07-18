@@ -1497,7 +1497,16 @@ export default function keeperEvents(
       "tool_result",
       "session_shutdown",
     ]) {
-      pi.on(kind, (event, context) => emit(event, context));
+      pi.on(kind, (event, context) => {
+        emit(event, context);
+        if (kind === "tool_result" && event.toolName === "Monitor") {
+          try {
+            refreshStatusFooter();
+          } catch {
+            // Monitor UI is advisory; lifecycle recording remains authoritative.
+          }
+        }
+      });
     }
     pi.on("session_start", (_event, context) => {
       try {
@@ -1514,6 +1523,9 @@ export default function keeperEvents(
             pi as PiExtensionApi & PiFooterApi,
             context,
             jobId,
+            {
+              getMonitorCount: () => monitorController?.list().length ?? 0,
+            },
           );
 
           void installPiEditorBorder(pi, context);
@@ -1591,6 +1603,11 @@ export default function keeperEvents(
                 sendPiMonitorTerminal(pi, outcome);
               } catch {
                 // Delivery is advisory and may race session replacement.
+              }
+              try {
+                refreshStatusFooter();
+              } catch {
+                // Monitor UI is advisory and may race session replacement.
               }
             },
           });

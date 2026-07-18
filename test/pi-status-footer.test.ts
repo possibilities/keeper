@@ -12,6 +12,9 @@ import {
   buildPiTelemetryPayload,
   compactPiKeeperLane,
   installPiStatusFooter,
+  type PiFooterData,
+  type PiFooterTheme,
+  renderPiMonitorLine,
   renderPiStatusFooter,
   resolvePiVersion,
 } from "../plugins/keeper/pi-extension/status-footer";
@@ -37,6 +40,13 @@ describe("Pi keeper status footer", () => {
         200,
       ),
     ).toBe("13 ∕ keeper ∕ main ∕ +309−9 ∕ claude opus 4.8 ∕ xhigh ∕ 0.80.6");
+  });
+
+  test("shows only the running Monitor count below the statusline", () => {
+    expect(renderPiMonitorLine(0, plainTheme, 80)).toBe("");
+    expect(renderPiMonitorLine(1, plainTheme, 80)).toBe("1 monitor");
+    expect(renderPiMonitorLine(3, plainTheme, 80)).toBe("3 monitors");
+    expect(renderPiMonitorLine(12, plainTheme, 5)).toBe("12 mo\u001b[0m");
   });
 
   test("compacts keeper worktree lanes to epic and task ordinal", () => {
@@ -109,6 +119,61 @@ describe("Pi keeper status footer", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("installed footer reads the live Monitor count", () => {
+    let monitorCount = 0;
+    let footerFactory:
+      | ((
+          tui: { requestRender(): void },
+          theme: PiFooterTheme,
+          footerData: PiFooterData,
+        ) => {
+          render(width: number): string[];
+          invalidate(): void;
+          dispose?(): void;
+        })
+      | undefined;
+    installPiStatusFooter(
+      { getThinkingLevel: () => "high" },
+      {
+        cwd: "/work/keeper",
+        mode: "tui",
+        model: { id: "model-1", contextWindow: 100_000 },
+        getContextUsage: () => ({
+          tokens: 1_000,
+          contextWindow: 100_000,
+          percent: 1,
+        }),
+        ui: {
+          setFooter: (factory) => {
+            footerFactory = factory;
+          },
+        },
+      },
+      "job-1",
+      {
+        version: "pi-test",
+        getMonitorCount: () => monitorCount,
+        writeTelemetry: () => {},
+        probeGit: async () => ({
+          project: "keeper",
+          insertions: 0,
+          deletions: 0,
+        }),
+      },
+    );
+    if (footerFactory === undefined) throw new Error("footer not installed");
+    const footer = footerFactory({ requestRender() {} }, plainTheme, {
+      getGitBranch: () => "main",
+      onBranchChange: () => () => {},
+    });
+
+    expect(footer.render(100)).toHaveLength(1);
+    monitorCount = 1;
+    expect(footer.render(100)[1]).toBe("1 monitor");
+    monitorCount = 2;
+    expect(footer.render(100)[1]).toBe("2 monitors");
   });
 
   test("non-TUI sessions publish telemetry without installing a footer", () => {
