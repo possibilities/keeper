@@ -64,11 +64,13 @@ class ExitError extends Error {
 
 interface FixtureTask {
   task_id: string;
+  jobs?: unknown[];
 }
 interface FixtureEpic {
   epic_id: string;
   status: string | null;
   tasks: FixtureTask[];
+  jobs?: unknown[];
   question?: string | null;
 }
 
@@ -86,6 +88,7 @@ interface SnapOverrides {
   /** Richer job fixtures carrying `job_id` + `dispatch_origin`, for the
    *  `in_flight.board_work_jobs` distinction — additive to `jobsByState`. */
   jobsDetailed?: FixtureJob[];
+  subagentInvocations?: unknown[];
   pendingDispatches?: number;
   deadLetters?: number;
   blockEscalations?: number;
@@ -134,7 +137,8 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
   return {
     epics: (o.epics ?? []) as unknown as ReadinessClientSnapshot["epics"],
     jobs: jobs as unknown as ReadinessClientSnapshot["jobs"],
-    subagentInvocations: [],
+    subagentInvocations: (o.subagentInvocations ??
+      []) as ReadinessClientSnapshot["subagentInvocations"],
     scheduledTasks: [],
     gitStatus: [],
     deadLetters: Array.from(
@@ -420,8 +424,8 @@ describe("readEventStoreStatus wiring", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version is v12", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(12);
+  test("status schema version is v13", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(13);
   });
 
   test("envelope carries every documented field", () => {
@@ -476,6 +480,7 @@ describe("buildStatusEnvelope shape", () => {
         task_id: "fn-1-a.1",
         verdict: "ready",
         pill: "[ready]",
+        last_evidence_at: null,
         dispatch_failure: [],
       },
     ]);
@@ -533,6 +538,117 @@ describe("buildStatusEnvelope shape", () => {
     expect(d?.board.epics[0]?.pill).toBe("[blocked:unknown]");
     expect(d?.board.epics[0]?.tasks[0]?.pill).toBe("[blocked:unknown]");
     expect(d?.board.epics[0]?.close).toBeNull();
+  });
+
+  test("counts partition fresh and stale running verdicts while stale views expose their last evidence", () => {
+    const snap = makeSnap({
+      epics: [
+        {
+          epic_id: "fn-3-c",
+          status: "open",
+          jobs: [
+            {
+              job_id: "monitor-worker",
+              has_live_worker_monitor: true,
+              updated_at: 400,
+            },
+          ],
+          tasks: [
+            {
+              task_id: "fn-3-c.1",
+              jobs: [{ job_id: "sub-worker", updated_at: 300 }],
+            },
+            { task_id: "fn-3-c.2" },
+          ],
+        },
+      ],
+      subagentInvocations: [
+        {
+          job_id: "sub-worker",
+          status: "running",
+          duration_ms: null,
+          updated_at: 300,
+        },
+      ],
+      perEpic: {
+        "fn-3-c": {
+          tag: "running",
+          reason: { kind: "monitor-stale" },
+        } as Verdict,
+        "fn-3-extra-live": {
+          tag: "running",
+          reason: { kind: "job-running" },
+        } as Verdict,
+        "fn-3-extra-ready": { tag: "ready" },
+        "fn-3-extra-done": { tag: "completed" },
+        "fn-3-extra-blocked": {
+          tag: "blocked",
+          reason: { kind: "unknown" },
+        } as Verdict,
+      },
+      perTask: {
+        "fn-3-c.1": {
+          tag: "running",
+          reason: { kind: "sub-agent-stale" },
+        } as Verdict,
+        "fn-3-c.2": {
+          tag: "running",
+          reason: { kind: "sub-agent-running" },
+        } as Verdict,
+        "fn-3-extra-ready": { tag: "ready" },
+        "fn-3-extra-done": { tag: "completed" },
+        "fn-3-extra-blocked": {
+          tag: "blocked",
+          reason: { kind: "unknown" },
+        } as Verdict,
+      },
+      perCloseRow: {
+        "fn-3-c": {
+          tag: "running",
+          reason: { kind: "monitor-stale" },
+        } as Verdict,
+        "fn-3-extra-live": {
+          tag: "running",
+          reason: { kind: "job-running" },
+        } as Verdict,
+        "fn-3-extra-ready": { tag: "ready" },
+        "fn-3-extra-done": { tag: "completed" },
+        "fn-3-extra-blocked": {
+          tag: "blocked",
+          reason: { kind: "unknown" },
+        } as Verdict,
+      },
+    });
+
+    const data = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(data?.counts.epics).toEqual({
+      total: 5,
+      ready: 1,
+      running: 1,
+      stale_running: 1,
+      completed: 1,
+      blocked: 1,
+    });
+    expect(data?.counts.tasks).toEqual({
+      total: 5,
+      ready: 1,
+      running: 1,
+      stale_running: 1,
+      completed: 1,
+      blocked: 1,
+    });
+    expect(data?.counts.close_rows).toEqual({
+      total: 5,
+      ready: 1,
+      running: 1,
+      stale_running: 1,
+      completed: 1,
+      blocked: 1,
+    });
+    expect(data?.board.epics[0]?.last_evidence_at).toBe(400);
+    expect(data?.board.epics[0]?.tasks[0]?.last_evidence_at).toBe(300);
+    expect(data?.board.epics[0]?.tasks[1]?.last_evidence_at).toBeNull();
+    expect(data?.board.epics[0]?.close?.last_evidence_at).toBe(400);
   });
 
   test("yolo mode reports an empty armed set", () => {
@@ -1188,11 +1304,13 @@ describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () =>
             question: string | null;
             verdict: string;
             pill: string;
+            last_evidence_at: number | null;
             dispatch_failure: string[];
             tasks: unknown[];
             close: {
               verdict: string;
               pill: string;
+              last_evidence_at: number | null;
               dispatch_failure: string[];
             } | null;
           }>;
@@ -1210,11 +1328,13 @@ describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () =>
         question: null,
         verdict: "completed",
         pill: "[completed]",
+        last_evidence_at: null,
         dispatch_failure: [],
         tasks: [],
         close: {
           verdict: "completed",
           pill: "[completed]",
+          last_evidence_at: null,
           dispatch_failure: ["merge-conflict"],
         },
       },
