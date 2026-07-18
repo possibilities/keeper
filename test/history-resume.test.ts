@@ -358,7 +358,13 @@ describe("foreground Session resume", () => {
 
     const cmd = h.spawned[0] ?? [];
     expect(h.routerCalls()).toBe(1);
-    expect(cmd[0]).toBe("/fake-home/.local/bin/claude");
+    expect(cmd.slice(0, 5)).toEqual([
+      "/fake-home/.local/bin/cswap",
+      "run",
+      "1",
+      "--share-history",
+      "--",
+    ]);
     expect(cmd).toContain("--resume");
     expect(cmd[cmd.indexOf("--resume") + 1]).toBe("claude-native");
     expect(cmd).toContain("--strict-mcp-config");

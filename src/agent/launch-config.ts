@@ -382,6 +382,9 @@ export function composeManagedClaudeArgv(opts: {
   slot: number;
   nativeClaudeArgv: readonly string[];
 }): string[] {
+  if (!Number.isSafeInteger(opts.slot) || opts.slot <= 0) {
+    throw new Error("claude-swap slot must be a positive integer");
+  }
   return [
     opts.cswapBin,
     "run",

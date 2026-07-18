@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
   RequestedRouteResolution,
-  RouteSelection,
+  RouteResolution,
   RoutingInspection,
 } from "../../src/account-router";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
@@ -30,7 +30,6 @@ import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 import type { PartnerLifecycle } from "../../src/agent/transcript-watch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
-import type { CodexBarAuthorizationResult } from "../../src/codexbar-authorization";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -178,19 +177,13 @@ export interface HarnessOptions {
   resolveResumeDecision?:
     | ResumeDecision
     | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
-  /**
-   * Account route the router seam returns for an unpinned claude launch. Default:
-   * the native default (no cswap wrap), so byte-pins stay native and the seam
-   * touches no fs. Pass a managed selection to exercise the claude-swap wrap.
-   */
-  selectAccountRoute?: () => RouteSelection;
+  /** Mandatory managed account result for an unpinned Claude launch. */
+  selectAccountRoute?: () => RouteResolution;
   /** Exact result for a requested zero-based account ordinal. */
   selectAccountRouteByOrdinal?: (ordinal: number) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
-  /** Foreground CodexBar authorization seam; never invokes a real provider. */
-  authorizeCodexBar?: () => Promise<CodexBarAuthorizationResult>;
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
@@ -223,10 +216,13 @@ export function makeHarness(opts: HarnessOptions): Harness {
   const selectAccountRoute =
     opts.selectAccountRoute ??
     (() => ({
-      id: "default",
-      kind: "native" as const,
-      slot: null,
-      reason: "harness-native",
+      ok: true as const,
+      selection: {
+        id: "claude-swap:1",
+        kind: "managed" as const,
+        slot: 1,
+        reason: "harness-managed",
+      },
     }));
 
   // Keep the cwd-confirm gate deterministic in temp-backed isolated worktrees.
@@ -338,9 +334,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
         opts.selectAccountRouteByOrdinal?.(ordinal) ?? {
           ok: true,
           selection: {
-            id: "default",
-            kind: "native" as const,
-            slot: null,
+            id: "claude-swap:1",
+            kind: "managed" as const,
+            slot: 1,
             accountOrdinal: ordinal,
             reason: "requested-account",
           },
@@ -355,24 +351,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
         age_ms: null,
         fresh: false,
         enabled: false,
-        would_choose: {
-          id: "default",
-          kind: "native",
-          slot: null,
-          reason: "no-observation",
-        },
+        error: "no claude-swap account inventory is available",
+        would_choose: null,
         candidates: [],
-      })),
-    authorizeCodexBarFn:
-      opts.authorizeCodexBar ??
-      (async () => ({
-        schema_version: 1,
-        binary_sha256: "a".repeat(64),
-        providers: {
-          claude: { authorized: true, health: "ok", failure: null },
-          codex: { authorized: true, health: "ok", failure: null },
-        },
-        ok: true,
       })),
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),

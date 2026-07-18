@@ -19,10 +19,10 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { queryCollection } from "../../cli/control-rpc";
-import { makeBoundedRunner } from "../account-observation-refresh";
 import {
   inspectRouting,
   type RequestedRouteResolution,
+  type RouteResolution,
   type RouteSelection,
   type RoutingInspection,
   selectRoute,
@@ -31,8 +31,6 @@ import {
 import {
   KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
-  resolveAccountRoutingRoot,
-  resolveCodexBarCommand,
   resolveCswapCommand,
 } from "../account-routing-config";
 import {
@@ -54,11 +52,6 @@ import {
   parseProviderLegLaunchCarrier,
   writeBirthIntent,
 } from "../birth-record";
-import {
-  authorizeCodexBar,
-  CODEXBAR_AUTHORIZATION_TIMEOUT_MS,
-  type CodexBarAuthorizationResult,
-} from "../codexbar-authorization";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import {
@@ -349,15 +342,11 @@ export interface MainDeps {
     requireHarness?: HarnessName,
   ) => ResumeDecision;
   /**
-   * Resolve the account route for one Claude launch (fresh / resume / restore) —
-   * the single Claude process-boundary decision. Reads the latest validated
-   * observation, records a short-lived launch reservation, and fails open to the
-   * native default on every uncertain path. Selection is INDEPENDENT per launch:
-   * no prior attribution or conversation identity participates. Injected so the
-   * launch path is testable without touching the real observation sidecar /
-   * ledger; `realDeps()` binds {@link selectRoute}.
+   * Resolve one mandatory managed account for a Claude launch. Selection is
+   * independent per start/resume/restore and fails before process creation when
+   * no fresh routeable claude-swap account exists.
    */
-  selectAccountRouteFn: () => RouteSelection;
+  selectAccountRouteFn: () => RouteResolution;
   /**
    * Resolve a human-requested zero-based Claude account index exactly. Unlike
    * automatic routing this is fail-loud and never substitutes another account.
@@ -370,12 +359,6 @@ export interface MainDeps {
    * {@link inspectRouting}.
    */
   inspectRoutingFn: () => RoutingInspection;
-  /**
-   * Deliberately authorize the current CodexBar generation. The production
-   * binding runs exact provider checks serially and persists only a PII-free
-   * receipt; tests inject a result and never touch a provider or Keychain.
-   */
-  authorizeCodexBarFn: () => Promise<CodexBarAuthorizationResult>;
   /** Read one exact jobs row through the daemon. Transport uncertainty remains
    *  unknown and can never be promoted to partner death. */
   probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
@@ -481,12 +464,6 @@ export function realDeps(): MainDeps {
     selectAccountRouteByOrdinalFn: (ordinal) =>
       selectRouteByAccountOrdinal(ordinal),
     inspectRoutingFn: () => inspectRouting(),
-    authorizeCodexBarFn: () =>
-      authorizeCodexBar({
-        stateDir: resolveAccountRoutingRoot(),
-        codexbarBin: resolveCodexBarCommand(),
-        runner: makeBoundedRunner(CODEXBAR_AUTHORIZATION_TIMEOUT_MS),
-      }),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin: resolveCswapCommand(),
@@ -2129,50 +2106,21 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
     `account routing: health=${inspection.health} ` +
       `fresh=${inspection.fresh} enabled=${inspection.enabled}\n`,
   );
-  deps.write(
-    `would choose: ${inspection.would_choose.id} ` +
-      `(${inspection.would_choose.reason})\n`,
-  );
+  if (inspection.would_choose === null) {
+    deps.write(
+      `would choose: unavailable (${inspection.error ?? "unknown"})\n`,
+    );
+  } else {
+    deps.write(
+      `would choose: ${inspection.would_choose.id} ` +
+        `(${inspection.would_choose.reason})\n`,
+    );
+  }
   for (const c of inspection.candidates) {
     deps.write(
       `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)}\n`,
     );
   }
-  return deps.exit(0);
-}
-
-/** Deliberately authorize one exact CodexBar generation for observer use. */
-async function runAccountsAuthorizeCodexBar(deps: MainDeps): Promise<never> {
-  let result: CodexBarAuthorizationResult;
-  try {
-    result = await deps.authorizeCodexBarFn();
-  } catch {
-    deps.writeErr(
-      "CodexBar authorization failed before completion; no raw provider or filesystem details were emitted.\n",
-    );
-    return deps.exit(1);
-  }
-
-  const digest = result.binary_sha256?.slice(0, 12) ?? "unavailable";
-  deps.write(`CodexBar authorization generation: ${digest}\n`);
-  for (const provider of ["claude", "codex"] as const) {
-    const providerResult = result.providers[provider];
-    deps.write(
-      `  ${provider}: ${providerResult.authorized ? "authorized" : "blocked"}` +
-        ` (health=${providerResult.health}` +
-        `${providerResult.failure ? `, failure=${providerResult.failure}` : ""})\n`,
-    );
-  }
-  if (!result.ok) {
-    deps.writeErr(
-      "Unsuccessful providers remain blocked from unattended observation; " +
-        "fix the provider and run this command again.\n",
-    );
-    return deps.exit(1);
-  }
-  deps.writeErr(
-    "CodexBar is authorized for unattended Keychain-backed observation.\n",
-  );
   return deps.exit(0);
 }
 
@@ -2451,9 +2399,6 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "accounts-check") {
     return runAccountsCheck(deps, dispatch.json);
-  }
-  if (dispatch.kind === "accounts-authorize-codexbar") {
-    return runAccountsAuthorizeCodexBar(deps);
   }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);
@@ -2745,9 +2690,44 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
+  // Resolve the one mandatory Claude route before either the passthrough or
+  // configured launch branch. This is the sole process-boundary decision.
+  let resolvedClaudeRoute: RouteSelection | null = null;
+  if (agent === "claude") {
+    const resolution =
+      parsed.launcherAccountOrdinal !== null
+        ? deps.selectAccountRouteByOrdinalFn(parsed.launcherAccountOrdinal)
+        : deps.selectAccountRouteFn();
+    if (!resolution.ok) {
+      deps.writeErr(`Error: ${resolution.error}.\n`);
+      return deps.exit(parsed.launcherAccountOrdinal === null ? 1 : 2);
+    }
+    resolvedClaudeRoute = resolution.selection;
+    deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = resolvedClaudeRoute.id;
+    delete deps.env[KEEPER_ACCOUNT_ORDINAL_ENV];
+    if (resolvedClaudeRoute.accountOrdinal !== undefined) {
+      deps.env[KEEPER_ACCOUNT_ORDINAL_ENV] = String(
+        resolvedClaudeRoute.accountOrdinal,
+      );
+    }
+    actionLog.push(
+      `Resolved account route: ${resolvedClaudeRoute.id} (${resolvedClaudeRoute.reason})`,
+    );
+    note(`route: ${resolvedClaudeRoute.id}`);
+  }
+
   if (shouldPassthrough) {
-    const ptCmd = [bin];
-    ptCmd.push(...remainingArgs);
+    let ptCmd = [bin, ...remainingArgs];
+    if (agent === "claude" && resolvedClaudeRoute !== null) {
+      ptCmd = composeManagedClaudeArgv({
+        cswapBin: deps.cswapBin,
+        slot: resolvedClaudeRoute.slot,
+        nativeClaudeArgv: ptCmd,
+      });
+      actionLog.push(
+        `Routed through claude-swap slot ${resolvedClaudeRoute.slot}`,
+      );
+    }
     if (launcherVeryVerbose) {
       printVerbose(deps, actionLog, ptCmd.join(" "));
     }
@@ -2998,49 +2978,16 @@ export async function main(deps: MainDeps): Promise<never> {
     scrubInheritedClaudeSessionEnv(deps.env, actionLog);
   }
 
-  // ── Claude account routing — the single Claude process-boundary decision ──
-  // Every Claude start/resume/restore resolves an account route from the latest
-  // validated observation. Selection is INDEPENDENT per launch: no prior
-  // attribution or conversation identity participates (cross-account resume stays
-  // conversation-correct via claude-swap's --share-history). The router fails open
-  // to the native default whenever an integration is unavailable or balancing is
-  // disabled, so a native decision preserves the launch byte-for-byte. A managed
-  // decision wraps the already-built Claude argv in the public
-  // `cswap run <slot> --share-history -- <argv…>` contract, letting claude-swap
-  // own account isolation and the exec handoff. The PII-free route id rides
-  // KEEPER_ACCOUNT_ROUTE on BOTH paths — it survives claude-swap's same-account
-  // fast path, so route identity never depends on CLAUDE_CONFIG_DIR. A separate
-  // optional ordinal carries only the selected position in a multi-account
-  // cswap inventory; sparse slot numbers are never shown as account ordinals.
-  if (agent === "claude") {
-    let route: RouteSelection;
-    if (parsed.launcherAccountOrdinal !== null) {
-      const requested = deps.selectAccountRouteByOrdinalFn(
-        parsed.launcherAccountOrdinal,
-      );
-      if (!requested.ok) {
-        deps.writeErr(`Error: ${requested.error}.\n`);
-        return deps.exit(2);
-      }
-      route = requested.selection;
-    } else {
-      route = deps.selectAccountRouteFn();
-    }
-    deps.env[KEEPER_ACCOUNT_ROUTE_ENV] = route.id;
-    delete deps.env[KEEPER_ACCOUNT_ORDINAL_ENV];
-    if (route.accountOrdinal !== undefined) {
-      deps.env[KEEPER_ACCOUNT_ORDINAL_ENV] = String(route.accountOrdinal);
-    }
-    actionLog.push(`Resolved account route: ${route.id} (${route.reason})`);
-    note(`route: ${route.id}`);
-    if (route.kind === "managed" && route.slot !== null) {
-      runCmd = composeManagedClaudeArgv({
-        cswapBin: deps.cswapBin,
-        slot: route.slot,
-        nativeClaudeArgv: runCmd,
-      });
-      actionLog.push(`Routed through claude-swap slot ${route.slot}`);
-    }
+  // Apply the already-resolved mandatory route to the configured Claude argv.
+  if (agent === "claude" && resolvedClaudeRoute !== null) {
+    runCmd = composeManagedClaudeArgv({
+      cswapBin: deps.cswapBin,
+      slot: resolvedClaudeRoute.slot,
+      nativeClaudeArgv: runCmd,
+    });
+    actionLog.push(
+      `Routed through claude-swap slot ${resolvedClaudeRoute.slot}`,
+    );
   }
 
   if (launcherVeryVerbose) {

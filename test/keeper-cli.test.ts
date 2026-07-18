@@ -79,7 +79,6 @@ function makeHarness(): Harness {
       frames: mkHandler("frames"),
       dash: mkHandler("dash"),
       status: mkHandler("status"),
-      usage: mkHandler("usage"),
       daemon: mkHandler("daemon"),
       query: mkHandler("query"),
       watch: mkHandler("watch"),
@@ -221,7 +220,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("board")).toBe(true);
     expect(isSubcommand("jobs")).toBe(true);
     expect(isSubcommand("git")).toBe(true);
-    expect(isSubcommand("usage")).toBe(true);
+    expect(isSubcommand("usage")).toBe(false);
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
@@ -248,18 +247,24 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("")).toBe(false);
   });
 
-  test("the usage command is routed and published in help metadata", async () => {
+  test("the retired usage command has no route or help metadata", async () => {
     const h = makeHarness();
-    await dispatch(["usage", "reset-codex-before-exceeding"], h.deps);
-    expect(h.calls).toEqual([
-      { sub: "usage", argv: ["reset-codex-before-exceeding"] },
-    ]);
-    expect(SUBCOMMANDS).toContain("usage");
-    expect(NATIVE_COMMANDS.map((command) => command.name)).toContain("usage");
+    let caught: unknown;
+    try {
+      await dispatch(["usage", "anything"], h.deps);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ExitError);
+    expect((caught as ExitError).code).toBe(1);
+    expect(SUBCOMMANDS).not.toContain("usage");
+    expect(NATIVE_COMMANDS.map((command) => command.name)).not.toContain(
+      "usage",
+    );
     expect(
       buildHelpIndex().subcommands.map((command) => command.name),
-    ).toContain("usage");
-    expect(USAGE).toContain("  usage");
+    ).not.toContain("usage");
+    expect(USAGE).not.toContain("  usage");
   });
 
   for (const retired of ["search-history", "find-file-history"] as const) {

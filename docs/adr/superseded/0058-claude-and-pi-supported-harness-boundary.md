@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Superseded by [ADR 0079](../0079-mandatory-claude-swap-routing.md), which preserves the Claude/Pi harness boundary while replacing the account-routing exception.
 
 ## Context
 

@@ -1,7 +1,7 @@
 /**
- * Shared, DB-free observation refresh boundary. It serializes only a single
- * refresh, double-checks freshness under that lock, runs the three exact-argv
- * provider calls concurrently, and atomically replaces the PII-free sidecar.
+ * Shared, DB-free claude-swap observation refresh boundary. One exact-argv
+ * inventory call is bounded, normalized, and atomically published under a
+ * nonblocking refresh lock.
  */
 
 import { mkdirSync } from "node:fs";
@@ -10,15 +10,11 @@ import {
   isObservationFresh,
   type Observation,
   type ProviderRunOutcome,
-  parseCodexBar,
-  parseCodexBarCodex,
   parseCswapList,
   readObservationSidecar,
   writeObservationSidecar,
 } from "./account-observation";
 import {
-  claudeCodexBarUsageArgv,
-  codexCodexBarUsageArgv,
   cswapListArgv,
   MAX_OUTPUT_BYTES,
   observationRefreshLockPath,
@@ -28,51 +24,28 @@ import {
 } from "./account-routing-config";
 import { FileLock } from "./file-lock";
 
-/** Exact argv only; no command strings or shell interpretation. */
 export type ExactArgvRunner = (argv: string[]) => Promise<ProviderRunOutcome>;
 
 export interface ObserveDeps {
   runner: ExactArgvRunner;
   nowMs: () => number;
-  claudeCodexbarArgv?: string[];
-  codexCodexbarArgv?: string[];
-  /** Compatibility alias for the Claude provider argv. */
-  codexbarArgv?: string[];
   cswapArgv?: string[];
   freshnessCeilingMs?: number;
 }
 
-/** Fetch all independent providers concurrently and normalize one observation. */
 export async function observeOnce(deps: ObserveDeps): Promise<Observation> {
-  const claudeArgv =
-    deps.claudeCodexbarArgv ?? deps.codexbarArgv ?? claudeCodexBarUsageArgv();
-  const codexArgv = deps.codexCodexbarArgv ?? codexCodexBarUsageArgv();
-  const cswapArgv = deps.cswapArgv ?? cswapListArgv();
-  const [claudeOutcome, codexOutcome, cswapOutcome] = await Promise.all([
-    deps.runner(claudeArgv),
-    deps.runner(codexArgv),
-    deps.runner(cswapArgv),
-  ]);
+  const outcome = await deps.runner(deps.cswapArgv ?? cswapListArgv());
   const observedAtMs = deps.nowMs();
-  const codexbarBinarySha256 =
-    claudeOutcome.binary_sha256 !== undefined &&
-    claudeOutcome.binary_sha256 === codexOutcome.binary_sha256
-      ? claudeOutcome.binary_sha256
-      : null;
   return buildObservation({
     observedAtMs,
-    codexbarBinarySha256,
-    codex: parseCodexBar(claudeOutcome),
-    codexCapacity: parseCodexBarCodex(codexOutcome),
     cswap: parseCswapList(
-      cswapOutcome,
+      outcome,
       observedAtMs,
       deps.freshnessCeilingMs ?? ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
     ),
   });
 }
 
-/** Ensure the state root exists, then atomically publish its sole observation. */
 export function publishObservation(stateDir: string, obs: Observation): void {
   mkdirSync(stateDir, { recursive: true });
   writeObservationSidecar(observationSidecarPath(stateDir), obs);
@@ -86,33 +59,20 @@ export type TryAcquireRefreshLock = (path: string) => RefreshLock | null;
 
 export interface RefreshObservationDeps extends ObserveDeps {
   stateDir: string;
-  /** Caller-specific age threshold; foreground and worker callers may differ. */
   maxAgeMs: number;
   tryAcquireLock?: TryAcquireRefreshLock;
-  /** Injectable bounded contention wait; production never spins. */
   sleep?: (ms: number) => Promise<void>;
-  /** Delay between non-blocking lock attempts. */
   contentionWaitMs?: number;
-  /** Total time allowed for another refresher to publish. */
   contentionTimeoutMs?: number;
-  /** Reject existing or newly produced state from a superseded generation. */
-  acceptObservation?: (observation: Observation) => boolean;
 }
 
 const DEFAULT_CONTENTION_WAIT_MS = 100;
 const DEFAULT_CONTENTION_TIMEOUT_MS = SUBPROCESS_TIMEOUT_MS + 1_000;
-
 const realTryAcquireLock: TryAcquireRefreshLock = (path) =>
   FileLock.tryAcquire(path);
-
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Return a fresh existing observation or refresh it once. Lock contention is a
- * normal bounded wait: repeatedly re-read the sidecar and retry the nonblocking
- * lock until the active publisher lands or the provider-sized deadline expires.
- */
 export async function refreshObservationIfStale(
   deps: RefreshObservationDeps,
 ): Promise<Observation | null> {
@@ -120,8 +80,7 @@ export async function refreshObservationIfStale(
   const freshSidecar = (): Observation | null => {
     const observation = readObservationSidecar(sidecar);
     return observation &&
-      isObservationFresh(observation, deps.nowMs(), deps.maxAgeMs) &&
-      (deps.acceptObservation?.(observation) ?? true)
+      isObservationFresh(observation, deps.nowMs(), deps.maxAgeMs)
       ? observation
       : null;
   };
@@ -149,20 +108,12 @@ export async function refreshObservationIfStale(
     if (published) return published;
     lock = acquire(lockPath);
   }
-  if (lock === null) {
-    const observation = readObservationSidecar(sidecar);
-    return observation && (deps.acceptObservation?.(observation) ?? true)
-      ? observation
-      : null;
-  }
+  if (lock === null) return readObservationSidecar(sidecar);
 
   try {
     const underLock = freshSidecar();
     if (underLock) return underLock;
     const observation = await observeOnce(deps);
-    if (!(deps.acceptObservation?.(observation) ?? true)) {
-      return null;
-    }
     publishObservation(deps.stateDir, observation);
     return observation;
   } finally {
@@ -170,16 +121,13 @@ export async function refreshObservationIfStale(
   }
 }
 
-/** Build the provider environment without Keeper's retired disable flag. */
+/** Preserve the caller environment; no retired provider-specific flags exist. */
 export function providerSubprocessEnvironment(
   inherited: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, string | undefined> {
-  const environment = { ...inherited };
-  delete environment.CODEXBAR_DISABLE_KEYCHAIN_ACCESS;
-  return environment;
+  return { ...inherited };
 }
 
-/** Build the no-shell, output-capped, deadline-bounded production runner. */
 export function makeBoundedRunner(
   timeoutMs: number = SUBPROCESS_TIMEOUT_MS,
   maxBytes: number = MAX_OUTPUT_BYTES,
@@ -222,7 +170,7 @@ export function makeBoundedRunner(
           try {
             proc.kill(9);
           } catch {
-            // best effort; the caller still receives an unavailable outcome
+            // best effort
           }
         }
         return { code: null, stdout: "", failure: "timeout" };
@@ -251,7 +199,7 @@ async function readCapped(
       if (total > maxBytes) break;
     }
   } catch {
-    // Return captured output; strict parsing decides whether it is usable.
+    // Strict parsing decides whether captured output is usable.
   } finally {
     try {
       await reader.cancel();

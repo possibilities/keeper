@@ -31,7 +31,7 @@ describe("startup verbosity", () => {
     const out = h.out.join("");
     expect(out).toContain("~ ensure shared Claude state\n");
     expect(out).toContain("~ discover plugin dirs\n");
-    expect(out).toContain("~ route: default\n");
+    expect(out).toContain("~ route: claude-swap:1\n");
     expect(out).toContain("~ session: ");
     expect(out).toContain("~ launching claude\n");
     expect(out).not.toContain("Actions:");

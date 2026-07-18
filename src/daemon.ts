@@ -10848,14 +10848,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   } // end `if (buildsWorker)`
 
-  // Spawn the account-observation PRODUCER worker — the optional, bounded probe
-  // over the two installed public CLIs (CodexBar + `cswap list --json`). It
-  // invokes each through an exact-argv runner, validates the payloads, and
-  // atomically publishes ONE PII-free observation sidecar under the routing
-  // root; the per-launch router reads that sidecar off the launch path. SHADOW
-  // MODE: it publishes health + candidate snapshots but nothing consumes them for
-  // launches yet. It posts NO messages to main and holds
-  // NO DB handle — its only output is the on-disk sidecar. NOT a file-watcher
+  // Spawn the account-observation PRODUCER worker — the bounded
+  // `cswap list --json` probe. It validates the payload and atomically publishes
+  // ONE PII-free observation sidecar under the routing root; every Claude launch
+  // requires a fresh routeable account from that sidecar. It posts NO messages to
+  // main and holds NO DB handle — its only output is the on-disk sidecar. NOT a file-watcher
   // (not in WATCHER_WORKERS). The state dir is resolved on main via
   // `resolveAccountRoutingRoot()` so the `KEEPER_ACCOUNT_ROUTING_ROOT` sandbox
   // seam moves the observer + router together.

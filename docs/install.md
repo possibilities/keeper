@@ -13,8 +13,9 @@ bash scripts/install.sh          # deps -> bun link -> keeperd bootstrap
 
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
 path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
-owned by you and mode `644` or macOS silently ignores it. Optional account-routing integrations are
-discovered through their CLIs; there is no keeper config map to author for them.
+owned by you and mode `644` or macOS silently ignores it. Keeper-launched Claude requires the
+installer-managed claude-swap CLI and at least one registered account; Pi and non-Claude surfaces remain
+available without it, and there is no account-routing config map to author.
 
 The autoclose worker force-closes the tmux window of a done-and-quiescent
 keeper-dispatched agent (an autopilot `work::`/`close::` worker, a finished
@@ -57,77 +58,44 @@ use the normal status/query surfaces to verify the same identifiers against the 
 treat moving live counts as an acceptance threshold.
 Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidence-diagnostics).
 
-### Account routing (optional)
+### Claude account routing
 
-Claude account routing is optional and fails open to the native default account when either integration
-is absent or unusable. On every run, the installer updates claude-swap from PyPI through
-`uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal and leaves any
-existing `cswap` installation untouched. It manages the CodexBar CLI, never the app bundle: it resolves
-the trusted, mutable `possibilities/CodexBar` `feature/claude-swap-single-account-option` tip and
-`steipete/CodexBar` `main` tip in disposable source state, then attempts a sealed noninteractive rebase with
-merge topology preserved. Only the successfully rebased tree can replace the managed CLI. An unavailable
-upstream, rebase conflict, or rebased-build failure leaves the previous generation active and sends a
-best-effort `notifyctl` message; it never publishes the unrebased fork. Unchanged source identities are an
-idempotent no-op; a changed identity updates automatically. Each immutable generation under
-`~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic
-`current` symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and
-interactive-shell path. Before publication, Keeper signs the staged executable with its pinned,
-certificate-backed local identity and verifies the exact designated requirement; the private key remains
-in the login Keychain. Provenance records source and tree SHAs, mode, architecture, Swift toolchain,
-signing identity and requirement, and the verified binary SHA-256. A failed fetch, build, signing, or
-publication retains the previous artifact, and the Homebrew cask is removed only after publication
-succeeds.
+Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). Every installer run executes
+`uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal to Keeper's
+non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
+registered.
 
-The observer may read CodexBar's Keychain-backed cache, but it never attempts a newly installed executable
-unattended. `keeper agent accounts authorize-codexbar` runs the exact Claude and Codex provider checks
-serially in the foreground, then records only the successful provider names, current binary SHA-256,
-a non-repeating generation nonce, per-provider attempt revisions, and timestamps in a private authorization receipt. Before each unattended
-spawn, the observer atomically consumes that provider's authority; only a parseable successful result for
-the same attempt grants it again. Concurrent or stale completions cannot overwrite a newer foreground
-decision. Capacity observations carry the executable digest, and both the worker and launch router reject
-a fresh-looking sidecar that no longer matches the current authorized generation. An automatic update
-therefore pauses CodexBar observation until the command is run again; `cswap` observation continues and
-routing fails open to the native default. A crash, timeout, malformed result, denied prompt, or receipt I/O
-failure cannot become an unattended prompt loop. Raw provider output, identities, and credentials never
-enter the receipt.
+Installer upgrades remove the retired CodexBar stable symlink only when it targets Keeper's exact data
+root, and remove the corresponding data only when it carries Keeper's signing identifier. A foreign
+symlink, non-symlink executable, unproven data directory, app bundle, and Homebrew cask are always left
+untouched.
 
-| Capability | Public command | Keeper role |
-|---|---|---|
-| Ambient gate | `codexbar --provider claude --format json` | Observes the ambient Claude account and gates automatic balancing; never supplies managed-account rows. |
-| Codex quota | `codexbar --provider codex --format json` | Supplies the PII-free weekly window and Full reset count used by foreground quota controls; never enters Claude route scoring. |
-| Managed telemetry | `cswap list --json` | Supplies managed-account inventory, launchability, quota windows, and freshness. |
-| Managed execution | `cswap run <slot> --share-history -- <claude arguments...>` | Runs one managed Claude process without globally switching other terminals. |
+The daemon invokes `cswap list --json` through an exact-argv, output-capped, deadline-bounded runner and
+publishes one private, freshness-bounded Capacity observation. Only managed rows with `usageStatus: ok`,
+a freshness signal, and at least one understood quota window are routeable. Unknown, stale, malformed,
+signed-out, or otherwise unusable rows are excluded rather than treated as spare capacity.
 
-`keeper agent accounts check --json` is the read-only, PII-free diagnostic: it reports integration
-health, snapshot age, candidate route ids such as `default` and `claude-swap:<slot>`, and the route the
-policy would choose without reserving it. Every Claude start, resume, and restore selects independently
-from the latest observation; launch attribution explains one process but never creates account affinity
-for a later process.
+Every fresh, resumed, or restored Claude process independently selects the route with the greatest
+worst-window headroom after short-lived Launch reservations; least-recently-used order breaks ties. A
+successful decision always executes through:
 
-Use `keeper agent claude --x-account cN` to request one account for a launch, where `c0`, `c1`, … are
-zero-based positions in the ordered `cswap list --json` inventory and match the Claude statusline label.
-The index is not a claude-swap slot number. An explicit request requires a fresh inventory and a currently
-routeable account; it exits without launching rather than substituting another account. The active cswap
-account uses the native route when its index is requested. A bare launch keeps automatic balancing.
+```sh
+cswap run <slot> --share-history -- <claude arguments...>
+```
 
-The selection policy is continuous: each routeable candidate is scored by its worst normalized quota
-window after short-lived launch reservations, the greatest remaining headroom wins, and
-least-recently-used order breaks ties. Every observer uses the same per-refresh lock and timestamp, so a
-fresh result produced by the daemon or a foreground command suppresses duplicate provider work until the
-caller's cadence expires.
+This applies to the currently active claude-swap account as well as every other slot. There is no native
+or ambient-account fallback: missing/stale inventory or zero routeable accounts fails before Claude
+starts. Launch attribution records only the PII-free `claude-swap:<slot>` route and never creates account
+affinity for a later process.
 
-Run `keeper usage reset-codex-before-exceeding` when one Full reset is available and a foreground process
-should wait for the weekly Codex window to reach its guarded 99% trigger. It checks every 30 seconds and
-notifies every five used-percentage points by default; `--check-every <duration>` and `--notify-every
-<integer>` tune those values. The command accepts only the pinned two-menu Codex layout, writes a durable
-same-window submission latch before the final Enter, submits at most once, reports one final outcome, and
-exits. It installs no background watcher. Account routing is specified by [ADR
-0064](./adr/0064-managed-codexbar-cli-and-per-launch-account-routing.md); shared refresh and reset safety
-are specified by [ADR 0065](./adr/0065-shared-capacity-refresh-and-foreground-codex-reset.md).
+`keeper agent accounts check --json` reports observation health, snapshot age, PII-free candidates, and
+the managed route the policy would choose without reserving it. Use `keeper agent claude --x-account cN`
+to request one account, where `c0`, `c1`, … are zero-based positions in ordered inventory and match the
+Claude statusline label. An explicit request fails rather than substituting another account.
 
-Claude `settings.json` is seeded at install time from the keeper stow source only when the live file is
-absent. After that seed, the local file is the canonical value: keeper leaves local edits in place and
-claude-swap shares the same live settings into managed sessions.
+Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
+absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.
+The routing contract is specified by [ADR 0079](./adr/0079-mandatory-claude-swap-routing.md).
 
 Private clean-break archive, outside keeper's runtime, with the archive root at mode `0700`:
 
@@ -376,8 +344,6 @@ rm -f ~/.config/fish/completions/keeper.fish
 rm -f ~/.local/share/bash-completion/completions/keeper
 rm -f ~/.local/share/zsh/site-functions/_keeper
 rm -f "$(brew --prefix 2>/dev/null)/share/zsh/site-functions/_keeper"
-rm -f ~/.local/bin/codexbar
-rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/keeper/codexbar"
 # Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```

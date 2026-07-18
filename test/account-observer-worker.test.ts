@@ -12,44 +12,17 @@ import {
   type ObserverClock,
   providerSubprocessEnvironment,
 } from "../src/account-observer-worker";
-import {
-  NATIVE_ROUTE_ID,
-  observationSidecarPath,
-} from "../src/account-routing-config";
+import { observationSidecarPath } from "../src/account-routing-config";
 
 const NOW_MS = Date.UTC(2026, 5, 1, 12, 0, 0);
-const CLAUDE_ARGV = ["CLAUDE"];
-const CODEX_ARGV = ["CODEX"];
-const CSWAP_ARGV = ["CSWAP"];
+const CSWAP_ARGV = ["CSWAP", "list", "--json"];
 
-function outcome(provider: string): ProviderRunOutcome {
-  if (provider === "claude") {
-    return {
-      code: 0,
-      stdout: JSON.stringify({
-        provider,
-        usage: { primary: { usedPercent: 20 }, secondary: { usedPercent: 30 } },
-      }),
-    };
-  }
-  if (provider === "codex") {
-    return {
-      code: 0,
-      stdout: JSON.stringify([
-        {
-          provider,
-          usage: {
-            secondary: { usedPercent: 40 },
-            codexResetCredits: { availableCount: 1 },
-          },
-        },
-      ]),
-    };
-  }
+function outcome(): ProviderRunOutcome {
   return {
     code: 0,
     stdout: JSON.stringify({
       schemaVersion: 1,
+      activeAccountNumber: 3,
       accounts: [
         {
           number: 3,
@@ -68,9 +41,7 @@ function runnerWithCalls(): { runner: ExactArgvRunner; calls: string[][] } {
     calls,
     runner: async (argv) => {
       calls.push(argv);
-      if (argv[0] === "CLAUDE") return outcome("claude");
-      if (argv[0] === "CODEX") return outcome("codex");
-      return outcome("cswap");
+      return outcome();
     },
   };
 }
@@ -80,7 +51,7 @@ function fakeLock(): { release(): void } {
 }
 
 describe("AccountObserver", () => {
-  test("one cycle uses the shared three-provider refresher and publishes v3", async () => {
+  test("one cycle fetches cswap and publishes a managed-only v4 sidecar", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
     try {
       const { runner, calls } = runnerWithCalls();
@@ -89,30 +60,24 @@ describe("AccountObserver", () => {
         runner,
         clock: { nowMs: () => NOW_MS, uniform: () => 0, sleep: async () => {} },
         shutdownSignal: new AbortController().signal,
-        codexbarArgv: CLAUDE_ARGV,
-        codexCodexbarArgv: CODEX_ARGV,
         cswapArgv: CSWAP_ARGV,
         tryAcquireLock: () => fakeLock(),
       });
       await observer.runCycleNoThrow();
 
-      expect(calls).toEqual([CLAUDE_ARGV, CODEX_ARGV, CSWAP_ARGV]);
+      expect(calls).toEqual([CSWAP_ARGV]);
       const observation = readObservationSidecar(observationSidecarPath(dir));
-      expect(observation?.schema_version).toBe(3);
+      expect(observation?.schema_version).toBe(4);
       expect(observation?.routes.map((route) => route.id)).toEqual([
-        NATIVE_ROUTE_ID,
         "claude-swap:3",
       ]);
-      expect(observation?.codex).toMatchObject({
-        health: "ok",
-        resetCreditsAvailableCount: 1,
-      });
+      expect(JSON.stringify(observation)).not.toContain("default");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("ordinary refresh-lock contention is a bounded no-op, not loop death", async () => {
+  test("ordinary refresh-lock contention is a bounded no-op", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-observer-"));
     try {
       let sleeps = 0;
@@ -160,13 +125,11 @@ describe("AccountObserver", () => {
         runner,
         clock,
         shutdownSignal: controller.signal,
-        codexbarArgv: CLAUDE_ARGV,
-        codexCodexbarArgv: CODEX_ARGV,
         cswapArgv: CSWAP_ARGV,
         tryAcquireLock: () => fakeLock(),
       });
       await observer.run();
-      expect(calls).toHaveLength(3);
+      expect(calls).toHaveLength(1);
       expect(sleepDurations).toEqual([60_007]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -175,14 +138,10 @@ describe("AccountObserver", () => {
 });
 
 describe("provider subprocess environment", () => {
-  test("removes the retired disable flag without mutating input", () => {
-    const inherited = {
-      PATH: "/test/bin",
-      CODEXBAR_DISABLE_KEYCHAIN_ACCESS: "1",
-    };
+  test("copies the inherited environment without mutation", () => {
+    const inherited = { PATH: "/test/bin", CUSTOM: "1" };
     const environment = providerSubprocessEnvironment(inherited);
-    expect(environment).toEqual({ PATH: "/test/bin" });
+    expect(environment).toEqual(inherited);
     expect(environment).not.toBe(inherited);
-    expect(inherited.CODEXBAR_DISABLE_KEYCHAIN_ACCESS).toBe("1");
   });
 });

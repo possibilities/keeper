@@ -2,7 +2,7 @@
 
 ## Status
 
-Superseded by [ADR 0064](../0064-managed-codexbar-cli-and-per-launch-account-routing.md). The per-launch routing decisions are consolidated there with the managed CodexBar CLI exception, and ADR 0064 preserves this record's supersession of ADRs 0009 and 0012.
+Superseded by [ADR 0064](./0064-managed-codexbar-cli-and-per-launch-account-routing.md). The per-launch routing decisions are consolidated there with the managed CodexBar CLI exception, and ADR 0064 preserves this record's supersession of ADRs 0009 and 0012.
 
 ## Context
 

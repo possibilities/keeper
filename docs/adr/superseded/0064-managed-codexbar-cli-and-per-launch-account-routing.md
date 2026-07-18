@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Supersedes ADR 0038 while preserving its account-routing decisions and its supersession chain to ADRs 0009 and 0012. ADR 0038 remains the historical record for the retired Keeper-owned profile balancer and usage viewer.
+Superseded by [ADR 0079](../0079-mandatory-claude-swap-routing.md). This record supersedes ADR 0038 and preserves its supersession chain to ADRs 0009 and 0012.
 
 ## Context
 

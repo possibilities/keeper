@@ -36,18 +36,11 @@ function harness(argv: string[]) {
 test("native descriptor exposes the nested accounts command family", () => {
   const agent = NATIVE_COMMANDS.find((command) => command.name === "agent");
   const accounts = agent?.verbs?.find((verb) => verb.name === "accounts");
-  expect(accounts?.mutates).toBe(true);
-  expect(accounts?.verbs?.map((verb) => verb.name)).toEqual([
-    "check",
-    "authorize-codexbar",
-  ]);
+  expect(accounts?.mutates).toBe(false);
+  expect(accounts?.verbs?.map((verb) => verb.name)).toEqual(["check"]);
   expect(accounts?.verbs?.find((verb) => verb.name === "check")?.mutates).toBe(
     false,
   );
-  expect(
-    accounts?.verbs?.find((verb) => verb.name === "authorize-codexbar")
-      ?.mutates,
-  ).toBe(true);
 });
 
 describe("splitSubcommand", () => {
@@ -150,15 +143,14 @@ describe("splitSubcommand", () => {
       unknown: "presets frobnicate",
     });
   });
-  test("accounts authorize-codexbar classifies exactly", () => {
-    expect(splitSubcommand(["accounts", "authorize-codexbar"])).toEqual({
-      kind: "accounts-authorize-codexbar",
+  test("accounts exposes only the read-only check verb", () => {
+    expect(splitSubcommand(["accounts", "check"])).toEqual({
+      kind: "accounts-check",
+      json: false,
     });
-    expect(
-      splitSubcommand(["accounts", "authorize-codexbar", "unexpected"]),
-    ).toEqual({
+    expect(splitSubcommand(["accounts", "authorize"])).toEqual({
       kind: "usage",
-      unknown: "accounts authorize-codexbar",
+      unknown: "accounts authorize",
     });
   });
   // The profile-check command is retired (no Keeper-owned profile farm to
@@ -256,10 +248,10 @@ describe("splitSubcommand", () => {
   });
 });
 describe("main() dispatch routing", () => {
-  test("claude + args reaches the spawn recorder", async () => {
+  test("claude + args reaches the spawn recorder through claude-swap", async () => {
     const h = harness(["claude", "--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
-    expect(cmd[0]).toBe(h.deps.claudeBin);
+    expect(cmd.slice(0, 3)).toEqual([h.deps.cswapBin, "run", "1"]);
     expect(cmd).toContain("hello");
     // The leading `claude` token was stripped — it must not leak into argv.
     expect(cmd.slice(1)).not.toContain("claude");
@@ -288,10 +280,10 @@ describe("main() dispatch routing", () => {
     expect(cmd).toContain("hello");
     expect(cmd.slice(1)).not.toContain("pi");
   });
-  test("bare claude launches interactively (spawn fires)", async () => {
+  test("bare claude launches through claude-swap (spawn fires)", async () => {
     const h = harness(["claude", "--x-no-confirm"]);
     const cmd = await runAndCapture(h, main);
-    expect(cmd[0]).toBe(h.deps.claudeBin);
+    expect(cmd.slice(0, 3)).toEqual([h.deps.cswapBin, "run", "1"]);
   });
   test("bare keeper agent → usage on stderr + exit 2", async () => {
     const h = harness([]);
@@ -348,10 +340,10 @@ describe("main() dispatch routing", () => {
     expect(h.out.join("")).toContain("Wrapper flags:");
     expect(h.spawned.length).toBe(0);
   });
-  test("claude --help passes --help through to claude", async () => {
+  test("claude --help passes through the mandatory account route", async () => {
     const h = harness(["claude", "--help"]);
     const cmd = await runAndCapture(h, main);
-    expect(cmd[0]).toBe(h.deps.claudeBin);
+    expect(cmd.slice(0, 3)).toEqual([h.deps.cswapBin, "run", "1"]);
     expect(cmd).toContain("--help");
   });
   test("pi --help passes --help through to pi", async () => {

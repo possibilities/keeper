@@ -596,20 +596,6 @@ export const RESUME_FLAGS = [
   FLAG_JSON_ALIAS,
 ] as const satisfies readonly FlagDescriptor[];
 
-export const USAGE_RESET_CODEX_FLAGS = [
-  {
-    name: "check-every",
-    type: "string",
-    summary: "Poll cadence, 5s..5m (default 30s)",
-  },
-  {
-    name: "notify-every",
-    type: "string",
-    summary: "Used-percentage notification boundary, 1..100 (default 5)",
-  },
-  FLAG_HELP,
-] as const satisfies readonly FlagDescriptor[];
-
 // ── native command tree ──────────────────────────────────────────────────────
 
 /**
@@ -787,32 +773,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         name: "connect-timeout",
         type: "string",
         summary: "Daemon connect timeout (duration, e.g. 30s, 5m)",
-      },
-    ],
-  },
-  {
-    name: "usage",
-    summary: "Foreground quota controls with guarded Codex reset redemption",
-    visibility: "public",
-    mutates: true,
-    requires_daemon: false,
-    requires_tty: false,
-    exit_codes: {
-      "1": "operational, ambiguous, lock-busy, or already-submitted outcome",
-      "2": "argument fault",
-      "130": "cancelled by SIGINT before submission",
-      "143": "cancelled by SIGTERM before submission",
-    },
-    flags: [],
-    verbs: [
-      {
-        name: "reset-codex-before-exceeding",
-        summary: "Wait, then redeem one Codex reset near weekly exhaustion",
-        visibility: "public",
-        mutates: true,
-        requires_daemon: false,
-        requires_tty: false,
-        flags: USAGE_RESET_CODEX_FLAGS,
       },
     ],
   },
@@ -1852,30 +1812,21 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       ].map(nameOnlyVerb),
       {
         name: "accounts",
-        summary: "Inspect account routing or authorize CodexBar observation",
+        summary: "Inspect mandatory claude-swap account routing",
         visibility: "public",
-        mutates: true,
+        mutates: false,
         requires_daemon: false,
         requires_tty: false,
         flags: [],
         verbs: [
           {
             name: "check",
-            summary: "Report the read-only account-routing snapshot",
+            summary: "Report the read-only claude-swap routing snapshot",
             visibility: "public",
             mutates: false,
             requires_daemon: false,
             requires_tty: false,
             flags: [FLAG_JSON_ALIAS],
-          },
-          {
-            name: "authorize-codexbar",
-            summary: "Authorize the current CodexBar generation",
-            visibility: "public",
-            mutates: true,
-            requires_daemon: false,
-            requires_tty: false,
-            flags: [],
           },
         ],
       },

@@ -282,25 +282,13 @@ export function worktreeBranchFromEnv(env: NodeJS.ProcessEnv): string | null {
 }
 
 /**
- * Capture the PII-free account ROUTE from `KEEPER_ACCOUNT_ROUTE` — the launch
- * carrier the Claude account router injects on every unpinned start / resume /
- * restore (`default` for the native ambient account, `claude-swap:<slot>` for a
- * managed route). SessionStart-gated by the caller, exactly like
- * {@link configDirFromEnv} / {@link worktreeBranchFromEnv}.
- *
- * The value is environment- and hook-sourced, so it is UNTRUSTED: it is size-
- * and shape-bounded HERE, at capture, never in the fold (the fold copies it
- * verbatim). Only the two known PII-free shapes survive —
- * - `default` (the native route id), or
- * - `claude-swap:<digits>` (a claude-swap slot number, which carries no PII).
- * Anything else — unset/empty, over-long, or an unrecognized shape — collapses
- * to `null`, so a malformed or hostile env can never persist an unbounded or
- * identity-bearing string, and a launcher that supplied no route folds NULL.
- * Recording only the bounded route id keeps attribution observational and
- * PII-free, and never claims a durable human identity (a slot is time-local and
- * reusable). The literals mirror `src/account-routing-config.ts`
- * (NATIVE_ROUTE_ID / managedRouteId), inlined because a hook may not import the
- * routing config (dependency-free island).
+ * Capture the PII-free managed account route from `KEEPER_ACCOUNT_ROUTE`, which
+ * every Keeper-launched Claude carries as `claude-swap:<slot>`. The value is
+ * environment- and hook-sourced, so it is size- and shape-bounded here before
+ * the fold copies it verbatim. Unset, oversized, or unrecognized values collapse
+ * to `null`; a slot remains time-local attribution, never durable identity. The
+ * route pattern mirrors `managedRouteId` but stays inlined because this hook is a
+ * dependency-free island.
  *
  * Stays pure (`process.env` read only) — no git, no fs, no `bun:sqlite`.
  */
@@ -309,10 +297,7 @@ export function accountRouteFromEnv(env: NodeJS.ProcessEnv): string | null {
   if (raw == null || raw.length === 0 || raw.length > 64) {
     return null;
   }
-  if (raw === "default") {
-    return raw;
-  }
-  return /^claude-swap:\d{1,10}$/.test(raw) ? raw : null;
+  return /^claude-swap:[1-9]\d{0,9}$/.test(raw) ? raw : null;
 }
 
 /** Parse the bounded exact-attempt carrier injected by the generic dispatcher.

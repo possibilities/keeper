@@ -26,7 +26,7 @@ import {
   runAndCapture,
 } from "./helpers/agent-main-harness";
 
-const CLAUDE_BIN = "/fake-home/.local/bin/claude";
+const CSWAP_BIN = "/fake-home/.local/bin/cswap";
 const PI_BIN = "/fake-home/.local/bin/pi";
 const UUID = "11111111-1111-1111-1111-111111111111";
 describe("keeper agent byte-pin — claude native argv", () => {
@@ -38,7 +38,11 @@ describe("keeper agent byte-pin — claude native argv", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
-      CLAUDE_BIN,
+      CSWAP_BIN,
+      "run",
+      "1",
+      "--share-history",
+      "--",
       "hello world",
       "--effort",
       "high",
@@ -63,7 +67,11 @@ describe("keeper agent byte-pin — claude native argv", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
-      CLAUDE_BIN,
+      CSWAP_BIN,
+      "run",
+      "1",
+      "--share-history",
+      "--",
       "--continue",
       "--strict-mcp-config",
       "--teammate-mode",

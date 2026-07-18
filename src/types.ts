@@ -315,16 +315,11 @@ export interface Event {
    */
   adopted: number | null;
   /**
-   * The PII-free account ROUTE this process launched on — `"default"` (native
-   * ambient account) or `"claude-swap:<slot>"` (a managed claude-swap route),
-   * NULL when the launcher supplied none (an explicit-profile override or a
-   * legacy / non-Claude row). An EXPLICIT launch carrier, never derived from a
-   * path or email: the hook size/shape-bounds `KEEPER_ACCOUNT_ROUTE` at
-   * capture, so a malformed value arrives NULL and the fold — which copies it
-   * verbatim onto `jobs.account_route` via the SessionStart COALESCE arm — never
-   * throws. Attribution is observational per-process: it describes only the
-   * process that emitted the event and never binds a conversation or drives a
-   * later route choice. NULL on every non-SessionStart row.
+   * The PII-free Account route this process launched on. Current Claude launches
+   * emit `"claude-swap:<slot>"`; NULL covers non-Claude or missing carriers, and
+   * deterministic replay may expose historical values. The hook shape-bounds
+   * `KEEPER_ACCOUNT_ROUTE` before the fold copies it onto `jobs.account_route`.
+   * Attribution describes one process and never drives a later route choice.
    */
   account_route: string | null;
 }

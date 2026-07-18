@@ -5,8 +5,8 @@
 Accepted (number PROVISIONAL until landed; fan-in renumber per ADR 0020/0022). Relates to ADR 0036
 (required host matrix — the cell axes and worker-cell eligibility), ADR 0040 (per-verb dispatch
 table — the session triples cell-less verbs keep), ADR 0011/0018 (selection review — the grading
-surface whose attribution this record settles), and ADR 0064 (per-launch account routing — a
-sibling bounded context that likewise rejected durable pinning of conversations; the worker
+surface whose attribution this record settles), and ADR 0079 (per-launch account routing — a
+sibling bounded context that likewise rejects durable pinning of conversations; the worker
 provider pins *dispatch translation*, never account affinity).
 
 ## Context

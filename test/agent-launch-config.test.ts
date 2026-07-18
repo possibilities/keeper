@@ -61,14 +61,14 @@ test("composeManagedClaudeArgv: drops the native executable (cswap resolves clau
   const native = ["/abs/claude", "--continue"];
   const wrapped = composeManagedClaudeArgv({
     cswapBin: "/abs/cswap",
-    slot: 0,
+    slot: 1,
     nativeClaudeArgv: native,
   });
-  // slot 0 is valid; the executable is dropped, only args forwarded.
+  // The executable is dropped; only its arguments are forwarded.
   expect(wrapped).toEqual([
     "/abs/cswap",
     "run",
-    "0",
+    "1",
     "--share-history",
     "--",
     "--continue",

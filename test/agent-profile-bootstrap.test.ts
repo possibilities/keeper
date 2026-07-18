@@ -48,7 +48,11 @@ describe("main() passthrough commands", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
-      join(home, ".local", "bin", "claude"),
+      "/fake-home/.local/bin/cswap",
+      "run",
+      "1",
+      "--share-history",
+      "--",
       "auth",
       "status",
     ]);
@@ -58,23 +62,24 @@ describe("main() passthrough commands", () => {
     expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
-  test("native global flags pass through with subcommands; router not run", async () => {
+  test("global flags and subcommands pass through the mandatory account route", async () => {
     const h = makeHarness({
       argv: ["--debug", "auth", "status"],
       env: {},
       homeBin: join(home, ".local", "bin", "claude"),
-      selectAccountRoute: () => {
-        throw new Error("router should not run for passthrough commands");
-      },
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([
-      join(home, ".local", "bin", "claude"),
+      "/fake-home/.local/bin/cswap",
+      "run",
+      "1",
+      "--share-history",
+      "--",
       "--debug",
       "auth",
       "status",
     ]);
-    expect(h.routerCalls()).toBe(0);
+    expect(h.routerCalls()).toBe(1);
   });
 });
 

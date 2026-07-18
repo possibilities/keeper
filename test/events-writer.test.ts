@@ -872,10 +872,8 @@ test("worktreeBranchFromEnv: a trailing slash is NOT stripped (canonical ref, re
 // accountRouteFromEnv unit (schema v119 / fn-1239.3 — KEEPER_ACCOUNT_ROUTE)
 // ---------------------------------------------------------------------------
 
-test("accountRouteFromEnv: the native default route passes through", () => {
-  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "default" })).toBe(
-    "default",
-  );
+test("accountRouteFromEnv: the retired native default route is rejected", () => {
+  expect(accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "default" })).toBeNull();
 });
 
 test("accountRouteFromEnv: a managed claude-swap slot passes through", () => {
@@ -890,7 +888,7 @@ test("accountRouteFromEnv: undefined / empty collapse to null (launcher supplied
 });
 
 test("accountRouteFromEnv: an unrecognized shape is rejected to null (PII-free by construction)", () => {
-  // The value is untrusted env — only the two known PII-free shapes survive, so
+  // The value is untrusted env — only a managed PII-free route survives, so
   // a path/email/arbitrary string can never be persisted as a route id.
   expect(
     accountRouteFromEnv({ KEEPER_ACCOUNT_ROUTE: "user@example.com" }),
