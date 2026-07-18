@@ -27,9 +27,8 @@
  *  4. `backend.listPanes()` — `null` (degraded/missing tmux) → skip the cycle.
  *  5. Pure {@link computeRenames}: join candidates to panes by pane id, group
  *     by window id, winner = max `created_at` (tie → higher `job_id`), target
- *     = optional configured status icon + optional configured harness icon +
- *     title, separated by one space; emit a rename ONLY
- *     where the swept `windowName !== target`. Every `rename-window` SUPPRESSES
+ *     = the winner's title verbatim; emit a rename ONLY where the swept
+ *     `windowName !== target`. Every `rename-window` SUPPRESSES
  *     that window's automatic-rename, so a matching name must not re-rename;
  *     the suppression is deliberately left in place (tmux fighting back on
  *     every activity tick is worse than a stale name on a dead window).
@@ -53,7 +52,6 @@ import {
   type PaneInfo,
   type TmuxPaneOps,
 } from "./exec-backend";
-import { type RobotRung, robotRung } from "./job-state-icon";
 import { runQuery } from "./server-worker";
 import type { Job } from "./types";
 import { watchLoop } from "./wake-worker";
@@ -65,9 +63,6 @@ import { watchLoop } from "./wake-worker";
  */
 export interface RenamerWorkerData {
   dbPath: string;
-  /** Optional harness/status icon prefixes, resolved from config.yaml on main. */
-  harnessIcons?: Record<string, string>;
-  stateIcons?: Record<string, string>;
   /**
    * Poll cadence in ms for the underlying `data_version` watch. Optional;
    * defaults to {@link watchLoop}'s default. Threaded through workerData for
@@ -90,10 +85,6 @@ export interface RenameCandidate {
   job_id: string;
   pane_id: string;
   title: string;
-  /** NULL legacy jobs are normalized to claude at this read boundary. */
-  harness: string;
-  /** Shared robot-face status rung derived from lifecycle + attention state. */
-  robot_rung: RobotRung;
   created_at: number;
 }
 
@@ -133,8 +124,6 @@ export function renameCandidates(jobs: Job[]): RenameCandidate[] {
       job_id: job.job_id,
       pane_id: job.backend_exec_pane_id,
       title: job.title,
-      harness: job.harness ?? "claude",
-      robot_rung: robotRung(job),
       created_at: job.created_at,
     });
   }
@@ -144,10 +133,8 @@ export function renameCandidates(jobs: Job[]): RenameCandidate[] {
 /**
  * Stable hash of the candidate set for the INPUT-side dedup gate. Sorts by
  * `(pane_id, job_id)` so SELECT order doesn't churn the hash, then hashes the
- * joined `(pane_id, title, harness, robot_rung, created_at, job_id)` tuple. An
- * empty set is the empty-string hash. Mirrors restore-worker's `hashPairs`.
- * Including the rung is load-bearing: a working↔stopped or attention-state
- * transition must re-fire even when every other candidate field is unchanged.
+ * joined `(pane_id, title, created_at, job_id)` tuple. An empty set is the
+ * empty-string hash. Mirrors restore-worker's `hashPairs`.
  */
 export function hashCandidates(candidates: RenameCandidate[]): string {
   const sorted = [...candidates].sort((a, b) =>
@@ -164,10 +151,7 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
   return String(
     Bun.hash(
       sorted
-        .map(
-          (c) =>
-            `${c.pane_id}\t${c.title}\t${c.harness}\t${c.robot_rung}\t${c.created_at}\t${c.job_id}`,
-        )
+        .map((c) => `${c.pane_id}\t${c.title}\t${c.created_at}\t${c.job_id}`)
         .join("\n"),
     ),
   );
@@ -178,10 +162,9 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
  * window id, pick the winner per window (max `created_at`; tie → higher
  * `job_id` — a deterministic tiebreak so equal-aged sessions don't flicker
  * the window name every pulse), and emit a `{windowId, name}` ONLY where the
- * sweep's current `windowName` differs from the target. The target includes the
- * configured status icon and harness icon when present, in that order, then the
- * title; the comparison uses that same target, so a window already
- * wearing it is NOT re-emitted — every `rename-window` permanently suppresses
+ * sweep's current `windowName` differs from the winner's title. The comparison
+ * uses the title verbatim, so a window already wearing it is NOT re-emitted —
+ * every `rename-window` permanently suppresses
  * that window's automatic-rename, so re-issuing a no-op rename is pure churn.
  *
  * Returned in ascending `windowId` order for stable test assertions and a
@@ -190,8 +173,6 @@ export function hashCandidates(candidates: RenameCandidate[]): string {
 export function computeRenames(
   candidates: RenameCandidate[],
   panes: PaneInfo[],
-  harnessIcons: Readonly<Record<string, string>> = {},
-  stateIcons: Readonly<Record<string, string>> = {},
 ): WindowRename[] {
   // pane id → its window's id + current name. A pane appears once per sweep.
   const paneToWindow = new Map<string, { windowId: string; name: string }>();
@@ -228,13 +209,7 @@ export function computeRenames(
 
   const renames: WindowRename[] = [];
   for (const [windowId, { windowName, winner }] of winners) {
-    const stateIcon = stateIcons[winner.robot_rung];
-    const harnessIcon = harnessIcons[winner.harness];
-    const target = [
-      ...(stateIcon === undefined ? [] : [stateIcon]),
-      ...(harnessIcon === undefined ? [] : [harnessIcon]),
-      winner.title,
-    ].join(" ");
+    const target = winner.title;
     if (windowName !== target) {
       renames.push({ windowId, name: target });
     }
@@ -259,8 +234,6 @@ export async function renamerPulse(
   db: Parameters<typeof runQuery>[0],
   backend: Pick<TmuxPaneOps, "listPanes" | "renameWindow">,
   state: PulseState,
-  harnessIcons: Readonly<Record<string, string>> = {},
-  stateIcons: Readonly<Record<string, string>> = {},
 ): Promise<void> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -300,7 +273,7 @@ export async function renamerPulse(
     return;
   }
 
-  const renames = computeRenames(candidates, panes, harnessIcons, stateIcons);
+  const renames = computeRenames(candidates, panes);
   for (const r of renames) {
     const res = await backend.renameWindow(r.windowId, r.name);
     if (!res.ok) {
@@ -348,8 +321,6 @@ function main(): void {
     },
   });
   const state: PulseState = { lastHash: null };
-  const harnessIcons = data.harnessIcons ?? {};
-  const stateIcons = data.stateIcons ?? {};
   let shutdown = false;
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
@@ -370,7 +341,7 @@ function main(): void {
     // Per-pulse try/catch: a projection-read throw or any unexpected error
     // degrades to a logged non-fatal skip rather than escaping the watch loop
     // (which would fatalExit the daemon over a cosmetic side-effect).
-    renamerPulse(db, backend, state, harnessIcons, stateIcons).catch((err) => {
+    renamerPulse(db, backend, state).catch((err) => {
       console.error(
         `[renamer-worker] pulse threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)

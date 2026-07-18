@@ -17,7 +17,6 @@ import {
   resolveAutocloseEnabled,
   resolveAutocloseGraceSeconds,
   resolveConfig,
-  resolveIconMap,
 } from "../src/db";
 
 let dir: string;
@@ -168,47 +167,21 @@ test("handoff_prompt_prefix resolves independently of a malformed sibling key", 
 });
 
 // ---------------------------------------------------------------------------
-// harness_icons / state_icons — optional tmux-renamer prefix segments
+// Unknown tmux icon keys are ignored
 // ---------------------------------------------------------------------------
 
-test("icon maps default empty when the file or keys are absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().harnessIcons).toEqual({});
-  expect(resolveConfig().stateIcons).toEqual({});
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().harnessIcons).toEqual({});
-  expect(resolveConfig().stateIcons).toEqual({});
-});
-
-test("harness_icons and state_icons resolve independently and trim values", () => {
+test("tmux icon keys are ignored without disturbing sibling config", () => {
   writeConfig(
-    'harness_icons:\n  pi: " 󰏿 "\n  claude: "󰛄"\n' +
-      'state_icons:\n  working: " 󰚩 "\n  stopped: "󱙺"\n',
+    'tab_icons:\n  pi: "󰏿"\n' +
+      'harness_icons:\n  pi: "󰏿"\n' +
+      'state_icons:\n  working: "󰚩"\n' +
+      "roots:\n  - ~/code\n",
   );
   const cfg = resolveConfig();
-  expect(cfg.harnessIcons).toEqual({ pi: "󰏿", claude: "󰛄" });
-  expect(cfg.stateIcons).toEqual({ working: "󰚩", stopped: "󱙺" });
-});
-
-test("icon maps skip malformed entries without disturbing valid siblings", () => {
-  writeConfig(
-    'harness_icons:\n  pi: "󰏿"\n  claude: 42\n' +
-      'state_icons:\n  working: "󰚩"\n  empty: "   "\n',
-  );
-  const cfg = resolveConfig();
-  expect(cfg.harnessIcons).toEqual({ pi: "󰏿" });
-  expect(cfg.stateIcons).toEqual({ working: "󰚩" });
-});
-
-test("the retired tab_icons key is ignored", () => {
-  writeConfig('tab_icons:\n  pi: "󰏿"\n');
-  expect(resolveConfig().harnessIcons).toEqual({});
-});
-
-test("resolveIconMap rejects a malformed whole value to the empty default", () => {
-  expect(resolveIconMap(["pi", "󰏿"])).toEqual({});
-  expect(resolveIconMap("pi=󰏿")).toEqual({});
-  expect(resolveIconMap(null)).toEqual({});
+  expect(cfg).not.toHaveProperty("tabIcons");
+  expect(cfg).not.toHaveProperty("harnessIcons");
+  expect(cfg).not.toHaveProperty("stateIcons");
+  expect(cfg.roots).toEqual(["~/code"]);
 });
 
 // ---------------------------------------------------------------------------

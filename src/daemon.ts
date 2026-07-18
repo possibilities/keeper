@@ -14951,11 +14951,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Gated on the selector — `null` when unselected.
   const renamerWorker = want("renamer")
     ? new Worker(new URL("./renamer-worker.ts", import.meta.url).href, {
-        workerData: {
-          dbPath,
-          harnessIcons: apConfig.harnessIcons,
-          stateIcons: apConfig.stateIcons,
-        } satisfies RenamerWorkerData,
+        workerData: { dbPath } satisfies RenamerWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;
 
