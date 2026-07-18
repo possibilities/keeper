@@ -26,8 +26,9 @@
  *    frozen `last_session`; restore.json window_index re-sourced from the
  *    projection; NO `list-panes -a` probe (topology silenced); the generation
  *    boundary probe still fires.
- *  - `probeServerGeneration` / `probeTmuxTopology` / `seedLastGenerationHash`:
- *    retained exports (the boot-seed imports the two probes).
+ *  - `probeServerGeneration`: shared dependency-neutral probe coverage.
+ *  - `probeTmuxTopology` / `seedLastGenerationHash`: restore-worker seams retained
+ *    for the boot-seed and generation-boundary pulse.
  */
 
 import type { Database } from "bun:sqlite";
@@ -48,7 +49,6 @@ import {
   type BackendExecStartMessage,
   buildRestoreTier,
   buildReviveScriptCandidates,
-  probeServerGeneration,
   probeTmuxTopology,
   RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
@@ -57,12 +57,15 @@ import {
   restorePulse,
   restoreSetIsEmpty,
   reviveScriptMirrorsNonEmptySet,
-  type SpawnSyncFn,
   seedLastGenerationHash,
   serializeForHash,
   serializeForWrite,
 } from "../src/restore-worker";
 import type { ResumeResolver } from "../src/resume-resolve";
+import {
+  probeServerGeneration,
+  type SpawnSyncFn,
+} from "../src/server-generation-probe";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
 

@@ -24,6 +24,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  installRpcHandlers,
   parseDispatchKey,
   perRootStoredWhileOffNote,
   replayDeadLetterHandler,
@@ -36,11 +37,17 @@ import {
   setEpicArmedHandler,
 } from "../src/rpc-handlers";
 import {
-  AWAIT_NOT_CANCELLABLE_MESSAGE,
   BadParamsError,
-  decideAwaitCancel,
+  createRpcRegistry,
   type ReplayBridge,
+  RPC_METHODS,
   SlugConflictError,
+} from "../src/rpc-runtime";
+import {
+  AWAIT_NOT_CANCELLABLE_MESSAGE,
+  decideAwaitCancel,
+  BadParamsError as ServerBadParamsError,
+  SlugConflictError as ServerSlugConflictError,
 } from "../src/server-worker";
 import { freshMemDb } from "./helpers/template-db";
 
@@ -78,6 +85,67 @@ afterEach(() => {
     process.env.KEEPER_CONFIG = originalKeeperConfig;
   }
   rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test("RPC runtime exports the exact server-worker error constructors", () => {
+  expect(ServerBadParamsError).toBe(BadParamsError);
+  expect(ServerSlugConflictError).toBe(SlugConflictError);
+});
+
+test("RPC installation supplies the authoritative eight methods", () => {
+  const registry = createRpcRegistry();
+  const expectedMethods = [
+    "replay_dead_letter",
+    "set_autopilot_paused",
+    "set_autopilot_mode",
+    "set_autopilot_config",
+    "set_epic_armed",
+    "retry_dispatch",
+    "request_handoff",
+    "request_await",
+  ];
+
+  expect<string[]>([...RPC_METHODS]).toEqual(expectedMethods);
+  installRpcHandlers(registry);
+  registry.assertInstalled();
+  expect([...registry.syncHandlers]).toEqual([]);
+  expect([...registry.asyncHandlers.keys()]).toEqual(expectedMethods);
+});
+
+test("RPC installation is partial- and duplicate-fatal without partial mutation", () => {
+  const registry = createRpcRegistry();
+  const existing = async () => null;
+
+  expect(() =>
+    registry.install([
+      {
+        method: "replay_dead_letter",
+        kind: "async",
+        handler: existing,
+      },
+    ]),
+  ).toThrow("RPC handler installation incomplete");
+  expect([...registry.asyncHandlers]).toEqual([]);
+
+  registry.registerAsync("set_autopilot_mode", existing);
+  expect(() => installRpcHandlers(registry)).toThrow(
+    "RPC method already registered: set_autopilot_mode",
+  );
+  expect([...registry.asyncHandlers]).toEqual([
+    ["set_autopilot_mode", existing],
+  ]);
+  expect(() => registry.assertInstalled()).toThrow("RPC registry incomplete");
+
+  registry.reset();
+  installRpcHandlers(registry);
+  expect(() => installRpcHandlers(registry)).toThrow(
+    "RPC method already registered: replay_dead_letter",
+  );
+  registry.assertInstalled();
+
+  registry.reset();
+  expect([...registry.syncHandlers]).toEqual([]);
+  expect([...registry.asyncHandlers]).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------

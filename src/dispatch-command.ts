@@ -6,10 +6,9 @@
  *
  * LEAF-MODULE DISCIPLINE (mirrors the events-writer hook): this file MUST stay
  * dep-free — no `bun:sqlite`, no `./db`, no `./server-worker`, no `./db.ts`
- * symbol. The validator returns a DISCRIMINATED result rather than throwing
- * `BadParamsError` (which lives in the heavy `./server-worker`), so importing
- * this module never drags the server-worker graph into a leaf. The RPC handler
- * re-wraps an `{ ok: false }` into `BadParamsError` to keep the `bad_params`
+ * symbol. The validator returns a DISCRIMINATED result rather than importing
+ * and throwing `BadParamsError`, so this leaf stays independent of RPC runtime
+ * policy. The RPC handler re-wraps an `{ ok: false }` into `BadParamsError` to keep the `bad_params`
  * wire contract byte-identical. The ONE import here — {@link REPO_TOKEN_RE}
  * from `./derivers` — is itself a dep-free leaf (zero imports of its own), so
  * it stays within this discipline; it exists so this module and `./derivers`

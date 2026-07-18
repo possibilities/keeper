@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "edges": [
+        ["src/agent/config.ts", "src/agent/triple.ts"],
+        ["src/agent/matrix.ts", "src/agent/config.ts"],
+        ["src/agent/triple.ts", "src/agent/matrix.ts"]
+      ]
+    }
+  ]
+}
