@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T10:11:52.580000Z",
+  "depends_on_epics": [],
+  "id": "fn-1330-cleanup-lane-paging-and-hygiene",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Cleanup lane paging and hygiene",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T10:11:52.580000Z"
+}
