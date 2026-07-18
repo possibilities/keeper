@@ -55,6 +55,7 @@
  *   - else `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
+import { COMPOSITE_KEY_SEPARATOR } from "./composite-key";
 import {
   type EpicDepResolution,
   resolveEpicDep as resolveEpicDepLeaf,
@@ -1814,11 +1815,12 @@ export function applyPerRootRoundRobinAllocator(
   // the fair-share fill grants to the epic holding the FEWEST. A pending dispatch
   // with no matching row (`fallbackRoots`) consumes a root slot but no epic's.
   const rootOccupied = new Map<string, number>();
-  const epicHeld = new Map<string, number>(); // key: `${root} ${epicId}`
+  const epicHeld = new Map<string, number>(); // key: `${root}${COMPOSITE_KEY_SEPARATOR}${epicId}`
   const bumpRoot = (root: string): void => {
     rootOccupied.set(root, (rootOccupied.get(root) ?? 0) + 1);
   };
-  const epicKey = (root: string, epicId: string): string => `${root} ${epicId}`;
+  const epicKey = (root: string, epicId: string): string =>
+    `${root}${COMPOSITE_KEY_SEPARATOR}${epicId}`;
   const bumpEpic = (root: string, epicId: string): void => {
     const k = epicKey(root, epicId);
     epicHeld.set(k, (epicHeld.get(k) ?? 0) + 1);
@@ -1884,7 +1886,7 @@ export function applyPerRootRoundRobinAllocator(
   // root → ordered list of per-epic queues (seam order). An epic spanning two
   // roots contributes one queue per root.
   const queuesByRoot = new Map<string, EpicQueue[]>();
-  const queueOf = new Map<string, EpicQueue>(); // `${root} ${epicId}`
+  const queueOf = new Map<string, EpicQueue>(); // `${root}${COMPOSITE_KEY_SEPARATOR}${epicId}`
   for (const epic of ordered) {
     const projectDir = stringOrNull(epic.project_dir);
     for (const task of epic.tasks) {

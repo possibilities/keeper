@@ -78,6 +78,8 @@ test("a past-tense provenance word FAILs as a CONTENT finding", () => {
     "retired",
     "replaced",
     "removed in",
+    "added for",
+    "fixed by",
   ]) {
     const findings = scanText(`- the relay ${word} spawned the worker.`);
     expect(findings.some((f) => f.message.includes("[provenance]"))).toBe(true);

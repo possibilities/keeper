@@ -9,7 +9,7 @@
   "scripts": {
     "start": "exec bun run src/daemon.ts",
     "dev": "exec bun --watch run src/daemon.ts",
-    "lint": "biome check --no-errors-on-unmatched cli src test",
+    "lint": "biome check --no-errors-on-unmatched cli src test && bun scripts/lint-source.ts",
     "assert-comment-only": "bun scripts/assert-comment-only.ts",
     "lint:retired-name": "bash scripts/lint-retired-name.sh",
     "lint:claude-md": "bun scripts/lint-claude-md.ts",
