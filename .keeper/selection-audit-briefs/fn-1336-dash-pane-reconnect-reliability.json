@@ -1,0 +1,75 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 3,
+        "files_changed": 2,
+        "insertions": 66
+      },
+      "done_summary": "Adopted a per-connection streaming TextDecoder in the subscribe driver so multibyte frames split across data events decode intact and a torn tail is discarded on reconnect; ported the snowman-split regression template.",
+      "input_hash": "cfd269cffd51fdb19a4cdb1598e0a80dc6546ca5f294ecccadeb7837fedeb001",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1907,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/readiness-client.ts, test/readiness-client.test.ts\n\n### Approach\n\nThe subscribe driver's data handler decodes each chunk statelessly, mangling\na multibyte sequence split across reads. Adopt the server's per-connection\nstreaming TextDecoder shape: a fresh decoder per dial (like the existing\nper-connection LineBuffer), lenient posture (U+FFFD, never throws), partial\ntail discarded on reconnect so a dead socket's torn bytes never bleed into\nthe new stream's first line. Newline framing is single-byte-safe, so this is\npure data fidelity \u2014 no framing change. Re-evaluate the surrounding\ntry/catch after the change and keep only what still has a live purpose.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/readiness-client.ts:1554 \u2014 the stateless decode inside the data handler; :1522-1570 connectOnce (where the per-dial decoder belongs, beside the fresh LineBuffer)\n- src/server-worker.ts:3668 decodeConnChunk + flushConnDecoder \u2014 the shape to mirror\n\n**Optional** (reference as needed):\n- test/server-worker.test.ts:281 \u2014 the snowman-split regression template to port\n\n### Test notes\n\nPort the split-multibyte template: a frame split mid-character across two\ndata events decodes intact; a torn tail from a killed dial is absent from\nthe next dial's first frame.\n\n## Acceptance\n\n- [ ] A multibyte character split across data events decodes intact through the subscribe driver\n- [ ] A reconnect discards the prior dial's partial decode tail\n- [ ] The readiness-client test gate passes\n\n## Done summary\nAdopted a per-connection streaming TextDecoder in the subscribe driver so multibyte frames split across data events decode intact and a torn tail is discarded on reconnect; ported the snowman-split regression template.\n## Evidence\n",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.1",
+      "tier": "high",
+      "title": "Streaming client frame decode"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 98,
+        "files_changed": 2,
+        "insertions": 420
+      },
+      "done_summary": "Reproduced the terminate-without-close and hung-connect-dial wedges under the injected socket seam, then hardened recovery unconditionally: a fallback reconnect kick fires even when close never re-drives, a 5s injected connect-timeout bounds every dial and routes to retry (never fatal), teardown stays hard-destroy, and lifecycle callback exceptions no longer kill the loop. Heartbeat/query-timeout thresholds left unchanged; readiness-client test gate and the flat-RSS soak both pass.",
+      "input_hash": "cfd269cffd51fdb19a4cdb1598e0a80dc6546ca5f294ecccadeb7837fedeb001",
+      "model": "opus",
+      "spec_chars": 3574,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/readiness-client.ts, test/readiness-client.test.ts\n\n### Approach\n\nRed-repro first: under the injected socket factory + fake clock, reproduce a\npermanently-dead client and NAME the wedge \u2014 the two verified candidates are\n(a) triggerReconnect's reconnecting latch sticking because self-terminate\nnever re-drives the close callback (the latch's only reset), and (b) the\nretry loop parked forever in an unbounded connect dial (no connect-timeout\nexists, and panes pass no give-up policy). The injected seam must faithfully\nmodel terminate-that-does-not-emit-close \u2014 a mock whose fallback always\nsynthesizes close cannot express the bug. Then harden recovery\nUNCONDITIONALLY: triggerReconnect guarantees a scheduled reconnect even when\nclose never fires (belt-and-suspenders), a hand-rolled connect-timeout\n(injected timers; above the backoff base, at most the query timeout) routes\na hung dial to teardown-and-retry, never fatal; every teardown path stays\nhard-destroy so the flat-RSS soak stays green; the give-up path that\nkeeper-await relies on is untouched. Touch the heartbeat/query-timeout\ndetection thresholds ONLY if the repro proves a false-positive teardown of a\nlive-but-slow socket; otherwise leave detection alone. Record which wedge\nstate reproduced (or the null result) in Evidence.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/readiness-client.ts:1105-1133 triggerReconnect + pollAll heartbeat; :1461-1520 teardown/destroy; :1522-1570 connectOnce + close handler; :1641-1669 connectWithRetry await; :938-987 give-up wiring (inert for panes); :160-221 constants\n- scripts/subscribe-bounce-soak.ts \u2014 the flat-RSS gate that must stay green\n\n**Optional** (reference as needed):\n- test/readiness-client.test.ts \u2014 the injected connect-factory/fake-now idioms to extend\n\n### Risks\n\n- A recovery regression here hits every pane, keeper await, and the dash \u2014 the shared-client blast radius is the whole TUI surface\n- A mock that always emits close validates the fix against a harness that cannot express the bug\n\n### Test notes\n\nRed: terminate-without-close leaves the client dead today; hung dial parks\nthe loop today. Green: both recover under the fix; attempt counter resets on\nserved result; give-up policy still honored when passed; a thrown lifecycle\ncallback does not kill the loop (bound the blast radius or record why not).\n\n## Acceptance\n\n- [ ] A red test reproduces (or records the null result for) each candidate wedge under a seam that models terminate-without-close\n- [ ] The hardened client schedules a reconnect without the close callback and bounds every connect dial, routing timeouts to retry, never fatal\n- [ ] Every teardown remains hard-destroy and the subscribe-bounce soak stays flat\n- [ ] Detection thresholds are unchanged unless the repro proved false-positive teardown, with the verdict recorded in Evidence\n- [ ] The readiness-client test gate passes\n\n## Done summary\nReproduced the terminate-without-close and hung-connect-dial wedges under the injected socket seam, then hardened recovery unconditionally: a fallback reconnect kick fires even when close never re-drives, a 5s injected connect-timeout bounds every dial and routes to retry (never fatal), teardown stays hard-destroy, and lifecycle callback exceptions no longer kill the loop. Heartbeat/query-timeout thresholds left unchanged; readiness-client test gate and the flat-RSS soak both pass.\n## Evidence\n",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.2",
+      "tier": "xhigh",
+      "title": "Wedge repro and recovery hardening"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 151,
+        "files_changed": 3,
+        "insertions": 198
+      },
+      "done_summary": "Rendered the three-state reconnect banner (grace, retrying with attempt/countdown, DISCONNECTED with monotonic last-good-frame age) driven from existing lifecycle telemetry; degrades in place, never blanks the panel. Revised ADR 0019 in place to the new model.",
+      "input_hash": "cfd269cffd51fdb19a4cdb1598e0a80dc6546ca5f294ecccadeb7837fedeb001",
+      "model": "sonnet",
+      "spec_chars": 2978,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/view-shell.ts, test/view-shell.test.ts, docs/adr/0019-tui-readiness-gate-over-boot-status.md, CONTEXT.md\n\n### Approach\n\nRender the reconnect truth the client already emits. Three banner states\nwith a fixed transition table: grace (hold-last-frame + the existing\nreconnecting pill, unchanged), retrying (after the grace: attempt N and a\nretry-in countdown driven from the waiting payload's attempt/retry_in_ms \u2014\ntoday that payload reaches only the lifecycle sidecar), and long-dead (the\nDISCONNECTED token plus last-good-frame age from a NEW monotonic per-frame\nstamp, shown once age exceeds a small threshold, ticking on the existing\nspinner cadence, gated on frame recency never socket state). Banner text\nstays plain (never SGR-parsed); color signals stay in the body indicator.\nThe countdown resets when data resumes (exitReconnecting on paint). A silent\ngeneration re-baseline with no transport drop surfaces nothing. Degrade in\nplace \u2014 never blank the panel. Revise ADR 0019's Decision/Consequences in\nplace to the new model (one slice, no stale second paragraph). Add CONTEXT.md\nterms only if the new states earn first-class names; DISCONNECTED remains the\nsole dead-socket token and \"reconnect\" is never used in the resume sense.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/view-shell.ts:620-895 \u2014 the banner state machine (grace arm, pill, DISCONNECTED token, formatIndicatorLine); :1231-1273 emitLifecycle (route the waiting branch to state, keep the sidecar write); :1202 paintLiveFrame ordering\n- src/dash/app.ts:782-798 \u2014 the other onLifecycle consumer that must keep working\n\n**Optional** (reference as needed):\n- test/view-shell.test.ts \u2014 injected-lifecycle-event test idioms\n\n### Risks\n\n- Wall-clock frame age lies across suspend/resume \u2014 the stamp must be monotonic\n- The banner is shared by five panes and the dash; a render regression is universally visible\n\n### Test notes\n\nDrive injected lifecycle events: grace shows the pill; waiting after grace\nshows attempt/countdown; long-dead shows DISCONNECTED + age advancing on the\nfake clock; paint clears everything; a generation re-baseline without a drop\nrenders nothing.\n\n## Acceptance\n\n- [ ] The three banner states render per the transition table from injected lifecycle events, countdown and age driven by the fake clock\n- [ ] Frame age uses a monotonic stamp gated on frame recency and the panel degrades in place, never blanking\n- [ ] ADR 0019 describes the new model in place with no stale remainder\n- [ ] The view-shell test gate passes\n\n## Done summary\nRendered the three-state reconnect banner (grace, retrying with attempt/countdown, DISCONNECTED with monotonic last-good-frame age) driven from existing lifecycle telemetry; degrades in place, never blanks the panel. Revised ADR 0019 in place to the new model.\n## Evidence\n",
+      "task_id": "fn-1336-dash-pane-reconnect-reliability.3",
+      "tier": "high",
+      "title": "Honest banner and frame age"
+    }
+  ],
+  "created_at": "2026-07-18T15:59:15.251000Z",
+  "epic_id": "fn-1336-dash-pane-reconnect-reliability",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "cfd269cffd51fdb19a4cdb1598e0a80dc6546ca5f294ecccadeb7837fedeb001",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
