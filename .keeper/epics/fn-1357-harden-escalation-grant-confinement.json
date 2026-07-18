@@ -7,7 +7,7 @@
     "fn-1347-escalation-grant-confinement-groundwork"
   ],
   "id": "fn-1357-harden-escalation-grant-confinement",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T22:16:44.753000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T22:16:43.633000Z"
+  "updated_at": "2026-07-18T22:16:44.753000Z"
 }
