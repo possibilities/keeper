@@ -40,5 +40,5 @@ Files:
       as delivered.
 
 ## Done summary
-
+Marked decline-recording deferred in ADR 0078 (parallel to auto-forfeiture), doc-commented the decline read/annotate surface as the awaiting-producer half, and reconciled the stale claim/diff drift in docs/problem-codes.md, the worker template, and fn-1322's task/epic done-summaries and audit brief.
 ## Evidence
