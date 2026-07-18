@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Concurrent freshness fencing, bounded keyset progress, and live-subscription preservation form subtle cross-file correctness invariants that warrant Opus at xhigh.",
+      "task_id": "fn-1340-bound-bus-presence-retention.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T18:06:11.846000Z",
+  "epic_id": "fn-1340-bound-bus-presence-retention",
+  "input_hash": "6a0e41d88e6518b8ed64fefb5559d4307eaaa220a753653bbecb9c0d878d4be0",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1779319256,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1340-bound-bus-presence-retention.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Concurrent freshness fencing, bounded keyset progress, and live-subscription preservation form subtle cross-file correctness invariants that warrant Opus at xhigh.\",\"confidence\":0.96}]}\n"
+}
