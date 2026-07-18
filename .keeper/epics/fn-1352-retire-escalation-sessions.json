@@ -3,7 +3,8 @@
   "bundles": [],
   "created_at": "2026-07-18T21:06:18.861000Z",
   "depends_on_epics": [
-    "fn-1351-repair-under-write-grant"
+    "fn-1351-repair-under-write-grant",
+    "fn-1346-retire-torn-down-lane-git-rows"
   ],
   "id": "fn-1352-retire-escalation-sessions",
   "last_validated_at": null,
@@ -14,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:06:18.861000Z"
+  "updated_at": "2026-07-18T21:06:54.871000Z"
 }
