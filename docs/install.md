@@ -192,6 +192,31 @@ them with session-wide tmux cleanup, process-name matching, or a target derived 
 Detailed states are in
 [problem-codes.md](./problem-codes.md#panel-run-lifecycle).
 
+### Pi shorthand and skill discovery
+
+Every keeper-launched Pi session gets `/hack` and `/plan` as native shorthand for
+`/skill:hack` and `/skill:plan`: an `input` handler rewrites only a leading complete
+`/hack` or `/plan` token, preserving the rest of the line, and hands the rewritten text
+back to Pi's own skill expansion pipeline — never an extension command, which would
+bypass it. A `resources_discover` handler contributes exactly Keeper's two canonical
+skill directories, resolved from the extension module itself rather than the launch cwd,
+so an edit to either skill body is visible without a reinstall or global link. The short
+aliases also surface in slash-command autocomplete ahead of any same-prefix match,
+without depending on a pre-discovery command snapshot.
+
+Both registrations are launch-scoped (`KEEPER_JOB_ID`-gated) and independently fail-open:
+a resource-discovery or autocomplete failure degrades only its own surface, never Task,
+Monitor, Agent Bus, event logging, footer, rename, or commit-work behavior. Standalone Pi
+sessions and same-name ambient skills are out of scope — Pi's own discovery and collision
+behavior applies; see
+[ADR 0091](./adr/0091-keeper-owned-pi-shorthands-and-skill-discovery.md). Verify the
+in-process contract (no real Pi subprocess, no ambient `~/.pi` state) with:
+
+```sh
+bun test test/pi-skill-autocomplete.test.ts
+bun test test/pi-extension.test.ts
+```
+
 After installing agent-template or extension changes, run the repository correctness gate:
 
 ```sh

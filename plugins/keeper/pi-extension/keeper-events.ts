@@ -85,9 +85,10 @@ import {
 } from "./monitor-facade.ts";
 import { type PiRenameApi, registerRenameCommand } from "./rename-command.ts";
 import {
-  installShadowedSkillAutocomplete,
-  type PiSkillAutocompleteApi,
+  expandSkillShorthandInput,
+  installSkillShorthandAutocomplete,
   type PiSkillAutocompleteContext,
+  SKILL_SHORTHANDS,
 } from "./skill-autocomplete.ts";
 import {
   installPiStatusFooter,
@@ -130,13 +131,64 @@ export interface PiObservedEvent {
   mutationPath?: string | null;
 }
 
+/**
+ * pi's `input` event, fired on raw user text before skill/template expansion.
+ * A `transform` result rewrites `text` and pi resumes native expansion on the
+ * rewritten form — the input handler never registers an extension command,
+ * which would bypass that pipeline entirely.
+ */
+export interface PiInputEvent {
+  type: "input";
+  text: string;
+}
+
+export interface PiInputTransformResult {
+  action: "transform";
+  text: string;
+}
+
+/**
+ * pi's `resources_discover` event, fired once after every `session_start`
+ * (`reason: "startup" | "reload"`). A returned `skillPaths` entry contributes
+ * an additional skill directory alongside pi's own discovery.
+ */
+export interface PiResourcesDiscoverEvent {
+  type: "resources_discover";
+  cwd: string;
+  reason: "startup" | "reload";
+}
+
+export interface PiResourcesDiscoverResult {
+  skillPaths?: string[];
+}
+
 /** The minimal surface of pi's `ExtensionAPI` this extension calls. Structural so
  *  the file needs no import from the pi package; pi passes an object with `.on`. */
 export type PiSessionContext = PiFooterContext &
   PiEditorBorderContext &
   PiSkillAutocompleteContext;
 
-export interface PiExtensionApi extends PiSkillAutocompleteApi {
+export interface PiExtensionApi {
+  on(
+    event: "input",
+    handler: (
+      event: PiInputEvent,
+      context?: PiSessionContext,
+    ) =>
+      | PiInputTransformResult
+      | undefined
+      | Promise<PiInputTransformResult | undefined>,
+  ): void;
+  on(
+    event: "resources_discover",
+    handler: (
+      event: PiResourcesDiscoverEvent,
+      context?: PiSessionContext,
+    ) =>
+      | PiResourcesDiscoverResult
+      | undefined
+      | Promise<PiResourcesDiscoverResult | undefined>,
+  ): void;
   on(
     event: string,
     handler: (
@@ -266,6 +318,20 @@ export function piDispatchAttemptFromEnv(
   }
   const attemptId = Number(raw);
   return Number.isSafeInteger(attemptId) ? attemptId : null;
+}
+
+/**
+ * The canonical Hack and Plan skill directories Keeper contributes through
+ * `resources_discover`, resolved from THIS module's own location — never the
+ * launch cwd or another repository — so every Keeper-launched Pi session
+ * discovers the same skill bodies the Claude side ships, with no sibling
+ * `plugins/plan/skills/*` entries exposed.
+ */
+export function piSkillShorthandResourcePaths(): string[] {
+  const extensionDir = dirname(fileURLToPath(import.meta.url));
+  return SKILL_SHORTHANDS.map((shorthand) =>
+    resolve(extensionDir, "..", "..", "plan", "skills", shorthand.name),
+  );
 }
 
 function dispatchAttemptPayload(
@@ -1499,6 +1565,24 @@ export default function keeperEvents(
     ]) {
       pi.on(kind, (event, context) => emit(event, context));
     }
+    // NOT observer-only: pi awaits these return values to rewrite raw input
+    // or extend its skill search path, so each handler resolves to a safe
+    // undefined instead of letting a throw escape into pi's core (ADR 0091).
+    pi.on("input", (event) => {
+      try {
+        const text = expandSkillShorthandInput(event.text);
+        return text === event.text ? undefined : { action: "transform", text };
+      } catch {
+        return undefined;
+      }
+    });
+    pi.on("resources_discover", () => {
+      try {
+        return { skillPaths: piSkillShorthandResourcePaths() };
+      } catch {
+        return undefined;
+      }
+    });
     pi.on("session_start", (_event, context) => {
       try {
         if (busInbox !== null && claimBusInboxOwnership(busOwnerToken)) {
@@ -1523,7 +1607,7 @@ export default function keeperEvents(
       }
       try {
         if (context !== undefined) {
-          installShadowedSkillAutocomplete(pi, context);
+          installSkillShorthandAutocomplete(context);
         }
       } catch {
         // Autocomplete is advisory and must never break Pi startup.

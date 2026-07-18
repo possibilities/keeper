@@ -802,16 +802,28 @@ describe("pi extension — factory arming + fail-open", () => {
   ) {
     const handlers = new Map<
       string,
-      ((e: PiObservedEvent, context?: PiSessionContext) => void)[]
+      Array<(e: unknown, context?: PiSessionContext) => unknown>
     >();
     const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
     const tools = new Map<string, unknown>();
-    const commands: Array<{ name: string; source: string }> = [];
     const sendCalls: Array<{ message: unknown; options: unknown }> = [];
+    // Cast once, same reasoning as `fakeRenamePi`'s `on`: this fake's single
+    // handler storage backs EVERY `PiExtensionApi.on` overload (lifecycle,
+    // `input`, `resources_discover`) — a plain function EXPRESSION assertion
+    // is exact where structural inference against the overloaded target
+    // (checked contravariantly, not bivariantly, for a property of this
+    // shape) is not.
+    const on = ((
+      kind: string,
+      h: (e: unknown, context?: PiSessionContext) => unknown,
+    ) => {
+      const list = handlers.get(kind) ?? [];
+      list.push(h);
+      handlers.set(kind, list);
+    }) as PiExtensionApi["on"];
     return {
       handlers,
       tools,
-      commands,
       sendCalls,
       events: {
         on(event: string, handler: (data: unknown) => void) {
@@ -826,30 +838,26 @@ describe("pi extension — factory arming + fail-open", () => {
           }
         },
       },
-      on(
-        kind: string,
-        h: (e: PiObservedEvent, context?: PiSessionContext) => void,
-      ) {
-        const list = handlers.get(kind) ?? [];
-        list.push(h);
-        handlers.set(kind, list);
-      },
-      fire(kind: string, e: PiObservedEvent, context?: PiSessionContext) {
+      on,
+      /** Returns the LAST registered handler's result (only one handler is
+       *  ever registered per kind in production wiring). */
+      fire(kind: string, e: unknown, context?: PiSessionContext): unknown {
+        let result: unknown;
         for (const h of handlers.get(kind) ?? []) {
-          void h(e, context);
+          result = h(e, context);
         }
+        return result;
       },
       async fireAsync(
         kind: string,
-        e: PiObservedEvent,
+        e: unknown,
         context?: PiSessionContext,
-      ) {
+      ): Promise<unknown> {
+        let result: unknown;
         for (const h of handlers.get(kind) ?? []) {
-          await h(e, context);
+          result = await h(e, context);
         }
-      },
-      getCommands() {
-        return commands;
+        return result;
       },
       registerTool(tool: unknown) {
         const name = (tool as { name?: unknown }).name;
@@ -909,7 +917,9 @@ describe("pi extension — factory arming + fail-open", () => {
     expect([...pi.handlers.keys()].sort()).toEqual([
       "agent_end",
       "agent_start",
+      "input",
       "model_select",
+      "resources_discover",
       "session_shutdown",
       "session_start",
       "thinking_level_select",
@@ -1180,13 +1190,9 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(pi.sendCalls).toHaveLength(deliveriesBeforeShutdown);
   });
 
-  test("session start hides skill commands shadowed by extension aliases", () => {
+  test("session start installs the skill shorthand autocomplete provider without a command snapshot", () => {
     process.env.KEEPER_JOB_ID = "job-live";
     const pi = fakePi();
-    pi.commands.push(
-      { name: "hack", source: "extension" },
-      { name: "skill:hack", source: "skill" },
-    );
     let installed = false;
     keeperEvents(pi);
     pi.fire(
@@ -1204,30 +1210,32 @@ describe("pi extension — factory arming + fail-open", () => {
     expect(installed).toBe(true);
   });
 
-  test("autocomplete failures never escape session start", () => {
+  test("repeated session startup re-installs the autocomplete provider each time", () => {
     process.env.KEEPER_JOB_ID = "job-live";
-    const commandFailure = fakePi();
-    commandFailure.getCommands = () => {
-      throw new Error("command discovery failed");
-    };
-    keeperEvents(commandFailure);
-    expect(() =>
-      commandFailure.fire(
-        "session_start",
-        { type: "session_start" },
-        {
-          cwd: "/work/repo",
-          ui: { addAutocompleteProvider() {} },
+    const pi = fakePi();
+    keeperEvents(pi);
+    let installCount = 0;
+    const ctx = {
+      cwd: "/work/repo",
+      ui: {
+        addAutocompleteProvider() {
+          installCount += 1;
         },
-      ),
-    ).not.toThrow();
+      },
+    };
+    pi.fire("session_start", { type: "session_start" }, ctx);
+    pi.fire("session_start", { type: "session_start", reason: "resume" }, ctx);
+    expect(installCount).toBe(2);
+  });
 
+  test("an autocomplete registration failure never escapes session start and never suppresses input/resources_discover", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
     const uiFailure = fakePi();
-    uiFailure.commands.push(
-      { name: "hack", source: "extension" },
-      { name: "skill:hack", source: "skill" },
-    );
     keeperEvents(uiFailure);
+    // input/resources_discover register at factory time, before any
+    // session_start fires — a later autocomplete throw cannot retract them.
+    expect(uiFailure.handlers.has("input")).toBe(true);
+    expect(uiFailure.handlers.has("resources_discover")).toBe(true);
     expect(() =>
       uiFailure.fire(
         "session_start",
@@ -1242,6 +1250,53 @@ describe("pi extension — factory arming + fail-open", () => {
         },
       ),
     ).not.toThrow();
+    expect(
+      uiFailure.fire("input", { type: "input", text: "/hack ship it" }),
+    ).toEqual({ action: "transform", text: "/skill:hack ship it" });
+  });
+
+  test("input rewrites exact aliases to native skill commands and passes through everything else", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    const pi = fakePi();
+    keeperEvents(pi);
+    expect(pi.fire("input", { type: "input", text: "/hack ship it" })).toEqual({
+      action: "transform",
+      text: "/skill:hack ship it",
+    });
+    expect(pi.fire("input", { type: "input", text: "/plan" })).toEqual({
+      action: "transform",
+      text: "/skill:plan",
+    });
+    expect(
+      pi.fire("input", { type: "input", text: "/skill:hack do it" }),
+    ).toBeUndefined();
+    expect(
+      pi.fire("input", { type: "input", text: "/hacker" }),
+    ).toBeUndefined();
+    expect(
+      pi.fire("input", { type: "input", text: "ordinary prompt" }),
+    ).toBeUndefined();
+  });
+
+  test("resources_discover contributes exactly the canonical Hack and Plan skill directories, independent of cwd", () => {
+    process.env.KEEPER_JOB_ID = "job-live";
+    const pi = fakePi();
+    keeperEvents(pi);
+    const result = pi.fire("resources_discover", {
+      type: "resources_discover",
+      cwd: "/some/other/launch/cwd",
+      reason: "startup",
+    }) as { skillPaths?: string[] } | undefined;
+    expect(result?.skillPaths).toHaveLength(2);
+    const paths = result?.skillPaths ?? [];
+    expect(paths.every((path) => existsSync(path))).toBe(true);
+    expect(paths.every((path) => !path.includes("arthack"))).toBe(true);
+    expect(
+      paths.some((path) => path.endsWith(join("plan", "skills", "hack"))),
+    ).toBe(true);
+    expect(
+      paths.some((path) => path.endsWith(join("plan", "skills", "plan"))),
+    ).toBe(true);
   });
 
   test("a fired event appends the translated line to the per-pid file", () => {
@@ -2553,13 +2608,15 @@ describe("pi extension — /rename arming via the keeperEvents factory", () => {
 
   test("a pi surface missing registerCommand/setSessionName never throws and never registers /rename", () => {
     const handlers = new Map<string, Array<(e: PiObservedEvent) => void>>();
-    const pi: PiExtensionApi = {
-      on(kind: string, h: (e: PiObservedEvent) => void) {
-        const list = handlers.get(kind) ?? [];
-        list.push(h);
-        handlers.set(kind, list);
-      },
-    };
+    // Same cast idiom as `fakeRenamePi`'s `on`: a plain function EXPRESSION
+    // assertion is exact where structural inference against the overloaded
+    // `PiExtensionApi.on` target is not.
+    const on = ((kind: string, h: (e: PiObservedEvent) => void) => {
+      const list = handlers.get(kind) ?? [];
+      list.push(h);
+      handlers.set(kind, list);
+    }) as PiExtensionApi["on"];
+    const pi: PiExtensionApi = { on };
     expect(() => keeperEvents(pi)).not.toThrow();
   });
 
