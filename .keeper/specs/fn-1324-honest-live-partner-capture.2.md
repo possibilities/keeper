@@ -46,5 +46,5 @@ Cover definite delivery plus answer, delivered timeout plus late transcript reco
 - [ ] Focused dispatch, resume-policy, capture, artifact, and dependency-boundary tests pass
 
 ## Done summary
-
+Extended agent run --resume to send a bounded message to an exact live Partner over the existing Bus artifact rail, capturing only the response observed after the injected-message boundary; single-request admission, honest ambiguity/death/timeout distinctions, and non-resending recovery guidance are preserved.
 ## Evidence
