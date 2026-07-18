@@ -131,6 +131,19 @@ function patchTimeouts(): TimeoutCapture {
   };
 }
 
+function makeFakeMonotonicClock(initial = 0): {
+  now: () => number;
+  advance: (ms: number) => void;
+} {
+  let value = initial;
+  return {
+    now: () => value,
+    advance: (ms) => {
+      value += ms;
+    },
+  };
+}
+
 // Spy on a live view's banner `setStatus` — the reconnecting pill is a banner
 // write (not a body write), so it doesn't surface on the passthrough stdout
 // sink. The shell reads `liveShell.setStatus` by property, so reassigning it
@@ -1467,12 +1480,11 @@ test("frames: reportSnapshotStream is inert (no coverage accounting to drift)", 
 });
 
 // ---------------------------------------------------------------------------
-// fn-1180: live-mode daemon-readiness gate. A catch-up-reporting result HOLDS
-// the data frame and paints the loading indicator (re-fold % / git-seed /
-// catching-up branches); the flip to ready paints the held frame at once. A
-// post-paint disconnect keeps the last frame under a "reconnecting…" pill,
-// flipping to the full indicator on grace expiry or immediately on a catch-up
-// report. The re-fold percentage never regresses across the poller→wire switch.
+// Live-mode daemon-readiness gate. A catch-up-reporting result holds the data
+// frame behind the loading indicator; the ready flip paints the held frame.
+// A post-paint disconnect retains the frame through grace, then presents retry
+// timing and eventually an age-based DISCONNECTED warning. The re-fold
+// percentage never regresses across the poller→wire switch.
 // ---------------------------------------------------------------------------
 
 test("live gate: a catch-up result holds the frame and paints the re-fold indicator; the flip paints it", () => {
@@ -1598,83 +1610,79 @@ test("live gate: the re-fold percentage never regresses across the poller→wire
   expect(joined).toContain("40.0%");
 });
 
-test("live gate: a post-paint disconnect holds the frame under a pill; grace expiry flips to an unmistakable DISCONNECTED indicator", () => {
+test("live gate: grace holds the frame, then retrying counts down before frame age becomes long-dead", () => {
   const timeouts = patchTimeouts();
-  const poller = makeFakePoller([{ cursor: 5, max: 10 }], {
-    cursor: 5,
-    max: 10,
-  });
+  const clock = makeFakeMonotonicClock();
   try {
     view = createViewShell<{ body: string[] }>({
       script: sidecarBase,
       renderBody,
-      refoldProgressPoller: poller,
+      monotonicNow: clock.now,
+      refoldProgressPoller: makeFakePoller([]),
     });
     const status = spyStatus(view);
 
-    // Paint a ready first frame.
     view.emit({ body: ["live data"] });
-    expect(stdoutCap.writes.join("")).toContain("live data");
-
-    // Disconnect AFTER the paint → reconnecting pill, last frame held, grace armed.
     view.emitLifecycle("disconnected", {});
-    expect(status).toContain("reconnecting…");
-    // No indicator armed during the grace — the last frame stays put.
+    expect(status.at(-1)).toBe("reconnecting…");
     expect(intervals.callbacks).toHaveLength(0);
-    expect(stdoutCap.writes.join("")).not.toContain("re-folding event log");
-    expect(stdoutCap.writes.join("")).not.toContain("DISCONNECTED");
 
-    // Grace elapses → the banner pill AND the body indicator both flip to the
-    // plain-text DISCONNECTED token — the sole owner of the body slot, no
-    // re-fold % or "connecting…" text that would read as an ordinary
-    // cold-start/catch-up state.
+    clock.advance(1500);
     timeouts.fireLast();
-    expect(status.at(-1)).toBe("DISCONNECTED");
+    expect(status.at(-1)).toBe("retrying…");
+    view.emitLifecycle("waiting", { attempt: 3, retry_in_ms: 800 });
+    expect(status.at(-1)).toBe("retrying · attempt 3 · retry in 0.8s");
     expect(intervals.callbacks).toHaveLength(1);
-    intervals.tick();
-    const joined = stdoutCap.writes.join("");
-    expect(joined).toContain("DISCONNECTED");
-    expect(joined).not.toContain("re-folding event log");
-    expect(joined).not.toContain("connecting to keeperd");
-  } finally {
-    timeouts.restore();
-  }
-});
 
-test("live gate: the DISCONNECTED body token survives repeated spinner ticks (one owner of the slot)", () => {
-  const timeouts = patchTimeouts();
-  const poller = makeFakePoller([{ cursor: 5, max: 10 }], {
-    cursor: 5,
-    max: 10,
-  });
-  try {
-    view = createViewShell<{ body: string[] }>({
-      script: sidecarBase,
-      renderBody,
-      refoldProgressPoller: poller,
-    });
-    view.emit({ body: ["live data"] });
-    view.emitLifecycle("disconnected", {});
-    timeouts.fireLast();
+    clock.advance(300);
     intervals.tick();
+    expect(status.at(-1)).toBe("retrying · attempt 3 · retry in 0.5s");
+    expect(stdoutCap.writes.at(-1)).toContain("live data");
 
-    // Several more ticks (the spinner glyph animates) — the DISCONNECTED
-    // token must never be overwritten by a re-fold % or plain "connecting…"
-    // line on any of them.
-    for (let i = 0; i < 5; i += 1) {
-      intervals.tick();
-    }
-    const joined = stdoutCap.writes.join("");
-    expect(joined).not.toContain("re-folding event log");
-    expect(joined).not.toContain("connecting to keeperd");
+    clock.advance(3200);
+    intervals.tick();
+    expect(status.at(-1)).toBe("DISCONNECTED · last good frame 5s ago");
     const lastWrite = stdoutCap.writes.at(-1) ?? "";
+    expect(lastWrite).toContain("live data");
     expect(lastWrite).toContain("DISCONNECTED");
   } finally {
     timeouts.restore();
   }
 });
 
-test("live gate: a transient flash cannot clobber the reconnecting pill or the post-grace DISCONNECTED token", () => {
+test("live gate: long-dead age advances by the monotonic frame clock, not socket lifecycle", () => {
+  const timeouts = patchTimeouts();
+  const clock = makeFakeMonotonicClock();
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      monotonicNow: clock.now,
+      refoldProgressPoller: makeFakePoller([]),
+    });
+    const status = spyStatus(view);
+    view.emit({ body: ["last good data"] });
+    view.emitLifecycle("disconnected", {});
+    clock.advance(1500);
+    timeouts.fireLast();
+    view.emitLifecycle("waiting", { attempt: 1, retry_in_ms: 1000 });
+
+    clock.advance(3500);
+    intervals.tick();
+    expect(status.at(-1)).toBe("DISCONNECTED · last good frame 5s ago");
+    expect(stdoutCap.writes.at(-1)).toContain("last good data");
+
+    // A transport-open event is not a fresh frame and cannot reset its age.
+    view.emitLifecycle("connected", {});
+    clock.advance(2000);
+    intervals.tick();
+    expect(status.at(-1)).toBe("DISCONNECTED · last good frame 7s ago");
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("live gate: a transient flash cannot clobber the grace or retrying banner", () => {
   const timeouts = patchTimeouts();
   const poller = makeFakePoller([], null);
   try {
@@ -1696,21 +1704,20 @@ test("live gate: a transient flash cannot clobber the reconnecting pill or the p
     expect(status.length).toBe(beforePreGrace);
     expect(status.at(-1)).toBe("reconnecting…");
 
-    // Grace expires → DISCONNECTED token owns the slot.
+    // Grace expiry promotes the banner to retrying, which owns the same slot.
     timeouts.fireLast();
-    expect(status.at(-1)).toBe("DISCONNECTED");
+    expect(status.at(-1)).toBe("retrying…");
 
-    // A flash post-grace is dropped the same way.
     const beforePostGrace = status.length;
     view.flashStatus("[copied frame 2]");
     expect(status.length).toBe(beforePostGrace);
-    expect(status.at(-1)).toBe("DISCONNECTED");
+    expect(status.at(-1)).toBe("retrying…");
   } finally {
     timeouts.restore();
   }
 });
 
-test("live gate: reconnecting after grace expiry clears DISCONNECTED via the existing teardown, restoring the normal banner", () => {
+test("live gate: a ready paint clears retrying and its countdown", () => {
   const timeouts = patchTimeouts();
   const poller = makeFakePoller([], null);
   try {
@@ -1723,11 +1730,11 @@ test("live gate: reconnecting after grace expiry clears DISCONNECTED via the exi
 
     view.emit({ body: ["live data"] });
     view.emitLifecycle("disconnected", {});
+    view.emitLifecycle("waiting", { attempt: 2, retry_in_ms: 500 });
     timeouts.fireLast();
-    expect(status.at(-1)).toBe("DISCONNECTED");
+    expect(status.at(-1)).toBe("retrying · attempt 2 · retry in 0.5s");
 
-    // A fresh ready frame lands — `paintLiveFrame` calls `exitReconnecting()`,
-    // clearing the DISCONNECTED pill and repainting normally.
+    // A fresh ready frame clears the retry state and repaints normally.
     expect(view.emit({ body: ["fresh data"] })).toBe(true);
     expect(status.at(-1)).toBe("");
     const joined = stdoutCap.writes.join("");
@@ -1765,6 +1772,26 @@ test("live gate: a sub-grace reconnect keeps the last frame with no indicator fl
   } finally {
     timeouts.restore();
   }
+});
+
+test("live gate: a generation re-baseline without a transport drop leaves no connection banner", () => {
+  const clock = makeFakeMonotonicClock();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    monotonicNow: clock.now,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  const status = spyStatus(view);
+  view.emit({ body: ["steady data"] });
+  clock.advance(10_000);
+
+  // A ready boot header and byte-identical frame are a generation re-baseline,
+  // not a transport drop, so no grace/retry/dead presentation is armed.
+  view.noteCatchingUp(false, makeBoot());
+  expect(view.emit({ body: ["steady data"] })).toBe(false);
+  expect(status).toEqual([]);
+  expect(stdoutCap.writes).toHaveLength(1);
 });
 
 test("live gate: a reconnect reporting catch-up flips to the indicator immediately (before grace)", () => {
