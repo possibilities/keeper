@@ -1,0 +1,32 @@
+{
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Two well-specified single-surface markdown skill edits with an exact acceptance (reorder HEAD capture after the ff-only pull; restore a dropped page-and-decline line) and no design choice, routing GPT-first at the do-exactly-this band.",
+      "task_id": "fn-1360-harden-escalation-plan-agent-migration.1",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Straight test additions but spanning a few surfaces (render/compile default_pin fallback plus effort-axis throw, and a grant-guard confinement integration seam over plan:* agent_types) with named acceptance, fitting the GPT workhorse for substantial well-specified multi-file work; the enforcement itself is out of scope so no opus gate.",
+      "task_id": "fn-1360-harden-escalation-plan-agent-migration.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T23:42:35.814000Z",
+  "epic_id": "fn-1360-harden-escalation-plan-agent-migration",
+  "input_hash": "1f9112e5219b8ae550128c1551fad7883e72a959901b973340f23840a797e423",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 529601253,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Two well-specified single-surface markdown skill edits with an exact acceptance (reorder HEAD capture after the ff-only pull; restore a dropped page-and-decline line) and no design choice, routing GPT-first at the do-exactly-this band.\",\"confidence\":0.82},{\"task_id\":\"2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Straight test additions but spanning a few surfaces (render/compile default_pin fallback plus effort-axis throw, and a grant-guard confinement integration seam over plan:* agent_types) with named acceptance, fitting the GPT workhorse for substantial well-specified multi-file work; the enforcement itself is out of scope so no opus gate.\",\"confidence\":0.72}]}\n"
+}
