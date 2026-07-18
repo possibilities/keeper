@@ -135,13 +135,23 @@ async function restartAndCapture(
 }
 
 describe("structured restart health", () => {
-  test("requires a result frame with exact identity and boolean Drain state", () => {
+  test("recognizes exact and positively served identity-incapable results", () => {
     expect(
       parseRestartHealthFrame({
         type: "result",
         boot: { ...NEXT, catching_up: false },
       }),
     ).toEqual(served(NEXT));
+    expect(parseRestartHealthFrame({ type: "result" })).toEqual({
+      status: "served-identity-incapable",
+      healthy: true,
+    });
+    expect(
+      parseRestartHealthFrame({
+        type: "result",
+        boot: { catching_up: false, rev: 7 },
+      }),
+    ).toEqual({ status: "served-identity-incapable", healthy: true });
     expect(isCaughtUpFrame({ type: "result" })).toBe(false);
     expect(
       isCaughtUpFrame({
@@ -155,10 +165,69 @@ describe("structured restart health", () => {
         boot: { ...NEXT, catching_up: false },
       }),
     ).toBe(true);
-    expect(parseRestartHealthFrame({ type: "error" })).toEqual({
-      status: "unavailable",
-      diagnostic: "non-result response frame",
-    });
+  });
+
+  test.each([
+    ["non-object frame", null],
+    ["array frame", []],
+    ["non-result", { type: "error" }],
+    ["null boot", { type: "result", boot: null }],
+    ["empty boot", { type: "result", boot: {} }],
+    ["wrong Drain type", { type: "result", boot: { catching_up: 0 } }],
+    [
+      "boot id only",
+      { type: "result", boot: { boot_id: NEXT.boot_id, catching_up: false } },
+    ],
+    [
+      "pid only",
+      { type: "result", boot: { pid: NEXT.pid, catching_up: false } },
+    ],
+    [
+      "start time only",
+      {
+        type: "result",
+        boot: { start_time: NEXT.start_time, catching_up: false },
+      },
+    ],
+    [
+      "boot id and pid",
+      {
+        type: "result",
+        boot: { boot_id: NEXT.boot_id, pid: NEXT.pid, catching_up: false },
+      },
+    ],
+    [
+      "boot id and start time",
+      {
+        type: "result",
+        boot: {
+          boot_id: NEXT.boot_id,
+          start_time: NEXT.start_time,
+          catching_up: false,
+        },
+      },
+    ],
+    [
+      "pid and start time",
+      {
+        type: "result",
+        boot: {
+          pid: NEXT.pid,
+          start_time: NEXT.start_time,
+          catching_up: false,
+        },
+      },
+    ],
+    [
+      "wrong-typed complete tuple",
+      {
+        type: "result",
+        boot: { ...NEXT, pid: String(NEXT.pid), catching_up: false },
+      },
+    ],
+    ["complete tuple without Drain", { type: "result", boot: NEXT }],
+  ])("keeps %s unavailable or ambiguous", (_name, frame) => {
+    expect(parseRestartHealthFrame(frame).status).toBe("unavailable");
   });
 });
 
@@ -229,6 +298,7 @@ describe("keeper daemon restart evidence verdict", () => {
       data: {
         domain: "gui/501/arthack.keeperd",
         identity: NEXT,
+        proof_path: "exact-replacement",
         healthy_probes: 12,
         stabilized_for_ms: 12_000,
       },
@@ -236,6 +306,88 @@ describe("keeper daemon restart evidence verdict", () => {
     expect(
       h.launchctlCalls.filter((args) => args[0] === "kickstart"),
     ).toHaveLength(1);
+  });
+
+  test("proves an identity-capability crossing from a readable empty ledger", async () => {
+    const h = restartHarness({
+      probe: (call) =>
+        call === 0
+          ? { status: "served-identity-incapable", healthy: true }
+          : served(NEXT),
+      ledger: (read) => (read === 0 ? readable() : readable(NEXT)),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(0);
+    expect(JSON.parse(exit.output).data).toMatchObject({
+      identity: NEXT,
+      proof_path: "identity-capability-crossing",
+      stabilized_for_ms: 12_000,
+    });
+    expect(
+      h.launchctlCalls.filter((args) => args[0] === "kickstart"),
+    ).toHaveLength(1);
+  });
+
+  test("crossing proof can retain a failed kickstart as a warning", async () => {
+    const h = restartHarness({
+      kickstart: {
+        exitCode: 1,
+        stdout: "",
+        stderr: "launchctl lost reply",
+      },
+      probe: (call) =>
+        call === 0
+          ? { status: "served-identity-incapable", healthy: true }
+          : served(NEXT),
+      ledger: (read) => (read === 0 ? readable() : readable(NEXT)),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(0);
+    expect(JSON.parse(exit.output).data).toMatchObject({
+      proof_path: "identity-capability-crossing",
+      kickstart_warning: {
+        exit_code: 1,
+        stderr: "launchctl lost reply",
+      },
+    });
+  });
+
+  test.each([
+    ["missing", { status: "missing" } as const],
+    ["unreadable", { status: "unreadable", diagnostic: "denied" } as const],
+    ["successor already present", readable(NEXT)],
+  ])("rejects crossing with %s pre-ledger evidence", async (_name, frozen) => {
+    const h = restartHarness({
+      timeoutMs: 13_000,
+      probe: (call) =>
+        call === 0
+          ? { status: "served-identity-incapable", healthy: true }
+          : served(NEXT),
+      ledger: (read) => (read === 0 ? frozen : readable(NEXT)),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(1);
+    expect(JSON.parse(exit.output).error.code).toBe("restart-unproven");
+  });
+
+  test("does not select crossing from an unavailable pre-restart probe", async () => {
+    const h = restartHarness({
+      timeoutMs: 13_000,
+      probe: (call) =>
+        call === 0
+          ? { status: "unavailable", diagnostic: "connection refused" }
+          : served(NEXT),
+      ledger: (read) => (read === 0 ? readable() : readable(NEXT)),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("restart-unproven");
+    expect(envelope.error.details.pre_restart_probe).toBe("connection refused");
   });
 
   test("resets stabilization when the served identity changes", async () => {
