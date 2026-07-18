@@ -58,5 +58,5 @@ have named them.
 - [ ] The autopilot-worker gate passes
 
 ## Done summary
-
+Every reconciler withhold of a ready task or close row now carries a bounded, machine-readable reason in the frame state, emitted transition-gated and rate-limited via stderr; the close-row conjunction decomposes decision-identically per-arm; problem-codes.md documents the enum contract.
 ## Evidence
