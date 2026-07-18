@@ -13,8 +13,8 @@ description: >-
   chunked blocking `agent panel wait` loop for a longer or multi-model ask, or
   the interactive `agent resume <name>` verb to re-attach a dead partner — then
   reads the partner's JSON answer envelope. NOT for launching a keeper worker on
-  plan work (that is `keeper:dispatch`), NOT for messaging another RUNNING agent
-  (that is `keeper:bus`), NOT for a multi-model consensus panel (that is
+  plan work (that is `keeper:dispatch`) or for fire-and-forget messaging (that is
+  `keeper:bus`), NOT for a multi-model consensus panel (that is
   `/plan:panel`, which itself fans out via this).
 allowed-tools: Bash
 argument-hint: <what to ask> [--preset <harness::model::effort> | --cli claude|pi] [--resume <name-or-id>] [--name <n>] [--role …] [--read-only]
@@ -36,8 +36,9 @@ entry states: **fresh-launch** starts a brand-new partner conversation, and
 launch handle: partner names are host-global among tracked jobs and are the
 dedup, dead-resume, and live-message routing key. An unnamed partner remains
 resumable by job id, but a name is easier to recall. A `--resume` launch ignores
-`--name`: the resumed partner keeps its original name. A live target always
-refuses resume; send it an Agent Bus message instead.
+`--name`: the resumed partner keeps its original name. `agent run --resume`
+messages a positively-live Partner through its existing Agent Bus inbox and
+captures the response; interactive re-attach still Refuse-lives.
 
 Use **blocking Bash calls**, never a Monitor. Shared wait and envelope mechanics
 live in the [Chunked wait](../../../../docs/agent-surface-contracts.md#chunked-wait)
@@ -147,9 +148,10 @@ starting cold. Resolution rules:
   collapse to the most recently updated one; keeper prints which job/harness it
   picked. An exact tie among equally-recent matches is ambiguous — resume by
   the exact job id instead.
-- **A live target refuses, routing to the Agent Bus.** A partner still running
-  is never resumed (that would create two writers on one conversation) — message
-  it instead: `keeper bus chat send <name-or-id> "<msg>"`.
+- **Refuse-live never creates a second writer.** Interactive `agent resume`
+  refuses a Partner still running. `agent run --resume` instead pins the exact
+  live job identity, sends one bounded Bus artifact through the Partner's
+  existing inbox, and captures only the response after that injected message.
 - **Resume is cwd-scoped.** Both supported harnesses launch in the matched
   partner's recorded cwd, preserving the original session's project context.
 - **Resuming chains.** Each resume mints a fresh session carrying the matched
@@ -163,16 +165,26 @@ drops you into the partner's TUI with the follow-up already queued:
 keeper agent resume codereview-1 "now check the error-handling paths too"
 ```
 
-**Resumed capture** — add `--resume <name-or-id>` to `agent run` to deliver a
-follow-up ask and capture the resumed session's new final answer in the same
-uniform envelope (`--model`/`--effort`/`--preset` are rejected alongside
-`--resume` — the resumed session keeps its own config):
+**Resumed or live capture** — add `--resume <name-or-id>` to `agent run` to
+deliver a follow-up ask and capture the new final answer in the same uniform
+envelope. A dead Partner is resumed; a positively-live Partner receives one
+bounded Bus artifact without another Harness writer. Delivery acknowledgement
+alone is never an answer: capture waits until the matching injected-message
+boundary appears in the exact transcript, then accepts a later settled stop.
+Only one response-bearing request per exact Partner is admitted, and an
+ambiguous send is never retried. `--model`/`--effort`/`--preset` are rejected
+alongside `--resume` because the Partner keeps its own config:
 
 ```bash
 keeper agent run pi "now check the error-handling paths too" \
   --resume codereview-1 --output /tmp/ans2.json
 # issue with Bash tool timeout: 600000 — read /tmp/ans2.json on exit 0
 ```
+
+A delivered `timed_out` means only that response observation expired: the live
+Partner is left untouched. Do not resend. Use the stderr-provided
+`keeper agent show-last-message <transcript> --agent <cli>` command to recover a
+late answer.
 
 ## Reading the answer
 

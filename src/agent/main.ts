@@ -52,6 +52,17 @@ import {
   parseProviderLegLaunchCarrier,
   writeBirthIntent,
 } from "../birth-record";
+import {
+  acquirePartnerCaptureLease,
+  BusSendAttemptError,
+  type BusSendResult,
+  type PartnerCaptureLease,
+  type PublishedBusArtifact,
+  publishBusArtifact,
+  removeBusArtifact,
+  resolveBusArtifactRoot,
+  sendBusArtifact,
+} from "../bus-artifact";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import {
@@ -156,6 +167,7 @@ import {
   buildRunCaptureEnvelope,
   buildRunControlArtifact,
   captureFromHandle,
+  captureLivePartnerResponse,
   composeRunCapture,
   createExactRunTeardown,
   type ExactTeardownResult,
@@ -186,6 +198,7 @@ import {
 } from "./tmux-launch";
 import {
   type PartnerLifecycle,
+  snapshotInjectedMessageCaptureBoundary,
   snapshotInvocationStopFloor,
   type TranscriptStop,
 } from "./transcript-watch";
@@ -342,6 +355,20 @@ export interface MainDeps {
     target: string,
     requireHarness?: HarnessName,
   ) => ResumeDecision;
+  publishBusArtifactFn: (root: string, body: string) => PublishedBusArtifact;
+  removeBusArtifactFn: (root: string, id: string) => boolean;
+  sendBusArtifactFn: (
+    sockPath: string,
+    artifact: PublishedBusArtifact,
+    target: string,
+    mediaType?: string,
+    beforePublish?: () => boolean,
+  ) => Promise<BusSendResult>;
+  acquirePartnerCaptureLeaseFn: (
+    root: string,
+    partnerJobId: string,
+  ) => PartnerCaptureLease | null;
+  resolveBusArtifactRootFn: () => string;
   /**
    * Resolve one mandatory managed account for a Claude launch. Selection is
    * independent per start/resume/restore and fails before process creation when
@@ -464,6 +491,11 @@ export function realDeps(): MainDeps {
         target,
         requireHarness,
       ),
+    publishBusArtifactFn: publishBusArtifact,
+    removeBusArtifactFn: removeBusArtifact,
+    sendBusArtifactFn: sendBusArtifact,
+    acquirePartnerCaptureLeaseFn: acquirePartnerCaptureLease,
+    resolveBusArtifactRootFn: resolveBusArtifactRoot,
     selectAccountRouteFn: (model) => selectRoute({ model }),
     selectAccountRouteByOrdinalFn: (ordinal, model) =>
       selectRouteByAccountOrdinal(ordinal, { model }),
@@ -960,6 +992,13 @@ function resolveAgentSockPath(env: NodeJS.ProcessEnv): string {
     : join(homedir(), ".local", "state", "keeper", "keeperd.sock");
 }
 
+function resolveBusSockPath(env: NodeJS.ProcessEnv): string {
+  const override = (env.KEEPER_BUS_SOCK ?? "").trim();
+  return override !== ""
+    ? override
+    : join(homedir(), ".local", "state", "keeper", "bus.sock");
+}
+
 async function probePartnerLifecycle(
   sockPath: string,
   jobId: string,
@@ -1110,13 +1149,25 @@ function emitRunCapture(
  */
 function emitTimeoutGuidance(deps: MainDeps, result: RunCaptureResult): void {
   const env = result.envelope;
-  const target = env.handle ?? env.transcript_path;
-  const recovery =
-    target !== null
-      ? ` Read its latest without resending via ` +
-        `\`keeper agent show-last-message ${target}\`, or keep waiting with ` +
-        `\`keeper agent wait ${target}\`.`
+  const target = env.transcript_path ?? env.handle;
+  const pathAgent =
+    target?.includes("/") === true && env.agent !== null
+      ? ` --agent ${env.agent}`
       : "";
+  const liveBusCapture =
+    env.handle !== null &&
+    env.transcript_path !== null &&
+    !env.handle.startsWith("tmux-") &&
+    env.handle !== env.transcript_path;
+  const recovery =
+    target === null
+      ? ""
+      : liveBusCapture
+        ? ` Read its late answer without resending via ` +
+          `\`keeper agent show-last-message ${target}${pathAgent}\`.`
+        : ` Read its latest without resending via ` +
+          `\`keeper agent show-last-message ${target}${pathAgent}\`, or keep waiting with ` +
+          `\`keeper agent wait ${target}${pathAgent}\`.`;
   const elapsed =
     env.elapsed_seconds !== null ? ` after ${env.elapsed_seconds}s` : "";
   const partner =
@@ -1448,12 +1499,13 @@ function composeRunPrompt(
  * `--preset` alongside `--resume` is bad_args; resolution goes through the
  * resume-policy module REQUIRING the `<cli>` positional's harness (a same-name
  * match on a different harness is a distinct `harness-mismatch`, never a wrong-CLI
- * launch). A refuse-live / unknown / ambiguous / no-target decision each emits a
- * distinct actionable bad_args with the envelope still written to `--output`.
+ * launch). Unknown / ambiguous / no-target decisions emit actionable bad_args;
+ * Refuse-live routes to the exact Partner's existing Bus inbox instead.
  * Launch + capture happen in the RECORDED cwd (resume is cwd-scoped — the native
  * CLI finds the session only there), pinning the resumed session's id on the handle
  * so discovery + the envelope resume_target resolve the POST-resume id: claude's
- * freshly-forked child uuid.
+ * freshly-forked child uuid. A positively-live decision takes the sibling path:
+ * one exact-job Bus artifact and a transcript capture gated on its injection.
  */
 async function runResumeCaptureSubcommand(
   deps: MainDeps,
@@ -1509,13 +1561,7 @@ async function runResumeCaptureSubcommand(
     return emitBad();
   }
   if (decision.kind === "live") {
-    deps.writeErr(
-      `agent: --resume '${target}' resolves to a LIVE ${displayAgent(decision.harness)} ` +
-        `session (job ${decision.job_id}${decision.title !== null ? `, "${decision.title}"` : ""}). ` +
-        `It is still running — message it instead: ` +
-        `keeper bus chat send ${decision.job_id} "<msg>"\n`,
-    );
-    return emitBad();
+    return runLivePartnerCapture(deps, parsed, agent, verbDeps, decision);
   }
   if (decision.kind === "ambiguous") {
     deps.writeErr(
@@ -1632,6 +1678,136 @@ async function runResumeCaptureSubcommand(
     ),
     control,
   );
+}
+
+async function runLivePartnerCapture(
+  deps: MainDeps,
+  parsed: ParsedRunArgs,
+  agent: AgentKind,
+  verbDeps: VerbDeps,
+  decision: Extract<ResumeDecision, { kind: "live" }>,
+): Promise<never> {
+  const emitBad = (message: string): never => {
+    deps.writeErr(`${message}\n`);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args", agent }),
+      parsed.output,
+    );
+  };
+  if (
+    decision.resume_target == null ||
+    decision.resume_target === "" ||
+    decision.cwd == null ||
+    decision.cwd === ""
+  ) {
+    return emitBad(
+      `agent: live Partner ${decision.job_id} has no exact transcript identity`,
+    );
+  }
+  const composed = composeRunPrompt(deps, parsed);
+  if (!composed.ok) return emitBad(composed.error.trimEnd());
+
+  const startMs = deps.now();
+  const artifactRoot = deps.resolveBusArtifactRootFn();
+  const identityStillLive = (): boolean => {
+    try {
+      const current = deps.resolveResumeDecisionFn(decision.job_id, agent);
+      return (
+        current.kind === "live" &&
+        current.job_id === decision.job_id &&
+        current.pid === decision.pid &&
+        current.start_time === decision.start_time &&
+        current.resume_target === decision.resume_target &&
+        current.cwd === decision.cwd
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const captured = await captureLivePartnerResponse(
+    {
+      ...runCaptureSeams(deps),
+      acquire: () =>
+        deps.acquirePartnerCaptureLeaseFn(artifactRoot, decision.job_id),
+      publish: () => deps.publishBusArtifactFn(artifactRoot, composed.prompt),
+      remove: (id) => {
+        deps.removeBusArtifactFn(artifactRoot, id);
+      },
+      snapshotBoundary: () =>
+        snapshotInjectedMessageCaptureBoundary({
+          agent,
+          cwd: decision.cwd as string,
+          env: deps.env,
+          homeDir: deps.transcriptHomeDir,
+          startedAtMs: 0,
+          sessionId: decision.resume_target as string,
+        }),
+      send: (artifact, beforePublish) =>
+        deps.sendBusArtifactFn(
+          resolveBusSockPath(deps.env),
+          artifact as PublishedBusArtifact,
+          decision.job_id,
+          "text/markdown",
+          beforePublish,
+        ),
+      identityStillLive,
+      deliveryIsAmbiguous: (err) =>
+        err instanceof BusSendAttemptError && err.deliveryAmbiguous,
+    },
+    verbDeps,
+    {
+      handle: {
+        agent,
+        cwd: decision.cwd,
+        sessionId: decision.resume_target,
+        startedAtMs: 0,
+        transcriptPath: null,
+        stopTimeoutMs: parsed.stopTimeoutMs,
+        lifecycleJobId: decision.job_id,
+      },
+      handleId: decision.job_id,
+      agent,
+      startMs,
+    },
+  );
+
+  switch (captured.disposition) {
+    case "capture_busy":
+      deps.writeErr(
+        `agent: a response-bearing request is already active for exact Partner ${decision.job_id}.\n`,
+      );
+      break;
+    case "identity_changed":
+      deps.writeErr(
+        `agent: exact Partner ${decision.job_id} changed identity before Bus publish; no message was sent.\n`,
+      );
+      break;
+    case "boundary_unavailable":
+      deps.writeErr(
+        `agent: exact Partner ${decision.job_id} has no attributable transcript; no message was sent.\n`,
+      );
+      break;
+    case "delivery_failed":
+      deps.writeErr(
+        `agent: Bus message to exact Partner ${decision.job_id} was not delivered${captured.detail ? `: ${captured.detail}` : "."}\n`,
+      );
+      break;
+    case "capture_failed":
+      deps.writeErr(
+        `agent: response capture for exact Partner ${decision.job_id} failed after possible delivery${captured.detail ? `: ${captured.detail}` : "."}\n`,
+      );
+      break;
+    case "delivery_ambiguous":
+      deps.writeErr(
+        `agent: Bus delivery acknowledgement for exact Partner ${decision.job_id} was ambiguous; the message was not resent, and capture waited for its transcript boundary.\n`,
+      );
+      break;
+    case "captured":
+      break;
+  }
+  return emitRunCapture(deps, captured.result, parsed.output);
 }
 
 /**

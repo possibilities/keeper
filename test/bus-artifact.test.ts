@@ -22,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  acquirePartnerCaptureLease,
   BUS_ARTIFACT_MAX_BYTES,
   BUS_ARTIFACT_REF_TAG,
   BUS_ARTIFACT_REF_VERSION,
@@ -518,6 +519,28 @@ describe("listBusArtifactIds bounded pages", () => {
       }
       expect(removed).toBe(7);
       expect(readdirSync(root)).toHaveLength(0);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// exact-Partner response capture admission
+// ---------------------------------------------------------------------------
+
+describe("acquirePartnerCaptureLease", () => {
+  test("admits one request per exact Partner and releases idempotently", () => {
+    withRoot((root) => {
+      const first = acquirePartnerCaptureLease(root, "job-exact");
+      expect(first).not.toBeNull();
+      expect(acquirePartnerCaptureLease(root, "job-exact")).toBeNull();
+      const other = acquirePartnerCaptureLease(root, "job-other");
+      expect(other).not.toBeNull();
+      other?.release();
+      first?.release();
+      first?.release();
+      const again = acquirePartnerCaptureLease(root, "job-exact");
+      expect(again).not.toBeNull();
+      again?.release();
     });
   });
 });

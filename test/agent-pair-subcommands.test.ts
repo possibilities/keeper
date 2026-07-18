@@ -471,6 +471,91 @@ describe("lifecycle-aware transcript waits", () => {
   });
 });
 
+describe("injected-message response boundary", () => {
+  test("Claude ignores unrelated stops until the matching Bus notification appears", async () => {
+    const path = join(tempDir(), "claude-live.jsonl");
+    const stop = (text: string) => ({
+      timestamp: new Date().toISOString(),
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text }],
+      },
+    });
+    const marker = "/trusted/bus-artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    writeFileSync(
+      path,
+      `${[
+        stop("before capture"),
+        stop("unrelated work finished"),
+        {
+          type: "queue-operation",
+          content: `Agent Bus message — read ${marker}`,
+        },
+        stop("causal answer"),
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: path,
+      injectedMessageMarker: marker,
+      transcriptLineFloor: 1,
+      stopTimeoutMs: 100,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("causal answer");
+  });
+
+  test("Pi accepts only a stop after its matching custom Bus message", async () => {
+    const path = join(tempDir(), "pi-live.jsonl");
+    const marker = "/trusted/bus-artifacts/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const piStop = (text: string) => ({
+      type: "message",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text }],
+      },
+    });
+    writeFileSync(
+      path,
+      `${[
+        piStop("old"),
+        piStop("unrelated"),
+        {
+          customType: "keeper-agent-bus",
+          content: `Agent Bus message — read ${marker}`,
+        },
+        piStop("pi causal answer"),
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+    const outcome = await waitForTranscriptStop({
+      agent: "pi",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: path,
+      injectedMessageMarker: marker,
+      transcriptLineFloor: 1,
+      stopTimeoutMs: 100,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("pi causal answer");
+  });
+});
+
 describe("waitForTranscriptStop is bounded", () => {
   const PINNED_NO_STOP = "33333333-3333-3333-3333-333333333333";
   test("a stop that never appears times out (no unbounded hang)", async () => {

@@ -55,6 +55,10 @@ export interface ResolvedHandle {
   lifecycleJobId?: string | null;
   /** Pre-launch resumed-transcript structural boundary. */
   invocationStopFloor?: number | null;
+  /** Exact Bus notification marker required before a stop can satisfy capture. */
+  injectedMessageMarker?: string | null;
+  /** Transcript line count sampled before the matching Bus publish. */
+  transcriptLineFloor?: number | null;
 }
 
 export interface ResolveHandleArgs {
@@ -301,6 +305,8 @@ export async function runWaitForStop(
     sessionId: handle.sessionId,
     isResume: handle.isResume,
     invocationStopFloor: handle.invocationStopFloor,
+    injectedMessageMarker: handle.injectedMessageMarker,
+    transcriptLineFloor: handle.transcriptLineFloor,
     lifecycleProbe: lifecycleProbe(handle, deps),
     transcriptPath,
     stopTimeoutMs: Math.max(1, deadlineMs - Date.now()),
@@ -364,6 +370,8 @@ export async function runShowLastMessage(
     isResume: handle.isResume,
     startedAtMs: handle.startedAtMs,
     invocationStopFloor: handle.invocationStopFloor,
+    injectedMessageMarker: handle.injectedMessageMarker,
+    transcriptLineFloor: handle.transcriptLineFloor,
   });
   return {
     ok: true,
@@ -395,6 +403,8 @@ async function resolveTranscriptPath(
     sessionId: handle.sessionId,
     isResume: handle.isResume,
     invocationStopFloor: handle.invocationStopFloor,
+    injectedMessageMarker: handle.injectedMessageMarker,
+    transcriptLineFloor: handle.transcriptLineFloor,
     lifecycleProbe: lifecycleProbe(handle, deps),
     pathTimeoutMs,
   });

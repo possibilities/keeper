@@ -30,6 +30,11 @@ import type { TmuxCommandResult } from "../../src/agent/tmux-launch";
 import type { PartnerLifecycle } from "../../src/agent/transcript-watch";
 import type { HostTriples } from "../../src/agent/triple";
 import type { BirthRecordDraft } from "../../src/birth-record";
+import type {
+  BusSendResult,
+  PartnerCaptureLease,
+  PublishedBusArtifact,
+} from "../../src/bus-artifact";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -177,6 +182,20 @@ export interface HarnessOptions {
   resolveResumeDecision?:
     | ResumeDecision
     | ((target: string, requireHarness?: HarnessName) => ResumeDecision);
+  publishBusArtifact?: (root: string, body: string) => PublishedBusArtifact;
+  removeBusArtifact?: (root: string, id: string) => boolean;
+  sendBusArtifact?: (
+    sockPath: string,
+    artifact: PublishedBusArtifact,
+    target: string,
+    mediaType?: string,
+    beforePublish?: () => boolean,
+  ) => Promise<BusSendResult>;
+  acquirePartnerCaptureLease?: (
+    root: string,
+    partnerJobId: string,
+  ) => PartnerCaptureLease | null;
+  busArtifactRoot?: string;
   /** Mandatory managed account result for an unpinned Claude launch. */
   selectAccountRoute?: (model: string | null) => RouteResolution;
   /** Exact result for a requested zero-based account ordinal. */
@@ -327,6 +346,30 @@ export function makeHarness(opts: HarnessOptions): Harness {
       }
       return decision ?? { kind: "unknown", target };
     },
+    publishBusArtifactFn:
+      opts.publishBusArtifact ??
+      ((_root, body) => ({
+        path: "/fake-bus-artifacts/00000000000000000000000000000001",
+        ref: {
+          id: "00000000000000000000000000000001",
+          len: body.length,
+          sha256: "0".repeat(64),
+        },
+      })),
+    removeBusArtifactFn: opts.removeBusArtifact ?? (() => true),
+    sendBusArtifactFn:
+      opts.sendBusArtifact ??
+      (async (_sock, _artifact, _target, _mediaType, beforePublish) => {
+        if (!(beforePublish?.() ?? true)) {
+          throw new Error("recipient identity is no longer live");
+        }
+        return { result: "delivered", recipients: 1 };
+      }),
+    acquirePartnerCaptureLeaseFn:
+      opts.acquirePartnerCaptureLease ??
+      (() => ({ path: "/fake-partner-capture", release() {} })),
+    resolveBusArtifactRootFn: () =>
+      opts.busArtifactRoot ?? "/fake-bus-artifacts",
     selectAccountRouteFn: (model) => {
       routerCalls += 1;
       return selectAccountRoute(model);
