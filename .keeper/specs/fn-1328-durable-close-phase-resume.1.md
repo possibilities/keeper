@@ -65,5 +65,5 @@ exactly once (`gitLogCount` + single follow-up mint).
 - [ ] The plan test gate passes
 
 ## Done summary
-
+close-preflight now emits a nullable phase_resume field grading each close phase (satisfied/not_needed/unfinished) against the fresh lane-aware commit-set hash, with first-invalid-downstream invalidation and selection-verdict chaining on its own input hash; seeded verb tests cover all-fresh/stale/findings=0/fatal/torn/too-new-schema/empty/skip-all-finalize-retry scenarios; ADR 0082 records the decision.
 ## Evidence
