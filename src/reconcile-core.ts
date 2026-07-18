@@ -134,6 +134,47 @@ export type Verb = "work" | "close";
  * baked into the worker argv (also the tmux window name).
  */
 export type DispatchKey = string;
+
+/**
+ * Stable machine codes explaining why a ready reconciler row did not dispatch.
+ * Keep this set finite: callers may branch on the code, while per-instance facts
+ * belong in {@link WithholdReason.detail} and may change without extending the
+ * vocabulary.
+ */
+export type WithholdReasonCode =
+  | "autopilot-paused"
+  | "not-armed"
+  | "merge-gate"
+  | "dispatch-in-flight"
+  | "failed-key"
+  | "claim-fence"
+  | "activity-collision"
+  | "live-tab"
+  | "cooldown"
+  | "finalizer-guard"
+  | "data-bug-missing-cwd"
+  | "budget-exhausted";
+
+/** One current, replace-merge withhold observation for a task or close target. */
+export interface WithholdReason {
+  code: WithholdReasonCode;
+  /** Missing launch coordinates are a data defect; every other code is routine. */
+  severity: "normal" | "error";
+  /** Churny target-specific context, deliberately separate from the stable code. */
+  detail: string | null;
+}
+
+function withhold(
+  code: WithholdReasonCode,
+  detail: string | null = null,
+): WithholdReason {
+  return {
+    code,
+    severity: code === "data-bug-missing-cwd" ? "error" : "normal",
+    detail:
+      detail === null ? null : detail.replace(/[\r\n]+/g, " ").slice(0, 512),
+  };
+}
 /**
  * The in-process re-dispatch cooldown window, in SECONDS — the fold-lag-immune
  * suppression arm. The projection-backed dedup arms (`failedKeys`,
@@ -1409,6 +1450,12 @@ export interface CloseRecoveryStamp {
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
   closeRecoveryStamps: CloseRecoveryStamp[];
+  /**
+   * Current ready rows withheld from dispatch, keyed by task id or epic id.
+   * Recomputed from scratch each cycle: consumers replace-merge this bounded
+   * frame rather than retaining history.
+   */
+  withholds: Map<string, WithholdReason>;
   completedRowIds: Set<string>;
   /** Plain producer-probed base-drift data, carried without any git/clock reads. */
   baseDriftEntries: readonly BaseDriftEntry[];
@@ -1614,6 +1661,39 @@ export function dispatchTargetHasActivityCollision(
   return false;
 }
 
+export function dispatchTargetWithholdCode(
+  snapshot: Pick<
+    ReconcileSnapshot,
+    "jobs" | "dispatchClaims" | "harnessActivityByJobId" | "livePaneIds"
+  >,
+  verb: Verb | "resolve",
+  id: string,
+): "claim-fence" | "activity-collision" | null {
+  if (
+    snapshot.dispatchClaims === undefined &&
+    snapshot.harnessActivityByJobId === undefined
+  ) {
+    return isOccupyingJob(snapshot.jobs, verb, id, snapshot.livePaneIds)
+      ? "activity-collision"
+      : null;
+  }
+  if (
+    dispatchClaimBlocksReplacement(
+      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
+    )
+  ) {
+    return "claim-fence";
+  }
+  return dispatchTargetHasActivityCollision(
+    snapshot.jobs,
+    snapshot.harnessActivityByJobId ?? new Map(),
+    verb,
+    id,
+  )
+    ? "activity-collision"
+    : null;
+}
+
 export function dispatchTargetIsOwned(
   snapshot: Pick<
     ReconcileSnapshot,
@@ -1622,23 +1702,7 @@ export function dispatchTargetIsOwned(
   verb: Verb | "resolve",
   id: string,
 ): boolean {
-  if (
-    snapshot.dispatchClaims === undefined &&
-    snapshot.harnessActivityByJobId === undefined
-  ) {
-    return isOccupyingJob(snapshot.jobs, verb, id, snapshot.livePaneIds);
-  }
-  return (
-    dispatchClaimBlocksReplacement(
-      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
-    ) ||
-    dispatchTargetHasActivityCollision(
-      snapshot.jobs,
-      snapshot.harnessActivityByJobId ?? new Map(),
-      verb,
-      id,
-    )
-  );
+  return dispatchTargetWithholdCode(snapshot, verb, id) !== null;
 }
 
 export type ResourceHoldObservation =
@@ -2189,6 +2253,7 @@ export function reconcile(
     return {
       launches: [],
       closeRecoveryStamps: [],
+      withholds: new Map(),
       completedRowIds: new Set(),
       baseDriftEntries: [],
       worktreeFinalize: [],
@@ -2201,6 +2266,7 @@ export function reconcile(
 
   const launches: PlannedLaunch[] = [];
   const closeRecoveryStamps: CloseRecoveryStamp[] = [];
+  const withholds = new Map<string, WithholdReason>();
 
   // The EPHEMERAL cross-epic merge-gate defer map (epic id → its deferred lane
   // repos), probed git-side ONCE per cycle in `loadReconcileSnapshot` and read here
@@ -2367,6 +2433,7 @@ export function reconcile(
       }
       const key = dispatchKey(verb, taskId);
       if (state.paused) {
+        withholds.set(taskId, withhold("autopilot-paused"));
         continue;
       }
       // Armed-mode gate: suppress a `work` launch for an epic NOT in the
@@ -2376,6 +2443,7 @@ export function reconcile(
       // `ready` when it wins a root with no eligible contender, and this gate is
       // the only thing that stops that winner launching. No-op in `yolo`.
       if (armedMode && verb === "work" && !eligible?.has(epic.epic_id)) {
+        withholds.set(taskId, withhold("not-armed"));
         continue;
       }
       // Cross-epic merge-gate (worktree mode): suppress a `work` launch whose GROUP
@@ -2389,22 +2457,32 @@ export function reconcile(
       if (deferredReposForEpic !== undefined) {
         const taskRepoDir = laneRepoForTask(worktreeResForEpic, taskId);
         if (taskRepoDir !== null && deferredReposForEpic.has(taskRepoDir)) {
+          withholds.set(taskId, withhold("merge-gate", taskRepoDir));
           continue;
         }
       }
       if (state.inFlight.has(key)) {
+        withholds.set(taskId, withhold("dispatch-in-flight"));
         continue;
       }
       if (snapshot.failedKeys.has(key)) {
+        withholds.set(taskId, withhold("failed-key"));
         continue;
       }
-      if (dispatchTargetIsOwned(snapshot, verb, taskId)) {
+      const ownershipWithhold = dispatchTargetWithholdCode(
+        snapshot,
+        verb,
+        taskId,
+      );
+      if (ownershipWithhold !== null) {
+        withholds.set(taskId, withhold(ownershipWithhold));
         continue;
       }
       if (snapshot.liveTabKeys.has(key)) {
         // A tab named verb::id is live in the managed session — a launched
         // worker occupies the slot before its jobs row binds. Complements
         // `isOccupyingJob` by covering the pre-SessionStart gap.
+        withholds.set(taskId, withhold("live-tab"));
         continue;
       }
       // Fold-lag-immune cooldown arm: suppress re-dispatch of a key dispatched
@@ -2412,6 +2490,7 @@ export function reconcile(
       // projection arm above is blind to it. READ-ONLY; stamp/clear in
       // `runReconcileCycle`, sweep in `driveCycle`. ABOVE the budget gate.
       if (isInCooldown(state.redispatchCooldown, key, now)) {
+        withholds.set(taskId, withhold("cooldown"));
         continue;
       }
       const cwd =
@@ -2421,11 +2500,19 @@ export function reconcile(
       if (cwd === "") {
         // No effective cwd — skip rather than dispatch a malformed command
         // (a missing project_dir is a data bug, not a runtime decision).
+        withholds.set(
+          taskId,
+          withhold(
+            "data-bug-missing-cwd",
+            "target_repo and project_dir are empty",
+          ),
+        );
         continue;
       }
       // Cap — LAST gate, after every verdict is computed. A budget skip does NOT
       // hold a slot; it defers this launch to a later cycle.
       if (budget <= 0) {
+        withholds.set(taskId, withhold("budget-exhausted"));
         continue;
       }
       // Resolve the launch-time worker-plugin cell from the TASK's {model, tier}
@@ -2583,32 +2670,34 @@ export function reconcile(
     const closeVerb = verbForVerdict("close", closeVerdict);
     if (closeVerb !== null) {
       const closeKey = dispatchKey(closeVerb, epicId);
-      const okToPlan =
-        !state.paused &&
-        !state.inFlight.has(closeKey) &&
-        !snapshot.failedKeys.has(closeKey) &&
-        !dispatchTargetIsOwned(snapshot, closeVerb, epicId) &&
-        // Standing dedup arm: a live `close::<epic>` tab proves a launched closer
-        // occupies the slot before its SessionStart binds.
-        !snapshot.liveTabKeys.has(closeKey) &&
-        // Fold-lag-immune cooldown arm at the close-row site too (miss it and
-        // close rows still DUP-DISPATCH). READ-ONLY; ABOVE the budget gate.
-        !isInCooldown(state.redispatchCooldown, closeKey, now) &&
-        // Per-epic FINALIZER guard — an epic-id-keyed fold-lag-immune backstop
-        // against a `close` re-dispatch. READ-ONLY; stamp/clear in
-        // `runReconcileCycle`, sweep in `driveCycle`.
-        !(
+      // Evaluate the close arms in the original conjunction order. The first
+      // failing arm names the withhold; reaching the action block is therefore
+      // decision-identical to the former fused `okToPlan && projectDir !== ""`.
+      let closeWithhold: WithholdReason | null = null;
+      if (state.paused) {
+        closeWithhold = withhold("autopilot-paused");
+      } else if (state.inFlight.has(closeKey)) {
+        closeWithhold = withhold("dispatch-in-flight");
+      } else if (snapshot.failedKeys.has(closeKey)) {
+        closeWithhold = withhold("failed-key");
+      } else {
+        const ownershipCode = dispatchTargetWithholdCode(
+          snapshot,
+          closeVerb,
+          epicId,
+        );
+        if (ownershipCode !== null) {
+          closeWithhold = withhold(ownershipCode);
+        } else if (snapshot.liveTabKeys.has(closeKey)) {
+          closeWithhold = withhold("live-tab");
+        } else if (isInCooldown(state.redispatchCooldown, closeKey, now)) {
+          closeWithhold = withhold("cooldown");
+        } else if (
           isFinalizerVerb(closeVerb) &&
           isFinalizerGuarded(state.finalizerGuard, epicId, now)
-        ) &&
-        // Narrowed armed-mode close gate. In `armed` mode a close dispatch is
-        // eligible ONLY for an epic in the armed dep-closure (`eligible.has`) OR
-        // in-flight (`isEpicInFlight`). A COLD never-touched, never-armed
-        // candidate is suppressed (no repeated closers on an unarmed sibling); a
-        // disarmed-MID-FLIGHT epic still finishes. No-op in `yolo`. ABOVE the
-        // budget gate. The per-root mutex and completion-reap stay mode-EXEMPT —
-        // this is the ONLY close-dispatch narrowing.
-        !(
+        ) {
+          closeWithhold = withhold("finalizer-guard");
+        } else if (
           armedMode &&
           !eligible?.has(epicId) &&
           !isEpicInFlight(
@@ -2619,24 +2708,34 @@ export function reconcile(
             snapshot.dispatchClaims ?? new Map(),
             snapshot.harnessActivityByJobId ?? new Map(),
           )
-        ) &&
-        // Cross-epic merge-gate: suppress the single plan-close while ANY of the
-        // epic's groups is deferred (`Map.has(epicId)` ⇒ ≥1 deferred lane repo) — the
-        // close gates every group's finalize, so an epic with an un-cut lane is not
-        // yet ready to audit + finalize. EPHEMERAL, no sticky; ABOVE the budget gate
-        // (the `budget > 0` term below is last). Inert (empty map) in OFF / yolo.
-        !deferredEpicIds.has(epicId) &&
-        // Cap — the close-row push shares the SAME decrementing budget as the
-        // task push, so a closer can't blow the cap.
-        budget > 0;
-      if (okToPlan && projectDir !== "") {
+        ) {
+          closeWithhold = withhold("not-armed");
+        } else if (deferredEpicIds.has(epicId)) {
+          closeWithhold = withhold(
+            "merge-gate",
+            [...(deferredEpicIds.get(epicId) ?? [])].sort().join(",") || null,
+          );
+        } else if (budget <= 0) {
+          closeWithhold = withhold("budget-exhausted");
+        } else if (projectDir === "") {
+          closeWithhold = withhold(
+            "data-bug-missing-cwd",
+            "project_dir is empty",
+          );
+        }
+      }
+      if (closeWithhold !== null) {
+        withholds.set(epicId, closeWithhold);
+      } else {
         const recoverDirectly =
           snapshot.worktreeMode &&
           snapshot.closeRecoveryEligibleIds?.has(epicId) === true &&
           epic.tasks.every((task) => task.worker_phase === "done") &&
           closerJobFinished(snapshot.jobs, epicId, snapshot.livePaneIds);
         if (recoverDirectly) {
-          if (!epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)) {
+          if (epicHasOccupyingJob(epic, snapshot.jobs, snapshot.livePaneIds)) {
+            withholds.set(epicId, withhold("activity-collision"));
+          } else {
             closeRecoveryStamps.push({ epicId, key: closeKey, projectDir });
             budget--;
           }
@@ -2780,6 +2879,7 @@ export function reconcile(
   return {
     launches,
     closeRecoveryStamps,
+    withholds,
     completedRowIds,
     baseDriftEntries,
     worktreeFinalize,
