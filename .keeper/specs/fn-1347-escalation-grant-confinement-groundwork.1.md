@@ -44,5 +44,5 @@ Denial tests FIRST, pure and in-process per the escalation-guard truth-table pat
 - [ ] The new denial truth-table suite and the updated sibling guard suites pass via named test gates
 
 ## Done summary
-
+Shipped escalation grant confinement groundwork: dep-free src/grant-leaf.ts (versioned owner-private grant leaf, shared path derivation, atomic writer, anti-TOCTOU fstat reader with valid/absent/expired/tuple-mismatch/malformed verdicts, grantCoversWrite override + isGrantProtectedPath); payload-identity-keyed grant-guard PreToolUse hook (Bash + edit tools) confining the four escalation agents' mutations to a validated exact-tuple unexpired grant covering the target, unblocker diagnosis-only, protected paths surviving grants, CVE-hardened Bash lexer carried forward. wrong-tree-guard and wrapped-guard honor exact grants via an injected override without weakening postures. Retired the env-keyed escalation-guard + test; updated hooks.json, CLAUDE.md. Verified from recorded events that Edit/Write payloads carry agent_type/agent_id in subagent context.
 ## Evidence
