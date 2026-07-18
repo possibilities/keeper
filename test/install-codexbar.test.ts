@@ -124,7 +124,9 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     expect(SECTION).toContain(
       'codexbar_upstream_url="https://github.com/steipete/CodexBar.git"',
     );
-    expect(SECTION).toContain('codexbar_fork_ref="main"');
+    expect(SECTION).toContain(
+      'codexbar_fork_ref="feature/claude-swap-single-account-option"',
+    );
     expect(SECTION).toContain('codexbar_upstream_ref="main"');
     expect(ORCHESTRATION).toContain(
       `"+refs/heads/\${codexbar_fork_ref}:refs/keeper/codexbar-fork"`,
@@ -226,7 +228,7 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     expect(BUILD).toContain("tr '\\r\\n\\t' '   '");
   });
 
-  test("aborts and discards failed source before a clean unrebased fallback", () => {
+  test("aborts and discards a failed rebase without building the unrebased fork", () => {
     expect(DISCARD).toContain("rebase --abort");
     expect(DISCARD).toContain("worktree remove --force");
     expect(DISCARD).toContain("worktree prune --expire now");
@@ -237,39 +239,29 @@ describe("scripts/install.sh managed CodexBar fork", () => {
       `codexbar_discard_worktree "\${repository}" "\${build_source}"`,
       rebase,
     );
-    const fallback = indexAfter(
+    indexAfter(
       ORCHESTRATION,
-      `fallback_source="\${source_state}/unrebased"`,
+      `codexbar_notify "\${failure_reason}; the previous binary was retained"`,
       discard,
     );
-    indexAfter(
-      ORCHESTRATION,
-      `codexbar_add_fork_worktree "\${repository}" "\${fallback_source}" "\${fork_sha}"`,
-      fallback,
-    );
+    expect(ORCHESTRATION).not.toContain("fallback_source");
+    expect(ORCHESTRATION).not.toContain("unrebased");
   });
 
-  test("falls back after a rebased build failure and reports fallback outcomes", () => {
-    const rebasedBuild = ORCHESTRATION.indexOf(
-      `codexbar_build_cli "\${build_source}"`,
-    );
-    const reason = indexAfter(
-      ORCHESTRATION,
-      'fallback_reason="the rebased CodexBar CLI build failed"',
-      rebasedBuild,
-    );
-    indexAfter(
-      ORCHESTRATION,
-      `codexbar_build_cli "\${fallback_source}"`,
-      reason,
-    );
-    expect(ORCHESTRATION).toContain(
-      "the unrebased fork build also failed; the previous binary was retained",
-    );
+  test("retains the previous binary and notifies for every rebase pipeline failure", () => {
+    for (const failure of [
+      `upstream CodexBar \${codexbar_upstream_ref} could not be resolved; the previous binary was retained`,
+      "the disposable rebased CodexBar source could not be prepared; the previous binary was retained",
+      `the CodexBar fork could not rebase onto upstream \${upstream_sha:0:10}`,
+      "the rebased CodexBar source did not resolve to a commit; the previous binary was retained",
+      "the rebased CodexBar CLI build failed; the previous binary was retained",
+    ]) {
+      expect(ORCHESTRATION).toContain(failure);
+    }
     expect(PUBLISH).toContain(
-      "the unrebased fallback built, but final staging/install failed; the previous binary was retained",
+      "the rebased CLI built, but final staging/install failed; the previous binary was retained",
     );
-    expect(PUBLISH).toContain("installed the unrebased fork fallback");
+    expect(PUBLISH).not.toContain("fallback");
     expect(SECTION).toContain("notifyctl show-message");
   });
 
@@ -322,6 +314,64 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     expect(ATOMIC_INSTALL).toContain(
       `chmod 444 "\${install_stage}/PROVENANCE"`,
     );
+  });
+
+  test("rolls current back when legacy stable-link publication fails", () => {
+    const script = `
+set -Eeuo pipefail
+${PRUNE}
+${ATOMIC_INSTALL}
+root="$(mktemp -d)"
+trap 'chmod -R u+w "$root" 2>/dev/null || true; rm -rf "$root"' EXIT
+export HOME="$root/home"
+codexbar_cli_dir="$root/managed"
+codexbar_cli_current="$codexbar_cli_dir/current"
+codexbar_cli_bin="$codexbar_cli_current/CodexBarCLI"
+codexbar_cli_link="$HOME/.local/bin/codexbar"
+codexbar_cli_link_target="$codexbar_cli_dir/current/CodexBarCLI"
+codexbar_legacy_cli_bin="$codexbar_cli_dir/CodexBarCLI"
+codexbar_signing_identity="test-identity"
+codexbar_signing_identifier="test.identifier"
+codexbar_signing_requirement="test-requirement"
+codexbar_fork_url="https://example.invalid/fork"
+codexbar_fork_ref="feature"
+codexbar_upstream_url="https://example.invalid/upstream"
+codexbar_upstream_ref="main"
+mkdir -p "$codexbar_cli_dir" "$HOME/.local/bin" "$root/build"
+printf '%s\\n' '#!/bin/sh' 'exit 0' >"$codexbar_legacy_cli_bin"
+chmod 755 "$codexbar_legacy_cli_bin"
+ln -s "$codexbar_legacy_cli_bin" "$codexbar_cli_link"
+printf '%s\\n' '#!/bin/sh' 'exit 0' >"$root/build/CodexBarCLI"
+chmod 755 "$root/build/CodexBarCLI"
+codesign() { return 0; }
+mv() {
+  if [ "$#" -eq 4 ] && [ "$4" = "$codexbar_cli_link" ]; then
+    return 1
+  fi
+  command mv "$@"
+}
+if codexbar_atomic_install \
+  "$root/build/CodexBarCLI" \
+  "1111111111111111111111111111111111111111" \
+  "2222222222222222222222222222222222222222" \
+  rebased \
+  "3333333333333333333333333333333333333333" \
+  "4444444444444444444444444444444444444444" \
+  "$(uname -m)" \
+  "test-swift"; then
+  exit 20
+fi
+[ ! -e "$codexbar_cli_current" ]
+[ ! -L "$codexbar_cli_current" ]
+[ "$(readlink "$codexbar_cli_link")" = "$codexbar_legacy_cli_bin" ]
+[ -x "$codexbar_legacy_cli_bin" ]
+`;
+    const run = Bun.spawnSync(["bash", "-c", script]);
+    expect({
+      exitCode: run.exitCode,
+      stdout: new TextDecoder().decode(run.stdout),
+      stderr: new TextDecoder().decode(run.stderr),
+    }).toEqual({ exitCode: 0, stdout: "", stderr: "" });
   });
 
   test("signs the staged CLI with a stable certificate identity before hashing and publication", () => {
@@ -508,14 +558,12 @@ describe("scripts/install.sh managed CodexBar fork", () => {
     ).toBeGreaterThan(install);
   });
 
-  test("uses provenance for stable resolved inputs but retries unavailable upstream", () => {
-    expect(ORCHESTRATION).toContain(
-      `if [ "\${upstream_sha}" != "unavailable" ]; then`,
-    );
+  test("uses provenance only for a successfully rebased resolved pair", () => {
+    expect(ORCHESTRATION).toContain(`[ "\${upstream_sha}" != "unavailable" ]`);
     expect(ORCHESTRATION).toContain(
       `codexbar_provenance_matches "\${fork_sha}" "\${upstream_sha}" rebased`,
     );
-    expect(ORCHESTRATION).toContain(
+    expect(ORCHESTRATION).not.toContain(
       `codexbar_provenance_matches "\${fork_sha}" "\${upstream_sha}" unrebased`,
     );
     expect(ORCHESTRATION).toContain(

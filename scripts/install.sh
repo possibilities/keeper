@@ -203,13 +203,13 @@ else
   pi_subagents_notify "fork unavailable — pi keeps its current package source and may be missing required fixes or RPC contracts"
 fi
 
-# 3c. CodexBar CLI: build the possibilities fork in disposable source state.
-#     Rebase its immutable main tip onto immutable upstream/main when possible;
-#     otherwise build the exact unrebased fork tip. Keeper never installs the app
-#     bundle and never mutates either developer checkout. Every failure preserves
-#     the previously managed CLI and remains non-fatal to the Keeper install.
+# 3c. CodexBar CLI: build the possibilities feature branch in disposable source
+#     state after rebasing its immutable tip onto immutable upstream/main. Keeper
+#     never installs the app bundle or mutates a developer checkout. A failed
+#     fetch, rebase, build, or publication preserves the previously managed CLI,
+#     notifies the human, and remains non-fatal to the Keeper install.
 codexbar_fork_url="https://github.com/possibilities/CodexBar.git"
-codexbar_fork_ref="main"
+codexbar_fork_ref="feature/claude-swap-single-account-option"
 codexbar_upstream_url="https://github.com/steipete/CodexBar.git"
 codexbar_upstream_ref="main"
 codexbar_cli_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/keeper/codexbar"
@@ -417,8 +417,8 @@ codexbar_provenance_matches() {
   [ -n "${swift_version}" ]
 }
 
-# Remove every trace of a failed/superseded rebase worktree before constructing
-# the exact-SHA fallback worktree. The enclosing repository is itself temporary.
+# Remove every trace of a failed rebase worktree before retaining the current
+# generation. The enclosing repository is itself temporary.
 codexbar_discard_worktree() {
   local repository worktree
   repository="$1"
@@ -549,7 +549,7 @@ codexbar_atomic_install() (
   set -Eeuo pipefail
   local built_binary fork_sha upstream_sha mode built_sha built_tree_sha
   local architecture swift_version binary_sha generation generation_name
-  local install_stage current_tmp link_tmp previous_generation previous_name
+  local install_stage current_tmp current_rollback link_tmp previous_generation previous_name
   built_binary="$1"
   fork_sha="$2"
   upstream_sha="$3"
@@ -560,6 +560,7 @@ codexbar_atomic_install() (
   swift_version="$8"
   install_stage=""
   current_tmp=""
+  current_rollback=""
   link_tmp=""
   generation=""
   generation_name=""
@@ -570,9 +571,10 @@ codexbar_atomic_install() (
   # shellcheck disable=SC2329
   codexbar_atomic_cleanup() {
     local status
-    status=$?
+    status="$1"
     trap - EXIT
     [ -z "${current_tmp}" ] || rm -f "${current_tmp}"
+    [ -z "${current_rollback}" ] || rm -f "${current_rollback}"
     [ -z "${link_tmp}" ] || rm -f "${link_tmp}"
     if [ -n "${install_stage}" ] && [ -e "${install_stage}" ]; then
       chmod -R u+w "${install_stage}" 2>/dev/null || true
@@ -580,7 +582,7 @@ codexbar_atomic_install() (
     fi
     exit "${status}"
   }
-  trap codexbar_atomic_cleanup EXIT
+  trap 'codexbar_atomic_cleanup "$?"' EXIT
 
   mkdir -p "${codexbar_cli_dir}" "${HOME}/.local/bin" || exit 1
   if [ -e "${codexbar_cli_current}" ] && [ ! -L "${codexbar_cli_current}" ]; then
@@ -655,7 +657,18 @@ codexbar_atomic_install() (
   mv -f -h "${current_tmp}" "${codexbar_cli_current}" || exit 1
   current_tmp=""
   if [ -n "${link_tmp}" ]; then
-    mv -f -h "${link_tmp}" "${codexbar_cli_link}" || exit 1
+    if ! mv -f -h "${link_tmp}" "${codexbar_cli_link}"; then
+      if [ -n "${previous_generation}" ]; then
+        current_rollback="$(mktemp "${codexbar_cli_dir}/.current.XXXXXX")" || exit 1
+        rm -f "${current_rollback}" || exit 1
+        ln -s "${previous_generation}" "${current_rollback}" || exit 1
+        mv -f -h "${current_rollback}" "${codexbar_cli_current}" || exit 1
+        current_rollback=""
+      else
+        rm -f "${codexbar_cli_current}" || exit 1
+      fi
+      exit 1
+    fi
     link_tmp=""
   fi
 
@@ -675,14 +688,13 @@ codexbar_remove_cask() {
 }
 
 codexbar_publish_build() {
-  local source fork_sha upstream_sha mode built_sha fallback_reason cask_failed
+  local source fork_sha upstream_sha mode built_sha cask_failed
   local authorization_note
   source="$1"
   fork_sha="$2"
   upstream_sha="$3"
   mode="$4"
   built_sha="$5"
-  fallback_reason="$6"
   cask_failed=0
   authorization_note="run keeper agent accounts authorize-codexbar to authorize unattended Keychain-backed observation"
 
@@ -694,11 +706,7 @@ codexbar_publish_build() {
     "${codexbar_build_tree_sha}" \
     "${codexbar_build_architecture}" \
     "${codexbar_build_swift_version}"; then
-    if [ -n "${fallback_reason}" ]; then
-      codexbar_notify "${fallback_reason}; the unrebased fallback built, but final staging/install failed; the previous binary was retained"
-    else
-      codexbar_notify "the rebased CLI built, but final staging/install failed; the previous binary was retained"
-    fi
+    codexbar_notify "the rebased CLI built, but final staging/install failed; the previous binary was retained"
     return 1
   fi
 
@@ -707,13 +715,7 @@ codexbar_publish_build() {
   if ! codexbar_remove_cask; then
     cask_failed=1
   fi
-  if [ -n "${fallback_reason}" ]; then
-    if [ "${cask_failed}" -ne 0 ]; then
-      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}; Homebrew cask removal failed; ${authorization_note}"
-    else
-      codexbar_notify "${fallback_reason}; installed the unrebased fork fallback at ${fork_sha:0:10}; ${authorization_note}"
-    fi
-  elif [ "${cask_failed}" -ne 0 ]; then
+  if [ "${cask_failed}" -ne 0 ]; then
     codexbar_notify "installed the rebased CLI, but Homebrew cask removal failed; ${authorization_note}"
   else
     codexbar_notify "installed the rebased CLI at ${built_sha:0:10}; ${authorization_note}"
@@ -723,16 +725,15 @@ codexbar_publish_build() {
 
 codexbar_cli_install() (
   set -Eeuo pipefail
-  local source_state repository build_source fallback_source
-  local fork_sha upstream_sha built_sha fallback_reason
+  local source_state repository build_source
+  local fork_sha upstream_sha built_sha failure_reason
   source_state=""
   repository=""
   build_source=""
-  fallback_source=""
   fork_sha=""
   upstream_sha="unavailable"
   built_sha=""
-  fallback_reason=""
+  failure_reason=""
 
   # This trap owns only disposable source state; generation staging has a
   # separate subshell-scoped trap in codexbar_atomic_install.
@@ -780,60 +781,48 @@ codexbar_cli_install() (
     fi
   fi
 
-  # Only a resolved pair is latched. An upstream-unavailable fallback is built
-  # and recorded, but the next Keeper install retries upstream resolution.
-  if [ "${upstream_sha}" != "unavailable" ]; then
-    if codexbar_provenance_matches "${fork_sha}" "${upstream_sha}" rebased \
-      || codexbar_provenance_matches "${fork_sha}" "${upstream_sha}" unrebased; then
-      echo "install: CodexBar CLI inputs unchanged; no rebuild"
-      codexbar_remove_cask \
-        || echo "install: Homebrew CodexBar cask removal failed (non-fatal)" >&2
-      return 0
-    fi
+  # Only a successfully rebased resolved pair is latched. Upstream resolution
+  # failures retain the current generation and are retried on the next install.
+  if [ "${upstream_sha}" != "unavailable" ] \
+    && codexbar_provenance_matches "${fork_sha}" "${upstream_sha}" rebased; then
+    echo "install: CodexBar CLI inputs unchanged; no rebuild"
+    codexbar_remove_cask \
+      || echo "install: Homebrew CodexBar cask removal failed (non-fatal)" >&2
+    return 0
   fi
 
   if [ "${upstream_sha}" = "unavailable" ]; then
-    fallback_reason="upstream CodexBar ${codexbar_upstream_ref} could not be resolved"
-  else
-    build_source="${source_state}/rebased"
-    if codexbar_add_fork_worktree "${repository}" "${build_source}" "${fork_sha}"; then
-      if codexbar_git -C "${build_source}" rebase --rebase-merges \
-        "${upstream_sha}" >/dev/null 2>&1; then
-        built_sha="$(codexbar_git -C "${build_source}" rev-parse HEAD \
-          2>/dev/null || true)"
-        if [[ "${built_sha}" =~ ^[0-9a-f]{40}$ ]] \
-          && codexbar_build_cli "${build_source}" "${source_state}"; then
-          codexbar_publish_build "${build_source}" "${fork_sha}" \
-            "${upstream_sha}" rebased "${built_sha}" "" || true
-          return 0
-        fi
-        fallback_reason="the rebased CodexBar CLI build failed"
-      else
-        fallback_reason="the CodexBar fork could not rebase onto upstream ${upstream_sha:0:10}"
-      fi
-    else
-      fallback_reason="the disposable rebased CodexBar source could not be prepared"
-    fi
-    if ! codexbar_discard_worktree "${repository}" "${build_source}"; then
-      codexbar_notify "${fallback_reason}; the failed source could not be discarded safely; the previous binary was retained"
-      return 0
-    fi
-    build_source=""
+    codexbar_notify "upstream CodexBar ${codexbar_upstream_ref} could not be resolved; the previous binary was retained"
+    return 0
   fi
 
-  # Every fallback starts from a fresh disposable worktree at the immutable fork
-  # SHA. A failed rebase/build tree is aborted and discarded above, never reused.
-  fallback_source="${source_state}/unrebased"
-  if ! codexbar_add_fork_worktree "${repository}" "${fallback_source}" "${fork_sha}"; then
-    codexbar_notify "${fallback_reason}; the clean unrebased fallback could not be prepared; the previous binary was retained"
+  build_source="${source_state}/rebased"
+  if ! codexbar_add_fork_worktree "${repository}" "${build_source}" "${fork_sha}"; then
+    codexbar_notify "the disposable rebased CodexBar source could not be prepared; the previous binary was retained"
     return 0
   fi
-  if ! codexbar_build_cli "${fallback_source}" "${source_state}"; then
-    codexbar_notify "${fallback_reason}; the unrebased fork build also failed; the previous binary was retained"
+  if ! codexbar_git -C "${build_source}" rebase --rebase-merges \
+    "${upstream_sha}" >/dev/null 2>&1; then
+    failure_reason="the CodexBar fork could not rebase onto upstream ${upstream_sha:0:10}"
+    if ! codexbar_discard_worktree "${repository}" "${build_source}"; then
+      failure_reason="${failure_reason}; the failed source could not be discarded safely"
+    fi
+    codexbar_notify "${failure_reason}; the previous binary was retained"
     return 0
   fi
-  codexbar_publish_build "${fallback_source}" "${fork_sha}" \
-    "${upstream_sha}" unrebased "${fork_sha}" "${fallback_reason}" || true
+
+  built_sha="$(codexbar_git -C "${build_source}" rev-parse HEAD \
+    2>/dev/null || true)"
+  if [[ ! "${built_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+    codexbar_notify "the rebased CodexBar source did not resolve to a commit; the previous binary was retained"
+    return 0
+  fi
+  if ! codexbar_build_cli "${build_source}" "${source_state}"; then
+    codexbar_notify "the rebased CodexBar CLI build failed; the previous binary was retained"
+    return 0
+  fi
+  codexbar_publish_build "${build_source}" "${fork_sha}" \
+    "${upstream_sha}" rebased "${built_sha}" || true
 )
 if ! codexbar_cli_install; then
   codexbar_notify "unexpected installer error; the previous binary was retained"

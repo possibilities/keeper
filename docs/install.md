@@ -61,11 +61,13 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 Claude account routing is optional and fails open to the native default account when either integration
 is absent or unusable. The installer manages only the CodexBar CLI, never the app bundle: on every run it
-resolves the trusted, mutable `possibilities/CodexBar` and `steipete/CodexBar` `main` tips in disposable
-source state, attempts a sealed noninteractive rebase with merge topology preserved, and builds the exact
-fork tip when upstream cannot be resolved, the rebase conflicts, or the rebased build fails. Unchanged
-source identities are an idempotent no-op; a changed identity updates automatically. Each immutable
-generation under `~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic
+resolves the trusted, mutable `possibilities/CodexBar` `feature/claude-swap-single-account-option` tip and
+`steipete/CodexBar` `main` tip in disposable source state, then attempts a sealed noninteractive rebase with
+merge topology preserved. Only the successfully rebased tree can replace the managed CLI. An unavailable
+upstream, rebase conflict, or rebased-build failure leaves the previous generation active and sends a
+best-effort `notifyctl` message; it never publishes the unrebased fork. Unchanged source identities are an
+idempotent no-op; a changed identity updates automatically. Each immutable generation under
+`~/.local/share/keeper/codexbar` contains `CodexBarCLI` and `PROVENANCE`; one atomic
 `current` symlink swap publishes both, while `~/.local/bin/codexbar` is the stable daemon and
 interactive-shell path. Before publication, Keeper signs the staged executable with its pinned,
 certificate-backed local identity and verifies the exact designated requirement; the private key remains
