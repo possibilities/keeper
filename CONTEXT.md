@@ -7,7 +7,7 @@
 - **Lifecycle stamp**: The per-job event-time high-water mark that lifecycle state transitions may not regress behind, so a stale out-of-order event annotates but never resurrects state. Avoid: watermark, cursor, last-seen.
 - **Re-fold**: Rebuilding a projection by replaying every event, which stays deterministic only because a fold never reads wall-clock, environment, or the filesystem. Avoid: rebuild, replay-repair, reprocess.
 - **Dead letter**: An event the reducer could not fold, parked for inspection and later replay instead of crashing the fold. Avoid: error queue, poison message, reject.
-- **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a rewind. Avoid: snapshot, ephemeral view, scratch state.
+- **Live-only projection**: A projection derived from the live world rather than replayed events, so it is refreshed in place and never wiped by a migration rewind; its producer may retire an individual row it declares gone via a targeted tombstone. Avoid: snapshot, ephemeral view, scratch state.
 - **Migration ladder**: The ordered array of explicit-version `{version, kind, apply}` step entries `migrate()` applies in order, with `SCHEMA_VERSION` derived as the tail entry's version rather than hand-typed; a one-lane-at-a-time singleton resource, so two concurrent schema edits collide at merge rather than compose silently. Avoid: registry, migration list, schema chain.
 ## Plan board
 - **Board**: The read-only plan state — epics, tasks, and their readiness — that an agent orients on before acting. Avoid: backlog, kanban, queue.
