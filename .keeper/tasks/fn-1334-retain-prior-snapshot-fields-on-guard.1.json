@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/dotfiles",
   "tier": "low",
   "title": "Retain snapshot fields on timeout",
-  "updated_at": "2026-07-18T14:28:11.596000Z"
+  "updated_at": "2026-07-18T14:30:31.551000Z",
+  "worker_done_at": "2026-07-18T14:30:31.551000Z"
 }

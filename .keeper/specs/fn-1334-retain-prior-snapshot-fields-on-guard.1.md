@@ -22,5 +22,5 @@ Files:
 - [ ] Prior snapshot fields are retained (not blanked) on a successful backup whose snapshot query times out.
 
 ## Done summary
-
+Widened the snapshot guard-failure branch in both restic-backup and restic-backup-silverbird from elif LAST_BACKUP_SUCCESS==false to else, mirroring the adjacent stats branch so prior snapshot fields are retained on any guard failure (timeout or non-clean exit), not just on backup failure.
 ## Evidence
