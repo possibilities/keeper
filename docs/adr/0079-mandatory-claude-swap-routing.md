@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Supersedes ADRs 0058, 0064, and 0065 while preserving Claude and Pi as Keeper's complete Supported harness set and preserving the account-routing supersession chain to ADRs 0038, 0012, and 0009.
+Superseded by ADR 0092. This record itself supersedes ADRs 0058, 0064, and 0065 while preserving Claude and Pi as Keeper's complete Supported harness set and preserving the account-routing supersession chain to ADRs 0038, 0012, and 0009.
 
 ## Context
 
