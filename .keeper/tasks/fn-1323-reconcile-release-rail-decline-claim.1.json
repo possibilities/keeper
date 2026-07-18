@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T01:09:08.116000Z",
+  "depends_on": [],
+  "epic": "fn-1323-reconcile-release-rail-decline-claim",
+  "id": "fn-1323-reconcile-release-rail-decline-claim.1",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Mark decline-recording deferred",
+  "updated_at": "2026-07-18T01:09:08.116000Z"
+}
