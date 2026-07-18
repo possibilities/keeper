@@ -36,9 +36,11 @@ import {
   appendMessage,
   artifactRowExists,
   type ChannelRow,
+  loadChannels,
   openBusDb,
   QUEUED_FOR_WAKE,
   replayFromCursor,
+  upsertChannel,
 } from "../src/bus-db";
 import type { BusResolveResult, ResolvedIdentity } from "../src/bus-identity";
 import {
@@ -62,7 +64,9 @@ import {
   registrationPresenceEffects,
   requeueTail,
   resolveHarnessIdentity,
+  retireSocketlessChannel,
   selectFanoutTargets,
+  sweepChannelRetention,
   takeoverVictim,
   toLiveChannel,
   validateChatPayload,
@@ -461,7 +465,7 @@ test("channelPruneDecision prunes a dead identity once past the grace age", () =
   ).toBe("prune");
 });
 
-test("channelPruneDecision keeps an alive identity whose start_time still matches", () => {
+test("channelPruneDecision keeps matching identity only inside the Presence horizon", () => {
   expect(
     channelPruneDecision(
       "darwin:x",
@@ -472,6 +476,16 @@ test("channelPruneDecision keeps an alive identity whose start_time still matche
       CHANNEL_PRESENCE_HORIZON_MS,
     ),
   ).toBe("keep");
+  expect(
+    channelPruneDecision(
+      "darwin:x",
+      CHANNEL_PRESENCE_HORIZON_MS,
+      1000,
+      false,
+      aliveWith("darwin:x"),
+      CHANNEL_PRESENCE_HORIZON_MS,
+    ),
+  ).toBe("prune");
 });
 
 test("channelPruneDecision prunes an alive-but-recycled pid (live start_time differs)", () => {
@@ -532,6 +546,222 @@ test("channelPruneDecision prunes a socketless unverifiable identity once past t
       CHANNEL_PRESENCE_HORIZON_MS,
     ),
   ).toBe("prune");
+});
+
+test("channel retention advances beyond a connected head with bounded work", async () => {
+  const db = openBusDb(":memory:");
+  const connectedPids = new Set<number>();
+  for (let i = 0; i < 70; i++) {
+    const pid = 20_000 + i;
+    connectedPids.add(pid);
+    upsertChannel(
+      db,
+      makeChannel({
+        channel_id: `ch-${String(i).padStart(3, "0")}`,
+        pid,
+        start_time: `live-${i}`,
+        last_heartbeat: 0,
+      }),
+    );
+  }
+  for (let i = 70; i < 73; i++) {
+    upsertChannel(
+      db,
+      makeChannel({
+        channel_id: `ch-${i}`,
+        pid: 20_000 + i,
+        start_time: `stale-${i}`,
+        last_heartbeat: 0,
+      }),
+    );
+  }
+
+  const state = { cursor: null };
+  let processChecks = 0;
+  const retired: string[] = [];
+  for (let tick = 0; tick < 4; tick++) {
+    const result = await sweepChannelRetention(
+      db,
+      10_000,
+      state,
+      {
+        identityConnected: (pid) => connectedPids.has(pid),
+        isPidAlive: () => {
+          processChecks += 1;
+          return true;
+        },
+        probeStartTime: async () => {
+          processChecks += 1;
+          return "matching";
+        },
+        retire: (row) => retired.push(row.channel_id),
+      },
+      {
+        candidates: 64,
+        probes: 1,
+        deletes: 2,
+        graceMs: 100,
+        horizonMs: 1_000,
+      },
+    );
+    expect(result.examined).toBeLessThanOrEqual(64);
+    expect(result.probes).toBeLessThanOrEqual(1);
+    expect(result.deleteAttempts).toBeLessThanOrEqual(2);
+  }
+
+  expect(processChecks).toBe(0);
+  expect(retired.sort()).toEqual(["ch-70", "ch-71", "ch-72"]);
+  expect(loadChannels(db)).toHaveLength(70);
+  db.close();
+});
+
+test("channel retention freshness and live-socket fences win async probe races", async () => {
+  const refreshedDb = openBusDb(":memory:");
+  upsertChannel(
+    refreshedDb,
+    makeChannel({
+      channel_id: "ch-refresh-old",
+      pid: 300,
+      start_time: "old-start",
+      last_heartbeat: 1_000,
+    }),
+  );
+  const refreshed = await sweepChannelRetention(
+    refreshedDb,
+    10_000,
+    { cursor: null },
+    {
+      identityConnected: () => false,
+      isPidAlive: () => true,
+      probeStartTime: async () => {
+        upsertChannel(
+          refreshedDb,
+          makeChannel({
+            channel_id: "ch-refresh-new",
+            pid: 300,
+            start_time: "old-start",
+            last_heartbeat: 9_500,
+          }),
+        );
+        return "recycled-start";
+      },
+      retire: () => {
+        throw new Error("fresh row must not retire");
+      },
+    },
+    {
+      candidates: 1,
+      probes: 1,
+      deletes: 1,
+      graceMs: 100,
+      horizonMs: 100_000,
+    },
+  );
+  expect(refreshed.deleteAttempts).toBe(1);
+  expect(refreshed.deleted).toBe(0);
+  expect(loadChannels(refreshedDb)[0].channel_id).toBe("ch-refresh-new");
+  refreshedDb.close();
+
+  const subscribedDb = openBusDb(":memory:");
+  upsertChannel(
+    subscribedDb,
+    makeChannel({
+      channel_id: "ch-subscribe",
+      pid: 400,
+      start_time: "subscribe-start",
+      last_heartbeat: 1_000,
+    }),
+  );
+  let subscribed = false;
+  const resubscribed = await sweepChannelRetention(
+    subscribedDb,
+    10_000,
+    { cursor: null },
+    {
+      identityConnected: () => subscribed,
+      isPidAlive: () => true,
+      probeStartTime: async () => {
+        subscribed = true;
+        return "recycled-start";
+      },
+      retire: () => {
+        throw new Error("subscribed row must not retire");
+      },
+    },
+    {
+      candidates: 1,
+      probes: 1,
+      deletes: 1,
+      graceMs: 100,
+      horizonMs: 100_000,
+    },
+  );
+  expect(resubscribed.deleteAttempts).toBe(0);
+  expect(resubscribed.deleted).toBe(0);
+  expect(loadChannels(subscribedDb)).toHaveLength(1);
+  subscribedDb.close();
+});
+
+test("horizon reap closes and detaches a stale unsubscribed registration", async () => {
+  const db = openBusDb(":memory:");
+  const channel = makeChannel({
+    channel_id: "ch-open-stale",
+    pid: 500,
+    start_time: "matching-live-process",
+    last_heartbeat: 0,
+  });
+  upsertChannel(db, channel);
+
+  let ended = 0;
+  const connection = {
+    write: () => 0,
+    end: () => {
+      ended += 1;
+    },
+    data: {},
+  } as unknown as NonNullable<RegistryEntry["connection"]>;
+  const entry = makeEntry(channel, { connection, sock: null });
+  (connection.data as unknown as { entry: RegistryEntry }).entry = entry;
+  const registry = new Map([[channel.channel_id, entry]]);
+  let processChecks = 0;
+
+  const result = await sweepChannelRetention(
+    db,
+    1_000,
+    { cursor: null },
+    {
+      identityConnected: () => false,
+      isPidAlive: () => {
+        processChecks += 1;
+        return true;
+      },
+      probeStartTime: async () => {
+        processChecks += 1;
+        return channel.start_time;
+      },
+      retire: (row) => {
+        retireSocketlessChannel(registry, row);
+      },
+    },
+    {
+      candidates: 1,
+      probes: 1,
+      deletes: 1,
+      graceMs: 100,
+      horizonMs: 1_000,
+    },
+  );
+
+  expect(result.deleted).toBe(1);
+  expect(result.probes).toBe(0);
+  expect(processChecks).toBe(0);
+  expect(ended).toBe(1);
+  expect(
+    (connection.data as unknown as { entry: RegistryEntry | null }).entry,
+  ).toBeNull();
+  expect(registry.size).toBe(0);
+  expect(loadChannels(db)).toHaveLength(0);
+  db.close();
 });
 
 // ---------------------------------------------------------------------------
