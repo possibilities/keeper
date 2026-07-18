@@ -58,5 +58,5 @@ surface expectations updated in the same change.
 - [ ] The full fast correctness gates stay green
 
 ## Done summary
-
+Attached ADR 0078's typed request-release pointer to all four ownership_conflict emit sites (claimant identity, contended paths, release invocation, and requester protocol text with never-signal-a-peer guidance and attempt-budgeted backoff on decline); extended the closed CommitWorkOutcome union without forking it; co-updated the Pi-side commit-work tool envelope and both test suites.
 ## Evidence
