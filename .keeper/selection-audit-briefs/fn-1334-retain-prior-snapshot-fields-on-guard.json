@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "low",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 4,
+        "files_changed": 2,
+        "insertions": 4
+      },
+      "done_summary": "Widened the snapshot guard-failure branch in both restic-backup and restic-backup-silverbird from elif LAST_BACKUP_SUCCESS==false to else, mirroring the adjacent stats branch so prior snapshot fields are retained on any guard failure (timeout or non-clean exit), not just on backup failure.",
+      "input_hash": "5ceabefd39049547c72def1f2bd5363cd0a3a3665cf97c71296a1039fc7442c1",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1550,
+      "spec_md": "## Description\n\nTraces to finding F2 (evidence: `bin/.local/bin/restic-backup:192-209`\nand `bin/.local/bin/restic-backup-silverbird:190-207`). The snapshot\nquery is wrapped in `guard \"$STATS_DEADLINE_SECONDS\"`, but its failure\nbranch is `elif [[ \"$LAST_BACKUP_SUCCESS\" == \"false\" ]]`, so on a\nsuccessful backup where the guard fails (timeout on the new 90s deadline,\nor any non-clean exit) the three snapshot vars fall through to their empty\ninitializers and are written blank to the state file. Mirror the adjacent\nstats branch (`else` at `restic-backup:216`), which was correctly widened\nto fall back to `prev_snapshot_*` on any guard failure. Apply the same\none-branch change to both scripts to keep them in sync.\n\nFiles:\n- `bin/.local/bin/restic-backup` (snapshot guard-failure branch)\n- `bin/.local/bin/restic-backup-silverbird` (same branch)\n\n## Acceptance\n\n- [ ] The snapshot guard-failure branch falls back to `prev_snapshot_time` / `prev_snapshot_age` / `prev_count` on any guard failure, not only when the backup failed.\n- [ ] Change applied identically to both `restic-backup` and `restic-backup-silverbird`.\n- [ ] Prior snapshot fields are retained (not blanked) on a successful backup whose snapshot query times out.\n\n## Done summary\nWidened the snapshot guard-failure branch in both restic-backup and restic-backup-silverbird from elif LAST_BACKUP_SUCCESS==false to else, mirroring the adjacent stats branch so prior snapshot fields are retained on any guard failure (timeout or non-clean exit), not just on backup failure.\n## Evidence\n",
+      "task_id": "fn-1334-retain-prior-snapshot-fields-on-guard.1",
+      "tier": "low",
+      "title": "Retain snapshot fields on timeout"
+    }
+  ],
+  "created_at": "2026-07-18T14:32:17.671000Z",
+  "epic_id": "fn-1334-retain-prior-snapshot-fields-on-guard",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "5ceabefd39049547c72def1f2bd5363cd0a3a3665cf97c71296a1039fc7442c1",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
