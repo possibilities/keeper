@@ -53,7 +53,7 @@ function artifact(...parts: string[]): string {
   return join(project.root, ".keeper", ...parts);
 }
 
-function setEpicTouchedRepos(epicId: string, repos: string[]): void {
+function _setEpicTouchedRepos(epicId: string, repos: string[]): void {
   const path = artifact("epics", `${epicId}.json`);
   const data = JSON.parse(readFileSync(path, "utf-8")) as Record<
     string,

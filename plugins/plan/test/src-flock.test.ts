@@ -100,7 +100,13 @@ describe("fakeVcs.inProgressOp / commitWorkLockPath", () => {
 
   test("reports each in-progress classification", () => {
     expect(fakeVcs.inProgressOp(root)).toBe("none");
-    for (const op of ["merge", "cherry-pick", "revert", "rebase", "sequencer"] as const) {
+    for (const op of [
+      "merge",
+      "cherry-pick",
+      "revert",
+      "rebase",
+      "sequencer",
+    ] as const) {
       armInProgressOp(root, op);
       expect(fakeVcs.inProgressOp(root)).toBe(op);
     }

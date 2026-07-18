@@ -293,5 +293,3 @@ describe("done — self-heal an uncommitted (STATE_UNCOMMITTED) wedge", () => {
     expect(gitLogCount(root)).toBe(afterFirst);
   });
 });
-
-

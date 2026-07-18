@@ -5,8 +5,8 @@
 // The verb assembles the audit brief (source commit groups, ordinal task list +
 // done summaries, the canonical commit_set_hash), persists it commit-free under
 // gitignored audits/<epic_id>/brief.json, and emits a content-blind envelope
-// {primary_repo, tasks, all_done, brief_ref, commit_set_hash} — commit_groups
-// prose lives ONLY in the brief. The verb-level tests drive the verb in a
+// {primary_repo, tasks, all_done, brief_ref, commit_set_hash, phase_resume} —
+// commit_groups prose lives ONLY in the brief. The verb-level tests drive the verb in a
 // withProject repo (git-free); the trailer-scan tests seed fake source commits
 // through the VCS fixture.
 //
@@ -18,6 +18,7 @@
 // citation target). The all-repos-broken verb path is python_only (drop).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -30,9 +31,16 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
+  AUDIT_SCHEMA_VERSION,
   auditsRoot,
   briefPath,
   computeCommitSetHash,
+  followupMetaPath,
+  followupPath,
+  reportMetaPath,
+  reportPath,
+  verdictPath,
+  writeArtifact,
 } from "../src/audit_artifacts.ts";
 import {
   AllReposBrokenError,
@@ -204,6 +212,251 @@ describe("close-preflight success envelope + brief", () => {
     expect(existsSync(join(proj.root, ".keeper", "state", "audits"))).toBe(
       true,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Durable close-phase resume grading.
+// ---------------------------------------------------------------------------
+
+const EMPTY_COMMIT_SET_HASH =
+  "1d9ebf5514067028b750fb8f1ec6dff67d94515b5224186200ee4331f6d2a029";
+
+function writeJsonArtifact(path: string, value: Record<string, unknown>): void {
+  writeArtifact(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function seedAuditPhase(
+  root: string,
+  epicId: string,
+  hash: string,
+  findings: number,
+  schemaVersion = AUDIT_SCHEMA_VERSION,
+): void {
+  writeArtifact(reportPath(root, epicId), "# Audit report\n");
+  writeJsonArtifact(reportMetaPath(root, epicId), {
+    schema_version: schemaVersion,
+    epic_id: epicId,
+    commit_set_hash: hash,
+    findings,
+    risk: "Low",
+  });
+}
+
+function seedPlanPhase(
+  root: string,
+  epicId: string,
+  hash: string,
+  opts: { fatal?: boolean; followup?: boolean } = {},
+): string | null {
+  writeJsonArtifact(verdictPath(root, epicId), {
+    schema_version: AUDIT_SCHEMA_VERSION,
+    commit_set_hash: hash,
+    fatal: opts.fatal ?? false,
+    fatal_reason: opts.fatal ? "ship block" : "",
+    decisions: opts.followup
+      ? [{ fid: "f1", action: "kept", task: 1, rationale: "real" }]
+      : [],
+  });
+  if (!opts.followup) {
+    return null;
+  }
+  const text =
+    "epic:\n  title: Follow-up\n  spec: |\n    follow-up\n" +
+    "tasks:\n  - title: Fix finding\n    tier: medium\n    model: opus\n";
+  writeArtifact(followupPath(root, epicId), text);
+  writeJsonArtifact(followupMetaPath(root, epicId), {
+    schema_version: AUDIT_SCHEMA_VERSION,
+    epic_id: epicId,
+    commit_set_hash: hash,
+    task_count: 1,
+  });
+  return text;
+}
+
+function seedSelectionPhase(
+  root: string,
+  epicId: string,
+  followupText: string,
+): string {
+  const inputHash = createHash("sha256").update(followupText).digest("hex");
+  const dir = join(root, ".keeper", "state", "selections", epicId);
+  mkdirSync(dir, { recursive: true });
+  const brief = join(dir, "followup-brief.json");
+  const verdict = join(dir, "followup-verdict.json");
+  writeJsonArtifact(brief, {
+    schema_version: 1,
+    epic_id: epicId,
+    from_followup: true,
+    input_hash: inputHash,
+  });
+  writeJsonArtifact(verdict, {
+    schema_version: 1,
+    cells: { "1": { tier: "medium", model: "opus" } },
+    selection: {
+      harness: "subagent",
+      model: "plan:model-selector",
+      config_hash: "fixture-config",
+      input_hash: inputHash,
+      shuffle_seed: 7,
+      outcome: "completed",
+      verdict_raw: "fixture",
+    },
+  });
+  return verdict;
+}
+
+describe("close-preflight durable phase resume", () => {
+  const getProj = withProject("planctl-cpf-resume-");
+
+  function preflight(
+    proj: { root: string; home: string },
+    epicId: string,
+  ): Record<string, unknown> {
+    const result = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(result.code).toBe(0);
+    return parseCliOutput(result.output);
+  }
+
+  test("all fresh phases are satisfied and emit the selection verdict path", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    const followup = seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, {
+      followup: true,
+    }) as string;
+    const selectionVerdict = seedSelectionPhase(proj.root, epicId, followup);
+
+    expect(preflight(proj, epicId).phase_resume).toEqual({
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "satisfied",
+      findings: 1,
+      fatal: false,
+      followup_present: true,
+      selection_verdict_path: selectionVerdict,
+    });
+  });
+
+  test("selection is unfinished when its input hash does not match the follow-up", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    const followup = seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, {
+      followup: true,
+    }) as string;
+    const verdict = seedSelectionPhase(proj.root, epicId, followup);
+    const parsed = JSON.parse(readFileSync(verdict, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    (parsed.selection as Record<string, unknown>).input_hash = "stale-input";
+    writeJsonArtifact(verdict, parsed);
+
+    expect(preflight(proj, epicId).phase_resume).toEqual({
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "unfinished",
+      findings: 1,
+      fatal: false,
+      followup_present: true,
+      selection_verdict_path: null,
+    });
+  });
+
+  test("a moved commit set invalidates audit and every downstream phase", () => {
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    const followup = seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, {
+      followup: true,
+    }) as string;
+    seedSelectionPhase(proj.root, epicId, followup);
+    seedCommit(proj.root, taskIds[0] as string);
+
+    expect(preflight(proj, epicId).phase_resume).toEqual({
+      audit: "unfinished",
+      plan: "unfinished",
+      selection: "unfinished",
+      findings: null,
+      fatal: null,
+      followup_present: false,
+      selection_verdict_path: null,
+    });
+  });
+
+  test("findings=0 makes plan and selection not needed", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 0);
+
+    expect(preflight(proj, epicId).phase_resume).toEqual({
+      audit: "satisfied",
+      plan: "not_needed",
+      selection: "not_needed",
+      findings: 0,
+      fatal: false,
+      followup_present: false,
+      selection_verdict_path: null,
+    });
+  });
+
+  test("a fresh fatal verdict satisfies plan and makes selection not needed", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, 1);
+    seedPlanPhase(proj.root, epicId, EMPTY_COMMIT_SET_HASH, { fatal: true });
+
+    expect(preflight(proj, epicId).phase_resume).toEqual({
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "not_needed",
+      findings: 1,
+      fatal: true,
+      followup_present: false,
+      selection_verdict_path: null,
+    });
+  });
+
+  test("a torn audit with report.md but no meta is unfinished", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    writeArtifact(reportPath(proj.root, epicId), "# Torn report\n");
+
+    expect(preflight(proj, epicId).phase_resume).toMatchObject({
+      audit: "unfinished",
+      plan: "unfinished",
+      selection: "unfinished",
+    });
+  });
+
+  test("a too-new artifact schema degrades to unfinished without failing", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    seedAuditPhase(
+      proj.root,
+      epicId,
+      EMPTY_COMMIT_SET_HASH,
+      1,
+      AUDIT_SCHEMA_VERSION + 1,
+    );
+
+    const env = preflight(proj, epicId);
+    expect(env.success).toBe(true);
+    expect(env.phase_resume).toMatchObject({
+      audit: "unfinished",
+      plan: "unfinished",
+      selection: "unfinished",
+    });
+  });
+
+  test("an empty artifact set emits null", () => {
+    const proj = getProj();
+    const { epicId } = makeEpic(proj, ["done"]);
+    expect(preflight(proj, epicId).phase_resume).toBeNull();
   });
 });
 

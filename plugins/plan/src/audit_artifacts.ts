@@ -108,6 +108,10 @@ export function followupPath(primaryRepo: string, epicId: string): string {
   return join(auditDir(primaryRepo, epicId), FOLLOWUP_BASENAME);
 }
 
+export function followupMetaPath(primaryRepo: string, epicId: string): string {
+  return `${followupPath(primaryRepo, epicId)}.meta.json`;
+}
+
 /** The durable minted-marker basename a blocking close-gate stamps once it
  * scaffolds the follow-up. */
 export const BLOCKING_FOLLOWUP_BASENAME = "blocking-followup.json";
@@ -261,6 +265,206 @@ export function taskFindingCoversCommitSet(
   const stored = parsed.commit_set_hash;
   return (
     typeof stored === "string" && stored === computeCommitSetHash(commitGroups)
+  );
+}
+
+export type ClosePhaseGrade = "satisfied" | "not_needed" | "unfinished";
+
+export interface ClosePhaseResume {
+  audit: ClosePhaseGrade;
+  plan: ClosePhaseGrade;
+  selection: ClosePhaseGrade;
+  findings: number | null;
+  fatal: boolean | null;
+  followup_present: boolean;
+  selection_verdict_path: string | null;
+}
+
+/** Grade persisted close artifacts against the freshly derived commit set.
+ * Each phase is usable only after every preceding applicable phase is usable;
+ * malformed, torn, stale, or too-new artifacts therefore invalidate that phase
+ * and everything downstream. No persisted phase artifact is the ordinary fresh
+ * close and returns null. */
+export function closePhaseResume(
+  primaryRepo: string,
+  epicId: string,
+  freshCommitSetHash: string,
+): ClosePhaseResume | null {
+  const auditRoot = join(auditsRoot(primaryRepo), epicId);
+  const report = join(auditRoot, REPORT_BASENAME);
+  const reportMeta = join(auditRoot, REPORT_META_BASENAME);
+  const verdict = join(auditRoot, VERDICT_BASENAME);
+  const followup = join(auditRoot, FOLLOWUP_BASENAME);
+  const followupMeta = `${followup}.meta.json`;
+  const stateDir = join(
+    resolveDataDirOrDefault(resolveResolved(primaryRepo)),
+    "state",
+  );
+  const selectionDir = join(stateDir, "selections", epicId);
+  const selectionBrief = join(selectionDir, "followup-brief.json");
+  const selectionVerdict = join(selectionDir, "followup-verdict.json");
+  const phasePaths = [
+    report,
+    reportMeta,
+    verdict,
+    followup,
+    followupMeta,
+    selectionBrief,
+    selectionVerdict,
+  ];
+  if (!phasePaths.some((path) => existsSync(path))) {
+    return null;
+  }
+
+  const unfinished = (audit: ClosePhaseGrade): ClosePhaseResume => ({
+    audit,
+    plan: "unfinished",
+    selection: "unfinished",
+    findings: null,
+    fatal: null,
+    followup_present: false,
+    selection_verdict_path: null,
+  });
+
+  const reportDoc = safeReadArtifact(reportMeta);
+  if (
+    !existsSync(report) ||
+    !artifactHasKnownSchema(reportDoc) ||
+    reportDoc.commit_set_hash !== freshCommitSetHash ||
+    typeof reportDoc.findings !== "number" ||
+    !Number.isInteger(reportDoc.findings) ||
+    reportDoc.findings < 0
+  ) {
+    return unfinished("unfinished");
+  }
+
+  const findings = reportDoc.findings;
+  if (findings === 0) {
+    return {
+      audit: "satisfied",
+      plan: "not_needed",
+      selection: "not_needed",
+      findings,
+      fatal: false,
+      followup_present: false,
+      selection_verdict_path: null,
+    };
+  }
+
+  const verdictDoc = safeReadArtifact(verdict);
+  if (
+    !artifactHasKnownSchema(verdictDoc) ||
+    verdictDoc.commit_set_hash !== freshCommitSetHash ||
+    typeof verdictDoc.fatal !== "boolean" ||
+    !Array.isArray(verdictDoc.decisions)
+  ) {
+    return {
+      ...unfinished("satisfied"),
+      findings,
+    };
+  }
+
+  const fatal = verdictDoc.fatal;
+  if (fatal) {
+    return {
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "not_needed",
+      findings,
+      fatal,
+      followup_present: false,
+      selection_verdict_path: null,
+    };
+  }
+
+  const needsFollowup = verdictDoc.decisions.some((decision) => {
+    if (decision === null || typeof decision !== "object") {
+      return false;
+    }
+    const task = (decision as Record<string, unknown>).task;
+    return typeof task === "number" && Number.isInteger(task) && task > 0;
+  });
+  if (!needsFollowup) {
+    return {
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "not_needed",
+      findings,
+      fatal,
+      followup_present: false,
+      selection_verdict_path: null,
+    };
+  }
+
+  const followupDoc = safeReadArtifact(followupMeta);
+  if (
+    !existsSync(followup) ||
+    !artifactHasKnownSchema(followupDoc) ||
+    followupDoc.commit_set_hash !== freshCommitSetHash
+  ) {
+    return {
+      ...unfinished("satisfied"),
+      findings,
+      fatal,
+    };
+  }
+
+  let followupInputHash: string;
+  try {
+    followupInputHash = createHash("sha256")
+      .update(readFileSync(followup))
+      .digest("hex");
+  } catch {
+    return {
+      ...unfinished("satisfied"),
+      findings,
+      fatal,
+    };
+  }
+
+  const selectionBriefDoc = safeReadArtifact(selectionBrief);
+  const selectionVerdictDoc = safeReadArtifact(selectionVerdict);
+  const selectionProvenance =
+    selectionVerdictDoc?.selection !== null &&
+    typeof selectionVerdictDoc?.selection === "object" &&
+    !Array.isArray(selectionVerdictDoc.selection)
+      ? (selectionVerdictDoc.selection as Record<string, unknown>)
+      : null;
+  const selectionFresh =
+    artifactHasKnownSchema(selectionBriefDoc) &&
+    selectionBriefDoc.from_followup === true &&
+    selectionBriefDoc.input_hash === followupInputHash &&
+    artifactHasKnownSchema(selectionVerdictDoc) &&
+    selectionProvenance?.input_hash === followupInputHash;
+
+  return {
+    audit: "satisfied",
+    plan: "satisfied",
+    selection: selectionFresh ? "satisfied" : "unfinished",
+    findings,
+    fatal,
+    followup_present: true,
+    selection_verdict_path: selectionFresh ? selectionVerdict : null,
+  };
+}
+
+function safeReadArtifact(path: string): Record<string, unknown> | null {
+  try {
+    return readArtifactJson(path);
+  } catch {
+    return null;
+  }
+}
+
+function artifactHasKnownSchema(
+  artifact: Record<string, unknown> | null,
+): artifact is Record<string, unknown> {
+  return (
+    artifact !== null &&
+    typeof artifact.schema_version === "number" &&
+    Number.isInteger(artifact.schema_version) &&
+    artifact.schema_version >= 1 &&
+    artifact.schema_version <= AUDIT_SCHEMA_VERSION
   );
 }
 

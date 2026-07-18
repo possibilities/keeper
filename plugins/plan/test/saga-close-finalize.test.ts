@@ -13,6 +13,7 @@
 // the retired `epic followup-of` node asserts the unknown-subcommand error.
 
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -27,8 +28,10 @@ import { join } from "node:path";
 import {
   AUDIT_SCHEMA_VERSION,
   computeCommitSetHash,
+  followupMetaPath,
   followupPath,
   reportMetaPath,
+  reportPath,
   verdictPath,
   writeArtifact,
   writeBriefArtifact,
@@ -163,6 +166,67 @@ function seedFollowupYaml(
     "  spec: |\n    ## Overview\n    follow overview\n" +
     `tasks:\n${blocks.join("\n")}\n`;
   writeArtifact(followupPath(root, epicId), yaml);
+}
+
+function seedFreshResumeReceipts(
+  root: string,
+  epicId: string,
+  commitSetHash: string,
+): string {
+  writeArtifact(reportPath(root, epicId), "# Quality audit\n");
+  seedReportMeta(root, epicId, commitSetHash, 1);
+  writeArtifact(
+    followupMetaPath(root, epicId),
+    `${JSON.stringify(
+      {
+        schema_version: AUDIT_SCHEMA_VERSION,
+        epic_id: epicId,
+        commit_set_hash: commitSetHash,
+        task_count: 1,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const followupText = readFileSync(followupPath(root, epicId), "utf-8");
+  const inputHash = createHash("sha256").update(followupText).digest("hex");
+  const selectionDir = join(root, ".keeper", "state", "selections", epicId);
+  mkdirSync(selectionDir, { recursive: true });
+  writeArtifact(
+    join(selectionDir, "followup-brief.json"),
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        epic_id: epicId,
+        from_followup: true,
+        input_hash: inputHash,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const selectionVerdict = join(selectionDir, "followup-verdict.json");
+  writeArtifact(
+    selectionVerdict,
+    `${JSON.stringify(
+      {
+        schema_version: 1,
+        cells: { "1": { tier: "high", model: "sonnet" } },
+        selection: {
+          harness: "subagent",
+          model: "plan:model-selector",
+          config_hash: "fixture-config",
+          input_hash: inputHash,
+          shuffle_seed: 17,
+          outcome: "completed",
+          verdict_raw: "fixture",
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return selectionVerdict;
 }
 
 function epicStatus(root: string, epicId: string): string {
@@ -521,6 +585,82 @@ describe("close-finalize closed_with_followup", () => {
     const rerun = finalize(proj, epicId);
     expect(rerun.code).toBe(0);
     expect(rerun.env.outcome).toBe("closed_with_followup");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("a finalize lock retry resumes every fresh phase and mints once", () => {
+    const proj = getProj();
+    const { epicId, hash } = doneEpic(
+      proj,
+      1,
+      KEPT_ONE,
+      "Durable phase resume",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const seededSelectionVerdict = seedFreshResumeReceipts(
+      proj.root,
+      epicId,
+      hash,
+    );
+    const beforeLogs = gitLogCount(proj.root);
+    const beforeEpics = countEpicFiles(proj.root);
+
+    armInProgressOp(proj.root, "merge");
+    const blocked = runCli(
+      [
+        "close-finalize",
+        epicId,
+        "--project",
+        proj.root,
+        "--selection-verdict",
+        seededSelectionVerdict,
+      ],
+      { cwd: proj.root, home: proj.home },
+    );
+    expect(blocked.code).toBe(1);
+    expect(
+      (parseCliOutput(blocked.output).error as Record<string, unknown>).code,
+    ).toBe("MERGE_IN_PROGRESS");
+    expect(gitLogCount(proj.root)).toBe(beforeLogs);
+    expect(countEpicFiles(proj.root)).toBe(beforeEpics);
+
+    armInProgressOp(proj.root, "none");
+    const preflight = runCli(
+      ["close-preflight", epicId, "--project", proj.root],
+      { cwd: proj.root, home: proj.home },
+    );
+    expect(preflight.code).toBe(0);
+    const resume = parseCliOutput(preflight.output).phase_resume as Record<
+      string,
+      unknown
+    >;
+    expect(resume).toEqual({
+      audit: "satisfied",
+      plan: "satisfied",
+      selection: "satisfied",
+      findings: 1,
+      fatal: false,
+      followup_present: true,
+      selection_verdict_path: seededSelectionVerdict,
+    });
+
+    const retried = runCli(
+      [
+        "close-finalize",
+        epicId,
+        "--project",
+        proj.root,
+        "--selection-verdict",
+        resume.selection_verdict_path as string,
+      ],
+      { cwd: proj.root, home: proj.home },
+    );
+    expect(retried.code).toBe(0);
+    const retriedEnv = parseCliOutput(retried.output);
+    expect(retriedEnv.outcome).toBe("closed_with_followup");
+    expect(countEpicFiles(proj.root)).toBe(beforeEpics + 1);
+    // Follow-up scaffold records the epic and task, then source-close records one.
+    expect(gitLogCount(proj.root)).toBe(beforeLogs + 3);
     expect(epicStatus(proj.root, epicId)).toBe("done");
   });
 

@@ -5,7 +5,8 @@
 // status + done summaries, and the canonical commit_set_hash — persist it
 // commit-free under gitignored audits/<epic_id>/brief.json, then emit a
 // content-blind envelope {primary_repo, tasks, all_done, brief_ref,
-// commit_set_hash}. The commit_groups prose lives ONLY in the brief file.
+// commit_set_hash, phase_resume}. The commit_groups prose lives ONLY in the
+// brief file.
 //
 // all_done is always true on success: a not-all-done epic is a typed
 // TASKS_NOT_DONE error, not a false data field. The brief is assembled fully
@@ -20,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
   AUDIT_SCHEMA_VERSION,
+  closePhaseResume,
   computeCommitSetHash,
   taskFindingPath,
   writeBriefArtifact,
@@ -358,6 +360,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
     throw exc;
   }
   const commitSetHash = computeCommitSetHash(commitGroups);
+  const phaseResume = closePhaseResume(primaryRepo, epicId, commitSetHash);
 
   // Depth signals. Per-repo diff stats come from the commit-set numstat; the
   // task / diff-line / touched-repo counts feed the policy that sizes the audit
@@ -485,6 +488,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       brief_ref: briefRef,
       commit_set_hash: commitSetHash,
       blocking_followup: blockingFollowup,
+      phase_resume: phaseResume,
     },
     format,
   );
