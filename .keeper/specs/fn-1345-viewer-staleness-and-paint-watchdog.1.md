@@ -89,5 +89,5 @@ plus `bun run typecheck`.
 - [ ] Focused named gates plus typecheck are green.
 
 ## Done summary
-
+Implemented ADR 0088 on the shared view shell: a body-region red STALE banner stamping the held frame's age past a visible-switch debounce, an accepted-frame observable with forced repaint that clears the stale state on a proven fresh frame, and a divergence-gated self-healing paint watchdog reading the out-of-band fold cursor off the read-only progress poll (the shipped rev source; heartbeat probe proved in-band) and resubscribing via a new ReadinessClientHandle.reconnect() seam. Wired all live panes; CONTEXT.md + ADR trued up.
 ## Evidence
