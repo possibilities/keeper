@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 51,
+        "files_changed": 17,
+        "insertions": 674
+      },
+      "done_summary": "Ported the four escalation capabilities (merge-resolver, deconflicter, unblocker, repairer) into rendered plan:* agent templates with role-appropriate disallowedTools, registered them in prompt-artifacts.yaml's plan:work/plan:close bundles with a default_pin fallback for missing host pins, documented example agent_pins rows, and re-captured both oracle golden fixtures.",
+      "input_hash": "a5e80bff78e46581d9692163fdc614632d275c48aa7993e0cdc3835e4d6708fb",
+      "model": "opus",
+      "spec_chars": 4078,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** plugins/plan/template/agents/merge-resolver.md.tmpl, plugins/plan/template/agents/deconflicter.md.tmpl, plugins/plan/template/agents/unblocker.md.tmpl, plugins/plan/template/agents/repairer.md.tmpl, plugins/plan/prompt-artifacts.yaml, plugins/plan/agents/, docs/examples/matrix.example.yaml, plugins/prompt/test/oracle/fixtures/render-plugin-templates.json, plugins/prompt/test/oracle/fixtures/check-generated.json\n\n### Approach\n\nAuthor four static agent templates porting the capability contracts: merge-resolver (tier-1 mechanical fan-in resolution \u2014 re-runs the failed merge in its cwd, resolves only mechanically-clear conflicts, declines to the deconflicter on anything needing judgment; sourced from the daemon's inline resolver brief builders), deconflicter (tier-2 judgment merge reconciliation with real edits), unblocker (blocked-task diagnosis and board-verb resolution, no source writes), repairer (granted trunk fix: reproduce at HEAD, land a gated fix or green no-op via keeper commit-work). Shared contract across all four: frontmatter disallowedTools per role (all deny Task; unblocker additionally denies Edit/Write), incident input arrives as a data-delimited prompt section plus a brief_ref the agent may read via the read-only escalation-brief CLI, output is exactly one typed receipt line \u2014 resolved | declined_clean | declined_residue | stale_base \u2014 plus a bounded reason, and receipts never carry instructions. Wire each into prompt-artifacts.yaml roles with static binding and membership in the work and close bundles, add example agent_pins rows to the example matrix, render, and re-capture both golden fixtures.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/prompt-artifacts.yaml \u2014 roles/bundles schema and how the eleven existing static agents register\n- plugins/plan/template/agents/ \u2014 frontmatter + body conventions of existing agent templates (pins, color, disallowedTools)\n- src/daemon.ts:3710 and :3813 \u2014 buildResolverBrief / buildWorkResolverBrief, the tier-1 contract being ported (close-scoped and work-scoped variants)\n- plugins/plan/skills/deconflict/SKILL.md, unblock/SKILL.md, repair/SKILL.md \u2014 the tier-2/diagnosis/repair contracts being ported\n- cli/escalation-brief.ts \u2014 the read-only envelope shape agents may consume\n\n**Optional** (reference as needed):\n- plugins/prompt/test/oracle/capture.ts \u2014 how goldens re-capture\n- docs/plugin-composition-map.md \u2014 bundle-to-skill composition background\n\n### Risks\n\n- agent_pins live in the host-generated gitignored matrix \u2014 the rendered agents must tolerate an absent pin (falling back to render defaults) rather than failing the render\n- Porting the resolver brief too literally would keep close-scoped assumptions; the agent must stay scope-neutral (works in a lane or a base checkout, told only its cwd and incident)\n\n### Test notes\n\n`keeper prompt render-plugin-templates --project-root plugins/plan` then `--check` clean; re-capture and commit both golden fixtures; no unit suite beyond the render/golden gates.\n\n## Acceptance\n\n- [ ] Four managed escalation agents render from templates, each with role-appropriate disallowedTools, no Task access, a data-delimited incident input contract, and the four-value typed receipt as its sole output contract\n- [ ] prompt-artifacts.yaml registers all four roles and both work and close bundles include them\n- [ ] The example matrix documents agent_pins rows for all four and rendering succeeds with pins absent\n- [ ] Render check and both golden fixtures are green\n\n## Done summary\nPorted the four escalation capabilities (merge-resolver, deconflicter, unblocker, repairer) into rendered plan:* agent templates with role-appropriate disallowedTools, registered them in prompt-artifacts.yaml's plan:work/plan:close bundles with a default_pin fallback for missing host pins, documented example agent_pins rows, and re-captured both oracle golden fixtures.\n## Evidence\n",
+      "task_id": "fn-1348-escalation-capabilities-as-plan-agents.1",
+      "tier": "xhigh",
+      "title": "Author four escalation agent templates"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 186,
+        "files_changed": 3,
+        "insertions": 207
+      },
+      "done_summary": "Rewrote deconflict/unblock/repair skills as thin Task-spawn wrappers over plan:deconflicter/unblocker/repairer, relaying typed receipts and preserving today's success close-out (retry, resume/cold-dispatch, unblock+resume fan-out) and decline paging.",
+      "input_hash": "a5e80bff78e46581d9692163fdc614632d275c48aa7993e0cdc3835e4d6708fb",
+      "model": "sonnet",
+      "spec_chars": 2532,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/skills/deconflict/SKILL.md, plugins/plan/skills/unblock/SKILL.md, plugins/plan/skills/repair/SKILL.md\n\n### Approach\n\nRewrite the three hand-authored escalation skills (verified hand-authored \u2014 no managed-file sidecar) as thin wrappers: each loads its incident context exactly as today (escalation-brief CLI), spawns the corresponding plan agent as a Task subagent with the data-delimited incident, relays the typed receipt, and on a resolved receipt performs the same close-out the skill performs today (for deconflict, the `keeper autopilot retry` clear of its own sticky). The wrappers stay dual-use: a human can invoke them directly, and a legacy autopilot-dispatched escalation session booting the skill gets identical behavior with the reasoning now confined to the subagent. No daemon changes here; the legacy dispatch path itself retires in the final epic.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/skills/deconflict/SKILL.md, unblock/SKILL.md, repair/SKILL.md \u2014 current phase structure, guardrail blocks, and close-out verbs to preserve in wrapper form\n- plugins/plan/skills/work/SKILL.md \u2014 the Task-spawn + receipt-parse idiom the wrappers mirror (worker spawn and audit-gate patterns)\n\n**Optional** (reference as needed):\n- cli/escalation-brief.ts \u2014 envelope fields the wrapper forwards into the data-delimited section\n\n### Risks\n\n- A wrapper that forwards the brief as instructions instead of data reopens the injection surface the agents' contract closes \u2014 keep the delimiting explicit\n\n### Test notes\n\nNo automated suite covers skill prose; verification is behavioral \u2014 boot each wrapper against a synthetic incident brief in a sandbox checkout and confirm the receipt relay and close-out verbs fire.\n\n## Acceptance\n\n- [ ] Each of the three skills delegates its reasoning to the corresponding plan agent and relays a typed receipt\n- [ ] A legacy escalation session booting any of the three skills completes its incident flow unchanged, including the sticky-clearing close-out on success\n- [ ] Human direct invocation of each skill still works\n\n## Done summary\nRewrote deconflict/unblock/repair skills as thin Task-spawn wrappers over plan:deconflicter/unblocker/repairer, relaying typed receipts and preserving today's success close-out (retry, resume/cold-dispatch, unblock+resume fan-out) and decline paging.\n## Evidence\n",
+      "task_id": "fn-1348-escalation-capabilities-as-plan-agents.2",
+      "tier": "high",
+      "title": "Skills become thin agent wrappers"
+    }
+  ],
+  "created_at": "2026-07-18T23:42:30.066000Z",
+  "epic_id": "fn-1348-escalation-capabilities-as-plan-agents",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "a5e80bff78e46581d9692163fdc614632d275c48aa7993e0cdc3835e4d6708fb",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
