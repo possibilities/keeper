@@ -45,5 +45,5 @@ and the corresponding guard/leaf test suites.
       >1 MB fail-open, and the symlink-component root.
 
 ## Done summary
-
+Hardened the escalation-grant confinement surface: git -C/--git-dir/--work-tree global path overrides are now denied for confined write-capable roles, a >1MB payload carrying a confined agent_type fails closed instead of allowing on truncated-JSON parse, and writeGrantLeaf canonicalizes writable_root at mint so a symlinked checkout no longer over-denies. Added regression tests for all three gaps in test/grant-guard.test.ts.
 ## Evidence
