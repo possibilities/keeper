@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical confinement hardening with subtle fail-open/fail-closed invariants across the guard and leaf surface (git flag redirection bypass, >1MB fail-open, canonicalization over-denial) is a nameable security-invariant opus gate, and the contract-touching guard blast radius warrants the xhigh band without reaching the max ceiling.",
+      "task_id": "fn-1357-harden-escalation-grant-confinement.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T22:16:44.193000Z",
+  "epic_id": "fn-1357-harden-escalation-grant-confinement",
+  "input_hash": "e5ddf5a0a7e7e5f3b914e5f4604efa6ea23943fba6d357cc8b29d817cdf5c7ce",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3856528800,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security-critical confinement hardening with subtle fail-open/fail-closed invariants across the guard and leaf surface (git flag redirection bypass, >1MB fail-open, canonicalization over-denial) is a nameable security-invariant opus gate, and the contract-touching guard blast radius warrants the xhigh band without reaching the max ceiling.\",\"confidence\":0.83}]}\n"
+}

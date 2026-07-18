@@ -1,16 +1,17 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-18T22:16:44.201000Z",
   "created_at": "2026-07-18T21:00:53.525000Z",
   "depends_on_epics": [],
   "id": "fn-1347-escalation-grant-confinement-groundwork",
   "last_validated_at": "2026-07-18T21:12:02.644000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Escalation grant confinement groundwork",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:12:02.644000Z"
+  "updated_at": "2026-07-18T22:16:44.201000Z"
 }
