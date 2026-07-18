@@ -51,6 +51,8 @@ import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
 } from "../src/readiness-client";
+import { isOpenTurnRow } from "../src/subagent-invocations";
+import type { EmbeddedJob, SubagentInvocation } from "../src/types";
 import { type FormatMode, parseOptions } from "./descriptor";
 import { parseDuration } from "./duration";
 import {
@@ -77,8 +79,12 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * session included); v10 adds display-only `needs_human.finalize_pending`; v11
  * adds the display-only legacy Provider-leg drain gauge; v12 adds the
  * display-only `event_store` block — event count, DB bytes, and durations
- * projected from the most recent boot's measured catch-up rate. */
-export const STATUS_SCHEMA_VERSION = 12;
+ * projected from the most recent boot's measured catch-up rate; the current
+ * schema revision adds `stale_running` count partitions and `last_evidence_at`
+ * on stale board views.
+ * `in_flight.running_jobs` remains emitted but is deprecated in favor of
+ * `in_flight.board_work_jobs`. */
+export const STATUS_SCHEMA_VERSION = 13;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -98,7 +104,9 @@ booleans, the display-only legacy Provider-leg drain gauge, in-flight launches,
 needs-human signals, and {rev, catching_up}. Each
 task + close view also carries dispatch_failure: string[] — the sticky
 dispatch_failures block KINDS (multi-repo / merge-conflict / dirty-tree / non-ff)
-readiness can't see; [] when clean.
+readiness can't see; [] when clean. Counts split fresh running from
+stale-running; stale board views carry last_evidence_at so cached evidence never
+presents as a current activity claim.
 
 Flags:
   --format json|yaml       Output format (default json); yaml for a yq consumer
@@ -116,6 +124,7 @@ Examples:
   keeper status --json | jq .data.autopilot
   keeper status | jq '.data.drained, .data.jammed'
   keeper status --json | jq '.data.board.epics[].tasks[].dispatch_failure, .data.board.epics[].close.dispatch_failure'
+  keeper status --json | jq .data.counts
   keeper status --json | jq .data.in_flight.board_work_jobs  # safe-to-stop the daemon: 0 excludes this session
 `;
 
@@ -127,6 +136,7 @@ export interface VerdictTally {
   total: number;
   ready: number;
   running: number;
+  stale_running: number;
   completed: number;
   blocked: number;
 }
@@ -144,6 +154,7 @@ export interface StatusBootInfo {
 interface VerdictView {
   verdict: string;
   pill: string;
+  last_evidence_at: number | null;
   // Sorted-unique short KIND tokens for any sticky `dispatch_failures` block on
   // this row (multi-repo / merge-conflict / dirty-tree / non-ff / …). Additive
   // (v2), `[]` when clean. Populated on task + close views; the epic-level view
@@ -201,6 +212,7 @@ export interface StatusData {
   };
   in_flight: {
     pending_dispatches: number;
+    /** @deprecated Use `board_work_jobs` for the maintenance-window-safe count. */
     running_jobs: number;
     // Working Board-work sessions only (autopilot work/close + escalation
     // unblock/deconflict/resolve/repair), excluding the caller's own session.
@@ -278,18 +290,66 @@ export function countLegacyWrappedProviderLegs(
   return count;
 }
 
-/** Render one (possibly absent) verdict to its JSON view. A miss renders the
- *  same inert `[blocked:unknown]` the board uses (visible bug indicator, never
- *  dispatchable). */
-function verdictView(v: Verdict | undefined): VerdictView {
+function isStaleRunningVerdict(
+  verdict: Verdict | undefined,
+): verdict is Extract<Verdict, { tag: "running" }> {
+  return (
+    verdict?.tag === "running" &&
+    (verdict.reason.kind === "sub-agent-stale" ||
+      verdict.reason.kind === "monitor-stale")
+  );
+}
+
+function lastEvidenceAt(
+  verdict: Verdict | undefined,
+  jobs: readonly EmbeddedJob[],
+  subagentInvocations: readonly SubagentInvocation[],
+): number | null {
+  if (!isStaleRunningVerdict(verdict)) {
+    return null;
+  }
+  let latest: number | null = null;
+  const consider = (value: number): void => {
+    if (Number.isFinite(value) && (latest === null || value > latest)) {
+      latest = value;
+    }
+  };
+  if (verdict.reason.kind === "sub-agent-stale") {
+    const jobIds = new Set(jobs.map((job) => job.job_id));
+    for (const invocation of subagentInvocations) {
+      if (jobIds.has(invocation.job_id) && isOpenTurnRow(invocation)) {
+        consider(invocation.updated_at);
+      }
+    }
+  } else {
+    for (const job of jobs) {
+      if (job.has_live_worker_monitor === true) {
+        consider(job.updated_at);
+      }
+    }
+  }
+  return latest;
+}
+
+function verdictView(
+  v: Verdict | undefined,
+  evidenceJobs: readonly EmbeddedJob[] = [],
+  subagentInvocations: readonly SubagentInvocation[] = [],
+): VerdictView {
   if (v === undefined) {
     return {
       verdict: "unknown",
       pill: "[blocked:unknown]",
+      last_evidence_at: null,
       dispatch_failure: [],
     };
   }
-  return { verdict: v.tag, pill: formatPill(v), dispatch_failure: [] };
+  return {
+    verdict: v.tag,
+    pill: formatPill(v),
+    last_evidence_at: lastEvidenceAt(v, evidenceJobs, subagentInvocations),
+    dispatch_failure: [],
+  };
 }
 
 /** Tally a verdict map by tag. `blocked` absorbs every non-ready/running/done. */
@@ -298,6 +358,7 @@ function tallyVerdicts(m: Map<string, Verdict>): VerdictTally {
     total: 0,
     ready: 0,
     running: 0,
+    stale_running: 0,
     completed: 0,
     blocked: 0,
   };
@@ -306,7 +367,11 @@ function tallyVerdicts(m: Map<string, Verdict>): VerdictTally {
     if (v.tag === "ready") {
       t.ready += 1;
     } else if (v.tag === "running") {
-      t.running += 1;
+      if (isStaleRunningVerdict(v)) {
+        t.stale_running += 1;
+      } else {
+        t.running += 1;
+      }
     } else if (v.tag === "completed") {
       t.completed += 1;
     } else {
@@ -368,16 +433,30 @@ export function buildStatusEnvelope(
 
   const board = {
     epics: snap.epics.map((epic): EpicView => {
+      const epicVerdict = snap.readiness.perEpic.get(epic.epic_id);
       const closeVerdict = snap.readiness.perCloseRow.get(epic.epic_id);
+      const completedTaskJobs = epic.tasks.flatMap((task) =>
+        snap.readiness.perTask.get(task.task_id)?.tag === "completed"
+          ? (task.jobs ?? [])
+          : [],
+      );
+      const allEpicJobs = [
+        ...(epic.jobs ?? []),
+        ...epic.tasks.flatMap((task) => task.jobs ?? []),
+      ];
       return {
         epic_id: epic.epic_id,
         status: epic.status,
         question: epic.question ?? null,
-        ...verdictView(snap.readiness.perEpic.get(epic.epic_id)),
+        ...verdictView(epicVerdict, allEpicJobs, snap.subagentInvocations),
         tasks: epic.tasks.map(
           (task): TaskView => ({
             task_id: task.task_id,
-            ...verdictView(snap.readiness.perTask.get(task.task_id)),
+            ...verdictView(
+              snap.readiness.perTask.get(task.task_id),
+              task.jobs ?? [],
+              snap.subagentInvocations,
+            ),
             dispatch_failure: sortedKinds(taskFailureKinds, task.task_id),
           }),
         ),
@@ -385,7 +464,11 @@ export function buildStatusEnvelope(
           closeVerdict === undefined
             ? null
             : {
-                ...verdictView(closeVerdict),
+                ...verdictView(
+                  closeVerdict,
+                  [...(epic.jobs ?? []), ...completedTaskJobs],
+                  snap.subagentInvocations,
+                ),
                 dispatch_failure: sortedKinds(closeFailureKinds, epic.epic_id),
               },
       };
