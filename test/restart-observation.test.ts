@@ -144,6 +144,30 @@ describe("restart evidence identity", () => {
     expect(verdict.verdict).toBe("incomplete");
   });
 
+  test("a valid marker proves exact replacement despite an invalid earlier frozen boot", () => {
+    const invalidBoot = {
+      boot_id: "boot-invalid",
+      pid: 409,
+      ts: 1_699_998_000_000,
+    } as unknown as RestartLedgerBootRecord;
+    const verdict = classifyRestartEvidence(
+      exactInput({
+        pre_restart: {
+          service: { status: "exact-identity", identity: OLD },
+          ledger: {
+            status: "readable",
+            boots: [invalidBoot, ledgerBoot(OLD, 1_699_999_000_000)],
+          },
+        },
+      }),
+    );
+
+    expect(verdict.verdict).toBe("proven");
+    expect(verdict.proof_path).toBe("exact-replacement");
+    expect(verdict.identity).toEqual(NEXT);
+    expect(verdict.reasons).toEqual([]);
+  });
+
   test("a missing or unreadable pre-restart marker cannot bless a later distinct row", () => {
     const missing = classifyRestartEvidence(
       exactInput({

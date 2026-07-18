@@ -546,7 +546,7 @@ export function classifyRestartEvidence(
     proofPath !== null &&
     command.status !== "not-issued" &&
     preRestartProofReady &&
-    frozenLedgerValid &&
+    (!crossingPath || frozenLedgerValid) &&
     timingValid &&
     replacement.status === "replaced" &&
     durableBoot.status === "matched" &&
