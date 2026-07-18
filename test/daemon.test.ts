@@ -231,6 +231,7 @@ import {
 } from "../src/dispatch-failure-key";
 import {
   classifyAgentbotPageOutcome,
+  resolveAgentbotBinaryPath,
   sendAgentbotPage,
 } from "../src/integrity-probe";
 import { MAX_LINE_LENGTH } from "../src/protocol";
@@ -270,7 +271,10 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test("agentbot page helper classifies spawn absence, transient exits, and delivery", async () => {
+test("agentbot page helper resolves absolute binary, latches absence, and classifies outcomes", async () => {
+  expect(classifyAgentbotPageOutcome({ kind: "absent" })).toBe(
+    "permanent_failure",
+  );
   expect(classifyAgentbotPageOutcome({ kind: "spawn_threw" })).toBe(
     "permanent_failure",
   );
@@ -284,15 +288,66 @@ test("agentbot page helper classifies spawn absence, transient exits, and delive
     "notified",
   );
 
-  const delivered = await sendAgentbotPage("fixture", {
-    spawn: () => ({ exited: Promise.resolve(0) }),
+  const configured = join(tmpDir, "configured-agentbot");
+  const fallback = join(tmpDir, "default-agentbot");
+  const configPath = join(tmpDir, "config.yaml");
+  writeFileSync(configPath, `agentbot_path: ${JSON.stringify(configured)}\n`);
+  expect(
+    resolveAgentbotBinaryPath({ configPath, defaultBinaryPath: fallback }),
+  ).toBe(configured);
+
+  const savedPath = process.env.PATH;
+  process.env.PATH = "/usr/bin:/bin";
+  const argvSeen: string[][] = [];
+  try {
+    const delivered = await sendAgentbotPage("fixture", {
+      configPath,
+      defaultBinaryPath: fallback,
+      canExecute: (path) => path === configured,
+      spawn: (argv) => {
+        argvSeen.push(argv);
+        return { exited: Promise.resolve(0) };
+      },
+    });
+    expect(delivered).toBe("notified");
+    expect(argvSeen[0]).toEqual([
+      configured,
+      "send-message",
+      "--topic",
+      "Keeper",
+      "fixture",
+    ]);
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+  }
+
+  const transient = await sendAgentbotPage("fixture", {
+    binaryPath: configured,
+    canExecute: (path) => path === configured,
+    spawn: () => ({ exited: Promise.resolve(17) }),
   });
-  const missing = await sendAgentbotPage("fixture", {
+  expect(transient).toBe("transient_failure");
+
+  const logs: string[] = [];
+  const latch = { logged: false };
+  const absentDeps = {
+    binaryPath: join(tmpDir, "missing-agentbot"),
+    canExecute: () => false,
+    log: (line: string) => logs.push(line),
+    absenceLogLatch: latch,
     spawn: () => {
-      throw Object.assign(new Error("agentbot missing"), { code: "ENOENT" });
+      throw new Error("spawn should not run after failed executable probe");
     },
-  });
-  expect([delivered, missing]).toEqual(["notified", "permanent_failure"]);
+  };
+  const firstAbsent = await sendAgentbotPage("fixture", absentDeps);
+  const secondAbsent = await sendAgentbotPage("fixture", absentDeps);
+  expect([firstAbsent, secondAbsent]).toEqual([
+    "permanent_failure",
+    "permanent_failure",
+  ]);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("paging transport unavailable");
 });
 
 test("paging-channel distress is idempotent and level-clears only after delivery", () => {

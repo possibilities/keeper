@@ -569,18 +569,36 @@ export function stuckSentinelOrphansToClear(
  * Normalize a lane worktree path to the key the lane-wedge tracker + the reason-scoped
  * clear match on: realpath (so the macOS `/tmp`→`/private/tmp` + `/var`→`/private/var`
  * symlinks collapse to ONE form on both the provision-mint side and the recover-probe
- * side), then strip a trailing slash. A realpath failure (a torn-down lane) keeps the
- * raw input, still trailing-slash-stripped. Mirrors {@link
- * normalizeWorktreeAttributionKey} so the two lane keyings never drift.
+ * side), then strip a trailing slash. A realpath failure keeps the raw input and
+ * distinguishes confirmed absence (`ENOENT`/`ENOTDIR`) from an unknown probe error.
+ * Mirrors {@link normalizeWorktreeAttributionKey} so the two lane keyings never drift.
  */
-function normalizeLanePath(p: string): string {
-  let resolved = p;
+export type LanePathPresence = "present" | "absent" | "unknown";
+
+export interface NormalizedLanePath {
+  path: string;
+  presence: LanePathPresence;
+}
+
+export type LanePathNormalizer = (path: string) => NormalizedLanePath;
+
+function normalizeLanePathState(p: string): NormalizedLanePath {
   try {
-    resolved = realpathSync.native(p);
-  } catch {
-    // A torn-down lane that no longer resolves — key on the raw path.
+    return {
+      path: stripTrailingSlashPath(realpathSync.native(p)),
+      presence: "present",
+    };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    return {
+      path: stripTrailingSlashPath(p),
+      presence: code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown",
+    };
   }
-  return stripTrailingSlashPath(resolved);
+}
+
+function normalizeLanePath(p: string): string {
+  return normalizeLanePathState(p).path;
 }
 
 /**
@@ -2065,21 +2083,30 @@ export interface LaneTeardownGraceTracker {
     backupFailedPaths: ReadonlySet<string>;
     openTeardownPaths: ReadonlySet<string>;
     openBackupPaths: ReadonlySet<string>;
-    allowClear?: boolean;
+    laneEnumerationComplete?: boolean;
   }): SharedWedgeDistressAction[];
 }
 
+function laneTeardownDistressIdForKey(path: string): string {
+  return `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}${repoDirHash(path)}`;
+}
+
+function laneBackupDistressIdForKey(path: string): string {
+  return `${LANE_BACKUP_DISTRESS_ID_PREFIX}${repoDirHash(path)}`;
+}
+
 export function laneTeardownDistressId(path: string): string {
-  return `${LANE_TEARDOWN_DISTRESS_ID_PREFIX}${repoDirHash(normalizeLanePath(path))}`;
+  return laneTeardownDistressIdForKey(normalizeLanePath(path));
 }
 
 export function laneBackupDistressId(path: string): string {
-  return `${LANE_BACKUP_DISTRESS_ID_PREFIX}${repoDirHash(normalizeLanePath(path))}`;
+  return laneBackupDistressIdForKey(normalizeLanePath(path));
 }
 
 /** Pure in-memory grace/page-once tracker; the producer supplies the only clock. */
 export function createLaneTeardownGraceTracker(
   graceSec: number = LANE_TEARDOWN_GRACE_SEC,
+  normalizePath: LanePathNormalizer = normalizeLanePathState,
 ): LaneTeardownGraceTracker {
   const firstSeen = new Map<string, { sinceSec: number; minted: boolean }>();
   const firstBackupFailure = new Map<
@@ -2089,7 +2116,7 @@ export function createLaneTeardownGraceTracker(
   const graceMin = Math.round(graceSec / 60);
   return {
     consider({ path, state, detail, nowSec }) {
-      const key = normalizeLanePath(path);
+      const key = normalizePath(path).path;
       let episode = firstSeen.get(key);
       if (episode === undefined) {
         episode = { sinceSec: nowSec, minted: false };
@@ -2102,7 +2129,7 @@ export function createLaneTeardownGraceTracker(
       return {
         destroy: false,
         mint: {
-          id: laneTeardownDistressId(key),
+          id: laneTeardownDistressIdForKey(key),
           dir: key,
           reason:
             `${LANE_TEARDOWN_DISTRESS_REASON}: ${key} stayed un-tearable past ` +
@@ -2112,7 +2139,7 @@ export function createLaneTeardownGraceTracker(
       };
     },
     noteBackupFailure({ path, detail, nowSec }) {
-      const key = normalizeLanePath(path);
+      const key = normalizePath(path).path;
       let episode = firstBackupFailure.get(key);
       if (episode === undefined) {
         episode = { sinceSec: nowSec, minted: false };
@@ -2121,7 +2148,7 @@ export function createLaneTeardownGraceTracker(
       if (episode.minted || nowSec - episode.sinceSec < graceSec) return null;
       episode.minted = true;
       return {
-        id: laneBackupDistressId(key),
+        id: laneBackupDistressIdForKey(key),
         dir: key,
         reason:
           `${LANE_BACKUP_DISTRESS_REASON}: the lane dirt spool snapshot for ${key} ` +
@@ -2135,7 +2162,7 @@ export function createLaneTeardownGraceTracker(
       backupFailedPaths,
       openTeardownPaths,
       openBackupPaths,
-      allowClear = true,
+      laneEnumerationComplete = true,
     }) {
       for (const path of firstSeen.keys()) {
         if (!candidatePaths.has(path)) firstSeen.delete(path);
@@ -2144,17 +2171,25 @@ export function createLaneTeardownGraceTracker(
         if (!backupFailedPaths.has(path)) firstBackupFailure.delete(path);
       }
       const clear: SharedWedgeDistressAction[] = [];
-      if (!allowClear) return clear;
+      const confirmedAbsent = ({ path, presence }: NormalizedLanePath) =>
+        !presentPaths.has(path) &&
+        (laneEnumerationComplete || presence === "absent");
       for (const path of openTeardownPaths) {
-        const key = normalizeLanePath(path);
-        if (!presentPaths.has(key)) {
-          clear.push({ id: laneTeardownDistressId(key), dir: key });
+        const normalized = normalizePath(path);
+        if (confirmedAbsent(normalized)) {
+          clear.push({
+            id: laneTeardownDistressIdForKey(normalized.path),
+            dir: normalized.path,
+          });
         }
       }
       for (const path of openBackupPaths) {
-        const key = normalizeLanePath(path);
-        if (!presentPaths.has(key)) {
-          clear.push({ id: laneBackupDistressId(key), dir: key });
+        const normalized = normalizePath(path);
+        if (confirmedAbsent(normalized)) {
+          clear.push({
+            id: laneBackupDistressIdForKey(normalized.path),
+            dir: normalized.path,
+          });
         }
       }
       return clear;
@@ -8042,7 +8077,7 @@ export async function recoverWorktrees(
     backupFailedPaths,
     openTeardownPaths: laneTeardown?.openTeardownPaths ?? new Set(),
     openBackupPaths: laneTeardown?.openBackupPaths ?? new Set(),
-    allowClear: laneEnumerationComplete,
+    laneEnumerationComplete,
   })) {
     laneTeardownDistress.push({ action: "clear", ...clear });
   }

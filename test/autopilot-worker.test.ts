@@ -12649,6 +12649,115 @@ test("lane teardown tracker: a persistent backup failure pages once on its own r
   ).toBeNull();
 });
 
+test("lane backup tracker keeps the mint key stable across present-to-absent normalization", () => {
+  const aliasPath = "/tmp/keeper-lane";
+  const canonicalPath = "/private/tmp/keeper-lane";
+  let present = true;
+  const tracker = createLaneTeardownGraceTracker(0, (path) =>
+    present
+      ? { path: canonicalPath, presence: "present" }
+      : { path, presence: "absent" },
+  );
+
+  const mint = tracker.noteBackupFailure({
+    path: aliasPath,
+    detail: "disk full",
+    nowSec: 1,
+  });
+  if (mint === null) throw new Error("expected immediate backup distress");
+  expect(mint.dir).toBe(canonicalPath);
+
+  present = false;
+  expect(
+    tracker.finishCycle({
+      presentPaths: new Set(),
+      candidatePaths: new Set(),
+      backupFailedPaths: new Set(),
+      openTeardownPaths: new Set(),
+      openBackupPaths: new Set([mint.dir]),
+      laneEnumerationComplete: true,
+    }),
+  ).toEqual([{ id: mint.id, dir: canonicalPath }]);
+});
+
+test("lane backup tracker clears a confirmed-absent lane despite incomplete enumeration", () => {
+  const path = "/worktrees/absent-lane";
+  const tracker = createLaneTeardownGraceTracker(0, (input) => ({
+    path: input,
+    presence: "absent",
+  }));
+  const mint = tracker.noteBackupFailure({
+    path,
+    detail: "disk full",
+    nowSec: 1,
+  });
+  if (mint === null) throw new Error("expected immediate backup distress");
+
+  expect(
+    tracker.finishCycle({
+      presentPaths: new Set(),
+      candidatePaths: new Set(),
+      backupFailedPaths: new Set(),
+      openTeardownPaths: new Set(),
+      openBackupPaths: new Set([path]),
+      laneEnumerationComplete: false,
+    }),
+  ).toEqual([{ id: mint.id, dir: path }]);
+});
+
+test("lane backup tracker minted while absent uses the later clear key", () => {
+  const path = "/worktrees/already-absent";
+  const tracker = createLaneTeardownGraceTracker(0, (input) => ({
+    path: input,
+    presence: "absent",
+  }));
+  const mint = tracker.noteBackupFailure({
+    path,
+    detail: "lane disappeared during backup",
+    nowSec: 1,
+  });
+  if (mint === null) throw new Error("expected immediate backup distress");
+  expect(mint.dir).toBe(path);
+
+  expect(
+    tracker.finishCycle({
+      presentPaths: new Set(),
+      candidatePaths: new Set(),
+      backupFailedPaths: new Set(),
+      openTeardownPaths: new Set(),
+      openBackupPaths: new Set([path]),
+      laneEnumerationComplete: false,
+    }),
+  ).toEqual([{ id: mint.id, dir: path }]);
+});
+
+test("lane backup tracker retains present and unknown lanes when enumeration is incomplete", () => {
+  const path = "/worktrees/unenumerable-lane";
+  for (const presence of ["present", "unknown"] as const) {
+    const tracker = createLaneTeardownGraceTracker(0, (input) => ({
+      path: input,
+      presence,
+    }));
+    const mint = tracker.noteBackupFailure({
+      path,
+      detail: "disk full",
+      nowSec: 1,
+    });
+    if (mint === null) throw new Error("expected immediate backup distress");
+
+    expect(
+      tracker.finishCycle({
+        presentPaths: new Set(),
+        candidatePaths: new Set(),
+        backupFailedPaths: new Set(),
+        openTeardownPaths: new Set(),
+        openBackupPaths: new Set([mint.dir]),
+        laneEnumerationComplete: false,
+      }),
+    ).toEqual([]);
+  }
+});
+
 test("lane teardown grace is longer than the paging graces", () => {
   expect(LANE_TEARDOWN_GRACE_SEC).toBeGreaterThan(
     SHARED_CHECKOUT_WEDGE_GRACE_SEC,
