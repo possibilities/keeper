@@ -426,6 +426,26 @@ function gitConfigInjection(tokens: string[], boundary: number): string | null {
   return null;
 }
 
+function gitGlobalPathOverride(
+  tokens: string[],
+  boundary: number,
+): string | null {
+  for (let i = 1; i < boundary; i++) {
+    const token = tokens[i] as string;
+    if (
+      token === "-C" ||
+      (token.startsWith("-C") && token.length > 2) ||
+      token === "--git-dir" ||
+      token.startsWith("--git-dir=") ||
+      token === "--work-tree" ||
+      token.startsWith("--work-tree=")
+    ) {
+      return token;
+    }
+  }
+  return null;
+}
+
 function isOpenFilesInPagerAbbrev(arg: string): boolean {
   const eq = arg.indexOf("=");
   const flag = eq === -1 ? arg : arg.slice(0, eq);
@@ -602,9 +622,14 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
 
   if (exe === "git") {
     const sub = gitSubcommandInfo(tokens);
-    const injection = gitConfigInjection(tokens, sub?.index ?? tokens.length);
+    const boundary = sub?.index ?? tokens.length;
+    const injection = gitConfigInjection(tokens, boundary);
     if (injection !== null) {
       return `${injection}, denied for the role '${cfg.role}'`;
+    }
+    const pathOverride = gitGlobalPathOverride(tokens, boundary);
+    if (pathOverride !== null) {
+      return `git global path override '${pathOverride}' can redirect repository mutations outside the granted checkout`;
     }
     if (sub === undefined) return "bare `git` with no subcommand";
     // `git config` writes `.git/config` — a protected path, denied for EVERY
@@ -944,11 +969,116 @@ export function decideGrantGuard(
 // Entry point — always exit 0; fail CLOSED in jurisdiction, OPEN otherwise.
 // ---------------------------------------------------------------------------
 
-/** Read all of stdin as text. `Bun.stdin.stream()` avoids the macOS
- *  `process.stdin` buffer-until-close hang (Bun #18239). */
-async function readStdin(): Promise<string> {
+const MAX_STDIN_CHARS = 1_000_000;
+
+interface StdinRead {
+  text: string;
+  truncated: boolean;
+}
+
+/** Read stdin with a bounded parse surface. `Bun.stdin.stream()` avoids the
+ *  macOS `process.stdin` buffer-until-close hang (Bun #18239). */
+async function readStdin(): Promise<StdinRead> {
   const text = await new Response(Bun.stdin.stream()).text();
-  return text.length > 1_000_000 ? text.slice(0, 1_000_000) : text;
+  return {
+    text: text.slice(0, MAX_STDIN_CHARS),
+    truncated: text.length > MAX_STDIN_CHARS,
+  };
+}
+
+function topLevelConfinedAgentType(head: string): string | undefined {
+  let objectDepth = 0;
+  let arrayDepth = 0;
+  for (let i = 0; i < head.length; i++) {
+    const char = head[i] as string;
+    if (char === '"') {
+      const start = i;
+      for (i += 1; i < head.length; i++) {
+        if (head[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (head[i] === '"') break;
+      }
+      if (i >= head.length) return undefined;
+      if (objectDepth !== 1 || arrayDepth !== 0) continue;
+      let key: unknown;
+      try {
+        key = JSON.parse(head.slice(start, i + 1));
+      } catch {
+        continue;
+      }
+      if (key !== "agent_type") continue;
+      let cursor = i + 1;
+      while (/\s/.test(head[cursor] ?? "")) cursor += 1;
+      if (head[cursor] !== ":") continue;
+      cursor += 1;
+      while (/\s/.test(head[cursor] ?? "")) cursor += 1;
+      if (head[cursor] !== '"') continue;
+      const valueStart = cursor;
+      for (cursor += 1; cursor < head.length; cursor++) {
+        if (head[cursor] === "\\") {
+          cursor += 1;
+          continue;
+        }
+        if (head[cursor] === '"') {
+          try {
+            const value: unknown = JSON.parse(
+              head.slice(valueStart, cursor + 1),
+            );
+            if (
+              typeof value === "string" &&
+              escalationRoleFor(value) !== null
+            ) {
+              return value;
+            }
+          } catch {
+            return undefined;
+          }
+          i = cursor;
+          break;
+        }
+      }
+      if (cursor >= head.length) return undefined;
+      continue;
+    }
+    if (char === "{") objectDepth += 1;
+    else if (char === "}") objectDepth -= 1;
+    else if (char === "[") arrayDepth += 1;
+    else if (char === "]") arrayDepth -= 1;
+  }
+  return undefined;
+}
+
+function decideStdin(
+  input: StdinRead,
+  deps: GrantGuardDeps,
+): GrantGuardDenyEnvelope | null {
+  if (input.truncated) {
+    return topLevelConfinedAgentType(input.text) === undefined
+      ? null
+      : denyEnvelope(MALFORMED_REASON);
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(input.text);
+  } catch {
+    payload = null;
+  }
+  return decideGrantGuard(payload, deps);
+}
+
+export function decideGrantGuardInput(
+  raw: string,
+  deps: GrantGuardDeps,
+): GrantGuardDenyEnvelope | null {
+  return decideStdin(
+    {
+      text: raw.slice(0, MAX_STDIN_CHARS),
+      truncated: raw.length > MAX_STDIN_CHARS,
+    },
+    deps,
+  );
 }
 
 function emit(decision: GrantGuardDenyEnvelope | null): void {
@@ -964,23 +1094,31 @@ function inJurisdiction(payload: unknown): boolean {
 
 async function main(): Promise<void> {
   const env = process.env as GrantEnv;
-  let raw = "";
+  let input: StdinRead = { text: "", truncated: false };
   try {
-    raw = await readStdin();
+    input = await readStdin();
   } catch {
-    raw = "";
-  }
-  let payload: unknown = null;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    payload = null;
+    input = { text: "", truncated: false };
   }
   try {
-    emit(decideGrantGuard(payload, productionDeps(env)));
+    emit(decideStdin(input, productionDeps(env)));
   } catch {
-    // Internal error: fail CLOSED for a confined subagent, OPEN otherwise.
-    if (inJurisdiction(payload)) emit(denyEnvelope(MALFORMED_REASON));
+    // Internal error: fail CLOSED when even a truncated payload identifies a
+    // confined subagent, OPEN otherwise.
+    const agentType = input.truncated
+      ? topLevelConfinedAgentType(input.text)
+      : (() => {
+          try {
+            const payload: unknown = JSON.parse(input.text);
+            return inJurisdiction(payload)
+              ? (payload as GrantGuardPayload).agent_type
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+    if (escalationRoleFor(agentType) !== null)
+      emit(denyEnvelope(MALFORMED_REASON));
   }
 }
 
