@@ -15,6 +15,7 @@ import {
   composeManagedClaudeArgv,
   isAgentRole,
   loadRolePrompt,
+  mergeClaudeWorkspaceTrust,
   nativeClaudeArgs,
   nativePiArgs,
   stripClaudeEnv,
@@ -92,6 +93,81 @@ test("composeManagedClaudeArgv: forwards a leading-dash prompt verbatim after --
     "--",
     "-leading-dash-prompt",
   ]);
+});
+
+test("mergeClaudeWorkspaceTrust: creates an absent project entry", () => {
+  const result = mergeClaudeWorkspaceTrust(
+    JSON.stringify({ theme: "dark", projects: {} }),
+    "/repo",
+  );
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(result.changed).toBe(true);
+  expect(JSON.parse(result.body)).toEqual({
+    theme: "dark",
+    projects: {
+      "/repo": {
+        hasTrustDialogAccepted: true,
+        hasClaudeMdExternalIncludesApproved: true,
+      },
+    },
+  });
+});
+
+test("mergeClaudeWorkspaceTrust: upgrades partial and false fields while preserving siblings", () => {
+  const result = mergeClaudeWorkspaceTrust(
+    JSON.stringify({
+      rootSibling: { keep: true },
+      projects: {
+        "/repo": {
+          hasTrustDialogAccepted: false,
+          hasClaudeMdExternalIncludesApproved: true,
+          mcpServers: { local: { command: "x" } },
+        },
+        "/other": { hasTrustDialogAccepted: false },
+      },
+    }),
+    "/repo",
+  );
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(JSON.parse(result.body)).toEqual({
+    rootSibling: { keep: true },
+    projects: {
+      "/repo": {
+        hasTrustDialogAccepted: true,
+        hasClaudeMdExternalIncludesApproved: true,
+        mcpServers: { local: { command: "x" } },
+      },
+      "/other": { hasTrustDialogAccepted: false },
+    },
+  });
+});
+
+test("mergeClaudeWorkspaceTrust: skips an already approved entry byte-for-byte", () => {
+  const body =
+    '{"projects":{"/repo":{"sibling":1,"hasTrustDialogAccepted":true,"hasClaudeMdExternalIncludesApproved":true}}}';
+  expect(mergeClaudeWorkspaceTrust(body, "/repo")).toEqual({
+    ok: true,
+    changed: false,
+    body,
+  });
+});
+
+test("mergeClaudeWorkspaceTrust: malformed config fails soft", () => {
+  expect(mergeClaudeWorkspaceTrust("{broken", "/repo")).toEqual({
+    ok: false,
+    error: "Claude account config is malformed JSON",
+  });
+  expect(
+    mergeClaudeWorkspaceTrust(
+      JSON.stringify({ projects: { "/repo": false } }),
+      "/repo",
+    ),
+  ).toEqual({
+    ok: false,
+    error: "Claude workspace config is not an object",
+  });
 });
 
 // ---------------------------------------------------------------------------
