@@ -32,5 +32,5 @@ generalizes, but the retention-loop wedge is the load-bearing case.
       `probeStartTime` seam).
 
 ## Done summary
-
+Bound the ps probe subprocess in startTimeViaPs/ppidViaPs with a kill-on-timeout wrapper returning null (inconclusive, row kept) instead of an unbounded await, and extracted the retention single-flight guard so a stuck probe cannot pin retentionPass forever; added a deterministic ManualScheduler-based test proving a never-resolving probe releases the latch for the next tick.
 ## Evidence

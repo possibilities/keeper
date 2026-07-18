@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Bound retention probe subprocess",
-  "updated_at": "2026-07-18T18:27:13.237000Z"
+  "updated_at": "2026-07-18T18:50:36.657000Z",
+  "worker_done_at": "2026-07-18T18:50:36.657000Z"
 }
