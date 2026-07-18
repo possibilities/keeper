@@ -43,5 +43,5 @@ Use synthetic observations only. Cover newly readable old marker after a null pr
 - [ ] Focused deterministic tests pass without subprocesses, sockets, launchd, or sleeps
 
 ## Done summary
-
+Added a pure, dependency-light restart evidence classifier (src/restart-observation.ts) covering exact identity matching, command/replacement/durable-boot/drain/health/stabilization state separation, bounded structured reasons, and a demonstrated-vs-unattributed forensic mechanism table; covered by 15 deterministic synthetic-data tests in test/restart-observation.test.ts.
 ## Evidence
