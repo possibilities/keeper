@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T23:32:18.898000Z",
+  "depends_on_epics": [],
+  "id": "fn-1359-add-durable-fable-focus",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Add durable Fable focus",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T23:32:18.898000Z"
+}
