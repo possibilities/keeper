@@ -52,5 +52,5 @@ no-artifact-read constraint. Verify the CONTEXT.md entry renders as pure glossar
 - [ ] The plan test gate passes
 
 ## Done summary
-
+Closer skill documents the phase_resume switch (mirroring blocking_followup precedence), skill-conformance test pins it, and CONTEXT.md gains one clustered glossary entry disambiguated from receipt/restore/resume terms.
 ## Evidence
