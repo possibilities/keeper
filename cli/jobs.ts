@@ -963,6 +963,14 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
           },
         }
       : {}),
+    // Paint watchdog (ADR 0088): self-heal a connected-but-not-painting wedge by
+    // resubscribing the single readiness stream. Inert outside live mode; the
+    // handle is initialized below and this thunk only runs on a later trip.
+    watchdog: {
+      resubscribe: (): void => {
+        handle.reconnect();
+      },
+    },
     // Insert mode captures the whole keyboard so navigation is local to
     // the job list (frame-scrub / copy / replay suppressed).
     captureKeys: () => insertMode,

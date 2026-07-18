@@ -1272,6 +1272,76 @@ test("subscribeReadiness: a post-paint disconnect terminate()s the dropped socke
 });
 
 // ---------------------------------------------------------------------------
+// ADR 0088: the paint-watchdog self-heal seam. `handle.reconnect()`
+// forces a teardown + resubscribe of the LIVE socket so a connected-but-not-
+// painting wedge re-baselines against a fresh subscription — never exiting.
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: reconnect() tears down the live socket and dials a fresh one", () => {
+  const timers = new ManualTimeouts();
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-wd",
+    onSnapshot: () => {},
+    onFatal: () => {},
+    connect: factory,
+    timers,
+  });
+  const sock1 = socketRef.current;
+  if (!sock1) {
+    throw new Error("mock socket never installed");
+  }
+  // Reach first-paint so a live socket exists to tear down.
+  sock1.deliver([
+    emptyResult("epics", "test-wd-epics"),
+    emptyResult("jobs", "test-wd-jobs"),
+    emptyResult("subagent_invocations", "test-wd-subagent-invocations"),
+    emptyResult("git", "test-wd-git"),
+    emptyResult("dead_letters", "test-wd-dead-letters"),
+    emptyResult("pending_dispatches", "test-wd-pending-dispatches"),
+    emptyResult("autopilot_state", "test-wd-autopilot-state"),
+    emptyResult("scheduled_tasks", "test-wd-scheduled-tasks"),
+    emptyResult("armed_epics", "test-wd-armed-epics"),
+    emptyResult("block_escalations", "test-wd-block-escalations"),
+    emptyResult("tmux_client_focus", "test-wd-tmux-client-focus"),
+  ]);
+  expect(sock1.terminated ?? 0).toBe(0);
+
+  // The watchdog trips → self-heal. The live socket is hard-destroyed…
+  handle.reconnect();
+  expect(sock1.terminated ?? 0).toBe(1);
+
+  // …and the scheduled reconnect kick dials a FRESH socket (re-subscribe).
+  timers.fire(0);
+  const sock2 = socketRef.current;
+  if (!sock2) {
+    throw new Error("reconnect never re-dialed");
+  }
+  expect(sock2).not.toBe(sock1);
+  expect(sock2.takeOutbound().length).toBeGreaterThan(0);
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: reconnect() before any live socket is a safe no-op", () => {
+  const timers = new ManualTimeouts();
+  // A factory that never opens (parks the dial), so there is no live socket.
+  const parkedFactory: ConnectFactory = () => new Promise(() => {});
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-wd-noop",
+    onSnapshot: () => {},
+    onFatal: () => {},
+    connect: parkedFactory,
+    timers,
+  });
+  // No throw, no exit — the reconnect loop already owns recovery here.
+  expect(() => handle.reconnect()).not.toThrow();
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // (d) terminal `error` frame with no gotResult invokes onFatal with the
 //     error payload (and onLifecycle sees the same error event).
 // ---------------------------------------------------------------------------

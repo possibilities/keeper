@@ -51,6 +51,7 @@ import {
   type ViewerExitProc,
   type ViewRender,
   type ViewShell,
+  type WatchdogTimer,
 } from "../src/view-shell";
 
 // ---------------------------------------------------------------------------
@@ -1641,10 +1642,15 @@ test("live gate: grace holds the frame, then retrying counts down before frame a
 
     clock.advance(3200);
     intervals.tick();
+    // The connection-axis PILL long-dead signal is unchanged.
     expect(status.at(-1)).toBe("DISCONNECTED · last good frame 5s ago");
+    // The freshness-axis body banner (ADR 0088) holds the frame + the aged red
+    // STALE banner — the prominent body-region replacement for the old subtle
+    // "keeperd unreachable" corner line.
     const lastWrite = stdoutCap.writes.at(-1) ?? "";
     expect(lastWrite).toContain("live data");
-    expect(lastWrite).toContain("DISCONNECTED");
+    expect(lastWrite).toContain("STALE");
+    expect(lastWrite).toContain("last good frame 5s ago");
   } finally {
     timeouts.restore();
   }
@@ -1950,4 +1956,325 @@ test("snapshot: no boot header observed → the trailer's catching_up is null", 
   expect(() => view?.runSnapshot(() => {})).toThrow("__SNAPSHOT_EXIT_0__");
   const trailer = parseSnapshotTrailer(hh.stdout.join(""));
   expect(trailer.catching_up).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0088: freshness axis — the body-region stale banner and the
+// divergence-gated, self-healing paint watchdog. The watchdog uses an INJECTED
+// interval seam (captured here) so ticks fire synchronously; its rev source is
+// the same fake poller + monotonic clock the disconnect tests use, and
+// `resubscribe` is a spy so the self-heal is asserted without a readiness client.
+// ---------------------------------------------------------------------------
+
+interface WatchdogTimerHarness {
+  tick: () => void;
+  readonly armed: boolean;
+  readonly cleared: number;
+  readonly pollMs: number | null;
+  setIntervalFn: (cb: () => void, ms: number) => WatchdogTimer;
+  clearIntervalFn: (h: WatchdogTimer) => void;
+}
+
+function makeWatchdogTimer(): WatchdogTimerHarness {
+  let cb: (() => void) | null = null;
+  let cleared = 0;
+  let pollMs: number | null = null;
+  return {
+    tick(): void {
+      if (cb === null) {
+        throw new Error("watchdog interval not armed — tick() before arm");
+      }
+      cb();
+    },
+    get armed() {
+      return cb !== null;
+    },
+    get cleared() {
+      return cleared;
+    },
+    get pollMs() {
+      return pollMs;
+    },
+    setIntervalFn(fn: () => void, ms: number): WatchdogTimer {
+      cb = fn;
+      pollMs = ms;
+      return 7;
+    },
+    clearIntervalFn(): void {
+      cleared += 1;
+      cb = null;
+    },
+  };
+}
+
+function makeWatchdogView(opts: {
+  clock: { now: () => number };
+  poller: RefoldProgressPoller;
+  wd: WatchdogTimerHarness;
+  resubscribe: () => void;
+}): ViewShell<{ body: string[] }> {
+  return createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    monotonicNow: opts.clock.now,
+    refoldProgressPoller: opts.poller,
+    watchdog: {
+      resubscribe: opts.resubscribe,
+      pollMs: 5000,
+      windowMs: 20000,
+      setIntervalFn: opts.wd.setIntervalFn,
+      clearIntervalFn: opts.wd.clearIntervalFn,
+    },
+  });
+}
+
+test("watchdog: a proven rev advance with zero accepted frames trips the banner + self-heal", () => {
+  const clock = makeFakeMonotonicClock();
+  const wd = makeWatchdogTimer();
+  let resubscribes = 0;
+  // Out-of-band fold cursor: 100, then 101 (the daemon keeps folding).
+  const poller = makeFakePoller([{ cursor: 100, max: 1000 }], {
+    cursor: 101,
+    max: 1000,
+  });
+  view = makeWatchdogView({
+    clock,
+    poller,
+    wd,
+    resubscribe: () => {
+      resubscribes += 1;
+    },
+  });
+  // First paint → steady painting → the divergence poll arms.
+  view.emit({ body: ["board row"] });
+  expect(wd.armed).toBe(true);
+  const acceptedAtPaint = view.getAcceptedFrameSeq();
+
+  // Tick 1 baselines the window at cursor 100 — never trips on its first read.
+  wd.tick();
+  expect(resubscribes).toBe(0);
+
+  // The cursor advances (101) while ZERO frames are accepted; the whole window
+  // must elapse before the wedge is proven.
+  clock.advance(20000);
+  wd.tick();
+
+  expect(resubscribes).toBe(1);
+  const joined = stdoutCap.writes.join("");
+  // Body-region red STALE banner, holding the frame and stamping its age.
+  expect(joined).toContain("STALE");
+  expect(joined).toContain("board row");
+  expect(joined).toContain("last good frame 20s ago");
+  // The connected-but-not-painting wording (the socket never dropped).
+  expect(joined).toContain("daemon not painting");
+  // No daemon frame was accepted, so the observable did not advance.
+  expect(view.getAcceptedFrameSeq()).toBe(acceptedAtPaint);
+});
+
+test("watchdog: an idle pane with no rev divergence never trips", () => {
+  const clock = makeFakeMonotonicClock();
+  const wd = makeWatchdogTimer();
+  let resubscribes = 0;
+  // The fold cursor never advances — a legitimately quiet pane (e.g. git).
+  const poller = makeFakePoller([], { cursor: 500, max: 1000 });
+  view = makeWatchdogView({
+    clock,
+    poller,
+    wd,
+    resubscribe: () => {
+      resubscribes += 1;
+    },
+  });
+  view.emit({ body: ["quiet git pane"] });
+  wd.tick();
+  clock.advance(60000);
+  wd.tick();
+  wd.tick();
+  expect(resubscribes).toBe(0);
+  expect(stdoutCap.writes.join("")).not.toContain("STALE");
+});
+
+test("watchdog: a byte-identical heartbeat reply re-baselines the window (no false trip on a busy-daemon quiet pane)", () => {
+  const clock = makeFakeMonotonicClock();
+  const wd = makeWatchdogTimer();
+  let resubscribes = 0;
+  // The daemon folds on EVERY poll (busy board) — a bare paint-idle timer would
+  // banner this pane. The divergence gate must not, because the pane still
+  // ACCEPTS a (byte-identical) heartbeat frame inside every window.
+  let cursor = 100;
+  const poller: RefoldProgressPoller = {
+    poll: () => ({ cursor: cursor++, max: 1000 }),
+    close: () => {},
+  };
+  view = makeWatchdogView({
+    clock,
+    poller,
+    wd,
+    resubscribe: () => {
+      resubscribes += 1;
+    },
+  });
+  view.emit({ body: ["row"] });
+  for (let i = 0; i < 6; i += 1) {
+    wd.tick();
+    clock.advance(10000);
+    // The idle heartbeat delivers a byte-identical frame: paint suppressed
+    // (returns false) yet the accepted-frame observable advances.
+    expect(view?.emit({ body: ["row"] })).toBe(false);
+  }
+  wd.tick();
+  expect(resubscribes).toBe(0);
+  expect(stdoutCap.writes.join("")).not.toContain("STALE");
+});
+
+test("bounce past grace then a byte-identical resume forces a repaint and clears the stale banner", () => {
+  const timeouts = patchTimeouts();
+  const clock = makeFakeMonotonicClock();
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      monotonicNow: clock.now,
+      refoldProgressPoller: makeFakePoller([]),
+    });
+    const status = spyStatus(view);
+    view.emit({ body: ["board data"] });
+    const acceptedAfterPaint = view.getAcceptedFrameSeq();
+
+    // The bounce is HELD past the visible-switch debounce → the stale banner shows.
+    view.emitLifecycle("disconnected", {});
+    clock.advance(1500);
+    timeouts.fireLast(); // grace fires → graceExpired → stale banner
+    expect(stdoutCap.writes.join("")).toContain("STALE");
+
+    // The daemon returns with a BYTE-IDENTICAL body — the witnessed case. It must
+    // FORCE a full repaint (proven fresh frame) and advance the observable even
+    // though byte-identical, clearing the stale state.
+    const writesBefore = stdoutCap.writes.length;
+    expect(view.emit({ body: ["board data"] })).toBe(true);
+    expect(view.getAcceptedFrameSeq()).toBe(acceptedAfterPaint + 1);
+    expect(stdoutCap.writes.length).toBeGreaterThan(writesBefore);
+    expect(status.at(-1)).toBe("");
+    // The forced-repaint is one-shot: a following identical emit is suppressed again.
+    expect(view.emit({ body: ["board data"] })).toBe(false);
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("a sub-grace bounce resolves without ever flashing the stale banner", () => {
+  const timeouts = patchTimeouts();
+  const clock = makeFakeMonotonicClock();
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      monotonicNow: clock.now,
+      refoldProgressPoller: makeFakePoller([]),
+    });
+    view.emit({ body: ["board data"] });
+    view.emitLifecycle("disconnected", {});
+    // The daemon reloads and re-delivers a byte-identical frame BEFORE the grace
+    // debounce fires — the internal state flipped but the visible banner never did.
+    clock.advance(300);
+    expect(view.emit({ body: ["board data"] })).toBe(false);
+    expect(stdoutCap.writes.join("")).not.toContain("STALE");
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("a local repaint during a watchdog wedge keeps the stale banner and does not advance the observable", () => {
+  const clock = makeFakeMonotonicClock();
+  const wd = makeWatchdogTimer();
+  let resubscribes = 0;
+  const poller = makeFakePoller([{ cursor: 100, max: 1000 }], {
+    cursor: 101,
+    max: 1000,
+  });
+  view = makeWatchdogView({
+    clock,
+    poller,
+    wd,
+    resubscribe: () => {
+      resubscribes += 1;
+    },
+  });
+  view.emit({ body: ["board row"] });
+  wd.tick();
+  clock.advance(20000);
+  wd.tick(); // trip
+  expect(resubscribes).toBe(1);
+  const acceptedAtTrip = view.getAcceptedFrameSeq();
+
+  // A local interaction repaint (e.g. jobs insert-mode selection) changes the body.
+  expect(view.repaintLocal({ body: ["board row (selected)"] })).toBe(true);
+  // The stale banner PERSISTS, re-appended atop the local body.
+  expect(stdoutCap.writes.at(-1)).toContain("board row (selected)");
+  expect(stdoutCap.writes.at(-1)).toContain("STALE");
+  // A local repaint is not a daemon frame: the observable did NOT advance and
+  // no second self-heal fired.
+  expect(view.getAcceptedFrameSeq()).toBe(acceptedAtTrip);
+  expect(resubscribes).toBe(1);
+});
+
+test("watchdog: inert outside live mode (snapshot arms no divergence poll)", () => {
+  const wd = makeWatchdogTimer();
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+    watchdog: {
+      resubscribe: () => {},
+      setIntervalFn: wd.setIntervalFn,
+      clearIntervalFn: wd.clearIntervalFn,
+    },
+  });
+  view.emit({ body: ["row"] });
+  expect(wd.armed).toBe(false);
+  expect(view.getAcceptedFrameSeq()).toBe(0);
+});
+
+test("watchdog: SIGINT teardown clears the divergence poll interval", () => {
+  const wd = makeWatchdogTimer();
+  view = makeWatchdogView({
+    clock: makeFakeMonotonicClock(),
+    poller: makeFakePoller([]),
+    wd,
+    resubscribe: () => {},
+  });
+  view.emit({ body: ["row"] });
+  expect(wd.armed).toBe(true);
+
+  const realOn = process.on.bind(process);
+  let captured: ((...args: unknown[]) => void) | null = null;
+  (process as unknown as { on: typeof process.on }).on = ((
+    event: string,
+    handler: (...args: unknown[]) => void,
+  ) => {
+    if (event === "SIGINT") {
+      captured = handler;
+      return process;
+    }
+    return realOn(event as never, handler as never);
+  }) as typeof process.on;
+  const realExit = process.exit;
+  (process as unknown as { exit: (code?: number) => never }).exit = ((
+    _code?: number,
+  ): never => {
+    throw new Error("__SIGINT_EXIT__");
+  }) as never;
+
+  try {
+    view.installSigintHandler(() => {});
+    expect(() => captured?.()).toThrow("__SIGINT_EXIT__");
+    expect(wd.cleared).toBe(1);
+    expect(wd.armed).toBe(false);
+  } finally {
+    (process as unknown as { exit: typeof process.exit }).exit = realExit;
+    (process as unknown as { on: typeof process.on }).on = realOn;
+  }
 });

@@ -444,9 +444,17 @@ export interface ReadinessTimers {
 /**
  * Caller-facing handle. `dispose()` is idempotent — safe to call from a
  * SIGINT handler that may also be reached via a normal exit path.
+ *
+ * `reconnect()` is the paint-watchdog self-heal seam (ADR 0088): it forces a
+ * teardown + reconnect of the LIVE socket so a connected-but-not-painting wedge
+ * re-baselines against a fresh subscription. Idempotent and safe: a no-op while
+ * shutting down, already mid-reconnect, or with no live socket (the reconnect
+ * loop already owns recovery on those paths). It NEVER exits the process — the
+ * viewer's reconnect-forever contract is unchanged.
  */
 export interface ReadinessClientHandle {
   dispose(): void;
+  reconnect(): void;
 }
 
 /**
@@ -1854,8 +1862,30 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   // via the callback and rely on `dispose()` for shutdown.
   void connectWithRetry();
 
+  /**
+   * Paint-watchdog self-heal (ADR 0088): force a teardown + reconnect of the
+   * live socket so a connected-but-not-painting wedge re-baselines against a
+   * fresh subscription. Mirrors `triggerReconnect` minus the `query_timeout`
+   * telemetry — this is a viewer-initiated resubscribe, not a stuck in-flight
+   * query. Guarded by `reconnecting` so it collapses with a racing close-driven
+   * reconnect into ONE dial. Never fires `onFatal` / exits (reconnect-forever).
+   */
+  function forceReconnect(): void {
+    if (shuttingDown || reconnecting || currentSock === null) {
+      return;
+    }
+    reconnecting = true;
+    emit("watchdog_resubscribe", { sock: sockPath });
+    teardownConnection();
+    // A synchronous close callback may already have opened the replacement.
+    if (currentSock === null) {
+      scheduleReconnect();
+    }
+  }
+
   let disposed = false;
   return {
+    reconnect: forceReconnect,
     dispose(): void {
       if (disposed) {
         return;

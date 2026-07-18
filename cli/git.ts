@@ -459,6 +459,15 @@ export async function runGit(config: RunGitConfig): Promise<void> {
           },
         }
       : {}),
+    // Paint watchdog (ADR 0088): self-heal a wedge by resubscribing the single
+    // git stream. The least-active pane — the divergence gate's quiet-pane guard
+    // (any accepted heartbeat frame re-baselines the window) is what keeps it
+    // from false-tripping here. Inert outside live mode; `handle` is set below.
+    watchdog: {
+      resubscribe: (): void => {
+        handle.reconnect();
+      },
+    },
   });
 
   const handle = subscribeCollection({

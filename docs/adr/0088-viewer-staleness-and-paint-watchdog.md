@@ -11,8 +11,8 @@ spinner presentation are unchanged.
 Live dash viewers hold the last-good frame across a daemon bounce with only a
 small status pill, and the sole live-paint path suppresses byte-identical
 bodies without advancing any observable. Operators have repeatedly misread a
-held stale board as live state — most recently concluding a running closer was
-not dispatched because the board rows were minutes old with no indication.
+held stale board as live state — minutes-old rows with no indication read as a
+running closer that was never dispatched.
 A second wedge class exists with the socket up: subscription frames stop
 arriving while the daemon keeps folding (the in-band lifecycle, cursor, and
 frame callbacks all freeze together), which no socket-liveness heartbeat can
@@ -41,19 +41,21 @@ connection axis rather than extending it linearly.
   accepted-frame observable even when byte-identical suppression skips the
   paint, and the first accepted frame after a reconnect or wedge forces a
   full repaint. The stale banner clears — and reconnect backoff resets —
-  only on that proven fresh frame, never on socket-open alone. One proven
-  frame suffices: frames are authoritative full bodies over a local socket
-  behind the per-boot generation guard.
+  only on that proven fresh frame (an authoritative full body behind the
+  per-boot generation guard), never on socket-open alone.
 - **Paint watchdog, divergence-gated and self-healing.** The
   connected-but-not-painting wedge is detected by comparing an out-of-band
   daemon rev source against the accepted-frame observable: only a proven rev
   advance with zero accepted frames inside the window trips it — a bare
-  paint-idle timer would banner every legitimately quiet pane. The idle
-  heartbeat probe result is the rev source of record; a connected-state
-  read-only progress poll is the sanctioned fallback if the probe path
-  proves in-band with the freeze. Tripping the watchdog both renders the
-  stale state and self-heals by tearing down and resubscribing. Local
-  interaction repaints never clear the state or feed the observable.
+  paint-idle timer would banner every legitimately quiet pane. The SHIPPED
+  source is the connected-state read-only progress poll (a read-only
+  `reducer_state.last_event_id` read, out-of-band from the socket); the in-band
+  idle heartbeat probe proved unusable — its reply is itself an accepted frame
+  and it freezes under the eviction. The window sits above the client's
+  heartbeat interval so a healthy socket's byte-identical heartbeat reply
+  re-baselines it first — the false-positive guard for a quiet pane. Tripping
+  renders the stale state and self-heals by resubscribing; local interaction
+  repaints never clear it or feed the observable.
 - **Purely in-viewer.** The watchdog emits no synthetic event, problem code,
   or needs-human row, and is inert outside live mode. Viewers keep
   reconnect-forever semantics; no watchdog or resume path may exit the
@@ -69,7 +71,9 @@ connection axis rather than extending it linearly.
   forced repaint, closing the gap where byte-identical suppression made a
   resumed pane indistinguishable from a wedged one.
 - The divergence gate ties false-positive behavior to the rev source's
-  honesty; a probe that cannot outlive the wedge would silence the watchdog,
-  which is why the source selection carries a verified fallback.
+  honesty; the in-band idle-heartbeat probe could not outlive the wedge, so the
+  out-of-band read-only DB poll is the shipped source. The self-heal degrades
+  gracefully: an unwired pane still banners and recovers on its own reconnect
+  heartbeat; a wired pane resubscribes at once.
 - All live panes inherit the behavior through the shared view shell; tuning
   must hold for the least-active pane, not only the board.

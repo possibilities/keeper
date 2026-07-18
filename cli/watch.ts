@@ -824,11 +824,16 @@ export function runWatch(
     ...(deps.connect === undefined ? {} : { connect: deps.connect }),
   });
 
-  // Wrap dispose to also clear the emitter's own timers.
+  // Wrap dispose to also clear the emitter's own timers. `reconnect` delegates
+  // to the underlying subscribe handle (the NDJSON tail has no paint watchdog,
+  // but the seam stays uniform across every `ReadinessClientHandle`).
   return {
     dispose(): void {
       emitter.dispose();
       handle.dispose();
+    },
+    reconnect(): void {
+      handle.reconnect();
     },
   };
 }
