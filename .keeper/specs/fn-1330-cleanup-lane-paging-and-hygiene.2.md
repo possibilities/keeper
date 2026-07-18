@@ -50,5 +50,5 @@ sweeps, transient non-zero unchanged, delivery unchanged. A stripped-env
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Consolidated agentbot paging onto one shared helper: configured absolute binary path (config-over-default), pre-spawn executable probe, array-form argv, and a log-once absence latch feeding the existing paging-channel distress row. All daemon.ts page callers already routed through the single notifyHuman/sendAgentbotPage call site, so migrating it covered every page trigger including the maintenance-worker relay sink. Extended the truth-table test and updated problem-codes.md for transport-name consistency.
 ## Evidence
