@@ -33,5 +33,5 @@ No automated suite covers skill prose; verification is behavioral — boot each 
 - [ ] Human direct invocation of each skill still works
 
 ## Done summary
-
+Rewrote deconflict/unblock/repair skills as thin Task-spawn wrappers over plan:deconflicter/unblocker/repairer, relaying typed receipts and preserving today's success close-out (retry, resume/cold-dispatch, unblock+resume fan-out) and decline paging.
 ## Evidence
