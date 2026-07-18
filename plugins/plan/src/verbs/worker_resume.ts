@@ -74,6 +74,7 @@ export function runWorkerResume(opts: {
   let tier: string | null = null;
   let model: string | null = null;
   let auditRequired = false;
+  let dispatchedResponse: Record<string, string> = {};
   let epicId = taskId.includes(".")
     ? taskId.slice(0, taskId.lastIndexOf("."))
     : taskId;
@@ -90,6 +91,22 @@ export function runWorkerResume(opts: {
       tier = (merged.tier as string | null | undefined) ?? null;
       model = (merged.model as string | null | undefined) ?? null;
       auditRequired = merged.audit_required === true;
+      if (
+        typeof runtime?.dispatch_constraint === "string" &&
+        runtime.dispatch_constraint !== ""
+      ) {
+        dispatchedResponse = {
+          dispatched_model:
+            typeof runtime.dispatched_model === "string"
+              ? runtime.dispatched_model
+              : "",
+          dispatched_tier:
+            typeof runtime.dispatched_tier === "string"
+              ? runtime.dispatched_tier
+              : "",
+          dispatch_constraint: runtime.dispatch_constraint,
+        };
+      }
     }
   }
 
@@ -176,6 +193,7 @@ export function runWorkerResume(opts: {
       status,
       tier,
       worker_model: model,
+      ...dispatchedResponse,
       worker_agent: workerAgentFor(tier, model),
       brief_ref: briefRef,
       nudge,
