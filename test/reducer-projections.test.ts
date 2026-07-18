@@ -16,7 +16,18 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { raiseTmuxProjectionFloor } from "../src/db";
+import {
+  ORPHANED_CLAIM_SKEW_GRACE_MS,
+  orphanedClaimIsReleaseable,
+  PENDING_DISPATCH_SWEEP_INTERVAL_MS,
+  PENDING_DISPATCH_TTL_MS,
+  planOrphanedClaimReaper,
+  planOwnerlessOrphanedClaimReleases,
+} from "../src/daemon";
+import {
+  raiseTmuxProjectionFloor,
+  truncateEphemeralProjections,
+} from "../src/db";
 import {
   __resetEpicIndexMemoForTest,
   applyEvent,
@@ -3996,6 +4007,236 @@ function getNeverBoundCounter(verb: string, id: string) {
     last_event_id: number;
   } | null;
 }
+
+test("a boot-truncated exact claim expires on both age gates, trips never-bound at K, and ownerless release re-folds identically", () => {
+  const verb = "work";
+  const id = "orphan-reaper.1";
+  const acquiredAt = 1_700_000_000;
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    ts: acquiredAt,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: acquiredAt,
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  truncateEphemeralProjections(db);
+  expect(getPendingDispatch(verb, id)).toBeNull();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: attemptId,
+    state: "acquired",
+    session_id: null,
+  });
+
+  const fullWindow =
+    PENDING_DISPATCH_TTL_MS +
+    ORPHANED_CLAIM_SKEW_GRACE_MS +
+    PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+  const bootAnchorMs = acquiredAt * 1000 + fullWindow * 2;
+  expect(
+    planOrphanedClaimReaper(
+      db,
+      bootAnchorMs + PENDING_DISPATCH_TTL_MS + ORPHANED_CLAIM_SKEW_GRACE_MS - 1,
+      bootAnchorMs,
+    ),
+  ).toEqual([]);
+  expect(
+    planOrphanedClaimReaper(db, bootAnchorMs + fullWindow, bootAnchorMs),
+  ).toHaveLength(1);
+
+  for (let sweep = 0; sweep < 3; sweep++) {
+    const planned = planOrphanedClaimReaper(
+      db,
+      bootAnchorMs + fullWindow + sweep * PENDING_DISPATCH_SWEEP_INTERVAL_MS,
+      bootAnchorMs,
+    );
+    expect(planned).toHaveLength(1);
+    insertEvent({
+      hook_event: "DispatchExpired",
+      session_id: `${verb}::${id}`,
+      data: JSON.stringify({
+        verb,
+        id,
+        attempt_id: attemptId,
+        reason: "orphaned_claim_expiry_timeout",
+      }),
+    });
+    drainAll();
+  }
+  expect(getNeverBoundCounter(verb, id)?.consecutive_expired).toBe(3);
+  expect(getDispatchFailure(verb, id)?.reason).toBe("never-bound");
+  expect(
+    orphanedClaimIsReleaseable(db, { verb, id, attempt_id: attemptId }),
+  ).toBe(true);
+  expect(planOwnerlessOrphanedClaimReleases(db)).toMatchObject([
+    { verb, id, attempt_id: attemptId },
+  ]);
+
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb,
+    id,
+    expected_attempt_id: attemptId,
+    session_id: null,
+    ownerless_acquired_only: true,
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)?.state).toBe("released");
+
+  const before = {
+    claim: getDispatchClaim(verb, id),
+    counter: getNeverBoundCounter(verb, id),
+    failure: getDispatchFailure(verb, id),
+  };
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_claims");
+  db.run("DELETE FROM dispatch_never_bound");
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM pending_dispatches");
+  drainAll();
+  truncateEphemeralProjections(db);
+  expect({
+    claim: getDispatchClaim(verb, id),
+    counter: getNeverBoundCounter(verb, id),
+    failure: getDispatchFailure(verb, id),
+  }).toEqual(before);
+});
+
+test("an orphan binding during the post-boot window resets cleanly and stale expiry cannot touch it", () => {
+  const verb = "work";
+  const id = "fn-1337-orphan-bind.1";
+  const acquiredAt = 1_700_100_000;
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    ts: acquiredAt,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: acquiredAt,
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  dispatchExpiredEvent(verb, id);
+  drainAll();
+  expect(getNeverBoundCounter(verb, id)?.consecutive_expired).toBe(1);
+  truncateEphemeralProjections(db);
+  const bootAnchorMs = acquiredAt * 1000 + 10_000;
+  expect(
+    planOrphanedClaimReaper(
+      db,
+      bootAnchorMs + PENDING_DISPATCH_TTL_MS,
+      bootAnchorMs,
+    ),
+  ).toEqual([]);
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "orphan-reaper-bound-session",
+    spawn_name: `${verb}::${id}`,
+    data: JSON.stringify({ dispatch_attempt_id: attemptId }),
+  });
+  insertEvent({
+    hook_event: "DispatchExpired",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      attempt_id: attemptId,
+      reason: "orphaned_claim_expiry_timeout",
+    }),
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    state: "bound",
+    session_id: "orphan-reaper-bound-session",
+  });
+  expect(getNeverBoundCounter(verb, id)).toBeNull();
+  expect(
+    planOrphanedClaimReaper(
+      db,
+      bootAnchorMs + PENDING_DISPATCH_TTL_MS * 10,
+      bootAnchorMs,
+    ),
+  ).toEqual([]);
+});
+
+test("ownerless-only claim release is fenced against supersede, bind, and any Provider-leg ownership", () => {
+  const verb = "work";
+  const id = "orphan-release-fence.1";
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb,
+    id,
+    attempt_id: 700,
+    expected_attempt_id: null,
+  });
+  dispatchClaimEvent("DispatchClaimSuperseded", {
+    verb,
+    id,
+    expected_attempt_id: 700,
+    next_attempt_id: 701,
+  });
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb,
+    id,
+    expected_attempt_id: 700,
+    session_id: null,
+    ownerless_acquired_only: true,
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: 701,
+    state: "acquired",
+  });
+
+  dispatchClaimEvent("DispatchClaimBound", {
+    verb,
+    id,
+    expected_attempt_id: 701,
+    session_id: "bound-owner",
+  });
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb,
+    id,
+    expected_attempt_id: 701,
+    session_id: null,
+    ownerless_acquired_only: true,
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)?.state).toBe("bound");
+
+  dispatchClaimEvent("DispatchClaimAcquired", {
+    verb,
+    id: "orphan-release-leg.1",
+    attempt_id: 702,
+    expected_attempt_id: null,
+  });
+  drainAll();
+  db.query(
+    `INSERT INTO provider_leg_ownership (
+       leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+       ownership_epoch_event_id, state, last_event_id, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, 'terminal', ?, ?, ?)`,
+  ).run("leg-702", "wrapper-702", 702, 900, 900, 1700, 1700);
+  dispatchClaimEvent("DispatchClaimReleased", {
+    verb,
+    id: "orphan-release-leg.1",
+    expected_attempt_id: 702,
+    session_id: null,
+    ownerless_acquired_only: true,
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, "orphan-release-leg.1")?.state).toBe(
+    "acquired",
+  );
+});
 
 test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-bound) and preserves the threshold", () => {
   // Each expire bumps the counter; the failure does NOT exist until the

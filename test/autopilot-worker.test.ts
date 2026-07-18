@@ -83,6 +83,7 @@ import {
   createSharedCheckoutDirtyTracker,
   createSharedCheckoutWedgeTracker,
   createStaleBaseLaneTracker,
+  createWithholdFrameState,
   createWorktreeDriver,
   DEFAULT_CEILING_MS,
   type DeadWriterCheckoutSweepOutcome,
@@ -186,7 +187,9 @@ import {
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   type TipObservation,
+  updateWithholdFrameState,
   verbForVerdict,
+  type WithholdReason,
   WORKER_EFFORT,
   WORKER_MODEL,
   WORKTREE_FINALIZE_ID_PREFIX,
@@ -215,10 +218,14 @@ import {
 } from "../src/commit-work/git-exec";
 import {
   buildParkedLaunchFailurePayload,
+  buildPendingDispatchSweepRecords,
   MERGE_ESCALATION_REASON_TOKEN,
+  ORPHANED_CLAIM_REAP_BATCH,
+  ORPHANED_CLAIM_SKEW_GRACE_MS,
   PARKED_LAUNCH_GRACE_MS,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  planOrphanedClaimReaper,
   planPendingDispatchSweep,
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
@@ -243,6 +250,7 @@ import {
   projectPendingDispatches,
 } from "../src/readiness-client";
 import {
+  type DispatchClaim,
   loadReadinessInputs,
   type ReadinessQuery,
 } from "../src/readiness-inputs";
@@ -252,6 +260,7 @@ import {
 } from "../src/reconcile-core";
 import { drain } from "../src/reducer";
 import { readBootStatus, runQuery } from "../src/server-worker";
+import type { HarnessActivity } from "../src/session-activity";
 import type {
   EmbeddedJob,
   Epic,
@@ -1841,6 +1850,269 @@ test("reconcile: paused state suppresses every launch (boots-paused safety)", ()
   const state = makeState({ paused: true });
   const decision = reconcile(snap, state, 0);
   expect(decision.launches).toEqual([]);
+});
+
+test("reconcile: every ready-task suppression arm exports a bounded withhold reason", () => {
+  const taskId = "fn-1-foo.1";
+  const epic = makeEpic({ tasks: [makeTask({ task_id: taskId })] });
+  const claim: DispatchClaim = {
+    verb: "work",
+    id: taskId,
+    attempt_id: 41,
+    state: "acquired",
+    session_id: null,
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: null,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 1,
+    updated_at: 1,
+  };
+  const collisionJob = makeJob({
+    job_id: "collision",
+    state: "ended",
+    plan_verb: "work",
+    plan_ref: taskId,
+  });
+  const activity: HarnessActivity = {
+    status: "unknown",
+    reason: "child-evidence-stale",
+    reservation: null,
+  };
+  const fixtures: Array<{
+    code: WithholdReason["code"];
+    snapshot?: Partial<ReconcileSnapshot>;
+    state?: Partial<ReconcileState>;
+  }> = [
+    { code: "autopilot-paused", state: { paused: true } },
+    {
+      code: "not-armed",
+      snapshot: { mode: "armed", armedIds: new Set() },
+    },
+    {
+      code: "merge-gate",
+      snapshot: {
+        worktreeMode: true,
+        worktreeRepoByEpicId: new Map([
+          [epic.epic_id, { kind: "ok", repoDir: "/repo" }],
+        ]),
+        deferredEpicIds: new Map([[epic.epic_id, new Set(["/repo"])]]),
+        worktreesRoot: "/worktrees",
+      },
+    },
+    {
+      code: "dispatch-in-flight",
+      state: { inFlight: new Set([`work::${taskId}`]) },
+    },
+    {
+      code: "failed-key",
+      snapshot: { failedKeys: new Set([`work::${taskId}`]) },
+    },
+    {
+      code: "claim-fence",
+      snapshot: {
+        dispatchClaims: new Map([[`work::${taskId}`, claim]]),
+        harnessActivityByJobId: new Map(),
+      },
+    },
+    {
+      code: "activity-collision",
+      snapshot: {
+        jobs: new Map([[collisionJob.job_id, collisionJob]]),
+        dispatchClaims: new Map(),
+        harnessActivityByJobId: new Map([[collisionJob.job_id, activity]]),
+      },
+    },
+    {
+      code: "live-tab",
+      snapshot: { liveTabKeys: new Set([`work::${taskId}`]) },
+    },
+    {
+      code: "cooldown",
+      state: { redispatchCooldown: new Map([[`work::${taskId}`, 100]]) },
+    },
+    {
+      code: "data-bug-missing-cwd",
+      snapshot: {
+        epics: [
+          makeEpic({
+            project_dir: "",
+            tasks: [makeTask({ task_id: taskId, target_repo: null })],
+          }),
+        ],
+      },
+    },
+    {
+      code: "budget-exhausted",
+      state: { maxConcurrentJobs: 0 },
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const snap = makeSnapshot({ epics: [epic], ...fixture.snapshot });
+    const decision = reconcile(snap, makeState(fixture.state), 100);
+    expect(decision.launches).toEqual([]);
+    expect(decision.withholds.get(taskId)?.code).toBe(fixture.code);
+  }
+
+  const claimDecision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      dispatchClaims: new Map([[`work::${taskId}`, claim]]),
+      harnessActivityByJobId: new Map(),
+    }),
+    makeState(),
+    100,
+  );
+  expect(claimDecision.withholds.get(taskId)).toEqual({
+    code: "claim-fence",
+    severity: "normal",
+    detail: null,
+  });
+});
+
+test("reconcile: decomposed close arms preserve dispatch decisions and name the first failing arm", () => {
+  const epicId = "fn-1-foo";
+  const task = makeTask({
+    task_id: `${epicId}.1`,
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic = makeEpic({ epic_id: epicId, tasks: [task] });
+  const closeKey = `close::${epicId}`;
+  const closeClaim: DispatchClaim = {
+    verb: "close",
+    id: epicId,
+    attempt_id: 7,
+    state: "acquired",
+    session_id: null,
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: null,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 1,
+    updated_at: 1,
+  };
+  const fixtures: Array<{
+    name: string;
+    code: WithholdReason["code"] | null;
+    snapshot?: Partial<ReconcileSnapshot>;
+    state?: Partial<ReconcileState>;
+  }> = [
+    { name: "all clear", code: null },
+    { name: "paused", code: "autopilot-paused", state: { paused: true } },
+    {
+      name: "in flight",
+      code: "dispatch-in-flight",
+      state: { inFlight: new Set([closeKey]) },
+    },
+    {
+      name: "failed",
+      code: "failed-key",
+      snapshot: { failedKeys: new Set([closeKey]) },
+    },
+    {
+      name: "claim",
+      code: "claim-fence",
+      snapshot: {
+        dispatchClaims: new Map([[closeKey, closeClaim]]),
+        harnessActivityByJobId: new Map(),
+      },
+    },
+    {
+      name: "live tab",
+      code: "live-tab",
+      snapshot: { liveTabKeys: new Set([closeKey]) },
+    },
+    {
+      name: "cooldown",
+      code: "cooldown",
+      state: { redispatchCooldown: new Map([[closeKey, 100]]) },
+    },
+    {
+      name: "finalizer guard",
+      code: "finalizer-guard",
+      state: { finalizerGuard: new Map([[epicId, 100]]) },
+    },
+    {
+      name: "not armed",
+      code: "not-armed",
+      snapshot: { mode: "armed", armedIds: new Set() },
+    },
+    {
+      name: "merge gate",
+      code: "merge-gate",
+      snapshot: {
+        deferredEpicIds: new Map([[epicId, new Set(["/repo"])]]),
+      },
+    },
+    {
+      name: "budget",
+      code: "budget-exhausted",
+      state: { maxConcurrentJobs: 0 },
+    },
+    {
+      name: "missing cwd",
+      code: "data-bug-missing-cwd",
+      snapshot: {
+        epics: [makeEpic({ epic_id: epicId, project_dir: "", tasks: [task] })],
+      },
+    },
+    {
+      name: "first failing arm wins",
+      code: "autopilot-paused",
+      snapshot: { failedKeys: new Set([closeKey]) },
+      state: { paused: true, inFlight: new Set([closeKey]) },
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    const decision = reconcile(
+      makeSnapshot({ epics: [epic], ...fixture.snapshot }),
+      makeState(fixture.state),
+      100,
+    );
+    const dispatched = decision.launches.some(
+      (launch) => launch.verb === "close" && launch.id === epicId,
+    );
+    expect(dispatched).toBe(fixture.code === null);
+    expect(decision.withholds.get(epicId)?.code ?? null).toBe(fixture.code);
+  }
+});
+
+test("withhold frame emission is transition-gated, pair-rate-limited, and replace-merged", () => {
+  const state = createWithholdFrameState();
+  const lines: string[] = [];
+  const emit = (line: string): void => {
+    lines.push(line);
+  };
+  const frame = (code: WithholdReason["code"]): Map<string, WithholdReason> =>
+    new Map([["fn-1-foo.1", { code, severity: "normal", detail: null }]]);
+
+  updateWithholdFrameState(state, frame("claim-fence"), 100, emit);
+  expect(lines).toHaveLength(1);
+  updateWithholdFrameState(state, frame("claim-fence"), 101, emit);
+  expect(lines).toHaveLength(1);
+  updateWithholdFrameState(state, frame("activity-collision"), 102, emit);
+  expect(lines).toHaveLength(2);
+  updateWithholdFrameState(state, frame("claim-fence"), 103, emit);
+  expect(lines).toHaveLength(2);
+  expect(state.current.get("fn-1-foo.1")?.code).toBe("claim-fence");
+
+  updateWithholdFrameState(state, frame("claim-fence"), 401, emit);
+  expect(lines).toHaveLength(2);
+  updateWithholdFrameState(state, frame("activity-collision"), 402, emit);
+  updateWithholdFrameState(state, frame("claim-fence"), 403, emit);
+  expect(lines).toHaveLength(4);
+
+  updateWithholdFrameState(state, new Map(), 404, emit);
+  expect(state.current.size).toBe(0);
+  expect(state.lastReasonByTarget.size).toBe(0);
+  expect(state.lastEmittedAtByTarget.size).toBe(0);
 });
 
 test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
@@ -4689,6 +4961,96 @@ test("parked pending sweep mints the suppressing sticky before TTL re-serve and 
         )
         .get(),
     ).toEqual({ n: 0 });
+  });
+});
+
+test("durable orphan Reaper requires claim age, excludes pending/bound/legacy/malformed rows, and emits source telemetry", async () => {
+  await withSeededDb((db) => {
+    const nowMs = 1_700_000_000_000;
+    const fullWindow =
+      PENDING_DISPATCH_TTL_MS +
+      ORPHANED_CLAIM_SKEW_GRACE_MS +
+      PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+    const bootAnchorMs = nowMs - fullWindow * 2;
+    const oldAcquiredAt = (nowMs - fullWindow * 2) / 1000;
+    const insertClaim = (
+      id: string,
+      attemptId: number,
+      state: string,
+      acquiredAt: number | string,
+      legacy = 0,
+    ): void => {
+      db.query(
+        `INSERT INTO dispatch_claims (
+           verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+           acquired_at, last_event_id, updated_at
+         ) VALUES ('work', ?, ?, ?, NULL, '/repo', ?, ?, ?, ?)`,
+      ).run(id, attemptId, state, legacy, acquiredAt, attemptId, oldAcquiredAt);
+    };
+    insertClaim("orphan-old.1", 101, "acquired", oldAcquiredAt);
+    insertClaim("orphan-young.1", 102, "acquired", nowMs / 1000);
+    insertClaim("orphan-bound.1", 103, "bound", oldAcquiredAt);
+    insertClaim("orphan-legacy.1", 104, "legacy_unfenced", oldAcquiredAt, 1);
+    insertClaim("orphan-malformed.1", 105, "acquired", "not-a-time");
+    insertClaim("orphan-pending.1", 106, "acquired", oldAcquiredAt);
+    db.query(
+      `INSERT INTO pending_dispatches
+         (verb, id, dir, dispatched_at, last_event_id, attempt_id)
+       VALUES ('work', 'orphan-pending.1', '/repo', ?, 106, 106)`,
+    ).run(oldAcquiredAt);
+
+    const planned = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    expect(planned.map((row) => row.id)).toEqual(["orphan-old.1"]);
+    expect(planned[0]?.ownerless).toBe(true);
+    const telemetry = buildPendingDispatchSweepRecords(
+      planned.map((row) => ({
+        verb: row.verb,
+        id: row.id,
+        dispatched_at: row.acquired_at,
+        source: "orphaned-claim" as const,
+        attempt_id: row.attempt_id,
+      })),
+      nowMs,
+    );
+    expect(telemetry[0]?.detail).toEqual({
+      verb: "work",
+      id: "orphan-old.1",
+      source: "orphaned-claim",
+      attempt_id: "101",
+    });
+  });
+});
+
+test("durable orphan Reaper deterministically jitters a reboot cohort and caps each heartbeat", async () => {
+  await withSeededDb((db) => {
+    const nowMs = 1_800_000_000_000;
+    const acquiredAt = 1_700_000_000;
+    for (let i = 0; i < 50; i++) {
+      db.query(
+        `INSERT INTO dispatch_claims (
+           verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+           acquired_at, last_event_id, updated_at
+         ) VALUES ('work', ?, ?, 'acquired', NULL, '/repo', 0, ?, ?, ?)`,
+      ).run(
+        `orphan-mass.${i + 1}`,
+        1_000 + i,
+        acquiredAt,
+        1_000 + i,
+        acquiredAt,
+      );
+    }
+    const bootAnchorMs =
+      nowMs -
+      PENDING_DISPATCH_TTL_MS -
+      ORPHANED_CLAIM_SKEW_GRACE_MS -
+      PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+    const first = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    const second = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    expect(first).toHaveLength(ORPHANED_CLAIM_REAP_BATCH);
+    expect(second).toEqual(first);
+    expect(new Set(first.map((row) => row.deadline_ms)).size).toBeGreaterThan(
+      1,
+    );
   });
 });
 

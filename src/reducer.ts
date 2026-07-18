@@ -4448,6 +4448,7 @@ interface DispatchExpiredPayload {
   verb: string;
   id: string;
   attemptId: number | null;
+  orphanedClaim: boolean;
 }
 
 interface DispatchClaimTarget {
@@ -4464,6 +4465,7 @@ interface DispatchClaimAcquirePayload extends DispatchClaimTarget {
 interface DispatchClaimMutationPayload extends DispatchClaimTarget {
   expectedAttemptId: number | null;
   sessionId: string | null;
+  ownerlessAcquiredOnly: boolean;
 }
 
 interface DispatchClaimSupersedePayload extends DispatchClaimTarget {
@@ -4562,7 +4564,13 @@ function extractDispatchClaimMutationPayload(
       typeof parsed.session_id === "string" && parsed.session_id.length > 0
         ? parsed.session_id
         : null;
-    return { ...target, expectedAttemptId, sessionId };
+    const ownerlessAcquiredOnly = parsed.ownerless_acquired_only === true;
+    return {
+      ...target,
+      expectedAttemptId,
+      sessionId,
+      ownerlessAcquiredOnly,
+    };
   } catch {
     return null;
   }
@@ -4853,6 +4861,26 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
     dispatchAttemptReleaseBlockedByLegs(db, payload.expectedAttemptId)
   ) {
     return;
+  }
+  if (payload.ownerlessAcquiredOnly) {
+    if (payload.expectedAttemptId == null || payload.sessionId != null) return;
+    const exactOwnerlessAcquire = db
+      .query(
+        `SELECT 1 FROM dispatch_claims c
+          WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
+            AND c.state = 'acquired' AND c.session_id IS NULL
+            AND c.legacy_unfenced = 0
+            AND NOT EXISTS (
+              SELECT 1 FROM pending_dispatches p
+               WHERE p.verb = c.verb AND p.id = c.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM provider_leg_ownership o
+               WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+            )`,
+      )
+      .get(payload.verb, payload.id, payload.expectedAttemptId);
+    if (exactOwnerlessAcquire == null) return;
   }
   const sessionClause = payload.sessionId == null ? "" : " AND session_id = ?";
   const bindings: Array<string | number> = [
@@ -5638,7 +5666,12 @@ function extractDispatchExpiredPayload(
     if (attemptId === undefined) {
       return null;
     }
-    return { verb: parsed.verb, id: parsed.id, attemptId };
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      attemptId,
+      orphanedClaim: parsed.reason === "orphaned_claim_expiry_timeout",
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse DispatchExpired payload for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -5748,6 +5781,18 @@ function foldDispatchExpired(db: Database, event: Event): void {
   const payload = extractDispatchExpiredPayload(event);
   if (payload == null) {
     return;
+  }
+  if (payload.orphanedClaim) {
+    if (payload.attemptId == null) return;
+    const claim = db
+      .query(
+        `SELECT 1 FROM dispatch_claims
+          WHERE verb = ? AND id = ? AND attempt_id = ?
+            AND state = 'acquired' AND session_id IS NULL
+            AND legacy_unfenced = 0`,
+      )
+      .get(payload.verb, payload.id, payload.attemptId);
+    if (claim == null) return;
   }
   if (payload.attemptId == null) {
     db.run(
@@ -10259,6 +10304,7 @@ function projectJobsRow(db: Database, event: Event): void {
                   id: plan_ref,
                   expectedAttemptId: dispatchAttemptId,
                   sessionId: jobId,
+                  ownerlessAcquiredOnly: false,
                 });
           if (claimAuthorized) {
             const dischargeRes =

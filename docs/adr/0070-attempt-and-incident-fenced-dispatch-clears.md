@@ -32,6 +32,10 @@ events contain neither identity.
    or instant-death streaks: no single attempt owns cross-attempt evidence. A
    positive bind or surviving terminal resets its respective streak; tripping a
    breaker preserves the streak so a still-broken retry re-trips immediately.
+   The durable orphaned-claim Reaper is the narrow exception: its exact-attempt
+   expiry advances the never-bound streak, and its release may mutate only the
+   same still-acquired, sessionless attempt after the breaker is visible and the
+   Fold proves that no Provider-leg ownership row exists.
 3. **Compare-and-clear is per effect.** The Fold independently mutates only rows
    whose recorded owner equals the relevant expected identity. A mixed snapshot
    may therefore clear an old incident while preserving a newer claim, pending

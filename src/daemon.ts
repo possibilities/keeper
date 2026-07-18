@@ -802,6 +802,12 @@ export const PARKED_LAUNCH_GRACE_MS = 90_000;
  */
 export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
 
+/** Clock-correction margin applied to both durable-age and current-boot gates. */
+export const ORPHANED_CLAIM_SKEW_GRACE_MS = 30_000;
+
+/** Maximum durable orphan expiries minted by one heartbeat. */
+export const ORPHANED_CLAIM_REAP_BATCH = 32;
+
 /**
  * Durable dispatch-mint rate-limit gate window (ms). Within this window after a
  * `verb::id` dispatchKey minted a `Dispatched` event, a re-mint of the SAME key is
@@ -883,6 +889,163 @@ export interface PendingDispatchSweepRow {
 export interface PendingDispatchSweepPlan {
   parked: PendingDispatchSweepRow[];
   expired: PendingDispatchSweepRow[];
+}
+
+export interface OrphanedDispatchClaimRow {
+  verb: string;
+  id: string;
+  attempt_id: number;
+  acquired_at: number;
+  dir: string | null;
+  ownerless: boolean;
+  deadline_ms: number;
+}
+
+function orphanedClaimJitterMs(
+  verb: string,
+  id: string,
+  attemptId: number,
+): number {
+  let hash = 2166136261;
+  for (const char of `${verb}\0${id}\0${attemptId}`) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash % PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+}
+
+/**
+ * Select durable, exact acquired claims whose ephemeral launch row did not
+ * survive boot. A key with any pending row remains exclusively owned by the
+ * pending sweep. Both the durable age and current-boot bind window must elapse;
+ * stable per-attempt jitter and a hard batch cap spread a reboot cohort.
+ */
+export function planOrphanedClaimReaper(
+  db: Database,
+  nowMs: number,
+  bootAnchorMs: number,
+  limit = ORPHANED_CLAIM_REAP_BATCH,
+): OrphanedDispatchClaimRow[] {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(bootAnchorMs)) return [];
+  const rows = db
+    .query(
+      `SELECT c.verb, c.id, c.attempt_id, c.acquired_at, c.dir,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM provider_leg_ownership o
+                 WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+              ) THEN 0 ELSE 1 END AS ownerless
+         FROM dispatch_claims c
+        WHERE c.state = 'acquired'
+          AND c.session_id IS NULL
+          AND c.legacy_unfenced = 0
+          AND c.attempt_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM pending_dispatches p
+             WHERE p.verb = c.verb AND p.id = c.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM dispatch_failures f
+             WHERE f.verb = c.verb AND f.id = c.id
+          )`,
+    )
+    .all() as Array<{
+    verb: string;
+    id: string;
+    attempt_id: number;
+    acquired_at: unknown;
+    dir: string | null;
+    ownerless: number;
+  }>;
+  const planned: OrphanedDispatchClaimRow[] = [];
+  for (const row of rows) {
+    if (
+      typeof row.acquired_at !== "number" ||
+      !Number.isFinite(row.acquired_at)
+    ) {
+      continue;
+    }
+    const deadlineMs =
+      Math.max(row.acquired_at * 1000, bootAnchorMs) +
+      PENDING_DISPATCH_TTL_MS +
+      ORPHANED_CLAIM_SKEW_GRACE_MS +
+      orphanedClaimJitterMs(row.verb, row.id, row.attempt_id);
+    if (nowMs < deadlineMs) continue;
+    planned.push({
+      verb: row.verb,
+      id: row.id,
+      attempt_id: row.attempt_id,
+      acquired_at: row.acquired_at,
+      dir: row.dir,
+      ownerless: row.ownerless === 1,
+      deadline_ms: deadlineMs,
+    });
+  }
+  planned.sort(
+    (a, b) =>
+      a.deadline_ms - b.deadline_ms ||
+      a.verb.localeCompare(b.verb) ||
+      a.id.localeCompare(b.id) ||
+      a.attempt_id - b.attempt_id,
+  );
+  return planned.slice(0, Math.max(0, Math.floor(limit)));
+}
+
+export function planOwnerlessOrphanedClaimReleases(
+  db: Database,
+  limit = ORPHANED_CLAIM_REAP_BATCH,
+): OrphanedDispatchClaimRow[] {
+  const rows = db
+    .query(
+      `SELECT c.verb, c.id, c.attempt_id, c.acquired_at, c.dir,
+              1 AS ownerless, 0 AS deadline_ms
+         FROM dispatch_claims c
+         JOIN dispatch_failures f ON f.verb = c.verb AND f.id = c.id
+        WHERE c.state = 'acquired' AND c.session_id IS NULL
+          AND c.legacy_unfenced = 0 AND c.attempt_id IS NOT NULL
+          AND f.reason = 'never-bound' AND f.attempt_id = c.attempt_id
+          AND NOT EXISTS (
+            SELECT 1 FROM pending_dispatches p
+             WHERE p.verb = c.verb AND p.id = c.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM provider_leg_ownership o
+             WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+          )
+        ORDER BY f.last_event_id, c.verb, c.id, c.attempt_id
+        LIMIT ?`,
+    )
+    .all(Math.max(0, Math.floor(limit))) as OrphanedDispatchClaimRow[];
+  return rows.filter(
+    (row) =>
+      typeof row.acquired_at === "number" && Number.isFinite(row.acquired_at),
+  );
+}
+
+export function orphanedClaimIsReleaseable(
+  db: Database,
+  row: Pick<OrphanedDispatchClaimRow, "verb" | "id" | "attempt_id">,
+): boolean {
+  return (
+    db
+      .query(
+        `SELECT 1
+           FROM dispatch_claims c
+           JOIN dispatch_failures f ON f.verb = c.verb AND f.id = c.id
+          WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
+            AND c.state = 'acquired' AND c.session_id IS NULL
+            AND c.legacy_unfenced = 0
+            AND f.reason = 'never-bound' AND f.attempt_id = c.attempt_id
+            AND NOT EXISTS (
+              SELECT 1 FROM pending_dispatches p
+               WHERE p.verb = c.verb AND p.id = c.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM provider_leg_ownership o
+               WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+            )`,
+      )
+      .get(row.verb, row.id, row.attempt_id) != null
+  );
 }
 
 /**
@@ -998,7 +1161,13 @@ export function selectExpiredPendingDispatches(
  * outside any fold. Returns `[]` for an empty `aged` set.
  */
 export function buildPendingDispatchSweepRecords(
-  aged: { verb: string; id: string; dispatched_at: number }[],
+  aged: {
+    verb: string;
+    id: string;
+    dispatched_at: number;
+    source?: "orphaned-claim";
+    attempt_id?: number | null;
+  }[],
   nowMs: number,
 ): BackstopRecord[] {
   return aged.map((row) =>
@@ -1008,7 +1177,14 @@ export function buildPendingDispatchSweepRecords(
       rescued: true,
       now: nowMs,
       stalenessMs: nowMs - row.dispatched_at * 1000,
-      detail: { verb: row.verb, id: row.id },
+      detail: {
+        verb: row.verb,
+        id: row.id,
+        ...(row.source === undefined ? {} : { source: row.source }),
+        ...(row.attempt_id == null
+          ? {}
+          : { attempt_id: String(row.attempt_id) }),
+      },
     }),
   );
 }
@@ -11810,6 +11986,51 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  function handleOwnerlessOrphanedClaimRelease(
+    row: OrphanedDispatchClaimRow,
+  ): void {
+    if (!row.ownerless || !orphanedClaimIsReleaseable(db, row)) return;
+    try {
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+         VALUES (?, ?, 'DispatchClaimReleased', 'dispatch_claims', ?)`,
+        [
+          Date.now() / 1000,
+          `${row.verb}::${row.id}`,
+          JSON.stringify({
+            verb: row.verb,
+            id: row.id,
+            expected_attempt_id: row.attempt_id,
+            session_id: null,
+            ownerless_acquired_only: true,
+          }),
+        ],
+      );
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] ownerless orphaned-claim release threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  function sweepOwnerlessOrphanedClaimReleases(): void {
+    try {
+      for (const row of planOwnerlessOrphanedClaimReleases(db)) {
+        handleOwnerlessOrphanedClaimRelease(row);
+      }
+    } catch (err) {
+      console.error(
+        `[keeperd] ownerless orphaned-claim release scan threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /**
    * Mint one synthetic `BlockEscalation{Requested,Attempted}` event onto the
    * writable connection — the producer's only write path into the
@@ -12570,30 +12791,58 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       });
     }
     const aged = plan.expired;
-    if (aged.length === 0) {
-      // Nothing to expire — the `rescued:false` denominator. Bump the counter
-      // only (no line); the rollup carries it.
+    let orphanedClaims: OrphanedDispatchClaimRow[];
+    try {
+      orphanedClaims = planOrphanedClaimReaper(
+        db,
+        nowMs,
+        bootCatchupStartedAtMs,
+      );
+    } catch (err) {
+      console.error(
+        `[keeperd] orphaned-claim Reaper read threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      orphanedClaims = [];
+    }
+    if (aged.length === 0 && orphanedClaims.length === 0) {
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", false);
+      sweepOwnerlessOrphanedClaimReleases();
       return;
     }
-    // Each expired row is a `rescued:true` timeout rescue. Build the records ONCE
-    // off a single `Date.now()` so every row shares the sweep's wall-clock. Main
-    // is the SOLE sidecar writer, so the lines are written directly.
-    const sweepRecords = buildPendingDispatchSweepRecords(aged, nowMs);
+    const sweepRecords = buildPendingDispatchSweepRecords(
+      [
+        ...aged,
+        ...orphanedClaims.map((row) => ({
+          verb: row.verb,
+          id: row.id,
+          dispatched_at: row.acquired_at,
+          source: "orphaned-claim" as const,
+          attempt_id: row.attempt_id,
+        })),
+      ],
+      nowMs,
+    );
     for (const row of aged) {
-      // Per-row failures are logged and swallowed inside the helper, so a throw
-      // doesn't abort the sweep — every aged row gets its own shot.
       handleDispatchExpiredMint({
         verb: row.verb as Verb,
         id: row.id,
-        // WHY this mint fired — the producer-side TTL sweep aged the pending row
-        // past its ceiling. Attribution telemetry on the event blob; the reducer
-        // fold reads only `(verb, id)`.
         reason: "dispatch_expiry_timeout",
         ...(row.attempt_id == null ? {} : { attempt_id: row.attempt_id }),
       });
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
     }
+    for (const row of orphanedClaims) {
+      handleDispatchExpiredMint({
+        verb: row.verb as Verb,
+        id: row.id,
+        reason: "orphaned_claim_expiry_timeout",
+        attempt_id: row.attempt_id,
+      });
+      mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
+    }
+    sweepOwnerlessOrphanedClaimReleases();
     for (const rec of sweepRecords) {
       appendBackstopRecord(rec, backstopLogPath);
     }
