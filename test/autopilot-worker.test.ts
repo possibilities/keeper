@@ -16813,7 +16813,7 @@ test("fn-1016 computeMergedLaneEntries: an ancestry probe TIMEOUT → NOT merged
   expect(entries).toEqual([]);
 });
 
-test("fn-1016 computeMergedLaneEntries: a DISABLED / non-`ok` epic has no lane → skipped, never probed", async () => {
+test("computeMergedLaneEntries: an explicitly DISABLED done epic emits serial landing evidence without git", async () => {
   const a = makeEpic({
     epic_id: "fn-1-a",
     project_dir: "/repo",
@@ -16824,8 +16824,53 @@ test("fn-1016 computeMergedLaneEntries: a DISABLED / non-`ok` epic has no lane �
   map.set("fn-1-a", { kind: "disabled", repoDir: "/repo", reason: "serial" });
   const { run, calls } = gateGit({ lanes: ["keeper/epic/fn-1-a"] });
   const entries = await computeMergedLaneEntries(epics, map, run);
-  expect(entries).toEqual([]);
-  expect(calls.length).toBe(0); // a non-`ok` epic is skipped before any git
+  expect(entries).toEqual([{ epic_id: "fn-1-a", repo_dir: "/repo" }]);
+  expect(calls).toHaveLength(0);
+});
+
+test("computeMergedLaneEntries: an explicitly DISABLED unfinished epic stays unlanded without git", async () => {
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    status: "open",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-a.1",
+        epic_id: "fn-1-a",
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const map = classifyIdentity([a]);
+  map.set("fn-1-a", { kind: "disabled", repoDir: "/repo", reason: "serial" });
+  const { run, calls } = gateGit({ lanes: [] });
+  expect(await computeMergedLaneEntries([a], map, run)).toEqual([]);
+  expect(calls).toHaveLength(0);
+});
+
+test("computeMergedLaneEntries: missing, rejected, and malformed classifications never imply serial landing", async () => {
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo",
+    status: "done",
+  });
+  const classifications: ReadonlyMap<string, WorktreeRepoResolution>[] = [
+    new Map(),
+    new Map([["fn-1-a", { kind: "multi-repo", reason: "rollout disabled" }]]),
+    new Map([["fn-1-a", { kind: "unresolved", reason: "unknown root" }]]),
+    new Map([["fn-1-a", { kind: "no-primary-repo", reason: "missing" }]]),
+    new Map([
+      ["fn-1-a", { kind: "unknown", repoDir: "/repo" }],
+    ]) as unknown as ReadonlyMap<string, WorktreeRepoResolution>,
+  ];
+  const { run, calls } = gateGit({ lanes: [] });
+  for (const classification of classifications) {
+    expect(await computeMergedLaneEntries([a], classification, run)).toEqual(
+      [],
+    );
+  }
+  expect(calls).toHaveLength(0);
 });
 
 test("fn-1016 computeMergedLaneEntries: entries are sorted by epic_id (stable serialization for the change-gate)", async () => {

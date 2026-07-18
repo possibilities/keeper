@@ -2488,21 +2488,21 @@ test("epicRemovedMet: present-then-absent → true; absent-at-baseline → false
 // fn-1016 landed (merge-landed milestone)
 // ---------------------------------------------------------------------------
 
-test("landedState: met when the epic is in the merge-landed set (full + bare)", () => {
+test("landedState: met with mode-neutral detail when the epic is in the merge-landed set (full + bare)", () => {
   expect(landedState("fn-2-b", ["fn-1-a", "fn-2-b"])).toEqual({
     kind: "met",
-    detail: "lane merged to default (fn-2-b)",
+    detail: "work landed on default branch (fn-2-b)",
   });
   // bare-id target resolves against the full id in the set
   expect(landedState("fn-2", ["fn-1-a", "fn-2-b"]).kind).toBe("met");
 });
 
-test("landedState: waiting when done-but-unmerged (not yet in the set)", () => {
-  // worktree mode ON: the epic finished (done) but its lane hasn't merged to
-  // default, so it is absent from `landedEpicIds` → waiting, not met.
+test("landedState: waiting detail stays truthful when evidence is absent", () => {
+  // A lane-capable epic may be done but unmerged, while a serial epic may still be
+  // unfinished. Set absence remains mode-neutral and never guesses which path ran.
   expect(landedState("fn-2-b", ["fn-1-a"])).toEqual({
     kind: "waiting",
-    detail: "lane not yet merged to default",
+    detail: "work not yet landed on default branch",
   });
   expect(landedState("fn-2-b", []).kind).toBe("waiting");
 });
@@ -2528,6 +2528,18 @@ test("landedState: degrades to complete semantics when worktree mode is OFF", ()
   const landedOn = computeLandedEpicIds(true, ["fn-3-c"], epics);
   expect(landedState("fn-3-c", landedOn).kind).toBe("met");
   expect(landedState("fn-2-b", landedOn).kind).toBe("waiting");
+});
+
+test("computeLandedEpicIds returns one stable sorted membership set in both modes", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-2-b", epic_number: 2, status: "done" }),
+    makeEpic({ epic_id: "fn-1-a", epic_number: 1, status: "done" }),
+    makeEpic({ epic_id: "fn-2-b", epic_number: 2, status: "done" }),
+  ];
+  expect(
+    computeLandedEpicIds(true, ["fn-2-b", "fn-1-a", "fn-2-b"], epics),
+  ).toEqual(["fn-1-a", "fn-2-b"]);
+  expect(computeLandedEpicIds(false, [], epics)).toEqual(["fn-1-a", "fn-2-b"]);
 });
 
 // ---------------------------------------------------------------------------

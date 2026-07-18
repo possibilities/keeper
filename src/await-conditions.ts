@@ -1623,13 +1623,14 @@ export function epicRemovedMet(
 }
 
 /**
- * `landed` predicate — "this epic's lane is merged to the default
- * branch." A thin membership read over the durable MERGE-LANDED set
- * (`ReadinessClientSnapshot.landedEpicIds`, computed by task-1's
- * `computeLandedEpicIds`), so the worktree ON/OFF degradation is ALREADY baked
- * into the input: ON → the `lane_merged` projection ids, OFF → done epics
- * (no lanes, so merged ⇔ done). This consumer just asks "is `target` in the
- * set?" — it never re-derives the degradation.
+ * `landed` predicate — "this epic's work is on the default branch." A thin
+ * membership read over the durable MERGE-LANDED set
+ * (`ReadinessClientSnapshot.landedEpicIds`, computed by
+ * `computeLandedEpicIds`), so execution-mode semantics are already baked into
+ * the input: lane-capable work requires producer merge evidence, an explicitly
+ * serial fallback requires epic completion, and global worktree-off degrades to
+ * done epics. This consumer just asks "is `target` in the set?" — it never
+ * inspects lane state or re-derives the producer classification.
  *
  * `target` is a full `fn-N-slug` epic id or a bare `fn-N`; matched against the
  * set via {@link epicIdMatchesTarget} (bare → numeric prefix, full → exact).
@@ -1651,10 +1652,10 @@ export function landedState(
   }
   for (const id of landedEpicIds) {
     if (epicIdMatchesTarget(id, target)) {
-      return { kind: "met", detail: `lane merged to default (${id})` };
+      return { kind: "met", detail: `work landed on default branch (${id})` };
     }
   }
-  return { kind: "waiting", detail: "lane not yet merged to default" };
+  return { kind: "waiting", detail: "work not yet landed on default branch" };
 }
 
 /** Stable string key for a verdict (tag + reason kind). Exported so the

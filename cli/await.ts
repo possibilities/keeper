@@ -157,8 +157,8 @@ Conditions (one per segment; join with the literal 'and' to wait for ALL):
                      Edge-triggered: never satisfied on first paint
   changed [since:R]  the board's epics/verdicts/autopilot move. Edge-triggered;
                      since:<hash> anchors against a prior 'changed' baseline
-  landed <epic>      the epic's worktree lane has merged into the LOCAL default
-                     branch (the finalize merge landed) — later than 'complete'
+  landed <epic>      the epic's work has landed on the LOCAL default branch:
+                     finalize merge for a lane, completion for a serial fallback
   <needs-human> [since:S]
                      a needs-human signal is present (level-triggered). Six
                      per-signal tokens — dead-letter, block-escalation,
@@ -213,7 +213,7 @@ Block until a plan/git/job condition holds, then act. Join conditions with the
 literal 'and' to wait for ALL. Durations are unit-required (30s, 5m).
 
   keeper await complete fn-N.M            # task/epic done+approved AND its session idle
-  keeper await landed fn-N                # epic's lane merged into LOCAL default (later than complete)
+  keeper await landed fn-N                # epic's work landed on LOCAL default
   keeper await git-clean and agents-idle  # cwd's git root quiet + no OTHER working session
   keeper await drained                    # no open keeper-dispatched work (plan scope — the default)
   keeper await drained --scope board --fail-on-stuck  # STRICT: whole board at rest; exit 5 on a jam
@@ -262,7 +262,8 @@ cleanly, does not hold. Footguns: server-up can't be ANDed or take an explicit
 --connect-timeout (no id) — under bare --probe it still gets a bounded deadline (the
 probe default), only the explicit flag combo is rejected; epic-added/epic-removed/changed
 are edge-triggered (never fire on first paint, and are a usage error under --probe);
-'complete' is done+idle, 'landed' is the later merge.
+'complete' is done+idle; 'landed' confirms work reached the default branch by
+finalize merge or completed serial execution.
 `;
 
 // ---------------------------------------------------------------------------
@@ -347,8 +348,8 @@ export type ConditionSegment =
   | { condition: "changed"; since?: string }
   | { condition: "epic-added"; target?: string }
   | { condition: "epic-removed"; target: string }
-  // fn-1016: `landed <epic>` — the lane-merged-to-default milestone. A
-  // board-family condition (reads the whole-board `landedEpicIds` set off the
+  // `landed <epic>` — the work-on-default milestone. A board-family condition
+  // (reads the whole-board `landedEpicIds` set off the
   // readiness snapshot), but carrying a required epic target like
   // `epic-removed`.
   | { condition: "landed"; target: string }
