@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 20
+      },
+      "done_summary": "atRest now requires epicTally.stale_running === 0, so a board whose only occupancy is stale-running epics reports drained: false. Pinned with a new test in test/status.test.ts.",
+      "input_hash": "8de223448cbd76e1f35f8ddd6ab9cd38a38dd42b3a6bda4cfdbbbc5eac753d6b",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1173,
+      "spec_md": "## Description\n\nFinding F1 (with merged test-gap F2). Evidence path: `cli/status.ts:432-433`\n\u2014 the `atRest` predicate reads `inFlightTotal === 0 && epicTally.ready === 0\n&& epicTally.running === 0`, but `tallyVerdicts` (cli/status.ts:367-372) now\npartitions stale-running rows into `stale_running` instead of `running`. So a\nboard whose only occupancy is stale-running epics computes\n`epicTally.running === 0` and flips `atRest`/`drained` true. Fix: extend the\npredicate to also require `epicTally.stale_running === 0`. Add the F2 test in\n`test/status.test.ts` asserting `drained: false` / correct `jammed` for a\nboard whose only occupancy is stale-running epics.\n\nFiles: cli/status.ts, test/status.test.ts\n\n## Acceptance\n\n- [ ] `atRest` includes `epicTally.stale_running === 0` in its predicate\n- [ ] Board with only stale-running epics + no needs-human reports `drained: false`\n- [ ] `test/status.test.ts` pins the atRest/drained/jammed x stale_running interaction\n\n## Done summary\natRest now requires epicTally.stale_running === 0, so a board whose only occupancy is stale-running epics reports drained: false. Pinned with a new test in test/status.test.ts.\n## Evidence\n",
+      "task_id": "fn-1333-fix-at-rest-flags-for-stale-running.1",
+      "tier": "medium",
+      "title": "Account stale_running in atRest"
+    }
+  ],
+  "created_at": "2026-07-18T12:05:25.830000Z",
+  "epic_id": "fn-1333-fix-at-rest-flags-for-stale-running",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "8de223448cbd76e1f35f8ddd6ab9cd38a38dd42b3a6bda4cfdbbbc5eac753d6b",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
