@@ -87,5 +87,5 @@ plus `bun run typecheck`.
 - [ ] The bug-encoding vanished-sweep test is inverted and all sibling tests reconciled; focused named gates plus typecheck are green.
 
 ## Done summary
-
+Retire torn-down watched lane git rows producer-side: selectVanishedRoots now retires currently-watched-and-gone roots behind an ENOENT/ENOTDIR-only, fail-closed, two-pass-debounced stat discriminator with exactly one tombstone per retire, and both teardown sites nudge an immediate vanished sweep on completed removals only. Verified the retract fold's null-attribution DELETE is already reachable (no reducer reorder), covered by fold + resurrection-safety tests.
 ## Evidence
