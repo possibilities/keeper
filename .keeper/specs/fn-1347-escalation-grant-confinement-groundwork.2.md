@@ -37,5 +37,5 @@ Extend each guard suite with a granted-vs-ungranted matrix: granted repairer wri
 - [ ] All three guard suites pass via named test gates
 
 ## Done summary
-
+Scoped keeper autopilot retry to the grant's own incident id in grant-guard (a confined subagent re-arms its own incident only), and extended the wrong-tree/wrapped guard suites with synthetic-leaf granted-vs-ungranted matrices plus the courier-under-sibling-grant deny case. All three guard suites and the full root gate are green.
 ## Evidence
