@@ -64,6 +64,7 @@ import {
   nextIdlePollDelayMs,
   POLL_IDLE_GROWTH_FACTOR,
   POLL_MS,
+  projectProviderLegActivityByWrapperJobId,
   type ReadinessClientSnapshot,
   type ReadinessSocket,
   type ReadinessTimers,
@@ -266,6 +267,45 @@ function errorFrame(
     ...(id === undefined ? {} : { id }),
   };
 }
+
+test("projectProviderLegActivityByWrapperJobId keeps only freshest live, live-session evidence", () => {
+  const jobs = new Map([
+    ["leg-fresh", { state: "working", updated_at: 1150 }],
+    ["leg-older", { state: "stopped", updated_at: 1100 }],
+    ["leg-terminal", { state: "ended", updated_at: 1190 }],
+  ]);
+  const activity = projectProviderLegActivityByWrapperJobId(
+    [
+      {
+        wrapper_job_id: "wrapper-1",
+        leg_session_id: "leg-older",
+        state: "live",
+      },
+      {
+        wrapper_job_id: "wrapper-1",
+        leg_session_id: "leg-fresh",
+        state: "live",
+      },
+      {
+        wrapper_job_id: "wrapper-2",
+        leg_session_id: "leg-fresh",
+        state: "transferred",
+      },
+      {
+        wrapper_job_id: "wrapper-3",
+        leg_session_id: "leg-terminal",
+        state: "live",
+      },
+      {
+        wrapper_job_id: "wrapper-4",
+        leg_session_id: "leg-absent",
+        state: "live",
+      },
+    ],
+    jobs,
+  );
+  expect(activity).toEqual(new Map([["wrapper-1", 1150]]));
+});
 
 // ---------------------------------------------------------------------------
 // (a) first-paint gate — onSnapshot does not fire until all three

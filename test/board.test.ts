@@ -1510,6 +1510,9 @@ test("colorizePillsInLine: running:<kind> fresh variants take the blue bucket vi
   expect(colorizePillsInLine("[running:sub-agent-running]")).toBe(
     `[${BLUE}running:sub-agent-running${RESET}]`,
   );
+  expect(colorizePillsInLine("[running:provider-leg-active]")).toBe(
+    `[${BLUE}running:provider-leg-active${RESET}]`,
+  );
 });
 
 test("colorizePillsInLine: running:sub-agent-stale takes the warn bucket (more-specific branch)", () => {

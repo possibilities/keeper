@@ -845,6 +845,8 @@ export interface ReconcileSnapshot {
    * path uses, so the two readiness paths agree byte-for-byte.
    */
   pendingDispatches: PendingDispatch[];
+  /** Wrapper job id → freshest owned live Provider-leg activity timestamp. */
+  providerLegActivityByWrapperJobId?: ReadonlyMap<string, number>;
   /**
    * The autopilot mode enum, read fresh from the `autopilot_state` singleton each
    * cycle (the projection is the single source of truth, surviving restart for
@@ -2360,6 +2362,7 @@ export function reconcile(
     // degraded pane probe, so the terminal gate then falls back to the
     // conservative liveness hold.
     snapshot.provenDeadJobIds,
+    snapshot.providerLegActivityByWrapperJobId ?? new Map(),
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second
