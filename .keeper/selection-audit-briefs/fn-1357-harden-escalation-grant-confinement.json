@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 18,
+        "files_changed": 4,
+        "insertions": 244
+      },
+      "done_summary": "Hardened the escalation-grant confinement surface: git -C/--git-dir/--work-tree global path overrides are now denied for confined write-capable roles, a >1MB payload carrying a confined agent_type fails closed instead of allowing on truncated-JSON parse, and writeGrantLeaf canonicalizes writable_root at mint so a symlinked checkout no longer over-denies. Added regression tests for all three gaps in test/grant-guard.test.ts.",
+      "input_hash": "e5ddf5a0a7e7e5f3b914e5f4604efa6ea23943fba6d357cc8b29d817cdf5c7ce",
+      "model": "opus",
+      "spec_chars": 3051,
+      "spec_md": "## Description\n\nHarden the shipped escalation-grant confinement surface for three\naudit-kept gaps (all inert until the mint side is wired):\n\n- **F1** \u2014 `plugins/keeper/plugin/hooks/grant-guard.ts`: `gitSubcommandInfo`\n  (:382-410) skips `GIT_VALUED_GLOBAL_FLAGS` (`-C`, `--git-dir`,\n  `--work-tree`), and for a write-capable role `classifyExecutable` returns\n  allowed for every git subcommand except `config` (:615). `decideBash`\n  (:895-909) binds only `payload.cwd` to `writableRoot`, so\n  `git -C /foreign/repo commit` (or `--git-dir=\u2026/--work-tree=\u2026`) mutates a\n  tree outside the granted checkout while the cwd check passes \u2014 contradicting\n  the :892 comment. Fix: when a git segment carries `-C`/`--git-dir`/`--work-tree`\n  for a write-capable role, resolve that target and require\n  `writableRootCovers` on it, or deny those global flags for the confined roles.\n\n- **F2** \u2014 `plugins/keeper/plugin/hooks/grant-guard.ts` (`readStdin` :947-952\n  + `main` :965-985): `readStdin` truncates to 1 MB, `main` `JSON.parse`s the\n  truncated text which throws to `payload=null`, and `decideGrantGuard(null)`\n  returns allow (:923) \u2014 the `catch` never fires. A confined agent's >1 MB\n  Write body or Bash command bypasses the guard. Fix: distinguish \"input was\n  truncated\" from \"well-formed small payload\" \u2014 scan the untruncated head for\n  a confined `agent_type` and fail CLOSED when one is present.\n\n- **F4** \u2014 `src/grant-leaf.ts`: `writableRootCovers` (:142, docstring\n  \"both already canonical\") and the parser (:248-249, `isAbsolute` only)\n  never canonicalize `writable_root`. A daemon-minted root with a symlink\n  component (e.g. a macOS `/tmp`/`/var` or a symlinked lane checkout) yields a\n  `..`-prefixed `relative()` and denies a legitimate in-root write \u2014 fail-closed\n  but a silent confinement-too-tight surprise. Fix: canonicalize\n  `writable_root` in `writeGrantLeaf` (and/or state the writer's canonical-root\n  contract at the reader).\n\nFiles: `plugins/keeper/plugin/hooks/grant-guard.ts`, `src/grant-leaf.ts`,\nand the corresponding guard/leaf test suites.\n\n## Acceptance\n\n- [ ] F1: a write-capable role's `git -C <foreign>` / `--git-dir` / `--work-tree`\n      mutation is denied (target resolved and root-checked, or the flags denied).\n- [ ] F2: a >1 MB payload carrying a confined `agent_type` is denied, not allowed.\n- [ ] F4: a non-canonical `writable_root` covers a legitimate in-root write\n      (canonicalized at mint) rather than over-denying.\n- [ ] Regression tests cover the `-C`/`--work-tree`/`--git-dir` escape, the\n      >1 MB fail-open, and the symlink-component root.\n\n## Done summary\nHardened the escalation-grant confinement surface: git -C/--git-dir/--work-tree global path overrides are now denied for confined write-capable roles, a >1MB payload carrying a confined agent_type fails closed instead of allowing on truncated-JSON parse, and writeGrantLeaf canonicalizes writable_root at mint so a symlinked checkout no longer over-denies. Added regression tests for all three gaps in test/grant-guard.test.ts.\n## Evidence\n",
+      "task_id": "fn-1357-harden-escalation-grant-confinement.1",
+      "tier": "xhigh",
+      "title": "Close grant confinement gaps"
+    }
+  ],
+  "created_at": "2026-07-18T23:01:46.692000Z",
+  "epic_id": "fn-1357-harden-escalation-grant-confinement",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "e5ddf5a0a7e7e5f3b914e5f4604efa6ea23943fba6d357cc8b29d817cdf5c7ce",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
