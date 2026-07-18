@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "Well-specified single-file fix in closePhaseResume with a named root cause and explicit acceptance (swap the two selection reads to selection-family schema ceilings while preserving safe-degrade) \u2014 GPT-first per hand_tuned since no intelligence-bound reason, at high because the cross-family ladder reasoning across three constant sources exceeds a mechanical medium edit.",
+      "task_id": "fn-1332-fix-close-phase-resume-selection-schema.1",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T10:31:54.805000Z",
+  "epic_id": "fn-1332-fix-close-phase-resume-selection-schema",
+  "input_hash": "2f371989feb2879485d826664b1f9c6b0e899fbb9eaa7427e18e57dc22eda742",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 792140169,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified single-file fix in closePhaseResume with a named root cause and explicit acceptance (swap the two selection reads to selection-family schema ceilings while preserving safe-degrade) \u2014 GPT-first per hand_tuned since no intelligence-bound reason, at high because the cross-family ladder reasoning across three constant sources exceeds a mechanical medium edit.\",\"confidence\":0.8}]}\n"
+}
