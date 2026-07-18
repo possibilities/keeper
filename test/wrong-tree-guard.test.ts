@@ -31,6 +31,11 @@ import {
   type TreeProbe,
   type WrongTreeGuardPayload,
 } from "../plugins/keeper/plugin/hooks/wrong-tree-guard.ts";
+import {
+  type GrantLeaf,
+  grantCoversWrite,
+  writeGrantLeaf,
+} from "../src/grant-leaf.ts";
 
 // ---------------------------------------------------------------------------
 // Tier 1 — extractBashTargets truth table
@@ -408,6 +413,178 @@ describe("fsProbe (real filesystem)", () => {
       expect(decideWrongTreeGuard(planState, env, fsProbe())).toBeNull();
     } finally {
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Grant override — a valid escalation grant lifts the wrong-tree deny without
+// weakening the protected-path or no-grant posture.
+// ---------------------------------------------------------------------------
+
+describe("decideWrongTreeGuard — escalation grant override", () => {
+  const grantAll = () => true;
+  const grantNone = () => false;
+
+  test("a covered foreign-tree Write is allowed when the grant override clears it", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("without the override the same foreign-tree Write still denies", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      ),
+    ).not.toBeNull();
+  });
+
+  test("a protected path denies even when the override would clear it", () => {
+    // Protected paths are checked BEFORE the grant override, so the deny stands.
+    const d = decideWrongTreeGuard(
+      writePayload(`${PRIMARY}/.git/config`),
+      LANE_ENV,
+      fakeProbe(),
+      undefined,
+      grantAll,
+    );
+    expect(d?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "protected",
+    );
+  });
+
+  test("the default (no override) preserves the existing deny posture", () => {
+    expect(
+      decideWrongTreeGuard(
+        writePayload(`${PRIMARY}/src/x.ts`),
+        LANE_ENV,
+        fakeProbe(),
+      ),
+    ).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Synthetic-leaf grant matrix — drive the deny with the PRODUCTION override
+// (`grantCoversWrite` over a real owner-private leaf), not an injected boolean.
+// A repairer granted the shared checkout (PRIMARY) writes it from a lane-marked
+// session; every ungranted / out-of-root / expired / mismatched case still denies.
+// ---------------------------------------------------------------------------
+
+describe("decideWrongTreeGuard — grant leaf override (synthetic leafs)", () => {
+  function makeGrant(over: Partial<GrantLeaf> = {}): GrantLeaf {
+    return {
+      schema_version: 1,
+      parent_job_id: "job-1",
+      agent_type: "repairer",
+      incident_id: "repair::keeper",
+      attempt_id: "att-1",
+      instance_event_id: 42,
+      writable_root: PRIMARY, // the shared checkout the repairer may write
+      role: "repair",
+      expires_at: 10_000,
+      fencing_token: 7,
+      ...over,
+    };
+  }
+
+  function grantEnv(dir: string): Record<string, string | undefined> {
+    return {
+      ...LANE_ENV,
+      KEEPER_GRANT_DIR: dir,
+      KEEPER_GRANT_PARENT_JOB: "job-1",
+      KEEPER_GRANT_INCIDENT: "repair::keeper",
+      KEEPER_GRANT_FENCING_TOKEN: "7",
+    };
+  }
+
+  // The production override closure: exactly how main() wires it — the payload's
+  // agent_type + env + now through grantCoversWrite over the real leaf.
+  function override(
+    env: Record<string, string | undefined>,
+    now: number,
+  ): (canonicalTarget: string) => boolean {
+    return (canonicalTarget) =>
+      grantCoversWrite(env, "repairer", canonicalTarget, now);
+  }
+
+  function run(
+    env: Record<string, string | undefined>,
+    now: number,
+    file: string,
+  ) {
+    return decideWrongTreeGuard(
+      writePayload(file),
+      env,
+      fakeProbe(),
+      undefined,
+      override(env, now),
+    );
+  }
+
+  test("a granted repairer writes the shared checkout (deny lifted)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant());
+      expect(run(grantEnv(dir), 5_000, `${PRIMARY}/src/x.ts`)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a write outside the granted root still denies", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant({ writable_root: "/w/elsewhere" }));
+      expect(run(grantEnv(dir), 5_000, `${PRIMARY}/src/x.ts`)).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an expired grant does not lift the deny", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant({ expires_at: 1_000 }));
+      // now (5_000) is past expiry (1_000).
+      expect(run(grantEnv(dir), 5_000, `${PRIMARY}/src/x.ts`)).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a fencing-token mismatch does not lift the deny", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant());
+      const env = { ...grantEnv(dir), KEEPER_GRANT_FENCING_TOKEN: "8" };
+      expect(run(env, 5_000, `${PRIMARY}/src/x.ts`)).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a protected path inside the granted root denies even with a valid leaf", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant());
+      const d = run(grantEnv(dir), 5_000, `${PRIMARY}/.git/config`);
+      expect(d?.hookSpecificOutput.permissionDecisionReason).toContain(
+        "protected",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

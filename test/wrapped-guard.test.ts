@@ -32,6 +32,11 @@ import {
   type WrappedGuardPayload,
   writeAtomicWrappedHandoff,
 } from "../plugins/keeper/plugin/hooks/wrapped-guard.ts";
+import {
+  type GrantLeaf,
+  grantCoversWrite,
+  writeGrantLeaf,
+} from "../src/grant-leaf.ts";
 
 // ---------------------------------------------------------------------------
 // Tier 1 — evaluateWrappedBash truth table
@@ -651,5 +656,221 @@ describe("decideWrappedGuard — deny-precedence / single-state intent", () => {
       }),
     );
     expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Grant override — a validly-granted escalation subagent (a different agent_type
+// than the wrapped work:worker) is exempted from the total edit-denial without
+// weakening the default posture.
+// ---------------------------------------------------------------------------
+
+describe("decideWrappedGuard — escalation grant override", () => {
+  const grantAll: (t: string) => boolean = () => true;
+  const grantNone: (t: string) => boolean = () => false;
+
+  test("a covered Edit is allowed under the grant override", () => {
+    expect(
+      decideWrappedGuard(
+        editPayload("Edit", `${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("a covered in-tree Write is allowed under the grant override", () => {
+    expect(
+      decideWrappedGuard(
+        writePayload(`${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantAll,
+      ),
+    ).toBeNull();
+  });
+
+  test("without the override, Edit and in-tree Write still deny (posture preserved)", () => {
+    expect(
+      decideWrappedGuard(
+        editPayload("Edit", `${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+    expect(
+      decideWrappedGuard(
+        writePayload(`${REPO}/src/x.ts`),
+        MARKED,
+        fakeProbe(),
+        undefined,
+        grantNone,
+      )?.hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
+    // The default (no override argument) matches the grant-none posture.
+    expect(
+      decide(editPayload("Edit", `${REPO}/src/x.ts`))?.hookSpecificOutput
+        .permissionDecision,
+    ).toBe("deny");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Synthetic-leaf grant matrix — the PRODUCTION override (`grantCoversWrite` over
+// a real owner-private leaf) lifting the total-edit denial for a validly-granted
+// escalation subagent, and the wrapped courier staying fully denied even when a
+// SIBLING escalation agent holds a grant.
+// ---------------------------------------------------------------------------
+
+describe("decideWrappedGuard — grant leaf override (synthetic leafs)", () => {
+  function makeGrant(over: Partial<GrantLeaf> = {}): GrantLeaf {
+    return {
+      schema_version: 1,
+      parent_job_id: "job-1",
+      agent_type: "repairer",
+      incident_id: "repair::keeper",
+      attempt_id: "att-1",
+      instance_event_id: 42,
+      writable_root: REPO,
+      role: "repair",
+      expires_at: 10_000,
+      fencing_token: 7,
+      ...over,
+    };
+  }
+
+  function grantEnv(dir: string): Record<string, string | undefined> {
+    return {
+      ...MARKED,
+      KEEPER_GRANT_DIR: dir,
+      KEEPER_GRANT_PARENT_JOB: "job-1",
+      KEEPER_GRANT_INCIDENT: "repair::keeper",
+      KEEPER_GRANT_FENCING_TOKEN: "7",
+    };
+  }
+
+  // The production override closure — the payload's agent_type + env + now through
+  // grantCoversWrite over the real leaf, exactly as main() wires it.
+  function overrideFor(
+    agentType: string | undefined,
+    env: Record<string, string | undefined>,
+    now: number,
+  ): (canonicalTarget: string) => boolean {
+    return (canonicalTarget) =>
+      grantCoversWrite(env, agentType, canonicalTarget, now);
+  }
+
+  test("a granted repairer's in-tree Edit is allowed (denial lifted)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant());
+      const env = grantEnv(dir);
+      expect(
+        decideWrappedGuard(
+          editPayload("Edit", `${REPO}/src/x.ts`, { agent_type: "repairer" }),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor("repairer", env, 5_000),
+        ),
+      ).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a granted repairer's in-tree Write is allowed (denial lifted)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant());
+      const env = grantEnv(dir);
+      expect(
+        decideWrappedGuard(
+          writePayload(`${REPO}/src/x.ts`, { agent_type: "repairer" }),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor("repairer", env, 5_000),
+        ),
+      ).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a write outside the granted root still denies", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant({ writable_root: "/w/elsewhere" }));
+      const env = grantEnv(dir);
+      expect(
+        decideWrappedGuard(
+          editPayload("Edit", `${REPO}/src/x.ts`, { agent_type: "repairer" }),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor("repairer", env, 5_000),
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an expired grant does not lift the denial", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant({ expires_at: 1_000 }));
+      const env = grantEnv(dir);
+      expect(
+        decideWrappedGuard(
+          editPayload("Edit", `${REPO}/src/x.ts`, { agent_type: "repairer" }),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor("repairer", env, 5_000), // now past expiry
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the wrapped courier stays edit-denied even when a SIBLING holds a grant", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-grant-"));
+    try {
+      writeGrantLeaf(dir, makeGrant()); // a valid repairer grant sits on disk
+      const env = grantEnv(dir);
+      // The courier is the wrapped work:worker — grantCoversWrite is false for any
+      // non-escalation agent_type, so the total-edit denial stands.
+      expect(
+        decideWrappedGuard(
+          editPayload("Edit", `${REPO}/src/x.ts`, {
+            agent_type: "work:worker",
+          }),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor("work:worker", env, 5_000),
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+      // The classic courier carries no agent_type at all — still denied.
+      expect(
+        decideWrappedGuard(
+          editPayload("Edit", `${REPO}/src/x.ts`),
+          env,
+          fakeProbe(),
+          undefined,
+          overrideFor(undefined, env, 5_000),
+        )?.hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -207,7 +207,6 @@
     "test/docs-pusher.test.ts": 2,
     "test/epic-deps.test.ts": 3,
     "test/escalation-brief.test.ts": 2,
-    "test/escalation-guard.test.ts": 1,
     "test/events-ingest-worker.test.ts": 8,
     "test/events-writer.test.ts": 16,
     "test/exec-backend.test.ts": 1,

@@ -229,12 +229,6 @@ export const FAST_TEST_POLICY_ALLOWLIST: readonly PolicyAllowance[] = [
     reason: "Reviewed stress-boundary case retains its scoped timeout.",
   },
   {
-    file: "test/escalation-guard.test.ts",
-    rule: "process-launch",
-    reason:
-      "Reviewed command-vector decision fixture does not execute its git tokens.",
-  },
-  {
     file: "test/exit-watcher.test.ts",
     rule: "fixed-sleep",
     reason:
