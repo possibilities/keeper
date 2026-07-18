@@ -56,5 +56,5 @@ stays green on current main after the freeze.
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Migrated the six raw-NUL composite-key separators to a shared src/composite-key.ts constant and added scripts/lint-source.ts, a source-wide comments-only lint banning net-new NUL literals and fn-id/provenance comments behind a committed shrink-only allowlist, with false-positive fixtures for string literals and hex digests; wired into bun run lint and CLAUDE.md rule #0 updated in place.
 ## Evidence
