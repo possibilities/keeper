@@ -1,0 +1,60 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-sol",
+      "assigned_tier": "xhigh",
+      "config_hash": "n/a-operator-manual",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 56,
+        "files_changed": 5,
+        "insertions": 67
+      },
+      "done_summary": "Extracted probeServerGeneration and its SpawnSyncFn contract into a dependency-neutral src/server-generation-probe.ts leaf, breaking the tabs-core <-> restore-worker runtime import cycle while preserving every consumer's existing probe classification and worker/render behavior.",
+      "input_hash": "n/a-operator-manual",
+      "model": "gpt-5.6-sol",
+      "spec_chars": 3292,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/restore-worker.ts, src/tabs-core.ts, src/tmux-boot-seed.ts, src/server-generation-probe.ts, test/restore-worker.test.ts, test/tabs.test.ts, test/tmux-boot-seed.test.ts\n\n### Approach\n\nMove `probeServerGeneration` and its injected spawn contract into a dependency-neutral leaf consumed by restore-worker, tabs-core, and tmux-boot-seed. Continue using exec-backend's sole generation argv builder and parser; preserve each caller's current distinction among confirmed absence, malformed output, spawn failure, timeout, and signal. Keep tabs-core's render and launcher-prefix ownership unless a neutral extraction is necessary\u2014never fork those implementations to make the graph pass.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/restore-worker.ts:806-863 \u2014 injected Generation probe and worker-side degradation semantics\n- src/restore-worker.ts:1074-1085,1131-1135 \u2014 tabs-core render/prefix consumers\n- src/restore-worker.ts:1228-1231 \u2014 current worker startup guard\n- src/tabs-core.ts:914-950 \u2014 tabs-side timeout/signal refusal versus confirmed absence\n- src/tmux-boot-seed.ts:62-63,127-151 \u2014 third probe consumer and topology integration\n- src/exec-backend.ts:485-498,522-565 \u2014 canonical Generation argv, parser, and producer\n- test/restore-worker.test.ts:884-941 \u2014 probe success and malformed/spawn failure fixtures\n- test/tabs.test.ts:1466-1495 \u2014 timeout/signal versus absent semantics\n\n**Optional** (reference as needed):\n- src/tabs-core.ts:722-799,1407-1414 \u2014 shared restore script and launcher-prefix implementation\n- test/restore-worker.test.ts:1231-1262 \u2014 restore script mode/exclusion behavior\n\n### Risks\n\n- Changing module evaluation time can freeze environment-derived launcher defaults earlier or later\n- Collapsing caller-specific timeout and absence semantics can restore against the wrong live Generation\n- A stale tmux-boot-seed import can preserve an indirect cycle even if the named pair looks clean\n\n### Test notes\n\nKeep injected spawn tests in-process. Cover all three consumers, canonical valid and malformed Generation values, thrown/nonzero probes, timeout/signal distinction, no duplicated builder/parser, render parity, mode 0600, and worker import inertness.\n\n## Acceptance\n\n- [ ] `tabs-core` has no runtime import path back to `restore-worker`, and all three consumers use one dependency-neutral Generation probe\n- [ ] The probe mints identity only through exec-backend's canonical argv/parser and accepts no alternate Generation format\n- [ ] Restore-worker, tabs-core, and tmux-boot-seed preserve their existing success, absence, malformed, spawn-failure, timeout, and signal classifications\n- [ ] Restore script rendering, launcher-prefix evaluation, mode 0600, exclusion behavior, and worker lifecycle remain unchanged\n- [ ] Focused restore, tabs, boot-seed tests plus typecheck pass\n\n## Done summary\nExtracted probeServerGeneration and its SpawnSyncFn contract into a dependency-neutral src/server-generation-probe.ts leaf, breaking the tabs-core <-> restore-worker runtime import cycle while preserving every consumer's existing probe classification and worker/render behavior.\n## Evidence\n",
+      "task_id": "fn-1325-split-runtime-import-cycles.2",
+      "tier": "xhigh",
+      "title": "Extract Generation probe seam"
+    },
+    {
+      "assigned_model": "gpt-5.6-sol",
+      "assigned_tier": "xhigh",
+      "config_hash": "n/a-operator-manual",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 3,
+        "insertions": 691
+      },
+      "done_summary": "",
+      "input_hash": "n/a-operator-manual",
+      "model": "gpt-5.6-sol",
+      "spec_chars": 3157,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** test/helpers/depgraph.ts, test/runtime-import-cycles.test.ts, scripts/runtime-cycle-exceptions.json\n\n### Approach\n\nBuild a deterministic production-`src/` runtime graph with the existing comment-aware, type-import-aware resolver. Compare canonical cyclic edge topology against a committed cycle exception manifest: the current Agent configuration SCC is exact reviewed debt, while the two removed cycles and every new direct or indirect cycle fail. Fail closed on unresolved local imports, malformed/stale/duplicate exceptions, and unsupported local dynamic/CommonJS edges; mixed type/value imports count as runtime edges.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- test/helpers/depgraph.ts:1-21,144-174,237-271 \u2014 shared parser, resolver, and runtime closure walker\n- test/daemon-load-surface.test.ts:43-92 \u2014 non-vacuous graph anchors and injected violation proof\n- test/reconcile-core-depgraph.test.ts:121-170 \u2014 ratchet-style structural boundary\n- scripts/test-manifest.ts:90-123 \u2014 standard root-test discovery\n- src/agent/config.ts:34, src/agent/triple.ts:30-36, src/agent/matrix.ts:23 \u2014 current SCC whose exact edges seed the exception manifest\n- docs/adr/0080-runtime-import-cycle-seams-and-exact-exceptions.md \u2014 exact-edge and stale-exception contract\n\n**Optional** (reference as needed):\n- scripts/daemon-load-roots.txt:1-20 \u2014 complete production source-root precedent\n\n### Risks\n\n- SCC-member or count-only allowances let new edge topology pass unnoticed\n- A stale exception can silently authorize a removed cycle's return unless disappearance fails\n- Platform-dependent path normalization or ignored resolver errors make local and CI outcomes diverge\n\n### Test notes\n\nAdd injected graphs for direct recurrence, indirect recurrence, a new SCC, changed edges with identical members, stale and duplicate exceptions, malformed data, unresolved local imports, mixed imports, and unsupported local dynamic/CommonJS imports. Diagnostics use canonical repo-relative paths.\n\n## Acceptance\n\n- [ ] The standard fast gate discovers a deterministic production-`src/` runtime-cycle test using canonical repo-relative paths\n- [ ] The committed exception manifest records exact cyclic edges for only the accepted current Agent SCC; matching is not count- or member-only\n- [ ] Direct and indirect recurrence, new cycles, same-member topology changes, stale/duplicate/malformed exceptions, unresolved local imports, and unsupported local runtime import forms all fail closed\n- [ ] Known graph anchors and injected violations prove the guard is non-vacuous, and diagnostics are stable across supported environments\n- [ ] The focused structural test and named fast gate pass\n\n## Done summary\n\n## Evidence\n- Commits: 46db34b3a8770aa6d395168e35a69f1d1ccdc2c9\n- Tests: bun test ./test/rpc-handlers.test.ts ./test/server-worker.test.ts ./test/restore-worker.test.ts ./test/tabs.test.ts ./test/runtime-import-cycles.test.ts: pass 244 tests, bun run typecheck: pass, bun run test:gate: pass 9335, 2 skipped",
+      "task_id": "fn-1325-split-runtime-import-cycles.3",
+      "tier": "xhigh",
+      "title": "Enforce exact cycle exceptions"
+    }
+  ],
+  "created_at": "2026-07-18T09:52:44.510000Z",
+  "epic_id": "fn-1325-split-runtime-import-cycles",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1325-split-runtime-import-cycles.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "n/a-operator-manual",
+  "selection_input_hash": "n/a-operator-manual",
+  "selector": {
+    "harness": "claude",
+    "model": "operator-manual"
+  }
+}
