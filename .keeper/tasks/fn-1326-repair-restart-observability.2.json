@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Make boot identity durable",
-  "updated_at": "2026-07-18T05:58:16.686000Z"
+  "updated_at": "2026-07-18T10:34:05.377000Z",
+  "worker_done_at": "2026-07-18T10:34:05.377000Z"
 }

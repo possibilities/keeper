@@ -47,5 +47,5 @@ Pin lock-before-append, append-before-DB/Drain, fsync/write failure fatality, tr
 - [ ] Focused daemon, server-worker, status, and typecheck gates pass
 
 ## Done summary
-
+Extracted the restart-ledger contract into a dependency-free leaf; the daemon now durably appends and syncs one bounded boot record after the single-instance lock and before DB open, migration, workers, Drain, or readiness, exiting nonzero on persistence failure. Normal boot no longer rewrites/ages ledger history (crash-loop windowing is read-side only); legacy conversion is explicit and lossless, and torn/malformed tails preserve their valid prefix. Every served result, including memoized steady state, and the restart CLI's own reads now carry the same recycle-safe {boot_id,pid,start_time} identity plus current Drain state.
 ## Evidence
