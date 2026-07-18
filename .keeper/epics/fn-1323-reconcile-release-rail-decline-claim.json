@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-18T05:08:53.000000Z",
   "created_at": "2026-07-18T01:09:08.116000Z",
   "created_by_close_of": "fn-1322-cooperative-claim-release-rail",
   "depends_on_epics": [
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-18T01:09:10.549000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Reconcile release-rail decline claim",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T01:09:10.549000Z"
+  "updated_at": "2026-07-18T05:08:53.000000Z"
 }
