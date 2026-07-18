@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped design across four confined agents introducing a new template pattern with a subtle security/confinement invariant (data-delimited incident input, receipts never lifting grants, per-role denylists) whose wrong abstraction propagates to every consumer.",
+      "task_id": "fn-1348-escalation-capabilities-as-plan-agents.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Judgment-heavy, under-specified prose rewrite of three skills into thin wrappers that mirror the existing work-skill Task-spawn idiom and preserve delicate dual-use close-out behavior, needing taste and idiom-matching but not opus-level novel reasoning.",
+      "task_id": "fn-1348-escalation-capabilities-as-plan-agents.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T21:09:02.642000Z",
+  "epic_id": "fn-1348-escalation-capabilities-as-plan-agents",
+  "input_hash": "a5e80bff78e46581d9692163fdc614632d275c48aa7993e0cdc3835e4d6708fb",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2783448063,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1348-escalation-capabilities-as-plan-agents.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped design across four confined agents introducing a new template pattern with a subtle security/confinement invariant (data-delimited incident input, receipts never lifting grants, per-role denylists) whose wrong abstraction propagates to every consumer.\",\"confidence\":0.72},{\"task_id\":\"fn-1348-escalation-capabilities-as-plan-agents.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy, under-specified prose rewrite of three skills into thin wrappers that mirror the existing work-skill Task-spawn idiom and preserve delicate dual-use close-out behavior, needing taste and idiom-matching but not opus-level novel reasoning.\",\"confidence\":0.68}]}\n"
+}
