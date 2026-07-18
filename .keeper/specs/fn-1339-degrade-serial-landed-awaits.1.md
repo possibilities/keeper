@@ -42,5 +42,5 @@ Add deterministic producer cases for disabled+done → one row with zero git cal
 - [ ] Focused await/autopilot tests and typecheck pass
 
 ## Done summary
-
+computeMergedLaneEntries now emits a merge-landed row for a done whole-epic disabled serial fallback with zero git probes, while unfinished/unresolved/rejected/unclassified epics stay absent; the shared landed set, await predicate, help text, and status inherit truthful mode-neutral landing evidence.
 ## Evidence
