@@ -1,13 +1,7 @@
 /**
- * Concrete RPC handlers registered against the server-worker's `RPC_REGISTRY`.
- * The registry is process-global; importing this module from
- * `src/server-worker.ts` is what installs the handlers into the worker thread.
- * No side effect runs at main-thread import time other than the
- * `registerAsyncRpc(...)` calls at the bottom of the file — which is the
- * design:
- * the worker module imports this, so registration happens once per worker
- * spawn, and tests that import the worker module piecemeal opt out by not
- * importing this file.
+ * Concrete RPC handlers installed into the registry supplied by the server
+ * role. Importing this module is inert; the server composition root explicitly
+ * calls `installRpcHandlers()` before it binds the socket.
  *
  * Registers the dead-letter replay + the autopilot-control async handlers:
  *
@@ -57,9 +51,10 @@ import {
 import {
   BadParamsError,
   type ReplayBridge,
-  registerAsyncRpc,
+  type RpcRegistrar,
+  type RpcRegistration,
   SlugConflictError,
-} from "./server-worker";
+} from "./rpc-runtime";
 
 // Re-export the verb type for downstream importers that read it off this
 // module (the validator itself now lives in the dep-free `./dispatch-command`
@@ -1032,24 +1027,49 @@ export async function retryDispatchHandler(
   return { ok: true, verb, id: dispatchId };
 }
 
-/**
- * Install every handler in this module into the process-global registries
- * (`RPC_REGISTRY` for sync handlers, `ASYNC_RPC_REGISTRY` for async ones).
- * Called for its side effect by the server-worker module body — a single
- * import is enough to register every concrete RPC.
- *
- * Idempotency: `registerRpc` / `registerAsyncRpc` throw on duplicate methods
- * (a programming error, not a runtime condition); never call this twice from
- * the same process. Tests that want to drive a handler directly should
- * import the handler and call it, NOT re-register it.
- */
-export function installRpcHandlers(): void {
-  registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
-  registerAsyncRpc("set_autopilot_paused", setAutopilotPausedHandler);
-  registerAsyncRpc("set_autopilot_mode", setAutopilotModeHandler);
-  registerAsyncRpc("set_autopilot_config", setAutopilotConfigHandler);
-  registerAsyncRpc("set_epic_armed", setEpicArmedHandler);
-  registerAsyncRpc("retry_dispatch", retryDispatchHandler);
-  registerAsyncRpc("request_handoff", requestHandoffHandler);
-  registerAsyncRpc("request_await", requestAwaitHandler);
+const RPC_HANDLER_REGISTRATIONS = [
+  {
+    method: "replay_dead_letter",
+    kind: "async",
+    handler: replayDeadLetterHandler,
+  },
+  {
+    method: "set_autopilot_paused",
+    kind: "async",
+    handler: setAutopilotPausedHandler,
+  },
+  {
+    method: "set_autopilot_mode",
+    kind: "async",
+    handler: setAutopilotModeHandler,
+  },
+  {
+    method: "set_autopilot_config",
+    kind: "async",
+    handler: setAutopilotConfigHandler,
+  },
+  {
+    method: "set_epic_armed",
+    kind: "async",
+    handler: setEpicArmedHandler,
+  },
+  {
+    method: "retry_dispatch",
+    kind: "async",
+    handler: retryDispatchHandler,
+  },
+  {
+    method: "request_handoff",
+    kind: "async",
+    handler: requestHandoffHandler,
+  },
+  {
+    method: "request_await",
+    kind: "async",
+    handler: requestAwaitHandler,
+  },
+] as const satisfies readonly RpcRegistration[];
+
+export function installRpcHandlers(registrar: RpcRegistrar): void {
+  registrar.install(RPC_HANDLER_REGISTRATIONS);
 }

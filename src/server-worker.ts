@@ -88,6 +88,18 @@ import {
   type ServerFrame,
 } from "./protocol";
 import { installRpcHandlers } from "./rpc-handlers";
+import {
+  type AsyncRpcHandler,
+  BadParamsError,
+  createRpcRegistry,
+  isMutatingRpcMethod,
+  type ReplayBridge,
+  type RpcHandler,
+  SlugConflictError,
+} from "./rpc-runtime";
+
+export type { AsyncRpcHandler, ReplayBridge, RpcHandler } from "./rpc-runtime";
+export { BadParamsError, SlugConflictError } from "./rpc-runtime";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -1617,237 +1629,28 @@ function clampLimit(limit: number | undefined): number {
 // RPC registry
 // ---------------------------------------------------------------------------
 
-/**
- * Handler signature for a sync RPC. Invoked with the WRITER connection and the
- * frame's `params` (opaque — handlers MUST validate and throw `BadParamsError`
- * on mismatch); the return is framed as `rpc_result.value`. A handler MAY throw
- * (framed `rpc_failed` / `bad_params`); it MUST NOT call `db.close()` or keep
- * connection state across invocations.
- */
-export type RpcHandler = (db: Database, params: unknown) => unknown;
+const RPC_RUNTIME = createRpcRegistry();
 
-/**
- * The seam a worker-side async RPC handler uses to round-trip work through main.
- * Per the "main is the sole writer of the events log" invariant, every async
- * handler that appends events MUST route through a bridge call rather than its
- * own DB write. The implementation lives in `main()`: it posts a request message
- * and awaits the matching reply under a deadline so a wedged main never hangs the
- * keypress.
- */
-export interface ReplayBridge {
-  /**
-   * Recover one oldest waiting dead-letter row. `{ok:true, recovered_dl_id}` on
-   * success (`recovered_dl_id: null` is a clean no-op ack on zero waiting rows);
-   * `{ok:false, error}` if main's transaction crashed. Rejects only on timeout /
-   * transport failure.
-   */
-  replay(): Promise<{
-    ok: boolean;
-    recovered_dl_id?: string | null;
-    error?: string;
-  }>;
-  /**
-   * Flip the in-memory `paused` flag AND relay a `set-paused` command to the
-   * autopilot worker. `{ok:false, error}` if main isn't running an autopilot
-   * worker. The flag is in-memory only and NEVER persisted (boots-paused).
-   */
-  setAutopilotPaused(paused: boolean): Promise<{
-    ok: boolean;
-    error?: string;
-  }>;
-  /**
-   * Append a `DispatchCleared` synthetic event — the only legal way to clear a
-   * sticky failure row out of `dispatch_failures`. The split `verb` +
-   * `dispatch_id` pair lands on the wire (not the composite key) so main treats
-   * the parts as opaque tokens.
-   */
-  retryDispatch(
-    verb: RetryDispatchVerb,
-    dispatch_id: string,
-  ): Promise<{
-    ok: boolean;
-    error?: string;
-  }>;
-  /**
-   * APPEND an `AutopilotMode` synthetic event (folded into `autopilot_state.mode`)
-   * and pump a wake. NO relay — the reconciler re-reads mode from the projection
-   * each cycle.
-   */
-  setAutopilotMode(mode: "yolo" | "armed"): Promise<{
-    ok: boolean;
-    error?: string;
-  }>;
-  /**
-   * APPEND an `AutopilotConfigSet` synthetic event carrying a PARTIAL config
-   * patch (folded into the `autopilot_state` singleton, setting ONLY the patched
-   * columns) and pump a wake. APPEND-ONLY (no relay) — the reconciler re-reads
-   * the config columns from the projection each cycle.
-   */
-  setAutopilotConfig(patch: {
-    max_concurrent_jobs?: number | null;
-    max_concurrent_per_root?: number | null;
-    worktree_mode?: boolean;
-  }): Promise<{
-    ok: boolean;
-    error?: string;
-    /** OPTIONAL stored-vs-effective advisory forwarded from main's reply. */
-    note?: string;
-  }>;
-  /**
-   * APPEND an `EpicArmed` synthetic event (folded into the `armed_epics` PRESENCE
-   * table) and pump a wake. APPEND-ONLY (no relay), no existence validation on
-   * `epic_id` — appends unconditionally to dodge the fold-lag race.
-   */
-  setEpicArmed(
-    epic_id: string,
-    armed: boolean,
-  ): Promise<{
-    ok: boolean;
-    error?: string;
-  }>;
-  /**
-   * APPEND a `HandoffRequested` synthetic event (folded into the durable
-   * `handoffs` projection, status=`requested`) and pump a wake. Main resolves
-   * `initiator_job_id` best-effort by pane before the append (it owns the full
-   * `jobs` projection); null-tolerant. APPEND-ONLY (no relay) — the dispatcher
-   * worker reads the requested set each cycle.
-   */
-  requestHandoff(req: {
-    desired_slug: string;
-    doc_path: string;
-    title: string | null;
-    target_session: string;
-    target_dir: string | null;
-    initiator_session: string | null;
-    initiator_pane: string | null;
-    capture: boolean;
-    model: string | null;
-    effort: string | null;
-    preset: string | null;
-  }): Promise<{
-    ok: boolean;
-    error?: string;
-    /** Set when the failure is a slug collision (vs an ordinary failure). */
-    conflict?: boolean;
-  }>;
-  /** APPEND one AwaitRequested Synthetic event and pump a wake. */
-  requestAwait(req: RequestAwaitRpcParams): Promise<{
-    ok: boolean;
-    error?: string;
-  }>;
-}
+export const RPC_REGISTRY = RPC_RUNTIME.syncHandlers;
+export const ASYNC_RPC_REGISTRY = RPC_RUNTIME.asyncHandlers;
 
-/**
- * Handler signature for an async RPC. Invoked with the request frame's
- * `params` (opaque; validate shape and throw `BadParamsError` on mismatch)
- * AND the {@link ReplayBridge} — the worker→main round-trip surface. The
- * resolved value is framed as `rpc_result.value`. A throw (rejection)
- * frames `rpc_failed` (or `bad_params` for `BadParamsError`). The handler
- * MUST NOT touch any DB connection — every write goes through the bridge.
- *
- * Why a distinct type from {@link RpcHandler}: the existing SYNC handler
- * contract is load-bearing for any file-writing handler (single-threaded JS
- * gives them per-file single-flight for free). The
- * async path is opt-in and isolated; tagging the handler type makes the
- * dispatch shell route the two paths separately and prevents accidental
- * cross-pollination (a sync handler that suddenly returns a Promise would
- * silently break the rev-stamping contract, since `readWorldRev(db)` runs
- * inline after the sync handler today).
- */
-export type AsyncRpcHandler = (
-  params: unknown,
-  bridge: ReplayBridge,
-) => Promise<unknown>;
-
-/**
- * A typed error a handler may throw when its `params` are malformed; the
- * dispatcher catches it and frames an `error` with code `bad_params`,
- * preserving the message. Distinct from a plain throw so the wire `code`
- * reflects the difference between "you sent garbage" and "we crashed".
- */
-export class BadParamsError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BadParamsError";
-  }
-}
-
-/**
- * A typed error a handler may throw when a user-authored unique key already
- * exists (today: a `request_handoff` slug collision). The dispatcher frames an
- * `error` with the DISTINCT code `slug_conflict`, so the CLI can map a duplicate
- * to a machine-distinguishable exit 3 (not `rpc_failed`/exit 1 "we crashed").
- * Reject-not-suffix: the slug is user-chosen, so the loud rejection tells the
- * agent to pick a new one rather than silently mutating their key.
- */
-export class SlugConflictError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SlugConflictError";
-  }
-}
-
-/**
- * The RPC dispatch registry: method name → handler. EMPTY by default at
- * module load — concrete handlers live in `src/rpc-handlers.ts` and install
- * themselves into this registry via `installRpcHandlers()`, which `main()`
- * calls once per worker spawn (so a plain import from a test or a main-thread
- * codepath leaves the registry empty). The registry is process-global,
- * matching the writer connection's process-global ownership in the
- * server-worker.
- *
- * Tests register temporary handlers via `registerRpc` + `unregisterRpc`
- * (the latter is test-only — there is no runtime un-registration path).
- */
-export const RPC_REGISTRY: Map<string, RpcHandler> = new Map();
-
-/**
- * Register an RPC handler. Throws if `method` is already registered — a
- * collision is a programming error, not a runtime condition the dispatcher
- * should silently paper over. Also throws if `method` is already registered
- * as an ASYNC handler ({@link registerAsyncRpc}) — sync vs async is a
- * dispatch-shell decision and a method must pick one.
- */
 export function registerRpc(method: string, handler: RpcHandler): void {
-  if (RPC_REGISTRY.has(method) || ASYNC_RPC_REGISTRY.has(method)) {
-    throw new Error(`RPC method already registered: ${method}`);
-  }
-  RPC_REGISTRY.set(method, handler);
+  RPC_RUNTIME.registerSync(method, handler);
 }
 
-/**
- * Remove a handler. Intended for tests that register a temporary handler and
- * tear it down after; production registrations are install-once. Removes
- * from BOTH the sync and async registries — a test that flipped a method's
- * sync/async kind across runs would otherwise leak across isolates.
- */
-export function unregisterRpc(method: string): void {
-  RPC_REGISTRY.delete(method);
-  ASYNC_RPC_REGISTRY.delete(method);
-}
-
-/**
- * The async-RPC dispatch registry: method name → handler. Mirrors
- * {@link RPC_REGISTRY} but for handlers that round-trip through main via
- * {@link ReplayBridge}. EMPTY by default at module load; concrete async
- * handlers install themselves via `installRpcHandlers()` in
- * `src/rpc-handlers.ts`. Process-global, matching the sync registry's
- * ownership model.
- */
-export const ASYNC_RPC_REGISTRY: Map<string, AsyncRpcHandler> = new Map();
-
-/**
- * Register an async RPC handler. Same collision contract as
- * {@link registerRpc} — a method can be sync OR async, never both.
- */
 export function registerAsyncRpc(
   method: string,
   handler: AsyncRpcHandler,
 ): void {
-  if (ASYNC_RPC_REGISTRY.has(method) || RPC_REGISTRY.has(method)) {
-    throw new Error(`RPC method already registered: ${method}`);
-  }
-  ASYNC_RPC_REGISTRY.set(method, handler);
+  RPC_RUNTIME.registerAsync(method, handler);
+}
+
+export function unregisterRpc(method: string): void {
+  RPC_RUNTIME.unregister(method);
+}
+
+export function resetRpcRegistryForTests(): void {
+  RPC_RUNTIME.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,7 +1890,7 @@ function dispatchRpc(
   if (
     bootGate !== undefined &&
     !bootGate.ready &&
-    MUTATING_RPC_METHODS.has(frame.method)
+    isMutatingRpcMethod(frame.method)
   ) {
     return [
       errorFrame(
@@ -2543,21 +2346,6 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
   }
   return computeEventStoreStatus(catchupStats, eventCount, dbBytes, head);
 }
-
-/** Mutating RPC methods (fn-897 B1) — the state-changing async handlers, gated
- *  behind boot-complete so a consumer never acts on partial state. A read RPC
- *  (none today) would NOT appear here. Kept in sync with `installRpcHandlers()`
- *  in `src/rpc-handlers.ts`. */
-const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
-  "replay_dead_letter",
-  "set_autopilot_paused",
-  "set_autopilot_mode",
-  "set_autopilot_config",
-  "set_epic_armed",
-  "retry_dispatch",
-  "request_handoff",
-  "request_await",
-]);
 
 /**
  * Stamp the boot-status header (fn-897 B1) onto every object-form served frame
@@ -4056,9 +3844,10 @@ function main(): void {
     bootRetry: true,
   });
 
-  // Install every concrete RPC handler. The registries only fill inside a real
-  // worker spawn (the `isMainThread` guard skips `main()` on a plain import).
-  installRpcHandlers();
+  // Installation is atomic and role-qualified, so no listener can observe a
+  // partial registry and imports in other worker roles leave it empty.
+  installRpcHandlers(RPC_RUNTIME);
+  RPC_RUNTIME.assertInstalled();
 
   // Worker→main async-RPC bridge state. Outgoing request messages await their
   // matching result reply by correlation id, resolving with the typed `{ok, …}`

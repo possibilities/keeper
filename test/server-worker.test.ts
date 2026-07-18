@@ -1,14 +1,26 @@
 import type { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
+  ASYNC_RPC_REGISTRY,
+  BadParamsError,
   decodeConnChunk,
   dispatchLine,
   freeConn,
   newConnState,
+  newResultMemo,
+  RPC_REGISTRY,
+  registerAsyncRpc,
+  registerRpc,
+  resetRpcRegistryForTests,
+  SlugConflictError,
   type Writable,
 } from "../src/server-worker";
 
 const encoder = new TextEncoder();
+
+afterEach(() => {
+  resetRpcRegistryForTests();
+});
 
 function fakeDb(): Database {
   return {
@@ -22,6 +34,163 @@ function fakeDb(): Database {
     },
   } as unknown as Database;
 }
+
+describe("server-worker RPC composition", () => {
+  test("a plain main-thread import leaves both registries empty", () => {
+    expect([...RPC_REGISTRY]).toEqual([]);
+    expect([...ASYNC_RPC_REGISTRY]).toEqual([]);
+  });
+
+  test("typed handler errors retain their wire problem-code mapping", () => {
+    registerRpc("bad", () => {
+      throw new BadParamsError("bad input");
+    });
+    registerRpc("conflict", () => {
+      throw new SlugConflictError("slug exists");
+    });
+    registerRpc("failed", () => {
+      throw new Error("handler crashed");
+    });
+
+    const db = fakeDb();
+    const conn = newConnState();
+    const call = (id: string, method: string) =>
+      dispatchLine(
+        db,
+        conn,
+        JSON.stringify({ type: "rpc", id, method, params: null }),
+      );
+
+    expect(call("1", "bad")).toEqual([
+      {
+        type: "error",
+        id: "1",
+        rev: 0,
+        code: "bad_params",
+        message: "bad input",
+      },
+    ]);
+    expect(call("2", "conflict")).toEqual([
+      {
+        type: "error",
+        id: "2",
+        rev: 0,
+        code: "slug_conflict",
+        message: "slug exists",
+      },
+    ]);
+    expect(call("3", "failed")).toEqual([
+      {
+        type: "error",
+        id: "3",
+        rev: 0,
+        code: "rpc_failed",
+        message: "handler crashed",
+      },
+    ]);
+  });
+
+  test("async typed errors retain their wire problem-code mapping", async () => {
+    registerAsyncRpc("bad", async () => {
+      throw new BadParamsError("bad input");
+    });
+    registerAsyncRpc("conflict", async () => {
+      throw new SlugConflictError("slug exists");
+    });
+    registerAsyncRpc("failed", async () => {
+      throw new Error("handler crashed");
+    });
+
+    const db = fakeDb();
+    const conn = newConnState();
+    const call = (id: string, method: string) =>
+      new Promise<unknown[]>((resolve) => {
+        const immediate = dispatchLine(
+          db,
+          conn,
+          JSON.stringify({ type: "rpc", id, method, params: null }),
+          undefined,
+          { bridge: {} as never, onAsyncResult: resolve },
+        );
+        expect(immediate).toEqual([]);
+      });
+
+    expect(await call("1", "bad")).toEqual([
+      {
+        type: "error",
+        id: "1",
+        rev: 0,
+        code: "bad_params",
+        message: "bad input",
+      },
+    ]);
+    expect(await call("2", "conflict")).toEqual([
+      {
+        type: "error",
+        id: "2",
+        rev: 0,
+        code: "slug_conflict",
+        message: "slug exists",
+      },
+    ]);
+    expect(await call("3", "failed")).toEqual([
+      {
+        type: "error",
+        id: "3",
+        rev: 0,
+        code: "rpc_failed",
+        message: "handler crashed",
+      },
+    ]);
+  });
+
+  test("boot gating rejects all eight mutating RPCs before invoking handlers", () => {
+    const methods = [
+      "replay_dead_letter",
+      "set_autopilot_paused",
+      "set_autopilot_mode",
+      "set_autopilot_config",
+      "set_epic_armed",
+      "retry_dispatch",
+      "request_handoff",
+      "request_await",
+    ];
+    let calls = 0;
+    for (const method of methods) {
+      registerRpc(method, () => {
+        calls += 1;
+        return { ok: true };
+      });
+    }
+
+    const db = fakeDb();
+    for (const method of methods) {
+      const frames = dispatchLine(
+        db,
+        newConnState(),
+        JSON.stringify({
+          type: "rpc",
+          id: method,
+          method,
+          params: null,
+        }),
+        undefined,
+        undefined,
+        newResultMemo(),
+        { ready: false },
+      );
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toMatchObject({
+        type: "error",
+        id: method,
+        rev: 0,
+        code: "server_booting",
+      });
+    }
+
+    expect(calls).toBe(0);
+  });
+});
 
 describe("server-worker inbound UTF-8 decode", () => {
   test("keeps a codepoint split across socket chunks intact", () => {
