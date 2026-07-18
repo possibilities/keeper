@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:00:53.525000Z",
+  "depends_on": [],
+  "epic": "fn-1347-escalation-grant-confinement-groundwork",
+  "id": "fn-1347-escalation-grant-confinement-groundwork.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Grant leaf module and grant guard",
+  "updated_at": "2026-07-18T21:00:53.525000Z"
+}
