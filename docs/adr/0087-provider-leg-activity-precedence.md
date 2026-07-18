@@ -63,8 +63,10 @@ an acknowledged cosmetic gap, not covered by this decision.
 - The conservative orphan property survives byte-for-byte: with no leg
   evidence the predicate is unchanged, and an empty leg-activity input keeps
   the readiness pass byte-identical for replay and simulator equivalence.
-- Evidence quality depends on which folded events advance a leg's job row; if
-  a non-progress event ever bumps it, the precedence over-trusts a chatty leg
-  for one window at most. Related lifecycle context: ADR 0056 (wrapped
-  provider-leg window lifecycle), ADR 0069 (leg death notices), ADR 0071
-  (durable wrapper-leg ownership).
+- Evidence quality follows the jobs-row activity contract rather than a
+  progress-only heartbeat: folded events including session telemetry and API
+  annotations advance `jobs.updated_at`. The precedence can therefore over-trust
+  a chatty leg for one staleness window at most; there is deliberately no second
+  ceiling. Related lifecycle context: ADR 0056 (wrapped provider-leg window
+  lifecycle), ADR 0069 (leg death notices), ADR 0071 (durable wrapper-leg
+  ownership).

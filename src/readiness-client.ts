@@ -695,6 +695,42 @@ export function projectGitStatusByProjectDir(
   return out;
 }
 
+export interface ProviderLegOwnershipActivityRow {
+  leg_session_id?: unknown;
+  wrapper_job_id?: unknown;
+  state?: unknown;
+}
+
+/** Build wrapper job id → freshest direct owned live Provider-leg activity. */
+export function projectProviderLegActivityByWrapperJobId(
+  ownershipRows: readonly ProviderLegOwnershipActivityRow[],
+  jobs: ReadonlyMap<string, Pick<Job, "state" | "updated_at">>,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const row of ownershipRows) {
+    if (
+      row.state !== "live" ||
+      typeof row.leg_session_id !== "string" ||
+      typeof row.wrapper_job_id !== "string"
+    ) {
+      continue;
+    }
+    const leg = jobs.get(row.leg_session_id);
+    if (
+      leg === undefined ||
+      (leg.state !== "working" && leg.state !== "stopped") ||
+      !Number.isFinite(leg.updated_at)
+    ) {
+      continue;
+    }
+    const prior = out.get(row.wrapper_job_id);
+    if (prior === undefined || leg.updated_at > prior) {
+      out.set(row.wrapper_job_id, leg.updated_at);
+    }
+  }
+  return out;
+}
+
 /**
  * Project the wire `pending_dispatches` rows into the plain
  * {@link PendingDispatch}[] shape `computeReadiness` consumes for the
@@ -2537,8 +2573,15 @@ export function subscribeReadiness(
       }
       eligibleEpicIds = computeEligibleEpics(armedIds, epicById);
     }
+    const providerLegActivityByWrapperJobId =
+      providerLegOwnership === null
+        ? new Map<string, number>()
+        : projectProviderLegActivityByWrapperJobId(
+            projectRows<ProviderLegOwnershipActivityRow>(providerLegOwnership),
+            jobsTyped,
+          );
     // This client has no pid probe: only the reconcile snapshot injects its
-    // proven-dead worker facts. Leaving that argument absent keeps an ambiguous
+    // proven-dead worker facts. Leaving that argument empty keeps an ambiguous
     // board session conservatively held rather than treating stopped as dead.
     const readiness = computeReadiness(
       epicsTyped,
@@ -2561,6 +2604,11 @@ export function subscribeReadiness(
       // way the reconciler does because both apply the ONE seam to the same {stored,
       // worktree_mode}. Default 1 = today's one-task-per-root mutex (worktree off).
       maxConcurrentPerRoot,
+      // Worktree lane keys are unavailable on this read-side client.
+      new Map(),
+      // Only the reconciler has a producer-side pid liveness probe.
+      new Set(),
+      providerLegActivityByWrapperJobId,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
     // Read from `state.rows` (not `byId.values()`) — the composite

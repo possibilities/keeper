@@ -26,7 +26,7 @@ import {
   monitorSlotWedgeDistressId,
   prepareWorktreeGeometry,
 } from "../src/autopilot-worker";
-import { isJamReason } from "../src/await-conditions";
+import { evaluateAwaitCondition, isJamReason } from "../src/await-conditions";
 import {
   effectivePerRootCap,
   MAX_EFFECTIVE_CONCURRENT_PER_ROOT,
@@ -48,6 +48,7 @@ import {
   type RunningReason,
   type Verdict,
 } from "../src/readiness";
+import { projectProviderLegActivityByWrapperJobId } from "../src/readiness-client";
 import type { HarnessActivity } from "../src/session-activity";
 import type {
   EmbeddedJob,
@@ -254,8 +255,22 @@ function runWithNow(
   subs: SubagentInvocation[],
   now: number,
   jobs: Map<string, Job> = new Map(),
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number> = new Map(),
 ) {
-  return computeReadiness(epics, jobs, subs, new Map(), now);
+  return computeReadiness(
+    epics,
+    jobs,
+    subs,
+    new Map(),
+    now,
+    [],
+    undefined,
+    new Set(),
+    1,
+    new Map(),
+    new Set(),
+    providerLegActivityByWrapperJobId,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +286,7 @@ test("isRootOccupant: real running workers occupy the root", () => {
   expect(isRootOccupant(running({ kind: "job-running" }))).toBe(true);
   expect(isRootOccupant(running({ kind: "sub-agent-running" }))).toBe(true);
   expect(isRootOccupant(running({ kind: "sub-agent-stale" }))).toBe(true);
+  expect(isRootOccupant(running({ kind: "provider-leg-active" }))).toBe(true);
   expect(isRootOccupant(running({ kind: "monitor-running" }))).toBe(true);
   expect(isRootOccupant(running({ kind: "monitor-stale" }))).toBe(true);
 });
@@ -1137,6 +1153,31 @@ test("fn-779 close-row: status:done + stale running sub-agent → running:sub-ag
   const snap = runWithNow([epic], subs, 1200);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     running({ kind: "sub-agent-stale" }),
+  );
+});
+
+test("close-row: fresh Provider-leg activity takes precedence over stale wrapper child evidence", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+      }),
+    ],
+  });
+  const subs = [makeSub({ job_id: "closer-1", status: "running", ts: 1000 })];
+  const snap = runWithNow(
+    [epic],
+    subs,
+    1200,
+    new Map(),
+    new Map([["closer-1", 1150]]),
+  );
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "provider-leg-active" }),
   );
 });
 
@@ -3224,6 +3265,81 @@ test("predicate 6: running sub-agent past staleness window → sub-agent-stale",
   );
 });
 
+test("predicate 6: fresh Provider-leg activity takes precedence over stale wrapper child evidence", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [
+      makeEmbeddedJob({ job_id: "wrapper-1", state: "stopped" }),
+      makeEmbeddedJob({ job_id: "wrapper-2", state: "stopped" }),
+    ],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "wrapper-1", status: "running", ts: 1000 })];
+  const legActivity = projectProviderLegActivityByWrapperJobId(
+    [
+      {
+        wrapper_job_id: "wrapper-2",
+        leg_session_id: "provider-leg-1",
+        state: "live",
+      },
+    ],
+    new Map([["provider-leg-1", { state: "working", updated_at: 1150 }]]),
+  );
+  const snap = runWithNow([epic], subs, 1200, new Map(), legActivity);
+  const verdict = snap.perTask.get(task.task_id);
+  expect(verdict).toEqual(running({ kind: "provider-leg-active" }));
+  expect(formatPill(verdict ?? blocked({ kind: "unknown" }))).toBe(
+    "[running:provider-leg-active]",
+  );
+  expect(isRootOccupant(verdict ?? blocked({ kind: "unknown" }))).toBe(true);
+  expect(
+    evaluateAwaitCondition(
+      { epics: [epic], snapshot: snap, priorPresence: true },
+      { id: task.task_id, kind: "task", condition: "complete" },
+    ).kind,
+  ).toBe("waiting");
+});
+
+test("predicate 6: stale or absent Provider-leg activity preserves sub-agent-stale", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "wrapper-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "wrapper-1", status: "running", ts: 1000 })];
+  expect(runWithNow([epic], subs, 1200).perTask.get(task.task_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+  expect(
+    runWithNow(
+      [epic],
+      subs,
+      1200,
+      new Map(),
+      new Map([["wrapper-1", 1000]]),
+    ).perTask.get(task.task_id),
+  ).toEqual(running({ kind: "sub-agent-stale" }));
+});
+
+test("predicate 6: future-skewed Provider-leg activity counts as fresh", () => {
+  const task = makeTask({
+    worker_phase: "done",
+    jobs: [makeEmbeddedJob({ job_id: "wrapper-1", state: "stopped" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const subs = [makeSub({ job_id: "wrapper-1", status: "running", ts: 1000 })];
+  const snap = runWithNow(
+    [epic],
+    subs,
+    1200,
+    new Map(),
+    new Map([["wrapper-1", 1201]]),
+  );
+  expect(snap.perTask.get(task.task_id)).toEqual(
+    running({ kind: "provider-leg-active" }),
+  );
+});
+
 test("predicate 6: a mix of stale + fresh running sub-agents stays at sub-agent-running", () => {
   // The point of `sub-agent-stale` is "the only live work is suspect".
   // If even one sub-agent on the row is fresh, the row genuinely is
@@ -4757,6 +4873,9 @@ test("formatPill renders the three tags + every reason kind", () => {
   );
   expect(formatPill(running({ kind: "sub-agent-stale" }))).toBe(
     "[running:sub-agent-stale]",
+  );
+  expect(formatPill(running({ kind: "provider-leg-active" }))).toBe(
+    "[running:provider-leg-active]",
   );
   expect(formatPill(blocked({ kind: "git-uncommitted" }))).toBe(
     "[blocked:git-uncommitted]",

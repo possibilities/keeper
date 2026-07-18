@@ -314,6 +314,7 @@ export type RunningReason =
   | { kind: "job-running" }
   | { kind: "sub-agent-running" }
   | { kind: "sub-agent-stale" }
+  | { kind: "provider-leg-active" }
   | { kind: "monitor-running" }
   | { kind: "monitor-stale" };
 
@@ -592,6 +593,12 @@ export function computeReadiness(
   // (producer-side liveness only, so re-fold stays deterministic). Appended LAST
   // so default-reliant call sites stay valid.
   provenDeadJobIds: ReadonlySet<string> = new Set<string>(),
+  // Wrapper job id → freshest owned live Provider-leg jobs-row activity
+  // timestamp (unix seconds). Positive fresh activity takes precedence over an
+  // age-stale wrapper-side sub-agent invocation; an absent/empty map preserves
+  // the conservative `sub-agent-stale` verdict. Appended LAST with an inert
+  // default so positional callers and the simulator remain byte-identical.
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number> = new Map(),
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
@@ -695,6 +702,7 @@ export function computeReadiness(
         pendingKeys,
         matchedPendingKeys,
         provenDeadJobIds,
+        providerLegActivityByWrapperJobId,
       );
       perTask.set(task.task_id, verdict);
     }
@@ -710,6 +718,7 @@ export function computeReadiness(
       pendingKeys,
       matchedPendingKeys,
       blockingFollowupBySource,
+      providerLegActivityByWrapperJobId,
     );
     perCloseRow.set(epic.epic_id, closeVerdict);
   }
@@ -893,6 +902,7 @@ function evaluateTask(
   // upstream terminal check so a proven-dead upstream reads done
   // order-independently. EMPTY on the board / autoclose / test paths.
   provenDeadJobIds: ReadonlySet<string>,
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number>,
 ): Verdict {
   // Record a pending dispatch keyed on THIS task's `work::`/`approve::` verb
   // so the root-fallback doesn't ALSO synthesize a root occupant (the per-row
@@ -962,9 +972,10 @@ function evaluateTask(
 
   // 6. own-progress-sub — a `running` sub-agent under THIS row's worker
   // session blocks. Split on staleness: if EVERY surviving running sub-agent
-  // is past `SUBAGENT_STALENESS_SEC`, render `sub-agent-stale` (a possibly-
-  // stuck orphan); else `sub-agent-running`. Runs AFTER the reducer's bounded
-  // Stop guard clears predicate 5, so this branch sees only survivors.
+  // is past `SUBAGENT_STALENESS_SEC`, fresh owned Provider-leg activity renders
+  // `provider-leg-active`; without it, render `sub-agent-stale` (a possibly-
+  // stuck orphan). Otherwise render `sub-agent-running`. Runs AFTER the reducer's
+  // bounded Stop guard clears predicate 5, so this branch sees only survivors.
   if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
     if (
       allRunningSubagentsAreStale(
@@ -974,6 +985,16 @@ function evaluateTask(
         SUBAGENT_STALENESS_SEC,
       )
     ) {
+      if (
+        anyProviderLegActivityIsFresh(
+          task.jobs,
+          providerLegActivityByWrapperJobId,
+          now,
+          SUBAGENT_STALENESS_SEC,
+        )
+      ) {
+        return { tag: "running", reason: { kind: "provider-leg-active" } };
+      }
       return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
@@ -1184,6 +1205,7 @@ function evaluateCloseRow(
   // pass in `computeReadiness`. Read O(1) by the close-followup predicate below;
   // the close row otherwise receives no cross-epic lookup.
   blockingFollowupBySource: Map<string, Epic>,
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number>,
 ): Verdict {
   // Record a matched `close::<epic_id>` dispatch (before the pipeline returns)
   // so the root-fallback never double-synthesizes a root occupant for it.
@@ -1264,14 +1286,24 @@ function evaluateCloseRow(
   // helpers for re-fold determinism). A not-yet-completed task is excluded and
   // falls through to predicate 10's `dep-on-task`.
   //
-  // Same stale split as the task path: `sub-agent-stale` iff EVERY surviving
-  // running sub-agent across the pooled scopes is past `SUBAGENT_STALENESS_SEC`;
-  // a single fresh sub-agent anywhere keeps the close row at
-  // `sub-agent-running`.
+  // Same stale split as the task path: when EVERY surviving running sub-agent
+  // across the pooled scopes is stale, fresh owned Provider-leg activity wins;
+  // otherwise the row stays `sub-agent-stale`. A single fresh sub-agent anywhere
+  // keeps the close row at `sub-agent-running`.
   if (closeRowHasRunningSubagent(epic, perTask, subRunningByJobId)) {
     if (
       allCloseRowRunningSubagentsAreStale(epic, perTask, subRunningByJobId, now)
     ) {
+      if (
+        closeRowHasFreshProviderLegActivity(
+          epic,
+          perTask,
+          providerLegActivityByWrapperJobId,
+          now,
+        )
+      ) {
+        return { tag: "running", reason: { kind: "provider-leg-active" } };
+      }
       return { tag: "running", reason: { kind: "sub-agent-stale" } };
     }
     return { tag: "running", reason: { kind: "sub-agent-running" } };
@@ -2297,6 +2329,25 @@ function allRunningSubagentsAreStale(
   return true;
 }
 
+/** Positive activity on any directly-owned Provider leg keeps the row fresh. */
+function anyProviderLegActivityIsFresh(
+  embedded: { job_id: string }[] | undefined,
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number>,
+  now: number,
+  threshold: number,
+): boolean {
+  if (embedded === undefined) {
+    return false;
+  }
+  for (const job of embedded) {
+    const updatedAt = providerLegActivityByWrapperJobId.get(job.job_id);
+    if (updatedAt !== undefined && now - updatedAt <= threshold) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Soft-TTL staleness helper for embedded live-monitor facts. Returns
  * `true` iff EVERY live-monitor job has `now - updated_at > threshold`. A single
@@ -2447,6 +2498,41 @@ function closeRowHasRunningSubagent(
       continue;
     }
     if (anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Positive Provider-leg activity across either close-row scope. */
+function closeRowHasFreshProviderLegActivity(
+  epic: Epic,
+  perTask: Map<string, Verdict>,
+  providerLegActivityByWrapperJobId: ReadonlyMap<string, number>,
+  now: number,
+): boolean {
+  if (
+    anyProviderLegActivityIsFresh(
+      epic.jobs,
+      providerLegActivityByWrapperJobId,
+      now,
+      SUBAGENT_STALENESS_SEC,
+    )
+  ) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (perTask.get(task.task_id)?.tag !== "completed") {
+      continue;
+    }
+    if (
+      anyProviderLegActivityIsFresh(
+        task.jobs,
+        providerLegActivityByWrapperJobId,
+        now,
+        SUBAGENT_STALENESS_SEC,
+      )
+    ) {
       return true;
     }
   }

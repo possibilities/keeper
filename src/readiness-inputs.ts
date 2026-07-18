@@ -32,6 +32,7 @@ import { orderEpicsForScheduling, type PendingDispatch } from "./readiness";
 import {
   projectGitStatusByProjectDir,
   projectPendingDispatches,
+  projectProviderLegActivityByWrapperJobId,
 } from "./readiness-client";
 import { runQuery } from "./server-worker";
 import {
@@ -83,6 +84,8 @@ export interface ReadinessInputs {
   /** Open `pending_dispatches` rows (launched-but-not-yet-bound workers), built
    *  through the SOLE `projectPendingDispatches` builder. */
   pendingDispatches: PendingDispatch[];
+  /** Wrapper job id → freshest owned live Provider-leg activity timestamp. */
+  providerLegActivityByWrapperJobId: Map<string, number>;
   /** Durable Dispatch claims remain separate from launch-window reservations. */
   dispatchClaims: DispatchClaim[];
   /** Canonical Harness activity keyed by Harness session id. */
@@ -160,6 +163,12 @@ export function loadReadinessInputs(
     read("subagent_invocations") as unknown as SubagentInvocation[],
   );
 
+  const providerLegActivityByWrapperJobId =
+    projectProviderLegActivityByWrapperJobId(
+      read("provider_leg_ownership"),
+      jobs,
+    );
+
   const gitStatusByProjectDir = projectGitStatusByProjectDir(
     read("git") as unknown as GitStatus[],
   );
@@ -217,6 +226,7 @@ export function loadReadinessInputs(
     subagentInvocations,
     gitStatusByProjectDir,
     pendingDispatches,
+    providerLegActivityByWrapperJobId,
     dispatchClaims,
     harnessActivityByJobId,
     unseededRoots,
