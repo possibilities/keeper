@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-touching envelope fields across three verbs plus a subtle sidecar-vs-env correctness invariant (ALREADY_MINE preserve-if-empty) warrant xhigh, while the delicate refusal-narrowing prose, committed-vocabulary ADR corollary, and in-repo idiom matching make this judgment-heavy sonnet work rather than a GPT tier, yet the design is already named and resolved so opus is not gated.",
+      "task_id": "fn-1338-surface-dispatched-cell-to-workers.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T16:59:59.565000Z",
+  "epic_id": "fn-1338-surface-dispatched-cell-to-workers",
+  "input_hash": "5e98c577f1258ec884fcc0c7529e2f7b611e3b8eee026c9100b2abad1e51a7fb",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1587070327,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1338-surface-dispatched-cell-to-workers.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Contract-touching envelope fields across three verbs plus a subtle sidecar-vs-env correctness invariant (ALREADY_MINE preserve-if-empty) warrant xhigh, while the delicate refusal-narrowing prose, committed-vocabulary ADR corollary, and in-repo idiom matching make this judgment-heavy sonnet work rather than a GPT tier, yet the design is already named and resolved so opus is not gated.\",\"confidence\":0.7}]}\n"
+}
