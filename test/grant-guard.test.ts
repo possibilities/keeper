@@ -421,6 +421,147 @@ describe("decideGrantGuard — Bash", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Incident-clearing retry — `keeper autopilot retry <verb::id>` is bound to the
+// grant's OWN incident id; a granted subagent re-arms its own incident only.
+// ---------------------------------------------------------------------------
+
+describe("decideGrantGuard — incident-clearing retry", () => {
+  function grantFor(
+    agentType: GrantLeaf["agent_type"],
+    role: GrantLeaf["role"],
+    incidentId: string,
+  ): GrantVerdict {
+    return {
+      kind: "valid",
+      grant: {
+        schema_version: 1,
+        parent_job_id: "job-1",
+        agent_type: agentType,
+        incident_id: incidentId,
+        attempt_id: "att-1",
+        instance_event_id: 42,
+        writable_root: ROOT,
+        role,
+        expires_at: 9_999_999,
+        fencing_token: 7,
+      },
+    };
+  }
+  const repairGrant = grantFor("repairer", "repair", "repair::keeper");
+
+  test("a granted subagent may retry its OWN incident", () => {
+    expect(
+      decideGrantGuard(
+        bashPayload("repairer", "keeper autopilot retry repair::keeper"),
+        deps({ grant: repairGrant }),
+      ),
+    ).toBeNull();
+  });
+
+  test("retrying a SIBLING's incident is denied", () => {
+    const d = decideGrantGuard(
+      bashPayload("repairer", "keeper autopilot retry repair::other-repo"),
+      deps({ grant: repairGrant }),
+    );
+    expect(d?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(d?.hookSpecificOutput.permissionDecisionReason).toContain("foreign");
+  });
+
+  test("a close-incident resolver retries only its own close key", () => {
+    expect(
+      decideGrantGuard(
+        bashPayload("merge-resolver", "keeper autopilot retry close::fn-1-x"),
+        deps({ grant: validGrant() }),
+      ),
+    ).toBeNull();
+    expect(
+      decideGrantGuard(
+        bashPayload("merge-resolver", "keeper autopilot retry close::fn-2-y"),
+        deps({ grant: validGrant() }),
+      ),
+    ).not.toBeNull();
+  });
+
+  test("retry is denied without a valid grant (no incident to match)", () => {
+    const noGrant: Array<GrantVerdict | undefined> = [
+      undefined, // absent
+      { kind: "expired" },
+      { kind: "tuple-mismatch", detail: "incident" },
+    ];
+    for (const verdict of noGrant) {
+      expect(
+        decideGrantGuard(
+          bashPayload("repairer", "keeper autopilot retry repair::keeper"),
+          deps(verdict === undefined ? {} : { grant: verdict }),
+        ),
+      ).not.toBeNull();
+    }
+  });
+
+  test("retry with no target, or a second target, is denied", () => {
+    expect(
+      decideGrantGuard(
+        bashPayload("repairer", "keeper autopilot retry"),
+        deps({ grant: repairGrant }),
+      ),
+    ).not.toBeNull();
+    expect(
+      decideGrantGuard(
+        bashPayload(
+          "repairer",
+          "keeper autopilot retry repair::keeper repair::keeper",
+        ),
+        deps({ grant: repairGrant }),
+      ),
+    ).not.toBeNull();
+  });
+
+  test("the optional --sock flag rides alongside the granted target", () => {
+    expect(
+      decideGrantGuard(
+        bashPayload(
+          "repairer",
+          "keeper autopilot retry repair::keeper --sock /tmp/k.sock",
+        ),
+        deps({ grant: repairGrant }),
+      ),
+    ).toBeNull();
+  });
+
+  test("a non-retry autopilot subcommand stays denied", () => {
+    for (const cmd of [
+      "keeper autopilot play",
+      "keeper autopilot pause",
+      "keeper autopilot mode yolo",
+    ]) {
+      expect(
+        decideGrantGuard(
+          bashPayload("repairer", cmd),
+          deps({ grant: repairGrant }),
+        ),
+      ).not.toBeNull();
+    }
+  });
+
+  test("retry is incident-keyed, not write-keyed — the unblocker clears its own", () => {
+    const unblockGrant = grantFor("unblocker", "unblock", "close::fn-9-z");
+    expect(
+      decideGrantGuard(
+        bashPayload("unblocker", "keeper autopilot retry close::fn-9-z"),
+        deps({ grant: unblockGrant }),
+      ),
+    ).toBeNull();
+    // ...but never a sibling's incident.
+    expect(
+      decideGrantGuard(
+        bashPayload("unblocker", "keeper autopilot retry close::fn-1-x"),
+        deps({ grant: unblockGrant }),
+      ),
+    ).not.toBeNull();
+  });
+});
+
 test("decideGrantGuard: a non-governed read tool is inert for a confined agent", () => {
   expect(
     decideGrantGuard(

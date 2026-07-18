@@ -51,6 +51,10 @@ import {
 export interface RoleConfig {
   readonly role: EscalationRole;
   readonly writeCapable: boolean;
+  /** The valid grant's incident id, or null/undefined when there is no valid
+   *  grant — bounds which `keeper autopilot retry <verb::id>` the subagent may
+   *  run to its OWN incident. */
+  readonly incidentId?: string | null;
 }
 
 /** `keeper <sub>` subcommands the read/board subset allows for EVERY role. */
@@ -521,6 +525,51 @@ function isNamedBunScript(target: string | undefined): boolean {
   );
 }
 
+/** `keeper autopilot retry <verb::id>` is an incident-CLEARING verb: a granted
+ *  subagent may re-arm its OWN incident, never a sibling's. Allowed only when a
+ *  valid grant names this exact incident id; a grant-less subagent, a foreign or
+ *  missing target, a second target, or an unrecognized option denies. Tracks the
+ *  `retry` CLI surface (`<verb::id> [--sock <path>]`); every other `autopilot`
+ *  subcommand (pause/play/mode/…) is off-list. */
+function classifyAutopilotRetry(
+  tokens: string[],
+  cfg: RoleConfig,
+): string | null {
+  if (tokens[2] !== "retry") {
+    return `\`keeper autopilot ${tokens[2] ?? ""}\` is not permitted (only \`retry\`)`;
+  }
+  const incidentId = cfg.incidentId ?? null;
+  if (incidentId === null) {
+    return "`keeper autopilot retry` requires a valid grant naming the incident it may clear";
+  }
+  let target: string | undefined;
+  for (let i = 3; i < tokens.length; i++) {
+    const arg = tokens[i] as string;
+    if (arg === "--sock") {
+      if (tokens[i + 1] === undefined || tokens[i + 1]?.startsWith("-")) {
+        return "`keeper autopilot retry --sock` requires a value";
+      }
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--sock=")) continue;
+    if (arg.startsWith("-")) {
+      return `\`keeper autopilot retry ${arg}\` carries an unrecognized option`;
+    }
+    if (target !== undefined) {
+      return "`keeper autopilot retry` permits exactly one incident target";
+    }
+    target = arg;
+  }
+  if (target === undefined) {
+    return "`keeper autopilot retry` requires the granted incident id as its target";
+  }
+  if (target !== incidentId) {
+    return `\`keeper autopilot retry ${target}\` targets a foreign incident; the grant authorizes clearing only '${incidentId}'`;
+  }
+  return null;
+}
+
 /** Classify one already-wrapper-stripped segment's executable against the role.
  *  Returns a deny reason, or null when the command is on the role's allowlist. */
 function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
@@ -545,9 +594,7 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
         : `\`keeper commit-work\` is write-capable and denied for the diagnosis role '${cfg.role}'`;
     }
     if (sub === "autopilot") {
-      return tokens[2] === "retry"
-        ? null
-        : `\`keeper autopilot ${tokens[2] ?? ""}\` is not permitted (only \`retry\`)`;
+      return classifyAutopilotRetry(tokens, cfg);
     }
     if (KEEPER_READ_SUBCOMMANDS.has(sub)) return null;
     return `\`keeper ${sub}\` is not on the escalation allowlist`;
@@ -773,6 +820,7 @@ const MALFORMED_REASON =
 
 interface ResolvedGrant {
   writableRoot: string | null;
+  incidentId: string | null;
   writeCapable: boolean;
   verdictKind: GrantVerdict["kind"];
 }
@@ -787,6 +835,7 @@ function resolveGrant(
   const valid = verdict.kind === "valid";
   return {
     writableRoot: valid ? verdict.grant.writable_root : null,
+    incidentId: valid ? verdict.grant.incident_id : null,
     // The unblocker never writes source even holding a valid grant.
     writeCapable: valid && roleIsWriteCapable(role),
     verdictKind: verdict.kind,
@@ -833,7 +882,11 @@ function decideBash(
 ): GrantGuardDenyEnvelope | null {
   const command = payload.tool_input?.command;
   if (typeof command !== "string") return denyEnvelope(MALFORMED_REASON);
-  const cfg: RoleConfig = { role, writeCapable: grant.writeCapable };
+  const cfg: RoleConfig = {
+    role,
+    writeCapable: grant.writeCapable,
+    incidentId: grant.incidentId,
+  };
   const violation = evaluateGrantBash(command, cfg);
   if (violation !== null) return denyEnvelope(bashReason(role, violation));
   // The command cleared the allowlist. A write-capable command (git/build/
