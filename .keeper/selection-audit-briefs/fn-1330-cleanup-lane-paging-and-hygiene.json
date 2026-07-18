@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 27,
+        "files_changed": 4,
+        "insertions": 180
+      },
+      "done_summary": "Injected a producer-side presence seam distinguishing confirmed-absent (ENOENT/ENOTDIR) from unknown lane probes, so a worktree-lane-backup-failed distress row now clears on positive absence evidence even when repo enumeration is incomplete, while still retaining rows for present or unenumerable lanes; added deterministic in-process coverage and the docs/problem-codes.md + ADR 0053 amendment.",
+      "input_hash": "27bc1df72e26e241ace27054e0c949160ad52889baf57250e58cae4bb790f9f4",
+      "model": "opus",
+      "spec_chars": 3648,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/autopilot-worker.ts, test/autopilot-worker.test.ts, docs/problem-codes.md\n\n### Approach\n\nInvestigation-first: build a deterministic in-process red repro for how an absent\nlane's `worktree-lane-backup-failed` row escaped the dir-keyed clear arm, then fix\nthe falsified seam. Two verified candidate causes: (1) `normalizeLanePath`\n(realpathSync.native) resolves symlinked prefixes while the lane exists but falls\nback to the raw path once absent, so the mint-time hash and the clear-time key\ndiverge across the present-to-absent transition (the /tmp -> /private/tmp class);\n(2) the clear is gated on `laneEnumerationComplete` and an enumeration failure\nwindow suppresses every clear cycle-after-cycle. Inject a normalize seam into the\nproducer (the fs call is not currently injectable) so the repro stays pure and\nin-process; falsify one hypothesis before fixing. The fix must define \"confirmed\nabsent\" vs \"unknown\" explicitly and never over-clear a present-but-unenumerable\nlane \u2014 the enumeration gate is today's only false-clear protection. Normalization\nstays strictly producer-side (never fold-reachable). Add the missing\n`lane-backup-failed` row to docs/problem-codes.md matching its table shape; amend\nADR 0053 only if clear-arm semantics change.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/autopilot-worker.ts:576 \u2014 normalizeLanePath realpath fallback asymmetry\n- src/autopilot-worker.ts:2077,2114 \u2014 mint (hash of normalized path, `dir: key`); :2132,2147 \u2014 finishCycle clear + early return; :8045 \u2014 allowClear gate; :9026-9032 \u2014 id-prefix routing; :10383 \u2014 openBackupPaths snapshot\n- src/dispatch-failure-key.ts:326-338 \u2014 LANE_BACKUP_DISTRESS_ID_PREFIX + key family predicates\n\n**Optional** (reference as needed):\n- src/worktree-git.ts:1990-2210, plugins/plan/src/epic_lane_teardown.ts:273-339 \u2014 backup-failed producers\n- test/worktree-git.test.ts:1437,1636,1661; test/autopilot-worker.test.ts:18001 \u2014 existing producer coverage; test/dispatch-failure-key.test.ts:677 \u2014 key classification\n\n### Risks\n\n- A more aggressive clear could mass-clear legitimate open distress rows on a live cycle \u2014 these rows are not human-recoverable via retry_dispatch\n- Fixing the wrong seam (normalization vs enumeration-gate) leaves the escape latent\n\n### Test notes\n\nPure, in-process, clock- and normalize-injected: mint under a \"present\" normalize\nmapping, flip to \"absent\" behavior, assert today's escape (red), then green under\nthe fix. Cover the mint-while-already-absent edge (raw-path dir stored). Assert a\npresent-but-unenumerable lane retains its row.\n\n## Acceptance\n\n- [ ] A deterministic test reproduces the clear-arm escape under the injected normalize seam and pins which candidate cause is real\n- [ ] The fixed producer clears an absent lane's backup-failed row and retains the row for a present-but-unenumerable lane\n- [ ] Mint-while-absent stores a key the later clear actually matches\n- [ ] docs/problem-codes.md carries the lane-backup-failed row; ADR 0053 amended only if semantics changed\n- [ ] Named test gates for the touched suites pass\n\n## Done summary\nInjected a producer-side presence seam distinguishing confirmed-absent (ENOENT/ENOTDIR) from unknown lane probes, so a worktree-lane-backup-failed distress row now clears on positive absence evidence even when repo enumeration is incomplete, while still retaining rows for present or unenumerable lanes; added deterministic in-process coverage and the docs/problem-codes.md + ADR 0053 amendment.\n## Evidence\n",
+      "task_id": "fn-1330-cleanup-lane-paging-and-hygiene.1",
+      "tier": "xhigh",
+      "title": "Lane clear-arm red repro"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 19,
+        "files_changed": 4,
+        "insertions": 213
+      },
+      "done_summary": "Consolidated agentbot paging onto one shared helper: configured absolute binary path (config-over-default), pre-spawn executable probe, array-form argv, and a log-once absence latch feeding the existing paging-channel distress row. All daemon.ts page callers already routed through the single notifyHuman/sendAgentbotPage call site, so migrating it covered every page trigger including the maintenance-worker relay sink. Extended the truth-table test and updated problem-codes.md for transport-name consistency.",
+      "input_hash": "27bc1df72e26e241ace27054e0c949160ad52889baf57250e58cae4bb790f9f4",
+      "model": "gpt-5.5",
+      "spec_chars": 3249,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/integrity-probe.ts, src/daemon.ts, src/maintenance-worker.ts, test/daemon.test.ts, docs/problem-codes.md\n\n### Approach\n\nOne shared agentbot spawn helper becomes the sole page transport: configured\nabsolute binary path (config-resolved, defaulting to the installed absolute\nlocation; never bare PATH resolution \u2014 the LaunchAgent PATH excludes it),\npre-spawn existence/executability probe, array-form argv, and the existing\noutcome classifier (spawn-throw/absence = permanent, non-zero = transient). All\nraw daemon.ts page spawns and the maintenance-worker sink adopt it so the two\nsilently-diverging transports collapse into one. A permanently absent binary\ndegrades with a log-once latch (mirror the paged-once discipline) and the\nexisting paging-channel distress row \u2014 never a per-sweep spam line, never a\ncrash. Verify the degrade under a stripped launchd-shaped environment. Update the\nproblem-codes Operator paging section for transport-name consistency.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/integrity-probe.ts:203-256 \u2014 sendAgentbotPage, AgentbotPageOutcome, classifyAgentbotPageOutcome (the helper to generalize)\n- src/daemon.ts:1556,1582,1608,2917,3115,12796 \u2014 the raw page spawn sites to migrate; :698-711 decidePagingChannelDistress\n- src/maintenance-worker.ts \u2014 its notifier sink\n\n**Optional** (reference as needed):\n- test/daemon.test.ts:272+ \u2014 the page-helper truth table to extend; test/reducer-projections.test.ts:2117 \u2014 non-terminal agentbot-failure marker\n\n### Risks\n\n- A config key nobody sets plus a wrong default silently kills ALL paging \u2014 the existence probe plus distress row must make absence loud\n- Worker-thread sites must keep imports within their allowed dependency set\n\n### Test notes\n\nExtend the existing truth table: absolute-path resolution order (config over\ndefault), absence yields permanent_failure + one latched log line across repeated\nsweeps, transient non-zero unchanged, delivery unchanged. A stripped-env\n(launchd-shaped PATH) case proves bare-name resolution is gone.\n\n## Acceptance\n\n- [ ] Every agentbot page site routes through the shared helper with a configured absolute path and existence probe; no bare-name PATH spawn remains\n- [ ] A permanently absent binary logs once, mints the existing paging-channel distress, and never crashes or spams\n- [ ] The truth-table test covers config-over-default resolution, latched absence, transient, and delivery\n- [ ] docs/problem-codes.md paging section names the transport consistently\n- [ ] Named test gates for the touched suites pass\n\n## Done summary\nConsolidated agentbot paging onto one shared helper: configured absolute binary path (config-over-default), pre-spawn executable probe, array-form argv, and a log-once absence latch feeding the existing paging-channel distress row. All daemon.ts page callers already routed through the single notifyHuman/sendAgentbotPage call site, so migrating it covered every page trigger including the maintenance-worker relay sink. Extended the truth-table test and updated problem-codes.md for transport-name consistency.\n## Evidence\n",
+      "task_id": "fn-1330-cleanup-lane-paging-and-hygiene.2",
+      "tier": "high",
+      "title": "Shared agentbot spawn helper"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 11,
+        "insertions": 862
+      },
+      "done_summary": "Migrated the six raw-NUL composite-key separators to a shared src/composite-key.ts constant and added scripts/lint-source.ts, a source-wide comments-only lint banning net-new NUL literals and fn-id/provenance comments behind a committed shrink-only allowlist, with false-positive fixtures for string literals and hex digests; wired into bun run lint and CLAUDE.md rule #0 updated in place.",
+      "input_hash": "27bc1df72e26e241ace27054e0c949160ad52889baf57250e58cae4bb790f9f4",
+      "model": "gpt-5.5",
+      "spec_chars": 3636,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** scripts/lint-claude-md.ts, scripts/lint-source.ts, src/composite-key.ts, scripts/backstop-stats.ts, src/backstop-telemetry.ts, src/readiness.ts, test/lint-claude-md.test.ts, CLAUDE.md\n\n### Approach\n\nTwo coupled hygiene moves. First, the six deliberate raw-NUL composite-key\nseparators migrate to one shared named constant in a new dep-free module so the\nseparator is defined exactly once; investigate leak-reachability of those keys to\nemission sinks and escape at the sink only if actually reachable. Second, a\nsource-wide lint (modeled on the lint-retired-name walker: explicit globs,\nexclusion list, pure scan functions) enforces two rules: no net-new raw NUL\nliteral outside the shared-constant module, and no fn-id/provenance comments \u2014\nCOMMENTS-ONLY matching with a tight token (the repo id shape), never raw file\ntext, with fixtures trapping \"fn-123\" inside a string literal and a SHA-256 hex.\nExisting violations freeze into a committed shrink-only per-file allowlist\n(fail on net-new, never demand a big-bang cleanup \u2014 the corpus is ~1,700 comment\nhits). Exempt: the lint's own file and fixtures, CLAUDE.md/AGENTS.md (symlink\ndouble-hit), plugins/plan/CLAUDE.md, .keeper/, docs/adr/. Wire into the existing\nlint entrypoint; keep runtime bounded with extension/size/path short-circuits.\nTouch CLAUDE.md rule #0 in place (two lines, prune not grow) to state the widened\ngate.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- scripts/lint-claude-md.ts:44-61 \u2014 CONTENT_PATTERNS (fn-id + provenance regexes to reuse); :163-188 \u2014 the two-literal-path main to leave intact\n- scripts/lint-retired-name.ts \u2014 the walker/exclusion/count idiom to model on (self-exemption pattern included)\n- scripts/backstop-stats.ts:89; src/backstop-telemetry.ts:187,363; src/readiness.ts:1817,1821,1887 \u2014 the six NUL separator sites\n\n**Optional** (reference as needed):\n- test/lint-claude-md.test.ts, test/lint-retired-name.test.ts, test/lint-matrix.test.ts \u2014 fixture idioms\n- package.json lint script \u2014 the gate wiring point\n\n### Risks\n\n- The lint file and CLAUDE.md edit contain the banned tokens by construction \u2014 self-exemption is load-bearing\n- readiness.ts is shared surface: keep the constant migration mechanical, no behavior change\n\n### Test notes\n\nFixture-driven: valid/invalid cases per rule including the false-positive traps;\nallowlist shrink-only enforcement (a file dropping to zero cannot regress);\nsymlink de-dupe; runtime bound sanity on the full tree. Verify `bun run lint`\nstays green on current main after the freeze.\n\n## Acceptance\n\n- [ ] The six NUL separator sites import one shared named constant; raw NUL literals elsewhere fail the lint\n- [ ] The comments-only fn-id/provenance rule runs source-wide behind a committed shrink-only allowlist, with false-positive fixtures proving string literals and hex digests do not trip it\n- [ ] The full lint matrix passes on the frozen tree and fails on injected net-new violations\n- [ ] CLAUDE.md rule #0 states the widened gate in place without growing\n- [ ] Named test gates for the touched suites pass\n\n## Done summary\nMigrated the six raw-NUL composite-key separators to a shared src/composite-key.ts constant and added scripts/lint-source.ts, a source-wide comments-only lint banning net-new NUL literals and fn-id/provenance comments behind a committed shrink-only allowlist, with false-positive fixtures for string literals and hex digests; wired into bun run lint and CLAUDE.md rule #0 updated in place.\n## Evidence\n",
+      "task_id": "fn-1330-cleanup-lane-paging-and-hygiene.3",
+      "tier": "high",
+      "title": "NUL constant and source lint"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 8,
+        "files_changed": 4,
+        "insertions": 131
+      },
+      "done_summary": "keeper plan epics envelope and human output now name the resolved project (name + path); no-project error path unchanged.",
+      "input_hash": "27bc1df72e26e241ace27054e0c949160ad52889baf57250e58cae4bb790f9f4",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1646,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/src/verbs/epics.ts, plugins/plan/test/epics.test.ts\n\n### Approach\n\n`keeper plan epics` stays cwd-only by charter, but its output self-identifies the\nresolved project so a listing from a foreign cwd (another git repo carrying its\nown stale `.keeper/`, as the dotfiles repo does) can never be silently mistaken\nfor a different board: the JSON envelope gains the resolved project root and\nname, and the human output leads with one identity line. The genuine no-project\nerror path is unchanged. Document the field in the verb's help.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/src/verbs/epics.ts:53-90 \u2014 runEpics resolve + list + slice; plugins/plan/src/cli.ts:766 \u2014 the default limit 50\n- plugins/plan/src/project.ts:76-83 \u2014 cwd-only resolveProject (the charter to preserve); :101-166 \u2014 the cwd-then-global charter that id verbs use (contrast, not adopt)\n\n**Optional** (reference as needed):\n- plugins/plan/src/state_path.ts:35-55 \u2014 resolveDataDir seam\n\n### Test notes\n\nDrive the verb in a temp project: envelope carries root+name; a second temp\nproject proves the identity distinguishes boards; no-project error unchanged.\n\n## Acceptance\n\n- [ ] The epics envelope and human output name the resolved project root\n- [ ] The no-project error path is unchanged and non-zero\n- [ ] The plan test gate passes\n\n## Done summary\nkeeper plan epics envelope and human output now name the resolved project (name + path); no-project error path unchanged.\n## Evidence\n",
+      "task_id": "fn-1330-cleanup-lane-paging-and-hygiene.4",
+      "tier": "medium",
+      "title": "Label plan epics project"
+    }
+  ],
+  "created_at": "2026-07-18T11:39:32.957000Z",
+  "epic_id": "fn-1330-cleanup-lane-paging-and-hygiene",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "27bc1df72e26e241ace27054e0c949160ad52889baf57250e58cae4bb790f9f4",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
