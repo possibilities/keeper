@@ -264,6 +264,94 @@ test("cutoff: a GitRootDropped at id <= floor NO-OPS (does not DELETE a freshly-
   expect(gitStatusRow("/repo")).not.toBeNull();
 });
 
+test("#1346 retract: a null-attribution GitRootDropped DELETEs a phantom row that has no prior floor row", () => {
+  // The torn-down-lane retire path posts `attribution_event_id: null` (a vanished
+  // root has no status observation to bind a watermark). This proves the DELETE is
+  // REACHABLE for the null case: a watched, snapshotted lane always carries a
+  // NUMERIC `git_status.attribution_event_id` (the column is `INTEGER NOT NULL
+  // DEFAULT 0`, and projectGitStatus always writes a validated ceiling), so
+  // readRootAttributionFloor returns a non-null floor from the row itself even with
+  // NO separate `attribution-floor` row — the prior-floor early return never fires,
+  // and the retract runs to the row DELETE. No fold reorder is needed.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    data: gitSnapshotData("/repo", ["a.ts"]),
+  });
+  drainAll();
+  expect(gitStatusRow("/repo")).not.toBeNull();
+  // No prior `attribution-floor` row exists yet — the row's own numeric
+  // attribution_event_id is the sole floor evidence.
+  const floorRowsBefore = db
+    .query(
+      "SELECT COUNT(*) AS n FROM file_attributions WHERE op = 'attribution-floor' AND project_dir = '/repo'",
+    )
+    .get() as { n: number };
+  expect(floorRowsBefore.n).toBe(0);
+
+  // A vanished-root tombstone (null attribution) ABOVE the git floor.
+  insertEvent({ hook_event: "GitRootDropped", session_id: "/repo" });
+  drainAll();
+
+  // The phantom row is gone, and the retract compacted a single impossible-path
+  // floor row (the boundary that keeps a returning root from resurrecting history).
+  expect(gitStatusRow("/repo")).toBeNull();
+  const floorRowsAfter = db
+    .query(
+      "SELECT COUNT(*) AS n FROM file_attributions WHERE op = 'attribution-floor' AND project_dir = '/repo'",
+    )
+    .get() as { n: number };
+  expect(floorRowsAfter.n).toBe(1);
+});
+
+test("#1346 retract: post-tombstone snapshot resurrection is impossible — a below-floor stale snapshot is suppressed", () => {
+  // FINDING (stated per the task): snapshots and tombstones travel the SAME
+  // git-worker→main MessagePort, so main folds them in strict emit/event-id order.
+  // A snapshot emitted BEFORE a tombstone is therefore ALWAYS folded before it —
+  // no stale snapshot can arrive AFTER the tombstone to re-create the row. Single-
+  // channel ordering, not the reducer floor gate, is the primary guarantee: the
+  // floor gate suppresses attribution STRICTLY below the drop floor but would admit
+  // an attribution EQUAL to it, so a hypothetical reordered same-watermark snapshot
+  // is ruled out only by the channel order. This test asserts the reducer's
+  // belt-and-suspenders half: a below-floor stale snapshot never resurrects the row.
+
+  // A filler event so the snapshot's bound watermark is positive (there is a
+  // below-floor id to model a stale snapshot with).
+  insertEvent({ hook_event: "PostToolUse", session_id: "/repo" });
+  const floorId = insertEvent({
+    hook_event: "GitSnapshot",
+    data: gitSnapshotData("/repo", ["a.ts"]),
+  });
+  drainAll();
+  expect(gitStatusRow("/repo")).not.toBeNull();
+
+  // Tombstone (null attribution) → row deleted, drop floor installed at the row's
+  // prior numeric attribution.
+  insertEvent({ hook_event: "GitRootDropped", session_id: "/repo" });
+  drainAll();
+  expect(gitStatusRow("/repo")).toBeNull();
+
+  // A STALE snapshot (models one reordered after the tombstone) carrying a watermark
+  // BELOW the installed floor. The reducer suppresses it — no resurrection.
+  insertEvent({
+    hook_event: "GitSnapshot",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "abc123",
+      upstream: "origin/main",
+      ahead: 0,
+      behind: 0,
+      dirty_files: [{ path: "a.ts", xy: " M", mtime_ms: null }],
+      // Explicit, below the drop floor (the filler event's id, < the snapshot id
+      // the drop floor was installed at). The helper leaves an explicit watermark
+      // untouched.
+      attribution_event_id: floorId - 2,
+    }),
+  });
+  drainAll();
+  expect(gitStatusRow("/repo")).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // mintPlanFileAttributions gate
 // ---------------------------------------------------------------------------
