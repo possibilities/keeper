@@ -60,5 +60,5 @@ the wrapped partial; rendered manifests carry it post-recompile.
 - [ ] The plan test gate passes with the extended envelope assertions
 
 ## Done summary
-
+Surfaced dispatched_model/dispatched_tier/dispatch_constraint from the stamped runtime sidecar in the claim, worker-resume, and resolve-task envelopes (omitted when unconstrained; ALREADY_MINE preserves the prior stamp); documented the wrapped-worker Dispatched cell validation invariant in the templates; amended ADR 0047 with the envelope corollary.
 ## Evidence
