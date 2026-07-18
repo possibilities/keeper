@@ -151,9 +151,9 @@ interface ClaimArgs {
   format: OutputFormat | null;
 }
 
-/** The dispatch-injected effective-cell env contract, shared with the dispatch
+/** The dispatch-injected Dispatched cell env contract, shared with the dispatch
  * seam: launchers always emit the three vars, non-empty exactly when a
- * provider constraint translated the assigned cell. Reads dispatchConstraint
+ * Provider constraint translated the assigned cell. Reads dispatchConstraint
  * as the non-empty gate — model/tier ride along only when it fires. */
 function readDispatchConstraint(): {
   dispatchedModel: string;
@@ -269,11 +269,14 @@ export function runClaim(args: ClaimArgs): void {
     dataDir,
   });
 
+  const dispatch = readDispatchConstraint();
+
   // CAS under lock: read-merge-decide-write in one lock.
   let outcome = "CLAIMED";
   let claimedAt = "";
   let claimNoteFinal = "";
   let briefRef = "";
+  let dispatchedResponse: Record<string, string> = {};
 
   stateStore.withTaskLock(taskId, () => {
     const runtime = stateStore.loadRuntime(taskId);
@@ -331,17 +334,37 @@ export function runClaim(args: ClaimArgs): void {
       evidence: "evidence" in merged ? merged.evidence : null,
       blocked_reason: null,
     };
-    // Capture the dispatched cell at claim time. saveRuntime overwrites the
-    // whole sidecar, so an unconstrained claim clearing stale values needs no
-    // explicit delete — simply not adding the keys here is enough. Never
-    // touches task.model/task.tier (the definition cells) or the selection
-    // sidecar.
-    const { dispatchedModel, dispatchedTier, dispatchConstraint, constrained } =
-      readDispatchConstraint();
-    if (constrained) {
-      newState.dispatched_model = dispatchedModel;
-      newState.dispatched_tier = dispatchedTier;
-      newState.dispatch_constraint = dispatchConstraint;
+    // saveRuntime replaces the sidecar. A first claim captures the dispatched
+    // cell; an ALREADY_MINE re-claim retains its prior stamped cell when the
+    // launch carries no Provider constraint.
+    if (dispatch.constrained) {
+      newState.dispatched_model = dispatch.dispatchedModel;
+      newState.dispatched_tier = dispatch.dispatchedTier;
+      newState.dispatch_constraint = dispatch.dispatchConstraint;
+    } else if (
+      alreadyMine &&
+      typeof runtime?.dispatch_constraint === "string" &&
+      runtime.dispatch_constraint !== ""
+    ) {
+      newState.dispatched_model = runtime.dispatched_model;
+      newState.dispatched_tier = runtime.dispatched_tier;
+      newState.dispatch_constraint = runtime.dispatch_constraint;
+    }
+    if (
+      typeof newState.dispatch_constraint === "string" &&
+      newState.dispatch_constraint !== ""
+    ) {
+      dispatchedResponse = {
+        dispatched_model:
+          typeof newState.dispatched_model === "string"
+            ? newState.dispatched_model
+            : "",
+        dispatched_tier:
+          typeof newState.dispatched_tier === "string"
+            ? newState.dispatched_tier
+            : "",
+        dispatch_constraint: newState.dispatch_constraint,
+      };
     }
     stateStore.saveRuntime(taskId, newState);
 
@@ -391,6 +414,7 @@ export function runClaim(args: ClaimArgs): void {
       primary_repo: primaryRepo,
       tier,
       worker_model: model,
+      ...dispatchedResponse,
       worker_agent: workerAgentFor(tier, model),
       task_state: taskState,
       epic_state: epicState,

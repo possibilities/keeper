@@ -87,6 +87,30 @@ describe("claim happy path + brief schema", () => {
     // (the launcher selects the cell via --plugin-dir). The value is vestigial
     // for the spawn; the composition is asserted as the null-gate contract.
     expect(payload.worker_agent).toBe("plan:worker-opus-medium");
+    expect("dispatched_model" in payload).toBe(false);
+    expect("dispatched_tier" in payload).toBe(false);
+    expect("dispatch_constraint" in payload).toBe(false);
+
+    const resumed = runCli(["worker", "resume", taskId], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(resumed.code).toBe(0);
+    const resumePayload = parseCliOutput(resumed.stdout);
+    expect("dispatched_model" in resumePayload).toBe(false);
+    expect("dispatched_tier" in resumePayload).toBe(false);
+    expect("dispatch_constraint" in resumePayload).toBe(false);
+
+    const resolved = runCli(["resolve-task", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(resolved.code).toBe(0);
+    const resolvePayload = parseCliOutput(resolved.output);
+    expect("dispatched_model" in resolvePayload).toBe(false);
+    expect("dispatched_tier" in resolvePayload).toBe(false);
+    expect("dispatch_constraint" in resolvePayload).toBe(false);
+
     const ts = payload.task_state as Record<string, unknown>;
     expect(ts.status).toBe("in_progress");
     expect(ts.assignee).toBe("alice@example.com");
@@ -305,8 +329,31 @@ describe("claim captures the dispatched cell", () => {
     expect(merged.dispatch_constraint).toBe("worker_provider=claude");
 
     const payload = parseCliOutput(r.output);
+    expect(payload.dispatched_model).toBe("sonnet");
+    expect(payload.dispatched_tier).toBe("low");
+    expect(payload.dispatch_constraint).toBe("worker_provider=claude");
     const briefRef = payload.brief_ref as string;
     expect(existsSync(briefRef)).toBe(true);
+
+    const resumed = runCli(["worker", "resume", taskId], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(resumed.code).toBe(0);
+    const resumePayload = parseCliOutput(resumed.stdout);
+    expect(resumePayload.dispatched_model).toBe("sonnet");
+    expect(resumePayload.dispatched_tier).toBe("low");
+    expect(resumePayload.dispatch_constraint).toBe("worker_provider=claude");
+
+    const resolved = runCli(["resolve-task", taskId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(resolved.code).toBe(0);
+    const resolvePayload = parseCliOutput(resolved.output);
+    expect(resolvePayload.dispatched_model).toBe("sonnet");
+    expect(resolvePayload.dispatched_tier).toBe("low");
+    expect(resolvePayload.dispatch_constraint).toBe("worker_provider=claude");
 
     // The definition cells (task.model / task.tier) and the selection sidecar
     // never change.
@@ -315,7 +362,7 @@ describe("claim captures the dispatched cell", () => {
     expect(defAfter.tier).toBe(defBefore.tier);
   });
 
-  test("a subsequent unconstrained claim clears the stale dispatched keys", () => {
+  test("an ALREADY_MINE re-claim preserves the prior dispatched cell", () => {
     const proj = getProj();
     const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
     const taskId = taskIds[0] as string;
@@ -333,8 +380,6 @@ describe("claim captures the dispatched cell", () => {
     expect(r1.code).toBe(0);
     expect(readRuntime(proj.root, taskId).dispatched_model).toBe("sonnet");
 
-    // Re-claim (same actor -> ALREADY_MINE) with the env absent — the launcher
-    // always emits the vars, so absent here models an unconstrained run.
     const r2 = runCli(["claim", taskId, "--project", proj.root], {
       cwd: proj.root,
       home: proj.home,
@@ -346,9 +391,13 @@ describe("claim captures the dispatched cell", () => {
     ).toBe("ALREADY_MINE");
 
     const runtime = readRuntime(proj.root, taskId);
-    expect("dispatched_model" in runtime).toBe(false);
-    expect("dispatched_tier" in runtime).toBe(false);
-    expect("dispatch_constraint" in runtime).toBe(false);
+    expect(runtime.dispatched_model).toBe("sonnet");
+    expect(runtime.dispatched_tier).toBe("low");
+    expect(runtime.dispatch_constraint).toBe("worker_provider=claude");
+    const payload = parseCliOutput(r2.output);
+    expect(payload.dispatched_model).toBe("sonnet");
+    expect(payload.dispatched_tier).toBe("low");
+    expect(payload.dispatch_constraint).toBe("worker_provider=claude");
   });
 
   test("empty-string constraint env is treated as absent (clears, not writes)", () => {

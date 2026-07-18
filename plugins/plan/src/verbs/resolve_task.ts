@@ -116,6 +116,21 @@ export function runResolveTask(opts: {
   const runtime = store.loadRuntime(taskId);
   const merged = mergeTaskState(taskDef, runtime);
   const status = (merged.status as string | undefined) ?? "todo";
+  const dispatchedResponse: Record<string, string> =
+    typeof runtime?.dispatch_constraint === "string" &&
+    runtime.dispatch_constraint !== ""
+      ? {
+          dispatched_model:
+            typeof runtime.dispatched_model === "string"
+              ? runtime.dispatched_model
+              : "",
+          dispatched_tier:
+            typeof runtime.dispatched_tier === "string"
+              ? runtime.dispatched_tier
+              : "",
+          dispatch_constraint: runtime.dispatch_constraint,
+        }
+      : {};
 
   const tier = (taskDef.tier as string | null) ?? null;
   const model = (taskDef.model as string | null) ?? null;
@@ -130,6 +145,7 @@ export function runResolveTask(opts: {
       primary_repo: primaryRepo,
       tier,
       worker_model: model,
+      ...dispatchedResponse,
       worker_agent: workerAgentFor(tier, model),
       status,
     },
