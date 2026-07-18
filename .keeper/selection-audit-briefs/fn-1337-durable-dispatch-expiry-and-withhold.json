@@ -1,0 +1,40 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.6-sol",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 49,
+        "files_changed": 4,
+        "insertions": 521
+      },
+      "done_summary": "Every reconciler withhold of a ready task or close row now carries a bounded, machine-readable reason in the frame state, emitted transition-gated and rate-limited via stderr; the close-row conjunction decomposes decision-identically per-arm; problem-codes.md documents the enum contract.",
+      "input_hash": "3290bcc726d89d2266b937b94b33417845d9bf46ba09993bb85f3164c95c9bd1",
+      "model": "gpt-5.6-sol",
+      "spec_chars": 3553,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/reconcile-core.ts, src/autopilot-worker.ts, test/autopilot-worker.test.ts, docs/problem-codes.md\n\n### Approach\n\nEvery withhold of a ready task gets a name without touching the DB: the\nreconciler's ready-task loop returns a bounded reason enum from each of its\n~ten continue branches (paused, armed, merge-gate, in-flight, failed-key,\nclaim-fence vs activity-collision as DISTINCT codes, live-tab, cooldown,\nmissing-cwd \u2014 a louder data-bug class \u2014 and budget), and the fused\nclose-row okToPlan conjunction decomposes into per-arm evaluation so a\nclose withhold names its arm too. The reasons surface in the reconciler's\nexported frame state (the machine-readable autopilot inspect surface) as a\nbounded replace-merge map keyed by target, and as transition-gated stderr\nlines (emit only when a target's reason CHANGES, rate-limited per\ntarget-reason pair; per-key last-reason memory lives beside the existing\nbounded reconcile state maps) \u2014 flood-then-silence is the failure mode the\ngating exists to prevent. No new projection, no new RPC, no history-growing\nfold. The reason enum is documented in problem-codes as a stable contract;\nchurny detail (ids, ages) stays out of the enum key in a detail field. The\npure decision core stays pure \u2014 reasons are computed from inputs it already\nholds; emission is the producer's.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/reconcile-core.ts:2361-2430 \u2014 the ten continue branches; :2586-2620 \u2014 the fused close-row conjunction to decompose; :1596-1640 \u2014 the fence sub-cases\n- src/autopilot-worker.ts \u2014 the frame-state export the reasons join, and the existing bounded per-cycle state maps the transition memory sits beside\n\n**Optional** (reference as needed):\n- test/autopilot-worker.test.ts:4635+ \u2014 sweep/ordering fixture idioms\n- src/board-render.ts \u2014 if a render hook is cheap, the ready-pill may carry the reason; never a new projection\n\n### Risks\n\n- Reason churn on an oscillating key (budget-cooldown-fence) must coalesce through the rate limit, not flood\n- The close-row decomposition changes a load-bearing conjunction \u2014 behavior must be byte-identical, only observability added\n\n### Test notes\n\nFixtures per branch: each withhold produces its enum code in the frame map;\nan unchanged reason across cycles emits zero new lines; a transition emits\none; the decomposed close conjunction reaches the same dispatch decisions\nas the fused original across the fixture matrix; the two live incidents'\nshape (claim-fence on a ready task) renders the exact reason that would\nhave named them.\n\n## Acceptance\n\n- [ ] Every ready-task and close-row withhold carries a bounded enum reason in the reconciler frame state, with claim-fence and activity-collision distinct and missing-cwd classed louder\n- [ ] Emission is transition-gated and rate-limited \u2014 an unchanged reason is silent, an oscillating key coalesces\n- [ ] The close-row decomposition is decision-identical to the fused conjunction across the fixture matrix\n- [ ] problem-codes documents the reason enum as a stable contract\n- [ ] The autopilot-worker gate passes\n\n## Done summary\nEvery reconciler withhold of a ready task or close row now carries a bounded, machine-readable reason in the frame state, emitted transition-gated and rate-limited via stderr; the close-row conjunction decomposes decision-identically per-arm; problem-codes.md documents the enum contract.\n## Evidence\n",
+      "task_id": "fn-1337-durable-dispatch-expiry-and-withhold.2",
+      "tier": "xhigh",
+      "title": "Withhold reason visibility"
+    }
+  ],
+  "created_at": "2026-07-18T17:04:34.030000Z",
+  "epic_id": "fn-1337-durable-dispatch-expiry-and-withhold",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1337-durable-dispatch-expiry-and-withhold.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "3290bcc726d89d2266b937b94b33417845d9bf46ba09993bb85f3164c95c9bd1",
+  "selector": {
+    "harness": "claude",
+    "model": "claude-fable-5"
+  }
+}
