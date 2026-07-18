@@ -46,6 +46,10 @@ export interface TranscriptWatchOptions {
   /** Persisted before launch for a resumed transcript whose timestamps are not
    *  an invocation boundary. Missing keeps legacy late-sampled behavior. */
   invocationStopFloor?: number | null;
+  /** Exact Bus artifact path whose injected notification opens response capture. */
+  injectedMessageMarker?: string | null;
+  /** Transcript line count sampled before the matching Bus publish. */
+  transcriptLineFloor?: number | null;
   /** Exact folded-job probe. Omitted for direct paths and legacy run artifacts. */
   lifecycleProbe?: () => Promise<PartnerLifecycle>;
   now?: () => number;
@@ -166,9 +170,20 @@ export async function waitForTranscriptStop(
 
   while (true) {
     const stop =
-      resumeStopFloor === null
-        ? findTranscriptStop(opts.agent, opts.transcriptPath, opts.startedAtMs)
-        : findStopPastFloor(opts.agent, opts.transcriptPath, resumeStopFloor);
+      opts.injectedMessageMarker != null
+        ? findStopAfterInjectedMessage(
+            opts.agent,
+            opts.transcriptPath,
+            opts.injectedMessageMarker,
+            opts.transcriptLineFloor ?? 0,
+          )
+        : resumeStopFloor === null
+          ? findTranscriptStop(
+              opts.agent,
+              opts.transcriptPath,
+              opts.startedAtMs,
+            )
+          : findStopPastFloor(opts.agent, opts.transcriptPath, resumeStopFloor);
     if (stop !== null) {
       return { ok: true, stop };
     }
@@ -207,17 +222,25 @@ export function findLastMessage(
     isResume?: boolean;
     startedAtMs?: number;
     invocationStopFloor?: number | null;
+    injectedMessageMarker?: string | null;
+    transcriptLineFloor?: number | null;
   },
 ): LastMessage {
   const lines = readLines(path);
   const start =
-    agent === "pi" &&
-    opts?.invocationStopFloor !== null &&
-    opts?.invocationStopFloor !== undefined
-      ? lineIndexPastStopFloor(lines, agent, opts.invocationStopFloor)
-      : opts?.isResume === true && agent === "pi"
-        ? lastPiUserPromptIndex(lines)
-        : 0;
+    opts?.injectedMessageMarker != null
+      ? lineIndexPastInjectedMarker(
+          lines,
+          opts.injectedMessageMarker,
+          opts.transcriptLineFloor ?? 0,
+        )
+      : agent === "pi" &&
+          opts?.invocationStopFloor !== null &&
+          opts?.invocationStopFloor !== undefined
+        ? lineIndexPastStopFloor(lines, agent, opts.invocationStopFloor)
+        : opts?.isResume === true && agent === "pi"
+          ? lastPiUserPromptIndex(lines)
+          : 0;
 
   let latestStopText: string | null = null;
   let sawStop = false;
@@ -462,6 +485,22 @@ export function snapshotInvocationStopFloor(
     : null;
 }
 
+export interface InjectedMessageCaptureBoundary {
+  transcriptPath: string;
+  lineFloor: number;
+}
+
+export function snapshotInjectedMessageCaptureBoundary(
+  opts: TranscriptWatchOptions,
+): InjectedMessageCaptureBoundary | null {
+  const lookup = findTranscriptPath(opts);
+  if (lookup.kind !== "found") return null;
+  return {
+    transcriptPath: lookup.path,
+    lineFloor: readLines(lookup.path).length,
+  };
+}
+
 async function probeTerminal(
   probe: TranscriptWatchOptions["lifecycleProbe"],
 ): Promise<PartnerLifecycleTerminal | null> {
@@ -472,6 +511,64 @@ async function probeTerminal(
   } catch {
     return null;
   }
+}
+
+function lineIndexPastInjectedMarker(
+  lines: string[],
+  marker: string,
+  floor: number,
+): number {
+  for (let i = Math.max(0, floor); i < lines.length; i++) {
+    const parsed = parseJsonObject(lines[i] as string);
+    if (parsed !== null && transcriptInjectionCarries(parsed, marker)) {
+      return i + 1;
+    }
+  }
+  return lines.length;
+}
+
+function transcriptInjectionCarries(
+  obj: Record<string, unknown>,
+  marker: string,
+): boolean {
+  const message = objectValue(obj.message);
+  if (stringValue(message?.role) === "assistant") return false;
+  const candidates: unknown[] = [obj.content, message?.content];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.includes(marker)) {
+      return true;
+    }
+    if (Array.isArray(candidate)) {
+      for (const block of candidate) {
+        const text =
+          typeof block === "object" && block !== null
+            ? stringValue((block as Record<string, unknown>).text)
+            : null;
+        if (text?.includes(marker)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function findStopAfterInjectedMessage(
+  agent: AgentKind,
+  path: string,
+  marker: string,
+  floor: number,
+): TranscriptStop | null {
+  if (agent === "claude") {
+    return findClaudeStopGated(path, 0, marker, floor);
+  }
+  const lines = readLines(path);
+  const start = lineIndexPastInjectedMarker(lines, marker, floor);
+  for (let i = start; i < lines.length; i++) {
+    const parsed = parseJsonObject(lines[i] as string);
+    if (parsed === null) continue;
+    const stop = stopFromObject(agent, parsed);
+    if (stop !== null) return stop;
+  }
+  return null;
 }
 
 function findTranscriptStop(
@@ -523,6 +620,8 @@ function findTranscriptStop(
 function findClaudeStopGated(
   path: string,
   startedAtMs: number,
+  injectedMarker: string | null = null,
+  lineFloor = 0,
 ): TranscriptStop | null {
   const pending = new Set<string>();
   // A stop held pending its governing turn_duration's count. turn_duration
@@ -532,15 +631,28 @@ function findClaudeStopGated(
   // trailing turn_duration is accepted at end-of-scan, since the count rule
   // only binds when a governing line exists.
   let provisional: TranscriptStop | null = null;
+  let injectedSeen = injectedMarker === null;
+  const lines = readLines(path);
 
-  for (const line of readLines(path)) {
-    // Hot-path pre-filter: skip JSON.parse for a line carrying no marker
-    // substring — it can be neither a launch/retire nor any stop shape.
-    if (!hasClaudeMarker(line)) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const mayCarryInjection =
+      !injectedSeen &&
+      i >= lineFloor &&
+      line.includes(injectedMarker as string);
+    if (!hasClaudeMarker(line) && !mayCarryInjection) {
       continue;
     }
     const parsed = parseJsonObject(line);
     if (parsed === null) {
+      continue;
+    }
+    if (
+      mayCarryInjection &&
+      transcriptInjectionCarries(parsed, injectedMarker as string)
+    ) {
+      injectedSeen = true;
+      provisional = null;
       continue;
     }
 
@@ -564,11 +676,15 @@ function findClaudeStopGated(
       // Count absent or zero: the turn is settled. Confirm the turn's
       // text-bearing assistant stop, else the turn_duration is itself a
       // structural stop.
-      if (provisional !== null && pending.size === 0) {
+      if (injectedSeen && provisional !== null && pending.size === 0) {
         return provisional;
       }
       provisional = null;
-      if (pending.size === 0 && withinStartWindow(parsed, startedAtMs)) {
+      if (
+        injectedSeen &&
+        pending.size === 0 &&
+        withinStartWindow(parsed, startedAtMs)
+      ) {
         return claudeStopFromObject(parsed);
       }
       continue;
@@ -578,6 +694,7 @@ function findClaudeStopGated(
     // Hold the FIRST settled candidate as provisional (freeze-on-first); a
     // trailing turn_duration may still reject it on a nonzero count.
     if (
+      injectedSeen &&
       provisional === null &&
       pending.size === 0 &&
       withinStartWindow(parsed, startedAtMs)

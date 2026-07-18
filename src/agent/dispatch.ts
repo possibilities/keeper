@@ -101,15 +101,19 @@ Usage:
                                     partner (by current/former name or id) of the
                                     SAME <cli> and captures its new answer; it
                                     forbids --model/--effort/--preset (the resumed
-                                    session owns its config) and refuses a live
-                                    target (points at keeper bus chat send).
+                                    session owns its config). A positively-live
+                                    Partner receives the ask over its existing Bus
+                                    inbox and is captured without another writer.
                                     --control publishes the canonical exact
                                     teardown artifact at a caller-owned path and
                                     requires the matching --control-owner tuple.
                                     --reap-window-on-terminal kills the launched
-                                    tmux window once the result file lands (the
-                                    one-shot panel-leg posture; a plain run stays
-                                    resident and resumable without it).
+                                    tmux window once a CONFIRMED-terminal result
+                                    lands (completed/no_message/partner_died); a
+                                    timed_out leaves the Partner resident and
+                                    resumable, never reaped. The one-shot
+                                    panel-leg posture; a plain run stays resident
+                                    without it.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -263,6 +267,13 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         (4) / launch_failed (1) / bad_args (2).
                                         the resume_target comes from the pinned session
                                         id or the harness's post-stop attribution.
+                                        A timed_out reports only that the observation
+                                        deadline elapsed: it preserves the bounded
+                                        partial, never reaps or marks the Partner
+                                        terminal, and leaves it resident for
+                                        show-last-message / resume — with stderr
+                                        distinguishing a live Partner from unknown
+                                        lifecycle evidence.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                         Wait + capture on an already-launched
                                         handle (a run id or a transcript path with
@@ -300,8 +311,9 @@ Panel fan-out (start | wait | status | prune):
                                         missing/corrupt manifest, or bad config.
 
 Launch handles: a caller-supplied handle is the surface-local deduplication and
-routing anchor. A dead partner resumes by its name or id; a live partner refuses
-another attach and points at \`keeper bus chat send\`. Partner names are host-global
+routing anchor. A dead partner resumes by its name or id; \`agent run --resume\`
+reaches a positively-live Partner through its existing Bus inbox while the
+interactive \`resume\` verb still refuses another attach. Partner names are host-global
 among tracked jobs. Handoff slugs are host-global event-sourced handles whose
 duplicate exits 3. Panel slugs are display/discovery metadata; their opaque request
 identity owns the panel request and controls.
@@ -354,8 +366,8 @@ Launch or drive a partner model CLI from this session.
   keeper agent panel start <prompt-file> --slug <slug> [--panel <name>]
   keeper agent panel wait --slug <slug>   # blocks ONE chunk; re-issue on exit 124
   keeper agent presets list         # the names for --preset / --panel
-  keeper agent resume <name-or-id> "<follow-up ask>"
-                                    # re-attach a dead partner by name/id, continuing the chat
+  keeper agent run <cli> "<follow-up ask>" --resume <name-or-id>
+                                    # capture a dead resume or a live Bus response
 
 Exit codes: 0 terminal answer · 124 panel wait chunk elapsed with no terminal answer
 (a re-issue SIGNAL, not a failure — call wait again) · 2 absent slug / bad config.

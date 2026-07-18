@@ -471,6 +471,91 @@ describe("lifecycle-aware transcript waits", () => {
   });
 });
 
+describe("injected-message response boundary", () => {
+  test("Claude ignores unrelated stops until the matching Bus notification appears", async () => {
+    const path = join(tempDir(), "claude-live.jsonl");
+    const stop = (text: string) => ({
+      timestamp: new Date().toISOString(),
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text }],
+      },
+    });
+    const marker = "/trusted/bus-artifacts/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    writeFileSync(
+      path,
+      `${[
+        stop("before capture"),
+        stop("unrelated work finished"),
+        {
+          type: "queue-operation",
+          content: `Agent Bus message — read ${marker}`,
+        },
+        stop("causal answer"),
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+    const outcome = await waitForTranscriptStop({
+      agent: "claude",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: path,
+      injectedMessageMarker: marker,
+      transcriptLineFloor: 1,
+      stopTimeoutMs: 100,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("causal answer");
+  });
+
+  test("Pi accepts only a stop after its matching custom Bus message", async () => {
+    const path = join(tempDir(), "pi-live.jsonl");
+    const marker = "/trusted/bus-artifacts/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const piStop = (text: string) => ({
+      type: "message",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text }],
+      },
+    });
+    writeFileSync(
+      path,
+      `${[
+        piStop("old"),
+        piStop("unrelated"),
+        {
+          customType: "keeper-agent-bus",
+          content: `Agent Bus message — read ${marker}`,
+        },
+        piStop("pi causal answer"),
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n")}\n`,
+    );
+    const outcome = await waitForTranscriptStop({
+      agent: "pi",
+      cwd: "/work/proj",
+      env: {},
+      homeDir: tempDir(),
+      startedAtMs: 0,
+      sessionId: "s",
+      transcriptPath: path,
+      injectedMessageMarker: marker,
+      transcriptLineFloor: 1,
+      stopTimeoutMs: 100,
+    });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.stop.message).toBe("pi causal answer");
+  });
+});
+
 describe("waitForTranscriptStop is bounded", () => {
   const PINNED_NO_STOP = "33333333-3333-3333-3333-333333333333";
   test("a stop that never appears times out (no unbounded hang)", async () => {
@@ -543,6 +628,82 @@ describe("runWaitForStop forwards --stop-timeout", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("50ms (caller)");
+    }
+  });
+});
+describe("runWaitForStop re-probes Partner liveness at the deadline", () => {
+  const PINNED_NO_STOP = "99999999-9999-9999-9999-999999999999";
+  // A resolvable transcript with NO settled stop (a tool_use assistant turn) so
+  // the stop wait always reaches its deadline; the run.json carries a lifecycle
+  // job id so the probe seam is wired.
+  function noStopLifecycleHandle(home: string, cwd: string) {
+    writeClaudeTranscript(home, cwd, PINNED_NO_STOP, {
+      text: "partial so far",
+      stopReason: "tool_use",
+    });
+    const stateDir = tempDir();
+    writeRunJson(stateDir, "tmux-live", {
+      agent: "claude",
+      cwd,
+      transcriptSessionId: PINNED_NO_STOP,
+      startedAtMs: 0,
+      lifecycleJobId: "job-live",
+    });
+    const res = resolveHandle({
+      rest: ["tmux-live", "--stop-timeout", "50ms"],
+      cwd,
+      stateDir,
+    });
+    if (!res.ok) {
+      throw new Error(`resolveHandle failed: ${res.error}`);
+    }
+    return res.handle;
+  }
+
+  test("a positively-live probe carries liveness 'live' (never partner_died)", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const handle = noStopLifecycleHandle(home, cwd);
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: home,
+      probePartnerLifecycle: async (jobId) => {
+        expect(jobId).toBe("job-live");
+        return { kind: "live" };
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("timeout");
+      expect(result.liveness).toBe("live");
+    }
+  });
+
+  test("a job id but no probe seam collapses liveness to 'unknown', never a fabricated live", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const handle = noStopLifecycleHandle(home, cwd);
+    const result = await runWaitForStop(handle, { env: {}, homeDir: home });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("timeout");
+      expect(result.liveness).toBe("unknown");
+    }
+  });
+
+  test("an unknown-lifecycle probe stays 'unknown' — the deadline never confirms termination", async () => {
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const handle = noStopLifecycleHandle(home, cwd);
+    const result = await runWaitForStop(handle, {
+      env: {},
+      homeDir: home,
+      probePartnerLifecycle: async () => ({ kind: "unknown" }),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("timeout");
+      expect(result.liveness).toBe("unknown");
     }
   });
 });

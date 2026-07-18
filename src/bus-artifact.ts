@@ -28,24 +28,27 @@
  * A symlink or non-regular inode PLANTED at the resolved path is rejected by an
  * `lstat` regular-file check that never follows the final link.
  *
- * This module adds INERT primitives only: no sender emits references and no
- * lifecycle row depends on them yet. It introduces no new unsandboxed state class
- * — the artifact root derives from the existing bus state location, so a
- * `KEEPER_BUS_DB` override relocates it under the per-test tmpdir with everything
- * else.
+ * The sender transport registers send-only, so publishing never takes over a
+ * Partner's existing watch channel. The artifact root derives from the existing
+ * bus state location, so a `KEEPER_BUS_DB` override relocates it under the
+ * per-test tmpdir with everything else.
  */
 
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   opendirSync,
   readFileSync,
+  renameSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { atomicWriteFile, resolveBusDbPath } from "./db";
+import { FileLock } from "./file-lock";
 
 /**
  * The reference version this codec produces and the sole version it accepts.
@@ -128,6 +131,51 @@ export interface PublishedBusArtifact {
   readonly path: string;
 }
 
+export interface BusArtifactRefPayload {
+  media_type: string;
+  text: string;
+  t: "bus-artifact-ref";
+  v: 1;
+  id: string;
+  len: number;
+  sha256: string;
+}
+
+export interface BusPublishFrame {
+  op: "publish";
+  event: "send";
+  namespace: string;
+  to: string;
+  payload: BusArtifactRefPayload;
+}
+
+export type BusPublishResult =
+  | "delivered"
+  | "queued_for_wake"
+  | "not_connected"
+  | "unknown_target"
+  | "ambiguous_target"
+  | "delivery_failed";
+
+export interface BusSendResult {
+  result: BusPublishResult;
+  recipients: number;
+}
+
+export class BusSendAttemptError extends Error {
+  constructor(
+    message: string,
+    readonly deliveryAmbiguous: boolean,
+  ) {
+    super(message);
+  }
+}
+
+export interface PartnerCaptureLease {
+  readonly path: string;
+  release(): void;
+}
+
 /** One bounded page of artifact ids present on disk. */
 export interface BusArtifactIdPage {
   /** Up to `limit` opaque ids of regular artifact files. */
@@ -154,8 +202,15 @@ export function newBusArtifactId(): string {
  * The Keeper-owned artifact root, derived from the bus state location so it needs
  * no new env var and rides the existing `KEEPER_BUS_DB` sandbox override. Pure.
  */
-export function resolveBusArtifactRoot(): string {
-  return join(dirname(resolveBusDbPath()), "bus-artifacts");
+export function resolveBusArtifactRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const override = (env.KEEPER_BUS_DB ?? "").trim();
+  const busDb =
+    override !== ""
+      ? override
+      : join(homedir(), ".local", "state", "keeper", "bus.db");
+  return join(dirname(busDb), "bus-artifacts");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +330,28 @@ export function publishBusArtifact(
   const id = newBusArtifactId();
   const path = join(root, id);
   const sha256 = createHash("sha256").update(body, "utf8").digest("hex");
-  atomicWriteFile(path, body, 0o600);
+  atomicPrivateWrite(path, body);
   return { ref: { id, len, sha256 }, path };
+}
+
+function atomicPrivateWrite(path: string, body: string): void {
+  const dir = dirname(path);
+  const tmp = join(
+    dir,
+    `${path.slice(dir.length + 1)}.tmp.${process.pid}.${newBusArtifactId()}`,
+  );
+  try {
+    writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      // Preserve the publication failure.
+    }
+    throw err;
+  }
 }
 
 /**
@@ -366,15 +441,25 @@ export function removeBusArtifact(root: string, id: string): boolean {
   }
 }
 
+/** Admit one response-bearing request for an exact Partner job identity. */
+export function acquirePartnerCaptureLease(
+  root: string,
+  partnerJobId: string,
+): PartnerCaptureLease | null {
+  ensureBusArtifactRoot(root);
+  const locks = join(root, "partner-captures");
+  mkdirSync(locks, { recursive: true, mode: 0o700 });
+  chmodSync(locks, 0o700);
+  const key = createHash("sha256").update(partnerJobId, "utf8").digest("hex");
+  const path = join(locks, key);
+  const lock = FileLock.tryAcquire(path);
+  return lock === null ? null : { path, release: () => lock.release() };
+}
+
 /**
- * Enumerate up to `limit` artifact ids present on disk — the BOUNDED orphan-scan
- * primitive. It streams the directory one entry at a time via `opendirSync` and
- * STOPS at `limit`, so a single call never materializes the whole listing the
- * way `readdirSync` would; a directory of any size costs at most ~`limit` reads.
- * Only regular files whose name is a well-formed opaque id are returned, so
- * in-flight `.tmp.` writes and any stray inode are skipped. Fail-soft: an absent
- * or unreadable root yields an empty, complete page. See {@link
- * BusArtifactIdPage} for the `complete` semantics.
+ * Enumerate up to `limit` artifact ids present on disk — the bounded orphan scan.
+ * Only regular files with opaque artifact ids are returned; lock metadata and
+ * in-flight temp files are skipped. An absent or unreadable root fails soft.
  */
 export function listBusArtifactIds(
   root: string,
@@ -424,4 +509,186 @@ export function listBusArtifactIds(
     }
   }
   return { ids, complete };
+}
+
+export const CHAT_NAMESPACE = "chat";
+export const BUS_RESPONSE_TIMEOUT_MS = 5000;
+
+export function buildBusPublishFrame(
+  artifact: PublishedBusArtifact,
+  target: string,
+  mediaType = "text/markdown",
+): BusPublishFrame {
+  const encoded = JSON.parse(encodeBusArtifactRef(artifact.ref)) as {
+    t: "bus-artifact-ref";
+    v: 1;
+    id: string;
+    len: number;
+    sha256: string;
+  };
+  return {
+    op: "publish",
+    event: "send",
+    namespace: CHAT_NAMESPACE,
+    to: target,
+    payload: {
+      media_type: mediaType,
+      text: encodeBusArtifactRef(artifact.ref),
+      ...encoded,
+    },
+  };
+}
+
+export function buildBusRegisterFrame(
+  sendOnly = false,
+  env: NodeJS.ProcessEnv = process.env,
+  pid = process.pid,
+): object {
+  const sessionId = (env.KEEPER_JOB_ID ?? "").trim();
+  return {
+    op: "register",
+    namespace: CHAT_NAMESPACE,
+    namespaces: [CHAT_NAMESPACE],
+    pid,
+    send_only: sendOnly,
+    ...(sessionId === "" ? {} : { session_id: sessionId }),
+  };
+}
+
+export function busSendTransportIsAmbiguous(
+  publishStarted: boolean,
+  serverRejected: boolean,
+): boolean {
+  return publishStarted && !serverRejected;
+}
+
+async function busRoundTrip<T>(
+  sockPath: string,
+  drive: (
+    send: (frame: object) => void,
+    onFrame: (handler: (frame: Record<string, unknown>) => void) => void,
+    resolve: (value: T) => void,
+    reject: (error: Error) => void,
+  ) => void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let remainder = "";
+    let settled = false;
+    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
+    let frameHandler: (frame: Record<string, unknown>) => void = () => {};
+    const settle = (error: Error | null, value?: T): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        sock?.end();
+      } catch {
+        // The round trip is already settled.
+      }
+      if (error) reject(error);
+      else resolve(value as T);
+    };
+    const timeout = setTimeout(() => {
+      settle(
+        new Error(`no response from bus within ${BUS_RESPONSE_TIMEOUT_MS}ms`),
+      );
+    }, BUS_RESPONSE_TIMEOUT_MS);
+    timeout.unref?.();
+    Bun.connect({
+      unix: sockPath,
+      socket: {
+        open(socket) {
+          sock = socket;
+          drive(
+            (frame) => {
+              try {
+                socket.write(`${JSON.stringify(frame)}\n`);
+              } catch (err) {
+                settle(new Error(`write failed: ${(err as Error).message}`));
+              }
+            },
+            (handler) => {
+              frameHandler = handler;
+            },
+            (value) => settle(null, value),
+            (error) => settle(error),
+          );
+        },
+        data(_socket, chunk) {
+          remainder += chunk.toString("utf8");
+          let newline = remainder.indexOf("\n");
+          while (newline !== -1) {
+            const line = remainder.slice(0, newline).trim();
+            remainder = remainder.slice(newline + 1);
+            if (line.length > 0) {
+              try {
+                frameHandler(JSON.parse(line) as Record<string, unknown>);
+              } catch {
+                // Await a valid acknowledgement.
+              }
+            }
+            newline = remainder.indexOf("\n");
+          }
+        },
+        close() {
+          settle(new Error("bus closed connection before responding"));
+        },
+        error(_socket, err) {
+          settle(new Error(`socket error: ${(err as Error).message}`));
+        },
+      },
+    }).catch((err: Error) => {
+      settle(new Error(`failed to connect to ${sockPath}: ${err.message}`));
+    });
+  });
+}
+
+export async function sendBusArtifact(
+  sockPath: string,
+  artifact: PublishedBusArtifact,
+  target: string,
+  mediaType = "text/markdown",
+  beforePublish?: () => boolean,
+): Promise<BusSendResult> {
+  let publishStarted = false;
+  let serverRejected = false;
+  try {
+    return await busRoundTrip<BusSendResult>(
+      sockPath,
+      (send, onFrame, resolve, reject) => {
+        onFrame((frame) => {
+          if (frame.type === "ack" && frame.op === "register") {
+            let eligible = true;
+            try {
+              eligible = beforePublish?.() ?? true;
+            } catch {
+              eligible = false;
+            }
+            if (!eligible) {
+              serverRejected = true;
+              reject(new Error("recipient identity is no longer live"));
+              return;
+            }
+            publishStarted = true;
+            send(buildBusPublishFrame(artifact, target, mediaType));
+          } else if (frame.type === "ack" && frame.op === "publish") {
+            resolve({
+              result: frame.result as BusPublishResult,
+              recipients:
+                typeof frame.recipients === "number" ? frame.recipients : 0,
+            });
+          } else if (frame.type === "error") {
+            serverRejected = true;
+            reject(new Error(`${frame.code}: ${frame.message}`));
+          }
+        });
+        send(buildBusRegisterFrame(true));
+      },
+    );
+  } catch (err) {
+    throw new BusSendAttemptError(
+      (err as Error).message,
+      busSendTransportIsAmbiguous(publishStarted, serverRejected),
+    );
+  }
 }

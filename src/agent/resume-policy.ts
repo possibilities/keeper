@@ -9,8 +9,9 @@
  *
  *  - **Refuse-live.** A target whose newest match is currently live (pid +
  *    start-time recycle identity, mirroring `isLiveIdentity` in
- *    `src/bus-worker.ts`) is never resumed — the caller is pointed at
- *    `keeper bus chat send` instead. A recycled pid is NOT live.
+ *    `src/bus-worker.ts`) is never re-attached. The live decision carries the
+ *    exact identity a response-bearing caller may message once over the Bus.
+ *    A recycled pid is NOT live.
  *  - **Newest-non-live wins, ties error.** `resolveTarget`'s own ambiguity
  *    collapse prefers a CONNECTED live channel, which never applies here (the
  *    channel set is always empty), so this module implements its OWN collapse:
@@ -59,12 +60,16 @@ export type ResumeDecision =
       cwd: string | null;
       title: string | null;
     }
-  /** Refused — the newest match is currently live. Points the caller at the bus. */
+  /** Refused for re-attach — the newest match is currently live. */
   | {
       kind: "live";
       job_id: string;
       harness: HarnessName;
       title: string | null;
+      resume_target: string | null;
+      cwd: string | null;
+      pid: number;
+      start_time: string;
     }
   /** An exact tie for newest among the matched candidates. */
   | { kind: "ambiguous"; candidates: ResumeCandidate[] }
@@ -232,10 +237,14 @@ export function resolveResumeDecision(
       job_id: top.job_id,
       harness: top.harness,
       title: top.title,
+      resume_target: top.resume_target,
+      cwd: top.cwd,
+      pid: top.pid as number,
+      start_time: top.start_time as string,
     };
   }
 
-  if (top.resume_target != null) {
+  if (top.resume_target != null && top.resume_target !== "") {
     return {
       kind: "ok",
       job_id: top.job_id,

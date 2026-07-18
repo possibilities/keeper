@@ -15,6 +15,7 @@
 
 import { describe, expect, spyOn, test } from "bun:test";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -41,6 +42,7 @@ import {
   cancelOwnedRunFromControlArtifact,
   cancelRunFromControlArtifact,
   captureFromHandle,
+  captureLivePartnerResponse,
   composeRunCapture,
   createExactRunTeardown,
   isRunControlArtifact,
@@ -53,6 +55,8 @@ import {
   runCaptureExitCode,
 } from "../src/agent/run-capture";
 import * as tmuxLaunch from "../src/agent/tmux-launch";
+import { findLastMessage } from "../src/agent/transcript-watch";
+import { BusSendAttemptError } from "../src/bus-artifact";
 import { buildPanelLegArgv, type PanelMember } from "../src/pair/panel";
 import {
   expectExit,
@@ -617,6 +621,68 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     expect(exitCode).toBe(4);
   });
 
+  test("timed_out surfaces 'live' liveness from the wait re-probe (envelope stays nine-key)", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: {
+          ok: false,
+          reason: "timeout",
+          error: "timed out waiting for transcript stop after 50ms (caller)",
+          transcriptPath: "/t.jsonl",
+          liveness: "live",
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "partial so far",
+          found: true,
+        },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-live", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("timed_out");
+    expect(result.timeoutLiveness).toBe("live");
+    // The liveness rides BESIDE the envelope — the wire contract is still 9 keys.
+    expect(Object.keys(result.envelope).sort()).toEqual([...ENVELOPE_KEYS]);
+    expect(result.envelope.message).toBe("partial so far");
+  });
+
+  test("timed_out with no wait liveness defaults timeoutLiveness to 'unknown'", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: {
+          ok: false,
+          error: "timed out waiting for transcript stop after 50ms (caller)",
+          transcriptPath: "/t.jsonl",
+        },
+        show: {
+          ok: true,
+          transcriptPath: "/t.jsonl",
+          text: "partial so far",
+          found: true,
+        },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-unk", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("timed_out");
+    expect(result.timeoutLiveness).toBe("unknown");
+  });
+
+  test("a non-timeout outcome carries no timeoutLiveness hint", async () => {
+    const result = await captureFromHandle(
+      seams({
+        wait: { ok: true, transcriptPath: "/t.jsonl", stop: STOP },
+        show: { ok: true, transcriptPath: "/t.jsonl", text: "x", found: true },
+      }),
+      VERB_DEPS,
+      { handle: handle(), handleId: "tmux-done", agent: "claude", startMs: 0 },
+    );
+    expect(result.envelope.outcome).toBe("completed");
+    expect(result.timeoutLiveness).toBeUndefined();
+  });
+
   test("transcript never appears → no_transcript (exit 4)", async () => {
     const { envelope, exitCode } = await captureFromHandle(
       seams({
@@ -753,6 +819,154 @@ describe("captureFromHandle — outcome matrix (injected seams)", () => {
     );
     // (3550 - 1000) / 1000 = 2.55 → rounded to tenths = 2.6.
     expect(envelope.elapsed_seconds).toBe(2.6);
+  });
+});
+
+describe("captureLivePartnerResponse — delivery and cleanup", () => {
+  const liveArgs = {
+    handle: {
+      ...handle("live-session"),
+      lifecycleJobId: "job-live",
+    },
+    handleId: "job-live",
+    agent: "claude" as const,
+    startMs: 0,
+  };
+  const artifact = {
+    path: "/bus-artifacts/00000000000000000000000000000001",
+    ref: { id: "00000000000000000000000000000001" },
+  };
+
+  function liveDeps(overrides: Record<string, unknown> = {}) {
+    let releases = 0;
+    let removes = 0;
+    let waits = 0;
+    let sends = 0;
+    const deps = {
+      waitForStop: async (resolved: ResolvedHandle) => {
+        waits++;
+        expect(resolved.injectedMessageMarker).toBe(artifact.path);
+        expect(resolved.transcriptLineFloor).toBe(4);
+        return { ok: true as const, transcriptPath: "/t.jsonl", stop: STOP };
+      },
+      showLastMessage: async () => ({
+        ok: true as const,
+        transcriptPath: "/t.jsonl",
+        text: "the answer",
+        found: true,
+      }),
+      now: () => 0,
+      acquire: () => ({ release: () => releases++ }),
+      publish: () => artifact,
+      remove: () => {
+        removes++;
+      },
+      snapshotBoundary: () => ({ transcriptPath: "/t.jsonl", lineFloor: 4 }),
+      send: async (_artifact: unknown, beforePublish: () => boolean) => {
+        sends++;
+        if (!beforePublish()) throw new Error("identity changed");
+        return { result: "delivered", recipients: 1 };
+      },
+      identityStillLive: () => true,
+      deliveryIsAmbiguous: (err: unknown) =>
+        err instanceof BusSendAttemptError && err.deliveryAmbiguous,
+      ...overrides,
+    } as Parameters<typeof captureLivePartnerResponse>[0];
+    return {
+      deps,
+      counts: () => ({ releases, removes, waits, sends }),
+    };
+  }
+
+  test("an ambiguous transport is never resent and may still capture the causal answer", async () => {
+    let attempts = 0;
+    const h = liveDeps({
+      send: async () => {
+        attempts++;
+        throw new BusSendAttemptError("ack lost", true);
+      },
+    });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.disposition).toBe("delivery_ambiguous");
+    expect(outcome.result.envelope.outcome).toBe("completed");
+    expect(attempts).toBe(1);
+    expect(h.counts()).toEqual({ releases: 1, removes: 0, waits: 1, sends: 0 });
+  });
+
+  test("definite non-delivery removes the artifact and never starts a transcript wait", async () => {
+    const h = liveDeps({
+      send: async () => ({ result: "not_connected", recipients: 0 }),
+    });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.disposition).toBe("delivery_failed");
+    expect(outcome.result.envelope.outcome).toBe("launch_failed");
+    expect(h.counts()).toEqual({ releases: 1, removes: 1, waits: 0, sends: 0 });
+  });
+
+  test("a concurrent request fails closed before artifact publication", async () => {
+    const h = liveDeps({ acquire: () => null });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.disposition).toBe("capture_busy");
+    expect(outcome.result.envelope.outcome).toBe("bad_args");
+    expect(h.counts()).toEqual({ releases: 0, removes: 0, waits: 0, sends: 0 });
+  });
+
+  test("an exact identity race refuses publish and cleans the unpublished artifact", async () => {
+    const h = liveDeps({ identityStillLive: () => false });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.disposition).toBe("identity_changed");
+    expect(h.counts()).toEqual({ releases: 1, removes: 1, waits: 0, sends: 1 });
+  });
+
+  test("Partner death after delivery keeps partner_died precedence", async () => {
+    const h = liveDeps({
+      waitForStop: async () => ({
+        ok: false,
+        reason: "partner_died",
+        error: "partner died",
+        transcriptPath: "/t.jsonl",
+        terminal: { kind: "terminal", state: "killed", reason: null },
+      }),
+    });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.result.envelope.outcome).toBe("partner_died");
+    expect(h.counts()).toMatchObject({ releases: 1, removes: 0 });
+  });
+
+  test("a cancelled waiter releases admission without deleting a possibly-delivered artifact", async () => {
+    const h = liveDeps({
+      waitForStop: async () => {
+        throw new Error("cancelled");
+      },
+    });
+    const outcome = await captureLivePartnerResponse(
+      h.deps,
+      VERB_DEPS,
+      liveArgs,
+    );
+    expect(outcome.disposition).toBe("capture_failed");
+    expect(outcome.detail).toBe("cancelled");
+    expect(h.counts()).toMatchObject({ releases: 1, removes: 0 });
   });
 });
 
@@ -1158,6 +1372,33 @@ function writeClaudeTranscript(
   return path;
 }
 
+/** A resolvable claude transcript with NO settled stop — a tool_use assistant
+ *  turn carrying readable text. The stop wait times out (tool_use is excluded)
+ *  while show-last-message still recovers the bounded partial. */
+function writeNoStopClaudeTranscript(
+  home: string,
+  cwd: string,
+  sessionId: string,
+  partial: string,
+): string {
+  const dir = join(home, ".claude", "projects", cwd.replace(/\//g, "-"));
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${sessionId}.jsonl`);
+  writeFileSync(
+    path,
+    `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "assistant",
+      message: {
+        role: "assistant",
+        stop_reason: "tool_use",
+        content: [{ type: "text", text: partial }],
+      },
+    })}\n`,
+  );
+  return path;
+}
+
 function writeRunJson(
   stateDir: string,
   runId: string,
@@ -1253,6 +1494,129 @@ describe("main() — agent run (faked tmux launch + real transcript)", () => {
       kill_window_command: ["tmux", "kill-window", "-t", "@1"],
       status: "terminal",
     });
+  });
+
+  test("a timeout leaves the Partner resident: no reap, control stays running, live guidance", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    writeNoStopClaudeTranscript(home, cwd, sessionId, "partial answer so far");
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "think hard",
+        "--stop-timeout",
+        "40ms",
+        "--reap-window-on-terminal",
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+      // The folded job is positively live — an elapsed observation deadline must
+      // never kill it or discard its recoverable answer.
+      probePartnerLifecycle: async () => ({ kind: "live" }),
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(4);
+    expect(parseEnvelope(h.out)).toMatchObject({
+      outcome: "timed_out",
+      message: "partial answer so far",
+      message_found: true,
+    });
+    // NO reap fired — the launched window is left resident for a live Partner.
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [],
+    );
+    // The run control stays `running`, never stamped terminal.
+    const control = JSON.parse(
+      readFileSync(
+        join(stateDir, "tmux-runs", `tmux-${sessionId}`, "control.json"),
+        "utf8",
+      ),
+    );
+    expect(control.status).toBe("running");
+    // Honest live guidance: still running, a non-resending recovery path, and an
+    // explicit "not final" on the partial.
+    const stderr = h.err.join("");
+    expect(stderr).toContain("still running");
+    expect(stderr).toContain("show-last-message");
+    expect(stderr).toContain("not a final answer");
+  });
+
+  test("an unknown-lifecycle timeout says only that termination was not observed, still no reap", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "eeeeeeee-1111-2222-3333-444444444444";
+    writeNoStopClaudeTranscript(home, cwd, sessionId, "partial so far");
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "think hard",
+        "--stop-timeout",
+        "40ms",
+        "--reap-window-on-terminal",
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+      // Default probe returns unknown → no positive liveness evidence.
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(4);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "timed_out" });
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [],
+    );
+    const stderr = h.err.join("");
+    expect(stderr).toContain("termination was not observed");
+    expect(stderr).not.toContain("still running");
+    expect(stderr).toContain("show-last-message");
+  });
+
+  test("a completed run under --reap-window-on-terminal STILL reaps and marks terminal (unchanged)", async () => {
+    const stateDir = tempDir();
+    const home = tempDir();
+    const cwd = "/fake-home/code/proj";
+    const sessionId = "cafecafe-cafe-cafe-cafe-cafecafecafe";
+    writeClaudeTranscript(home, cwd, sessionId, "the final answer");
+    const h = makeHarness({
+      argv: ["run", "claude", "answer", "--reap-window-on-terminal"],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: fakeTmux,
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "completed" });
+    // A confirmed-terminal outcome reaps exactly its own window and marks control
+    // terminal — the honest-timeout change never weakened this path.
+    expect(h.tmuxCommands.filter((cmd) => cmd.includes("kill-window"))).toEqual(
+      [["tmux", "kill-window", "-t", "@1"]],
+    );
+    const control = JSON.parse(
+      readFileSync(
+        join(stateDir, "tmux-runs", `tmux-${sessionId}`, "control.json"),
+        "utf8",
+      ),
+    );
+    expect(control.status).toBe("terminal");
   });
 
   test("an unknown <cli> exits bad_args (2) with the uniform envelope", async () => {
@@ -1717,26 +2081,153 @@ describe("main() — agent run --resume", () => {
     expect(h.tmuxCommands.length).toBe(0);
   });
 
-  test("live target → bad_args pointing at keeper bus chat send, no launch", async () => {
+  test("live target sends once over the Bus and captures only after its injected boundary", async () => {
+    const home = tempDir();
+    const cwd = "/work/live-partner";
+    const sessionId = "99999999-9999-9999-9999-999999999999";
+    const transcriptPath = writeClaudeTranscript(
+      home,
+      cwd,
+      sessionId,
+      "unrelated pre-existing stop",
+    );
+    let sends = 0;
+    const resolvedTargets: string[] = [];
     const h = makeHarness({
       argv: ["run", "claude", "hi", "--resume", "reviewer"],
       rawArgv: true,
-      resolveResumeDecision: () => ({
-        kind: "live",
-        job_id: "job-9",
-        harness: "claude",
-        title: "reviewer",
-      }),
+      transcriptHomeDir: home,
+      resolveResumeDecision: (target) => {
+        resolvedTargets.push(target);
+        return {
+          kind: "live",
+          job_id: "job-9",
+          harness: "claude",
+          title: target === "job-9" ? "renamed-reviewer" : "reviewer",
+          resume_target: sessionId,
+          cwd,
+          pid: 9009,
+          start_time: "start-9",
+        };
+      },
+      sendBusArtifact: async (
+        _sock,
+        artifact,
+        target,
+        _media,
+        beforePublish,
+      ) => {
+        sends++;
+        expect(target).toBe("job-9");
+        expect(beforePublish?.()).toBe(true);
+        appendFileSync(
+          transcriptPath,
+          `${JSON.stringify({
+            type: "queue-operation",
+            content: `Agent Bus message — read ${artifact.path}`,
+          })}\n${JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: "assistant",
+            message: {
+              role: "assistant",
+              stop_reason: "end_turn",
+              content: [{ type: "text", text: "causal live answer" }],
+            },
+          })}\n`,
+        );
+        return { result: "delivered", recipients: 1 };
+      },
     });
 
     const code = await expectExit(main(h.deps));
 
-    expect(code).toBe(2);
-    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "bad_args" });
-    const err = h.err.join("");
-    expect(err).toContain("LIVE");
-    expect(err).toContain("keeper bus chat send job-9");
+    expect(code).toBe(0);
+    expect(sends).toBe(1);
+    expect(resolvedTargets).toEqual(["reviewer", "job-9"]);
+    expect(parseEnvelope(h.out)).toMatchObject({
+      outcome: "completed",
+      handle: "job-9",
+      resume_target: sessionId,
+      transcript_path: transcriptPath,
+      message: "causal live answer",
+    });
     expect(h.tmuxCommands.length).toBe(0);
+  });
+
+  test("a delivered live timeout leaves the Partner live and names non-resending recovery", async () => {
+    const home = tempDir();
+    const cwd = "/work/live-timeout";
+    const sessionId = "88888888-8888-8888-8888-888888888888";
+    const transcriptPath = writeClaudeTranscript(home, cwd, sessionId, "old");
+    let sends = 0;
+    const h = makeHarness({
+      argv: [
+        "run",
+        "claude",
+        "follow up",
+        "--resume",
+        "reviewer",
+        "--stop-timeout",
+        "20ms",
+      ],
+      rawArgv: true,
+      transcriptHomeDir: home,
+      probePartnerLifecycle: async () => ({ kind: "live" }),
+      resolveResumeDecision: () => ({
+        kind: "live",
+        job_id: "job-live-timeout",
+        harness: "claude",
+        title: "reviewer",
+        resume_target: sessionId,
+        cwd,
+        pid: 8080,
+        start_time: "start-8",
+      }),
+      sendBusArtifact: async (
+        _sock,
+        artifact,
+        _target,
+        _media,
+        beforePublish,
+      ) => {
+        sends++;
+        expect(beforePublish?.()).toBe(true);
+        appendFileSync(
+          transcriptPath,
+          `${JSON.stringify({
+            customType: "keeper-agent-bus",
+            content: `Agent Bus message — read ${artifact.path}`,
+          })}\n`,
+        );
+        return { result: "delivered", recipients: 1 };
+      },
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(4);
+    expect(sends).toBe(1);
+    expect(parseEnvelope(h.out)).toMatchObject({ outcome: "timed_out" });
+    const err = h.err.join("");
+    expect(err).toContain("still running");
+    expect(err).toContain(
+      `keeper agent show-last-message ${transcriptPath} --agent claude`,
+    );
+    expect(err).not.toContain("keeper agent wait");
+
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "assistant",
+        message: {
+          role: "assistant",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "late live answer" }],
+        },
+      })}\n`,
+    );
+    expect(findLastMessage("claude", transcriptPath).text).toBe(
+      "late live answer",
+    );
   });
 
   test("model/effort/preset alongside --resume → bad_args BEFORE the resolver is consulted, envelope written to --output", async () => {

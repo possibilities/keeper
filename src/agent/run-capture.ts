@@ -22,6 +22,7 @@ import { parseDuration } from "../duration";
 import type { AgentKind } from "./dispatch";
 import { HARNESS_NAME_SET } from "./harness";
 import type {
+  PartnerLiveness,
   ResolvedHandle,
   ShowLastMessageResult,
   VerbDeps,
@@ -351,6 +352,13 @@ export interface RunCaptureEnvelope {
 export interface RunCaptureResult {
   envelope: RunCaptureEnvelope;
   exitCode: number;
+  /**
+   * Present ONLY on a `timed_out` outcome: the Partner's liveness at the
+   * observation deadline (`live` → still running; `unknown` → termination not
+   * observed). It drives the caller's honest timeout guidance and is NEVER part
+   * of the nine-key wire envelope, so the schema is unchanged.
+   */
+  timeoutLiveness?: PartnerLiveness;
 }
 
 const OUTCOME_EXIT_CODE: Record<RunCaptureOutcome, number> = {
@@ -767,6 +775,44 @@ export interface RunCaptureDeps {
   now: () => number;
 }
 
+export interface LiveCaptureArtifact {
+  path: string;
+  ref: { id: string };
+}
+
+export interface LiveCaptureBoundary {
+  transcriptPath: string;
+  lineFloor: number;
+}
+
+export type LivePartnerCaptureDisposition =
+  | "captured"
+  | "delivery_ambiguous"
+  | "delivery_failed"
+  | "capture_failed"
+  | "identity_changed"
+  | "capture_busy"
+  | "boundary_unavailable";
+
+export interface LivePartnerCaptureResult {
+  result: RunCaptureResult;
+  disposition: LivePartnerCaptureDisposition;
+  detail: string | null;
+}
+
+export interface LivePartnerCaptureDeps extends RunCaptureDeps {
+  acquire: () => { release(): void } | null;
+  publish: () => LiveCaptureArtifact;
+  remove: (artifactId: string) => void;
+  snapshotBoundary: () => LiveCaptureBoundary | null;
+  send: (
+    artifact: LiveCaptureArtifact,
+    beforePublish: () => boolean,
+  ) => Promise<{ result: string; recipients: number }>;
+  identityStillLive: () => boolean;
+  deliveryIsAmbiguous: (error: unknown) => boolean;
+}
+
 /**
  * The in-process detached-launch result for `agent run`. On success the pinned
  * {@link ResolvedHandle} is held LOCALLY (no run.json re-resolution, no
@@ -857,16 +903,22 @@ export async function captureFromHandle(
         elapsedSeconds: elapsed(),
       });
     }
-    return buildRunCaptureEnvelope({
-      outcome: "timed_out",
-      agent,
-      handle: handleId,
-      transcriptPath: show.transcriptPath,
-      resumeTarget: baseResume,
-      message: show.text,
-      messageFound: show.found,
-      elapsedSeconds: elapsed(),
-    });
+    // A timeout means only the observation deadline elapsed: preserve the bounded
+    // partial and carry the re-probed liveness so the caller reports honest
+    // guidance. `timeoutLiveness` never touches the nine-key envelope.
+    return {
+      ...buildRunCaptureEnvelope({
+        outcome: "timed_out",
+        agent,
+        handle: handleId,
+        transcriptPath: show.transcriptPath,
+        resumeTarget: baseResume,
+        message: show.text,
+        messageFound: show.found,
+        elapsedSeconds: elapsed(),
+      }),
+      timeoutLiveness: wait.liveness ?? "unknown",
+    };
   }
 
   const show = await deps.showLastMessage(handle, verbDeps);
@@ -905,6 +957,90 @@ export async function captureFromHandle(
     messageFound,
     elapsedSeconds: elapsed(),
   });
+}
+
+export async function captureLivePartnerResponse(
+  deps: LivePartnerCaptureDeps,
+  verbDeps: VerbDeps,
+  args: {
+    handle: ResolvedHandle;
+    handleId: string;
+    agent: AgentKind;
+    startMs: number;
+  },
+): Promise<LivePartnerCaptureResult> {
+  const failure = (
+    disposition: Exclude<
+      LivePartnerCaptureDisposition,
+      "captured" | "delivery_ambiguous"
+    >,
+    detail: string | null = null,
+  ): LivePartnerCaptureResult => ({
+    disposition,
+    detail,
+    result: buildRunCaptureEnvelope({
+      outcome: disposition === "capture_busy" ? "bad_args" : "launch_failed",
+      agent: args.agent,
+      handle: args.handleId,
+      resumeTarget: args.handle.sessionId,
+      elapsedSeconds: roundTenths((deps.now() - args.startMs) / 1000),
+    }),
+  });
+
+  const lease = deps.acquire();
+  if (lease === null) return failure("capture_busy");
+
+  let artifact: LiveCaptureArtifact | null = null;
+  let retainArtifact = false;
+  try {
+    artifact = deps.publish();
+    const boundary = deps.snapshotBoundary();
+    if (boundary === null) return failure("boundary_unavailable");
+
+    let ambiguous = false;
+    try {
+      const delivery = await deps.send(artifact, deps.identityStillLive);
+      if (delivery.result !== "delivered" || delivery.recipients !== 1) {
+        return failure("delivery_failed", delivery.result);
+      }
+      retainArtifact = true;
+    } catch (err) {
+      if (!deps.deliveryIsAmbiguous(err)) {
+        const identityChanged = !deps.identityStillLive();
+        return failure(
+          identityChanged ? "identity_changed" : "delivery_failed",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+      ambiguous = true;
+      retainArtifact = true;
+    }
+
+    const result = await captureFromHandle(deps, verbDeps, {
+      ...args,
+      handle: {
+        ...args.handle,
+        transcriptPath: boundary.transcriptPath,
+        injectedMessageMarker: artifact.path,
+        transcriptLineFloor: boundary.lineFloor,
+      },
+    });
+    return {
+      result,
+      disposition: ambiguous ? "delivery_ambiguous" : "captured",
+      detail: null,
+    };
+  } catch (err) {
+    return failure(
+      retainArtifact ? "capture_failed" : "delivery_failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  } finally {
+    if (artifact !== null && !retainArtifact) {
+      deps.remove(artifact.ref.id);
+    }
+    lease.release();
+  }
 }
 
 /**

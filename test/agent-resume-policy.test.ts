@@ -122,6 +122,10 @@ test("a live process (pid + start-time identity match) is refused, naming the ca
     job_id: "sess-live",
     harness: "claude",
     title: "gamma",
+    resume_target: "native-live",
+    cwd: null,
+    pid: 4242,
+    start_time: "t-live",
   });
 });
 test("a recycled pid (same pid, different OS start_time) is NOT treated as live", () => {

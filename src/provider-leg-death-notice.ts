@@ -1,11 +1,25 @@
 import { parseWrappedProviderTaskId } from "./autoclose-worker";
 import type { PublishedBusArtifact } from "./bus-artifact";
 import {
-  encodeBusArtifactRef,
+  BusSendAttemptError,
   publishBusArtifact,
   removeBusArtifact,
   resolveBusArtifactRoot,
+  sendBusArtifact,
 } from "./bus-artifact";
+
+export {
+  BUS_RESPONSE_TIMEOUT_MS,
+  type BusPublishResult,
+  BusSendAttemptError,
+  type BusSendResult,
+  buildBusPublishFrame,
+  buildBusRegisterFrame,
+  busSendTransportIsAmbiguous,
+  CHAT_NAMESPACE,
+  sendBusArtifact,
+} from "./bus-artifact";
+
 import type { WrappedLegAbortCapture } from "./exec-backend";
 
 // Schema v2 adds the launch-time abort capture (redacted, bounded pane
@@ -23,9 +37,6 @@ export const PROVIDER_LEG_DEATH_NOTICE_SEND_CAP = 5;
 export const PROVIDER_LEG_DEATH_NOTICE_MEMO_CAP = 256;
 export const PROVIDER_LEG_DEATH_NOTICE_MAX_ATTEMPTS = 3;
 export const PROVIDER_LEG_DEATH_NOTICE_RETRY_MS = 250;
-
-export const CHAT_NAMESPACE = "chat";
-export const BUS_RESPONSE_TIMEOUT_MS = 5000;
 
 export type ProviderLegTerminalKind = "ended" | "killed";
 
@@ -158,46 +169,6 @@ export interface ProviderLegDeathNoticeSweepDeps {
   ) => Promise<ProviderLegNoticeSendResult>;
   nowMs: () => number;
   noteLine?: (line: string) => void;
-}
-
-export interface BusArtifactRefPayload {
-  media_type: string;
-  text: string;
-  t: "bus-artifact-ref";
-  v: 1;
-  id: string;
-  len: number;
-  sha256: string;
-}
-
-export interface BusPublishFrame {
-  op: "publish";
-  event: "send";
-  namespace: string;
-  to: string;
-  payload: BusArtifactRefPayload;
-}
-
-export type BusPublishResult =
-  | "delivered"
-  | "queued_for_wake"
-  | "not_connected"
-  | "unknown_target"
-  | "ambiguous_target"
-  | "delivery_failed";
-
-export interface BusSendResult {
-  result: BusPublishResult;
-  recipients: number;
-}
-
-export class BusSendAttemptError extends Error {
-  constructor(
-    message: string,
-    readonly deliveryAmbiguous: boolean,
-  ) {
-    super(message);
-  }
 }
 
 function truncateUtf8(
@@ -704,187 +675,6 @@ export async function runProviderLegDeathNoticeSweep(
       candidate.terminalEventId,
       result,
       deps.nowMs(),
-    );
-  }
-}
-
-export function buildBusPublishFrame(
-  artifact: PublishedBusArtifact,
-  target: string,
-  mediaType = "text/markdown",
-): BusPublishFrame {
-  const encoded = JSON.parse(encodeBusArtifactRef(artifact.ref)) as {
-    t: "bus-artifact-ref";
-    v: 1;
-    id: string;
-    len: number;
-    sha256: string;
-  };
-  return {
-    op: "publish",
-    event: "send",
-    namespace: CHAT_NAMESPACE,
-    to: target,
-    payload: {
-      media_type: mediaType,
-      text: encodeBusArtifactRef(artifact.ref),
-      ...encoded,
-    },
-  };
-}
-
-export function buildBusRegisterFrame(
-  sendOnly = false,
-  env: NodeJS.ProcessEnv = process.env,
-  pid = process.pid,
-): object {
-  const sessionId = (env.KEEPER_JOB_ID ?? "").trim();
-  return {
-    op: "register",
-    namespace: CHAT_NAMESPACE,
-    namespaces: [CHAT_NAMESPACE],
-    pid,
-    send_only: sendOnly,
-    ...(sessionId === "" ? {} : { session_id: sessionId }),
-  };
-}
-
-export function busSendTransportIsAmbiguous(
-  publishStarted: boolean,
-  serverRejected: boolean,
-): boolean {
-  return publishStarted && !serverRejected;
-}
-
-async function busRoundTrip<T>(
-  sockPath: string,
-  drive: (
-    send: (frame: object) => void,
-    onFrame: (handler: (frame: Record<string, unknown>) => void) => void,
-    resolve: (value: T) => void,
-    reject: (error: Error) => void,
-  ) => void,
-): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    let remainder = "";
-    let settled = false;
-    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
-    let frameHandler: (frame: Record<string, unknown>) => void = () => {};
-    const settle = (error: Error | null, value?: T): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      try {
-        sock?.end();
-      } catch {
-        // best-effort
-      }
-      if (error) reject(error);
-      else resolve(value as T);
-    };
-    const timeout = setTimeout(() => {
-      settle(
-        new Error(`no response from bus within ${BUS_RESPONSE_TIMEOUT_MS}ms`),
-      );
-    }, BUS_RESPONSE_TIMEOUT_MS);
-    timeout.unref?.();
-    Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(socket) {
-          sock = socket;
-          drive(
-            (frame) => {
-              try {
-                socket.write(`${JSON.stringify(frame)}\n`);
-              } catch (err) {
-                settle(new Error(`write failed: ${(err as Error).message}`));
-              }
-            },
-            (handler) => {
-              frameHandler = handler;
-            },
-            (value) => settle(null, value),
-            (error) => settle(error),
-          );
-        },
-        data(_socket, chunk) {
-          remainder += chunk.toString("utf8");
-          let newline = remainder.indexOf("\n");
-          while (newline !== -1) {
-            const line = remainder.slice(0, newline).trim();
-            remainder = remainder.slice(newline + 1);
-            if (line.length > 0) {
-              try {
-                frameHandler(JSON.parse(line) as Record<string, unknown>);
-              } catch {
-                // Ignore malformed relay output and await a valid acknowledgement.
-              }
-            }
-            newline = remainder.indexOf("\n");
-          }
-        },
-        close() {
-          settle(new Error("bus closed connection before responding"));
-        },
-        error(_socket, err) {
-          settle(new Error(`socket error: ${(err as Error).message}`));
-        },
-      },
-    }).catch((err: Error) => {
-      settle(new Error(`failed to connect to ${sockPath}: ${err.message}`));
-    });
-  });
-}
-
-export async function sendBusArtifact(
-  sockPath: string,
-  artifact: PublishedBusArtifact,
-  target: string,
-  mediaType = "text/markdown",
-  beforePublish?: () => boolean,
-): Promise<BusSendResult> {
-  let publishStarted = false;
-  let serverRejected = false;
-  try {
-    return await busRoundTrip<BusSendResult>(
-      sockPath,
-      (send, onFrame, resolve, reject) => {
-        onFrame((frame) => {
-          if (frame.type === "ack" && frame.op === "register") {
-            let eligible = true;
-            try {
-              eligible = beforePublish?.() ?? true;
-            } catch {
-              eligible = false;
-            }
-            if (!eligible) {
-              serverRejected = true;
-              reject(
-                new Error("recipient Dispatch attempt is no longer eligible"),
-              );
-              return;
-            }
-            publishStarted = true;
-            send(buildBusPublishFrame(artifact, target, mediaType));
-          } else if (frame.type === "ack" && frame.op === "publish") {
-            resolve({
-              result: frame.result as BusPublishResult,
-              recipients:
-                typeof frame.recipients === "number" ? frame.recipients : 0,
-            });
-          } else if (frame.type === "error") {
-            serverRejected = true;
-            reject(new Error(`${frame.code}: ${frame.message}`));
-          }
-        });
-        send(buildBusRegisterFrame(true));
-      },
-    );
-  } catch (err) {
-    throw new BusSendAttemptError(
-      (err as Error).message,
-      busSendTransportIsAmbiguous(publishStarted, serverRejected),
     );
   }
 }
