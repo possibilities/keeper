@@ -754,6 +754,22 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.jammed).toBe(false);
   });
 
+  test("a board with only stale-running occupancy is not drained", () => {
+    const snap = makeSnap({
+      epics: [{ epic_id: "fn-stale-1", status: "open", tasks: [] }],
+      perEpic: {
+        "fn-stale-1": {
+          tag: "running",
+          reason: { kind: "monitor-stale" },
+        } as Verdict,
+      },
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.counts.epics.stale_running).toBe(1);
+    expect(d?.drained).toBe(false);
+    expect(d?.jammed).toBe(false);
+  });
+
   test("a ready epic is NOT drained (dispatchable work remains)", () => {
     const snap = makeSnap({
       epics: [{ epic_id: "fn-1-a", status: "open", tasks: [] }],
