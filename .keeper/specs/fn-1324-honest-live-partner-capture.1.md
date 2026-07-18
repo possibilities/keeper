@@ -41,5 +41,5 @@ Pin positive-live timeout, unknown-lifecycle timeout, partial/no-transcript guid
 - [ ] The focused agent capture, pair-subcommand, and golden tests pass
 
 ## Done summary
-
+timed_out now means only that the observation deadline elapsed: run-capture never reaps the window or marks control terminal for a timeout (even under --reap-window-on-terminal), leaving the Partner resident/resumable. runWaitForStop re-probes lifecycle at the deadline and main emits honest 'still running' vs 'termination was not observed' guidance; confirmed-terminal/partner_died paths and the nine-key envelope are unchanged.
 ## Evidence
