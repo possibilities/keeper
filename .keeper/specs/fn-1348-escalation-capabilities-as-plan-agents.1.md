@@ -39,5 +39,5 @@ Author four static agent templates porting the capability contracts: merge-resol
 - [ ] Render check and both golden fixtures are green
 
 ## Done summary
-
+Ported the four escalation capabilities (merge-resolver, deconflicter, unblocker, repairer) into rendered plan:* agent templates with role-appropriate disallowedTools, registered them in prompt-artifacts.yaml's plan:work/plan:close bundles with a default_pin fallback for missing host pins, documented example agent_pins rows, and re-captured both oracle golden fixtures.
 ## Evidence
