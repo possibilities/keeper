@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T22:16:43.633000Z",
+  "created_by_close_of": "fn-1347-escalation-grant-confinement-groundwork",
+  "depends_on_epics": [
+    "fn-1347-escalation-grant-confinement-groundwork"
+  ],
+  "id": "fn-1357-harden-escalation-grant-confinement",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Harden escalation grant confinement",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T22:16:43.633000Z"
+}
