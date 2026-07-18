@@ -48,10 +48,10 @@ export const OBSERVATION_FRESHNESS_CEILING_MS = 5 * 60_000;
 export const ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS = 10 * 60_000;
 
 /** Base interval between observer cycles. */
-export const OBSERVE_INTERVAL_MS = 60_000;
+export const OBSERVE_INTERVAL_MS = 30_000;
 
 /** Uniform jitter added to each observer sleep. */
-export const OBSERVE_JITTER_MS = 15_000;
+export const OBSERVE_JITTER_MS = 5_000;
 
 /** Short-lived launch reservation lifetime. */
 export const RESERVATION_TTL_MS = 90_000;

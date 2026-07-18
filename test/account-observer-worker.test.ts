@@ -121,7 +121,11 @@ describe("AccountObserver", () => {
       const sleepDurations: number[] = [];
       const clock: ObserverClock = {
         nowMs: () => NOW_MS,
-        uniform: () => 7,
+        uniform: (lo, hi) => {
+          expect(lo).toBe(0);
+          expect(hi).toBe(5_000);
+          return hi;
+        },
         sleep: async (ms) => {
           sleepDurations.push(ms);
           controller.abort();
@@ -137,7 +141,7 @@ describe("AccountObserver", () => {
       });
       await observer.run();
       expect(calls).toHaveLength(1);
-      expect(sleepDurations).toEqual([60_007]);
+      expect(sleepDurations).toEqual([35_000]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
