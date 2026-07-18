@@ -86,5 +86,5 @@ byte-identity.
 - [ ] Focused named gates plus typecheck are green.
 
 ## Done summary
-
+Added providerLegActivityByWrapperJobId (shared builder in readiness-client.ts, consumed by both loadReadinessInputs and subscribeReadiness) as a new appended-last computeReadiness input; task and close-row staleness splits now render running:provider-leg-active when an owned live Provider leg shows fresh activity within the staleness window, otherwise falling back to the byte-identical sub-agent-stale path. Added regression tests (fresh/stale/absent/future-skewed/transferred leg cases, close-row analog, await/board-color assertions) and a CONTEXT.md glossary entry; ADR 0087 Consequences trued up on evidence-quality wording.
 ## Evidence
