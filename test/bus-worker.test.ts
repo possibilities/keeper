@@ -51,6 +51,7 @@ import {
   channelPruneDecision,
   cleanupBusArtifacts,
   closeOwnsBinding,
+  createRetentionSingleFlight,
   duplicateRegistrationDecision,
   enrichPeerFromJobs,
   HARNESS_WALK_MAX_DEPTH,
@@ -61,6 +62,7 @@ import {
   payloadFromMessage,
   publishOutcome,
   type RegistryEntry,
+  readBoundedPsOutput,
   registrationPresenceEffects,
   requeueTail,
   resolveHarnessIdentity,
@@ -71,6 +73,7 @@ import {
   toLiveChannel,
   validateChatPayload,
 } from "../src/bus-worker";
+import { drainMicrotasks, ManualScheduler } from "./helpers/retry-until";
 import { freshMemDb } from "./helpers/template-db";
 
 /** A no-op writable stand-in: a non-null `sock` so an entry counts as CONNECTED
@@ -700,6 +703,89 @@ test("channel retention freshness and live-socket fences win async probe races",
   expect(resubscribed.deleted).toBe(0);
   expect(loadChannels(subscribedDb)).toHaveLength(1);
   subscribedDb.close();
+});
+
+test("retention probe timeouts release the single-flight pass for the next tick", async () => {
+  const db = openBusDb(":memory:");
+  upsertChannel(
+    db,
+    makeChannel({
+      channel_id: "ch-never-probe",
+      last_heartbeat: 0,
+    }),
+  );
+  const timer = new ManualScheduler();
+  const state = { cursor: null };
+  let completedPasses = 0;
+  let probes = 0;
+  const runPass = async (): Promise<void> => {
+    await sweepChannelRetention(
+      db,
+      10_000,
+      state,
+      {
+        identityConnected: () => false,
+        isPidAlive: () => true,
+        probeStartTime: () => {
+          probes += 1;
+          return new Promise<string | null>(() => {});
+        },
+        retire: () => {
+          throw new Error("timed-out probe must keep its row");
+        },
+        probeTimeoutMs: 1,
+        probeTimer: timer,
+      },
+      {
+        candidates: 1,
+        probes: 1,
+        deletes: 1,
+        graceMs: 100,
+        horizonMs: 100_000,
+      },
+    );
+    completedPasses += 1;
+  };
+  const retention = createRetentionSingleFlight(runPass, (error) => {
+    throw error;
+  });
+
+  retention.tick();
+  await drainMicrotasks();
+  expect(retention.active).toBe(true);
+  await timer.advanceBy(1);
+  expect(retention.active).toBe(false);
+  expect(completedPasses).toBe(1);
+  expect(loadChannels(db)).toHaveLength(1);
+
+  retention.tick();
+  await drainMicrotasks();
+  expect(retention.active).toBe(true);
+  await timer.advanceBy(1);
+  expect(retention.active).toBe(false);
+  expect(completedPasses).toBe(2);
+  expect(probes).toBe(2);
+  db.close();
+});
+
+test("bounded ps output kills an unresponsive probe and returns null", async () => {
+  const timer = new ManualScheduler();
+  let killed = 0;
+  const output = readBoundedPsOutput(
+    {
+      readOutput: () => new Promise<string>(() => {}),
+      exited: new Promise<never>(() => {}),
+      kill: () => {
+        killed += 1;
+      },
+    },
+    1,
+    timer,
+  );
+
+  await timer.advanceBy(1);
+  expect(await output).toBeNull();
+  expect(killed).toBe(1);
 });
 
 test("horizon reap closes and detaches a stale unsubscribed registration", async () => {

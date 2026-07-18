@@ -680,11 +680,78 @@ export interface ChannelRetentionState {
   cursor: ChannelRetentionCursor | null;
 }
 
+export interface ProbeTimer {
+  setTimer(callback: () => void, delayMs: number): unknown;
+  clearTimer(handle: unknown): void;
+}
+
+const systemProbeTimer: ProbeTimer = {
+  setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+export const PS_PROBE_TIMEOUT_MS = 1_000;
+
+export async function runBoundedProbe<T>(
+  probe: () => Promise<T>,
+  timeoutMs = PS_PROBE_TIMEOUT_MS,
+  timer: ProbeTimer = systemProbeTimer,
+  onTimeout?: () => void,
+): Promise<T | null> {
+  let timerHandle: unknown;
+  try {
+    const timedOut = new Promise<null>((resolve) => {
+      timerHandle = timer.setTimer(
+        () => {
+          try {
+            onTimeout?.();
+          } catch {}
+          resolve(null);
+        },
+        Math.max(0, timeoutMs),
+      );
+    });
+    return await Promise.race([Promise.resolve().then(probe), timedOut]);
+  } catch {
+    return null;
+  } finally {
+    if (timerHandle !== undefined) {
+      try {
+        timer.clearTimer(timerHandle);
+      } catch {}
+    }
+  }
+}
+
+export interface PsProbe {
+  readOutput(): Promise<string>;
+  exited: Promise<unknown>;
+  kill(): void;
+}
+
+export function readBoundedPsOutput(
+  probe: PsProbe,
+  timeoutMs = PS_PROBE_TIMEOUT_MS,
+  timer: ProbeTimer = systemProbeTimer,
+): Promise<string | null> {
+  return runBoundedProbe(
+    async () => {
+      const [output] = await Promise.all([probe.readOutput(), probe.exited]);
+      return output;
+    },
+    timeoutMs,
+    timer,
+    () => probe.kill(),
+  );
+}
+
 export interface ChannelRetentionSweepDeps {
   identityConnected(pid: number, startTime: string): boolean;
   isPidAlive(pid: number): boolean;
   probeStartTime(pid: number): Promise<string | null>;
   retire(row: ChannelRow): void;
+  probeTimeoutMs?: number;
+  probeTimer?: ProbeTimer;
 }
 
 export interface ChannelRetentionSweepLimits {
@@ -752,7 +819,11 @@ export async function sweepChannelRetention(
       result.probes += 1;
       liveness = {
         alive: true,
-        startTime: await deps.probeStartTime(row.pid),
+        startTime: await runBoundedProbe(
+          () => deps.probeStartTime(row.pid),
+          deps.probeTimeoutMs,
+          deps.probeTimer,
+        ),
       };
     }
 
@@ -992,9 +1063,13 @@ export async function ppidViaPs(pid: number): Promise<number | null> {
       stdout: "pipe",
       stderr: "ignore",
     });
-    const raw = (await new Response(proc.stdout).text()).trim();
-    await proc.exited;
-    if (proc.exitCode !== 0) return null;
+    const output = await readBoundedPsOutput({
+      readOutput: () => new Response(proc.stdout).text(),
+      exited: proc.exited,
+      kill: () => proc.kill(),
+    });
+    if (output === null || proc.exitCode !== 0) return null;
+    const raw = output.trim();
     if (raw.length === 0) return null;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
@@ -1020,9 +1095,12 @@ export async function startTimeViaPs(pid: number): Promise<string | null> {
         ["ps", "-ww", "-p", String(pid), "-o", "lstart=,args="],
         { stdout: "pipe", stderr: "ignore" },
       );
-      const raw = await new Response(proc.stdout).text();
-      await proc.exited;
-      if (proc.exitCode !== 0) return null;
+      const raw = await readBoundedPsOutput({
+        readOutput: () => new Response(proc.stdout).text(),
+        exited: proc.exited,
+        kill: () => proc.kill(),
+      });
+      if (raw === null || proc.exitCode !== 0) return null;
       const split = splitArgsLstart(raw);
       return split ? `darwin:${split.lstart}` : null;
     }
@@ -1035,6 +1113,31 @@ export async function startTimeViaPs(pid: number): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+export interface RetentionSingleFlight {
+  tick(): void;
+  readonly active: boolean;
+}
+
+export function createRetentionSingleFlight(
+  runPass: () => Promise<void>,
+  onError: (error: unknown) => void,
+): RetentionSingleFlight {
+  let retentionPass: Promise<void> | null = null;
+  return {
+    tick() {
+      if (retentionPass !== null) return;
+      retentionPass = runPass()
+        .catch(onError)
+        .finally(() => {
+          retentionPass = null;
+        });
+    },
+    get active() {
+      return retentionPass !== null;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,17 +1990,10 @@ export function startBusServer(
     }
   };
 
-  let retentionPass: Promise<void> | null = null;
-  const retentionTimer = setInterval(() => {
-    if (retentionPass !== null) return;
-    retentionPass = runRetentionPass()
-      .catch((err) => {
-        console.error("[bus-worker] retention pass failed (non-fatal):", err);
-      })
-      .finally(() => {
-        retentionPass = null;
-      });
-  }, RETENTION_INTERVAL_MS);
+  const retentionLoop = createRetentionSingleFlight(runRetentionPass, (err) => {
+    console.error("[bus-worker] retention pass failed (non-fatal):", err);
+  });
+  const retentionTimer = setInterval(retentionLoop.tick, RETENTION_INTERVAL_MS);
   // Never let the GC timer keep the worker alive past shutdown.
   retentionTimer.unref?.();
 
