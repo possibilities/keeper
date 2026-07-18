@@ -8,7 +8,7 @@
     "fn-1353-attribute-native-crashes-at-boot"
   ],
   "id": "fn-1349-in-session-blocked-task-handling",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T21:16:29.751000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:16:29.005000Z"
+  "updated_at": "2026-07-18T21:16:29.751000Z"
 }
