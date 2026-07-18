@@ -6,7 +6,8 @@
     "fn-1346-retire-torn-down-lane-git-rows",
     "fn-1353-attribute-native-crashes-at-boot",
     "fn-1347-escalation-grant-confinement-groundwork",
-    "fn-1354-own-pi-skill-shorthands"
+    "fn-1354-own-pi-skill-shorthands",
+    "fn-1359-add-durable-fable-focus"
   ],
   "id": "fn-1355-add-pi-codex-account-pool",
   "last_validated_at": "2026-07-18T21:39:22.814000Z",
@@ -17,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:47:38.404000Z"
+  "updated_at": "2026-07-18T23:35:51.926000Z"
 }
