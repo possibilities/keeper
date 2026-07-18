@@ -37,5 +37,5 @@ in `closePhaseResume` and their schema gate).
       torn / stale selection artifacts is preserved.
 
 ## Done summary
-
+closePhaseResume now grades followup-brief.json / followup-verdict.json against their own selection-family schema ceilings (SELECTION_BRIEF_SCHEMA_VERSION / SELECTION_SCHEMA_VERSION) instead of AUDIT_SCHEMA_VERSION, preserving audit-family gating and safe-degrade behavior.
 ## Evidence
