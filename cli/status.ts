@@ -513,7 +513,10 @@ export function buildStatusEnvelope(
   // epic header, no in-flight launch). `jammed` vs `drained` splits on whether
   // a human-blocking signal remains.
   const atRest =
-    inFlightTotal === 0 && epicTally.ready === 0 && epicTally.running === 0;
+    inFlightTotal === 0 &&
+    epicTally.ready === 0 &&
+    epicTally.running === 0 &&
+    epicTally.stale_running === 0;
   const jammed = atRest && needsHumanTotal > 0;
   const drained = atRest && needsHumanTotal === 0;
 
