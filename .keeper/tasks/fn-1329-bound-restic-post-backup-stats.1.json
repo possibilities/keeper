@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-18T09:46:07.532000Z",
   "depends_on": [],
   "epic": "fn-1329-bound-restic-post-backup-stats",
   "id": "fn-1329-bound-restic-post-backup-stats.1",
-  "model": "opus",
+  "model": "gpt-5.5",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/dotfiles",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Bound and degrade backup stats",
-  "updated_at": "2026-07-18T09:46:07.532000Z"
+  "updated_at": "2026-07-18T09:46:50.446000Z"
 }
