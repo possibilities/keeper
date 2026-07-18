@@ -26,8 +26,19 @@ function harness(inputs: {
   const stdout: string[] = [];
   const calls: string[][] = [];
   let probeIndex = 0;
+  let preProbed = false;
   let printIndex = 0;
   let bootReadCount = 0;
+  const oldIdentity = {
+    boot_id: "before-restart",
+    pid: 101,
+    start_time: "darwin:before",
+  };
+  const nextIdentity = {
+    boot_id: "after-restart",
+    pid: 202,
+    start_time: "darwin:after",
+  };
   const deps: RestartDeps = {
     runLaunchctl: async (args) => {
       calls.push(args);
@@ -41,11 +52,38 @@ function harness(inputs: {
         }
       );
     },
-    probeHealth: async () => inputs.probes[probeIndex++] ?? false,
-    readLatestBoot: async () =>
-      bootReadCount++ === 0
-        ? { boot_id: "before-restart", ts: 1 }
-        : { boot_id: "after-restart", ts: 2 },
+    probeHealth: async () => {
+      if (!preProbed) {
+        preProbed = true;
+        return {
+          status: "served",
+          identity: oldIdentity,
+          healthy: true,
+          catching_up: false,
+        };
+      }
+      const healthy =
+        inputs.probes[probeIndex++] ?? inputs.probes.at(-1) ?? false;
+      return healthy
+        ? {
+            status: "served",
+            identity: nextIdentity,
+            healthy: true,
+            catching_up: false,
+          }
+        : { status: "unavailable", diagnostic: "refused" };
+    },
+    readBootLedger: async () => ({
+      status: "readable",
+      boots:
+        bootReadCount++ === 0
+          ? [{ ...oldIdentity, ts: 1 }]
+          : [
+              { ...oldIdentity, ts: 1 },
+              { ...nextIdentity, ts: 2 },
+            ],
+    }),
+    classifyOldProcess: async () => "dead" as const,
     sleep: async (ms) => {
       now += ms;
     },
@@ -81,10 +119,11 @@ describe("keeper daemon restart", () => {
     expect(caught).toBeInstanceOf(ExitError);
     expect((caught as ExitError).code).toBe(0);
     expect(h.calls[0]).toEqual(["kickstart", "-k", "gui/501/arthack.keeperd"]);
-    expect(JSON.parse(h.stdout.join(""))).toMatchObject({
-      ok: true,
-      data: { healthy_probes: REQUIRED_HEALTHY_PROBES },
-    });
+    const envelope = JSON.parse(h.stdout.join(""));
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data.healthy_probes).toBeGreaterThanOrEqual(
+      REQUIRED_HEALTHY_PROBES,
+    );
   });
 
   test("treats refused probes during replacement as transient", async () => {
@@ -103,6 +142,7 @@ describe("keeper daemon restart", () => {
   test("reports a launchd throttle separately", async () => {
     const h = harness({
       probes: [false],
+      timeoutMs: 500,
       prints: [
         {
           exitCode: 0,

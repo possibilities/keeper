@@ -8,17 +8,15 @@
  *
  * This is the slow-tier answer to a blind spot the correctness gates cannot cover:
  * a defect in the CONTRACT between a live serve frame and its live consumer. The
- * restart-verdict defect proved fixture-invisible because both the probe and the
- * code were written from the same misunderstanding — the probe demanded a boot
- * header the serve protocol deliberately OMITS on memoized steady-state replies.
- * So here nothing is a fixture: a real keeperd boots fully sandboxed, and the
+ * The live contract is checked independently of fixtures: a real keeperd boots
+ * fully sandboxed, and the
  * shipped {@link isCaughtUpFrame} (imported from the restart CLI, the exact
  * consumer) is asserted to AGREE with both live frame shapes off the real wire.
  * Scenarios (b) and (c) go further and run the shipped {@link runRestart} itself
  * against a REAL sandboxed daemon — only `runLaunchctl` (the launchctl seam) is
  * test-driven, kill-and-respawning the sandboxed process the way `launchctl
- * kickstart -k` respawns the real LaunchAgent job; `probeHealth` and
- * `readLatestBoot` are the shipped functions, unmodified.
+ * kickstart -k` respawns the real LaunchAgent job; the health, ledger, and
+ * process-identity consumers are the shipped functions, unmodified.
  *
  * Runs behind the `slow-daemon` named gate only (`bun run test:slow-daemon`);
  * never a correctness gate. See `test/helpers/daemon-smoke-harness.ts`.
@@ -28,10 +26,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  classifyOldProcess,
   isCaughtUpFrame,
   probeSocketHealth,
   type RestartDeps,
-  readLatestBoot,
+  readRestartBootLedger,
   runRestart,
 } from "../../cli/restart";
 import type { EventStoreStatus } from "../../src/protocol";
@@ -45,6 +44,7 @@ import {
   runScenario,
   type SandboxedDaemon,
   type ServeFrame,
+  servedBootIdentity,
 } from "../helpers/daemon-smoke-harness";
 import { retryUntil } from "../helpers/retry-until";
 
@@ -80,7 +80,7 @@ async function restartAndCapture(
 // longer than the ~150ms a client needs to connect — so the transient
 // catching-up frame shape is reliably observable over the wire (an empty DB
 // catches up before the first probe lands).
-const SEED_EVENTS = 600;
+const SEED_EVENTS = 1_100;
 
 describe("sandboxed real-daemon boot + served frame contract", () => {
   let observations: {
@@ -157,29 +157,19 @@ describe("sandboxed real-daemon boot + served frame contract", () => {
     }
   });
 
-  test("the steady-state memoized reply omits the boot header and the shipped isCaughtUpFrame agrees it is caught up", () => {
+  test("the steady-state memoized reply carries exact served identity and completed Drain", () => {
     const frame = observations.steadyStateFrame;
     expect(frame.type).toBe("result");
-    // The memo line is built without a boot header — the exact shape the
-    // restart-verdict defect got wrong. Assert the header is absent from the
-    // parsed frame AND that the boot-header KEY is absent from the wire bytes.
-    // (A bare "boot" substring check would false-positive on the event-store
-    // block's `last_boot_catchup` field, so match the header key precisely.)
-    expect(frame.boot).toBeUndefined();
-    expect(observations.steadyStateRaw).not.toContain('"boot":');
-    // The shipped consumer must read a header-less result as caught up.
+    expect(observations.steadyStateRaw).toContain('"boot":');
+    expect(servedBootIdentity(frame)).not.toBeNull();
+    expect(frame.boot?.catching_up).toBe(false);
     expect(isCaughtUpFrame(frame)).toBe(true);
   });
 
-  // fn-1312 (ADR 0073 amendment): the event-store block rode the boot header,
-  // so a caught-up daemon — whose memoized reply omits the header — served
-  // `event_store: null` exactly when healthy. The block now rides the `result`
-  // frame directly. Assert the live steady-state wire carries the FULL non-null
-  // block, the contract this scenario pins so it can't regress blind again.
-  test("the steady-state reply carries the full event-store block on the frame (delivered off the omitted boot header)", () => {
+  test("the steady-state reply carries the full event-store block on the frame", () => {
     const frame = observations.steadyStateFrame;
     const eventStore = frame.event_store as EventStoreStatus | undefined;
-    // Present and non-null against a caught-up daemon — the whole point.
+    // Present and non-null against a caught-up daemon.
     expect(eventStore).toBeDefined();
     expect(eventStore).not.toBeNull();
     if (eventStore === undefined || eventStore === null) {
@@ -336,39 +326,38 @@ describe("worker-kill supervision contract", () => {
 });
 
 describe("restart CLI evidence verdict against the sandboxed daemon", () => {
-  test("returns a true success once the launchctl-seam respawn reaches health", async () => {
+  test("proves retained history and one matching served identity through stabilization", async () => {
     const verdict = await runScenario(
       async (daemon: SandboxedDaemon) => {
-        await pollUntilCaughtUp(daemon.sockPath, 8_000);
+        const predecessor = await pollUntilCaughtUp(daemon.sockPath, 8_000);
+        const predecessorIdentity = servedBootIdentity(
+          predecessor.caughtUpFrame,
+        );
+        if (predecessorIdentity === null) {
+          throw new Error("predecessor served no boot identity");
+        }
 
         let current = daemon;
         const stdout: string[] = [];
+        const ledgerPath = join(daemon.tmpDir, "restart-ledger.json");
+        const ledgerBefore = readFileSync(ledgerPath, "utf8");
         const savedLedgerEnv = process.env.KEEPER_RESTART_LEDGER;
-        process.env.KEEPER_RESTART_LEDGER = join(
-          daemon.tmpDir,
-          "restart-ledger.json",
-        );
+        process.env.KEEPER_RESTART_LEDGER = ledgerPath;
         try {
           const deps: RestartDeps = {
             runLaunchctl: async (args) => {
               if (args[0] !== "kickstart") {
                 return { exitCode: 0, stdout: "state = running", stderr: "" };
               }
-              // The launchctl seam: real kill + real respawn into the SAME
-              // sandbox, mirroring `launchctl kickstart -k`. Everything else
-              // (the socket, the ledger, the health probe below) is real.
               await killDaemonProcess(current);
               current = respawnSandboxedDaemon(current.tmpDir);
               return { exitCode: 0, stdout: "", stderr: "" };
             },
-            // The shipped consumer, unmodified — it hits the real sandbox
-            // socket.
             probeHealth: probeSocketHealth,
-            // The shipped consumer, unmodified — it reads
-            // `KEEPER_RESTART_LEDGER`, pointed above at the sandbox ledger.
-            readLatestBoot,
+            readBootLedger: readRestartBootLedger,
+            classifyOldProcess,
             sleep: (ms) => Bun.sleep(ms),
-            now: () => Date.now(),
+            now: () => performance.now(),
             random: () => Math.random(),
             uid: () => 501,
             writeStdout: (text) => stdout.push(text),
@@ -379,16 +368,29 @@ describe("restart CLI evidence verdict against the sandboxed daemon", () => {
           };
 
           const exit = await restartAndCapture(
-            { sock: daemon.sockPath, timeoutMs: 20_000 },
+            { sock: daemon.sockPath, timeoutMs: 28_000 },
             deps,
           );
-          return { exit, finalPid: current.pid };
+          const served = await probeServeFrame(daemon.sockPath, 2_000);
+          const ledgerAfter = readFileSync(ledgerPath, "utf8");
+          return {
+            exit,
+            predecessorIdentity,
+            successorIdentity:
+              served === null ? null : servedBootIdentity(served.frame),
+            ledgerBefore,
+            ledgerAfter,
+          };
         } finally {
-          process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+          if (savedLedgerEnv === undefined) {
+            delete process.env.KEEPER_RESTART_LEDGER;
+          } else {
+            process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+          }
           await killDaemonProcess(current);
         }
       },
-      { deadlineMs: 35_000, retries: 1 },
+      { deadlineMs: 45_000, retries: 1 },
     );
     if (verdict.kind !== "ok") {
       throw new Error(
@@ -396,12 +398,29 @@ describe("restart CLI evidence verdict against the sandboxed daemon", () => {
       );
     }
 
-    const { exit } = verdict.value;
+    const {
+      exit,
+      predecessorIdentity,
+      successorIdentity,
+      ledgerBefore,
+      ledgerAfter,
+    } = verdict.value;
     expect(exit.code).toBe(0);
     const envelope = JSON.parse(exit.output);
     expect(envelope.ok).toBe(true);
-    expect(envelope.data.healthy_probes).toBeGreaterThanOrEqual(3);
-  }, 90_000);
+    expect(envelope.data.identity).not.toEqual(predecessorIdentity);
+    expect(envelope.data.identity).toEqual(successorIdentity);
+    expect(envelope.data.stabilized_for_ms).toBeGreaterThanOrEqual(12_000);
+    expect(ledgerAfter.startsWith(ledgerBefore)).toBe(true);
+    const bootIds = ledgerAfter
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind?: string; boot_id?: string })
+      .filter((line) => line.kind === "boot")
+      .map((line) => line.boot_id);
+    expect(bootIds).toContain(predecessorIdentity.boot_id);
+    expect(bootIds).toContain(envelope.data.identity.boot_id);
+  }, 100_000);
 
   test("returns the honest failure when the sandboxed daemon never returns", async () => {
     const verdict = await runScenario(
@@ -427,9 +446,10 @@ describe("restart CLI evidence verdict against the sandboxed daemon", () => {
               return { exitCode: 0, stdout: "", stderr: "" };
             },
             probeHealth: probeSocketHealth,
-            readLatestBoot,
+            readBootLedger: readRestartBootLedger,
+            classifyOldProcess,
             sleep: (ms) => Bun.sleep(ms),
-            now: () => Date.now(),
+            now: () => performance.now(),
             random: () => Math.random(),
             uid: () => 501,
             writeStdout: (text) => stdout.push(text),
@@ -444,7 +464,11 @@ describe("restart CLI evidence verdict against the sandboxed daemon", () => {
             deps,
           );
         } finally {
-          process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+          if (savedLedgerEnv === undefined) {
+            delete process.env.KEEPER_RESTART_LEDGER;
+          } else {
+            process.env.KEEPER_RESTART_LEDGER = savedLedgerEnv;
+          }
         }
       },
       { deadlineMs: 18_000, retries: 1 },

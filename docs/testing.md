@@ -64,12 +64,15 @@ boundary:
 | Gate | Command | Proves |
 | --- | --- | --- |
 | Real-git publication | `bun run test:slow-git` | `commit-work`'s atomic publication against a real git subprocess. |
-| Real-daemon smoke | `bun run test:slow-daemon` | A sandboxed real keeperd boot and catch-up, the served frame/probe contract, killing a real worker, and the restart CLI's evidence verdict, end to end (ADR 0073). |
+| Real-daemon smoke | `bun run test:slow-daemon` | A sandboxed real keeperd boot and catch-up, served identity/Drain framing, worker-fatal cleanup, and the restart verdict's retained ledger history, identity match, stabilization hold, and no-replacement control (ADR 0073). |
 | Fold-cost bench | `bun run test:bench-folds` | The reducer's growth curves stay pinned: the epic-fold memoized index-serving path flat in board size, and the `syncPlanLinks` per-session commit-trailer prefix cost inside a documented regression band. |
 
 The real-git and real-daemon gates sandbox every state class under a per-run tmpdir
 and boot real subprocesses (git, a keeperd, its workers) — never the host daemon,
-never host-wide state or locks. Each owns a hard parent wall-clock deadline that
+never host-wide state or locks. The daemon restart scenario preserves the predecessor
+ledger bytes, requires the successor's served and durable identities to match, holds
+that identity caught up through the stabilization interval, and keeps the existing
+no-replacement failure control. Each gate owns a hard parent wall-clock deadline that
 force-kills a hang into a bounded red result rather than a wedge, and absorbs one
 disclosed retry to cover environment noise; a second failure is red. The fold-cost
 bench carries no subprocess or sandbox surface at all — it lives entirely inside one

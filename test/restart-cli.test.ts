@@ -4,44 +4,53 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type CommandResult,
-  DEFAULT_RESTART_TIMEOUT_MS,
   isCaughtUpFrame,
   KICKSTART_TIMEOUT_MS,
-  type RestartBootMarker,
+  parseRestartHealthFrame,
   type RestartDeps,
+  type RestartHealthProbe,
   readLatestBoot,
+  readRestartBootLedger,
   runRestart,
 } from "../cli/restart";
+import type {
+  RestartIdentity,
+  RestartLedgerSnapshot,
+  RestartProcessIdentityState,
+} from "../src/restart-observation";
 
-describe("isCaughtUpFrame", () => {
-  test("a steady-state memo result frame with no boot header is caught up", () => {
-    // The live serve shape: pre-serialized memo lines carry no boot header and
-    // ride only at steady state.
-    expect(
-      isCaughtUpFrame({
-        type: "result",
-        // biome-ignore lint/suspicious/noExplicitAny: mirrors the wire frame's extra keys
-      } as any),
-    ).toBe(true);
-  });
+const OLD: RestartIdentity = {
+  boot_id: "boot-old",
+  pid: 410,
+  start_time: "darwin:old",
+};
+const NEXT: RestartIdentity = {
+  boot_id: "boot-next",
+  pid: 520,
+  start_time: "darwin:next",
+};
+const THIRD: RestartIdentity = {
+  boot_id: "boot-third",
+  pid: 630,
+  start_time: "darwin:third",
+};
 
-  test("a result frame positively catching up is not caught up", () => {
-    expect(
-      isCaughtUpFrame({ type: "result", boot: { catching_up: true } }),
-    ).toBe(false);
-  });
+function served(
+  identity: RestartIdentity,
+  catching_up = false,
+): RestartHealthProbe {
+  return { status: "served", identity, healthy: true, catching_up };
+}
 
-  test("a result frame with catching_up false is caught up", () => {
-    expect(
-      isCaughtUpFrame({ type: "result", boot: { catching_up: false } }),
-    ).toBe(true);
-  });
-
-  test("a non-result frame never reads caught up", () => {
-    expect(isCaughtUpFrame({ type: "error" })).toBe(false);
-    expect(isCaughtUpFrame({})).toBe(false);
-  });
-});
+function readable(...identities: RestartIdentity[]): RestartLedgerSnapshot {
+  return {
+    status: "readable",
+    boots: identities.map((identity, index) => ({
+      ...identity,
+      ts: 100 + index * 100,
+    })),
+  };
+}
 
 class ExitError extends Error {
   constructor(
@@ -52,31 +61,48 @@ class ExitError extends Error {
   }
 }
 
-function restartHarness(inputs: {
-  kickstart: CommandResult;
-  latestBoot: RestartBootMarker | null;
+interface HarnessOptions {
+  kickstart?: CommandResult;
   timeoutMs?: number;
-}) {
+  probe?: (call: number, now: number) => RestartHealthProbe;
+  ledger?: (read: number, now: number) => RestartLedgerSnapshot;
+  oldProcess?: RestartProcessIdentityState;
+  cancelled?: (now: number) => boolean;
+}
+
+function restartHarness(options: HarnessOptions = {}) {
   let now = 0;
-  let bootReads = 0;
+  let probeCalls = 0;
+  let ledgerReads = 0;
+  const launchctlCalls: string[][] = [];
   const stdout: string[] = [];
   const deps: RestartDeps = {
     runLaunchctl: async (args) => {
-      if (args[0] === "kickstart") return inputs.kickstart;
-      return { exitCode: 0, stdout: "state = running", stderr: "" };
+      launchctlCalls.push(args);
+      return args[0] === "kickstart"
+        ? (options.kickstart ?? { exitCode: 0, stdout: "", stderr: "" })
+        : { exitCode: 0, stdout: "state = running", stderr: "" };
     },
-    probeHealth: async () => true,
-    readLatestBoot: async () => {
-      bootReads += 1;
-      return bootReads === 1
-        ? { boot_id: "boot-before", ts: 100 }
-        : inputs.latestBoot;
+    probeHealth: async () => {
+      const call = probeCalls++;
+      return (
+        options.probe?.(call, now) ?? (call === 0 ? served(OLD) : served(NEXT))
+      );
     },
+    readBootLedger: async () => {
+      const read = ledgerReads++;
+      return (
+        options.ledger?.(read, now) ??
+        (read === 0 ? readable(OLD) : readable(OLD, NEXT))
+      );
+    },
+    classifyOldProcess: async () => options.oldProcess ?? "dead",
     sleep: async (ms) => {
       now += ms;
     },
     now: () => now,
     random: () => 0.5,
+    isCancelled: () => options.cancelled?.(now) ?? false,
     uid: () => 501,
     writeStdout: (text) => stdout.push(text),
     writeStderr: () => {},
@@ -85,8 +111,12 @@ function restartHarness(inputs: {
     },
   };
   return {
-    args: { sock: "/tmp/keeperd.sock", timeoutMs: inputs.timeoutMs ?? 500 },
+    args: {
+      sock: "/tmp/keeperd.sock",
+      timeoutMs: options.timeoutMs ?? 30_000,
+    },
     deps,
+    launchctlCalls,
     stdout,
   };
 }
@@ -104,352 +134,284 @@ async function restartAndCapture(
   throw new Error("restart did not exit");
 }
 
-describe("readLatestBoot", () => {
-  const KEY = "KEEPER_RESTART_LEDGER";
+describe("structured restart health", () => {
+  test("requires a result frame with exact identity and boolean Drain state", () => {
+    expect(
+      parseRestartHealthFrame({
+        type: "result",
+        boot: { ...NEXT, catching_up: false },
+      }),
+    ).toEqual(served(NEXT));
+    expect(isCaughtUpFrame({ type: "result" })).toBe(false);
+    expect(
+      isCaughtUpFrame({
+        type: "result",
+        boot: { ...NEXT, catching_up: true },
+      }),
+    ).toBe(false);
+    expect(
+      isCaughtUpFrame({
+        type: "result",
+        boot: { ...NEXT, catching_up: false },
+      }),
+    ).toBe(true);
+    expect(parseRestartHealthFrame({ type: "error" })).toEqual({
+      status: "unavailable",
+      diagnostic: "non-result response frame",
+    });
+  });
+});
 
-  test("uses the override, skips non-boots and torn lines, and returns the last valid boot", async () => {
+describe("restart ledger reader", () => {
+  test("returns full valid boot identities and distinguishes a missing ledger", async () => {
     const tempDir = mkdtempSync(join(tmpdir(), "keeper-restart-cli-ledger-"));
-    const saved = process.env[KEY];
+    const saved = process.env.KEEPER_RESTART_LEDGER;
     const ledgerPath = join(tempDir, "restart-ledger.json");
-    process.env[KEY] = ledgerPath;
+    process.env.KEEPER_RESTART_LEDGER = ledgerPath;
     try {
       writeFileSync(
         ledgerPath,
         [
-          JSON.stringify({ kind: "boot", boot_id: "boot-first", ts: 100 }),
-          JSON.stringify({ kind: "death", boot_id: "boot-ignored", ts: 150 }),
-          JSON.stringify({ kind: "boot", boot_id: "boot-second", ts: 200 }),
+          JSON.stringify({
+            kind: "boot",
+            ...OLD,
+            ts: 100,
+            provenance: "launchd",
+            prev_runtime_ms: null,
+          }),
+          JSON.stringify({ kind: "death", boot_id: "ignored", ts: 150 }),
+          JSON.stringify({
+            kind: "boot",
+            ...NEXT,
+            ts: 200,
+            provenance: "launchd",
+            prev_runtime_ms: 100,
+          }),
+          JSON.stringify({
+            kind: "boot",
+            boot_id: "legacy-incomplete",
+            pid: null,
+            start_time: null,
+            ts: 300,
+          }),
           '{"kind":"boot","boot_id":"torn',
         ].join("\n"),
       );
 
-      await expect(readLatestBoot()).resolves.toEqual({
-        boot_id: "boot-second",
-        ts: 200,
-      });
+      await expect(readRestartBootLedger()).resolves.toEqual(
+        readable(OLD, NEXT),
+      );
+      await expect(readLatestBoot()).resolves.toEqual({ ...NEXT, ts: 200 });
 
-      process.env[KEY] = join(tempDir, "missing-restart-ledger.json");
+      process.env.KEEPER_RESTART_LEDGER = join(tempDir, "missing.json");
+      await expect(readRestartBootLedger()).resolves.toEqual({
+        status: "missing",
+      });
       await expect(readLatestBoot()).resolves.toBeNull();
     } finally {
-      if (saved === undefined) delete process.env[KEY];
-      else process.env[KEY] = saved;
+      if (saved === undefined) delete process.env.KEEPER_RESTART_LEDGER;
+      else process.env.KEEPER_RESTART_LEDGER = saved;
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
 
 describe("keeper daemon restart evidence verdict", () => {
-  test("accepts a fresh healthy boot after a nonzero kickstart and reports its warning", async () => {
-    const longStdout = "x".repeat(4_100);
+  test("proves one distinct ledger-backed identity through twelve monotonic seconds", async () => {
+    const h = restartHarness();
+    const exit = await restartAndCapture(h.args, h.deps);
+
+    expect(exit.code).toBe(0);
+    expect(JSON.parse(exit.output)).toEqual({
+      schema_version: 1,
+      ok: true,
+      error: null,
+      data: {
+        domain: "gui/501/arthack.keeperd",
+        identity: NEXT,
+        healthy_probes: 12,
+        stabilized_for_ms: 12_000,
+      },
+    });
+    expect(
+      h.launchctlCalls.filter((args) => args[0] === "kickstart"),
+    ).toHaveLength(1);
+  });
+
+  test("resets stabilization when the served identity changes", async () => {
+    const h = restartHarness({
+      timeoutMs: 35_000,
+      probe: (call, now) => {
+        if (call === 0) return served(OLD);
+        return served(now < 6_000 ? NEXT : THIRD);
+      },
+      ledger: (read) =>
+        read === 0 ? readable(OLD) : readable(OLD, NEXT, THIRD),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(0);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.data.identity).toEqual(THIRD);
+    expect(envelope.data.stabilized_for_ms).toBeGreaterThanOrEqual(12_000);
+  });
+
+  test("reports an unstable replacement when the reset run misses the deadline", async () => {
+    const h = restartHarness({
+      timeoutMs: 13_000,
+      probe: (call, now) => {
+        if (call === 0) return served(OLD);
+        return served(now < 6_000 ? NEXT : THIRD);
+      },
+      ledger: (read) =>
+        read === 0 ? readable(OLD) : readable(OLD, NEXT, THIRD),
+    });
+
+    const exit = await restartAndCapture(h.args, h.deps);
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("restart-unproven");
+    expect(envelope.error.details.evidence.reasons).toContainEqual({
+      code: "replacement-during-stabilization",
+      phase: "stabilization",
+    });
+  });
+
+  test("retains a bounded kickstart warning only after stronger proof succeeds", async () => {
     const h = restartHarness({
       kickstart: {
-        exitCode: 17,
-        stdout: longStdout,
-        stderr: " launchctl said no ",
+        exitCode: 143,
+        stdout: "x".repeat(5_000),
+        stderr: " launchctl timed out ",
         timedOut: true,
       },
-      latestBoot: { boot_id: "boot-after", ts: 200 },
     });
 
     const exit = await restartAndCapture(h.args, h.deps);
-
     expect(exit.code).toBe(0);
-    expect(JSON.parse(h.stdout.join(""))).toEqual({
-      schema_version: 1,
-      ok: true,
-      error: null,
-      data: {
-        domain: "gui/501/arthack.keeperd",
-        healthy_probes: 3,
-        kickstart_warning: {
-          exit_code: 17,
-          stdout: `${"x".repeat(4_084)}…[truncated]`,
-          stderr: "launchctl said no",
-          timed_out: true,
-        },
-      },
+    const warning = JSON.parse(exit.output).data.kickstart_warning;
+    expect(warning).toEqual({
+      exit_code: 143,
+      stdout: `${"x".repeat(4_084)}…[truncated]`,
+      stderr: "launchctl timed out",
+      timed_out: true,
     });
+    expect(
+      h.launchctlCalls.filter((args) => args[0] === "kickstart"),
+    ).toHaveLength(1);
   });
 
-  test("accepts a fresh boot that lands after the healthy-probe window, near the deadline", async () => {
-    // Live reproduction: kickstart exits 143 (our own launchctl-kill timeout,
-    // empty output), probes are healthy throughout, but the fresh boot row
-    // lands only after the three-consecutive-healthy window — during the final
-    // backoff before the deadline. The in-loop success check reads the ledger
-    // only on a healthy probe, so it never sees the boot; the verdict must
-    // still fall through to the final evidence re-check and report success.
-    let now = 0;
-    const stdout: string[] = [];
-    // Boot lands at t=400: after the third healthy probe's ledger read (t=300)
-    // but before the t=500 deadline — the exact gap the in-loop check misses.
-    const bootLandsAt = 400;
-    const deps: RestartDeps = {
-      runLaunchctl: async (args) =>
-        args[0] === "kickstart"
-          ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
-          : { exitCode: 0, stdout: "state = running", stderr: "" },
-      probeHealth: async () => true,
-      readLatestBoot: async () =>
-        now >= bootLandsAt
-          ? { boot_id: "boot-after", ts: 200 }
-          : { boot_id: "boot-before", ts: 100 },
-      sleep: async (ms) => {
-        now += ms;
-      },
-      now: () => now,
-      random: () => 0.5,
-      uid: () => 501,
-      writeStdout: (text) => stdout.push(text),
-      writeStderr: () => {},
-      exit: (code): never => {
-        throw new ExitError(code, stdout.join(""));
-      },
-    };
-
-    const exit = await restartAndCapture(
-      { sock: "/tmp/keeperd.sock", timeoutMs: 500 },
-      deps,
-    );
-
-    expect(exit.code).toBe(0);
-    expect(JSON.parse(stdout.join(""))).toEqual({
-      schema_version: 1,
-      ok: true,
-      error: null,
-      data: {
-        domain: "gui/501/arthack.keeperd",
-        healthy_probes: 3,
-        kickstart_warning: {
-          exit_code: 143,
-          stdout: "",
-          stderr: "",
-          timed_out: true,
-        },
-      },
-    });
-  });
-
-  test("retains failed kickstart output when no fresh boot appears by the deadline", async () => {
-    const h = restartHarness({
-      kickstart: {
-        exitCode: 9,
-        stdout: "launchctl output",
-        stderr: "launchctl error",
-      },
-      latestBoot: { boot_id: "boot-before", ts: 100 },
-      timeoutMs: 400,
-    });
-
+  test("cannot succeed while the old recycle-safe identity remains alive", async () => {
+    const h = restartHarness({ oldProcess: "alive", timeoutMs: 13_000 });
     const exit = await restartAndCapture(h.args, h.deps);
 
     expect(exit.code).toBe(1);
-    expect(JSON.parse(h.stdout.join(""))).toEqual({
-      schema_version: 1,
-      ok: false,
-      error: {
-        code: "kickstart-failed",
-        message: "launchd could not restart the keeper daemon.",
-        recovery:
-          "Confirm the LaunchAgent is bootstrapped, then retry. Plist edits require launchctl bootout plus bootstrap, not kickstart.",
-        details: {
-          kickstart_warning: {
-            exit_code: 9,
-            stdout: "launchctl output",
-            stderr: "launchctl error",
-            timed_out: false,
-          },
-        },
-      },
-      data: null,
-    });
-  });
-
-  test("reports a health timeout when a successful kickstart has no fresh boot", async () => {
-    const h = restartHarness({
-      kickstart: { exitCode: 0, stdout: "", stderr: "" },
-      latestBoot: { boot_id: "boot-before", ts: 100 },
-      timeoutMs: 400,
-    });
-
-    const exit = await restartAndCapture(h.args, h.deps);
-
-    expect(exit.code).toBe(1);
-    const envelope = JSON.parse(h.stdout.join(""));
-    expect(envelope.ok).toBe(false);
+    const envelope = JSON.parse(exit.output);
     expect(envelope.error.code).toBe("health-timeout");
+    expect(envelope.error.details.evidence.reasons).toContainEqual({
+      code: "old-process-still-alive",
+      phase: "replacement",
+    });
   });
 
-  test("keeps a zero-status kickstart success free of a warning", async () => {
+  test("rejects a served identity whose durable row only partially matches", async () => {
     const h = restartHarness({
-      kickstart: { exitCode: 0, stdout: "unused", stderr: "unused" },
-      latestBoot: { boot_id: "boot-after", ts: 200 },
+      timeoutMs: 13_000,
+      ledger: (read) =>
+        read === 0
+          ? readable(OLD)
+          : readable(OLD, { ...NEXT, start_time: "darwin:wrong" }),
     });
-
     const exit = await restartAndCapture(h.args, h.deps);
 
-    expect(exit.code).toBe(0);
-    expect(JSON.parse(h.stdout.join(""))).toEqual({
-      schema_version: 1,
-      ok: true,
-      error: null,
-      data: {
-        domain: "gui/501/arthack.keeperd",
-        healthy_probes: 3,
-      },
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("restart-unproven");
+    expect(envelope.error.details.evidence.reasons).toContainEqual({
+      code: "durable-boot-mismatched",
+      phase: "durable-boot",
     });
   });
 
-  test("gives kickstart its own multi-second subprocess budget, not the 1s probe budget", async () => {
-    let capturedKickstartTimeout: number | null = null;
-    let bootReads = 0;
-    const deps: RestartDeps = {
-      runLaunchctl: async (args, timeoutMs) => {
-        if (args[0] === "kickstart") {
-          capturedKickstartTimeout = timeoutMs;
-          return { exitCode: 0, stdout: "", stderr: "" };
-        }
-        return { exitCode: 0, stdout: "state = running", stderr: "" };
-      },
-      probeHealth: async () => true,
-      readLatestBoot: async () => {
-        bootReads += 1;
-        return bootReads === 1
-          ? { boot_id: "boot-before", ts: 100 }
-          : { boot_id: "boot-after", ts: 200 };
-      },
-      sleep: async () => {},
-      now: () => 0,
-      random: () => 0.5,
-      uid: () => 501,
-      writeStdout: () => {},
-      writeStderr: () => {},
-      exit: (code): never => {
-        throw new ExitError(code, "");
-      },
-    };
-
-    await restartAndCapture(
-      { sock: "/tmp/keeperd.sock", timeoutMs: DEFAULT_RESTART_TIMEOUT_MS },
-      deps,
-    );
-
-    expect(capturedKickstartTimeout).not.toBeNull();
-    expect(capturedKickstartTimeout ?? -1).toBe(KICKSTART_TIMEOUT_MS);
-    expect(KICKSTART_TIMEOUT_MS).toBeGreaterThanOrEqual(10_000);
-    expect(KICKSTART_TIMEOUT_MS).toBeLessThanOrEqual(15_000);
-  });
-
-  test("a healthy restart shape with a multi-second kickstart and sub-2-minute catch-up succeeds without a kickstart warning", async () => {
-    let now = 0;
-    let bootReads = 0;
-    const stdout: string[] = [];
-    // A real kill-and-respawn: kickstart itself takes 12s (well inside the
-    // 15s KICKSTART_TIMEOUT_MS budget), then the daemon reports catching_up
-    // for 90s of post-boot catch-up (well inside the 150s default deadline
-    // and under the acceptance's 2-minute bar).
-    const kickstartDurationMs = 12_000;
-    const caughtUpAtMs = 90_000;
-    const deps: RestartDeps = {
-      runLaunchctl: async (args, timeoutMs) => {
-        if (args[0] === "kickstart") {
-          now += kickstartDurationMs;
-          const timedOut = kickstartDurationMs > timeoutMs;
-          return {
-            exitCode: timedOut ? 143 : 0,
-            stdout: "",
-            stderr: "",
-            timedOut,
-          };
-        }
-        return { exitCode: 0, stdout: "state = running", stderr: "" };
-      },
-      probeHealth: async () => now >= caughtUpAtMs,
-      readLatestBoot: async () => {
-        bootReads += 1;
-        return bootReads === 1
-          ? { boot_id: "boot-before", ts: 100 }
-          : { boot_id: "boot-after", ts: 200 };
-      },
-      sleep: async (ms) => {
-        now += ms;
-      },
-      now: () => now,
-      random: () => 0.5,
-      uid: () => 501,
-      writeStdout: (text) => stdout.push(text),
-      writeStderr: () => {},
-      exit: (code): never => {
-        throw new ExitError(code, stdout.join(""));
-      },
-    };
-
-    const exit = await restartAndCapture(
-      { sock: "/tmp/keeperd.sock", timeoutMs: DEFAULT_RESTART_TIMEOUT_MS },
-      deps,
-    );
-
-    expect(exit.code).toBe(0);
-    expect(JSON.parse(stdout.join(""))).toEqual({
-      schema_version: 1,
-      ok: true,
-      error: null,
-      data: {
-        domain: "gui/501/arthack.keeperd",
-        healthy_probes: 3,
-      },
+  test("reports bounded unreadable-ledger evidence", async () => {
+    const h = restartHarness({
+      timeoutMs: 1_000,
+      ledger: () => ({
+        status: "unreadable",
+        diagnostic: "E".repeat(10_000),
+      }),
     });
-  });
-
-  test("the same slow-catch-up boot still fails under an explicit short --timeout", async () => {
-    let now = 0;
-    let bootReads = 0;
-    const stdout: string[] = [];
-    const kickstartDurationMs = 12_000;
-    const caughtUpAtMs = 90_000;
-    const deps: RestartDeps = {
-      runLaunchctl: async (args, timeoutMs) => {
-        if (args[0] === "kickstart") {
-          now += kickstartDurationMs;
-          const timedOut = kickstartDurationMs > timeoutMs;
-          return {
-            exitCode: timedOut ? 143 : 0,
-            stdout: "",
-            stderr: "",
-            timedOut,
-          };
-        }
-        return { exitCode: 0, stdout: "state = running", stderr: "" };
-      },
-      probeHealth: async () => now >= caughtUpAtMs,
-      readLatestBoot: async () => {
-        bootReads += 1;
-        return bootReads === 1
-          ? { boot_id: "boot-before", ts: 100 }
-          : { boot_id: "boot-after", ts: 200 };
-      },
-      sleep: async (ms) => {
-        now += ms;
-      },
-      now: () => now,
-      random: () => 0.5,
-      uid: () => 501,
-      writeStdout: (text) => stdout.push(text),
-      writeStderr: () => {},
-      exit: (code): never => {
-        throw new ExitError(code, stdout.join(""));
-      },
-    };
-
-    const exit = await restartAndCapture(
-      { sock: "/tmp/keeperd.sock", timeoutMs: 10_000 },
-      deps,
-    );
+    const exit = await restartAndCapture(h.args, h.deps);
 
     expect(exit.code).toBe(1);
-    const envelope = JSON.parse(stdout.join(""));
-    expect(envelope.ok).toBe(false);
-    expect(["kickstart-failed", "health-timeout"]).toContain(
-      envelope.error.code,
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("restart-unproven");
+    expect(envelope.error.details.ledger.length).toBeLessThanOrEqual(512);
+    expect(envelope.error.details.evidence.durable_boot.status).toBe(
+      "unreadable",
     );
+  });
+
+  test("fails honestly when no replacement is ever served", async () => {
+    const h = restartHarness({
+      timeoutMs: 1_000,
+      probe: (call) =>
+        call === 0
+          ? served(OLD)
+          : { status: "unavailable", diagnostic: "connection refused" },
+    });
+    const exit = await restartAndCapture(h.args, h.deps);
+
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("health-timeout");
+    expect(envelope.error.details.last_probe).toBe("connection refused");
+    expect(envelope.error.details.evidence.replacement.status).toBe("old-gone");
+  });
+
+  test("a short deadline cannot borrow elapsed time beyond the deadline", async () => {
+    const h = restartHarness({ timeoutMs: 5_000 });
+    const exit = await restartAndCapture(h.args, h.deps);
+
+    expect(exit.code).toBe(1);
+    const evidence = JSON.parse(exit.output).error.details.evidence;
+    expect(evidence.stabilization.status).toBe("deadline-exceeded");
+    expect(evidence.stabilization.observed_for_ms).toBeLessThan(12_000);
+  });
+
+  test("cancellation returns bounded incomplete evidence without another command", async () => {
+    const h = restartHarness({ cancelled: (now) => now >= 700 });
+    const exit = await restartAndCapture(h.args, h.deps);
+
+    expect(exit.code).toBe(1);
+    const envelope = JSON.parse(exit.output);
+    expect(envelope.error.code).toBe("restart-unproven");
+    expect(envelope.error.details.cancelled).toBe(true);
+    expect(
+      h.launchctlCalls.filter((args) => args[0] === "kickstart"),
+    ).toHaveLength(1);
+  });
+
+  test("gives the one kickstart its bounded multi-second command budget", async () => {
+    let captured = 0;
+    const h = restartHarness({
+      timeoutMs: 20_000,
+      cancelled: () => true,
+    });
+    const original = h.deps.runLaunchctl;
+    const deps: RestartDeps = {
+      ...h.deps,
+      runLaunchctl: async (args, timeoutMs) => {
+        if (args[0] === "kickstart") captured = timeoutMs;
+        return original(args, timeoutMs);
+      },
+    };
+
+    await restartAndCapture(h.args, deps);
+    expect(captured).toBe(KICKSTART_TIMEOUT_MS);
+    expect(captured).toBeGreaterThanOrEqual(10_000);
+    expect(
+      h.launchctlCalls.filter((args) => args[0] === "kickstart"),
+    ).toHaveLength(1);
   });
 });

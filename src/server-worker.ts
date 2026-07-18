@@ -35,7 +35,6 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -87,6 +86,7 @@ import {
   type RpcResultFrame,
   type ServerFrame,
 } from "./protocol";
+import type { RestartBootIdentity } from "./restart-ledger";
 import { installRpcHandlers } from "./rpc-handlers";
 import {
   type AsyncRpcHandler,
@@ -105,10 +105,14 @@ export { BadParamsError, SlugConflictError } from "./rpc-runtime";
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
  * strings cross the boundary — the Database handle and the listener cannot.
  */
+export type DaemonBootIdentity = RestartBootIdentity;
+
 export interface ServerWorkerData {
   dbPath: string;
   sockPath?: string;
   lockPath?: string;
+  /** Identity already synced to the restart ledger before the DB was opened. */
+  bootIdentity: DaemonBootIdentity;
   /** Realtime poll cadence in ms (defaults to `DEFAULT_POLL_MS`, floored at 25). */
   pollMs?: number;
   /**
@@ -728,8 +732,7 @@ export interface ResultMemo {
   /**
    * fn-1311: the event-store block for this `worldRev` window, computed ONCE on
    * the reset that stamps the window (not per query) and baked into every memo
-   * line built here — the steady-state delivery channel for the block the boot
-   * header omits. Block-global at a world-rev, so one read serves every
+   * line built here. Block-global at a world-rev, so one read serves every
    * connection's cached line. `null` only on the fresh `-1` sentinel window.
    */
   eventStore: EventStoreStatus | null;
@@ -863,6 +866,7 @@ function serveFromMemo(
   frame: QueryFrame,
   worldRev: number,
   memo: ResultMemo,
+  bootGate: BootGate,
 ): (ServerFrame | PreSerialized)[] | null {
   const descriptor = getCollection(frame.collection);
   if (!descriptor) {
@@ -876,9 +880,9 @@ function serveFromMemo(
   if (memo.worldRev !== worldRev) {
     memo.entries = new Map();
     memo.worldRev = worldRev;
-    // fn-1311: refresh the window's event-store block once per rev (not per
-    // query), so every memo line built below carries the steady-state block the
-    // boot header omits without paying a `COUNT(*)` on each memo hit.
+    // Refresh the window's event-store block once per rev (not per query), so
+    // every memo line carries the steady-state block without paying a
+    // `COUNT(*)` on each memo hit.
     memo.eventStore = readEventStoreStatus(db);
   }
 
@@ -949,8 +953,8 @@ function serveFromMemo(
   );
 
   // Per-conn pre-serialized line: the result envelope concatenated around the
-  // ONE shared `rowsJson`, plus the window's event-store block (fn-1311) — the
-  // steady-state delivery channel for what the omitted boot header would carry.
+  // ONE shared `rowsJson`, plus the window's event-store block and the current
+  // boot/Drain header.
   const line = buildResultLine(
     frame.id,
     descriptor.name,
@@ -958,6 +962,7 @@ function serveFromMemo(
     entry.total,
     entry.rowsJson,
     memo.eventStore,
+    readBootStatus(db, bootGate),
   );
   return [{ __line: line }];
 }
@@ -978,21 +983,21 @@ function buildResultLine(
   total: number,
   rowsJson: string,
   eventStore: EventStoreStatus | null,
+  boot: BootStatus,
 ): string {
   const idSeg = id !== undefined ? `,"id":${JSON.stringify(id)}` : "";
-  // fn-1311: the event-store block trails the rows, mirroring the object-frame
-  // key order `stampEventStore` produces (it stamps `event_store` before the
-  // boot header), so the memo line stays byte-identical to the un-memoized
-  // object frame modulo that steady-state-omitted header. Omitted only on the
-  // `-1` sentinel window (never a live serve).
+  // The event-store block trails the rows, mirroring the object-frame key order
+  // `stampEventStore` produces (`event_store` before the boot header). It is
+  // omitted only on the `-1` sentinel window, never a live serve.
   const esSeg =
     eventStore !== null ? `,"event_store":${JSON.stringify(eventStore)}` : "";
+  const bootSeg = `,"boot":${JSON.stringify(boot)}`;
   return (
     `{"type":"result"${idSeg}` +
     `,"collection":${JSON.stringify(collection)}` +
     `,"rev":${rev}` +
     `,"total":${total}` +
-    `,"rows":${rowsJson}${esSeg}}\n`
+    `,"rows":${rowsJson}${esSeg}${bootSeg}}\n`
   );
 }
 
@@ -1753,16 +1758,19 @@ export function dispatchLine(
       // when a memo was threaded in (the worker passes it; direct-dispatch
       // tests omit it).
       //
-      // fn-897 B1: SKIP the memo while booting (gate un-`ready`). The memo emits
-      // a PreSerialized line built WITHOUT the boot-status header, but the header
-      // must ride EVERY reply during catch-up — so during boot we fall through to
-      // the un-memoized object-frame path that `handleData` stamps. The memo's win
-      // is a steady-state optimization; the brief boot window can afford the
-      // un-memoized SELECT, and this keeps the steady-state memo line
-      // byte-identical (no boot field once `ready`).
+      // Skip the memo while booting so every catch-up query reads its rows
+      // directly. At steady state the memo line carries the same boot/Drain
+      // header as the object path.
       if (memo && (bootGate === undefined || bootGate.ready)) {
         try {
-          const memoResult = serveFromMemo(db, conn, frame, worldRev, memo);
+          const memoResult = serveFromMemo(
+            db,
+            conn,
+            frame,
+            worldRev,
+            memo,
+            bootGate ?? { ready: true },
+          );
           if (memoResult) return memoResult;
         } catch (err) {
           // Memo path bug → fall through to the un-memoized path below; never
@@ -2044,12 +2052,11 @@ function readWorldRev(db: Database): number {
  */
 export interface BootGate {
   ready: boolean;
+  identity?: DaemonBootIdentity;
   /**
-   * Per-daemon-boot nonce (see {@link BootStatus.generation}), minted once when
-   * the server worker spawns so the value is stable for this worker's whole life
-   * and distinct from the prior boot's. Optional so the many `{ ready: … }` test
-   * gates needn't mint one — an absent nonce simply omits the wire field, leaving
-   * a client on its always-re-baseline-on-reconnect fallback.
+   * Per-daemon-boot nonce (see {@link BootStatus.generation}), equal to the
+   * parent-owned durable boot id in production. Optional so direct unit gates
+   * needn't carry an identity; omission keeps the reconnect fallback active.
    */
   generation?: string;
 }
@@ -2145,6 +2152,7 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
     }
   }
   return {
+    ...(gate.identity === undefined ? {} : gate.identity),
     rev,
     head_event_id: head,
     // Catch-up persists while EITHER the fold is behind head OR the git surface
@@ -2348,13 +2356,10 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
 }
 
 /**
- * Stamp the boot-status header (fn-897 B1) onto every object-form served frame
- * (`result` / `rpc_result` / `error`) in place — the single chokepoint is the
- * write path (`handleData` + async-RPC `onAsyncResult`). A {@link PreSerialized}
- * memo line is left untouched: the memo is bypassed during catch-up (see
- * `dispatchLine`), so a memo line only ever rides at steady state where
- * `catching_up` is false and the header is optional. Mutates and returns the same
- * array so callers can inline it. Computes the status ONCE per call.
+ * Stamp the boot-status header onto every object-form served frame
+ * (`result` / `rpc_result` / `error`) in place. A {@link PreSerialized} memo
+ * line already carries the header assembled by {@link buildResultLine}. Mutates
+ * and returns the same array so callers can inline it. Computes the status once.
  */
 function stampBootStatus(
   db: Database,
@@ -2379,12 +2384,11 @@ function stampBootStatus(
 /**
  * Stamp the event-store block (fn-1311) onto every object-form `result` frame in
  * place — the catch-up-path sibling of the memo line's baked block (see
- * {@link buildResultLine}), so a steady-state consumer reads the SAME field
- * whether its reply rode the memo or the un-memoized object path. A
- * {@link PreSerialized} memo line already carries its own block and is skipped.
- * The (`COUNT(*)` + `PRAGMA`) read fires ONCE per call and ONLY when there is an
- * object `result` frame to carry it — a batch of memo lines pays nothing. Ride
- * the `result` frame only; `rpc_result` / `error` are not snapshot surfaces.
+ * {@link buildResultLine}), so a consumer reads the same field on either path.
+ * A {@link PreSerialized} memo line already carries its own block and is skipped.
+ * The (`COUNT(*)` + `PRAGMA`) read fires once per call and only when there is an
+ * object `result` frame to carry it. Ride the `result` frame only;
+ * `rpc_result` / `error` are not snapshot surfaces.
  */
 function stampEventStore(
   db: Database,
@@ -3776,9 +3780,8 @@ function handleData(
     // is skipped; only the un-memoized (catch-up, or steady cap-skip) object
     // path pays the read here.
     stampEventStore(db, frames);
-    // fn-897 B1: stamp the boot-status header on the synchronous reply set (the
-    // memo path is bypassed during catch-up, so any PreSerialized line here only
-    // rides at steady state and stamps nothing).
+    // Stamp object replies here; a pre-serialized memo result already includes
+    // the same identity and current Drain fields.
     stampBootStatus(db, bootGate, frames);
     const _dispatchDur = performance.now() - _dispatchStart;
     // Feed the served-latency window unconditionally (the watchdog's eyes).
@@ -4128,16 +4131,36 @@ function main(): void {
     },
   };
 
+  // The durable identity is parent-owned: main synced it before opening the DB,
+  // so the worker may serve only the exact ledger-backed process identity.
+  const bootIdentity = data.bootIdentity;
+  if (
+    bootIdentity === undefined ||
+    typeof bootIdentity.boot_id !== "string" ||
+    bootIdentity.boot_id.length === 0 ||
+    !Number.isInteger(bootIdentity.pid) ||
+    bootIdentity.pid <= 0 ||
+    typeof bootIdentity.start_time !== "string" ||
+    bootIdentity.start_time.length === 0
+  ) {
+    console.error(
+      "[server-worker] missing durable boot identity in workerData",
+    );
+    process.exit(1);
+  }
+
   // fn-897 B1 boot gate. The server worker now spawns right after `migrate()`,
   // BEFORE the boot drain, so it serves reads during catch-up. The gate boots
   // un-`ready` (mutating RPCs rejected `server_booting`, every frame stamped
   // `catching_up`) and flips on main's `{type:"boot-complete"}` message, posted
   // after drain-reaches-head + git-seed + ephemeral-truncate.
-  // Mint the per-boot generation nonce ONCE here: this object lives for the whole
-  // worker instance, so every frame it stamps carries the same value, and the
-  // next daemon boot spawns a fresh worker with a fresh nonce — exactly the
-  // "did the daemon bounce under me?" signal the client's epoch guard reads.
-  const bootGate: BootGate = { ready: false, generation: randomUUID() };
+  // The durable boot id also serves as the reconnect generation: both fields
+  // identify one worker lifetime and cannot drift apart.
+  const bootGate: BootGate = {
+    ready: false,
+    identity: bootIdentity,
+    generation: bootIdentity.boot_id,
+  };
 
   // Shared round-robin fan-out position. Threaded into BOTH the poll loop and the
   // post-fold kick handler so one rotation advances no matter which drives the
