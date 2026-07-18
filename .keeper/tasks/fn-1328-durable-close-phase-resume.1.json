@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T09:35:29.812000Z",
+  "depends_on": [],
+  "epic": "fn-1328-durable-close-phase-resume",
+  "id": "fn-1328-durable-close-phase-resume.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Preflight phase-resume signal",
+  "updated_at": "2026-07-18T09:35:29.812000Z"
+}
