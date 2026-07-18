@@ -144,6 +144,30 @@ describe("restart evidence identity", () => {
     expect(verdict.verdict).toBe("incomplete");
   });
 
+  test("a valid marker proves exact replacement despite an invalid earlier frozen boot", () => {
+    const invalidBoot = {
+      boot_id: "boot-invalid",
+      pid: 409,
+      ts: 1_699_998_000_000,
+    } as unknown as RestartLedgerBootRecord;
+    const verdict = classifyRestartEvidence(
+      exactInput({
+        pre_restart: {
+          service: { status: "exact-identity", identity: OLD },
+          ledger: {
+            status: "readable",
+            boots: [invalidBoot, ledgerBoot(OLD, 1_699_999_000_000)],
+          },
+        },
+      }),
+    );
+
+    expect(verdict.verdict).toBe("proven");
+    expect(verdict.proof_path).toBe("exact-replacement");
+    expect(verdict.identity).toEqual(NEXT);
+    expect(verdict.reasons).toEqual([]);
+  });
+
   test("a missing or unreadable pre-restart marker cannot bless a later distinct row", () => {
     const missing = classifyRestartEvidence(
       exactInput({
@@ -284,6 +308,35 @@ describe("restart identity-capability crossing", () => {
       status: "replaced",
       old_process: "unknown",
     });
+  });
+
+  test("proves an absent successor against a non-empty valid frozen ledger", () => {
+    const verdict = classifyRestartEvidence({
+      pre_restart: {
+        service: { status: "identity-incapable" },
+        ledger: {
+          status: "readable",
+          boots: [ledgerBoot(OLD, 1_699_999_000_000)],
+        },
+      },
+      command: { issued: true, accepted: true },
+      old_process: "unknown",
+      ledger: {
+        status: "readable",
+        boots: [ledgerBoot(NEXT, 1_700_000_001_000)],
+      },
+      health: [health(NEXT, 1_000), health(NEXT, 7_000), health(NEXT, 13_000)],
+      monotonic: {
+        started_at_ms: 0,
+        now_ms: 13_000,
+        deadline_at_ms: 20_000,
+        stabilization_ms: 12_000,
+      },
+      required_healthy_observations: 3,
+    });
+
+    expect(verdict.verdict).toBe("proven");
+    expect(verdict.proof_path).toBe("identity-capability-crossing");
   });
 
   test.each([
