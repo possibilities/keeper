@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle correctness invariant in the deterministic-fold reducer: a boot re-anchored durable-expiry Reaper must close a double-dispatch hazard without liveness probes and preserve re-fold determinism plus the parked-sticky never-double-fire invariant, a nameable intelligence-bound reason that overrides the GPT-first default.",
+      "task_id": "fn-1337-durable-dispatch-expiry-and-withhold.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Decomposing a load-bearing okToPlan conjunction in the autopilot reconciler's decision core must stay byte-for-byte decision-identical while adding a transition-gated, rate-limited bounded-enum contract, a subtle correctness invariant plus stable-contract design that clears the opus gate.",
+      "task_id": "fn-1337-durable-dispatch-expiry-and-withhold.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T15:44:31.367000Z",
+  "epic_id": "fn-1337-durable-dispatch-expiry-and-withhold",
+  "input_hash": "347bd158598a2359800e9e583c99a96472c300359ff8fa84711c41105e2eb97c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 880529752,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1337-durable-dispatch-expiry-and-withhold.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle correctness invariant in the deterministic-fold reducer: a boot re-anchored durable-expiry Reaper must close a double-dispatch hazard without liveness probes and preserve re-fold determinism plus the parked-sticky never-double-fire invariant, a nameable intelligence-bound reason that overrides the GPT-first default.\",\"confidence\":0.83},{\"task_id\":\"fn-1337-durable-dispatch-expiry-and-withhold.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Decomposing a load-bearing okToPlan conjunction in the autopilot reconciler's decision core must stay byte-for-byte decision-identical while adding a transition-gated, rate-limited bounded-enum contract, a subtle correctness invariant plus stable-contract design that clears the opus gate.\",\"confidence\":0.72}]}\n"
+}
