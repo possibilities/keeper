@@ -192,6 +192,12 @@ export const TRANSIENT_SERVER_CODES = new Set<string>(["max_connections"]);
 const SLOW_FLIGHT_MS = 1000;
 const QUERY_TIMEOUT_MS = 5000;
 /**
+ * Upper bound for one socket dial. A connect that neither opens nor rejects
+ * must not park the reconnect loop forever. Kept above the initial retry
+ * backoff and capped at the connected-query deadline.
+ */
+export const CONNECT_TIMEOUT_MS = QUERY_TIMEOUT_MS;
+/**
  * Catching-up backstop interval. While the per-connection catching-up latch is
  * set, refetch ONE idle subscribed collection this often so a freshly stamped
  * `result` always arrives to observe the settling flip: `boot-complete` fans out
@@ -425,6 +431,15 @@ export type ConnectFactory = (
   handlers: SocketHandlers,
 ) => Promise<ReadinessSocket>;
 
+/** Injectable timeout seam for deterministic reconnect tests. */
+export interface ReadinessTimers {
+  setTimeout(
+    callback: () => void,
+    delayMs: number,
+  ): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+}
+
 /**
  * Caller-facing handle. `dispose()` is idempotent — safe to call from a
  * SIGINT handler that may also be reached via a normal exit path.
@@ -435,12 +450,14 @@ export interface ReadinessClientHandle {
 
 /**
  * Lifecycle-event callback shape. The driver emits `connecting` / `connected`
- * / `disconnected` / `waiting` / `error` / `query_slow_flight` /
- * `query_timeout` / `heartbeat_probe` / `generation_change` with a small detail
- * payload (fields per event). `query_slow_flight` fires once per stuck in-flight
- * window; `query_timeout` fires just before the socket teardown + reconnect;
- * `heartbeat_probe` fires when the idle-liveness probe is sent; `generation_change`
- * fires when a daemon-generation change is detected across a (re)connect.
+ * / `disconnected` / `waiting` / `error` / `connect_timeout` /
+ * `query_slow_flight` / `query_timeout` / `heartbeat_probe` /
+ * `generation_change` with a small detail payload (fields per event).
+ * `connect_timeout` bounds a dial that never opens; `query_slow_flight` fires
+ * once per stuck in-flight window; `query_timeout` fires just before the socket
+ * teardown + reconnect; `heartbeat_probe` fires when the idle-liveness probe is
+ * sent; `generation_change` fires when a daemon-generation change is detected
+ * across a (re)connect.
  */
 export type LifecycleCallback = (
   event: string,
@@ -823,6 +840,8 @@ interface MultiOptions {
    * advancing real wall-clock. Production callers omit it.
    */
   readonly now?: () => number;
+  /** Injectable timeout seam; production callers use the global timers. */
+  readonly timers?: ReadinessTimers;
 }
 
 /**
@@ -845,6 +864,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     onCatchingUp,
   } = opts;
   const now = opts.now ?? Date.now;
+  const timers: ReadinessTimers = opts.timers ?? {
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (timer) => clearTimeout(timer),
+  };
   const byCollection = new Map(states.map((s) => [s.collection, s]));
   // Parallel id-keyed index for multi-sub-aware routing: the server echoes each
   // query's `id` on its frames, so a connection carrying N concurrent subs
@@ -891,6 +914,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   let inboundFrameSeq = 0;
   let lastPollFrameSeq = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // A zero-delay fallback kick for query-timeout teardown. A following socket
+  // close can consume the pending kick immediately; de-duplication keeps the
+  // two recovery signals from spawning parallel reconnect loops.
+  let reconnectKickTimer: ReturnType<typeof setTimeout> | null = null;
+  // Bounds the pre-open dial independently of the connected query timeout.
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  let abortConnectDial: ((reason: Error) => void) | null = null;
   // ---- steady-state liveness heartbeat (see HEARTBEAT_IDLE_MS) ----
   // Wall-clock (`Date.now`, matching the slow-flight machinery) of the last
   // inbound frame of ANY kind on the CURRENT connection — stamped on `open` and
@@ -950,10 +980,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     }
     unpaintedAnchor = now();
     if (giveUpTimer !== null) {
-      clearTimeout(giveUpTimer);
+      timers.clearTimeout(giveUpTimer);
       giveUpTimer = null;
     }
-    giveUpTimer = setTimeout(() => {
+    giveUpTimer = timers.setTimeout(() => {
       giveUpTimer = null;
       checkGiveUp();
     }, giveUpPolicy.deadlineMs);
@@ -963,7 +993,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   function clearGiveUp(): void {
     unpaintedAnchor = null;
     if (giveUpTimer !== null) {
-      clearTimeout(giveUpTimer);
+      timers.clearTimeout(giveUpTimer);
       giveUpTimer = null;
     }
   }
@@ -984,7 +1014,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       // Backstop timer fired early relative to the injected clock — re-arm
       // off the residual budget rather than giving up prematurely.
       if (giveUpTimer === null) {
-        giveUpTimer = setTimeout(
+        giveUpTimer = timers.setTimeout(
           () => {
             giveUpTimer = null;
             checkGiveUp();
@@ -1000,6 +1030,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     shuttingDown = true;
     unpaintedAnchor = null;
     teardownConnection();
+    abortConnectDial?.(new Error("give-up deadline reached"));
+    abortConnectDial = null;
     onFatal({
       code: "unreachable",
       message: `give-up: no first paint within ${giveUpPolicy.deadlineMs}ms`,
@@ -1007,7 +1039,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   function emit(event: string, detail?: Record<string, unknown>): void {
-    onLifecycle?.(event, detail);
+    try {
+      onLifecycle?.(event, detail);
+    } catch {
+      // Lifecycle telemetry is observational; a broken observer must not stop
+      // transport recovery or leave a socket half-torn-down.
+    }
   }
 
   function scheduleRefetchFor(state: CollectionState): void {
@@ -1095,12 +1132,27 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     onCatchingUp?.(catchingUp, freshestBoot);
   }
 
+  /** Schedule exactly one reconnect independently of socket close delivery. */
+  function scheduleReconnect(): void {
+    if (shuttingDown || reconnectKickTimer !== null) {
+      return;
+    }
+    reconnectKickTimer = timers.setTimeout(() => {
+      reconnectKickTimer = null;
+      if (shuttingDown) {
+        return;
+      }
+      reconnecting = false;
+      void connectWithRetry();
+    }, 0);
+  }
+
   /**
-   * Tear down the live connection on a hard query timeout. Emits
-   * `query_timeout` for the state that crossed the deadline, then
-   * `teardownConnection()`; the `close` handler drives the reconnect, so no new
-   * plumbing. Guarded by `reconnecting` so two stuck collections crossing the
-   * threshold on the same poll produce one reconnect.
+   * Tear down the live connection on a hard query timeout. The explicit
+   * reconnect kick is required because a hard terminate is not guaranteed to
+   * re-drive the transport's close callback. Guarded by `reconnecting` so two
+   * stuck collections crossing the threshold on the same poll produce one
+   * reconnect.
    */
   function triggerReconnect(state: CollectionState): void {
     if (reconnecting || shuttingDown) {
@@ -1117,10 +1169,11 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       sock: sockPath,
       age_ms: ageMs,
     });
-    // `teardownConnection()` HARD-destroys the held socket (`terminate()`), so
-    // it's forcibly closed here; the resulting `close` callback fires, so
-    // `connectWithRetry` re-runs.
     teardownConnection();
+    // A synchronous close callback may already have opened the replacement.
+    if (currentSock === null) {
+      scheduleReconnect();
+    }
   }
 
   /**
@@ -1493,16 +1546,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     disarmBackstop();
     catchingUp = false;
     freshestBoot = undefined;
-    // Destroy the live socket BEFORE dropping the reference (else the native
-    // buffers leak on a flapping daemon). Safe and idempotent on both the
-    // peer-closed `close`-handler path and the still-open give-up path.
-    if (currentSock !== null) {
-      destroySocket(currentSock);
-    }
-    currentSock = null;
-    // Re-arm the served latch so the NEXT connection's first result resets the
-    // backoff counter; an accept-then-reject window (torn down WITHOUT serving)
-    // leaves it false → no spurious reset.
+    // Reset connection state before destroying the socket because terminate may
+    // synchronously re-drive close; that callback may open the next connection.
     servedThisConnection = false;
     for (const s of states) {
       s.order.length = 0;
@@ -1512,86 +1557,171 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       s.queryInFlight = false;
       s.refetchDirty = false;
       s.gotResult = false;
-      // Reset the slow-flight + timeout machinery so a survived
-      // `lastSlowFlightAt` can't suppress the first emit of the new window.
       s.queryInFlightSince = null;
       s.lastSlowFlightAt = null;
+    }
+    const sockToDestroy = currentSock;
+    currentSock = null;
+    if (sockToDestroy !== null) {
+      destroySocket(sockToDestroy);
     }
   }
 
   async function connectOnce(): Promise<void> {
     const buffer = new LineBuffer();
     const decoder = new TextDecoder("utf-8", { fatal: false });
-    await connect(sockPath, {
-      open(sock) {
-        // Do NOT reset `attempt` here — socket `open` means ACCEPTED, not
-        // SERVED. The reset is keyed on the first `result` (`servedThisConnection`).
-        reconnecting = false;
-        currentSock = sock;
-        // Seed the liveness clock at connect so the heartbeat measures idleness
-        // from the fresh connection, not a stale prior-connection stamp. The
-        // frame-seq checkpoint is left as-is (both sides of the fresh
-        // connection's first comparison start at whatever `inboundFrameSeq`
-        // already is — nothing has arrived on THIS connection yet, so the
-        // first tick correctly sees no inbound activity).
-        lastInboundAt = Date.now();
-        lastPollFrameSeq = inboundFrameSeq;
-        currentPollDelayMs = POLL_MS;
-        emit("connected", { sock: sockPath });
-        // Send every subscribed query up front, stamping `queryInFlightSince`
-        // and resetting `lastSlowFlightAt` so the post-reconnect window is clean.
-        const now = Date.now();
-        for (const s of states) {
-          s.queryInFlight = true;
-          s.queryInFlightSince = now;
-          s.lastSlowFlightAt = null;
-          sock.write(encodeFrame(s.query));
-        }
-        pollTimer = setInterval(pollTick, POLL_MS);
-      },
-      data(sock, chunk) {
-        let lines: string[];
-        try {
-          lines = buffer.push(decoder.decode(chunk, { stream: true }));
-        } catch (err) {
-          // A line-buffer failure is fatal for this connection but not the
-          // caller's process — surface via lifecycle and HARD-destroy; the
-          // `close` callback drives the reconnect.
-          emit("error", { message: (err as Error).message });
-          destroySocket(sock);
-          return;
-        }
-        for (const line of lines) {
-          if (line.trim().length === 0) {
-            continue;
-          }
-          handleFrame(JSON.parse(line) as ServerFrame);
-        }
-      },
-      close() {
-        decoder.decode();
-        if (shuttingDown) {
-          return;
-        }
-        // Clear the single-flight latch so a fresh `connectWithRetry` cycle can
-        // advance to `open`, and a future timeout-triggered reconnect isn't
-        // permanently suppressed.
-        reconnecting = false;
-        teardownConnection();
-        // Re-arm the give-up anchor on a POST-PAINT drop for a fresh post-bounce
-        // window. A drop BEFORE any paint leaves the start-armed anchor running
-        // (re-arming there would let an accept-then-drop flap dodge give-up
-        // forever), so only re-arm when the anchor is cleared (we were painted).
-        if (everPainted && unpaintedAnchor === null) {
-          armGiveUp();
-        }
-        emit("disconnected");
-        void connectWithRetry();
-      },
-      error(_sock, err) {
-        emit("error", { message: err.message });
-      },
+    let connectionSock: ReadinessSocket | null = null;
+    let closed = false;
+    let dialSettled = false;
+    let resolveDial: (() => void) | null = null;
+    let rejectDial: ((reason: Error) => void) | null = null;
+    const dial = new Promise<void>((resolve, reject) => {
+      resolveDial = resolve;
+      rejectDial = reject;
     });
+
+    function settleDial(reason?: Error): void {
+      if (dialSettled) {
+        return;
+      }
+      dialSettled = true;
+      if (connectTimer !== null) {
+        timers.clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      abortConnectDial = null;
+      if (reason === undefined) {
+        resolveDial?.();
+      } else {
+        rejectDial?.(reason);
+      }
+      resolveDial = null;
+      rejectDial = null;
+    }
+
+    abortConnectDial = (reason) => settleDial(reason);
+
+    let connectResult: Promise<ReadinessSocket>;
+    try {
+      connectResult = connect(sockPath, {
+        open(sock) {
+          connectionSock = sock;
+          if (dialSettled || shuttingDown) {
+            destroySocket(sock);
+            return;
+          }
+          // Do NOT reset `attempt` here — socket `open` means ACCEPTED, not
+          // SERVED. The reset is keyed on the first `result`.
+          reconnecting = false;
+          currentSock = sock;
+          lastInboundAt = Date.now();
+          lastPollFrameSeq = inboundFrameSeq;
+          currentPollDelayMs = POLL_MS;
+          emit("connected", { sock: sockPath });
+          const now = Date.now();
+          for (const s of states) {
+            s.queryInFlight = true;
+            s.queryInFlightSince = now;
+            s.lastSlowFlightAt = null;
+            sock.write(encodeFrame(s.query));
+          }
+          pollTimer = setInterval(pollTick, POLL_MS);
+          settleDial();
+        },
+        data(sock, chunk) {
+          let lines: string[];
+          try {
+            lines = buffer.push(decoder.decode(chunk, { stream: true }));
+          } catch (err) {
+            emit("error", { message: (err as Error).message });
+            destroySocket(sock);
+            return;
+          }
+          for (const line of lines) {
+            if (line.trim().length === 0) {
+              continue;
+            }
+            handleFrame(JSON.parse(line) as ServerFrame);
+          }
+        },
+        close() {
+          if (closed) {
+            return;
+          }
+          closed = true;
+          decoder.decode();
+          const closedBeforeOpen = !dialSettled;
+          if (closedBeforeOpen) {
+            settleDial(new Error("connection closed before open"));
+          }
+          if (shuttingDown || closedBeforeOpen) {
+            return;
+          }
+          // A close that follows timeout teardown may beat the fallback kick;
+          // consume that pending kick immediately. Any later stale close must
+          // not tear down the replacement or start a parallel dial.
+          if (currentSock !== connectionSock) {
+            if (currentSock === null && reconnectKickTimer !== null) {
+              timers.clearTimeout(reconnectKickTimer);
+              reconnectKickTimer = null;
+              reconnecting = false;
+              void connectWithRetry();
+            }
+            return;
+          }
+          reconnecting = false;
+          teardownConnection();
+          if (everPainted && unpaintedAnchor === null) {
+            armGiveUp();
+          }
+          emit("disconnected");
+          if (reconnectKickTimer !== null) {
+            timers.clearTimeout(reconnectKickTimer);
+            reconnectKickTimer = null;
+          }
+          void connectWithRetry();
+        },
+        error(_sock, err) {
+          emit("error", { message: err.message });
+        },
+      });
+    } catch (err) {
+      settleDial(err as Error);
+      await dial;
+      return;
+    }
+
+    void connectResult.then(
+      () => {
+        if (!dialSettled) {
+          settleDial(new Error("connection ended before open"));
+        }
+      },
+      (err: unknown) => settleDial(err as Error),
+    );
+
+    // Immediate refusals settle on their already-queued promise reaction before
+    // this timer is armed; only a genuinely pending dial receives the deadline.
+    queueMicrotask(() => {
+      if (dialSettled || shuttingDown) {
+        return;
+      }
+      connectTimer = timers.setTimeout(() => {
+        connectTimer = null;
+        if (dialSettled || shuttingDown) {
+          return;
+        }
+        const err = new Error(`connect timeout after ${CONNECT_TIMEOUT_MS}ms`);
+        emit("connect_timeout", {
+          sock: sockPath,
+          timeout_ms: CONNECT_TIMEOUT_MS,
+        });
+        teardownConnection();
+        settleDial(err);
+      }, CONNECT_TIMEOUT_MS);
+    });
+
+    await dial;
   }
 
   /**
@@ -1632,7 +1762,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     emit("waiting", { attempt, retry_in_ms: delay, reason });
     await new Promise<void>((resolve) => {
       sleepResolve = resolve;
-      reconnectTimer = setTimeout(() => {
+      reconnectTimer = timers.setTimeout(() => {
         reconnectTimer = null;
         sleepResolve = null;
         resolve();
@@ -1706,12 +1836,22 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       // Cancel the give-up backstop timer so `dispose()` leaves no live timer
       // holding the event loop open.
       if (giveUpTimer !== null) {
-        clearTimeout(giveUpTimer);
+        timers.clearTimeout(giveUpTimer);
         giveUpTimer = null;
       }
       unpaintedAnchor = null;
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
+      if (reconnectKickTimer !== null) {
+        timers.clearTimeout(reconnectKickTimer);
+        reconnectKickTimer = null;
+      }
+      if (connectTimer !== null) {
+        timers.clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      abortConnectDial?.(new Error("subscription disposed"));
+      abortConnectDial = null;
+      if (reconnectTimer !== null) {
+        timers.clearTimeout(reconnectTimer);
         reconnectTimer = null;
         // Resolve the pending sleep promise so `connectWithRetry`'s loop
         // observes `shuttingDown` and exits cleanly.
@@ -1764,6 +1904,8 @@ export interface SubscribeCollectionOptions {
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
+  /** Injectable timeout seam; production callers use the global timers. */
+  readonly timers?: ReadinessTimers;
   /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). */
   readonly onBootStatus?: (boot: BootStatus) => void;
   /** Catching-up transition callback (see {@link CatchingUpCallback}). */
@@ -1819,6 +1961,7 @@ export function subscribeCollection(
       ? {}
       : { giveUpPolicy: opts.giveUpPolicy }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    ...(opts.timers === undefined ? {} : { timers: opts.timers }),
     ...(opts.onBootStatus === undefined
       ? {}
       : { onBootStatus: opts.onBootStatus }),
@@ -1849,6 +1992,8 @@ export interface SubscribeOptions {
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
+  /** Injectable timeout seam; production callers use the global timers. */
+  readonly timers?: ReadinessTimers;
   /**
    * Explicit filter for the `jobs` subscription, overriding the descriptor's
    * default live-only scope (`state not_in [ended, killed]`). A
@@ -2516,6 +2661,7 @@ export function subscribeReadiness(
       ? {}
       : { giveUpPolicy: opts.giveUpPolicy }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    ...(opts.timers === undefined ? {} : { timers: opts.timers }),
     // fn-905: latch the per-root unseeded set for the readiness pass AND forward
     // to a caller-supplied `onBootStatus` (the readiness pass reads the latch on
     // its NEXT emit, which fires on the same frame). An older server omitting the

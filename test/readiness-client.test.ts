@@ -54,6 +54,7 @@ import {
 } from "../src/protocol";
 import {
   CATCHUP_BACKSTOP_MS,
+  CONNECT_TIMEOUT_MS,
   type ConnectFactory,
   computeLandedEpicIds,
   type FatalError,
@@ -65,6 +66,7 @@ import {
   POLL_MS,
   type ReadinessClientSnapshot,
   type ReadinessSocket,
+  type ReadinessTimers,
   type SocketHandlers,
   subscribeCollection,
   subscribeReadiness,
@@ -113,6 +115,44 @@ interface MockConnectResult {
  * that don't want a reconnect either set `shuttingDown` (via
  * `dispose()`) before closing, or just don't trigger `close` at all.
  */
+class ManualTimeouts implements ReadinessTimers {
+  private nextId = 1;
+  private readonly pending = new Map<
+    number,
+    { callback: () => void; delayMs: number }
+  >();
+
+  setTimeout(
+    callback: () => void,
+    delayMs: number,
+  ): ReturnType<typeof setTimeout> {
+    const id = this.nextId++;
+    this.pending.set(id, { callback, delayMs });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }
+
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void {
+    this.pending.delete(timer as unknown as number);
+  }
+
+  count(delayMs: number): number {
+    return [...this.pending.values()].filter(
+      (timer) => timer.delayMs === delayMs,
+    ).length;
+  }
+
+  fire(delayMs: number): void {
+    const entry = [...this.pending.entries()].find(
+      ([, timer]) => timer.delayMs === delayMs,
+    );
+    if (entry === undefined) {
+      throw new Error(`no timeout scheduled for ${delayMs}ms`);
+    }
+    this.pending.delete(entry[0]);
+    entry[1].callback();
+  }
+}
+
 function makeMockConnect(): MockConnectResult {
   const socketRef: { current: MockSocket | null } = { current: null };
   const factory: ConnectFactory = async (_path, handlers) => {
@@ -1768,6 +1808,142 @@ function installTimerHarness(startMs = 1_000_000): TimerHarness {
     },
   };
 }
+
+test("reconnect evidence: terminate without close cannot strand the reconnect latch", () => {
+  const harness = installTimerHarness();
+  const timers = new ManualTimeouts();
+  try {
+    const { factory, sockets, connectCount } = makeMultiConnect();
+    let fatalCalls = 0;
+    const lifecycle: string[] = [];
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-no-close-reconnect",
+      collection: "jobs",
+      onRows: () => {},
+      onLifecycle: (event) => {
+        lifecycle.push(event);
+        if (event === "query_timeout") {
+          throw new Error("broken lifecycle observer");
+        }
+      },
+      onFatal: () => {
+        fatalCalls += 1;
+      },
+      connect: factory,
+      timers,
+    });
+    const first = sockets[0];
+    if (!first) throw new Error("first socket never installed");
+
+    // The existing query-timeout threshold is sufficient: only reconnect
+    // scheduling is under test, so heartbeat and detection tuning stay intact.
+    harness.advance(QUERY_TIMEOUT_MS + 1);
+    harness.pollHandler()();
+
+    expect(first.terminated ?? 0).toBe(1);
+    expect(connectCount()).toBe(1);
+    expect(timers.count(0)).toBe(1);
+    expect(lifecycle).toContain("query_timeout");
+
+    // This socket seam resolves terminate but deliberately never emits close.
+    // The explicit fallback kick is therefore the only path to socket two.
+    timers.fire(0);
+    expect(connectCount()).toBe(2);
+    expect(sockets[1]).toBeDefined();
+    expect(fatalCalls).toBe(0);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("reconnect evidence: a hung connect dial times out, backs off, and retries", async () => {
+  const timers = new ManualTimeouts();
+  let calls = 0;
+  let terminated = 0;
+  const firstHandlers: { current: SocketHandlers | null } = { current: null };
+  const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+  const factory: ConnectFactory = (_path, handlers) => {
+    calls += 1;
+    if (calls === 1) {
+      firstHandlers.current = handlers;
+      return new Promise<ReadinessSocket>(() => {
+        // A dial that neither opens nor rejects is the parked-loop candidate.
+      });
+    }
+    const sock: ReadinessSocket = {
+      write(): void {},
+      end(): void {},
+      terminate(): void {
+        terminated += 1;
+      },
+    };
+    handlers.open(sock);
+    return Promise.resolve(sock);
+  };
+  let fatalCalls = 0;
+  const handle = subscribeCollection({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-hung-dial",
+    collection: "jobs",
+    onRows: () => {},
+    onLifecycle: (event, detail) => {
+      lifecycle.push({ event, detail });
+      if (event === "connect_timeout") {
+        throw new Error("broken lifecycle observer");
+      }
+    },
+    onFatal: () => {
+      fatalCalls += 1;
+    },
+    connect: factory,
+    timers,
+  });
+
+  // The dial timer arms on the next microtask so immediate refusals can reject
+  // without allocating a redundant timeout.
+  await Promise.resolve();
+  expect(timers.count(CONNECT_TIMEOUT_MS)).toBe(1);
+  timers.fire(CONNECT_TIMEOUT_MS);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const timeoutEvents = lifecycle.filter((e) => e.event === "connect_timeout");
+  expect(timeoutEvents).toHaveLength(1);
+  expect(timeoutEvents[0]?.detail?.timeout_ms).toBe(CONNECT_TIMEOUT_MS);
+  expect(timers.count(250)).toBe(1);
+  expect(fatalCalls).toBe(0);
+
+  timers.fire(250);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(calls).toBe(2);
+  expect(lifecycle.filter((e) => e.event === "connected")).toHaveLength(1);
+  expect(fatalCalls).toBe(0);
+
+  // If the timed-out transport eventually opens, it is stale and must be
+  // hard-destroyed without replacing the healthy retry socket.
+  let lateTerminated = 0;
+  const lateSock: ReadinessSocket = {
+    write(): void {},
+    end(): void {},
+    terminate(): void {
+      lateTerminated += 1;
+    },
+  };
+  const lateHandlers = firstHandlers.current;
+  if (lateHandlers === null) {
+    throw new Error("first dial handlers were not captured");
+  }
+  lateHandlers.open(lateSock);
+  expect(lateTerminated).toBe(1);
+  expect(lifecycle.filter((e) => e.event === "connected")).toHaveLength(1);
+
+  handle.dispose();
+  expect(terminated).toBe(1);
+});
 
 test("subscribeReadiness: Path A (<1 s) — result arrives before slow-flight threshold, no events", () => {
   const harness = installTimerHarness();
