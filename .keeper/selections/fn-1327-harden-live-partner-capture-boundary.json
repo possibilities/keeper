@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-shaped fix coordinating a boundary token across two surfaces (notification renderer and capture matcher) with a real design choice (spill/truncate vs budget-immune id) and delicate in-repo idiom matching, warranting sonnet's judgment at the contract-touching xhigh band; no novel-algorithm or cross-cutting-cascade reason clears the opus bar.",
+      "task_id": "fn-1327-harden-live-partner-capture-boundary.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T08:41:31.445000Z",
+  "epic_id": "fn-1327-harden-live-partner-capture-boundary",
+  "input_hash": "6260636ae1c74af440cc6c98b5bf52cf53e5ffd1c44456c2d27ca03b5d0a111f",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1650484074,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Contract-shaped fix coordinating a boundary token across two surfaces (notification renderer and capture matcher) with a real design choice (spill/truncate vs budget-immune id) and delicate in-repo idiom matching, warranting sonnet's judgment at the contract-touching xhigh band; no novel-algorithm or cross-cutting-cascade reason clears the opus bar.\",\"confidence\":0.72}]}\n"
+}
