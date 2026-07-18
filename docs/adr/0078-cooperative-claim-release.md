@@ -46,9 +46,10 @@ non-consenting holder, the risky half of the protocol.
   conflict is stamped BLOCKED with the request evidence, and the existing
   escalation ladder — resolver, then page-once — carries it to the operator.
   No new paging machinery, no daemon sweep.
-- **Declines are durable and honored.** A recorded decline is a terminal
-  answer for that request; the requester backs off under an attempt budget
-  rather than re-asking in a loop.
+- **Decline recording is deliberately deferred.** The read/annotate/protocol
+  half awaits a producer; production release records do not record declines.
+  A future producer must make a recorded decline a terminal answer for that
+  request, with attempt-budgeted backoff rather than a re-ask loop.
 - **Auto-forfeiture is deliberately out.** Expiry never retires a live
   claimant's claim in this design; that half — forfeiture plus fencing a
   non-consenting holder — is a separate future decision with its own record.
