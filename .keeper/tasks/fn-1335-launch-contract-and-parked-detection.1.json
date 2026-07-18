@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Producer launchability gate",
-  "updated_at": "2026-07-18T14:29:39.638000Z"
+  "updated_at": "2026-07-18T14:46:26.717000Z",
+  "worker_done_at": "2026-07-18T14:46:26.717000Z"
 }

@@ -54,5 +54,5 @@ touched suites.
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Producer-owned launch-contract gate: resolveWorkerCell now validates an active provider constraint's effective cell against its launchable route/driver/marker before spawn, returning a closed provider-unlaunchable kind that mints the sticky worker-provider-cell-unlaunchable reason instead of launching a doomed worker (fn-1325.2 replay fixture covered). Added ADR 0084 plus CONTEXT.md/problem-codes.md entries for provider constraint and parked launch.
 ## Evidence
