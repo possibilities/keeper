@@ -58,5 +58,5 @@ account config dir on every hop when the eliminate-home path proves out.
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Threaded the resolved claude-swap account slot into CLAUDE_CONFIG_DIR (eliminating the home-store dependency), derived the account config dir via one cswap list --json read per slot (email-keyed session layout), and pre-seed workspace trust for the launch cwd via an atomic temp-file+rename merge that preserves sibling fields and fails soft.
 ## Evidence
