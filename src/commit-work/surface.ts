@@ -66,6 +66,8 @@ export interface OwnershipClaim {
   orderedTerminalProof?: true;
   /** Un-ingested receipts temporarily obscure otherwise-terminal evidence. */
   receiptsPending?: ReceiptPendingEvidence;
+  /** Durable claimant refusal for this path and requester, if one matched. */
+  releaseDecline?: ReleaseDeclineEvidence;
 }
 
 export interface ReceiptPendingEvidence {
@@ -83,6 +85,20 @@ export interface ReceiptPendingEvidence {
  * commit-work authority check proves ancestry. Distinct from the vacated-claim
  * gone-witness (the process is gone) and from a wrapper-attempt lease release.
  */
+export interface ReleaseDeclineRecord {
+  requesterSessionId: string | null;
+  /** Canonical, worktree-relative paths the claimant declined to release. */
+  paths: ReadonlySet<string>;
+  evidence: string | null;
+  reason: string | null;
+}
+
+export interface ReleaseDeclineEvidence {
+  requesterSessionId: string | null;
+  evidence: string | null;
+  reason: string | null;
+}
+
 export interface ReleaseRecord {
   sessionId: string;
   pid: number;
@@ -91,6 +107,46 @@ export interface ReleaseRecord {
   worktree: string;
   /** Canonical, worktree-relative paths being released. */
   paths: ReadonlySet<string>;
+  /** Durable claimant refusals for already-requested releases. */
+  declines?: readonly ReleaseDeclineRecord[];
+}
+
+export interface RequestReleaseDeclineAnnotation {
+  status: "declined";
+  requester_session_id: string | null;
+  paths: string[];
+  path_total: number;
+  paths_truncated: boolean;
+  evidence: string | null;
+  reason: string | null;
+  protocol: string;
+}
+
+export interface RequestReleaseClaimantPointer {
+  claimant_session_id: string;
+  paths: string[];
+  path_total: number;
+  paths_truncated: boolean;
+  release_argv: string[];
+  release_invocation: string;
+  advisory_notice: string;
+  decline?: RequestReleaseDeclineAnnotation;
+}
+
+export interface RequestReleasePointer {
+  schema_version: 1;
+  kind: "commit-work-request-release";
+  requester_session_id: string | null;
+  requester_protocol: string;
+  claimant_total: number;
+  claimants_truncated: boolean;
+  claimants: RequestReleaseClaimantPointer[];
+}
+
+export interface RequestReleaseConflict {
+  claimantSessionId: string;
+  path: string;
+  decline?: ReleaseDeclineEvidence;
 }
 
 /**
@@ -146,6 +202,7 @@ export interface AdoptionRejection {
   code: AdoptionRejectionCode;
   conflicting_sessions?: string[];
   pending_sessions?: string[];
+  request_release?: RequestReleasePointer;
 }
 
 export interface SurfaceDiscoveryResult {
@@ -218,8 +275,10 @@ const RECEIPT_RECORD_LIMIT = 10_000;
 const RECEIPT_BYTE_LIMIT = 8 * 1_048_576;
 const RELEASE_FILE_LIMIT = 1_024;
 const RELEASE_PATH_LIMIT = 4_096;
+const RELEASE_DECLINE_LIMIT = 1_024;
 const RELEASE_PATH_LENGTH_LIMIT = 1_024;
 const RELEASE_RECORD_BYTE_LIMIT = 8 * 1_048_576;
+const REQUEST_RELEASE_TEXT_BYTES = 4_096;
 // Node's fs constants omit O_CLOEXEC; keep descriptor inheritance atomic.
 const O_CLOEXEC = process.platform === "darwin" ? 0x1000000 : 0o2000000;
 
@@ -1361,6 +1420,67 @@ export function defaultReleaseRecordDir(): string {
   return join(homedir(), ".local", "state", "keeper", "release-records");
 }
 
+function truncateUtf8(value: string, maxBytes: number): string {
+  const source = Buffer.from(value, "utf8");
+  if (source.byteLength <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (source[end] & 0xc0) === 0x80) end -= 1;
+  return source.subarray(0, end).toString("utf8");
+}
+
+function boundedNullableString(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.includes("\0")) return null;
+  return truncateUtf8(value, REQUEST_RELEASE_TEXT_BYTES);
+}
+
+function parseReleasePathSet(value: unknown): ReadonlySet<string> | null {
+  if (!Array.isArray(value) || value.length > RELEASE_PATH_LIMIT) return null;
+  const paths = new Set<string>();
+  for (const path of value) {
+    if (
+      typeof path !== "string" ||
+      path.length === 0 ||
+      path.length > RELEASE_PATH_LENGTH_LIMIT ||
+      path.includes("\0")
+    ) {
+      return null;
+    }
+    paths.add(path);
+  }
+  return paths;
+}
+
+function parseReleaseDeclines(value: unknown): ReleaseDeclineRecord[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > RELEASE_DECLINE_LIMIT) {
+    return null;
+  }
+  const declines: ReleaseDeclineRecord[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) return null;
+    const record = item as Record<string, unknown>;
+    const requester =
+      record.requester_session_id === undefined ||
+      record.requester_session_id === null
+        ? null
+        : typeof record.requester_session_id === "string" &&
+            isUuid(record.requester_session_id)
+          ? record.requester_session_id.toLowerCase()
+          : undefined;
+    if (requester === undefined) return null;
+    const paths = parseReleasePathSet(record.paths);
+    if (paths === null) return null;
+    declines.push({
+      requesterSessionId: requester,
+      paths,
+      evidence: boundedNullableString(record.evidence),
+      reason: boundedNullableString(record.reason),
+    });
+  }
+  return declines;
+}
+
 /** Parse and validate one release record. A torn/oversized/off-shape body is null. */
 export function parseReleaseRecord(body: string): ReleaseRecord | null {
   let parsed: unknown;
@@ -1388,30 +1508,17 @@ export function parseReleaseRecord(body: string): ReleaseRecord | null {
   if (typeof record.worktree !== "string" || record.worktree.length === 0) {
     return null;
   }
-  if (
-    !Array.isArray(record.paths) ||
-    record.paths.length > RELEASE_PATH_LIMIT
-  ) {
-    return null;
-  }
-  const paths = new Set<string>();
-  for (const path of record.paths) {
-    if (
-      typeof path !== "string" ||
-      path.length === 0 ||
-      path.length > RELEASE_PATH_LENGTH_LIMIT ||
-      path.includes("\0")
-    ) {
-      return null;
-    }
-    paths.add(path);
-  }
+  const paths = parseReleasePathSet(record.paths);
+  if (paths === null) return null;
+  const declines = parseReleaseDeclines(record.declines);
+  if (declines === null) return null;
   return {
     sessionId: record.session_id.toLowerCase(),
     pid: record.pid,
     startTime: record.start_time,
     worktree: record.worktree,
     paths,
+    declines,
   };
 }
 
@@ -1514,6 +1621,7 @@ export function writeReleaseRecord(input: WriteReleaseRecordInput): {
   const root = canonicalWorktree(input.worktree);
   const file = join(input.dir, `${sessionId}.json`);
   const merged = new Set<string>();
+  let declines: readonly ReleaseDeclineRecord[] = [];
   const existing = readOneReleaseRecord(file);
   if (
     existing !== null &&
@@ -1523,6 +1631,7 @@ export function writeReleaseRecord(input: WriteReleaseRecordInput): {
     existing.worktree === root
   ) {
     for (const path of existing.paths) merged.add(path);
+    declines = existing.declines ?? [];
   }
   for (const path of input.paths) merged.add(path);
   const paths = [...merged].sort().slice(0, RELEASE_PATH_LIMIT);
@@ -1533,6 +1642,16 @@ export function writeReleaseRecord(input: WriteReleaseRecordInput): {
     start_time: input.startTime,
     worktree: root,
     paths,
+    ...(declines.length === 0
+      ? {}
+      : {
+          declines: declines.map((decline) => ({
+            requester_session_id: decline.requesterSessionId,
+            paths: [...decline.paths].sort(),
+            evidence: decline.evidence,
+            reason: decline.reason,
+          })),
+        }),
   });
   const tmpDir = join(input.dir, "tmp");
   mkdirSync(tmpDir, { recursive: true });
@@ -1546,6 +1665,7 @@ export function writeReleaseRecord(input: WriteReleaseRecordInput): {
       startTime: input.startTime,
       worktree: root,
       paths: new Set(paths),
+      declines,
     },
     file,
   };
@@ -1555,14 +1675,12 @@ function defaultReadReleases(worktree: string): ReleaseRecord[] {
   return readReleaseRecords(defaultReleaseRecordDir(), worktree);
 }
 
-function releaseMatchesClaim(
+function recordMatchesClaimIdentity(
   record: ReleaseRecord,
   claim: OwnershipClaim,
   identity: string | null,
 ): boolean {
-  if (record.sessionId !== claim.sessionId || !record.paths.has(claim.path)) {
-    return false;
-  }
+  if (record.sessionId !== claim.sessionId) return false;
   // Self-fence: the current session is already identity-proven upstream, so its
   // own record fences it by session id alone (its direct-evidence claims carry
   // no pid/start-time to bind).
@@ -1575,6 +1693,34 @@ function releaseMatchesClaim(
     claim.pid === record.pid &&
     claim.startTime === record.startTime
   );
+}
+
+function releaseMatchesClaim(
+  record: ReleaseRecord,
+  claim: OwnershipClaim,
+  identity: string | null,
+): boolean {
+  return (
+    record.paths.has(claim.path) &&
+    recordMatchesClaimIdentity(record, claim, identity)
+  );
+}
+
+function declineMatchesClaim(
+  record: ReleaseRecord,
+  decline: ReleaseDeclineRecord,
+  claim: OwnershipClaim,
+  identity: string | null,
+): boolean {
+  if (!decline.paths.has(claim.path)) return false;
+  if (
+    decline.requesterSessionId !== null &&
+    identity !== null &&
+    decline.requesterSessionId !== identity
+  ) {
+    return false;
+  }
+  return recordMatchesClaimIdentity(record, claim, identity);
 }
 
 /**
@@ -1595,10 +1741,26 @@ function applyReleaseWitness(
       if (!claimIsExclusiveOwnership(claim) || claim.liveness === "terminal") {
         continue;
       }
-      if (
-        releases.some((record) => releaseMatchesClaim(record, claim, identity))
-      ) {
+      const matchingRelease = releases.find((record) =>
+        releaseMatchesClaim(record, claim, identity),
+      );
+      if (matchingRelease !== undefined) {
         claim.liveness = "terminal";
+        continue;
+      }
+      const matchingDecline = releases
+        .flatMap((record) =>
+          (record.declines ?? []).map((decline) => ({ record, decline })),
+        )
+        .find(({ record, decline }) =>
+          declineMatchesClaim(record, decline, claim, identity),
+        );
+      if (matchingDecline !== undefined) {
+        claim.releaseDecline = {
+          requesterSessionId: matchingDecline.decline.requesterSessionId,
+          evidence: matchingDecline.decline.evidence,
+          reason: matchingDecline.decline.reason,
+        };
       }
     }
   }
@@ -1901,6 +2063,24 @@ export function unsafeForeignSessions(
   };
 }
 
+function requestReleaseConflictsForPath(
+  path: string,
+  claims: readonly OwnershipClaim[],
+  sessions: readonly string[],
+): RequestReleaseConflict[] {
+  return sessions.map((session) => ({
+    claimantSessionId: session,
+    path,
+    decline: claims.find(
+      (claim) =>
+        claim.sessionId === session &&
+        claimIsExclusiveOwnership(claim) &&
+        claim.liveness !== "terminal" &&
+        claim.releaseDecline !== undefined,
+    )?.releaseDecline,
+  }));
+}
+
 export function summarizeReceiptLag(receipts: readonly PendingReceiptBlock[]): {
   events: number;
   seconds: number;
@@ -1913,6 +2093,123 @@ export function summarizeReceiptLag(receipts: readonly PendingReceiptBlock[]): {
       0,
     ),
     stalledIngester: receipts.some((receipt) => receipt.stalledIngester),
+  };
+}
+
+const REQUEST_RELEASE_PROTOCOL =
+  "Send one bounded advisory `keeper bus chat send` notice with send-only delivery; treat it as best-effort and never load-bearing. Wait the grace window, then re-run keeper commit-work. If the same live conflict remains, stamp BLOCKED with the request evidence so the existing escalation ladder carries it; never signal a live peer. If a durable decline is annotated, use attempt-budgeted backoff under the attempt budget before any later ask and never immediately re-request.";
+const DECLINE_PROTOCOL =
+  "A durable claimant decline is the terminal answer for this request; use attempt-budgeted backoff under the attempt budget before any later ask and do not immediately re-request.";
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./:=@+-]+$/.test(value)
+    ? value
+    : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function boundedText(value: string): string {
+  return truncateUtf8(value, REQUEST_RELEASE_TEXT_BYTES);
+}
+
+function requestDeclineAnnotation(
+  paths: readonly string[],
+  limit: number,
+  declines: readonly ReleaseDeclineEvidence[],
+): RequestReleaseDeclineAnnotation | undefined {
+  if (declines.length === 0) return undefined;
+  const first = declines[0] as ReleaseDeclineEvidence;
+  const declinedPaths = [...new Set(paths)].sort();
+  const sample = declinedPaths
+    .slice(0, limit)
+    .map((path) => truncateUtf8(path, RELEASE_PATH_LENGTH_LIMIT));
+  return {
+    status: "declined",
+    requester_session_id: first.requesterSessionId,
+    paths: sample,
+    path_total: declinedPaths.length,
+    paths_truncated: declinedPaths.length > sample.length,
+    evidence: first.evidence,
+    reason: first.reason,
+    protocol: DECLINE_PROTOCOL,
+  };
+}
+
+export function buildRequestReleasePointer(
+  conflicts: readonly RequestReleaseConflict[],
+  requesterSessionId: string | null,
+  limit = 20,
+): RequestReleasePointer | undefined {
+  if (conflicts.length === 0) return undefined;
+  const byClaimant = new Map<
+    string,
+    {
+      paths: Set<string>;
+      declinedPaths: Set<string>;
+      declines: ReleaseDeclineEvidence[];
+    }
+  >();
+  for (const conflict of conflicts) {
+    const claimant = truncateUtf8(conflict.claimantSessionId, 256);
+    const path = truncateUtf8(conflict.path, RELEASE_PATH_LENGTH_LIMIT);
+    const bucket = byClaimant.get(claimant) ?? {
+      paths: new Set<string>(),
+      declinedPaths: new Set<string>(),
+      declines: [],
+    };
+    bucket.paths.add(path);
+    if (conflict.decline !== undefined) {
+      bucket.declinedPaths.add(path);
+      bucket.declines.push(conflict.decline);
+    }
+    byClaimant.set(claimant, bucket);
+  }
+  const claimants = [...byClaimant.entries()].sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  const visible = claimants.slice(0, limit);
+  return {
+    schema_version: 1,
+    kind: "commit-work-request-release",
+    requester_session_id: requesterSessionId,
+    requester_protocol: REQUEST_RELEASE_PROTOCOL,
+    claimant_total: claimants.length,
+    claimants_truncated: claimants.length > visible.length,
+    claimants: visible.map(([claimant, bucket]) => {
+      const paths = [...bucket.paths].sort();
+      const pathSample = paths
+        .slice(0, limit)
+        .map((path) => truncateUtf8(path, RELEASE_PATH_LENGTH_LIMIT));
+      const releaseArgv = [
+        "keeper",
+        "session",
+        "release",
+        "--session-id",
+        claimant,
+        "--",
+        ...pathSample,
+      ];
+      const invocation = boundedText(releaseArgv.map(shellQuote).join(" "));
+      return {
+        claimant_session_id: claimant,
+        paths: pathSample,
+        path_total: paths.length,
+        paths_truncated: paths.length > pathSample.length,
+        release_argv: releaseArgv,
+        release_invocation: invocation,
+        advisory_notice: boundedText(
+          `Cooperative release request from ${requesterSessionId ?? "an untracked requester"}: if safe, run ${invocation}. This notice is advisory, send-only, and not load-bearing; do not signal any process.`,
+        ),
+        ...(bucket.declines.length === 0
+          ? {}
+          : {
+              decline: requestDeclineAnnotation(
+                [...bucket.declinedPaths],
+                limit,
+                bucket.declines,
+              ),
+            }),
+      };
+    }),
   };
 }
 
@@ -2087,16 +2384,19 @@ export async function discoverCommitWorkSurface(
       rejections.push({ input, path, code: "ownership_unavailable" });
       continue;
     }
-    const blockers = unsafeForeignSessions(
-      claimsByPath.get(path) ?? [],
-      identity,
-    );
+    const pathClaims = claimsByPath.get(path) ?? [];
+    const blockers = unsafeForeignSessions(pathClaims, identity);
     if (blockers.conflicts.length > 0) {
       rejections.push({
         input,
         path,
         code: "ownership_conflict",
         conflicting_sessions: blockers.conflicts.slice(0, limit),
+        request_release: buildRequestReleasePointer(
+          requestReleaseConflictsForPath(path, pathClaims, blockers.conflicts),
+          identity,
+          limit,
+        ),
       });
       continue;
     }
@@ -2119,10 +2419,8 @@ export async function discoverCommitWorkSurface(
         rejections.push({ input, path: peer, code: "excluded" });
         continue;
       }
-      const peerBlockers = unsafeForeignSessions(
-        claimsByPath.get(peer) ?? [],
-        identity,
-      );
+      const peerClaims = claimsByPath.get(peer) ?? [];
+      const peerBlockers = unsafeForeignSessions(peerClaims, identity);
       if (peerBlockers.conflicts.length > 0) {
         adopted.delete(path);
         rejections.push({
@@ -2130,6 +2428,15 @@ export async function discoverCommitWorkSurface(
           path: peer,
           code: "ownership_conflict",
           conflicting_sessions: peerBlockers.conflicts.slice(0, limit),
+          request_release: buildRequestReleasePointer(
+            requestReleaseConflictsForPath(
+              peer,
+              peerClaims,
+              peerBlockers.conflicts,
+            ),
+            identity,
+            limit,
+          ),
         });
       } else if (peerBlockers.receiptsPending.length > 0) {
         adopted.delete(path);

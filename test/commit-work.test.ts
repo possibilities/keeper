@@ -2688,6 +2688,12 @@ function releaseOf(paths: string[]): ReleaseRecord {
   };
 }
 
+function firstReleaseClaimant(envelope: unknown): Record<string, unknown> {
+  const request = (envelope as { request_release: { claimants: unknown[] } })
+    .request_release;
+  return request.claimants[0] as Record<string, unknown>;
+}
+
 describe("commit-work: cooperative claim release", () => {
   test("a released path becomes adoptable while unreleased paths stay protected", async () => {
     const surface = await discoverCommitWorkSurface({
@@ -2715,7 +2721,7 @@ describe("commit-work: cooperative claim release", () => {
     expect(conflict?.conflicting_sessions).toEqual([HOLDER]);
   });
 
-  test("no release record leaves every foreign live path protected", async () => {
+  test("surface ownership-conflict rejections carry a request-release pointer", async () => {
     const surface = await discoverCommitWorkSurface({
       worktree: "/repo",
       identity: PEER,
@@ -2728,7 +2734,182 @@ describe("commit-work: cooperative claim release", () => {
       },
     });
     expect(surface.adopted).toEqual([]);
-    expect(surface.rejections[0]?.code).toBe("ownership_conflict");
+    const rejection = surface.rejections[0];
+    expect(rejection?.code).toBe("ownership_conflict");
+    expect(rejection?.request_release?.requester_session_id).toBe(PEER);
+    expect(rejection?.request_release?.claimants[0]).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+      release_argv: [
+        "keeper",
+        "session",
+        "release",
+        "--session-id",
+        HOLDER,
+        "--",
+        "shared/a.txt",
+      ],
+    });
+    expect(rejection?.request_release?.requester_protocol).toContain(
+      "send-only",
+    );
+    expect(rejection?.request_release?.requester_protocol).toContain(
+      "never signal a live peer",
+    );
+  });
+
+  test("commit-work adoption refusal carries the claimant pointer and bounded paths", async () => {
+    const paths = Array.from(
+      { length: 25 },
+      (_, index) => `shared/${index.toString().padStart(2, "0")}.txt`,
+    );
+    const { d } = deps({
+      files: paths,
+      rules: successRules({ stagedNames: paths }),
+    });
+    const { code, stdout } = await runForTest(
+      [
+        "feat: adopt blocked",
+        "--session-id",
+        "s1",
+        ...paths.flatMap((path) => ["--adopt", path]),
+      ],
+      {
+        ...d,
+        readClaims: () => paths.map((path) => liveHolderClaim(path)),
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env.outcome).toBe("ownership_conflict");
+    const claimant = firstReleaseClaimant(env);
+    expect(claimant.claimant_session_id).toBe(HOLDER);
+    expect(claimant.path_total).toBe(25);
+    expect(claimant.paths as string[]).toHaveLength(20);
+    expect(claimant.paths_truncated).toBe(true);
+    expect(String(env.request_release.requester_protocol)).toContain(
+      "BLOCKED with the request evidence",
+    );
+  });
+
+  test("durable claimant decline annotates the pointer with backoff guidance", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-decline-"));
+    try {
+      writeFileSync(
+        join(dir, `${HOLDER}.json`),
+        JSON.stringify({
+          schema: 1,
+          session_id: HOLDER,
+          pid: 4242,
+          start_time: "linux:100",
+          worktree: "/repo",
+          paths: [],
+          declines: [
+            {
+              requester_session_id: PEER,
+              paths: ["shared/a.txt"],
+              evidence: "bus-request-1",
+              reason: "still in use",
+            },
+          ],
+        }),
+      );
+      const records = readReleaseRecords(dir, "/repo");
+      const { d } = deps({
+        files: ["shared/a.txt"],
+        rules: successRules({ stagedNames: ["shared/a.txt"] }),
+      });
+      const { code, stdout } = await runForTest(
+        [
+          "feat: adopt blocked",
+          "--session-id",
+          "s1",
+          "--adopt",
+          "shared/a.txt",
+        ],
+        {
+          ...d,
+          readClaims: () => [liveHolderClaim("shared/a.txt")],
+          classifyClaim: (claim) => claim.liveness,
+          readReleases: () => records,
+        },
+      );
+      expect(code).toBe(1);
+      const claimant = firstReleaseClaimant(JSON.parse(stdout));
+      expect(claimant.decline).toMatchObject({
+        status: "declined",
+        requester_session_id: PEER,
+        paths: ["shared/a.txt"],
+        evidence: "bus-request-1",
+        reason: "still in use",
+      });
+      const protocol = String(
+        (claimant.decline as Record<string, unknown>).protocol,
+      );
+      expect(protocol).toContain("attempt budget");
+      expect(protocol).toContain("do not immediately re-request");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("post-lint ownership refusal carries the request-release pointer", async () => {
+    let reads = 0;
+    const { d } = deps({
+      files: ["shared/a.txt"],
+      rules: successRules({ stagedNames: ["shared/a.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: late conflict", "--session-id", "s1"],
+      {
+        ...d,
+        readClaims: () => {
+          reads += 1;
+          return reads >= 3 ? [liveHolderClaim("shared/a.txt")] : [];
+        },
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env).toMatchObject({
+      outcome: "ownership_conflict",
+      reason: "foreign_claim_after_lint",
+    });
+    expect(firstReleaseClaimant(env)).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+    });
+  });
+
+  test("pre-publication ownership refusal carries the request-release pointer", async () => {
+    let reads = 0;
+    const { d } = deps({
+      files: ["shared/a.txt"],
+      rules: successRules({ stagedNames: ["shared/a.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: final conflict", "--session-id", "s1"],
+      {
+        ...d,
+        readClaims: () => {
+          reads += 1;
+          return reads >= 4 ? [liveHolderClaim("shared/a.txt")] : [];
+        },
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env).toMatchObject({
+      outcome: "ownership_conflict",
+      reason: "foreign_claim_before_publication",
+    });
+    expect(firstReleaseClaimant(env)).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+    });
   });
 
   test("the releasing session's own next discover drops released paths from its owned set", async () => {
