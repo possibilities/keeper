@@ -10,13 +10,13 @@ upstream:
 filter_rule: whole snippet domains {engineering, source-dirs} + whole bundle {engineering-rules}; covers every `keeper prompt render` cite in keeper/plan skill bodies plus the engineering-rules members for coherent bundle renders
 files:
   claude/arthack/template/_partials/bundles/engineering-rules.yaml: 3f32d67c88790afc7eb51684ec9be06a169c879b8721e9ba807ad34675e05141
-  claude/arthack/template/_partials/snippets/_index.yaml: 230befe0ed53fbf392bc2cca30362401fc435f43634bf6180170f34ec10ee853
+  claude/arthack/template/_partials/snippets/_index.yaml: 4ded5353963b7ef54da93df3c8f52bb09eaff4cfac10f76fbf725bce0c51a1bb
   claude/arthack/template/_partials/snippets/engineering/agents-md-symlink.md.tmpl: 61b73be6a5c6fb55c9bb838fc3065bec00b086fed59f1d9164ebb07637f7c245
   claude/arthack/template/_partials/snippets/engineering/build-forward-no-fallback.md.tmpl: 508fa1c40b0c61de5b8a1d2f0dee17482af4d8a62ac2d5440d03d9c555ca5577
   claude/arthack/template/_partials/snippets/engineering/claude-md-scope.md.tmpl: d0f71007fc15872b078ecaf55dfc6b74ef6d985af712b9871de243ff2613c694
   claude/arthack/template/_partials/snippets/engineering/code-comment-style.md.tmpl: 4c56e59cf018eb4daa106b819cd970cee3f477a1ccac529e087f6254a81b227d
   claude/arthack/template/_partials/snippets/engineering/commit-hygiene-flags.md.tmpl: ff840e006dccf1e2c667f4fe5edfdef94e3ed4c94e94d2053173631b7abd7862
-  claude/arthack/template/_partials/snippets/engineering/commit-via-keeper-default.md.tmpl: 5636b8cf80814236d3407a0017173925b72c198f8526d17ca886215ee7908d24
+  claude/arthack/template/_partials/snippets/engineering/commit-via-keeper-default.md.tmpl: ae6c4a09f26ec2a281f7cb40a45de6d92b0fb349cd2c9e273cf03099e452c973
   claude/arthack/template/_partials/snippets/engineering/domain-docs.md.tmpl: 5a9f99c7cfea453a41ea2a3214f950750a343693c65fb030387980f06179b9fe
   claude/arthack/template/_partials/snippets/engineering/escalate-inline-or-plan.md.tmpl: 812e953b1584d91ee6308b8c9e4aebdcabee0a842ff999884f3e7bd094801745
   claude/arthack/template/_partials/snippets/engineering/future-facing-docs.md.tmpl: 3fb941075fb58f92e72688b13f4dc7424ca79d52f7a8d2754a2f1ee2be8439df

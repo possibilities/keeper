@@ -314,7 +314,7 @@ Every invocation emits one versioned `commit-work-result` JSON line; inspect `ou
 
 **On `outcome:"lint_failed"`:** read the named files, fix per bounded stderr, then re-run `keeper commit-work` with the same message and adoption arguments. A lint failure is not an attribution gap; do not add adoption just to bypass it.
 
-**On any other refusal:** follow the envelope's typed recovery. Ownership conflicts require the other claimant to become positively terminal or to land its own work; surface/index/ref drift requires a fresh preview; operation and jam gates require their named recovery. Do not retry blindly and never fall back to raw `git commit`.
+**On any other refusal:** follow the envelope's typed recovery. An ownership conflict's `request_release` pointer names the live claimant and contested paths and carries a `keeper session release` invocation — advise it as one bounded, best-effort bus notice and never signal or terminate the claimant; wait the grace window, then retry, or escalate a still-live conflict through the usual block path. Otherwise let the claimant land or become positively terminal; surface/index/ref drift requires a fresh preview; operation and jam gates require their named recovery. Do not retry blindly and never fall back to raw `git commit`.
 
 **Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `keeper prompt render engineering/commit-hygiene-flags`.
 

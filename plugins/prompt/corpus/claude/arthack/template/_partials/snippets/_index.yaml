@@ -104,7 +104,7 @@ snippets:
     token-estimate: 140
     used-in: []
   - name: commit-via-keeper-default
-    summary: Default to `keeper commit-work` for committing source changes — runs the project's lint matrix, lands the commit under a flock, pushes to origin. Skip only for explicit experimental or debugging scratch.
+    summary: Default to `keeper commit-work` for byte-bound source commits — explicit adoption covers attribution gaps; hooks, signing, CAS publication, and exact-SHA push remain enforced.
     domain: engineering
     audience: agent
     severity: default
@@ -125,7 +125,7 @@ snippets:
     related:
       - commit-hygiene-flags
     path: _partials/snippets/engineering/commit-via-keeper-default.md.tmpl
-    token-estimate: 628
+    token-estimate: 624
     used-in: []
   - name: domain-docs
     summary: The domain-modeling reflex for design work — read CONTEXT.md + ADRs first, challenge and sharpen terms, offer a clustered glossary update in conversation but commit merited updates autonomously at plan time, gate ADRs on the 3-part test, supersede old records into superseded/.
