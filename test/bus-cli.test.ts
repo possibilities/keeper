@@ -478,6 +478,44 @@ describe("emitMessage (filesystem, sandboxed)", () => {
     }
   });
 
+  test("a resolved over-budget reference preserves its artifact id", () => {
+    const base = mkdtempSync(join(tmpdir(), "bus-artifact-render-"));
+    const root = join(
+      base,
+      ...Array.from({ length: 16 }, () => "deep-root-segment"),
+    );
+    const id = "0123456789abcdef0123456789abcdef";
+    const sender = "s".repeat(128);
+    try {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, id), "");
+      const msg: InboundMessage = {
+        namespace: "chat",
+        event: "message",
+        from: { name: sender, channel_id: "ch-1" },
+        ts: 0,
+        payload: {
+          text: "read artifact",
+          t: BUS_ARTIFACT_REF_TAG,
+          v: BUS_ARTIFACT_REF_VERSION,
+          id,
+          len: 0,
+          sha256:
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        },
+      };
+      const expected = `Agent Bus message from ${sender} — read artifact ${id} (path omitted)`;
+      const fullPathLine = `Agent Bus message from ${sender} — read ${join(root, id)}`;
+      const line = renderMessageNotification(msg, join(base, "inbox"), root);
+      expect(fullPathLine.length).toBeGreaterThan(NOTIFY_LINE_BUDGET);
+      expect(line).toBe(expected);
+      expect(line.length).toBeLessThanOrEqual(NOTIFY_LINE_BUDGET);
+      expect(line).toContain(id);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test("bad references fail loud without body fallback or untrusted path disclosure", () => {
     const base = mkdtempSync(join(tmpdir(), "bus-artifact-render-"));
     try {

@@ -845,7 +845,7 @@ describe("captureLivePartnerResponse — delivery and cleanup", () => {
     const deps = {
       waitForStop: async (resolved: ResolvedHandle) => {
         waits++;
-        expect(resolved.injectedMessageMarker).toBe(artifact.path);
+        expect(resolved.injectedMessageMarker).toBe(artifact.ref.id);
         expect(resolved.transcriptLineFloor).toBe(4);
         return { ok: true as const, transcriptPath: "/t.jsonl", stop: STOP };
       },

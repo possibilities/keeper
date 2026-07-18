@@ -8,9 +8,16 @@
  * signal; the removed `--wait-for-stop` flag no longer short-circuits launch.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { renderMessageNotification } from "../cli/bus";
 import { main } from "../src/agent/main";
 import { resolveHandle, runWaitForStop } from "../src/agent/pair-subcommands";
 import {
@@ -18,6 +25,10 @@ import {
   waitForTranscriptPath,
   waitForTranscriptStop,
 } from "../src/agent/transcript-watch";
+import {
+  BUS_ARTIFACT_REF_TAG,
+  BUS_ARTIFACT_REF_VERSION,
+} from "../src/bus-artifact";
 import {
   expectExit,
   flagValues,
@@ -512,6 +523,81 @@ describe("injected-message response boundary", () => {
     });
     expect(outcome.ok).toBe(true);
     if (outcome.ok) expect(outcome.stop.message).toBe("causal answer");
+  });
+
+  test("an over-budget artifact notification still opens the capture boundary", async () => {
+    const base = tempDir();
+    const root = join(
+      base,
+      ...Array.from({ length: 16 }, () => "deep-root-segment"),
+    );
+    const path = join(base, "claude-over-budget.jsonl");
+    const id = "0123456789abcdef0123456789abcdef";
+    const sender = "s".repeat(128);
+    try {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, id), "");
+      const notification = renderMessageNotification(
+        {
+          namespace: "chat",
+          event: "message",
+          from: { name: sender, channel_id: "ch-1" },
+          ts: 0,
+          payload: {
+            text: "read artifact",
+            t: BUS_ARTIFACT_REF_TAG,
+            v: BUS_ARTIFACT_REF_VERSION,
+            id,
+            len: 0,
+            sha256:
+              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          },
+        },
+        join(base, "inbox"),
+        root,
+      );
+      const expected = `Agent Bus message from ${sender} — read artifact ${id} (path omitted)`;
+      const fullPathLine = `Agent Bus message from ${sender} — read ${join(root, id)}`;
+      expect(fullPathLine.length).toBeGreaterThan(400);
+      expect(notification).toBe(expected);
+      expect(notification.length).toBeLessThanOrEqual(400);
+      writeFileSync(
+        path,
+        `${[
+          {
+            type: "queue-operation",
+            content: notification,
+          },
+          {
+            timestamp: new Date().toISOString(),
+            type: "assistant",
+            message: {
+              role: "assistant",
+              stop_reason: "end_turn",
+              content: [{ type: "text", text: "causal answer" }],
+            },
+          },
+        ]
+          .map((line) => JSON.stringify(line))
+          .join("\n")}\n`,
+      );
+      const outcome = await waitForTranscriptStop({
+        agent: "claude",
+        cwd: "/work/proj",
+        env: {},
+        homeDir: tempDir(),
+        startedAtMs: 0,
+        sessionId: "s",
+        transcriptPath: path,
+        injectedMessageMarker: id,
+        transcriptLineFloor: 0,
+        stopTimeoutMs: 100,
+      });
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) expect(outcome.stop.message).toBe("causal answer");
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 
   test("Pi accepts only a stop after its matching custom Bus message", async () => {

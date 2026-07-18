@@ -973,7 +973,7 @@ export function renderMessageNotification(
     const line = `Agent Bus message from ${boundedSender(msg)} — read ${resolved.path}`;
     return line.length <= NOTIFY_LINE_BUDGET
       ? line
-      : artifactFailureNotification(msg);
+      : artifactOverBudgetNotification(msg, decoded.ref);
   }
   if (decoded.reason !== "not-a-reference") {
     return artifactFailureNotification(msg);
@@ -1014,6 +1014,14 @@ function boundedSender(msg: InboundMessage): string {
 
 function artifactFailureNotification(msg: InboundMessage): string {
   return `Agent Bus message from ${boundedSender(msg)} — message artifact unavailable`;
+}
+
+/** The opaque id survives the budget where a variable-length artifact path cannot. */
+function artifactOverBudgetNotification(
+  msg: InboundMessage,
+  ref: BusArtifactRef,
+): string {
+  return `Agent Bus message from ${boundedSender(msg)} — read artifact ${ref.id} (path omitted)`;
 }
 
 export function emitMessage(
