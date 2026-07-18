@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T11:59:12.089000Z",
+  "created_by_close_of": "fn-1331-status-stale-running-taxonomy",
+  "depends_on_epics": [
+    "fn-1331-status-stale-running-taxonomy"
+  ],
+  "id": "fn-1333-fix-at-rest-flags-for-stale-running",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix at-rest flags for stale-running boards",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T11:59:12.089000Z"
+}

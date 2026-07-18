@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T11:59:12.089000Z",
+  "depends_on": [],
+  "epic": "fn-1333-fix-at-rest-flags-for-stale-running",
+  "id": "fn-1333-fix-at-rest-flags-for-stale-running.1",
+  "model": "gpt-5.4-mini",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Account stale_running in atRest",
+  "updated_at": "2026-07-18T11:59:12.089000Z"
+}
