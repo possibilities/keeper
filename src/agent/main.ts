@@ -12,7 +12,9 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -29,9 +31,13 @@ import {
   selectRouteByAccountOrdinal,
 } from "../account-router";
 import {
+  cswapListArgv,
+  existingCswapAccountConfigDir,
   KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
+  MAX_OUTPUT_BYTES,
   resolveCswapCommand,
+  SUBPROCESS_TIMEOUT_MS,
 } from "../account-routing-config";
 import {
   awaitProviderLegGrant,
@@ -107,6 +113,7 @@ import {
   buildAgentLaunchArgv,
   composeManagedClaudeArgv,
   FINAL_MESSAGE_DIRECTIVE,
+  mergeClaudeWorkspaceTrust,
   piExtensionArgs,
   READ_ONLY_DIRECTIVE,
 } from "./launch-config";
@@ -400,6 +407,8 @@ export interface MainDeps {
    * independent.
    */
   cswapBin: string;
+  resolveAccountConfigDirFn: (slot: number) => string;
+  seedClaudeWorkspaceTrustFn: (configDir: string, cwd: string) => boolean;
 }
 
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
@@ -422,6 +431,7 @@ export function realDeps(): MainDeps {
     claude: join(homedir(), ".local", "bin", "claude"),
     pi: "pi",
   };
+  const cswapBin = resolveCswapCommand();
   const launcherArgvPrefix = buildLauncherArgvPrefix(
     process.execPath,
     resolveKeeperAgentPathDepFree(),
@@ -502,8 +512,63 @@ export function realDeps(): MainDeps {
     inspectRoutingFn: () => inspectRouting(),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
-    cswapBin: resolveCswapCommand(),
+    cswapBin,
+    resolveAccountConfigDirFn: (slot) =>
+      resolveAccountConfigDir(cswapBin, slot),
+    seedClaudeWorkspaceTrustFn: seedClaudeWorkspaceTrust,
   };
+}
+
+function resolveAccountConfigDir(cswapBin: string, slot: number): string {
+  const [command, ...args] = cswapListArgv(cswapBin);
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    maxBuffer: MAX_OUTPUT_BYTES,
+    timeout: SUBPROCESS_TIMEOUT_MS,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error("claude-swap account inventory is unavailable");
+  }
+  let inventory: unknown;
+  try {
+    inventory = JSON.parse(result.stdout);
+  } catch {
+    throw new Error("claude-swap account inventory is malformed");
+  }
+  return existingCswapAccountConfigDir(slot, inventory);
+}
+
+export function seedClaudeWorkspaceTrust(
+  configDir: string,
+  cwd: string,
+): boolean {
+  const canonicalCwd = realpathSync.native(cwd);
+  const legacyPath = join(configDir, ".config.json");
+  const configPath = existsSync(legacyPath)
+    ? legacyPath
+    : join(configDir, ".claude.json");
+  const merge = mergeClaudeWorkspaceTrust(
+    readFileSync(configPath, "utf8"),
+    canonicalCwd,
+  );
+  if (!merge.ok) throw new Error(merge.error);
+  if (!merge.changed) return false;
+
+  const tmpPath = join(
+    dirname(configPath),
+    `.${basename(configPath)}.keeper-${process.pid}-${crypto.randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(tmpPath, merge.body, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(tmpPath, configPath);
+  } finally {
+    if (existsSync(tmpPath)) unlinkSync(tmpPath);
+  }
+  return true;
 }
 
 /** Absolute path to `resume-resolve-cli.ts`, resolved relative to THIS module
@@ -2927,6 +2992,7 @@ export async function main(deps: MainDeps): Promise<never> {
   // non-Fable conservation participates in account scoring. Informational
   // passthrough has no model workload and follows the non-Fable policy.
   let resolvedClaudeRoute: RouteSelection | null = null;
+  let resolvedClaudeConfigDir: string | null = null;
   if (agent === "claude") {
     const routingModel = shouldPassthrough
       ? null
@@ -2961,6 +3027,20 @@ export async function main(deps: MainDeps): Promise<never> {
       actionLog.push(`Applied account quota scope for model: ${routingModel}`);
     }
     note(`route: ${resolvedClaudeRoute.id}`);
+    try {
+      resolvedClaudeConfigDir = deps.resolveAccountConfigDirFn(
+        resolvedClaudeRoute.slot,
+      );
+      deps.env.CLAUDE_CONFIG_DIR = resolvedClaudeConfigDir;
+      actionLog.push(
+        `Resolved account config directory for slot ${resolvedClaudeRoute.slot}`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      deps.writeErr(
+        `Warning: Claude account config preflight failed: ${message}; launching anyway.\n`,
+      );
+    }
   }
 
   if (shouldPassthrough) {
@@ -3259,6 +3339,25 @@ export async function main(deps: MainDeps): Promise<never> {
       "Error: owned provider-leg gate requires launcher birth support.\n",
     );
     return deps.exit(2);
+  }
+
+  if (agent === "claude" && resolvedClaudeConfigDir !== null) {
+    try {
+      const changed = deps.seedClaudeWorkspaceTrustFn(
+        resolvedClaudeConfigDir,
+        deps.cwd,
+      );
+      actionLog.push(
+        changed
+          ? "Seeded Claude workspace trust"
+          : "Claude workspace trust already seeded",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      deps.writeErr(
+        `Warning: Claude workspace trust preflight failed: ${message}; launching anyway.\n`,
+      );
+    }
   }
 
   // pi shares this path with claude; only pi gets a launcher birth record.

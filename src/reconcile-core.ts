@@ -264,6 +264,11 @@ export interface HostMatrixAxes {
    *  never drift. A model absent from the map is treated as wrapped (mirrors the
    *  renderer's `driverByModel.get(model) ?? "wrapped"`). */
   driverByModel: ReadonlyMap<string, CellDriver>;
+  /** capability → its launchable provider route's driver. Production snapshots
+   *  always carry this map; optionality preserves small injected fixtures, where
+   *  absence means the declared driver is also the route. A present map with no
+   *  entry is positive evidence that the capability has no launch route. */
+  routeByModel?: ReadonlyMap<string, CellDriver>;
 }
 
 /**
@@ -1261,6 +1266,21 @@ export interface PlannedLaunch {
    * capture keys the selection cohort exclusion on this being present.
    */
   dispatchConstraint?: WorkerProvider | null;
+  /**
+   * Producer-admission contract for an active Provider constraint, including
+   * same-family constraints that do not populate {@link dispatchConstraint}.
+   * The pure planner records the effective cell, its rendered driver, the
+   * roster-first route (null when absent), and the provisional wrapped marker;
+   * the producer validates this joint shape before any launch side effect.
+   */
+  providerLaunchContract?: {
+    provider: WorkerProvider;
+    model: string;
+    tier: string;
+    driver: CellDriver;
+    route: CellDriver | null;
+    wrappedCell: string | null;
+  };
   /**
    * The wrapped-cell guard marker for a `work` row whose EFFECTIVE cell is wrapped
    * (its model not natively served by claude — {@link isWrappedCell}). {@link
@@ -2429,6 +2449,7 @@ export function reconcile(
       let dispatchedCellModel: string | null = null;
       let dispatchedCellTier: string | null = null;
       let dispatchConstraint: WorkerProvider | null = null;
+      let providerLaunchContract: PlannedLaunch["providerLaunchContract"];
       let providerReject: PlannedLaunch["providerReject"];
       // The wrapped-cell guard marker (task .1) — computed off the EFFECTIVE cell
       // (`composeModel`/`composeTier` below, the pin-translated cell when the pin
@@ -2503,6 +2524,23 @@ export function reconcile(
                 wrappedCell = `${composeModel}::${composeTier}`;
                 wrappedEnvelope = wrappedEnvelopePath(cwd, taskId);
               }
+              if (provider !== null) {
+                const driver =
+                  snapshot.hostMatrix.driverByModel.get(composeModel) ??
+                  "wrapped";
+                providerLaunchContract = {
+                  provider,
+                  model: composeModel,
+                  tier: composeTier,
+                  driver,
+                  route:
+                    snapshot.hostMatrix.routeByModel === undefined
+                      ? driver
+                      : (snapshot.hostMatrix.routeByModel.get(composeModel) ??
+                        null),
+                  wrappedCell: wrappedCell ?? null,
+                };
+              }
             }
           }
         }
@@ -2528,6 +2566,9 @@ export function reconcile(
         dispatchedCellModel,
         dispatchedCellTier,
         dispatchConstraint,
+        ...(providerLaunchContract !== undefined
+          ? { providerLaunchContract }
+          : {}),
         ...(wrappedCell !== undefined ? { wrappedCell } : {}),
         ...(wrappedEnvelope !== undefined ? { wrappedEnvelope } : {}),
         ...(pluginDirReject !== undefined ? { pluginDirReject } : {}),

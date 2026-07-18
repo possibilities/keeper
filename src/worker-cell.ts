@@ -44,6 +44,7 @@ import type {
   WorkerProvider,
 } from "./provider-equivalence";
 import {
+  type CellDriver,
   type HostMatrixAxes,
   KEEPER_ROOT,
   type MatrixFailureState,
@@ -378,6 +379,17 @@ export interface WorkerCellCompose {
    */
   model?: string | null;
   tier?: string | null;
+  /** Active provider policy plus the pure planner's provisional effective-cell
+   *  route/marker facts. Present only on the producer path; the launcher-owned
+   *  resolution seam validates the joint contract before touching the manifest. */
+  providerLaunchContract?: {
+    provider: WorkerProvider;
+    model: string;
+    tier: string;
+    driver: CellDriver;
+    route: CellDriver | null;
+    wrappedCell: string | null;
+  };
 }
 
 /**
@@ -458,6 +470,17 @@ export type WorkerCellResult =
       detail?: string;
     }
   | { ok: false; kind: "out-of-matrix"; message: string }
+  | {
+      ok: false;
+      kind: "provider-unlaunchable";
+      provider: WorkerProvider;
+      model: string;
+      tier: string;
+      driver: CellDriver;
+      route: CellDriver | null;
+      wrappedCell: string | null;
+      constraintDriver: CellDriver;
+    }
   | { ok: false; kind: "missing"; pluginDir: string }
   | { ok: false; kind: "stale"; pluginDir: string; detail: string }
   | { ok: false; kind: "shadowed"; pluginDir: string; shadowManifest: string };
@@ -516,6 +539,33 @@ export function resolveWorkerCell(
   if (compose.reject !== undefined) {
     return { ok: false, kind: "out-of-matrix", message: compose.reject };
   }
+  const contract = compose.providerLaunchContract;
+  if (contract !== undefined) {
+    const constraintDriver: CellDriver =
+      contract.provider === "claude" ? "native" : "wrapped";
+    const expectedWrappedCell = `${contract.model}::${contract.tier}`;
+    const markerMatches =
+      contract.driver === "wrapped"
+        ? contract.wrappedCell === expectedWrappedCell
+        : contract.wrappedCell === null;
+    if (
+      contract.driver !== constraintDriver ||
+      contract.route !== contract.driver ||
+      !markerMatches
+    ) {
+      return {
+        ok: false,
+        kind: "provider-unlaunchable",
+        provider: contract.provider,
+        model: contract.model,
+        tier: contract.tier,
+        driver: contract.driver,
+        route: contract.route,
+        wrappedCell: contract.wrappedCell,
+        constraintDriver,
+      };
+    }
+  }
   const pluginDir = compose.pluginDir;
   if (pluginDir == null) {
     // Cell-less: either axis null, or a `close` row — no `--plugin-dir`.
@@ -557,6 +607,25 @@ export function resolveWorkerCell(
  * documented problem codes (docs/problem-codes.md). The closed switch is
  * `assertNever`-guarded so a new reason fails compilation here.
  */
+export function providerUnlaunchableReason(reject: {
+  provider: WorkerProvider;
+  model: string;
+  tier: string;
+  driver: CellDriver;
+  route: CellDriver | null;
+  wrappedCell: string | null;
+  constraintDriver: CellDriver;
+}): string {
+  return (
+    `worker-provider-cell-unlaunchable: worker_provider=${reject.provider} cannot ` +
+    `launch effective cell ${reject.model}/${reject.tier} — constraint requires ` +
+    `${reject.constraintDriver}, but driver=${reject.driver}, ` +
+    `route=${reject.route ?? "none"}, wrapped_marker=${reject.wrappedCell ?? "none"}; ` +
+    "refusing to dispatch before spawn; fix the provider constraint, equivalence " +
+    "map, host matrix route, or compiled cell, then retry"
+  );
+}
+
 export function providerRejectReason(reject: {
   reason: ProviderConstraintRejectReason;
   provider: WorkerProvider;

@@ -184,6 +184,7 @@ import {
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
   PAGING_CHANNEL_DOWN_DISTRESS_REASON,
   PAGING_CHANNEL_DOWN_DISTRESS_VERB,
+  PARKED_LAUNCH_REASON_PREFIX,
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_REASON,
@@ -787,6 +788,13 @@ export const BOOT_DRAIN_CHECKPOINT_WAL_BYTES = 50_000 * 4096;
 export const PENDING_DISPATCH_TTL_MS = 120_000;
 
 /**
+ * Grace for a fired Dispatch attempt whose pending row has not bound a Harness
+ * session. The ordering is load-bearing: confirm ceiling (60s) < parked grace
+ * (90s) < pending TTL (120s) < redispatch cooldown (200s).
+ */
+export const PARKED_LAUNCH_GRACE_MS = 90_000;
+
+/**
  * Heartbeat cadence (ms) for the producer-side `pending_dispatches` TTL sweep.
  * MUST ride a heartbeat, not the level-triggered `data_version` wake: a crashed
  * dispatch can be the only pending row on a quiescent board, where a
@@ -860,6 +868,91 @@ export const MUTATION_PATH_BACKFILL_INTERVAL_MS = 300_000;
  * wall-clock that feeds a fold.
  */
 export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
+
+export interface PendingDispatchSweepRow {
+  verb: string;
+  id: string;
+  dir: string | null;
+  dispatched_at: number;
+  attempt_id: number | null;
+  launch_session: string | null;
+  launch_window: string | null;
+  launch_pane: string | null;
+}
+
+export interface PendingDispatchSweepPlan {
+  parked: PendingDispatchSweepRow[];
+  expired: PendingDispatchSweepRow[];
+}
+
+/**
+ * Classify pending rows from one producer-time snapshot. A named, unfailed row
+ * past the parked grace goes only to `parked`, even when it is also beyond TTL:
+ * the sticky must suppress re-serve before an expiry can release the slot.
+ */
+export function planPendingDispatchSweep(
+  db: Database,
+  nowMs: number,
+): PendingDispatchSweepPlan {
+  const rows = db
+    .query(
+      `SELECT p.verb, p.id, p.dir, p.dispatched_at, p.attempt_id,
+              p.launch_session, p.launch_window, p.launch_pane,
+              CASE WHEN f.verb IS NULL THEN 0 ELSE 1 END AS failed
+         FROM pending_dispatches p
+         LEFT JOIN dispatch_failures f ON f.verb = p.verb AND f.id = p.id`,
+    )
+    .all() as Array<PendingDispatchSweepRow & { failed: number }>;
+  const parkedCutoffMs = nowMs - PARKED_LAUNCH_GRACE_MS;
+  const expiredCutoffMs = nowMs - PENDING_DISPATCH_TTL_MS;
+  const parked: PendingDispatchSweepRow[] = [];
+  const expired: PendingDispatchSweepRow[] = [];
+  for (const row of rows) {
+    const dispatchedAtMs = row.dispatched_at * 1000;
+    const isParked =
+      row.failed === 0 &&
+      row.launch_session != null &&
+      row.launch_session !== "" &&
+      row.launch_window != null &&
+      row.launch_window !== "" &&
+      dispatchedAtMs < parkedCutoffMs;
+    if (isParked) {
+      parked.push(row);
+    } else if (dispatchedAtMs < expiredCutoffMs) {
+      expired.push(row);
+    }
+  }
+  return { parked, expired };
+}
+
+export function buildParkedLaunchFailurePayload(
+  row: PendingDispatchSweepRow,
+  nowSec: number,
+): {
+  verb: string;
+  id: string;
+  reason: string;
+  dir: string | null;
+  conflictedFiles: null;
+  ts: number;
+  attempt_id?: number;
+} {
+  const pane =
+    row.launch_pane == null || row.launch_pane === ""
+      ? ""
+      : ` (pane ${JSON.stringify(row.launch_pane)})`;
+  return {
+    verb: row.verb,
+    id: row.id,
+    reason:
+      `${PARKED_LAUNCH_REASON_PREFIX}: dispatch ${row.verb}::${row.id} is parked or slow, ` +
+      `inspect the window ${JSON.stringify(row.launch_window)}${pane} in tmux session ${JSON.stringify(row.launch_session)}`,
+    dir: row.dir,
+    conflictedFiles: null,
+    ts: nowSec,
+    ...(row.attempt_id == null ? {} : { attempt_id: row.attempt_id }),
+  };
+}
 
 /**
  * Select every `pending_dispatches` row aged past the TTL — UNCONDITIONALLY on
@@ -12426,14 +12519,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return outcome === "notified" ? "notified" : "notify_failed";
   }
 
-  // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
-  // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
-  // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
-  // expire an aged row even when the never-bound breaker has minted a sticky
-  // failure for the key, else the slot is held forever; see
-  // `selectExpiredPendingDispatches`). The expiry DELETE is idempotent with a
-  // concurrent `DispatchFailed` fold, so re-including those rows can't corrupt
-  // the projection.
+  // Producer-side pending-dispatch sweep. A named, unbound attempt first crosses
+  // the parked grace and mints a natural-key sticky; that row is withheld from
+  // TTL expiry so no re-serve can double-launch its still-inspectable wrapper.
+  // Every other row aged past `PENDING_DISPATCH_TTL_MS` still mints
+  // `DispatchExpired` unconditionally on failure membership.
   // MUST ride the heartbeat timer, not the level-triggered `data_version` wake: a
   // crashed dispatch can be the only pending row on a quiescent board, where a
   // write-triggered wake never fires. All wallclock lives HERE in the producer,
@@ -12458,24 +12548,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
-    let aged: {
-      verb: string;
-      id: string;
-      dispatched_at: number;
-      attempt_id: number | null;
-    }[];
+    const nowMs = Date.now();
+    let plan: PendingDispatchSweepPlan;
     try {
-      aged = selectExpiredPendingDispatches(db, Date.now());
+      plan = planPendingDispatchSweep(db, nowMs);
     } catch (err) {
       // A read failure here is unexpected. Log non-fatally; the next heartbeat
       // retries.
       console.error(
-        `[keeperd] pending_dispatches TTL sweep read threw (non-fatal): ${
+        `[keeperd] pending_dispatches sweep read threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
       return;
     }
+    for (const row of plan.parked) {
+      const payload = buildParkedLaunchFailurePayload(row, nowMs / 1000);
+      handleDispatchFailedMint({
+        ...payload,
+        verb: payload.verb as Verb,
+      });
+    }
+    const aged = plan.expired;
     if (aged.length === 0) {
       // Nothing to expire — the `rescued:false` denominator. Bump the counter
       // only (no line); the rollup carries it.
@@ -12485,7 +12579,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // Each expired row is a `rescued:true` timeout rescue. Build the records ONCE
     // off a single `Date.now()` so every row shares the sweep's wall-clock. Main
     // is the SOLE sidecar writer, so the lines are written directly.
-    const sweepRecords = buildPendingDispatchSweepRecords(aged, Date.now());
+    const sweepRecords = buildPendingDispatchSweepRecords(aged, nowMs);
     for (const row of aged) {
       // Per-row failures are logged and swallowed inside the helper, so a throw
       // doesn't abort the sweep — every aged row gets its own shot.

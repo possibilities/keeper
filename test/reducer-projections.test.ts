@@ -2235,11 +2235,18 @@ function dispatchedEvent(
   dir: string | null,
   ts: number,
   sessionId = "reconciler",
+  launch?: { session: string; window: string; pane: string | null },
 ): number {
   return insertEvent({
     hook_event: "Dispatched",
     session_id: sessionId,
-    data: JSON.stringify({ verb, id, dir, ts }),
+    data: JSON.stringify({
+      verb,
+      id,
+      dir,
+      ts,
+      ...(launch === undefined ? {} : { launch }),
+    }),
   });
 }
 
@@ -2265,6 +2272,9 @@ function getPendingDispatch(verb: string, id: string) {
     dispatched_at: number;
     last_event_id: number;
     attempt_id: number | null;
+    launch_session: string | null;
+    launch_window: string | null;
+    launch_pane: string | null;
   } | null;
 }
 
@@ -2318,6 +2328,20 @@ test("Dispatched UPSERTs a new pending_dispatches row and advances the cursor (f
   expect(row?.dispatched_at).toBe(1_700_000_000);
   expect(row?.last_event_id).toBe(eventId);
   expect(getCursor()).toBe(eventId);
+});
+
+test("Dispatched projects the frozen tmux launch identity", () => {
+  dispatchedEvent("work", "fn-parked.1", "/repo", 1700, "reconciler", {
+    session: "autopilot",
+    window: "work::fn-parked.1",
+    pane: "%42",
+  });
+  drainAll();
+  expect(getPendingDispatch("work", "fn-parked.1")).toMatchObject({
+    launch_session: "autopilot",
+    launch_window: "work::fn-parked.1",
+    launch_pane: "%42",
+  });
 });
 
 test("Dispatched UPSERT updates dir / dispatched_at / last_event_id on collision (fn-678)", () => {
@@ -2737,7 +2761,11 @@ test("from-scratch re-fold reproduces the pending_dispatches projection byte-ide
   dispatchedEvent("close", "fn-678-d-epic", "/r5", 2000);
   dispatchExpiredEvent("close", "fn-678-d-epic");
   // After this point: fn-678-d-epic also gone (TTL expired).
-  dispatchedEvent("approve", "fn-678-e.1", "/r6", 2100);
+  dispatchedEvent("approve", "fn-678-e.1", "/r6", 2100, "reconciler", {
+    session: "autopilot",
+    window: "approve::fn-678-e.1",
+    pane: null,
+  });
   // After this point: ONLY fn-678-b-epic + fn-678-e.1 are still pending.
   drainAll();
 
@@ -4139,6 +4167,210 @@ test("an expiry of an already-failed key does NOT re-trip the breaker — no cou
   expect(getDispatchFailure("work", "fn-870-already-failed.1")?.reason).toBe(
     "never-bound",
   );
+});
+
+test("a bind ordered before a parked-launch mint suppresses the stale sticky", () => {
+  const verb = "work";
+  const id = "fn-1335-parked-bind-race.1";
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1700,
+      launch: {
+        session: "autopilot",
+        window: `${verb}::${id}`,
+        pane: null,
+      },
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-parked-bind-race",
+    spawn_name: `${verb}::${id}`,
+    data: JSON.stringify({ dispatch_attempt_id: attemptId }),
+  });
+  dispatchFailedEvent(
+    verb,
+    id,
+    "parked-launch: parked or slow, inspect the window",
+    "/repo",
+    1800,
+    "reconciler",
+    attemptId,
+  );
+  drainAll();
+
+  expect(getDispatchClaim(verb, id)?.state).toBe("bound");
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getPendingDispatch(verb, id)).toBeNull();
+});
+
+test("a late exact SessionStart bind level-clears its parked-launch sticky", () => {
+  const verb = "work";
+  const id = "fn-1335-parked-late-bind.1";
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1700,
+      launch: {
+        session: "autopilot",
+        window: `${verb}::${id}`,
+        pane: null,
+      },
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  dispatchFailedEvent(
+    verb,
+    id,
+    `parked-launch: dispatch ${verb}::${id} is parked or slow; inspect the window`,
+    "/repo",
+    1800,
+    "reconciler",
+    attemptId,
+  );
+  drainAll();
+  expect(getPendingDispatch(verb, id)).toBeNull();
+  expect(getDispatchFailure(verb, id)?.reason).toStartWith("parked-launch:");
+  expect(getDispatchClaim(verb, id)?.state).toBe("acquired");
+
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-parked-late-bind",
+    spawn_name: `${verb}::${id}`,
+    data: JSON.stringify({ dispatch_attempt_id: attemptId }),
+  });
+  drainAll();
+  expect(getDispatchClaim(verb, id)?.state).toBe("bound");
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getDispatchOrigin("sess-parked-late-bind")).toBe("autopilot");
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: attemptId,
+    state: "bound",
+    session_id: "sess-parked-late-bind",
+  });
+});
+
+test("retry_dispatch clears a parked-launch sticky and releases its exact claim", () => {
+  const verb = "work";
+  const id = "fn-1335-parked-retry.1";
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1700,
+      launch: {
+        session: "autopilot",
+        window: `${verb}::${id}`,
+        pane: null,
+      },
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  const failureId = dispatchFailedEvent(
+    verb,
+    id,
+    "parked-launch: parked or slow, inspect the window",
+    "/repo",
+    1800,
+    "reconciler",
+    attemptId,
+  );
+  drainAll();
+
+  dispatchClearedEvent(verb, id, "reconciler", {
+    expectedAttemptId: attemptId,
+    expectedInstanceEventId: failureId,
+  });
+  drainAll();
+  expect(getDispatchFailure(verb, id)).toBeNull();
+  expect(getDispatchClaim(verb, id)?.state).toBe("released");
+
+  const retryAttemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1900,
+      launch: {
+        session: "autopilot",
+        window: `${verb}::${id}`,
+        pane: null,
+      },
+      attempt_from_event_id: true,
+      expected_attempt_id: attemptId,
+    }),
+  });
+  drainAll();
+  expect(getPendingDispatch(verb, id)?.attempt_id).toBe(retryAttemptId);
+  expect(getDispatchClaim(verb, id)).toMatchObject({
+    attempt_id: retryAttemptId,
+    state: "acquired",
+  });
+});
+
+test("DispatchExpired never double-counts never-bound while parked-launch is active", () => {
+  const verb = "work";
+  const id = "fn-1335-parked-no-double.1";
+  const attemptId = insertEvent({
+    hook_event: "Dispatched",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      dir: "/repo",
+      ts: 1700,
+      launch: {
+        session: "autopilot",
+        window: `${verb}::${id}`,
+        pane: null,
+      },
+      attempt_from_event_id: true,
+      expected_attempt_id: null,
+    }),
+  });
+  drainAll();
+  const failureId = dispatchFailedEvent(
+    verb,
+    id,
+    "parked-launch: parked or slow, inspect the window",
+    "/repo",
+    1800,
+    "reconciler",
+    attemptId,
+  );
+  drainAll();
+  insertEvent({
+    hook_event: "DispatchExpired",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({ verb, id, attempt_id: attemptId }),
+  });
+  drainAll();
+
+  expect(getNeverBoundCounter(verb, id)).toBeNull();
+  expect(getDispatchFailure(verb, id)).toMatchObject({
+    reason: "parked-launch: parked or slow, inspect the window",
+    last_event_id: failureId,
+  });
 });
 
 test("DispatchExpired with a malformed payload does NOT touch dispatch_never_bound (cursor still advances) (fn-846)", () => {

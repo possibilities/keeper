@@ -201,6 +201,7 @@ import {
   inventoryLaunchCwdWorkPluginManifests,
   physicalPluginDir,
   providerRejectReason,
+  providerUnlaunchableReason,
   resolveWorkerCell,
   selectedWorkerCellFreshness,
   verifyWorkerCellCohort,
@@ -2895,6 +2896,11 @@ export interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
+  launch: {
+    session: string;
+    window: string;
+    pane: string | null;
+  };
   /**
    * The dispatched-cell translation forensics (ADR 0047), present ONLY for a
    * cell-bearing `work` launch: the ASSIGNED cell, the EFFECTIVE cell that
@@ -4329,6 +4335,7 @@ export async function confirmRunning(
   launchCell?: DispatchedPayload["cell"],
 ): Promise<ConfirmOutcome> {
   const key = dispatchKey(verb, id);
+  const launchWindow = spec.claudeName ?? key;
   // Watermark BEFORE launch: a re-open of a stale terminal row carries
   // `last_event_id <= watermark` (excluded), while the SessionStart that PROVES
   // this dispatch carries `> watermark`.
@@ -4347,6 +4354,11 @@ export async function confirmRunning(
       id,
       dir: cwd === "" ? null : cwd,
       ts: deps.now(),
+      launch: {
+        session: MANAGED_EXEC_SESSION,
+        window: launchWindow,
+        pane: null,
+      },
       ...(launchCell !== undefined ? { cell: launchCell } : {}),
     });
   } catch {
@@ -4383,7 +4395,10 @@ export async function confirmRunning(
   // 3. Launch — ONLY after the durable ack returned the admitted attempt. The
   // generic metadata rides the structured spec; prompts, names, cells, and the
   // pre-wrapped command remain unchanged.
-  const admittedSpec = withDispatchAttempt(spec, ack.attemptId);
+  const admittedSpec = withDispatchAttempt(
+    { ...spec, claudeName: launchWindow },
+    ack.attemptId,
+  );
   const launchResult: LaunchResult = await deps
     .launch(argv, key, cwd, admittedSpec)
     .catch((err) => ({
@@ -4457,9 +4472,10 @@ export async function confirmRunning(
   // ghost worker. So: SUPPRESS the emit and KEEP the `pending_dispatches` row —
   // it holds the slot, and the TTL sweep mints `DispatchExpired` if the bind
   // never arrives. The full ordering chain is load-bearing:
-  //   ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s) < REDISPATCH_COOLDOWN_S (200s).
+  //   ceilingMs (60s) < parked grace (90s) < pending TTL (120s) < cooldown (200s).
   // ceiling < TTL: a sweep < ceiling would clear the row mid-confirm and re-open
-  // the dispatch. TTL < cooldown: the cooldown must outlast the worst-case
+  // the dispatch. The producer keeps the parked-launch grace between the ceiling
+  // and TTL, and TTL < cooldown: the cooldown must outlast the worst-case
   // round-trip (the row surviving a full TTL plus the sweep tick) so suppression
   // never lapses while a phantom is in flight. NOTE: this chain bounds the
   // FOLD-LAG round-trip, but NOT an arbitrary `claude` cold-boot tail —
@@ -4467,7 +4483,8 @@ export async function confirmRunning(
   // cooldown (cover-end dispatch+260s with one indoubt re-stamp) lapsed before the
   // bind. `refreshSuppressionForOpenPending` now re-anchors the cooldown each cycle
   // the `pending_dispatches` row is still OPEN, extending cover to the phantom's
-  // durable lifetime (still TTL-sweep-bounded). Telemetry rides alongside: the
+  // durable lifetime. The parked-launch sweep suppresses the row at its grace
+  // before the TTL can release it for a second launch. Telemetry rides alongside: the
   // ceiling RESCUED a stuck dispatch, so `rescued:true` with the elapsed
   // `stalenessMs`.
   deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: elapsedMs });
@@ -4684,6 +4701,13 @@ export async function stampEpicCloseRecovery(
   } catch (err) {
     return { ok: false, detail: errMsg(err) };
   }
+}
+
+function providerCellContext(plan: PlannedLaunch): string {
+  const contract = plan.providerLaunchContract;
+  return contract === undefined
+    ? ""
+    : ` (worker_provider=${contract.provider}, effective cell ${contract.model}/${contract.tier})`;
 }
 
 export async function runReconcileCycle(
@@ -4941,6 +4965,9 @@ export async function runReconcileCycle(
         ...(plan.providerReject !== undefined
           ? { providerReject: plan.providerReject }
           : {}),
+        ...(plan.providerLaunchContract !== undefined
+          ? { providerLaunchContract: plan.providerLaunchContract }
+          : {}),
       },
       {
         dirExists,
@@ -4972,10 +4999,17 @@ export async function runReconcileCycle(
         case "out-of-matrix":
           reason = `worker-cell-invalid: ${cell.message}`;
           break;
+        // (2b) the effective cell's route/driver/marker cannot jointly satisfy
+        //      the active provider constraint. This producer-only admission gate
+        //      catches a valid-looking cell path before its wrapper guard can park
+        //      a native worker, and names the constraint + effective pair.
+        case "provider-unlaunchable":
+          reason = providerUnlaunchableReason(cell);
+          break;
         // (3) selected manifest absent: compile the complete owned cohort.
         case "missing":
           reason =
-            `worker-cell-missing: ${cell.pluginDir} — regenerate via ` +
+            `worker-cell-missing: ${cell.pluginDir}${providerCellContext(plan)} — regenerate via ` +
             `'${WORKER_CELL_COMPILE_COMMAND}' (without the cell manifest ` +
             `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
             `cannot resolve 'work:worker')`;
@@ -4983,7 +5017,7 @@ export async function runReconcileCycle(
         // (4) verifier failure or selected dir absent from its exact output set.
         case "stale":
           reason =
-            `worker-cell-stale: ${cell.detail} — regenerate via ` +
+            `worker-cell-stale: ${cell.detail}${providerCellContext(plan)} — regenerate via ` +
             `'${WORKER_CELL_COMPILE_COMMAND}'`;
           break;
         // (5) any other preloaded `work` manifest, including a generated sibling.
@@ -9454,6 +9488,18 @@ export async function loadReconcileSnapshot(
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
       driverByModel: matrix.driverByModel,
+      routeByModel: new Map(
+        matrix.subagentModels.flatMap((model) => {
+          const driver = matrix.driverByModel.get(model) ?? "wrapped";
+          const hasRoute = matrix.providers.some(
+            (entry) =>
+              (driver === "native"
+                ? entry.name === "claude"
+                : entry.name !== "claude") && entry.models.has(model),
+          );
+          return hasRoute ? ([[model, driver]] as const) : [];
+        }),
+      ),
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {

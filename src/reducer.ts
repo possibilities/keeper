@@ -28,6 +28,7 @@ import {
 } from "./derivers";
 import {
   INSTANT_DEATH_BREAKER_REASON,
+  isParkedLaunchReason,
   SHARED_DIRTY_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
@@ -4260,6 +4261,26 @@ function foldDispatchFailed(db: Database, event: Event): void {
   if (payload == null) {
     return;
   }
+  if (isParkedLaunchReason(payload.reason)) {
+    const claim = db
+      .query(
+        "SELECT attempt_id, state, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+      )
+      .get(payload.verb, payload.id) as {
+      attempt_id: number | null;
+      state: string;
+      session_id: string | null;
+    } | null;
+    if (
+      claim?.attempt_id === payload.attemptId &&
+      claim.session_id != null &&
+      (claim.state === "bound" ||
+        claim.state === "resume_requested" ||
+        claim.state === "legacy_unfenced")
+    ) {
+      return;
+    }
+  }
   db.run(
     `INSERT INTO dispatch_failures (
        verb, id, reason, dir, conflicted_files, ts, last_event_id, created_at,
@@ -4410,6 +4431,9 @@ interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
+  launchSession: string | null;
+  launchWindow: string | null;
+  launchPane: string | null;
   attemptId: number | null;
   expectedAttemptId: number | null;
 }
@@ -5551,11 +5575,30 @@ function extractDispatchedPayload(event: Event): DispatchedPayload | null {
       typeof parsed.dir === "string" && parsed.dir.length > 0
         ? parsed.dir
         : null;
+    const launch =
+      parsed.launch != null && typeof parsed.launch === "object"
+        ? (parsed.launch as Record<string, unknown>)
+        : null;
+    const launchSession =
+      typeof launch?.session === "string" && launch.session.length > 0
+        ? launch.session
+        : null;
+    const launchWindow =
+      typeof launch?.window === "string" && launch.window.length > 0
+        ? launch.window
+        : null;
+    const launchPane =
+      typeof launch?.pane === "string" && launch.pane.length > 0
+        ? launch.pane
+        : null;
     return {
       verb: parsed.verb,
       id: parsed.id,
       dir,
       ts: parsed.ts,
+      launchSession,
+      launchWindow,
+      launchPane,
       attemptId,
       expectedAttemptId,
     };
@@ -5629,13 +5672,17 @@ function foldDispatched(db: Database, event: Event): void {
   }
   db.run(
     `INSERT INTO pending_dispatches (
-       verb, id, dir, dispatched_at, last_event_id, attempt_id
-     ) VALUES (?, ?, ?, ?, ?, ?)
+       verb, id, dir, dispatched_at, last_event_id, attempt_id,
+       launch_session, launch_window, launch_pane
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(verb, id) DO UPDATE SET
        dir = excluded.dir,
        dispatched_at = excluded.dispatched_at,
        last_event_id = excluded.last_event_id,
-       attempt_id = excluded.attempt_id
+       attempt_id = excluded.attempt_id,
+       launch_session = excluded.launch_session,
+       launch_window = excluded.launch_window,
+       launch_pane = excluded.launch_pane
      WHERE pending_dispatches.attempt_id IS NULL
         OR (pending_dispatches.attempt_id IS NOT NULL
             AND excluded.attempt_id > pending_dispatches.attempt_id)`,
@@ -5646,6 +5693,9 @@ function foldDispatched(db: Database, event: Event): void {
       payload.ts,
       event.id,
       payload.attemptId,
+      payload.launchSession,
+      payload.launchWindow,
+      payload.launchPane,
     ],
   );
 }
@@ -10221,7 +10271,28 @@ function projectJobsRow(db: Database, event: Event): void {
                     "DELETE FROM pending_dispatches WHERE verb = ? AND id = ? AND attempt_id = ?",
                     [plan_verb, plan_ref, dispatchAttemptId],
                   );
-            if (dischargeRes.changes > 0) {
+            const parkedFailure = db
+              .query(
+                "SELECT reason, attempt_id FROM dispatch_failures WHERE verb = ? AND id = ?",
+              )
+              .get(plan_verb, plan_ref) as {
+              reason: string;
+              attempt_id: number | null;
+            } | null;
+            const parkedClearRes =
+              parkedFailure != null &&
+              isParkedLaunchReason(parkedFailure.reason) &&
+              parkedFailure.attempt_id === dispatchAttemptId
+                ? db.run(
+                    dispatchAttemptId == null
+                      ? "DELETE FROM dispatch_failures WHERE verb = ? AND id = ? AND attempt_id IS NULL"
+                      : "DELETE FROM dispatch_failures WHERE verb = ? AND id = ? AND attempt_id = ?",
+                    dispatchAttemptId == null
+                      ? [plan_verb, plan_ref]
+                      : [plan_verb, plan_ref, dispatchAttemptId],
+                  )
+                : { changes: 0 };
+            if (dischargeRes.changes > 0 || parkedClearRes.changes > 0) {
               db.run(
                 "UPDATE jobs SET dispatch_origin = 'autopilot' WHERE job_id = ?",
                 [jobId],

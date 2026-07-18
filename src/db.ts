@@ -4444,6 +4444,20 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "boot_catchup_stats", "fold_work_ms", "REAL");
     },
   },
+  {
+    version: 135,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "pending_dispatches",
+        "launch_session",
+        "TEXT",
+      );
+      addColumnIfMissing(ctx.db, "pending_dispatches", "launch_window", "TEXT");
+      addColumnIfMissing(ctx.db, "pending_dispatches", "launch_pane", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4464,7 +4478,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v134:88b29e5b5b658893ee08bdfb358920bb47df75b391f27849651140698227f5a8";
+  "v135:dc109578b2f7de01588cd657d07d38a074ce9818e30f7db5514bc7aa3407a2b9";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -5801,6 +5815,9 @@ CREATE TABLE IF NOT EXISTS pending_dispatches (
     dispatched_at REAL NOT NULL,
     last_event_id INTEGER NOT NULL,
     attempt_id INTEGER,
+    launch_session TEXT,
+    launch_window TEXT,
+    launch_pane TEXT,
     PRIMARY KEY (verb, id)
 )
 `;

@@ -123,6 +123,23 @@ export const SLOT_OCCUPIED_REASON_PREFIX = "slot-occupied";
 export const INSTANT_DEATH_BREAKER_REASON = "instant-death-breaker";
 
 /**
+ * The natural-key sticky minted when a fired Dispatch attempt remains unbound
+ * past the launch grace. The reason names the frozen tmux target and stays
+ * cause-agnostic: the wrapper may be parked on an interactive gate or merely
+ * slow. A late exact bind level-clears it; otherwise `retry_dispatch` is the
+ * operator unstick. Natural `(verb, id)` keying makes the existing `failedKeys`
+ * arm suppress another launch while the inspectable window stays open.
+ */
+export const PARKED_LAUNCH_REASON_PREFIX = "parked-launch";
+
+export function isParkedLaunchReason(reason: string): boolean {
+  return (
+    reason === PARKED_LAUNCH_REASON_PREFIX ||
+    reason.startsWith(`${PARKED_LAUNCH_REASON_PREFIX}:`)
+  );
+}
+
+/**
  * The synthetic `(verb, id)` and `reason` prefix of the daemon CRASH-LOOP distress
  * signal — a self-restart storm made loud. Main appends each boot to a durable
  * restart ledger (a state-dir sidecar, NOT a fold) and, when the recent-boot rate
@@ -586,6 +603,7 @@ export type DispatchFailureDisplayKind =
   | "slot-reclaimed"
   | "slot-occupied"
   | "instant-death"
+  | "parked-launch"
   | "crash-loop"
   | "shared-wedge"
   | "shared-dirty"
@@ -620,6 +638,7 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: SLOT_RECLAIMED_REASON_PREFIX, kind: "slot-reclaimed" },
   { prefix: SLOT_OCCUPIED_REASON_PREFIX, kind: "slot-occupied" },
   { prefix: INSTANT_DEATH_BREAKER_REASON, kind: "instant-death" },
+  { prefix: PARKED_LAUNCH_REASON_PREFIX, kind: "parked-launch" },
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
   { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },

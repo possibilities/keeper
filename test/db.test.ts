@@ -3287,7 +3287,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // pace-free fold-work rate the full-replay projection derives from) — an
   // additive ALTER on that operational singleton, not a touch of the epics
   // SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(134);
+  expect(SCHEMA_VERSION).toBe(135);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

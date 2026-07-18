@@ -74,6 +74,7 @@ import {
   defaultShadowingWorkProbe,
   defaultWorkerCellFreshnessProbe,
   providerRejectReason,
+  providerUnlaunchableReason,
   resolveWorkerCell,
   WORKER_CELL_COMPILE_COMMAND,
   type WorkerCellCompose,
@@ -889,6 +890,11 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
               `refusing to launch ${claudeName}: its {model, tier} resolves no valid ` +
                 `worker cell — ${cell.message}; fix the task's model/tier in the plan ` +
                 "or regenerate the worker matrix",
+            );
+            break;
+          case "provider-unlaunchable":
+            die(
+              `refusing to launch ${claudeName}: ${providerUnlaunchableReason(cell)}`,
             );
             break;
           case "missing":

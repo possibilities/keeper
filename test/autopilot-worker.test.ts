@@ -214,9 +214,12 @@ import {
   type GitRunner,
 } from "../src/commit-work/git-exec";
 import {
+  buildParkedLaunchFailurePayload,
   MERGE_ESCALATION_REASON_TOKEN,
+  PARKED_LAUNCH_GRACE_MS,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  planPendingDispatchSweep,
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
 } from "../src/daemon";
@@ -2551,6 +2554,100 @@ test("reconcile: target-not-on-host refuses when the mapped cell is absent", () 
   });
 });
 
+test("runReconcileCycle: provider constraint plus native-only effective cell mints sticky and never launches", async () => {
+  const { deps, log } = makeFakeDeps();
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const nativeOnlyTarget = {
+    ...PROVIDER_MATRIX,
+    driverByModel: new Map<string, "native" | "wrapped">([
+      ["opus", "native"],
+      ["sonnet", "native"],
+      ["gpt-5.6-sol", "native"],
+    ]),
+    routeByModel: new Map<string, "native" | "wrapped">([
+      ["opus", "native"],
+      ["sonnet", "native"],
+      ["gpt-5.6-sol", "native"],
+    ]),
+  };
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: nativeOnlyTarget,
+    workerProvider: "gpt",
+    providerEquivalence: PROVIDER_MAP_OK,
+  });
+  const state = makeState();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.launches[0]?.providerLaunchContract).toEqual({
+    provider: "gpt",
+    model: "gpt-5.6-sol",
+    tier: "max",
+    driver: "native",
+    route: "native",
+    wrappedCell: null,
+  });
+
+  await runReconcileCycle(
+    decision,
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(state.inFlight.size).toBe(0);
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]?.reason).toBe(
+    "worker-provider-cell-unlaunchable: worker_provider=gpt cannot launch effective cell gpt-5.6-sol/max — constraint requires wrapped, but driver=native, route=native, wrapped_marker=none; refusing to dispatch before spawn; fix the provider constraint, equivalence map, host matrix route, or compiled cell, then retry",
+  );
+});
+
+test("runReconcileCycle: constrained wrapped cell with missing manifest names constraint and pair", async () => {
+  const { deps, log } = makeFakeDeps({
+    dirExists: (path) => path === "/repo",
+  });
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      hostMatrix: {
+        ...PROVIDER_MATRIX,
+        routeByModel: new Map<string, "native" | "wrapped">([
+          ["opus", "native"],
+          ["sonnet", "native"],
+          ["gpt-5.6-sol", "wrapped"],
+        ]),
+      },
+      workerProvider: "gpt",
+      providerEquivalence: PROVIDER_MAP_OK,
+    }),
+    makeState(),
+    0,
+  );
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]?.reason).toContain("worker-cell-missing:");
+  expect(log.emissions[0]?.reason).toContain(
+    "worker_provider=gpt, effective cell gpt-5.6-sol/max",
+  );
+});
+
 test("reconcile: a malformed map refuses per-cell (map-malformed, never a crash)", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
@@ -4131,6 +4228,11 @@ test("confirmRunning IN-DOUBT (fn-724): launch.ok + ceiling elapses, NO jobs row
   expect(log.dispatchedEmissions.length).toBe(1);
   expect(log.dispatchedEmissions[0]?.verb).toBe("work");
   expect(log.dispatchedEmissions[0]?.id).toBe("fn-1-foo.1");
+  expect(log.dispatchedEmissions[0]?.launch).toEqual({
+    session: "autopilot",
+    window: "work::fn-1-foo.1",
+    pane: null,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4530,12 +4632,103 @@ test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signa
   expect(log.emissions).toEqual([]); // no DispatchFailed
 });
 
-test("ceiling invariant (fn-724): DEFAULT_CEILING_MS < PENDING_DISPATCH_TTL_MS", () => {
-  // Load-bearing for the in-doubt path: the producer-side TTL sweep MUST
-  // fire AFTER the confirm ceiling, never during it. Were the sweep ≤ the
-  // ceiling, it would clear the pending_dispatches row mid-confirm and the
-  // slot would re-dispatch (the fn-627 hazard the row exists to prevent).
-  expect(DEFAULT_CEILING_MS).toBeLessThan(PENDING_DISPATCH_TTL_MS);
+test("pending launch ordering keeps confirm < parked grace < TTL < cooldown", () => {
+  expect(DEFAULT_CEILING_MS).toBeLessThan(PARKED_LAUNCH_GRACE_MS);
+  expect(PARKED_LAUNCH_GRACE_MS).toBeLessThan(PENDING_DISPATCH_TTL_MS);
+  expect(PENDING_DISPATCH_TTL_MS / 1000).toBeLessThan(REDISPATCH_COOLDOWN_S);
+});
+
+test("parked pending sweep mints the suppressing sticky before TTL re-serve and names the window", async () => {
+  await withSeededDb((db) => {
+    const nowMs = 1_700_000_000_000;
+    const dispatchedAt = (nowMs - PENDING_DISPATCH_TTL_MS - 1) / 1000;
+    db.query(
+      `INSERT INTO pending_dispatches
+         (verb, id, dir, dispatched_at, last_event_id, attempt_id,
+          launch_session, launch_window, launch_pane)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "work",
+      "fn-parked-sweep.1",
+      "/repo",
+      dispatchedAt,
+      41,
+      41,
+      "autopilot",
+      "work::fn-parked-sweep.1",
+      null,
+    );
+
+    const plan = planPendingDispatchSweep(db, nowMs);
+    expect(plan.expired).toEqual([]);
+    expect(plan.parked).toHaveLength(1);
+    const parked = plan.parked[0];
+    if (parked === undefined) throw new Error("expected one parked row");
+    const payload = buildParkedLaunchFailurePayload(parked, nowMs / 1000);
+    expect(payload.reason).toContain("parked or slow");
+    expect(payload.reason).toContain('window "work::fn-parked-sweep.1"');
+    expect(payload.reason).toContain('session "autopilot"');
+    expect(payload.attempt_id).toBe(41);
+
+    db.query(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'DispatchFailed', 'dispatch_failures', ?)`,
+    ).run(nowMs / 1000, "work::fn-parked-sweep.1", JSON.stringify(payload));
+    expect(drain(db)).toBe(1);
+    expect(
+      db
+        .query(
+          "SELECT reason FROM dispatch_failures WHERE verb = 'work' AND id = 'fn-parked-sweep.1'",
+        )
+        .get(),
+    ).toEqual({ reason: payload.reason });
+    expect(
+      db
+        .query(
+          "SELECT COUNT(*) AS n FROM pending_dispatches WHERE verb = 'work' AND id = 'fn-parked-sweep.1'",
+        )
+        .get(),
+    ).toEqual({ n: 0 });
+  });
+});
+
+test("a bind before parked grace leaves nothing for the sweep to mint", async () => {
+  await withSeededDb((db) => {
+    const dispatchedAt = 1_700_000_000;
+    db.query(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, 'work::fn-1335-parked-fast.1', 'Dispatched', 'pending_dispatches', ?)`,
+    ).run(
+      dispatchedAt,
+      JSON.stringify({
+        verb: "work",
+        id: "fn-1335-parked-fast.1",
+        dir: "/repo",
+        ts: dispatchedAt,
+        launch: {
+          session: "autopilot",
+          window: "work::fn-1335-parked-fast.1",
+          pane: null,
+        },
+      }),
+    );
+    expect(drain(db)).toBe(1);
+    db.query(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, spawn_name, data)
+       VALUES (?, 'sess-parked-fast', 'SessionStart', 'SessionStart', ?, '{}')`,
+    ).run(dispatchedAt + 1, "work::fn-1335-parked-fast.1");
+    expect(drain(db)).toBe(1);
+
+    const plan = planPendingDispatchSweep(
+      db,
+      dispatchedAt * 1000 + PARKED_LAUNCH_GRACE_MS + 1,
+    );
+    expect(plan).toEqual({ parked: [], expired: [] });
+    expect(
+      db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get(),
+    ).toEqual({ n: 0 });
+  });
 });
 
 // ---------------------------------------------------------------------------
