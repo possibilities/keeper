@@ -63,5 +63,5 @@ file retains the prior size, and the script exits with the backup's own status;
 - [ ] Script headers state monitoring is best-effort/bounded and the dotfiles CLAUDE.md carries the one-line guardrail; the dirty Brewfile is never staged
 
 ## Done summary
-
+Bound post-backup restic stats/snapshots monitoring in both backup scripts to a 90s perl-alarm guard (with TERM-then-KILL escalation) under nice+taskpolicy throttling, using --no-lock and raw-data mode; retained prior repo size on any non-clean stats exit via a plain else with a one-line timeout log; documented best-effort monitoring in script headers and CLAUDE.md.
 ## Evidence
