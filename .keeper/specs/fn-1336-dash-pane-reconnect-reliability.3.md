@@ -52,5 +52,5 @@ renders nothing.
 - [ ] The view-shell test gate passes
 
 ## Done summary
-
+Rendered the three-state reconnect banner (grace, retrying with attempt/countdown, DISCONNECTED with monotonic last-good-frame age) driven from existing lifecycle telemetry; degrades in place, never blanks the panel. Revised ADR 0019 in place to the new model.
 ## Evidence
