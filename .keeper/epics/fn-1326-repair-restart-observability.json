@@ -6,7 +6,7 @@
     "fn-1325-split-runtime-import-cycles"
   ],
   "id": "fn-1326-repair-restart-observability",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T05:58:17.370000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T05:58:16.797000Z"
+  "updated_at": "2026-07-18T05:58:17.370000Z"
 }
