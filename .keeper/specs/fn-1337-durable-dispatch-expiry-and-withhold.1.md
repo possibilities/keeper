@@ -67,5 +67,5 @@ exactly-once release for the ownerless class and never for one with legs.
 - [ ] Named gates for reducer-projections and autopilot-worker pass with re-fold equivalence green
 
 ## Done summary
-
+Boot-anchored orphaned-claim Reaper: expires an exact acquired, sessionless dispatch claim whose pending row was boot-truncated once both the durable acquired-at age and the current-boot TTL-plus-grace window elapse, jittered and batch-capped per sweep; mints ride the existing DispatchExpired plumbing and trip the never-bound sticky, with an ownerless-only self-heal release fenced against bind/supersede/Provider-leg ownership. Amends ADR 0070, adds ADR 0085, revises the problem-codes stale_attempts row, and consolidates the Dispatch-claim/Orphaned-claim glossary entry.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Boot-safe never-bound expiry",
-  "updated_at": "2026-07-18T15:44:31.367000Z"
+  "updated_at": "2026-07-18T16:06:15.876000Z",
+  "worker_done_at": "2026-07-18T16:06:15.876000Z"
 }
