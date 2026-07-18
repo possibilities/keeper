@@ -63,3 +63,13 @@ Delivering the block off the omitted header onto the always-present `result`
 frame is the fix; asserting it on the real wire here pins the contract so it
 cannot ship blind again. This is a scenario-set growth admitted under the
 "adding a scenario requires amending this ADR" rule above.
+
+## Amendment — stable restart identity and retained history
+
+Scenario (c), the existing restart-verdict scenario, gains assertions rather
+than a new process class: capture the predecessor identity and ledger history,
+restart once, require one different served boot identity whose durable row
+preserves the prior history, and hold that same caught-up identity through the
+stabilization interval. Its negative control proves no replacement cannot pass.
+A simulated replacement inside the interval remains deterministic fast coverage;
+the slow tier does not manufacture a new crash-loop scenario.
