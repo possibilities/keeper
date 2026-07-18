@@ -5,8 +5,9 @@
  * resolution only.
  */
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 /** Sidecars are transient; an old schema is treated as absent, never migrated. */
 export const OBSERVATION_SCHEMA_VERSION = 6;
@@ -97,4 +98,89 @@ export function resolveCswapCommand(): string {
 /** Exact no-shell argv for the managed-account inventory. */
 export function cswapListArgv(bin: string = resolveCswapCommand()): string[] {
   return [bin, "list", "--json"];
+}
+
+export interface CswapAccountConfigPathOptions {
+  homeDir?: string;
+  platform?: NodeJS.Platform;
+  xdgDataHome?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function cswapEmailSlug(email: string): string {
+  let slug = "";
+  for (const char of email.normalize("NFC")) {
+    slug += /^[A-Za-z0-9._-]$/u.test(char) ? char : "_";
+  }
+  return slug;
+}
+
+function expandedDataHome(value: string, homeDir: string): string {
+  if (value === "~") return homeDir;
+  if (value.startsWith("~/")) return join(homeDir, value.slice(2));
+  return value;
+}
+
+function cswapBackupRoot(options: CswapAccountConfigPathOptions): string {
+  const homeDir = options.homeDir ?? homedir();
+  const platform = options.platform ?? process.platform;
+  if (platform === "linux") {
+    const configured = options.xdgDataHome ?? process.env.XDG_DATA_HOME ?? "";
+    if (configured.length > 0) {
+      const expanded = expandedDataHome(configured, homeDir);
+      if (isAbsolute(expanded)) return join(expanded, "claude-swap");
+    }
+    return join(homeDir, ".local", "share", "claude-swap");
+  }
+  return join(homeDir, ".claude-swap-backup");
+}
+
+/** Derive claude-swap's per-account session directory from one live inventory. */
+export function deriveCswapAccountConfigDir(
+  slot: number,
+  inventory: unknown,
+  options: CswapAccountConfigPathOptions = {},
+): string {
+  if (!Number.isSafeInteger(slot) || slot <= 0) {
+    throw new Error("claude-swap slot must be a positive integer");
+  }
+  if (
+    !isRecord(inventory) ||
+    inventory.schemaVersion !== CSWAP_SUPPORTED_SCHEMA_MAJOR ||
+    !Array.isArray(inventory.accounts)
+  ) {
+    throw new Error("claude-swap inventory has an unsupported shape");
+  }
+  const account = inventory.accounts.find(
+    (candidate) => isRecord(candidate) && candidate.number === slot,
+  );
+  if (!isRecord(account) || typeof account.email !== "string") {
+    throw new Error(`claude-swap inventory has no account for slot ${slot}`);
+  }
+  const email = account.email.trim();
+  if (email.length === 0) {
+    throw new Error(`claude-swap inventory has no account for slot ${slot}`);
+  }
+  return join(
+    cswapBackupRoot(options),
+    "sessions",
+    `${slot}-${cswapEmailSlug(email)}`,
+  );
+}
+
+/** Derive and verify the selected claude-swap session directory. */
+export function existingCswapAccountConfigDir(
+  slot: number,
+  inventory: unknown,
+  options: CswapAccountConfigPathOptions = {},
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const path = deriveCswapAccountConfigDir(slot, inventory, options);
+  if (!exists(path)) {
+    throw new Error(`claude-swap profile directory is absent for slot ${slot}`);
+  }
+  return path;
 }

@@ -359,6 +359,60 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
 // Managed account route — the claude-swap wrapper composition
 // ---------------------------------------------------------------------------
 
+export type ClaudeWorkspaceTrustMerge =
+  | { ok: true; changed: boolean; body: string }
+  | { ok: false; error: string };
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Merge the two non-interactive workspace approvals without replacing siblings. */
+export function mergeClaudeWorkspaceTrust(
+  body: string,
+  cwd: string,
+): ClaudeWorkspaceTrustMerge {
+  let config: unknown;
+  try {
+    config = JSON.parse(body);
+  } catch {
+    return { ok: false, error: "Claude account config is malformed JSON" };
+  }
+  if (!isJsonRecord(config)) {
+    return { ok: false, error: "Claude account config is not an object" };
+  }
+  const projectsValue = config.projects;
+  if (projectsValue !== undefined && !isJsonRecord(projectsValue)) {
+    return {
+      ok: false,
+      error: "Claude account projects config is not an object",
+    };
+  }
+  const projects = projectsValue ?? {};
+  const projectValue = projects[cwd];
+  if (projectValue !== undefined && !isJsonRecord(projectValue)) {
+    return { ok: false, error: "Claude workspace config is not an object" };
+  }
+  const project = projectValue ?? {};
+  if (
+    project.hasTrustDialogAccepted === true &&
+    project.hasClaudeMdExternalIncludesApproved === true
+  ) {
+    return { ok: true, changed: false, body };
+  }
+  projects[cwd] = {
+    ...project,
+    hasTrustDialogAccepted: true,
+    hasClaudeMdExternalIncludesApproved: true,
+  };
+  config.projects = projects;
+  return {
+    ok: true,
+    changed: true,
+    body: `${JSON.stringify(config, null, 2)}\n`,
+  };
+}
+
 /**
  * Compose the managed claude-swap wrapper argv around an already-built native
  * Claude command. The account router's MANAGED decision routes a launch through

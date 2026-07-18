@@ -209,6 +209,8 @@ export interface HarnessOptions {
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
+  resolveAccountConfigDir?: (slot: number) => string;
+  seedClaudeWorkspaceTrust?: (configDir: string, cwd: string) => boolean;
 }
 
 /**
@@ -405,6 +407,10 @@ export function makeHarness(opts: HarnessOptions): Harness {
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),
     cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",
+    resolveAccountConfigDirFn:
+      opts.resolveAccountConfigDir ??
+      ((slot) => `/fake-home/.claude-swap/sessions/${slot}-account`),
+    seedClaudeWorkspaceTrustFn: opts.seedClaudeWorkspaceTrust ?? (() => false),
   };
 
   return {

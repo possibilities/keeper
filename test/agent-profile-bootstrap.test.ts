@@ -2,9 +2,10 @@
  * main()-driving launch-composition pins. There is no Keeper-owned profile farm
  * (retired — see test/agent-state-sharing.test.ts for the surviving
  * global-instruction-guard leaf behaviors): `--x-profile` and
- * `KEEPER_AGENT_PROFILE` no longer create a profile dir, set `CLAUDE_CONFIG_DIR`,
- * or bypass the account router for Claude, and Pi carries no automatic profile
- * selection either. This file pins those negative boundaries plus the launch
+ * `KEEPER_AGENT_PROFILE` no longer create or select a profile dir or bypass the
+ * account router for Claude. The resolved claude-swap account supplies
+ * `CLAUDE_CONFIG_DIR`; Pi carries no automatic profile selection. This file
+ * pins those boundaries plus the launch
  * composition assertions that happen to live alongside them (model override,
  * session env scrub, session-id/name auto-append suppression) via the MainDeps
  * harness: the spawn recorder captures the composed command and the state
@@ -39,8 +40,10 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+const ACCOUNT_CONFIG = "/fake-home/.claude-swap/sessions/1-account";
+
 describe("main() passthrough commands", () => {
-  test("a profiled `auth status` passes through without session flags or CLAUDE_CONFIG_DIR", async () => {
+  test("a profiled `auth status` passes through without session flags", async () => {
     const h = makeHarness({
       argv: ["--x-profile", "multi-claude-1", "auth", "status"],
       env: {},
@@ -59,7 +62,7 @@ describe("main() passthrough commands", () => {
     expect(cmd).not.toContain("--strict-mcp-config");
     expect(cmd).not.toContain("--session-id");
     expect(cmd).not.toContain("--name");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(ACCOUNT_CONFIG);
   });
 
   test("global flags and subcommands pass through the mandatory account route", async () => {
@@ -92,7 +95,7 @@ describe("main() has no profile farm — Claude always routes, Pi always native"
     const h = makeHarness({ argv: ["--print"], env: {} });
     expect((await runAndCapture(h, main)).length).toBeGreaterThan(0);
     expect(h.routerCalls()).toBe(1);
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(ACCOUNT_CONFIG);
   });
 
   test("an explicit --x-profile still routes via the account router (no effect)", async () => {
@@ -102,7 +105,7 @@ describe("main() has no profile farm — Claude always routes, Pi always native"
     });
     await runAndCapture(h, main);
     expect(h.routerCalls()).toBe(1);
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(ACCOUNT_CONFIG);
   });
 
   test("KEEPER_AGENT_PROFILE env is no longer read — the router still runs unconditionally", async () => {
@@ -112,7 +115,7 @@ describe("main() has no profile farm — Claude always routes, Pi always native"
     });
     await runAndCapture(h, main);
     expect(h.routerCalls()).toBe(1);
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(ACCOUNT_CONFIG);
   });
 
   test("--resume routes via the account router after shared-state setup", async () => {
@@ -125,7 +128,7 @@ describe("main() has no profile farm — Claude always routes, Pi always native"
     expect(h.routerCalls()).toBe(1);
     // Resume carries its own session posture — no wrapper --model injected.
     expect(cmd).not.toContain("--model");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(ACCOUNT_CONFIG);
   });
 
   test("Pi has no automatic profile selection — it always launches natively", async () => {

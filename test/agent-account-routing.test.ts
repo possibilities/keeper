@@ -1,6 +1,21 @@
 import { describe, expect, test } from "bun:test";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { RouteResolution, RouteSelection } from "../src/account-router";
-import { main } from "../src/agent/main";
+import {
+  deriveCswapAccountConfigDir,
+  existingCswapAccountConfigDir,
+} from "../src/account-routing-config";
+import { main, seedClaudeWorkspaceTrust } from "../src/agent/main";
 import {
   expectExit,
   makeHarness,
@@ -42,6 +57,12 @@ describe("mandatory Claude account routing", () => {
     ]);
     expect(command.slice(5)).toContain("hello");
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:2");
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(
+      "/fake-home/.claude-swap/sessions/2-account",
+    );
+    expect(h.spawnOptions[0]?.env?.CLAUDE_CONFIG_DIR).toBe(
+      "/fake-home/.claude-swap/sessions/2-account",
+    );
     expect(h.routerCalls()).toBe(1);
   });
 
@@ -122,8 +143,134 @@ describe("mandatory Claude account routing", () => {
     await runAndCapture(h, main);
     expect(h.deps.env.KEEPER_ACCOUNT_ROUTE).toBe("claude-swap:5");
     expect(h.deps.env.KEEPER_ACCOUNT_ORDINAL).toBe("1");
-    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBe(
+      "/fake-home/.claude-swap/sessions/5-account",
+    );
   });
+
+  test("serial and worktree launches seed the selected account store", async () => {
+    for (const cwd of [
+      "/fake-home/code/repo",
+      "/fake-home/worktrees/repo-lane",
+    ]) {
+      const calls: Array<[string, string]> = [];
+      const h = makeHarness({
+        argv: ["claude", "task"],
+        rawArgv: true,
+        cwd,
+        env: cwd.includes("worktrees")
+          ? { KEEPER_PLAN_WORKTREE: cwd }
+          : undefined,
+        selectAccountRoute: managed(3),
+        seedClaudeWorkspaceTrust: (configDir, launchCwd) => {
+          calls.push([configDir, launchCwd]);
+          return true;
+        },
+      });
+      await runAndCapture(h, main);
+      expect(calls).toEqual([
+        ["/fake-home/.claude-swap/sessions/3-account", cwd],
+      ]);
+    }
+  });
+
+  test("a trust write failure logs once and still launches", async () => {
+    const h = makeHarness({
+      argv: ["claude", "task"],
+      rawArgv: true,
+      seedClaudeWorkspaceTrust: () => {
+        throw new Error("read-only account config");
+      },
+    });
+    const command = await runAndCapture(h, main);
+    expect(command.slice(0, 3)).toEqual([CSWAP, "run", "1"]);
+    expect(h.err).toEqual([
+      "Warning: Claude workspace trust preflight failed: read-only account config; launching anyway.\n",
+    ]);
+  });
+
+  test("an absent account directory logs once and still launches", async () => {
+    const h = makeHarness({
+      argv: ["claude", "task"],
+      rawArgv: true,
+      resolveAccountConfigDir: () => {
+        throw new Error("claude-swap profile directory is absent for slot 1");
+      },
+    });
+    const command = await runAndCapture(h, main);
+    expect(command.slice(0, 3)).toEqual([CSWAP, "run", "1"]);
+    expect(h.deps.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(h.err).toEqual([
+      "Warning: Claude account config preflight failed: claude-swap profile directory is absent for slot 1; launching anyway.\n",
+    ]);
+  });
+});
+
+describe("claude-swap account config resolution", () => {
+  const inventory = {
+    schemaVersion: 1,
+    accounts: [{ number: 2, email: "person+work@example.com" }],
+  };
+
+  test("derives the installed session layout from one live inventory", () => {
+    expect(
+      deriveCswapAccountConfigDir(2, inventory, {
+        homeDir: "/Users/test",
+        platform: "darwin",
+      }),
+    ).toBe(
+      "/Users/test/.claude-swap-backup/sessions/2-person_work_example.com",
+    );
+    expect(
+      deriveCswapAccountConfigDir(2, inventory, {
+        homeDir: "/home/test",
+        platform: "linux",
+        xdgDataHome: "/state",
+      }),
+    ).toBe("/state/claude-swap/sessions/2-person_work_example.com");
+  });
+
+  test("fails loudly when the derived profile directory is absent", () => {
+    expect(() =>
+      existingCswapAccountConfigDir(
+        2,
+        inventory,
+        { homeDir: "/Users/test", platform: "darwin" },
+        () => false,
+      ),
+    ).toThrow("claude-swap profile directory is absent for slot 2");
+  });
+});
+
+test("seedClaudeWorkspaceTrust uses the real launch cwd and preserves config fields", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-claude-trust-"));
+  try {
+    const configDir = join(root, "account");
+    const repo = join(root, "repo");
+    const alias = join(root, "repo-alias");
+    mkdirSync(configDir);
+    mkdirSync(repo);
+    symlinkSync(repo, alias);
+    writeFileSync(
+      join(configDir, ".claude.json"),
+      JSON.stringify({ projects: {}, sibling: { keep: true } }),
+    );
+
+    expect(seedClaudeWorkspaceTrust(configDir, alias)).toBe(true);
+    const config = JSON.parse(
+      readFileSync(join(configDir, ".claude.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(config.sibling).toEqual({ keep: true });
+    expect(
+      (config.projects as Record<string, unknown>)[realpathSync(repo)],
+    ).toEqual({
+      hasTrustDialogAccepted: true,
+      hasClaudeMdExternalIncludesApproved: true,
+    });
+    expect(seedClaudeWorkspaceTrust(configDir, alias)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 describe("explicit account selection", () => {
