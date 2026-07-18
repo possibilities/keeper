@@ -35,5 +35,5 @@ project proves the identity distinguishes boards; no-project error unchanged.
 - [ ] The plan test gate passes
 
 ## Done summary
-
+keeper plan epics envelope and human output now name the resolved project (name + path); no-project error path unchanged.
 ## Evidence
