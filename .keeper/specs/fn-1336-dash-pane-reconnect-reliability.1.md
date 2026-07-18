@@ -38,5 +38,5 @@ the next dial's first frame.
 - [ ] The readiness-client test gate passes
 
 ## Done summary
-
+Adopted a per-connection streaming TextDecoder in the subscribe driver so multibyte frames split across data events decode intact and a torn tail is discarded on reconnect; ported the snowman-split regression template.
 ## Evidence
