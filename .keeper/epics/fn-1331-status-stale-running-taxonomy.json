@@ -7,7 +7,7 @@
     "fn-1330-cleanup-lane-paging-and-hygiene"
   ],
   "id": "fn-1331-status-stale-running-taxonomy",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T10:14:07.588000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T10:14:07.352000Z"
+  "updated_at": "2026-07-18T10:14:07.588000Z"
 }
