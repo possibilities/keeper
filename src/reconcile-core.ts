@@ -1587,6 +1587,15 @@ export interface WorktreeRecoveryOutcome {
     dir: string;
     reason?: string;
   }[];
+  /**
+   * True when pass-3 actually REMOVED at least one lane worktree this cycle (a
+   * completed-removal exit) — the caller nudges the git vanished sweep to retire
+   * the torn-down lane's `git_status` row promptly. A deferred/failed teardown
+   * leaves it absent/false, so the sweep never drops a still-present lane. Distinct
+   * from `laneResolved`, which also carries lanes found merely READY (no removal).
+   * Optional so a fake driver may omit it (→ no nudge).
+   */
+  tornDownLane?: boolean;
 }
 /**
  * Translate a single readiness verdict on a row into the verb the

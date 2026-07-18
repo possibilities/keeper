@@ -834,6 +834,17 @@ export interface ConfirmRunningDeps {
     expected_instance_event_id: number | null;
   }): void;
   /**
+   * Nudge the git-worker (via main) to run an IMMEDIATE vanished-worktree sweep
+   * after a lane teardown's removals COMPLETE (finalize / recover pass-3), so the
+   * sweep retires a torn-down lane's `git_status` row promptly instead of at the
+   * next full sweep. Payload-free — the sweep keys on the canonical `git_status`
+   * rows and re-verifies each with an ENOENT gate, so it introduces NO second
+   * retire path. OPTIONAL — a no-op when absent (a fake-deps test never needs the
+   * relay), so the teardown path is byte-identical without it. NEVER fires on a
+   * deferred/failed removal — the sweep must not drop a still-present path.
+   */
+  nudgeVanishedSweep?(): void;
+  /**
    * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
    * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
    * effect the slot-occupancy reclaim takes, gated behind the strict
@@ -1128,6 +1139,12 @@ export interface WorktreeDriver {
     info: WorktreeLaunchInfo,
     isEpicDone: (epicId: string) => Promise<boolean>,
     runMergeSuite?: MergeSuiteProbe,
+    // Called EXACTLY ONCE after this finalize actually removes a lane worktree (a
+    // completed-removal teardown), so the caller nudges the git vanished sweep to
+    // retire the torn-down lane's row promptly. NEVER called when teardown is
+    // deferred/failed, or is a no-op. A callback (mirroring recover's
+    // `onResyncSkipped`) so the `{ ok: true }` result shape is unchanged.
+    onLaneTornDown?: () => void,
   ): Promise<
     | { ok: true }
     | {
@@ -5433,6 +5450,10 @@ export async function runReconcileCycle(
         info,
         deps.isEpicDone,
         deps.runMergeSuite,
+        // A COMPLETED lane teardown nudges the git vanished sweep so it retires
+        // the lane's git_status row promptly, not at the next full sweep. Fired
+        // only on an actual removal — never on a hold-deferred/failed teardown.
+        () => deps.nudgeVanishedSweep?.(),
       );
       if (result.ok) {
         // Clean finalize (base merged + torn down) OR the lane is already gone —
@@ -5825,7 +5846,7 @@ export function createWorktreeDriver(
         };
       }
     },
-    async finalizeEpic(info, isEpicDone, runMergeSuite) {
+    async finalizeEpic(info, isEpicDone, runMergeSuite, onLaneTornDown) {
       const { repoDir, baseBranch, baseWorktreePath, laneOrder } = info;
       try {
         // A never-forked epic (a `done` epic that completed before worktree mode,
@@ -6140,6 +6161,10 @@ export function createWorktreeDriver(
             expectedBranchByPath.set(normalizeLanePath(entry.path), short);
           }
         }
+        // Set once a lane worktree is actually removed below, so the caller nudges
+        // the git vanished sweep ONLY on a completed removal — never on a
+        // retry-skip (dirty / cleanup-conflict) exit that left the path present.
+        let tornDownLane = false;
         for (const p of paths) {
           const key = normalizeLanePath(p);
           const current = registeredByPath.get(key);
@@ -6159,6 +6184,7 @@ export function createWorktreeDriver(
               `worktree-finalize-teardown-deferred: ${p} has uncommitted changes — the recover pass owns backup-then-force teardown after its grace (${removed.stderr})`,
             );
           }
+          tornDownLane = true;
           // Removed clean (THIS path's own result): sweep a residue-only `.claude`
           // husk dir git may have left behind. Swallow-and-log — a husk-prune throw
           // must NEVER become a teardown failure row (teardown already succeeded).
@@ -6192,6 +6218,9 @@ export function createWorktreeDriver(
         if (await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run)) {
           await gitDeleteBranch(repoDir, baseBranch, run);
         }
+        // Completed teardown: nudge the vanished sweep ONLY if a lane was actually
+        // removed (never on a hold-deferred teardown, which never enters the loop).
+        if (tornDownLane) onLaneTornDown?.();
         return { ok: true };
       } catch (err) {
         return {
@@ -7507,6 +7536,12 @@ export async function recoverWorktrees(
   // passes settle the tree) and by pass-3's teardown (a torn-down lane resolves).
   const laneWedged: { path: string; reason: string; immediate: boolean }[] = [];
   const laneResolved: string[] = [];
+  // Set once pass-3 actually removes a lane worktree (any completed-removal exit),
+  // so the caller nudges the git vanished sweep. A deferred/failed teardown
+  // (retry-skip / backup-failed / remove-failed) leaves it false — the sweep must
+  // not drop a still-present lane. Distinct from `laneResolved`, which ALSO
+  // carries lanes found merely READY by the readiness probe (no removal).
+  let tornDownLane = false;
   const laneTeardownDistress: NonNullable<
     WorktreeRecoveryOutcome["laneTeardownDistress"]
   > = [];
@@ -8070,9 +8105,12 @@ export async function recoverWorktrees(
             (entry) => normalizeLanePath(entry.path) === wtKey,
           );
           if (fresh === undefined) {
+            // The worktree is already gone (removed between the two list reads):
+            // a completed removal — nudge the vanished sweep to retire its row.
             presentLanePaths.delete(wtKey);
             laneResolved.push(wt.path);
             prunedLanePaths.add(wt.path);
+            tornDownLane = true;
             continue;
           }
           if (await epicPresentAndNotDone(lane.epicId)) continue;
@@ -8143,6 +8181,9 @@ export async function recoverWorktrees(
           presentLanePaths.delete(wtKey);
         }
 
+        // Reached only on a COMPLETED removal (every deferred/failed sub-case
+        // `continue`d above), so mark the teardown for the vanished-sweep nudge.
+        tornDownLane = true;
         laneResolved.push(wt.path);
         prunedLanePaths.add(wt.path);
         try {
@@ -8207,6 +8248,7 @@ export async function recoverWorktrees(
     laneWedged,
     laneResolved,
     laneTeardownDistress,
+    tornDownLane,
   };
 }
 
@@ -8829,6 +8871,17 @@ export interface WorktreeRepoStatusMessage {
 export interface LaneMergedMessage {
   kind: "lane-merged";
   entries: readonly LaneMergedEntry[];
+}
+
+/**
+ * Worker → main: run an immediate git vanished-worktree sweep. Posted after a lane
+ * teardown's removals COMPLETE (finalize / recover pass-3); main relays it to the
+ * git-worker (mirroring the plan-worker nudge-discovery relay) so the sweep retires
+ * a torn-down lane's `git_status` row promptly instead of at the next full sweep.
+ * Payload-free — the sweep keys on the canonical git_status rows, not a path.
+ */
+export interface VanishedSweepNudgeMessage {
+  kind: "nudge-vanished-sweep";
 }
 
 type IncomingMessage =
@@ -10086,6 +10139,14 @@ function main(): void {
         expected_instance_event_id: payload.expected_instance_event_id,
       } satisfies SharedWedgeDistressMessage);
     },
+    nudgeVanishedSweep: () => {
+      // Payload-free relay to main → git-worker (mirrors the nudge-discovery
+      // relay). Fired only from a completed lane teardown, so the immediate
+      // vanished sweep it triggers acts on a genuinely-gone lane.
+      parentPort?.postMessage({
+        kind: "nudge-vanished-sweep",
+      } satisfies VanishedSweepNudgeMessage);
+    },
     reclaimSlotPane: async (paneId) => {
       // Kill the dead session's window to free its slot. Fire-and-log: killWindow
       // never throws, and a nonzero exit is the benign TOCTOU (the window already
@@ -10505,6 +10566,7 @@ function main(): void {
               laneWedged,
               laneResolved,
               laneTeardownDistress,
+              tornDownLane,
             } = await deps.worktree.recover(
               repos,
               // Pass-2's TRI-STATE done-probe — surfaces authoritatively-absent and
@@ -10551,6 +10613,12 @@ function main(): void {
                 openBackupPaths: snapshot.laneBackupDistressDirs ?? new Set(),
               },
             );
+            // A COMPLETED pass-3 lane teardown: nudge the git vanished sweep so it
+            // retires the torn-down lane's git_status row promptly, not at the next
+            // full sweep. Deferred/failed teardowns leave `tornDownLane` false.
+            if (tornDownLane) {
+              deps.nudgeVanishedSweep?.();
+            }
             for (const action of laneTeardownDistress ?? []) {
               if (action.action === "mint") {
                 deps.emitSharedWedgeDistress?.({

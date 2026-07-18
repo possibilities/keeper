@@ -13065,6 +13065,193 @@ test("recoverWorktrees: a merged dirty closed lane snapshots then force-removes 
   }
 });
 
+// ---------------------------------------------------------------------------
+// #1346 teardown → vanished-sweep nudge. A COMPLETED lane removal (finalize or
+// recover pass-3) signals the git vanished sweep so the torn-down lane's phantom
+// git_status row is retired promptly; a deferred/failed removal never signals it.
+// ---------------------------------------------------------------------------
+
+test("#1346 finalizeEpic: a completed lane teardown fires onLaneTornDown exactly once (vanished-sweep nudge)", async () => {
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" }; // clean
+    }
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" }; // base branch exists
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" }; // not-ahead / is-ancestor
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout: `worktree ${basePath}\nHEAD z\nbranch refs/heads/keeper/epic/fn-1-foo\n\n`,
+        stderr: "",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" }; // `worktree remove` → code 0 → removed
+  };
+  let nudged = 0;
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    undefined,
+    () => {
+      nudged += 1;
+    },
+  );
+  expect(res).toEqual({ ok: true });
+  expect(nudged).toBe(1);
+});
+
+test("#1346 finalizeEpic: a dirty-lane teardown retry-skip does NOT fire onLaneTornDown (deferred removal never nudges)", async () => {
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    if (args[0] === "rev-parse" && args.includes("--verify")) {
+      return { code: 0, stdout: "abc\n", stderr: "" };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === "rev-parse --abbrev-ref HEAD") {
+      return { code: 0, stdout: "main\n", stderr: "" };
+    }
+    if (joined.startsWith("merge-base --is-ancestor")) {
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (joined.startsWith("worktree list")) {
+      return {
+        code: 0,
+        stdout: `worktree ${basePath}\nHEAD z\nbranch refs/heads/keeper/epic/fn-1-foo\n\n`,
+        stderr: "",
+      };
+    }
+    if (joined.startsWith("worktree remove")) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: "contains modified or untracked files",
+      };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  let nudged = 0;
+  const res = await createWorktreeDriver(fakeRun).finalizeEpic(
+    makeFinalizeInfo(),
+    async () => true,
+    undefined,
+    () => {
+      nudged += 1;
+    },
+  );
+  expect(res.ok).toBe(false);
+  if (!res.ok) {
+    expect(res.reason).toMatch(/^worktree-finalize-teardown-deferred:/);
+  }
+  expect(nudged).toBe(0);
+});
+
+test("#1346 recoverWorktrees pass-3: a completed orphan-base teardown sets tornDownLane", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]), // merged → swept clean
+    repoHead: "main",
+  });
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(outcome.tornDownLane).toBe(true);
+});
+
+test("#1346 recoverWorktrees pass-3: a DIRTY lane force-removed after grace sets tornDownLane (the witnessed reproducer)", async () => {
+  // The recover pass-3 backup-then-force-remove of a DIRTY closed lane is the
+  // witnessed phantom-row reproducer — cover it explicitly, not only the clean path.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "kpr-1346-force-")));
+  const lanePath = join(root, "lane");
+  const spoolDir = join(root, "spool");
+  mkdirSync(lanePath, { recursive: true });
+  const base = "keeper/epic/fn-1-foo";
+  const { run } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${lanePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    repoHead: "main",
+    dirtyRemoveAt: new Set([lanePath]), // refuses clean → backup-then-force
+  });
+  try {
+    const outcome = await recoverWorktrees(
+      ["/repo"],
+      async () => "done",
+      run,
+      undefined,
+      async () => false,
+      () => false,
+      undefined,
+      () => false,
+      {
+        tracker: createLaneTeardownGraceTracker(0), // grace 0 → force this cycle
+        nowSec: 100,
+        spoolDir,
+      },
+    );
+    expect(outcome.failures).toEqual([]);
+    expect(outcome.tornDownLane).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#1346 recoverWorktrees pass-3: a dirty base still within its teardown grace does NOT set tornDownLane (deferred removal never nudges)", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set([base]),
+    repoHead: "main",
+    dirtyRemoveAt: new Set([basePath]), // dirty → enters grace, no removal this cycle
+  });
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+  );
+  expect(outcome.tornDownLane ?? false).toBe(false);
+});
+
 test("recoverWorktrees: repeated force-remove failures keep one lane dirt snapshot", async () => {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "kpr-lane-spool-bound-")),

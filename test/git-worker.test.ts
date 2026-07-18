@@ -1,5 +1,11 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -38,6 +44,8 @@ import {
   type ParsedGitStatus,
   parseCommitFiles,
   parsePorcelainV2,
+  probeRootPresence,
+  type RootPresence,
   readGitMetaSignature,
   selectVanishedRoots,
   semanticSnapshotKey,
@@ -1938,59 +1946,258 @@ test("a not-watched-but-still-desired root re-enters toAdd exactly once via deci
 });
 
 // ---------------------------------------------------------------------------
-// selectVanishedRoots — the ghost-row prune. A git_status projection row
-// whose worktree was deleted/moved is unreachable by
-// decideReconcileTransitions (which only walks currentlyWatched), so this
-// producer-side existsSync probe tombstones it.
+// selectVanishedRoots — the ghost-row prune. A git_status projection row whose
+// worktree was deleted/moved is unreachable by decideReconcileTransitions (which
+// only walks currentlyWatched) AND, for an always-watched `.keeper` lane, by the
+// dwell drop, so this producer-side stat probe tombstones it. The discriminator
+// treats ONLY ENOENT/ENOTDIR ("vanished") as gone — a currently-watched lane
+// retires on that verdict across two consecutive passes (debounce), any other
+// error fails closed, and an unwatched root keeps today's single-pass behavior.
 // ---------------------------------------------------------------------------
 
-test("selectVanishedRoots: a missing dir is dropped and recorded as tombstoned", () => {
+/** Build a probe from a fixed dir→verdict map (default "present"). */
+function fixedProbe(
+  verdicts: Record<string, RootPresence>,
+): (dir: string) => RootPresence {
+  return (dir) => verdicts[dir] ?? "present";
+}
+
+test("selectVanishedRoots: an unwatched vanished dir is dropped and recorded as tombstoned", () => {
   const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
   const drop = selectVanishedRoots(
     ["/code/gone", "/code/here"],
-    (d) => d === "/code/here",
+    fixedProbe({ "/code/gone": "vanished", "/code/here": "present" }),
     new Set(),
     tombstoned,
+    streak,
   );
   expect(drop).toEqual(["/code/gone"]);
   expect(tombstoned.has("/code/gone")).toBe(true);
 });
 
-test("selectVanishedRoots: an existing dir is skipped and un-tombstoned", () => {
+test("selectVanishedRoots: an unwatched non-ENOENT probe error still retires (byte-identical to the old existsSync=false drop)", () => {
+  // The fail-closed discrimination is scoped to WATCHED lanes only; an unwatched
+  // root retires on ANY not-present verdict, exactly like the prior existsSync path.
+  const tombstoned = new Set<string>();
+  const drop = selectVanishedRoots(
+    ["/code/eio"],
+    fixedProbe({ "/code/eio": "error" }),
+    new Set(),
+    tombstoned,
+    new Map(),
+  );
+  expect(drop).toEqual(["/code/eio"]);
+  expect(tombstoned.has("/code/eio")).toBe(true);
+});
+
+test("selectVanishedRoots: a present dir is skipped and un-tombstoned", () => {
   // /code/back vanished last sweep (still in tombstoned) but its dir is now
   // present again — clear the dedupe entry so a future vanish can re-drop it.
   const tombstoned = new Set<string>(["/code/back"]);
+  const streak = new Map<string, number>([["/code/back", 1]]);
   const drop = selectVanishedRoots(
     ["/code/back"],
-    () => true,
+    fixedProbe({ "/code/back": "present" }),
     new Set(),
     tombstoned,
+    streak,
   );
   expect(drop).toEqual([]);
   expect(tombstoned.has("/code/back")).toBe(false);
+  expect(streak.has("/code/back")).toBe(false);
 });
 
-test("selectVanishedRoots: a currently-watched missing root is left to the dwell path", () => {
+test("selectVanishedRoots: a currently-watched vanished root retires only after two consecutive passes (debounce)", () => {
+  // The inverted #1346 bug fixture: the OLD code skipped a watched root forever
+  // (the retirement deadlock). Now it retires — but only once the vanished verdict
+  // holds across two consecutive sweep passes, protecting a live lane from a blip.
   const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  const watched = new Set(["/code/watched-gone"]);
+  const probe = fixedProbe({ "/code/watched-gone": "vanished" });
+
+  // First pass: no retire, streak recorded.
+  const pass1 = selectVanishedRoots(
+    ["/code/watched-gone"],
+    probe,
+    watched,
+    tombstoned,
+    streak,
+  );
+  expect(pass1).toEqual([]);
+  expect(tombstoned.has("/code/watched-gone")).toBe(false);
+  expect(streak.get("/code/watched-gone")).toBe(1);
+
+  // Second consecutive vanished pass: retire (exactly one tombstone entry), and
+  // the debounce counter is cleared as the retire fires.
+  const pass2 = selectVanishedRoots(
+    ["/code/watched-gone"],
+    probe,
+    watched,
+    tombstoned,
+    streak,
+  );
+  expect(pass2).toEqual(["/code/watched-gone"]);
+  expect(tombstoned.has("/code/watched-gone")).toBe(true);
+  expect(streak.has("/code/watched-gone")).toBe(false);
+});
+
+test("selectVanishedRoots: a single-pass vanish on a watched root does not retire (debounce)", () => {
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
   const drop = selectVanishedRoots(
     ["/code/watched-gone"],
-    () => false,
+    fixedProbe({ "/code/watched-gone": "vanished" }),
     new Set(["/code/watched-gone"]),
     tombstoned,
+    streak,
   );
   expect(drop).toEqual([]);
   expect(tombstoned.has("/code/watched-gone")).toBe(false);
 });
 
-test("selectVanishedRoots: an already-tombstoned missing root is not re-emitted", () => {
+test("selectVanishedRoots: a non-ENOENT probe error never retires a watched lane (fail closed), across repeated passes", () => {
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  const watched = new Set(["/code/watched-eio"]);
+  const probe = fixedProbe({ "/code/watched-eio": "error" });
+  for (let i = 0; i < 3; i++) {
+    const drop = selectVanishedRoots(
+      ["/code/watched-eio"],
+      probe,
+      watched,
+      tombstoned,
+      streak,
+    );
+    expect(drop).toEqual([]);
+  }
+  expect(tombstoned.has("/code/watched-eio")).toBe(false);
+  expect(streak.has("/code/watched-eio")).toBe(false);
+});
+
+test("selectVanishedRoots: an inconclusive error between two vanishes breaks the consecutive streak", () => {
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  const watched = new Set(["/code/blippy"]);
+  const vanished = fixedProbe({ "/code/blippy": "vanished" });
+  const errored = fixedProbe({ "/code/blippy": "error" });
+  const pass = (probe: (d: string) => RootPresence) =>
+    selectVanishedRoots(["/code/blippy"], probe, watched, tombstoned, streak);
+
+  expect(pass(vanished)).toEqual([]); // streak 1
+  expect(pass(errored)).toEqual([]); // reset
+  expect(streak.has("/code/blippy")).toBe(false);
+  expect(pass(vanished)).toEqual([]); // streak 1 again
+  expect(pass(vanished)).toEqual(["/code/blippy"]); // 2 consecutive → retire
+});
+
+test("selectVanishedRoots: the immediate (nudge) sweep retires a watched vanished root in one pass", () => {
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  const drop = selectVanishedRoots(
+    ["/code/torn-down"],
+    fixedProbe({ "/code/torn-down": "vanished" }),
+    new Set(["/code/torn-down"]),
+    tombstoned,
+    streak,
+    /* immediate */ true,
+  );
+  expect(drop).toEqual(["/code/torn-down"]);
+  expect(tombstoned.has("/code/torn-down")).toBe(true);
+});
+
+test("selectVanishedRoots: the immediate sweep double-probes — a blip healed between the two probes keeps the lane", () => {
+  // The immediate sweep confirms with a SECOND probe in the same pass; if the dir
+  // reappears between them, the lane is kept (the ENOENT gate re-verifies).
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  let calls = 0;
+  const flapping = (): RootPresence => (++calls === 1 ? "vanished" : "present");
+  const drop = selectVanishedRoots(
+    ["/code/flap"],
+    flapping,
+    new Set(["/code/flap"]),
+    tombstoned,
+    streak,
+    /* immediate */ true,
+  );
+  expect(calls).toBe(2); // the second confirming probe ran
+  expect(drop).toEqual([]);
+  expect(tombstoned.has("/code/flap")).toBe(false);
+});
+
+test("selectVanishedRoots: an already-tombstoned vanished root is not re-emitted", () => {
   const tombstoned = new Set<string>(["/code/gone"]);
   const drop = selectVanishedRoots(
     ["/code/gone"],
-    () => false,
+    fixedProbe({ "/code/gone": "vanished" }),
     new Set(),
     tombstoned,
+    new Map(),
   );
   expect(drop).toEqual([]);
+});
+
+test("selectVanishedRoots: boot shape (empty watched set) drops every vanished root single-pass — byte-identical to today", () => {
+  // At boot currentlyWatched is empty, so EVERY row is an unwatched root and
+  // retires on the first not-present pass, exactly as the prior existsSync sweep.
+  const tombstoned = new Set<string>();
+  const streak = new Map<string, number>();
+  const drop = selectVanishedRoots(
+    ["/a/gone", "/b/here", "/c/gone"],
+    fixedProbe({
+      "/a/gone": "vanished",
+      "/b/here": "present",
+      "/c/gone": "vanished",
+    }),
+    new Set(),
+    tombstoned,
+    streak,
+  );
+  expect(drop).toEqual(["/a/gone", "/c/gone"]);
+  // Boot debounce is inert (no watched roots), so the streak map stays empty.
+  expect(streak.size).toBe(0);
+});
+
+test("selectVanishedRoots: a round-tripped tombstone (row gone from git_status) is pruned so the bookkeeping stays bounded", () => {
+  // /old was tombstoned last sweep; its DELETE has since round-tripped so it no
+  // longer appears among the live git_status rows. Its dedupe + debounce entries
+  // are stale — prune them so both structures stay bounded by the live row count.
+  const tombstoned = new Set<string>(["/old", "/present"]);
+  const streak = new Map<string, number>([
+    ["/old", 1],
+    ["/present", 1],
+  ]);
+  const drop = selectVanishedRoots(
+    ["/present"],
+    fixedProbe({ "/present": "vanished" }),
+    new Set(["/present"]),
+    tombstoned,
+    streak,
+  );
+  expect(drop).toEqual([]); // /present is already-tombstoned → not re-emitted
+  expect(tombstoned.has("/old")).toBe(false); // pruned (round-tripped)
+  expect(streak.has("/old")).toBe(false); // pruned (round-tripped)
+});
+
+// ---------------------------------------------------------------------------
+// probeRootPresence — the real stat probe. present ⟺ existsSync===true;
+// ENOENT/ENOTDIR ⟺ "vanished"; any other errno ⟺ "error" (fail-closed).
+// ---------------------------------------------------------------------------
+
+test("probeRootPresence: an existing dir is 'present', a missing one 'vanished', a non-dir parent 'vanished'", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-probe-"));
+  try {
+    expect(probeRootPresence(root)).toBe("present");
+    expect(probeRootPresence(join(root, "nope"))).toBe("vanished");
+    // A path whose PARENT is a file → ENOTDIR, still classified vanished.
+    const file = join(root, "afile");
+    writeFileSync(file, "x");
+    expect(probeRootPresence(join(file, "child"))).toBe("vanished");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

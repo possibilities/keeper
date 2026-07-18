@@ -50,6 +50,7 @@ import type {
   LaneMergedMessage,
   ResolverOutcome,
   SharedWedgeDistressMessage,
+  VanishedSweepNudgeMessage,
   Verb,
   WorktreeRepoStatusMessage,
 } from "./autopilot-worker";
@@ -224,6 +225,7 @@ import type {
   AddDiscoveryRootMessage,
   GitWorkerData,
   GitWorkerMessage,
+  NudgeVanishedSweepMessage,
 } from "./git-worker";
 import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
 import { handoffSlugExists } from "./handoff-slug";
@@ -10968,6 +10970,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | WorktreeRepoStatusMessage
         | LaneMergedMessage
         | SharedWedgeDistressMessage
+        | VanishedSweepNudgeMessage
         | BackstopMessage
         | undefined
       >,
@@ -10978,6 +10981,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // Main is the SOLE sidecar writer — append the line. NOT an event fold
         // (a pure consumer-side side-file, never read by the reducer).
         handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind === "nudge-vanished-sweep") {
+        // Teardown nudge relay (mirrors the plan-worker nudge-discovery relay):
+        // the autopilot-worker's lane teardown completed removals; forward to the
+        // git-worker so it runs an IMMEDIATE vanished sweep instead of waiting for
+        // the next full sweep. NOT an event — it drives a producer worker. The
+        // forward-ref null-guards the boot window before the git worker exists.
+        gitWorkerRef?.postMessage({
+          type: "nudge-vanished-sweep",
+        } satisfies NudgeVanishedSweepMessage);
         return;
       }
       if (msg.kind === "dispatch-failed") {

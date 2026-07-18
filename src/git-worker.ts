@@ -32,7 +32,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
@@ -88,8 +88,24 @@ export interface AddDiscoveryRootMessage {
   root: string;
 }
 
+/**
+ * Teardown nudge (main → git-worker): a lane worktree's removals COMPLETED
+ * (autopilot-worker finalize / recover pass-3), so run an IMMEDIATE
+ * vanished-worktree sweep instead of waiting for the next full sweep. Payload-free
+ * — the sweep keys on the canonical `git_status.project_dir` rows, and the
+ * ENOENT/ENOTDIR gate re-verifies each candidate at retire time, so no path
+ * canonicalization can no-op the retire. Idempotent: coalesces into any in-flight
+ * reconcile via the single-flight guard.
+ */
+export interface NudgeVanishedSweepMessage {
+  type: "nudge-vanished-sweep";
+}
+
 /** Every shape main sends to the git-worker. */
-export type GitWorkerInbound = ShutdownMessage | AddDiscoveryRootMessage;
+export type GitWorkerInbound =
+  | ShutdownMessage
+  | AddDiscoveryRootMessage
+  | NudgeVanishedSweepMessage;
 
 export interface GitFileStatus {
   path: string;
@@ -1360,33 +1376,114 @@ export function deriveChangeToRescueMs(
 }
 
 /**
+ * The presence verdict for a `git_status` project_dir, from a stat probe (never
+ * bare `existsSync`): `present` (stat succeeded — exactly `existsSync === true`),
+ * `vanished` (ENOENT/ENOTDIR — the dir is PROVABLY gone), or `error` (any other
+ * stat failure — inconclusive). A currently-watched lane retires ONLY on
+ * `vanished`; `error` fails closed so a stat blip never retires a live lane.
+ */
+export type RootPresence = "present" | "vanished" | "error";
+
+/**
+ * Stat probe for {@link selectVanishedRoots}. Follows symlinks (matching the
+ * prior `existsSync`) so a `present` verdict is exactly `existsSync === true`.
+ * ONLY ENOENT/ENOTDIR count as `vanished`; every other errno is `error`
+ * (fail-closed). Mirrors {@link normalizeLanePathState}'s absence discriminator.
+ */
+export function probeRootPresence(dir: string): RootPresence {
+  try {
+    statSync(dir);
+    return "present";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "vanished" : "error";
+  }
+}
+
+/**
  * Select `git_status` rows to tombstone because their worktree vanished from
  * disk. Such a row is unreachable by {@link decideReconcileTransitions} (a
  * missing dir fails cwd→toplevel resolution, so the root never re-enters the
- * watched set), so it would strand forever after a daemon restart. The
- * `existsSync` probe runs in the producer (never inside a fold), allowed by the
- * event-sourcing invariants; the reducer's idempotent DELETE reconciles.
+ * watched set) AND, for an always-watched `.keeper` lane, by the dwell drop, so
+ * it would strand forever as phantom whole-tree orphan dirt. The stat `probe`
+ * runs in the producer (never inside a fold), allowed by the event-sourcing
+ * invariants; the reducer's idempotent DELETE reconciles.
  *
- * The `exists` probe is injected so the caller owns the one fs read per row.
- * - Skips `currentlyWatched` roots — the normal dwell path drops those;
- *   emitting here too would double-fire.
+ * The `probe` is injected so the caller owns the one fs read per row.
+ * - An UNWATCHED root retires on any not-`present` verdict — today's single-pass
+ *   behavior (byte-identical to the old `existsSync === false` drop). The boot
+ *   path, where the watched set is empty, is exactly this branch.
+ * - A currently-WATCHED lane retires ONLY on `vanished` (ENOENT/ENOTDIR), and
+ *   only once that verdict holds across two consecutive passes (`vanishStreak`
+ *   debounce) so a transient stat blip on a live lane never drops it. `immediate`
+ *   (the teardown nudge's sweep) confirms with a second probe in THIS pass instead
+ *   of waiting a second cadence — teardown declared the dir gone.
  * - Mutates `alreadyTombstoned`: adds each newly-dropped root (so it isn't
- *   re-emitted before its DELETE round-trips), clears a reappeared dir.
+ *   re-emitted before its DELETE round-trips), clears a reappeared dir, and prunes
+ *   round-tripped entries so the set stays bounded by the live row count.
+ * - Mutates `vanishStreak`: the per-watched-root consecutive-vanished counter,
+ *   reset on `present`/`error` and on retire, pruned on round-trip.
  */
 export function selectVanishedRoots(
   projectDirs: string[],
-  exists: (dir: string) => boolean,
+  probe: (dir: string) => RootPresence,
   currentlyWatched: Set<string>,
   alreadyTombstoned: Set<string>,
+  vanishStreak: Map<string, number>,
+  immediate = false,
 ): string[] {
+  const present = new Set(projectDirs);
+  // Prune round-tripped bookkeeping: a dir absent from the live git_status
+  // rows has had its tombstone DELETE land, so its dedupe + debounce entries are
+  // stale. Dropping them keeps both structures bounded by the live row count
+  // rather than by every root ever torn down.
+  for (const dir of [...alreadyTombstoned]) {
+    if (!present.has(dir)) alreadyTombstoned.delete(dir);
+  }
+  for (const dir of [...vanishStreak.keys()]) {
+    if (!present.has(dir)) vanishStreak.delete(dir);
+  }
+
   const drop: string[] = [];
   for (const dir of projectDirs) {
-    if (exists(dir)) {
+    const verdict = probe(dir);
+    if (verdict === "present") {
+      // Reappeared (or never gone): clear the dedupe + debounce so a future
+      // vanish can re-drop it.
       alreadyTombstoned.delete(dir);
+      vanishStreak.delete(dir);
       continue;
     }
-    if (currentlyWatched.has(dir)) continue;
     if (alreadyTombstoned.has(dir)) continue;
+
+    if (currentlyWatched.has(dir)) {
+      if (verdict !== "vanished") {
+        // Fail closed: an inconclusive stat error keeps a live lane and breaks
+        // the consecutive-vanished streak.
+        vanishStreak.delete(dir);
+        continue;
+      }
+      if (immediate) {
+        // The teardown nudge's immediate sweep satisfies the two-consecutive-pass
+        // debounce with a second confirming probe in this same pass; the ENOENT
+        // gate re-verifies regardless, so a blip that healed between probes stays.
+        if (probe(dir) !== "vanished") {
+          vanishStreak.delete(dir);
+          continue;
+        }
+      } else {
+        const streak = (vanishStreak.get(dir) ?? 0) + 1;
+        if (streak < 2) {
+          vanishStreak.set(dir, streak);
+          continue;
+        }
+      }
+      vanishStreak.delete(dir);
+      alreadyTombstoned.add(dir);
+      drop.push(dir);
+      continue;
+    }
+
     alreadyTombstoned.add(dir);
     drop.push(dir);
   }
@@ -2021,6 +2118,24 @@ function startWorker(): void {
    */
   const vanishedTombstoned = new Set<string>();
 
+  /**
+   * Per-currently-watched-root count of CONSECUTIVE vanished ({@link
+   * probeRootPresence} → `vanished`) sweep passes. A live lane retires only
+   * once this reaches two, so a transient stat blip on a watched `.keeper` lane
+   * never drops it. Reset the moment a probe reports `present` or `error`, and on
+   * retire; pruned once the row round-trips. Unwatched roots never touch it (their
+   * single-pass retire is unchanged), so the boot path is byte-identical.
+   */
+  const vanishStreak = new Map<string, number>();
+
+  /**
+   * Set by a teardown nudge ({@link NudgeVanishedSweepMessage}); consumed at the
+   * top of the next {@link reconcileRoots} to run an IMMEDIATE vanished sweep
+   * (satisfying the debounce with a second confirming probe) even when the
+   * throttled full sweep is not due. Cleared as it is consumed.
+   */
+  let vanishedSweepRequested = false;
+
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
   let gitPollTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -2442,23 +2557,29 @@ function startWorker(): void {
     }
   }
 
-  async function unsubscribeRoot(
+  // Post the retract tombstone — main lifts this into a synthetic GitRootDropped
+  // event whose reducer fold DELETEs the projection row. `attribution_event_id`
+  // is a clean-read watermark for a dwell drop, or `null` for a vanished root
+  // whose fs state cannot be observed. Skip during shutdown — main has already
+  // cleared its onmessage handler and a post would just race the worker's exit
+  // path. Split from {@link cleanupRootState} so the vanished-sweep retire path
+  // fires EXACTLY ONE tombstone per retire (the double-post hazard).
+  function postRootDropped(
     root: string,
-    attributionEventId: number,
-  ): Promise<void> {
-    // Tombstone first — main lifts this into a synthetic GitRootDropped event
-    // whose reducer fold DELETEs the projection row. Posting before teardown
-    // keeps the producer-only contract: the event log is the sole driver of
-    // git_status changes, so re-fold determinism extends to retractions.
-    // Skip during shutdown — main has already cleared its onmessage handler
-    // and posting would be a no-op that just races the worker's exit path.
-    if (!shuttingDown) {
-      port.postMessage({
-        kind: "git-root-dropped",
-        project_dir: root,
-        attribution_event_id: attributionEventId,
-      } satisfies GitRootDroppedMessage);
-    }
+    attributionEventId: number | null,
+  ): void {
+    if (shuttingDown) return;
+    port.postMessage({
+      kind: "git-root-dropped",
+      project_dir: root,
+      attribution_event_id: attributionEventId,
+    } satisfies GitRootDroppedMessage);
+  }
+
+  // Clean a root's subscription + scheduler + per-root caches so no poller leaks
+  // against a dropped/vanished dir. NO tombstone — the caller posts exactly one
+  // via {@link postRootDropped}.
+  function cleanupRootState(root: string): void {
     // fn-921 poll-only: a watched root is just a map entry now — no async
     // FSEvents teardown, only the delete.
     subscriptions.delete(root);
@@ -2475,6 +2596,19 @@ function startWorker(): void {
     // lockstep.
     lastHeadOidByRoot.delete(root);
     headEnumFailuresByRoot.delete(root);
+  }
+
+  async function unsubscribeRoot(
+    root: string,
+    attributionEventId: number,
+  ): Promise<void> {
+    // Tombstone FIRST (posting before teardown keeps the producer-only contract:
+    // the event log is the sole driver of git_status changes, so re-fold
+    // determinism extends to retractions), then clean the root state. The
+    // vanished-sweep retire path calls the same two primitives with a null
+    // attribution, so exactly one tombstone posts per retire on both paths.
+    postRootDropped(root, attributionEventId);
+    cleanupRootState(root);
   }
 
   async function reconcileRoots(): Promise<void> {
@@ -2510,28 +2644,38 @@ function startWorker(): void {
 
       const currentlyWatched = new Set(subscriptions.keys());
 
-      // Vanished-worktree prune. Gated to the full-sweep cadence (runs at boot
-      // — lastFullSweepMs === null — and every FULL_SWEEP_INTERVAL_MS), so a
-      // git_status row whose directory was deleted/moved sheds its ghost
-      // instead of lingering forever (decideReconcileTransitions can't reach an
-      // unwatched root). See selectVanishedRoots.
-      if (runFullSweep) {
+      // Vanished-worktree prune. Runs on the full-sweep cadence (at boot —
+      // lastFullSweepMs === null — and every FULL_SWEEP_INTERVAL_MS) AND on a
+      // teardown nudge's immediate pass, so a git_status row whose directory was
+      // deleted/moved sheds its ghost instead of lingering forever
+      // (decideReconcileTransitions can't reach an unwatched root, and the dwell
+      // path skips an always-watched `.keeper` lane). See selectVanishedRoots.
+      const immediateVanishedSweep = vanishedSweepRequested;
+      vanishedSweepRequested = false;
+      if (runFullSweep || immediateVanishedSweep) {
         const rows = db.query("SELECT project_dir FROM git_status").all() as {
           project_dir: string;
         }[];
         for (const dir of selectVanishedRoots(
           rows.map((r) => r.project_dir),
-          existsSync,
+          probeRootPresence,
           currentlyWatched,
           vanishedTombstoned,
+          vanishStreak,
+          immediateVanishedSweep,
         )) {
-          port.postMessage({
-            kind: "git-root-dropped",
-            project_dir: dir,
-            // A vanished root has no status observation to bind a newer event
-            // watermark. The reducer preserves its prior per-root floor.
-            attribution_event_id: null,
-          } satisfies GitRootDroppedMessage);
+          // Retiring a currently-WATCHED lane also cleans its subscription +
+          // scheduler state so no poller leaks against the dead dir; keep
+          // `currentlyWatched` in lockstep so the reconcile below never re-drops
+          // (double-tombstones) an already-swept root. An unwatched root has no
+          // such state — just post the single tombstone. A vanished root has no
+          // status observation to bind a newer watermark, so `null` attribution:
+          // the reducer preserves its prior per-root floor.
+          if (currentlyWatched.has(dir)) {
+            cleanupRootState(dir);
+            currentlyWatched.delete(dir);
+          }
+          postRootDropped(dir, null);
         }
       }
 
@@ -2615,6 +2759,17 @@ function startWorker(): void {
       // single-flighted). A nudge during shutdown is a tolerated no-op.
       if (shuttingDown) return;
       extraCandidateRoots.add(msg.root);
+      void reconcileRoots();
+      return;
+    }
+    if (msg.type === "nudge-vanished-sweep") {
+      // Teardown nudge: a lane worktree's removals completed, so run an IMMEDIATE
+      // vanished sweep instead of waiting for the next full sweep. The flag is
+      // consumed at the top of reconcileRoots; the single-flight guard coalesces a
+      // nudge landing mid-reconcile (it sets reconcilePending, never re-enters
+      // concurrently). A nudge during shutdown is a tolerated no-op.
+      if (shuttingDown) return;
+      vanishedSweepRequested = true;
       void reconcileRoots();
       return;
     }
