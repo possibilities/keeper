@@ -201,6 +201,7 @@ import {
   inventoryLaunchCwdWorkPluginManifests,
   physicalPluginDir,
   providerRejectReason,
+  providerUnlaunchableReason,
   resolveWorkerCell,
   selectedWorkerCellFreshness,
   verifyWorkerCellCohort,
@@ -4686,6 +4687,13 @@ export async function stampEpicCloseRecovery(
   }
 }
 
+function providerCellContext(plan: PlannedLaunch): string {
+  const contract = plan.providerLaunchContract;
+  return contract === undefined
+    ? ""
+    : ` (worker_provider=${contract.provider}, effective cell ${contract.model}/${contract.tier})`;
+}
+
 export async function runReconcileCycle(
   decision: ReconcileDecision,
   state: ReconcileState,
@@ -4941,6 +4949,9 @@ export async function runReconcileCycle(
         ...(plan.providerReject !== undefined
           ? { providerReject: plan.providerReject }
           : {}),
+        ...(plan.providerLaunchContract !== undefined
+          ? { providerLaunchContract: plan.providerLaunchContract }
+          : {}),
       },
       {
         dirExists,
@@ -4972,10 +4983,17 @@ export async function runReconcileCycle(
         case "out-of-matrix":
           reason = `worker-cell-invalid: ${cell.message}`;
           break;
+        // (2b) the effective cell's route/driver/marker cannot jointly satisfy
+        //      the active provider constraint. This producer-only admission gate
+        //      catches a valid-looking cell path before its wrapper guard can park
+        //      a native worker, and names the constraint + effective pair.
+        case "provider-unlaunchable":
+          reason = providerUnlaunchableReason(cell);
+          break;
         // (3) selected manifest absent: compile the complete owned cohort.
         case "missing":
           reason =
-            `worker-cell-missing: ${cell.pluginDir} — regenerate via ` +
+            `worker-cell-missing: ${cell.pluginDir}${providerCellContext(plan)} — regenerate via ` +
             `'${WORKER_CELL_COMPILE_COMMAND}' (without the cell manifest ` +
             `claude --plugin-dir falls back to the dir basename and '/plan:work' ` +
             `cannot resolve 'work:worker')`;
@@ -4983,7 +5001,7 @@ export async function runReconcileCycle(
         // (4) verifier failure or selected dir absent from its exact output set.
         case "stale":
           reason =
-            `worker-cell-stale: ${cell.detail} — regenerate via ` +
+            `worker-cell-stale: ${cell.detail}${providerCellContext(plan)} — regenerate via ` +
             `'${WORKER_CELL_COMPILE_COMMAND}'`;
           break;
         // (5) any other preloaded `work` manifest, including a generated sibling.
@@ -9454,6 +9472,18 @@ export async function loadReconcileSnapshot(
       effortsByModel: matrix.effortsByModel,
       efforts: matrix.efforts,
       driverByModel: matrix.driverByModel,
+      routeByModel: new Map(
+        matrix.subagentModels.flatMap((model) => {
+          const driver = matrix.driverByModel.get(model) ?? "wrapped";
+          const hasRoute = matrix.providers.some(
+            (entry) =>
+              (driver === "native"
+                ? entry.name === "claude"
+                : entry.name !== "claude") && entry.models.has(model),
+          );
+          return hasRoute ? ([[model, driver]] as const) : [];
+        }),
+      ),
     };
   } catch (err) {
     if (err instanceof MatrixConfigError) {

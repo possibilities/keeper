@@ -2551,6 +2551,100 @@ test("reconcile: target-not-on-host refuses when the mapped cell is absent", () 
   });
 });
 
+test("runReconcileCycle: provider constraint plus native-only effective cell mints sticky and never launches", async () => {
+  const { deps, log } = makeFakeDeps();
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const nativeOnlyTarget = {
+    ...PROVIDER_MATRIX,
+    driverByModel: new Map<string, "native" | "wrapped">([
+      ["opus", "native"],
+      ["sonnet", "native"],
+      ["gpt-5.6-sol", "native"],
+    ]),
+    routeByModel: new Map<string, "native" | "wrapped">([
+      ["opus", "native"],
+      ["sonnet", "native"],
+      ["gpt-5.6-sol", "native"],
+    ]),
+  };
+  const snap = makeSnapshot({
+    epics: [epic],
+    hostMatrix: nativeOnlyTarget,
+    workerProvider: "gpt",
+    providerEquivalence: PROVIDER_MAP_OK,
+  });
+  const state = makeState();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.launches[0]?.providerLaunchContract).toEqual({
+    provider: "gpt",
+    model: "gpt-5.6-sol",
+    tier: "max",
+    driver: "native",
+    route: "native",
+    wrappedCell: null,
+  });
+
+  await runReconcileCycle(
+    decision,
+    state,
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(state.inFlight.size).toBe(0);
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]?.reason).toBe(
+    "worker-provider-cell-unlaunchable: worker_provider=gpt cannot launch effective cell gpt-5.6-sol/max — constraint requires wrapped, but driver=native, route=native, wrapped_marker=none; refusing to dispatch before spawn; fix the provider constraint, equivalence map, host matrix route, or compiled cell, then retry",
+  );
+});
+
+test("runReconcileCycle: constrained wrapped cell with missing manifest names constraint and pair", async () => {
+  const { deps, log } = makeFakeDeps({
+    dirExists: (path) => path === "/repo",
+  });
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],
+  });
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      hostMatrix: {
+        ...PROVIDER_MATRIX,
+        routeByModel: new Map<string, "native" | "wrapped">([
+          ["opus", "native"],
+          ["sonnet", "native"],
+          ["gpt-5.6-sol", "wrapped"],
+        ]),
+      },
+      workerProvider: "gpt",
+      providerEquivalence: PROVIDER_MAP_OK,
+    }),
+    makeState(),
+    0,
+  );
+
+  await runReconcileCycle(
+    decision,
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches).toEqual([]);
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]?.reason).toContain("worker-cell-missing:");
+  expect(log.emissions[0]?.reason).toContain(
+    "worker_provider=gpt, effective cell gpt-5.6-sol/max",
+  );
+});
+
 test("reconcile: a malformed map refuses per-cell (map-malformed, never a crash)", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1", tier: "max", model: "opus" })],

@@ -38,6 +38,7 @@ import {
   inventoryConfiguredWorkPluginManifests,
   inventoryLaunchCwdWorkPluginManifests,
   inventoryWorkPluginManifests,
+  providerUnlaunchableReason,
   resolveWorkerCell as resolveWorkerCellBase,
   selectedWorkerCellFreshness,
   verifyWorkerCellCohort,
@@ -282,6 +283,102 @@ test("resolveWorkerCell: provider-reject ranks after bad-matrix and before out-o
       neverProbe,
     ),
   ).toMatchObject({ kind: "bad-matrix" });
+});
+
+test("resolveWorkerCell: provider launch contract accepts current native and wrapped cell classes", () => {
+  const cases: WorkerCellCompose[] = [
+    {
+      pluginDir: "/abs/opus-max",
+      providerLaunchContract: {
+        provider: "claude",
+        model: "opus",
+        tier: "max",
+        driver: "native",
+        route: "native",
+        wrappedCell: null,
+      },
+    },
+    {
+      pluginDir: "/abs/gpt-5.6-sol-max",
+      providerLaunchContract: {
+        provider: "gpt",
+        model: "gpt-5.6-sol",
+        tier: "max",
+        driver: "wrapped",
+        route: "wrapped",
+        wrappedCell: "gpt-5.6-sol::max",
+      },
+    },
+  ];
+  for (const compose of cases) {
+    expect(
+      resolveWorkerCell(compose, {
+        dirExists: () => true,
+        probeShadow: () => null,
+      }),
+    ).toEqual({ ok: true, pluginDir: compose.pluginDir });
+  }
+});
+
+test("resolveWorkerCell: provider constraint rejects a native-only effective cell before filesystem probes", () => {
+  const cell = resolveWorkerCell(
+    {
+      pluginDir: "/abs/opus-xhigh",
+      providerLaunchContract: {
+        provider: "gpt",
+        model: "opus",
+        tier: "xhigh",
+        driver: "native",
+        route: "native",
+        wrappedCell: null,
+      },
+    },
+    neverProbe,
+  );
+  expect(cell).toEqual({
+    ok: false,
+    kind: "provider-unlaunchable",
+    provider: "gpt",
+    model: "opus",
+    tier: "xhigh",
+    driver: "native",
+    route: "native",
+    wrappedCell: null,
+    constraintDriver: "wrapped",
+  });
+  if (!cell.ok && cell.kind === "provider-unlaunchable") {
+    expect(providerUnlaunchableReason(cell)).toBe(
+      "worker-provider-cell-unlaunchable: worker_provider=gpt cannot launch effective cell opus/xhigh — constraint requires wrapped, but driver=native, route=native, wrapped_marker=none; refusing to dispatch before spawn; fix the provider constraint, equivalence map, host matrix route, or compiled cell, then retry",
+    );
+  }
+});
+
+test("resolveWorkerCell: wrapped marker cannot bless a route-less or native route", () => {
+  for (const route of [null, "native"] as const) {
+    expect(
+      resolveWorkerCell(
+        {
+          pluginDir: "/abs/gpt-5.6-sol-max",
+          providerLaunchContract: {
+            provider: "gpt",
+            model: "gpt-5.6-sol",
+            tier: "max",
+            driver: "wrapped",
+            route,
+            wrappedCell: "gpt-5.6-sol::max",
+          },
+        },
+        neverProbe,
+      ),
+    ).toMatchObject({
+      ok: false,
+      kind: "provider-unlaunchable",
+      provider: "gpt",
+      model: "gpt-5.6-sol",
+      tier: "max",
+      route,
+    });
+  }
 });
 
 test("resolveWorkerCell: an absent cell manifest → missing, BEFORE the shadow probe", () => {
@@ -796,6 +893,8 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
         return "provider-reject";
       case "out-of-matrix":
         return "out-of-matrix";
+      case "provider-unlaunchable":
+        return "provider-unlaunchable";
       case "missing":
         return "missing";
       case "stale":
@@ -822,6 +921,17 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
         target: null,
       },
     }, // → provider-reject
+    {
+      pluginDir: "/c",
+      providerLaunchContract: {
+        provider: "gpt",
+        model: "opus",
+        tier: "high",
+        driver: "native",
+        route: "native",
+        wrappedCell: null,
+      },
+    }, // → provider-unlaunchable
   ];
   for (const c of cases) {
     kinds.add(
@@ -867,6 +977,7 @@ test("resolveWorkerCell result is a closed union an assertNever switch can exhau
       "out-of-matrix",
       "bad-matrix",
       "provider-reject",
+      "provider-unlaunchable",
       "missing",
       "stale",
       "shadowed",
