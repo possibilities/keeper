@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Contract-touching change to the status JSON envelope and possible minimal readiness verdict-shape extension earns xhigh, while ADR authoring, deprecation-model rationale, user-facing freshness wording, and mirroring the existing board pill taxonomy are judgment- and taste-heavy but bounded with no nameable intelligence-bound reason for opus, so sonnet fits.",
+      "task_id": "fn-1331-status-stale-running-taxonomy.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T10:14:07.317000Z",
+  "epic_id": "fn-1331-status-stale-running-taxonomy",
+  "input_hash": "45c6ac4ae619bd9ed0de8047c2067732cd7b6b6ac22419da4ca420feb38d948f",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1170648138,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1331-status-stale-running-taxonomy.1\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"Contract-touching change to the status JSON envelope and possible minimal readiness verdict-shape extension earns xhigh, while ADR authoring, deprecation-model rationale, user-facing freshness wording, and mirroring the existing board pill taxonomy are judgment- and taste-heavy but bounded with no nameable intelligence-bound reason for opus, so sonnet fits.\"}]}\n"
+}
