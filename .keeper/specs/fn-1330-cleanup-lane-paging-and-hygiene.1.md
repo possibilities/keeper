@@ -55,5 +55,5 @@ present-but-unenumerable lane retains its row.
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Injected a producer-side presence seam distinguishing confirmed-absent (ENOENT/ENOTDIR) from unknown lane probes, so a worktree-lane-backup-failed distress row now clears on positive absence evidence even when repo enumeration is incomplete, while still retaining rows for present or unenumerable lanes; added deterministic in-process coverage and the docs/problem-codes.md + ADR 0053 amendment.
 ## Evidence
