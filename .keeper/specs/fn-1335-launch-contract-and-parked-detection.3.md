@@ -56,5 +56,5 @@ never-bound counting never double-fires alongside the suppressing sticky.
 - [ ] Named test gates for the touched suites pass
 
 ## Done summary
-
+Added parked-launch distress detection: the producer freezes launch window/pane identity onto the Dispatched event, the daemon sweep mints a self-clearing sticky at a 90s grace (between the 60s confirm ceiling and 120s TTL) naming the window, level-clears on a late bind, and never double-counts with the never-bound breaker. docs/problem-codes.md documents the new parked-launch code.
 ## Evidence
