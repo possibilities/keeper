@@ -7,7 +7,7 @@
     "fn-1331-status-stale-running-taxonomy"
   ],
   "id": "fn-1333-fix-at-rest-flags-for-stale-running",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T11:59:12.404000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T11:59:12.089000Z"
+  "updated_at": "2026-07-18T11:59:12.404000Z"
 }
