@@ -32,5 +32,5 @@ must still carry whatever token the capture side matches on.
       capture boundary.
 
 ## Done summary
-
+Keyed the live-Partner capture boundary off the fixed-length Bus artifact id instead of the variable-length resolved artifact path, so a deep artifact root or long sender label can no longer push the notification line over NOTIFY_LINE_BUDGET and silently drop the boundary token; default-config behavior is unchanged, and a new regression test covers the over-budget notification + capture-boundary path.
 ## Evidence
