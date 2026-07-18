@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-07-18T11:59:12.274000Z",
   "created_at": "2026-07-18T10:12:24.162000Z",
   "depends_on_epics": [
     "fn-1326-repair-restart-observability",
@@ -10,10 +11,10 @@
   "last_validated_at": "2026-07-18T10:14:07.588000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Status stale-running taxonomy",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T10:14:07.588000Z"
+  "updated_at": "2026-07-18T11:59:12.274000Z"
 }
