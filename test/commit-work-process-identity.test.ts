@@ -4,6 +4,7 @@ import {
   type TerminationProcessObservation,
   terminateSessionProcess,
 } from "../cli/agent";
+import type { GitRunner } from "../src/commit-work/git-exec";
 import {
   invocationDescendsFrom,
   type ProcessIdentityReader,
@@ -11,6 +12,11 @@ import {
   parseLinuxProcessIdentity,
   recordedProcessIdentity,
 } from "../src/commit-work/process-identity";
+import {
+  discoverCommitWorkSurface,
+  type OwnershipClaim,
+  type ReleaseRecord,
+} from "../src/commit-work/surface";
 
 describe("commit-work invocation process identity", () => {
   test("parses Linux ppid and recycle-safe start time around a hostile comm", () => {
@@ -133,6 +139,82 @@ describe("commit-work invocation process identity", () => {
         read: () => ({ ppid: 42, startTime: "x" }),
       }),
     ).toBe(false);
+  });
+});
+
+describe("cooperative release binds to recorded process identity", () => {
+  const PEER = "11111111-1111-4111-8111-111111111111";
+  const HOLDER = "22222222-2222-4222-8222-222222222222";
+
+  const statusGit: GitRunner = async (args) =>
+    args[0] === "status"
+      ? { code: 0, stdout: "? shared/a.txt\0", stderr: "" }
+      : { code: 1, stdout: "", stderr: "" };
+
+  const holderClaim: OwnershipClaim = {
+    path: "shared/a.txt",
+    sessionId: HOLDER,
+    liveness: "live",
+    state: "working",
+    source: "tool",
+    pid: 4242,
+    startTime: "linux:100",
+  };
+
+  async function adoptedUnder(record: ReleaseRecord): Promise<string[]> {
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: PEER,
+      adoptedPaths: ["shared/a.txt"],
+      git: statusGit,
+      deps: {
+        readClaims: () => [holderClaim],
+        classifyClaim: (claim) => claim.liveness,
+        readReleases: () => [record],
+      },
+    });
+    return surface.adopted;
+  }
+
+  test("a release matching the exact pid and start-time relaxes the claim", async () => {
+    expect(
+      await adoptedUnder({
+        sessionId: HOLDER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/repo",
+        paths: new Set(["shared/a.txt"]),
+      }),
+    ).toEqual(["shared/a.txt"]);
+  });
+
+  test("a recycled pid or mismatched start-time never relaxes the claim", async () => {
+    for (const [pid, startTime] of [
+      [9999, "linux:100"],
+      [4242, "linux:999"],
+    ] as const) {
+      expect(
+        await adoptedUnder({
+          sessionId: HOLDER,
+          pid,
+          startTime,
+          worktree: "/repo",
+          paths: new Set(["shared/a.txt"]),
+        }),
+      ).toEqual([]);
+    }
+  });
+
+  test("a peer cannot release the holder's claim by naming the holder's path", async () => {
+    expect(
+      await adoptedUnder({
+        sessionId: PEER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/repo",
+        paths: new Set(["shared/a.txt"]),
+      }),
+    ).toEqual([]);
   });
 });
 

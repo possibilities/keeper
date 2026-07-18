@@ -119,6 +119,62 @@ describe("Pi keeper_commit_work tool", () => {
     expect(text).not.toContain("identities");
   });
 
+  test("ownership-conflict request-release pointer survives the compact Pi envelope", async () => {
+    const run: CommitWorkExecFile = (_file, _args, _options, callback) => {
+      callback(
+        { code: 1 },
+        `${JSON.stringify({
+          schema_version: 1,
+          kind: "commit-work-result",
+          outcome: "ownership_conflict",
+          success: false,
+          identity: ENV.KEEPER_JOB_ID,
+          request_release: {
+            schema_version: 1,
+            kind: "commit-work-request-release",
+            requester_session_id: ENV.KEEPER_JOB_ID,
+            requester_protocol:
+              "send-only notice, wait the grace window, re-run, then BLOCKED with request evidence; never signal a live peer",
+            claimant_total: 1,
+            claimants_truncated: false,
+            claimants: [
+              {
+                claimant_session_id: "22222222-2222-4222-8222-222222222222",
+                paths: ["shared/a.txt"],
+                path_total: 1,
+                paths_truncated: false,
+                release_argv: [
+                  "keeper",
+                  "session",
+                  "release",
+                  "--session-id",
+                  "22222222-2222-4222-8222-222222222222",
+                  "--",
+                  "shared/a.txt",
+                ],
+                release_invocation:
+                  "keeper session release --session-id 22222222-2222-4222-8222-222222222222 -- shared/a.txt",
+              },
+            ],
+          },
+        })}\n`,
+        "",
+      );
+    };
+    const result = await executePiCommitWork(
+      { message: "feat(pi): blocked" },
+      { cwd: "/work/repo" },
+      undefined,
+      ENV,
+      run,
+    );
+    expect(result.details.outcome).toBe("ownership_conflict");
+    const text = result.content[0]?.text ?? "";
+    expect(text).toContain('"request_release"');
+    expect(text).toContain("22222222-2222-4222-8222-222222222222");
+    expect(text).toContain("shared/a.txt");
+  });
+
   test("an explicit unknown push state remains null", async () => {
     const run: CommitWorkExecFile = (_file, _args, _options, callback) => {
       callback(

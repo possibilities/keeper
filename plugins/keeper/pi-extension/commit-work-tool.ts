@@ -244,6 +244,7 @@ function compactEnvelope(parsed: Record<string, unknown>): string {
     error: compactValue(parsed.error),
     hint: compactValue(parsed.hint),
     reason: compactValue(parsed.reason),
+    request_release: compactValue(parsed.request_release),
     stderr_sample: compactValue(parsed.stderr_sample),
   };
   const rendered = JSON.stringify(compact);

@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   constants,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -33,6 +34,9 @@ import {
   trustedCommitWorkAuthority,
   trustedCommitWorkIdentity,
 } from "../cli/commit-work";
+import type { EnvelopeSink } from "../cli/envelope";
+import { type ReleaseDeps, releaseMain } from "../cli/session";
+import type { GitRunner } from "../src/commit-work/git-exec";
 import { GIT_SPAWN_TIMEOUT_CODE } from "../src/commit-work/git-exec";
 import { LintFailure } from "../src/commit-work/lint-matrix";
 import { MAX_COMMIT_MESSAGE_BYTES } from "../src/commit-work/private-index";
@@ -48,6 +52,13 @@ import {
   sharedCheckoutJam,
   sharedCheckoutJamActive,
 } from "../src/commit-work/repo-state";
+import {
+  discoverCommitWorkSurface,
+  type OwnershipClaim,
+  type ReleaseRecord,
+  readReleaseRecords,
+  writeReleaseRecord,
+} from "../src/commit-work/surface";
 import {
   SHARED_DESYNC_DISTRESS_ID_PREFIX,
   SHARED_DIRTY_DISTRESS_ID_PREFIX,
@@ -2631,5 +2642,494 @@ describe("commit-work: mass_reversion tripwire", () => {
     );
     // Refused on ls-files alone — no cat-file probe needed.
     expect(calls.some((c) => argvStartsWith(c.args, "cat-file"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cooperative claim release rail (ADR 0078)
+// ---------------------------------------------------------------------------
+
+const PEER = "11111111-1111-4111-8111-111111111111";
+const HOLDER = "22222222-2222-4222-8222-222222222222";
+
+/** A porcelain-v2 status runner listing exactly the given untracked paths. */
+function statusGit(paths: string[]): GitRunner {
+  return async (args) => {
+    if (args[0] === "status") {
+      return {
+        code: 0,
+        stdout: paths.map((path) => `? ${path}\0`).join(""),
+        stderr: "",
+      };
+    }
+    return { code: 1, stdout: "", stderr: "" };
+  };
+}
+
+function liveHolderClaim(path: string): OwnershipClaim {
+  return {
+    path,
+    sessionId: HOLDER,
+    liveness: "live",
+    state: "working",
+    source: "tool",
+    pid: 4242,
+    startTime: "linux:100",
+  };
+}
+
+function releaseOf(paths: string[]): ReleaseRecord {
+  return {
+    sessionId: HOLDER,
+    pid: 4242,
+    startTime: "linux:100",
+    worktree: "/repo",
+    paths: new Set(paths),
+  };
+}
+
+function firstReleaseClaimant(envelope: unknown): Record<string, unknown> {
+  const request = (envelope as { request_release: { claimants: unknown[] } })
+    .request_release;
+  return request.claimants[0] as Record<string, unknown>;
+}
+
+describe("commit-work: cooperative claim release", () => {
+  test("a released path becomes adoptable while unreleased paths stay protected", async () => {
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: PEER,
+      adoptedPaths: ["shared/a.txt", "shared/b.txt"],
+      git: statusGit(["shared/a.txt", "shared/b.txt"]),
+      deps: {
+        readClaims: () => [
+          liveHolderClaim("shared/a.txt"),
+          liveHolderClaim("shared/b.txt"),
+        ],
+        classifyClaim: (claim) => claim.liveness,
+        readReleases: () => [releaseOf(["shared/a.txt"])],
+      },
+    });
+    // The released path is voluntary-terminal (adoptable); the unreleased one
+    // stays a live foreign conflict.
+    expect(surface.adopted).toEqual(["shared/a.txt"]);
+    expect(surface.summary.terminal_foreign_adoptable.sample).toContain(
+      "shared/a.txt",
+    );
+    const conflict = surface.rejections.find((r) => r.path === "shared/b.txt");
+    expect(conflict?.code).toBe("ownership_conflict");
+    expect(conflict?.conflicting_sessions).toEqual([HOLDER]);
+  });
+
+  test("surface ownership-conflict rejections carry a request-release pointer", async () => {
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: PEER,
+      adoptedPaths: ["shared/a.txt"],
+      git: statusGit(["shared/a.txt"]),
+      deps: {
+        readClaims: () => [liveHolderClaim("shared/a.txt")],
+        classifyClaim: (claim) => claim.liveness,
+        readReleases: () => [],
+      },
+    });
+    expect(surface.adopted).toEqual([]);
+    const rejection = surface.rejections[0];
+    expect(rejection?.code).toBe("ownership_conflict");
+    expect(rejection?.request_release?.requester_session_id).toBe(PEER);
+    expect(rejection?.request_release?.claimants[0]).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+      release_argv: [
+        "keeper",
+        "session",
+        "release",
+        "--session-id",
+        HOLDER,
+        "--",
+        "shared/a.txt",
+      ],
+    });
+    expect(rejection?.request_release?.requester_protocol).toContain(
+      "send-only",
+    );
+    expect(rejection?.request_release?.requester_protocol).toContain(
+      "never signal a live peer",
+    );
+  });
+
+  test("commit-work adoption refusal carries the claimant pointer and bounded paths", async () => {
+    const paths = Array.from(
+      { length: 25 },
+      (_, index) => `shared/${index.toString().padStart(2, "0")}.txt`,
+    );
+    const { d } = deps({
+      files: paths,
+      rules: successRules({ stagedNames: paths }),
+    });
+    const { code, stdout } = await runForTest(
+      [
+        "feat: adopt blocked",
+        "--session-id",
+        "s1",
+        ...paths.flatMap((path) => ["--adopt", path]),
+      ],
+      {
+        ...d,
+        readClaims: () => paths.map((path) => liveHolderClaim(path)),
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env.outcome).toBe("ownership_conflict");
+    const claimant = firstReleaseClaimant(env);
+    expect(claimant.claimant_session_id).toBe(HOLDER);
+    expect(claimant.path_total).toBe(25);
+    expect(claimant.paths as string[]).toHaveLength(20);
+    expect(claimant.paths_truncated).toBe(true);
+    expect(String(env.request_release.requester_protocol)).toContain(
+      "BLOCKED with the request evidence",
+    );
+  });
+
+  test("durable claimant decline annotates the pointer with backoff guidance", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-decline-"));
+    try {
+      writeFileSync(
+        join(dir, `${HOLDER}.json`),
+        JSON.stringify({
+          schema: 1,
+          session_id: HOLDER,
+          pid: 4242,
+          start_time: "linux:100",
+          worktree: "/repo",
+          paths: [],
+          declines: [
+            {
+              requester_session_id: PEER,
+              paths: ["shared/a.txt"],
+              evidence: "bus-request-1",
+              reason: "still in use",
+            },
+          ],
+        }),
+      );
+      const records = readReleaseRecords(dir, "/repo");
+      const { d } = deps({
+        files: ["shared/a.txt"],
+        rules: successRules({ stagedNames: ["shared/a.txt"] }),
+      });
+      const { code, stdout } = await runForTest(
+        [
+          "feat: adopt blocked",
+          "--session-id",
+          "s1",
+          "--adopt",
+          "shared/a.txt",
+        ],
+        {
+          ...d,
+          readClaims: () => [liveHolderClaim("shared/a.txt")],
+          classifyClaim: (claim) => claim.liveness,
+          readReleases: () => records,
+        },
+      );
+      expect(code).toBe(1);
+      const claimant = firstReleaseClaimant(JSON.parse(stdout));
+      expect(claimant.decline).toMatchObject({
+        status: "declined",
+        requester_session_id: PEER,
+        paths: ["shared/a.txt"],
+        evidence: "bus-request-1",
+        reason: "still in use",
+      });
+      const protocol = String(
+        (claimant.decline as Record<string, unknown>).protocol,
+      );
+      expect(protocol).toContain("attempt budget");
+      expect(protocol).toContain("do not immediately re-request");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("post-lint ownership refusal carries the request-release pointer", async () => {
+    let reads = 0;
+    const { d } = deps({
+      files: ["shared/a.txt"],
+      rules: successRules({ stagedNames: ["shared/a.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: late conflict", "--session-id", "s1"],
+      {
+        ...d,
+        readClaims: () => {
+          reads += 1;
+          return reads >= 3 ? [liveHolderClaim("shared/a.txt")] : [];
+        },
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env).toMatchObject({
+      outcome: "ownership_conflict",
+      reason: "foreign_claim_after_lint",
+    });
+    expect(firstReleaseClaimant(env)).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+    });
+  });
+
+  test("pre-publication ownership refusal carries the request-release pointer", async () => {
+    let reads = 0;
+    const { d } = deps({
+      files: ["shared/a.txt"],
+      rules: successRules({ stagedNames: ["shared/a.txt"] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: final conflict", "--session-id", "s1"],
+      {
+        ...d,
+        readClaims: () => {
+          reads += 1;
+          return reads >= 4 ? [liveHolderClaim("shared/a.txt")] : [];
+        },
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env).toMatchObject({
+      outcome: "ownership_conflict",
+      reason: "foreign_claim_before_publication",
+    });
+    expect(firstReleaseClaimant(env)).toMatchObject({
+      claimant_session_id: HOLDER,
+      paths: ["shared/a.txt"],
+    });
+  });
+
+  test("the releasing session's own next discover drops released paths from its owned set", async () => {
+    const surface = await discoverCommitWorkSurface({
+      worktree: "/repo",
+      identity: HOLDER,
+      adoptedPaths: [],
+      git: statusGit(["shared/a.txt", "shared/c.txt"]),
+      deps: {
+        // The holder's own current-session paths (direct evidence carries no
+        // pid/start-time — the self-fence binds by session id alone).
+        readClaims: () => [],
+        readReleases: () => [releaseOf(["shared/a.txt"])],
+      },
+      directEvidence: {
+        currentSessionPaths: ["shared/a.txt", "shared/c.txt"],
+        complete: true,
+      },
+    });
+    // c.txt is still automatically owned; the released a.txt is fenced out.
+    expect(surface.automatic).toEqual(["shared/c.txt"]);
+    expect(surface.selected).toEqual(["shared/c.txt"]);
+    expect(surface.summary.caller_owned_selected.sample).not.toContain(
+      "shared/a.txt",
+    );
+    expect(surface.summary.adoptable_unattributed.sample).toContain(
+      "shared/a.txt",
+    );
+  });
+
+  test("a release scoped to a different worktree does not apply", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-scope-"));
+    try {
+      writeReleaseRecord({
+        sessionId: HOLDER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/elsewhere",
+        paths: ["shared/a.txt"],
+        dir,
+      });
+      expect(readReleaseRecords(dir, "/repo")).toEqual([]);
+      expect(readReleaseRecords(dir, "/elsewhere")).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("write merges re-released paths and reader round-trips them", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-merge-"));
+    try {
+      writeReleaseRecord({
+        sessionId: HOLDER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/repo",
+        paths: ["shared/a.txt"],
+        dir,
+      });
+      const second = writeReleaseRecord({
+        sessionId: HOLDER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/repo",
+        paths: ["shared/b.txt"],
+        dir,
+      });
+      expect([...second.record.paths].sort()).toEqual([
+        "shared/a.txt",
+        "shared/b.txt",
+      ]);
+      const records = readReleaseRecords(dir, "/repo");
+      expect(records.map((r) => [...r.paths].sort())).toEqual([
+        ["shared/a.txt", "shared/b.txt"],
+      ]);
+      // No tmp residue leaks into the record listing.
+      expect(readdirSync(dir).filter((n) => n.endsWith(".json"))).toEqual([
+        `${HOLDER}.json`,
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a torn or oversized record is skipped; valid siblings still classify", () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-torn-"));
+    try {
+      writeReleaseRecord({
+        sessionId: HOLDER,
+        pid: 4242,
+        startTime: "linux:100",
+        worktree: "/repo",
+        paths: ["shared/a.txt"],
+        dir,
+      });
+      // A half-written / non-JSON record.
+      writeFileSync(join(dir, "torn.json"), '{"schema":1,"session_id":');
+      // An oversized record.
+      writeFileSync(
+        join(dir, "big.json"),
+        JSON.stringify({
+          schema: 1,
+          session_id: PEER,
+          pid: 5,
+          start_time: "linux:5",
+          worktree: "/repo",
+          paths: ["x".repeat(9 * 1_048_576)],
+        }),
+      );
+      const records = readReleaseRecords(dir, "/repo");
+      expect(records.map((r) => r.sessionId)).toEqual([HOLDER]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// session release verb
+// ---------------------------------------------------------------------------
+
+function captureSink(): {
+  sink: EnvelopeSink;
+  body: () => unknown;
+  code: () => number | null;
+} {
+  let out = "";
+  let exitCode: number | null = null;
+  return {
+    sink: {
+      writeStdout: (s) => {
+        out += s;
+      },
+      exit: ((c: number) => {
+        exitCode = c;
+      }) as EnvelopeSink["exit"],
+    },
+    body: () => JSON.parse(out),
+    code: () => exitCode,
+  };
+}
+
+const RELEASE_AUTHORITY = {
+  state: "working",
+  harness: "claude" as const,
+  pid: 4242,
+  startTime: "linux:100",
+};
+
+describe("session release verb", () => {
+  test("refuses when the session identity is not a proven working session", async () => {
+    const cap = captureSink();
+    const deps: ReleaseDeps = {
+      sink: cap.sink,
+      env: {},
+      cwd: "/repo",
+      dir: "/unused",
+      gitToplevel: () => "/repo",
+      readAuthority: () => null,
+      descendsFrom: async () => true,
+    };
+    await releaseMain(["shared/a.txt", "--session-id", HOLDER], deps);
+    expect(cap.code()).toBe(1);
+    const env = cap.body() as { ok: boolean; error: { code: string } };
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe("session_identity_unproven");
+  });
+
+  test("refuses when the current process does not descend from the recorded session", async () => {
+    const cap = captureSink();
+    const deps: ReleaseDeps = {
+      sink: cap.sink,
+      env: {},
+      cwd: "/repo",
+      dir: "/unused",
+      gitToplevel: () => "/repo",
+      readAuthority: () => RELEASE_AUTHORITY,
+      descendsFrom: async () => false,
+    };
+    await releaseMain(["shared/a.txt", "--session-id", HOLDER], deps);
+    expect(cap.code()).toBe(1);
+    const env = cap.body() as { ok: boolean; error: { code: string } };
+    expect(env.error.code).toBe("session_identity_unproven");
+  });
+
+  test("a proven session writes an identity-bound record the reader honors", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-release-verb-"));
+    const worktree = mkdtempSync(join(tmpdir(), "keeper-release-tree-"));
+    try {
+      const cap = captureSink();
+      const deps: ReleaseDeps = {
+        sink: cap.sink,
+        env: {},
+        cwd: worktree,
+        dir,
+        gitToplevel: () => worktree,
+        readAuthority: () => RELEASE_AUTHORITY,
+        descendsFrom: async () => true,
+      };
+      await releaseMain(["shared/a.txt", "--session-id", HOLDER], deps);
+      expect(cap.code()).toBe(0);
+      const env = cap.body() as {
+        ok: boolean;
+        data: { released: string[]; database_written: boolean };
+      };
+      expect(env.ok).toBe(true);
+      expect(env.data.released).toEqual(["shared/a.txt"]);
+      expect(env.data.database_written).toBe(false);
+
+      const records = readReleaseRecords(dir, worktree);
+      expect(
+        records.map((r) => ({
+          sessionId: r.sessionId,
+          pid: r.pid,
+          paths: [...r.paths],
+        })),
+      ).toEqual([{ sessionId: HOLDER, pid: 4242, paths: ["shared/a.txt"] }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(worktree, { recursive: true, force: true });
+    }
   });
 });

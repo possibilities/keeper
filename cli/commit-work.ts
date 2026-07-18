@@ -45,12 +45,16 @@ import {
   sharedCheckoutJam,
 } from "../src/commit-work/repo-state";
 import {
+  buildRequestReleasePointer,
   type ClaimLiveness,
   type CommitWorkSurfaceSummary,
   claimIsExclusiveOwnership,
   type DirectSurfaceEvidence,
   discoverCommitWorkSurface,
   type OwnershipClaim,
+  type ReleaseRecord,
+  type RequestReleaseConflict,
+  type RequestReleasePointer,
   type SurfaceDiscoveryDeps,
   type SurfaceDiscoveryResult,
   summarizeReceiptLag,
@@ -467,6 +471,7 @@ export interface CommitWorkResult {
   surface?: CommitWorkSurfaceSummary;
   commit?: Record<string, unknown>;
   push?: Record<string, unknown>;
+  request_release?: RequestReleasePointer;
   error?: string;
   [key: string]: unknown;
 }
@@ -617,6 +622,7 @@ export interface CommitWorkDeps {
   ) => DirectSurfaceEvidence | undefined;
   readClaims?: (worktree: string) => OwnershipClaim[] | null;
   classifyClaim?: (claim: OwnershipClaim) => ClaimLiveness;
+  readReleases?: (worktree: string) => ReleaseRecord[];
   runLint?: (files: string[], cwd: string) => Promise<void>;
   acquireLock?: (
     lockPath: string,
@@ -680,6 +686,7 @@ async function discover(
   const surfaceDeps: SurfaceDiscoveryDeps = {
     readClaims: deps.readClaims,
     classifyClaim: deps.classifyClaim,
+    readReleases: deps.readReleases,
   };
   const supplied = deps.directEvidence?.(identity, worktree);
   return discoverCommitWorkSurface({
@@ -736,24 +743,38 @@ function selectedForeignConflicts(
   identity: string | null,
 ): {
   conflicts: Array<{ path: string; sessions: string[] }>;
+  requestReleaseConflicts: RequestReleaseConflict[];
   receiptsPending: ReturnType<typeof summarizeReceiptLag>;
   pending: boolean;
 } {
   const conflicts: Array<{ path: string; sessions: string[] }> = [];
+  const requestReleaseConflicts: RequestReleaseConflict[] = [];
   const receipts = new Map<
     string,
     Parameters<typeof summarizeReceiptLag>[0][number]
   >();
   for (const path of selected) {
-    const blockers = unsafeForeignSessions(
-      surface.claimsByPath.get(path) ?? [],
-      identity,
-    );
+    const pathClaims = surface.claimsByPath.get(path) ?? [];
+    const blockers = unsafeForeignSessions(pathClaims, identity);
     if (blockers.conflicts.length > 0) {
+      const sessions = blockers.conflicts.slice(0, SAMPLE_LIMIT);
       conflicts.push({
         path,
-        sessions: blockers.conflicts.slice(0, SAMPLE_LIMIT),
+        sessions,
       });
+      for (const session of sessions) {
+        requestReleaseConflicts.push({
+          claimantSessionId: session,
+          path,
+          decline: pathClaims.find(
+            (claim) =>
+              claim.sessionId === session &&
+              claimIsExclusiveOwnership(claim) &&
+              claim.liveness !== "terminal" &&
+              claim.releaseDecline !== undefined,
+          )?.releaseDecline,
+        });
+      }
     }
     for (const receipt of blockers.receiptsPending) {
       receipts.set(receipt.sessionId, receipt);
@@ -761,9 +782,40 @@ function selectedForeignConflicts(
   }
   return {
     conflicts,
+    requestReleaseConflicts,
     receiptsPending: summarizeReceiptLag([...receipts.values()]),
     pending: receipts.size > 0,
   };
+}
+
+function requestReleaseFromRejections(
+  surface: SurfaceDiscoveryResult,
+  identity: string | null,
+): RequestReleasePointer | undefined {
+  const conflicts: RequestReleaseConflict[] = [];
+  for (const rejection of surface.rejections) {
+    if (
+      rejection.code !== "ownership_conflict" ||
+      rejection.path === undefined
+    ) {
+      continue;
+    }
+    const claims = surface.claimsByPath.get(rejection.path) ?? [];
+    for (const session of rejection.conflicting_sessions ?? []) {
+      conflicts.push({
+        claimantSessionId: session,
+        path: rejection.path,
+        decline: claims.find(
+          (claim) =>
+            claim.sessionId === session &&
+            claimIsExclusiveOwnership(claim) &&
+            claim.liveness !== "terminal" &&
+            claim.releaseDecline !== undefined,
+        )?.releaseDecline,
+      });
+    }
+  }
+  return buildRequestReleasePointer(conflicts, identity, SAMPLE_LIMIT);
 }
 
 function receiptsPendingFields(
@@ -827,6 +879,9 @@ function surfaceFailure(
       {
         identity,
         ...(receiptsPending ? receiptsPendingFields(surface, identity) : {}),
+        ...(conflict
+          ? { request_release: requestReleaseFromRejections(surface, identity) }
+          : {}),
         selection: selectionEnvelope(surface, identity),
         surface: surface.summary,
       },
@@ -861,6 +916,11 @@ function finalOwnershipFailure(
       reason: "foreign_claim_before_publication",
       count: foreign.conflicts.length,
       sample: foreign.conflicts.slice(0, SAMPLE_LIMIT),
+      request_release: buildRequestReleasePointer(
+        foreign.requestReleaseConflicts,
+        identity,
+        SAMPLE_LIMIT,
+      ),
       ...resultFileFields(frozen.paths),
       selection: selectionEnvelope(current, identity),
       surface: current.summary,
@@ -1584,6 +1644,11 @@ async function runAttempt(
           reason: "foreign_claim_after_lint",
           count: foreignAfterLint.conflicts.length,
           sample: foreignAfterLint.conflicts.slice(0, SAMPLE_LIMIT),
+          request_release: buildRequestReleasePointer(
+            foreignAfterLint.requestReleaseConflicts,
+            identity,
+            SAMPLE_LIMIT,
+          ),
           ...resultFileFields(surface.selected),
           selection: selectionEnvelope(postLintSurface, identity),
           surface: postLintSurface.summary,
