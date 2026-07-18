@@ -14,6 +14,7 @@ import {
   writeSync,
 } from "node:fs";
 import {
+  type AccountObservationIssue,
   isObservationFresh,
   isRouteMeasurementFresh,
   type NormalizedWindow,
@@ -28,6 +29,7 @@ import {
   ledgerPath,
   MAX_RESERVATIONS_PER_ROUTE,
   managedRouteId,
+  OBSERVATION_FRESHNESS_CEILING_MS,
   observationSidecarPath,
   RESERVATION_TTL_MS,
   RESERVATION_UTILIZATION_STEP,
@@ -91,7 +93,11 @@ export function selectRoute(deps: SelectRouteDeps = {}): RouteResolution {
   try {
     return doSelectRoute(deps);
   } catch {
-    return { ok: false, error: "account routing failed" };
+    return {
+      ok: false,
+      error:
+        "Claude cannot start because account routing failed unexpectedly; run `keeper agent accounts check --json`",
+    };
   }
 }
 
@@ -103,28 +109,54 @@ export function selectRouteByAccountOrdinal(
   try {
     return doSelectRouteByAccountOrdinal(ordinal, deps);
   } catch {
-    return { ok: false, error: `account c${ordinal} could not be resolved` };
+    return {
+      ok: false,
+      error:
+        `requested account c${ordinal} could not be resolved; ` +
+        "run `keeper agent accounts check --json`",
+    };
   }
 }
 
 function readFreshObservation(
   stateDir: string,
   nowMs: number,
+  model: string | null | undefined,
 ): { ok: true; observation: Observation } | { ok: false; error: string } {
   const observation = readObservationSidecar(observationSidecarPath(stateDir));
   if (observation === null) {
     return {
       ok: false,
-      error: "no claude-swap account inventory is available",
+      error: [
+        `Claude cannot start${launchModelLabel(model) ? ` with ${launchModelLabel(model)}` : ""}: no current claude-swap inventory is available.`,
+        "Next: wait for keeperd to refresh it or run `cswap list --json`.",
+      ].join("\n"),
     };
   }
   if (!isObservationFresh(observation, nowMs)) {
-    return { ok: false, error: "claude-swap account inventory is stale" };
+    const ageSeconds = Math.max(
+      0,
+      Math.ceil((nowMs - observation.observed_at_ms) / 1000),
+    );
+    return {
+      ok: false,
+      error: inventoryWideError(
+        observation,
+        model,
+        `inventory snapshot is stale (${ageSeconds}s old; maximum ${OBSERVATION_FRESHNESS_CEILING_MS / 1000}s)`,
+        "wait for keeperd to refresh it or run `cswap list --json`",
+      ),
+    };
   }
   if (observation.health !== "ok") {
     return {
       ok: false,
-      error: `claude-swap account inventory is ${observation.health}`,
+      error: inventoryWideError(
+        observation,
+        model,
+        `inventory health is ${observation.health}`,
+        "run `cswap list --json` and repair account sign-in or telemetry errors",
+      ),
     };
   }
   return { ok: true, observation };
@@ -180,10 +212,36 @@ function fableUtilization(route: Route, nowMs: number): number | null {
   return found ? worst : null;
 }
 
-function hasAvailableBaseQuota(route: Route, nowMs: number): boolean {
+type LaunchRouteIssue =
+  | AccountObservationIssue
+  | "session-quota-missing"
+  | "session-quota-exhausted"
+  | "weekly-quota-missing"
+  | "weekly-quota-exhausted"
+  | "fable-entitlement-missing"
+  | "fable-quota-exhausted";
+
+function routeIssues(
+  route: Route,
+  model: string | null | undefined,
+  nowMs: number,
+): LaunchRouteIssue[] {
+  const issues: LaunchRouteIssue[] = [];
+  if (!isRouteMeasurementFresh(route, nowMs)) {
+    issues.push("measurement-stale");
+  }
   const session = worstUtilizationForKey(route, SESSION_WINDOW, nowMs);
   const week = worstUtilizationForKey(route, WEEK_WINDOW, nowMs);
-  return session !== null && week !== null && session < 1 && week < 1;
+  if (session === null) issues.push("session-quota-missing");
+  else if (session >= 1) issues.push("session-quota-exhausted");
+  if (week === null) issues.push("weekly-quota-missing");
+  else if (week >= 1) issues.push("weekly-quota-exhausted");
+  if (isFableRequest(model)) {
+    const fable = fableUtilization(route, nowMs);
+    if (fable === null) issues.push("fable-entitlement-missing");
+    else if (fable >= 1) issues.push("fable-quota-exhausted");
+  }
+  return issues;
 }
 
 function routeIsEligible(
@@ -191,10 +249,166 @@ function routeIsEligible(
   model: string | null | undefined,
   nowMs: number,
 ): boolean {
-  if (!hasAvailableBaseQuota(route, nowMs)) return false;
-  if (!isFableRequest(model)) return true;
-  const fable = fableUtilization(route, nowMs);
-  return fable !== null && fable < 1;
+  return routeIssues(route, model, nowMs).length === 0;
+}
+
+function launchModelLabel(model: string | null | undefined): string | null {
+  const normalized = normalizedModelName(model);
+  if (normalized === null) return null;
+  if (normalized === FABLE_MODEL) return "Fable";
+  return /^[a-z0-9][a-z0-9._/-]{0,63}$/u.test(normalized)
+    ? `model '${normalized}'`
+    : "the requested model";
+}
+
+function inventoryWideError(
+  observation: Observation,
+  model: string | null | undefined,
+  reason: string,
+  next: string,
+): string {
+  const modelLabel = launchModelLabel(model);
+  const lines = [
+    observation.claude_accounts.count === 0
+      ? `Claude cannot start${modelLabel ? ` with ${modelLabel}` : ""}: ${reason}.`
+      : `Claude cannot start${modelLabel ? ` with ${modelLabel}` : ""}.`,
+  ];
+  for (
+    let ordinal = 0;
+    ordinal < observation.claude_accounts.count;
+    ordinal += 1
+  ) {
+    lines.push(`  c${ordinal}: ${reason}.`);
+  }
+  lines.push(`Next: ${next}.`);
+  return lines.join("\n");
+}
+
+function quotaResetSuffix(
+  route: Route,
+  matches: (window: NormalizedWindow) => boolean,
+  nowMs: number,
+): string {
+  let worst: NormalizedWindow | null = null;
+  let worstUtilization = -1;
+  for (const window of route.windows) {
+    if (!matches(window)) continue;
+    const utilization = effectiveUtilization(window, nowMs);
+    if (utilization > worstUtilization) {
+      worst = window;
+      worstUtilization = utilization;
+    }
+  }
+  const reset = worst?.resetsAt;
+  return typeof reset === "string" && reset.length > 0 && reset.length <= 80
+    ? `; resets ${reset}`
+    : "";
+}
+
+function issueMessage(
+  issue: LaunchRouteIssue,
+  route: Route | null,
+  nowMs: number,
+): string {
+  switch (issue) {
+    case "relogin-required":
+      return "needs sign-in again";
+    case "token-expired":
+      return "has an expired token";
+    case "keychain-unavailable":
+      return "credentials are unavailable";
+    case "no-credentials":
+      return "has no usable credentials";
+    case "api-key":
+      return "has no subscription quota (API-key account)";
+    case "account-unavailable":
+      return "is unavailable according to claude-swap";
+    case "missing-freshness":
+      return "has no quota freshness timestamp";
+    case "measurement-stale":
+      return "quota measurement is stale";
+    case "missing-windows":
+      return "has no usable quota windows";
+    case "malformed-scoped-windows":
+      return "has malformed or ambiguous model quota data";
+    case "session-quota-missing":
+      return "has no session quota data";
+    case "session-quota-exhausted":
+      return `session quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === SESSION_WINDOW, nowMs) : ""}`;
+    case "weekly-quota-missing":
+      return "has no weekly quota data";
+    case "weekly-quota-exhausted":
+      return `weekly quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === WEEK_WINDOW, nowMs) : ""}`;
+    case "fable-entitlement-missing":
+      return "has no Fable quota";
+    case "fable-quota-exhausted":
+      return `Fable quota is exhausted${
+        route
+          ? quotaResetSuffix(
+              route,
+              (window) =>
+                window.key.startsWith(MODEL_WINDOW_PREFIX) &&
+                normalizedModelName(
+                  window.key.slice(MODEL_WINDOW_PREFIX.length),
+                ) === FABLE_MODEL,
+              nowMs,
+            )
+          : ""
+      }`;
+  }
+}
+
+function accountRouteIdAtOrdinal(
+  observation: Observation,
+  ordinal: number,
+): string | null {
+  return (
+    Object.entries(observation.claude_accounts.ordinals).find(
+      ([, index]) => index === ordinal,
+    )?.[0] ?? null
+  );
+}
+
+function accountFailureDetail(
+  observation: Observation,
+  ordinal: number,
+  model: string | null | undefined,
+  nowMs: number,
+): string {
+  const routeId = accountRouteIdAtOrdinal(observation, ordinal);
+  if (routeId === null) return `c${ordinal}: inventory entry is invalid`;
+  const route = observation.routes.find(
+    (candidate) => candidate.id === routeId,
+  );
+  const issues = route
+    ? routeIssues(route, model, nowMs)
+    : [observation.account_issues[routeId] ?? "account-unavailable"];
+  return `c${ordinal}: ${issues
+    .map((issue) => issueMessage(issue, route ?? null, nowMs))
+    .join(", ")}`;
+}
+
+function routeUnavailableError(
+  observation: Observation,
+  model: string | null | undefined,
+  nowMs: number,
+): string {
+  const modelLabel = launchModelLabel(model);
+  if (observation.claude_accounts.count === 0) {
+    return [
+      `Claude cannot start${modelLabel ? ` with ${modelLabel}` : ""}: claude-swap has no managed accounts.`,
+      "Next: register or sign in to an account, then run `cswap list --json`.",
+    ].join("\n");
+  }
+  const details = Array.from(
+    { length: observation.claude_accounts.count },
+    (_, ordinal) => accountFailureDetail(observation, ordinal, model, nowMs),
+  );
+  return [
+    `Claude cannot start${modelLabel ? ` with ${modelLabel}` : ""}.`,
+    ...details.map((detail) => `  ${detail}.`),
+    "Next: run `cswap list --json` to refresh status or repair the listed account.",
+  ].join("\n");
 }
 
 function reserveSelection(
@@ -221,11 +435,17 @@ function doSelectRouteByAccountOrdinal(
   deps: SelectRouteDeps,
 ): RequestedRouteResolution {
   if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
-    return { ok: false, error: "account index must be a non-negative integer" };
+    return {
+      ok: false,
+      error: [
+        "Requested account index is invalid.",
+        "Next: use a non-negative cN label such as --x-account c0.",
+      ].join("\n"),
+    };
   }
   const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
   const nowMs = deps.nowMs ?? Date.now();
-  const fresh = readFreshObservation(stateDir, nowMs);
+  const fresh = readFreshObservation(stateDir, nowMs, deps.model);
   if (!fresh.ok) return fresh;
   const observation = fresh.observation;
   const display = observation.claude_accounts;
@@ -238,7 +458,11 @@ function doSelectRouteByAccountOrdinal(
           : `c0-c${display.count - 1}`;
     return {
       ok: false,
-      error: `account c${ordinal} is out of range (available: ${available})`,
+      error: [
+        `Requested account c${ordinal} is not registered.`,
+        `  Available account labels: ${available}.`,
+        "Next: choose a listed --x-account label or register another claude-swap account.",
+      ].join("\n"),
     };
   }
   const routeId = Object.entries(display.ordinals).find(
@@ -248,14 +472,23 @@ function doSelectRouteByAccountOrdinal(
     (candidate) =>
       candidate.id === routeId &&
       candidate.slot > 0 &&
-      managedRouteId(candidate.slot) === candidate.id &&
-      routeIsEligible(candidate, deps.model, nowMs) &&
-      isRouteMeasurementFresh(candidate, nowMs),
+      managedRouteId(candidate.slot) === candidate.id,
   );
-  if (!route) {
+  if (!route || !routeIsEligible(route, deps.model, nowMs)) {
+    const detail = accountFailureDetail(
+      observation,
+      ordinal,
+      deps.model,
+      nowMs,
+    );
+    const modelLabel = launchModelLabel(deps.model);
     return {
       ok: false,
-      error: `account c${ordinal} is known but is not currently routeable`,
+      error: [
+        `Requested account c${ordinal} cannot serve${modelLabel ? ` ${modelLabel}` : " this Claude launch"}.`,
+        `  ${detail}.`,
+        "Next: choose another --x-account or run `cswap list --json`.",
+      ].join("\n"),
     };
   }
   return {
@@ -273,18 +506,16 @@ function doSelectRouteByAccountOrdinal(
 function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
   const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
   const nowMs = deps.nowMs ?? Date.now();
-  const fresh = readFreshObservation(stateDir, nowMs);
+  const fresh = readFreshObservation(stateDir, nowMs, deps.model);
   if (!fresh.ok) return fresh;
   const observation = fresh.observation;
-  const candidates = observation.routes.filter(
-    (route) =>
-      routeIsEligible(route, deps.model, nowMs) &&
-      isRouteMeasurementFresh(route, nowMs),
+  const candidates = observation.routes.filter((route) =>
+    routeIsEligible(route, deps.model, nowMs),
   );
   if (candidates.length === 0) {
     return {
       ok: false,
-      error: "no fresh routeable claude-swap account is available",
+      error: routeUnavailableError(observation, deps.model, nowMs),
     };
   }
 
@@ -397,15 +628,13 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       extras,
     );
   }
-  const routeable = observation.routes.filter(
-    (route) =>
-      routeIsEligible(route, deps.model, nowMs) &&
-      isRouteMeasurementFresh(route, nowMs),
+  const routeable = observation.routes.filter((route) =>
+    routeIsEligible(route, deps.model, nowMs),
   );
   if (routeable.length === 0) {
     return disabledInspection(
       observation.health,
-      "no fresh routeable claude-swap account is available",
+      routeUnavailableError(observation, deps.model, nowMs),
       extras,
     );
   }

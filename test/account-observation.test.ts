@@ -10,7 +10,10 @@ import {
   validateObservation,
   writeObservationSidecar,
 } from "../src/account-observation";
-import { OBSERVATION_SCHEMA_VERSION } from "../src/account-routing-config";
+import {
+  MAX_CSWAP_ACCOUNTS,
+  OBSERVATION_SCHEMA_VERSION,
+} from "../src/account-routing-config";
 
 const NOW = Date.parse("2026-07-18T00:00:00Z");
 const roots: string[] = [];
@@ -62,6 +65,14 @@ describe("parseCswapList", () => {
       parseCswapList(outcome({ schemaVersion: 2, accounts: [] }), NOW, 60_000)
         .health,
     ).toBe("unsupported");
+    const tooMany = Array.from({ length: MAX_CSWAP_ACCOUNTS + 1 }, (_, index) =>
+      account(index + 1),
+    );
+    const bounded = parseCswapList(outcome(inventory(tooMany)), NOW, 60_000);
+    expect(bounded.health).toBe("unsupported");
+    expect(bounded.notes).toEqual([
+      `cswap: account count exceeds ${MAX_CSWAP_ACCOUNTS}`,
+    ]);
   });
 
   test("retains the active slot as an ordinary managed route", () => {
@@ -102,6 +113,9 @@ describe("parseCswapList", () => {
       "claude-swap:4": 0,
       "claude-swap:9": 1,
     });
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:4": "relogin-required",
+    });
     expect(parsed.notes).toContain(
       "cswap: slot 4 not routeable (relogin_required)",
     );
@@ -121,6 +135,11 @@ describe("parseCswapList", () => {
       60_000,
     );
     expect(parsed.routes.map((route) => route.id)).toEqual(["claude-swap:4"]);
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:1": "missing-freshness",
+      "claude-swap:2": "measurement-stale",
+      "claude-swap:3": "missing-windows",
+    });
     expect(parsed.notes).toEqual(
       expect.arrayContaining([
         "cswap: slot 1 has no freshness signal",
@@ -175,6 +194,12 @@ describe("parseCswapList", () => {
       "claude-swap:4": 3,
       "claude-swap:5": 4,
     });
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:2": "malformed-scoped-windows",
+      "claude-swap:3": "malformed-scoped-windows",
+      "claude-swap:4": "malformed-scoped-windows",
+      "claude-swap:5": "malformed-scoped-windows",
+    });
     expect(parsed.notes).toEqual(
       expect.arrayContaining([
         "cswap: slot 2 has malformed scoped windows",
@@ -183,6 +208,30 @@ describe("parseCswapList", () => {
         "cswap: slot 5 has malformed scoped windows",
       ]),
     );
+  });
+
+  test("drops malformed reset timestamps instead of emitting provider text", () => {
+    const privateReset = "private-account@example.test\nZ";
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(8, {
+            usage: {
+              fiveHour: { pct: 20 },
+              sevenDay: { pct: 40 },
+              scoped: [{ name: "Fable", pct: 50, resetsAt: privateReset }],
+            },
+          }),
+        ]),
+      ),
+      NOW,
+      60_000,
+    );
+    expect(
+      parsed.routes[0]?.windows.find((window) => window.key === "model:Fable")
+        ?.resetsAt,
+    ).toBeNull();
+    expect(JSON.stringify(parsed)).not.toContain(privateReset);
   });
 
   test("normalizes account and scoped windows without retaining PII", () => {
@@ -201,7 +250,7 @@ describe("parseCswapList", () => {
   });
 });
 
-describe("schema-v5 observation sidecar", () => {
+describe("schema-v6 observation sidecar", () => {
   test("builds a managed-only observation", () => {
     const cswap = parseCswapList(outcome(inventory([account(5)])), NOW, 60_000);
     const observation = buildObservation({ observedAtMs: NOW, cswap });
@@ -213,6 +262,7 @@ describe("schema-v5 observation sidecar", () => {
         count: 1,
         ordinals: { "claude-swap:5": 0 },
       },
+      account_issues: {},
     });
     expect(JSON.stringify(observation)).not.toContain('"default"');
   });
@@ -231,6 +281,47 @@ describe("schema-v5 observation sidecar", () => {
       validateObservation({
         ...observation,
         schema_version: OBSERVATION_SCHEMA_VERSION - 1,
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        routes: [],
+        account_issues: {},
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        claude_accounts: {
+          count: 1,
+          ordinals: { "claude-swap:99": 0 },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_issues: { "claude-swap:6": "measurement-stale" },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_issues: { "claude-swap:99": "measurement-stale" },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        routes: observation.routes.map((route) => ({
+          ...route,
+          windows: route.windows.map((window, index) =>
+            index === 0
+              ? { ...window, resetsAt: "private@example.test\nZ" }
+              : window,
+          ),
+        })),
       }),
     ).toBeNull();
     expect(

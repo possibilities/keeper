@@ -70,6 +70,7 @@ function observation(observedAtMs: number): Observation {
       },
     ],
     claude_accounts: { count: 1, ordinals: { "claude-swap:2": 0 } },
+    account_issues: {},
     notes: [],
   };
 }

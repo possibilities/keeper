@@ -2941,7 +2941,9 @@ export async function main(deps: MainDeps): Promise<never> {
           )
         : deps.selectAccountRouteFn(routingModel);
     if (!resolution.ok) {
-      deps.writeErr(`Error: ${resolution.error}.\n`);
+      const routingError = resolution.error.trimEnd();
+      const punctuation = /[.!?]$/u.test(routingError) ? "" : ".";
+      deps.writeErr(`Error: ${routingError}${punctuation}\n`);
       return deps.exit(parsed.launcherAccountOrdinal === null ? 1 : 2);
     }
     resolvedClaudeRoute = resolution.selection;

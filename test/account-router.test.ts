@@ -70,6 +70,7 @@ function observation(
     observedAtMs?: number;
     health?: Observation["health"];
     count?: number;
+    accountIssues?: Observation["account_issues"];
   } = {},
 ): Observation {
   const count = options.count ?? routes.length;
@@ -85,6 +86,7 @@ function observation(
     health: options.health ?? "ok",
     routes,
     claude_accounts: { count, ordinals },
+    account_issues: options.accountIssues ?? {},
     notes: [],
   };
 }
@@ -96,28 +98,62 @@ function publish(dir: string, value: Observation): void {
 describe("mandatory managed account selection", () => {
   test("missing, stale, unhealthy, and empty observations fail closed", () => {
     const dir = root();
-    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toEqual({
-      ok: false,
-      error: "no claude-swap account inventory is available",
-    });
+    const missing = selectRoute({ stateDir: dir, nowMs: NOW });
+    expect(missing.ok).toBe(false);
+    expect(!missing.ok && missing.error).toContain(
+      "no current claude-swap inventory is available",
+    );
 
     publish(dir, observation([route(1, 0.2)], { observedAtMs: NOW - 300_001 }));
-    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toEqual({
-      ok: false,
-      error: "claude-swap account inventory is stale",
-    });
+    const stale = selectRoute({ stateDir: dir, nowMs: NOW });
+    expect(stale.ok).toBe(false);
+    expect(!stale.ok && stale.error).toContain("301s old; maximum 300s");
 
     publish(dir, observation([], { health: "error", count: 0 }));
-    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toEqual({
-      ok: false,
-      error: "claude-swap account inventory is error",
-    });
+    const unhealthy = selectRoute({ stateDir: dir, nowMs: NOW });
+    expect(unhealthy.ok).toBe(false);
+    expect(!unhealthy.ok && unhealthy.error).toContain(
+      "inventory health is error",
+    );
 
     publish(dir, observation([], { count: 0 }));
-    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toEqual({
+    const empty = selectRoute({ stateDir: dir, nowMs: NOW });
+    expect(empty.ok).toBe(false);
+    expect(!empty.ok && empty.error).toContain("has no managed accounts");
+  });
+
+  test("stale Fable inventory explains every known account", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.2, 0.3), routeWithFable(2, 0.4, 0.5)], {
+        observedAtMs: NOW - 300_001,
+      }),
+    );
+    const result = selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" });
+    expect(result).toEqual({
       ok: false,
-      error: "no fresh routeable claude-swap account is available",
+      error: [
+        "Claude cannot start with Fable.",
+        "  c0: inventory snapshot is stale (301s old; maximum 300s).",
+        "  c1: inventory snapshot is stale (301s old; maximum 300s).",
+        "Next: wait for keeperd to refresh it or run `cswap list --json`.",
+      ].join("\n"),
     });
+  });
+
+  test("unsafe model text never enters launch diagnostics", () => {
+    const dir = root();
+    const result = selectRoute({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "private@example.test\nmodel",
+    });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain(
+      "Claude cannot start with the requested model",
+    );
+    expect(!result.ok && result.error).not.toContain("private@example.test");
   });
 
   test("revalidates route measurement freshness at the launch boundary", () => {
@@ -131,20 +167,23 @@ describe("mandatory managed account selection", () => {
 
     const expired = { ...boundary, measuredAtMs: boundary.measuredAtMs - 1 };
     publish(dir, observation([expired]));
-    expect(selectRoute({ stateDir: dir, nowMs: NOW })).toEqual({
-      ok: false,
-      error: "no fresh routeable claude-swap account is available",
+    const automatic = selectRoute({ stateDir: dir, nowMs: NOW });
+    expect(automatic.ok).toBe(false);
+    expect(!automatic.ok && automatic.error).toContain(
+      "c0: quota measurement is stale",
+    );
+    const explicit = selectRouteByAccountOrdinal(0, {
+      stateDir: dir,
+      nowMs: NOW,
     });
-    expect(
-      selectRouteByAccountOrdinal(0, { stateDir: dir, nowMs: NOW }),
-    ).toEqual({
-      ok: false,
-      error: "account c0 is known but is not currently routeable",
-    });
+    expect(explicit.ok).toBe(false);
+    expect(!explicit.ok && explicit.error).toContain(
+      "Requested account c0 cannot serve this Claude launch.\n  c0: quota measurement is stale.",
+    );
     expect(inspectRouting({ stateDir: dir, nowMs: NOW })).toMatchObject({
       enabled: false,
       would_choose: null,
-      error: "no fresh routeable claude-swap account is available",
+      error: expect.stringContaining("c0: quota measurement is stale"),
     });
   });
 
@@ -240,6 +279,26 @@ describe("mandatory managed account selection", () => {
     expect(leastFable.ok && leastFable.selection.id).toBe("claude-swap:2");
   });
 
+  test("Fable failure explains every managed account on separate lines", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.2, 1)], {
+        count: 2,
+        accountIssues: { "claude-swap:21": "measurement-stale" },
+      }),
+    );
+    expect(selectRoute({ stateDir: dir, nowMs: NOW, model: "fable" })).toEqual({
+      ok: false,
+      error: [
+        "Claude cannot start with Fable.",
+        "  c0: Fable quota is exhausted.",
+        "  c1: quota measurement is stale.",
+        "Next: run `cswap list --json` to refresh status or repair the listed account.",
+      ].join("\n"),
+    });
+  });
+
   test("Fable requires live session, week, and Fable quota", () => {
     const missingSession = routeWithFable(1, 0.1, 0.1);
     missingSession.windows = missingSession.windows.filter(
@@ -328,32 +387,46 @@ describe("explicit account resolution", () => {
       dir,
       observation([routeWithFable(1, 0.1, 1), routeWithFable(2, 0.8, 0.1)]),
     );
-    expect(
-      selectRouteByAccountOrdinal(0, {
-        stateDir: dir,
-        nowMs: NOW,
-        model: "fable",
-      }),
-    ).toEqual({
-      ok: false,
-      error: "account c0 is known but is not currently routeable",
+    const result = selectRouteByAccountOrdinal(0, {
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
     });
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error).toContain(
+      "Requested account c0 cannot serve Fable.\n  c0: Fable quota is exhausted.",
+    );
+    expect(!result.ok && result.error).toContain(
+      "Next: choose another --x-account",
+    );
   });
 
   test("known but unrouteable and out-of-range accounts fail", () => {
     const dir = root();
-    publish(dir, observation([route(9, 0.1)], { count: 2 }));
-    expect(
-      selectRouteByAccountOrdinal(1, { stateDir: dir, nowMs: NOW }),
-    ).toEqual({
-      ok: false,
-      error: "account c1 is known but is not currently routeable",
+    publish(
+      dir,
+      observation([route(9, 0.1)], {
+        count: 2,
+        accountIssues: { "claude-swap:21": "account-unavailable" },
+      }),
+    );
+    const unavailable = selectRouteByAccountOrdinal(1, {
+      stateDir: dir,
+      nowMs: NOW,
     });
+    expect(unavailable.ok).toBe(false);
+    expect(!unavailable.ok && unavailable.error).toContain(
+      "Requested account c1 cannot serve this Claude launch.\n  c1: is unavailable according to claude-swap.",
+    );
     expect(
       selectRouteByAccountOrdinal(2, { stateDir: dir, nowMs: NOW }),
     ).toEqual({
       ok: false,
-      error: "account c2 is out of range (available: c0-c1)",
+      error: [
+        "Requested account c2 is not registered.",
+        "  Available account labels: c0-c1.",
+        "Next: choose a listed --x-account label or register another claude-swap account.",
+      ].join("\n"),
     });
   });
 });

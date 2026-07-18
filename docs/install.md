@@ -99,7 +99,10 @@ the non-Fable conservation route the policy would choose without reserving it; `
 that model-free diagnostic explicit, and each candidate reports generic pressure plus remaining Fable
 fraction (or `null` for no Fable entitlement). Use `keeper agent claude --x-account cN`
 to request one account, where `c0`, `c1`, … are zero-based positions in ordered inventory and match the
-Claude statusline label. An explicit request fails rather than substituting another account.
+Claude statusline label. An explicit request fails rather than substituting another account. A blocked
+launch prints one PII-free `cN` reason per managed account—stale telemetry, sign-in trouble, missing or
+exhausted session/week quota, or missing/exhausted Fable quota—followed by a concrete refresh or repair
+step; raw provider output and account identities remain private.
 
 Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
 absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.

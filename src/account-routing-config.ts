@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** Sidecars are transient; an old schema is treated as absent, never migrated. */
-export const OBSERVATION_SCHEMA_VERSION = 5;
+export const OBSERVATION_SCHEMA_VERSION = 6;
 
 /** A version mismatch discards incompatible reservation state. */
 export const LEDGER_SCHEMA_VERSION = 2;
@@ -36,6 +36,9 @@ export const MAX_OUTPUT_BYTES = 262_144;
 
 /** Refuse pathologically deep JSON. */
 export const MAX_JSON_DEPTH = 32;
+
+/** Bound managed inventory and per-account launch diagnostics. */
+export const MAX_CSWAP_ACCOUNTS = 32;
 
 /** Maximum age of the daemon observation used for one launch decision. */
 export const OBSERVATION_FRESHNESS_CEILING_MS = 5 * 60_000;

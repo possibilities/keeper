@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import {
   CSWAP_SUPPORTED_SCHEMA_MAJOR,
+  MAX_CSWAP_ACCOUNTS,
   MAX_JSON_DEPTH,
   MAX_NOTE_LENGTH,
   MAX_OBSERVATION_NOTES,
@@ -49,6 +50,18 @@ export type ObservationHealth =
   | "unsupported"
   | "error";
 
+export type AccountObservationIssue =
+  | "relogin-required"
+  | "token-expired"
+  | "keychain-unavailable"
+  | "no-credentials"
+  | "api-key"
+  | "account-unavailable"
+  | "missing-freshness"
+  | "measurement-stale"
+  | "missing-windows"
+  | "malformed-scoped-windows";
+
 export interface ClaudeAccountDisplay {
   count: number;
   /** Managed route id → zero-based position in cswap inventory order. */
@@ -61,6 +74,8 @@ export interface Observation {
   health: ObservationHealth;
   routes: Route[];
   claude_accounts: ClaudeAccountDisplay;
+  /** Managed route id → bounded PII-free reason the account was excluded. */
+  account_issues: Record<string, AccountObservationIssue>;
   notes: string[];
 }
 
@@ -76,6 +91,7 @@ export interface CswapInventory {
   health: ObservationHealth;
   routes: Route[];
   accountOrdinals: Record<string, number>;
+  accountIssues: Record<string, AccountObservationIssue>;
   notes: string[];
 }
 
@@ -103,9 +119,11 @@ function hasTimezone(stamp: string): boolean {
 }
 
 function trustworthyResetsAt(raw: unknown): string | null {
-  return typeof raw === "string" && raw.length > 0 && hasTimezone(raw)
-    ? raw
-    : null;
+  if (typeof raw !== "string" || raw.length === 0 || !hasTimezone(raw)) {
+    return null;
+  }
+  const parsed = new Date(raw).getTime();
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
 }
 
 function tzAwareEpochMs(raw: unknown): number | null {
@@ -138,11 +156,34 @@ function parseBoundedJson(stdout: string): unknown | null {
 
 const CSWAP_ROUTEABLE_STATUS = "ok";
 
+function statusIssue(status: unknown): AccountObservationIssue {
+  switch (status) {
+    case "relogin_required":
+      return "relogin-required";
+    case "token_expired":
+      return "token-expired";
+    case "keychain_unavailable":
+      return "keychain-unavailable";
+    case "no_credentials":
+      return "no-credentials";
+    case "api_key":
+      return "api-key";
+    default:
+      return "account-unavailable";
+  }
+}
+
 function emptyInventory(
   health: ObservationHealth,
   note: string,
 ): CswapInventory {
-  return { health, routes: [], accountOrdinals: {}, notes: [note] };
+  return {
+    health,
+    routes: [],
+    accountOrdinals: {},
+    accountIssues: {},
+    notes: [note],
+  };
 }
 
 /**
@@ -175,10 +216,17 @@ export function parseCswapList(
   if (!Array.isArray(parsed.accounts)) {
     return emptyInventory("unsupported", "cswap: no accounts array");
   }
+  if (parsed.accounts.length > MAX_CSWAP_ACCOUNTS) {
+    return emptyInventory(
+      "unsupported",
+      `cswap: account count exceeds ${MAX_CSWAP_ACCOUNTS}`,
+    );
+  }
 
   const routes: Route[] = [];
   const notes: string[] = [];
   const accountOrdinals: Record<string, number> = {};
+  const accountIssues: Record<string, AccountObservationIssue> = {};
   const seenAccounts = new Set<number>();
   const seenRoutes = new Set<number>();
 
@@ -198,9 +246,23 @@ export function parseCswapList(
 
     const parsedRow = parseCswapAccount(row, nowMs, freshnessCeilingMs);
     if (parsedRow.note) notes.push(parsedRow.note);
+    const rowSlot = isRecord(row) ? row.number : null;
+    const rowRouteId =
+      typeof rowSlot === "number" && Number.isInteger(rowSlot) && rowSlot > 0
+        ? managedRouteId(rowSlot)
+        : null;
+    if (
+      parsedRow.issue &&
+      rowRouteId !== null &&
+      accountOrdinals[rowRouteId] !== undefined &&
+      accountIssues[rowRouteId] === undefined
+    ) {
+      accountIssues[rowRouteId] = parsedRow.issue;
+    }
     if (parsedRow.route && !seenRoutes.has(parsedRow.route.slot)) {
       seenRoutes.add(parsedRow.route.slot);
       routes.push(parsedRow.route);
+      delete accountIssues[parsedRow.route.id];
     }
   }
 
@@ -208,6 +270,7 @@ export function parseCswapList(
     health: "ok",
     routes,
     accountOrdinals,
+    accountIssues,
     notes: boundNotes(notes),
   };
 }
@@ -216,7 +279,7 @@ function parseCswapAccount(
   row: unknown,
   nowMs: number,
   freshnessCeilingMs: number,
-): { route?: Route; note?: string } {
+): { route?: Route; note?: string; issue?: AccountObservationIssue } {
   if (!isRecord(row)) return { note: "cswap: non-object row" };
   const slot = row.number;
   if (typeof slot !== "number" || !Number.isInteger(slot) || slot <= 0) {
@@ -225,23 +288,36 @@ function parseCswapAccount(
   if (row.usageStatus !== CSWAP_ROUTEABLE_STATUS) {
     return {
       note: `cswap: slot ${slot} not routeable (${String(row.usageStatus)})`,
+      issue: statusIssue(row.usageStatus),
     };
   }
   const measuredAtMs = cswapMeasuredAtMs(row, nowMs);
   if (measuredAtMs === null) {
-    return { note: `cswap: slot ${slot} has no freshness signal` };
+    return {
+      note: `cswap: slot ${slot} has no freshness signal`,
+      issue: "missing-freshness",
+    };
   }
   const ageMs = nowMs - measuredAtMs;
   if (ageMs < 0 || ageMs > freshnessCeilingMs) {
-    return { note: `cswap: slot ${slot} measurement stale` };
+    return {
+      note: `cswap: slot ${slot} measurement stale`,
+      issue: "measurement-stale",
+    };
   }
   const parsedWindows = parseCswapWindows(row.usage);
   if (parsedWindows.scopedMalformed) {
-    return { note: `cswap: slot ${slot} has malformed scoped windows` };
+    return {
+      note: `cswap: slot ${slot} has malformed scoped windows`,
+      issue: "malformed-scoped-windows",
+    };
   }
   const { windows } = parsedWindows;
   if (windows.length === 0) {
-    return { note: `cswap: slot ${slot} has no windows` };
+    return {
+      note: `cswap: slot ${slot} has no windows`,
+      issue: "missing-windows",
+    };
   }
   return {
     route: {
@@ -334,6 +410,7 @@ export function buildObservation(input: {
       count: Object.keys(cswap.accountOrdinals).length,
       ordinals: { ...cswap.accountOrdinals },
     },
+    account_issues: { ...cswap.accountIssues },
     notes: boundNotes(cswap.notes),
   };
 }
@@ -381,14 +458,27 @@ export function validateObservation(data: unknown): Observation | null {
   }
   const display = validateClaudeAccountDisplay(data.claude_accounts);
   if (display === null) return null;
+  const accountIssues = validateAccountIssues(data.account_issues, display);
+  if (accountIssues === null) return null;
 
   const routes: Route[] = [];
   const routeIds = new Set<string>();
   for (const raw of data.routes) {
     const route = validateRoute(raw);
-    if (route === null || routeIds.has(route.id)) return null;
+    if (
+      route === null ||
+      routeIds.has(route.id) ||
+      display.ordinals[route.id] === undefined
+    ) {
+      return null;
+    }
     routeIds.add(route.id);
     routes.push(route);
+  }
+  for (const routeId of Object.keys(display.ordinals)) {
+    const hasRoute = routeIds.has(routeId);
+    const hasIssue = accountIssues[routeId] !== undefined;
+    if (hasRoute === hasIssue) return null;
   }
   const notes = Array.isArray(data.notes)
     ? data.notes.filter((note): note is string => typeof note === "string")
@@ -399,6 +489,7 @@ export function validateObservation(data: unknown): Observation | null {
     health: data.health,
     routes,
     claude_accounts: display,
+    account_issues: accountIssues,
     notes: boundNotes(notes),
   };
 }
@@ -411,6 +502,7 @@ function validateClaudeAccountDisplay(
     typeof data.count !== "number" ||
     !Number.isInteger(data.count) ||
     data.count < 0 ||
+    data.count > MAX_CSWAP_ACCOUNTS ||
     !isRecord(data.ordinals)
   ) {
     return null;
@@ -436,6 +528,41 @@ function validateClaudeAccountDisplay(
     if (!seen.has(ordinal)) return null;
   }
   return { count: data.count, ordinals };
+}
+
+function isAccountObservationIssue(
+  value: unknown,
+): value is AccountObservationIssue {
+  return (
+    value === "relogin-required" ||
+    value === "token-expired" ||
+    value === "keychain-unavailable" ||
+    value === "no-credentials" ||
+    value === "api-key" ||
+    value === "account-unavailable" ||
+    value === "missing-freshness" ||
+    value === "measurement-stale" ||
+    value === "missing-windows" ||
+    value === "malformed-scoped-windows"
+  );
+}
+
+function validateAccountIssues(
+  data: unknown,
+  display: ClaudeAccountDisplay,
+): Record<string, AccountObservationIssue> | null {
+  if (!isRecord(data)) return null;
+  const issues: Record<string, AccountObservationIssue> = {};
+  for (const [routeId, issue] of Object.entries(data)) {
+    if (
+      display.ordinals[routeId] === undefined ||
+      !isAccountObservationIssue(issue)
+    ) {
+      return null;
+    }
+    issues[routeId] = issue;
+  }
+  return issues;
 }
 
 function validateRoute(data: unknown): Route | null {
@@ -481,10 +608,13 @@ function validateWindow(data: unknown): NormalizedWindow | null {
   ) {
     return null;
   }
+  const resetsAt =
+    data.resetsAt === null ? null : trustworthyResetsAt(data.resetsAt);
+  if (data.resetsAt !== null && resetsAt === null) return null;
   return {
     key: data.key,
     utilization: data.utilization,
-    resetsAt: data.resetsAt,
+    resetsAt,
   };
 }
 

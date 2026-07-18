@@ -93,12 +93,23 @@ describe("mandatory Claude account routing", () => {
       rawArgv: true,
       selectAccountRoute: () => ({
         ok: false,
-        error: "no fresh routeable claude-swap account is available",
+        error: [
+          "Claude cannot start with Fable.",
+          "  c0: Fable quota is exhausted.",
+          "Next: refresh account status.",
+        ].join("\n"),
       }),
     });
     expect(await expectExit(main(h.deps))).toBe(1);
     expect(h.spawned).toEqual([]);
-    expect(h.err.join("")).toContain("no fresh routeable claude-swap account");
+    expect(h.err.join("")).toBe(
+      [
+        "Error: Claude cannot start with Fable.",
+        "  c0: Fable quota is exhausted.",
+        "Next: refresh account status.",
+        "",
+      ].join("\n"),
+    );
   });
 
   test("route identity and display ordinal survive the same-account path", async () => {

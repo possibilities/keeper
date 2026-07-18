@@ -43,5 +43,5 @@ Keeper does not install, authorize, invoke, or otherwise integrate a second acco
 - All Claude process paths share one account inventory, route identity, and execution seam.
 - Cross-account resume remains conversation-correct through shared history, without durable account affinity.
 - Model-aware routing is a launch-time decision; an interactive model change does not move an already-running process to another account.
-- Provider uncertainty is visible and blocks only Claude; Pi and non-Claude Keeper surfaces remain usable.
+- Provider uncertainty is visible as bounded PII-free per-account launch diagnostics and blocks only Claude; Pi and non-Claude Keeper surfaces remain usable.
 - Historical ADRs and event data retain their original terminology as rationale and replay evidence, not live behavior.
