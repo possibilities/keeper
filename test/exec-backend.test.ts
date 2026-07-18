@@ -733,6 +733,8 @@ test("buildKeeperAgentLaunchArgv: exact landed-contract invocation (byte-pinned)
     "--x-tmux-detached",
     "--x-tmux-session",
     "autopilot",
+    "--x-tmux-window-name",
+    "work::fn-1-x.1",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     // Serial launch ALWAYS carries an empty lane entry so a stale tmux
@@ -802,6 +804,8 @@ test("buildKeeperAgentLaunchArgv: a pluginDir emits --plugin-dir right after --n
     "--x-tmux-detached",
     "--x-tmux-session",
     "autopilot",
+    "--x-tmux-window-name",
+    "work::fn-1-x.1",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     "--x-tmux-env",
@@ -1109,6 +1113,8 @@ test("buildKeeperAgentLaunchArgv: a worktree-mode launch emits a 2nd --x-tmux-en
     "--x-tmux-detached",
     "--x-tmux-session",
     "autopilot",
+    "--x-tmux-window-name",
+    "work::fn-1-x.1",
     "--x-tmux-env",
     "KEEPER_TMUX_SESSION=autopilot",
     // The 2nd repeated env entry — the worktree lane carrier, right after the

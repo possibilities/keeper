@@ -667,6 +667,7 @@ describe("single vocabulary source", () => {
       ["slot-reclaimed", "slot-reclaimed"],
       ["slot-occupied", "slot-occupied"],
       ["instant-death-breaker", "instant-death"],
+      ["parked-launch", "parked-launch"],
       ["daemon-crash-loop", "crash-loop"],
       ["shared-checkout-wedge", "shared-wedge"],
       ["shared-checkout-dirty", "shared-dirty"],

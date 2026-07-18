@@ -114,7 +114,8 @@ export interface LaunchSpec {
    *  <harness>` with its native resume verb and NO claude permission flags (keeper
    *  agent applies the harness's own posture default). */
   readonly harness?: string;
-  /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
+  /** `--name <claudeName>` plus the matching tmux window name (the
+   *  reap/classify correlation key and inspectable launch identity). Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
   readonly model?: string;
@@ -1132,7 +1133,8 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
 // Launcher contract (NO shared module — matching comments are the drift
 // guard, byte-pinned by a fixture in test/exec-backend.test.ts):
 //   - CLI flags: `claude --x-tmux --x-tmux-detached
-//     --x-tmux-session <s> --x-tmux-env KEEPER_TMUX_SESSION=<s>`.
+//     --x-tmux-session <s> [--x-tmux-window-name <name>]
+//     --x-tmux-env KEEPER_TMUX_SESSION=<s>`.
 //   - stdout: exactly one line of `schema_version:1` JSON (`session`/`windowId`/
 //     `paneId` at top level). keeper DISCARDS `paneId` — binding is hook-based.
 //   - exit codes (the launcher's `TMUX_EXIT`): 0=launched, 1=INTERNAL, 2=BAD_ARGS,
@@ -1195,7 +1197,8 @@ export interface KeeperAgentLaunchOpts {
    *  agent applies the harness's own default), and shapes the resume tail via the
    *  descriptor's resume verb. */
   readonly harness?: string;
-  /** `--name <claudeName>` (the reap/classify correlation key). Omitted when absent. */
+  /** Matching tmux window name plus harness-native `--name <claudeName>`.
+   *  Omitted when absent. */
   readonly claudeName?: string;
   /** `--model <m>`. Omitted when absent. */
   readonly model?: string;
@@ -1275,6 +1278,7 @@ export interface KeeperAgentLaunchOpts {
  *
  *   `<bun> <abs cli/keeper.ts> agent claude --x-tmux
  *     --x-tmux-detached --x-tmux-session <session>
+ *     [--x-tmux-window-name <claudeName>]
  *     --x-tmux-env KEEPER_TMUX_SESSION=<session>
  *     --x-tmux-env KEEPER_PLAN_WORKTREE=<lane>
  *     --x-tmux-env KEEPER_PLAN_WORKTREE_BRANCH=<branch>
@@ -1370,6 +1374,9 @@ export function buildKeeperAgentLaunchArgv(
     "--x-tmux-detached",
     "--x-tmux-session",
     opts.session,
+    ...(opts.claudeName !== undefined && opts.claudeName !== ""
+      ? ["--x-tmux-window-name", opts.claudeName]
+      : []),
     "--x-tmux-env",
     `KEEPER_TMUX_SESSION=${opts.session}`,
     // Worktree-lane carrier — ALWAYS a SECOND repeated `--x-tmux-env` (keeper agent

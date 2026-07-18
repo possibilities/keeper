@@ -2896,6 +2896,11 @@ export interface DispatchedPayload {
   id: string;
   dir: string | null;
   ts: number;
+  launch: {
+    session: string;
+    window: string;
+    pane: string | null;
+  };
   /**
    * The dispatched-cell translation forensics (ADR 0047), present ONLY for a
    * cell-bearing `work` launch: the ASSIGNED cell, the EFFECTIVE cell that
@@ -4330,6 +4335,7 @@ export async function confirmRunning(
   launchCell?: DispatchedPayload["cell"],
 ): Promise<ConfirmOutcome> {
   const key = dispatchKey(verb, id);
+  const launchWindow = spec.claudeName ?? key;
   // Watermark BEFORE launch: a re-open of a stale terminal row carries
   // `last_event_id <= watermark` (excluded), while the SessionStart that PROVES
   // this dispatch carries `> watermark`.
@@ -4348,6 +4354,11 @@ export async function confirmRunning(
       id,
       dir: cwd === "" ? null : cwd,
       ts: deps.now(),
+      launch: {
+        session: MANAGED_EXEC_SESSION,
+        window: launchWindow,
+        pane: null,
+      },
       ...(launchCell !== undefined ? { cell: launchCell } : {}),
     });
   } catch {
@@ -4384,7 +4395,10 @@ export async function confirmRunning(
   // 3. Launch — ONLY after the durable ack returned the admitted attempt. The
   // generic metadata rides the structured spec; prompts, names, cells, and the
   // pre-wrapped command remain unchanged.
-  const admittedSpec = withDispatchAttempt(spec, ack.attemptId);
+  const admittedSpec = withDispatchAttempt(
+    { ...spec, claudeName: launchWindow },
+    ack.attemptId,
+  );
   const launchResult: LaunchResult = await deps
     .launch(argv, key, cwd, admittedSpec)
     .catch((err) => ({
@@ -4458,9 +4472,10 @@ export async function confirmRunning(
   // ghost worker. So: SUPPRESS the emit and KEEP the `pending_dispatches` row —
   // it holds the slot, and the TTL sweep mints `DispatchExpired` if the bind
   // never arrives. The full ordering chain is load-bearing:
-  //   ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s) < REDISPATCH_COOLDOWN_S (200s).
+  //   ceilingMs (60s) < parked grace (90s) < pending TTL (120s) < cooldown (200s).
   // ceiling < TTL: a sweep < ceiling would clear the row mid-confirm and re-open
-  // the dispatch. TTL < cooldown: the cooldown must outlast the worst-case
+  // the dispatch. The producer keeps the parked-launch grace between the ceiling
+  // and TTL, and TTL < cooldown: the cooldown must outlast the worst-case
   // round-trip (the row surviving a full TTL plus the sweep tick) so suppression
   // never lapses while a phantom is in flight. NOTE: this chain bounds the
   // FOLD-LAG round-trip, but NOT an arbitrary `claude` cold-boot tail —
@@ -4468,7 +4483,8 @@ export async function confirmRunning(
   // cooldown (cover-end dispatch+260s with one indoubt re-stamp) lapsed before the
   // bind. `refreshSuppressionForOpenPending` now re-anchors the cooldown each cycle
   // the `pending_dispatches` row is still OPEN, extending cover to the phantom's
-  // durable lifetime (still TTL-sweep-bounded). Telemetry rides alongside: the
+  // durable lifetime. The parked-launch sweep suppresses the row at its grace
+  // before the TTL can release it for a second launch. Telemetry rides alongside: the
   // ceiling RESCUED a stuck dispatch, so `rescued:true` with the elapsed
   // `stalenessMs`.
   deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: elapsedMs });
