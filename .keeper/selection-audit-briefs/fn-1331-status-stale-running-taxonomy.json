@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 15,
+        "files_changed": 3,
+        "insertions": 262
+      },
+      "done_summary": "Split stale-running from live-running in status counts and per-row JSON views, added last_evidence_at freshness on stale rows, kept running_jobs emitting with a deprecation docstring, and recorded the decision in ADR 0083.",
+      "input_hash": "45c6ac4ae619bd9ed0de8047c2067732cd7b6b6ac22419da4ca420feb38d948f",
+      "model": "sonnet",
+      "spec_chars": 3163,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** cli/status.ts, test/status.test.ts, docs/adr/\n\n### Approach\n\nExtend `tallyVerdicts` in place (never a parallel counter) so the counts split\nstale-running from live running, deriving the subtype from the same machinery\nthe board pill uses \u2014 prefer consuming the existing verdict/pill token without\nchanging the readiness verdict shape; extend that shape minimally only if the\ntally input genuinely lacks the subtype. Add the stale counts to the JSON\nenvelope additively; `running_jobs` keeps emitting with its docstring marking it\ndeprecated in favor of `board_work_jobs` (zero in-repo consumers beyond one\nfixture; external readers stay unbroken). Bump/document the schema doc\naccordingly. Human-rendered summaries show stale entries with their last-evidence\nfreshness, not confident present tense. Ship the decision as a new\nprovisional-numbered ADR: the deprecation model (emit-both, docstring-deprecated),\nthe stale-count taxonomy, and why removal is deferred. Re-verify the observed\n`running:sub-agent-stale` pill while a nested wrapped Provider leg is positively\nlive and editing \u2014 stale evidence must not present as dead work; record the\nverdict in Evidence.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/status.ts:296-317 \u2014 tallyVerdicts; :397-403 \u2014 runningJobs/boardWorkJobs; :461-462 \u2014 envelope emission; :74-119 \u2014 schema docstring\n- src/board-render.ts:571-628 \u2014 bucketForToken stale/live branch ordering (the taxonomy to mirror)\n- src/readiness-client.ts:2401-2417 \u2014 where the stale reference timestamp is injected\n\n**Optional** (reference as needed):\n- src/icon-theme.ts:100-104 \u2014 existing stale/live icon split\n- cli/status.ts:198,456-457 \u2014 legacy wrapped Provider leg counting (for the stale-pill re-verification)\n\n### Risks\n\n- Deriving staleness by re-parsing pill strings would couple counts to display text \u2014 use the token/verdict machinery\n- fn-1326 lands served boot-identity fields in the same fixture file \u2014 the epic dep serializes, but rebase carefully\n\n### Test notes\n\nExtend the status fixture: mixed live/stale running jobs produce split counts;\nenvelope carries both old and new fields; the deprecated field still emits.\nBoard test already pins the pill contract \u2014 keep them consistent.\n\n## Acceptance\n\n- [ ] Status counts and JSON envelope distinguish stale-running from live running additively, consistent with the board pill taxonomy\n- [ ] running_jobs still emits and is documented deprecated in favor of board_work_jobs; a new ADR records the deprecation model and taxonomy decision\n- [ ] Stale entries in human output co-display last-evidence freshness\n- [ ] The wrapped-Provider-leg stale-pill observation is re-verified with the verdict recorded in Evidence\n- [ ] Named test gates for status and board pass\n\n## Done summary\nSplit stale-running from live-running in status counts and per-row JSON views, added last_evidence_at freshness on stale rows, kept running_jobs emitting with a deprecation docstring, and recorded the decision in ADR 0083.\n## Evidence\n",
+      "task_id": "fn-1331-status-stale-running-taxonomy.1",
+      "tier": "xhigh",
+      "title": "Split stale-running status counts"
+    }
+  ],
+  "created_at": "2026-07-18T11:59:08.970000Z",
+  "epic_id": "fn-1331-status-stale-running-taxonomy",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "45c6ac4ae619bd9ed0de8047c2067732cd7b6b6ac22419da4ca420feb38d948f",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
