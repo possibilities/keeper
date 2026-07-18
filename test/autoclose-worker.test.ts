@@ -18,6 +18,7 @@ import {
   type ComputeAutocloseReapsArgs,
   computeAutocloseReaps,
   parseWrappedProviderTaskId,
+  readLegOwnedAttemptIds,
 } from "../src/autoclose-worker";
 import {
   type LaunchResult,
@@ -297,6 +298,103 @@ test("autopilot cleanup releases the exact bound claim before starting grace", (
   });
   expect(released.claimReleases).toEqual([]);
   expect(released.reaps.map((decision) => decision.jobId)).toEqual(["j-work"]);
+});
+
+test("a bound claim owning Provider legs is retained through grace/reap with zero release requests", () => {
+  const job = autopilotWork();
+  const claim = {
+    verb: "work",
+    id: "fn-1-x.2",
+    attempt_id: 41,
+    state: "bound",
+    session_id: "j-work",
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: 2,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 2,
+    updated_at: 2,
+  };
+  const quiescent = new Map([
+    [
+      "j-work",
+      {
+        status: "quiescent" as const,
+        reason: "parent-quiescent" as const,
+        reservation: null,
+      },
+    ],
+  ]);
+  const over = {
+    jobs: [job],
+    panes: [pane()],
+    activityByJobId: quiescent,
+    processIdentityByJobId: new Map([["j-work", "alive" as const]]),
+    dispatchClaims: [claim],
+    legOwnedAttemptIds: new Set([41]),
+  };
+
+  // First observation: enters grace, emits NO release request, reaps nothing.
+  const first = run({ ...over, graceMap: new Map() });
+  expect(first.claimReleases).toEqual([]);
+  expect(first.reaps).toEqual([]);
+  expect(first.graceMap.has("j-work")).toBe(true);
+
+  // Many wakes before terminality: still zero release requests — repeated
+  // pulses must not grow the event stream.
+  let graceMap: ReadonlyMap<string, number> = first.graceMap;
+  for (let wake = 1; wake <= 25; wake++) {
+    const pulse = run({ ...over, graceMap, now: NOW + wake });
+    expect(pulse.claimReleases).toEqual([]);
+    expect(pulse.reaps).toEqual([]);
+    graceMap = pulse.graceMap;
+  }
+
+  // Past grace: the reap fires with the claim still bound and still unreleased.
+  const due = run({ ...over, graceMap: elapsed("j-work") });
+  expect(due.claimReleases).toEqual([]);
+  expect(due.reaps.map((decision) => decision.jobId)).toEqual(["j-work"]);
+});
+
+test("an omitted legOwnedAttemptIds treats every attempt as ownerless (release-first preserved)", () => {
+  const job = autopilotWork();
+  const claim = {
+    verb: "work",
+    id: "fn-1-x.2",
+    attempt_id: 41,
+    state: "bound",
+    session_id: "j-work",
+    dir: "/repo",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: 2,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 2,
+    updated_at: 2,
+  };
+  const result = run({
+    jobs: [job],
+    panes: [pane()],
+    graceMap: elapsed("j-work"),
+    activityByJobId: new Map([
+      [
+        "j-work",
+        {
+          status: "quiescent" as const,
+          reason: "parent-quiescent" as const,
+          reservation: null,
+        },
+      ],
+    ]),
+    processIdentityByJobId: new Map([["j-work", "alive"]]),
+    dispatchClaims: [claim],
+    legOwnedAttemptIds: new Set([999]),
+  });
+  expect(result.reaps).toEqual([]);
+  expect(result.claimReleases).toHaveLength(1);
 });
 
 test("renewed activity, unknown probes, and recycled pids cancel autoclose", () => {
@@ -1233,6 +1331,26 @@ test("autoclosePulse: a durable ownership row excludes the wrapped leg from the 
   );
   expect(killed).toEqual([]);
   expect(state.graceMap.has("ownedwrapped")).toBe(false);
+  db.close();
+});
+
+test("readLegOwnedAttemptIds: distinct attempt ids from the ownership projection", () => {
+  const { db } = freshMemDb();
+  db.run(
+    `INSERT INTO provider_leg_ownership
+       (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+        ownership_epoch_event_id, leg_session_id, pane_id, pane_generation,
+        backend_exec_type, backend_exec_session_id, state, last_event_id,
+        created_at, updated_at)
+     VALUES
+       ('launch-a', 'wrapper-1', 7, 9, 'leg-a', '%5', '105:1005',
+        'tmux', 'wrapped', 'live', 9, 1, 1),
+       ('launch-b', 'wrapper-1', 7, 9, 'leg-b', '%6', '105:1006',
+        'tmux', 'wrapped', 'terminal', 9, 1, 1),
+       ('launch-c', 'wrapper-2', 12, 9, 'leg-c', '%7', '105:1007',
+        'tmux', 'wrapped', 'live', 9, 1, 1)`,
+  );
+  expect(readLegOwnedAttemptIds(db)).toEqual(new Set([7, 12]));
   db.close();
 });
 

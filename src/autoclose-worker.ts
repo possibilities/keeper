@@ -17,8 +17,13 @@
  * elapses on a quiet board — no DB write to bump data_version — still gets
  * re-examined), and writes ONLY to tmux (`kill-window`). It NEVER writes
  * keeper.db: the exit-watcher remains the sole `Killed` producer. Before an
- * autopilot reap it asks main to mint an exact `DispatchClaimReleased`; after
- * that release folds it sends the pre-kill intent hint
+ * autopilot reap whose exact claim owns NO durable Provider legs it asks main to
+ * mint an exact `DispatchClaimReleased` and reaps only after that release folds;
+ * a claim whose attempt owns Provider legs is RETAINED through grace/reap — the
+ * reducer rejects a release until the wrapper's terminal cascade, so the
+ * wrapper's terminal fold arms the cascade and
+ * `releaseSettledProviderLegAttempts` stays the sole release producer after
+ * settlement. Before each kill it sends the pre-kill intent hint
  * ({@link AutocloseIntentMessage}) so main owns `kill_reason: 'autoclosed'`.
  *
  * Managed membership is proven by projection evidence: the autopilot bucket
@@ -225,6 +230,11 @@ export interface ComputeAutocloseReapsArgs {
   /** Canonical activity and claims. Omitted only by compatibility callers. */
   activityByJobId?: ReadonlyMap<string, HarnessActivity>;
   dispatchClaims?: readonly DispatchClaim[];
+  /** Attempt ids holding at least one durable Provider-leg ownership row. For
+   *  these the terminal cascade owns the exact release
+   *  (`releaseSettledProviderLegAttempts`); the decision core must never
+   *  request one. Absent ⇒ treated as empty (every attempt is ownerless). */
+  legOwnedAttemptIds?: ReadonlySet<number>;
   /** Fresh recycle-safe process verdicts keyed by job id. */
   processIdentityByJobId?: ReadonlyMap<
     string,
@@ -457,6 +467,7 @@ export function computeAutocloseReaps(
     now,
     activityByJobId,
     dispatchClaims,
+    legOwnedAttemptIds,
     processIdentityByJobId,
   } = args;
 
@@ -525,7 +536,12 @@ export function computeAutocloseReaps(
         continue;
       }
       if (claim.session_id === job.job_id && claim.state !== "released") {
-        if (claim.state === "bound") {
+        if (claim.state !== "bound") {
+          continue;
+        }
+        if (!(legOwnedAttemptIds?.has(claim.attempt_id) ?? false)) {
+          // Ownerless attempt (no durable Provider legs): release-first, and
+          // reap only once the release folds.
           claimReleases.push({
             kind: "autoclose-claim-release",
             verb: job.plan_verb,
@@ -533,8 +549,15 @@ export function computeAutocloseReaps(
             expectedAttemptId: claim.attempt_id,
             sessionId: job.job_id,
           });
+          continue;
         }
-        continue;
+        // The attempt owns durable Provider legs: the reducer rejects a release
+        // until the wrapper's terminal cascade, so requesting one here can only
+        // mint rejected-release events — each a durable data_version bump that
+        // re-wakes this worker into the same request. Retain the claim and
+        // proceed through grace/reap; the wrapper's terminal fold arms the
+        // cascade and `releaseSettledProviderLegAttempts` releases exactly once
+        // after settlement.
       }
       if (claim.session_id == null && claim.state === "acquired") {
         // A newer exact attempt revoked this owner; its old pane remains safe to
@@ -627,6 +650,22 @@ function readAutocloseJobs(db: Database): AutocloseJob[] {
         WHERE j.state = 'stopped'`,
     )
     .all() as AutocloseJob[];
+}
+
+/** Read the attempt ids holding at least one durable Provider-leg ownership
+ *  row. For these the terminal cascade owns the exact release
+ *  (`releaseSettledProviderLegAttempts`), so the decision core never requests
+ *  one. A throw is caught by the pulse's non-fatal skip. Exported for unit
+ *  reach. */
+export function readLegOwnedAttemptIds(db: Database): Set<number> {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT wrapper_dispatch_attempt_id AS attempt_id
+         FROM provider_leg_ownership
+        WHERE wrapper_dispatch_attempt_id IS NOT NULL`,
+    )
+    .all() as { attempt_id: number }[];
+  return new Set(rows.map((row) => row.attempt_id));
 }
 
 /**
@@ -768,6 +807,7 @@ export async function autoclosePulse(
     now,
     activityByJobId: inputs.harnessActivityByJobId,
     dispatchClaims: inputs.dispatchClaims,
+    legOwnedAttemptIds: readLegOwnedAttemptIds(db),
     processIdentityByJobId,
   });
   state.graceMap = graceMap;
