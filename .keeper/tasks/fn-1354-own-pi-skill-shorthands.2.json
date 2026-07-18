@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:21:29.958000Z",
+  "depends_on": [
+    "fn-1354-own-pi-skill-shorthands.1"
+  ],
+  "epic": "fn-1354-own-pi-skill-shorthands",
+  "id": "fn-1354-own-pi-skill-shorthands.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "xhigh",
+  "title": "Retire Arthack Pi aliases",
+  "updated_at": "2026-07-18T21:21:29.958000Z"
+}
