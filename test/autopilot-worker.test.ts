@@ -215,10 +215,14 @@ import {
 } from "../src/commit-work/git-exec";
 import {
   buildParkedLaunchFailurePayload,
+  buildPendingDispatchSweepRecords,
   MERGE_ESCALATION_REASON_TOKEN,
+  ORPHANED_CLAIM_REAP_BATCH,
+  ORPHANED_CLAIM_SKEW_GRACE_MS,
   PARKED_LAUNCH_GRACE_MS,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
+  planOrphanedClaimReaper,
   planPendingDispatchSweep,
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
@@ -4689,6 +4693,96 @@ test("parked pending sweep mints the suppressing sticky before TTL re-serve and 
         )
         .get(),
     ).toEqual({ n: 0 });
+  });
+});
+
+test("durable orphan Reaper requires claim age, excludes pending/bound/legacy/malformed rows, and emits source telemetry", async () => {
+  await withSeededDb((db) => {
+    const nowMs = 1_700_000_000_000;
+    const fullWindow =
+      PENDING_DISPATCH_TTL_MS +
+      ORPHANED_CLAIM_SKEW_GRACE_MS +
+      PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+    const bootAnchorMs = nowMs - fullWindow * 2;
+    const oldAcquiredAt = (nowMs - fullWindow * 2) / 1000;
+    const insertClaim = (
+      id: string,
+      attemptId: number,
+      state: string,
+      acquiredAt: number | string,
+      legacy = 0,
+    ): void => {
+      db.query(
+        `INSERT INTO dispatch_claims (
+           verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+           acquired_at, last_event_id, updated_at
+         ) VALUES ('work', ?, ?, ?, NULL, '/repo', ?, ?, ?, ?)`,
+      ).run(id, attemptId, state, legacy, acquiredAt, attemptId, oldAcquiredAt);
+    };
+    insertClaim("orphan-old.1", 101, "acquired", oldAcquiredAt);
+    insertClaim("orphan-young.1", 102, "acquired", nowMs / 1000);
+    insertClaim("orphan-bound.1", 103, "bound", oldAcquiredAt);
+    insertClaim("orphan-legacy.1", 104, "legacy_unfenced", oldAcquiredAt, 1);
+    insertClaim("orphan-malformed.1", 105, "acquired", "not-a-time");
+    insertClaim("orphan-pending.1", 106, "acquired", oldAcquiredAt);
+    db.query(
+      `INSERT INTO pending_dispatches
+         (verb, id, dir, dispatched_at, last_event_id, attempt_id)
+       VALUES ('work', 'orphan-pending.1', '/repo', ?, 106, 106)`,
+    ).run(oldAcquiredAt);
+
+    const planned = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    expect(planned.map((row) => row.id)).toEqual(["orphan-old.1"]);
+    expect(planned[0]?.ownerless).toBe(true);
+    const telemetry = buildPendingDispatchSweepRecords(
+      planned.map((row) => ({
+        verb: row.verb,
+        id: row.id,
+        dispatched_at: row.acquired_at,
+        source: "orphaned-claim" as const,
+        attempt_id: row.attempt_id,
+      })),
+      nowMs,
+    );
+    expect(telemetry[0]?.detail).toEqual({
+      verb: "work",
+      id: "orphan-old.1",
+      source: "orphaned-claim",
+      attempt_id: "101",
+    });
+  });
+});
+
+test("durable orphan Reaper deterministically jitters a reboot cohort and caps each heartbeat", async () => {
+  await withSeededDb((db) => {
+    const nowMs = 1_800_000_000_000;
+    const acquiredAt = 1_700_000_000;
+    for (let i = 0; i < 50; i++) {
+      db.query(
+        `INSERT INTO dispatch_claims (
+           verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+           acquired_at, last_event_id, updated_at
+         ) VALUES ('work', ?, ?, 'acquired', NULL, '/repo', 0, ?, ?, ?)`,
+      ).run(
+        `orphan-mass.${i + 1}`,
+        1_000 + i,
+        acquiredAt,
+        1_000 + i,
+        acquiredAt,
+      );
+    }
+    const bootAnchorMs =
+      nowMs -
+      PENDING_DISPATCH_TTL_MS -
+      ORPHANED_CLAIM_SKEW_GRACE_MS -
+      PENDING_DISPATCH_SWEEP_INTERVAL_MS;
+    const first = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    const second = planOrphanedClaimReaper(db, nowMs, bootAnchorMs);
+    expect(first).toHaveLength(ORPHANED_CLAIM_REAP_BATCH);
+    expect(second).toEqual(first);
+    expect(new Set(first.map((row) => row.deadline_ms)).size).toBeGreaterThan(
+      1,
+    );
   });
 });
 
