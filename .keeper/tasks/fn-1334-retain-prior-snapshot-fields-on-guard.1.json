@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T14:28:11.596000Z",
+  "depends_on": [],
+  "epic": "fn-1334-retain-prior-snapshot-fields-on-guard",
+  "id": "fn-1334-retain-prior-snapshot-fields-on-guard.1",
+  "model": "gpt-5.6-terra",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/dotfiles",
+  "tier": "low",
+  "title": "Retain snapshot fields on timeout",
+  "updated_at": "2026-07-18T14:28:11.596000Z"
+}
