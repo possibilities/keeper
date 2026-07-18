@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-18T10:11:52.580000Z",
   "depends_on": [],
   "epic": "fn-1330-cleanup-lane-paging-and-hygiene",
   "id": "fn-1330-cleanup-lane-paging-and-hygiene.4",
-  "model": "opus",
+  "model": "gpt-5.6-terra",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "medium",
   "title": "Label plan epics project",
-  "updated_at": "2026-07-18T10:11:52.580000Z"
+  "updated_at": "2026-07-18T10:13:24.751000Z"
 }
