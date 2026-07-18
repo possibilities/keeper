@@ -482,7 +482,7 @@ export const PLAN_COMMANDS: readonly PlanCommand[] = [
   },
   {
     name: "epics",
-    summary: "List all epics.",
+    summary: "List all epics with the resolved project name and path.",
     options: [OPT_LIMIT, OPT_OFFSET],
   },
   {

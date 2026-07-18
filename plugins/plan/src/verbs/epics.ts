@@ -33,8 +33,11 @@ const STATUS_KEYS = ["todo", "in_progress", "done", "blocked"] as const;
 type StatusKey = (typeof STATUS_KEYS)[number];
 
 /** Render the epics envelope as _render_human's table text. */
-function renderHuman(data: { epics?: EpicEntry[] }): string {
-  const lines: string[] = [];
+function renderHuman(data: {
+  project: { name: string; path: string };
+  epics?: EpicEntry[];
+}): string {
+  const lines = [`Project: ${data.project.name} (${data.project.path})`];
   for (const epic of data.epics ?? []) {
     const s = epic.task_summary;
     const parts: string[] = [];
@@ -132,9 +135,23 @@ export function runEpics(opts: {
     : null;
 
   formatOutput(
-    { success: true, epics: resultEpics, total, returned, truncated, hint },
+    {
+      success: true,
+      project: { name: ctx.name, path: ctx.projectPath },
+      epics: resultEpics,
+      total,
+      returned,
+      truncated,
+      hint,
+    },
     format,
-    (d) => renderHuman(d as { epics?: EpicEntry[] }),
+    (d) =>
+      renderHuman(
+        d as {
+          project: { name: string; path: string };
+          epics?: EpicEntry[];
+        },
+      ),
   );
   return ctx.projectPath;
 }
