@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:01:39.116000Z",
+  "depends_on": [],
+  "epic": "fn-1348-escalation-capabilities-as-plan-agents",
+  "id": "fn-1348-escalation-capabilities-as-plan-agents.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Author four escalation agent templates",
+  "updated_at": "2026-07-18T21:01:39.116000Z"
+}

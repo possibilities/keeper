@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-18T21:01:39.116000Z",
+  "depends_on_epics": [
+    "fn-1347-escalation-grant-confinement-groundwork"
+  ],
+  "id": "fn-1348-escalation-capabilities-as-plan-agents",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Escalation capabilities as plan agents",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-18T21:01:39.116000Z"
+}

@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-18T21:01:39.116000Z",
+  "depends_on": [
+    "fn-1348-escalation-capabilities-as-plan-agents.1"
+  ],
+  "epic": "fn-1348-escalation-capabilities-as-plan-agents",
+  "id": "fn-1348-escalation-capabilities-as-plan-agents.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Skills become thin agent wrappers",
+  "updated_at": "2026-07-18T21:01:39.116000Z"
+}
