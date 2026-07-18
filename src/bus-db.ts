@@ -72,6 +72,10 @@ const CREATE_CHANNELS_INDEXES = [
   "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_pid_start ON channels(pid, start_time)",
 ];
 
+const CREATE_CHANNELS_MAINTENANCE_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_channels_retention ON channels(last_heartbeat, channel_id)",
+];
+
 const CREATE_MESSAGES = `
 CREATE TABLE IF NOT EXISTS messages (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +154,9 @@ export function migrateBusDb(db: Database): void {
   db.transaction(() => {
     db.run(CREATE_CHANNELS);
     for (const ddl of CREATE_CHANNELS_INDEXES) db.run(ddl);
+    for (const ddl of CREATE_CHANNELS_MAINTENANCE_INDEXES) {
+      createIndexFailOpen(db, ddl);
+    }
     db.run(CREATE_MESSAGES);
     for (const ddl of CREATE_MESSAGES_INDEXES) createIndexFailOpen(db, ddl);
     if (stored < 2) {
@@ -282,20 +289,58 @@ export function loadChannels(db: Database): ChannelRow[] {
   return rows.map(rowToChannel);
 }
 
+/** Ordered keyset retained by the channel-retention worker between ticks. */
+export interface ChannelRetentionCursor {
+  last_heartbeat: number;
+  channel_id: string;
+}
+
 /**
- * Load the `limit` OLDEST channel rows (by `last_heartbeat`) — the retention
- * pass's bounded candidate window. Oldest-first so the stalest rows are examined
- * first; a live-connected row with an old stamp is re-examined each pass but
- * cheaply kept (the worker's liveness gate), so progress still drains the dead
- * tail behind it. Bounded read by construction — never a full-table scan.
+ * Load at most `limit` channel rows after `cursor`, ordered by the retention
+ * index. Reaching the tail wraps into the head with the remaining budget, so
+ * connected keeps cannot permanently hide later rows. The tuple tie-breaker
+ * makes equal-heartbeat traversal total and stable.
  */
-export function loadOldestChannels(db: Database, limit: number): ChannelRow[] {
-  const rows = db
+export function loadChannelRetentionCandidates(
+  db: Database,
+  cursor: ChannelRetentionCursor | null,
+  limit: number,
+): ChannelRow[] {
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  const boundedLimit = Math.floor(limit);
+  if (cursor === null) {
+    const rows = db
+      .prepare(
+        "SELECT * FROM channels ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?",
+      )
+      .all(boundedLimit) as Record<string, unknown>[];
+    return rows.map(rowToChannel);
+  }
+
+  const tail = db
     .prepare(
-      "SELECT * FROM channels ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?",
+      `SELECT * FROM channels
+       WHERE (last_heartbeat, channel_id) > (?, ?)
+       ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?`,
     )
-    .all(limit) as Record<string, unknown>[];
-  return rows.map(rowToChannel);
+    .all(cursor.last_heartbeat, cursor.channel_id, boundedLimit) as Record<
+    string,
+    unknown
+  >[];
+  if (tail.length === boundedLimit) return tail.map(rowToChannel);
+
+  const head = db
+    .prepare(
+      `SELECT * FROM channels
+       WHERE (last_heartbeat, channel_id) <= (?, ?)
+       ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?`,
+    )
+    .all(
+      cursor.last_heartbeat,
+      cursor.channel_id,
+      boundedLimit - tail.length,
+    ) as Record<string, unknown>[];
+  return [...tail, ...head].map(rowToChannel);
 }
 
 /** Delete a channel by its stable `(pid, start_time)` identity (deregister/reap). */
@@ -308,6 +353,24 @@ export function deleteChannel(
     pid,
     startTime,
   );
+}
+
+/**
+ * Reap only the candidate version that was observed before asynchronous
+ * liveness work. A concurrent upsert advances `last_heartbeat`, making the
+ * zero-row result a benign freshness win.
+ */
+export function deleteChannelIfUnchanged(
+  db: Database,
+  candidate: Pick<ChannelRow, "pid" | "start_time" | "last_heartbeat">,
+): boolean {
+  const result = db
+    .prepare(
+      `DELETE FROM channels
+       WHERE pid = ? AND start_time = ? AND last_heartbeat = ?`,
+    )
+    .run(candidate.pid, candidate.start_time, candidate.last_heartbeat);
+  return result.changes === 1;
 }
 
 // ---------------------------------------------------------------------------

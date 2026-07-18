@@ -42,7 +42,19 @@ row-first artifact coupling stand.
 - **The partial index lands in the unconditional create-if-missing block** —
   no bus schema version bump; an older binary keeps working against the
   same file.
-- **Presence follows its definition.** A channel row with no live socket
-  past a generous age horizon is reaped even when its pid identity cannot
-  be verified; the fail-safe keep applies only inside the horizon. A row
-  with a live socket is never reaped.
+- **Presence follows its definition.** A channel row with no live subscribed
+  socket is reaped at a generous age horizon regardless of whether its process
+  identity is dead, unverifiable, recycled, or still matching. Process checks
+  preserve their early-reap and fail-safe roles only inside the horizon; expired
+  rows consume no process-probe budget. A row with a live subscribed socket is
+  never reaped.
+- **Channel traversal is a bounded keyset cycle.** Retention orders channels by
+  `(last_heartbeat, channel_id)`, advances its in-memory cursor over every row it
+  examines, and wraps at the end. Separate scan, process-probe, and delete bounds
+  keep each tick fixed-cost while connected rows cannot pin the scan head. A
+  create-if-missing composite index serves the order without a schema bump.
+- **Fresh Presence wins races.** Before deletion the worker rechecks the live
+  subscribed socket and compares the candidate's observed heartbeat in the
+  delete predicate. A refresh therefore turns deletion into a benign no-op, and
+  reaping retires any open unsubscribed registration connection before removing
+  its registry entry.

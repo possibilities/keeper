@@ -16,11 +16,13 @@ import type { BusArtifactRef } from "../src/bus-artifact";
 import {
   appendMessage,
   BUS_SCHEMA_VERSION,
+  type ChannelRetentionCursor,
   type ChannelRow,
   DELIVERED_AFTER_WAKE,
   deleteChannel,
+  deleteChannelIfUnchanged,
+  loadChannelRetentionCandidates,
   loadChannels,
-  loadOldestChannels,
   markMessageDelivered,
   maxMessageId,
   migrateBusDb,
@@ -910,38 +912,75 @@ test("pruneControlMessagesOlderThan counts eligible rows and reaches aged rows b
   db.close();
 });
 
-test("loadOldestChannels returns the oldest channels by last_heartbeat, bounded by the limit", () => {
+test("channel retention keyset traverses equal timestamps once per cycle and wraps", () => {
   const db = openBusDb(":memory:");
+  const expected: string[] = [];
+  for (let i = 0; i < 70; i++) {
+    const channelId = `ch-${String(i).padStart(3, "0")}`;
+    expected.push(channelId);
+    upsertChannel(
+      db,
+      makeChannel({
+        channel_id: channelId,
+        pid: 10_000 + i,
+        start_time: `s-${i}`,
+        last_heartbeat: 100,
+      }),
+    );
+  }
+
+  let cursor: ChannelRetentionCursor | null = null;
+  const examined: string[] = [];
+  while (examined.length < expected.length) {
+    const rows = loadChannelRetentionCandidates(db, cursor, 8);
+    expect(rows.length).toBeLessThanOrEqual(8);
+    examined.push(...rows.map((row) => row.channel_id));
+    const last = rows.at(-1);
+    if (last === undefined) throw new Error("retention traversal stalled");
+    cursor = {
+      last_heartbeat: last.last_heartbeat,
+      channel_id: last.channel_id,
+    };
+  }
+  expect(examined.slice(0, 70)).toEqual(expected);
+  expect(new Set(examined.slice(0, 70)).size).toBe(70);
+  expect(examined.slice(70)).toEqual(["ch-000", "ch-001"]);
+
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT * FROM channels
+       WHERE (last_heartbeat, channel_id) > (?, ?)
+       ORDER BY last_heartbeat ASC, channel_id ASC LIMIT ?`,
+    )
+    .all(100, "ch-010", 8) as { detail: string }[];
+  expect(
+    plan.some((row) => row.detail.includes("idx_channels_retention")),
+  ).toBe(true);
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_channels_retention'",
+      )
+      .get(),
+  ).not.toBeNull();
+  expect(BUS_SCHEMA_VERSION).toBe(2);
+  db.close();
+});
+
+test("channel retention delete CAS preserves a refreshed identity", () => {
+  const db = openBusDb(":memory:");
+  const stale = makeChannel({ last_heartbeat: 100 });
+  upsertChannel(db, stale);
+  const [candidate] = loadChannelRetentionCandidates(db, null, 1);
   upsertChannel(
     db,
-    makeChannel({
-      channel_id: "ch-newest",
-      pid: 1,
-      start_time: "s1",
-      last_heartbeat: 300,
-    }),
+    makeChannel({ channel_id: "ch-fresh", last_heartbeat: 9_000 }),
   );
-  upsertChannel(
-    db,
-    makeChannel({
-      channel_id: "ch-oldest",
-      pid: 2,
-      start_time: "s2",
-      last_heartbeat: 100,
-    }),
-  );
-  upsertChannel(
-    db,
-    makeChannel({
-      channel_id: "ch-mid",
-      pid: 3,
-      start_time: "s3",
-      last_heartbeat: 200,
-    }),
-  );
-  expect(loadOldestChannels(db, 2).map((c) => c.channel_id)).toEqual([
-    "ch-oldest",
-    "ch-mid",
-  ]);
+
+  expect(deleteChannelIfUnchanged(db, candidate)).toBe(false);
+  const [survivor] = loadChannels(db);
+  expect(survivor.channel_id).toBe("ch-fresh");
+  expect(survivor.last_heartbeat).toBe(9_000);
   db.close();
 });

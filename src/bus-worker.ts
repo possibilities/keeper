@@ -54,11 +54,13 @@ import {
 import {
   appendMessage,
   artifactRowExists,
+  type ChannelRetentionCursor,
   type ChannelRow,
   DELIVERED_AFTER_WAKE,
   deleteChannel,
+  deleteChannelIfUnchanged,
+  loadChannelRetentionCandidates,
   loadChannels,
-  loadOldestChannels,
   type MessageRow,
   markMessageDelivered,
   maxMessageId,
@@ -145,6 +147,10 @@ export const CHANNEL_CANDIDATE_BATCH = 64;
  *  connected agents need no probe; only an alive-but-disconnected candidate does,
  *  and those are capped so a tick spawns a bounded number of subprocesses. */
 export const CHANNEL_PROBE_BOUND = 16;
+
+/** Max channel delete attempts per tick, independently bounded from scanning and
+ *  process probes so maintenance write work cannot grow with the registry. */
+export const CHANNEL_DELETE_BOUND = 64;
 
 /** A channel row younger than this is never pruned — grace for a just-registered
  *  agent whose liveness probe momentarily races. */
@@ -598,20 +604,16 @@ export type ChannelLiveness =
  * feeds it `connected` (a live socket for this identity right now) and
  * `liveness`.
  *
- * Prune ONLY a row that is provably stale, or old enough that an unverifiable
- * identity is no longer worth the fail-safe keep:
- *  - `connected` → keep. A live socket is present regardless of what any probe
- *    says; this also protects a keeper-miss registration whose stored
- *    `start_time` is a synthetic placeholder that no OS probe would match.
+ * Prune ONLY a row that is provably stale or has outlived socketless Presence:
+ *  - `connected` → keep. A live subscribed socket is authoritative regardless
+ *    of age or what any process probe says.
  *  - younger than `graceMs` → keep. A just-registered row whose probe raced.
- *  - identity dead (no process on the pid) → prune.
- *  - alive but the probe returned `null` (transient failure, or none was
- *    possible): keep inside `horizonMs` (fail-safe: never prune on an
- *    inconclusive probe within the horizon); past `horizonMs` → prune (an
- *    unverifiable-forever row must not accumulate presence indefinitely).
- *  - alive with a start_time that does NOT match the row → prune (the pid was
- *    recycled by a different process, or the stored start_time is unverifiable).
- *  - alive with a matching start_time → keep (the agent's process is still up).
+ *  - at or beyond `horizonMs` without a socket → prune. Process identity is not
+ *    Presence and is deliberately irrelevant at this boundary.
+ *  - inside the horizon, identity dead → prune.
+ *  - inside the horizon, alive but unverifiable → keep fail-safe.
+ *  - inside the horizon, a different live start_time → prune (pid recycle).
+ *  - inside the horizon, a matching live start_time → keep.
  */
 export function channelPruneDecision(
   rowStartTime: string,
@@ -623,10 +625,9 @@ export function channelPruneDecision(
 ): "keep" | "prune" {
   if (connected) return "keep";
   if (rowAgeMs < graceMs) return "keep";
+  if (rowAgeMs >= horizonMs) return "prune";
   if (!liveness.alive) return "prune";
-  if (liveness.startTime === null) {
-    return rowAgeMs >= horizonMs ? "prune" : "keep";
-  }
+  if (liveness.startTime === null) return "keep";
   return liveness.startTime === rowStartTime ? "keep" : "prune";
 }
 
@@ -673,6 +674,144 @@ export interface RegistryEntry {
    * persisted channel (keyed on the shared `(pid, start_time)`) on its behalf.
    */
   ephemeral?: boolean;
+}
+
+export interface ChannelRetentionState {
+  cursor: ChannelRetentionCursor | null;
+}
+
+export interface ChannelRetentionSweepDeps {
+  identityConnected(pid: number, startTime: string): boolean;
+  isPidAlive(pid: number): boolean;
+  probeStartTime(pid: number): Promise<string | null>;
+  retire(row: ChannelRow): void;
+}
+
+export interface ChannelRetentionSweepLimits {
+  candidates: number;
+  probes: number;
+  deletes: number;
+  graceMs: number;
+  horizonMs: number;
+}
+
+export interface ChannelRetentionSweepResult {
+  examined: number;
+  probes: number;
+  deleteAttempts: number;
+  deleted: number;
+}
+
+/**
+ * Run one bounded keyset retention sweep. The cursor advances before any async
+ * work for every examined row, including connected keeps and probe-budget
+ * deferrals. Horizon-expired rows bypass process probes because socket Presence,
+ * not process identity, owns that boundary.
+ */
+export async function sweepChannelRetention(
+  db: Database,
+  now: number,
+  state: ChannelRetentionState,
+  deps: ChannelRetentionSweepDeps,
+  limits: ChannelRetentionSweepLimits = {
+    candidates: CHANNEL_CANDIDATE_BATCH,
+    probes: CHANNEL_PROBE_BOUND,
+    deletes: CHANNEL_DELETE_BOUND,
+    graceMs: CHANNEL_PRUNE_GRACE_MS,
+    horizonMs: CHANNEL_PRESENCE_HORIZON_MS,
+  },
+): Promise<ChannelRetentionSweepResult> {
+  const candidates = loadChannelRetentionCandidates(
+    db,
+    state.cursor,
+    limits.candidates,
+  );
+  const result: ChannelRetentionSweepResult = {
+    examined: 0,
+    probes: 0,
+    deleteAttempts: 0,
+    deleted: 0,
+  };
+
+  for (const row of candidates) {
+    state.cursor = {
+      last_heartbeat: row.last_heartbeat,
+      channel_id: row.channel_id,
+    };
+    result.examined += 1;
+
+    const connected = deps.identityConnected(row.pid, row.start_time);
+    const ageMs = now - row.last_heartbeat;
+    let liveness: ChannelLiveness;
+    if (connected || ageMs >= limits.horizonMs) {
+      liveness = { alive: true, startTime: row.start_time };
+    } else if (!deps.isPidAlive(row.pid)) {
+      liveness = { alive: false };
+    } else {
+      if (result.probes >= limits.probes) continue;
+      result.probes += 1;
+      liveness = {
+        alive: true,
+        startTime: await deps.probeStartTime(row.pid),
+      };
+    }
+
+    if (
+      channelPruneDecision(
+        row.start_time,
+        ageMs,
+        limits.graceMs,
+        connected,
+        liveness,
+        limits.horizonMs,
+      ) !== "prune"
+    ) {
+      continue;
+    }
+    if (result.deleteAttempts >= limits.deletes) continue;
+    if (deps.identityConnected(row.pid, row.start_time)) continue;
+
+    result.deleteAttempts += 1;
+    try {
+      if (!deleteChannelIfUnchanged(db, row)) continue;
+    } catch {
+      continue;
+    }
+    result.deleted += 1;
+    deps.retire(row);
+  }
+  return result;
+}
+
+/** Close and detach socketless registrations after their durable row is reaped. */
+export function retireSocketlessChannel(
+  registry: Map<string, RegistryEntry>,
+  row: Pick<ChannelRow, "pid" | "start_time">,
+): number {
+  let retired = 0;
+  for (const [channelId, entry] of registry) {
+    if (
+      entry.sock !== null ||
+      entry.channel.pid !== row.pid ||
+      entry.channel.start_time !== row.start_time
+    ) {
+      continue;
+    }
+    const connection = entry.connection;
+    entry.connection = null;
+    const connectionState = connection?.data as unknown as
+      | { entry?: RegistryEntry | null }
+      | undefined;
+    if (connectionState?.entry === entry) connectionState.entry = null;
+    try {
+      connection?.end?.();
+    } catch {
+      // best-effort stale registration retirement
+    }
+    registry.delete(channelId);
+    retired += 1;
+  }
+  return retired;
 }
 
 /**
@@ -1690,59 +1829,18 @@ export function startBusServer(
     return false;
   };
 
-  /**
-   * Prune the stalest channel cache rows whose `(pid, start_time)` identity is
-   * provably dead — bounded candidate window, capped async identity probes. Drops
-   * the matching disconnected in-memory entries too, so `registryList()` stops
-   * walking them (the fanout/resolve/list amplifier).
-   */
+  const channelRetentionState: ChannelRetentionState = { cursor: null };
+
+  /** One bounded channel-cache sweep with a cursor retained across timer ticks. */
   const pruneStaleChannels = async (now: number): Promise<void> => {
-    const candidates = loadOldestChannels(busDb, CHANNEL_CANDIDATE_BATCH);
-    let probes = 0;
-    for (const row of candidates) {
-      const connected = identityConnected(row.pid, row.start_time);
-      let liveness: ChannelLiveness;
-      if (connected) {
-        liveness = { alive: true, startTime: row.start_time };
-      } else if (!isPidAlive(row.pid)) {
-        liveness = { alive: false };
-      } else {
-        // Alive pid, no live socket — needs an identity probe. Bounded per tick:
-        // over the cap, leave the rest for the next pass.
-        if (probes >= CHANNEL_PROBE_BOUND) continue;
-        probes += 1;
-        liveness = { alive: true, startTime: await startTimeViaPs(row.pid) };
-      }
-      if (
-        channelPruneDecision(
-          row.start_time,
-          now - row.last_heartbeat,
-          CHANNEL_PRUNE_GRACE_MS,
-          connected,
-          liveness,
-          CHANNEL_PRESENCE_HORIZON_MS,
-        ) !== "prune"
-      ) {
-        continue;
-      }
-      // Re-check LIVE: a reconnect during the await above may have rebound this
-      // identity to a fresh socket + re-upserted its row — never prune it then.
-      if (identityConnected(row.pid, row.start_time)) continue;
-      try {
-        deleteChannel(busDb, row.pid, row.start_time);
-      } catch {
-        // best-effort cache delete
-      }
-      for (const [cid, e] of registry) {
-        if (
-          e.sock === null &&
-          e.channel.pid === row.pid &&
-          e.channel.start_time === row.start_time
-        ) {
-          registry.delete(cid);
-        }
-      }
-    }
+    await sweepChannelRetention(busDb, now, channelRetentionState, {
+      identityConnected,
+      isPidAlive,
+      probeStartTime: startTimeViaPs,
+      retire: (row) => {
+        retireSocketlessChannel(registry, row);
+      },
+    });
   };
 
   /** One paced retention pass: stale channels + aged messages + WAL bound. Every
@@ -1789,8 +1887,16 @@ export function startBusServer(
     }
   };
 
+  let retentionPass: Promise<void> | null = null;
   const retentionTimer = setInterval(() => {
-    void runRetentionPass();
+    if (retentionPass !== null) return;
+    retentionPass = runRetentionPass()
+      .catch((err) => {
+        console.error("[bus-worker] retention pass failed (non-fatal):", err);
+      })
+      .finally(() => {
+        retentionPass = null;
+      });
   }, RETENTION_INTERVAL_MS);
   // Never let the GC timer keep the worker alive past shutdown.
   retentionTimer.unref?.();
