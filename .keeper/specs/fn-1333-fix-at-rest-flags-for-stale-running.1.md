@@ -19,5 +19,5 @@ Files: cli/status.ts, test/status.test.ts
 - [ ] `test/status.test.ts` pins the atRest/drained/jammed x stale_running interaction
 
 ## Done summary
-
+atRest now requires epicTally.stale_running === 0, so a board whose only occupancy is stale-running epics reports drained: false. Pinned with a new test in test/status.test.ts.
 ## Evidence

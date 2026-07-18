@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Account stale_running in atRest",
-  "updated_at": "2026-07-18T11:59:12.089000Z"
+  "updated_at": "2026-07-18T12:02:49.535000Z",
+  "worker_done_at": "2026-07-18T12:02:49.535000Z"
 }
