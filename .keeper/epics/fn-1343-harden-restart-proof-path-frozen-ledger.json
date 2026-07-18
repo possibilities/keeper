@@ -7,7 +7,7 @@
     "fn-1341-prove-identity-capability-crossing"
   ],
   "id": "fn-1343-harden-restart-proof-path-frozen-ledger",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-18T18:50:50.535000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T18:50:49.258000Z"
+  "updated_at": "2026-07-18T18:50:50.535000Z"
 }
