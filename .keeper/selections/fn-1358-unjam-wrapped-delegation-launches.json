@@ -1,0 +1,31 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [
+      "fn-1358-unjam-wrapped-delegation-launches.1"
+    ],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical guard-lexer hardening against a CVE deny corpus that must never flip, where a wrongly-loosened POSIX/ANSI-C boundary opens a bypass \u2014 a subtle load-bearing security invariant plus contract-shaped manifest/denial changes across multiple guards, a hard opus gate best served at the security-review ceiling.",
+      "task_id": "fn-1358-unjam-wrapped-delegation-launches.1",
+      "tier": "max"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-18T23:04:25.521000Z",
+  "epic_id": "fn-1358-unjam-wrapped-delegation-launches",
+  "input_hash": "665d65632616eaabd514ebc813e4232324f79fba07cbe64b831b72ad06f2abaa",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1717396835,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1358-unjam-wrapped-delegation-launches.1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Security-critical guard-lexer hardening against a CVE deny corpus that must never flip, where a wrongly-loosened POSIX/ANSI-C boundary opens a bypass \u2014 a subtle load-bearing security invariant plus contract-shaped manifest/denial changes across multiple guards, a hard opus gate best served at the security-review ceiling.\",\"confidence\":0.83}]}\n"
+}
