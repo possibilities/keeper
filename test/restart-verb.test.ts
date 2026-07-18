@@ -121,6 +121,7 @@ describe("keeper daemon restart", () => {
     expect(h.calls[0]).toEqual(["kickstart", "-k", "gui/501/arthack.keeperd"]);
     const envelope = JSON.parse(h.stdout.join(""));
     expect(envelope.ok).toBe(true);
+    expect(envelope.data.proof_path).toBe("exact-replacement");
     expect(envelope.data.healthy_probes).toBeGreaterThanOrEqual(
       REQUIRED_HEALTHY_PROBES,
     );

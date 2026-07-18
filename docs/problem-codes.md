@@ -14,13 +14,17 @@ here in the same change that introduces them.
 
 ## Daemon restart (`keeper daemon restart`)
 
-The restart verb snapshots the served process identity and durable ledger marker,
-asks launchd exactly once to restart the already bootstrapped keeperd job, then
-requires one different identity to be ledger-backed, caught up, and unchanged for
-at least twelve monotonic seconds. It never opens keeper.db or invokes a daemon RPC.
+The restart verb freezes the served capability and readable durable-ledger
+identities, asks launchd exactly once to restart the already bootstrapped keeperd
+job, then requires one successor identity to be ledger-backed, caught up, and
+unchanged for at least twelve monotonic seconds. An identity-capable predecessor
+requires exact disappearance and replacement; a positively served predecessor
+with no identity capability may instead prove a successor absent from the frozen
+ledger set. Successful `data.proof_path` is `exact-replacement` or
+`identity-capability-crossing`. It never opens keeper.db or invokes a daemon RPC.
 A refused socket while the old process releases its flock is transient; unreadable,
-mismatched, unstable, or inconclusive evidence cannot succeed. Plist edits are a
-different operation: use `launchctl bootout` plus `launchctl bootstrap`, not
+partial, reused, unstable, or inconclusive evidence cannot succeed. Plist edits are
+a different operation: use `launchctl bootout` plus `launchctl bootstrap`, not
 `kickstart`.
 
 | code | meaning | recovery | retry-safe |

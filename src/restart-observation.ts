@@ -48,11 +48,15 @@ export interface RestartCommandObservation {
   diagnostics?: RestartCommandDiagnostics;
 }
 
+export type RestartPreRestartServiceEvidence =
+  | { status: "exact-identity"; identity: RestartIdentity }
+  | { status: "identity-incapable" }
+  | { status: "unavailable-or-ambiguous" };
+
 export interface RestartObservationInput {
   pre_restart: {
-    served_identity: RestartIdentity | null;
-    ledger_marker: RestartLedgerBootRecord | null;
-    ledger_status?: "readable" | "missing" | "unreadable";
+    service: RestartPreRestartServiceEvidence;
+    ledger: RestartLedgerSnapshot;
   };
   command?: RestartCommandObservation;
   old_process: RestartProcessIdentityState;
@@ -72,6 +76,8 @@ export type RestartEvidenceReasonCode =
   | "pre-restart-identity-missing"
   | "pre-restart-ledger-missing"
   | "pre-restart-ledger-unreadable"
+  | "pre-restart-ledger-invalid"
+  | "successor-present-before-restart"
   | "old-process-still-alive"
   | "old-process-state-unknown"
   | "replacement-not-distinct"
@@ -148,8 +154,13 @@ export interface RestartStabilizationState {
   required_ms: number;
 }
 
+export type RestartProofPath =
+  | "exact-replacement"
+  | "identity-capability-crossing";
+
 export interface RestartEvidenceVerdict {
   verdict: "incomplete" | "proven";
+  proof_path: RestartProofPath | null;
   identity: RestartIdentity | null;
   command: RestartCommandState;
   replacement: RestartReplacementState;
@@ -286,13 +297,24 @@ export function classifyRestartEvidence(
     addReason("command-not-issued", "command");
   }
 
+  const preRestartService = input.pre_restart.service;
+  const exactPath = preRestartService.status === "exact-identity";
+  const crossingPath = preRestartService.status === "identity-incapable";
+  const frozenLedger = input.pre_restart.ledger;
+  const frozenBoots =
+    frozenLedger.status === "readable" ? frozenLedger.boots : [];
+  const frozenLedgerValid = frozenBoots.every(identityIsValid);
+  const preRestartMarker = frozenBoots.at(-1) ?? null;
   const preRestartLedgerStatus =
-    input.pre_restart.ledger_status ??
-    (input.pre_restart.ledger_marker === null ? "missing" : "readable");
+    frozenLedger.status === "readable" && exactPath && preRestartMarker === null
+      ? "missing"
+      : frozenLedger.status;
   if (preRestartLedgerStatus === "missing") {
     addReason("pre-restart-ledger-missing", "durable-boot");
   } else if (preRestartLedgerStatus === "unreadable") {
     addReason("pre-restart-ledger-unreadable", "durable-boot");
+  } else if (!frozenLedgerValid) {
+    addReason("pre-restart-ledger-invalid", "durable-boot");
   }
 
   const timingValid = timingIsValid(input);
@@ -314,8 +336,20 @@ export function classifyRestartEvidence(
   const candidateValid = candidate !== null && identityIsValid(candidate);
 
   let replacement: RestartReplacementState;
-  const oldIdentity = input.pre_restart.served_identity;
-  if (oldIdentity === null) {
+  const oldIdentity = exactPath ? preRestartService.identity : null;
+  const candidateWasPresent =
+    candidate !== null &&
+    frozenBoots.some((boot) => sameRestartIdentity(boot, candidate));
+  if (crossingPath) {
+    if (candidate === null) {
+      replacement = { status: "unobserved", old_process: input.old_process };
+    } else if (candidateWasPresent) {
+      replacement = { status: "not-distinct", old_process: input.old_process };
+      addReason("successor-present-before-restart", "replacement");
+    } else {
+      replacement = { status: "replaced", old_process: input.old_process };
+    }
+  } else if (oldIdentity === null) {
     replacement = {
       status: "unobserved",
       old_process: input.old_process,
@@ -362,14 +396,20 @@ export function classifyRestartEvidence(
     const exact = input.ledger.boots.find((boot) =>
       sameRestartIdentity(boot, candidate),
     );
-    const isOld =
-      sameRestartIdentity(candidate, oldIdentity) ||
-      candidate.boot_id === oldIdentity?.boot_id ||
-      sameRestartIdentity(candidate, input.pre_restart.ledger_marker) ||
-      candidate.boot_id === input.pre_restart.ledger_marker?.boot_id;
+    const isOld = exactPath
+      ? sameRestartIdentity(candidate, oldIdentity) ||
+        candidate.boot_id === oldIdentity?.boot_id ||
+        sameRestartIdentity(candidate, preRestartMarker) ||
+        candidate.boot_id === preRestartMarker?.boot_id
+      : crossingPath && candidateWasPresent;
     if (exact !== undefined && isOld) {
       durableBoot = { status: "old" };
-      addReason("durable-boot-is-old-marker", "durable-boot");
+      addReason(
+        crossingPath
+          ? "successor-present-before-restart"
+          : "durable-boot-is-old-marker",
+        "durable-boot",
+      );
     } else if (exact !== undefined) {
       durableBoot = { status: "matched" };
     } else if (
@@ -494,10 +534,19 @@ export function classifyRestartEvidence(
     };
   }
 
+  const proofPath: RestartProofPath | null = exactPath
+    ? "exact-replacement"
+    : crossingPath
+      ? "identity-capability-crossing"
+      : null;
+  const preRestartProofReady = exactPath
+    ? preRestartLedgerStatus === "readable" && preRestartMarker !== null
+    : crossingPath && preRestartLedgerStatus === "readable";
   const proven =
+    proofPath !== null &&
     command.status !== "not-issued" &&
-    preRestartLedgerStatus === "readable" &&
-    input.pre_restart.ledger_marker !== null &&
+    preRestartProofReady &&
+    frozenLedgerValid &&
     timingValid &&
     replacement.status === "replaced" &&
     durableBoot.status === "matched" &&
@@ -507,6 +556,7 @@ export function classifyRestartEvidence(
 
   return {
     verdict: proven ? "proven" : "incomplete",
+    proof_path: proven ? proofPath : null,
     identity:
       proven && candidate !== null
         ? {

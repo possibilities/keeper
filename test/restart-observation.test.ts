@@ -51,8 +51,11 @@ function exactInput(
 ): RestartObservationInput {
   return {
     pre_restart: {
-      served_identity: OLD,
-      ledger_marker: ledgerBoot(OLD, 1_699_999_000_000),
+      service: { status: "exact-identity", identity: OLD },
+      ledger: {
+        status: "readable",
+        boots: [ledgerBoot(OLD, 1_699_999_000_000)],
+      },
     },
     command: { issued: true, accepted: true },
     old_process: "dead",
@@ -72,6 +75,23 @@ function exactInput(
   };
 }
 
+function crossingInput(
+  overrides: Partial<RestartObservationInput> = {},
+): RestartObservationInput {
+  return exactInput({
+    pre_restart: {
+      service: { status: "identity-incapable" },
+      ledger: { status: "readable", boots: [] },
+    },
+    old_process: "unknown",
+    ledger: {
+      status: "readable",
+      boots: [ledgerBoot(NEXT, 1_700_000_001_000)],
+    },
+    ...overrides,
+  });
+}
+
 function reasonCodes(input: RestartObservationInput): string[] {
   return classifyRestartEvidence(input).reasons.map((reason) => reason.code);
 }
@@ -80,7 +100,10 @@ describe("restart evidence identity", () => {
   test("a newly readable old row after a null marker snapshot is not a new boot", () => {
     const verdict = classifyRestartEvidence(
       exactInput({
-        pre_restart: { served_identity: OLD, ledger_marker: null },
+        pre_restart: {
+          service: { status: "exact-identity", identity: OLD },
+          ledger: { status: "readable", boots: [] },
+        },
         ledger: { status: "readable", boots: [ledgerBoot(OLD)] },
         health: [health(OLD, 1_000), health(OLD, 7_000), health(OLD, 13_000)],
       }),
@@ -125,18 +148,16 @@ describe("restart evidence identity", () => {
     const missing = classifyRestartEvidence(
       exactInput({
         pre_restart: {
-          served_identity: OLD,
-          ledger_marker: null,
-          ledger_status: "missing",
+          service: { status: "exact-identity", identity: OLD },
+          ledger: { status: "missing" },
         },
       }),
     );
     const unreadable = classifyRestartEvidence(
       exactInput({
         pre_restart: {
-          served_identity: OLD,
-          ledger_marker: null,
-          ledger_status: "unreadable",
+          service: { status: "exact-identity", identity: OLD },
+          ledger: { status: "unreadable" },
         },
       }),
     );
@@ -249,6 +270,141 @@ describe("restart evidence identity", () => {
     expect(wrongStart.durable_boot.status).toBe("mismatched");
     expect(wrongBootId.verdict).toBe("incomplete");
     expect(wrongStart.verdict).toBe("incomplete");
+  });
+});
+
+describe("restart identity-capability crossing", () => {
+  test("proves one new exact durable identity from a readable empty snapshot", () => {
+    const verdict = classifyRestartEvidence(crossingInput());
+
+    expect(verdict.verdict).toBe("proven");
+    expect(verdict.proof_path).toBe("identity-capability-crossing");
+    expect(verdict.identity).toEqual(NEXT);
+    expect(verdict.replacement).toEqual({
+      status: "replaced",
+      old_process: "unknown",
+    });
+  });
+
+  test.each([
+    ["missing", { status: "missing" } as const, "pre-restart-ledger-missing"],
+    [
+      "unreadable",
+      { status: "unreadable", diagnostic: "denied" } as const,
+      "pre-restart-ledger-unreadable",
+    ],
+    [
+      "partial",
+      {
+        status: "readable",
+        boots: [{ boot_id: "partial", pid: 7, ts: 1 }],
+      } as unknown as RestartObservationInput["pre_restart"]["ledger"],
+      "pre-restart-ledger-invalid",
+    ],
+  ])("fails closed for a %s frozen ledger", (_name, ledger, reason) => {
+    const verdict = classifyRestartEvidence(
+      crossingInput({
+        pre_restart: {
+          service: { status: "identity-incapable" },
+          ledger,
+        },
+      }),
+    );
+
+    expect(verdict.verdict).toBe("incomplete");
+    expect(verdict.proof_path).toBeNull();
+    expect(
+      reasonCodes(
+        crossingInput({
+          pre_restart: {
+            service: { status: "identity-incapable" },
+            ledger,
+          },
+        }),
+      ),
+    ).toContain(reason);
+  });
+
+  test("rejects a successor already present anywhere in the frozen set", () => {
+    const verdict = classifyRestartEvidence(
+      crossingInput({
+        pre_restart: {
+          service: { status: "identity-incapable" },
+          ledger: {
+            status: "readable",
+            boots: [ledgerBoot(OLD), ledgerBoot(NEXT)],
+          },
+        },
+      }),
+    );
+
+    expect(verdict.verdict).toBe("incomplete");
+    expect(verdict.replacement.status).toBe("not-distinct");
+    expect(verdict.durable_boot.status).toBe("old");
+    expect(verdict.reasons).toContainEqual({
+      code: "successor-present-before-restart",
+      phase: "replacement",
+    });
+  });
+
+  test("unavailable pre-state cannot borrow an otherwise complete successor proof", () => {
+    const verdict = classifyRestartEvidence(
+      crossingInput({
+        pre_restart: {
+          service: { status: "unavailable-or-ambiguous" },
+          ledger: { status: "readable", boots: [] },
+        },
+      }),
+    );
+
+    expect(verdict.verdict).toBe("incomplete");
+    expect(verdict.proof_path).toBeNull();
+    expect(verdict.reasons).toContainEqual({
+      code: "pre-restart-identity-missing",
+      phase: "replacement",
+    });
+  });
+
+  test.each([
+    [
+      "missing durable row",
+      {
+        ledger: { status: "readable", boots: [] },
+      } as Partial<RestartObservationInput>,
+    ],
+    [
+      "mismatched durable row",
+      {
+        ledger: {
+          status: "readable",
+          boots: [ledgerBoot({ ...NEXT, start_time: "darwin:wrong" })],
+        },
+      } as Partial<RestartObservationInput>,
+    ],
+    [
+      "incomplete Drain",
+      {
+        health: [
+          health(NEXT, 1_000),
+          health(NEXT, 7_000),
+          health(NEXT, 13_000, { catching_up: true }),
+        ],
+      } as Partial<RestartObservationInput>,
+    ],
+    [
+      "interrupted health",
+      {
+        health: [
+          health(NEXT, 1_000),
+          health(NEXT, 7_000, { healthy: false }),
+          health(NEXT, 13_000),
+        ],
+      } as Partial<RestartObservationInput>,
+    ],
+  ])("withholds crossing proof for %s", (_name, overrides) => {
+    expect(classifyRestartEvidence(crossingInput(overrides)).verdict).toBe(
+      "incomplete",
+    );
   });
 });
 
@@ -424,6 +580,7 @@ describe("restart evidence phases", () => {
 
     expect(verdict).toEqual({
       verdict: "proven",
+      proof_path: "exact-replacement",
       identity: NEXT,
       command: { status: "accepted" },
       replacement: { status: "replaced", old_process: "dead" },

@@ -56,10 +56,10 @@ export const HELP = `keeper daemon restart — restart keeperd and wait for a ca
 Usage:
   keeper daemon restart [--timeout <duration>] [--sock <path>]
 
-Runs \`launchctl kickstart -k gui/$UID/arthack.keeperd\` once, then proves the
-old process identity is gone and one different ledger-backed served identity is
-caught up and unchanged for at least 12 seconds. The wait is bounded; refused or
-inconclusive evidence fails honestly and never triggers another kickstart.
+Runs \`launchctl kickstart -k gui/$UID/arthack.keeperd\` once, then proves an
+exact identity replacement or a positively served identity-capability crossing.
+The ledger-backed successor must be caught up and unchanged for at least 12
+seconds. The wait is bounded; inconclusive evidence never triggers another kickstart.
 
 Flags:
   --timeout <duration>  Overall wait bound (default 10m; e.g. 30s, 2m)
@@ -178,6 +178,10 @@ export type RestartHealthProbe =
       identity: RestartIdentity;
       healthy: boolean;
       catching_up: boolean;
+    }
+  | {
+      status: "served-identity-incapable";
+      healthy: true;
     }
   | {
       status: "unavailable";
@@ -345,17 +349,39 @@ export function parseRestartHealthFrame(frame: unknown): RestartHealthProbe {
     return { status: "unavailable", diagnostic: "invalid response frame" };
   }
   const object = frame as Record<string, unknown>;
-  const boot = object.boot;
   if (object.type !== "result") {
     return { status: "unavailable", diagnostic: "non-result response frame" };
   }
-  if (!validIdentity(boot)) {
+  if (!("boot" in object)) {
+    return { status: "served-identity-incapable", healthy: true };
+  }
+  const boot = object.boot;
+  if (boot === null || typeof boot !== "object" || Array.isArray(boot)) {
     return {
       status: "unavailable",
-      diagnostic: "result frame omitted a valid served boot identity",
+      diagnostic: "result frame carried an ambiguous boot header",
     };
   }
-  const catchingUp = (boot as unknown as Record<string, unknown>).catching_up;
+  const bootObject = boot as Record<string, unknown>;
+  const identityFields = ["boot_id", "pid", "start_time"] as const;
+  const identityFieldCount = identityFields.filter(
+    (field) => field in bootObject,
+  ).length;
+  const catchingUp = bootObject.catching_up;
+  if (identityFieldCount === 0) {
+    return typeof catchingUp === "boolean"
+      ? { status: "served-identity-incapable", healthy: true }
+      : {
+          status: "unavailable",
+          diagnostic: "result frame omitted boolean Drain state",
+        };
+  }
+  if (identityFieldCount !== identityFields.length || !validIdentity(boot)) {
+    return {
+      status: "unavailable",
+      diagnostic: "result frame carried a partial or invalid boot identity",
+    };
+  }
   if (typeof catchingUp !== "boolean") {
     return {
       status: "unavailable",
@@ -517,8 +543,19 @@ export async function runRestart(
       ),
     };
   }
+  const preRestartService =
+    preRestartProbe.status === "served"
+      ? ({
+          status: "exact-identity",
+          identity: preRestartProbe.identity,
+        } as const)
+      : preRestartProbe.status === "served-identity-incapable"
+        ? ({ status: "identity-incapable" } as const)
+        : ({ status: "unavailable-or-ambiguous" } as const);
   const preRestartIdentity =
-    preRestartProbe.status === "served" ? preRestartProbe.identity : null;
+    preRestartService.status === "exact-identity"
+      ? preRestartService.identity
+      : null;
 
   let preRestartLedger: RestartLedgerSnapshot;
   try {
@@ -531,17 +568,6 @@ export async function runRestart(
       ),
     };
   }
-  const ledgerMarker =
-    preRestartLedger.status === "readable"
-      ? (preRestartLedger.boots.at(-1) ?? null)
-      : null;
-  const preRestartLedgerStatus =
-    preRestartLedger.status === "readable"
-      ? ledgerMarker === null
-        ? "missing"
-        : "readable"
-      : preRestartLedger.status;
-
   let kickstart: CommandResult;
   try {
     kickstart = await deps.runLaunchctl(
@@ -588,9 +614,8 @@ export async function runRestart(
   let cancelled = false;
   let evidence = classifyRestartEvidence({
     pre_restart: {
-      served_identity: preRestartIdentity,
-      ledger_marker: ledgerMarker,
-      ledger_status: preRestartLedgerStatus,
+      service: preRestartService,
+      ledger: preRestartLedger,
     },
     command,
     old_process: oldProcess,
@@ -640,28 +665,33 @@ export async function runRestart(
       lastProbeDiagnostic = undefined;
     } else {
       health = [];
-      lastProbeDiagnostic = boundDiagnostic(probe.diagnostic);
-      try {
-        const state = await deps.runLaunchctl(
-          ["print", domain],
-          Math.max(
-            1,
-            Math.min(DEFAULT_PROBE_TIMEOUT_MS, deadline - deps.now()),
-          ),
-        );
-        launchctlState = kickstartWarning(state);
-        sawThrottledState ||= isThrottledLaunchctlState(
-          `${state.stdout}\n${state.stderr}`,
-        );
-      } catch (error) {
-        launchctlState = {
-          exit_code: -1,
-          stdout: "",
-          stderr: boundDiagnostic(
-            error instanceof Error ? error.message : String(error),
-          ),
-          timed_out: false,
-        };
+      lastProbeDiagnostic =
+        probe.status === "unavailable"
+          ? boundDiagnostic(probe.diagnostic)
+          : "served result omitted Daemon boot identity";
+      if (probe.status === "unavailable") {
+        try {
+          const state = await deps.runLaunchctl(
+            ["print", domain],
+            Math.max(
+              1,
+              Math.min(DEFAULT_PROBE_TIMEOUT_MS, deadline - deps.now()),
+            ),
+          );
+          launchctlState = kickstartWarning(state);
+          sawThrottledState ||= isThrottledLaunchctlState(
+            `${state.stdout}\n${state.stderr}`,
+          );
+        } catch (error) {
+          launchctlState = {
+            exit_code: -1,
+            stdout: "",
+            stderr: boundDiagnostic(
+              error instanceof Error ? error.message : String(error),
+            ),
+            timed_out: false,
+          };
+        }
       }
     }
 
@@ -690,9 +720,8 @@ export async function runRestart(
 
     evidence = classifyRestartEvidence({
       pre_restart: {
-        served_identity: preRestartIdentity,
-        ledger_marker: ledgerMarker,
-        ledger_status: preRestartLedgerStatus,
+        service: preRestartService,
+        ledger: preRestartLedger,
       },
       command,
       old_process: oldProcess,
@@ -711,6 +740,7 @@ export async function runRestart(
         successEnvelope(RESTART_SCHEMA_VERSION, {
           domain,
           identity: evidence.identity,
+          proof_path: evidence.proof_path,
           healthy_probes: evidence.health.consecutive_caught_up_observations,
           stabilized_for_ms: evidence.stabilization.observed_for_ms,
           ...(retainedKickstartWarning === undefined
@@ -734,9 +764,8 @@ export async function runRestart(
   const now = Math.max(startedAt, deps.now());
   evidence = classifyRestartEvidence({
     pre_restart: {
-      served_identity: preRestartIdentity,
-      ledger_marker: ledgerMarker,
-      ledger_status: preRestartLedgerStatus,
+      service: preRestartService,
+      ledger: preRestartLedger,
     },
     command,
     old_process: oldProcess,
@@ -767,6 +796,8 @@ export async function runRestart(
                 "pre-restart-identity-missing",
                 "pre-restart-ledger-missing",
                 "pre-restart-ledger-unreadable",
+                "pre-restart-ledger-invalid",
+                "successor-present-before-restart",
               ].includes(reason.code),
             )
           ? "restart-unproven"
