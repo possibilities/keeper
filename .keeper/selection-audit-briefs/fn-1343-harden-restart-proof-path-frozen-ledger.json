@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 25
+      },
+      "done_summary": "Scoped the frozenLedgerValid conjunct in the proven gate to the identity-capability crossing path only, restoring the exact-replacement path's parent behavior (an invalid non-marker frozen boot no longer blocks an exact restart from proving). Added a regression test covering an exact restart with a valid marker but an invalid earlier frozen boot.",
+      "input_hash": "265df858fdad7a1890cf79bb87c5923d1b45d65a3ee05eb97427565dd77d19de",
+      "model": "opus",
+      "spec_chars": 1794,
+      "spec_md": "## Description\n\nAddresses F1 (kept) with F3 (merged-into-F1) folded in. In\nsrc/restart-observation.ts the `frozenLedgerValid` conjunct was added to\nthe SHARED `proven` gate (audited commit 1a9d887b4, gate at line 549),\nso it governs the exact-replacement path as well as the crossing path.\nThe parent gate (`git show 1a9d887b4^:src/restart-observation.ts`, line\n497) validated only `ledger_marker !== null`, never the whole frozen\nledger \u2014 so an exact restart whose frozen ledger holds any invalid\nnon-marker boot now trips `pre-restart-ledger-invalid` and returns\n`unproven`, contradicting the commit's \"exact branch unchanged\nbyte-for-byte\" claim.\n\nScope the conjunct so it only gates the crossing path (e.g. require\n`frozenLedgerValid` only when `crossingPath`, leaving the exact path's\ngate as it was in the parent). F3 is the regression test that proves this:\nan exact-replacement fixture with a valid marker but an invalid non-marker\nfrozen boot must still prove.\n\nFiles: src/restart-observation.ts, test/restart-observation.test.ts\n\n## Acceptance\n\n- [ ] The exact-replacement path proves when the frozen ledger marker is valid even if an earlier non-marker frozen boot is invalid.\n- [ ] The crossing path still requires every frozen boot valid (an invalid frozen boot yields `pre-restart-ledger-invalid` / unproven).\n- [ ] A deterministic test asserts the exact-path-with-invalid-non-marker-boot case proves.\n\n## Done summary\nScoped the frozenLedgerValid conjunct in the proven gate to the identity-capability crossing path only, restoring the exact-replacement path's parent behavior (an invalid non-marker frozen boot no longer blocks an exact restart from proving). Added a regression test covering an exact restart with a valid marker but an invalid earlier frozen boot.\n## Evidence\n",
+      "task_id": "fn-1343-harden-restart-proof-path-frozen-ledger.1",
+      "tier": "high",
+      "title": "Scope frozen-ledger check to crossing"
+    },
+    {
+      "assigned_model": "gpt-5.6-terra",
+      "assigned_tier": "medium",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 0,
+        "files_changed": 1,
+        "insertions": 29
+      },
+      "done_summary": "Added a deterministic test proving the identity-capability crossing path against a non-empty valid frozen boot set with a genuinely absent successor, asserting both verdict:proven and proof_path:identity-capability-crossing.",
+      "input_hash": "265df858fdad7a1890cf79bb87c5923d1b45d65a3ee05eb97427565dd77d19de",
+      "model": "gpt-5.6-terra",
+      "spec_chars": 1346,
+      "spec_md": "## Description\n\nAddresses F4 (kept). The crossing feature's defining positive scenario \u2014\nan identity-incapable predecessor crossing to a successor that is\ngenuinely absent from a NON-EMPTY, fully valid frozen ledger snapshot \u2014\nis untested. Existing crossing tests cover only the empty-snapshot proven\ncase and the present-in-set rejection (`successor-present-before-restart`).\nADR 0086 (docs/adr/0086-positive-legacy-service-restart-crossing.md) calls\nfor deterministic fixtures over the compatibility matrix; this cell is\nmissing.\n\nAdd a deterministic fixture where `pre_restart.service` is\n`identity-incapable`, the frozen ledger is readable with a non-empty set\nof valid boots, and the caught-up healthy successor's identity is absent\nfrom that set \u2014 assert `verdict: proven` and\n`proof_path: identity-capability-crossing`.\n\nFiles: test/restart-observation.test.ts\n\n## Acceptance\n\n- [ ] A test proves the crossing path against a non-empty valid frozen set with a genuinely absent successor.\n- [ ] The assertion checks both `verdict: proven` and `proof_path: identity-capability-crossing`.\n\n## Done summary\nAdded a deterministic test proving the identity-capability crossing path against a non-empty valid frozen boot set with a genuinely absent successor, asserting both verdict:proven and proof_path:identity-capability-crossing.\n## Evidence\n",
+      "task_id": "fn-1343-harden-restart-proof-path-frozen-ledger.2",
+      "tier": "medium",
+      "title": "Cover crossing against non-empty ledger"
+    }
+  ],
+  "created_at": "2026-07-18T19:21:12.317000Z",
+  "epic_id": "fn-1343-harden-restart-proof-path-frozen-ledger",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "265df858fdad7a1890cf79bb87c5923d1b45d65a3ee05eb97427565dd77d19de",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
