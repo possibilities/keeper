@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-18T21:24:49.602000Z",
   "depends_on": [
@@ -13,5 +14,5 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Arm Keeper Pi account pooling",
-  "updated_at": "2026-07-18T21:24:49.602000Z"
+  "updated_at": "2026-07-18T21:25:54.887000Z"
 }
