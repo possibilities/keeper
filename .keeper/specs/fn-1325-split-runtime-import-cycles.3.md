@@ -43,3 +43,5 @@ Add injected graphs for direct recurrence, indirect recurrence, a new SCC, chang
 ## Done summary
 
 ## Evidence
+- Commits: 46db34b3a8770aa6d395168e35a69f1d1ccdc2c9
+- Tests: bun test ./test/rpc-handlers.test.ts ./test/server-worker.test.ts ./test/restore-worker.test.ts ./test/tabs.test.ts ./test/runtime-import-cycles.test.ts: pass 244 tests, bun run typecheck: pass, bun run test:gate: pass 9335, 2 skipped
