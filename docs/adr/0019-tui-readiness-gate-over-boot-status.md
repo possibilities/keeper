@@ -28,23 +28,30 @@ hold `catching_up: true` forever on a quiet board.
 
 ## Decision
 
-Human-facing viewers full-gate on `catching_up`: while it holds (or while the
-daemon is unreachable past a short grace) they render only a loading
-indicator — re-fold progress while the fold cursor trails head, a distinct
-non-spinning git-seed wait once at head, a plain catching-up line for the
-residual boot window — and never paint provisional rows. The gate is a
-client-side value-latch in the shared subscribe client: initially ready,
-set by each boot-carrying result, cleared by a `catching_up: false` header
-OR by a boot-less `result` observed while latched (the pre-serialized result
-memo is bypassed during catch-up, so a headerless result is positive
+Human-facing viewers full-gate on `catching_up`: while it holds they render
+only a loading indicator — re-fold progress while the fold cursor trails
+head, a distinct non-spinning git-seed wait once at head, a plain catching-up
+line for the residual boot window — and never paint provisional rows. The
+gate is a client-side value-latch in the shared subscribe client: initially
+ready, set by each boot-carrying result, cleared by a `catching_up: false`
+header OR by a boot-less `result` observed while latched (the pre-serialized
+result memo is bypassed during catch-up, so a headerless result is positive
 steady-state evidence). While latched, a catch-up-scoped slow poll refetches
 one idle collection through the existing coalescer until it clears; a
 server-side boot-complete push was rejected (a dropped push re-strands a
 reconnecting client) in favor of the level-triggered poll, which converges
-unconditionally. On a socket drop after a first paint the viewer holds the
-last frame behind a reconnecting pill through a short grace, flipping to the
-loading indicator on grace expiry or immediately on positive evidence (the
-reconnect's first result reporting `catching_up: true`).
+unconditionally.
+
+A post-paint transport drop has three presentation states. The short grace
+holds the last-good frame behind the unchanged `reconnecting…` pill. After
+grace, `waiting` lifecycle telemetry supplies a plain banner with its attempt
+and decreasing retry countdown, while the frame remains visible. Once the
+monotonic age of that last-good frame crosses a small threshold, the banner
+uses the plain `DISCONNECTED` token with that age and the body adds the
+colorized indicator without replacing the panel. A ready paint clears every
+connection presentation and resets its monotonic frame stamp; transport-open
+alone does neither. A generation re-baseline with no transport drop therefore
+has no banner effect.
 
 The machine-facing surfaces stamp rather than block: the snapshot
 `keeper-meta:` trailer and the frames `FrameRecord`/`TrailerRecord` envelopes
@@ -60,20 +67,13 @@ during catch-up (no ticking percentage), never a spinner flood.
   with no board visible. That is the accepted trade-off: partial fold state
   is actively misleading, and the indicator carries real progress (wire
   header while connected, the SQLite re-fold poller while down).
+- A post-paint outage degrades in place: it first exposes retry timing, then
+  an age-based `DISCONNECTED` warning, rather than blanking the last-good
+  panel or confusing it with a readiness gate.
 - A wedged git seed renders as an explicit, actionable wait line rather than
   an indistinguishable hang; the distress-row machinery remains the escape
   hatch for a daemon that never becomes ready.
 - The headerless-result clear couples the client to the memo-bypass invariant
   (nothing unstamped is served during catch-up). A weakened invariant fails
   as visible churn (an early backstop-tick clear), not a wedge.
-- Headless consumers are structurally unaffected: the gate lives in the
-  display harnesses, and data callbacks keep delivering during catch-up.
-
-## Amendment — post-grace DISCONNECTED indication supersedes the pill
-
-Grace expiry now flips the banner and body indicator to one unmistakable
-`DISCONNECTED` signal — the shim's recognized red bucket wrapping the plain
-token (banner skips the shim, so it's plain-only) — instead of the ordinary
-loading indicator, which read as a plain catch-up state. `DISCONNECTED` owns
-both slots exclusively while grace-expired holds, never clobbered by a
-spinner tick or flash-restore, until `exitReconnecting` clears it.
+- Headless consumers are structurally unaffected: the gate lives in the display harnesses, and data callbacks keep delivering during catch-up.
