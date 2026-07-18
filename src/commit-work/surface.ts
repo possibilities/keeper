@@ -79,11 +79,8 @@ export interface ReceiptPendingEvidence {
 }
 
 /**
- * A voluntary release record: the durable, identity-proven witness a claimant
- * writes to give named paths back to a blocked peer while staying alive. Sole
- * writer is the releasing session, proven the same pid-and-start-time way the
- * commit-work authority check proves ancestry. Distinct from the vacated-claim
- * gone-witness (the process is gone) and from a wrapper-attempt lease release.
+ * The decline read/annotate/protocol rail awaits a producer; production release
+ * records do not write declines.
  */
 export interface ReleaseDeclineRecord {
   requesterSessionId: string | null;
@@ -99,6 +96,13 @@ export interface ReleaseDeclineEvidence {
   reason: string | null;
 }
 
+/**
+ * A voluntary release record: the durable, identity-proven witness a claimant
+ * writes to give named paths back to a blocked peer while staying alive. Sole
+ * writer is the releasing session, proven the same pid-and-start-time way the
+ * commit-work authority check proves ancestry. Distinct from the vacated-claim
+ * gone-witness (the process is gone) and from a wrapper-attempt lease release.
+ */
 export interface ReleaseRecord {
   sessionId: string;
   pid: number;

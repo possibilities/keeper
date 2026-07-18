@@ -51,7 +51,7 @@ keeper commit-work --task-id "$TASK_ID" "<type>(<scope>): <summary>
 
 **An inspected missing path is an explicit adoption decision.** Re-preview with repeatable exact `--adopt <path>` arguments (or a versioned `--adopt-from` manifest). Adoption is invocation-local, byte/mode-bound, and refuses any live or unknown foreign exclusive claim. Never broaden the set or fall back to raw Git.
 
-**On `ownership_conflict`, never signal or terminate the other claimant.** Read the envelope's `request_release` pointer — it names the claimant, the contested paths, and a `keeper session release` invocation you may advise via one bounded, best-effort `keeper bus chat send` notice. Wait the grace window, then re-run `keeper commit-work`; a still-live conflict on retry is `BLOCKED: DEPENDENCY_BLOCKED` naming the claimant and paths. A `decline` on the pointer is terminal — back off rather than re-asking.
+**On `ownership_conflict`, never signal or terminate the other claimant.** Read the envelope's `request_release` pointer — it names the claimant, the contested paths, and a `keeper session release` invocation you may advise via one bounded, best-effort `keeper bus chat send` notice. Wait the grace window, then re-run `keeper commit-work`; a still-live conflict on retry is `BLOCKED: DEPENDENCY_BLOCKED` naming the claimant and paths. Decline recording is deferred, so do not expect a decline annotation.
 
 **On `outcome:"lint_failed"`** (including `linter:"multiple"` with aggregated bounded stderr): read the named files, fix per the stderr, then re-invoke `keeper commit-work` with the same message and adoption set. A lint failure is not an attribution gap.
 
