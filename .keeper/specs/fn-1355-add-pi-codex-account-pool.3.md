@@ -75,5 +75,5 @@ Land with native fallback and a visible activation-pending status. The dependent
 - [ ] Named launcher, installer, package, proof, and account-routing gates pass entirely against sandboxed state.
 
 ## Done summary
-
+Arm proof-gated Pi Codex account pooling: tracked keeper agent pi launches load the companion and Keeper extension as separate sources with capacity-aware routing context and native fail-open; added versioned enroll/status/proof/activate/verify/rollback/recovery workflow gated on a fresh proof report bound to revision/config/aliases, separate Claude/Codex diagnostic reporting, installer contract pins, and consolidated activation-pending docs.
 ## Evidence
