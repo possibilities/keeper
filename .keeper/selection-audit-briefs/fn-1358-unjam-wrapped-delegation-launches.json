@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "max",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 59,
+        "files_changed": 6,
+        "insertions": 446
+      },
+      "done_summary": "",
+      "input_hash": "665d65632616eaabd514ebc813e4232324f79fba07cbe64b831b72ad06f2abaa",
+      "model": "opus",
+      "spec_chars": 5700,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** plugins/keeper/plugin/hooks/wrapped-guard.ts, plugins/keeper/plugin/hooks/grant-guard.ts, test/wrapped-guard.test.ts, test/grant-guard.test.ts, plugins/plan/template/_partials/worker-implement-wrapped.md, plugins/plan/workers/, plugins/prompt/test/oracle/fixtures/render-plugin-templates.json\n\n### Approach\n\nVerify-then-fix, three arms. (1) RED-REPRO the lexer: seed a corpus\nfrom the REAL failing launches (query the events log for session\n9897dd3c's Bash commands containing `agent run`) plus the POSIX\nchecklist \u2014 quote-run concatenation into one word, empty quoted words\npreserved, comments only at word start, backslash-newline ordering,\nANSI-C quoting \u2014 judged against a static POSIX word-splitting\nreference table (never a live shell; test doctrine). Fix ONLY\ndivergences where the lexer wrongly DENIES a well-formed single-argv\nlaunch; never loosen toward bash where that would weaken the CVE deny\ncorpus (comment-stripping and ANSI-C stay conservative; a tightening\nthat names its construct is acceptable). \"Zero divergences proven\" is\na valid, complete outcome for this arm \u2014 land the characterization\nlock test and change nothing. A proven lexer fix propagates to\ngrant-guard's byte-identical copy ONLY (re-run its corpus);\nwrong-tree/branch variants and the derivers fold copy are out of\nscope (fold determinism forbids the latter categorically).\n(2) ACTIONABLE DENIALS, scoped to the wrappedAgentViolation run-gate\nstrings (no return-type change): each denial names the construct,\nstates expected-vs-received positional counts, excerpts the first\noffending token TRUNCATED and sanitized (never echo the full\nworker-composed command; one size-bounded line), distinguishes the\noption-lookalike-in-prose case from the quoting case, denies an\nempty-string positional by name, and carries the explicit steer:\ndo not retry the same quoting \u2014 single short quoted instruction,\ncontent in --system-file. Keep the name-the-construct property the\nexisting substring tests assert; extend those tests.\n(3) MANIFEST: the wrapped partial's launch and resume templates\nmandate the trivially-parseable shape \u2014 a single-line, double-quoted,\nsubstitution-free short instruction (resume stays inline within the\nexisting allowlist; no new flag, no ADR) \u2014 and the Failure map gains\nthe guard-denied branch: a PreToolUse deny of the launch command\nmeans reshape per the denial's steer and retry BOUNDED times (state\nthe bound), never write an envelope, never classify it\nTOOLING_FAILURE; only leg-side outcomes reach the envelope taxonomy.\nRecompile the generated worker cohort (`keeper prompt compile --role\nwork:worker --target claude`) and regenerate the render golden at the\nworker's actual base \u2014 generated outputs are never hand-edited.\n\n### Investigation targets\n\n*Verify before relying \u2014 refs are planner-verified at authoring time.*\n\n**Required**:\n- plugins/keeper/plugin/hooks/wrapped-guard.ts:147-256 (lexSegments), :567-657 (wrappedAgentViolation; positional gate :636, binding :639-648, index-4 assumption :613), :896-946 (deny-reason builders)\n- test/wrapped-guard.test.ts:45-263 (truth tables; CVE corpus :234-263 \u2014 must never flip), :265-274 (name-the-construct), :302 (bashPayload harness)\n- plugins/plan/template/_partials/worker-implement-wrapped.md:19-57 (contract-write rule :19, launch :26-33, resume :43-48, Failure map :52-57)\n- plugins/keeper/plugin/hooks/grant-guard.ts:208 (the byte-identical lexer copy)\n- The events log for session 9897dd3c \u2014 the real failing command corpus\n\n**Optional**:\n- docs/adr/0050-wrapped-delegation-guard.md (stay inside its allowlist decision)\n- plugins/plan/CLAUDE.md (generated-outputs rule)\n\n### Risks\n\n- Loosening the lexer toward bash on comments or ANSI-C opens bypasses \u2014 the asymmetry rule is load-bearing; every lexer edit re-runs the full deny corpus in BOTH guards it lands in.\n- The recompile touches every wrapped cell \u2014 regenerate, never hand-edit; regenerate the golden fresh at the merged base (the fn-1348 dep guarantees ordering on the singleton fixture).\n- The denial excerpt is worker-influenced text \u2014 bound and sanitize it; no raw command echo.\n\n### Test notes\n\nCorpus-driven: real failing commands (allow after reshape guidance\napplies, or deny with the RIGHT reason), POSIX checklist cases as\nlock tests, empty-positional deny, option-in-prose deny hint,\nCVE corpus green in wrapped-guard AND grant-guard. Manifest render:\nthe recompiled cohort and golden pass their oracle test. Named gates:\n`bun test test/wrapped-guard.test.ts test/grant-guard.test.ts` and\n`bun test plugins/prompt/test/oracle/render-plugin-templates.test.ts`\nplus `bun run typecheck`.\n\n## Acceptance\n\n- [ ] The red-repro corpus (seeded from the real failing launches plus the POSIX checklist) is landed as tests; any lexer change is a proven wrongly-denies fix mirrored to grant-guard only, and the CVE deny corpus is green in both guards \u2014 or the lexer is proven correct and locked, with zero production lexer change.\n- [ ] Every run-gate denial names its construct, carries expected-vs-received counts with a bounded sanitized excerpt, distinguishes quoting splits from option-lookalikes, denies empty instructions by name, and steers away from same-shape retries.\n- [ ] The wrapped manifest mandates the single-line quoted substitution-free instruction shape for launch and resume, and its Failure map routes a guard-denied launch to bounded reshape-and-retry \u2014 never an envelope-absent TOOLING_FAILURE.\n- [ ] The worker cohort is recompiled and the render golden regenerated at the merged base; generated outputs carry no hand edits.\n- [ ] Focused named gates plus typecheck are green.\n\n## Done summary\n\n## Evidence\n",
+      "task_id": "fn-1358-unjam-wrapped-delegation-launches.1",
+      "tier": "max",
+      "title": "Actionable run gate and manifest"
+    }
+  ],
+  "created_at": "2026-07-19T06:56:24.920000Z",
+  "epic_id": "fn-1358-unjam-wrapped-delegation-launches",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "665d65632616eaabd514ebc813e4232324f79fba07cbe64b831b72ad06f2abaa",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
