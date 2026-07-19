@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import type { LiveProofReport } from "../integrations/pi-codex-pool/src/proof";
 import {
   activateCodexPool,
+  armCodexPoolProofWindow,
   type CodexPoolActivationDeps,
   type CodexPoolActivationState,
   type CodexPoolActivationStore,
   captureCodexPoolProof,
+  codexPoolProofWindowActive,
   codexPoolStatus,
   effectiveCodexPoolActivation,
   recoverCodexPool,
@@ -155,6 +157,50 @@ function deps(
     ...overrides,
   };
 }
+
+describe("Codex pool launch-scoped proof window", () => {
+  test("arms one exact bounded launcher-child window", () => {
+    const state = armCodexPoolProofWindow(1_000_000, 4242);
+    expect(state).toEqual({
+      schema_version: 1,
+      armed_at_ms: 1_000_000,
+      expires_at_ms: 1_900_000,
+      launcher_pid: 4242,
+    });
+    const encoded = JSON.stringify(state);
+    expect(codexPoolProofWindowActive(encoded, 1_000_000, 4242)).toBe(true);
+    expect(codexPoolProofWindowActive(encoded, 1_899_999, 4242)).toBe(true);
+    expect(codexPoolProofWindowActive(encoded, 1_900_000, 4242)).toBe(false);
+  });
+
+  test("rejects absent, restarted, malformed, and extended windows", () => {
+    const exact = {
+      schema_version: 1,
+      armed_at_ms: 1_000_000,
+      expires_at_ms: 1_900_000,
+      launcher_pid: 4242,
+    };
+    expect(codexPoolProofWindowActive(undefined, 1_000_001, 4242)).toBe(false);
+    expect(codexPoolProofWindowActive(exact, 1_000_001, 4343)).toBe(false);
+    expect(
+      codexPoolProofWindowActive(
+        { ...exact, expires_at_ms: 1_900_001 },
+        1_000_001,
+        4242,
+      ),
+    ).toBe(false);
+    expect(
+      codexPoolProofWindowActive(
+        { ...exact, unexpected: true },
+        1_000_001,
+        4242,
+      ),
+    ).toBe(false);
+    expect(
+      codexPoolProofWindowActive(JSON.stringify(exact), 999_999, 4242),
+    ).toBe(false);
+  });
+});
 
 describe("Codex pool proof-gated activation", () => {
   test("activates only a fresh exact passing report and publishes once", () => {
