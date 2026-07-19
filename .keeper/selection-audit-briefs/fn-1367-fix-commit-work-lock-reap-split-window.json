@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 95,
+        "files_changed": 2,
+        "insertions": 81
+      },
+      "done_summary": "Removed the split-lock hazard in probeCommitWorkLock: the reap no longer unlinkSync's the stale lock file, so a blocked acquire() and a fresh open() can never flock different inodes. Preview lock_state and refusal-envelope lock_path/cause naming are unchanged; the retained absent/held/available/probe_failed branches are each covered by a test, and the removed reaped/present branches plus auditStaleLockReap/COMMIT_WORK_STALE_LOCK_AGE_MS are deleted rather than left dead.",
+      "input_hash": "e2cb0d2bef7e4e93df5db65b2682b1189359df406892b800677d8d516d0aff3a",
+      "model": "opus",
+      "spec_chars": 2566,
+      "spec_md": "## Description\n\nRework `probeCommitWorkLock` in `cli/commit-work.ts` to close the\nsplit-lock window found in the fn-1365 audit (F1). The reap `unlinkSync`s\na stale lock path while a concurrent blocking `CommitWorkLock.acquire()`\nmay be parked on `flock(LOCK_EX)` for that same inode: the parked\nacquirer then wins the flock on the now-unlinked inode while the next\n`acquire()` opens the path with `O_CREAT` and gets a fresh inode \u2014 two\ninvocations hold flocks on different inodes and both believe they own the\nexclusive commit-work lock.\n\nEvidence: the reap in `cli/commit-work.ts` (`probeCommitWorkLock` /\n`auditStaleLockReap`, commit aa0fb4f) and the primitive in\n`src/commit-work/flock.ts:176-231` (`acquire` / `tryAcquire` open with\n`O_CREAT|O_TRUNC` and flock the open-file-description). The same evidence\nshows the reap is benefit-free: a dead holder's flock is auto-released by\nthe kernel and an empty unheld file is re-locked cleanly by `acquire()`,\nso the reap only deletes a harmless directory entry while introducing the\nhazard. Preferred fix: stop unlinking (report `lock_state` in preview but\nleave the empty unheld file in place); if a stale entry must still be\nremoved, rename-to-unique-then-unlink or have `acquire()` reject a lock\nwhose fd inode no longer matches the path after locking.\n\nMerged finding F2: the defensive reap branches (`probe_failed` on a\nnon-ENOENT `lstat`, the dev/ino-changed and re-lstat-ENOENT \"available\"\nfallbacks, the non-file/symlink branch) are untested and exist only to\nmake the unlink safe. Dropping the unlink removes most of them; whatever\nthe chosen fix retains must be exercised by a test.\n\nFiles: `cli/commit-work.ts`, `test/commit-work.test.ts`.\n\n## Acceptance\n\n- [ ] No sequence of concurrent `acquire()` / reap can leave two commit-work invocations both holding a lock on different inodes for one worktree.\n- [ ] Preview still reports `lock_state`; refusal envelopes still carry `lock_path` and `cause`.\n- [ ] Retained defensive branches are covered by a test; removed branches are deleted, not left dead.\n\n## Done summary\nRemoved the split-lock hazard in probeCommitWorkLock: the reap no longer unlinkSync's the stale lock file, so a blocked acquire() and a fresh open() can never flock different inodes. Preview lock_state and refusal-envelope lock_path/cause naming are unchanged; the retained absent/held/available/probe_failed branches are each covered by a test, and the removed reaped/present branches plus auditStaleLockReap/COMMIT_WORK_STALE_LOCK_AGE_MS are deleted rather than left dead.\n## Evidence\n",
+      "task_id": "fn-1367-fix-commit-work-lock-reap-split-window.1",
+      "tier": "xhigh",
+      "title": "Fix commit-work lock reap race"
+    }
+  ],
+  "created_at": "2026-07-19T05:19:21.379000Z",
+  "epic_id": "fn-1367-fix-commit-work-lock-reap-split-window",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "e2cb0d2bef7e4e93df5db65b2682b1189359df406892b800677d8d516d0aff3a",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
