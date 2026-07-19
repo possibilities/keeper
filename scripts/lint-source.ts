@@ -1,8 +1,16 @@
 #!/usr/bin/env bun
-/** Source-wide hygiene guard: raw NUL bytes + comment-only provenance tokens. */
+/** Source-wide hygiene guard: raw NUL bytes + comment-only provenance tokens + bun import graph. */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, extname, join, relative } from "node:path";
+import * as ts from "typescript";
 import { CONTENT_PATTERNS } from "./lint-claude-md";
 
 const RAW_NUL = "\0";
@@ -61,10 +69,23 @@ const SLASH_COMMENT_EXTENSIONS = new Set([
   ".tsx",
 ]);
 
+const MODULE_SOURCE_EXTENSION_ORDER = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+] as const;
+const MODULE_SOURCE_EXTENSIONS = new Set<string>(MODULE_SOURCE_EXTENSION_ORDER);
+
 export type SourceLintKind =
   | "RAW_NUL_LITERAL"
   | "COMMENT_RENARRATION"
-  | "ALLOWLIST";
+  | "ALLOWLIST"
+  | "BUN_BUILTIN_IMPORT";
 
 export interface SourceFinding {
   kind: SourceLintKind;
@@ -127,9 +148,17 @@ function isSourcePath(relpath: string): boolean {
   return SOURCE_EXTENSIONS.has(extname(name));
 }
 
+function isModuleSourcePath(relpath: string): boolean {
+  const name = relpath.split("/").at(-1) ?? relpath;
+  return MODULE_SOURCE_EXTENSIONS.has(extname(name));
+}
+
 function allowsRawNul(relpath: string): boolean {
   const rel = normalized(relpath);
-  return rel === "src/composite-key.ts" || rel.startsWith("test/fixtures/lint-source/");
+  return (
+    rel === "src/composite-key.ts" ||
+    rel.startsWith("test/fixtures/lint-source/")
+  );
 }
 
 function commentModes(relpath: string): { slash: boolean; hash: boolean } {
@@ -223,7 +252,11 @@ function extractComments(text: string, relpath: string): CommentChunk[] {
       continue;
     }
 
-    if (modes.hash && ch === "#" && (atLineStart || text[i - 1] === " " || text[i - 1] === "\t")) {
+    if (
+      modes.hash &&
+      ch === "#" &&
+      (atLineStart || text[i - 1] === " " || text[i - 1] === "\t")
+    ) {
       const startLine = line;
       i++;
       let body = "";
@@ -244,6 +277,179 @@ function extractComments(text: string, relpath: string): CommentChunk[] {
     i++;
   }
   return chunks;
+}
+
+interface ModuleEdge {
+  spec: string;
+  line: number;
+}
+
+const SCRIPT_KIND_BY_EXT: Record<string, ts.ScriptKind> = {
+  ".cjs": ts.ScriptKind.JS,
+  ".cts": ts.ScriptKind.TS,
+  ".js": ts.ScriptKind.JS,
+  ".jsx": ts.ScriptKind.TSX,
+  ".mjs": ts.ScriptKind.JS,
+  ".mts": ts.ScriptKind.TS,
+  ".ts": ts.ScriptKind.TS,
+  ".tsx": ts.ScriptKind.TSX,
+};
+
+function scriptKindForPath(relpath: string): ts.ScriptKind {
+  const ext = extname(relpath.split("/").at(-1) ?? relpath);
+  return SCRIPT_KIND_BY_EXT[ext] ?? ts.ScriptKind.TS;
+}
+
+function lineAt(sourceFile: ts.SourceFile, node: ts.Node): number {
+  return (
+    sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+  );
+}
+
+function importDeclarationIsTypeOnly(node: ts.ImportDeclaration): boolean {
+  const clause = node.importClause;
+  if (!clause) return false;
+  if (clause.isTypeOnly) return true;
+  const bindings = clause.namedBindings;
+  if (!bindings || !ts.isNamedImports(bindings) || clause.name !== undefined) {
+    return false;
+  }
+  return (
+    bindings.elements.length > 0 &&
+    bindings.elements.every((element) => element.isTypeOnly)
+  );
+}
+
+function exportDeclarationIsTypeOnly(node: ts.ExportDeclaration): boolean {
+  if (node.isTypeOnly) return true;
+  const clause = node.exportClause;
+  if (!clause || !ts.isNamedExports(clause)) return false;
+  return (
+    clause.elements.length > 0 &&
+    clause.elements.every((element) => element.isTypeOnly)
+  );
+}
+
+function parseModuleEdges(relpath: string, text: string): ModuleEdge[] {
+  const sourceFile = ts.createSourceFile(
+    relpath,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKindForPath(relpath),
+  );
+  const edges: ModuleEdge[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isImportDeclaration(node) &&
+      ts.isStringLiteralLike(node.moduleSpecifier)
+    ) {
+      if (!importDeclarationIsTypeOnly(node)) {
+        edges.push({
+          spec: node.moduleSpecifier.text,
+          line: lineAt(sourceFile, node.moduleSpecifier),
+        });
+      }
+    } else if (
+      ts.isExportDeclaration(node) &&
+      node.moduleSpecifier !== undefined &&
+      ts.isStringLiteralLike(node.moduleSpecifier)
+    ) {
+      if (!exportDeclarationIsTypeOnly(node)) {
+        edges.push({
+          spec: node.moduleSpecifier.text,
+          line: lineAt(sourceFile, node.moduleSpecifier),
+        });
+      }
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      !node.isTypeOnly &&
+      ts.isExternalModuleReference(node.moduleReference) &&
+      ts.isStringLiteralLike(node.moduleReference.expression)
+    ) {
+      edges.push({
+        spec: node.moduleReference.expression.text,
+        line: lineAt(sourceFile, node.moduleReference.expression),
+      });
+    } else if (
+      ts.isCallExpression(node) &&
+      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+      node.arguments.length > 0 &&
+      ts.isStringLiteralLike(node.arguments[0])
+    ) {
+      edges.push({
+        spec: node.arguments[0].text,
+        line: lineAt(sourceFile, node.arguments[0]),
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return edges;
+}
+
+function resolveModuleSource(
+  fromRelpath: string,
+  spec: string,
+  knownFiles: Set<string>,
+): string | null {
+  if (!spec.startsWith(".")) return null;
+  const base = normalized(join(dirname(fromRelpath), spec));
+  const candidates = [
+    base,
+    ...MODULE_SOURCE_EXTENSION_ORDER.map((ext) => `${base}${ext}`),
+    ...MODULE_SOURCE_EXTENSION_ORDER.map((ext) =>
+      normalized(join(base, `index${ext}`)),
+    ),
+  ];
+  for (const candidate of candidates) {
+    if (!isModuleSourcePath(candidate)) continue;
+    if (knownFiles.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+function isPiExtensionSourceRoot(relpath: string): boolean {
+  return (
+    /^integrations\/pi-[^/]+\/src\//.test(normalized(relpath)) &&
+    isModuleSourcePath(relpath)
+  );
+}
+
+function findPiExtensionBunBuiltinFindings(
+  files: SourceLintFiles,
+): SourceFinding[] {
+  const paths = [...files.paths()];
+  const knownFiles = new Set(paths.map(normalized));
+  const findings: SourceFinding[] = [];
+  const visited = new Set<string>();
+  const parsed = new Map<string, ModuleEdge[]>();
+  const visit = (relpath: string): void => {
+    const rel = normalized(relpath);
+    if (visited.has(rel)) return;
+    visited.add(rel);
+    const text = files.read(rel);
+    if (text === null) return;
+    const edges = parsed.get(rel) ?? parseModuleEdges(rel, text);
+    parsed.set(rel, edges);
+    for (const edge of edges) {
+      if (edge.spec === "bun" || edge.spec.startsWith("bun:")) {
+        findings.push({
+          kind: "BUN_BUILTIN_IMPORT",
+          file: rel,
+          line: edge.line,
+          message: `pi-extension import graph reaches bun builtin "${edge.spec}"`,
+        });
+        continue;
+      }
+      const resolved = resolveModuleSource(rel, edge.spec, knownFiles);
+      if (resolved !== null) visit(resolved);
+    }
+  };
+  for (const relpath of paths.filter(isPiExtensionSourceRoot)) {
+    visit(relpath);
+  }
+  return findings;
 }
 
 export function scanSourceText(relpath: string, text: string): SourceFinding[] {
@@ -281,13 +487,21 @@ function emptyAllowlist(): SourceAllowlist {
 
 export function parseAllowlist(text: string): SourceAllowlist {
   const parsed = JSON.parse(text) as Partial<SourceAllowlist>;
-  if (parsed.version !== 1 || typeof parsed.commentViolations !== "object" || parsed.commentViolations === null) {
-    throw new Error("lint-source allowlist must be {version:1, commentViolations:{...}}");
+  if (
+    parsed.version !== 1 ||
+    typeof parsed.commentViolations !== "object" ||
+    parsed.commentViolations === null
+  ) {
+    throw new Error(
+      "lint-source allowlist must be {version:1, commentViolations:{...}}",
+    );
   }
   const commentViolations: Record<string, number> = {};
   for (const [path, count] of Object.entries(parsed.commentViolations)) {
     if (!Number.isInteger(count) || count < 0) {
-      throw new Error(`lint-source allowlist count for ${path} must be a non-negative integer`);
+      throw new Error(
+        `lint-source allowlist count for ${path} must be a non-negative integer`,
+      );
     }
     commentViolations[normalized(path)] = count;
   }
@@ -325,7 +539,12 @@ export function treeFiles(root: string): SourceLintFiles {
       if (st.isDirectory()) {
         if (!isSkippedPath(`${rel}/placeholder`)) walk(path);
       } else if (st.isFile()) {
-        if (isSkippedPath(rel) || !isSourcePath(rel) || st.size > MAX_FILE_BYTES) continue;
+        if (
+          isSkippedPath(rel) ||
+          !isSourcePath(rel) ||
+          st.size > MAX_FILE_BYTES
+        )
+          continue;
         try {
           contents.set(rel, readFileSync(path, "utf8"));
         } catch {
@@ -347,13 +566,18 @@ export function buildAllowlist(files: SourceLintFiles): SourceAllowlist {
     if (isSkippedPath(relpath) || !isSourcePath(relpath)) continue;
     const text = files.read(relpath);
     if (text === null) continue;
-    const count = scanSourceText(relpath, text).filter((f) => f.kind === "COMMENT_RENARRATION").length;
+    const count = scanSourceText(relpath, text).filter(
+      (f) => f.kind === "COMMENT_RENARRATION",
+    ).length;
     if (count > 0) commentViolations[normalized(relpath)] = count;
   }
   return { version: 1, commentViolations };
 }
 
-export function lintSourceFiles(files: SourceLintFiles, allowlist: SourceAllowlist): SourceLintResult {
+export function lintSourceFiles(
+  files: SourceLintFiles,
+  allowlist: SourceAllowlist,
+): SourceLintResult {
   const findings: SourceFinding[] = [];
   const actualCommentCounts = new Map<string, number>();
   let scanned = 0;
@@ -365,7 +589,9 @@ export function lintSourceFiles(files: SourceLintFiles, allowlist: SourceAllowli
     if (text === null) continue;
     scanned++;
     const fileFindings = scanSourceText(rel, text);
-    const commentCount = fileFindings.filter((f) => f.kind === "COMMENT_RENARRATION").length;
+    const commentCount = fileFindings.filter(
+      (f) => f.kind === "COMMENT_RENARRATION",
+    ).length;
     actualCommentCounts.set(rel, commentCount);
     findings.push(...fileFindings.filter((f) => f.kind === "RAW_NUL_LITERAL"));
     const allowed = allowlist.commentViolations[rel] ?? 0;
@@ -379,22 +605,30 @@ export function lintSourceFiles(files: SourceLintFiles, allowlist: SourceAllowli
     }
   }
 
-  for (const [relpath, allowed] of Object.entries(allowlist.commentViolations)) {
+  for (const [relpath, allowed] of Object.entries(
+    allowlist.commentViolations,
+  )) {
     const actual = actualCommentCounts.get(normalized(relpath)) ?? 0;
     if (allowed > 0 && actual === 0) {
       findings.push({
         kind: "ALLOWLIST",
         file: relpath,
         line: 0,
-        message: "allowlist entry is inflated for a clean file; remove it or keep the count at zero",
+        message:
+          "allowlist entry is inflated for a clean file; remove it or keep the count at zero",
       });
     }
   }
 
+  findings.push(...findPiExtensionBunBuiltinFindings(files));
+
   return { findings, scanned };
 }
 
-export function lintSource(root: string, allowlistPath = join(root, DEFAULT_ALLOWLIST)): SourceLintResult {
+export function lintSource(
+  root: string,
+  allowlistPath = join(root, DEFAULT_ALLOWLIST),
+): SourceLintResult {
   const files = treeFiles(root);
   const allowlist = existsSync(allowlistPath)
     ? parseAllowlist(readFileSync(allowlistPath, "utf8"))
@@ -403,7 +637,8 @@ export function lintSource(root: string, allowlistPath = join(root, DEFAULT_ALLO
 }
 
 function main(): void {
-  const root = process.env.KEEPER_SOURCE_LINT_REPO_ROOT ?? dirname(import.meta.dir);
+  const root =
+    process.env.KEEPER_SOURCE_LINT_REPO_ROOT ?? dirname(import.meta.dir);
   if (!existsSync(root)) {
     console.error(`ERROR: source lint repo root not found at ${root}`);
     process.exitCode = 1;
@@ -416,7 +651,9 @@ function main(): void {
     const allowlist = buildAllowlist(files);
     mkdirSync(dirname(allowlistPath), { recursive: true });
     writeFileSync(allowlistPath, stringifyAllowlist(allowlist));
-    console.log(`[lint-source] wrote ${Object.keys(allowlist.commentViolations).length} allowlist entr${Object.keys(allowlist.commentViolations).length === 1 ? "y" : "ies"} to ${DEFAULT_ALLOWLIST}`);
+    console.log(
+      `[lint-source] wrote ${Object.keys(allowlist.commentViolations).length} allowlist entr${Object.keys(allowlist.commentViolations).length === 1 ? "y" : "ies"} to ${DEFAULT_ALLOWLIST}`,
+    );
     return;
   }
 
@@ -437,10 +674,14 @@ function main(): void {
     return;
   }
 
-  console.error(`ERROR: source hygiene guard found ${findings.length} violation(s):`);
+  console.error(
+    `ERROR: source hygiene guard found ${findings.length} violation(s):`,
+  );
   for (const finding of findings) {
     const where = finding.line > 0 ? `:${finding.line}` : "";
-    console.error(`  - ${finding.file}${where} [${finding.kind}] ${finding.message}`);
+    console.error(
+      `  - ${finding.file}${where} [${finding.kind}] ${finding.message}`,
+    );
   }
   process.exitCode = 1;
 }
