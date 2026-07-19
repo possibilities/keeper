@@ -222,6 +222,8 @@ describe("commit-work foreign claim adoption", () => {
       laterDbSession?: string;
       laterDbHook?: string;
       receiptSession?: string;
+      jobsState?: "ended" | "killed";
+      jobsLastEvent?: "later-nonlifecycle";
       cursor: "head" | "mutation";
       expected: "terminal" | "unknown";
       rejection?: "receipts_pending";
@@ -252,6 +254,18 @@ describe("commit-work foreign claim adoption", () => {
         cursor: "head",
         expected: "unknown",
       },
+      {
+        name: "jobs row advanced past terminal by a later fold",
+        jobsLastEvent: "later-nonlifecycle",
+        cursor: "head",
+        expected: "terminal",
+      },
+      {
+        name: "killed projection with SessionEnd tail",
+        jobsState: "killed",
+        cursor: "head",
+        expected: "terminal",
+      },
     ];
 
     for (const entry of cases) {
@@ -267,8 +281,8 @@ describe("commit-work foreign claim adoption", () => {
       try {
         const { db } = openDb(dbPath, { migrate: false });
         db.run(
-          "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES (?, 1, 'ended', 1)",
-          [OTHER],
+          "INSERT INTO jobs (job_id, created_at, state, updated_at) VALUES (?, 1, ?, 1)",
+          [OTHER, entry.jobsState ?? "ended"],
         );
         const mutation = db.run(
           `INSERT INTO events
@@ -283,8 +297,18 @@ describe("commit-work foreign claim adoption", () => {
            VALUES (2, ?, 'SessionEnd', 'session_end', '/repo', '{}')`,
           [OTHER],
         );
+        let jobsLastEventId = terminal.lastInsertRowid;
+        if (entry.jobsLastEvent === "later-nonlifecycle") {
+          const fold = db.run(
+            `INSERT INTO events
+               (ts, session_id, hook_event, event_type, cwd, data)
+             VALUES (3, ?, 'GitSnapshot', 'git_snapshot', '/repo', '{}')`,
+            [OTHER],
+          );
+          jobsLastEventId = fold.lastInsertRowid;
+        }
         db.run("UPDATE jobs SET last_event_id = ? WHERE job_id = ?", [
-          terminal.lastInsertRowid,
+          jobsLastEventId,
           OTHER,
         ]);
         if (entry.laterDbSession !== undefined) {

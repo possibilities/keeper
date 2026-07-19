@@ -10,7 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   CODEX_POOL_PROOF_WINDOW_ENV,
   codexPoolProofWindowActive,
-} from "../../../src/codex-pool-activation.ts";
+} from "../../../src/codex-pool-proof-window.ts";
 import {
   aliasesFromEnvironment,
   type CanonicalOAuth,

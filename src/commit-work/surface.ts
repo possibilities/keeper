@@ -974,25 +974,32 @@ const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
 
 interface OrderedTerminalProofInput {
   mutationEventId: number | null;
-  sessionId: string;
   state: string | null;
-  terminalEventId: number | null;
-  terminalSessionId: string | null;
-  terminalHookEvent: string | null;
   sessionLifecycleTailEventId: number | null;
+  sessionLifecycleTailHook: string | null;
   reducerCursorEventId: number;
 }
 
+/**
+ * A claim is terminally proven only from the session's own lifecycle tail: the
+ * last lifecycle word must be a terminal one, ordered after the mutation and
+ * already consumed by the reducer so the projected state reflects it. The
+ * jobs row's last_event_id is NOT the witness — any later fold touching the
+ * row (a GitSnapshot, an enrich) moves it past the terminal event, and a
+ * pointer that drifts must not be able to un-prove a real death. Cross-pairing
+ * is accepted (a killed projection whose tail is SessionEnd, or vice versa):
+ * either terminal word ends the session; which one won the race to disk does
+ * not change that.
+ */
 function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
   return (
     row.mutationEventId !== null &&
-    row.terminalEventId !== null &&
-    row.terminalEventId > row.mutationEventId &&
-    row.reducerCursorEventId >= row.terminalEventId &&
-    row.terminalEventId === row.sessionLifecycleTailEventId &&
-    row.terminalSessionId === row.sessionId &&
-    ((row.state === "ended" && row.terminalHookEvent === "SessionEnd") ||
-      (row.state === "killed" && row.terminalHookEvent === "Killed"))
+    row.sessionLifecycleTailEventId !== null &&
+    row.sessionLifecycleTailEventId > row.mutationEventId &&
+    row.reducerCursorEventId >= row.sessionLifecycleTailEventId &&
+    (row.sessionLifecycleTailHook === "SessionEnd" ||
+      row.sessionLifecycleTailHook === "Killed") &&
+    (row.state === "ended" || row.state === "killed")
   );
 }
 
@@ -1023,16 +1030,18 @@ export function readOwnershipClaims(
           `SELECT fa.file_path, fa.session_id, fa.worktree_oid, fa.worktree_mode,
                   fa.source, fa.last_event_id AS mutation_event_id, j.state,
                   j.pid, j.start_time,
-                  j.last_event_id AS terminal_event_id,
-                  terminal.session_id AS terminal_session_id,
-                  terminal.hook_event AS terminal_hook_event,
                   (SELECT MAX(tail.id)
                      FROM events tail
                     WHERE tail.session_id = fa.session_id
-                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id
+                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id,
+                  (SELECT tail2.hook_event
+                     FROM events tail2
+                    WHERE tail2.session_id = fa.session_id
+                      AND tail2.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})
+                    ORDER BY tail2.id DESC
+                    LIMIT 1) AS session_lifecycle_tail_hook
              FROM file_attributions fa
              LEFT JOIN jobs j ON j.job_id = fa.session_id
-             LEFT JOIN events terminal ON terminal.id = j.last_event_id
             WHERE fa.project_dir = ?
               AND fa.last_mutation_at > COALESCE(fa.last_commit_at, 0)
             ORDER BY fa.file_path, fa.session_id
@@ -1048,10 +1057,8 @@ export function readOwnershipClaims(
         state: string | null;
         pid: number | null;
         start_time: string | null;
-        terminal_event_id: number | null;
-        terminal_session_id: string | null;
-        terminal_hook_event: string | null;
         session_lifecycle_tail_event_id: number | null;
+        session_lifecycle_tail_hook: string | null;
       }>;
       if (durable.length > DURABLE_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -1124,16 +1131,18 @@ export function readOwnershipClaims(
         .query(
           `SELECT e.id AS event_id, e.mutation_path, e.session_id, j.state,
                   j.pid, j.start_time,
-                  j.last_event_id AS terminal_event_id,
-                  terminal.session_id AS terminal_session_id,
-                  terminal.hook_event AS terminal_hook_event,
                   (SELECT MAX(tail.id)
                      FROM events tail
                     WHERE tail.session_id = e.session_id
-                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id
+                      AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS session_lifecycle_tail_event_id,
+                  (SELECT tail2.hook_event
+                     FROM events tail2
+                    WHERE tail2.session_id = e.session_id
+                      AND tail2.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})
+                    ORDER BY tail2.id DESC
+                    LIMIT 1) AS session_lifecycle_tail_hook
              FROM events e
              LEFT JOIN jobs j ON j.job_id = e.session_id
-             LEFT JOIN events terminal ON terminal.id = j.last_event_id
             WHERE e.id > ?
               AND e.id <= ?
               AND (
@@ -1153,10 +1162,8 @@ export function readOwnershipClaims(
         state: string | null;
         pid: number | null;
         start_time: string | null;
-        terminal_event_id: number | null;
-        terminal_session_id: string | null;
-        terminal_hook_event: string | null;
         session_lifecycle_tail_event_id: number | null;
+        session_lifecycle_tail_hook: string | null;
       }>;
       if (pending.length > PENDING_DIRECT_CLAIM_LIMIT) {
         db.run("ROLLBACK");
@@ -1167,12 +1174,9 @@ export function readOwnershipClaims(
       const claims: OwnershipClaim[] = durable.map((row) => {
         const orderedTerminalProof = hasOrderedTerminalProof({
           mutationEventId: row.mutation_event_id,
-          sessionId: row.session_id,
           state: row.state,
-          terminalEventId: row.terminal_event_id,
-          terminalSessionId: row.terminal_session_id,
-          terminalHookEvent: row.terminal_hook_event,
           sessionLifecycleTailEventId: row.session_lifecycle_tail_event_id,
+          sessionLifecycleTailHook: row.session_lifecycle_tail_hook,
           reducerCursorEventId: reducerCursor,
         });
         const claim: OwnershipClaim = {
@@ -1203,22 +1207,18 @@ export function readOwnershipClaims(
         if (relativePath === null) continue;
         const terminalAfterMutation = hasOrderedTerminalProof({
           mutationEventId: row.event_id,
-          sessionId: row.session_id,
           state: row.state,
-          terminalEventId: row.terminal_event_id,
-          terminalSessionId: row.terminal_session_id,
-          terminalHookEvent: row.terminal_hook_event,
           sessionLifecycleTailEventId: row.session_lifecycle_tail_event_id,
+          sessionLifecycleTailHook: row.session_lifecycle_tail_hook,
           reducerCursorEventId: reducerCursor,
         });
         claims.push({
           path: relativePath,
           sessionId: row.session_id,
           // A pending mutation can be newer than jobs.state, so a bare
-          // non-working projection is never terminal proof. The job reducer's
-          // exact last_event_id is sufficient only when it names a matching
-          // terminal lifecycle event ordered after this mutation, folded by the
-          // reducer cursor, and still the same session's last lifecycle word.
+          // non-working projection is never terminal proof. Only the session's
+          // own terminal lifecycle tail, ordered after this mutation and
+          // consumed by the reducer cursor, proves the session over.
           liveness:
             row.state === "working"
               ? "live"
