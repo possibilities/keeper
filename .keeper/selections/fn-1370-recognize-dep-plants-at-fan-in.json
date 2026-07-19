@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Correctness-critical merge-safety invariant in the autopilot base-readiness classifier where a wrong byte-identity verdict clobbers real work product, plus crash-safe pre-merge removal reasoning across producer/git seams \u2014 a nameable intelligence-bound reason gating opus at the contract-shaped xhigh band.",
+      "task_id": "fn-1370-recognize-dep-plants-at-fan-in.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T08:51:40.318000Z",
+  "epic_id": "fn-1370-recognize-dep-plants-at-fan-in",
+  "input_hash": "8dba0d5103199c93f09f168835798b7280a78b293889cb446f3c18c5e8324a7c",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2377780561,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1370-recognize-dep-plants-at-fan-in.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Correctness-critical merge-safety invariant in the autopilot base-readiness classifier where a wrong byte-identity verdict clobbers real work product, plus crash-safe pre-merge removal reasoning across producer/git seams \u2014 a nameable intelligence-bound reason gating opus at the contract-shaped xhigh band.\",\"confidence\":0.8}]}\n"
+}
