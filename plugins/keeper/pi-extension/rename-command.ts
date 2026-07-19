@@ -20,6 +20,18 @@
  */
 
 import { execFile } from "node:child_process";
+import {
+  closeSync,
+  constants as FS_CONSTANTS,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, sep as pathSeparator, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // constants
@@ -31,6 +43,9 @@ export const RENAME_MODEL_ID = "gpt-5.3-codex-spark";
 
 /** Bounded model input: at most this many UTF-8 bytes of transcript text. */
 export const RENAME_MAX_TRANSCRIPT_BYTES = 16 * 1024;
+export const RENAME_MAX_REFERENCES = 8;
+export const RENAME_MAX_FILE_BYTES = 8 * 1024;
+export const RENAME_MAX_AGGREGATE_FILE_BYTES = 12 * 1024;
 /** Bounded model output: a short title needs very few tokens. */
 export const RENAME_MAX_RESPONSE_TOKENS = 64;
 /** Minimal/disabled reasoning — this is a metadata completion, not a turn. */
@@ -114,6 +129,386 @@ export function stripSkillBlocks(text: string): string {
   return text.replace(/<skill(?:\s[^>]*)?>[\s\S]*?<\/skill>/g, "");
 }
 
+const RENAME_UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+const RENAME_COMMAND_WRAPPER_TAGS = [
+  "command-name",
+  "command-message",
+  "local-command-stdout",
+] as const;
+
+export interface RenameInputStat {
+  dev: number | bigint;
+  ino: number | bigint;
+  mode: number | bigint;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+export interface RenameInputFileSystem {
+  realpath(path: string): string;
+  lstat(path: string): RenameInputStat;
+  open(path: string, flags: number): number;
+  fstat(fd: number): RenameInputStat;
+  read(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null,
+  ): number;
+  close(fd: number): void;
+}
+
+export interface RenameInputExpansionOptions {
+  projectDir: string;
+  homeDir?: string;
+  fileSystem?: RenameInputFileSystem;
+}
+
+const renameNodeFileSystem: RenameInputFileSystem = {
+  realpath: realpathSync,
+  lstat: lstatSync,
+  open: openSync,
+  fstat: fstatSync,
+  read: readSync,
+  close: closeSync,
+};
+
+function stripRenameScaffolding(text: string): string {
+  let result = stripSkillBlocks(text);
+  for (const tag of RENAME_COMMAND_WRAPPER_TAGS) {
+    result = result.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "g"), "");
+  }
+  return result.replace(/<command-args>([\s\S]*?)<\/command-args>/g, "$1");
+}
+
+function renameFenceStart(
+  text: string,
+  index: number,
+  marker: "`" | "~",
+): number {
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const indent = text.slice(lineStart, index);
+  if (indent.length > 3 || /[^ ]/.test(indent)) return 0;
+  let length = 0;
+  while (text[index + length] === marker) length += 1;
+  return length >= 3 ? length : 0;
+}
+
+function renameReferenceBoundary(text: string, index: number): boolean {
+  if (index === 0) return true;
+  return !/[\p{L}\p{N}_@]/u.test(text[index - 1] ?? "");
+}
+
+function renameReferenceHasUnsafeCharacter(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/** Find @-prefixed references in ordinary prose without interpreting code. */
+export function findRenamePathReferences(text: string): string[] {
+  const references: string[] = [];
+  let fence: { marker: "`" | "~"; length: number } | null = null;
+  let index = 0;
+  while (index < text.length) {
+    if (fence !== null) {
+      const length = renameFenceStart(text, index, fence.marker);
+      if (length >= fence.length) {
+        fence = null;
+        index += length;
+      } else {
+        index += 1;
+      }
+      continue;
+    }
+
+    const char = text[index];
+    if (char === "`" || char === "~") {
+      const fenceLength = renameFenceStart(text, index, char);
+      if (fenceLength > 0) {
+        fence = { marker: char, length: fenceLength };
+        index += fenceLength;
+        continue;
+      }
+      if (char === "`") {
+        let run = 1;
+        while (text[index + run] === "`") run += 1;
+        const delimiter = "`".repeat(run);
+        const close = text.indexOf(delimiter, index + run);
+        if (close < 0) break;
+        index = close + run;
+        continue;
+      }
+    }
+
+    if (char !== "@" || !renameReferenceBoundary(text, index)) {
+      index += 1;
+      continue;
+    }
+    let cursor = index + 1;
+    let value = "";
+    const quote = text[cursor];
+    if (quote === '"' || quote === "'") {
+      cursor += 1;
+      const end = text.indexOf(quote, cursor);
+      if (end < 0 || text.slice(cursor, end).includes("\n")) {
+        index += 1;
+        continue;
+      }
+      value = text.slice(cursor, end);
+      cursor = end + 1;
+    } else {
+      const start = cursor;
+      while (cursor < text.length) {
+        const current = text[cursor] ?? "";
+        if (/\s/u.test(current) || "<>[]{}()\"'`,;!?".includes(current)) break;
+        cursor += 1;
+      }
+      value = text.slice(start, cursor).replace(/[.,;:!?]+$/u, "");
+    }
+    if (value.length > 0 && !renameReferenceHasUnsafeCharacter(value)) {
+      references.push(value);
+    }
+    index = Math.max(cursor, index + 1);
+  }
+  return references;
+}
+
+function sameRenameFileIdentity(
+  left: RenameInputStat,
+  right: RenameInputStat,
+): boolean {
+  return (
+    BigInt(left.dev) === BigInt(right.dev) &&
+    BigInt(left.ino) === BigInt(right.ino) &&
+    BigInt(left.mode) === BigInt(right.mode) &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
+}
+
+function renameContainedRelative(root: string, target: string): string | null {
+  const rel = relative(root, target);
+  if (
+    rel === "" ||
+    rel === ".." ||
+    rel.startsWith(`..${pathSeparator}`) ||
+    isAbsolute(rel)
+  ) {
+    return rel === "" ? "" : null;
+  }
+  return rel;
+}
+
+function normalizeRenameReference(
+  value: string,
+  homeDir: string,
+): string | null {
+  let normalized = value.replace(RENAME_UNICODE_SPACES, " ");
+  try {
+    if (normalized === "~") return homeDir;
+    if (normalized.startsWith("~/")) {
+      return resolve(homeDir, normalized.slice(2));
+    }
+    if (normalized.startsWith("file://")) {
+      normalized = fileURLToPath(normalized);
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+function renameUnavailableMarker(label: string | null): string {
+  return label === null
+    ? "[Referenced file unavailable]"
+    : `[Referenced file unavailable: ${JSON.stringify(label)}]`;
+}
+
+interface RenameOpenedReference {
+  label: string;
+  content: string;
+  contentBytes: number;
+  truncated: boolean;
+}
+
+function readRenameReference(
+  fs: RenameInputFileSystem,
+  path: string,
+  label: string,
+  maxBytes: number,
+): RenameOpenedReference | null {
+  let before: RenameInputStat;
+  try {
+    before = fs.lstat(path);
+    if (before.isSymbolicLink() || !before.isFile()) return null;
+    const canonical = fs.realpath(path);
+    if (canonical !== path) return null;
+  } catch {
+    return null;
+  }
+
+  let fd: number | null = null;
+  try {
+    const noFollow =
+      typeof FS_CONSTANTS.O_NOFOLLOW === "number" ? FS_CONSTANTS.O_NOFOLLOW : 0;
+    fd = fs.open(
+      path,
+      FS_CONSTANTS.O_RDONLY | FS_CONSTANTS.O_NONBLOCK | noFollow,
+    );
+    const opened = fs.fstat(fd);
+    if (!opened.isFile() || !sameRenameFileIdentity(before, opened))
+      return null;
+
+    const wanted = Math.min(maxBytes, before.size);
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (total < wanted) {
+      const chunk = new Uint8Array(Math.min(4096, wanted - total));
+      const count = fs.read(fd, chunk, 0, chunk.byteLength, null);
+      if (count <= 0) break;
+      chunks.push(chunk.subarray(0, count));
+      total += count;
+    }
+    const after = fs.fstat(fd);
+    if (total !== wanted || !sameRenameFileIdentity(opened, after)) return null;
+
+    const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+    if (bytes.includes(0)) return null;
+    const truncated = before.size > maxBytes;
+    let content: string;
+    try {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      content = decoder.decode(bytes, truncated ? { stream: true } : undefined);
+    } catch {
+      return null;
+    }
+    return {
+      label,
+      content,
+      contentBytes: bytes.byteLength,
+      truncated,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.close(fd);
+      } catch {
+        // A close failure does not change the bounded snapshot already read.
+      }
+    }
+  }
+}
+
+function expandRenameHumanSections(
+  sections: readonly RenameConversationSection[],
+  options: RenameInputExpansionOptions | undefined,
+): RenameConversationSection[] {
+  if (options === undefined) return sections.map((section) => ({ ...section }));
+  const occurrences = sections.map((section) =>
+    section.label === "User" ? findRenamePathReferences(section.text) : [],
+  );
+  if (!occurrences.some((references) => references.length > 0)) {
+    return sections.map((section) => ({ ...section }));
+  }
+
+  const fs = options.fileSystem ?? renameNodeFileSystem;
+  const homeDir = options.homeDir ?? homedir();
+  let projectAvailable = true;
+  let canonicalProject: string;
+  try {
+    canonicalProject = fs.realpath(resolve(options.projectDir));
+  } catch {
+    projectAvailable = false;
+    canonicalProject = resolve(options.projectDir);
+  }
+  const lexicalProject = resolve(options.projectDir);
+  const seen = new Set<string>();
+  let referenceCount = 0;
+  let aggregateBytes = 0;
+
+  return sections.map((section, sectionIndex) => {
+    const additions: string[] = [];
+    for (const raw of occurrences[sectionIndex] ?? []) {
+      if (referenceCount >= RENAME_MAX_REFERENCES) break;
+      const normalized = normalizeRenameReference(raw, homeDir);
+      let candidate: string | null = null;
+      let label: string | null = null;
+      if (normalized !== null) {
+        if (isAbsolute(normalized)) {
+          const rel = renameContainedRelative(
+            lexicalProject,
+            resolve(normalized),
+          );
+          if (rel !== null) candidate = resolve(canonicalProject, rel);
+        } else {
+          candidate = resolve(canonicalProject, normalized);
+        }
+        if (candidate !== null) {
+          const rel = renameContainedRelative(canonicalProject, candidate);
+          if (rel === null) candidate = null;
+          else label = rel.split(pathSeparator).join("/");
+        }
+      }
+      const key = candidate === null ? `invalid:${raw}` : candidate;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      referenceCount += 1;
+
+      if (
+        candidate === null ||
+        !projectAvailable ||
+        aggregateBytes >= RENAME_MAX_AGGREGATE_FILE_BYTES
+      ) {
+        additions.push(renameUnavailableMarker(label));
+        continue;
+      }
+      let canonicalTarget: string;
+      try {
+        canonicalTarget = fs.realpath(candidate);
+      } catch {
+        additions.push(renameUnavailableMarker(label));
+        continue;
+      }
+      if (
+        canonicalTarget !== candidate ||
+        renameContainedRelative(canonicalProject, canonicalTarget) === null
+      ) {
+        additions.push(renameUnavailableMarker(label));
+        continue;
+      }
+      const remaining = RENAME_MAX_AGGREGATE_FILE_BYTES - aggregateBytes;
+      const opened = readRenameReference(
+        fs,
+        candidate,
+        label ?? "",
+        Math.min(RENAME_MAX_FILE_BYTES, remaining),
+      );
+      if (opened === null) {
+        additions.push(renameUnavailableMarker(label));
+        continue;
+      }
+      aggregateBytes += opened.contentBytes;
+      const suffix = opened.truncated ? "\n[Referenced file truncated]" : "";
+      additions.push(
+        `[Referenced file: ${JSON.stringify(opened.label)}]\n${opened.content}${suffix}\n[End referenced file]`,
+      );
+    }
+    return additions.length === 0
+      ? { ...section }
+      : { ...section, text: `${section.text}\n\n${additions.join("\n\n")}` };
+  });
+}
+
 /**
  * Remove expanded skills, then bound the combined prompt+response text to
  * `maxBytes` UTF-8 bytes. PURE. A slice can land mid-codepoint; the model
@@ -124,19 +519,31 @@ export function buildRenameInputText(
   prompt: string,
   response: string | null,
   maxBytes: number,
+  expansionOptions?: RenameInputExpansionOptions,
 ): string {
-  const parts = [`User: ${prompt}`];
+  const sections: RenameConversationSection[] = [
+    { label: "User", text: stripRenameScaffolding(prompt), weight: 2 },
+  ];
   if (response !== null && response.length > 0) {
-    parts.push(`Assistant: ${response}`);
+    sections.push({
+      label: "Assistant",
+      text: stripRenameScaffolding(response),
+      weight: 1,
+    });
   }
-  const combined = stripSkillBlocks(parts.join("\n\n"));
-  if (Buffer.byteLength(combined, "utf8") <= maxBytes) {
+  const combined = expandRenameHumanSections(sections, expansionOptions)
+    .map((section) => `${section.label}: ${section.text}`)
+    .join("\n\n");
+  const budget = Number.isNaN(maxBytes)
+    ? 0
+    : Math.max(0, Math.min(RENAME_MAX_TRANSCRIPT_BYTES, Math.floor(maxBytes)));
+  if (Buffer.byteLength(combined, "utf8") <= budget) {
     return combined;
   }
   let sliceLen = combined.length;
   while (
     sliceLen > 0 &&
-    Buffer.byteLength(combined.slice(0, sliceLen), "utf8") > maxBytes
+    Buffer.byteLength(combined.slice(0, sliceLen), "utf8") > budget
   ) {
     sliceLen -= 1;
   }
@@ -246,8 +653,9 @@ function allocateConversationBytes(
 export function buildRenameConversationInput(
   messages: readonly unknown[],
   maxBytes: number,
+  expansionOptions?: RenameInputExpansionOptions,
 ): string | null {
-  const sections: RenameConversationSection[] = [];
+  const rawSections: RenameConversationSection[] = [];
   for (const raw of messages) {
     if (!isRecord(raw)) continue;
     const message = raw as RenameContextMessage;
@@ -273,10 +681,14 @@ export function buildRenameConversationInput(
     } else {
       continue;
     }
-    text = stripSkillBlocks(text).trim();
-    if (text.length > 0) sections.push({ label, text, weight });
+    text = stripRenameScaffolding(text).trim();
+    if (text.length > 0) rawSections.push({ label, text, weight });
   }
-  if (sections.length === 0 || maxBytes <= 0) return null;
+  const budget = Number.isNaN(maxBytes)
+    ? 0
+    : Math.max(0, Math.min(RENAME_MAX_TRANSCRIPT_BYTES, Math.floor(maxBytes)));
+  if (rawSections.length === 0 || budget === 0) return null;
+  const sections = expandRenameHumanSections(rawSections, expansionOptions);
 
   const separator = "\n\n";
   const overhead = sections.reduce(
@@ -286,16 +698,16 @@ export function buildRenameConversationInput(
       (index === 0 ? 0 : Buffer.byteLength(separator, "utf8")),
     0,
   );
-  if (overhead >= maxBytes) {
+  if (overhead >= budget) {
     return truncateUtf8(
       sections
         .map((section) => `${section.label}: ${section.text}`)
         .join(separator),
-      maxBytes,
+      budget,
     );
   }
 
-  const allocations = allocateConversationBytes(sections, maxBytes - overhead);
+  const allocations = allocateConversationBytes(sections, budget - overhead);
   return sections
     .map(
       (section, index) =>
@@ -563,6 +975,8 @@ export interface RenameCommandDeps {
    *  AbortController fires in milliseconds instead of the real
    *  {@link RENAME_TIMEOUT_MS}; production deps omit it. */
   timeoutMs?: number;
+  renameInputFileSystem?: RenameInputFileSystem;
+  renameInputHomeDir?: string;
 }
 
 export function defaultRenameCommandDeps(): RenameCommandDeps {
@@ -695,6 +1109,11 @@ async function runRenameAttempt(
       inputText = buildRenameConversationInput(
         buildSessionContext.call(ctx.sessionManager).messages,
         RENAME_MAX_TRANSCRIPT_BYTES,
+        {
+          projectDir: ctx.cwd,
+          homeDir: deps.renameInputHomeDir,
+          fileSystem: deps.renameInputFileSystem,
+        },
       );
     } catch {
       return { outcome: "read_failed" };
@@ -725,6 +1144,11 @@ async function runRenameAttempt(
       turnOutcome.prompt,
       turnOutcome.response,
       RENAME_MAX_TRANSCRIPT_BYTES,
+      {
+        projectDir: ctx.cwd,
+        homeDir: deps.renameInputHomeDir,
+        fileSystem: deps.renameInputFileSystem,
+      },
     );
   }
 
@@ -903,8 +1327,7 @@ async function drivePendingRename(
     state.wakeContext = ctx;
     return;
   }
-  const usesLiveContext =
-    ctx.sessionManager.buildSessionContext !== undefined;
+  const usesLiveContext = ctx.sessionManager.buildSessionContext !== undefined;
   if (!usesLiveContext && !(ctx.isIdle?.() ?? true)) return;
 
   state.running = true;
@@ -925,10 +1348,7 @@ async function drivePendingRename(
         request.readFailures += 1;
         if (request.readFailures < RENAME_MAX_READ_FAILURES) continue;
       }
-      if (
-        result.outcome === "stale" &&
-        result.staleReason === "retryable"
-      ) {
+      if (result.outcome === "stale" && result.staleReason === "retryable") {
         if (request.completionAttempts < RENAME_MAX_COMPLETION_ATTEMPTS) {
           if (usesLiveContext || (ctx.isIdle?.() ?? true)) continue;
           return;

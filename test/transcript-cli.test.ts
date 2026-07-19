@@ -18,6 +18,7 @@ import {
   discoverClaudeProjectsRoots,
   encodeClaudeProject,
   listClaudeSessions,
+  projectClaudeNamingSections,
 } from "../src/transcript/claude";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
@@ -205,6 +206,48 @@ afterEach(() => {
 function run(args: string[]) {
   return runTranscriptCli(["claude", ...args, "--config-dir", configDir], deps);
 }
+
+describe("Claude naming projection reader boundary", () => {
+  test("selects the explicit leaf without exposing tool or title records", () => {
+    const records = [
+      line({
+        type: "user",
+        uuid: "user-1",
+        parentUuid: null,
+        message: { role: "user", content: "Build search" },
+      }),
+      line({
+        type: "assistant",
+        uuid: "abandoned",
+        parentUuid: "user-1",
+        message: { role: "assistant", content: "Abandoned detail" },
+      }),
+      line({
+        type: "assistant",
+        uuid: "active",
+        parentUuid: "user-1",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "private" },
+            { type: "tool_use", id: "tool", name: "Read" },
+            { type: "text", text: "Implemented ranking" },
+          ],
+        },
+      }),
+      line({ type: "custom-title", customTitle: "Native title" }),
+      line({ type: "last-prompt", leafUuid: "active" }),
+    ];
+    const transcript = `${records.join("\n")}\n`;
+
+    expect(
+      projectClaudeNamingSections(transcript, Buffer.byteLength(transcript)),
+    ).toEqual([
+      { role: "user", text: "Build search" },
+      { role: "assistant", text: "Implemented ranking" },
+    ]);
+  });
+});
 
 describe("keeper transcript show", () => {
   test("renders conversation, compact tools, pagination, and subagent ids", () => {

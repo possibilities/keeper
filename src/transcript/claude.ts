@@ -525,6 +525,122 @@ export function createClaudeLineNormalizer(options: {
   };
 }
 
+export interface ClaudeNamingSection {
+  role: "user" | "assistant" | "summary";
+  text: string;
+}
+
+interface ClaudeNamingNode {
+  id: string;
+  parentId: string | null;
+  section: ClaudeNamingSection | null;
+}
+
+function namingText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const text: string[] = [];
+  for (const block of content) {
+    if (typeof block === "string") {
+      text.push(block);
+      continue;
+    }
+    const object = recordOf(block);
+    if (object?.type === "text" && typeof object.text === "string") {
+      text.push(object.text);
+    }
+  }
+  return text.join("\n");
+}
+
+/**
+ * Project the active Claude branch at an exact byte cutoff into only the
+ * authored text useful for deriving a Session title. A cutoff in the middle
+ * of a JSONL record excludes that record; an exact EOF may include a final
+ * record without a newline.
+ */
+export function projectClaudeNamingSections(
+  transcript: string | Uint8Array,
+  cutoffBytes: number,
+): ClaudeNamingSection[] {
+  const source =
+    typeof transcript === "string"
+      ? Buffer.from(transcript, "utf8")
+      : transcript;
+  const cutoff = Math.max(
+    0,
+    Math.min(source.byteLength, Math.floor(cutoffBytes)),
+  );
+  let prefix = source.subarray(0, cutoff);
+  if (cutoff < source.byteLength && prefix.at(-1) !== 0x0a) {
+    const lastLf = prefix.lastIndexOf(0x0a);
+    prefix =
+      lastLf < 0 ? prefix.subarray(0, 0) : prefix.subarray(0, lastLf + 1);
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(prefix);
+  } catch {
+    return [];
+  }
+
+  const nodes = new Map<string, ClaudeNamingNode>();
+  const order: string[] = [];
+  let explicitLeaf: string | null = null;
+  let fallbackLeaf: string | null = null;
+  for (const line of text.split("\n")) {
+    if (line.trim() === "" || !withinTranscriptLineByteCap(line)) continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const object = recordOf(raw);
+    if (object === null) continue;
+    const selectedLeaf = stringOrNull(object.leafUuid);
+    if (selectedLeaf !== null) explicitLeaf = selectedLeaf;
+
+    const id = stringOrNull(object.uuid);
+    if (id === null || nodes.has(id)) continue;
+    const parentId =
+      object.parentUuid === null ? null : stringOrNull(object.parentUuid);
+    const type = stringOrNull(object.type);
+    if (type === "user" || type === "assistant") fallbackLeaf = id;
+    let section: ClaudeNamingSection | null = null;
+    if ((type === "user" || type === "assistant") && object.isMeta !== true) {
+      const message = recordOf(object.message);
+      const value = namingText(message?.content);
+      if (value.length > 0) {
+        section =
+          object.isCompactSummary === true
+            ? { role: "summary", text: value }
+            : { role: type, text: value };
+      }
+    }
+    nodes.set(id, { id, parentId, section });
+    order.push(id);
+  }
+
+  const leaf =
+    explicitLeaf !== null && nodes.has(explicitLeaf)
+      ? explicitLeaf
+      : fallbackLeaf;
+  if (leaf === null) return [];
+
+  const active = new Set<string>();
+  let cursor: string | null = leaf;
+  while (cursor !== null && !active.has(cursor)) {
+    active.add(cursor);
+    cursor = nodes.get(cursor)?.parentId ?? null;
+  }
+  return order.flatMap((id) => {
+    const section = active.has(id) ? nodes.get(id)?.section : null;
+    return section === null || section === undefined ? [] : [section];
+  });
+}
+
 export function readClaudeTitleHistory(path: string): string[] {
   const titles: string[] = [];
   scanTranscriptJsonlSync(
