@@ -345,9 +345,13 @@ Standing up a host:
    install the missing binary or correct the triple, rather than treating the failure as a bug.
 6. Wire the four `<harness>_default` triples plus the per-verb `dispatch:` table
    (`work`/`close`/`resolve`/`unblock`/`deconflict`/`repair`/`handoff`) in
-   `~/.config/keeper/presets.yaml` from the triples `presets list` discovered. The panel roster is
-   installed only through `/plan:panel-guidance`; its `default` pointer and described panel objects
-   travel together in the committed copy.
+   `~/.config/keeper/presets.yaml` from the triples `presets list` discovered. `dispatch.handoff`
+   chooses the default Handoff harness, model, and effort independently of result capture; an explicit
+   Launch triple replaces all three, while an explicit model/effort pair keeps that harness. The
+   `config.yaml` key `handoff_prompt_prefix` may be omitted; `/hack` is its only accepted compatibility
+   value and does not alter prompt composition. Remove any other value or set it to `/hack` when Keeper
+   reports the configuration fault. The panel roster is installed only through `/plan:panel-guidance`;
+   its `default` pointer and described panel objects travel together in the committed copy.
 7. Let the selector assign the cell, then watch the first dispatch land — the wrapper owns the close-out and its commit carries the `Job-Id`/`Task` trailers.
 
 ## Shell completions

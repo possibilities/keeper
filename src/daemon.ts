@@ -139,7 +139,6 @@ import {
   resolveBuildbotUrl,
   resolveBusSockPath,
   resolveClaudeProjectsRoot,
-  resolveConfig,
   resolveDbPath,
   resolveDeadLetterDir,
   resolveEventsLogDir,
@@ -11140,9 +11139,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // flips ONLY via the `set_autopilot_paused` RPC → bridge → `{type:"set-paused"}`
   // relay. The concurrency cap is NO LONGER threaded from config here — it is
   // RUNTIME-settable via `set_autopilot_config` and the reconciler reads it from
-  // the `autopilot_state` projection each cycle. `apConfig` survives for the other
-  // worker-launch knobs (the launcher prefix prefixes / handoff prompt prefix).
-  const apConfig = resolveConfig();
+  // the `autopilot_state` projection each cycle.
   // The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`) the reconciler
   // spawns to reach the folded `keeper agent` launcher — keeper's sole launch
   // transport. Resolved once on main (`process.execPath` + env override + config +
@@ -11276,7 +11273,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           launcherArgvPrefix,
-          handoffPromptPrefix: apConfig.handoffPromptPrefix,
           cwd: process.cwd(),
         } satisfies HandoffWorkerData,
       } as WorkerOptions & { workerData: unknown })

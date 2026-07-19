@@ -216,8 +216,8 @@ export interface HandoffDispatchDeps {
   launch(session: string, cwd: string, spec: LaunchSpec): Promise<LaunchResult>;
   /** Mint a terminal `HandoffLaunchFailed` event + a dead-letter (permanent). */
   emitLaunchFailed(payload: HandoffLaunchFailedPayload): void;
-  /** The launch prompt = `handoffPromptPrefix` + the selected framing + inline brief. */
-  buildPrompt(doc: string, capture: boolean): string;
+  /** Compose the launch-only `/hack ` prefix with the raw stored Brief. */
+  buildPrompt(doc: string): string;
   /** Resolve the `dispatch.handoff` launch pin (ADR 0040). Returns `{}` when the
    *  row is absent — handoff carries NO compiled default, so an absent row yields a
    *  flagless launch (byte-identical to the prior behavior); a present row makes
@@ -288,8 +288,8 @@ export async function dispatchOneHandoff(
     return "aborted-shutdown";
   }
   // Launch — ONLY after the durable `HandoffDispatching` ack. keeper agent owns the
-  // tmux window; the prompt boots the handoff-ee into the prefix skill with the
-  // brief inline (the framing + `row.doc`), no `keeper handoff show` round-trip.
+  // tmux window; the prompt carries the raw Brief inline, with no inspection
+  // round-trip.
   // Handoff becomes pinnable (ADR 0040): a present `dispatch.handoff` row adds
   // --model/--effort to the spec; an absent row resolves to `{}` and the launch
   // stays flagless (the prior default — LaunchSpec omits the flags when undefined).
@@ -299,7 +299,7 @@ export async function dispatchOneHandoff(
   );
   const capture = Boolean(row.capture);
   const spec: LaunchSpec = {
-    prompt: deps.buildPrompt(row.doc, capture),
+    prompt: deps.buildPrompt(row.doc),
     claudeName: `handoff::${row.handoff_id}`,
     ...(handoffLaunch.harness !== undefined
       ? { harness: handoffLaunch.harness }
@@ -350,50 +350,9 @@ export async function dispatchOneHandoff(
   return "launched";
 }
 
-/**
- * The investigate-then-confirm framing prepended to the inline brief. It frames
- * the brief as the session's REQUEST — handled under the handoff-ee's normal
- * `/hack` workflow (investigate, then confirm before any code lands), NOT a
- * pre-approved order to execute blind. It carries NO execute verb on purpose: an
- * execute order would override `/hack`'s confirm-before-acting beat, which is
- * exactly the behavior a handoff-ee must run. Exported so the coupled-cap test
- * can size `prefix + framing + doc` against `PROMPT_MAX_BYTES`.
- */
-export const HANDOFF_PROMPT_FRAMING =
-  "The text below is your brief for this session — your REQUEST, NOT a pre-approved order to execute. Handle it under your normal workflow: investigate first, then confirm before any code lands.";
-
-/**
- * Autonomous capture framing for a handoff-ee with a durable deliverable. No
- * self-reporting CLI exists for an already-running detached session: `agent run`
- * would launch a nested leg and `agent wait` requires launch metadata this surface
- * does not mint. The handoff-ee therefore writes its own single JSON envelope.
- */
-export const HANDOFF_CAPTURE_PROMPT_FRAMING =
-  "The text below is your autonomous brief. Investigate and act within it without parking for a confirm beat. Finish your turn with the answer. As your final tool action, write exactly one UTF-8 JSON object (no markdown or extra text) to $KEEPER_HANDOFF_ENVELOPE. The serialized object must stay at or below 65536 bytes and have exactly these keys: schema_version (1), agent (claude, pi, or null), handle (string or null), transcript_path (string or null), resume_target (string or null), message (your final answer or null), message_found (boolean), elapsed_seconds (number or null), outcome (completed, no_message, timed_out, no_transcript, transcript_ambiguous, launch_failed, or bad_args). Use null for unavailable values.";
-
-/**
- * Compose the launch prompt: the configured `handoff_prompt_prefix` (e.g.
- * `/hack`, so the handoff-ee boots into the skill), selected framing, and full
- * brief INLINE — the handoff-ee gets its whole world directly in the launch
- * prompt, no `keeper handoff show` pointer round-trip. The doc is capped CLI-side
- * at 64KB and the framing+prefix stay below the 96KB argv cap (`PROMPT_MAX_BYTES`)
- * — the caps are coupled and pinned by tests. `keeper handoff show <slug>` remains
- * inspection-only. `capture:false` is byte-identical to the pre-capture prompt.
- * Pure; exported for tests.
- */
-export function buildHandoffPrompt(
-  doc: string,
-  promptPrefix: string | undefined,
-  capture = false,
-): string {
-  const framing = capture
-    ? HANDOFF_CAPTURE_PROMPT_FRAMING
-    : HANDOFF_PROMPT_FRAMING;
-  const body = `${framing}\n\n${doc}`;
-  if (promptPrefix !== undefined && promptPrefix !== "") {
-    return `${promptPrefix} ${body}`;
-  }
-  return body;
+/** Compose a fresh Handoff prompt without interpreting or normalizing its Brief. */
+export function buildHandoffPrompt(doc: string): string {
+  return `/hack ${doc}`;
 }
 
 /**
@@ -467,8 +426,6 @@ export interface HandoffWorkerData {
   dbPath: string;
   /** The launcher argv prefix (`[bun, cli/keeper.ts, "agent"]`), resolved on main. */
   launcherArgvPrefix?: readonly string[];
-  /** The configured `handoff_prompt_prefix` (e.g. `/hack`); resolved on main. */
-  handoffPromptPrefix?: string;
   /** The repo cwd the handoff-ee launches in. Resolved on main (keeperd's cwd). */
   cwd?: string;
   /** Poll cadence for the data_version wake loop (ms). Tests override. */
@@ -529,7 +486,6 @@ function main(): void {
   });
   const port = parentPort;
   const launcherArgvPrefix = data.launcherArgvPrefix ?? [];
-  const promptPrefix = data.handoffPromptPrefix;
   // keeperd's cwd is NOT a worker repo, but keeper agent reads its own
   // `process.cwd()` for the launch-script `cd`; a handoff-ee carries no plan ref,
   // so the launch dir is just "somewhere valid". Default to keeperd's cwd.
@@ -634,8 +590,7 @@ function main(): void {
         payload,
       } satisfies HandoffLaunchFailedMessage);
     },
-    buildPrompt: (doc, capture) =>
-      buildHandoffPrompt(doc, promptPrefix, capture),
+    buildPrompt: buildHandoffPrompt,
     resolveDispatchConfig: () => resolveDispatchLaunchConfig("handoff"),
   };
 

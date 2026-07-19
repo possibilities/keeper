@@ -4633,12 +4633,9 @@ export interface KeeperConfig {
   // with NO default: absent/empty/garbage → undefined → no prefix applied.
   // Plan-form dispatches are never prefixed.
   dispatchPromptPrefix?: string;
-  // Global prompt prefix for `keeper handoff` dispatches: when set (e.g.
-  // `/hack`), it boots each fire-and-forget handoff-ee worker into the prefix
-  // skill before it reads its brief. Independent best-effort key with NO
-  // default: absent/empty/garbage → undefined → no prefix applied. Mirrors
-  // `dispatchPromptPrefix`.
-  handoffPromptPrefix?: string;
+  // Compatibility value for `keeper handoff`. Only `/hack` is accepted, and
+  // prompt composition always uses `/hack` whether this key is present or not.
+  handoffPromptPrefix?: "/hack";
   // Absolute path to the keeper CLI entry the detached tmux pane re-execs to
   // reach the folded launcher (`<bun> <keeperAgentPath> agent <agent> …`).
   // Independent best-effort key with NO default at the parse layer (absent →
@@ -4777,9 +4774,8 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
-  // No default — absent leaves `handoffPromptPrefix` undefined so no prefix is
-  // applied to `keeper handoff` dispatches.
-  let handoffPromptPrefix: string | undefined;
+  // `/hack` is accepted for compatibility but does not control composition.
+  let handoffPromptPrefix: "/hack" | undefined;
   // No default at the parse layer — absent leaves `keeperAgentPath` undefined so
   // `resolveKeeperAgentPath()` derives the `cli/keeper.ts` default.
   let keeperAgentPath: string | undefined;
@@ -4840,13 +4836,14 @@ export function resolveConfig(): KeeperConfig {
       if (typeof dpp === "string" && dpp.length > 0) {
         dispatchPromptPrefix = dpp;
       }
-      // Independent best-effort key — non-empty string only; garbage/absent
-      // leaves `handoffPromptPrefix` undefined and no handoff prompt prefix is
-      // applied.
       const hpp = (raw as { handoff_prompt_prefix?: unknown })
         .handoff_prompt_prefix;
-      if (typeof hpp === "string" && hpp.length > 0) {
+      if (hpp === "/hack") {
         handoffPromptPrefix = hpp;
+      } else if (hpp !== undefined) {
+        console.error(
+          `[keeper] unsupported handoff_prompt_prefix ${JSON.stringify(hpp)}; Handoff prompts always use /hack — set handoff_prompt_prefix: /hack or remove the key`,
+        );
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `keeperAgentPath` undefined and `resolveKeeperAgentPath()` falls

@@ -130,8 +130,7 @@ test("dispatch_prompt_prefix resolves independently of a malformed sibling key",
 });
 
 // ---------------------------------------------------------------------------
-// handoff_prompt_prefix (fn-946) — non-empty-string only, else undefined
-// (mirrors dispatch_prompt_prefix's independent best-effort string-key pattern)
+// handoff_prompt_prefix — `/hack` is compatibility-only; other values diagnose
 // ---------------------------------------------------------------------------
 
 test("handoffPromptPrefix defaults to undefined when the file is absent", () => {
@@ -144,20 +143,36 @@ test("handoffPromptPrefix defaults to undefined when the key is absent", () => {
   expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
 });
 
-test("handoff_prompt_prefix: /hack → /hack (a non-empty string overrides)", () => {
+test("handoff_prompt_prefix: /hack is accepted as a compatibility value", () => {
   writeConfig("handoff_prompt_prefix: /hack\n");
   expect(resolveConfig().handoffPromptPrefix).toBe("/hack");
 });
 
-test('handoff_prompt_prefix: "" → undefined (empty is rejected)', () => {
-  writeConfig('handoff_prompt_prefix: ""\n');
-  expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
-});
-
-test("a non-string handoff_prompt_prefix falls back to undefined", () => {
-  writeConfig("handoff_prompt_prefix: 42\n");
-  expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
-});
+for (const yaml of [
+  'handoff_prompt_prefix: ""\n',
+  "handoff_prompt_prefix: /plan:hack\n",
+  "handoff_prompt_prefix: 42\n",
+]) {
+  test(`an unsupported handoff_prompt_prefix surfaces actionable guidance (${yaml.trim()})`, () => {
+    writeConfig(yaml);
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    try {
+      expect(resolveConfig().handoffPromptPrefix).toBeUndefined();
+    } finally {
+      console.error = originalError;
+    }
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("unsupported handoff_prompt_prefix");
+    expect(errors[0]).toContain("Handoff prompts always use /hack");
+    expect(errors[0]).toContain(
+      "set handoff_prompt_prefix: /hack or remove the key",
+    );
+  });
+}
 
 test("handoff_prompt_prefix resolves independently of a malformed sibling key", () => {
   writeConfig("roots: not-a-list\nhandoff_prompt_prefix: /hack\n");
