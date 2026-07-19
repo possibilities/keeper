@@ -8273,6 +8273,89 @@ export function publishFableFocusProjection(
   return { schema_version: 1, policy: projected.policy };
 }
 
+const NATIVE_CRASH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+type NativeCrashAttributionProbeOutcome = {
+  scanned: number;
+  matched: number;
+  marked: number;
+  timedOut: boolean;
+};
+
+export function runNativeCrashAttributionProbe(deps: {
+  ledgerPath: string;
+  reportsDir: string;
+  exhausted: boolean;
+  nowMs: number;
+  log?: (line: string) => void;
+}): NativeCrashAttributionProbeOutcome {
+  const log = deps.log ?? ((line: string) => console.error(line));
+  let scanned = 0;
+  let matched = 0;
+  let marked = 0;
+  let timedOut = false;
+  try {
+    const compactLines = compactRestartLedger(
+      readRestartLedger(deps.ledgerPath),
+      {
+        nowMs: deps.nowMs,
+        windowMs: NATIVE_CRASH_BACKFILL_WINDOW_MS,
+        cap: RESTART_LEDGER_CAP,
+      },
+    );
+    const boots = collapseRestartLedger(compactLines);
+    const windows: NativeCrashBootIdentityWindow[] = [];
+    for (let index = 0; index + 1 < boots.length; index += 1) {
+      const boot = boots[index];
+      if (
+        isNativeCrashAttributed(boot) ||
+        boot.pid === null ||
+        boot.start_time === null ||
+        !boot.start_time.startsWith("darwin:")
+      ) {
+        continue;
+      }
+      windows.push({
+        boot_id: boot.boot_id,
+        pid: boot.pid,
+        start_time: boot.start_time,
+        started_at_ms: boot.ts,
+        died_at_ms: boots[index + 1].ts,
+      });
+    }
+    scanned = windows.length;
+    const scan = scanCrashReports({
+      directory: deps.reportsDir,
+      boots: windows,
+    });
+    matched = scan.matches.length;
+    timedOut = scan.timedOut;
+    const planned = planNativeCrashEnrichLines({
+      boots,
+      matches: scan.matches,
+      exhausted: deps.exhausted,
+      nowMs: deps.nowMs,
+    });
+    marked = planned.filter(
+      (line) => line.native_crash_no_report === true,
+    ).length;
+    for (const line of planned) {
+      appendRestartLedgerLine(deps.ledgerPath, line);
+    }
+  } catch (error) {
+    log(
+      `[keeperd] native-crash attribution probe degraded: ${boundRestartReason(
+        error instanceof Error ? error.message : String(error),
+      )}`,
+    );
+  } finally {
+    log(
+      `[keeperd] native-crash attribution probe: scanned=${scanned} matched=${matched} marked=${marked}`,
+    );
+  }
+  return { scanned, matched, marked, timedOut };
+}
+
 /**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
@@ -10077,47 +10160,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     const runNativeCrashProbe = (exhausted: boolean): void => {
       const nowMs = Date.now();
       try {
-        const ledgerPath = resolveRestartLedgerPath();
-        const compactLines = compactRestartLedger(
-          readRestartLedger(ledgerPath),
-          {
-            nowMs,
-            windowMs: CRASH_LOOP_WINDOW_MS,
-            cap: RESTART_LEDGER_CAP,
-          },
-        );
-        const boots = collapseRestartLedger(compactLines);
-        const windows: NativeCrashBootIdentityWindow[] = [];
-        for (let index = 0; index + 1 < boots.length; index += 1) {
-          const boot = boots[index];
-          if (
-            isNativeCrashAttributed(boot) ||
-            boot.pid === null ||
-            boot.start_time === null ||
-            !boot.start_time.startsWith("darwin:")
-          ) {
-            continue;
-          }
-          windows.push({
-            boot_id: boot.boot_id,
-            pid: boot.pid,
-            start_time: boot.start_time,
-            started_at_ms: boot.ts,
-            died_at_ms: boots[index + 1].ts,
-          });
-        }
-        const scan = scanCrashReports({
-          directory: reportsDir,
-          boots: windows,
-        });
-        for (const line of planNativeCrashEnrichLines({
-          boots,
-          matches: scan.matches,
-          exhausted,
+        runNativeCrashAttributionProbe({
+          ledgerPath: resolveRestartLedgerPath(),
+          reportsDir,
           nowMs,
-        })) {
-          appendRestartLedgerLine(ledgerPath, line);
-        }
+          exhausted,
+        });
       } catch (error) {
         console.error(
           `[keeperd] native-crash attribution probe degraded: ${boundRestartReason(
