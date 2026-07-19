@@ -8,7 +8,7 @@
     "fn-1358-unjam-wrapped-delegation-launches"
   ],
   "id": "fn-1360-harden-escalation-plan-agent-migration",
-  "last_validated_at": "2026-07-18T23:42:36.564000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T23:47:55.466000Z"
+  "updated_at": "2026-07-19T03:54:38.567000Z"
 }
