@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 17,
+        "files_changed": 3,
+        "insertions": 117
+      },
+      "done_summary": "Scoped the publication snapshot's raw content fingerprint to selected commit paths (status identity alone covers unselected ignored/untracked drift), fixing commit-work in worktrees with gigabytes of ignored content; a snapshot-path throw now surfaces error.message in the envelope instead of a bare stage_failed.",
+      "input_hash": "8518993bac687fddcb2e395c41befc39014eefcbe77ed3cdb8e3d9fa1e842d29",
+      "model": "opus",
+      "spec_chars": 3406,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/commit-work/private-index.ts, cli/commit-work.ts, test/commit-work.test.ts\n\n### Approach\n\nThe publication baseline exists to detect a concurrent worktree mutation racing the\npublication compare-and-swap; it does not need the raw bytes of every ignored file to do\nthat. Restructure the fingerprint so its cost scales with the SELECTED surface rather than\nthe whole worktree \u2014 candidate shapes, worker's judgment which composes: exclude ignored\npaths from the raw-read set (status identity alone covers them), fingerprint oversized\npaths by stable index metadata (size/mtime/inode) instead of content, or degrade past the\nbyte budget to a status-only baseline with an audited envelope note. Whatever shape lands,\nthe invariant to preserve is: a mutation of a SELECTED path between freeze and publish must\nstill fail the CAS. Separately, the CLI catch that maps a non-`PrivateIndexError` throw to\n`stage_failed` must surface `error.message` in the envelope (`stderr_sample` or a new\n`detail` field), so a snapshot failure is never a bare `stage_failed` again.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/commit-work/private-index.ts:1334 \u2014 rawPathSetFingerprint cumulative cap throw (plain Error, three throw sites)\n- src/commit-work/private-index.ts:1459 \u2014 worktreeSnapshot builds the path set from status --untracked-files=all --ignored=traditional\n- src/commit-work/private-index.ts:2064 \u2014 refreshFrozenPublicationBaseline call chain from createFrozenPrivateIndex:744\n- cli/commit-work.ts:1610 \u2014 the catch that collapses non-typed throws to bare stage_failed (typed?.code ?? \"stage_failed\")\n\n**Optional** (reference as needed):\n- src/commit-work/private-index.ts:666 \u2014 requireExactStagedSet shows the typed-error-with-paths pattern to mirror\n- test/commit-work.test.ts \u2014 existing frozen-index test seams (pure GitRunner injection, no real git needed)\n\n### Risks\n\n- The baseline's race-detection contract is load-bearing for the CAS publish; weakening it for\n  unselected ignored paths must not open a window for a selected-path mutation to slip through.\n- `excludeRuntimePaths` already filters some paths from one snapshot variant \u2014 understand why the\n  ignored set is deliberately included today (the whole-worktree `wholeRaw` variant) before excluding.\n\n### Test notes\n\nDeterministic, in-process, through the PrivateIndexFs / GitRunner seams: a fake status feed with a\nmulti-GiB ignored file must produce a successful freeze; an injected snapshot failure must surface\nits message in the envelope. No real git, per test doctrine.\n\n## Acceptance\n\n- [ ] createFrozenPrivateIndex succeeds when unselected ignored/untracked content exceeds the byte budget\n- [ ] a mutation of a selected path between freeze and publish still fails the publication CAS\n- [ ] a snapshot-path throw reaches the commit-work envelope with its message, never bare stage_failed\n- [ ] named commit-work gates green\n\n## Done summary\nScoped the publication snapshot's raw content fingerprint to selected commit paths (status identity alone covers unselected ignored/untracked drift), fixing commit-work in worktrees with gigabytes of ignored content; a snapshot-path throw now surfaces error.message in the envelope instead of a bare stage_failed.\n## Evidence\n",
+      "task_id": "fn-1369-unjam-commit-work-large-worktrees.1",
+      "tier": "xhigh",
+      "title": "Bound snapshot set surface errors"
+    }
+  ],
+  "created_at": "2026-07-19T07:22:29.584000Z",
+  "epic_id": "fn-1369-unjam-commit-work-large-worktrees",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "8518993bac687fddcb2e395c41befc39014eefcbe77ed3cdb8e3d9fa1e842d29",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
