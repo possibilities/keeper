@@ -36,5 +36,5 @@ Deterministic, in-process, through the pure seam: simulate a stranded empty lock
 - [ ] `bun test ./test/commit-work.test.ts` and the other named commit-work gates pass, plus `bun run typecheck`.
 
 ## Done summary
-
+commit-work now names the contended lock's absolute path in refusal envelopes and reaps a provably-stale (empty, past age bound, no live holder) lock in-line with one audited log line; a live-held lock is never reaped and still serializes as before. Preview now also probes/reports lock state.
 ## Evidence

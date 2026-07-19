@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Name and reap stale commit-work locks",
-  "updated_at": "2026-07-19T04:29:52.424000Z"
+  "updated_at": "2026-07-19T04:47:12.045000Z",
+  "worker_done_at": "2026-07-19T04:47:12.045000Z"
 }
