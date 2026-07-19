@@ -6,7 +6,7 @@
     "fn-1364-fix-fable-focus-boot-wipe"
   ],
   "id": "fn-1366-re-arm-block-escalation-latch",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T04:30:20.169000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T04:30:19.293000Z"
+  "updated_at": "2026-07-19T04:30:20.169000Z"
 }
