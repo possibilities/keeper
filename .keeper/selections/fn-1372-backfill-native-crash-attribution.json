@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.4-mini",
+      "rationale": "Well-specified S-size bounded work across two named files with a do-exactly-this acceptance (separate a horizon constant, emit a summary line, add a deterministic test) that needs real but modest reasoning and light investigation\u2014more than spark can reliably hold yet well short of any opus/sonnet judgment gate, so GPT-first at the mid-light tier and the medium band.",
+      "task_id": "fn-1372-backfill-native-crash-attribution.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T10:26:18.038000Z",
+  "epic_id": "fn-1372-backfill-native-crash-attribution",
+  "input_hash": "280677e72cffc6a99a931cf7f9b302d1d5f64b327598cb9898ed1834664f44e7",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 671512551,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1372-backfill-native-crash-attribution.1\",\"tier\":\"medium\",\"model\":\"gpt-5.4-mini\",\"rationale\":\"Well-specified S-size bounded work across two named files with a do-exactly-this acceptance (separate a horizon constant, emit a summary line, add a deterministic test) that needs real but modest reasoning and light investigation\u2014more than spark can reliably hold yet well short of any opus/sonnet judgment gate, so GPT-first at the mid-light tier and the medium band.\",\"confidence\":0.7}]}\n"
+}
