@@ -68,6 +68,13 @@ Decline:
 1. `keeper bus chat send work::<task_id> "RESOLVED: <what changed> — resume now"`
 2. If that command returns `not_connected` or `unknown_target`, run
    `keeper dispatch work::<task_id>`.
+   Confirm the dispatch envelope reports success.
+   If cold-dispatch fails with a receipt like `receipt=failed reason=<failure>`, page once and decline:
+
+   ```bash
+   agentbot send-message --topic Keeper "unblock::<task_id> declined — dispatch failed: <failure>"
+   ```
+   Then stop.
 
 Do not run `keeper plan unblock` here; the subagent already cleared the block.
 

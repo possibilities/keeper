@@ -51,9 +51,13 @@ git symbolic-ref refs/remotes/origin/HEAD
 # current branch must be the repo default for this incident
 git branch --show-current
 
-git rev-parse HEAD
-# if you are already on default, pull to current tip before spawning
+# pull to current tip before spawning
+# (this updates checkout to the post-pull HEAD that will be observed by the repairer)
 git pull --ff-only
+
+# capture spawn-time HEAD
+# passed as expected_tip in Phase 3
+git rev-parse HEAD
 ```
 
 For every `task_id` in `incident.affected_tasks[]`, run:
