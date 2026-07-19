@@ -57,5 +57,5 @@ seam-inconclusive surfaces as its own typed outcome.
 - [ ] The companion test gate is green and the extension import graph reaches no bun builtin
 
 ## Done summary
-
+Added forced-refresh and fault-injection proof seams to the pi-codex-pool companion, both gated on an armed proof window plus a keeper job id; forced refresh coalesces concurrent calls into one rotation with rotated/inconclusive/failed typed outcomes, the fault seam emits every classifiable fault class pre-output and mid-stream after substantive output, and companion tests plus the bun-free lint gate are green.
 ## Evidence
