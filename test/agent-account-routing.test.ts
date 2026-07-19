@@ -677,6 +677,10 @@ describe("keeper agent accounts codex-pool", () => {
       armed_at_ms: 1_000_000,
       expires_at_ms: 1_900_000,
       launcher_pid: process.pid,
+      seams: {
+        forced_refresh: true,
+        fault_injection: true,
+      },
     });
     expect(h.spawnOptions[0]?.env?.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBe(
       h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,

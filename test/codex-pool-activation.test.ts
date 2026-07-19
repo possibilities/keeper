@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import type { LiveProofReport } from "../integrations/pi-codex-pool/src/proof";
+import type {
+  LiveProofReport,
+  ProofTranscriptEntry,
+} from "../integrations/pi-codex-pool/src/proof";
 import {
   activateCodexPool,
   armCodexPoolProofWindow,
@@ -32,6 +35,77 @@ const BINDINGS = {
   config_binding: CONFIG_BINDING,
   alias_binding: ALIAS_BINDING,
 };
+const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
+  {
+    sequence: 1,
+    clause: "independent_credentials",
+    evidence: ["primary-credential-rotated", "alternate-credential-rotated"],
+  },
+  {
+    sequence: 2,
+    clause: "sanitized_observer",
+    evidence: ["sanitized-observer-rendered"],
+  },
+  {
+    sequence: 3,
+    clause: "deterministic_routing",
+    evidence: ["routes-recorded", "attempt-aliases-recorded"],
+  },
+  {
+    sequence: 4,
+    clause: "session_stickiness",
+    evidence: ["completed-session-reused-alias"],
+  },
+  {
+    sequence: 5,
+    clause: "pressure_cooldown",
+    evidence: [
+      "concurrent-routes-observed",
+      "classified-retry-observed",
+      "cooldown-observed",
+    ],
+  },
+  {
+    sequence: 6,
+    clause: "single_retry",
+    evidence: ["two-attempt-route-observed", "all-routes-at-most-two-attempts"],
+  },
+  {
+    sequence: 7,
+    clause: "substantive_cutoff",
+    evidence: ["substantive-output-fault-not-retried"],
+  },
+  {
+    sequence: 8,
+    clause: "abort_preserved",
+    evidence: ["deliberate-child-abort-not-retried"],
+  },
+  {
+    sequence: 9,
+    clause: "request_contract",
+    evidence: ["all-attempts-preserved-request-contract"],
+  },
+  {
+    sequence: 10,
+    clause: "native_fallback",
+    evidence: ["native-fallback-completed"],
+  },
+  {
+    sequence: 11,
+    clause: "compat_root_delegate",
+    evidence: ["compat-root-delegate-used"],
+  },
+  {
+    sequence: 12,
+    clause: "root_child_sessions",
+    evidence: ["root-route-observed", "child-route-observed"],
+  },
+  {
+    sequence: 13,
+    clause: "transport_isolation",
+    evidence: ["root-child-distinct-aliases"],
+  },
+];
 
 function passingReport(): LiveProofReport {
   return {
@@ -46,6 +120,7 @@ function passingReport(): LiveProofReport {
       { alias: "keeper-codex-a", role: "primary" },
       { alias: "keeper-codex-b", role: "alternate" },
     ],
+    transcript: clone(PASSING_TRANSCRIPT),
     clauses: {
       independent_credentials: true,
       sanitized_observer: true,
@@ -166,6 +241,10 @@ describe("Codex pool launch-scoped proof window", () => {
       armed_at_ms: 1_000_000,
       expires_at_ms: 1_900_000,
       launcher_pid: 4242,
+      seams: {
+        forced_refresh: true,
+        fault_injection: true,
+      },
     });
     const encoded = JSON.stringify(state);
     expect(codexPoolProofWindowActive(encoded, 1_000_000, 4242)).toBe(true);
