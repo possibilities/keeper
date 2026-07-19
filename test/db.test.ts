@@ -25,7 +25,9 @@ import {
   JOBS_DESCRIPTOR,
   selectByIds,
 } from "../src/collections";
+import { publishFableFocusProjection } from "../src/daemon";
 import {
+  AUTOPILOT_STATE_REBUILD_COPY_LISTS,
   computeSchemaFingerprint,
   DEFAULT_MAX_CONCURRENT_PER_ROOT,
   DEFAULT_REPO_CLONE_ROOT,
@@ -49,6 +51,7 @@ import {
   SCHEMA_VERSION,
   selectWorldRev,
 } from "../src/db";
+import { readFableFocusLeaf } from "../src/fable-focus";
 import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import type { Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
@@ -516,6 +519,19 @@ test("SCHEMA_FINGERPRINT pins the fully-migrated schema shape — re-pin it with
   expect(live).toBe(SCHEMA_FINGERPRINT);
 });
 
+test("every autopilot_state rebuild copy list covers every current column", () => {
+  const { db } = openDb(":memory:");
+  const currentColumns = (
+    db.prepare("PRAGMA table_info(autopilot_state)").all() as { name: string }[]
+  ).map((column) => column.name);
+  db.close();
+
+  for (const copyColumns of Object.values(AUTOPILOT_STATE_REBUILD_COPY_LISTS)) {
+    const copied = new Set<string>(copyColumns);
+    expect(currentColumns.filter((column) => !copied.has(column))).toEqual([]);
+  }
+});
+
 test("SCHEMA_STEPS versions are unique — a duplicate version is a structural error", () => {
   const versions = SCHEMA_STEPS.map((s) => s.version);
   const uniq = new Set(versions);
@@ -828,6 +844,46 @@ test("Fable focus schema defaults are nullable on fresh and upgraded projections
     ).fable_intent,
   ).toBeNull();
   db.close();
+});
+
+test("an openDb boot cycle preserves durable Fable focus and republishes the same absolute policy", () => {
+  const policyJson =
+    '{"schema_version":1,"policy_id":"event:4242","target_route":"claude-swap:7","fable_intent":true,"set_at":"2026-01-02T03:04:05.000Z","lifetime":{"kind":"absolute","deadline_at":"2026-12-31T23:59:59.000Z"}}';
+  const expectedPolicy = {
+    schema_version: 1,
+    policy_id: "event:4242",
+    target_route: "claude-swap:7",
+    fable_intent: true,
+    set_at: "2026-01-02T03:04:05.000Z",
+    lifetime: {
+      kind: "absolute",
+      deadline_at: "2026-12-31T23:59:59.000Z",
+    },
+  } as const;
+  const seeded = openDb(dbPath);
+  seeded.db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, fable_focus)
+     VALUES (1, 1, 4242, 1767323045, 1767323045, ?)`,
+    [policyJson],
+  );
+  seeded.db.close();
+
+  const booted = openDb(dbPath);
+  const durable = booted.db
+    .prepare("SELECT fable_focus FROM autopilot_state WHERE id = 1")
+    .get() as { fable_focus: string | null };
+  expect(durable.fable_focus).toBe(policyJson);
+
+  const routingRoot = join(tmpDir, "account-routing");
+  expect(publishFableFocusProjection(booted.db, routingRoot)).toEqual({
+    schema_version: 1,
+    policy: expectedPolicy,
+  });
+  expect(
+    readFableFocusLeaf(join(routingRoot, "fable-focus-policy.json")),
+  ).toEqual({ available: true, policy: expectedPolicy });
+  booted.db.close();
 });
 
 test("autopilot_state adoption-column drop preserves every surviving value and fresh-schema order", () => {
