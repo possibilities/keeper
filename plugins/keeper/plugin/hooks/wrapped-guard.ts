@@ -4,7 +4,8 @@
 // Fourth sibling of branch-guard / grant-guard / wrong-tree-guard. A WRAPPED
 // worker cell's `work:worker` is a claude wrapper that delegates ALL implementation
 // (code, tests, lint iteration) to the model's serving provider via `keeper agent
-// run --resume` and owns only the keeper close-out (`commit-work` + `plan done`).
+// run --resume` and owns only the keeper close-out (`commit-work` + task-bound
+// `plan done`, or an AUDIT_READY self-park).
 // Because the dumb-courier wrapper never authors source, this guard is a SINGLE-
 // STATE total edit-denial: every source-editing vector is denied for the whole run
 // — no phase gate, no result-envelope unlock, nothing forgeable.
@@ -321,7 +322,8 @@ const INTERPRETER_EXECUTABLES = new Set([
 const BUN_EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
 
 /** The `keeper` top-level subcommands a wrapped worker may run: the delegation
- *  surface (`agent`), the close-out (`commit-work`, `plan done`), and the reads it
+ *  surface (`agent`), the close-out (`commit-work`, task-bound `plan done` or
+ *  AUDIT_READY self-park), and the reads it
  *  orients on (`plan` reads, `session` state, `baseline`). None of these author
  *  source. Every other keeper subcommand is denied. */
 const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
@@ -333,6 +335,7 @@ const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
 
 const WRAPPED_PLAN_VERBS = new Set([
   "done",
+  "block",
   "status",
   "tasks",
   "show",
@@ -568,11 +571,25 @@ function wrappedPlanViolation(
 ): string | null {
   const verb = tokens[2];
   if (verb === undefined || !WRAPPED_PLAN_VERBS.has(verb)) {
-    return "wrapped `keeper plan` permits only task-bound `done` and read-only status/tasks/show/cat/list/epics/reconcile verbs";
+    return "wrapped `keeper plan` permits only task-bound `done`/`block` and read-only status/tasks/show/cat/list/epics/reconcile verbs";
   }
-  if (verb !== "done") return null;
+  if (verb !== "done" && verb !== "block") return null;
   if (context.taskId === undefined || tokens[3] !== context.taskId) {
-    return "wrapped `keeper plan done` must name the launch-bound task";
+    return `wrapped \`keeper plan ${verb}\` must name the launch-bound task`;
+  }
+  if (verb === "block") {
+    for (const option of tokens.slice(4)) {
+      if (option === "--force" || option.startsWith("--force=")) {
+        return "wrapped `keeper plan block --force` is forbidden";
+      }
+    }
+    if (tokens.length !== 6 || tokens[4] !== "--reason") {
+      return "wrapped `keeper plan block` permits only one --reason value";
+    }
+    if (!(tokens[5] as string).startsWith("AUDIT_READY:")) {
+      return "wrapped `keeper plan block --reason` must start with `AUDIT_READY:`";
+    }
+    return null;
   }
   for (let index = 4; index < tokens.length; index += 1) {
     const option = tokens[index] as string;
@@ -936,7 +953,7 @@ function classifyWrappedExecutable(
     if (sub === "plan") return wrappedPlanViolation(tokens, context);
     if (sub === "agent") return wrappedAgentViolation(tokens, context);
     if (WRAPPED_KEEPER_SUBCOMMANDS.has(sub)) return null;
-    return `\`keeper ${sub}\` is not on the wrapped-worker allowlist (permitted: agent, session, bounded plan reads/done, commit-work, baseline)`;
+    return `\`keeper ${sub}\` is not on the wrapped-worker allowlist (permitted: agent, session, bounded plan reads/done/AUDIT_READY block, commit-work, baseline)`;
   }
 
   if (exe === "git") {
@@ -1039,7 +1056,7 @@ const DELEGATE_HINT =
   "A wrapped (delegated) worker never authors source — delegate all " +
   "implementation, tests, and lint iteration to the provider leg via " +
   "`keeper agent run --resume`, then own only the keeper close-out " +
-  "(`keeper commit-work` + `keeper plan done`).";
+  "(`keeper commit-work` + `keeper plan done` or an AUDIT_READY self-park).";
 
 function editToolReason(tool: string): string {
   return `Wrapped-cell worker BLOCKED: the ${tool} tool is denied outright. ${DELEGATE_HINT}`;
@@ -1058,7 +1075,8 @@ function bashReason(violation: string): string {
     `Wrapped-cell worker BLOCKED: this Bash command is off the delegation + ` +
     `close-out allowlist: ${violation}. Permitted: \`keeper agent\` (run/--resume/` +
     `wait/wait-for-stop/show-last-message/providers), \`keeper commit-work\`, ` +
-    `\`keeper plan done\` + bounded reads, \`keeper session state\`, and the ` +
+    `task-bound \`keeper plan done\`/AUDIT_READY \`block\` + bounded reads, ` +
+    `\`keeper session state\`, and the ` +
     `read-only git surface (log / status / diff / show / rev-parse). ` +
     `Repository-defined tests/scripts execute only inside the provider leg. ` +
     `Every source-editing vector — redirects, heredocs, tee, sed -i, ` +
