@@ -6,7 +6,7 @@
     "fn-1375-reap-stopped-sessions-release-claims"
   ],
   "id": "fn-1377-tear-down-panes-on-session-end",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T17:26:46.789000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T17:26:42.819000Z"
+  "updated_at": "2026-07-19T17:26:46.792000Z"
 }
