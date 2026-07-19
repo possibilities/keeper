@@ -342,6 +342,45 @@ test("setStatus updates the banner without growing history", async () => {
   expect(core.historyLen()).toBe(1);
 });
 
+test("semantic headers stay pinned and resize their body geometry", async () => {
+  const { setup, core, paint } = await bootPaint({ width: 100, height: 8 });
+  const header = {
+    lines: ["Fable focus: c2 · permanent · focused", "autopilot: playing"],
+    renderAtWidth: (width: number) =>
+      width >= 80
+        ? ["Fable focus: c2 · permanent · focused", "autopilot: playing"]
+        : ["Fable focus: c2", "lifetime: permanent", "state: focused"],
+  };
+  core.pushFrame(tallFrame(), header);
+  await setup.renderOnce();
+  expect(textContent(paint.header)).toBe(
+    "Fable focus: c2 · permanent · focused\nautopilot: playing",
+  );
+  expect(paint.scrollBox.top).toBe(3);
+  expect(paint.scrollBox.height).toBe(5);
+
+  paint.scrollBox.scrollTop = 12;
+  setup.resize(40, 8);
+  await setup.renderOnce();
+  expect(textContent(paint.header)).toBe(
+    "Fable focus: c2\nlifetime: permanent\nstate: focused",
+  );
+  expect(paint.scrollBox.top).toBe(4);
+  expect(paint.scrollBox.height).toBe(4);
+  expect(paint.scrollBox.scrollTop).toBe(12);
+
+  core.setStatus("[copied frame 1]");
+  setup.resize(100, 8);
+  await setup.renderOnce();
+  expect(textContent(paint.banner)).toContain("[copied frame 1]");
+  expect(textContent(paint.header)).toBe(
+    "Fable focus: c2 · permanent · focused\nautopilot: playing",
+  );
+  expect(paint.scrollBox.top).toBe(3);
+  expect(paint.scrollBox.height).toBe(5);
+  expect(paint.scrollBox.scrollTop).toBe(12);
+});
+
 // A frame taller than the viewport so the ScrollBox has somewhere to
 // scroll. height 6 viewport → ~5 body rows visible, 30 rows of content.
 const tallFrame = (tag = ""): string[] =>

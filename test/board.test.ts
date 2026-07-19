@@ -29,11 +29,17 @@
 
 import { expect, test } from "bun:test";
 import {
+  BOARD_HEADER_MIN_WIDTH,
+  BOARD_HEADER_NARROW_WIDTH,
+  type BoardHeaderViewModel,
   boardFrameStateJson,
+  boardHeaderDisplayWidth,
+  boardHeaderWidth,
   boardSummaryLines,
   colorizePillsInLine,
   computeBoardSummary,
   epicNumFromIdOrBare,
+  formatBoardHeader,
   homedBlockedWorkRows,
   needsHumanLines,
   orphanedFailureRows,
@@ -301,6 +307,146 @@ test("boardFrameStateJson carries epics AND the stable-ordered subagent index", 
     "session-1",
     "session-2",
   ]);
+});
+
+const HEADER_MODEL: BoardHeaderViewModel = {
+  summary: {
+    tasksOpen: 3,
+    tasksRunning: 1,
+    epicsOpen: 2,
+    epicsRunning: 1,
+    epicsClosing: 1,
+  },
+  autopilot: {
+    paused: false,
+    mode: "armed",
+    armedCount: 2,
+    maxConcurrentJobs: 4,
+    maxConcurrentPerRoot: 1,
+    worktreeMode: false,
+    workerProvider: "claude",
+  },
+  needsHumanCount: 2,
+  fableFocus: {
+    configured: true,
+    state: "active",
+    target_route: "claude-swap:2",
+    lifetime: { kind: "permanent" },
+    target_eligible: true,
+    outcome: "focused",
+    reason: "target-focused",
+    diagnostic: "none",
+  },
+};
+
+test("board semantic header has fixed wide, normal, and compact row counts", () => {
+  const wide = formatBoardHeader({
+    viewModel: HEADER_MODEL,
+    width: 160,
+    now: 1_700_000_000_000,
+  });
+  expect(wide).toEqual([
+    "Fable focus: c2 · permanent · focused | tasks 3/1 · epics 2/1/1",
+    "autopilot: playing · armed · armed 2 · cap 4 · root 1 | human 2 · tree off · prov claude",
+  ]);
+
+  const normal = formatBoardHeader({
+    viewModel: HEADER_MODEL,
+    width: BOARD_HEADER_NARROW_WIDTH,
+    now: 1_700_000_000_000,
+  });
+  expect(normal).toHaveLength(2);
+  expect(normal[0]).toContain("Fable focus: c2 · permanent · focused");
+  expect(normal.every((line) => boardHeaderDisplayWidth(line) <= 80)).toBe(
+    true,
+  );
+
+  const narrow = formatBoardHeader({
+    viewModel: HEADER_MODEL,
+    width: BOARD_HEADER_MIN_WIDTH,
+    now: 1_700_000_000_000,
+  });
+  expect(narrow).toHaveLength(3);
+  expect(narrow[0]).toBe("Fable focus: c2 · permanent");
+  expect(narrow[1]).toBe(
+    "state: focused | AP: playing · armed:2 · cap 4 · root 1",
+  );
+  expect(narrow[2]).toBe(
+    "tasks 3/1 · epics 2/1/1 | human 2 · tree off · prov claude",
+  );
+  expect(narrow.every((line) => boardHeaderDisplayWidth(line) <= 60)).toBe(
+    true,
+  );
+
+  const belowMinimum = formatBoardHeader({
+    viewModel: HEADER_MODEL,
+    width: 16,
+    now: 1_700_000_000_000,
+  });
+  expect(belowMinimum).toEqual([
+    "Fable focus: c2…",
+    "state: focused …",
+    "tasks 3/1 · epi…",
+  ]);
+  expect(
+    belowMinimum.every((line) => boardHeaderDisplayWidth(line) <= 16),
+  ).toBe(true);
+  expect(
+    boardHeaderWidth({ isTTY: false, columns: 8 } as NodeJS.WriteStream),
+  ).toBe(100);
+});
+
+test("board semantic header preserves Fable fallback and unavailable evidence", () => {
+  const absolute = {
+    ...HEADER_MODEL,
+    fableFocus: {
+      ...HEADER_MODEL.fableFocus,
+      lifetime: {
+        kind: "absolute" as const,
+        deadline_at: "2023-11-14T22:13:20.000Z",
+      },
+    },
+  } satisfies BoardHeaderViewModel;
+  expect(
+    formatBoardHeader({
+      viewModel: absolute,
+      width: 120,
+      now: 1_700_000_000_001,
+    })[0],
+  ).toContain("fallback");
+
+  const unavailable = {
+    ...HEADER_MODEL,
+    fableFocus: {
+      ...HEADER_MODEL.fableFocus,
+      state: "unavailable" as const,
+      target_route: null,
+      lifetime: null,
+      outcome: "fallback" as const,
+      reason: "policy-unavailable" as const,
+    },
+  } satisfies BoardHeaderViewModel;
+  const rows = formatBoardHeader({
+    viewModel: unavailable,
+    width: BOARD_HEADER_MIN_WIDTH,
+    now: 1_700_000_000_000,
+  });
+  expect(rows[0]).toContain("Fable focus: off · off");
+  expect(rows[1]).toContain("state: unavailable");
+  expect(rows.join("\n")).not.toContain("\x1b[");
+});
+
+test("board frame state records the exact semantic header inputs", () => {
+  const state = boardFrameStateJson([], new Map(), {
+    viewModel: HEADER_MODEL,
+    width: 100,
+    renderedAtMs: 1_700_000_000_000,
+  });
+  expect(state.header).toEqual({
+    viewModel: HEADER_MODEL,
+    width: 100,
+    renderedAtMs: 1_700_000_000_000,
+  });
 });
 
 // ---------------------------------------------------------------------------
