@@ -1,0 +1,19 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-19T04:56:18.023000Z",
+  "created_by_close_of": "fn-1365-reap-stale-commit-work-locks",
+  "depends_on_epics": [
+    "fn-1365-reap-stale-commit-work-locks"
+  ],
+  "id": "fn-1367-fix-commit-work-lock-reap-split-window",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Fix commit-work lock reap split window",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-19T04:56:18.023000Z"
+}
