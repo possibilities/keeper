@@ -15,10 +15,10 @@
     }
   ],
   "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
-  "created_at": "2026-07-19T15:15:13.949000Z",
+  "created_at": "2026-07-19T15:20:40.537000Z",
   "epic_id": "fn-1376-wire-live-proof-collection",
-  "input_hash": "5e8f51f46e4979019d27d308a5d30db8276ebfe34b2e1b10b8c62a68ae3a6736",
-  "outcome": "degraded:selector-verdict-unparseable-twice",
+  "input_hash": "a1b925eb8cf07459e81953d335196915280edd6523ea3be068c1551510bf0464",
+  "outcome": "degraded:refine-reselect-skipped-same-single-cell",
   "schema_version": 1,
   "selector": {
     "harness": "none",
