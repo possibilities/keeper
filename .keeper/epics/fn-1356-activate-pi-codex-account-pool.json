@@ -5,7 +5,8 @@
   "depends_on_epics": [
     "fn-1355-add-pi-codex-account-pool",
     "fn-1374-add-codex-pool-proof-window",
-    "fn-1376-wire-live-proof-collection"
+    "fn-1376-wire-live-proof-collection",
+    "fn-1378-machine-runnable-codex-pool-proof"
   ],
   "id": "fn-1356-activate-pi-codex-account-pool",
   "last_validated_at": "2026-07-18T21:41:38.835000Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T15:13:46.912000Z"
+  "updated_at": "2026-07-19T21:42:32.195000Z"
 }
