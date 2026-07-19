@@ -43,5 +43,5 @@ provenance, no fn-ids.
 - [ ] No doc gains provenance/history prose; doc linters green
 
 ## Done summary
-
+Rewrote the codex-pool proof docs for the managed machine-runnable path: install walkthrough drops slash commands for the managed proof probe, the companion README covers the tool/seams/attestation contract, problem-codes reflects re-derived verdicts, and CONTEXT.md gains the seam and genuineness glossary entries.
 ## Evidence
