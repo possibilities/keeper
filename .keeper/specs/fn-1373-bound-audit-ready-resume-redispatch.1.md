@@ -30,5 +30,5 @@ Files:
 - [ ] a daemon.test.ts case drives dead -> resume -> replacement dies past grace -> ... and asserts the bound fires and the human is paged
 
 ## Done summary
-
+Bounded the AUDIT_READY work rung on the same owner-redispatch attempt bound (blockOwnerEscalationDecision) as ordinary unblock categories, so a crash-looping replacement audit orchestrator falls through to the legacy unblock/paging rung past the bound instead of redispatching forever; added a daemon.test.ts case driving repeated replacement deaths that asserts the bound fires and the human is paged.
 ## Evidence

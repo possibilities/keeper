@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Bound audit-resume redispatch",
-  "updated_at": "2026-07-19T10:54:53.341000Z"
+  "updated_at": "2026-07-19T11:02:06.148000Z",
+  "worker_done_at": "2026-07-19T11:02:06.148000Z"
 }
