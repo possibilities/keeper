@@ -193,6 +193,11 @@ function deps(opts: {
   detectInProgress?: CommitWorkDeps["detectInProgress"];
   checkSharedCheckoutJam?: CommitWorkDeps["checkSharedCheckoutJam"];
   fingerprintIndex?: (path: string) => string;
+  fingerprintWorktreePaths?: (
+    worktree: string,
+    paths: readonly string[],
+  ) => string;
+  statusRecords?: Array<{ tag: "?" | "!"; path: string }>;
 }): { d: CommitWorkDeps; calls: ReturnType<typeof fakeAsyncGit>["calls"] } {
   const fake = fakeAsyncGit(opts.rules);
   const baseRun = fake.run;
@@ -235,6 +240,15 @@ function deps(opts: {
     }
     if (args[0] === "status") {
       await baseRun(args, options);
+      if (opts.statusRecords) {
+        return {
+          code: 0,
+          stdout: opts.statusRecords
+            .map(({ tag, path }) => `${tag} ${path}\0`)
+            .join(""),
+          stderr: "",
+        };
+      }
       const ignored = await baseRun(["check-ignore", "-z", "--stdin"], {
         cwd: options?.cwd,
         stdin: new TextEncoder().encode(`${opts.files.join("\0")}\0`),
@@ -384,6 +398,7 @@ function deps(opts: {
         executable: false,
       }),
       fingerprintIndex: opts.fingerprintIndex ?? (() => "stable-private-index"),
+      fingerprintWorktreePaths: opts.fingerprintWorktreePaths,
       targetIndexPath: () => "/repo/.git/index",
     },
     detectInProgress: opts.detectInProgress ?? (async () => null),
@@ -1963,6 +1978,93 @@ describe("commit-work: isolated-index commit", () => {
     });
     expect(linted).toBe(false);
     expect(calls.some((call) => call.args[0] === "commit-tree")).toBe(false);
+  });
+
+  test("large unselected ignored and untracked files do not exhaust the publication snapshot", async () => {
+    const bytesByPath = new Map([
+      ["selected.txt", 12],
+      ["ignored-cache.bin", 3_221_225_472],
+      ["untracked-cache.bin", 2_147_483_648],
+    ]);
+    const fingerprinted: string[][] = [];
+    const { d } = deps({
+      files: ["selected.txt"],
+      rules: successRules({ stagedNames: ["selected.txt"] }),
+      statusRecords: [
+        { tag: "?", path: "selected.txt" },
+        { tag: "!", path: "ignored-cache.bin" },
+        { tag: "?", path: "untracked-cache.bin" },
+      ],
+      fingerprintWorktreePaths: (_worktree, paths) => {
+        fingerprinted.push([...paths]);
+        const bytes = paths.reduce(
+          (total, path) => total + (bytesByPath.get(path) ?? 0),
+          0,
+        );
+        if (bytes > 1_073_741_824) {
+          throw new Error("fixture snapshot byte budget exceeded");
+        }
+        return `fixture:selected:bytes:${bytes}`;
+      },
+    });
+
+    const { code } = await runForTest(
+      ["feat: selected only", "--session-id", "s1"],
+      d,
+    );
+
+    expect(code).toBe(0);
+    expect(fingerprinted.length).toBeGreaterThan(0);
+    expect(
+      fingerprinted.every((paths) => paths.join("\0") === "selected.txt"),
+    ).toBe(true);
+  });
+
+  test("a selected-path mutation after freeze fails the publication baseline", async () => {
+    let selectedVersion = "before-lint";
+    const { d, calls } = deps({
+      files: ["selected.txt"],
+      rules: successRules({ stagedNames: ["selected.txt"] }),
+      runLint: async () => {
+        selectedVersion = "after-lint";
+      },
+      fingerprintWorktreePaths: (_worktree, paths) =>
+        `fixture:${paths.join("\0")}:${selectedVersion}`,
+    });
+
+    const { code, stdout } = await runForTest(
+      ["feat: reject mutation", "--session-id", "s1"],
+      d,
+    );
+
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "surface_changed",
+      stderr_sample: expect.stringContaining("worktree changed"),
+    });
+    expect(calls.some((call) => call.args[0] === "commit-tree")).toBe(false);
+    expect(calls.some((call) => call.args[0] === "update-ref")).toBe(false);
+  });
+
+  test("an untyped snapshot failure includes its message in stage_failed", async () => {
+    const { d } = deps({
+      files: ["selected.txt"],
+      rules: successRules({ stagedNames: ["selected.txt"] }),
+      fingerprintWorktreePaths: () => {
+        throw new Error("snapshot fixture exploded");
+      },
+    });
+
+    const { code, stdout } = await runForTest(
+      ["feat: snapshot failure", "--session-id", "s1"],
+      d,
+    );
+
+    expect(code).toBe(1);
+    expect(JSON.parse(stdout)).toMatchObject({
+      outcome: "stage_failed",
+      stderr_sample: "snapshot fixture exploded",
+    });
   });
 
   test("a rename's A and D halves both become exact entries when attributed", async () => {

@@ -1619,7 +1619,10 @@ async function runAttempt(
             identity,
             lock_path: lockPath,
             lock_state: "held_by_invocation",
-            stderr_sample: capStderr(typed?.stderr),
+            stderr_sample: capStderr(
+              typed?.stderr ??
+                (error instanceof Error ? error.message : String(error)),
+            ),
             affected_total: typed?.paths?.length,
             affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
             selection: selectionEnvelope(surface, identity),

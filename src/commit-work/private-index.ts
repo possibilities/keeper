@@ -69,7 +69,7 @@ export interface FrozenPrivateIndex {
   paths: string[];
   /** Selection-scoped pre-lint context; Excluded-prefix runtime churn is omitted. */
   worktreeBaseline: string;
-  /** Whole-tree context captured immediately before executable publication hooks. */
+  /** Whole worktree status and selected-path bytes captured before publication hooks. */
   worktreeHookBaseline: string;
   targetIndexPath: string;
   targetIndexBaseline: string;
@@ -151,6 +151,10 @@ export interface PrivateIndexFs {
   readLink?: (absolutePath: string) => Uint8Array;
   /** Complete primary + split-companion fingerprint seam for unit fixtures. */
   fingerprintIndex?: (indexPath: string) => string;
+  fingerprintWorktreePaths?: (
+    worktree: string,
+    paths: readonly string[],
+  ) => string;
   /** Canonical target-worktree index path seam for plumbing-only fixtures. */
   targetIndexPath?: (worktree: string) => string;
 }
@@ -1285,6 +1289,9 @@ function rawPathSetFingerprint(
       `worktree snapshot exceeds ${MAX_WORKTREE_SNAPSHOT_PATHS} paths`,
     );
   }
+  if (fs.fingerprintWorktreePaths) {
+    return fs.fingerprintWorktreePaths(worktree, paths);
+  }
   // Plumbing-only fixtures have no real worktree. Their injected complete
   // fingerprint seam still binds the deterministic path set.
   if (fs.fingerprintIndex) return `fixture:${paths.join("\0")}`;
@@ -1455,19 +1462,9 @@ async function worktreeSnapshot(
   // target-index fingerprint already owns staged identity, and a competing ref
   // advance must reach the CAS rather than masquerade as a worktree mutation.
   const status = worktreeStatusSnapshot(before.stdout, excludeRuntimePaths);
-  const paths = [...new Set([...frozen.paths, ...status.paths])].sort();
-  const raw = rawPathSetFingerprint(worktree, paths, fs);
+  const raw = rawPathSetFingerprint(worktree, frozen.paths, fs);
   const wholeStatus = captureWhole
     ? worktreeStatusSnapshot(before.stdout, false)
-    : null;
-  const wholeRaw = wholeStatus
-    ? JSON.stringify(wholeStatus) === JSON.stringify(status)
-      ? raw
-      : rawPathSetFingerprint(
-          worktree,
-          [...new Set([...frozen.paths, ...wholeStatus.paths])].sort(),
-          fs,
-        )
     : null;
   const after = await readStatus();
   if (after.code !== 0) {
@@ -1480,7 +1477,7 @@ async function worktreeSnapshot(
   ) {
     throw new Error("worktree status changed while fingerprinted");
   }
-  if (captureWhole && wholeStatus && wholeRaw) {
+  if (captureWhole && wholeStatus) {
     const afterWhole = worktreeStatusSnapshot(after.stdout, false);
     if (
       JSON.stringify(afterWhole.identity) !==
@@ -1489,9 +1486,7 @@ async function worktreeSnapshot(
     ) {
       throw new Error("worktree status changed while fingerprinted");
     }
-    captureWhole(
-      JSON.stringify({ status: afterWhole.identity, raw: wholeRaw }),
-    );
+    captureWhole(JSON.stringify({ status: afterWhole.identity, raw }));
   }
   return JSON.stringify({ status: afterStatus.identity, raw });
 }
