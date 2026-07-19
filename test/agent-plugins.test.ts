@@ -6,9 +6,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { discoverPlugins, PluginError } from "../src/agent/plugins";
 
 let tmpDir: string;
@@ -53,6 +59,20 @@ describe("plugin_dirs (fail-loud)", () => {
       "plugins.yaml",
     );
     expect(d.args).toEqual(["--plugin-dir", p]);
+  });
+  test("the Keeper plugin remains discoverable with its rename skill", () => {
+    const keeperPlugin = resolve(import.meta.dir, "../plugins/keeper");
+    const cwd = join(tmpDir, "bare");
+    mkdirSync(cwd, { recursive: true });
+    const d = discoverPlugins(
+      cwd,
+      { pluginDirs: [keeperPlugin], pluginScanDirs: [] },
+      "plugins.yaml",
+    );
+    expect(d.args).toEqual(["--plugin-dir", keeperPlugin]);
+    expect(
+      readFileSync(join(keeperPlugin, "skills/rename/SKILL.md"), "utf8"),
+    ).toContain("\nname: rename\n");
   });
   test("a missing manifest throws PluginError", () => {
     const p = join(tmpDir, "broken");

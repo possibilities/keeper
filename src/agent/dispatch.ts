@@ -201,6 +201,11 @@ Wrapper flags:
                                     ordered cswap inventory for this launch.
                                     The request fails loudly if the inventory is
                                     stale or that account is not routeable.
+  --x-metadata-inference <input>
+                              Claude only: run one internal, non-persistent
+                                    title inference and emit its typed JSON
+                                    envelope. Diagnostic integration surface;
+                                    not a normal Session launch.
 
 Preset resolution:
   keeper agent presets resolve <name>  Emit the resolved JSON for a single preset

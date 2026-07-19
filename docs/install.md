@@ -266,19 +266,19 @@ names the exact identities maintenance continues to reconcile; operator action i
 persistent fail-closed control diagnosis. The canonical test commands and budget policy are in
 [docs/testing.md](./testing.md).
 
-Every keeper-launched Pi session (`keeper agent pi`) also gets `/rename`, which derives
-a short Session title from the active branch's bounded, compaction-aware conversation context,
-with extra weight on user requests, and applies it through Pi's own `setSessionName()`. Passing a
-canonical lowercase slug sets it directly (`/rename project-search-ranking`); any non-slug argument
-returns an error without changing the title. Bare `/rename` starts inference as soon as the active
-context contains one user or assistant message, including while the assistant is still responding;
-it remains pending only when no such message exists yet. Inference requires Pi's own OAuth login to
-serve the one fixed cheap `openai-codex/gpt-5.3-codex-spark` model — no fallback model, no separate
-keeper credential. Absent that OAuth, an unresolvable model, or a malformed model response,
-`/rename` no-ops with an in-Pi notification and leaves the existing title unchanged; a successful
-rename reaches
-Keeper's title projection and the tmux renamer asynchronously through the existing `TranscriptTitle`
-event, never a direct DB/tmux write.
+Every keeper-launched Claude or Pi session gets `/rename` on managed launch. Bare `/rename`
+derives a short Session title from the active branch's bounded, compaction-aware conversation
+context, gives extra weight to human requests, and safely expands eligible project-file references.
+A canonical lowercase slug sets the title directly (`/rename project-search-ranking`); any other
+argument, including an `@path`, leaves the existing title unchanged. Empty context, cancellation,
+stale Session state, unavailable auth/model/routing, timeout, or malformed output likewise fails
+open with content-free feedback.
+
+Pi performs its fixed cheap inference through its own OAuth-aware host API and commits with
+`setSessionName()`. Claude uses the managed Account route for one non-persistent Haiku metadata
+process and commits through the `UserPromptSubmit` hook's native `sessionTitle`. Either native title
+reaches Keeper's title projection and the tmux renamer asynchronously through the existing
+`TranscriptTitle` event, never a direct database or tmux write.
 
 ## Host worker matrix (required)
 

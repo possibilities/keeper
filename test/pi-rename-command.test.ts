@@ -3,10 +3,78 @@ import {
   buildRenameConversationInput,
   createRenameCommandHandler,
   createRenameInvocationState,
+  findRenamePathReferences,
   isValidRenameSlug,
   type RenameCommandContext,
   type RenameCommandDeps,
+  type RenameInputFileSystem,
+  type RenameInputStat,
 } from "../plugins/keeper/pi-extension/rename-command";
+import {
+  buildSessionRenameInputFromSections,
+  findSessionRenamePathReferences,
+} from "../src/session-rename-input";
+
+function parityFileSystem(): RenameInputFileSystem {
+  const files = new Map([
+    ["/project", { bytes: Buffer.alloc(0), directory: true, ino: 1 }],
+    [
+      "/project/docs/name file.md",
+      {
+        bytes: Buffer.from("design context with @recursive.ts"),
+        directory: false,
+        ino: 2,
+      },
+    ],
+  ]);
+  const handles = new Map<number, { path: string; offset: number }>();
+  let nextFd = 10;
+  const entry = (path: string) => {
+    const found = files.get(path);
+    if (found === undefined) throw new Error("missing");
+    return found;
+  };
+  const stat = (path: string): RenameInputStat => {
+    const found = entry(path);
+    return {
+      dev: 1,
+      ino: found.ino,
+      mode: found.directory ? 0o040755 : 0o100644,
+      size: found.bytes.byteLength,
+      mtimeMs: 1,
+      ctimeMs: 1,
+      isFile: () => !found.directory,
+      isSymbolicLink: () => false,
+    };
+  };
+  return {
+    realpath: (path) => {
+      entry(path);
+      return path;
+    },
+    lstat: stat,
+    open: (path) => {
+      entry(path);
+      const fd = nextFd++;
+      handles.set(fd, { path, offset: 0 });
+      return fd;
+    },
+    fstat: (fd) => stat(handles.get(fd)?.path ?? ""),
+    read: (fd, buffer, offset, length) => {
+      const handle = handles.get(fd);
+      if (handle === undefined) throw new Error("bad fd");
+      const bytes = entry(handle.path).bytes;
+      const count = Math.min(length, bytes.byteLength - handle.offset);
+      if (count <= 0) return 0;
+      buffer.set(bytes.subarray(handle.offset, handle.offset + count), offset);
+      handle.offset += count;
+      return count;
+    },
+    close: (fd) => {
+      handles.delete(fd);
+    },
+  };
+}
 
 describe("/rename conversation input", () => {
   test("a single user message is sufficient input", () => {
@@ -84,6 +152,54 @@ describe("/rename conversation input", () => {
 
     expect(Buffer.byteLength(input ?? "", "utf8")).toBeLessThanOrEqual(11);
     expect(input).toBe("User: 😀");
+  });
+
+  test("cannot be configured above the final 16 KiB input cap", () => {
+    const input = buildRenameConversationInput(
+      [{ role: "user", content: "x".repeat(30_000) }],
+      1_000_000,
+    );
+
+    expect(Buffer.byteLength(input ?? "", "utf8")).toBe(16 * 1024);
+  });
+
+  test("matches the root path grammar and expanded allocation contract", () => {
+    const prose = [
+      'Use @"docs/name\u00a0file.md", not me@example.com.',
+      "Ignore `@inline.ts` and:",
+      "```",
+      "@fenced.ts",
+      "```",
+    ].join("\n");
+    expect(findRenamePathReferences(prose)).toEqual(
+      findSessionRenamePathReferences(prose),
+    );
+
+    const root = buildSessionRenameInputFromSections(
+      [
+        { role: "summary", text: "Earlier design work" },
+        { role: "user", text: prose },
+        { role: "assistant", text: "Assistant says @assistant.ts" },
+      ],
+      { projectDir: "/project", fileSystem: parityFileSystem() },
+    );
+    const pi = buildRenameConversationInput(
+      [
+        { role: "compactionSummary", summary: "Earlier design work" },
+        { role: "user", content: prose },
+        { role: "assistant", content: "Assistant says @assistant.ts" },
+      ],
+      16 * 1024,
+      { projectDir: "/project", fileSystem: parityFileSystem() },
+    );
+
+    const expected = [
+      "Conversation summary: Earlier design work",
+      `User: ${prose}\n\n[Referenced file: "docs/name file.md"]\ndesign context with @recursive.ts\n[End referenced file]`,
+      "Assistant: Assistant says @assistant.ts",
+    ].join("\n\n");
+    expect(root).toBe(expected);
+    expect(pi).toBe(expected);
   });
 });
 
