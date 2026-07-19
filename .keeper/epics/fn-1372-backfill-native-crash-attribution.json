@@ -6,7 +6,7 @@
     "fn-1371-autonomous-audit-ready-resume"
   ],
   "id": "fn-1372-backfill-native-crash-attribution",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T10:26:19.560000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T10:26:18.184000Z"
+  "updated_at": "2026-07-19T10:26:19.560000Z"
 }
