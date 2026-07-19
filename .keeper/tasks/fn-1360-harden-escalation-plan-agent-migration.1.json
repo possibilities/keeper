@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix escalation skill regressions",
-  "updated_at": "2026-07-19T03:56:38.476000Z"
+  "updated_at": "2026-07-19T07:27:13.963000Z",
+  "worker_done_at": "2026-07-19T07:27:13.963000Z"
 }

@@ -23,5 +23,5 @@ Files: plugins/plan/skills/repair/SKILL.md, plugins/plan/skills/unblock/SKILL.md
 - [ ] unblock/SKILL.md Phase 3 pages once and declines on a failed cold-dispatch rather than silently ending
 
 ## Done summary
-
+Fixed repair/SKILL.md Phase 2 to capture HEAD after git pull --ff-only (so expected_tip matches the post-pull tip the repairer observes, fixing a false stale_base decline), and restored unblock/SKILL.md Phase 3's page-once-and-decline instruction for a failed cold-dispatch.
 ## Evidence
