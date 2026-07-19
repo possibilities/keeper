@@ -240,17 +240,17 @@ export function compactKeeperLane(branch: string): string {
 }
 
 /**
- * Render the selected account's zero-based position in claude-swap's ordered
- * inventory. The launcher supplies this only when multiple Claude accounts are
- * known, so a sole account and every non-Claude provider render no account
- * segment. Slot numbers are deliberately ignored: they may be sparse and are
- * stable route identities, not human-facing ordinals.
+ * Render the selected account's one-based position in claude-swap's ordered
+ * inventory. The launcher supplies a zero-based ordinal only when multiple
+ * Claude accounts are known, so a sole account and every non-Claude provider
+ * render no account segment. Slot numbers are deliberately ignored: they may
+ * be sparse and are stable route identities, not human-facing positions.
  */
 function accountLabel(rawOrdinal: string): string {
   if (!/^(0|[1-9]\d*)$/.test(rawOrdinal)) {
     return "";
   }
-  return `c${rawOrdinal}`;
+  return `c${BigInt(rawOrdinal) + 1n}`;
 }
 
 function resolveGitBranch(

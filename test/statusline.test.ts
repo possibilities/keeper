@@ -120,11 +120,15 @@ describe("statusline render", () => {
       }),
     );
 
-    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} c1`)).toBe(true);
+    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} c2`)).toBe(true);
   });
 
-  test("renders c0/c1/c2 from validated inventory ordinals, never route slots", () => {
-    for (const ordinal of ["0", "1", "2"]) {
+  test("renders one-based account positions from validated inventory ordinals, never route slots", () => {
+    for (const [ordinal, position] of [
+      ["0", "1"],
+      ["1", "2"],
+      ["2", "3"],
+    ]) {
       const plain = stripAnsi(
         renderStatusline(payload(), {
           env: {
@@ -136,7 +140,7 @@ describe("statusline render", () => {
           runGit: fakeGit("keeper"),
         }),
       );
-      expect(plain.endsWith(`2.1.204 ${SEP} c${ordinal}`)).toBe(true);
+      expect(plain.endsWith(`2.1.204 ${SEP} c${position}`)).toBe(true);
       expect(plain).not.toContain("c99");
     }
   });
