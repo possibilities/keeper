@@ -24,5 +24,5 @@ Files: plugins/keeper/plugin/hooks/wrapped-guard.ts, plugins/keeper/plugin/hooks
 - [ ] Legitimate `\<newline>` continuations inside and outside double quotes still lex without a false deny
 
 ## Done summary
-
+Fixed the inDouble backslash-newline continuation-consume in both guard lexers to re-check $/( adjacency across consumed continuations (skipLineContinuations helper, identical in both files); added single- and multi-continuation split-vector denials to both CVE deny corpora; existing legitimate-continuation tests still pass.
 ## Evidence
