@@ -46,5 +46,5 @@ Assert exact bytes for ordinary and captured prompts, including multiline Unicod
 - [ ] Handoff, config, skill-contract, corpus-drift, and focused launch tests pass.
 
 ## Done summary
-
+Composed every fresh Handoff prompt as exactly /hack plus the raw stored Brief with no injected framing, keyed /hack's captured autonomy and canonical envelope publication on a non-empty KEEPER_HANDOFF_ENVELOPE carrier alone, made handoff_prompt_prefix a harmless /hack-only compatibility key with actionable guidance for other values, and updated Handoff/hack skill docs plus agent-surface-contracts.md and install.md for caller-owned mandates and capture-independent launch selection.
 ## Evidence
