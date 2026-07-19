@@ -66,5 +66,5 @@ The internal mode has no standalone discovery surface beyond wrapper help intend
 - [ ] Deterministic in-process tests cover route selection, argv/environment construction, artifact suppression, output caps, process outcomes, timeout, and cancellation without launching a real Claude process.
 
 ## Done summary
-
+Added an internal Claude-only metadata-inference launch mode: independent Account-route selection, canonical claude-swap --share-history composition, a fixed Haiku/low-effort/safe-mode/no-tools/no-persistence print invocation with a 20s hard timeout, scrubbed environment/session identity, bounded output capture with process-tree teardown, and typed success/failure envelopes. Skips ordinary session-id/name minting, plugin discovery, birth intent, and Session-catalog artifacts.
 ## Evidence
