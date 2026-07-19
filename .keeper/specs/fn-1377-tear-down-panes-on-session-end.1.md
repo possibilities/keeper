@@ -5,51 +5,56 @@
 
 ### Approach
 
-Give session terminal transitions ownership of their pane: when a job
-reaches ended, killed, or autoclosed with a recorded
-backend_exec_pane_id, the producer plans a pane teardown (kill the
-pane, shell included) within one bounded window, decision-gated
-through a pure seam with injected pane/process liveness so a live
-agent's pane is never a candidate. Add a bounded, capped periodic GC
-pass that collects terminal-state jobs' panes missed across daemon
-restarts — mirror the occupancy pass's conservative guards (working
-rows never candidates; degraded tmux probe leaves the pass inert;
-blast cap per sweep). Panes not created by keeper (no recorded
-ownership) are never touched. Compose beside fn-1375's stopped-session
-reap — teardown here fires only on TERMINAL states, never on stopped.
+Give AUTOPILOT-DISPATCHED sessions' terminal transitions ownership of
+their pane: when a board job (dispatch_origin autopilot; plan-verb
+work/close/resolve/deconflict/repair/unblock) reaches ended, killed, or
+autoclosed with a recorded backend_exec_pane_id, the producer plans a
+pane teardown (kill the pane, shell included) within one bounded
+window, decision-gated through a pure seam with injected pane/process
+liveness. Add a bounded, capped periodic GC collecting terminal-state
+AUTOPILOT panes missed across daemon restarts — mirror the occupancy
+pass's conservative guards (working rows never candidates; degraded
+probe inert; blast cap per sweep). HARD BOUNDARY, test-enforced: named
+sessions, handoffs, free-form operator dispatches, manual and adopted
+sessions are NEVER candidates in ANY state — the human keeps those tabs
+deliberately; a stopped non-autopilot session is resting, not litter.
+Panes without a keeper ownership record are never touched. Compose
+beside fn-1375's stopped-session reap — teardown fires only on
+TERMINAL states.
 
 ### Investigation targets
 
-*Verify before relying — these refs are planner-verified at authoring time, but the repo moves.*
+*Verify before relying — these file refs are planner-verified at authoring time, but the repo moves.*
 
 **Required** (read before coding):
-- src/reconcile-core.ts:2033 — computeSlotOccupancy's dead-classification arms and conservative guards (the pattern to mirror; the bare-shell reclaim that today runs only on mint contention)
-- src/autopilot-worker.ts — reclaimSlotPane (the existing pane-kill executor to reuse, near :4903) and the reaper step pattern (:1770)
-- jobs table lifecycle: backend_exec_pane_id + state transitions (terminal fold sites in src/reducer.ts; teardown is producer-side, folds stay pure)
-- src/agent/tmux-launch.ts — pane creation/ownership records (what marks a pane keeper-owned)
-- fn-1375's landed changes on this surface (your lane includes them — this epic is dep-sequenced behind it)
+- jobs table: dispatch_origin + plan_verb + backend_exec_pane_id columns — the candidacy key; verify how free-form `keeper dispatch --prompt-file` sessions stamp dispatch_origin (they must NOT classify as candidates)
+- src/reconcile-core.ts:2033 — computeSlotOccupancy's guards and the mint-driven bare-shell reclaim (the gap this fills)
+- src/autopilot-worker.ts — reclaimSlotPane executor (near :4903) + reaper step pattern (:1770)
+- src/agent/tmux-launch.ts — pane creation/ownership records
+- fn-1375's landed changes on this surface (dep-sequenced behind it)
 
 **Optional** (reference as needed):
-- test/autopilot-worker.test.ts pure-seam table patterns (slotInput/zombieDecisionInput factories)
-- Backlog #64 entry in ~/docs/keeper-phase2-backlog.md — census + mechanism
+- test/autopilot-worker.test.ts pure-seam table patterns
+- ~/docs/keeper-phase2-backlog.md #64 entry — census, mechanism, and the mis-scoped sweep
 
 ### Risks
 
-- Killing a pane whose job row is stale-working with a live agent is the catastrophic case — candidacy requires TERMINAL job state AND no live agent child, both re-verified at act time.
-- Autoclose and operator kills already have partial teardown paths — find and compose with them rather than adding a second killer for the same pane.
-- Panes the human created or adopted must be structurally out of scope (keeper-ownership record required).
+- Misclassifying a named/handoff/manual session as a candidate is the defect that already burned the human once — the candidacy predicate must be positive-evidence (autopilot origin + board verb), never inferred from state or pane appearance.
+- Killing a pane whose job row is stale-working with a live agent: candidacy requires TERMINAL state AND no live agent child, re-verified at act time.
+- Autoclose and operator-kill paths have partial teardown behavior — compose, don't double-kill.
 
 ### Test notes
 
-Deterministic pure-seam tables with injected liveness; no real tmux.
-Named gates only.
+Deterministic pure-seam tables with injected liveness; explicit
+negative table rows for every non-autopilot session class. No real
+tmux. Named gates only.
 
 ## Acceptance
 
-- [ ] A terminal-state job's keeper-owned pane is teardown-decided within one bounded window, shell included, and a live agent's pane is never a candidate — table-tested through the pure decision seam.
-- [ ] The periodic GC collects terminal-state panes missed across a restart, is blast-capped, inert on a degraded probe, and never touches a pane without a keeper ownership record.
-- [ ] Existing occupancy/reap regression tables stay green.
-- [ ] The named focused gates and the typecheck are green.
+- [ ] A terminal-state autopilot-dispatched job's keeper-owned pane is teardown-decided within one bounded window, shell included, table-tested through the pure decision seam.
+- [ ] Every non-autopilot session class (named, handoff, free-form operator dispatch, manual, adopted) is proven a non-candidate in every job state by explicit negative tests.
+- [ ] A live agent's pane is never a candidate; the GC is blast-capped, inert on a degraded probe, and requires a keeper ownership record.
+- [ ] Existing occupancy/reap regression tables stay green; named focused gates and typecheck green.
 
 ## Done summary
 
