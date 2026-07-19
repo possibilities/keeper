@@ -779,7 +779,10 @@ describe("keeper agent accounts codex-pool", () => {
     }
   });
 
-  test("interactive enrollment inherits the terminal and loads only the companion", async () => {
+  test("interactive enrollment warns before starting Pi and loads only the companion", async () => {
+    const warning =
+      "Warning: enrolling this alias revokes that account's other live grants " +
+      "(legacy leg and bare Pi), causing a native Codex outage until activation.\n";
     const h = makeHarness({
       argv: ["accounts", "codex-pool", "enroll", "keeper-codex-b"],
       rawArgv: true,
@@ -789,6 +792,11 @@ describe("keeper agent accounts codex-pool", () => {
         problem_code: null,
       }),
     });
+    const spawn = h.deps.spawn;
+    h.deps.spawn = (argv, options) => {
+      expect(h.err.join("")).toContain(warning);
+      return spawn(argv, options);
+    };
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.spawned).toEqual([
       [
@@ -800,7 +808,8 @@ describe("keeper agent accounts codex-pool", () => {
       ],
     ]);
     expect(h.err.join("")).toBe(
-      "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
+      warning +
+        "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(

@@ -3398,6 +3398,10 @@ async function runCodexPoolCommand(
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(context.aliases);
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = context.config_binding;
     deps.writeErr(
+      "Warning: enrolling this alias revokes that account's other live grants " +
+        "(legacy leg and bare Pi), causing a native Codex outage until activation.\n",
+    );
+    deps.writeErr(
       `Codex pool enrollment is interactive; in Pi run /login ${alias}, then exit.\n`,
     );
     return runPassthrough(
