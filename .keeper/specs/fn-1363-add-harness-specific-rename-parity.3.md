@@ -69,5 +69,5 @@ The skill and hook load together from the Keeper Claude plugin on the next manag
 - [ ] README, install guidance, and the imperative hook inventory describe the current harness-specific contract without duplicating ADR history.
 
 ## Done summary
-
+Added Claude native /rename parity: a shadowing plugin skill plus a fail-open UserPromptSubmit hook that returns explicit canonical slugs immediately via native sessionTitle, and derives bare-rename candidates through task 1's bounded transcript projection and task 2's isolated Haiku metadata inference, revalidating session/transcript state before committing. Consolidated hook inventory and rename docs across CLAUDE.md, README.md, and docs/install.md.
 ## Evidence
