@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle security-invariant fix to a defense-in-depth shell lexer, closing a reachable command-substitution bypass without introducing false denies and keeping both byte-identical guard copies in sync \u2014 a hard opus gate; xhigh fits the named-root-cause, correctness-critical scope short of open-ended debugging.",
+      "task_id": "fn-1368-fix-guard-lexer-continuation.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T06:56:28.309000Z",
+  "epic_id": "fn-1368-fix-guard-lexer-continuation",
+  "input_hash": "97e9acddc4a31ad17aac0f7774bce982767cfddca10b762f54594fa1099d08f4",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2548673757,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle security-invariant fix to a defense-in-depth shell lexer, closing a reachable command-substitution bypass without introducing false denies and keeping both byte-identical guard copies in sync \u2014 a hard opus gate; xhigh fits the named-root-cause, correctness-critical scope short of open-ended debugging.\",\"confidence\":0.8}]}\n"
+}
