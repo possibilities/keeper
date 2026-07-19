@@ -182,6 +182,7 @@ function lexSegments(command: string): LexResult {
     }
     if (inDouble) {
       if (c === '"') inDouble = false;
+      else if (c === "\\" && next === "\n") i++;
       else if (c === "`") return { kind: "deny", reason: SUBSTITUTION };
       else if (c === "$" && next === "(")
         return { kind: "deny", reason: SUBSTITUTION };
@@ -204,7 +205,9 @@ function lexSegments(command: string): LexResult {
       continue;
     }
     if (c === "\\") {
-      if (next !== "") {
+      if (next === "\n") {
+        i++;
+      } else if (next !== "") {
         word += next;
         hasWord = true;
         i++;
@@ -348,6 +351,20 @@ const READONLY_GIT_SUBCOMMANDS = new Set([
 ]);
 
 const WRAPPED_PROVIDER_HARNESSES = new Set(["codex", "hermes", "pi"]);
+const WRAPPED_PROVIDER_VALUE_OPTIONS = new Set([
+  "--model",
+  "--preset",
+  "--system-file",
+  "--session",
+  "--name",
+  "--output",
+  "--stop-timeout",
+  "--resume",
+]);
+const WRAPPED_PROVIDER_BOOLEAN_OPTIONS = new Set(["--reap-window-on-terminal"]);
+const RUN_GATE_STEER =
+  "Do not retry the same quoting; use a single short, single-line double-quoted " +
+  "instruction with no substitutions, with any longer content in --system-file.";
 
 export interface WrappedCommandContext {
   taskId?: string;
@@ -564,6 +581,65 @@ function wrappedPlanViolation(
   return null;
 }
 
+function runGateExcerpt(token: string | undefined): string {
+  const sanitized = Array.from(token ?? "<missing>", (char) => {
+    const codePoint = char.codePointAt(0) as number;
+    return codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      (codePoint >= 0x200b && codePoint <= 0x200f) ||
+      (codePoint >= 0x2028 && codePoint <= 0x202e) ||
+      (codePoint >= 0x2060 && codePoint <= 0x206f) ||
+      codePoint === 0xfeff
+      ? "?"
+      : char;
+  }).join("");
+  let excerpt = "";
+  let byteLength = 0;
+  let truncated = false;
+  for (const char of sanitized) {
+    const charBytes = Buffer.byteLength(char, "utf8");
+    if (byteLength + charBytes > 64) {
+      truncated = true;
+      break;
+    }
+    excerpt += char;
+    byteLength += charBytes;
+  }
+  return JSON.stringify(`${excerpt}${truncated ? "… [truncated]" : ""}`);
+}
+
+function runGateDeny(
+  construct: string,
+  positional: readonly string[],
+  offendingToken: string | undefined,
+): string {
+  return (
+    `wrapped provider run ${construct}: expected positional count 1, received ` +
+    `${positional.length}; first offending token ${runGateExcerpt(offendingToken)}. ` +
+    RUN_GATE_STEER
+  );
+}
+
+function providerRunPositionals(tokens: readonly string[]): string[] {
+  const positional: string[] = [];
+  for (let index = 4; index < tokens.length; index += 1) {
+    const token = tokens[index] as string;
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    if (WRAPPED_PROVIDER_BOOLEAN_OPTIONS.has(token)) continue;
+    if (
+      WRAPPED_PROVIDER_VALUE_OPTIONS.has(token) &&
+      tokens[index + 1] !== undefined &&
+      !(tokens[index + 1] as string).startsWith("--")
+    ) {
+      index += 1;
+    }
+  }
+  return positional;
+}
+
 function wrappedAgentViolation(
   tokens: string[],
   context: WrappedCommandContext,
@@ -590,68 +666,115 @@ function wrappedAgentViolation(
   if (verb !== "run") {
     return "wrapped `keeper agent` permits only constrained provider run/wait/show/providers operations";
   }
+
+  const positional = providerRunPositionals(tokens);
   const provider = tokens[3];
   if (provider === undefined || !WRAPPED_PROVIDER_HARNESSES.has(provider)) {
-    return "wrapped provider runs must use the non-Claude codex, hermes, or pi harness";
+    return runGateDeny(
+      "provider harness construct (expected codex, hermes, or pi)",
+      positional,
+      provider,
+    );
   }
+
   const values = new Map<string, string>();
-  const valueOptions = new Set([
-    "--model",
-    "--preset",
-    "--system-file",
-    "--session",
-    "--name",
-    "--output",
-    "--stop-timeout",
-    "--resume",
-  ]);
   // One-shot leg posture: a wrapped leg must not outlive its landed envelope —
   // a resident leg holds live claims that wedge the wrapper's own commit-work.
-  const booleanOptions = new Set(["--reap-window-on-terminal"]);
   const flags = new Set<string>();
-  const positional: string[] = [];
   for (let index = 4; index < tokens.length; index += 1) {
     const token = tokens[index] as string;
-    if (!token.startsWith("--")) {
-      positional.push(token);
-      continue;
-    }
-    if (booleanOptions.has(token)) {
+    if (!token.startsWith("--")) continue;
+    if (WRAPPED_PROVIDER_BOOLEAN_OPTIONS.has(token)) {
       if (flags.has(token)) {
-        return `wrapped provider run option '${token}' is not permitted`;
+        return runGateDeny(
+          "duplicate boolean option construct",
+          positional,
+          token,
+        );
       }
       flags.add(token);
       continue;
     }
-    if (!valueOptions.has(token) || values.has(token)) {
-      return `wrapped provider run option '${token}' is not permitted`;
+    if (!WRAPPED_PROVIDER_VALUE_OPTIONS.has(token)) {
+      return runGateDeny(
+        positional.length > 0
+          ? "option-lookalike in instruction prose construct"
+          : "unsupported option construct",
+        positional,
+        token,
+      );
+    }
+    if (values.has(token)) {
+      return runGateDeny("duplicate value option construct", positional, token);
     }
     const value = tokens[index + 1];
     if (value === undefined || value.startsWith("--")) {
-      return `wrapped provider run option '${token}' requires one value`;
+      return runGateDeny("missing option value construct", positional, token);
     }
     values.set(token, value);
     index += 1;
   }
-  if (positional.length !== 1) {
-    return "wrapped provider run requires exactly one inert instruction argument";
+  if (positional.length === 0) {
+    return runGateDeny("positional count construct", positional, undefined);
   }
-  if (
-    values.get("--session") !== "wrapped" ||
+  if (positional.length > 1) {
+    return runGateDeny("quoting split construct", positional, positional[1]);
+  }
+  if (positional[0] === "") {
+    return runGateDeny(
+      "empty positional instruction construct",
+      positional,
+      "",
+    );
+  }
+
+  let bindingMismatch = true;
+  let bindingOffender: string | undefined;
+  if (values.get("--session") !== "wrapped") {
+    bindingOffender = values.get("--session");
+  } else if (
     context.taskId === undefined ||
-    values.get("--name") !== context.taskId ||
-    context.envelopeReference === undefined ||
-    values.get("--output") !== context.envelopeReference ||
-    !/^\d+(?:ms|s|m)$/.test(values.get("--stop-timeout") ?? "")
+    values.get("--name") !== context.taskId
   ) {
-    return "wrapped provider run must bind --session wrapped, --name, --output, and --stop-timeout to the launch context";
+    bindingOffender = values.get("--name");
+  } else if (
+    context.envelopeReference === undefined ||
+    values.get("--output") !== context.envelopeReference
+  ) {
+    bindingOffender = values.get("--output");
+  } else if (!/^\d+(?:ms|s|m)$/.test(values.get("--stop-timeout") ?? "")) {
+    bindingOffender = values.get("--stop-timeout");
+  } else {
+    bindingMismatch = false;
   }
+  if (bindingMismatch) {
+    return runGateDeny(
+      "launch-context binding construct (--session/--name/--output/--stop-timeout)",
+      positional,
+      bindingOffender,
+    );
+  }
+
   const resumed = values.has("--resume");
   if (!resumed && !values.has("--system-file")) {
-    return "an initial wrapped provider run requires --system-file";
+    return runGateDeny(
+      "missing --system-file construct on an initial launch",
+      positional,
+      undefined,
+    );
   }
   if (!resumed && values.has("--model") === values.has("--preset")) {
-    return "an initial wrapped provider run requires exactly one --model or --preset";
+    const modelIndex = tokens.indexOf("--model");
+    const presetIndex = tokens.indexOf("--preset");
+    const secondSelector =
+      modelIndex >= 0 && presetIndex >= 0
+        ? tokens[Math.max(modelIndex, presetIndex)]
+        : undefined;
+    return runGateDeny(
+      "model/preset option-count construct (expected exactly one)",
+      positional,
+      secondSelector,
+    );
   }
   return null;
 }

@@ -138,6 +138,82 @@ describe("evaluateGrantBash — write-capable role (granted resolve/deconflict/r
   }
 });
 
+describe("evaluateGrantBash — static POSIX word reference", () => {
+  const reference: ReadonlyArray<{
+    name: string;
+    command: string;
+    referenceArgv: readonly string[] | "non-POSIX";
+    expected: "allow" | "deny";
+  }> = [
+    {
+      name: "adjacent quote runs concatenate",
+      command: `g""it l'o'g --oneline`,
+      referenceArgv: ["git", "log", "--oneline"],
+      expected: "allow",
+    },
+    {
+      name: "empty quoted words are preserved",
+      command: `"" git log`,
+      referenceArgv: ["", "git", "log"],
+      expected: "deny",
+    },
+    {
+      name: "comments begin only at a word boundary",
+      command: `# comment
+git log --oneline`,
+      referenceArgv: ["git", "log", "--oneline"],
+      expected: "deny",
+    },
+    {
+      name: "backslash-newline is removed before word recognition",
+      command: `git \\\n  log --oneline`,
+      referenceArgv: ["git", "log", "--oneline"],
+      expected: "allow",
+    },
+    {
+      name: "backslash-newline is removed inside double quotes",
+      command: `git "l\\
+og" --oneline`,
+      referenceArgv: ["git", "log", "--oneline"],
+      expected: "allow",
+    },
+    {
+      name: "ANSI-C quoting remains a conservative non-POSIX deny",
+      command: `$'g\\'it' log`,
+      referenceArgv: "non-POSIX",
+      expected: "deny",
+    },
+  ];
+
+  for (const entry of reference) {
+    test(`${entry.name}: ${JSON.stringify(entry.referenceArgv)}`, () => {
+      const reason = evaluateGrantBash(entry.command, DIAGNOSIS);
+      if (entry.expected === "allow") expect(reason).toBeNull();
+      else expect(reason).not.toBeNull();
+    });
+  }
+});
+
+describe("evaluateGrantBash — CVE-2025-66032 shell-bypass corpus", () => {
+  const corpus = [
+    "git log $(python3 -c 'x')",
+    "git log `whoami`",
+    'git log "$(rm -rf src)"',
+    "diff <(git show a) <(git show b)",
+    "git status; cp /tmp/evil src/x.ts",
+    "git log --oneline | sh",
+    "git status && python3 -c 'x'",
+    "git status & rm -rf src",
+    "env sh -c 'edit src'",
+    "git log > /tmp/out",
+  ];
+  for (const command of corpus) {
+    test(`denies bypass: ${command}`, () => {
+      expect(evaluateGrantBash(command, WRITE)).not.toBeNull();
+    });
+  }
+});
+
 test("evaluateGrantBash: the deny reason names the offending construct", () => {
   expect(evaluateGrantBash("cat f > out", WRITE)).toContain("redirect");
   expect(evaluateGrantBash("cat <<EOF", WRITE)).toContain("heredoc");

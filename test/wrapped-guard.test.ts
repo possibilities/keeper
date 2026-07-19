@@ -231,6 +231,187 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
   }
 });
 
+describe("evaluateWrappedBash — observed launch shapes and static POSIX word reference", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const observedContext = {
+    taskId: "fn-1354-own-pi-skill-shorthands.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const contract = "/private/tmp/keeper-wrapped-249pt0/contract.md";
+  const observedLaunches = [
+    `keeper agent run pi 'You are implementing one task in the arthack repo. Work in place and run tests until green.' \\\n  --model openai-codex/gpt-5.6-sol --system-file ${contract} \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
+    `keeper agent run pi 'Read the task brief and implement it in this repo.' \\\n  --resume 4ad8de58-52b3-4de9-b500-53a8a1941a44 \\\n  --session wrapped --name fn-1354-own-pi-skill-shorthands.2 \\\n  --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
+    `keeper agent run pi 'line one
+line two
+line three' --model openai-codex/gpt-5.6-sol --system-file ${contract} --session wrapped --name fn-1354-own-pi-skill-shorthands.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 480000ms`,
+  ];
+
+  for (const command of observedLaunches) {
+    test(`allows observed single-argv launch: ${JSON.stringify(command.slice(0, 80))}`, () => {
+      expect(evaluateWrappedBash(command, observedContext)).toBeNull();
+    });
+  }
+
+  const suffix =
+    `--model gpt-5 --system-file ${contract} --session wrapped ` +
+    `--name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s`;
+  const reference: ReadonlyArray<{
+    name: string;
+    command: string;
+    referenceInstructionArgv: readonly string[] | "non-POSIX";
+    expected: "allow" | "deny";
+  }> = [
+    {
+      name: "adjacent quote runs concatenate into one word",
+      command: `keeper agent run codex "implement "'task' ${suffix}`,
+      referenceInstructionArgv: ["implement task"],
+      expected: "allow",
+    },
+    {
+      name: "an empty quoted word is preserved",
+      command: `keeper agent run codex "" ${suffix}`,
+      referenceInstructionArgv: [""],
+      expected: "deny",
+    },
+    {
+      name: "a hash inside a word is literal",
+      command: `keeper agent run codex "implement"#task ${suffix}`,
+      referenceInstructionArgv: ["implement#task"],
+      expected: "allow",
+    },
+    {
+      name: "a comment begins only at a word boundary",
+      command: `keeper agent run codex "implement task" ${suffix} # ignored by POSIX shells`,
+      referenceInstructionArgv: ["implement task"],
+      expected: "deny",
+    },
+    {
+      name: "backslash-newline is removed before word recognition",
+      command: `keeper agent run codex "implement task" \\\n  ${suffix}`,
+      referenceInstructionArgv: ["implement task"],
+      expected: "allow",
+    },
+    {
+      name: "backslash-newline is removed inside double quotes",
+      command: `keeper agent run codex "implement task" --model gpt-5 --system-file ${contract} --session wrapped --name "fn-1-x.\\
+2" --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s`,
+      referenceInstructionArgv: ["implement task"],
+      expected: "allow",
+    },
+    {
+      name: "ANSI-C quoting remains a conservative non-POSIX deny",
+      command: `keeper agent run codex $'can\\'t retry' ${suffix}`,
+      referenceInstructionArgv: "non-POSIX",
+      expected: "deny",
+    },
+  ];
+
+  for (const entry of reference) {
+    test(`${entry.name}: ${JSON.stringify(entry.referenceInstructionArgv)}`, () => {
+      const reason = evaluateWrappedBash(entry.command, context);
+      if (entry.expected === "allow") expect(reason).toBeNull();
+      else expect(reason).not.toBeNull();
+    });
+  }
+});
+
+describe("evaluateWrappedBash — actionable provider run-gate denials", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+  const binding =
+    '--session wrapped --name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s';
+  const cases = [
+    {
+      construct: "provider harness",
+      command: `keeper agent run claude "implement task" --model opus --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "option-lookalike in instruction prose",
+      command: `keeper agent run codex implement this --carefully --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "duplicate boolean option",
+      command: `keeper agent run codex "implement task" --model gpt-5 --system-file /tmp/contract.md ${binding} --reap-window-on-terminal --reap-window-on-terminal`,
+    },
+    {
+      construct: "duplicate value option",
+      command: `keeper agent run codex "implement task" --model gpt-5 --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "missing option value",
+      command: `keeper agent run codex "implement task" --model --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "positional count",
+      command: `keeper agent run codex --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "quoting split",
+      command: `keeper agent run codex implement task --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "empty positional instruction",
+      command: `keeper agent run codex "" --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+    },
+    {
+      construct: "launch-context binding",
+      command:
+        'keeper agent run codex "implement task" --model gpt-5 --system-file /tmp/contract.md --session other --name fn-1-x.2 --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout 300s',
+    },
+    {
+      construct: "missing --system-file",
+      command: `keeper agent run codex "implement task" --model gpt-5 ${binding}`,
+    },
+    {
+      construct: "model/preset option-count",
+      command: `keeper agent run codex "implement task" --model gpt-5 --preset gpt-5::high --system-file /tmp/contract.md ${binding}`,
+    },
+  ];
+
+  for (const row of cases) {
+    test(`names and steers: ${row.construct}`, () => {
+      const reason = evaluateWrappedBash(row.command, context);
+      expect(reason).toContain(row.construct);
+      expect(reason).toMatch(/expected positional count 1, received \d+/);
+      expect(reason).toContain("first offending token ");
+      expect(reason).toContain("Do not retry the same quoting");
+      expect(reason).toContain(
+        "single short, single-line double-quoted instruction",
+      );
+      expect(reason).toContain("--system-file");
+    });
+  }
+
+  test("distinguishes option-lookalike prose from a quoting split", () => {
+    const optionReason = evaluateWrappedBash(cases[1].command, context);
+    const splitReason = evaluateWrappedBash(cases[6].command, context);
+    expect(optionReason).toContain("option-lookalike in instruction prose");
+    expect(optionReason).not.toContain("quoting split");
+    expect(splitReason).toContain("quoting split");
+    expect(splitReason).not.toContain("option-lookalike in instruction prose");
+  });
+
+  test("bounds and sanitizes the first offending token excerpt", () => {
+    const offending = `${"x".repeat(96)}\n\t\u0000tail`;
+    const reason = evaluateWrappedBash(
+      `keeper agent run codex "implement task" "${offending}" --model gpt-5 --system-file /tmp/contract.md ${binding}`,
+      context,
+    );
+    expect(reason).toContain("quoting split");
+    expect(reason).toContain("[truncated]");
+    expect(reason).not.toContain(offending);
+    expect(reason).not.toContain("\n");
+    expect(reason).not.toContain("\t");
+    expect(reason).not.toContain("\u0000");
+    expect((reason ?? "").length).toBeLessThan(500);
+  });
+});
+
 describe("evaluateWrappedBash — CVE-2025-66032 shell-bypass corpus (deny vectors)", () => {
   // The blocklist-bypass class that must be rejected UP FRONT by the positive
   // allowlist: substitution, compound operators smuggling an off-list segment,

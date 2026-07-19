@@ -25,8 +25,10 @@ It emits one JSON line `{driver, candidates: [{harness, model_id, preset_name}, 
 
 **Launch the first candidate with `keeper agent run` directly — no manual detach, no pidfile.** `run` already opens its own detached tmux window, launches the harness into it, and waits inside the SAME process; you never need `nohup`/`sh -c`/a hand-rolled pidfile, and the wrapped-cell guard denies all of those anyway (every interpreter/shell and every re-entrant wrapper is off its Bash allowlist). Bound the FIRST call's own `--stop-timeout` to a chunk safely under your Bash tool's own per-call ceiling (well under 10 minutes — a real implementation outlasts one call) — never pass the full `stop_timeout_ms` from `defaults` verbatim if it exceeds that. Group every provider leg in the shared `wrapped` tmux session, give its window the deterministic bare task-ID name `<task-id>`, and target `--output` at the injected `$KEEPER_WRAPPED_ENVELOPE` (a literal shell env reference, not a value you compose — it resolves to exactly the path the producer set, the same path task 4's detection surface probes). The guard permits only Keeper delegation/close-out and read-only Git — raw staging/ref commands, mutating Plan verbs other than `done`, and direct repository tests/scripts stay denied. The window is resident while the provider runs; exact cleanup is daemon-owned by the run handle/window identity, not by a title and not by a one-shot reap flag.
 
+The `<delegate prompt>` positional MUST be one short, single-line, double-quoted instruction with no substitutions, embedded option-lookalikes, or composed/multiline prose. Put every longer instruction and all task detail in `--system-file`; do not substitute a file into the positional.
+
 ```bash
-keeper agent run <harness> "<delegate prompt>" \
+keeper agent run <harness> "<short substitution-free instruction>" \
   --model <model_id> --system-file <contract-path> \
   --session wrapped --name <task-id> \
   --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout <chunk>ms
@@ -38,10 +40,10 @@ This one call replaces launch + first wait. It returns the uniform envelope `{sc
 
 **Wait in chunks under the budget.** While the leg is still running, poll `keeper agent wait <handle> --stop-timeout <chunk>ms`, re-invoking across turns until the leg stops or the `stop_timeout_ms` budget from `defaults` is spent — never idle-wait text-only, never one call sized to the whole budget. Exhausting the budget with no stop is a genuine timeout (see Failure map). On a retry, keep polling the exact `handle` you already captured (or the durable fenced transfer target) rather than double-launching a second `<task-id>` leg — never discover a stale same-name leg in the shared `wrapped` session and adopt it by title.
 
-**Iterate: resume the leg, never fix it yourself.** Any unfinished/failed/needs-more-work outcome — Phase 3 finds the suite still red, `commit-work` in Phase 4 returns `lint_failed`, or the leg's own `status` reports incomplete — is delivered back to the SAME leg as a fresh instruction, never patched by you. Resume by the captured Harness `resume_target`; if the harness reports no resume target, use the exact resolved stopped session id. Keep the presentation fields so the resumed provider leg rejoins the shared `wrapped` tmux session with the same bare task-ID title:
+**Iterate: resume the leg, never fix it yourself.** Any unfinished/failed/needs-more-work outcome — Phase 3 finds the suite still red, `commit-work` in Phase 4 returns `lint_failed`, or the leg's own `status` reports incomplete — is delivered back to the SAME leg as a fresh instruction, never patched by you. Resume by the captured Harness `resume_target`; if the harness reports no resume target, use the exact resolved stopped session id. Keep the presentation fields so the resumed provider leg rejoins the shared `wrapped` tmux session with the same bare task-ID title. The resume positional obeys the same shape: one short, single-line, double-quoted instruction with no substitutions. Keep the correction inline on the existing allowlist with no new flag, and name only the failing check plus its one-line delta rather than composing multiline prose.
 
 ```bash
-keeper agent run <harness> "<instructions: failing test names + the one-line assertion delta, or the verbatim lint stderr, or the specific gap>" \
+keeper agent run <harness> "<short substitution-free correction>" \
   --resume <captured-resume-target-or-exact-session> \
   --session wrapped --name <task-id> \
   --output "$KEEPER_WRAPPED_ENVELOPE" --stop-timeout <chunk>ms
@@ -51,9 +53,10 @@ keeper agent run <harness> "<instructions: failing test names + the one-line ass
 
 **Failure map:**
 
+- Guard-denied launch/resume (a `PreToolUse` deny, so no leg started and no envelope was written) → reshape the positional exactly as the denial steers and retry at most **2 reshape-retries**. Never write an envelope for a denied attempt and never classify it `TOOLING_FAILURE`; only leg-side, post-launch outcomes enter the envelope taxonomy below.
 - Launch failure (`outcome: launch_failed`, the harness never came up) → fall through to the NEXT candidate in the pecking order; cap the walk at the roster length so cost order never flaps.
 - Budget timeout (the `stop_timeout_ms` budget is spent with the leg still unstopped, distinct from an in-budget chunk timeout) → retry the SAME provider up to `max_attempts`, then `BLOCKED: EXTERNAL_BLOCKED`.
-- Malformed run args (`outcome: bad_args`) or an absent/unwritten `$KEEPER_WRAPPED_ENVELOPE` → `BLOCKED: TOOLING_FAILURE`.
+- Malformed run args (`outcome: bad_args`) or an absent/unwritten `$KEEPER_WRAPPED_ENVELOPE` after an allowed launch → `BLOCKED: TOOLING_FAILURE`.
 - A no-message completion (`outcome: no_message`) that nonetheless left a non-empty diff → treat as completed and proceed to adjudicate.
 
 ## Phase 3 — Adjudicate: require the authoritative test pass

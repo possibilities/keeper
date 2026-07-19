@@ -243,6 +243,7 @@ function lexSegments(command: string): LexResult {
     }
     if (inDouble) {
       if (c === '"') inDouble = false;
+      else if (c === "\\" && next === "\n") i++;
       else if (c === "`") return { kind: "deny", reason: SUBSTITUTION };
       else if (c === "$" && next === "(")
         return { kind: "deny", reason: SUBSTITUTION };
@@ -265,7 +266,9 @@ function lexSegments(command: string): LexResult {
       continue;
     }
     if (c === "\\") {
-      if (next !== "") {
+      if (next === "\n") {
+        i++;
+      } else if (next !== "") {
         word += next;
         hasWord = true;
         i++;
@@ -305,6 +308,7 @@ function lexSegments(command: string): LexResult {
     word += c;
     hasWord = true;
   }
+  // An unterminated quote is malformed input — fail closed for a marked session.
   if (inSingle || inDouble) {
     return {
       kind: "deny",
