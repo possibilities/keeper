@@ -51,6 +51,7 @@ import {
 import {
   BUS_ARTIFACT_REF_TAG,
   BUS_ARTIFACT_REF_VERSION,
+  decodeBusSendResultFrame,
   publishBusArtifact,
 } from "../src/bus-artifact";
 import type { WakeResult } from "../src/bus-wake";
@@ -732,10 +733,94 @@ describe("send result disposition (exit-0 successes vs exit-1 misses)", () => {
     }
   });
 
-  test("sendSuccessMessage distinguishes a live delivery from a wake-queue", () => {
-    expect(sendSuccessMessage("delivered", "bob")).toBe("delivered to bob");
-    expect(sendSuccessMessage("queued_for_wake", "planner@fn-1")).toBe(
-      "queued_for_wake for planner@fn-1",
+  test("old acknowledgements preserve exact output and wake-queues stay unchanged", () => {
+    const old = decodeBusSendResultFrame({
+      result: "delivered",
+      recipients: 1,
+    });
+    expect(old).toEqual({ result: "delivered", recipients: 1 });
+    expect(sendSuccessMessage(old.result as "delivered", "bob")).toBe(
+      "delivered to bob",
     );
+    expect(
+      sendSuccessMessage("queued_for_wake", "planner@fn-1", {
+        status: "active",
+        reason: "main-turn",
+        observed_at: 123,
+      }),
+    ).toBe("queued_for_wake for planner@fn-1");
+  });
+
+  test("valid activity adds conservative send-time guidance", () => {
+    const active = decodeBusSendResultFrame({
+      result: "delivered",
+      recipients: 1,
+      recipient_activity: {
+        status: "active",
+        reason: "main-turn",
+        observed_at: 123,
+      },
+    });
+    expect(active).toEqual({
+      result: "delivered",
+      recipients: 1,
+      recipient_activity: {
+        status: "active",
+        reason: "main-turn",
+        observed_at: 123,
+      },
+    });
+    expect(
+      sendSuccessMessage("delivered", "bob", active.recipient_activity),
+    ).toBe(
+      "delivered to bob (recipient activity at send time: active; a reply already in progress may not include this message)",
+    );
+    expect(
+      sendSuccessMessage("delivered", "bob", {
+        status: "quiescent",
+        reason: "parent-quiescent",
+        observed_at: 123,
+      }),
+    ).toBe(
+      "delivered to bob (recipient activity at send time: quiescent; this does not confirm the message was read)",
+    );
+    expect(
+      sendSuccessMessage("delivered", "bob", {
+        status: "unknown",
+        reason: "child-evidence-stale",
+        observed_at: 123,
+      }),
+    ).toBe(
+      "delivered to bob (recipient activity at send time: unknown; this does not confirm the message was read)",
+    );
+  });
+
+  test("malformed and future activity metadata is ignored without changing send truth", () => {
+    for (const recipient_activity of [
+      { status: "busy", reason: "main-turn", observed_at: 123 },
+      { status: "active", reason: "future-reason", observed_at: 123 },
+      { status: "active", reason: "main-turn", observed_at: "now" },
+      { status: "quiescent", reason: "main-turn", observed_at: 123 },
+      "active",
+    ]) {
+      expect(
+        decodeBusSendResultFrame({
+          result: "delivered",
+          recipients: 1,
+          recipient_activity,
+        }),
+      ).toEqual({ result: "delivered", recipients: 1 });
+    }
+    expect(
+      decodeBusSendResultFrame({
+        result: "not_connected",
+        recipients: 0,
+        recipient_activity: {
+          status: "active",
+          reason: "main-turn",
+          observed_at: 123,
+        },
+      }),
+    ).toEqual({ result: "not_connected", recipients: 0 });
   });
 });

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { WrappedLegAbortCapture } from "../src/exec-backend";
 import {
   assembleWrappedLegAbortPayload,
@@ -19,6 +22,7 @@ import {
   redactAbortEvidence,
   resolveUniqueEligibleWrapper,
   runProviderLegDeathNoticeSweep,
+  sendProviderLegDeathNotice,
   terminalRowToCandidate,
   type WrapperAttemptRow,
 } from "../src/provider-leg-death-notice";
@@ -393,6 +397,30 @@ describe("launch-time abort capture", () => {
         detail: null,
         exit: { signal: null, code: null },
       });
+    }
+  });
+
+  test("recipient activity metadata does not change Provider-leg delivery truth", async () => {
+    const root = mkdtempSync(join(tmpdir(), "provider-leg-notice-"));
+    try {
+      const result = await sendProviderLegDeathNotice({
+        sockPath: "/unused",
+        candidate: candidate(),
+        wrapperJobId: "wrapper-1",
+        artifactRoot: root,
+        sendArtifact: async () => ({
+          result: "delivered",
+          recipients: 1,
+          recipient_activity: {
+            status: "quiescent",
+            reason: "parent-quiescent",
+            observed_at: 123,
+          },
+        }),
+      });
+      expect(result).toEqual({ kind: "delivered" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

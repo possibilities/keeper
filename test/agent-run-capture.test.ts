@@ -2135,7 +2135,15 @@ describe("main() — agent run --resume", () => {
             },
           })}\n`,
         );
-        return { result: "delivered", recipients: 1 };
+        return {
+          result: "delivered",
+          recipients: 1,
+          recipient_activity: {
+            status: "active",
+            reason: "main-turn",
+            observed_at: 123,
+          },
+        };
       },
     });
 

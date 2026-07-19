@@ -44,6 +44,7 @@ import { dirname, join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import {
   type BusArtifactRef,
+  type BusRecipientActivity,
   decodeBusArtifactRef,
   encodeBusArtifactRef,
   listBusArtifactIds,
@@ -89,6 +90,11 @@ import {
   unlinkIfExists,
   type Writable,
 } from "./server-worker";
+import {
+  deriveHarnessActivity,
+  type HarnessChildEvidence,
+  type HarnessParentEvidence,
+} from "./session-activity";
 
 /** Reserved control namespace (lifecycle: join / part / reap / takeover). */
 export const CONTROL_NAMESPACE = "bus";
@@ -470,6 +476,116 @@ export function publishOutcome(
   if (resolveKind === "ambiguous") return "ambiguous_target";
   if (!resolvedConnected) return "not_connected";
   return deliveredCount >= 1 ? "delivered" : "delivery_failed";
+}
+
+/** Maximum child evidence rows one send may transfer off the indexed lookup. */
+export const RECIPIENT_ACTIVITY_CHILD_CAP = 256;
+
+export interface RecipientActivityEvidence {
+  parent: HarnessParentEvidence | null;
+  children: HarnessChildEvidence[];
+}
+
+export type RecipientActivityEvidenceReader = (
+  db: Database,
+  jobId: string,
+) => RecipientActivityEvidence | null;
+
+/**
+ * Read parent and child/resource evidence in one short read-only transaction.
+ * Both lookups are recipient-keyed and the child history read stops at cap + 1;
+ * an oversized history is partial evidence and therefore omits enrichment.
+ */
+export const readRecipientActivityEvidence: RecipientActivityEvidenceReader = (
+  db,
+  jobId,
+) => {
+  const read = db.transaction((): RecipientActivityEvidence | null => {
+    const parent = db
+      .query(
+        `SELECT job_id, state, updated_at, monitors
+           FROM jobs
+          WHERE job_id = ?`,
+      )
+      .get(jobId) as HarnessParentEvidence | null;
+    if (parent === null) return null;
+    // Canonical activity consults child/resource evidence only for a stopped
+    // parent. Other states resolve from the parent row alone.
+    if (parent.state !== "stopped") return { parent, children: [] };
+
+    const children = db
+      .query(
+        `SELECT job_id, agent_id, turn_seq, status, duration_ms, updated_at,
+                subagent_type
+           FROM subagent_invocations
+          WHERE job_id = ?
+          LIMIT ?`,
+      )
+      .all(jobId, RECIPIENT_ACTIVITY_CHILD_CAP + 1) as HarnessChildEvidence[];
+    if (children.length > RECIPIENT_ACTIVITY_CHILD_CAP) return null;
+    return { parent, children };
+  });
+  return read();
+};
+
+/**
+ * Sample canonical Harness activity once for a stable recipient identity.
+ * Every read/shape/derivation fault fails soft to omission; canonical
+ * inconclusive evidence remains an explicit `unknown` observation.
+ */
+export function sampleRecipientActivity(
+  db: Database,
+  jobId: string | null | undefined,
+  observedAt: number = Math.floor(Date.now() / 1000),
+  readEvidence: RecipientActivityEvidenceReader = readRecipientActivityEvidence,
+): BusRecipientActivity | null {
+  if (
+    typeof jobId !== "string" ||
+    jobId.length === 0 ||
+    !Number.isSafeInteger(observedAt) ||
+    observedAt < 0
+  ) {
+    return null;
+  }
+  try {
+    const evidence = readEvidence(db, jobId);
+    if (
+      evidence === null ||
+      evidence.parent === null ||
+      evidence.parent.job_id !== jobId ||
+      !Array.isArray(evidence.children) ||
+      evidence.children.some((child) => child.job_id !== jobId)
+    ) {
+      return null;
+    }
+    const activity = deriveHarnessActivity({
+      parent: evidence.parent,
+      children: evidence.children,
+      now: observedAt,
+    });
+    return {
+      status: activity.status,
+      reason: activity.reason,
+      observed_at: observedAt,
+    } as BusRecipientActivity;
+  } catch {
+    return null;
+  }
+}
+
+/** Attach activity only to the final delivered acknowledgement. */
+export function publishAckBody(
+  result: string,
+  recipients: number,
+  activity: BusRecipientActivity | null,
+): Record<string, unknown> {
+  return {
+    result,
+    recipients,
+    ...(result === "delivered" && activity !== null
+      ? { recipient_activity: activity }
+      : {}),
+  };
 }
 
 /**
@@ -1692,7 +1808,7 @@ export function startBusServer(
         status,
         reply_to: op.reply_to ?? null,
       });
-      sendAck(sock, "publish", { result: status, recipients: 0 });
+      sendAck(sock, "publish", publishAckBody(status, 0, null));
       return;
     }
 
@@ -1724,6 +1840,12 @@ export function startBusServer(
       payload,
       op.reply_to ?? null,
     );
+    // Sample the resolved stable recipient once immediately BEFORE fanout. A
+    // failed or partial projection read omits only this optional metadata.
+    const recipientActivity = sampleRecipientActivity(
+      keeperDb,
+      res.kind === "ok" ? res.identity?.job_id : null,
+    );
     const delivered = fanout(
       namespace,
       resolvedChannelId,
@@ -1737,7 +1859,11 @@ export function startBusServer(
       outcome,
       outcome === "delivered" ? Date.now() : undefined,
     );
-    sendAck(sock, "publish", { result: outcome, recipients: delivered });
+    sendAck(
+      sock,
+      "publish",
+      publishAckBody(outcome, delivered, recipientActivity),
+    );
   };
 
   /** Build one delivered-message event envelope (the 2-axis wire shape). */
