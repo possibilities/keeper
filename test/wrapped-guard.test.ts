@@ -422,6 +422,11 @@ describe("evaluateWrappedBash — CVE-2025-66032 shell-bypass corpus (deny vecto
     "keeper agent wait $(python3 -c 'x')",
     "keeper agent wait `whoami`",
     'keeper agent wait "$(rm -rf src)"',
+    `keeper agent wait "$\\
+(evil)"`,
+    `keeper agent wait "$\\
+\\
+(evil)"`,
     // process substitution
     "diff <(git show a) <(git show b)",
     // compound where a LATER segment is the bypass (allowlisted prefix + off-list)
