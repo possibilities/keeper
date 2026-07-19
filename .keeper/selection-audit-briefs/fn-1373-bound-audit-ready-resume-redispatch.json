@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 23,
+        "files_changed": 2,
+        "insertions": 112
+      },
+      "done_summary": "Bounded the AUDIT_READY work rung on the same owner-redispatch attempt bound (blockOwnerEscalationDecision) as ordinary unblock categories, so a crash-looping replacement audit orchestrator falls through to the legacy unblock/paging rung past the bound instead of redispatching forever; added a daemon.test.ts case driving repeated replacement deaths that asserts the bound fires and the human is paged.",
+      "input_hash": "e3e0a75c735ccc39f078d6f30e8520b585fb6d13bc008e8a65f9d31336335f96",
+      "model": "opus",
+      "spec_chars": 2414,
+      "spec_md": "## Description\n\nAddresses finding F1 (with the F3 test gap folded in). At audited commit c5967fb0,\nsrc/daemon.ts runBlockEscalationSweep derives the handling rung as\n`route === \"work\" ? \"redispatch_owner\" : \"dispatch_legacy_unblock\"` and consults\nthe owner-redispatch attempt bound (blockOwnerEscalationDecision, gated on\n`owner_redispatch_attempts < BLOCK_OWNER_REDISPATCH_LIMIT`) ONLY inside the\n`route === \"unblock\"` branch. The AUDIT_READY work route therefore hard-sets\nredispatch_owner and never checks the bound: a replacement audit orchestrator that\nrepeatedly dies past the 120s grace re-dispatches a fresh owner forever and NEVER\npages the human \u2014 the eventual-escalation safety net every sibling category keeps\nis absent for this one category (F3: the pathological loop is untested; only the\nresume-once happy path and the at-cap skip are covered).\n\nGate the AUDIT_READY work rung on the same attempt bound so that, past N witnessed\nreplacement-orchestrator deaths, it falls through to a page (the legacy-unblock\npaging rung, or a distinct AUDIT_READY-resume-exhausted surface). Preserve the\nintended autonomous single-resume below the bound and leave the live-orchestrator\ndefer path and AUDIT_SEVERE routing untouched.\n\nFiles:\n- src/daemon.ts \u2014 the runBlockEscalationSweep handlingRung derivation / route==work gate.\n- test/daemon.test.ts \u2014 add the repeated replacement-orchestrator death case.\n\n## Acceptance\n\n- [ ] the AUDIT_READY work rung consults blockOwnerEscalationDecision (or the equivalent attempt bound) rather than hard-setting redispatch_owner\n- [ ] past the bound, the resume pages (or surfaces an AUDIT_READY-resume-exhausted row) instead of redispatching indefinitely\n- [ ] autonomous resume of a once-dead orchestrator below the bound is unchanged; live-orchestrator defer and AUDIT_SEVERE routing are unchanged\n- [ ] a daemon.test.ts case drives dead -> resume -> replacement dies past grace -> ... and asserts the bound fires and the human is paged\n\n## Done summary\nBounded the AUDIT_READY work rung on the same owner-redispatch attempt bound (blockOwnerEscalationDecision) as ordinary unblock categories, so a crash-looping replacement audit orchestrator falls through to the legacy unblock/paging rung past the bound instead of redispatching forever; added a daemon.test.ts case driving repeated replacement deaths that asserts the bound fires and the human is paged.\n## Evidence\n",
+      "task_id": "fn-1373-bound-audit-ready-resume-redispatch.1",
+      "tier": "xhigh",
+      "title": "Bound audit-resume redispatch"
+    }
+  ],
+  "created_at": "2026-07-19T11:26:22.520000Z",
+  "epic_id": "fn-1373-bound-audit-ready-resume-redispatch",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "e3e0a75c735ccc39f078d6f30e8520b585fb6d13bc008e8a65f9d31336335f96",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
