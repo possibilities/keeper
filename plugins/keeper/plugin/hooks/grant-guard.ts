@@ -28,7 +28,7 @@
 // permissionDecision envelope; ALWAYS exit 0 (a non-zero exit could fail-close a
 // human session); an internal error WHILE IN JURISDICTION denies (fail closed).
 
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 
 import {
   type EscalationRole,
@@ -55,6 +55,8 @@ export interface RoleConfig {
    *  grant — bounds which `keeper autopilot retry <verb::id>` the subagent may
    *  run to its OWN incident. */
   readonly incidentId?: string | null;
+  /** Launch-bound wrapped task, when this guard runs in a marked wrapped cell. */
+  readonly taskId?: string;
 }
 
 /** `keeper <sub>` subcommands the read/board subset allows for EVERY role. */
@@ -558,6 +560,27 @@ function isNamedBunScript(target: string | undefined): boolean {
   );
 }
 
+function wrappedPlanBlockViolation(
+  tokens: string[],
+  expectedTask: string | undefined,
+): string | null {
+  if (expectedTask === undefined || tokens[3] !== expectedTask) {
+    return "wrapped `keeper plan block` must name the launch-bound task";
+  }
+  for (const option of tokens.slice(4)) {
+    if (option === "--force" || option.startsWith("--force=")) {
+      return "wrapped `keeper plan block --force` is forbidden";
+    }
+  }
+  if (tokens.length !== 6 || tokens[4] !== "--reason") {
+    return "wrapped `keeper plan block` permits only one --reason value";
+  }
+  if (!(tokens[5] as string).startsWith("AUDIT_READY:")) {
+    return "wrapped `keeper plan block --reason` must start with `AUDIT_READY:`";
+  }
+  return null;
+}
+
 /** `keeper autopilot retry <verb::id>` is an incident-CLEARING verb: a granted
  *  subagent may re-arm its OWN incident, never a sibling's. Allowed only when a
  *  valid grant names this exact incident id; a grant-less subagent, a foreign or
@@ -628,6 +651,9 @@ function classifyExecutable(tokens: string[], cfg: RoleConfig): string | null {
     }
     if (sub === "autopilot") {
       return classifyAutopilotRetry(tokens, cfg);
+    }
+    if (sub === "plan" && tokens[2] === "block") {
+      return wrappedPlanBlockViolation(tokens, cfg.taskId);
     }
     if (KEEPER_READ_SUBCOMMANDS.has(sub)) return null;
     return `\`keeper ${sub}\` is not on the escalation allowlist`;
@@ -787,12 +813,28 @@ export interface GrantGuardDeps {
   realpath(abs: string): string | null;
   /** Producer clock (epoch-ms); a grant validates against it. */
   now(): number;
+  /** Launch-bound wrapped task derived from the marked cell's envelope path. */
+  wrappedTaskId?: string;
+}
+
+type WrappedGrantEnv = GrantEnv & {
+  KEEPER_WRAPPED_CELL?: string;
+  KEEPER_WRAPPED_ENVELOPE?: string;
+};
+
+function wrappedTaskIdFromEnv(env: WrappedGrantEnv): string | undefined {
+  if ((env.KEEPER_WRAPPED_CELL ?? "").trim() === "") return undefined;
+  const envelope = (env.KEEPER_WRAPPED_ENVELOPE ?? "").trim();
+  const file = basename(envelope);
+  const taskId = file.endsWith(".json") ? file.slice(0, -5) : "";
+  return taskId.match(/^fn-\d+-[a-z0-9-]+\.\d+$/) ? taskId : undefined;
 }
 
 export function productionDeps(
-  env: GrantEnv,
+  env: WrappedGrantEnv,
   now: () => number = Date.now,
 ): GrantGuardDeps {
+  const wrappedTaskId = wrappedTaskIdFromEnv(env);
   return {
     grantLookup: (agentType, at) => {
       const expectation = grantExpectationFromEnv(env, agentType);
@@ -801,6 +843,7 @@ export function productionDeps(
     },
     realpath: realpathNearest,
     now,
+    ...(wrappedTaskId === undefined ? {} : { wrappedTaskId }),
   };
 }
 
@@ -927,6 +970,9 @@ function decideBash(
     role,
     writeCapable: grant.writeCapable,
     incidentId: grant.incidentId,
+    ...(deps.wrappedTaskId === undefined
+      ? {}
+      : { taskId: deps.wrappedTaskId }),
   };
   const violation = evaluateGrantBash(command, cfg);
   if (violation !== null) return denyEnvelope(bashReason(role, violation));

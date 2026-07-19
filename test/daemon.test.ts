@@ -5836,10 +5836,11 @@ test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and 
     orchestrator,
     nowMs: diedAtMs,
   };
-  const { deps, mints, dispatches } = fakeSweepDeps(options);
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps(options);
 
   await runBlockEscalationSweep(deps);
   expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([]);
   expect(mints.at(-1)).toEqual({
     kind: "attempted",
     epicId: "fn-1-rearm",
@@ -5859,7 +5860,8 @@ test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and 
 
   options.nowMs = diedAtMs + AUDIT_READY_ORCHESTRATOR_GRACE_MS;
   await runBlockEscalationSweep(deps);
-  expect(dispatches).toEqual([
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([
     { epicId: "fn-1-rearm", taskId: "fn-1-rearm.1" },
   ]);
   expect(mints.slice(-2)).toEqual([
@@ -5868,15 +5870,16 @@ test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and 
       kind: "attempted",
       epicId: "fn-1-rearm",
       taskId,
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
 
-  // Simulate those events folding before the next heartbeat: the terminal
-  // dispatched row is outside both eligible selector states.
-  row.outcome = "dispatched";
+  // A folded replacement owner keeps the still-parked latch pending while its
+  // live jobs row makes the audit gate defer.
+  row.outcome = "owner_redispatched";
+  orchestrator[taskId] = { state: "live" };
   await runBlockEscalationSweep(deps);
-  expect(dispatches).toHaveLength(1);
+  expect(ownerDispatches).toHaveLength(1);
 });
 
 test("runBlockEscalationSweep: repeat surface-and-stop reason classes stay terminal without re-emitting", async () => {
@@ -6357,7 +6360,7 @@ const AUDIT_SEVERE_REASON =
   "AUDIT_SEVERE: verified-severe finding survived refute";
 
 test("runBlockEscalationSweep: AUDIT_READY with a LIVE orchestrator defers — no dispatch, no mint (self-handled)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
     orchestrator: { "fn-1-foo.1": { state: "live" } },
@@ -6368,11 +6371,12 @@ test("runBlockEscalationSweep: AUDIT_READY with a LIVE orchestrator defers — n
   // A live orchestrator owns the audit — the producer pages no one and mints
   // nothing, so the latch stays pending and re-sweeps.
   expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([]);
   expect(mints).toEqual([]);
 });
 
-test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace escalates like any block (one unblock dispatch)", async () => {
-  const { deps, mints, dispatches } = fakeSweepDeps({
+test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace dispatches one work resume", async () => {
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
     pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
     reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
     // Died 200s ago, grace is 120s — past grace → escalate.
@@ -6385,18 +6389,39 @@ test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace e
   );
   await runBlockEscalationSweep(deps);
 
-  // A witnessed death past grace hands the park to the ordinary block path —
-  // exactly one unblock dispatch, latch advanced pending→requested→attempted once.
-  expect(dispatches).toEqual([{ epicId: "fn-1-foo", taskId: "fn-1-foo.1" }]);
+  // The work dispatcher is the owner-fenced autopilot path; the unblock dispatcher
+  // must remain untouched because an unblocker cannot advance the audit handoff.
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
   expect(mints).toEqual([
     { kind: "requested", epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
     {
       kind: "attempted",
       epicId: "fn-1-foo",
       taskId: "fn-1-foo.1",
-      outcome: "dispatched",
+      outcome: "owner_redispatched",
     },
   ]);
+});
+
+test("runBlockEscalationSweep: an AUDIT_READY work resume at cap stays pending", async () => {
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
+    orchestrator: { "fn-1-foo.1": { state: "dead", diedAtMs: 800_000 } },
+    nowMs: 1_000_000,
+    dispatchOwner: async () => "at_cap",
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([]);
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
+  ]);
+  expect(mints).toEqual([]);
 });
 
 test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator WITHIN grace defers (no page yet)", async () => {
@@ -6763,9 +6788,10 @@ test("BlockCandidateDropClass: the class union is stable (alarm/grep contract)",
 
 // ---- routeBlockedCategory (the category→handler dispatch table / shared seam) --
 
-test("routeBlockedCategory: the three routes are keyed by category", () => {
-  // SHARED_BASE_BROKEN → repair; TOOLING_FAILURE / null / unparseable → surface_and_stop;
-  // every other escalatable category → unblock.
+test("routeBlockedCategory: the four routes are keyed by category", () => {
+  // AUDIT_READY resumes work; SHARED_BASE_BROKEN repairs; TOOLING_FAILURE / null
+  // surface-and-stop; every other escalatable category unblocks.
+  expect(routeBlockedCategory("AUDIT_READY")).toBe("work");
   expect(routeBlockedCategory(SHARED_BASE_BROKEN_CATEGORY)).toBe("repair");
   expect(routeBlockedCategory(BLOCK_ESCALATION_SKIP_CATEGORY)).toBe(
     "surface_and_stop",

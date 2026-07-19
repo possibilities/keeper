@@ -591,6 +591,72 @@ describe("decideGrantGuard — Bash", () => {
   });
 });
 
+describe("decideGrantGuard — launch-bound AUDIT_READY block", () => {
+  const wrappedDeps = () =>
+    productionDeps(
+      {
+        KEEPER_WRAPPED_CELL: "gpt-5::high",
+        KEEPER_WRAPPED_ENVELOPE:
+          "/repo/.keeper/state/wrapped-envelopes/fn-1-x.2.json",
+      },
+      () => 1_000,
+    );
+
+  test("allows the launch-bound task with an AUDIT_READY-prefixed reason", () => {
+    expect(
+      decideGrantGuard(
+        bashPayload(
+          "unblocker",
+          "keeper plan block fn-1-x.2 --reason 'AUDIT_READY: abc123 committed'",
+        ),
+        wrappedDeps(),
+      ),
+    ).toBeNull();
+  });
+
+  test("denies an AUDIT_READY block for a foreign task", () => {
+    const decision = decideGrantGuard(
+      bashPayload(
+        "unblocker",
+        "keeper plan block fn-1-other.9 --reason 'AUDIT_READY: abc123 committed'",
+      ),
+      wrappedDeps(),
+    );
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "launch-bound task",
+    );
+  });
+
+  test("denies a launch-bound block whose reason is not AUDIT_READY", () => {
+    const decision = decideGrantGuard(
+      bashPayload(
+        "unblocker",
+        "keeper plan block fn-1-x.2 --reason 'TOOLING_FAILURE: provider failed'",
+      ),
+      wrappedDeps(),
+    );
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "must start with `AUDIT_READY:`",
+    );
+  });
+
+  test("denies --force on an otherwise valid launch-bound AUDIT_READY block", () => {
+    const decision = decideGrantGuard(
+      bashPayload(
+        "unblocker",
+        "keeper plan block fn-1-x.2 --reason 'AUDIT_READY: abc123 committed' --force",
+      ),
+      wrappedDeps(),
+    );
+    expect(decision?.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(decision?.hookSpecificOutput.permissionDecisionReason).toContain(
+      "plan block --force",
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Incident-clearing retry — `keeper autopilot retry <verb::id>` is bound to the
 // grant's OWN incident id; a granted subagent re-arms its own incident only.
