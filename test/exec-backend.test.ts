@@ -1686,6 +1686,38 @@ test("keeperAgentLaunch: exit 0 + valid JSON → ok; spawns the keeper agent arg
   expect(records[0]?.cwd).toBe("/repo");
 });
 
+test("keeperAgentLaunch: a raw Pi Launch triple reaches native argv with exact prompt bytes", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeKeeperAgentSpawnStub(
+    LAP,
+    { stdout: KEEPER_AGENT_OK_LINE, exitCode: 0 },
+    records,
+  );
+  const prompt = "  lead\nUnicode 🧪; $HOME; `cmd`; $(touch nope)\ntrail  ";
+  const res = await keeperAgentLaunch({
+    noteLine: () => {},
+    launcherArgvPrefix: LAP,
+    session: "work",
+    cwd: "/repo",
+    label: "handoff::raw-pi",
+    spec: {
+      prompt,
+      claudeName: "handoff::raw-pi",
+      harness: "pi",
+      preset: "pi::openai/gpt-5.5::high",
+    },
+    spawn,
+  });
+  expect(res).toEqual({ ok: true });
+  const argv = records[0]?.cmd ?? [];
+  expect(argv[LAP.length]).toBe("pi");
+  const presetIndex = argv.indexOf("--x-preset");
+  expect(argv[presetIndex + 1]).toBe("pi::openai/gpt-5.5::high");
+  expect(argv.at(-1)).toBe(prompt);
+  expect(argv).not.toContain("--model");
+  expect(argv).not.toContain("--effort");
+});
+
 test("keeperAgentLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeKeeperAgentSpawnStub(LAP, { exitCode: 4 }, records);

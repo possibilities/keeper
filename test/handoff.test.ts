@@ -90,7 +90,7 @@ test("buildRequestHandoffFrame: carries desired_slug + doc_path, not the inline 
   });
 });
 
-test("buildRequestHandoffFrame: carries capture fields only for a capturing request", () => {
+test("buildRequestHandoffFrame: carries independent capture and selector fields when present", () => {
   const req = {
     desired_slug: "capture-result",
     doc_path: "/state/handoff/rpc-capture.txt",
@@ -100,60 +100,64 @@ test("buildRequestHandoffFrame: carries capture fields only for a capturing requ
     initiator_session: null,
     initiator_pane: null,
   };
-  expect(
-    buildRequestHandoffFrame("rpc-capture", req, {
-      capture: true,
-      model: "opus",
-      effort: "high",
-      preset: null,
-    }),
-  ).toEqual({
-    type: "rpc",
-    id: "rpc-capture",
-    method: "request_handoff",
-    params: {
-      ...req,
-      capture: true,
-      model: "opus",
-      effort: "high",
-      preset: null,
-    },
-  });
+  for (const capture of [false, true]) {
+    expect(
+      buildRequestHandoffFrame(`rpc-${capture}`, req, {
+        capture,
+        model: "opus",
+        effort: "high",
+        preset: null,
+      }),
+    ).toEqual({
+      type: "rpc",
+      id: `rpc-${capture}`,
+      method: "request_handoff",
+      params: {
+        ...req,
+        capture,
+        model: "opus",
+        effort: "high",
+        preset: null,
+      },
+    });
+  }
 });
 
-test("resolveHandoffCaptureRequest: validates capture launch triples client-side", () => {
-  expect(
-    resolveHandoffCaptureRequest({
-      capture: true,
-      preset: "pi::openai/gpt-5.5::high",
-      model: undefined,
-      effort: undefined,
-    }),
-  ).toEqual({
-    ok: true,
-    capture: {
-      capture: true,
-      model: null,
-      effort: null,
-      preset: "pi::openai/gpt-5.5::high",
-    },
-  });
-  expect(
-    resolveHandoffCaptureRequest({
-      capture: true,
-      preset: undefined,
-      model: "opus",
-      effort: "high",
-    }),
-  ).toEqual({
-    ok: true,
-    capture: {
-      capture: true,
-      model: "opus",
-      effort: "high",
-      preset: null,
-    },
-  });
+test("resolveHandoffCaptureRequest: validates launch selection independently from capture", () => {
+  for (const capture of [false, true]) {
+    expect(
+      resolveHandoffCaptureRequest({
+        capture,
+        preset: "pi::openai/gpt-5.5::high",
+        model: undefined,
+        effort: undefined,
+      }),
+    ).toEqual({
+      ok: true,
+      capture: {
+        capture,
+        model: null,
+        effort: null,
+        preset: "pi::openai/gpt-5.5::high",
+      },
+    });
+    expect(
+      resolveHandoffCaptureRequest({
+        capture,
+        preset: undefined,
+        model: "opus",
+        effort: "high",
+      }),
+    ).toEqual({
+      ok: true,
+      capture: {
+        capture,
+        model: "opus",
+        effort: "high",
+        preset: null,
+      },
+    });
+  }
   expect(
     resolveHandoffCaptureRequest({
       capture: false,
@@ -162,46 +166,53 @@ test("resolveHandoffCaptureRequest: validates capture launch triples client-side
       effort: undefined,
     }),
   ).toEqual({ ok: true, capture: null });
+  expect(
+    resolveHandoffCaptureRequest({
+      capture: true,
+      preset: undefined,
+      model: undefined,
+      effort: undefined,
+    }),
+  ).toEqual({
+    ok: true,
+    capture: { capture: true, model: null, effort: null, preset: null },
+  });
 
-  for (const args of [
-    {
-      capture: false,
-      preset: "claude::opus::high",
-      model: undefined,
-      effort: undefined,
-    },
-    {
-      capture: true,
-      preset: "not-a-triple",
-      model: undefined,
-      effort: undefined,
-    },
-    {
-      capture: true,
-      preset: "claude::opus::high",
-      model: "opus",
-      effort: "high",
-    },
-    {
-      capture: true,
-      preset: undefined,
-      model: "opus",
-      effort: undefined,
-    },
-    {
-      capture: true,
-      preset: undefined,
-      model: undefined,
-      effort: "high",
-    },
-    {
-      capture: true,
-      preset: undefined,
-      model: "bad:model",
-      effort: "high",
-    },
-  ]) {
-    expect(resolveHandoffCaptureRequest(args).ok).toBe(false);
+  for (const capture of [false, true]) {
+    for (const args of [
+      {
+        capture,
+        preset: "not-a-triple",
+        model: undefined,
+        effort: undefined,
+      },
+      {
+        capture,
+        preset: "claude::opus::high",
+        model: "opus",
+        effort: "high",
+      },
+      {
+        capture,
+        preset: undefined,
+        model: "opus",
+        effort: undefined,
+      },
+      {
+        capture,
+        preset: undefined,
+        model: undefined,
+        effort: "high",
+      },
+      {
+        capture,
+        preset: undefined,
+        model: "bad:model",
+        effort: "high",
+      },
+    ]) {
+      expect(resolveHandoffCaptureRequest(args).ok).toBe(false);
+    }
   }
 });
 
@@ -314,7 +325,7 @@ test("resolveTargetDir: a --cwd pointing at a file (not a directory) is a miss (
 
 // ── retired spelling: the launch dir is --cwd; the old --dir hard-fails ──────
 
-test("request_handoff capture fields validate and reach the worker bridge", async () => {
+test("request_handoff selector fields validate independently from capture and reach the worker bridge", async () => {
   const calls: Parameters<ReplayBridge["requestHandoff"]>[0][] = [];
   const bridge = {
     requestHandoff: async (
@@ -325,36 +336,63 @@ test("request_handoff capture fields validate and reach the worker bridge", asyn
     },
   } as unknown as ReplayBridge;
 
-  await expect(
-    requestHandoffHandler(
+  const expected: Parameters<ReplayBridge["requestHandoff"]>[0][] = [];
+  for (const capture of [false, true]) {
+    for (const selector of [
       {
-        desired_slug: "capture-result",
-        doc_path: "/state/handoff/rpc-capture.txt",
-        target_session: "work",
-        capture: true,
+        suffix: "none",
+        input: {},
+        model: null,
+        effort: null,
+        preset: null,
+      },
+      {
+        suffix: "preset",
+        input: { preset: "pi::openai/gpt-5.5::high" },
+        model: null,
+        effort: null,
         preset: "pi::openai/gpt-5.5::high",
       },
-      bridge,
-    ),
-  ).resolves.toEqual({ ok: true, handoff_id: "capture-result" });
-  expect(calls).toEqual([
-    {
-      desired_slug: "capture-result",
-      doc_path: "/state/handoff/rpc-capture.txt",
-      title: null,
-      target_session: "work",
-      target_dir: null,
-      initiator_session: null,
-      initiator_pane: null,
-      capture: true,
-      model: null,
-      effort: null,
-      preset: "pi::openai/gpt-5.5::high",
-    },
-  ]);
+      {
+        suffix: "pair",
+        input: { model: "opus", effort: "high" },
+        model: "opus",
+        effort: "high",
+        preset: null,
+      },
+    ] as const) {
+      const desired_slug = `${capture ? "capture" : "ordinary"}-${selector.suffix}`;
+      await expect(
+        requestHandoffHandler(
+          {
+            desired_slug,
+            doc_path: "/state/handoff/rpc-capture.txt",
+            target_session: "work",
+            capture,
+            ...selector.input,
+          },
+          bridge,
+        ),
+      ).resolves.toEqual({ ok: true, handoff_id: desired_slug });
+      expected.push({
+        desired_slug,
+        doc_path: "/state/handoff/rpc-capture.txt",
+        title: null,
+        target_session: "work",
+        target_dir: null,
+        initiator_session: null,
+        initiator_pane: null,
+        capture,
+        model: selector.model,
+        effort: selector.effort,
+        preset: selector.preset,
+      });
+    }
+  }
+  expect(calls).toEqual(expected);
 });
 
-test("request_handoff capture validation rejects malformed launch combinations", async () => {
+test("request_handoff selector validation rejects malformed combinations independently from capture", async () => {
   let calls = 0;
   const bridge = {
     requestHandoff: async () => {
@@ -367,21 +405,25 @@ test("request_handoff capture validation rejects malformed launch combinations",
     doc_path: "/state/handoff/rpc-capture.txt",
     target_session: "work",
   };
-  for (const extra of [
-    { capture: "true" },
-    { model: "opus", effort: "high" },
-    { capture: true, model: "opus" },
-    {
-      capture: true,
-      model: "opus",
-      effort: "high",
-      preset: "claude::opus::high",
-    },
-    { capture: true, preset: "not-a-triple" },
-  ]) {
-    await expect(
-      requestHandoffHandler({ ...base, ...extra }, bridge),
-    ).rejects.toThrow();
+  await expect(
+    requestHandoffHandler({ ...base, capture: "true" }, bridge),
+  ).rejects.toThrow();
+  for (const capture of [false, true]) {
+    for (const selector of [
+      { model: "opus" },
+      { effort: "high" },
+      {
+        model: "opus",
+        effort: "high",
+        preset: "claude::opus::high",
+      },
+      { preset: "not-a-triple" },
+      { model: 42, effort: "high" },
+    ]) {
+      await expect(
+        requestHandoffHandler({ ...base, capture, ...selector }, bridge),
+      ).rejects.toThrow();
+    }
   }
   expect(calls).toBe(0);
 });
@@ -572,15 +614,11 @@ test("fresh and migrated databases agree on the handoffs capture column shape", 
   }
 });
 
-test("handoff main: invalid capture/triple combinations exit 2 before any RPC work", async () => {
+test("handoff main: invalid selector combinations exit 2 before any RPC work", async () => {
   const realExit = process.exit;
   const realErr = process.stderr.write.bind(process.stderr);
   try {
     for (const [argv, expected] of [
-      [
-        ["--slug", "x", "--prompt", "p", "--preset", "claude::opus::high"],
-        "require --capture",
-      ],
       [
         [
           "--capture",

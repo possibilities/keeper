@@ -14,6 +14,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { HANDOFF_DOC_MAX_BYTES } from "../cli/handoff";
 import { PROMPT_MAX_BYTES } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
@@ -21,7 +22,6 @@ import {
   buildHandoffPrompt,
   decideHandoffAction,
   dispatchOneHandoff,
-  HANDOFF_CAPTURE_PROMPT_FRAMING,
   HANDOFF_LEASE_TTL_MS,
   type HandoffDispatchDeps,
   type HandoffDispatchingAck,
@@ -32,6 +32,14 @@ import {
 } from "../src/handoff-worker";
 
 const NOW = 1_700_000_000_000; // unix ms
+const HACK_SKILL = readFileSync(
+  new URL("../plugins/plan/skills/hack/SKILL.md", import.meta.url),
+  "utf8",
+);
+const HANDOFF_SKILL = readFileSync(
+  new URL("../plugins/keeper/skills/handoff/SKILL.md", import.meta.url),
+  "utf8",
+);
 
 function row(over: Partial<HandoffDispatchRow>): HandoffDispatchRow {
   return {
@@ -122,50 +130,71 @@ test("an unknown status is inert", () => {
 
 // ── prompt composition ────────────────────────────────────────────────────
 
-test("buildHandoffPrompt prepends the configured prefix + the framing + the inline brief", () => {
-  const p = buildHandoffPrompt("investigate the flaky reaper", "/hack");
-  expect(p.startsWith("/hack ")).toBe(true);
-  // The brief rides INLINE — no `keeper handoff show` pointer round-trip.
-  expect(p).toContain("investigate the flaky reaper");
-  expect(p).not.toContain("keeper handoff show");
-  // The framing frames the brief as the session's REQUEST, never an execute
-  // order — an order would override `/hack`'s confirm-before-acting beat, which
-  // is the whole behavior a handoff-ee must run. Regression guard.
-  expect(p).not.toContain("carry it out");
-  expect(p.toLowerCase()).toContain("request");
+test("buildHandoffPrompt is the literal /hack prefix plus every raw Brief byte", () => {
+  const brief =
+    "  goal: preserve bytes\nUnicode 雪 🧪\n'\" $HOME $" +
+    "{USER} `cmd` $(touch nope); & | < >\ntrail  ";
+  const expected =
+    "/hack   goal: preserve bytes\nUnicode 雪 🧪\n'\" $HOME $" +
+    "{USER} `cmd` $(touch nope); & | < >\ntrail  ";
+  expect(buildHandoffPrompt(brief)).toBe(expected);
 });
 
-test("buildHandoffPrompt with no prefix is just the framing + the inline brief", () => {
-  const p = buildHandoffPrompt("investigate the flaky reaper", undefined);
-  expect(p.startsWith("/")).toBe(false);
-  expect(p).toContain("investigate the flaky reaper");
-  expect(p).not.toContain("keeper handoff show");
-  // An empty-string prefix is treated as absent.
-  expect(buildHandoffPrompt("investigate the flaky reaper", "")).toBe(p);
-});
-
-test("the coupled cap holds: both framings + a max-size 64KB brief fit under PROMPT_MAX_BYTES", () => {
-  // The doc cap (64KB) and argv cap (96KB) are coupled: the full inline brief
-  // rides the launch argv. Pin the longer autonomous capture framing too.
+test("the coupled cap holds for /hack plus a max-size 64KB Brief", () => {
   const maxDoc = "x".repeat(HANDOFF_DOC_MAX_BYTES);
-  for (const capture of [false, true]) {
-    const prompt = buildHandoffPrompt(maxDoc, "/hack", capture);
-    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(
-      PROMPT_MAX_BYTES,
-    );
+  const prompt = buildHandoffPrompt(maxDoc);
+  expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(
+    PROMPT_MAX_BYTES,
+  );
+  expect(Buffer.byteLength(prompt, "utf8")).toBe(
+    HANDOFF_DOC_MAX_BYTES + Buffer.byteLength("/hack ", "utf8"),
+  );
+});
+
+test("/hack grants captured autonomy only for a non-empty Handoff carrier and owns the canonical envelope", () => {
+  expect(HACK_SKILL).toContain("printenv KEEPER_HANDOFF_ENVELOPE");
+  expect(HACK_SKILL).toContain("Empty or unset carrier");
+  expect(HACK_SKILL).toContain("Non-empty carrier");
+  expect(HACK_SKILL).toContain("presence alone grants nothing");
+  expect(HACK_SKILL).toContain("without parking for confirmation");
+  expect(HACK_SKILL).toContain("exactly these nine keys");
+  for (const key of [
+    "schema_version",
+    "agent",
+    "handle",
+    "transcript_path",
+    "resume_target",
+    "message",
+    "message_found",
+    "elapsed_seconds",
+    "outcome",
+  ]) {
+    expect(HACK_SKILL).toContain(`\`${key}\``);
   }
 });
 
-test("capture prompt is autonomous and instructs the handoff-ee to write one bounded nine-key envelope", () => {
-  const prompt = buildHandoffPrompt("repair the flaky reaper", "/hack", true);
-  expect(prompt).toBe(
-    `/hack ${HANDOFF_CAPTURE_PROMPT_FRAMING}\n\nrepair the flaky reaper`,
+test("Handoff guidance requires a complete caller mandate and keeps launch selection separate from capture", () => {
+  expect(HANDOFF_SKILL).toContain("self-contained mandate");
+  for (const part of [
+    "goal",
+    "context and evidence",
+    "constraints",
+    "desired posture",
+    "expected outcome or deliverable",
+  ]) {
+    expect(HANDOFF_SKILL).toContain(part);
+  }
+  expect(HANDOFF_SKILL).toContain("Launch posture is independent of capture");
+  expect(HANDOFF_SKILL.replace(/\s+/g, " ")).toContain(
+    "`--capture` controls only result collection",
   );
-  expect(prompt).toContain("without parking for a confirm beat");
-  expect(prompt).toContain("$KEEPER_HANDOFF_ENVELOPE");
-  expect(prompt).toContain("exactly these keys: schema_version");
-  expect(prompt).toContain("at or below 65536 bytes");
-  expect(prompt).not.toContain("pre-approved order to execute");
+  expect(HANDOFF_SKILL).toContain(
+    "exactly `/hack ` followed by that raw Brief",
+  );
+  expect(HANDOFF_SKILL).not.toContain("The text below is your brief");
+  expect(HANDOFF_SKILL).not.toContain(
+    "The text below is your autonomous brief",
+  );
 });
 
 // ── dispatchOneHandoff confirm path ─────────────────────────────────────────
@@ -197,7 +226,7 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
     emitLaunchFailed: (p): void => {
       rec.failed.push(p);
     },
-    buildPrompt: (doc) => `/hack ${doc}`,
+    buildPrompt: buildHandoffPrompt,
     // Default: no `dispatch.handoff` pin → flagless launch (the prior default).
     // Pin-carrying tests override this.
     resolveDispatchConfig: () => ({}),
@@ -207,6 +236,32 @@ function makeDeps(over: Partial<HandoffDispatchDeps> & { rec?: Recorder }): {
 }
 
 const noAbort = new AbortController().signal;
+
+test("ordinary and captured launch specs share the exact raw-Brief prompt boundary", async () => {
+  const brief =
+    "  line one\n雪 ' \" $VAR $" + "{HOME} `tick` $(cmd) ; && |\nline three  ";
+  const expected =
+    "/hack   line one\n雪 ' \" $VAR $" +
+    "{HOME} `tick` $(cmd) ; && |\nline three  ";
+  for (const capture of [0, 1]) {
+    const { deps, rec } = makeDeps({});
+    const source = row({
+      handoff_id: `h-exact-${capture}`,
+      doc: brief,
+      capture,
+      envelope_path: capture ? "/durable/handoffs/h-exact.json" : null,
+    });
+    await dispatchOneHandoff(source, "/repo", noAbort, deps);
+    expect(rec.launches[0]?.spec.prompt).toBe(expected);
+    expect(source.doc).toBe(brief);
+    expect(rec.launches[0]?.spec.prompt).not.toContain(
+      "/durable/handoffs/h-exact.json",
+    );
+    expect(rec.launches[0]?.spec.handoffEnvelope).toBe(
+      capture ? "/durable/handoffs/h-exact.json" : undefined,
+    );
+  }
+});
 
 test("dispatchOneHandoff mints HandoffDispatching BEFORE launch with --name handoff::<id>", async () => {
   const order: string[] = [];
@@ -274,10 +329,8 @@ test("dispatchOneHandoff carries the dispatch.handoff pin's model/effort onto th
   expect(rec.launches[0]?.spec.effort).toBe("high");
 });
 
-test("a capture row launches with its requested triple, autonomous prompt, and envelope carrier", async () => {
+test("a captured row launches with its raw triple, exact prompt, and envelope carrier", async () => {
   const { deps, rec } = makeDeps({
-    buildPrompt: (doc, capture) =>
-      capture ? `AUTONOMOUS ${doc}` : `PARK ${doc}`,
     resolveDispatchConfig: () => ({
       harness: "claude",
       model: "fallback",
@@ -301,22 +354,68 @@ test("a capture row launches with its requested triple, autonomous prompt, and e
       session: "work",
       cwd: "/repo",
       spec: {
-        prompt: "AUTONOMOUS brief",
+        prompt: "/hack brief",
         claudeName: "handoff::h-capture",
         harness: "pi",
-        model: "gpt-5.4",
-        effort: "high",
+        preset: "pi::gpt-5.4::high",
         handoffEnvelope: "/durable/handoffs/h-capture.json",
       },
     },
   ]);
 });
 
-test("a non-capture row's complete launch spec remains byte-identical", async () => {
+test("an ordinary Pi Launch triple reaches the launcher intact without creating an envelope", async () => {
   const { deps, rec } = makeDeps({
-    buildPrompt: (doc, capture) => `${capture ? "UNEXPECTED" : "/hack"} ${doc}`,
-    // The legacy dispatch path used model/effort but deliberately ignored a
-    // harness pin; capture must not alter that default surface.
+    resolveDispatchConfig: () => ({
+      harness: "claude",
+      model: "fallback",
+      effort: "low",
+    }),
+  });
+  await dispatchOneHandoff(
+    row({
+      handoff_id: "h-ordinary-pi",
+      capture: 0,
+      preset: "pi::gpt-5.4::high",
+    }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.spec).toEqual({
+    prompt: "/hack brief",
+    claudeName: "handoff::h-ordinary-pi",
+    harness: "pi",
+    preset: "pi::gpt-5.4::high",
+  });
+  expect(rec.launches[0]?.spec.handoffEnvelope).toBeUndefined();
+});
+
+test("an explicit model/effort pair overrides the cell but retains the dispatch.handoff harness", async () => {
+  const { deps, rec } = makeDeps({
+    resolveDispatchConfig: () => ({
+      harness: "pi",
+      model: "fallback",
+      effort: "low",
+    }),
+  });
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-pair", model: "gpt-5.4", effort: "max" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.spec).toEqual({
+    prompt: "/hack brief",
+    claudeName: "handoff::h-pair",
+    harness: "pi",
+    model: "gpt-5.4",
+    effort: "max",
+  });
+});
+
+test("an ordinary row preserves the configured dispatch.handoff harness and cell", async () => {
+  const { deps, rec } = makeDeps({
     resolveDispatchConfig: () => ({
       harness: "pi",
       model: "sonnet",
@@ -336,6 +435,7 @@ test("a non-capture row's complete launch spec remains byte-identical", async ()
       spec: {
         prompt: "/hack brief",
         claudeName: "handoff::h-plain",
+        harness: "pi",
         model: "sonnet",
         effort: "high",
       },
@@ -351,6 +451,12 @@ test("resolveHandoffLaunchConfig falls back safely for malformed or partial row 
       dispatch,
     ),
   ).toEqual(dispatch);
+  expect(
+    resolveHandoffLaunchConfig(
+      { preset: "pi::gpt-5.4::high", model: null, effort: null },
+      dispatch,
+    ),
+  ).toEqual({ harness: "pi", preset: "pi::gpt-5.4::high" });
   expect(
     resolveHandoffLaunchConfig(
       { preset: null, model: "opus", effort: null },

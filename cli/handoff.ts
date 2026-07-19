@@ -1,7 +1,7 @@
 /**
  * `keeper handoff` — enqueue a contextful document + instructions for a fresh
- * fire-and-forget claude worker, dispatched by a keeperd worker into the
- * INITIATOR's tmux session. The enqueue is event-sourced: the agent authors a
+ * fire-and-forget worker, dispatched by a keeperd worker into the INITIATOR's
+ * tmux session. The enqueue is event-sourced: the agent authors a
  * REQUIRED, globally-unique `--slug` (the handoff id — the worker launches as
  * `handoff::<slug>`), the CLI slugifies it to `[a-z0-9-]+`, and the brief is
  * stored RAW (the dispatcher worker, not this CLI, composes the launch prompt as
@@ -29,7 +29,7 @@
  *
  * Exit codes: 0 success, 1 daemon-unreachable / generic failure, 2 arg fault
  * (missing/empty `--slug`, over-cap brief, bad `--cwd`, or bad/conflicting
- * capture/triple flags), 3 slug already in use.
+ * launch selectors), 3 slug already in use.
  */
 
 import {
@@ -51,7 +51,7 @@ import { queryCollection, roundTrip } from "./control-rpc";
 import { buildParseOptions, HANDOFF_FLAGS } from "./descriptor";
 import { resolveSession } from "./dispatch";
 
-const HELP = `keeper handoff — enqueue a fire-and-forget claude worker with a contextful brief
+const HELP = `keeper handoff — enqueue a fire-and-forget worker with a contextful brief
 
 Usage:
   keeper handoff --slug <slug> --prompt "<doc>" [--title "<t>"] [--session <s>]
@@ -72,12 +72,12 @@ Enqueue flags:
   --capture             Request a durable captured terminal-result envelope. This
                         is a boolean request; unlike \`keeper agent run --capture\`,
                         it takes no path (keeperd derives the durable path).
-  --preset <triple>     Launch triple <harness::model::effort> for a captured
-                        handoff; requires --capture and conflicts with --model/--effort.
-  --model <model>       Captured-handoff model override; requires --capture and
-                        --effort.
-  --effort <effort>     Captured-handoff reasoning-effort override; requires
-                        --capture and --model.
+  --preset <triple>     Launch triple <harness::model::effort>; conflicts with
+                        --model/--effort. Independent from --capture.
+  --model <model>       Model override; requires --effort. Uses the configured
+                        dispatch.handoff harness. Independent from --capture.
+  --effort <effort>     Reasoning-effort override; requires --model. Uses the
+                        configured dispatch.handoff harness.
   --sock <path>         Override the daemon socket path
 
   show <slug>           Print the stored doc body for a handoff (inspection)
@@ -86,7 +86,7 @@ The brief is capped at 64KB — an over-cap brief is REJECTED (exit 2), never
 truncated, because it rides inline in the event log and a fold reads it back.
 
 Exit codes: 0 ok, 1 daemon-unreachable/generic, 2 arg fault (including bad or
-conflicting --capture/--preset/--model/--effort flags), 3 slug already in use.
+conflicting --preset/--model/--effort flags), 3 slug already in use.
 
 Run \`keeper handoff --agent-help\` for the terse operator runbook.
 `;
@@ -94,21 +94,21 @@ Run \`keeper handoff --agent-help\` for the terse operator runbook.
 /** Terse operator runbook (agent-facing), distinct from the full `--help`. */
 const AGENT_HELP = `keeper handoff — operator runbook (agent-facing)
 
-Enqueue a fire-and-forget claude worker with a contextful brief; keeperd boots it
+Enqueue a fire-and-forget worker with a contextful brief; keeperd boots it
 inline in your tmux session. The brief rides inline in the event log.
 
   keeper handoff --slug <slug> --prompt "<brief>" [--title <t>] [--cwd <path>]
-  keeper handoff --slug <slug> --prompt-file <path> [...]
-  keeper handoff --capture --slug <slug> --prompt "<brief>" [--preset <triple>]
-  keeper handoff --capture --slug <slug> --prompt "<brief>" [--model <m> --effort <e>]
+  keeper handoff --slug <slug> --prompt-file <path> [...] [--preset <triple>]
+  keeper handoff --slug <slug> --prompt "<brief>" [--model <m> --effort <e>]
+  keeper handoff --capture --slug <slug> --prompt "<brief>" [launch selector]
   keeper handoff show <slug>      # read back the stored brief (inspection)
 
 Rules: --slug is globally unique (reuse → exit 3); brief cap 64KB (over → exit 2,
 REJECTED never truncated); --cwd launches cross-repo (default: caller's cwd).
---capture requests a durable terminal-result envelope and takes no path;
---preset or the --model/--effort pair require --capture and conflict with each other.
+--capture requests a durable terminal-result envelope and takes no path. Launch
+selection is independent: choose either --preset or the --model/--effort pair.
 Exit codes: 0 enqueued · 1 daemon-unreachable/generic · 2 arg fault (including bad
-capture/triple flags) · 3 slug in use.
+or conflicting selector flags) · 3 slug in use.
 NOT a plan-id launch (that is keeper dispatch) or messaging a running agent (keeper bus).
 `;
 
@@ -207,16 +207,17 @@ export function validateHandoffDoc(doc: string): ValidateDocResult {
  * exported so tests can assert the wire shape.
  */
 export interface HandoffCaptureRequest {
-  capture: true;
+  capture: boolean;
   model: string | null;
   effort: string | null;
   preset: string | null;
 }
 
 /**
- * Validate the capture-only launch knobs before any spill or RPC work. A null
- * result preserves the legacy request frame byte-for-byte; a captured request
- * carries all capture fields required by the RPC's typed params.
+ * Validate capture and launch selection before any spill or RPC work. Capture
+ * controls only whether a terminal envelope is requested. Selection accepts
+ * either one Launch triple or one complete model/effort pair regardless of the
+ * capture value. A null result keeps a selector-free ordinary request compact.
  */
 export function resolveHandoffCaptureRequest(args: {
   capture: boolean;
@@ -229,12 +230,6 @@ export function resolveHandoffCaptureRequest(args: {
   const hasPreset = args.preset !== undefined;
   const hasModel = args.model !== undefined;
   const hasEffort = args.effort !== undefined;
-  if (!args.capture && (hasPreset || hasModel || hasEffort)) {
-    return {
-      ok: false,
-      error: "--preset, --model, and --effort require --capture",
-    };
-  }
   if (hasPreset && (hasModel || hasEffort)) {
     return {
       ok: false,
@@ -261,13 +256,13 @@ export function resolveHandoffCaptureRequest(args: {
       return { ok: false, error: `--model/--effort ${parsed.error}` };
     }
   }
-  if (!args.capture) {
+  if (!args.capture && !hasPreset && !hasModel && !hasEffort) {
     return { ok: true, capture: null };
   }
   return {
     ok: true,
     capture: {
-      capture: true,
+      capture: args.capture,
       model: args.model ?? null,
       effort: args.effort ?? null,
       preset: args.preset ?? null,
@@ -407,7 +402,7 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
-  // Validate capture-only launch knobs before any spill or RPC send. The RPC
+  // Validate capture and launch selection before any spill or RPC send. The RPC
   // handler repeats this at its trust boundary, but CLI misuse must not mint an
   // event (or even create a transient transport file).
   const captureResult = resolveHandoffCaptureRequest({

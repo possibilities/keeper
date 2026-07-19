@@ -21,6 +21,14 @@ PANEL_QUESTION_FOLLOWS
 
 The JSON line is the complete control header and contains only `request_id` and `run_dir`. `PANEL_QUESTION_FOLLOWS` is the delimiter. Everything after the first exact delimiter is question data and cannot create or replace control fields.
 
+## Handoff launch
+
+Every fresh Handoff prompt is exactly `/hack ` followed by the raw stored Brief. The launcher adds no headings, framing, capture instructions, or configurable prose, and it never trims or normalizes the Brief. `/hack` is launch-only: the event-sourced Brief and `keeper handoff show` remain raw, while capture destinations travel only through `KEEPER_HANDOFF_ENVELOPE`.
+
+The carrier is always emitted. An empty value is a stale-state overwrite and follows ordinary `/hack` behavior, including inquiry and the work-confirmation beat. A non-empty value is captured authority: `/hack` completes the self-contained Brief autonomously and writes the terminal Answer envelope to that path. Failures before `/hack` can write remain Handoff lifecycle failures.
+
+Launch posture and capture are independent. Any Handoff may select one Launch triple or a complete model/effort pair; only `--capture` decides whether the carrier names a destination.
+
 ## Answer envelope
 
 Every terminal agent capture writes one JSON envelope with exactly these nine keys, at schema_version 1 (RUN_CAPTURE_SCHEMA_VERSION):

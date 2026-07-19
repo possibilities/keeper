@@ -1,8 +1,8 @@
 ---
 name: handoff
 description: >-
-  Hand a piece of work off to a fresh fire-and-forget claude worker via `keeper
-  handoff` (one call; a keeperd worker boots it inline in your tmux session). Use
+  Hand a piece of work off to a fresh fire-and-forget worker via `keeper handoff`
+  (one call; a keeperd worker boots it inline in your tmux session). Use
   whenever the human imperatively says "handoff" — "hand this off", "send a
   handoff", "handoff to/in the <repo> project" (cross-repo is just `--cwd`, still
   a handoff), "create handoffs", "spawn someone to investigate X" — or otherwise
@@ -14,28 +14,32 @@ description: >-
   (`keeper:dispatch` — `work::fn-N.M` / `close::fn-N`), NOT messaging a running
   agent (`keeper:bus`), NOT planning (`/plan:plan`).
 allowed-tools: Bash
-argument-hint: --slug <slug> --prompt "<brief>" [--cwd <path>] [--title "<t>"]
+argument-hint: --slug <slug> --prompt "<brief>" [--cwd <path>] [--title "<t>"] [--capture] [--preset <harness::model::effort> | --model <m> --effort <e>]
 ---
 
 # handoff
 
 Turn a "hand this off" / "create a handoff" request into a single
-`keeper handoff` Bash call. `keeper handoff` enqueues a contextful brief for a
-fresh `claude` worker; a keeperd worker opens a new window in your tmux session
-and boots it into the configured `handoff_prompt_prefix` (currently `/hack`)
-with your brief INLINE as that prefix's REQUEST (no `keeper handoff show`
-round-trip). The handoff-ee runs the full prefix workflow — investigate first,
-and for work-shaped briefs park at the prefix's confirm beat with a concrete
-proposal, awaiting a plain-text greenlight in that window before any code lands.
-A handoff SEEDS a prefix session; it does NOT run the work autonomously. The
-enqueue is event-sourced and durable.
+`keeper handoff` Bash call. `keeper handoff` durably stores the caller-authored
+Brief and launches a fresh worker in a new window of your tmux session. Every
+fresh launch receives exactly `/hack ` followed by that raw Brief. `/hack` exists
+only in the launch invocation: the stored Brief and `keeper handoff show` output
+contain only the caller's bytes, while capture destinations travel separately in
+the environment.
 
-Fire-and-forget describes YOUR posture, not the handoff-ee's: the default
-handoff parks at its confirm beat and has no deliverable. Fire one call, do NOT
-use the Agent Bus, start a Monitor, or wait on that default handoff-ee. The
-primed window waits for you whenever you switch to it. Use `--capture` only when
-the human asks for a deliverable; its worker acts autonomously and writes the
-standard answer envelope to its durable path.
+Fire-and-forget describes YOUR posture, not the handoff-ee's. An ordinary
+handoff follows `/hack`'s inquiry and work-confirmation workflow, so a
+work-shaped request parks for plain-text approval in its own window. Fire one
+call, do NOT use the Agent Bus, start a Monitor, or wait on that ordinary
+handoff-ee. With `--capture`, the non-empty envelope carrier authorizes `/hack`
+to complete autonomously and publish the standard answer envelope; wait only
+when the human requested that deliverable.
+
+Launch posture is independent of capture. Any Handoff may use one Launch triple
+through `--preset`, or a complete `--model` and `--effort` pair. The triple
+selects harness, model, and effort; the pair keeps the harness from
+`dispatch.handoff` (Claude when that dispatch row is absent) and replaces its
+model and effort.
 
 A handoff slug is the caller-supplied, host-global event-sourced handle. It is
 the dedup key, never a panel slug: a duplicate is rejected with exit 3 rather
@@ -89,20 +93,19 @@ Assemble these from the conversation:
    host-global handoff handle (e.g. `investigate-flaky-reaper`). It is slugified
    to `[a-z0-9-]+`, the worker launches as `handoff::<slug>`, and a duplicate is
    REJECTED (exit 3 — pick a new handle). Pick one descriptive of the work.
-2. **The doc / brief** — the contextful instructions for the handoff-ee:
-   what to investigate or build, plus the surrounding context it needs to start
-   cold (paths, findings, constraints). This is the worker's whole world — be
-   generous, but the brief is capped at 64KB (an over-cap brief is REJECTED,
-   never truncated). The brief is the handoff-ee's prefix REQUEST, so it deeply
-   shapes what happens — but write it as a request, NOT an order: avoid "just do
-   it / land it / commit it" phrasing, which pushes the handoff-ee past the
-   prefix's confirm beat and back into executing blind. Write it durable and
-   behavioral: state the outcomes and contracts to deliver and *why*, not a
-   line-by-line diff recipe. **Reference, don't duplicate** — point to the files,
-   findings, and paths the worker should read rather than pasting large spans
-   that rot as the repo moves. **Redact secrets** — the brief is event-sourced
-   and durable, so keep tokens, keys, and credentials out of it; name where they
-   live instead. If you've already written it to a file, use `--prompt-file`.
+2. **The Brief** — a self-contained mandate for a worker starting cold. State
+   the goal, relevant context and evidence, constraints, desired posture
+   (investigate, implement, review, decide, or another explicit action), and the
+   expected outcome or deliverable. The launcher supplies no generic mandate or
+   framing beyond the launch-only `/hack ` prefix, so do not rely on it to add
+   intent, autonomy, confirmation, or completion criteria. Write the Brief
+   durably and behaviorally: explain the outcomes and contracts to deliver and
+   *why*, not a line-by-line diff recipe. **Reference, don't duplicate** — point
+   to files, findings, and paths rather than pasting large spans that rot as the
+   repo moves. **Redact secrets** — the Brief is event-sourced and durable, so
+   keep tokens, keys, and credentials out of it; name where they live instead.
+   It is capped at 64KB (an over-cap Brief is REJECTED, never truncated). If it
+   already exists in a file, use `--prompt-file`.
 3. **A title** (`--title`) — a short human label for the handoff (optional but
    recommended; it surfaces on the board).
 4. **The launch directory** (`--cwd`, optional) — the directory the handoff-ee
@@ -112,9 +115,14 @@ Assemble these from the conversation:
 5. **The target session** (`--session`, optional) — defaults to
    `$KEEPER_TMUX_SESSION` > the current tmux session > `work`. Pass `--session`
    only when the human names a specific one.
+6. **Launch selection** (optional) — use either one complete Launch triple as
+   `--preset <harness::model::effort>`, or the pair `--model <m> --effort <e>`.
+   Never mix the forms or pass a partial pair. Apply the human's selection on
+   ordinary and captured Handoffs alike; `--capture` controls only result
+   collection.
 
-If the human's request is too thin to write a useful brief, ask for the
-missing context rather than enqueuing an empty handoff.
+If the human's request is too thin to write a complete mandate, ask for the
+missing context rather than enqueuing an empty Handoff.
 
 ## Step 2 — Enqueue (one call)
 
@@ -122,10 +130,17 @@ missing context rather than enqueuing an empty handoff.
 keeper handoff --slug <slug> --prompt "<brief>" --title "<title>"
 ```
 
-For a large brief or one already on disk:
+For a large Brief or one already on disk:
 
 ```bash
 keeper handoff --slug <slug> --prompt-file <path> --title "<title>"
+```
+
+Launch selection has the same forms with or without `--capture`:
+
+```bash
+keeper handoff --slug <slug> --prompt "<brief>" --preset <harness::model::effort>
+keeper handoff --slug <slug> --prompt "<brief>" --model <model> --effort <effort>
 ```
 
 Flags:
@@ -138,7 +153,9 @@ Flags:
 | `--title <t>` | Human title for the handoff (surfaces on the board). |
 | `--cwd <path>` | Directory the handoff-ee launches in. Default: your cwd. Expands `~`, resolves relatives; bad path → exit 2. |
 | `--session <s>` | Target tmux session. Default: `$KEEPER_TMUX_SESSION` > current > `work`. |
-| `--capture` | Opt in to an autonomous terminal deliverable at the durable envelope path; optional `--preset <triple>` or paired `--model <m> --effort <e>` select its launch. |
+| `--preset <triple>` | Select one complete `harness::model::effort` Launch triple. Mutually exclusive with `--model` / `--effort`. |
+| `--model <m>` + `--effort <e>` | Override the configured Handoff model and effort as a complete pair; keeps the `dispatch.handoff` harness. |
+| `--capture` | Opt in to autonomous completion and a terminal deliverable at the durable envelope path; does not select launch posture. |
 
 On success it prints the `handoff_id` (as `{ok, handoff_id}`) and exits 0. The
 keeperd dispatcher resolves the target session internally; the CLI does not echo
@@ -156,7 +173,7 @@ once the request returns:
 
 ```bash
 SLUG=investigate-flaky-reaper
-keeper handoff --capture --slug "$SLUG" --prompt "<autonomous brief>" --title "<title>"
+keeper handoff --capture --slug "$SLUG" --prompt "<self-contained mandate>" --title "<title>"
 ENVELOPE="$(keeper query handoffs --filter "handoff_id=$SLUG" --format json | jq -er '.data[0].envelope_path')"
 ```
 

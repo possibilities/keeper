@@ -405,13 +405,17 @@ export const HANDOFF_FLAGS = [
   {
     name: "preset",
     type: "string",
-    summary: "Launch triple <harness::model::effort> (--capture only)",
+    summary: "Launch triple <harness::model::effort>",
   },
-  { name: "model", type: "string", summary: "Model override (--capture only)" },
+  {
+    name: "model",
+    type: "string",
+    summary: "Model override (pair with --effort)",
+  },
   {
     name: "effort",
     type: "string",
-    summary: "Reasoning-effort override (--capture only)",
+    summary: "Reasoning-effort override (pair with --model)",
   },
   FLAG_SOCK,
   FLAG_HELP_DEFAULTED,
@@ -1771,14 +1775,14 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
   {
     name: "handoff",
     summary:
-      "Enqueue a fire-and-forget claude worker with a contextful brief (`keeper handoff show <id>` reads it)",
+      "Enqueue a fire-and-forget worker with a contextful brief (`keeper handoff show <id>` reads it)",
     visibility: "public",
     mutates: true,
     requires_daemon: true,
     requires_tty: false,
     agent_help: true,
     exit_codes: {
-      "2": "argument fault (bad/conflicting flags, or a bad capture/triple combination)",
+      "2": "argument fault (bad/conflicting flags or launch selectors)",
       "3": "slug already in use",
     },
     flags: HANDOFF_FLAGS,
