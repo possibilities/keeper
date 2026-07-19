@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. The usage-viewer clauses are superseded by ADR 0097; the frame stream
+covers only daemon-derived viewers with Fold cursors.
 
 ## Context
 
@@ -59,3 +60,11 @@ only; no cross-pid sweep ever runs.
   usage viewer's open-coded shell path, so the wire contract cannot drift
   between them; its diff runs behind an injectable seam so the pure test tier
   covers the multi-frame path without a subprocess.
+
+## Amendment — sidecar usage stays outside frames
+
+`keeper usage` consumes transient Capacity observation files and has no daemon
+Fold cursor, reconnect coverage, or historical replay claim. It uses the shared
+live/snapshot shell but is not a `keeper frames --view` member. Adding a
+sidecar-derived stream requires a separate provenance contract rather than a
+null or fabricated cursor.

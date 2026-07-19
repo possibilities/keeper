@@ -1191,6 +1191,9 @@ export function createViewShell<TSnap>(
     });
   }
 
+  // The shared teardown is installed just after each caller wires its streams.
+  // Before that brief synchronous window, preserve the shell's direct exit.
+  let requestShellExit = (): void => process.exit(0);
   const liveShell: LiveShell = createLiveShell({
     // Only LIVE mode paints. Snapshot and frames both pass `enabled: false` so
     // no OpenTUI renderer is constructed and the shell is a clean no-op (its
@@ -1202,6 +1205,7 @@ export function createViewShell<TSnap>(
     enabled: mode === "live",
     title,
     captureKeys: opts.captureKeys,
+    onExit: () => requestShellExit(),
     onUnhandledKey: (key) => {
       // Modal capture: the view owns every key — skip the shell's `c`
       // (copy) so the sub-mode is fully local.
@@ -1738,6 +1742,9 @@ export function createViewShell<TSnap>(
       log("...");
       process.exit(0);
     };
+    // Keyboard q/Ctrl-C and process-level exits share one teardown so caller
+    // pollers/subscriptions cannot survive the terminal renderer.
+    requestShellExit = exitCleanly;
     // SIGINT (Ctrl-C) is this view's canonical interactive exit; the
     // parent-death / TTY-close triggers (SIGHUP, stdin-EOF, ppid===1
     // poll) are the fn-723 self-reap path. All route through the one

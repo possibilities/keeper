@@ -6,7 +6,7 @@
  * Status is dual-encoded as a Nerd Font md-robot face plus a colored left rail,
  * so the board is calm when idle and the few jobs that need attention pop.
  *
- * Unlike the five viewer subcommands, dash is TTY-ONLY — there is NO snapshot
+ * Unlike the six viewer subcommands, dash is TTY-ONLY — there is NO snapshot
  * mode. The TTY gate fires here, BEFORE any `@opentui/core` import, so a piped
  * invocation exits 1 with a one-line stderr message and never pays the
  * native-loader cost. The renderer construction + data wiring lives in

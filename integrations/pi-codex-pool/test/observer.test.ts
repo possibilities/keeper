@@ -58,11 +58,12 @@ function usage(usedPercent: number) {
       secondary_window: {
         used_percent: Math.max(0, usedPercent - 10),
         reset_at: 300,
+        limit_window_seconds: 604_800,
       },
     },
     additional_rate_limits: [
       {
-        limit_name: "private-model-bucket",
+        limit_name: "GPT-5.3-Codex-Spark",
         metered_feature: "private-feature",
         rate_limit: {
           primary_window: { used_percent: usedPercent / 2, reset_at: 250 },
@@ -121,9 +122,30 @@ describe("Codex usage observer", () => {
       "healthy",
     ]);
     expect(envelope.aliases[0]?.usage.windows).toEqual([
-      { role: "primary", used_percent: 90, reset_at_ms: 200_000 },
-      { role: "secondary", used_percent: 80, reset_at_ms: 300_000 },
-      { role: "additional", used_percent: 45, reset_at_ms: 250_000 },
+      {
+        role: "primary",
+        key: "session",
+        label: "session",
+        window_seconds: 18_000,
+        used_percent: 90,
+        reset_at_ms: 200_000,
+      },
+      {
+        role: "secondary",
+        key: "week",
+        label: "weekly",
+        window_seconds: 604_800,
+        used_percent: 80,
+        reset_at_ms: 300_000,
+      },
+      {
+        role: "additional",
+        key: "meter:95e633c373a9cdcf6cdc5e63:primary",
+        label: "GPT-5.3-Codex-Spark",
+        window_seconds: null,
+        used_percent: 45,
+        reset_at_ms: 250_000,
+      },
     ]);
     expect(routes.select("new-session")).toBe("keeper-codex-b");
 
@@ -138,11 +160,11 @@ describe("Codex usage observer", () => {
       "owner@example.test",
       "Authorization",
       "should-never-render",
-      "private-model-bucket",
       "private-feature",
     ]) {
       expect(rendered).not.toContain(forbidden);
     }
+    expect(rendered).toContain("GPT-5.3-Codex-Spark");
     expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(16 * 1024);
   });
 
@@ -188,10 +210,34 @@ describe("Codex usage observer", () => {
       100,
     );
     expect(parsed.windows).toEqual([
-      { role: "primary", used_percent: 12.3, reset_at_ms: null },
+      {
+        role: "primary",
+        key: "window:primary",
+        label: "primary",
+        window_seconds: null,
+        used_percent: 12.3,
+        reset_at_ms: null,
+      },
     ]);
     expect(JSON.stringify(parsed)).not.toContain("unknown");
     expect(JSON.stringify(parsed)).not.toContain("raw-secret");
+
+    const privateLabel = parseUsageResponse(
+      "keeper-codex-a",
+      {
+        additional_rate_limits: [
+          {
+            limit_name: "OpenAI Account 123456",
+            rate_limit: {
+              primary_window: { used_percent: 8, reset_at: null },
+            },
+          },
+        ],
+      },
+      100,
+    );
+    expect(privateLabel.windows[0]?.label).toBe("additional 1");
+    expect(JSON.stringify(privateLabel)).not.toContain("Account 123456");
   });
 
   test("bounds rendered output even for a hostile in-memory envelope", () => {

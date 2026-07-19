@@ -1,7 +1,7 @@
 /**
- * `src/snapshot.ts` — shared snapshot-mode core for keeper's five
- * subscribe-driven TUI subcommands (`board`, `jobs`, `git`, `autopilot`,
- * `usage`).
+ * `src/snapshot.ts` — shared snapshot-mode core for keeper's six TUI viewers:
+ * five daemon streams (`board`, `jobs`, `git`, `autopilot`, `builds`) plus the
+ * sidecar-backed `usage` view.
  *
  * When `keeper <view>` runs with a non-TTY stdout (piped into an agent's
  * tool call), the live OpenTUI stream is the wrong shape: every `pushFrame`
@@ -11,9 +11,8 @@
  * followed by a dual-audience metadata block (human-readable labeled paths
  * + a final machine-parseable `keeper-meta:` JSON line), then exits.
  *
- * This module owns the PURE-ish pieces so the contract can never drift
- * between the shared `createViewShell` harness and the open-coded `usage`
- * main (task .3):
+ * This module owns the PURE-ish pieces so the contract cannot drift between
+ * viewers using the shared `createViewShell` harness:
  *
  *   - `resolveSnapshotMode(...)` — the trigger precedence
  *     (flag > `CI`/`TERM=dumb` > `stdout.isTTY !== true`), tri-state safe,

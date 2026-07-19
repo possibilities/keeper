@@ -76,6 +76,7 @@ function makeHarness(): Harness {
       git: mkHandler("git"),
       autopilot: mkHandler("autopilot"),
       builds: mkHandler("builds"),
+      usage: mkHandler("usage"),
       frames: mkHandler("frames"),
       dash: mkHandler("dash"),
       status: mkHandler("status"),
@@ -220,7 +221,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("board")).toBe(true);
     expect(isSubcommand("jobs")).toBe(true);
     expect(isSubcommand("git")).toBe(true);
-    expect(isSubcommand("usage")).toBe(false);
+    expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);
     expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
@@ -247,24 +248,30 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("")).toBe(false);
   });
 
-  test("the retired usage command has no route or help metadata", async () => {
+  test("usage is a public daemon-free snapshot-capable viewer", async () => {
     const h = makeHarness();
-    let caught: unknown;
-    try {
-      await dispatch(["usage", "anything"], h.deps);
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(ExitError);
-    expect((caught as ExitError).code).toBe(1);
-    expect(SUBCOMMANDS).not.toContain("usage");
-    expect(NATIVE_COMMANDS.map((command) => command.name)).not.toContain(
-      "usage",
+    await dispatch(["usage", "--snapshot"], h.deps);
+    expect(h.calls).toEqual([{ sub: "usage", argv: ["--snapshot"] }]);
+    expect(SUBCOMMANDS).toContain("usage");
+    const descriptor = NATIVE_COMMANDS.find(
+      (command) => command.name === "usage",
     );
+    expect(descriptor).toMatchObject({
+      visibility: "public",
+      mutates: false,
+      requires_daemon: false,
+      requires_tty: false,
+    });
+    expect(descriptor?.flags.map((flag) => flag.name)).toEqual([
+      "snapshot",
+      "watch",
+      "timeout",
+      "help",
+    ]);
     expect(
       buildHelpIndex().subcommands.map((command) => command.name),
-    ).not.toContain("usage");
-    expect(USAGE).not.toContain("  usage");
+    ).toContain("usage");
+    expect(USAGE).toContain("  usage");
   });
 
   for (const retired of ["search-history", "find-file-history"] as const) {

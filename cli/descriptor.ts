@@ -212,6 +212,28 @@ export const VIEWER_FLAGS = [
   FLAG_HELP_DEFAULTED,
 ] as const satisfies readonly FlagDescriptor[];
 
+/** Sidecar-backed usage viewer; intentionally has no daemon socket flag. */
+export const USAGE_FLAGS = [
+  {
+    name: "snapshot",
+    type: "boolean",
+    default: false,
+    summary: "Force one current frame + exit (even on a TTY)",
+  },
+  {
+    name: "watch",
+    type: "boolean",
+    default: false,
+    summary: "Force the live viewer even when piped (never exits)",
+  },
+  {
+    name: "timeout",
+    type: "string",
+    summary: "Snapshot wait bound (unit required, e.g. 500ms, 2s)",
+  },
+  FLAG_HELP,
+] as const satisfies readonly FlagDescriptor[];
+
 /** `keeper git` adds `--project-dir` to the viewer trio. */
 export const GIT_FLAGS = [
   FLAG_SOCK,
@@ -734,6 +756,16 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: true,
     requires_tty: false,
     flags: VIEWER_FLAGS,
+  },
+  {
+    name: "usage",
+    summary:
+      "Claude/Codex capacity (TTY: live TUI; non-TTY: one snapshot + exit)",
+    visibility: "public",
+    mutates: false,
+    requires_daemon: false,
+    requires_tty: false,
+    flags: USAGE_FLAGS,
   },
   {
     name: "frames",
