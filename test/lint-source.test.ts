@@ -32,8 +32,22 @@ function putAllowlist(allowlist: SourceAllowlist): void {
   put("scripts/lint-source-allowlist.json", stringifyAllowlist(allowlist));
 }
 
-function run(): { code: number; stderr: string } {
-  const findings = lintSource(root).findings;
+function putPiExtensionPackage(): void {
+  put(
+    "integrations/pi-fake/package.json",
+    `${JSON.stringify(
+      {
+        type: "module",
+        pi: { extensions: ["./src/index.ts"] },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+function run(targetRoot = root): { code: number; stderr: string } {
+  const findings = lintSource(targetRoot).findings;
   return {
     code: findings.length === 0 ? 0 : 1,
     stderr: findings
@@ -78,6 +92,64 @@ test("a frozen file passes at its count and an injected file fails independently
   expect(code).toBe(1);
   expect(stderr).toContain("src/injected.ts");
   expect(stderr).not.toContain("src/base.ts:0");
+});
+
+test("a pi extension graph reaching bun:sqlite fails", () => {
+  putPiExtensionPackage();
+  put(
+    "integrations/pi-fake/src/index.ts",
+    `import { shared } from "../../../src/shared.ts";
+export const entry = shared;
+`,
+  );
+  put(
+    "src/shared.ts",
+    `import { Database } from "bun:sqlite";
+export const shared = 1;
+`,
+  );
+  const { code, stderr } = run();
+  expect(code).toBe(1);
+  expect(stderr).toContain("BUN_BUILTIN_IMPORT");
+  expect(stderr).toContain("bun:sqlite");
+  expect(stderr).toContain("src/shared.ts");
+});
+
+test("a dynamic bun import string fails conservatively", () => {
+  putPiExtensionPackage();
+  put(
+    "integrations/pi-fake/src/index.ts",
+    `import { dynamic } from "../../../src/dynamic.ts";
+export const entry = dynamic;
+`,
+  );
+  put("src/dynamic.ts", `export const dynamic = import("bun:sqlite");\n`);
+  const { code, stderr } = run();
+  expect(code).toBe(1);
+  expect(stderr).toContain("BUN_BUILTIN_IMPORT");
+  expect(stderr).toContain("bun:sqlite");
+  expect(stderr).toContain("src/dynamic.ts");
+});
+
+test("a type-only bun import in the graph does not trip", () => {
+  putPiExtensionPackage();
+  put(
+    "integrations/pi-fake/src/index.ts",
+    `import { typed } from "../../../src/type-only.ts";
+export const entry = typed;
+`,
+  );
+  put(
+    "src/type-only.ts",
+    `import type { Database } from "bun:sqlite";
+export const typed = 1;
+`,
+  );
+  expect(run().code).toBe(0);
+});
+
+test("the live tree passes the bun builtin gate", () => {
+  expect(lintSource(process.cwd()).findings).toEqual([]);
 });
 
 test("raw NUL bytes fail outside the shared separator module", () => {
