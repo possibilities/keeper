@@ -6,7 +6,7 @@
     "fn-1359-add-durable-fable-focus"
   ],
   "id": "fn-1363-add-harness-specific-rename-parity",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T00:33:54.602000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -14,5 +14,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T00:33:35.270000Z"
+  "updated_at": "2026-07-19T00:33:54.602000Z"
 }
