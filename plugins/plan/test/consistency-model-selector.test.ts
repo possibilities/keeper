@@ -81,20 +81,20 @@ describe("on-disk selector config", () => {
     }
   });
 
-  test("no guidance prose carries cost or provider language (capability-shaped only)", () => {
+  test("no skill-authored guidance prose carries economics or provider language (capability-shaped only)", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
-    // Skill-authored selector guidance must stay capability-shaped: cost and
-    // provider ordering live in the host matrix, never in the usage rule or any
-    // efforts/models guidance block. hand_tuned is exempt — the HUMAN-OWNED
-    // routing policy is sanctioned to carry the family split's economics
-    // (the GPT-first rule names the families and their cost posture outright).
+    // Skill-authored selector guidance must stay capability-shaped: economics
+    // and provider ordering live outside the usage/effort/model blocks.
+    // hand_tuned is exempt — the HUMAN-OWNED routing policy is sanctioned to
+    // carry both the family split's cost posture and model-specific quota policy.
     const forbidden = [
       "cost",
       "cheap",
       "expensive",
       "price",
+      "quota",
       "provider",
       "codex",
       "claude",
@@ -125,10 +125,14 @@ describe("on-disk selector config", () => {
     expect(lower).toContain("burden of proof");
     expect(lower).toContain("sonnet");
     expect(lower).toContain("opus");
+    expect(lower).toContain("gpt-5.3-codex-spark");
+    expect(lower).toContain("independent");
+    expect(lower).toContain("quota");
+    expect(lower).toContain("never widens");
     expect(lower).toContain("anti-anchor");
   });
 
-  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the burden-of-proof + anti-anchor rule", () => {
+  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the Spark-first capability gate", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
@@ -160,11 +164,15 @@ describe("on-disk selector config", () => {
       expect(configProse).not.toContain(phrase);
       expect(agentLower).not.toContain(phrase);
     }
-    // Positive: both surfaces state the sonnet-first burden-of-proof rule and the
-    // anti-anchor clause (spec length/adjectives are not difficulty).
+    // Positive: both surfaces state the burden-of-proof rule, the Spark-first
+    // capability gate, and the anti-anchor clause.
     expect(config.hand_tuned.toLowerCase()).toContain("burden of proof");
+    expect(config.hand_tuned.toLowerCase()).toContain("gpt-5.3-codex-spark");
+    expect(config.hand_tuned.toLowerCase()).toContain("never widens");
     expect(agentLower).toContain("burden of proof");
     expect(agentLower).toContain("intelligence-bound");
+    expect(agentLower).toContain("gpt-5.3-codex-spark");
+    expect(agentLower).toContain("never widens");
     expect(agentLower).toContain("not difficulty");
   });
 

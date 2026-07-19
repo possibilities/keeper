@@ -34,8 +34,9 @@ usage: |
   judgment-heavy work, and opus the exception, chosen only on a concrete,
   nameable intelligence-bound reason. When uncertain on the model axis, bounded
   well-specified work resolves to a GPT tier and open-ended or judgment-heavy
-  work resolves to sonnet; when uncertain on the effort axis for mechanical
-  work, resolve to the lower band.
+  work resolves to sonnet. Among reliable GPT fits, apply the hand-tuned Spark
+  preference before the generic lightest-fitting-tier rule; when uncertain on
+  the effort axis for mechanical work, resolve to the lower band.
 
 # HUMAN-OWNED binding routing policy — the highest-precedence tie-break, carried
 # verbatim in every selector brief. NOT authored or refreshed by the
@@ -54,9 +55,14 @@ hand_tuned: |
   reason: a novel algorithm or design, a cross-cutting multi-file architectural
   cascade, a subtle correctness or security invariant, or long-horizon
   planning. Security- or correctness-critical work is a hard opus gate that
-  overrides the GPT-first default regardless of size. Anti-anchor clause: spec
-  length and difficulty adjectives are not difficulty — a short spec can be
-  intelligence-bound and a long spec mechanical. Model and effort are
+  overrides the GPT-first default regardless of size. For work that clears those
+  Claude/opus gates, apply the Spark burn preference: `gpt-5.3-codex-spark` has
+  independent, non-conserved quota. When its capability guidance says it can
+  reliably complete the task, choose it ahead of every other model that could
+  also complete the task. This ranks models after the capability gate; it never
+  widens that gate. Otherwise continue normal best-fit routing. Anti-anchor
+  clause: spec length and difficulty adjectives are not difficulty — a short spec
+  can be intelligence-bound and a long spec mechanical. Model and effort are
   independent axes: cranking a cheaper tier's effort is not a substitute for a
   more capable model.
 
