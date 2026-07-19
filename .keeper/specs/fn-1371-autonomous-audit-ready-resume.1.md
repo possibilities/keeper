@@ -30,5 +30,5 @@ change in both and keep the identity check green.
 - [ ] both guard suites green and the byte-identity contract holds
 
 ## Done summary
-
+Wrapped-guard and grant-guard now allow a wrapped worker to self-park its own launch-bound task via keeper plan block --reason AUDIT_READY:...; foreign tasks, non-AUDIT_READY reasons, and --force stay denied.
 ## Evidence
