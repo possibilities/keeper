@@ -39,6 +39,7 @@ import {
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
+import { loadMatrixV2, MatrixConfigError, type MatrixV2 } from "./agent/matrix";
 import type {
   AutocloseWorkerData,
   AutocloseWorkerMessage,
@@ -51,8 +52,10 @@ import type {
   AutopilotWorkerData,
   DispatchClearedMessage,
   DispatchExpiredMessage,
+  DispatchedAck,
   DispatchedAckMessage,
   DispatchedMessage,
+  DispatchedPayload,
   DispatchFailedMessage,
   LaneMergedMessage,
   ResolverOutcome,
@@ -277,6 +280,10 @@ import type {
   RecheckPendingMessage,
 } from "./plan-worker";
 import {
+  loadProviderEquivalenceSnapshot,
+  type WorkerProvider,
+} from "./provider-equivalence";
+import {
   assembleWrappedLegAbortPayload,
   createProviderLegDeathNoticeState,
   nextProviderLegNoticeRetryDelayMs,
@@ -289,10 +296,16 @@ import {
   type WrapperAttemptRow,
 } from "./provider-leg-death-notice";
 import {
+  applyProviderConstraint,
+  buildPlannedLaunchSpec,
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
+  type HostMatrixAxes,
   isStoppedJobLive,
+  isWrappedCell,
   REPAIR_TERMINAL_GRACE_SEC,
+  withDispatchAttempt,
+  wrappedEnvelopePath,
 } from "./reconcile-core";
 import {
   DEFAULT_BATCH_SIZE,
@@ -381,6 +394,12 @@ import type {
   WakeWorkerData,
   WakeWorkerOutbound,
 } from "./wake-worker";
+import {
+  composeWorkerCellDir,
+  defaultShadowingWorkProbe,
+  defaultWorkerCellFreshnessProbe,
+  resolveWorkerCell,
+} from "./worker-cell";
 import {
   backupThenCleanSharedCheckout,
   probeLaneMergeHead,
@@ -1264,12 +1283,17 @@ export interface PendingBlockEscalation {
   status: string;
   /** Current terminal/retry outcome, or null before the first attempt. */
   outcome: string | null;
+  /** Durable count of owning-work attachment attempts for this block instance. */
+  owner_redispatch_attempts: number;
   /** Owning epic's `project_dir` — the plan state-file root for the reason read. */
   project_dir: string | null;
   /** The embedded task's live `runtime_status` — the cancellation-guard signal. */
   runtime_status: string | null;
   /** The embedded task's `target_repo` — the effective-repo override. */
   target_repo: string | null;
+  /** Assigned worker cell axes used when re-dispatching `work::<task>`. */
+  model: string | null;
+  tier: string | null;
 }
 
 /**
@@ -1292,7 +1316,7 @@ export function selectPendingBlockEscalations(
 ): PendingBlockEscalation[] {
   const latches = db
     .query(
-      `SELECT epic_id, task_id, status, outcome
+      `SELECT epic_id, task_id, status, outcome, owner_redispatch_attempts
          FROM block_escalations
         WHERE status = 'pending'
            OR (status = 'attempted' AND outcome = 'skipped_category')`,
@@ -1302,6 +1326,7 @@ export function selectPendingBlockEscalations(
     task_id: string;
     status: string;
     outcome: string | null;
+    owner_redispatch_attempts: number;
   }[];
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
@@ -1314,6 +1339,8 @@ export function selectPendingBlockEscalations(
       | undefined;
     let runtimeStatus: string | null = null;
     let targetRepo: string | null = null;
+    let model: string | null = null;
+    let tier: string | null = null;
     if (epicRow != null) {
       // The embedded `tasks` JSON is a foreign-process array; a parse failure
       // folds to "task element not found" (null fields) — never throws into the
@@ -1323,6 +1350,8 @@ export function selectPendingBlockEscalations(
           task_id?: unknown;
           runtime_status?: unknown;
           target_repo?: unknown;
+          model?: unknown;
+          tier?: unknown;
         }[];
         const el = tasks.find((t) => t.task_id === latch.task_id);
         if (el != null) {
@@ -1330,6 +1359,8 @@ export function selectPendingBlockEscalations(
             typeof el.runtime_status === "string" ? el.runtime_status : null;
           targetRepo =
             typeof el.target_repo === "string" ? el.target_repo : null;
+          model = typeof el.model === "string" ? el.model : null;
+          tier = typeof el.tier === "string" ? el.tier : null;
         }
       } catch {
         // Leave null fields — the producer skips a latch it can't resolve.
@@ -1340,9 +1371,12 @@ export function selectPendingBlockEscalations(
       task_id: latch.task_id,
       status: latch.status,
       outcome: latch.outcome,
+      owner_redispatch_attempts: latch.owner_redispatch_attempts,
       project_dir: epicRow?.project_dir ?? null,
       runtime_status: runtimeStatus,
       target_repo: targetRepo,
+      model,
+      tier,
     });
   }
   return out;
@@ -1386,8 +1420,8 @@ export function shouldEscalateBlockedCategory(
  *    write-capable `repair::<repo-token>` dispatch, so the block sweep skips the row
  *    (latch left `pending`, re-sweeps; a successful repair unblocks the task,
  *    deleting the latch).
- *  - `unblock` — every other escalatable category: today's per-epic-serialized
- *    `unblock::<task>` dispatch, byte-equivalent.
+ *  - `unblock` — every other escalatable category enters the per-epic block
+ *    handling ladder (owning-work attachment, then legacy unblock fallback).
  */
 export type BlockRoute = "surface_and_stop" | "repair" | "unblock";
 
@@ -1509,17 +1543,69 @@ export function auditReadyEscalationDecision(
   return "defer";
 }
 
+/** The liveness reading for the `work::<task>` session that owns an ordinary
+ * blocked task. Same safe three-state shape as the audit gate, but scoped to the
+ * task's work owner rather than the audit gate's task-or-epic owner set. */
+export type BlockOwnerLiveness = AuditOrchestratorLiveness;
+
+/** Number of owning-work attachment attempts before the legacy unblock fallback. */
+export const BLOCK_OWNER_REDISPATCH_LIMIT = 2;
+
+/** The ordinary blocked-task owner uses the audit gate's established death grace. */
+export const BLOCK_OWNER_GRACE_MS = AUDIT_READY_ORCHESTRATOR_GRACE_MS;
+
+/**
+ * Classify the owning `work::<task>` orchestrator from projected jobs. A live
+ * owner wins; a dead owner carries the latest event-timestamp death anchor; no
+ * matching row is `absent`. Pure over injected projection rows.
+ */
+export function probeBlockOwner(
+  jobs: readonly Job[],
+  epicId: string,
+  taskId: string,
+  activityByJobId: ReadonlyMap<string, HarnessActivity> = new Map(),
+): BlockOwnerLiveness {
+  return probeAuditOrchestrator(
+    jobs.filter((job) => job.plan_verb === "work" && job.plan_ref === taskId),
+    epicId,
+    taskId,
+    activityByJobId,
+  );
+}
+
+/**
+ * Decide the next ordinary block-handling rung. Only a witnessed owner death
+ * beyond grace can act: live, grace-held, and absent owners all defer. A dead
+ * owner receives a bounded number of `work::<task>` attachment attempts before
+ * the legacy `unblock::<task>` fallback becomes eligible. Pure.
+ */
+export function blockOwnerEscalationDecision(
+  liveness: BlockOwnerLiveness,
+  ownerRedispatchAttempts: number,
+  nowMs: number,
+  graceMs: number = BLOCK_OWNER_GRACE_MS,
+  attemptLimit: number = BLOCK_OWNER_REDISPATCH_LIMIT,
+): "defer" | "redispatch_owner" | "dispatch_legacy_unblock" {
+  if (liveness.state !== "dead" || nowMs - liveness.diedAtMs < graceMs) {
+    return "defer";
+  }
+  return ownerRedispatchAttempts < attemptLimit
+    ? "redispatch_owner"
+    : "dispatch_legacy_unblock";
+}
+
 /** The outcome the producer records on the `block_escalations` latch (the
  *  `BlockEscalationAttempted.outcome` column). The TERMINAL `dispatched` (the
- *  `unblock::<task>` session launched) and the two skip terminals advance the latch
- *  to `attempted`; a later parsed reason-class change can re-arm
- *  `skipped_category` through the producer. The non-terminal `dispatch_failed` (the
- *  launch missed) RESETS it to `pending` so the sweep re-attempts
- *  (`foldBlockEscalationAttempted`). A cap/occupancy SKIP (`at_cap` /
- *  `already_live`) mints NOTHING at all — the latch stays eligible and re-sweeps. */
+ *  legacy `unblock::<task>` fallback launched) and the two skip terminals advance
+ *  the latch to `attempted`; a later parsed reason-class change can re-arm
+ *  `skipped_category` through the producer. Ordinary `dispatch_failed` resets to
+ *  `pending`; the two `owner_*` outcomes also reset to pending while consuming a
+ *  durable attachment attempt. A cap/occupancy skip mints nothing. */
 export type BlockEscalationOutcome =
   | "dispatched"
   | "dispatch_failed"
+  | "owner_redispatched"
+  | "owner_redispatch_failed"
   | "skipped_category"
   | "skipped_unblocked";
 
@@ -1557,13 +1643,18 @@ export interface BlockEscalationSweepDeps {
   readonly dispatchUnblock: (
     row: PendingBlockEscalation,
   ) => Promise<EscalationDispatchOutcome>;
-  /** True IFF an `unblock::<task>` session for ANY task in `epicId` is already LIVE
-   *  — the per-EPIC serialization guard. At most one live unblock session per epic,
-   *  so a mass-block never fans an epic's siblings out at once; a same-epic sibling
-   *  stays latched `pending` and re-sweeps once the live session goes terminal.
-   *  Production reads the live jobs (via {@link epicHasLiveUnblock}) PLUS the
-   *  producer's not-yet-folded in-flight memo. */
-  readonly isEpicUnblockLive: (epicId: string) => boolean;
+  /** Launch one `work::<task>` owner attachment attempt. A real launch success or
+   *  failure consumes one durable attempt; occupancy/cap skips consume none. */
+  readonly dispatchOwner: (
+    row: PendingBlockEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
+  /** True IFF block handling for ANY task in `epicId` is already live — either an
+   *  owning work orchestrator or a legacy unblock fallback. This preserves the
+   *  per-epic serialization guard across both ladder rungs. */
+  readonly isEpicBlockHandlingLive: (epicId: string) => boolean;
+  /** Classify the ordinary blocked task's owning `work::<task>` orchestrator.
+   *  Optional absent reads `absent`, which safely defers. */
+  readonly ownerLiveness?: (row: PendingBlockEscalation) => BlockOwnerLiveness;
   /** Classify the owning orchestrator's liveness for an AUDIT_READY park
    *  (DELEGATES to {@link probeAuditOrchestrator} over the live jobs in
    *  production). Read ONLY for the `AUDIT_READY` category — every other category
@@ -1572,7 +1663,7 @@ export interface BlockEscalationSweepDeps {
   readonly auditOrchestratorLiveness?: (
     row: PendingBlockEscalation,
   ) => AuditOrchestratorLiveness;
-  /** Wall-clock now in ms — the AUDIT_READY grace clock (producer-side).
+  /** Wall-clock now in ms — the owner-death grace clock (producer-side).
    *  Optional; defaults to {@link Date.now}. */
   readonly now?: () => number;
   /** True IFF an OPEN sticky `dispatch_failures` row already exists for
@@ -1615,12 +1706,11 @@ export type BlockCandidateDropClass =
 
 /**
  * Run one daemon block-escalation sweep (stage 2) — the producer half of the
- * dispatch-once loop for a blocked task with an escalatable category. Walk the
- * pending `block_escalations` latch rows, gate each by the cancellation guard + the
- * category denylist, then DISPATCH one `unblock::<task>` escalation session per
- * escalatable block — SERIALIZED per epic (at most one live unblock session per
- * epic). No planner@ bus message: the session boots `/plan:unblock` and resolves the
- * blocker without the creator's context.
+ * blocked-task handling ladder. Walk pending latches, preserve the category routes,
+ * defer ordinary escalatable blocks while their owning work orchestrator is live or
+ * death-grace-held, then consume bounded `work::<task>` attachment attempts before
+ * dispatching the legacy `unblock::<task>` fallback. Every launch rung is serialized
+ * per epic. No planner@ bus message.
  *
  * Each row resolves to one of:
  *  - `skipped_unblocked` (terminal) — the cancellation guard fired (task left
@@ -1628,12 +1718,12 @@ export type BlockCandidateDropClass =
  *  - `skipped_category` (terminal) — `TOOLING_FAILURE` / absent-or-unparseable
  *    reason: surface-and-stop. Mints Requested→Attempted AND a durable
  *    `work::<task>` re-dispatch suppression (once-only). NEVER dispatches an agent.
- *  - a same-epic serialization SKIP — a sibling already holds the epic's one live
- *    unblock (won the claim THIS cycle, or still live from a prior cycle): mints
- *    NOTHING, so the latch stays `pending` and re-sweeps once that session goes
- *    terminal (no starvation, no same-epic collision).
- *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal, re-sweeps) — the
- *    launch outcome. A cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING.
+ *  - a same-epic serialization skip — a sibling already holds the epic's live
+ *    block handler: mints nothing, so the latch stays pending.
+ *  - `owner_redispatched` / `owner_redispatch_failed` — consume one durable
+ *    attachment attempt and stay pending.
+ *  - `dispatched` (terminal) / `dispatch_failed` (non-terminal) — the legacy
+ *    fallback launch outcome. A cap/occupancy skip mints nothing.
  *
  * Every disqualifying drop emits a class-stable diagnostic through `note` ({@link
  * BlockCandidateDropClass}); a re-sweepable cap/occupancy park (per-epic
@@ -1666,11 +1756,10 @@ export async function runBlockEscalationSweep(
   }
   if (pending.length === 0) return;
 
-  // Per-EPIC serialization: at most one `unblock::<task>` dispatch per epic per
-  // sweep. `claimedEpics` bounds the WITHIN-sweep fan-out (a mass-block of many
-  // same-epic tasks); `isEpicUnblockLive` bounds it ACROSS sweeps (a session
-  // dispatched a prior cycle is still live). A same-epic sibling loses both guards
-  // and stays latched `pending` — it re-sweeps once the live session goes terminal.
+  // Per-EPIC serialization: at most one block-handling launch per epic per sweep.
+  // `claimedEpics` bounds within-sweep fan-out; `isEpicBlockHandlingLive` bounds it
+  // across sweeps for both owning-work attachments and legacy unblock fallbacks. A
+  // same-epic sibling stays pending until the live handler goes terminal.
   const claimedEpics = new Set<string>();
   for (const row of pending) {
     const rearmFromSkippedCategory =
@@ -1783,6 +1872,26 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
+    // Both audit categories retain their dedicated behavior above: AUDIT_READY
+    // defers on its task-or-epic owner and falls straight into the legacy fallback
+    // after witnessed death; AUDIT_SEVERE continues to escalate immediately. Every
+    // other unblock-routed category uses the owning-work attachment ladder.
+    let handlingRung: "redispatch_owner" | "dispatch_legacy_unblock" =
+      "dispatch_legacy_unblock";
+    if (
+      category !== AUDIT_READY_CATEGORY &&
+      category !== AUDIT_SEVERE_CATEGORY
+    ) {
+      const liveness = deps.ownerLiveness?.(row) ?? { state: "absent" };
+      const decision = blockOwnerEscalationDecision(
+        liveness,
+        row.owner_redispatch_attempts,
+        (deps.now ?? Date.now)(),
+      );
+      if (decision === "defer") continue;
+      handlingRung = decision;
+    }
+
     // Defensive guard, mirrors {@link selectRepairCandidates}'s `empty_repo`: since
     // `readBlockedReason` (production: {@link readTaskBlockedReason}) ties
     // reason-readability to a non-empty `project_dir`, reaching here already implies
@@ -1801,18 +1910,74 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
-    // Per-epic serialization: an unblock is already in play for this epic — either a
-    // sibling won the claim THIS sweep, or a session dispatched a prior cycle is
-    // still live. Skip WITHOUT minting so the latch stays `pending` and re-sweeps
-    // once that session terminates (a shared root cause the unblock clears takes the
-    // sibling out of `blocked`, deleting its latch before it ever dispatches).
-    if (claimedEpics.has(row.epic_id) || deps.isEpicUnblockLive(row.epic_id)) {
+    // Per-epic serialization: a block handler is already in play for this epic —
+    // either a sibling won this sweep or an owning-work/legacy-unblock session from a
+    // prior cycle is still live. Skip without minting so the latch stays pending.
+    if (
+      claimedEpics.has(row.epic_id) ||
+      deps.isEpicBlockHandlingLive(row.epic_id)
+    ) {
       note(
         `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=epic_serialized`,
       );
       continue;
     }
     claimedEpics.add(row.epic_id);
+
+    // Re-probe at the dispatch boundary. The owner may have attached after the
+    // first decision but before this row won per-epic serialization; every rung
+    // takes the defer direction on that race instead of double-handling the block.
+    if (
+      category !== AUDIT_READY_CATEGORY &&
+      category !== AUDIT_SEVERE_CATEGORY
+    ) {
+      const refreshed = blockOwnerEscalationDecision(
+        deps.ownerLiveness?.(row) ?? { state: "absent" },
+        row.owner_redispatch_attempts,
+        (deps.now ?? Date.now)(),
+      );
+      if (refreshed === "defer") continue;
+      handlingRung = refreshed;
+    }
+
+    // A witnessed-dead owner below the durable bound gets another owning-work
+    // attachment attempt before any legacy escalation session can launch. Both a
+    // successful launch and a real launch failure consume one durable attempt;
+    // occupancy/cap skips do not. The attempted fold resets the latch to `pending`
+    // while incrementing the owner-attempt column, so daemon restarts resume at the
+    // same rung.
+    if (handlingRung === "redispatch_owner") {
+      let ownerOutcome: EscalationDispatchOutcome;
+      try {
+        ownerOutcome = await deps.dispatchOwner(row);
+      } catch (err) {
+        note(
+          `# warn: owner redispatch threw for ${row.task_id} (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        ownerOutcome = "dispatch_failed";
+      }
+      if (
+        ownerOutcome === "at_cap" ||
+        ownerOutcome === "already_live" ||
+        ownerOutcome === "checkout_busy"
+      ) {
+        note(
+          `# block-escalation-skip epic=${row.epic_id} task=${row.task_id} class=owner_${ownerOutcome}`,
+        );
+        continue;
+      }
+      deps.mintRequested(row.epic_id, row.task_id);
+      deps.mintAttempted(
+        row.epic_id,
+        row.task_id,
+        ownerOutcome === "dispatched"
+          ? "owner_redispatched"
+          : "owner_redispatch_failed",
+      );
+      continue;
+    }
 
     // The escalatable serialization-winner row. Launch the `unblock::<task>` session,
     // then record the outcome. A SKIP (`at_cap` / `already_live`) mints nothing — the
@@ -12088,30 +12253,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint a synthetic `Dispatched` event AND reply a durable `dispatched-ack{id,
-   * ok}`. The reducer's fold UPSERTs a `pending_dispatches` row keyed `(verb,
-   * id)` carrying the producer-side `dispatched_at` — outbox-ordered intent so a
-   * crash between mint and `launch()` leaves a phantom row the TTL sweep clears.
-   *
-   * DURABLE before launch: the worker AWAITS this ack BEFORE `launch()`, so the
-   * reply MUST fire on every path (`ok:true` once the insert lands, `ok:false`
-   * when it throws OR when the durable gate suppresses). The worker launches only
-   * on `ok:true`; an `ok:false` or ack-timeout aborts WITHOUT launching — strictly
-   * preferable to the fire-and-forget race that re-opened the double-dispatch
-   * window. NON-FATAL on insert failure.
-   *
-   * DURABLE MINT GATE: one logical dispatch attempt otherwise amplifies into N
-   * same-instant `Dispatched` rows (pre-launch abort loops, restart storms, the
-   * insert→fold gap). The gate read + the conditional event insert run in ONE
-   * `BEGIN IMMEDIATE` transaction on main's writable connection: a re-mint of the
-   * same `verb::id` inside `DISPATCH_MINT_GATE_WINDOW_MS` inserts NO row and
-   * replies a DISTINCT suppressed ack (`ok:false, suppressed:true`); a fresh mint
-   * stamps the gate AND inserts atomically, so a crash between them can neither
-   * un-dedup the next attempt nor suppress a legit one forever. Suppression does
-   * NOT re-stamp the gate — the window stays absolute from the frozen first mint.
+   * Admit one `Dispatched` attempt through the durable mint gate. Both the
+   * reconciler bridge and the blocked-owner attachment path call this before
+   * launch, so every `work::<task>` side effect carries an exact Event-derived
+   * attempt fence and a crash leaves a bounded `pending_dispatches` lease.
    */
-  function handleDispatchedMint(msg: DispatchedMessage): void {
-    const { id, payload } = msg;
+  function admitDispatched(payload: DispatchedPayload): DispatchedAck {
     const dispatchKey = `${payload.verb}::${payload.id}`;
     let ok = false;
     let suppressed = false;
@@ -12200,34 +12347,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
-    // Reply on EVERY path — the worker is blocked awaiting this ack before it
-    // launches. A suppressed mint replies a DISTINCT `ok:false, suppressed:true`
-    // (a benign dedup, not an error) and needs no pump (nothing was inserted).
-    // The `?.` keeps it null-safe for the type system on an unselected-autopilot
-    // boot.
-    if (suppressed) {
-      autopilotWorkerInstance?.postMessage({
-        type: "dispatched-ack",
-        id,
-        ok: false,
-        suppressed: true,
-      } satisfies DispatchedAckMessage);
-      return;
-    }
-    // Reply IMMEDIATELY after the committed INSERT, BEFORE the (potentially slow)
-    // reducer pump: the launch must not wait on the drain, and the ack already
-    // reflects everything it promises. Outbox ordering is UNCHANGED — the insert
-    // still precedes the launch.
-    autopilotWorkerInstance?.postMessage({
-      type: "dispatched-ack",
-      id,
+    if (suppressed) return { ok: false, suppressed: true };
+    return {
       ok,
       ...(attemptId === undefined ? {} : { attemptId }),
+    };
+  }
+
+  /** Reply to the reconciler only after its dispatch intent is durable. */
+  function handleDispatchedMint(msg: DispatchedMessage): void {
+    const ack = admitDispatched(msg.payload);
+    autopilotWorkerInstance?.postMessage({
+      type: "dispatched-ack",
+      id: msg.id,
+      ...ack,
     } satisfies DispatchedAckMessage);
-    // Pump the reducer AFTER the ack, in its own guarded block — a pump throw is
-    // logged but can neither flip the sent ack nor escape this handler. Only pump
-    // when the insert landed.
-    if (ok) {
+    // Preserve the existing ack-before-pump ordering: the durable insert is the
+    // launch fence, while the projection may catch up after the worker proceeds.
+    if (ack.ok) {
       try {
         wakePending = true;
         pumpWakes();
@@ -13183,6 +13320,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // terminal) or ages past its TTL (a never-folded launch), so it stays bounded and is
   // NEVER a fold input.
   const inFlightEscalations = new Map<string, number>();
+  // Owning-work attachment launches that have not folded a fresh `jobs` row yet.
+  // This closes the launch→SessionStart gap inside one daemon lifetime; the durable
+  // attempt count bounds recovery after a restart.
+  const inFlightBlockOwners = new Map<string, number>();
   // Producer-side memo of the resolved base CHECKOUT each merge-recreating escalation
   // (`resolve::` / `deconflict::`) was launched into, keyed by `<verb>::<id>` label — the
   // per-checkout occupancy guard's not-yet-folded arm (a launch's `jobs.cwd` folds SECONDS
@@ -13243,6 +13384,78 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     return false;
   }
+  function readBlockOwnerJobs(taskId: string): Job[] {
+    try {
+      return db
+        .query("SELECT * FROM jobs WHERE plan_verb = 'work' AND plan_ref = ?")
+        .all(taskId) as unknown as Job[];
+    } catch {
+      return [];
+    }
+  }
+
+  function workDispatchPending(taskId: string): boolean {
+    try {
+      return (
+        db
+          .query(
+            "SELECT 1 FROM pending_dispatches WHERE verb = 'work' AND id = ? LIMIT 1",
+          )
+          .get(taskId) != null
+      );
+    } catch {
+      // An inconclusive lease read must never open a second launch window.
+      return true;
+    }
+  }
+
+  function ownerActivities(jobs: readonly Job[]): Map<string, HarnessActivity> {
+    const ids = jobs.map((job) => job.job_id);
+    let children: Array<Record<string, unknown>> = [];
+    if (ids.length > 0) {
+      try {
+        const placeholders = ids.map(() => "?").join(",");
+        children = db
+          .query(
+            `SELECT * FROM subagent_invocations WHERE job_id IN (${placeholders})`,
+          )
+          .all(...ids) as Array<Record<string, unknown>>;
+      } catch {
+        children = ids.map((job_id) => ({ job_id }));
+      }
+    }
+    return deriveHarnessActivities(
+      jobs,
+      children,
+      Math.floor(Date.now() / 1000),
+    );
+  }
+
+  function blockOwnerLiveness(row: PendingBlockEscalation): BlockOwnerLiveness {
+    const jobs = readBlockOwnerJobs(row.task_id);
+    const launchedAt = inFlightBlockOwners.get(row.task_id);
+    if (launchedAt !== undefined) {
+      const folded = jobs.some(
+        (job) => (job.updated_at ?? 0) * 1000 >= launchedAt,
+      );
+      if (folded || launchedAt < Date.now() - INFLIGHT_ESCALATION_TTL_MS) {
+        inFlightBlockOwners.delete(row.task_id);
+      } else {
+        return { state: "live" };
+      }
+    }
+    // A durable outbox lease covers a cold-booting work owner even before its
+    // jobs row folds, including after a daemon restart when the in-memory memo is
+    // empty. Its TTL producer eventually releases a genuinely never-bound lease.
+    if (workDispatchPending(row.task_id)) return { state: "live" };
+    return probeBlockOwner(
+      jobs,
+      row.epic_id,
+      row.task_id,
+      ownerActivities(jobs),
+    );
+  }
+
   // The owning-orchestrator jobs for an AUDIT_READY park — the `work::<task>` and
   // `close::<epic>` sessions that run (or re-dispatch) the audit and resume the
   // worker. Selects `updated_at` (the dead-owner death anchor) on top of the
@@ -13832,6 +14045,235 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  function readWorkerProvider(): WorkerProvider | null {
+    try {
+      const row = db
+        .query("SELECT worker_provider FROM autopilot_state WHERE id = 1")
+        .get() as { worker_provider: string | null } | null;
+      return row?.worker_provider === "claude" || row?.worker_provider === "gpt"
+        ? row.worker_provider
+        : null;
+    } catch {
+      // Match the manual dispatch recovery posture: an unreadable pin does not
+      // silently prevent the owner attachment from using its assigned cell.
+      return null;
+    }
+  }
+
+  function blockOwnerHostMatrix(): {
+    matrix: MatrixV2;
+    axes: HostMatrixAxes;
+  } | null {
+    try {
+      const matrix = loadMatrixV2();
+      const axes: HostMatrixAxes = {
+        models: matrix.subagentModels,
+        effortsByModel: matrix.effortsByModel,
+        efforts: matrix.efforts,
+        driverByModel: matrix.driverByModel,
+        routeByModel: new Map(
+          matrix.subagentModels.flatMap((model) => {
+            const driver = matrix.driverByModel.get(model) ?? "wrapped";
+            const hasRoute = matrix.providers.some(
+              (provider) =>
+                (driver === "native"
+                  ? provider.name === "claude"
+                  : provider.name !== "claude") && provider.models.has(model),
+            );
+            return hasRoute ? ([[model, driver]] as const) : [];
+          }),
+        ),
+      };
+      return { matrix, axes };
+    } catch (err) {
+      const detail =
+        err instanceof MatrixConfigError
+          ? `${err.state}: ${err.message}`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      console.error(
+        `[keeperd] # block owner redispatch matrix rejected ${detail}`,
+      );
+      return null;
+    }
+  }
+
+  function buildBlockOwnerLaunch(row: PendingBlockEscalation): {
+    cwd: string;
+    spec: LaunchSpec;
+    cell: DispatchedPayload["cell"];
+  } | null {
+    const owners = readBlockOwnerJobs(row.task_id);
+    const latestOwner = owners.reduce<Job | null>((latest, job) => {
+      if (latest == null) return job;
+      const byUpdated = (job.updated_at ?? 0) - (latest.updated_at ?? 0);
+      if (byUpdated !== 0) return byUpdated > 0 ? job : latest;
+      return (job.last_event_id ?? 0) > (latest.last_event_id ?? 0)
+        ? job
+        : latest;
+    }, null);
+    const fallbackCwd = effectiveBlockEscalationRepo(
+      row.target_repo,
+      row.project_dir,
+    );
+    const cwd = latestOwner?.cwd || fallbackCwd;
+    const worktreeBranch = latestOwner?.worktree ?? undefined;
+    const worktreePath = worktreeBranch == null ? undefined : cwd;
+    const launch = resolveDispatchLaunchConfig("work");
+
+    if (row.model == null || row.tier == null) {
+      return {
+        cwd,
+        spec: buildPlannedLaunchSpec(
+          "work",
+          row.task_id,
+          launch.model ?? WORKER_MODEL,
+          launch.effort ?? WORKER_EFFORT,
+          worktreePath,
+          worktreeBranch,
+          null,
+        ),
+        cell: undefined,
+      };
+    }
+
+    const host = blockOwnerHostMatrix();
+    if (host == null) return null;
+    const provider = readWorkerProvider();
+    let effectiveModel = row.model;
+    let effectiveTier = row.tier;
+    let dispatchedModel: string | null = null;
+    let dispatchedTier: string | null = null;
+    let dispatchConstraint: WorkerProvider | null = null;
+    if (provider != null) {
+      const constrained = applyProviderConstraint(
+        { model: row.model, effort: row.tier },
+        provider,
+        loadProviderEquivalenceSnapshot(),
+        host.axes,
+      );
+      if (constrained.kind === "reject") {
+        console.error(
+          `[keeperd] # block owner redispatch provider rejected task=${row.task_id} reason=${constrained.reason}`,
+        );
+        return null;
+      }
+      if (constrained.kind === "translated") {
+        effectiveModel = constrained.cell.model;
+        effectiveTier = constrained.cell.effort;
+        dispatchedModel = effectiveModel;
+        dispatchedTier = effectiveTier;
+        dispatchConstraint = provider;
+      }
+    }
+
+    const wrapped = isWrappedCell(host.axes, effectiveModel);
+    const wrappedCell = wrapped
+      ? `${effectiveModel}::${effectiveTier}`
+      : undefined;
+    const compose = composeWorkerCellDir(
+      effectiveModel,
+      effectiveTier,
+      () => host.matrix,
+    );
+    if (provider != null) {
+      const driver = host.axes.driverByModel.get(effectiveModel) ?? "wrapped";
+      compose.providerLaunchContract = {
+        provider,
+        model: effectiveModel,
+        tier: effectiveTier,
+        driver,
+        route: host.axes.routeByModel?.get(effectiveModel) ?? null,
+        wrappedCell: wrappedCell ?? null,
+      };
+    }
+    const cell = resolveWorkerCell(compose, {
+      dirExists: existsSync,
+      probeFreshness: defaultWorkerCellFreshnessProbe,
+      probeShadow: (pluginDir) => defaultShadowingWorkProbe(pluginDir, cwd),
+    });
+    if (!cell.ok) {
+      console.error(
+        `[keeperd] # block owner redispatch cell rejected task=${row.task_id} class=${cell.kind}`,
+      );
+      return null;
+    }
+    const envelopeRoot = fallbackCwd || cwd;
+    return {
+      cwd,
+      spec: buildPlannedLaunchSpec(
+        "work",
+        row.task_id,
+        launch.model ?? WORKER_MODEL,
+        launch.effort ?? WORKER_EFFORT,
+        worktreePath,
+        worktreeBranch,
+        cell.pluginDir,
+        dispatchedModel,
+        dispatchedTier,
+        dispatchConstraint,
+        wrappedCell,
+        wrapped ? wrappedEnvelopePath(envelopeRoot, row.task_id) : undefined,
+      ),
+      cell: {
+        assigned: { model: row.model, tier: row.tier },
+        effective: { model: effectiveModel, tier: effectiveTier },
+        constraint: dispatchConstraint,
+      },
+    };
+  }
+
+  // Re-dispatch the owning `work::<task>` orchestrator after witnessed death.
+  // Admission uses the same durable outbox + attempt fence as reconciler work
+  // launches, and the prior owner's lane identity keeps the attachment in place.
+  async function dispatchBlockOwner(
+    row: PendingBlockEscalation,
+  ): Promise<EscalationDispatchOutcome> {
+    if (blockOwnerLiveness(row).state === "live") return "already_live";
+    const launch = buildBlockOwnerLaunch(row);
+    if (launch == null) return "dispatch_failed";
+    const label = `work::${row.task_id}`;
+    const ack = admitDispatched({
+      verb: "work",
+      id: row.task_id,
+      dir: launch.cwd || null,
+      ts: Date.now() / 1000,
+      launch: {
+        session: MANAGED_EXEC_SESSION,
+        window: label,
+        pane: null,
+      },
+      ...(launch.cell === undefined ? {} : { cell: launch.cell }),
+    });
+    if (!ack.ok)
+      return ack.suppressed === true ? "already_live" : "dispatch_failed";
+    if (ack.attemptId == null) return "dispatch_failed";
+    // Fold the exact claim before the side effect so wrapped provider legs can
+    // validate their owner tuple as soon as the orchestrator starts.
+    wakePending = true;
+    pumpWakes();
+    const result = await keeperAgentLaunch({
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+      launcherArgvPrefix,
+      session: MANAGED_EXEC_SESSION,
+      cwd: launch.cwd,
+      label,
+      spec: withDispatchAttempt(launch.spec, ack.attemptId),
+    });
+    if (result.ok) {
+      inFlightBlockOwners.set(row.task_id, Date.now());
+      return "dispatched";
+    }
+    handleDispatchExpiredMint({
+      verb: "work",
+      id: row.task_id,
+      reason: "block_owner_attachment_launch_failed",
+      attempt_id: ack.attemptId,
+    });
+    return "dispatch_failed";
+  }
+
   // Launch ONE `unblock::<task>` escalation session for a blocked task with an
   // escalatable category. Sibling of `dispatchDeconflict`: cwd = the task's effective
   // repo (the lane worktree / project dir — the skill re-derives context from its
@@ -13866,6 +14308,39 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return epicHasLiveUnblock(jobs, epicId);
   }
 
+  function epicBlockHandlingLive(epicId: string): boolean {
+    if (epicUnblockLive(epicId)) return true;
+    for (const taskId of inFlightBlockOwners.keys()) {
+      if (parsePlanRef(taskId)?.epic_id === epicId) return true;
+    }
+    let jobs: Job[];
+    try {
+      const taskPattern = `${epicId}.*`;
+      const pending = db
+        .query(
+          "SELECT id FROM pending_dispatches WHERE verb = 'work' AND id GLOB ?",
+        )
+        .all(taskPattern) as { id: string }[];
+      if (pending.length > 0) return true;
+      jobs = db
+        .query(
+          "SELECT * FROM jobs WHERE plan_verb = 'work' AND plan_ref GLOB ?",
+        )
+        .all(taskPattern) as unknown as Job[];
+    } catch {
+      // Every failed occupancy read takes the defer direction.
+      return true;
+    }
+    const activity = ownerActivities(jobs);
+    return jobs.some((job) => {
+      const taskId = job.plan_ref;
+      return (
+        taskId != null &&
+        probeBlockOwner([job], epicId, taskId, activity).state === "live"
+      );
+    });
+  }
+
   // Send the ONE agentbot notification about a declined/dead `unblock::<task>` session
   // (stage 3). Sibling of `notifyHumanOfDeconflict`: ASYNC spawn, array form so the body
   // rides as a literal argv element (no shell interpolation). A non-zero exit OR a missing
@@ -13884,18 +14359,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return notifyHuman(body);
   }
 
-  // Producer-side block/unblock-dispatch sweep (fn-1129 stage 2), the rewired successor to
-  // the block-escalation planner@ notify. Each heartbeat tick walks fresh pending latches
-  // plus terminal category skips whose current reason class may re-arm them, gates each by
-  // the cancellation guard + the TOOLING_FAILURE denylist (surface-and-stop still
-  // suppresses `work::<task>` re-dispatch, never dispatching an agent), and DISPATCHES one
-  // `unblock::<task>` escalation session
-  // per escalatable block — SERIALIZED per epic (at most one live unblock per epic). A
-  // terminal `dispatched` stamps the latch to `attempted` (the reducer fold); a
-  // `dispatch_failed` resets it to `pending`, and a cap/occupancy or same-epic
-  // serialization SKIP leaves it `pending` — all re-sweepable. All wall-clock + fs + spawn
-  // lives HERE in the producer; the spawn lives only here, so a re-fold never re-fires a
-  // launch.
+  // Producer-side block-handling sweep. Each heartbeat walks pending latches plus
+  // re-armable category skips, preserves the surface-and-stop and repair routes,
+  // defers ordinary blocks to live owners, and advances the bounded owning-work →
+  // legacy-unblock ladder after witnessed death. Every launch is per-epic serialized;
+  // all wall-clock, filesystem, and spawn work stays producer-side.
   async function runBlockEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control; a paused board never auto-dispatches a NEW
@@ -13919,32 +14387,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           outcome,
         ),
       dispatchUnblock: (row) => dispatchUnblock(row),
-      isEpicUnblockLive: (epicId) => epicUnblockLive(epicId),
+      dispatchOwner: (row) => dispatchBlockOwner(row),
+      isEpicBlockHandlingLive: (epicId) => epicBlockHandlingLive(epicId),
+      ownerLiveness: (row) => blockOwnerLiveness(row),
       auditOrchestratorLiveness: (row) => {
         const jobs = readAuditOrchestratorJobs(row.epic_id, row.task_id);
-        const ids = jobs.map((job) => job.job_id);
-        let children: Array<Record<string, unknown>> = [];
-        if (ids.length > 0) {
-          try {
-            const placeholders = ids.map(() => "?").join(",");
-            children = db
-              .query(
-                `SELECT * FROM subagent_invocations WHERE job_id IN (${placeholders})`,
-              )
-              .all(...ids) as Array<Record<string, unknown>>;
-          } catch {
-            children = ids.map((job_id) => ({ job_id }));
-          }
-        }
         return probeAuditOrchestrator(
           jobs,
           row.epic_id,
           row.task_id,
-          deriveHarnessActivities(
-            jobs,
-            children,
-            Math.floor(Date.now() / 1000),
-          ),
+          ownerActivities(jobs),
         );
       },
       now: () => Date.now(),

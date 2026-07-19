@@ -6126,23 +6126,31 @@ function extractBlockEscalationAttemptedPayload(
 }
 
 /**
- * Fold one synthetic `BlockEscalationAttempted` event with STAGED outcomes. For a
- * TERMINAL outcome (the escalation-dispatch `dispatched`, or any outcome that is
- * not in the non-terminal set) it advances the `block_escalations` latch
- * `requested → attempted` and records the `outcome`. For a NON-TERMINAL outcome
- * (`dispatch_failed` — the `unblock::<task>` launch failed — or the bus-send
- * `send_failed`) it instead RESETS the latch to `pending` so
- * `selectPendingBlockEscalations` re-sweeps it on the next heartbeat tick — a
- * transient dispatch failure retries instead of dropping the escalation forever
- * (the latch otherwise only re-arms on an unblock→re-block `TaskSnapshot`
- * transition). The `outcome` is still recorded on the row so the failure is
- * observable. The branch reads ONLY the payload `outcome` + the persisted row
- * (`event.id`, no wall-clock/fs/liveness), so re-fold stays byte-deterministic.
- * Idempotent on a missing latch row (the UPDATE matches zero rows).
+ * Fold one synthetic `BlockEscalationAttempted` event with staged outcomes. The
+ * terminal legacy-fallback outcome advances requested → attempted. Ordinary
+ * non-terminal launch failures reset to pending. Owning-work outcomes also reset
+ * to pending while incrementing the durable attachment count, whether the launch
+ * succeeded or failed. Every branch reads only the payload, event id, and persisted
+ * row, so replay is deterministic; a missing latch is a safe no-op.
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
+    return;
+  }
+  const ownerRedispatch =
+    payload.outcome === "owner_redispatched" ||
+    payload.outcome === "owner_redispatch_failed";
+  if (ownerRedispatch) {
+    db.run(
+      `UPDATE block_escalations
+          SET status = 'pending',
+              outcome = ?,
+              owner_redispatch_attempts = owner_redispatch_attempts + 1,
+              last_event_id = ?
+        WHERE epic_id = ? AND task_id = ?`,
+      [payload.outcome, event.id, payload.epic_id, payload.task_id],
+    );
     return;
   }
   const nonTerminal =
