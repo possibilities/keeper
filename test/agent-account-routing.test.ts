@@ -656,6 +656,7 @@ describe("keeper agent accounts codex-pool", () => {
         mode: "native",
         aliases: ["keeper-codex-a", "keeper-codex-b"],
         config_binding: "b".repeat(64),
+        revision: "c".repeat(40),
         initial_alias: null,
         problem_code: "activation-pending",
       }),
@@ -668,6 +669,7 @@ describe("keeper agent accounts codex-pool", () => {
       '["keeper-codex-a","keeper-codex-b"]',
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBe("c".repeat(40));
     expect(
       JSON.parse(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW ?? "null"),
     ).toEqual({
@@ -711,6 +713,7 @@ describe("keeper agent accounts codex-pool", () => {
     expect(command).toContain("/fake/pi-codex-pool.ts");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_REVISION).toBeUndefined();
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
       "activation-pending",
     );

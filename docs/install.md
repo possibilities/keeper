@@ -210,9 +210,9 @@ Activation is intentionally pending until the separate live two-account proof is
 missing, incompatible, stale, interrupted, or unhealthy machinery uses Pi's native `openai-codex`
 credential and emits the fixed warning
 `[keeper-codex-pool] pool-unavailable; using native openai-codex`; it never claims a balanced route.
-The launch environment carries only `native|active`, opaque aliases, an optional opaque initial route
-candidate for Codex work, a SHA-256 configuration binding, and a bounded reason code. OAuth credentials
-remain in Pi's private `auth.json`; account ids, provider
+The launch environment carries only a bounded mode and proof-window state, opaque aliases, an optional
+opaque initial route candidate for Codex work, revision and configuration bindings, and a bounded reason
+code. OAuth credentials remain in Pi's private `auth.json`; account ids, provider
 headers, raw errors, tokens, plan labels, and account PII do not enter Keeper diagnostics, proof reports,
 launch environments, the daemon database, or a Projection.
 
@@ -242,8 +242,9 @@ keeper agent accounts codex-pool enroll keeper-codex-b
 Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
 Codex on those surfaces to remain unavailable until activation.
 
-Arm one proof window in a fresh managed Pi session, then use that bounded session to complete the live
-proof and produce its report:
+Arm one proof window in a fresh managed Pi session, use that bounded session to exercise the live proof,
+then run `/codex-pool-observe` and `/codex-pool-proof` before the window closes. The companion writes the
+private report atomically to `~/.config/keeper/codex-pool/live-proof.json`:
 
 ```sh
 keeper agent pi --x-codex-pool-proof-window=arm \
@@ -255,7 +256,8 @@ revision/configuration/alias bindings, interruption, incomplete root/child route
 cannot pass:
 
 ```sh
-keeper agent accounts codex-pool proof capture /path/to/live-proof.json --json
+keeper agent accounts codex-pool proof capture \
+  ~/.config/keeper/codex-pool/live-proof.json --json
 keeper agent accounts codex-pool proof verdict --json
 keeper agent accounts codex-pool activate --json
 keeper agent accounts codex-pool verify --json

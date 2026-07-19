@@ -18,12 +18,7 @@ import {
 import { poolConfigBinding } from "../integrations/pi-codex-pool/src/state.ts";
 import type { CodexRoutingInspection } from "./codex-account-router.ts";
 import {
-  armCodexPoolProofWindow,
-  CODEX_POOL_PROOF_WINDOW_DURATION_MS,
-  CODEX_POOL_PROOF_WINDOW_ENV,
   CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
-  type CodexPoolProofWindowState,
-  codexPoolProofWindowActive,
   exactKeys,
   record,
 } from "./codex-pool-proof-window.ts";
@@ -34,9 +29,9 @@ export {
   CODEX_POOL_PROOF_WINDOW_DURATION_MS,
   CODEX_POOL_PROOF_WINDOW_ENV,
   CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
-  codexPoolProofWindowActive,
   type CodexPoolProofWindowState,
-};
+  codexPoolProofWindowActive,
+} from "./codex-pool-proof-window.ts";
 
 export const CODEX_POOL_MAX_REPORT_BYTES = 256 * 1024;
 export const CODEX_POOL_MAX_STATE_BYTES = 32 * 1024;

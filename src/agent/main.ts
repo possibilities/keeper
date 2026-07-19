@@ -260,6 +260,7 @@ export interface CodexPoolLaunchContext {
   mode: "native" | "active";
   aliases: string[];
   config_binding: string;
+  revision?: string;
   initial_alias: string | null;
   problem_code: CodexPoolProblemCode | null;
 }
@@ -582,6 +583,7 @@ function productionCodexPoolLaunchContext(
       mode: ready && routed ? "active" : "native",
       aliases: [...deps.bindings.aliases],
       config_binding: deps.bindings.config_binding,
+      revision: deps.bindings.revision,
       initial_alias: route?.kind === "pooled" ? route.alias : null,
       problem_code:
         ready && routed
@@ -2948,6 +2950,7 @@ async function runCodexPoolCommand(
     deps.env.KEEPER_PI_CODEX_POOL_MODE = "native";
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(context.aliases);
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = context.config_binding;
+    delete deps.env.KEEPER_PI_CODEX_POOL_REVISION;
     deps.writeErr(
       "Warning: enrolling this alias revokes that account's other live grants " +
         "(legacy leg and bare Pi), causing a native Codex outage until activation.\n",
@@ -3915,8 +3918,14 @@ export async function main(deps: MainDeps): Promise<never> {
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = codexContext.config_binding;
     if (codexMode === "proof" && codexProofWindow !== null) {
       deps.env[CODEX_POOL_PROOF_WINDOW_ENV] = JSON.stringify(codexProofWindow);
+      if (codexContext.revision !== undefined) {
+        deps.env.KEEPER_PI_CODEX_POOL_REVISION = codexContext.revision;
+      } else {
+        delete deps.env.KEEPER_PI_CODEX_POOL_REVISION;
+      }
     } else {
       delete deps.env[CODEX_POOL_PROOF_WINDOW_ENV];
+      delete deps.env.KEEPER_PI_CODEX_POOL_REVISION;
     }
     if (codexMode === "active" && codexContext.initial_alias !== null) {
       deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = codexContext.initial_alias;
