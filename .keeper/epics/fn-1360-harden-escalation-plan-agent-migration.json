@@ -5,7 +5,8 @@
   "created_by_close_of": "fn-1348-escalation-capabilities-as-plan-agents",
   "depends_on_epics": [
     "fn-1348-escalation-capabilities-as-plan-agents",
-    "fn-1358-unjam-wrapped-delegation-launches"
+    "fn-1358-unjam-wrapped-delegation-launches",
+    "fn-1368-fix-guard-lexer-continuation"
   ],
   "id": "fn-1360-harden-escalation-plan-agent-migration",
   "last_validated_at": "2026-07-19T03:56:48.666000Z",
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T03:56:48.666000Z"
+  "updated_at": "2026-07-19T06:57:41.005000Z"
 }
