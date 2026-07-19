@@ -3,8 +3,8 @@
 //
 // Sibling of branch-guard / wrong-tree-guard / wrapped-guard. Jurisdiction is
 // keyed on the hook payload's SUBAGENT IDENTITY (`agent_type`), not a role marker:
-// when `agent_type` names one of the four confined escalation agents
-// (merge-resolver, deconflicter, unblocker, repairer) this hook ENFORCES fail-
+// when `agent_type` names a confined escalation agent (bare or plan:-qualified
+// merge-resolver, deconflicter, unblocker, repairer) this hook ENFORCES fail-
 // closed; for any other agent_type, and for identity-less top-level calls, it is
 // INERT (allow, no output) — a human or ordinary worker is never touched.
 //
@@ -789,15 +789,18 @@ export interface GrantGuardDeps {
   now(): number;
 }
 
-export function productionDeps(env: GrantEnv): GrantGuardDeps {
+export function productionDeps(
+  env: GrantEnv,
+  now: () => number = Date.now,
+): GrantGuardDeps {
   return {
-    grantLookup: (agentType, now) => {
+    grantLookup: (agentType, at) => {
       const expectation = grantExpectationFromEnv(env, agentType);
       if (expectation === null) return { kind: "absent" };
-      return readGrantLeaf(grantsDirOf(env), expectation, now);
+      return readGrantLeaf(grantsDirOf(env), expectation, at);
     },
     realpath: realpathNearest,
-    now: Date.now,
+    now,
   };
 }
 
@@ -950,9 +953,10 @@ function decideBash(
 
 /**
  * Pure decision: the deny envelope for this (payload, env), or null to allow.
- * Jurisdiction is payload-identity-keyed: only the four escalation agent types
- * ENFORCE; every other identity (and a malformed/identity-less payload) is INERT.
- * In jurisdiction the guard fails CLOSED on anything it cannot positively clear.
+ * Jurisdiction is payload-identity-keyed: only confined escalation agent
+ * identities ENFORCE; every other identity (and a malformed/identity-less
+ * payload) is INERT. In jurisdiction the guard fails CLOSED on anything it
+ * cannot positively clear.
  */
 export function decideGrantGuard(
   payload: unknown,

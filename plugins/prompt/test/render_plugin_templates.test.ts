@@ -44,13 +44,18 @@ const STATIC_AGENTS = [
   "selection-auditor",
 ];
 
-const AGENT_PINS = [
-  "agent_pins:",
-  ...STATIC_AGENTS.map((agent) => `  ${agent}: {model: opus, effort: high}`),
-];
+const STATIC_AGENT_PIN_LINES = STATIC_AGENTS.map(
+  (agent) => `  ${agent}: {model: opus, effort: high}`,
+);
+
+const AGENT_PINS = ["agent_pins:", ...STATIC_AGENT_PIN_LINES];
 
 function matrix(lines: string[]): string {
   return [...lines, ...AGENT_PINS, ""].join("\n");
+}
+
+function matrixWithAgentPins(lines: string[], pins: string[]): string {
+  return [...lines, "agent_pins:", ...pins, ""].join("\n");
 }
 
 const MULTI_PROVIDER_MATRIX = matrix([
@@ -155,6 +160,12 @@ function readWorker(work: string, cell: string): string {
     join(work, "workers", cell, "agents", "worker.md"),
     "utf-8",
   );
+}
+
+function frontmatterOf(body: string): string {
+  const match = body.match(/^---\n([\s\S]*?)\n---\n/);
+  if (match === null) throw new Error("missing frontmatter");
+  return match[1] as string;
 }
 
 function hasNoPartialTree(work: string): boolean {
@@ -297,6 +308,80 @@ describe("runRenderPluginTemplates delegated worker publication", () => {
       ).toBe(true);
     } finally {
       rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("renders the repairer catalog default_pin when its host pin is omitted", () => {
+    const matrixYaml = matrixWithAgentPins(
+      [
+        "efforts: [high, xhigh]",
+        "subagent_templates: [template/agents/worker.md.tmpl]",
+        "subagent_models: [opus]",
+        "providers:",
+        "  - name: claude",
+        "    models:",
+        "      - {id: opus, efforts: [high, xhigh]}",
+        "      - {id: sonnet, efforts: [xhigh]}",
+        "wrapper_driver:",
+        "  model: sonnet",
+        "  effort: xhigh",
+      ],
+      [
+        ...STATIC_AGENT_PIN_LINES,
+        "  deconflicter: {model: opus, effort: xhigh}",
+        "  merge-resolver: {model: opus, effort: high}",
+        "  unblocker: {model: opus, effort: high}",
+      ],
+    );
+    expect(matrixYaml).not.toContain("  repairer:");
+    const { work, rc } = renderPlan(matrixYaml);
+    try {
+      expect(rc).toBe(0);
+      const frontmatter = frontmatterOf(
+        readFileSync(join(work, "agents", "repairer.md"), "utf-8"),
+      );
+      expect(frontmatter).toContain("model: opus\n");
+      expect(frontmatter).toContain('effort: "xhigh"\n');
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a catalog default_pin effort outside the host effort axis", () => {
+    const root = mkdtempSync(join(tmpdir(), "prompt-default-pin-axis-"));
+    const matrixPath = join(root, "matrix.yaml");
+    try {
+      writeFileSync(
+        matrixPath,
+        matrix([
+          "efforts: [high]",
+          "subagent_templates: [template/agents/worker.md.tmpl]",
+          "subagent_models: [opus]",
+          "providers:",
+          "  - name: claude",
+          "    models:",
+          "      - {id: opus, efforts: [high]}",
+          "      - {id: sonnet, efforts: [xhigh]}",
+          "  - name: pi",
+          "    models: [gpt-5.6-sol]",
+          "wrapper_driver:",
+          "  model: sonnet",
+          "  effort: xhigh",
+        ]),
+      );
+      expect(() =>
+        compilePromptArtifacts({
+          request: { target: "pi", role: "plan:deconflicter" },
+          repoRoot: KEEPER_ROOT,
+          planRoot: PLAN_PLUGIN,
+          matrixPath,
+          targetDir: join(root, "pi-agents"),
+        }),
+      ).toThrow(
+        "plan:deconflicter: default_pin effort 'xhigh' is not in the host matrix effort axis",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
