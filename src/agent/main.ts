@@ -3373,7 +3373,7 @@ async function runCodexPoolCommand(
       `Codex pool enrollment is interactive; in Pi run /login ${alias}, then exit.\n`,
     );
     return runPassthrough(
-      [deps.piBin, ...companion.args, "--model", "openai-codex"],
+      [deps.piBin, ...companion.args, "--model", "openai-codex/gpt-5.4-mini"],
       deps.spawn,
       deps.exit,
       { env: deps.env, cwd: deps.cwd },

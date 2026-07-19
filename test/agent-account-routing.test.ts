@@ -697,7 +697,13 @@ describe("keeper agent accounts codex-pool", () => {
     });
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.spawned).toEqual([
-      [h.deps.piBin, "-e", "/fake/pi-codex-pool.ts", "--model", "openai-codex"],
+      [
+        h.deps.piBin,
+        "-e",
+        "/fake/pi-codex-pool.ts",
+        "--model",
+        "openai-codex/gpt-5.4-mini",
+      ],
     ]);
     expect(h.err.join("")).toBe(
       "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
