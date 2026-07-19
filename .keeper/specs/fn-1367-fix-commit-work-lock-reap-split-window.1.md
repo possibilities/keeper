@@ -36,5 +36,5 @@ Files: `cli/commit-work.ts`, `test/commit-work.test.ts`.
 - [ ] Retained defensive branches are covered by a test; removed branches are deleted, not left dead.
 
 ## Done summary
-
+Removed the split-lock hazard in probeCommitWorkLock: the reap no longer unlinkSync's the stale lock file, so a blocked acquire() and a fresh open() can never flock different inodes. Preview lock_state and refusal-envelope lock_path/cause naming are unchanged; the retained absent/held/available/probe_failed branches are each covered by a test, and the removed reaped/present branches plus auditStaleLockReap/COMMIT_WORK_STALE_LOCK_AGE_MS are deleted rather than left dead.
 ## Evidence

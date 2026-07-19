@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Fix commit-work lock reap race",
-  "updated_at": "2026-07-19T04:56:18.023000Z"
+  "updated_at": "2026-07-19T05:12:34.294000Z",
+  "worker_done_at": "2026-07-19T05:12:34.294000Z"
 }
