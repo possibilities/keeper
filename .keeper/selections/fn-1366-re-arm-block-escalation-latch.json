@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Rewrites the producer-owned block-escalation latch state machine under event-sourcing determinism invariants where exactly-once dispatch, the double-dispatch liveness guard, and category-class classification are subtle correctness concerns that reintroduce the failure class if the re-arm abstraction is wrong -- a nameable opus gate, at xhigh for the multi-region daemon+CLI blast radius.",
+      "task_id": "fn-1366-re-arm-block-escalation-latch.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T04:30:19.136000Z",
+  "epic_id": "fn-1366-re-arm-block-escalation-latch",
+  "input_hash": "792ce1c7fe5f840573b59c23595a856d63e1ffcf01833579128e79d00ea4bec6",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2032984519,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1366-re-arm-block-escalation-latch.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Rewrites the producer-owned block-escalation latch state machine under event-sourcing determinism invariants where exactly-once dispatch, the double-dispatch liveness guard, and category-class classification are subtle correctness concerns that reintroduce the failure class if the re-arm abstraction is wrong -- a nameable opus gate, at xhigh for the multi-region daemon+CLI blast radius.\", \"confidence\": 0.8}]}\n"
+}
