@@ -42,5 +42,5 @@ Add a sandboxed installer test with temporary source and destination roots. Prov
 - [ ] Arthack's installer guidance describes only its remaining current responsibilities, and focused sandbox plus shell checks pass.
 
 ## Done summary
-
+Narrowed scripts/install.sh so ArtHack no longer installs Keeper's Pi Hack/Plan skill links or the Pi alias extension, added idempotent ownership-checked reconciliation for upgraded homes, removed the retired system/pi-extensions package, and added a sandboxed installer test.
 ## Evidence
