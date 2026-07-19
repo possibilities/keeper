@@ -51,5 +51,5 @@ Cover main-turn active, stopped/quiescent, stopped with an active child/resource
 - [ ] Focused Bus worker, Bus CLI, Partner capture, and Provider-leg sender tests pass.
 
 ## Done summary
-
+Extended the Agent Bus synchronous publish acknowledgement with an optional recipient_activity snapshot (status/reason/observed_at) sampled once from the recipient's canonical Harness activity immediately before fanout, attached only on delivered outcomes; the shared decoder and every caller (CLI, Partner capture, Provider-leg notices) stay additive-compatible and the CLI adds a conservative send-time suffix only when a valid snapshot is present.
 ## Evidence
