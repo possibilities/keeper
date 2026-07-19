@@ -12,6 +12,9 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
   Resource holds remain independently observable and recoverable
+- **Fable focus** — a durable, PII-free Account route preference for Fable work,
+  inspectable through account checks, `keeper status`, and `keeper board`; see the
+  [routing operations guide](./docs/install.md#claude-account-routing-and-fable-focus)
 - **History forensics** — `keeper history list|show|search|files|index` is the
   canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
   foreground continuation path; `keeper transcript` stays for explicit

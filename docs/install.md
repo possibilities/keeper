@@ -58,55 +58,106 @@ use the normal status/query surfaces to verify the same identifiers against the 
 treat moving live counts as an acceptance threshold.
 Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidence-diagnostics).
 
-### Claude account routing
+### Claude account routing and Fable focus
 
 Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). Every installer run executes
 `uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal to Keeper's
 non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
 registered.
 
-Installer upgrades remove the retired CodexBar stable symlink only when it targets Keeper's exact data
-root, and remove the corresponding data only when it carries Keeper's signing identifier. A foreign
-symlink, non-symlink executable, unproven data directory, app bundle, and Homebrew cask are always left
-untouched.
+The daemon publishes one private, freshness-bounded Capacity observation from `cswap list --json`. A
+route must have fresh `usageStatus: ok` data plus remaining session and weekly quota; Fable work also
+requires remaining Fable quota. Unknown, stale, malformed, signed-out, exhausted, or otherwise unusable
+routes are excluded rather than treated as spare capacity. A successful managed launch always runs through
+`cswap run <slot> --share-history -- <claude arguments...>`; missing or stale inventory and zero eligible
+routes fail before Claude starts.
 
-The daemon invokes `cswap list --json` through an exact-argv, output-capped, deadline-bounded runner and
-publishes one private, freshness-bounded Capacity observation. A launch candidate must have fresh
-`usageStatus: ok` data and remaining session and weekly quota. Unknown, stale, malformed, signed-out,
-exhausted, or otherwise unusable rows are excluded rather than treated as spare capacity.
+#### Routing model
 
-Every fresh, resumed, or restored Claude process selects independently. A `fable` model resolved through
-`--model` or a Claude launch triple additionally requires remaining Fable quota and chooses the account
-with the greatest Fable percentage left; generic quota pressure and least-recently-used order break ties.
-A non-Fable launch conserves Fable capacity: an account with no Fable quota is preferred first, otherwise
-the account with the least Fable percentage left is preferred, with generic quota pressure and recency
-breaking equal conservation scores. Short-lived Launch reservations spread otherwise-equal concurrent
-choices but never override unequal Fable percentages. A model selected later inside the interactive Claude
-session does not reroute the already-running process. A
-successful decision always executes through:
+An **Account route** is the PII-free stable identity `claude-swap:<slot>`. Persist and operate on that
+route, not on a display ordinal: `cN` is only the current zero-based inventory label shown by Claude and
+can name a different Account route after inventory changes. An explicit per-launch `--x-account` request
+uses that display label and takes precedence for that one process; it never changes Fable focus.
+
+Every fresh, resumed, restored, or forked Claude process is selected independently from current eligible
+routes. Without an effective Fable focus, normal balancing selects the route from current quota pressure,
+Fable availability, recency, and short-lived Launch reservations. Launch attribution records the selected
+Account route for that process only; it never creates account affinity for later work.
+
+**Fable focus** is one optional durable preference for a stable Account route. For Fable work, an eligible
+focus target wins after normal eligibility filtering. If that target cannot serve the launch, Keeper reports
+`fallback` and uses normal eligible-route balancing; focus never makes an ineligible route viable. For
+non-Fable Claude work, the target is soft-avoided whenever another route is eligible, but remains eligible
+as the sole route. This preserves availability while reserving the target's Fable capacity when possible.
+
+**Fable intent** is process-lineage routing metadata, not Launch attribution. An explicit effective model
+sets or overrides it; a continuation, resume, restore, or fork inherits it when no explicit override is
+present. An interactive model change cannot move an already-running process to another Account route.
+
+A focus lifetime is one of:
+
+- `permanent`, effective until replacement or clear;
+- `absolute`, effective strictly before its timezone-bearing UTC deadline;
+- `current-reset`, which snapshots the selected route's fresh `model:Fable` reset boundary as an absolute
+  deadline; or
+- `cycle-end`, which completes when that same reset boundary passes or a fresh target observation proves
+  full Fable utilization.
+
+#### Inspect routing state
+
+Use the read-only account check for Capacity observation health, candidate Account routes, and the
+ordinary route choice; it records no Launch reservation. Use the focus view for durable policy, effective
+state, target, lifetime, fallback, and delivery diagnostic. Both are PII-free.
 
 ```sh
-cswap run <slot> --share-history -- <claude arguments...>
+keeper agent accounts check --json
+keeper agent accounts fable-focus show --json
+keeper status --json
+keeper board
 ```
 
-This applies to the currently active claude-swap account as well as every other slot. There is no native
-or ambient-account fallback: missing/stale inventory or zero routeable accounts fails before Claude
-starts. Launch attribution records only the PII-free `claude-swap:<slot>` route and never creates account
-affinity for a later process.
+`keeper status --json` includes `data.fable_focus`. `keeper board` presents the same effective Fable focus
+state in its semantic header, including the target, lifetime, and focused or fallback outcome; its snapshot
+and copied diagnostics retain that header.
 
-`keeper agent accounts check --json` reports observation health, snapshot age, PII-free candidates, and
-the non-Fable conservation route the policy would choose without reserving it; `model_scope: null` makes
-that model-free diagnostic explicit, and each candidate reports generic pressure plus remaining Fable
-fraction (or `null` for no Fable entitlement). Use `keeper agent claude --x-account cN`
-to request one account, where `c0`, `c1`, … are zero-based positions in ordered inventory and match the
-Claude statusline label. An explicit request fails rather than substituting another account. A blocked
-launch prints one PII-free `cN` reason per managed account—stale telemetry, sign-in trouble, missing or
-exhausted session/week quota, or missing/exhausted Fable quota—followed by a concrete refresh or repair
-step; raw provider output and account identities remain private.
+#### Activate, verify, and clear Fable focus
+
+Use a stable Account route from a fresh inspection. For a guarded current-reset activation, set the
+expected value to the fresh target `model:Fable` reset boundary in timezone-bearing UTC; the placeholders
+below are values to substitute, not account identities or a rollout schedule.
+
+```sh
+route='claude-swap:<stable-slot>'
+expected_reset='<fresh-model-Fable-reset-in-UTC>'
+keeper agent accounts fable-focus set "$route" current-reset \
+  --expect-reset "$expected_reset" --json
+keeper agent accounts fable-focus show --json
+```
+
+The command atomically snapshots the observed boundary before setting policy. An expected-boundary
+mismatch, stale or missing reset evidence, or an already elapsed boundary is a refusal: it leaves the
+existing policy unchanged and never advances the focus into a later reset cycle. Re-read `show` after any
+refusal or uncertain acknowledgement before choosing another action.
+
+Other durable lifetimes use the same stable route form:
+
+```sh
+keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' permanent --json
+keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' absolute '<timezone-bearing-UTC-deadline>' --json
+keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' cycle-end --json
+```
+
+Clear is the rollback and is idempotent when the policy is already off. It also repairs an unavailable
+delivery view by publishing the durable clear; if its acknowledgement is uncertain, inspect before
+repeating it.
+
+```sh
+keeper agent accounts fable-focus clear --json
+keeper agent accounts fable-focus show --json
+```
 
 Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
 absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.
-The routing contract is specified by [ADR 0079](./adr/0079-mandatory-claude-swap-routing.md).
 
 Private clean-break archive, outside keeper's runtime, with the archive root at mode `0700`:
 

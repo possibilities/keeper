@@ -30,7 +30,7 @@ file is imperative guardrails only.
 
 ## Event-sourcing invariants
 
-- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold writes the projection AND bumps `reducer_state.last_event_id` together.
+- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold writes the projection AND bumps `reducer_state.last_event_id`.
 - **Never throw inside a fold.** Malformed `data` folds safely and the cursor advances. Schema
   defaults match the zero-event projection.
 - **Re-fold determinism is sacred** for the deterministic-replayed projection class

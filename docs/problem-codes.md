@@ -143,6 +143,23 @@ CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                                                                                                       | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.                 | Retry; if it persists, confirm the daemon and CLI are the same version.                                                                                                                   | conditional       |
 
+## Fable focus routing (`keeper agent accounts fable-focus`)
+
+`show --json` is a PII-free read of durable policy and effective routing state. `set` and `clear` return a
+JSON envelope on stdout; a guarded `current-reset` refusal exits before any policy update. Re-read `show`
+before repeating a mutation whose acknowledgement is uncertain. `clear` is idempotent when the policy is
+off and is the rollback for every lifetime.
+
+| code / diagnostic | meaning | recovery | retry-safe |
+| --- | --- | --- | --- |
+| `policy-invalid` | The delivered policy fails validation, so it is not used for routing. | Inspect with `show --json`; clear the invalid policy, then set a valid stable `claude-swap:<slot>` Account route and lifetime. | yes after inspection |
+| `delivery-missing`, `delivery-malformed`, `delivery-unsupported`, `delivery-insecure`, `delivery-unreachable` | The launcher cannot use the delivered policy. Routing visibly falls back to normal balancing rather than blocking Claude. | Re-read `show --json`; repair the delivery path through a normal `clear` or `set` operation, never by editing launch state directly. | conditional; inspect first |
+| `focus_observation_unavailable`, `focus_observation_stale` | Guarded activation has no healthy fresh Capacity observation. | Refresh the observation, confirm it is fresh with `accounts check --json`, then construct a new guarded request. The current policy is unchanged. | yes; no update applied |
+| `focus_target_unavailable`, `focus_reset_unavailable` | The requested stable Account route is absent or cannot supply a fresh `model:Fable` reset boundary. | Select an eligible stable route and obtain fresh reset evidence before retrying. The current policy is unchanged. | yes; no update applied |
+| `focus_reset_mismatch` | `--expect-reset` does not match the currently observed target reset boundary. | Treat the boundary as changed; inspect fresh evidence and submit a new deliberate request. The current policy is unchanged. | yes; no update applied |
+| `focus_reset_elapsed` | The observed reset boundary has already elapsed. | Do not reuse it or roll focus into a later cycle. Inspect a fresh boundary and make a new deliberate choice. The current policy is unchanged. | yes; no update applied |
+| `focus_rpc_unreachable`, `focus_rpc_unexpected`, or a daemon-provided RPC code | Keeper cannot prove that a set or clear acknowledgement completed. The intended update may already be durable. | Run `keeper agent accounts fable-focus show --json`; stop if it reports the intended state, otherwise retry the deliberate mutation. | conditional; inspect first |
+
 ## Autopilot withhold reasons
 
 The reconciler's machine frame carries `withholds`, a replace-merge map keyed by
