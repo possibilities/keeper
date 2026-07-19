@@ -34,5 +34,5 @@ Render + golden re-capture; behavioral verification via a sandboxed work session
 - [ ] Suppression and audit branches are unchanged; render check and goldens green
 
 ## Done summary
-
+Gave the work skill's blocked Phase 2c a bounded, one-round in-session unblocker spawn (SendMessage/cold-resume ladder on a resolved receipt, stamped stop on decline), leaving TOOLING_FAILURE/unparseable/AUDIT_SEVERE/SHARED_BASE_BROKEN and the Phase 2d audit gate unchanged; regenerated the work SKILL.md and the render oracle fixture.
 ## Evidence
