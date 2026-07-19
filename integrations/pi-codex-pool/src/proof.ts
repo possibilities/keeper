@@ -26,10 +26,44 @@ export const LIVE_PROOF_CLAUSES = [
 
 export type LiveProofClause = (typeof LIVE_PROOF_CLAUSES)[number];
 export type ProofClassification = "proven" | "incomplete" | "failed";
+
+export const LIVE_PROOF_REQUIRED_EVIDENCE = {
+  independent_credentials: [
+    "primary-credential-rotated",
+    "alternate-credential-rotated",
+  ],
+  sanitized_observer: ["sanitized-observer-rendered"],
+  deterministic_routing: ["routes-recorded", "attempt-aliases-recorded"],
+  session_stickiness: ["completed-session-reused-alias"],
+  pressure_cooldown: [
+    "concurrent-routes-observed",
+    "classified-retry-observed",
+    "cooldown-observed",
+  ],
+  single_retry: [
+    "two-attempt-route-observed",
+    "all-routes-at-most-two-attempts",
+  ],
+  substantive_cutoff: ["substantive-output-fault-not-retried"],
+  abort_preserved: ["deliberate-child-abort-not-retried"],
+  request_contract: ["all-attempts-preserved-request-contract"],
+  native_fallback: ["native-fallback-completed"],
+  compat_root_delegate: ["compat-root-delegate-used"],
+  root_child_sessions: ["root-route-observed", "child-route-observed"],
+  transport_isolation: ["root-child-distinct-aliases"],
+} as const satisfies Record<LiveProofClause, readonly string[]>;
+
+export interface ProofTranscriptEntry {
+  sequence: number;
+  clause: LiveProofClause;
+  evidence: string[];
+}
+
 export type ArtifactSurface =
   | "observer"
   | "state"
   | "proof"
+  | "transcript"
   | "log"
   | "error"
   | "session"
@@ -64,6 +98,7 @@ export interface LiveProofReport {
     alias: string;
     role: "primary" | "alternate";
   }>;
+  transcript: ProofTranscriptEntry[];
   clauses: Record<LiveProofClause, boolean>;
   routes: Array<{
     session_role: "root" | "child";
@@ -88,6 +123,7 @@ export interface ProofVerdict {
     | "binding-mismatch"
     | "stale"
     | "interrupted"
+    | "transcript-mismatch"
     | "clause-incomplete"
     | "route-incomplete"
     | "restoration-incomplete"
@@ -114,6 +150,7 @@ const REPORT_KEYS = [
   "completed_at_ms",
   "interrupted",
   "alias_roles",
+  "transcript",
   "clauses",
   "routes",
   "restoration",
@@ -182,6 +219,7 @@ function schemaShape(input: unknown): {
   let unknown = hasUnknownKeys(top, REPORT_KEYS);
   if (!hasExactKeys(top, REPORT_KEYS)) return { unknown };
   const roles = top.alias_roles;
+  const transcript = top.transcript;
   const clauses = record(top.clauses);
   const routes = top.routes;
   const restoration = record(top.restoration);
@@ -197,9 +235,10 @@ function schemaShape(input: unknown): {
     !Array.isArray(roles) ||
     roles.length < 2 ||
     roles.length > 8 ||
+    !Array.isArray(transcript) ||
+    transcript.length !== LIVE_PROOF_CLAUSES.length ||
     !clauses ||
     !Array.isArray(routes) ||
-    routes.length < 2 ||
     routes.length > 16 ||
     !restoration ||
     !scan ||
@@ -232,6 +271,29 @@ function schemaShape(input: unknown): {
     seenAliases.add(role.alias);
   }
   if (primaryCount !== 1) return { unknown };
+  for (const [index, rawEntry] of transcript.entries()) {
+    const entry = record(rawEntry);
+    const clause = LIVE_PROOF_CLAUSES[index];
+    if (!entry || clause === undefined) return { unknown };
+    unknown ||= hasUnknownKeys(entry, ["sequence", "clause", "evidence"]);
+    if (
+      !hasExactKeys(entry, ["sequence", "clause", "evidence"]) ||
+      entry.sequence !== index + 1 ||
+      entry.clause !== clause ||
+      !Array.isArray(entry.evidence) ||
+      entry.evidence.length > LIVE_PROOF_REQUIRED_EVIDENCE[clause].length ||
+      entry.evidence.some((item) => typeof item !== "string") ||
+      new Set(entry.evidence).size !== entry.evidence.length ||
+      entry.evidence.some(
+        (item) =>
+          !(LIVE_PROOF_REQUIRED_EVIDENCE[clause] as readonly string[]).includes(
+            String(item),
+          ),
+      )
+    ) {
+      return { unknown };
+    }
+  }
   for (const rawRoute of routes) {
     const route = record(rawRoute);
     const routeKeys = [
@@ -329,7 +391,15 @@ function classifyWithoutDeclaredVerdict(
     addReason(reasons, "stale");
   }
   if (report.interrupted) addReason(reasons, "interrupted");
-  if (LIVE_PROOF_CLAUSES.some((clause) => report.clauses[clause] !== true)) {
+  const transcriptClauses = clausesFromProofTranscript(report.transcript);
+  if (
+    LIVE_PROOF_CLAUSES.some(
+      (clause) => report.clauses[clause] !== transcriptClauses[clause],
+    )
+  ) {
+    addReason(reasons, "transcript-mismatch");
+  }
+  if (LIVE_PROOF_CLAUSES.some((clause) => !transcriptClauses[clause])) {
     addReason(reasons, "clause-incomplete");
   }
   if (
@@ -352,6 +422,7 @@ function classifyWithoutDeclaredVerdict(
     addReason(reasons, "sanitation-finding");
   }
   if (
+    reasons.includes("transcript-mismatch") ||
     reasons.includes("artifact-scan-error") ||
     reasons.includes("sanitation-finding")
   ) {
@@ -384,6 +455,41 @@ export function classifyLiveProof(
   return { verdict: computed, reasons };
 }
 
+export function buildProofTranscript(
+  observed: Partial<Record<LiveProofClause, readonly string[]>>,
+): ProofTranscriptEntry[] {
+  return LIVE_PROOF_CLAUSES.map((clause, index) => {
+    const supplied = new Set(observed[clause] ?? []);
+    return {
+      sequence: index + 1,
+      clause,
+      evidence: LIVE_PROOF_REQUIRED_EVIDENCE[clause].filter((item) =>
+        supplied.has(item),
+      ),
+    };
+  });
+}
+
+export function clausesFromProofTranscript(
+  transcript: readonly ProofTranscriptEntry[],
+): Record<LiveProofClause, boolean> {
+  const byClause = new Map(
+    transcript.map((entry) => [entry.clause, new Set(entry.evidence)]),
+  );
+  return Object.fromEntries(
+    LIVE_PROOF_CLAUSES.map((clause) => {
+      const observed = byClause.get(clause);
+      return [
+        clause,
+        observed !== undefined &&
+          LIVE_PROOF_REQUIRED_EVIDENCE[clause].every((item) =>
+            observed.has(item),
+          ),
+      ];
+    }),
+  ) as Record<LiveProofClause, boolean>;
+}
+
 export function aliasRoleBinding(
   roles: ReadonlyArray<{ alias: string; role: "primary" | "alternate" }>,
 ): string {
@@ -412,6 +518,11 @@ export function collectLiveProof(
     completed_at_ms: input.completed_at_ms,
     interrupted: input.interrupted,
     alias_roles: input.alias_roles.map(({ alias, role }) => ({ alias, role })),
+    transcript: input.transcript.map((entry) => ({
+      sequence: entry.sequence,
+      clause: entry.clause,
+      evidence: [...entry.evidence],
+    })),
     clauses: Object.fromEntries(
       LIVE_PROOF_CLAUSES.map((clause) => [clause, input.clauses[clause]]),
     ) as Record<LiveProofClause, boolean>,
@@ -451,6 +562,7 @@ export function scanProofArtifacts(
       "observer",
       "state",
       "proof",
+      "transcript",
       "log",
       "error",
       "session",

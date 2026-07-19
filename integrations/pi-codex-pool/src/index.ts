@@ -25,10 +25,17 @@ import {
 import { observePool, renderObserverEnvelope } from "./observer.ts";
 import {
   type CodexDelegate,
+  type CodexPoolProofFaultOptions,
   classifyPoolFailure,
+  createCodexPoolProofFaultDelegate,
   createPooledCodexStream,
 } from "./pool.ts";
-import type { ArtifactSurface, LiveProofReport } from "./proof.ts";
+import type {
+  ArtifactSurface,
+  LiveProofClause,
+  LiveProofReport,
+  ProofTranscriptEntry,
+} from "./proof.ts";
 import { PoolRouteState, PoolStateStore } from "./state.ts";
 
 type CompatPiAi = typeof import("@earendil-works/pi-ai/compat");
@@ -51,6 +58,29 @@ interface CommandContext {
     notify(message: string, level: "info" | "warning" | "error"): void;
   };
   signal?: AbortSignal;
+}
+
+interface ProofToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+}
+
+interface ProofToolDefinition {
+  name: "codex_pool_proof";
+  label: string;
+  description: string;
+  executionMode: "sequential";
+  parameters: Record<string, unknown>;
+  execute(
+    toolCallId: string,
+    params: Record<string, never>,
+    signal: AbortSignal | undefined,
+  ): Promise<ProofToolResult>;
+}
+
+export interface CodexPoolInstallOptions {
+  nativeDelegate?: CodexDelegate;
+  oauth?: CanonicalOAuth;
 }
 
 interface PoolExtensionApi {
@@ -81,6 +111,7 @@ interface PoolExtensionApi {
       handler(args: string, ctx: CommandContext): Promise<void> | void;
     },
   ): void;
+  registerTool?(tool: ProofToolDefinition): void;
 }
 
 interface RouteEvidence {
@@ -94,6 +125,8 @@ interface RouteEvidence {
   terminal: boolean;
   restored: boolean;
   aborted: boolean;
+  deliberateAbort: boolean;
+  proofFaultPhase: "pre-output" | "mid-stream" | null;
 }
 
 function eventFailureClass(event: AssistantMessageEvent): ReportFailureClass {
@@ -175,9 +208,22 @@ class ProofEvidence {
       terminal: false,
       restored: false,
       aborted: false,
+      deliberateAbort: false,
+      proofFaultPhase: null,
     };
     this.routes.push(route);
     return route;
+  }
+
+  deliberateAbort(route: RouteEvidence | null): void {
+    if (route !== null) route.deliberateAbort = true;
+  }
+
+  proofFault(
+    route: RouteEvidence | null,
+    phase: "pre-output" | "mid-stream",
+  ): void {
+    if (route !== null) route.proofFaultPhase = phase;
   }
 
   attempt(
@@ -279,11 +325,31 @@ class ProofEvidence {
     );
   }
 
-  clauses(): Record<string, boolean> {
-    const aliases = new Set(this.routes.flatMap((route) => route.aliases));
+  transcriptEvidence(
+    aliasRoles: ReadonlyArray<{
+      alias: string;
+      role: "primary" | "alternate";
+    }>,
+    state: ReturnType<PoolRouteState["snapshot"]>,
+  ): Partial<Record<LiveProofClause, readonly string[]>> {
+    const observed: Partial<Record<LiveProofClause, string[]>> = {};
+    const add = (
+      clause: LiveProofClause,
+      condition: boolean,
+      token: string,
+    ) => {
+      if (!condition) return;
+      const entries = observed[clause] ?? [];
+      entries.push(token);
+      observed[clause] = entries;
+    };
     const retryRoutes = this.routes.filter((route) => route.attempts === 2);
-    const sticky = [...this.completedAliases.values()].some(
-      (entries) => entries.length >= 2 && new Set(entries).size === 1,
+    const classifiedRetries = retryRoutes.filter(
+      (route) =>
+        route.proofFaultPhase === "pre-output" &&
+        route.failureClass !== "none" &&
+        route.aliases.length === 2 &&
+        route.aliases[0] !== route.aliases[1],
     );
     const rootAlias = this.routes
       .find((route) => route.sessionRole === "root")
@@ -291,54 +357,118 @@ class ProofEvidence {
     const childAlias = this.routes
       .find((route) => route.sessionRole === "child")
       ?.aliases.at(-1);
-    const isolated =
-      rootAlias !== undefined &&
-      childAlias !== undefined &&
-      rootAlias !== childAlias;
-    return {
-      independent_credentials:
-        aliases.size >= 2 && this.refreshedAliases.size >= 2,
-      sanitized_observer: this.observerArtifact !== null,
-      deterministic_routing:
-        this.routes.length > 0 &&
+    const primary = aliasRoles.find((entry) => entry.role === "primary")?.alias;
+    const alternates = aliasRoles
+      .filter((entry) => entry.role === "alternate")
+      .map((entry) => entry.alias);
+    add(
+      "independent_credentials",
+      primary !== undefined && this.refreshedAliases.has(primary),
+      "primary-credential-rotated",
+    );
+    add(
+      "independent_credentials",
+      alternates.some((alias) => this.refreshedAliases.has(alias)),
+      "alternate-credential-rotated",
+    );
+    add(
+      "sanitized_observer",
+      this.observerArtifact !== null,
+      "sanitized-observer-rendered",
+    );
+    add("deterministic_routing", this.routes.length > 0, "routes-recorded");
+    add(
+      "deterministic_routing",
+      this.routes.length > 0 &&
         this.routes.every(
           (route) =>
             route.aliases.length === route.attempts &&
             route.aliases.every((alias) => alias.length > 0),
         ),
-      session_stickiness: sticky,
-      pressure_cooldown:
-        this.concurrentPressure &&
-        retryRoutes.some(
-          (route) =>
-            route.failureClass !== "none" &&
-            route.aliases.length === 2 &&
-            route.aliases[0] !== route.aliases[1],
-        ),
-      single_retry:
-        retryRoutes.length > 0 &&
-        this.routes.every((route) => route.attempts <= 2),
-      substantive_cutoff: this.routes.some(
+      "attempt-aliases-recorded",
+    );
+    add(
+      "session_stickiness",
+      [...this.completedAliases.values()].some(
+        (entries) => entries.length >= 2 && new Set(entries).size === 1,
+      ),
+      "completed-session-reused-alias",
+    );
+    add(
+      "pressure_cooldown",
+      this.concurrentPressure,
+      "concurrent-routes-observed",
+    );
+    add(
+      "pressure_cooldown",
+      classifiedRetries.length > 0,
+      "classified-retry-observed",
+    );
+    add(
+      "pressure_cooldown",
+      state.accounts.some((account) => account.cooldown_until_ms > 0),
+      "cooldown-observed",
+    );
+    add("single_retry", retryRoutes.length > 0, "two-attempt-route-observed");
+    add(
+      "single_retry",
+      this.routes.every((route) => route.attempts <= 2),
+      "all-routes-at-most-two-attempts",
+    );
+    add(
+      "substantive_cutoff",
+      this.routes.some(
         (route) =>
+          route.proofFaultPhase === "mid-stream" &&
           route.substantiveOutput &&
           route.failureClass !== "none" &&
           route.attempts === 1,
       ),
-      abort_preserved: this.routes.some(
-        (route) => route.aborted && route.attempts === 1,
+      "substantive-output-fault-not-retried",
+    );
+    add(
+      "abort_preserved",
+      this.routes.some(
+        (route) =>
+          route.deliberateAbort && route.aborted && route.attempts === 1,
       ),
-      request_contract:
-        this.routes.length > 0 &&
+      "deliberate-child-abort-not-retried",
+    );
+    add(
+      "request_contract",
+      this.routes.length > 0 &&
         this.routes.every((route) => route.requestContract),
-      native_fallback:
-        this.nativeFallbackAttempts > 0 &&
+      "all-attempts-preserved-request-contract",
+    );
+    add(
+      "native_fallback",
+      this.nativeFallbackAttempts > 0 &&
         this.nativeFallbackSuccesses === this.nativeFallbackAttempts,
-      compat_root_delegate: this.compatDelegateUsed,
-      root_child_sessions:
-        this.routes.some((route) => route.sessionRole === "root") &&
-        this.routes.some((route) => route.sessionRole === "child"),
-      transport_isolation: isolated,
-    };
+      "native-fallback-completed",
+    );
+    add(
+      "compat_root_delegate",
+      this.compatDelegateUsed,
+      "compat-root-delegate-used",
+    );
+    add(
+      "root_child_sessions",
+      this.routes.some((route) => route.sessionRole === "root"),
+      "root-route-observed",
+    );
+    add(
+      "root_child_sessions",
+      this.routes.some((route) => route.sessionRole === "child"),
+      "child-route-observed",
+    );
+    add(
+      "transport_isolation",
+      rootAlias !== undefined &&
+        childAlias !== undefined &&
+        rootAlias !== childAlias,
+      "root-child-distinct-aliases",
+    );
+    return observed;
   }
 
   reportRoutes(): LiveProofReport["routes"] {
@@ -354,6 +484,7 @@ class ProofEvidence {
   }
 
   artifacts(
+    transcript: readonly ProofTranscriptEntry[],
     clauses: Record<string, boolean>,
     routes: LiveProofReport["routes"],
     state: ReturnType<PoolRouteState["snapshot"]>,
@@ -371,6 +502,7 @@ class ProofEvidence {
         surface: "proof",
         content: JSON.stringify({ clauses, routes }),
       },
+      { surface: "transcript", content: JSON.stringify(transcript) },
       {
         surface: "log",
         content:
@@ -389,7 +521,7 @@ class ProofEvidence {
           })),
         ),
       },
-      { surface: "tool", content: "codex-pool-proof" },
+      { surface: "tool", content: "codex_pool_proof" },
     ];
   }
 }
@@ -443,27 +575,78 @@ function reportPath(env: NodeJS.ProcessEnv): string {
   );
 }
 
-function proofWindowStart(input: string | undefined): number | null {
+function proofWindowTimes(
+  input: string | undefined,
+): { startedAt: number; expiresAt: number } | null {
   try {
-    const value = JSON.parse(input ?? "null") as { armed_at_ms?: unknown };
-    return Number.isSafeInteger(value.armed_at_ms)
-      ? (value.armed_at_ms as number)
+    const value = JSON.parse(input ?? "null") as {
+      armed_at_ms?: unknown;
+      expires_at_ms?: unknown;
+    };
+    return Number.isSafeInteger(value.armed_at_ms) &&
+      Number.isSafeInteger(value.expires_at_ms)
+      ? {
+          startedAt: value.armed_at_ms as number,
+          expiresAt: value.expires_at_ms as number,
+        }
       : null;
   } catch {
     return null;
   }
 }
 
-export function installCodexPool(pi: PoolExtensionApi): void {
+function deliberateAbortStream(
+  model: Model<"openai-codex-responses">,
+): AssistantMessageEventStream {
+  const error = {
+    role: "assistant" as const,
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "aborted" as const,
+    errorMessage: "request-aborted",
+    timestamp: Date.now(),
+  };
+  const event = { type: "error" as const, reason: "aborted" as const, error };
+  return {
+    result: async () => error,
+    async *[Symbol.asyncIterator]() {
+      yield event;
+    },
+  } as AssistantMessageEventStream;
+}
+
+async function consumeStream(
+  source: AssistantMessageEventStream,
+): Promise<void> {
+  for await (const _event of source) {
+    // Consuming the production stream drives its retry and restoration paths.
+  }
+}
+
+export function installCodexPool(
+  pi: PoolExtensionApi,
+  options: CodexPoolInstallOptions = {},
+): void {
   if ((process.env[KEEPER_MARKER] ?? "").trim() === "") return;
 
-  const nativeDelegate = openAICodexResponsesApi()
-    .streamSimple as CodexDelegate;
+  const nativeDelegate =
+    options.nativeDelegate ??
+    (openAICodexResponsesApi().streamSimple as CodexDelegate);
   let aliases: string[];
   let oauth: CanonicalOAuth | undefined;
   try {
     aliases = aliasesFromEnvironment(process.env[ALIASES_ENV]);
-    oauth = nativeOAuth();
+    oauth = options.oauth ?? nativeOAuth();
   } catch {
     aliases = [];
   }
@@ -483,6 +666,14 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     codexPoolProofSeamActive(
       proofWindow,
       "forced_refresh",
+      Date.now(),
+      process.ppid,
+      process.env[KEEPER_MARKER],
+    );
+  const proofFaultActive = (): boolean =>
+    codexPoolProofSeamActive(
+      proofWindow,
+      "fault_injection",
       Date.now(),
       process.ppid,
       process.env[KEEPER_MARKER],
@@ -573,10 +764,25 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     });
   }
 
-  const pooledDelegate = (
+  type ProofInvocation = {
+    model: Model<"openai-codex-responses">;
+    context: Context;
+    options: SimpleStreamOptions;
+  };
+  type ProofRouteControls = {
+    fault?: {
+      failure_class: "quota" | "rate" | "auth" | "transport";
+      phase: "pre-output" | "mid-stream";
+    };
+    deliberateAbort?: boolean;
+  };
+  let proofInvocation: ProofInvocation | null = null;
+
+  const createManagedStream = (
     model: Model<"openai-codex-responses">,
     context: Context,
     options?: SimpleStreamOptions,
+    controls: ProofRouteControls = {},
   ): AssistantMessageEventStream => {
     if (mode === "proof" && !proofWindowActive()) {
       return fallbackStream(nativeDelegate, model, context, options);
@@ -596,6 +802,25 @@ export function installCodexPool(pi: PoolExtensionApi): void {
       );
     }
     const route = evidence.beginRoute(options);
+    if (controls.deliberateAbort === true) evidence.deliberateAbort(route);
+    let attemptDelegate: CodexDelegate = nativeDelegate;
+    if (controls.deliberateAbort === true) {
+      attemptDelegate = (attemptModel) => deliberateAbortStream(attemptModel);
+    } else if (controls.fault !== undefined) {
+      const faultOptions: CodexPoolProofFaultOptions = {
+        request: { schema_version: 1, ...controls.fault },
+        active: proofFaultActive,
+        onOutcome(outcome) {
+          if (outcome.status === "injected") {
+            evidence.proofFault(route, outcome.phase);
+          }
+        },
+      };
+      attemptDelegate = createCodexPoolProofFaultDelegate(
+        nativeDelegate,
+        faultOptions,
+      );
+    }
     const instrumentedDelegate: CodexDelegate = (
       attemptModel,
       attemptContext,
@@ -619,7 +844,7 @@ export function installCodexPool(pi: PoolExtensionApi): void {
       );
       let terminal = false;
       let substantive = false;
-      const upstream = nativeDelegate(
+      const upstream = attemptDelegate(
         attemptModel,
         attemptContext,
         attemptOptions,
@@ -670,6 +895,74 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     );
   };
 
+  const pooledDelegate = (
+    model: Model<"openai-codex-responses">,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream => {
+    if (evidence !== null && options?.sessionId !== undefined) {
+      proofInvocation = { model, context, options: { ...options } };
+    }
+    return createManagedStream(model, context, options);
+  };
+
+  const aliasRoles = aliases.map((alias, index) => ({
+    alias,
+    role: index === 0 ? ("primary" as const) : ("alternate" as const),
+  }));
+  const writeProofReport = async (
+    interrupted: boolean,
+  ): Promise<LiveProofReport> => {
+    if (
+      revision === undefined ||
+      !/^[a-f0-9]{7,64}$/.test(revision) ||
+      !/^[a-f0-9]{64}$/.test(routes.binding)
+    ) {
+      throw new Error("proof-binding-invalid");
+    }
+    const times = proofWindowTimes(proofWindow);
+    if (times === null) throw new Error("proof-window-invalid");
+    const proof = await import("./proof.ts");
+    const state = routes.snapshot();
+    const transcript = proof.buildProofTranscript(
+      evidence?.transcriptEvidence(aliasRoles, state) ?? {},
+    );
+    const clauses = proof.clausesFromProofTranscript(transcript);
+    const reportRoutes = evidence?.reportRoutes() ?? [];
+    const artifactScan = proof.scanProofArtifacts(
+      evidence?.artifacts(transcript, clauses, reportRoutes, state) ?? [],
+    );
+    const completedAt = Date.now();
+    const aliasBinding = proof.aliasRoleBinding(aliasRoles);
+    const report = proof.collectLiveProof(
+      {
+        revision,
+        config_binding: routes.binding,
+        alias_binding: aliasBinding,
+        started_at_ms: times.startedAt,
+        completed_at_ms: completedAt,
+        interrupted: interrupted || evidence?.interrupted === true,
+        alias_roles: aliasRoles,
+        transcript,
+        clauses,
+        routes: reportRoutes,
+        restoration: {
+          required: evidence?.restorationRequired(reportRoutes) ?? false,
+          completed: evidence?.restorationCompleted(reportRoutes) ?? false,
+        },
+        artifact_scan: artifactScan,
+      },
+      {
+        revision,
+        config_binding: routes.binding,
+        alias_binding: aliasBinding,
+        now_ms: completedAt,
+      },
+    );
+    proof.writeLiveProofReport(reportPath(process.env), report);
+    return report;
+  };
+
   pi.registerProvider("openai-codex", {
     api: "openai-codex-responses",
     streamSimple: pooledDelegate,
@@ -716,56 +1009,7 @@ export function installCodexPool(pi: PoolExtensionApi): void {
           return;
         }
         try {
-          if (
-            revision === undefined ||
-            !/^[a-f0-9]{7,64}$/.test(revision) ||
-            !/^[a-f0-9]{64}$/.test(routes.binding)
-          ) {
-            throw new Error("proof-binding-invalid");
-          }
-          const startedAt = proofWindowStart(proofWindow);
-          if (startedAt === null) throw new Error("proof-window-invalid");
-          const completedAt = Date.now();
-          const proof = await import("./proof.ts");
-          const aliasRoles = aliases.map((alias, index) => ({
-            alias,
-            role: index === 0 ? ("primary" as const) : ("alternate" as const),
-          }));
-          const clauses = evidence.clauses();
-          const reportRoutes = evidence.reportRoutes();
-          const artifactScan = proof.scanProofArtifacts(
-            evidence.artifacts(clauses, reportRoutes, routes.snapshot()),
-          );
-          const report = proof.collectLiveProof(
-            {
-              revision,
-              config_binding: routes.binding,
-              alias_binding: proof.aliasRoleBinding(aliasRoles),
-              started_at_ms: startedAt,
-              completed_at_ms: completedAt,
-              interrupted: evidence.interrupted || ctx.signal?.aborted === true,
-              alias_roles: aliasRoles,
-              clauses: Object.fromEntries(
-                proof.LIVE_PROOF_CLAUSES.map((clause) => [
-                  clause,
-                  clauses[clause] === true,
-                ]),
-              ) as LiveProofReport["clauses"],
-              routes: reportRoutes,
-              restoration: {
-                required: evidence.restorationRequired(reportRoutes),
-                completed: evidence.restorationCompleted(reportRoutes),
-              },
-              artifact_scan: artifactScan,
-            },
-            {
-              revision,
-              config_binding: routes.binding,
-              alias_binding: proof.aliasRoleBinding(aliasRoles),
-              now_ms: completedAt,
-            },
-          );
-          proof.writeLiveProofReport(reportPath(process.env), report);
+          const report = await writeProofReport(ctx.signal?.aborted === true);
           ctx.ui.notify(
             JSON.stringify({
               schema_version: 1,
@@ -786,6 +1030,151 @@ export function installCodexPool(pi: PoolExtensionApi): void {
         }
       },
     });
+
+    let proofExecution: Promise<ProofToolResult> | null = null;
+    const executeProof = async (
+      signal: AbortSignal | undefined,
+    ): Promise<ProofToolResult> => {
+      const invocation = proofInvocation;
+      const times = proofWindowTimes(proofWindow);
+      if (
+        invocation === null ||
+        invocation.options.sessionId === undefined ||
+        times === null ||
+        !proofWindowActive()
+      ) {
+        const unavailable = {
+          schema_version: 1,
+          status: "unavailable",
+          reason: "proof-window-inactive",
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(unavailable) }],
+          details: unavailable,
+        };
+      }
+
+      const deadline = times.expiresAt - 250;
+      const controller = new AbortController();
+      let interruption: "deadline" | "external" | null = null;
+      const interrupt = (kind: "deadline" | "external"): void => {
+        interruption ??= kind;
+        controller.abort();
+      };
+      const onExternalAbort = (): void => interrupt("external");
+      signal?.addEventListener("abort", onExternalAbort, { once: true });
+      if (signal?.aborted) onExternalAbort();
+      const remainingAtStart = deadline - Date.now();
+      const timer = setTimeout(
+        () => interrupt("deadline"),
+        Math.max(0, remainingAtStart),
+      );
+      const assertRunnable = (): void => {
+        if (
+          controller.signal.aborted ||
+          Date.now() >= deadline ||
+          !proofWindowActive()
+        ) {
+          if (interruption === null) interrupt("deadline");
+          throw new Error("proof-run-interrupted");
+        }
+      };
+      const runRoute = async (
+        sessionId: string | undefined,
+        controls: ProofRouteControls = {},
+      ): Promise<void> => {
+        assertRunnable();
+        const timeoutMs = Math.max(1, deadline - Date.now());
+        await consumeStream(
+          createManagedStream(
+            invocation.model,
+            invocation.context,
+            {
+              ...invocation.options,
+              sessionId,
+              signal: controller.signal,
+              timeoutMs,
+            },
+            controls,
+          ),
+        );
+        assertRunnable();
+      };
+
+      try {
+        evidence.setRootSession(invocation.options.sessionId);
+        for (const alias of aliases.slice(0, 2)) {
+          assertRunnable();
+          await vault.forceRefresh(
+            { schema_version: 1, alias },
+            { signal: controller.signal, deadlineMs: deadline },
+          );
+        }
+        assertRunnable();
+        evidence.observed(
+          renderObserverEnvelope(
+            await observePool({
+              aliases,
+              vault,
+              routes,
+              signal: controller.signal,
+            }),
+          ),
+        );
+        assertRunnable();
+
+        const rootSession = invocation.options.sessionId;
+        const childSession = `${rootSession}:codex-pool-proof-child`;
+        await Promise.all([runRoute(rootSession), runRoute(childSession)]);
+        await runRoute(rootSession);
+        await runRoute(`${childSession}:retry`, {
+          fault: { failure_class: "quota", phase: "pre-output" },
+        });
+        await runRoute(`${childSession}:cutoff`, {
+          fault: { failure_class: "rate", phase: "mid-stream" },
+        });
+        await runRoute(`${childSession}:abort`, { deliberateAbort: true });
+        await runRoute(undefined);
+      } catch {
+        evidence.interrupted = true;
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onExternalAbort);
+      }
+
+      const report = await writeProofReport(interruption !== null);
+      const result = {
+        schema_version: 1,
+        status: "written",
+        verdict: report.verdict,
+        interrupted: report.interrupted,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        details: result,
+      };
+    };
+
+    try {
+      pi.registerTool?.({
+        name: "codex_pool_proof",
+        label: "Codex Pool Proof",
+        description:
+          "Run the complete armed Codex pool proof once and write its attested report.",
+        executionMode: "sequential",
+        parameters: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        async execute(_toolCallId, _params, signal) {
+          proofExecution ??= executeProof(signal);
+          return proofExecution;
+        },
+      });
+    } catch {
+      // Tool registration cannot disable provider routing or manual diagnosis.
+    }
   }
 }
 

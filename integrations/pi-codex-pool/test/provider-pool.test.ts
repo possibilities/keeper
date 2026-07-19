@@ -304,7 +304,7 @@ describe("provider registration and compatibility", () => {
     }
   });
 
-  test("collects an armed live proof that the capture gate accepts", async () => {
+  test("keeps manually assembled evidence diagnostic-only", async () => {
     const { installCodexPool } = await import("../src/index.ts");
     const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-live-proof-"));
     const revision = "0123456789abcdef0123456789abcdef01234567";
@@ -441,15 +441,15 @@ describe("provider registration and compatibility", () => {
       expect(existsSync(path)).toBe(true);
       expect(statSync(path).mode & 0o777).toBe(0o600);
       const report = JSON.parse(readFileSync(path, "utf8"));
-      expect(report.verdict).toBe("proven");
+      expect(report.verdict).toBe("incomplete");
       expect(report.artifact_scan.status).toBe("clean");
       expect(notifications.at(-1)).toEqual({
         message: JSON.stringify({
           schema_version: 1,
           status: "written",
-          verdict: "proven",
+          verdict: "incomplete",
         }),
-        level: "info",
+        level: "warning",
       });
 
       const store = new FileCodexPoolActivationStore(
@@ -471,8 +471,8 @@ describe("provider registration and compatibility", () => {
         ok: true,
         operation: "proof-capture",
         state: "native",
-        problem_code: null,
-        proof: { verdict: "proven", reasons: [] },
+        problem_code: "proof-incomplete",
+        proof: { verdict: "incomplete", reasons: ["clause-incomplete"] },
       });
 
       failNativeFallback = true;
