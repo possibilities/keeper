@@ -278,6 +278,12 @@ type PiBackgroundTask =
   | MonitorTaskSnapshot
   | (AmbientBusWatchTask & { kind: "ambient" });
 
+export interface PiBackendExecCoords {
+  type: "tmux" | null;
+  sessionId: string | null;
+  paneId: string | null;
+}
+
 export interface PiTranslateMeta {
   /** `KEEPER_JOB_ID` — the join key to the birth-record row (== jobs.job_id). */
   jobId: string;
@@ -293,6 +299,8 @@ export interface PiTranslateMeta {
   dispatchAttemptId?: number;
   /** Harness-armed background resources reflected on Stop. */
   backgroundTasks?: PiBackgroundTask[];
+  /** Launch-time tmux identity retained on every lifecycle event. */
+  backendExec?: PiBackendExecCoords;
 }
 
 /** One bare-column `events` binding map — the payload of an events-log line.
@@ -305,6 +313,37 @@ export type PiEventBindings = Record<string, string | number | null>;
  * valid-JSON envelope, so `data` is ALWAYS parseable (the fold JSON-parses it).
  */
 const MAX_DATA_BYTES = 16_384;
+
+/**
+ * Resolve the default-server tmux coordinate from Pi's launch environment.
+ * This self-contained extension cannot import the shared source helper, so it
+ * mirrors the native-TMUX and stripped-TMUX carrier arms and fails closed for a
+ * foreign socket or missing pane.
+ */
+export function piBackendExecCoordsFromEnv(
+  env: NodeJS.ProcessEnv,
+): PiBackendExecCoords {
+  const collapse = (value: string | undefined): string | null =>
+    value === undefined || value === "" ? null : value;
+  const sessionId = collapse(env.KEEPER_TMUX_SESSION);
+  const tmux = collapse(env.TMUX);
+  if (tmux !== null) {
+    const comma = tmux.indexOf(",");
+    const socketPath = comma < 0 ? tmux : tmux.slice(0, comma);
+    const leaf = socketPath.slice(socketPath.lastIndexOf("/") + 1);
+    if (leaf !== "default") {
+      return { type: null, sessionId: null, paneId: null };
+    }
+    const paneId = collapse(env.TMUX_PANE);
+    return paneId === null
+      ? { type: null, sessionId: null, paneId: null }
+      : { type: "tmux", sessionId, paneId };
+  }
+  const paneId = collapse(env.KEEPER_TMUX_PANE);
+  return paneId === null
+    ? { type: null, sessionId: null, paneId: null }
+    : { type: "tmux", sessionId, paneId };
+}
 
 /** Parse Pi's local copy of the bounded Dispatch-attempt environment contract.
  * This isolated extension cannot import keeper source; every malformed shape
@@ -617,6 +656,14 @@ export function piEventBindings(
     hook_event: hookEvent,
     event_type: eventType,
     cwd: meta.cwd,
+    ...(meta.backendExec?.type === "tmux" &&
+    meta.backendExec.paneId !== null
+      ? {
+          backend_exec_type: meta.backendExec.type,
+          backend_exec_session_id: meta.backendExec.sessionId,
+          backend_exec_pane_id: meta.backendExec.paneId,
+        }
+      : {}),
   });
 
   switch (event.type) {
@@ -1508,6 +1555,7 @@ export default function keeperEvents(
     const cwd = process.cwd();
     const storePaths = injectedStorePaths ?? defaultPiEventStorePaths();
     const dispatchAttemptId = piDispatchAttemptFromEnv(process.env);
+    const backendExec = piBackendExecCoordsFromEnv(process.env);
     const busInbox =
       typeof pi.sendMessage === "function"
         ? (runtimeOptions.busInbox ??
@@ -1535,6 +1583,7 @@ export default function keeperEvents(
           pid,
           cwd: eventCwd,
           tsSec: Date.now() / 1000,
+          backendExec,
           ...(dispatchAttemptId == null ? {} : { dispatchAttemptId }),
           ...(event.type === "agent_end"
             ? {

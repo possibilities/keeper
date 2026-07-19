@@ -23,6 +23,26 @@ import { isRunControlArtifact } from "./run-capture";
 const CAPTURE_FS = "\x01";
 const CAPTURE_FORMAT = `#{session_name}${CAPTURE_FS}#{window_id}${CAPTURE_FS}#{pane_id}`;
 
+/** Pane-local tmux option binding a launched pane to its exact Keeper job. */
+export const KEEPER_PANE_OWNER_OPTION = "@keeper_job_id";
+
+/** Build the exact pane-local ownership stamp issued immediately after creation. */
+export function buildTmuxPaneOwnershipArgs(
+  tmuxBase: readonly string[],
+  paneId: string,
+  jobId: string,
+): string[] {
+  return [
+    ...tmuxBase,
+    "set-option",
+    "-p",
+    "-t",
+    paneId,
+    KEEPER_PANE_OWNER_OPTION,
+    jobId,
+  ];
+}
+
 /**
  * Bounded spawn timeouts. tmux lookups/window creation are cheap; session
  * creation may briefly block on server startup. A timeout is mapped to a
@@ -573,6 +593,20 @@ export function launchKeeperAgentInTmux(
   }
 
   const target = parseCreatedTarget(created.stdout, session);
+  const ownerJobId = req.lifecycleJobId?.trim() ?? "";
+  if (ownerJobId !== "") {
+    const stamped = runTmux(
+      req,
+      buildTmuxPaneOwnershipArgs(tmuxBase, target.paneId, ownerJobId),
+    );
+    if (stamped.exitCode !== 0) {
+      // A pane without its exact owner stamp is intentionally unusable by
+      // automatic teardown. Remove the just-created window instead of returning
+      // an unowned successful launch that can only become permanent litter.
+      runTmux(req, [...tmuxBase, "kill-window", "-t", target.windowId]);
+      throw tmuxError("failed to record tmux pane ownership", stamped);
+    }
+  }
   if (runDir !== null && launchScript !== null) {
     writeRunMetadata(req, {
       id: runId,

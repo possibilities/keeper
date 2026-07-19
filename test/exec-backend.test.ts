@@ -187,7 +187,7 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "list-panes",
     "-a",
     "-F",
-    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
   ]);
 });
 
@@ -390,13 +390,13 @@ test("createTmuxPaneOps.focusPane: ENOENT throw → { ok: false }, never throws 
 // createTmuxPaneOps.listPanes — server-wide sweep, tab-safe parse, null degrade
 // ---------------------------------------------------------------------------
 
-test("createTmuxPaneOps.listPanes: parses (tmuxGenerationId, paneId, windowId, currentCommand, paneDead, sessionName, windowName) from one -a sweep", async () => {
+test("createTmuxPaneOps.listPanes: parses topology and pane-local Keeper ownership from one -a sweep", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
         stdout:
-          "900:1700000000\t%1\t@1\tclaude\t0\tautopilot\twork::fn-1-x.2\n900:1700000000\t%2\t@2\tzsh\t1\tmisc\tplain shell\n",
+          "900:1700000000\t%1\t@1\tclaude\t0\tautopilot\tjob-1\twork::fn-1-x.2\n900:1700000000\t%2\t@2\tzsh\t1\tmisc\t\tplain shell\n",
         exitCode: 0,
       },
     },
@@ -413,6 +413,7 @@ test("createTmuxPaneOps.listPanes: parses (tmuxGenerationId, paneId, windowId, c
       currentCommand: "claude",
       paneDead: "0",
       sessionName: "autopilot",
+      keeperJobId: "job-1",
       windowName: "work::fn-1-x.2",
     },
     {
@@ -422,6 +423,7 @@ test("createTmuxPaneOps.listPanes: parses (tmuxGenerationId, paneId, windowId, c
       currentCommand: "zsh",
       paneDead: "1",
       sessionName: "misc",
+      keeperJobId: null,
       windowName: "plain shell",
     },
   ]);
@@ -432,11 +434,11 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // window name itself contains a tab, a colon, and unicode; the six
-        // leading fixed fields (generation/pane/window/command/dead/session) are
-        // taken off the first six tabs, so a name-internal tab never bleeds into
-        // them.
-        stdout: "900:1700000000\t%7\t@7\tzsh\t0\tsess\tweird:\tname é\n",
+        // window name itself contains a tab, a colon, and unicode; the seven
+        // leading fixed fields (generation/pane/window/command/dead/session/owner)
+        // are taken off the first seven tabs, so a name-internal tab never bleeds
+        // into them.
+        stdout: "900:1700000000\t%7\t@7\tzsh\t0\tsess\tjob-7\tweird:\tname é\n",
         exitCode: 0,
       },
     },
@@ -452,6 +454,7 @@ test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowNam
       currentCommand: "zsh",
       paneDead: "0",
       sessionName: "sess",
+      keeperJobId: "job-7",
       windowName: "weird:\tname é",
     },
   ]);
@@ -462,11 +465,11 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
-        // line 1 has no tab; line 2 has only 5 tabs (too few for the six fixed
-        // fields); line 3 is 6-tab but has an empty pane id; line 4 is
-        // well-formed (and a name may be empty — valid).
+        // line 1 has no tab; line 2 has too few fixed fields; line 3 is
+        // seven-tab but has an empty pane id; line 4 is well-formed (an owner
+        // and a name may both be empty — valid).
         stdout:
-          "garbage\n900:1\t%2\t@2\tsh\t0\tsess\n900:1\t\t@3\tsh\t0\tsess\tname\n900:1\t%4\t@4\tsh\t0\tsess\t\n",
+          "garbage\n900:1\t%2\t@2\tsh\t0\tsess\n900:1\t\t@3\tsh\t0\tsess\t\tname\n900:1\t%4\t@4\tsh\t0\tsess\t\t\n",
         exitCode: 0,
       },
     },
@@ -482,6 +485,7 @@ test("createTmuxPaneOps.listPanes: drops malformed lines (too few tabs / empty i
       currentCommand: "sh",
       paneDead: "0",
       sessionName: "sess",
+      keeperJobId: null,
       windowName: "",
     },
   ]);

@@ -10903,9 +10903,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $bash_mutation_kind: null,
         $bash_mutation_targets: null,
         $plan_files: null,
-        $backend_exec_type: null,
+        $backend_exec_type: row.backend_exec_pane_id == null ? null : "tmux",
         $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
+        // Preserve the pre-terminal pane handle on the immutable lifecycle event.
+        // The jobs fold still clears its recyclable live coordinate.
+        $backend_exec_pane_id: row.backend_exec_pane_id,
         $worktree: null,
       });
       // Our own INSERT bumps data_version — pump directly so the Killed fold

@@ -163,6 +163,15 @@ describe("--x-tmux", () => {
         cwd,
         `exec bash '${launchScript}'`,
       ],
+      [
+        "tmux",
+        "set-option",
+        "-p",
+        "-t",
+        "%10",
+        "@keeper_job_id",
+        "11111111-1111-1111-1111-111111111111",
+      ],
       ["tmux", "select-window", "-t", "@9"],
       ["tmux", "switch-client", "-t", "dash"],
     ]);
@@ -274,6 +283,7 @@ describe("--x-tmux", () => {
     expect(h.tmuxCommands.map((cmd) => cmd[1])).toEqual([
       "has-session",
       "new-session",
+      "set-option",
       "select-window",
     ]);
     const newSession = h.tmuxCommands.find((cmd) =>
@@ -334,11 +344,12 @@ describe("--x-tmux", () => {
     const code = await expectExit(main(h.deps));
 
     expect(code).toBe(0);
-    // probe → new-session (rejected duplicate) → new-window (recovery) → select
+    // probe → new-session (rejected duplicate) → new-window (recovery) → owner stamp → select
     expect(h.tmuxCommands.map((cmd) => cmd[1])).toEqual([
       "has-session",
       "new-session",
       "new-window",
+      "set-option",
       "select-window",
     ]);
     expect(parseJsonOutput(h.out)).toMatchObject({
@@ -617,6 +628,56 @@ describe("--x-tmux exit-code taxonomy", () => {
       error: true,
       reason: "transient",
       exitCode: 4,
+    });
+  });
+
+  test("a pane-owner stamp failure removes the new window and fails the launch", async () => {
+    const h = makeHarness({
+      argv: ["claude", "--x-tmux-L", "scratch", "hello"],
+      rawArgv: true,
+      launcherStateDir: tempDir(),
+      cwd: "/fake-home/code/proj",
+      randomUuid: () => "77777777-7777-7777-7777-777777777777",
+      tmuxCommand: (cmd) => {
+        if (cmd.includes("has-session")) {
+          return { exitCode: 1, stdout: "", stderr: "" };
+        }
+        if (cmd.includes("new-session")) {
+          return {
+            exitCode: 0,
+            stdout: "keeper agent\x01@7\x01%8\n",
+            stderr: "",
+          };
+        }
+        if (cmd.includes("set-option")) {
+          return { exitCode: 1, stdout: "", stderr: "option failed" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    const code = await expectExit(main(h.deps));
+
+    expect(code).toBe(1);
+    expect(h.tmuxCommands.map((cmd) => cmd[3] ?? cmd[1])).toEqual([
+      "has-session",
+      "new-session",
+      "set-option",
+      "kill-window",
+    ]);
+    expect(h.tmuxCommands.at(-1)).toEqual([
+      "tmux",
+      "-L",
+      "scratch",
+      "kill-window",
+      "-t",
+      "@7",
+    ]);
+    expect(parseJsonOutput(h.out)).toMatchObject({
+      schema_version: 1,
+      error: true,
+      reason: "internal",
+      exitCode: 1,
     });
   });
 
