@@ -57,5 +57,5 @@ tmux. Named gates only.
 - [ ] Existing occupancy/reap regression tables stay green; named focused gates and typecheck green.
 
 ## Done summary
-
+Terminal autopilot job transitions (ended/killed/autoclosed) now own their tmux pane teardown through a pure decision seam (decideTerminalPaneTeardowns) requiring positive-evidence candidacy: autopilot dispatch_origin, board plan_verb, non-adopted tmux job, exact pane-owner stamp, and dead/recycled process. Panes are stamped with their exact keeper job id at launch (claude and pi paths), the pre-terminal pane coordinate survives onto the lifecycle event instead of being nulled, and a bounded periodic GC plus transition-driven sweep both funnel through the same seam, capped and inert on a degraded probe. Named/handoff/free-form/manual/adopted sessions are proven non-candidates in every state by explicit negative tests.
 ## Evidence
