@@ -70,5 +70,5 @@ The resting policy-off header remains useful and compact; no live account policy
 - [ ] Named board, view-shell, live-shell, and clipboard tests pass at wide and narrow widths.
 
 ## Done summary
-
+Added a canonical semantic board header view model shared across live, snapshot, frame, sidecar, and clipboard output, rendering Fable focus target/lifetime/state at two normal-width rows and three compact narrow rows, with dynamic live geometry on resize and structured frame state carrying the header inputs.
 ## Evidence
