@@ -28,5 +28,5 @@ Present-tense docs only; the outage history lives in the commit message.
 - [ ] agent-account-routing suite green
 
 ## Done summary
-
+Enroll now warns of grant revocation before OAuth; docs/install.md and ADR 0090 amended with the transition ordering and one-grant-per-account end state.
 ## Evidence
