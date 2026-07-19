@@ -70,5 +70,5 @@ This task creates no live focus. Existing zero-event and upgraded installations 
 - [ ] Named schema, reducer, RPC, collection, daemon, and policy tests pass.
 
 ## Done summary
-
+Added durable, atomically-validated Fable-focus policy: schema step v136, generic-config fold extension (set/clear/preserve), pure policy model with deterministic active/expired/completed/invalid/unavailable evaluation, and a versioned PII-free launch leaf published/rehydrated at boot and after every mutation before acknowledgement.
 ## Evidence
