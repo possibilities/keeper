@@ -52,5 +52,5 @@ its message in the envelope. No real git, per test doctrine.
 - [ ] named commit-work gates green
 
 ## Done summary
-
+Scoped the publication snapshot's raw content fingerprint to selected commit paths (status identity alone covers unselected ignored/untracked drift), fixing commit-work in worktrees with gigabytes of ignored content; a snapshot-path throw now surfaces error.message in the envelope instead of a bare stage_failed.
 ## Evidence
