@@ -4458,6 +4458,16 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "pending_dispatches", "launch_pane", "TEXT");
     },
   },
+  {
+    version: 136,
+    kind: "additive",
+    apply: (ctx) => {
+      // One JSON cell keeps target + lifetime + boundary + identity atomic.
+      addColumnIfMissing(ctx.db, "autopilot_state", "fable_focus", "TEXT");
+      // NULL is legacy/unknown lineage; later launch producers stamp 0/1.
+      addColumnIfMissing(ctx.db, "jobs", "fable_intent", "INTEGER");
+    },
+  },
 ];
 
 /**
@@ -4478,7 +4488,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v135:dc109578b2f7de01588cd657d07d38a074ce9818e30f7db5514bc7aa3407a2b9";
+  "v136:2654a0a5086e2ba30db957e22dfedfe473ac483255a48120270bff5791c6ec7e";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6254,7 +6264,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     worktree_multi_repo INTEGER,
     worker_provider TEXT,
     drift_behind_threshold INTEGER,
-    drift_age_threshold_days INTEGER
+    drift_age_threshold_days INTEGER,
+    fable_focus TEXT
 )
 `;
 

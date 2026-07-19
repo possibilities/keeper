@@ -197,15 +197,21 @@ export interface HarnessOptions {
   ) => PartnerCaptureLease | null;
   busArtifactRoot?: string;
   /** Mandatory managed account result for an unpinned Claude launch. */
-  selectAccountRoute?: (model: string | null) => RouteResolution;
+  selectAccountRoute?: (
+    model: string | null,
+    fableIntent?: boolean | null,
+  ) => RouteResolution;
   /** Exact result for a requested zero-based account ordinal. */
   selectAccountRouteByOrdinal?: (
     ordinal: number,
     model: string | null,
+    fableIntent?: boolean | null,
   ) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
   inspectRouting?: () => RoutingInspection;
+  resolveFableIntent?: (target: string) => Promise<boolean | null>;
+  setFableFocus?: MainDeps["setFableFocusFn"];
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
@@ -372,14 +378,14 @@ export function makeHarness(opts: HarnessOptions): Harness {
       (() => ({ path: "/fake-partner-capture", release() {} })),
     resolveBusArtifactRootFn: () =>
       opts.busArtifactRoot ?? "/fake-bus-artifacts",
-    selectAccountRouteFn: (model) => {
+    selectAccountRouteFn: (model, fableIntent) => {
       routerCalls += 1;
-      return selectAccountRoute(model);
+      return selectAccountRoute(model, fableIntent);
     },
-    selectAccountRouteByOrdinalFn: (ordinal, model) => {
+    selectAccountRouteByOrdinalFn: (ordinal, model, fableIntent) => {
       requestedAccountOrdinals.push(ordinal);
       return (
-        opts.selectAccountRouteByOrdinal?.(ordinal, model) ?? {
+        opts.selectAccountRouteByOrdinal?.(ordinal, model, fableIntent) ?? {
           ok: true,
           selection: {
             id: "claude-swap:1",
@@ -391,6 +397,8 @@ export function makeHarness(opts: HarnessOptions): Harness {
         }
       );
     },
+    resolveFableIntentFn: opts.resolveFableIntent ?? (async () => null),
+    setFableFocusFn: opts.setFableFocus ?? (async () => ({ ok: true })),
     inspectRoutingFn:
       opts.inspectRouting ??
       (() => ({
@@ -403,6 +411,16 @@ export function makeHarness(opts: HarnessOptions): Harness {
         error: "no claude-swap account inventory is available",
         would_choose: null,
         candidates: [],
+        fable_focus: {
+          configured: false,
+          state: "off",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off",
+          reason: "policy-off",
+          diagnostic: "none",
+        },
       })),
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),

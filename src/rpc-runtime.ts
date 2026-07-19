@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { RetryDispatchVerb } from "./dispatch-command";
+import type { NormalizedFableFocusInput } from "./fable-focus";
 import type { RequestAwaitRpcParams } from "./protocol";
 
 export const RPC_METHODS = [
@@ -42,6 +43,11 @@ export interface ReplayBridge {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
+    worktree_multi_repo?: boolean;
+    worker_provider?: "claude" | "gpt" | null;
+    drift_behind_threshold?: number | null;
+    drift_age_threshold_days?: number | null;
+    fable_focus?: NormalizedFableFocusInput | null;
   }): Promise<{
     ok: boolean;
     error?: string;

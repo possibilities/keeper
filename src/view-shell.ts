@@ -21,9 +21,9 @@
  *     / multi-stream blends) — the caller wires its own subscribe and
  *     calls `view.emit(snap)` on each tick.
  *   - The render function — pure `(snap: TSnap) => { bodyLines,
- *     stateJson }`. The shell takes the body lines, ships them to the
- *     live shell (with SGR colorization when enabled), and writes the
- *     state JSON to the per-frame sidecar.
+ *     semanticHeader?, stateJson }`. The shell pins semantic rows above the
+ *     live body, prepends them to non-live text, and writes state JSON to the
+ *     per-frame sidecar.
  *   - Extra key handlers (`onKey: (key) => void`) — `c` is owned by the
  *     shell; everything else delegates to the caller. The caller drives
  *     `flashStatus(text)` for transient banner updates; the shared
@@ -46,9 +46,9 @@
  *   /tmp/keeper-<script>.<pid>.lifecycle.txt      (warn/lifecycle log)
  *   /tmp/keeper-<script>.<pid>.prev.frame.txt     (scratch — diff input)
  *
- * The frame text shipped to sidecars is the `"---" + bodyLines` form;
- * only `bodyLines` is shipped to the live shell (the `---` lead is a
- * sidecar/non-TTY artifact, not painted in the alt-screen).
+ * The frame text shipped to sidecars is the `"---" + semantic header + body`
+ * form; live mode pins the semantic rows above the scroll body. The `---` lead
+ * remains a sidecar/non-TTY artifact, not part of the alt-screen.
  */
 
 import { appendFileSync, writeFileSync } from "node:fs";
@@ -57,6 +57,7 @@ import { colorizePillsInLine } from "./board-render";
 import { buildDebugSnapshot, copyToClipboard } from "./clipboard-debug";
 import type { FramesEmitter, TrailerReason } from "./frames-emitter";
 import { createLiveShell, type LiveShell } from "./live-shell";
+import type { LiveShellHeader } from "./live-shell-core";
 import type { BootStatus } from "./protocol";
 import {
   createRefoldProgressPoller,
@@ -231,6 +232,8 @@ export interface ViewRender {
    * normalized to the honest-empty line (`snapshotBodyLines`), never a
    * `---`-only frame; live mode paints an empty body as-is. */
   bodyLines: string[];
+  /** Fixed semantic rows pinned above the live scroll body and prepended elsewhere. */
+  semanticHeader?: LiveShellHeader;
   /** Arbitrary JSON-serializable state captured per frame in the sidecar. */
   stateJson: unknown;
 }
@@ -625,6 +628,7 @@ export function createViewShell<TSnap>(
     process.env.NO_COLOR == null;
 
   let lastBody: string | null = null;
+  let lastLiveRender: ViewRender | null = null;
   let lastFrameText: string | null = null;
   let frameCount = 0;
 
@@ -633,8 +637,7 @@ export function createViewShell<TSnap>(
   // here and reports the latch once. `runSnapshot` reads the captured
   // composite when the latch resolves, writes the sidecars ONE time, prints
   // the frame + trailer, and exits. `null` until the first `emit`.
-  let snapshotCapture: { bodyLines: string[]; stateJson: unknown } | null =
-    null;
+  let snapshotCapture: ViewRender | null = null;
   let latchReported = false;
   // fn-772: explicit per-stream reports (`reportSnapshotStream`) made by a
   // multi-stream view's SECONDARY streams. `emit` auto-reports the first
@@ -695,7 +698,7 @@ export function createViewShell<TSnap>(
   let catchingUpObserved: boolean | null = null;
   // The freshest rendered composite held while gated (live mode). Retained so
   // the flip to ready paints it immediately; `null` when nothing is held.
-  let heldRender: { bodyLines: string[]; stateJson: unknown } | null = null;
+  let heldRender: ViewRender | null = null;
   // ---- post-paint disconnect presentation ----
   let reconnecting = false;
   let graceExpired = false;
@@ -1077,13 +1080,13 @@ export function createViewShell<TSnap>(
     if (reconnecting || graceExpired) {
       liveShell.setStatus(reconnectBanner());
     }
-    if (!isStale() || lastBody === null) {
+    if (!isStale() || lastLiveRender === null) {
       return;
     }
-    liveShell.refreshLive([
-      ...toShellLines(lastBody.split("\n")),
-      staleBannerLine(),
-    ]);
+    liveShell.refreshLive(
+      [...toShellLines(lastLiveRender.bodyLines), staleBannerLine()],
+      shellHeader(lastLiveRender.semanticHeader),
+    );
   }
 
   function armReconnectGrace(): void {
@@ -1265,6 +1268,26 @@ export function createViewShell<TSnap>(
     });
   }
 
+  function shellHeader(
+    header: LiveShellHeader | undefined,
+  ): LiveShellHeader | undefined {
+    if (header === undefined) {
+      return undefined;
+    }
+    const renderAtWidth = header.renderAtWidth;
+    if (renderAtWidth === undefined) {
+      return { lines: toShellLines(header.lines.slice()) };
+    }
+    return {
+      lines: toShellLines(header.lines.slice()),
+      renderAtWidth: (width) => toShellLines(renderAtWidth(width)),
+    };
+  }
+
+  function frameLines(render: ViewRender): string[] {
+    return [...(render.semanticHeader?.lines ?? []), ...render.bodyLines];
+  }
+
   // Sidecar frame text strips the selection prefix so postmortem output
   // stays clean (the prefix is a live-paint protocol, not data).
   function sidecarFrameText(bodyLines: string[]): string {
@@ -1327,7 +1350,8 @@ export function createViewShell<TSnap>(
   }
 
   function emit(snap: TSnap): boolean {
-    const { bodyLines, stateJson } = renderBody(snap);
+    const render = renderBody(snap);
+    const lines = frameLines(render);
     // Snapshot mode: capture the latest composite + report the latch on the
     // FIRST emit (the readiness client's first-paint gate guarantees every
     // stream has folded before this fires). No live paint, no per-emit
@@ -1335,7 +1359,7 @@ export function createViewShell<TSnap>(
     // We always capture (so a later emit before the latch resolves keeps
     // the freshest composite) but report only once.
     if (isSnapshot) {
-      snapshotCapture = { bodyLines, stateJson };
+      snapshotCapture = render;
       if (!latchReported) {
         latchReported = true;
         reportLatch();
@@ -1368,14 +1392,14 @@ export function createViewShell<TSnap>(
       // Ready: resume data frames and re-arm the loading latch for any future
       // catch-up window (a mid-run daemon restart).
       framesLoadingEmitted = false;
-      const body = bodyLines.join("\n");
+      const body = lines.join("\n");
       if (body === lastBody) {
         return false;
       }
       lastBody = body;
-      emitFramesRecord(plainBodyText(bodyLines), {
+      emitFramesRecord(plainBodyText(lines), {
         catchingUp: catchingUpObserved,
-        stateJson,
+        stateJson: render.stateJson,
       });
       return true;
     }
@@ -1391,13 +1415,13 @@ export function createViewShell<TSnap>(
     // an immediate paint on the flip to ready) and mint no history frame — the
     // loading indicator owns the body via the `refreshLive` overlay.
     if (catchingUp) {
-      heldRender = { bodyLines, stateJson };
+      heldRender = render;
       return false;
     }
     // Ready: paint. The byte-compare body KEEPS the selection prefix so moving
     // the selection (which only changes which line carries the prefix)
     // invalidates the cache and repaints.
-    return paintLiveFrame(bodyLines, stateJson);
+    return paintLiveFrame(render);
   }
 
   // Emit one frames record (baseline on the first, frame thereafter), stamping
@@ -1449,7 +1473,7 @@ export function createViewShell<TSnap>(
   // indicator, byte-compare, and on a change push the frame + write sidecars.
   // The sole live-paint path — `emit`'s ready branch and the flip-to-ready in
   // `noteCatchingUp` both route through it.
-  function paintLiveFrame(bodyLines: string[], stateJson: unknown): boolean {
+  function paintLiveFrame(render: ViewRender): boolean {
     // Capture staleness BEFORE clearing it: this accepted frame is the "proven
     // fresh frame" that clears the stale state, and it must FORCE a full repaint
     // even when byte-identical (the witnessed resumed-byte-identical-body case)
@@ -1458,15 +1482,20 @@ export function createViewShell<TSnap>(
     exitReconnecting();
     clearWatchdogStale();
     stopConnectingSpinner();
-    const body = bodyLines.join("\n");
+    const lines = frameLines(render);
+    const body = lines.join("\n");
     if (body === lastBody && !wasStale) {
       return false;
     }
     lastBody = body;
+    lastLiveRender = render;
     lastGoodFrameAt = monotonicNow();
     frameCount += 1;
-    liveShell.pushFrame(toShellLines(bodyLines));
-    writeSidecars(stateJson, sidecarFrameText(bodyLines));
+    liveShell.pushFrame(
+      toShellLines(render.bodyLines),
+      shellHeader(render.semanticHeader),
+    );
+    writeSidecars(render.stateJson, sidecarFrameText(lines));
     // Steady painting resumed — (re-)arm the divergence poll and re-baseline its
     // window off this fresh frame.
     armWatchdog();
@@ -1474,8 +1503,9 @@ export function createViewShell<TSnap>(
   }
 
   function repaintLocal(snap: TSnap): boolean {
-    const { bodyLines } = renderBody(snap);
-    const body = bodyLines.join("\n");
+    const render = renderBody(snap);
+    const lines = frameLines(render);
+    const body = lines.join("\n");
     if (body === lastBody) {
       return false;
     }
@@ -1487,9 +1517,11 @@ export function createViewShell<TSnap>(
     // clear the stale state (ADR 0088). While stale, RE-APPEND the stale banner
     // so a local interaction never silently drops it.
     lastBody = body;
-    const shellLines = toShellLines(bodyLines);
+    lastLiveRender = render;
+    const shellLines = toShellLines(render.bodyLines);
     liveShell.refreshLive(
       isStale() ? [...shellLines, staleBannerLine()] : shellLines,
+      shellHeader(render.semanticHeader),
     );
     return true;
   }
@@ -1591,7 +1623,7 @@ export function createViewShell<TSnap>(
       if (heldRender !== null) {
         const held = heldRender;
         heldRender = null;
-        paintLiveFrame(held.bodyLines, held.stateJson);
+        paintLiveFrame(held);
       }
     } else if (!was && catchingUp) {
       // Flip to catch-up (e.g. a reconnect reporting catch-up): the loading
@@ -1707,10 +1739,13 @@ export function createViewShell<TSnap>(
         // A frame was captured (ready, or timeout-degrade with ≥1 stream).
         // Bump frameCount to 1 so the sidecar filenames are frame-1 and the
         // trailer's `frame` matches, then write the sidecars ONCE.
-        const { bodyLines: rawBodyLines, stateJson } = snapshotCapture;
+        const { stateJson } = snapshotCapture;
         // A zero-line render (healthy but idle projection) becomes the
         // honest-empty line so the frame is never bare separators.
-        const bodyLines = snapshotBodyLines(rawBodyLines, snapshotEmptyLine);
+        const bodyLines = snapshotBodyLines(
+          frameLines(snapshotCapture),
+          snapshotEmptyLine,
+        );
         const truncated = outcome.kind === "timeout";
         frameCount = 1;
         const frameText = sidecarFrameText(bodyLines);

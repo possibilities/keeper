@@ -921,6 +921,34 @@ test("snapshot: first ready composite prints frame + keeper-meta: line, exits 0"
   expect(typeof trailer.state).toBe("string");
 });
 
+test("snapshot prepends the semantic header to stdout and its accepted sidecar", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+    renderBody: (snap) => ({
+      bodyLines: snap.body,
+      semanticHeader: {
+        lines: ["Fable focus: c2 · permanent · focused", "autopilot: playing"],
+      },
+      stateJson: { header: "exact" },
+    }),
+  });
+  view.emit({ body: ["epic body"] });
+  expect(() => view?.runSnapshot(() => {})).toThrow("__SNAPSHOT_EXIT_0__");
+
+  const printed = h.stdout.join("");
+  expect(printed).toContain(
+    "Fable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+  );
+  const framePath = `/tmp/keeper-${sidecarBase}.${process.pid}.frame.1.txt`;
+  expect(readFileSync(framePath, "utf8")).toBe(
+    "---\nFable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+  );
+});
+
 test("snapshot: empty-but-healthy projection still emits a frame and exits 0", () => {
   const h = makeSnapshotHarness();
   view = createViewShell<{ body: string[] }>({
@@ -1254,6 +1282,7 @@ test("snapshot: reportSnapshotStream is inert in live mode (no latch armed)", ()
 interface FramesHarness {
   stdout: string[];
   exits: number[];
+  files: Map<string, string>;
   setNow: (ms: number) => void;
   fireTimeout: () => void;
   timeoutClears: () => number;
@@ -1268,14 +1297,17 @@ interface FramesHarness {
 function makeFramesHarness(proc?: ViewerExitProc): FramesHarness {
   const stdout: string[] = [];
   const exits: number[] = [];
+  const files = new Map<string, string>();
   let now = 0;
   let timeoutCb: (() => void) | null = null;
   let timeoutClears = 0;
   const io: FramesIo = {
-    // Sidecar writes are irrelevant to the wire contract under test — no-op
-    // them so the pure tier writes zero files.
-    writeFile: () => {},
-    unlink: () => {},
+    writeFile: (path, contents) => {
+      files.set(path, contents);
+    },
+    unlink: (path) => {
+      files.delete(path);
+    },
     nowIso: () => "2026-06-10T00:00:00.000Z",
     nowMs: () => now,
   };
@@ -1297,6 +1329,7 @@ function makeFramesHarness(proc?: ViewerExitProc): FramesHarness {
   return {
     stdout,
     exits,
+    files,
     setNow: (ms) => {
       now = ms;
     },
@@ -1349,6 +1382,34 @@ test("frames: envelopes carry monotonic contiguous seq + the freshest cursor", (
   expect(recs.every((r) => r.view === "board")).toBe(true);
   // 2: FRAMES_SCHEMA_VERSION as of the catching_up field's addition.
   expect(recs.every((r) => r.schema_version === 2)).toBe(true);
+});
+
+test("frames serialize the same semantic header as snapshots", () => {
+  const h = makeFramesHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    mode: "frames",
+    frames: { emitter: h.makeEmitter(), io: h.runIo },
+    renderBody: (snap) => ({
+      bodyLines: snap.body,
+      semanticHeader: {
+        lines: ["Fable focus: c2 · permanent · focused", "autopilot: playing"],
+      },
+      stateJson: { policy: "focused" },
+    }),
+  });
+  view.emit({ body: ["epic body"] });
+  const baseline = h.records()[0];
+  const framePath = baseline?.frame_path;
+  const statePath = baseline?.state_path;
+  expect(typeof framePath).toBe("string");
+  expect(typeof statePath).toBe("string");
+  expect(h.files.get(framePath as string)).toBe(
+    "Fable focus: c2 · permanent · focused\nautopilot: playing\nepic body\n",
+  );
+  expect(JSON.parse(h.files.get(statePath as string) ?? "null")).toEqual({
+    policy: "focused",
+  });
 });
 
 test("frames: max-frames bound terminates with a trailer as the final line", () => {

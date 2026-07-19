@@ -18,9 +18,9 @@
  * Public surface (unchanged from pre-OpenTUI-port)
  * --------------
  * - `createLiveShell(opts)` — returns a `LiveShell` handle.
- * - `pushFrame(lines)` — called once per script emit. `lines` is one
- *   element per row.
- * - `refreshLive(lines)` — re-render the live view's body without
+ * - `pushFrame(lines, header?)` — called once per script emit. `lines` is one
+ *   element per scrollable row; `header` stays pinned above it.
+ * - `refreshLive(lines, header?)` — re-render the live view's body without
  *   appending to history. Cleared by the next `pushFrame`.
  * - `setStatus(status)` — update a short caller-controlled segment
  *   folded into the banner row.
@@ -89,6 +89,7 @@ import { type AnsiToStyledRuntime, linesToContent } from "./ansi-to-styled";
 import {
   createLiveShellCore,
   type LiveShellCore,
+  type LiveShellHeader,
   type LiveShellTimers,
 } from "./live-shell-core";
 
@@ -189,8 +190,8 @@ export interface SafetyNetTarget {
  * Caller-facing handle — unchanged from pre-OpenTUI-port.
  */
 export interface LiveShell {
-  pushFrame(lines: string[]): void;
-  refreshLive(lines: string[]): void;
+  pushFrame(lines: string[], header?: LiveShellHeader): void;
+  refreshLive(lines: string[], header?: LiveShellHeader): void;
   setStatus(status: string): void;
   dispose(): void;
 }
@@ -206,9 +207,9 @@ export interface LiveShell {
  * queued during the brief async window). The root layout is a
  * column Box of:
  *   - row 0: a dim `TextRenderable` banner (height 1, width 100%);
- *   - row 1+: a `ScrollBoxRenderable` body (height: rest of viewport)
- *     containing one `TextRenderable` whose `content` is the joined
- *     visible rows.
+ *   - row 1+: semantic header rows (when supplied);
+ *   - remaining rows: a `ScrollBoxRenderable` body containing one
+ *     `TextRenderable` whose `content` is the joined visible rows.
  *
  * In passthrough mode: no renderer is constructed; the core's
  * passthrough writes are routed back to `stdout.write`.
@@ -234,8 +235,8 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
       captureKeys: opts.captureKeys,
     });
     return {
-      pushFrame: (lines) => core.pushFrame(lines),
-      refreshLive: (lines) => core.refreshLive(lines),
+      pushFrame: (lines, header) => core.pushFrame(lines, header),
+      refreshLive: (lines, header) => core.refreshLive(lines, header),
       setStatus: (status) => core.setStatus(status),
       dispose: () => core.dispose(),
     };
@@ -387,17 +388,17 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
   })();
 
   return {
-    pushFrame: (lines: string[]): void => {
+    pushFrame: (lines: string[], header?: LiveShellHeader): void => {
       if (disposed || setupErrored) {
         return;
       }
-      core.pushFrame(lines);
+      core.pushFrame(lines, header);
     },
-    refreshLive: (lines: string[]): void => {
+    refreshLive: (lines: string[], header?: LiveShellHeader): void => {
       if (disposed || setupErrored) {
         return;
       }
-      core.refreshLive(lines);
+      core.refreshLive(lines, header);
     },
     setStatus: (status: string): void => {
       if (disposed || setupErrored) {
@@ -488,6 +489,7 @@ export interface LiveShellPaintRuntime {
 export interface LiveShellPaint {
   readonly renderer: CliRenderer;
   readonly banner: TextRenderable;
+  readonly header: TextRenderable;
   readonly body: TextRenderable;
   readonly scrollBox: ScrollBoxRenderable;
   repaint(): void;
@@ -496,8 +498,8 @@ export interface LiveShellPaint {
 
 /**
  * Build the live-shell paint scene against an OpenTUI renderer:
- * column layout with a dim banner pinned at row 0 and a ScrollBox
- * body filling the rest of the viewport. Wires the renderer's
+ * column layout with a dim banner at row 0, semantic header rows beneath it,
+ * and a ScrollBox body filling the remaining viewport. Wires the renderer's
  * `keyInput` to feed the core's `feedStdin` via a `key.name`-to-raw-
  * string translation, and re-fits the ScrollBox height on resize.
  *
@@ -523,6 +525,8 @@ export function attachLiveShellPaint(
   // (identical content) is a true no-op on the TextRenderable side
   // (avoids reflow + re-shape work for the same string).
   let lastBannerText: string | null = null;
+  let lastHeaderText: string | null = null;
+  let lastHeaderHeight = -1;
   let lastBodyText: string | null = null;
   let lastBodyLineCount = -1;
   // Last viewport width the body was padded against — a resize that changes
@@ -540,13 +544,23 @@ export function attachLiveShellPaint(
     attributes: runtime.TextAttributes.DIM,
     content: core.bannerText(),
   });
-  const sb = new runtime.ScrollBoxRenderable(renderer, {
-    id: "live-shell-scroll",
+  const initialHeaderRows = core.visibleHeaderRows(renderer.width);
+  const headerNode = new runtime.TextRenderable(renderer, {
+    id: "live-shell-header",
     position: "absolute",
     top: 1,
     left: 0,
     width: "100%",
-    height: Math.max(0, renderer.height - 1),
+    height: initialHeaderRows.length,
+    content: initialHeaderRows.join("\n"),
+  });
+  const sb = new runtime.ScrollBoxRenderable(renderer, {
+    id: "live-shell-scroll",
+    position: "absolute",
+    top: 1 + initialHeaderRows.length,
+    left: 0,
+    width: "100%",
+    height: Math.max(0, renderer.height - 1 - initialHeaderRows.length),
     viewportCulling: true,
   });
   // No scrollbar in any keeper TUI. The bar's `visible` SETTER pins
@@ -574,9 +588,12 @@ export function attachLiveShellPaint(
   });
   sb.add(bodyNode);
   renderer.root.add(bannerNode);
+  renderer.root.add(headerNode);
   renderer.root.add(sb);
 
   lastBannerText = core.bannerText();
+  lastHeaderText = initialHeaderRows.join("\n");
+  lastHeaderHeight = initialHeaderRows.length;
   lastBodyText = core.visibleRows().join("\n");
   lastBodyLineCount = core.visibleRows().length;
   lastBodyWidth = sb.viewport.width;
@@ -638,7 +655,6 @@ export function attachLiveShellPaint(
     if (destroyed) {
       return;
     }
-    sb.height = Math.max(0, renderer.height - 1);
     repaint();
   };
   renderer.on("resize", onResize);
@@ -701,6 +717,19 @@ export function attachLiveShellPaint(
       bannerNode.content = bannerNext;
       lastBannerText = bannerNext;
     }
+    const headerRows = core.visibleHeaderRows(renderer.width);
+    const headerText = headerRows.join("\n");
+    if (headerText !== lastHeaderText) {
+      headerNode.content = headerText;
+      lastHeaderText = headerText;
+    }
+    if (headerRows.length !== lastHeaderHeight) {
+      headerNode.height = headerRows.length;
+      lastHeaderHeight = headerRows.length;
+    }
+    const bodyTop = 1 + headerRows.length;
+    sb.top = bodyTop;
+    sb.height = Math.max(0, renderer.height - bodyTop);
     const rows = core.visibleRows();
     // Cache key is still the plain `\n`-joined text — it's a faithful
     // change-detector regardless of whether the actual `bodyNode.content`
@@ -744,6 +773,7 @@ export function attachLiveShellPaint(
   return {
     renderer,
     banner: bannerNode,
+    header: headerNode,
     body: bodyNode,
     scrollBox: sb,
     repaint,

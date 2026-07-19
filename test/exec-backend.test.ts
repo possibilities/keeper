@@ -970,6 +970,22 @@ test("buildKeeperAgentLaunchArgv: resume mode emits --resume <target> and NO tra
   ]);
 });
 
+test("buildKeeperAgentLaunchArgv: inherited Fable intent rides separately from account attribution", () => {
+  const argv = buildKeeperAgentLaunchArgv({
+    launcherArgvPrefix: LAP,
+    session: "work",
+    prompt: "",
+    resumeTarget: "session-fable",
+    fableIntent: true,
+    noConfirm: true,
+  });
+  expect(argv.filter((arg) => arg.startsWith("--x-fable-intent="))).toEqual([
+    "--x-fable-intent=1",
+  ]);
+  expect(argv).not.toContain("KEEPER_ACCOUNT_ROUTE");
+  expect(argv.slice(-2)).toEqual(["--resume", "session-fable"]);
+});
+
 test("buildKeeperAgentLaunchArgv: an empty resumeTarget falls back to prompt mode", () => {
   // A degenerate empty target must NOT emit `--resume ""` (a quoting/UX hazard);
   // it falls through to the trailing prompt positional.
@@ -1030,11 +1046,13 @@ test("buildKeeperAgentLaunchArgv: Pi resume emits `--session <t>`", () => {
     prompt: "",
     resumeTarget: "pi-42",
     harness: "pi",
+    fableIntent: true,
     noConfirm: true,
   });
   expect(pi.slice(-2)).toEqual(["--session", "pi-42"]);
   expect(pi[LAP.length]).toBe("pi");
   expect(pi).not.toContain("--dangerously-skip-permissions");
+  expect(pi.some((arg) => arg.startsWith("--x-fable-intent="))).toBe(false);
 });
 
 test("buildKeeperAgentLaunchArgv: an explicit claude harness is byte-identical to the default", () => {

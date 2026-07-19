@@ -8,6 +8,8 @@
  */
 
 import { DEFAULT_MAX_CONCURRENT_PER_ROOT } from "./db";
+import { parseFableFocusPolicy, validateFableFocusPolicy } from "./fable-focus";
+import type { FableFocusPolicy } from "./types";
 
 /**
  * Coerce a singleton `autopilot_state` wire row's `paused` column (INTEGER:
@@ -101,6 +103,21 @@ export function projectWorktreeMultiRepo(
     return null;
   }
   return rows[0]?.worktree_multi_repo === 1;
+}
+
+/** Parse the raw SQLite cell or decoded query value without activating malformed state. */
+export function projectFableFocus(
+  rows: Record<string, unknown>[],
+): { valid: true; policy: FableFocusPolicy | null } | { valid: false } {
+  if (rows.length === 0 || rows[0]?.fable_focus == null) {
+    return { valid: true, policy: null };
+  }
+  const raw = rows[0]?.fable_focus;
+  const policy =
+    typeof raw === "string"
+      ? parseFableFocusPolicy(raw)
+      : validateFableFocusPolicy(raw);
+  return policy === null ? { valid: false } : { valid: true, policy };
 }
 
 /**

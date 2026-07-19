@@ -52,6 +52,7 @@ export interface DebugSnapshotInputs {
  * reads — the timestamp is an explicit input.
  */
 export function buildDebugSnapshot(input: DebugSnapshotInputs): string {
+  const frame = Bun.stripANSI(input.frame);
   const statePath = `/tmp/keeper-${input.script}.${input.pid}.state.${input.frameNumber}.json`;
   const framePath = `/tmp/keeper-${input.script}.${input.pid}.frame.${input.frameNumber}.txt`;
   const diffPath = `/tmp/keeper-${input.script}.${input.pid}.diff.${input.frameNumber}.txt`;
@@ -61,7 +62,7 @@ export function buildDebugSnapshot(input: DebugSnapshotInputs): string {
     "",
     "## Frame",
     "",
-    input.frame,
+    frame,
     "",
     "## Full state",
     "",

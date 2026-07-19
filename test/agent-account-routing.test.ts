@@ -10,10 +10,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { writeObservationSidecar } from "../src/account-observation";
 import type { RouteResolution, RouteSelection } from "../src/account-router";
 import {
   deriveCswapAccountConfigDir,
   existingCswapAccountConfigDir,
+  OBSERVATION_SCHEMA_VERSION,
+  observationSidecarPath,
 } from "../src/account-routing-config";
 import { main, seedClaudeWorkspaceTrust } from "../src/agent/main";
 import {
@@ -329,6 +332,36 @@ describe("selection remains independent per invocation", () => {
     expect(command.slice(5)).toContain("--resume");
   });
 
+  test("continuation inherits Fable intent while an explicit model overrides it", async () => {
+    const inherited: Array<boolean | null | undefined> = [];
+    const resume = makeHarness({
+      argv: ["claude", "--resume", UUID],
+      rawArgv: true,
+      resolveFableIntent: async (target) => target === UUID,
+      selectAccountRoute: (_model, fableIntent) => {
+        inherited.push(fableIntent);
+        return { ok: true, selection: selection(3) };
+      },
+    });
+    await runAndCapture(resume, main);
+    expect(inherited).toEqual([true]);
+    expect(resume.deps.env.KEEPER_FABLE_INTENT).toBe("1");
+
+    const overridden: Array<boolean | null | undefined> = [];
+    const explicit = makeHarness({
+      argv: ["claude", "--resume", UUID, "--model", "opus", "--effort", "high"],
+      rawArgv: true,
+      resolveFableIntent: async () => true,
+      selectAccountRoute: (_model, fableIntent) => {
+        overridden.push(fableIntent);
+        return { ok: true, selection: selection(4) };
+      },
+    });
+    await runAndCapture(explicit, main);
+    expect(overridden).toEqual([false]);
+    expect(explicit.deps.env.KEEPER_FABLE_INTENT).toBe("0");
+  });
+
   test("Pi launches never consult claude-swap routing", async () => {
     const h = makeHarness({ argv: ["pi", "hello"], rawArgv: true });
     const command = await runAndCapture(h, main);
@@ -348,6 +381,255 @@ describe("selection remains independent per invocation", () => {
     expect(command[0]).toBe("/fake-home/.local/bin/pi");
     expect(command[command.indexOf("--model") + 1]).toBe("fable");
     expect(h.routerCalls()).toBe(0);
+  });
+});
+
+describe("keeper agent accounts fable-focus", () => {
+  const baseInspection = {
+    model_scope: "fable",
+    health: "ok" as const,
+    observed_at_ms: 1000,
+    age_ms: 0,
+    fresh: true,
+    enabled: true,
+    error: null,
+    would_choose: null,
+    candidates: [],
+  };
+
+  test("show emits one PII-free machine status envelope", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "fable-focus", "show", "--json"],
+      rawArgv: true,
+      inspectRouting: () => ({
+        ...baseInspection,
+        fable_focus: {
+          configured: true,
+          state: "active",
+          target_route: "claude-swap:2",
+          lifetime: { kind: "permanent" },
+          target_eligible: true,
+          outcome: "focused",
+          reason: "target-focused",
+          diagnostic: "none",
+        },
+      }),
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const envelope = JSON.parse(h.out.join(""));
+    expect(envelope.schema_version).toBe(1);
+    expect(envelope.data.target_route).toBe("claude-swap:2");
+    expect(JSON.stringify(envelope)).not.toContain("@");
+  });
+
+  test("guarded current-reset refusal never mutates prior policy", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "keeper-focus-refusal-"));
+    let mutations = 0;
+    try {
+      const h = makeHarness({
+        argv: [
+          "accounts",
+          "fable-focus",
+          "set",
+          "claude-swap:2",
+          "current-reset",
+          "--expect-reset",
+          "2026-07-19T00:00:00Z",
+          "--json",
+        ],
+        rawArgv: true,
+        env: { KEEPER_ACCOUNT_ROUTING_ROOT: stateDir },
+        now: () => Date.parse("2026-07-18T00:00:00Z"),
+        inspectRouting: () => ({
+          ...baseInspection,
+          fable_focus: {
+            configured: true,
+            state: "active",
+            target_route: "claude-swap:1",
+            lifetime: { kind: "permanent" },
+            target_eligible: true,
+            outcome: "focused",
+            reason: "target-focused",
+            diagnostic: "none",
+          },
+        }),
+        setFableFocus: async () => {
+          mutations += 1;
+          return { ok: true };
+        },
+      });
+      expect(await expectExit(main(h.deps))).toBe(2);
+      expect(mutations).toBe(0);
+      expect(JSON.parse(h.out.join("")).error.code).toBe(
+        "focus_observation_unavailable",
+      );
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("absolute, cycle-end, and guarded current-reset setters preserve stable route identity", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "keeper-focus-lifetimes-"));
+    const now = Date.parse("2026-07-18T00:00:00Z");
+    const resetAt = "2026-07-18T01:00:00.900Z";
+    const applied: unknown[] = [];
+    try {
+      writeObservationSidecar(observationSidecarPath(stateDir), {
+        schema_version: OBSERVATION_SCHEMA_VERSION,
+        observed_at_ms: now,
+        health: "ok",
+        routes: [
+          {
+            id: "claude-swap:2",
+            kind: "managed",
+            slot: 2,
+            measuredAtMs: now,
+            windows: [
+              { key: "session", utilization: 0.2, resetsAt: null },
+              { key: "week", utilization: 0.3, resetsAt: null },
+              { key: "model:Fable", utilization: 0.4, resetsAt: resetAt },
+            ],
+          },
+        ],
+        claude_accounts: {
+          count: 1,
+          ordinals: { "claude-swap:2": 0 },
+        },
+        account_issues: {},
+        notes: [],
+      });
+      const runSet = async (args: string[]): Promise<void> => {
+        const h = makeHarness({
+          argv: ["accounts", "fable-focus", "set", ...args, "--json"],
+          rawArgv: true,
+          env: { KEEPER_ACCOUNT_ROUTING_ROOT: stateDir },
+          now: () => now,
+          inspectRouting: () => ({
+            ...baseInspection,
+            fable_focus: {
+              configured: false,
+              state: "off",
+              target_route: null,
+              lifetime: null,
+              target_eligible: null,
+              outcome: "off",
+              reason: "policy-off",
+              diagnostic: "none",
+            },
+          }),
+          setFableFocus: async (focus) => {
+            applied.push(focus);
+            return { ok: true };
+          },
+        });
+        expect(await expectExit(main(h.deps))).toBe(0);
+      };
+      await runSet(["claude-swap:2", "absolute", "2026-07-19T03:00:00+03:00"]);
+      await runSet(["c0", "cycle-end"]);
+      await runSet([
+        "claude-swap:2",
+        "current-reset",
+        "--expect-reset",
+        "2026-07-18T01:00:00.100Z",
+      ]);
+      expect(applied).toEqual([
+        {
+          target_route: "claude-swap:2",
+          lifetime: {
+            kind: "absolute",
+            deadline_at: "2026-07-19T00:00:00.000Z",
+          },
+        },
+        {
+          target_route: "claude-swap:2",
+          lifetime: { kind: "cycle-end", reset_at: resetAt },
+        },
+        {
+          target_route: "claude-swap:2",
+          lifetime: { kind: "current-reset", reset_at: resetAt },
+        },
+      ]);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("clear repairs unavailable delivery instead of treating it as off", async () => {
+    let cleared = 0;
+    const h = makeHarness({
+      argv: ["accounts", "fable-focus", "clear", "--json"],
+      rawArgv: true,
+      inspectRouting: () => ({
+        ...baseInspection,
+        fable_focus: {
+          configured: false,
+          state: "unavailable",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "fallback",
+          reason: "policy-unavailable",
+          diagnostic: "delivery-malformed",
+        },
+      }),
+      setFableFocus: async (focus) => {
+        expect(focus).toBeNull();
+        cleared += 1;
+        return { ok: true };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(cleared).toBe(1);
+  });
+
+  test("set persists a stable route and clear is idempotent when already off", async () => {
+    const applied: unknown[] = [];
+    const set = makeHarness({
+      argv: [
+        "accounts",
+        "fable-focus",
+        "set",
+        "claude-swap:2",
+        "permanent",
+        "--json",
+      ],
+      rawArgv: true,
+      now: () => Date.parse("2026-07-18T00:00:00Z"),
+      inspectRouting: () => ({
+        ...baseInspection,
+        fable_focus: {
+          configured: false,
+          state: "off",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off",
+          reason: "policy-off",
+          diagnostic: "none",
+        },
+      }),
+      setFableFocus: async (focus) => {
+        applied.push(focus);
+        return { ok: true };
+      },
+    });
+    expect(await expectExit(main(set.deps))).toBe(0);
+    expect(applied).toEqual([
+      {
+        target_route: "claude-swap:2",
+        lifetime: { kind: "permanent" },
+      },
+    ]);
+
+    const clear = makeHarness({
+      argv: ["accounts", "fable-focus", "clear", "--json"],
+      rawArgv: true,
+      inspectRouting: set.deps.inspectRoutingFn,
+      setFableFocus: async () => {
+        throw new Error("idempotent clear must not mutate");
+      },
+    });
+    expect(await expectExit(main(clear.deps))).toBe(0);
   });
 });
 
@@ -375,6 +657,16 @@ describe("keeper agent accounts check", () => {
         fable_remaining: 0.4,
       },
     ],
+    fable_focus: {
+      configured: false,
+      state: "off" as const,
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off" as const,
+      reason: "policy-off" as const,
+      diagnostic: "none",
+    },
   };
 
   test("--json emits the read-only snapshot", async () => {
@@ -406,6 +698,16 @@ describe("keeper agent accounts check", () => {
         error: "no claude-swap account inventory is available",
         would_choose: null,
         candidates: [],
+        fable_focus: {
+          configured: false,
+          state: "unavailable",
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "fallback",
+          reason: "policy-unavailable",
+          diagnostic: "delivery-missing",
+        },
       }),
     });
     expect(await expectExit(main(h.deps))).toBe(0);

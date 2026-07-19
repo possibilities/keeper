@@ -1259,6 +1259,39 @@ test("autopilot_state: a durable AutopilotPaused{paused:false} survives, and the
   ).toBe(0);
 });
 
+test("autopilot_state: Fable-focus identity and approved boundary re-fold byte-identically", () => {
+  insertEvent({
+    hook_event: "AutopilotConfigSet",
+    session_id: "autopilot",
+    event_type: "autopilot_state",
+    data: JSON.stringify({
+      fable_focus: {
+        target_route: "claude-swap:3",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2026-07-20T23:59:59Z",
+        },
+      },
+    }),
+  });
+  drainAll();
+  const first = snapshotProjections().autopilot_state;
+  const encoded = (first[0] as { fable_focus?: unknown } | undefined)
+    ?.fable_focus;
+  expect(typeof encoded).toBe("string");
+  expect(JSON.parse(encoded as string)).toMatchObject({
+    policy_id: "event:1",
+    target_route: "claude-swap:3",
+    lifetime: {
+      kind: "absolute",
+      deadline_at: "2026-07-20T23:59:59.000Z",
+    },
+  });
+  rewindAndWipeProjections();
+  drainAll();
+  expect(snapshotProjections().autopilot_state).toEqual(first);
+});
+
 test("autopilot_state: a fresh board with no AutopilotPaused history boots PAUSED via the AutopilotCapSet INSERT default", () => {
   // No `AutopilotPaused` event at all — only the daemon's `AutopilotCapSet` boot
   // re-arm. Its INSERT path (`VALUES (1, 1, …)`) is the SOLE carrier of the

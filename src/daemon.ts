@@ -34,12 +34,18 @@ import {
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AccountObserverWorkerData } from "./account-observer-worker";
-import { resolveAccountRoutingRoot } from "./account-routing-config";
+import {
+  fableFocusPolicyPath,
+  resolveAccountRoutingRoot,
+} from "./account-routing-config";
 import type {
   AutocloseWorkerData,
   AutocloseWorkerMessage,
 } from "./autoclose-worker";
-import { projectAutopilotPaused } from "./autopilot-projection";
+import {
+  projectAutopilotPaused,
+  projectFableFocus,
+} from "./autopilot-projection";
 import type {
   AutopilotWorkerData,
   DispatchClearedMessage,
@@ -227,6 +233,12 @@ import type {
   StuckSentinelMessage,
 } from "./exit-watcher";
 import { REPROBE_MIN_AGE_SECS, REPROBE_MS } from "./exit-watcher";
+import {
+  type FableFocusDelivery,
+  type FableFocusLeaf,
+  publishFableFocusLeaf,
+  readFableFocusLeaf,
+} from "./fable-focus";
 import { fingerprintFailure } from "./failure-fingerprint";
 import { seedGitProjection } from "./git-boot-seed";
 import type {
@@ -8027,6 +8039,41 @@ function acquireSingleInstanceLock(): void {
   singleInstanceLock = action.lock;
 }
 
+export interface FableFocusProjectionPublishDeps {
+  publish?: (path: string, policy: FableFocusLeaf["policy"]) => void;
+  read?: (path: string) => FableFocusDelivery;
+}
+
+/**
+ * Publish the authoritative singleton cell and verify the cold-launch leaf
+ * before a setter may acknowledge success. The same seam is used at boot.
+ */
+export function publishFableFocusProjection(
+  db: Database,
+  routingRoot: string,
+  deps: FableFocusProjectionPublishDeps = {},
+): FableFocusLeaf {
+  const row = db
+    .query("SELECT fable_focus FROM autopilot_state WHERE id = 1")
+    .get() as { fable_focus: string | null } | null;
+  const projected = projectFableFocus(
+    row === null ? [] : [row as Record<string, unknown>],
+  );
+  if (!projected.valid) {
+    throw new Error("authoritative Fable-focus Projection is invalid");
+  }
+  const path = fableFocusPolicyPath(routingRoot);
+  (deps.publish ?? publishFableFocusLeaf)(path, projected.policy);
+  const delivered = (deps.read ?? readFableFocusLeaf)(path);
+  if (
+    !delivered.available ||
+    JSON.stringify(delivered.policy) !== JSON.stringify(projected.policy)
+  ) {
+    throw new Error("Fable-focus launch leaf does not match the Projection");
+  }
+  return { schema_version: 1, policy: projected.policy };
+}
+
 /**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
@@ -8092,6 +8139,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // Resolve the UDS path the same way the server worker does, so the returned
   // handle exposes it for `waitForDaemon`.
   const sockPath = resolveSockPath();
+  const accountRoutingRoot = resolveAccountRoutingRoot();
 
   const dbPath = resolveDbPath();
   // 256MB page cache on the writer connection: folds run here under the write
@@ -9198,6 +9246,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           });
           wakePending = true;
           pumpWakes();
+          // Focus delivery is part of the acknowledgement boundary: the event is
+          // authoritative once folded, but an `ok:true` response is withheld until
+          // the owner-only launch leaf verifies the exact same policy identity.
+          if ("fable_focus" in msg.patch) {
+            publishFableFocusProjection(db, accountRoutingRoot);
+          }
           // `pumpWakes` drains synchronously, so the `AutopilotConfigSet` event is
           // now folded — this read reflects the worktree mode AS OF the applied
           // patch (the folded mode at reply time). A per-root cap stored while
@@ -9685,6 +9739,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // pacing sleep. Reads a reducer module-global — never inside a fold.
   const bootCatchupStartWorkMs = readFoldWorkMsAccum();
   serveBootDrain();
+  // Rehydrate the SQLite-free launch boundary from the authoritative Projection.
+  // A failed boot publish degrades visibly to `unavailable`; it never changes or
+  // clears durable operator intent and does not block the rest of keeperd.
+  try {
+    publishFableFocusProjection(db, accountRoutingRoot);
+  } catch (error) {
+    console.error(
+      `[keeperd] Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   scheduleProviderLegDeathNoticeSweep();
   scheduleProviderLegCascadeSweep();
 
@@ -10866,7 +10930,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         new URL("./account-observer-worker.ts", import.meta.url).href,
         {
           workerData: {
-            stateDir: resolveAccountRoutingRoot(),
+            stateDir: accountRoutingRoot,
           } satisfies AccountObserverWorkerData,
         } as WorkerOptions & { workerData: unknown },
       )

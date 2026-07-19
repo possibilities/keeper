@@ -262,6 +262,7 @@ export type EnsureLaunchedFn = (
   cwd: string,
   harness: string,
   jobId: string,
+  fableIntent?: boolean | null,
 ) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 /** Sleep injection for {@link applyRestore} — production passes the real
@@ -320,6 +321,7 @@ export async function applyRestore(
         cwd,
         harness,
         entry.candidate.job_id,
+        entry.candidate.fable_intent,
       );
       if (res.ok) {
         out.push({ kind: "restored", candidate: entry.candidate });
@@ -461,6 +463,7 @@ export async function applyRestoreVerified(
         cwd,
         harness,
         candidate.job_id,
+        candidate.fable_intent,
       );
       if (!res.ok) {
         deps.intent.write(touchIntent(base, "failed", res.error));
@@ -887,6 +890,9 @@ export function renderSnapshotScript(
         resumeTarget: candidate.resume_target,
         jobId: candidate.job_id,
         harness,
+        ...(candidate.fable_intent == null
+          ? {}
+          : { fableIntent: candidate.fable_intent }),
         noConfirm: true,
       });
       if (windowsEmitted > 0) {
@@ -1426,14 +1432,20 @@ export function makeEnsureLaunched(
   launcherArgvPrefix: string[],
   noteLine: (line: string) => void,
 ): EnsureLaunchedFn {
-  return (session, resumeTarget, cwd, harness, jobId) =>
+  return (session, resumeTarget, cwd, harness, jobId, fableIntent) =>
     keeperAgentLaunch({
       noteLine,
       launcherArgvPrefix,
       session,
       cwd,
       label: `restore resume ${harness} ${resumeTarget}`,
-      spec: { prompt: "", resumeTarget, jobId, harness },
+      spec: {
+        prompt: "",
+        resumeTarget,
+        jobId,
+        harness,
+        ...(fableIntent == null ? {} : { fableIntent }),
+      },
     });
 }
 

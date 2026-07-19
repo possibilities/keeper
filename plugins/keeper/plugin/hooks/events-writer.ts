@@ -300,6 +300,11 @@ export function accountRouteFromEnv(env: NodeJS.ProcessEnv): string | null {
   return /^claude-swap:[1-9]\d{0,9}$/.test(raw) ? raw : null;
 }
 
+export function fableIntentFromEnv(env: NodeJS.ProcessEnv): boolean | null {
+  const raw = env.KEEPER_FABLE_INTENT;
+  return raw === "1" ? true : raw === "0" ? false : null;
+}
+
 /** Parse the bounded exact-attempt carrier injected by the generic dispatcher.
  * Kept local because this hook's dependency-free island cannot import launch
  * configuration. Malformed or missing metadata is unfenced evidence. */
@@ -851,10 +856,17 @@ export function buildEventBindings(
   // metadata leaves the original payload byte-for-byte unchanged.
   const dispatchAttemptId =
     hookEvent === "SessionStart" ? dispatchAttemptFromEnv(env) : null;
+  const fableIntent = fableIntentFromEnv(env);
   const eventData =
-    dispatchAttemptId == null
+    dispatchAttemptId == null && fableIntent == null
       ? raw
-      : JSON.stringify({ ...data, dispatch_attempt_id: dispatchAttemptId });
+      : JSON.stringify({
+          ...data,
+          ...(dispatchAttemptId == null
+            ? {}
+            : { dispatch_attempt_id: dispatchAttemptId }),
+          ...(fableIntent == null ? {} : { fable_intent: fableIntent }),
+        });
 
   // SessionStart only: capture the PII-free account ROUTE from the launcher-
   // injected `KEEPER_ACCOUNT_ROUTE` env (mirrors config_dir / worktree). NULL on

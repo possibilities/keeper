@@ -32,6 +32,11 @@ import {
   SHARED_DIRTY_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
+import {
+  materializeFableFocusPolicy,
+  normalizeFableFocusInput,
+  serializeFableFocusPolicy,
+} from "./fable-focus";
 import { allGatedRootsSeeded } from "./gated-roots";
 import {
   ATTRIBUTION_FLOOR_PATH,
@@ -6785,6 +6790,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   worker_provider: "worker_provider",
   drift_behind_threshold: "drift_behind_threshold",
   drift_age_threshold_days: "drift_age_threshold_days",
+  fable_focus: "fable_focus",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -6845,6 +6851,9 @@ interface AutopilotConfigSetPayload {
    *  it. Both drift thresholds resolving `null` is the OFF default: `.2`'s
    *  drift probe and `.4`'s refresh pass both stay inert. */
   drift_age_threshold_days?: number | null;
+  /** Canonical policy JSON, or NULL for an idempotent clear. The whole policy
+   *  occupies one cell so a fold can never expose a partial target/lifetime. */
+  fable_focus?: string | null;
 }
 
 /**
@@ -6940,6 +6949,22 @@ function extractAutopilotConfigSetPayload(
         typeof raw === "number" && Number.isInteger(raw) && raw > 0
           ? raw
           : null;
+    }
+    if ("fable_focus" in parsed) {
+      const raw = parsed.fable_focus;
+      if (raw === null) {
+        patch.fable_focus = null;
+      } else {
+        const input = normalizeFableFocusInput(raw);
+        const policy =
+          input === null
+            ? null
+            : materializeFableFocusPolicy(input, event.id, event.ts);
+        // Malformed structured policies are a no-op, never a partial clear.
+        if (policy !== null) {
+          patch.fable_focus = serializeFableFocusPolicy(policy);
+        }
+      }
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;
@@ -10141,9 +10166,19 @@ function projectJobsRow(db: Database, event: Event): void {
         // SET); the title precedence-write block is the only path that appends.
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
+        let fableIntent: number | null = null;
+        try {
+          const sessionData = JSON.parse(event.data) as {
+            fable_intent?: unknown;
+          };
+          if (sessionData.fable_intent === true) fableIntent = 1;
+          else if (sessionData.fable_intent === false) fableIntent = 0;
+        } catch {
+          fableIntent = null;
+        }
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target, adopted, account_route)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, start_time, last_event_id, updated_at, title, title_source, transcript_path, plan_verb, plan_ref, config_dir, profile_name, name_history, worktree, harness, resume_target, adopted, account_route, fable_intent)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO UPDATE SET
              pid = COALESCE(excluded.pid, jobs.pid),
              start_time = COALESCE(excluded.start_time, jobs.start_time),
@@ -10185,6 +10220,7 @@ function projectJobsRow(db: Database, event: Event): void {
              -- NEVER synthesizes one — so attribution stays observational and no
              -- prior route ever binds a conversation or drives a later choice.
              account_route = COALESCE(excluded.account_route, jobs.account_route),
+             fable_intent = COALESCE(excluded.fable_intent, jobs.fable_intent),
              -- Schema v36: track config_dir's nullability — a resume carrying
              -- a NULL config_dir derives a NULL excluded.profile_name, so
              -- COALESCE preserves the seeded name (mirrors config_dir above).
@@ -10260,6 +10296,7 @@ function projectJobsRow(db: Database, event: Event): void {
             event.resume_target,
             event.adopted,
             event.account_route,
+            fableIntent,
             // The three trailing `?` bind the ADR-0013 lifecycle-stamp gate + set
             // value added to the ON CONFLICT DO UPDATE re-open above (state-CASE
             // gate, stamp-CASE gate, stamp value) — all the event ts. The DO
@@ -10513,11 +10550,21 @@ function projectJobsRow(db: Database, event: Event): void {
       // no pre-SELECT of projection state — and reads ONLY event fields, so a
       // from-scratch re-fold reproduces the minted row byte-identically.
       if (event.pid != null) {
+        let forkFableIntent: number | null = null;
+        try {
+          const promptData = JSON.parse(event.data) as {
+            fable_intent?: unknown;
+          };
+          if (promptData.fable_intent === true) forkFableIntent = 1;
+          else if (promptData.fable_intent === false) forkFableIntent = 0;
+        } catch {
+          forkFableIntent = null;
+        }
         db.run(
-          `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at, fable_intent)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id) DO NOTHING`,
-          [jobId, ts, event.cwd, event.pid, event.id, ts],
+          [jobId, ts, event.cwd, event.pid, event.id, ts, forkFableIntent],
         );
       }
       // A prompt means the session is ALIVE — set 'working' unconditionally (no

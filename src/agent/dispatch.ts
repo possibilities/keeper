@@ -33,6 +33,11 @@ export type Dispatch =
   | { kind: "providers-check" }
   // Read-only claude-swap account-routing diagnostics.
   | { kind: "accounts-check"; json: boolean }
+  | {
+      kind: "accounts-fable-focus";
+      operation: "show" | "set" | "clear";
+      rest: string[];
+    }
   | { kind: "subcommand"; verb: SubcommandKind; rest: string[] }
   // The blocking run-and-capture verbs. `run-capture` composes launch→wait→show
   // in one process; `wait-capture` runs wait→show on an already-launched handle.
@@ -75,6 +80,9 @@ Usage:
   keeper agent presets list [--json]   List configured presets + panels.
   keeper agent accounts check [--json] Report claude-swap inventory health + the
                                     managed route policy would choose (read-only).
+  keeper agent accounts fable-focus show|clear [--json]
+  keeper agent accounts fable-focus set <route|cN> <permanent|absolute|current-reset|cycle-end> [deadline] [--expect-reset <UTC>] [--json]
+                                    Inspect or atomically replace durable Fable focus.
   keeper agent providers resolve <model> <effort>
                                     Emit the cost-ordered serving candidates for a
                                     model from the host matrix (no_route exit 3 for
@@ -420,7 +428,26 @@ export function splitSubcommand(argv: string[]): Dispatch {
   }
   if (head === "accounts") {
     if (argv[1] === "check") {
-      return { kind: "accounts-check", json: argv.slice(2).includes("--json") };
+      const rest = argv.slice(2);
+      if (rest.some((arg) => arg !== "--json")) {
+        return { kind: "usage", unknown: "accounts check" };
+      }
+      return { kind: "accounts-check", json: rest.includes("--json") };
+    }
+    if (argv[1] === "fable-focus") {
+      const operation = argv[2];
+      if (
+        operation === "show" ||
+        operation === "set" ||
+        operation === "clear"
+      ) {
+        return {
+          kind: "accounts-fable-focus",
+          operation,
+          rest: argv.slice(3),
+        };
+      }
+      return { kind: "usage", unknown: "accounts fable-focus" };
     }
     return { kind: "usage", unknown: `accounts ${argv[1] ?? ""}`.trim() };
   }

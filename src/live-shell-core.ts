@@ -125,14 +125,20 @@ export interface LiveShellCoreOptions {
  * `visibleRows` / `historyLen` / `getViewIdx` are the projection
  * surface the paint layer reads when rendering a frame.
  */
+export interface LiveShellHeader {
+  readonly lines: readonly string[];
+  readonly renderAtWidth?: (width: number) => string[];
+}
+
 export interface LiveShellCore {
   readonly mode: "tui" | "passthrough";
-  pushFrame(lines: string[]): void;
-  refreshLive(lines: string[]): void;
+  pushFrame(lines: string[], header?: LiveShellHeader): void;
+  refreshLive(lines: string[], header?: LiveShellHeader): void;
   setStatus(status: string): void;
   feedStdin(chunk: string | Buffer): void;
   bannerText(): string;
   visibleRows(): string[];
+  visibleHeaderRows(width: number): string[];
   historyLen(): number;
   getViewIdx(): ViewIdx;
   /**
@@ -182,13 +188,13 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     let passthroughDisposed = false;
     return {
       mode: "passthrough",
-      pushFrame(lines: string[]): void {
+      pushFrame(lines: string[], header?: LiveShellHeader): void {
         if (passthroughDisposed) {
           return;
         }
-        onPlainWrite(`${lines.join("\n")}\n`);
+        onPlainWrite(`${[...(header?.lines ?? []), ...lines].join("\n")}\n`);
       },
-      refreshLive(lines: string[]): void {
+      refreshLive(lines: string[], header?: LiveShellHeader): void {
         // Write plain exactly like passthrough `pushFrame` so the
         // connecting spinner (fn-696, now routed through `refreshLive`)
         // still emits when non-TTY/piped and the view-shell tests that
@@ -199,7 +205,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
         if (passthroughDisposed) {
           return;
         }
-        onPlainWrite(`${lines.join("\n")}\n`);
+        onPlainWrite(`${[...(header?.lines ?? []), ...lines].join("\n")}\n`);
       },
       setStatus(_status: string): void {
         // Silent no-op in passthrough: no banner to update.
@@ -211,6 +217,9 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
         return "";
       },
       visibleRows(): string[] {
+        return [];
+      },
+      visibleHeaderRows(_width: number): string[] {
         return [];
       },
       historyLen(): number {
@@ -241,10 +250,13 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
   const titlePrefix =
     opts.title != null && opts.title !== "" ? `[[${opts.title}]] ` : "";
 
-  const history: string[][] = [];
+  type Frame = { body: string[]; header: LiveShellHeader };
+  const emptyHeader: LiveShellHeader = { lines: [] };
+  const history: Frame[] = [];
   let viewIdx: ViewIdx = "live";
   let disposed = false;
-  let liveOverlay: string[] | null = null;
+  let liveOverlay: { body: string[]; header: LiveShellHeader | null } | null =
+    null;
   let bannerStatus = "";
   // Set by the navigation actions, read-and-cleared by the paint layer
   // via `takeScrollReset()`. Distinguishes a user-initiated frame switch
@@ -282,18 +294,32 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
    * reads the held frame. An empty history yields an empty array so
    * a pre-first-frame paint doesn't crash.
    */
-  function visibleRows(): string[] {
+  function visibleFrame(): Frame {
+    const tip = history[history.length - 1];
     if (history.length === 0) {
-      // Empty history but an overlay may be set — the connecting spinner
-      // (fn-696) paints via `refreshLive` before the first real frame
-      // lands. Honor it so the indicator is visible during connect; cold
-      // start with no overlay still yields `[]`.
-      return liveOverlay ?? [];
+      return {
+        body: liveOverlay?.body ?? [],
+        header: liveOverlay?.header ?? emptyHeader,
+      };
     }
-    if (viewIdx === "live") {
-      return liveOverlay ?? history[history.length - 1] ?? [];
+    if (viewIdx === "live" && liveOverlay !== null) {
+      return {
+        body: liveOverlay.body,
+        header: liveOverlay.header ?? tip?.header ?? emptyHeader,
+      };
     }
-    return history[viewIdx] ?? [];
+    return viewIdx === "live"
+      ? (tip ?? { body: [], header: emptyHeader })
+      : (history[viewIdx] ?? { body: [], header: emptyHeader });
+  }
+
+  function visibleRows(): string[] {
+    return visibleFrame().body;
+  }
+
+  function visibleHeaderRows(width: number): string[] {
+    const header = visibleFrame().header;
+    return (header.renderAtWidth?.(width) ?? header.lines).slice();
   }
 
   function stepBack(): void {
@@ -495,14 +521,13 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     }
   }
 
-  function pushFrame(lines: string[]): void {
+  function pushFrame(lines: string[], header?: LiveShellHeader): void {
     if (disposed) {
       return;
     }
     // A fresh tip supersedes any time-driven overlay.
     liveOverlay = null;
-    const copy = lines.slice();
-    history.push(copy);
+    history.push({ body: lines.slice(), header: header ?? emptyHeader });
     if (history.length > historyCap) {
       // Drop oldest; nudge `viewIdx` down so an integer index keeps
       // pointing at the same logical frame (clamp at 0).
@@ -514,11 +539,11 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     onRender();
   }
 
-  function refreshLive(lines: string[]): void {
+  function refreshLive(lines: string[], header?: LiveShellHeader): void {
     if (disposed) {
       return;
     }
-    liveOverlay = lines.slice();
+    liveOverlay = { body: lines.slice(), header: header ?? null };
     if (viewIdx === "live") {
       onRender();
     }
@@ -553,6 +578,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     feedStdin,
     bannerText,
     visibleRows,
+    visibleHeaderRows,
     historyLen: () => history.length,
     getViewIdx: () => viewIdx,
     takeScrollReset: () => {

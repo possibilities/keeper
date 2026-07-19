@@ -150,6 +150,8 @@ interface SeedJob {
   last_event_id?: number | null;
   harness?: string | null;
   resume_target?: string | null;
+  fable_intent?: number | null;
+  current_model_id?: string | null;
 }
 
 function seedJob(db: Database, j: SeedJob): void {
@@ -157,8 +159,8 @@ function seedJob(db: Database, j: SeedJob): void {
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, cwd, close_kind,
        window_index, backend_exec_session_id, plan_verb, last_event_id,
-       harness, resume_target
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       harness, resume_target, fable_intent, current_model_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? RECENT,
@@ -175,6 +177,8 @@ function seedJob(db: Database, j: SeedJob): void {
       j.last_event_id ?? null,
       j.harness ?? null,
       j.resume_target ?? null,
+      j.fable_intent ?? null,
+      j.current_model_id ?? null,
     ],
   );
 }
@@ -259,6 +263,7 @@ function fakeCandidate(opts: {
   backend_exec_session_id?: string;
   created_at?: number;
   harness?: string;
+  fable_intent?: boolean | null;
 }): RestoreCandidate {
   return {
     job_id: opts.job_id,
@@ -269,6 +274,9 @@ function fakeCandidate(opts: {
     backend_exec_session_id: opts.backend_exec_session_id ?? "work",
     created_at: opts.created_at ?? 1000,
     ...(opts.harness !== undefined ? { harness: opts.harness } : {}),
+    ...(opts.fable_intent !== undefined
+      ? { fable_intent: opts.fable_intent }
+      : {}),
   };
 }
 
@@ -354,6 +362,25 @@ test("renderSnapshotScript emits a get-or-create guard + paced BARE keeper agent
   expect(script).toContain(
     "# summary: keeper tabs dump sessions=1 windows=2 excluded-managed=0",
   );
+});
+
+test("renderSnapshotScript preserves inherited Fable intent without account affinity", () => {
+  const script = renderSnapshotScript(
+    [
+      fakeCandidate({
+        job_id: "fable-job",
+        resume_target: "fable-native",
+        fable_intent: true,
+      }),
+    ],
+    {
+      prefix: RESTORE_PREFIX,
+      tmuxSessionCwd: RESTORE_TMUX_SESSION_CWD,
+      sourcePath: "/tmp/keeper.db",
+    },
+  );
+  expect(script).toContain("'--x-fable-intent=1'");
+  expect(script).not.toContain("KEEPER_ACCOUNT_ROUTE");
 });
 
 test("renderSnapshotScript header reports captured + excluded-managed counts", () => {

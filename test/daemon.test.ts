@@ -136,6 +136,7 @@ import {
   probeReplyProvesLife,
   probeSettleStep,
   pruneRecoveredDeadLetters,
+  publishFableFocusProjection,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
@@ -238,6 +239,11 @@ import {
   SHARED_WEDGE_DISTRESS_ID_PREFIX,
   SHARED_WEDGE_DISTRESS_VERB,
 } from "../src/dispatch-failure-key";
+import {
+  materializeFableFocusPolicy,
+  readFableFocusLeaf,
+  serializeFableFocusPolicy,
+} from "../src/fable-focus";
 import {
   classifyAgentbotPageOutcome,
   resolveAgentbotBinaryPath,
@@ -4486,6 +4492,70 @@ test("PENDING_DISPATCH_TTL_MS is 120s (>= 2x the documented 60s cold-start ceili
   expect(PENDING_DISPATCH_TTL_MS).toBe(120_000);
 });
 
+test("Fable-focus Projection publication rehydrates the exact policy identity on restart", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-fable-daemon-"));
+  const policy = materializeFableFocusPolicy(
+    {
+      target_route: "claude-swap:2",
+      lifetime: {
+        kind: "absolute",
+        deadline_at: "2026-07-20T23:59:59.000Z",
+      },
+    },
+    7,
+    1_752_840_000,
+  );
+  if (policy === null) throw new Error("expected policy");
+  db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, fable_focus)
+     VALUES (1, 1, 7, 1, 1, ?)`,
+    [serializeFableFocusPolicy(policy)],
+  );
+  try {
+    expect(publishFableFocusProjection(db, root)).toEqual({
+      schema_version: 1,
+      policy,
+    });
+    expect(() =>
+      publishFableFocusProjection(db, root, {
+        publish: () => {},
+        read: () => ({ available: true, policy: null }),
+      }),
+    ).toThrow("Fable-focus launch leaf does not match the Projection");
+    const path = join(root, "fable-focus-policy.json");
+    writeFileSync(path, "corrupt");
+    // A restart republishes from SQLite; it does not recompute the approved time.
+    expect(publishFableFocusProjection(db, root).policy).toEqual(policy);
+    expect(readFableFocusLeaf(path)).toEqual({ available: true, policy });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Fable-focus mutation acknowledgement fails closed on leaf publication failure", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-fable-daemon-"));
+  try {
+    expect(() =>
+      publishFableFocusProjection(db, root, {
+        publish: () => {
+          throw new Error("injected atomic write failure");
+        },
+      }),
+    ).toThrow("injected atomic write failure");
+    expect(readFableFocusLeaf(join(root, "fable-focus-policy.json"))).toEqual({
+      available: false,
+      diagnostic: "delivery-missing",
+    });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no schema)", () => {
   // The fn-724 durable mint-before-launch + three-way outcome is entirely
   // a producer-side control-flow change: a new id-correlated
@@ -4757,7 +4827,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(135);
+  expect(SCHEMA_VERSION).toBe(136);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

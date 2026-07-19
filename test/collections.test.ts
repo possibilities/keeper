@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectDrainedRunningJobs } from "../cli/await";
+import { projectFableFocus } from "../src/autopilot-projection";
 import { drainedState } from "../src/await-conditions";
 import {
   AUTOPILOT_STATE_DESCRIPTOR,
@@ -646,6 +647,13 @@ test("runQuery pages a seeded pending_dispatches row with the served columns (sc
   db.close();
 });
 
+test("jobs and autopilot descriptors serve Fable lineage and atomic focus policy", () => {
+  expect(JOBS_DESCRIPTOR.columns).toContain("fable_intent");
+  expect(JOBS_DESCRIPTOR.jsonColumns.has("fable_intent")).toBe(false);
+  expect(AUTOPILOT_STATE_DESCRIPTOR.columns).toContain("fable_focus");
+  expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("fable_focus")).toBe(true);
+});
+
 test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", () => {
   // Regression: worktree_mode is in the write path (db column + reducer fold)
   // but was absent from AUTOPILOT_STATE_DESCRIPTOR.columns, so runQuery never
@@ -654,9 +662,19 @@ test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", (
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   db.query(
     `INSERT INTO autopilot_state
-       (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode, max_concurrent_per_root, worktree_mode)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(0, 7, 100.0, 200.0, 3, "yolo", 2, 1);
+       (id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs, mode, max_concurrent_per_root, worktree_mode, fable_focus)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    0,
+    7,
+    100.0,
+    200.0,
+    3,
+    "yolo",
+    2,
+    1,
+    '{"schema_version":1,"policy_id":"event:7","target_route":"claude-swap:2","fable_intent":true,"set_at":"2026-07-18T12:00:00.000Z","lifetime":{"kind":"permanent"}}',
+  );
   const res = asResult(
     runQuery(db, 7, { type: "query", collection: "autopilot_state" }),
   );
@@ -665,6 +683,19 @@ test("runQuery serves autopilot_state.worktree_mode on the wire row (fn-969)", (
   if (row == null) throw new Error("expected one autopilot_state row");
   expect(row.worktree_mode).toBe(1);
   expect(row.max_concurrent_per_root).toBe(2);
+  const expectedFocus = {
+    schema_version: 1 as const,
+    policy_id: "event:7",
+    target_route: "claude-swap:2" as const,
+    fable_intent: true as const,
+    set_at: "2026-07-18T12:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  expect(row.fable_focus).toEqual(expectedFocus);
+  expect(projectFableFocus([row])).toEqual({
+    valid: true,
+    policy: expectedFocus,
+  });
   // worktree_mode stays out of jsonColumns (it is a scalar INTEGER).
   expect(AUTOPILOT_STATE_DESCRIPTOR.jsonColumns.has("worktree_mode")).toBe(
     false,

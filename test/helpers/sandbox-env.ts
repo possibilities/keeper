@@ -126,6 +126,7 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
   env.KEEPER_LANE_DIRT_SPOOL_DIR = join(tmpDir, "lane-dirt-spool");
   env.KEEPER_EVENTS_LOG = join(tmpDir, "events-log");
+  env.KEEPER_ACCOUNT_ROUTING_ROOT = join(tmpDir, "account-routing");
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");

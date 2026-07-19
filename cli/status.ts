@@ -33,6 +33,10 @@
  */
 
 import { parseArgs } from "node:util";
+import {
+  type FableFocusRoutingView,
+  inspectRouting,
+} from "../src/account-router";
 import { parseWrappedProviderTaskId } from "../src/autoclose-worker";
 import { isBoardWorkJob } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
@@ -84,7 +88,7 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * on stale board views.
  * `in_flight.running_jobs` remains emitted but is deprecated in favor of
  * `in_flight.board_work_jobs`. */
-export const STATUS_SCHEMA_VERSION = 13;
+export const STATUS_SCHEMA_VERSION = 14;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -197,6 +201,7 @@ export interface StatusData {
     // from effective.
     max_concurrent_per_root_stored: number | null;
   };
+  fable_focus: FableFocusRoutingView;
   board: { epics: EpicView[] };
   counts: {
     epics: VerdictTally;
@@ -390,11 +395,23 @@ function tallyVerdicts(m: Map<string, Verdict>): VerdictTally {
  * unset) excludes the caller's own row from `in_flight.board_work_jobs` —
  * defaults to `null` so existing callers/fixtures are unaffected.
  */
+const OFF_FABLE_FOCUS: FableFocusRoutingView = {
+  configured: false,
+  state: "off",
+  target_route: null,
+  lifetime: null,
+  target_eligible: null,
+  outcome: "off",
+  reason: "policy-off",
+  diagnostic: "none",
+};
+
 export function buildStatusEnvelope(
   snap: ReadinessClientSnapshot,
   boot: StatusBootInfo,
   dispatchFailures: readonly Row[],
   ownSessionId: string | null = null,
+  fableFocus: FableFocusRoutingView = OFF_FABLE_FOCUS,
 ): StatusEnvelope {
   // Resolve + classify each sticky `dispatch_failures` row to its board target
   // (a `work::` row → its task, a `close::` row — bare or worktree-mode-keyed →
@@ -531,6 +548,7 @@ export function buildStatusEnvelope(
       max_concurrent_per_root: snap.maxConcurrentPerRoot,
       max_concurrent_per_root_stored: snap.maxConcurrentPerRootStored ?? null,
     },
+    fable_focus: fableFocus,
     board,
     counts: {
       epics: epicTally,
@@ -664,6 +682,7 @@ export interface RunStatusDeps {
   /** The caller's own `CLAUDE_CODE_SESSION_ID` (`null` when unset), excluded
    *  from `in_flight.board_work_jobs`. Defaults to `null`. */
   ownSessionId?: string | null;
+  inspectRouting?: () => ReturnType<typeof inspectRouting>;
 }
 
 /**
@@ -705,6 +724,7 @@ export async function runStatus(
       latestBoot,
       failures,
       deps.ownSessionId ?? null,
+      deps.inspectRouting?.().fable_focus ?? OFF_FABLE_FOCUS,
     );
     emitEnvelopeFormatted(envelope, deps, args.format);
   };
@@ -797,6 +817,7 @@ export async function main(argv: string[]): Promise<void> {
     writeStderr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
     ownSessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null,
+    inspectRouting: () => inspectRouting({ model: "fable", fableIntent: true }),
   });
 }
 

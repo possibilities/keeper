@@ -545,6 +545,14 @@ export function buildReviveScriptCandidates(jobs: Job[]): {
       // ABSENT ⇒ claude: tag only a non-claude harness so the claude revive
       // script stays byte-identical.
       ...(harness !== "claude" ? { harness } : {}),
+      fable_intent:
+        (job as Job & { fable_intent?: number | null }).fable_intent === 1
+          ? true
+          : (job as Job & { fable_intent?: number | null }).fable_intent === 0
+            ? false
+            : job.current_model_id?.trim().toLowerCase() === "fable"
+              ? true
+              : null,
     });
   }
   candidates.sort(compareCandidates);

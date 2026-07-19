@@ -681,6 +681,59 @@ test("set_autopilot_config rejects a worker_provider value outside claude|gpt|nu
   expect(state.setConfigCalls).toEqual([]);
 });
 
+test("set_autopilot_config atomically validates, canonicalizes, and clears Fable focus", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const set = await setAutopilotConfigHandler(
+    {
+      fable_focus: {
+        target_route: "claude-swap:2",
+        lifetime: {
+          kind: "current-reset",
+          reset_at: "2026-07-20T19:59:59-04:00",
+        },
+      },
+    },
+    bridge,
+  );
+  expect(set).toEqual({
+    ok: true,
+    patch: {
+      fable_focus: {
+        target_route: "claude-swap:2",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2026-07-20T23:59:59.000Z",
+        },
+      },
+    },
+  });
+  const cleared = await setAutopilotConfigHandler(
+    { fable_focus: null },
+    bridge,
+  );
+  expect(cleared).toEqual({ ok: true, patch: { fable_focus: null } });
+  expect(state.setConfigCalls).toEqual([set.patch, { fable_focus: null }]);
+});
+
+test("set_autopilot_config rejects malformed or PII-bearing Fable focus as one field", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const fable_focus of [
+    { target_route: "person@example.com", lifetime: { kind: "permanent" } },
+    { target_route: "claude-swap:2\n", lifetime: { kind: "permanent" } },
+    { target_route: "claude-swap:2", lifetime: { kind: "absolute" } },
+    {
+      target_route: "claude-swap:2",
+      lifetime: { kind: "permanent" },
+      email: "person@example.com",
+    },
+  ]) {
+    await expect(
+      setAutopilotConfigHandler({ fable_focus }, bridge),
+    ).rejects.toBeInstanceOf(BadParamsError);
+  }
+  expect(state.setConfigCalls).toEqual([]);
+});
+
 test("set_autopilot_config throws rpc_failed when the bridge reports ok:false", async () => {
   const { bridge } = autopilotStubBridge({
     setConfig: { ok: false, error: "insert lock contention" },

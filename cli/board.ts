@@ -37,6 +37,11 @@
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
+  type FableFocusRoutingView,
+  inspectRouting,
+} from "../src/account-router";
+import { projectFableFocus } from "../src/autopilot-projection";
+import {
   apiErrorPillSeg,
   armedPill,
   epicHeaderLabel,
@@ -93,13 +98,7 @@ import type {
   SubagentInvocation,
 } from "../src/types";
 import { createViewShell } from "../src/view-shell";
-// Autopilot banner — the SAME metadata `keeper autopilot` pins at its top, so
-// `keeper board` reuses its pure projections + label rather than duplicating
-// the wire-decode (single source of truth; these stay byte-identical to the
-// autopilot viewer). The module is import-inert (its `import.meta.main` guard
-// is neutralized), so pulling these symbols in spins up no second CLI.
 import {
-  autopilotBannerLabel,
   projectAutopilotMode,
   projectAutopilotPaused,
   projectMaxConcurrentJobs,
@@ -381,6 +380,155 @@ export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
   ];
 }
 
+export const BOARD_HEADER_NARROW_WIDTH = 80;
+export const BOARD_HEADER_MIN_WIDTH = 60;
+export const BOARD_HEADER_NON_TTY_WIDTH = 100;
+
+export interface BoardHeaderAutopilot {
+  readonly paused: boolean;
+  readonly mode: "yolo" | "armed";
+  readonly armedCount: number;
+  readonly maxConcurrentJobs: number | null;
+  readonly maxConcurrentPerRoot: number;
+  readonly worktreeMode: boolean;
+  readonly workerProvider: "claude" | "gpt" | null;
+}
+
+export interface BoardHeaderViewModel {
+  readonly summary: BoardSummaryCounts;
+  readonly autopilot: BoardHeaderAutopilot;
+  readonly needsHumanCount: number;
+  readonly fableFocus: FableFocusRoutingView;
+}
+
+export interface BoardHeaderFormatInput {
+  readonly viewModel: BoardHeaderViewModel;
+  readonly width: number;
+  readonly now: number;
+}
+
+function stripHeaderAnsi(value: string): string {
+  return Bun.stripANSI(value);
+}
+
+export function boardHeaderDisplayWidth(value: string): number {
+  return Bun.stringWidth(stripHeaderAnsi(value));
+}
+
+export function truncateBoardHeader(value: string, width: number): string {
+  const bounded = Math.max(0, Math.floor(width));
+  const plain = stripHeaderAnsi(value);
+  if (bounded === 0 || plain === "") {
+    return "";
+  }
+  if (boardHeaderDisplayWidth(plain) <= bounded) {
+    return plain;
+  }
+  if (bounded === 1) {
+    return "…";
+  }
+  let out = "";
+  for (const unit of plain) {
+    if (boardHeaderDisplayWidth(`${out}${unit}…`) > bounded) {
+      break;
+    }
+    out += unit;
+  }
+  return `${out}…`;
+}
+
+function compactFocusTarget(target: string | null): string {
+  if (target === null) {
+    return "off";
+  }
+  const slot = /^claude-swap:(\d+)$/u.exec(target)?.[1];
+  return slot === undefined ? target : `c${slot}`;
+}
+
+function focusLifetime(focus: FableFocusRoutingView): string {
+  const lifetime = focus.lifetime;
+  if (lifetime === null) {
+    return "off";
+  }
+  if (lifetime.kind === "permanent") {
+    return "permanent";
+  }
+  return lifetime.kind === "absolute"
+    ? `absolute ${lifetime.deadline_at}`
+    : `cycle-end ${lifetime.reset_at}`;
+}
+
+function focusState(focus: FableFocusRoutingView, now: number): string {
+  if (focus.state === "unavailable" || focus.state === "invalid") {
+    return "unavailable";
+  }
+  if (focus.state === "off") {
+    return "off";
+  }
+  const lifetime = focus.lifetime;
+  if (
+    focus.state === "active" &&
+    lifetime !== null &&
+    lifetime.kind !== "permanent" &&
+    Number.isFinite(now) &&
+    Date.parse(
+      lifetime.kind === "absolute" ? lifetime.deadline_at : lifetime.reset_at,
+    ) <= now
+  ) {
+    return "fallback";
+  }
+  return focus.state === "active" && focus.outcome === "focused"
+    ? "focused"
+    : "fallback";
+}
+
+export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
+  const { autopilot, fableFocus, needsHumanCount, summary } = input.viewModel;
+  const width = Math.max(1, Math.floor(input.width));
+  const target = compactFocusTarget(fableFocus.target_route);
+  const lifetime = focusLifetime(fableFocus);
+  const state = focusState(fableFocus, input.now);
+  const cap =
+    autopilot.maxConcurrentJobs === null
+      ? "∞"
+      : String(autopilot.maxConcurrentJobs);
+  const root = autopilot.worktreeMode
+    ? "lanes"
+    : String(autopilot.maxConcurrentPerRoot);
+  const armed =
+    autopilot.mode === "armed" ? ` · armed ${autopilot.armedCount}` : "";
+  const compactArmed =
+    autopilot.mode === "armed" ? `:${autopilot.armedCount}` : "";
+  const summaryText = `tasks ${summary.tasksOpen}/${summary.tasksRunning} · epics ${summary.epicsOpen}/${summary.epicsRunning}/${summary.epicsClosing}`;
+  const normalAutopilot = `autopilot: ${autopilot.paused ? "paused" : "playing"} · ${autopilot.mode}${armed} · cap ${cap} · root ${root}`;
+  const compactAutopilot = `AP: ${autopilot.paused ? "paused" : "playing"} · ${autopilot.mode}${compactArmed} · cap ${cap} · root ${root}`;
+  const normalDetail = `human ${needsHumanCount} · tree ${autopilot.worktreeMode ? "on" : "off"} · prov ${autopilot.workerProvider ?? "cell"}`;
+  const compactDetail = `human ${needsHumanCount} · tree ${autopilot.worktreeMode ? "on" : "off"} · prov ${autopilot.workerProvider ?? "cell"}`;
+  const normal = [
+    `Fable focus: ${target} · ${lifetime} · ${state} | ${summaryText}`,
+    `${normalAutopilot} | ${normalDetail}`,
+  ];
+  const compact = [
+    `Fable focus: ${target} · ${lifetime}`,
+    `state: ${state} | ${compactAutopilot}`,
+    `${summaryText} | ${compactDetail}`,
+  ];
+  if (width < BOARD_HEADER_MIN_WIDTH) {
+    return compact.map((row) => truncateBoardHeader(row, width));
+  }
+  const rows = width >= BOARD_HEADER_NARROW_WIDTH ? normal : compact;
+  return rows.map((row) => truncateBoardHeader(row, width));
+}
+
+export function boardHeaderWidth(
+  stdout: Pick<NodeJS.WriteStream, "columns" | "isTTY"> = process.stdout,
+): number {
+  if (stdout.isTTY !== true || !Number.isFinite(stdout.columns)) {
+    return BOARD_HEADER_NON_TTY_WIDTH;
+  }
+  return Math.max(1, Math.floor(stdout.columns ?? BOARD_HEADER_NON_TTY_WIDTH));
+}
+
 /** A stuck dispatch_failures row with no on-board home, folded for the
  * `needs human` block: `locator` is the host dir (host-level distress) or the
  * epic/task key (an orphaned close/work failure). */
@@ -654,8 +802,21 @@ export function serializeSubagentIndex(
 export function boardFrameStateJson(
   epics: readonly unknown[],
   subagentIndex: ReadonlyMap<string, SubagentInvocation[]>,
-): { epics: readonly unknown[]; subagents: SerializedSubagentEntry[] } {
-  return { epics, subagents: serializeSubagentIndex(subagentIndex) };
+  header: {
+    readonly viewModel: BoardHeaderViewModel;
+    readonly width: number;
+    readonly renderedAtMs: number;
+  } | null = null,
+): {
+  epics: readonly unknown[];
+  subagents: SerializedSubagentEntry[];
+  header: {
+    readonly viewModel: BoardHeaderViewModel;
+    readonly width: number;
+    readonly renderedAtMs: number;
+  } | null;
+} {
+  return { epics, subagents: serializeSubagentIndex(subagentIndex), header };
 }
 
 /**
@@ -663,8 +824,8 @@ export function boardFrameStateJson(
  * `snapshot`; `runBoardFrames` drives it in `frames` (the entry the future
  * `keeper frames --view board` subcommand dispatch calls, on its OWN flag
  * grammar — never `resolveSnapshotMode`). All three share ONE subscription
- * wiring so the board's four-stream fold, banner, and diagnostics drain cannot
- * drift between modes.
+ * wiring so the board's four-stream fold and diagnostics drain cannot drift
+ * between modes.
  */
 export interface BoardFramesConfig {
   /** Data-frame bound; `null`/omitted ⇒ unbounded. */
@@ -796,9 +957,8 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
   // stays stable.
   const distress: NeedsHumanRow[] = [];
   // The last-rendered `needs human` row count (host distress + off-board
-  // orphans). Computed in `renderBody` (orphan detection needs the epic set) and
-  // read by `apBanner` for the `[needs-human:N]` pill — the banner resyncs
-  // post-emit, so it trails the body by at most one edge and self-heals.
+  // orphans). Computed in `renderBody` because orphan detection needs the epic
+  // set, then folded into the semantic header in the same render pass.
   let needsHumanCount = 0;
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
@@ -806,39 +966,29 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
   // the rows immediately. Null until the first frame.
   let lastSnap: ReadinessClientSnapshot | null = null;
 
-  // Autopilot banner state — the metadata `keeper autopilot` pins at its top
-  // (paused/mode/caps/worktree), sourced over the socket from the
-  // `autopilot_state` singleton; the armed count reuses `armedSet` above.
-  // Seeded to the daemon's boot-safe defaults (paused · yolo · max ∞ · per-root
-  // 1 · worktree:off); the first `autopilot_state` edge overwrites them. The
-  // banner repaints on every autopilot_state or armed_epics edge, and the
-  // view-shell restores it after a copy-key flash via the `persistentBannerPill`
-  // below.
+  // Semantic-header state sourced from the `autopilot_state` singleton; the
+  // armed count reuses `armedSet` above. Boot-safe defaults hold until its first
+  // edge, then either autopilot-state stream can re-render the same board frame.
   const apState = {
     paused: true,
     maxConcurrentJobs: null as number | null,
-    // Holds the durable STORED per-root intent (raw column); the banner derives
-    // the EFFECTIVE cap from it + `worktreeMode` through the shared helper.
+    // Holds the durable STORED per-root intent; the header derives its effective
+    // cap from it + `worktreeMode` through the shared helper.
     maxConcurrentPerRootStored: DEFAULT_MAX_CONCURRENT_PER_ROOT,
     mode: "yolo" as "yolo" | "armed",
     worktreeMode: false,
     workerProvider: null as "claude" | "gpt" | null,
+    fableFocus: {
+      configured: false,
+      state: "off",
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off",
+      reason: "policy-off",
+      diagnostic: "none",
+    } as FableFocusRoutingView,
   };
-  const apBanner = (): string =>
-    autopilotBannerLabel({
-      paused: apState.paused,
-      maxConcurrentJobs: apState.maxConcurrentJobs,
-      maxConcurrentPerRoot: effectivePerRootCap(
-        apState.maxConcurrentPerRootStored,
-        apState.worktreeMode,
-      ),
-      mode: apState.mode,
-      armedCount: armedSet.size,
-      worktreeMode: apState.worktreeMode,
-      workerProvider: apState.workerProvider,
-      needsHumanCount,
-    });
-
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
     jobsArr: unknown,
@@ -1102,10 +1252,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       ...homedBlockedWorkRows({ openTaskIds, workFailures }),
     ];
     needsHumanCount = needsHuman.length;
-    const head = [
-      ...needsHumanLines(needsHuman),
-      ...boardSummaryLines(computeBoardSummary(snap)),
-    ];
+    const head = needsHumanLines(needsHuman);
     const body = renderEpicsBody(snap, subagentIndex);
     return body === "" ? [...head, "no epics"] : [...head, ...body.split("\n")];
   }
@@ -1133,7 +1280,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     script: "board",
     title: "board",
     // Board folds FOUR streams — the readiness composite, the `armed_epics`
-    // presence table, the `autopilot_state` singleton (the banner-metadata
+    // presence table, the `autopilot_state` singleton (the semantic-header
     // substrate), and the `dispatch_failures` projection (the close-row
     // sticky-failure pill) — so the snapshot latch holds until ALL FOUR report
     // (readiness via the auto-report in `view.emit`; the other three via the
@@ -1149,9 +1296,6 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
           },
         }
       : {}),
-    // The fixed banner row carries autopilot metadata. Restored here after a
-    // copy-key flash expires.
-    persistentBannerPill: apBanner,
     // Paint watchdog (ADR 0088): the shell owns detection + the stale banner off
     // the injected re-fold poller; the caller owns the self-heal. On a wedge we
     // force a fresh resubscribe of all four streams (the wedge is socket/daemon
@@ -1180,20 +1324,41 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       for (const arr of subagentIndex.values()) {
         arr.sort((a, b) => a.turn_seq - b.turn_seq);
       }
+      const bodyLines = renderBody(snap, subagentIndex);
+      const viewModel: BoardHeaderViewModel = {
+        summary: computeBoardSummary(snap),
+        autopilot: {
+          paused: apState.paused,
+          mode: apState.mode,
+          armedCount: armedSet.size,
+          maxConcurrentJobs: apState.maxConcurrentJobs,
+          maxConcurrentPerRoot: effectivePerRootCap(
+            apState.maxConcurrentPerRootStored,
+            apState.worktreeMode,
+          ),
+          worktreeMode: apState.worktreeMode,
+          workerProvider: apState.workerProvider,
+        },
+        needsHumanCount,
+        fableFocus: apState.fableFocus,
+      };
+      const renderedAtMs = Date.now();
+      const width = boardHeaderWidth();
       return {
-        bodyLines: renderBody(snap, subagentIndex),
-        // The per-frame state sidecar carries the epics AND the stable-ordered
-        // subagent index — a frames consumer's ground truth for stale-pill
-        // truthfulness. Written in every mode (sidecar-only; the painted /
-        // snapshot output is unchanged).
-        stateJson: boardFrameStateJson(snap.epics, subagentIndex),
+        bodyLines,
+        semanticHeader: {
+          lines: formatBoardHeader({ viewModel, width, now: renderedAtMs }),
+          renderAtWidth: (nextWidth) =>
+            formatBoardHeader({ viewModel, width: nextWidth, now: Date.now() }),
+        },
+        stateJson: boardFrameStateJson(snap.epics, subagentIndex, {
+          viewModel,
+          width,
+          renderedAtMs,
+        }),
       };
     },
   });
-
-  // Seed the banner immediately so the autopilot metadata is on screen before
-  // the first `autopilot_state` edge lands.
-  view.liveShell.setStatus(apBanner());
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
     lastSnap = snap;
@@ -1205,10 +1370,6 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       appendDiagnostic(d, diagnosticsLogPath);
     }
     view.emit(snap);
-    // `view.emit` renders synchronously, refreshing `needsHumanCount` (orphan
-    // detection needs this frame's epic set) — resync the banner pill so its
-    // `[needs-human:N]` count tracks the block the frame just rendered.
-    view.liveShell.setStatus(apBanner());
   }
 
   const handle = subscribeReadiness({
@@ -1262,8 +1423,9 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
           armedSet.add(id);
         }
       }
-      // The armed count rides the banner — repaint it on every edge.
-      view.liveShell.setStatus(apBanner());
+      if (lastSnap !== null) {
+        emitFrame(lastSnap);
+      }
       if (!armedStreamReported) {
         armedStreamReported = true;
         view.reportSnapshotStream();
@@ -1275,9 +1437,8 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
-  // The `autopilot_state` singleton feeds the banner's paused/mode/caps/worktree
-  // metadata — the same wire row + pure projections `keeper autopilot` reads, so
-  // the two banners can't drift. Keyed on `id = 1`; at most one row. An empty
+  // The `autopilot_state` singleton feeds the semantic header's
+  // paused/mode/caps/worktree metadata. Keyed on `id = 1`; at most one row. An empty
   // result (singleton not yet folded on a fresh board) leaves the boot-default
   // seed untouched. Report to the snapshot latch exactly once (BEFORE the
   // empty-rows path's no-op return so a freshly-booted daemon doesn't hang the
@@ -1303,7 +1464,26 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
       apState.workerProvider = projectWorkerProvider(rows);
-      view.liveShell.setStatus(apBanner());
+      const focus = projectFableFocus(rows);
+      apState.fableFocus = focus.valid
+        ? inspectRouting({
+            model: "fable",
+            fableIntent: true,
+            focusDelivery: { available: true, policy: focus.policy },
+          }).fable_focus
+        : {
+            configured: false,
+            state: "unavailable",
+            target_route: null,
+            lifetime: null,
+            target_eligible: null,
+            outcome: "fallback",
+            reason: "policy-unavailable",
+            diagnostic: "policy-invalid",
+          };
+      if (lastSnap !== null) {
+        emitFrame(lastSnap);
+      }
     },
     onLifecycle: view.emitLifecycle,
   });
@@ -1347,8 +1527,8 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
         } else {
           // Any other verb is host-level distress (`daemon` shared-checkout /
           // lane wedge, `crash-loop`, …) — no epic/task home, surfaced in the
-          // `needs human` block. The banner count is recomputed in `renderBody`
-          // (orphan detection needs the epic set) and resynced post-emit.
+          // `needs human` block. The semantic-header count is recomputed in
+          // `renderBody` because orphan detection needs the epic set.
           distress.push({ locator: seg(r.dir), reason });
         }
       }
