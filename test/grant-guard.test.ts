@@ -199,6 +199,11 @@ describe("evaluateGrantBash — CVE-2025-66032 shell-bypass corpus", () => {
     "git log $(python3 -c 'x')",
     "git log `whoami`",
     'git log "$(rm -rf src)"',
+    `git log "$\\
+(whoami)"`,
+    `git log "$\\
+\\
+(whoami)"`,
     "diff <(git show a) <(git show b)",
     "git status; cp /tmp/evil src/x.ts",
     "git log --oneline | sh",

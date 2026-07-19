@@ -205,6 +205,12 @@ const SUBSTITUTION = "command/process substitution";
 const HEREDOC = "a heredoc / here-string redirect";
 const REDIRECT = "a file redirect";
 
+function skipLineContinuations(command: string, from: number): number {
+  let i = from;
+  while (command[i] === "\\" && command[i + 1] === "\n") i += 2;
+  return i;
+}
+
 function lexSegments(command: string): LexResult {
   const segments: string[][] = [];
   let seg: string[] = [];
@@ -245,7 +251,10 @@ function lexSegments(command: string): LexResult {
       if (c === '"') inDouble = false;
       else if (c === "\\" && next === "\n") i++;
       else if (c === "`") return { kind: "deny", reason: SUBSTITUTION };
-      else if (c === "$" && next === "(")
+      else if (
+        c === "$" &&
+        command[skipLineContinuations(command, i + 1)] === "("
+      )
         return { kind: "deny", reason: SUBSTITUTION };
       else {
         word += c;
