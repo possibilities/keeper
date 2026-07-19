@@ -72,5 +72,5 @@ accounts, no live OAuth, no network. Named gates only.
 - [ ] The named focused gates and the typecheck are green.
 
 ## Done summary
-
+Extracted a dep-free proof-window leaf so the Pi extension no longer imports FileLock/bun:ffi, and wired the armed proof window to instrument pooled routing and produce the live-proof report via the landed collector; native/active modes stay inert. Added an import-graph test proving the extension never reaches a bun-only builtin.
 ## Evidence
