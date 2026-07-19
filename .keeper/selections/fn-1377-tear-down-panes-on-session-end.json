@@ -15,10 +15,10 @@
     }
   ],
   "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
-  "created_at": "2026-07-19T17:26:41.958000Z",
+  "created_at": "2026-07-19T17:32:12.816000Z",
   "epic_id": "fn-1377-tear-down-panes-on-session-end",
-  "input_hash": "abb291054544107168f39dbb3b8893a7d96e91459b4c642cd5e81053a6c31962",
-  "outcome": "degraded:single-cell-defaults-match-selector-band",
+  "input_hash": "44b8af26cae3e5690600c8f255f3ae25ac0d3950f7f26f07a379fd5e81d5fbb2",
+  "outcome": "degraded:refine-reselect-single-cell-defaults",
   "schema_version": 1,
   "selector": {
     "harness": "none",
