@@ -75,5 +75,5 @@ Do not activate the live target from a task lane. Supply the guarded command and
 - [ ] Named router, launcher, resume, restore, descriptor, and status tests pass.
 
 ## Done summary
-
+Extended account routing with durable Fable focus: filter-then-prefer selection (focus target preferred for Fable, soft-avoided for other Claude launches, visible fallback on ineligibility), guarded permanent/absolute/cycle-end/current-reset focus commands, Fable intent threaded through launch/continuation/resume/restore/fork without account affinity, and status/inspection surfaces exposing target/lifetime/eligibility/reason with no PII.
 ## Evidence
