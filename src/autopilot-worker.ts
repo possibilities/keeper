@@ -243,6 +243,7 @@ import {
   mergeReadiness as gitMergeReadiness,
   parseWorktreeList as gitParseWorktreeList,
   probeLaneMergeHead as gitProbeLaneMergeHead,
+  probeLosslesslyCleanableUntracked as gitProbeLosslesslyCleanableUntracked,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
   pruneWorktrees as gitPruneWorktrees,
   remotePushFastForwardable as gitRemotePushFastForwardable,
@@ -5618,6 +5619,8 @@ export function createWorktreeDriver(
           baseBranch,
           run,
           defaultBranch,
+          undefined,
+          entry.repo_dir,
         );
         if (ready.kind !== "ready") {
           return retry(
@@ -5749,6 +5752,8 @@ export function createWorktreeDriver(
               branch,
               run,
               source,
+              undefined,
+              repoDir,
             );
             if (ready.kind === "dirty") {
               const cleaned = await gitLosslessPremergeClean(
@@ -8214,6 +8219,7 @@ export async function recoverWorktrees(
     // lanes pass-3 tore down. Wrapped so a producer git error never wedges the cycle.
     try {
       const probe = await probeLaneBaseReadiness(
+        repo,
         entries,
         prunedLanePaths,
         run,
@@ -8267,13 +8273,15 @@ export async function recoverWorktrees(
  *  - `mid-merge` surviving pass-1's abort → `immediate` wedge (a hard `abort-failed`:
  *    git could not clear it), mints distress AT ONCE (matching finalize's precedent).
  *  - tracked-`dirty` / `off-branch` → graced wedge (a base a human must hand-resolve).
- *  - clean+on-branch but carrying UNTRACKED files → graced wedge: the would-clobber
- *    class {@link mergeReadiness} ignores (`--untracked-files=no`), probed here so a
- *    would-clobber lane row is CLEARED only once the untracked files are gone, never
- *    flap-cleared against a source-agnostic "ready".
- *  - fully clean + on-branch + no untracked → `resolved`.
+ *  - clean+on-branch but carrying UNTRACKED work product → graced wedge: the
+ *    would-clobber class {@link mergeReadiness} ignores (`--untracked-files=no`),
+ *    probed here so a would-clobber lane row is CLEARED only once the work product
+ *    is gone. A byte-identical dependency plant is losslessly cleanable residue;
+ *    replaced residue at that path remains work product.
+ *  - fully clean + on-branch + no untracked work product → `resolved`.
  */
 async function probeLaneBaseReadiness(
+  depLinkSource: string,
   entries: readonly WorktreeEntry[],
   prunedLanePaths: ReadonlySet<string>,
   run: WorktreeGitRunner,
@@ -8300,26 +8308,21 @@ async function probeLaneBaseReadiness(
     const expectedShort = shortBranchName(entry.branch);
     const ready = await gitMergeReadiness(entry.path, expectedShort, run);
     if (ready.kind === "ready") {
-      // Clean tracked tree on-branch — but a lingering UNTRACKED file is the
-      // would-clobber hazard `mergeReadiness` skips. One extra untracked probe so a
-      // would-clobber lane stays wedged until it is cleaned (no source needed here).
-      const untracked = await run(
-        ["status", "--porcelain", "--untracked-files=all"],
-        { cwd: entry.path, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      const untracked = await gitProbeLosslesslyCleanableUntracked(
+        entry.path,
+        depLinkSource,
+        run,
       );
-      const hasUntracked =
-        untracked.code === 0 &&
-        untracked.stdout.split("\n").some((l) => l.startsWith("?? "));
-      if (untracked.code === 0 && !hasUntracked) {
+      if (untracked.kind === "cleanable") {
         resolved.push(entry.path);
-      } else if (hasUntracked) {
+      } else if (untracked.kind === "would-clobber") {
         wedged.push({
           path: entry.path,
-          reason: `would-clobber: ${entry.path} carries untracked files a fan-in merge could overwrite`,
+          reason: `would-clobber: ${entry.path} carries untracked work product a fan-in merge could overwrite — ${untracked.paths.join(", ")}`,
           immediate: false,
         });
       }
-      // A non-zero untracked probe (code !== 0) DEFERS this lane — neither wedged nor
+      // An inconclusive untracked probe DEFERS this lane — neither wedged nor
       // resolved (absence retains any open row), never a false clear.
       continue;
     }
