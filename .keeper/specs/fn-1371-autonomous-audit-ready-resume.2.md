@@ -34,5 +34,5 @@ normal autopilot owner tuple so wrapped legs launch.
 - [ ] daemon gates green
 
 ## Done summary
-
+Route dead-orchestrator AUDIT_READY blocks to a work:: dispatch (owner tuple carried) instead of unblock::; live orchestrators still defer and other categories keep their existing routing.
 ## Evidence
