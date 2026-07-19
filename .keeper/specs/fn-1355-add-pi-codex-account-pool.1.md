@@ -73,5 +73,5 @@ Package installation alone is inert outside a Keeper-marked Pi launch. Native fa
 - [ ] Secret scanning proves tokens, token-derived identities, raw auth/provider objects, headers, and account PII never appear in observer output, package state, proof reports, logs, errors, session entries, or tool results.
 
 ## Done summary
-
+Added the Keeper-owned integrations/pi-codex-pool package: opaque Codex account aliases with locked atomic credential refresh, sanitized capacity observation, sticky bounded routing with one safe pre-output failover to a different alias, native openai-codex fallback on any pool failure, and a versioned allowlisted live-proof collector/classifier with secret-scanning across every artifact surface.
 ## Evidence
