@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-19T22:42:09.423000Z",
+  "depends_on_epics": [],
+  "id": "fn-1379-hold-live-lanes-against-resets",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Hold live lanes against resets",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-19T22:42:09.423000Z"
+}
