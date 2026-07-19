@@ -59,5 +59,5 @@ artifacts.
 - [ ] Companion suites green
 
 ## Done summary
-
+Add a single model-callable codex_pool_proof orchestrator tool driving all 13 proof clauses, with transcript-derived, non-self-reportable verdicts, deliberate-vs-interrupting abort classification, and sanitation-clean transcript artifacts.
 ## Evidence
