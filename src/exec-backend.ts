@@ -207,8 +207,9 @@ export interface LaunchSpec {
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
  *  server-global pane id, its window id (`@N`), the pane's current foreground
- *  command (`pane_current_command`), the pane's dead flag / hosting session, and
- *  the window's current name. The renamer worker keys windows by `windowId` and
+ *  command (`pane_current_command`), the pane's dead flag / hosting session,
+ *  its pane-local Keeper job owner, and the window's current name. The renamer
+ *  worker keys windows by `windowId` and
  *  compares `windowName`; the reconciler's slot-occupancy gate reads
  *  `currentCommand` to tell a live claude from the dead `exec $SHELL -l -i` shell
  *  tail holding a stopped session's pane.
@@ -231,6 +232,8 @@ export interface PaneInfo {
   readonly currentCommand: string;
   readonly paneDead: string;
   readonly sessionName: string;
+  /** Exact job id stamped by the launcher on this pane. Absent/null is unowned. */
+  readonly keeperJobId?: string | null;
   readonly windowName: string;
 }
 
@@ -610,14 +613,15 @@ export function classifyProcessIdentity(
 /**
  * Build the tmux `list-panes -a -F '#{pid}:#{start_time}\t#{pane_id}\t
  * #{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t
- * #{window_name}'` sweep argv. Pure — exported for tests. `-a` spans every
- * session on the server. The format is TAB-delimited with `window_name` LAST so
- * the parse's final split keeps a tab inside an arbitrary window name from
- * corrupting the SIX leading FIXED fields (generation / pane id / window id /
- * current command / pane dead flag / session name); names are free user text —
- * tabs, colons, unicode all survive. The six leading values are tab-free by
- * construction (`pid:start_time`, pane/window ids, `pane_current_command`,
- * `pane_dead`, and session names contain no tabs), so each rides a fixed field.
+ * #{@keeper_job_id}\t#{window_name}'` sweep argv. Pure — exported for tests. `-a`
+ * spans every session on the server. The format is TAB-delimited with
+ * `window_name` LAST so the parse's final split keeps a tab inside an arbitrary
+ * window name from corrupting the SEVEN leading FIXED fields (generation / pane
+ * id / window id / current command / pane dead flag / session name / exact
+ * Keeper owner); names are free user text — tabs, colons, unicode all survive.
+ * The seven leading values are tab-free by construction (`pid:start_time`,
+ * pane/window ids, `pane_current_command`, `pane_dead`, session names, and job
+ * ids contain no tabs), so each rides a fixed field.
  */
 export function buildTmuxListPanesArgs(): string[] {
   return [
@@ -625,7 +629,7 @@ export function buildTmuxListPanesArgs(): string[] {
     "list-panes",
     "-a",
     "-F",
-    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_name}",
+    "#{pid}:#{start_time}\t#{pane_id}\t#{window_id}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{@keeper_job_id}\t#{window_name}",
   ];
 }
 
@@ -1015,11 +1019,11 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
-      // to skip this cycle. Parse takes the SIX leading fixed fields (generation
-      // / pane id / window id / current command / pane dead flag / session name)
-      // off the first six tabs, with `window_name` LAST so a tab inside an
+      // to skip this cycle. Parse takes the SEVEN leading fixed fields (generation
+      // / pane id / window id / current command / pane dead flag / session name /
+      // Keeper owner) off the first seven tabs, with `window_name` LAST so a tab inside an
       // arbitrary window name cannot bleed into them. Malformed lines (fewer than
-      // six tabs) are dropped silently — a partial sweep is still a usable
+      // seven tabs) are dropped silently — a partial sweep is still a usable
       // snapshot. The locale-defaulted env is LOAD-BEARING: a C-locale client
       // sanitizes the TAB delimiters to `_`, which would drop every line and read
       // as an empty sweep.
@@ -1031,7 +1035,7 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
       if (res == null || res.exitCode !== 0) {
         return null;
       }
-      const FIXED_FIELDS = 6;
+      const FIXED_FIELDS = 7;
       const panes: PaneInfo[] = [];
       for (const line of res.stdout.split("\n")) {
         if (line === "") {
@@ -1058,7 +1062,8 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
         const currentCommand = line.slice(tabs[2] + 1, tabs[3]);
         const paneDead = line.slice(tabs[3] + 1, tabs[4]);
         const sessionName = line.slice(tabs[4] + 1, tabs[5]);
-        const windowName = line.slice(tabs[5] + 1);
+        const rawKeeperJobId = line.slice(tabs[5] + 1, tabs[6]);
+        const windowName = line.slice(tabs[6] + 1);
         if (paneId === "" || windowId === "") {
           continue;
         }
@@ -1069,6 +1074,7 @@ export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
           currentCommand,
           paneDead,
           sessionName,
+          keeperJobId: rawKeeperJobId === "" ? null : rawKeeperJobId,
           windowName,
         });
       }

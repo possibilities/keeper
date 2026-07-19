@@ -132,12 +132,14 @@ import {
 } from "./dispatch-failure-key";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
+  classifyProcessIdentity,
   compareCanonicalGeneration,
   createTmuxPaneOps,
   keeperAgentLaunch,
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
   type PaneInfo,
+  type TmuxPaneOps,
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
@@ -1487,6 +1489,340 @@ export function dupEpicNumberDistressId(
  */
 export function sharedDesyncDistressId(repoDir: string): string {
   return `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
+}
+
+// ── Terminal autopilot pane teardown ───────────────────────────────────────
+
+/** Board verbs whose autopilot-dispatched terminal panes Keeper owns. */
+export const TERMINAL_PANE_TEARDOWN_VERBS: ReadonlySet<string> = new Set([
+  "work",
+  "close",
+  "resolve",
+  "deconflict",
+  "repair",
+  "unblock",
+]);
+
+/** Maximum exact windows one terminal-pane sweep may tear down. */
+export const TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP = 5;
+
+/** Maximum pane-owner records one periodic pass admits to its DB join. */
+export const TERMINAL_PANE_TEARDOWN_SCAN_MAX = 256;
+
+/** Idle cadence for restart recovery when no DB commit wakes the worker. */
+export const TERMINAL_PANE_TEARDOWN_IDLE_MS = 5_000;
+
+export type TerminalPaneProcessIdentity =
+  | "alive"
+  | "dead"
+  | "recycled"
+  | "unknown";
+
+/** Terminal row joined to the immutable lifecycle event's pre-clear pane id. */
+export interface TerminalPaneTeardownJob {
+  job_id: string;
+  state: string;
+  pid: number | null;
+  start_time: string | null;
+  dispatch_origin: string | null;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  adopted: number | null;
+  backend_exec_type: string | null;
+  terminal_pane_id: string | null;
+}
+
+export interface TerminalPaneTeardownDecision {
+  jobId: string;
+  paneId: string;
+}
+
+export interface TerminalPaneOwnerScan {
+  jobIds: string[];
+  nextCursor: string | null;
+}
+
+/**
+ * Select one bounded page of exact pane owners. The caller retains
+ * `nextCursor` across periodic passes, so a stable prefix of manual/live owners
+ * cannot starve terminal candidates later in the tmux server snapshot.
+ */
+export function selectTerminalPaneOwnerScan(
+  panes: readonly PaneInfo[] | null,
+  afterJobId: string | null = null,
+  limit: number = TERMINAL_PANE_TEARDOWN_SCAN_MAX,
+): TerminalPaneOwnerScan {
+  if (panes === null) return { jobIds: [], nextCursor: null };
+  const allOwnerIds = [
+    ...new Set(
+      panes
+        .filter(
+          (pane) =>
+            pane.sessionName === MANAGED_EXEC_SESSION &&
+            typeof pane.keeperJobId === "string" &&
+            pane.keeperJobId !== "",
+        )
+        .map((pane) => pane.keeperJobId as string),
+    ),
+  ].sort();
+  if (allOwnerIds.length === 0) return { jobIds: [], nextCursor: null };
+
+  const boundedLimit = Math.max(
+    1,
+    Math.min(TERMINAL_PANE_TEARDOWN_SCAN_MAX, Math.floor(limit)),
+  );
+  const firstAfter =
+    afterJobId === null
+      ? 0
+      : allOwnerIds.findIndex((jobId) => jobId > afterJobId);
+  const start = firstAfter < 0 ? 0 : firstAfter;
+  const jobIds = allOwnerIds.slice(start, start + boundedLimit);
+  const reachedEnd = start + jobIds.length >= allOwnerIds.length;
+  return {
+    jobIds,
+    nextCursor: reachedEnd ? null : (jobIds.at(-1) ?? null),
+  };
+}
+
+/**
+ * Pure fail-closed boundary for terminal pane teardown. Positive authority is
+ * the full conjunction: terminal state, literal autopilot provenance, a board
+ * verb/ref, non-adopted tmux job, exact lifecycle pane id, matching pane-local
+ * owner record, and proof that the recorded agent process is gone. A live
+ * foreground agent command also vetoes teardown, closing the resume-before-bind
+ * window even when the prior process identity is dead.
+ */
+export function decideTerminalPaneTeardowns(input: {
+  jobs: readonly TerminalPaneTeardownJob[];
+  panes: readonly PaneInfo[] | null;
+  processIdentityByJobId: ReadonlyMap<
+    string,
+    TerminalPaneProcessIdentity
+  > | null;
+  maxPerSweep?: number;
+  afterJobId?: string | null;
+}): TerminalPaneTeardownDecision[] {
+  if (input.panes === null || input.processIdentityByJobId === null) return [];
+  const paneById = new Map(input.panes.map((pane) => [pane.paneId, pane]));
+  const paneCountByWindow = new Map<string, number>();
+  for (const pane of input.panes) {
+    paneCountByWindow.set(
+      pane.windowId,
+      (paneCountByWindow.get(pane.windowId) ?? 0) + 1,
+    );
+  }
+  const decisions: TerminalPaneTeardownDecision[] = [];
+  const seenPanes = new Set<string>();
+
+  for (const job of input.jobs) {
+    if (
+      job.state !== "ended" &&
+      job.state !== "killed" &&
+      job.state !== "autoclosed"
+    ) {
+      continue;
+    }
+    if (job.dispatch_origin !== "autopilot") continue;
+    if (
+      job.plan_verb == null ||
+      !TERMINAL_PANE_TEARDOWN_VERBS.has(job.plan_verb) ||
+      job.plan_ref == null ||
+      job.plan_ref === ""
+    ) {
+      continue;
+    }
+    if (job.adopted === 1 || job.backend_exec_type !== "tmux") continue;
+    const paneId = job.terminal_pane_id;
+    if (paneId == null || paneId === "" || seenPanes.has(paneId)) continue;
+    const pane = paneById.get(paneId);
+    if (
+      pane == null ||
+      pane.keeperJobId !== job.job_id ||
+      pane.sessionName !== MANAGED_EXEC_SESSION ||
+      paneCountByWindow.get(pane.windowId) !== 1
+    ) {
+      continue;
+    }
+    const identity = input.processIdentityByJobId.get(job.job_id);
+    if (identity !== "dead" && identity !== "recycled") continue;
+    if (pane.paneDead !== "1" && !isBareShellCommand(pane.currentCommand)) {
+      continue;
+    }
+    seenPanes.add(paneId);
+    decisions.push({ jobId: job.job_id, paneId });
+  }
+
+  decisions.sort((a, b) => {
+    const byJob = a.jobId.localeCompare(b.jobId);
+    return byJob === 0 ? a.paneId.localeCompare(b.paneId) : byJob;
+  });
+  const afterJobId = input.afterJobId;
+  const firstAfter =
+    afterJobId == null
+      ? 0
+      : decisions.findIndex((decision) => decision.jobId > afterJobId);
+  const ordered =
+    firstAfter > 0
+      ? [...decisions.slice(firstAfter), ...decisions.slice(0, firstAfter)]
+      : decisions;
+  const cap = Math.max(
+    0,
+    Math.min(
+      TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP,
+      Math.floor(input.maxPerSweep ?? TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP),
+    ),
+  );
+  return ordered.slice(0, cap);
+}
+
+/**
+ * Read terminal rows only for pane-local owners in the current healthy tmux
+ * observation. The lifecycle event retains the pane id that the terminal jobs
+ * fold deliberately clears, and the pure seam requires it to match the current
+ * pane before authorizing any action.
+ */
+export function loadTerminalPaneTeardownJobs(
+  db: Parameters<typeof runQuery>[0],
+  panes: readonly PaneInfo[] | null,
+  scannedOwnerJobIds?: readonly string[],
+): TerminalPaneTeardownJob[] {
+  if (panes === null) return [];
+  const ownerIds = [
+    ...new Set(scannedOwnerJobIds ?? selectTerminalPaneOwnerScan(panes).jobIds),
+  ]
+    .sort()
+    .slice(0, TERMINAL_PANE_TEARDOWN_SCAN_MAX);
+  if (ownerIds.length === 0) return [];
+  const placeholders = ownerIds.map(() => "?").join(",");
+  return db
+    .query(
+      `SELECT j.job_id, j.state, j.pid, j.start_time, j.dispatch_origin,
+              j.plan_verb, j.plan_ref, j.adopted, j.backend_exec_type,
+              e.backend_exec_pane_id AS terminal_pane_id
+         FROM jobs j
+         JOIN events e ON e.id = (
+           SELECT e2.id
+             FROM events e2
+            WHERE e2.session_id = j.job_id
+              AND e2.id <= j.last_event_id
+              AND e2.hook_event IN ('SessionEnd', 'Killed')
+            ORDER BY e2.id DESC
+            LIMIT 1
+         )
+        WHERE j.job_id IN (${placeholders})
+          AND j.state IN ('ended', 'killed', 'autoclosed')
+          AND j.dispatch_origin = 'autopilot'
+          AND j.plan_verb IN ('work', 'close', 'resolve', 'deconflict', 'repair', 'unblock')
+          AND j.plan_ref IS NOT NULL AND j.plan_ref != ''
+          AND COALESCE(j.adopted, 0) != 1
+          AND j.backend_exec_type = 'tmux'
+          AND e.backend_exec_pane_id IS NOT NULL
+          AND e.backend_exec_pane_id != ''
+        ORDER BY e.id, j.job_id`,
+    )
+    .all(...ownerIds) as TerminalPaneTeardownJob[];
+}
+
+function terminalPaneProcessIdentities(
+  jobs: readonly TerminalPaneTeardownJob[],
+  deps: {
+    isPidAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+  },
+): Map<string, TerminalPaneProcessIdentity> {
+  const out = new Map<string, TerminalPaneProcessIdentity>();
+  for (const job of jobs) {
+    try {
+      out.set(
+        job.job_id,
+        classifyProcessIdentity(job.pid, job.start_time, deps),
+      );
+    } catch {
+      out.set(job.job_id, "unknown");
+    }
+  }
+  return out;
+}
+
+/**
+ * Run one periodic/transition-driven teardown pass. The second pane sweep, jobs
+ * read, and process-identity probe are adjacent to the kill and repeat every
+ * authority predicate; a stale plan can therefore only degrade to no action.
+ */
+export async function runTerminalPaneTeardownSweep(
+  db: Parameters<typeof runQuery>[0],
+  backend: Pick<TmuxPaneOps, "listPanes" | "killWindow">,
+  initialPanes: readonly PaneInfo[] | null,
+  deps: {
+    isPidAlive?: (pid: number) => boolean;
+    readStartTime?: (pid: number) => string | null;
+    noteLine?: (line: string) => void;
+    scannedOwnerJobIds?: readonly string[];
+    afterJobId?: string | null;
+  } = {},
+): Promise<TerminalPaneTeardownDecision[]> {
+  const probes = {
+    isPidAlive: deps.isPidAlive ?? isPidAlive,
+    readStartTime: deps.readStartTime ?? readOsStartTime,
+  };
+  const initialJobs = loadTerminalPaneTeardownJobs(
+    db,
+    initialPanes,
+    deps.scannedOwnerJobIds,
+  );
+  const planned = decideTerminalPaneTeardowns({
+    jobs: initialJobs,
+    panes: initialPanes,
+    processIdentityByJobId: terminalPaneProcessIdentities(initialJobs, probes),
+    afterJobId: deps.afterJobId,
+  });
+  if (planned.length === 0) return [];
+
+  const decided: TerminalPaneTeardownDecision[] = [];
+  for (const candidate of planned) {
+    let actPanes: readonly PaneInfo[] | null;
+    try {
+      actPanes = await backend.listPanes();
+    } catch {
+      break;
+    }
+    if (actPanes === null) break;
+    const actJobs = loadTerminalPaneTeardownJobs(db, actPanes, [
+      candidate.jobId,
+    ]).filter(
+      (job) =>
+        job.job_id === candidate.jobId &&
+        job.terminal_pane_id === candidate.paneId,
+    );
+    const revalidated = decideTerminalPaneTeardowns({
+      jobs: actJobs,
+      panes: actPanes,
+      processIdentityByJobId: terminalPaneProcessIdentities(actJobs, probes),
+      maxPerSweep: 1,
+    });
+    const decision = revalidated[0];
+    if (
+      decision == null ||
+      decision.jobId !== candidate.jobId ||
+      decision.paneId !== candidate.paneId
+    ) {
+      continue;
+    }
+    decided.push(decision);
+    try {
+      const result = await backend.killWindow(decision.paneId);
+      if (!result.ok && result.error != null) {
+        deps.noteLine?.(
+          `terminal pane teardown deferred job=${decision.jobId} pane=${decision.paneId}: ${result.error}`,
+        );
+      }
+    } catch (err) {
+      deps.noteLine?.(
+        `terminal pane teardown threw job=${decision.jobId} pane=${decision.paneId}: ${errMsg(err)}`,
+      );
+    }
+  }
+  return decided;
 }
 
 /** A long-unknown live monitor pages after this horizon; it never releases. */
@@ -10142,6 +10478,54 @@ function main(): void {
   // it targets server-global tmux ids the hook stamps, independent of the launch
   // transport.
   const paneOps = createTmuxPaneOps({ noteLine });
+  let terminalPaneSweepRunning = false;
+  let terminalPaneSweepPending = false;
+  let terminalPaneOwnerScanCursor: string | null = null;
+  let terminalPaneDecisionCursor: string | null = null;
+  const driveTerminalPaneSweep = async (
+    initialPanes?: readonly PaneInfo[] | null,
+  ): Promise<void> => {
+    if (terminalPaneSweepRunning) {
+      terminalPaneSweepPending = true;
+      return;
+    }
+    terminalPaneSweepRunning = true;
+    let panes = initialPanes;
+    try {
+      do {
+        terminalPaneSweepPending = false;
+        if (panes === undefined) {
+          try {
+            panes = await paneOps.listPanes();
+          } catch (err) {
+            noteLine(`terminal pane observation failed: ${errMsg(err)}`);
+            panes = null;
+          }
+        }
+        const ownerScan = selectTerminalPaneOwnerScan(
+          panes,
+          terminalPaneOwnerScanCursor,
+        );
+        terminalPaneOwnerScanCursor = ownerScan.nextCursor;
+        const decisions = await runTerminalPaneTeardownSweep(
+          db,
+          paneOps,
+          panes,
+          {
+            noteLine,
+            scannedOwnerJobIds: ownerScan.jobIds,
+            afterJobId: terminalPaneDecisionCursor,
+          },
+        );
+        terminalPaneDecisionCursor = decisions.at(-1)?.jobId ?? null;
+        panes = undefined;
+      } while (terminalPaneSweepPending && !shutdown);
+    } catch (err) {
+      noteLine(`terminal pane teardown sweep failed: ${errMsg(err)}`);
+    } finally {
+      terminalPaneSweepRunning = false;
+    }
+  };
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
@@ -10401,11 +10785,22 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        // Pass the backend's `listPanes` as the read-time liveness probe so the
-        // stopped-arm occupancy gate (`isOccupyingJob`) sees which sessions are
-        // actually live — a stopped-dead pane no longer wedges its slot.
-        const snapshot = await loadReconcileSnapshot(db, () =>
-          paneOps.listPanes(),
+        // Share one whole-server pane observation between the occupancy snapshot
+        // and terminal-pane planner. A second observation happens only adjacent
+        // to an authorized teardown action.
+        let observedPanes: PaneInfo[] | null = null;
+        try {
+          observedPanes = await paneOps.listPanes();
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] terminal pane observation threw (non-fatal):",
+            err,
+          );
+        }
+        await driveTerminalPaneSweep(observedPanes);
+        const snapshot = await loadReconcileSnapshot(
+          db,
+          async () => observedPanes,
         );
         if (snapshot.readinessDegraded) {
           continue;
@@ -11316,6 +11711,9 @@ function main(): void {
       console.error("[autopilot-worker] backstop rollup flush failed:", err);
     }
   }, BACKSTOP_ROLLUP_FLUSH_MS);
+  const terminalPaneGcTimer = setInterval(() => {
+    if (!shutdown) void driveTerminalPaneSweep();
+  }, TERMINAL_PANE_TEARDOWN_IDLE_MS);
 
   // Bind the unpause/boot kick now that `driveCycle` exists, then run one cycle.
   // The boot cycle is a no-op for launches while paused; the play-edge kick
@@ -11335,6 +11733,7 @@ function main(): void {
   )
     .then(() => {
       clearInterval(rollupTimer);
+      clearInterval(terminalPaneGcTimer);
       // Final rollup flush so the on-shutdown denominator lands before exit.
       flushBackstopRollups();
       closeDb();
@@ -11343,6 +11742,7 @@ function main(): void {
     .catch((err) => {
       console.error("[autopilot-worker] watch loop crashed:", err);
       clearInterval(rollupTimer);
+      clearInterval(terminalPaneGcTimer);
       flushBackstopRollups();
       closeDb();
       process.exit(1);

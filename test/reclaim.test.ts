@@ -18,6 +18,10 @@ import {
   type RunDeps,
   run,
 } from "../cli/reclaim";
+import {
+  buildTmuxPaneOwnershipArgs,
+  KEEPER_PANE_OWNER_OPTION,
+} from "../src/agent/tmux-launch";
 
 let root: string;
 let dbPath: string;
@@ -140,6 +144,27 @@ function invoke(deps: RunDeps): void {
     if (!(err instanceof ExitSignal)) throw err;
   }
 }
+
+test("tmux pane ownership stamp is pane-local and exact-job keyed", () => {
+  expect(
+    buildTmuxPaneOwnershipArgs(
+      ["/opt/homebrew/bin/tmux", "-L", "agents"],
+      "%17",
+      "job-exact",
+    ),
+  ).toEqual([
+    "/opt/homebrew/bin/tmux",
+    "-L",
+    "agents",
+    "set-option",
+    "-p",
+    "-t",
+    "%17",
+    "@keeper_job_id",
+    "job-exact",
+  ]);
+  expect(KEEPER_PANE_OWNER_OPTION).toBe("@keeper_job_id");
+});
 
 test("reclaim command plan confines output and sidecars to the DB basename", () => {
   expect(planReclaimCommand(args())).toEqual({

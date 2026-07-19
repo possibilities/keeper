@@ -37,6 +37,7 @@ import keeperEventsExtension, {
   type PiObservedEvent,
   type PiSessionContext,
   type PiTranslateMeta,
+  piBackendExecCoordsFromEnv,
   piDispatchAttemptFromEnv,
   piEventBindings,
   preparePiMutationEvent,
@@ -381,13 +382,41 @@ describe("pi extension — pure translation", () => {
     expect(piEventBindings(event, META)?.mutation_path).toBeNull();
   });
 
-  test("session_shutdown[quit] folds to a clean SessionEnd", () => {
+  test("session_shutdown[quit] folds to SessionEnd with its terminal pane coordinate", () => {
     const b = piEventBindings(
       { type: "session_shutdown", reason: "quit" },
-      META,
+      {
+        ...META,
+        backendExec: piBackendExecCoordsFromEnv({
+          TMUX: "/tmp/tmux-501/default,1,0",
+          TMUX_PANE: "%7",
+          KEEPER_TMUX_SESSION: "autopilot",
+        }),
+      },
     );
-    expect(b?.hook_event).toBe("SessionEnd");
-    expect(b?.event_type).toBe("session_end");
+    expect(b).toMatchObject({
+      hook_event: "SessionEnd",
+      event_type: "session_end",
+      backend_exec_type: "tmux",
+      backend_exec_session_id: "autopilot",
+      backend_exec_pane_id: "%7",
+    });
+  });
+
+  test("Pi backend coordinates reject foreign tmux and accept the stripped-TMUX carrier", () => {
+    expect(
+      piBackendExecCoordsFromEnv({
+        TMUX: "/tmp/tmux-501/foreign,1,0",
+        TMUX_PANE: "%7",
+        KEEPER_TMUX_SESSION: "autopilot",
+      }),
+    ).toEqual({ type: null, sessionId: null, paneId: null });
+    expect(
+      piBackendExecCoordsFromEnv({
+        KEEPER_TMUX_PANE: "%8",
+        KEEPER_TMUX_SESSION: "autopilot",
+      }),
+    ).toEqual({ type: "tmux", sessionId: "autopilot", paneId: "%8" });
   });
 
   test("no SessionStart is emitted — the birth record owns pi presence", () => {

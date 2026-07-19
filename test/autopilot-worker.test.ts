@@ -95,6 +95,7 @@ import {
   type DispatchKey,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   type DupEpicNumberObservation,
+  decideTerminalPaneTeardowns,
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
@@ -138,6 +139,7 @@ import {
   laneWedgeDistressId,
   loadLatestCloseReceipts,
   loadReconcileSnapshot,
+  loadTerminalPaneTeardownJobs,
   logMergeGateDeferral,
   logWrappedDelegationSkip,
   type MergeSuiteProbe,
@@ -160,6 +162,7 @@ import {
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
+  runTerminalPaneTeardownSweep,
   runZombieSessionReaperStep,
   SHARED_CHECKOUT_DESYNC_GRACE_SEC,
   SHARED_CHECKOUT_DIRTY_GRACE_SEC,
@@ -179,6 +182,7 @@ import {
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
   type StaleBaseLaneObservation,
+  selectTerminalPaneOwnerScan,
   sharedCheckoutDistressObservations,
   sharedDesyncDistressId,
   sharedDirtyDistressId,
@@ -188,6 +192,10 @@ import {
   stuckSentinelOrphansToClear,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
+  TERMINAL_PANE_TEARDOWN_IDLE_MS,
+  TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP,
+  type TerminalPaneProcessIdentity,
+  type TerminalPaneTeardownJob,
   type TipObservation,
   updateWithholdFrameState,
   verbForVerdict,
@@ -1479,6 +1487,286 @@ test("isBareShellCommand: worker commands are not bare-shell duplicate preferenc
   }
   // A missing command entry (probe degraded / pane gone) is "cannot prove dead".
   expect(isBareShellCommand(undefined)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// terminal autopilot pane teardown — positive provenance + exact ownership
+// ---------------------------------------------------------------------------
+
+function terminalPaneJob(
+  overrides: Partial<TerminalPaneTeardownJob> = {},
+): TerminalPaneTeardownJob {
+  return {
+    job_id: "terminal-job",
+    state: "ended",
+    pid: 42,
+    start_time: "linux:1",
+    dispatch_origin: "autopilot",
+    plan_verb: "work",
+    plan_ref: "fn-1-foo.1",
+    adopted: null,
+    backend_exec_type: "tmux",
+    terminal_pane_id: "%7",
+    ...overrides,
+  };
+}
+
+function ownedTerminalPane(overrides: Partial<PaneInfo> = {}): PaneInfo {
+  return {
+    tmuxGenerationId: "10:20",
+    paneId: "%7",
+    windowId: "@7",
+    currentCommand: "zsh",
+    paneDead: "0",
+    sessionName: "autopilot",
+    keeperJobId: "terminal-job",
+    windowName: "work::fn-1-foo.1",
+    ...overrides,
+  };
+}
+
+function terminalPaneDecision(
+  job: TerminalPaneTeardownJob,
+  pane: PaneInfo,
+  identity: TerminalPaneProcessIdentity = "dead",
+) {
+  return decideTerminalPaneTeardowns({
+    jobs: [job],
+    panes: [pane],
+    processIdentityByJobId: new Map([[job.job_id, identity]]),
+  });
+}
+
+for (const entry of [
+  { state: "ended", verb: "work", ref: "fn-1-foo.1" },
+  { state: "killed", verb: "work", ref: "fn-1-foo.1" },
+  { state: "autoclosed", verb: "work", ref: "fn-1-foo.1" },
+  { state: "ended", verb: "close", ref: "fn-1-foo" },
+  { state: "killed", verb: "close", ref: "fn-1-foo" },
+  { state: "ended", verb: "resolve", ref: "fn-1-foo" },
+  { state: "killed", verb: "resolve", ref: "fn-1-foo" },
+  { state: "ended", verb: "deconflict", ref: "fn-1-foo" },
+  { state: "killed", verb: "deconflict", ref: "fn-1-foo" },
+  { state: "ended", verb: "repair", ref: "/repo" },
+  { state: "killed", verb: "repair", ref: "/repo" },
+  { state: "ended", verb: "unblock", ref: "fn-1-foo.1" },
+  { state: "killed", verb: "unblock", ref: "fn-1-foo.1" },
+] as const) {
+  test(`terminal pane teardown: ${entry.state} autopilot ${entry.verb} tears down its owned shell pane`, () => {
+    expect(
+      terminalPaneDecision(
+        terminalPaneJob({
+          state: entry.state,
+          plan_verb: entry.verb,
+          plan_ref: entry.ref,
+        }),
+        ownedTerminalPane(),
+      ),
+    ).toEqual([{ jobId: "terminal-job", paneId: "%7" }]);
+  });
+}
+
+test("terminal pane teardown: working and stopped autopilot jobs are resting or active, never terminal litter", () => {
+  for (const state of ["working", "stopped"] as const) {
+    expect(
+      terminalPaneDecision(terminalPaneJob({ state }), ownedTerminalPane()),
+    ).toEqual([]);
+  }
+});
+
+test("terminal pane teardown: an autoclosed killed row converges without double-killing an already-gone pane", () => {
+  const job = terminalPaneJob({ state: "killed" });
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [],
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+});
+
+const NON_AUTOPILOT_SESSION_CLASSES = [
+  {
+    name: "named",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "handoff",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "free-form operator dispatch",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "manual plan-form dispatch",
+    overrides: {
+      dispatch_origin: null,
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+    },
+  },
+  {
+    name: "adopted",
+    overrides: { dispatch_origin: "autopilot", adopted: 1 },
+  },
+] satisfies Array<{
+  name: string;
+  overrides: Partial<TerminalPaneTeardownJob>;
+}>;
+
+for (const sessionClass of NON_AUTOPILOT_SESSION_CLASSES) {
+  for (const state of [
+    "working",
+    "stopped",
+    "ended",
+    "killed",
+    "autoclosed",
+  ] as const) {
+    test(`terminal pane teardown: ${sessionClass.name} is never a candidate in ${state}`, () => {
+      expect(
+        terminalPaneDecision(
+          terminalPaneJob({ state, ...sessionClass.overrides }),
+          ownedTerminalPane(),
+        ),
+      ).toEqual([]);
+    });
+  }
+}
+
+test("terminal pane teardown: live, unknown, and foreground-agent process evidence fail closed", () => {
+  const job = terminalPaneJob();
+  expect(terminalPaneDecision(job, ownedTerminalPane(), "alive")).toEqual([]);
+  expect(terminalPaneDecision(job, ownedTerminalPane(), "unknown")).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      job,
+      ownedTerminalPane({ currentCommand: "claude" }),
+      "dead",
+    ),
+  ).toEqual([]);
+});
+
+test("terminal pane teardown: degraded probes and absent or mismatched ownership are inert", () => {
+  const job = terminalPaneJob();
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: null,
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [ownedTerminalPane()],
+      processIdentityByJobId: null,
+    }),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      terminalPaneJob({ terminal_pane_id: null }),
+      ownedTerminalPane(),
+    ),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(job, ownedTerminalPane({ keeperJobId: null })),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      job,
+      ownedTerminalPane({ keeperJobId: "someone-else" }),
+    ),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(job, ownedTerminalPane({ sessionName: "pair" })),
+  ).toEqual([]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [
+        ownedTerminalPane(),
+        ownedTerminalPane({
+          paneId: "%8",
+          keeperJobId: null,
+          currentCommand: "bash",
+        }),
+      ],
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+});
+
+test("terminal pane teardown: periodic GC is deterministic and blast-capped", () => {
+  const jobs: TerminalPaneTeardownJob[] = [];
+  const panes: PaneInfo[] = [];
+  const identities = new Map<string, TerminalPaneProcessIdentity>();
+  for (const id of ["a", "b", "c", "d", "e", "f", "g"]) {
+    const jobId = `job-${id}`;
+    const paneId = `%${id}`;
+    jobs.push(terminalPaneJob({ job_id: jobId, terminal_pane_id: paneId }));
+    panes.push(
+      ownedTerminalPane({ paneId, windowId: `@${id}`, keeperJobId: jobId }),
+    );
+    identities.set(jobId, "dead");
+  }
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: jobs.reverse(),
+      panes: panes.reverse(),
+      processIdentityByJobId: identities,
+    }),
+  ).toEqual([
+    { jobId: "job-a", paneId: "%a" },
+    { jobId: "job-b", paneId: "%b" },
+    { jobId: "job-c", paneId: "%c" },
+    { jobId: "job-d", paneId: "%d" },
+    { jobId: "job-e", paneId: "%e" },
+  ]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs,
+      panes,
+      processIdentityByJobId: identities,
+      afterJobId: "job-e",
+    }),
+  ).toEqual([
+    { jobId: "job-f", paneId: "%f" },
+    { jobId: "job-g", paneId: "%g" },
+    { jobId: "job-a", paneId: "%a" },
+    { jobId: "job-b", paneId: "%b" },
+    { jobId: "job-c", paneId: "%c" },
+  ]);
+  expect(TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP).toBe(5);
+  expect(TERMINAL_PANE_TEARDOWN_IDLE_MS).toBe(5_000);
+});
+
+test("terminal pane teardown: bounded owner scan advances past a stable prefix", () => {
+  const panes = ["d", "b", "a", "c"].map((id) =>
+    ownedTerminalPane({
+      paneId: `%${id}`,
+      windowId: `@${id}`,
+      keeperJobId: `job-${id}`,
+    }),
+  );
+  panes.push(
+    ownedTerminalPane({
+      paneId: "%manual",
+      windowId: "@manual",
+      keeperJobId: "job-manual",
+      sessionName: "manual",
+    }),
+  );
+
+  const first = selectTerminalPaneOwnerScan(panes, null, 2);
+  expect(first).toEqual({
+    jobIds: ["job-a", "job-b"],
+    nextCursor: "job-b",
+  });
+  expect(selectTerminalPaneOwnerScan(panes, first.nextCursor, 2)).toEqual({
+    jobIds: ["job-c", "job-d"],
+    nextCursor: null,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -6406,6 +6694,146 @@ async function withSeededDb(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("terminal pane loader joins the immutable terminal coordinate only for a current owner", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES
+         ('owned-terminal', 1, 2, 'ended', 42, 'linux:1', 'work',
+          'fn-1-foo.1', 'autopilot', NULL, 'tmux'),
+         ('manual-terminal', 1, 2, 'ended', 43, 'linux:2', 'work',
+          'fn-1-foo.1', NULL, NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES
+         (2, 'owned-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%21'),
+         (2, 'manual-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%22')`,
+    );
+    db.run(
+      `UPDATE jobs
+          SET last_event_id = COALESCE(
+            (SELECT MAX(id) FROM events WHERE session_id = jobs.job_id), 0
+          )
+        WHERE job_id IN ('owned-terminal', 'manual-terminal')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (3, 'owned-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%99')`,
+    );
+
+    expect(
+      loadTerminalPaneTeardownJobs(db, [
+        ownedTerminalPane({ paneId: "%21", keeperJobId: "owned-terminal" }),
+        ownedTerminalPane({ paneId: "%22", keeperJobId: "manual-terminal" }),
+      ]),
+    ).toEqual([
+      {
+        job_id: "owned-terminal",
+        state: "ended",
+        pid: 42,
+        start_time: "linux:1",
+        dispatch_origin: "autopilot",
+        plan_verb: "work",
+        plan_ref: "fn-1-foo.1",
+        adopted: null,
+        backend_exec_type: "tmux",
+        terminal_pane_id: "%21",
+      },
+    ]);
+  });
+});
+
+test("terminal pane sweep re-proves process identity at act time", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES ('terminal-job', 1, 2, 'ended', 42, 'linux:1', 'work',
+               'fn-1-foo.1', 'autopilot', NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (2, 'terminal-job', 'SessionEnd', 'session', '{}', 'tmux', '%7')`,
+    );
+    db.run(
+      `UPDATE jobs SET last_event_id =
+        (SELECT MAX(id) FROM events WHERE session_id = 'terminal-job')
+        WHERE job_id = 'terminal-job'`,
+    );
+    const killed: string[] = [];
+    let identityProbe = 0;
+    const decided = await runTerminalPaneTeardownSweep(
+      db,
+      {
+        listPanes: async () => [ownedTerminalPane()],
+        killWindow: async (paneId) => {
+          killed.push(paneId);
+          return { ok: true };
+        },
+      },
+      [ownedTerminalPane()],
+      {
+        isPidAlive: () => {
+          identityProbe += 1;
+          return identityProbe > 1;
+        },
+        readStartTime: () => "linux:1",
+      },
+    );
+    expect(decided).toEqual([]);
+    expect(killed).toEqual([]);
+    expect(identityProbe).toBe(2);
+  });
+});
+
+test("terminal pane sweep kills the exact owned shell window after both proofs", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES ('terminal-job', 1, 2, 'killed', 42, 'linux:1', 'work',
+               'fn-1-foo.1', 'autopilot', NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (2, 'terminal-job', 'Killed', 'killed', '{}', 'tmux', '%7')`,
+    );
+    db.run(
+      `UPDATE jobs SET last_event_id =
+        (SELECT MAX(id) FROM events WHERE session_id = 'terminal-job')
+        WHERE job_id = 'terminal-job'`,
+    );
+    const killed: string[] = [];
+    const decided = await runTerminalPaneTeardownSweep(
+      db,
+      {
+        listPanes: async () => [ownedTerminalPane()],
+        killWindow: async (paneId) => {
+          killed.push(paneId);
+          return { ok: true };
+        },
+      },
+      [ownedTerminalPane()],
+      { isPidAlive: () => false, readStartTime: () => null },
+    );
+    expect(decided).toEqual([{ jobId: "terminal-job", paneId: "%7" }]);
+    expect(killed).toEqual(["%7"]);
+  });
+});
 
 test("close-finalize receipt parser accepts the hook envelope and rejects malformed output", () => {
   const data = JSON.stringify({
