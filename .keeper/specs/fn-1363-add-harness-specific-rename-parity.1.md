@@ -65,5 +65,5 @@ The new projection is consumed only by rename paths. Existing transcript list/sh
 - [ ] Focused deterministic tests cover active branches, compaction, parity, path grammar, containment, type failures, UTF-8 boundaries, duplicate charging, and all byte ceilings without real harnesses or processes.
 
 ## Done summary
-
+Added a naming-oriented Claude transcript projection (active-branch, cutoff-bounded, human/assistant/compaction-only) and a bounded, project-contained @path expansion, mirrored inside Pi's isolated rename extension with shared-fixture parity coverage.
 ## Evidence
