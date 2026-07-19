@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-19T13:57:20.817000Z",
+  "depends_on_epics": [],
+  "id": "fn-1374-add-codex-pool-proof-window",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Add codex pool proof window",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-19T13:57:20.817000Z"
+}
