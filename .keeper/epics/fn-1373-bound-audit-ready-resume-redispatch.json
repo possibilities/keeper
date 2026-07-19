@@ -7,7 +7,7 @@
     "fn-1371-autonomous-audit-ready-resume"
   ],
   "id": "fn-1373-bound-audit-ready-resume-redispatch",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T10:54:54.171000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T10:54:53.341000Z"
+  "updated_at": "2026-07-19T10:54:54.171000Z"
 }
