@@ -61,5 +61,5 @@ Documentation lands with the feature. The live current-cycle activation remains 
 - [ ] Documented commands match generated help and repository documentation lint passes.
 
 ## Done summary
-
+Consolidated Claude account-routing docs around Fable focus: rewrote docs/install.md's routing runbook (route identity, fallback, avoidance, lifetimes, continuation inheritance, inspection, guarded activation, rollback), added Fable focus problem codes/recovery table to docs/problem-codes.md, and linked the guide from README.
 ## Evidence
