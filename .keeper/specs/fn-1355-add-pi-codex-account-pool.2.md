@@ -67,5 +67,5 @@ Publish in shadow/diagnostic mode first. The launcher may inspect the sidecar, b
 - [ ] Pure named tests cover malformed/stale data, atomic publication, last-good retention, contention, crash expiry, cooldown recovery, all-unavailable fallback, and PII/size bounds.
 
 ## Done summary
-
+Added a provider-qualified Codex capacity observation/pressure/routing stack (observation sidecar, refresh coordination, deterministic selector, DB-free supervised observer worker) parallel to the Claude cswap schema, wired into the daemon load surface, with pure named test coverage for freshness, atomicity, contention, cooldown, and fallback edges.
 ## Evidence
