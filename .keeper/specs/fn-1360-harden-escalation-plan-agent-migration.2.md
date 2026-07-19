@@ -29,5 +29,5 @@ Files: plugins/prompt/test/render_plugin_templates.test.ts, plugins/keeper/plugi
 - [ ] An integration test proves a spawned escalation subagent's write is grant-gated (denied without a grant leaf, allowed with one) for the agent_type delivered by a plan:* Task spawn
 
 ## Done summary
-
+Added end-to-end coverage for the default_pin fallback (render + compile paths, including the effort-axis throw) and for plan-qualified escalation grant confinement (denied without a grant leaf, allowed with one, for a plan:repairer Task spawn).
 ## Evidence
