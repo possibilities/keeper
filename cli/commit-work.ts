@@ -1,6 +1,14 @@
 #!/usr/bin/env bun
 
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  unlinkSync,
+} from "node:fs";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -63,6 +71,7 @@ import {
 import { emitCommitWorkOutcome } from "../src/commit-work/telemetry";
 import { defaultDbPath, openDb } from "../src/db";
 import { parsePlanRef } from "../src/derivers";
+import { commitWorkLockPath } from "../src/worktree-git";
 
 const HELP = `keeper commit-work [MSG] [options]
 
@@ -118,6 +127,7 @@ const MAX_ADOPTION_TOTAL_PATH_BYTES = 1_048_576;
 const PUBLICATION_MAX_ATTEMPTS = 3;
 const PUBLICATION_RETRY_JITTER_MIN_MS = 10;
 const PUBLICATION_RETRY_JITTER_SPAN_MS = 20;
+export const COMMIT_WORK_STALE_LOCK_AGE_MS = 10 * 60 * 1000;
 /** Atomic nonblocking open: FIFOs/devices cannot hang before descriptor fstat. */
 export const BOUNDED_INPUT_OPEN_FLAGS =
   constants.O_RDONLY | constants.O_NONBLOCK;
@@ -627,6 +637,9 @@ export interface CommitWorkDeps {
   acquireLock?: (
     lockPath: string,
   ) => { release: () => void } | null | Promise<{ release: () => void } | null>;
+  tryAcquireLock?: (lockPath: string) => { release: () => void } | null;
+  lockAudit?: (line: string) => void;
+  now?: () => number;
   detectInProgress?: (
     worktree: string,
     git: GitRunner,
@@ -644,6 +657,116 @@ export interface CommitWorkDeps {
     identity: string,
     taskId: string,
   ) => boolean | Promise<boolean>;
+}
+
+type CommitWorkLockProbe =
+  | "absent"
+  | "available"
+  | "held"
+  | "present"
+  | "probe_failed"
+  | "reaped";
+
+function isMissingPathError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}
+
+function auditStaleLockReap(
+  lockPath: string,
+  ageMs: number,
+  deps: CommitWorkDeps,
+): void {
+  const line = JSON.stringify({
+    schema_version: 1,
+    kind: "commit-work-lock-reaped",
+    lock_path: lockPath,
+    age_ms: Math.floor(ageMs),
+  });
+  try {
+    (deps.lockAudit ?? ((entry: string) => process.stderr.write(`${entry}\n`)))(
+      line,
+    );
+  } catch {
+    // The stale inode is already gone; audit transport cannot safely restore it.
+  }
+}
+
+/**
+ * Reap only an old empty lock inode that a real non-blocking flock proves has
+ * no holder. Preview additionally probes every present inode so it can report a
+ * live holder without taking the advisory lock for the preview duration.
+ */
+function probeCommitWorkLock(
+  lockPath: string,
+  deps: CommitWorkDeps,
+  probeAvailability: boolean,
+): CommitWorkLockProbe {
+  let initial: ReturnType<typeof lstatSync>;
+  try {
+    initial = lstatSync(lockPath);
+  } catch (error) {
+    return isMissingPathError(error) ? "absent" : "probe_failed";
+  }
+
+  const now = (deps.now ?? Date.now)();
+  const ageMs = now - initial.mtimeMs;
+  const stale =
+    initial.isFile() &&
+    initial.size === 0 &&
+    Number.isFinite(ageMs) &&
+    ageMs >= COMMIT_WORK_STALE_LOCK_AGE_MS;
+  if (!stale && !probeAvailability) return "present";
+
+  let probe: { release: () => void } | null;
+  try {
+    probe = (deps.tryAcquireLock ?? CommitWorkLock.tryAcquire)(lockPath);
+  } catch {
+    return "probe_failed";
+  }
+  if (probe === null) return "held";
+
+  try {
+    if (!stale) return "available";
+    let current: ReturnType<typeof lstatSync>;
+    try {
+      current = lstatSync(lockPath);
+    } catch (error) {
+      return isMissingPathError(error) ? "available" : "probe_failed";
+    }
+    if (
+      !current.isFile() ||
+      current.dev !== initial.dev ||
+      current.ino !== initial.ino
+    ) {
+      return "available";
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch (error) {
+      return isMissingPathError(error) ? "available" : "probe_failed";
+    }
+    auditStaleLockReap(lockPath, ageMs, deps);
+    return "reaped";
+  } finally {
+    probe.release();
+  }
+}
+
+function lockFailureFields(
+  lockPath: string,
+  state: "held" | "unavailable" | "probe_failed",
+  detail?: string,
+): Record<string, unknown> {
+  return {
+    lock_path: lockPath,
+    lock_state: state,
+    cause: `commit-work lock ${lockPath} could not be acquired`,
+    ...(detail === undefined ? {} : { detail }),
+  };
 }
 
 function probeSharedCheckoutJam(
@@ -1253,12 +1376,28 @@ async function runAttempt(
   }
 
   if (args.previewFiles) {
+    const lockPath = await commitWorkLockPath(worktree, git);
+    const lockState = probeCommitWorkLock(lockPath, deps, true);
+    if (lockState === "held" || lockState === "probe_failed") {
+      return {
+        code: 1,
+        identity,
+        result: result("commit-work-result", "lock_timeout", false, {
+          identity,
+          ...lockFailureFields(lockPath, lockState),
+          selection: selectionEnvelope(advisory, identity),
+          surface: advisory.summary,
+        }),
+      };
+    }
     return {
       code: 0,
       identity,
       result: result("commit-work-result", "preview", true, {
         identity,
         ...resultFileFields(advisory.selected),
+        lock_path: lockPath,
+        lock_state: lockState,
         selection: selectionEnvelope(advisory, identity),
         surface: advisory.summary,
       }),
@@ -1328,26 +1467,24 @@ async function runAttempt(
     }
   }
 
-  const gitDirResult = await git(
-    ["rev-parse", "--path-format=absolute", "--git-dir"],
-    { cwd: worktree },
-  );
-  const lockDir =
-    gitDirResult.code === 0 && gitDirResult.stdout.trim()
-      ? gitDirResult.stdout.trim()
-      : `${worktree}/.git`;
+  const lockPath = await commitWorkLockPath(worktree, git);
+  probeCommitWorkLock(lockPath, deps, false);
   const acquire =
     deps.acquireLock ?? ((path: string) => CommitWorkLock.acquire(path));
   let lock: { release: () => void } | null;
   try {
-    lock = await acquire(`${lockDir}/keeper-commit-work.lock`);
+    lock = await acquire(lockPath);
   } catch (error) {
     return {
       code: 1,
       identity,
       result: result("commit-work-result", "lock_timeout", false, {
         identity,
-        detail: error instanceof Error ? error.name : "lock_error",
+        ...lockFailureFields(
+          lockPath,
+          "unavailable",
+          error instanceof Error ? error.name : "lock_error",
+        ),
       }),
     };
   }
@@ -1355,7 +1492,10 @@ async function runAttempt(
     return {
       code: 1,
       identity,
-      result: result("commit-work-result", "lock_timeout", false, { identity }),
+      result: result("commit-work-result", "lock_timeout", false, {
+        identity,
+        ...lockFailureFields(lockPath, "held"),
+      }),
     };
   }
 
@@ -1402,6 +1542,8 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "stage_failed", false, {
           identity,
+          lock_path: lockPath,
+          lock_state: "held_by_invocation",
           selection: selectionEnvelope(surface, identity),
           surface: surface.summary,
         }),
@@ -1483,6 +1625,8 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "stage_failed", false, {
           identity,
+          lock_path: lockPath,
+          lock_state: "held_by_invocation",
         }),
       };
     }
@@ -1538,6 +1682,8 @@ async function runAttempt(
           false,
           {
             identity,
+            lock_path: lockPath,
+            lock_state: "held_by_invocation",
             stderr_sample: capStderr(typed?.stderr),
             affected_total: typed?.paths?.length,
             affected_paths: typed?.paths ? pathSample(typed.paths) : undefined,
