@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 2,
+        "insertions": 361
+      },
+      "done_summary": "commit-work now names the contended lock's absolute path in refusal envelopes and reaps a provably-stale (empty, past age bound, no live holder) lock in-line with one audited log line; a live-held lock is never reaped and still serializes as before. Preview now also probes/reports lock state.",
+      "input_hash": "42cc95313f63ff2a9d841e387164bb54fabd056b5c94e53efc7ee10764ee92c5",
+      "model": "opus",
+      "spec_chars": 3310,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** cli/commit-work.ts, src/worktree-git.ts, test/commit-work.test.ts\n\n### Approach\n\nThe commit-work lock serializes whole-repo staging: one lock file under the repo's shared `.git` dir covers every worktree of that repo. A crashed invocation strands an empty lock file, and today every subsequent invocation fails `stage_failed` without ever naming the lock \u2014 the failure is invisible and unreaped, so autonomous workers block TOOLING_FAILURE on verified diffs. Two behavioral changes, one owner: (1) when lock acquisition is why the invocation cannot proceed, the failure envelope names the lock's absolute path and that it is the cause; (2) before failing on an existing lock, a provably-stale lock \u2014 empty, older than a conservative age bound, and with no live holder \u2014 is removed in-line with one audited log line, and the invocation proceeds normally. A lock with a live holder is never touched: concurrent invocations must still serialize exactly as today. Determine the actual acquire semantics first (flock vs create-exclusive) \u2014 the reap predicate must match how the lock is genuinely held so a held flock is never misread as stale.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- cli/commit-work.ts:1343 \u2014 the `acquire(`${lockDir}/keeper-commit-work.lock`)` call site; what acquire() actually does decides the staleness predicate\n- cli/commit-work.ts:1403,1484,1537 \u2014 the `stage_failed` envelope constructions that today swallow the lock cause\n- src/worktree-git.ts:28,348-394 \u2014 the lock-path derivation contract (worktree-anchored absolute `--git-dir`, never bare relative `.git`) and the merge-serialization flock comment\n\n**Optional** (reference as needed):\n- test/commit-work-worktree-isolation.test.ts \u2014 existing worktree lock-sharing coverage patterns\n- test/commit-work-foundation.test.ts \u2014 envelope-shape test patterns\n\n### Risks\n\n- The same lock filename is taken by daemon-side merge paths (src/worktree-git.ts); the reap must not fight a live fan-in merge \u2014 the no-live-holder predicate must cover those holders too.\n\n### Test notes\n\nDeterministic, in-process, through the pure seam: simulate a stranded empty lock, a fresh lock, and a live-held lock; assert reap/name/serialize respectively. Never boot a daemon or spawn real concurrent processes.\n\n## Acceptance\n\n- [ ] A commit-work invocation refused because the repo lock is present/held emits an envelope naming the lock path as the cause, not a bare stage_failed.\n- [ ] An invocation meeting a provably-stale lock (empty + past the age bound + no live holder) reaps it with one audited log line and completes with a normal outcome.\n- [ ] A lock with a live holder is never reaped and still serializes the invocation exactly as before.\n- [ ] `bun test ./test/commit-work.test.ts` and the other named commit-work gates pass, plus `bun run typecheck`.\n\n## Done summary\ncommit-work now names the contended lock's absolute path in refusal envelopes and reaps a provably-stale (empty, past age bound, no live holder) lock in-line with one audited log line; a live-held lock is never reaped and still serializes as before. Preview now also probes/reports lock state.\n## Evidence\n",
+      "task_id": "fn-1365-reap-stale-commit-work-locks.1",
+      "tier": "xhigh",
+      "title": "Name and reap stale commit-work locks"
+    }
+  ],
+  "created_at": "2026-07-19T04:56:13.919000Z",
+  "epic_id": "fn-1365-reap-stale-commit-work-locks",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "42cc95313f63ff2a9d841e387164bb54fabd056b5c94e53efc7ee10764ee92c5",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
