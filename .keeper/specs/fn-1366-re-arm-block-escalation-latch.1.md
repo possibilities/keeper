@@ -38,5 +38,5 @@ Deterministic in-process tests through the latch producer seam: TOOLING_FAILURE 
 - [ ] `bun test ./test/daemon.test.ts ./test/reducer-projections.test.ts` pass, plus `bun run typecheck`.
 
 ## Done summary
-
+Re-arm the block_escalations latch when a task terminally settled TOOLING_FAILURE/unparseable skipped_category is later re-blocked under an escalatable category, dispatching exactly one unblock:: session after grace while keeping repeat TOOLING_FAILURE suppressed. Fixed the unblock:: CLI collision guard to stop asserting the falsified autopilot-may-dispatch premise against a terminal latch.
 ## Evidence
