@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-19T15:13:38.611000Z",
+  "depends_on_epics": [],
+  "id": "fn-1376-wire-live-proof-collection",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Wire live proof collection",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-19T15:13:38.611000Z"
+}

@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-19T15:13:38.611000Z",
+  "depends_on": [],
+  "epic": "fn-1376-wire-live-proof-collection",
+  "id": "fn-1376-wire-live-proof-collection.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Wire collector into proof window",
+  "updated_at": "2026-07-19T15:13:38.611000Z"
+}
