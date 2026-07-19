@@ -8,7 +8,7 @@
     "fn-1375-reap-stopped-sessions-release-claims"
   ],
   "id": "fn-1352-retire-escalation-sessions",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T23:09:19.059000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T23:09:18.101000Z"
+  "updated_at": "2026-07-19T23:09:19.059000Z"
 }
