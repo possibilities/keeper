@@ -80,6 +80,7 @@ import {
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
+import { slugify } from "../slug";
 import type { FableFocusInput } from "../types";
 import { parseArgsForAgent } from "./args";
 import {
@@ -116,6 +117,11 @@ import {
 } from "./harness";
 import {
   buildAgentLaunchArgv,
+  buildClaudeMetadataInferenceArgv,
+  buildClaudeMetadataInferenceEnv,
+  CLAUDE_METADATA_INFERENCE_MAX_OUTPUT_BYTES,
+  CLAUDE_METADATA_INFERENCE_MODEL,
+  CLAUDE_METADATA_INFERENCE_TIMEOUT_MS,
   composeManagedClaudeArgv,
   FINAL_MESSAGE_DIRECTIVE,
   mergeClaudeWorkspaceTrust,
@@ -227,11 +233,46 @@ import {
 } from "./triple";
 import { readSingleChar } from "./tty";
 
+export interface MetadataInferenceCapture {
+  text: string;
+  overflow: boolean;
+}
+
+export interface MetadataInferenceChild {
+  exited: Promise<number>;
+  captureStdout(maxBytes: number): Promise<MetadataInferenceCapture>;
+  captureStderr(maxBytes: number): Promise<MetadataInferenceCapture>;
+  terminateTree(signal: "SIGKILL"): void;
+}
+
+export interface MetadataInferenceSpawnOptions {
+  env: Record<string, string>;
+  cwd: string;
+}
+
+export type MetadataInferenceSpawnFn = (
+  argv: string[],
+  options: MetadataInferenceSpawnOptions,
+) => MetadataInferenceChild;
+
+export interface MetadataInferenceCancellation {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+export interface MetadataInferenceRuntime {
+  spawn: MetadataInferenceSpawnFn;
+  setTimeout: (callback: () => void, ms: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+  createCancellation: () => MetadataInferenceCancellation;
+}
+
 export interface MainDeps {
   argv: string[];
   env: NodeJS.ProcessEnv;
   cwd: string;
   spawn: SpawnFn;
+  metadataInferenceRuntime?: MetadataInferenceRuntime;
   readChar: () => string;
   nextCwdOrdinalFn: (dirName: string) => number;
   randomUuid: () => string;
@@ -425,6 +466,413 @@ export interface MainDeps {
   seedClaudeWorkspaceTrustFn: (configDir: string, cwd: string) => boolean;
 }
 
+export type ClaudeMetadataInferenceFailureKind =
+  | "invalid_input"
+  | "route_unavailable"
+  | "spawn_failed"
+  | "capture_failed"
+  | "timeout"
+  | "cancelled"
+  | "output_too_large"
+  | "auth_failed"
+  | "quota_unavailable"
+  | "process_failed"
+  | "malformed_output"
+  | "unusable_candidate";
+
+export type ClaudeMetadataInferenceEnvelope =
+  | { schema_version: 1; ok: true; candidate: string }
+  | {
+      schema_version: 1;
+      ok: false;
+      error: { kind: ClaudeMetadataInferenceFailureKind; message: string };
+    };
+
+const METADATA_FAILURE_MESSAGES: Record<
+  ClaudeMetadataInferenceFailureKind,
+  string
+> = {
+  invalid_input: "metadata input is invalid",
+  route_unavailable: "no managed Claude account route is available",
+  spawn_failed: "Claude metadata inference could not start",
+  capture_failed: "Claude metadata inference output could not be captured",
+  timeout: "Claude metadata inference timed out",
+  cancelled: "Claude metadata inference was cancelled",
+  output_too_large: "Claude metadata inference output exceeded its byte cap",
+  auth_failed: "Claude metadata inference authentication failed",
+  quota_unavailable: "Claude metadata inference quota is unavailable",
+  process_failed: "Claude metadata inference failed",
+  malformed_output: "Claude metadata inference returned malformed output",
+  unusable_candidate: "Claude metadata inference returned no usable name",
+};
+
+function metadataFailure(
+  kind: ClaudeMetadataInferenceFailureKind,
+): ClaudeMetadataInferenceEnvelope {
+  return {
+    schema_version: 1,
+    ok: false,
+    error: { kind, message: METADATA_FAILURE_MESSAGES[kind] },
+  };
+}
+
+async function captureMetadataStream(
+  stream: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+): Promise<MetadataInferenceCapture> {
+  if (stream === null) return { text: "", overflow: false };
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let overflow = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = maxBytes - total;
+      if (value.byteLength > remaining) {
+        if (remaining > 0) chunks.push(value.subarray(0, remaining));
+        total = maxBytes;
+        overflow = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    if (overflow) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The byte cap is already enforced even when stream cancellation races exit.
+      }
+    }
+    reader.releaseLock();
+  }
+  return {
+    text: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
+      "utf8",
+    ),
+    overflow,
+  };
+}
+
+export const defaultMetadataInferenceSpawn: MetadataInferenceSpawnFn = (
+  argv,
+  options,
+) => {
+  const proc = Bun.spawn(argv, {
+    env: options.env,
+    cwd: options.cwd,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  });
+  const stdout = proc.stdout as ReadableStream<Uint8Array> | null;
+  const stderr = proc.stderr as ReadableStream<Uint8Array> | null;
+  return {
+    exited: proc.exited,
+    captureStdout: (maxBytes) => captureMetadataStream(stdout, maxBytes),
+    captureStderr: (maxBytes) => captureMetadataStream(stderr, maxBytes),
+    terminateTree: (signal) => {
+      try {
+        process.kill(-proc.pid, signal);
+      } catch {
+        try {
+          proc.kill(signal);
+        } catch {
+          // The process tree already exited.
+        }
+      }
+    },
+  };
+};
+
+function createProcessMetadataCancellation(): MetadataInferenceCancellation {
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, abort);
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+        process.removeListener(signal, abort);
+      }
+    },
+  };
+}
+
+function defaultMetadataInferenceRuntime(): MetadataInferenceRuntime {
+  return {
+    spawn: defaultMetadataInferenceSpawn,
+    setTimeout: (callback, ms) => setTimeout(callback, ms),
+    clearTimeout: (handle) =>
+      clearTimeout(handle as ReturnType<typeof setTimeout>),
+    createCancellation: createProcessMetadataCancellation,
+  };
+}
+
+function diagnosticFailureKind(
+  diagnostic: string,
+): "auth_failed" | "quota_unavailable" | "process_failed" {
+  const normalized = diagnostic.toLowerCase();
+  if (
+    /authentication|unauthorized|not logged in|invalid api key|oauth|token expired/u.test(
+      normalized,
+    )
+  ) {
+    return "auth_failed";
+  }
+  if (
+    /quota|rate.?limit|usage limit|credit balance|capacity|overloaded/u.test(
+      normalized,
+    )
+  ) {
+    return "quota_unavailable";
+  }
+  return "process_failed";
+}
+
+function exactStructuredName(value: unknown): string | null {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 1 ||
+    !("name" in value) ||
+    typeof (value as { name?: unknown }).name !== "string"
+  ) {
+    return null;
+  }
+  const name = (value as { name: string }).name;
+  return name.length <= 80 ? name : null;
+}
+
+function parseMetadataCandidate(
+  stdout: string,
+):
+  | { kind: "candidate"; name: string }
+  | { kind: "error"; diagnostic: string }
+  | { kind: "malformed" } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return { kind: "malformed" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { kind: "malformed" };
+  }
+  const record = parsed as Record<string, unknown>;
+  if (record.is_error === true) {
+    return {
+      kind: "error",
+      diagnostic:
+        typeof record.result === "string" ? record.result : "model error",
+    };
+  }
+  const direct = exactStructuredName(parsed);
+  if (direct !== null) return { kind: "candidate", name: direct };
+  const structured = exactStructuredName(record.structured_output);
+  if (structured !== null) return { kind: "candidate", name: structured };
+  const resultObject = exactStructuredName(record.result);
+  if (resultObject !== null) {
+    return { kind: "candidate", name: resultObject };
+  }
+  if (typeof record.result === "string") {
+    try {
+      const nested = exactStructuredName(JSON.parse(record.result));
+      if (nested !== null) return { kind: "candidate", name: nested };
+    } catch {
+      return { kind: "malformed" };
+    }
+  }
+  return { kind: "malformed" };
+}
+
+export async function captureClaudeMetadataInference(opts: {
+  argv: string[];
+  env: Record<string, string>;
+  cwd: string;
+  runtime: MetadataInferenceRuntime;
+  signal: AbortSignal;
+}): Promise<ClaudeMetadataInferenceEnvelope> {
+  if (opts.signal.aborted) return metadataFailure("cancelled");
+  let child: MetadataInferenceChild;
+  try {
+    child = opts.runtime.spawn(opts.argv, { env: opts.env, cwd: opts.cwd });
+  } catch {
+    return metadataFailure("spawn_failed");
+  }
+
+  type Completion =
+    | {
+        kind: "completed";
+        code: number;
+        stdout: MetadataInferenceCapture;
+        stderr: MetadataInferenceCapture;
+      }
+    | { kind: "capture_failed" };
+  type Interrupted =
+    | { kind: "timeout" }
+    | { kind: "cancelled" }
+    | { kind: "output_too_large" };
+  let interrupt: ((result: Interrupted) => void) | null = null;
+  let interrupted = false;
+  const interruption = new Promise<Interrupted>((resolve) => {
+    interrupt = (result) => {
+      if (interrupted) return;
+      interrupted = true;
+      resolve(result);
+    };
+  });
+  const onAbort = (): void => interrupt?.({ kind: "cancelled" });
+  opts.signal.addEventListener("abort", onAbort, { once: true });
+  if (opts.signal.aborted) onAbort();
+  let timer: unknown;
+  let timerSet = false;
+  let stdoutCapture: Promise<MetadataInferenceCapture>;
+  let stderrCapture: Promise<MetadataInferenceCapture>;
+  try {
+    timer = opts.runtime.setTimeout(
+      () => interrupt?.({ kind: "timeout" }),
+      CLAUDE_METADATA_INFERENCE_TIMEOUT_MS,
+    );
+    timerSet = true;
+    stdoutCapture = child.captureStdout(
+      CLAUDE_METADATA_INFERENCE_MAX_OUTPUT_BYTES,
+    );
+    stderrCapture = child.captureStderr(
+      CLAUDE_METADATA_INFERENCE_MAX_OUTPUT_BYTES,
+    );
+  } catch {
+    if (timerSet) opts.runtime.clearTimeout(timer);
+    opts.signal.removeEventListener("abort", onAbort);
+    child.terminateTree("SIGKILL");
+    return metadataFailure("capture_failed");
+  }
+  const completion: Promise<Completion> = Promise.all([
+    child.exited,
+    stdoutCapture,
+    stderrCapture,
+  ]).then(
+    ([code, stdout, stderr]) => ({
+      kind: "completed" as const,
+      code,
+      stdout,
+      stderr,
+    }),
+    () => ({ kind: "capture_failed" as const }),
+  );
+  for (const capture of [stdoutCapture, stderrCapture]) {
+    void capture.then(
+      (result) => {
+        if (result.overflow) interrupt?.({ kind: "output_too_large" });
+      },
+      () => {},
+    );
+  }
+
+  let outcome: Completion | Interrupted;
+  try {
+    outcome = await Promise.race([completion, interruption]);
+  } finally {
+    opts.runtime.clearTimeout(timer);
+    opts.signal.removeEventListener("abort", onAbort);
+  }
+  if (
+    outcome.kind === "timeout" ||
+    outcome.kind === "cancelled" ||
+    outcome.kind === "output_too_large"
+  ) {
+    child.terminateTree("SIGKILL");
+    return metadataFailure(outcome.kind);
+  }
+  if (outcome.kind === "capture_failed") {
+    child.terminateTree("SIGKILL");
+    return metadataFailure("capture_failed");
+  }
+  if (outcome.stdout.overflow || outcome.stderr.overflow) {
+    return metadataFailure("output_too_large");
+  }
+  const diagnostic = `${outcome.stdout.text}\n${outcome.stderr.text}`;
+  if (outcome.code !== 0) {
+    return metadataFailure(diagnosticFailureKind(diagnostic));
+  }
+  const parsed = parseMetadataCandidate(outcome.stdout.text);
+  if (parsed.kind === "error") {
+    return metadataFailure(
+      diagnosticFailureKind(`${parsed.diagnostic}\n${outcome.stderr.text}`),
+    );
+  }
+  if (parsed.kind === "malformed") {
+    return metadataFailure("malformed_output");
+  }
+  const candidate = slugify(parsed.name);
+  if (candidate === null) return metadataFailure("unusable_candidate");
+  return { schema_version: 1, ok: true, candidate };
+}
+
+async function runClaudeMetadataInferenceMode(
+  deps: MainDeps,
+  input: string | null,
+  invalid: boolean,
+): Promise<never> {
+  let envelope: ClaudeMetadataInferenceEnvelope;
+  if (invalid || input === null) {
+    envelope = metadataFailure("invalid_input");
+  } else {
+    let resolution: RouteResolution;
+    try {
+      resolution = deps.selectAccountRouteFn(
+        CLAUDE_METADATA_INFERENCE_MODEL,
+        false,
+      );
+    } catch {
+      resolution = { ok: false, error: "account routing failed" };
+    }
+    if (!resolution.ok) {
+      envelope = metadataFailure("route_unavailable");
+    } else {
+      let argv: string[];
+      try {
+        argv = buildClaudeMetadataInferenceArgv({
+          claudeBin: deps.claudeBin,
+          cswapBin: deps.cswapBin,
+          slot: resolution.selection.slot,
+          input,
+        });
+      } catch {
+        deps.write(`${JSON.stringify(metadataFailure("invalid_input"))}\n`);
+        return deps.exit(2);
+      }
+      const env = buildClaudeMetadataInferenceEnv(
+        deps.env,
+        resolution.selection,
+      );
+      const runtime =
+        deps.metadataInferenceRuntime ?? defaultMetadataInferenceRuntime();
+      const cancellation = runtime.createCancellation();
+      try {
+        envelope = await captureClaudeMetadataInference({
+          argv,
+          env,
+          cwd: deps.cwd,
+          runtime,
+          signal: cancellation.signal,
+        });
+      } finally {
+        cancellation.dispose();
+      }
+    }
+  }
+  deps.write(`${JSON.stringify(envelope)}\n`);
+  return deps.exit(envelope.ok ? 0 : invalid ? 2 : 1);
+}
+
 /** Parse a host YAML file to its raw body, or null when the file is absent (the
  *  lenient host-triple harvest treats an absent file as no triples). Malformed
  *  YAML surfaces as a ConfigError from `parseYaml`, propagated to the verb. */
@@ -459,6 +907,7 @@ export function realDeps(): MainDeps {
     env: process.env,
     cwd: process.cwd(),
     spawn: defaultSpawn,
+    metadataInferenceRuntime: defaultMetadataInferenceRuntime(),
     readChar: readSingleChar,
     nextCwdOrdinalFn: nextCwdOrdinal,
     randomUuid: () => crypto.randomUUID(),
@@ -3058,6 +3507,27 @@ export async function main(deps: MainDeps): Promise<never> {
   if (hasKeeperAgentHelpFlag(argv)) {
     deps.write(KEEPER_AGENT_HELP);
     return deps.exit(0);
+  }
+
+  const earlyParsed = parseArgsForAgent(argv, agent);
+  if (earlyParsed.launcherMetadataInferenceRequested) {
+    const incompatible =
+      agent !== "claude" ||
+      earlyParsed.launcherMetadataInferenceError !== null ||
+      earlyParsed.remainingArgs.length !== 0 ||
+      earlyParsed.launcherVerbose ||
+      earlyParsed.launcherVeryVerbose ||
+      earlyParsed.launcherNoConfirm ||
+      earlyParsed.launcherPreset !== null ||
+      earlyParsed.launcherAccountOrdinal !== null ||
+      earlyParsed.launcherAccountError !== null ||
+      earlyParsed.launcherFableIntent !== null ||
+      earlyParsed.launcherFableIntentError !== null;
+    return runClaudeMetadataInferenceMode(
+      deps,
+      earlyParsed.launcherMetadataInferenceInput,
+      incompatible,
+    );
   }
 
   // Bind every Pi descendant to this launcher's already-resolved compiler

@@ -15,6 +15,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES } from "./args";
 import {
   buildHarnessResumeArgv,
   buildResumeLaunchPromptTail,
@@ -358,6 +359,97 @@ export function nativePiArgs(opts: AgentLaunchOpts): string[] {
 // ---------------------------------------------------------------------------
 // Managed account route — the claude-swap wrapper composition
 // ---------------------------------------------------------------------------
+
+export { CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES } from "./args";
+export const CLAUDE_METADATA_INFERENCE_MAX_OUTPUT_BYTES = 32 * 1024;
+export const CLAUDE_METADATA_INFERENCE_TIMEOUT_MS = 20_000;
+export const CLAUDE_METADATA_INFERENCE_MODEL = "haiku";
+export const CLAUDE_METADATA_INFERENCE_EFFORT = "low";
+export const CLAUDE_METADATA_INFERENCE_SCHEMA =
+  '{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":80}},"required":["name"],"additionalProperties":false}';
+
+export const CLAUDE_METADATA_INFERENCE_SYSTEM_PROMPT =
+  "Generate a short session title (3-6 words) for the supplied conversation. " +
+  "Prioritize the user's requests, goals, and repeated themes over assistant " +
+  "implementation detail. Return only the schema-constrained name.";
+
+const CLAUDE_METADATA_ENV_ALLOWLIST = [
+  "HOME",
+  "PATH",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+] as const;
+
+/** Compose the fixed, non-persistent Claude metadata process behind one managed route. */
+export function buildClaudeMetadataInferenceArgv(opts: {
+  claudeBin: string;
+  cswapBin: string;
+  slot: number;
+  input: string;
+}): string[] {
+  const inputBytes = Buffer.byteLength(opts.input, "utf8");
+  if (
+    opts.input.trim() === "" ||
+    inputBytes > CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES ||
+    opts.input.includes("\0")
+  ) {
+    throw new Error("Claude metadata input is unusable or over its byte cap");
+  }
+  const nativeClaudeArgv = [
+    opts.claudeBin,
+    "--print",
+    "--model",
+    CLAUDE_METADATA_INFERENCE_MODEL,
+    "--effort",
+    CLAUDE_METADATA_INFERENCE_EFFORT,
+    "--safe-mode",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+    "--output-format",
+    "json",
+    "--json-schema",
+    CLAUDE_METADATA_INFERENCE_SCHEMA,
+    "--system-prompt",
+    CLAUDE_METADATA_INFERENCE_SYSTEM_PROMPT,
+    "--",
+    opts.input,
+  ];
+  return composeManagedClaudeArgv({
+    cswapBin: opts.cswapBin,
+    slot: opts.slot,
+    nativeClaudeArgv,
+  });
+}
+
+/** Materialize only host basics plus PII-free route attribution for metadata inference. */
+export function buildClaudeMetadataInferenceEnv(
+  inherited: Readonly<Record<string, string | undefined>>,
+  route: { id: string; accountOrdinal?: number },
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of CLAUDE_METADATA_ENV_ALLOWLIST) {
+    const value = inherited[key];
+    if (value !== undefined) env[key] = value;
+  }
+  env.KEEPER_ACCOUNT_ROUTE = route.id;
+  if (route.accountOrdinal !== undefined) {
+    env.KEEPER_ACCOUNT_ORDINAL = String(route.accountOrdinal);
+  }
+  return env;
+}
 
 export type ClaudeWorkspaceTrustMerge =
   | { ok: true; changed: boolean; body: string }
