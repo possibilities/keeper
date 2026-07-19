@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 4,
+        "insertions": 30
+      },
+      "done_summary": "Fixed the inDouble backslash-newline continuation-consume in both guard lexers to re-check $/( adjacency across consumed continuations (skipLineContinuations helper, identical in both files); added single- and multi-continuation split-vector denials to both CVE deny corpora; existing legitimate-continuation tests still pass.",
+      "input_hash": "97e9acddc4a31ad17aac0f7774bce982767cfddca10b762f54594fa1099d08f4",
+      "model": "opus",
+      "spec_chars": 1849,
+      "spec_md": "## Description\n\nClose the command-substitution split bypass identified as F1. In BOTH\nbyte-identical guard lexers \u2014 `plugins/keeper/plugin/hooks/wrapped-guard.ts`\n(inDouble block, ~line 185) and `plugins/keeper/plugin/hooks/grant-guard.ts`\n(inDouble block, ~line 246) \u2014 the `else if (c === \"\\\\\" && next === \"\\n\") i++;`\ncontinuation-consume strips a backslash-newline without re-checking `$`/`(`\nadjacency. Evidence: `\"$\\<newline>(evil)\"` lexes with `$` and `(` landing in\nseparate iterations, so neither the inDouble `$(` deny nor the backtick deny\nfires, and the PreToolUse gate admits a command a real shell expands as\n`$(evil)`. Fix by re-joining `$` to a following `(` across a consumed\ncontinuation (or pre-stripping `\\<newline>` outside single-quoted regions so\n`$` and `(` re-adjoin), applied IDENTICALLY to both copies to preserve the\nisolation-driven duplicate-copy convention. Add the split vector to the CVE\ndeny corpus in BOTH `test/wrapped-guard.test.ts` and `test/grant-guard.test.ts`.\n\nFiles: plugins/keeper/plugin/hooks/wrapped-guard.ts, plugins/keeper/plugin/hooks/grant-guard.ts, test/wrapped-guard.test.ts, test/grant-guard.test.ts\n\n## Acceptance\n\n- [ ] `\"$\\<newline>(evil)\"` and equivalent split forms are denied SUBSTITUTION by both guards\n- [ ] Both guard copies carry the identical fix\n- [ ] CVE deny corpus in both test files asserts the split vector is denied\n- [ ] Legitimate `\\<newline>` continuations inside and outside double quotes still lex without a false deny\n\n## Done summary\nFixed the inDouble backslash-newline continuation-consume in both guard lexers to re-check $/( adjacency across consumed continuations (skipLineContinuations helper, identical in both files); added single- and multi-continuation split-vector denials to both CVE deny corpora; existing legitimate-continuation tests still pass.\n## Evidence\n",
+      "task_id": "fn-1368-fix-guard-lexer-continuation.1",
+      "tier": "xhigh",
+      "title": "Deny split-continuation substitution"
+    }
+  ],
+  "created_at": "2026-07-19T07:17:07.118000Z",
+  "epic_id": "fn-1368-fix-guard-lexer-continuation",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "97e9acddc4a31ad17aac0f7774bce982767cfddca10b762f54594fa1099d08f4",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
