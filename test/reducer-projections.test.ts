@@ -2040,6 +2040,20 @@ function unblockTask(
   });
 }
 
+function blockRequestedEvent(
+  epicId: string,
+  taskId: string,
+  ts: number,
+  sessionId = "reconciler",
+): number {
+  return insertEvent({
+    hook_event: "BlockEscalationRequested",
+    session_id: sessionId,
+    ts,
+    data: JSON.stringify({ epic_id: epicId, task_id: taskId }),
+  });
+}
+
 function blockAttemptedEvent(
   epicId: string,
   taskId: string,
@@ -2099,6 +2113,44 @@ test("BlockEscalationAttempted with the terminal dispatched outcome advances the
   const latch = getBlockLatch("fn-be-1", "fn-be-1.1");
   expect(latch?.status).toBe("attempted");
   expect(latch?.outcome).toBe("dispatched");
+});
+
+test("a terminal category skip can re-enter requested and finish dispatched for stage 3", () => {
+  armBlockLatch("fn-be-rearm", "fn-be-rearm.1", 1700);
+  blockRequestedEvent("fn-be-rearm", "fn-be-rearm.1", 1710);
+  blockAttemptedEvent("fn-be-rearm", "fn-be-rearm.1", "skipped_category", 1720);
+  drainAll();
+  expect(getBlockLatch("fn-be-rearm", "fn-be-rearm.1")).toEqual({
+    status: "attempted",
+    outcome: "skipped_category",
+    human_notified_at: null,
+  });
+
+  blockRequestedEvent("fn-be-rearm", "fn-be-rearm.1", 1800);
+  drainAll();
+  expect(getBlockLatch("fn-be-rearm", "fn-be-rearm.1")).toEqual({
+    status: "requested",
+    outcome: "skipped_category",
+    human_notified_at: null,
+  });
+
+  blockAttemptedEvent("fn-be-rearm", "fn-be-rearm.1", "dispatched", 1810);
+  drainAll();
+  expect(getBlockLatch("fn-be-rearm", "fn-be-rearm.1")).toEqual({
+    status: "attempted",
+    outcome: "dispatched",
+    human_notified_at: null,
+  });
+  expect(
+    db
+      .query(
+        `SELECT epic_id, task_id FROM block_escalations
+          WHERE status = 'attempted'
+            AND outcome = 'dispatched'
+            AND human_notified_at IS NULL`,
+      )
+      .all(),
+  ).toEqual([{ epic_id: "fn-be-rearm", task_id: "fn-be-rearm.1" }]);
 });
 
 test("BlockEscalationAttempted with the non-terminal dispatch_failed outcome resets the latch to pending (re-sweepable)", () => {

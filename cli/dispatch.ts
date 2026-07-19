@@ -460,12 +460,16 @@ export async function resolvePlanCwd(
 /**
  * Plan-form race guard. Best-effort scan: refuses (naming the tripped condition
  * and the right-path recovery) when a `pending_dispatches` row for the key
- * exists, autopilot is unpaused, or a `working`/`stopped` job carries the plan
- * key (client-side scan — `jobs` has no `plan_verb`/`plan_ref` filter). Each
- * refusal names the recovery BEFORE `--force` (the caller appends the `--force`
- * suffix, keeping it last): a stopped-but-live worker warm-resumes over the bus,
- * a dead one is reclaimed. Returns the tripped-condition string, or `null` when
- * clear. Skipped by the caller under `--force`.
+ * exists, autopilot is unpaused and still eligible to dispatch the key, or a
+ * `working`/`stopped` job carries the plan key (client-side scan — `jobs` has no
+ * `plan_verb`/`plan_ref` filter). An `unblock::` key with an attempted terminal
+ * block latch bypasses only the generic unpaused refusal: whether its parsed
+ * category class has re-armed is producer-owned state the CLI cannot infer from
+ * the latch, while pending and live collisions still refuse. Each refusal names the
+ * recovery BEFORE `--force` (the caller appends the `--force` suffix, keeping it
+ * last): a stopped-but-live worker warm-resumes over the bus, a dead one is
+ * reclaimed. Returns the tripped-condition string, or `null` when clear.
+ * Skipped by the caller under `--force`.
  *
  * A daemon-unreachable read here is treated as "clear" — the launch surface
  * itself will fail loudly if the daemon is truly gone, and a manual hatch must
@@ -485,7 +489,14 @@ export async function checkRaceGuard(
     const state = await query("autopilot_state", { id: 1 });
     const paused = state[0]?.paused;
     if (paused === 0 || paused === false) {
-      return "autopilot is unpaused — it may dispatch this key itself; pause it first";
+      let terminalBlockLatch = false;
+      if (verb === "unblock") {
+        const latches = await query("block_escalations", { task_id: id });
+        terminalBlockLatch = latches.some((row) => row.status === "attempted");
+      }
+      if (!terminalBlockLatch) {
+        return "autopilot is unpaused — it may dispatch this key itself; pause it first";
+      }
     }
     // jobs has no plan_verb/plan_ref filter — scan the live set client-side.
     const jobs = await query("jobs");
