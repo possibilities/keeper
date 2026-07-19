@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "medium",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 2,
+        "insertions": 13
+      },
+      "done_summary": "Fixed repair/SKILL.md Phase 2 to capture HEAD after git pull --ff-only (so expected_tip matches the post-pull tip the repairer observes, fixing a false stale_base decline), and restored unblock/SKILL.md Phase 3's page-once-and-decline instruction for a failed cold-dispatch.",
+      "input_hash": "b5a6f8d0fee0e59d5e57e1eabc47af6be73a624ca962ec6447155e9981a299fe",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1504,
+      "spec_md": "## Description\n\nTwo behavior regressions from the thin-wrapper rewrite (finding F2 and\nF3), both in plugins/plan/skills/:\n\n- F2 (repair/SKILL.md, Phase 2 to Phase 3): the skeleton lists\n  `git rev-parse HEAD` before `git pull --ff-only`, but the Phase 3\n  payload sets `expected_tip: \"<current HEAD>\"`. repairer.md.tmpl step 1\n  returns `stale_base` when HEAD != expected_tip, so capturing the\n  pre-pull tip false-declines a healthy repair whenever the shared\n  checkout was behind. Fix: capture HEAD explicitly after the ff-only pull.\n- F3 (unblock/SKILL.md, Phase 3): the rewrite dropped the old skill's\n  \"confirm the dispatch envelope reports success; a failed dispatch is a\n  decline\" step, so a failed `keeper dispatch work::<task_id>` now\n  silently ends. Fix: restore the \"a failed cold-dispatch pages once and\n  declines\" instruction to Phase 3.\n\nFiles: plugins/plan/skills/repair/SKILL.md, plugins/plan/skills/unblock/SKILL.md\n\n## Acceptance\n\n- [ ] repair/SKILL.md captures the spawn-time HEAD after `git pull --ff-only`, so expected_tip matches the tip the repairer will observe\n- [ ] unblock/SKILL.md Phase 3 pages once and declines on a failed cold-dispatch rather than silently ending\n\n## Done summary\nFixed repair/SKILL.md Phase 2 to capture HEAD after git pull --ff-only (so expected_tip matches the post-pull tip the repairer observes, fixing a false stale_base decline), and restored unblock/SKILL.md Phase 3's page-once-and-decline instruction for a failed cold-dispatch.\n## Evidence\n",
+      "task_id": "fn-1360-harden-escalation-plan-agent-migration.1",
+      "tier": "medium",
+      "title": "Fix escalation skill regressions"
+    },
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 22,
+        "files_changed": 4,
+        "insertions": 190
+      },
+      "done_summary": "Added end-to-end coverage for the default_pin fallback (render + compile paths, including the effort-axis throw) and for plan-qualified escalation grant confinement (denied without a grant leaf, allowed with one, for a plan:repairer Task spawn).",
+      "input_hash": "b5a6f8d0fee0e59d5e57e1eabc47af6be73a624ca962ec6447155e9981a299fe",
+      "model": "gpt-5.5",
+      "spec_chars": 2034,
+      "spec_md": "## Description\n\nAdd the two missing end-to-end tests for this epic's headline paths\n(finding F1 and F5):\n\n- F1: the `default_pin` fallback is never exercised because every fixture\n  and example matrix carries explicit `agent_pins` for the four new\n  agents. Add a test loading a host matrix with a new agent's pin omitted\n  that asserts (a) the plain-rendered `.md` frontmatter carries the\n  `default_pin` model/effort (renderAgents `?? defaultPins.get(stem)`),\n  and (b) `planRoles` throws when the `default_pin` effort is absent from\n  the host effort axis (the new `!matrix.efforts.includes(pin.effort)`\n  throw). Touches plugins/prompt/test/ (render_plugin_templates.test.ts\n  and/or the compile path over prompt_compiler.ts).\n- F5: nothing confirms the confinement engages for the new plan:* agent\n  types. grant-guard keys on bare agent_type via `escalationRoleFor` with\n  no `plan:` prefix normalization, and no test drives a plan:-prefixed\n  spawn. Add an integration assertion that a spawned escalation subagent's\n  in-tree write is denied without a matching grant leaf and allowed with\n  one, exercising the agent_type the harness actually delivers for a\n  Task(subagent_type=\"plan:repairer\") spawn.\n\nFiles: plugins/prompt/test/render_plugin_templates.test.ts, plugins/keeper/plugin/hooks/grant-guard.ts (test seam)\n\n## Acceptance\n\n- [ ] A test loads a host matrix omitting a new agent's pin and asserts the rendered frontmatter carries the default_pin model/effort\n- [ ] A test asserts planRoles throws when the default_pin effort is not in the host effort axis\n- [ ] An integration test proves a spawned escalation subagent's write is grant-gated (denied without a grant leaf, allowed with one) for the agent_type delivered by a plan:* Task spawn\n\n## Done summary\nAdded end-to-end coverage for the default_pin fallback (render + compile paths, including the effort-axis throw) and for plan-qualified escalation grant confinement (denied without a grant leaf, allowed with one, for a plan:repairer Task spawn).\n## Evidence\n",
+      "task_id": "fn-1360-harden-escalation-plan-agent-migration.2",
+      "tier": "high",
+      "title": "Cover escalation fallback and confinement"
+    }
+  ],
+  "created_at": "2026-07-19T07:48:11.073000Z",
+  "epic_id": "fn-1360-harden-escalation-plan-agent-migration",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "b5a6f8d0fee0e59d5e57e1eabc47af6be73a624ca962ec6447155e9981a299fe",
+  "selector": {
+    "harness": "human",
+    "model": "spark-burn-policy"
+  }
+}
