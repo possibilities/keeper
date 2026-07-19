@@ -1,8 +1,6 @@
 /**
- * Shared configuration for Keeper's claude-swap-only account routing. The
- * observer and launcher wrap the public `cswap` CLI with exact argv arrays and
- * no shell. This module is a DB-free leaf: pure paths, constants, and executable
- * resolution only.
+ * DB-free paths, bounds, and exact command vectors for the independent Claude
+ * launch router and Codex session router.
  */
 
 import { existsSync } from "node:fs";
@@ -66,6 +64,22 @@ export const MAX_RESERVATIONS_PER_ROUTE = 64;
 export const MAX_OBSERVATION_NOTES = 16;
 export const MAX_NOTE_LENGTH = 200;
 
+export const CODEX_OBSERVER_ENVELOPE_SCHEMA_VERSION = 1;
+export const CODEX_OBSERVATION_SCHEMA_VERSION = 1;
+export const CODEX_PRESSURE_LEDGER_SCHEMA_VERSION = 1;
+export const CODEX_MAX_ALIASES = 8;
+export const CODEX_MAX_WINDOWS_PER_ALIAS = 6;
+export const CODEX_MAX_OBSERVER_OUTPUT_BYTES = 16 * 1024;
+export const CODEX_MAX_OBSERVATION_BYTES = 32 * 1024;
+export const CODEX_OBSERVATION_FRESHNESS_CEILING_MS = 90_000;
+export const CODEX_OBSERVE_INTERVAL_MS = 30_000;
+export const CODEX_OBSERVE_JITTER_MS = 5_000;
+export const CODEX_OBSERVER_TIMEOUT_MS = 10_000;
+export const CODEX_PRESSURE_TTL_MS = 30_000;
+export const CODEX_FAILURE_COOLDOWN_MS = 60_000;
+export const CODEX_PRESSURE_PERCENT_STEP = 10;
+export const CODEX_MAX_RESERVATIONS_PER_ALIAS = 64;
+
 /** Resolve the private account-routing state root. */
 export function resolveAccountRoutingRoot(): string {
   const override = process.env.KEEPER_ACCOUNT_ROUTING_ROOT;
@@ -94,6 +108,28 @@ export function observationRefreshLockPath(root: string): string {
   return join(root, "observation.json.refresh.lock");
 }
 
+export function resolveCodexAccountRoutingRoot(): string {
+  const override = process.env.KEEPER_CODEX_ACCOUNT_ROUTING_ROOT;
+  if (override && override.length > 0) return override;
+  return join(homedir(), ".local", "state", "keeper", "codex-account-routing");
+}
+
+export function codexObservationSidecarPath(root: string): string {
+  return join(root, "observation.json");
+}
+
+export function codexObservationRefreshLockPath(root: string): string {
+  return join(root, "observation.json.refresh.lock");
+}
+
+export function codexPressureLedgerPath(root: string): string {
+  return join(root, "pressure.json");
+}
+
+export function codexPressureLedgerLockPath(root: string): string {
+  return join(root, "pressure.json.lock");
+}
+
 /** Resolve claude-swap through the operator override or PATH. */
 export function resolveCswapCommand(): string {
   const override = process.env.KEEPER_CSWAP_BIN;
@@ -103,6 +139,17 @@ export function resolveCswapCommand(): string {
 /** Exact no-shell argv for the managed-account inventory. */
 export function cswapListArgv(bin: string = resolveCswapCommand()): string[] {
   return [bin, "list", "--json"];
+}
+
+export function resolveCodexObserverCommand(): string {
+  const override = process.env.KEEPER_PI_CODEX_OBSERVER_BIN;
+  return override && override.length > 0 ? override : "keeper-pi-codex-observe";
+}
+
+export function codexObserverArgv(
+  bin: string = resolveCodexObserverCommand(),
+): string[] {
+  return [bin];
 }
 
 export interface CswapAccountConfigPathOptions {

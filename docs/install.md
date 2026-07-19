@@ -191,6 +191,82 @@ chmod 700 "$archive"
 This archive is rollback evidence only. It moves retired private state byte-for-byte without reading,
 inspecting, importing, or translating credentials, and keeper never reads the archive as launch state.
 
+### Pi Codex account pool
+
+The installer verifies the repository-owned `integrations/pi-codex-pool` manifest and source contract but
+never adds it to Pi's global package list. A configured `keeper agent pi` launch passes the tracked
+node-only Keeper extension and the Codex companion as two separate `-e` sources. Pi metadata and package
+commands take their native passthrough path, and Pi started outside Keeper receives neither source nor
+pool environment. The loaded pi-subagents checkout stays on the fork's live integration lineage; upstream
+proposal branches belong in separate checkouts and never replace that loaded tree.
+
+The companion affects only `openai-codex`. Non-Codex providers keep Pi's native path. Root and inherited
+pi-subagents child requests share the Provider wrapper but select independently by session id. A session
+keeps its healthy opaque alias. One logical Provider call may move to one different alias only after a
+classified quota, rate, authentication, or transport failure **before** Substantive output. Text,
+thinking, tool calls, and unknown stream events close that retry window.
+
+Activation is intentionally pending until the separate live two-account proof is complete. Pending,
+missing, incompatible, stale, interrupted, or unhealthy machinery uses Pi's native `openai-codex`
+credential and emits the fixed warning
+`[keeper-codex-pool] pool-unavailable; using native openai-codex`; it never claims a balanced route.
+The launch environment carries only `native|active`, opaque aliases, an optional opaque initial route
+candidate for Codex work, a SHA-256 configuration binding, and a bounded reason code. OAuth credentials
+remain in Pi's private `auth.json`; account ids, provider
+headers, raw errors, tokens, plan labels, and account PII do not enter Keeper diagnostics, proof reports,
+launch environments, the daemon database, or a Projection.
+
+Inspect Claude launch-routing and Codex session-routing together. This read does not create a Claude
+Launch reservation or Codex pressure:
+
+```sh
+keeper agent accounts check --json
+keeper agent accounts codex-pool status --json
+```
+
+Enroll each configured opaque alias in a real terminal. The command starts an inherited-stdio Pi with the
+companion loaded and tells the operator which `/login <alias>` command to run; it rejects JSON/captured
+enrollment. Alias names must match the configured `keeper-codex-*` set and contain no identity. The host
+default is `keeper-codex-a` plus `keeper-codex-b`; an operator may set
+`KEEPER_PI_CODEX_POOL_ALIASES` to a JSON array of one through eight opaque aliases before every workflow
+and launch command.
+
+```sh
+keeper agent accounts codex-pool enroll keeper-codex-a
+keeper agent accounts codex-pool enroll keeper-codex-b
+```
+
+The live-proof run produces one bounded report using the companion's versioned schema. Stage and classify
+that exact file before activation; unknown fields, sanitation findings, stale revision/configuration/alias
+bindings, interruption, incomplete root/child routes, or incomplete restoration cannot pass:
+
+```sh
+keeper agent accounts codex-pool proof capture /path/to/live-proof.json --json
+keeper agent accounts codex-pool proof verdict --json
+keeper agent accounts codex-pool activate --json
+keeper agent accounts codex-pool verify --json
+```
+
+Activation uses a host-local advisory lock and a private transaction marker. The marker makes native mode
+authoritative throughout reload and verification; the active state publishes atomically only after the
+fresh report still matches the current code revision, configuration, alias roles, companion contract, and
+healthy Capacity observation. A concurrent activation is refused. Reload or immediate verification
+failure returns `rollback-complete`; an interrupted or unwritable rollback leaves `recovery-required`,
+which also forces native mode.
+
+Rollback and recovery are idempotent and require no credential edits:
+
+```sh
+keeper agent accounts codex-pool rollback --json
+keeper agent accounts codex-pool status --json
+keeper agent accounts codex-pool recover --json   # only for recovery-required
+keeper agent accounts codex-pool verify --json
+```
+
+Removing the companion `-e` source or leaving activation native also restores ordinary Codex behavior.
+Runtime pool failures after a successful activation remain visible native fallbacks; they do not alter the
+fail-closed proof gate.
+
 ### Reload trigger
 
 `install.sh` reloads keeperd only when the daemon's **load surface** changed — not on every commit.

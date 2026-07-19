@@ -21,12 +21,12 @@ function between(source: string, start: string, end: string): string {
 const RETIRED_CLEANUP = between(
   INSTALL,
   "retire_keeper_codexbar_cli() {",
-  "# 3d. claude-swap CLI:",
+  "# 3e. claude-swap CLI:",
 );
 
 describe("mandatory claude-swap installation", () => {
   test("installs or upgrades the stable tool without blocking non-Claude setup", () => {
-    expect(INSTALL).toContain("# 3d. claude-swap CLI:");
+    expect(INSTALL).toContain("# 3e. claude-swap CLI:");
     expect(INSTALL).toContain("uv tool install --upgrade claude-swap");
     expect(INSTALL).toContain(
       "claude-swap install failed; leaving any existing installation unchanged (non-fatal)",

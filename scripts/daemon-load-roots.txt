@@ -18,3 +18,4 @@ plugins/prompt/src/claude_worker_compiler.ts
 plugins/prompt/src/project_root.ts
 plugins/prompt/src/render_engine.ts
 src
+src/codex-account-observer-worker.ts

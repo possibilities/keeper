@@ -82,7 +82,43 @@ if command -v pi >/dev/null 2>&1; then
   ( cd "${repo_root}" && PI_CODING_AGENT_DIR="${HOME}/.pi/agent" bun scripts/install-pi-plan-agents.ts )
 fi
 
-# 3b. pi-subagents fork: ensure installed, then sync against upstream. pi loads
+# 3b. Verify the repository-owned Pi Codex companion before any live checkout
+#     maintenance. It remains an explicit keeper-launch `-e` source and is never
+#     added to Pi's global package list, so standalone Pi stays native.
+echo "install: verify Pi Codex pool companion"
+PI_CODEX_POOL_ROOT="${repo_root}/integrations/pi-codex-pool" bun -e '
+  const { readFileSync } = require("node:fs");
+  const { join } = require("node:path");
+  const root = process.env.PI_CODEX_POOL_ROOT;
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  const source = readFileSync(join(root, "src", "index.ts"), "utf8");
+  const exact = manifest.name === "@earendil-works/keeper-pi-codex-pool"
+    && manifest.version === "0.1.0"
+    && manifest.private === true
+    && JSON.stringify(manifest.pi?.extensions) === JSON.stringify(["./src/index.ts"])
+    && typeof manifest.peerDependencies?.["@earendil-works/pi-ai"] === "string"
+    && typeof manifest.peerDependencies?.["@earendil-works/pi-coding-agent"] === "string"
+    && source.includes("openAICodexResponsesApi")
+    && source.includes("KEEPER_PI_CODEX_POOL_MODE")
+    && source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS");
+  if (!exact) throw new Error("Pi Codex pool companion manifest/source contract is incompatible");
+'
+if command -v pi >/dev/null 2>&1; then
+  pi_real="$(realpath "$(command -v pi)")"
+  pi_root="$(dirname "$(dirname "${pi_real}")")"
+  pi_loader="${pi_root}/dist/core/extensions/loader.js"
+  pi_compat="${pi_root}/node_modules/@earendil-works/pi-ai/dist/compat.js"
+  if grep -q '"@earendil-works/pi-ai": _bundledPiAiCompat' "${pi_loader}" 2>/dev/null \
+    && grep -q 'openAICodexResponsesApi' "${pi_compat}" 2>/dev/null; then
+    echo "install: Pi Codex provider compatibility verified"
+  else
+    echo "install: Pi Codex provider compatibility unavailable; Keeper launches use visible native fallback" >&2
+  fi
+else
+  echo "install: Pi unavailable; Codex companion provisioned but not runtime-verified" >&2
+fi
+
+# 3c. pi-subagents fork: ensure installed, then sync against upstream. pi loads
 #     @tintinweb/pi-subagents LIVE from the local fork checkout (a local-path
 #     package source in ~/.pi/agent/settings.json) so local patches and
 #     in-flight upstream PR branches take effect without a package reinstall.
@@ -94,6 +130,8 @@ fi
 #     desktop notification that we are out of sync with upstream. This step
 #     never fails the keeper install.
 pi_subagents_fork="${HOME}/src/possibilities--pi-subagents"
+# Fork master is the live integration lineage. Upstream proposal branches stay
+# in separate worktrees and are never checked out here.
 pi_subagents_branch="master"
 pi_subagents_origin="https://github.com/possibilities/pi-subagents.git"
 pi_subagents_upstream="https://github.com/tintinweb/pi-subagents.git"
@@ -194,16 +232,20 @@ if [ -d "${pi_subagents_fork}/.git" ]; then
     pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the owner-scoped RPC v3 contract"
   grep -q "manager.cancelScope(handle" "${pi_subagents_fork}/src/cross-extension-rpc.ts" 2>/dev/null || \
     pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }acknowledged recursive cancellation"
+  grep -q "modelRegistry: ctx.modelRegistry" "${pi_subagents_fork}/src/agent-runner.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the inherited model registry contract"
+  grep -q "modelRuntime: parentModelRuntime" "${pi_subagents_fork}/src/agent-runner.ts" 2>/dev/null || \
+    pi_subagents_missing="${pi_subagents_missing:+${pi_subagents_missing} and }the inherited provider runtime contract"
   if [ -n "${pi_subagents_missing}" ]; then
     pi_subagents_notify "loaded tree is missing ${pi_subagents_missing} — pi runs without it"
   else
-    echo "install: pi-subagents contracts verified in the loaded tree (terminal status + compaction + nested Task context + scoped cancellation)"
+    echo "install: pi-subagents contracts verified in the live integration tree (terminal status + compaction + nested Task context + scoped cancellation + provider runtime inheritance)"
   fi
 else
   pi_subagents_notify "fork unavailable — pi keeps its current package source and may be missing required fixes or RPC contracts"
 fi
 
-# 3c. Remove only the retired CodexBar CLI footprint carrying Keeper's exact
+# 3d. Remove only the retired CodexBar CLI footprint carrying Keeper's exact
 #     ownership proof. Never touch an app bundle, Homebrew cask, foreign symlink,
 #     non-symlink executable, or unproven data directory.
 retire_keeper_codexbar_cli() {
@@ -258,7 +300,7 @@ retire_keeper_codexbar_cli() {
 retire_keeper_codexbar_cli
 unset -f retire_keeper_codexbar_cli
 
-# 3d. claude-swap CLI: install or update the stable PyPI package through uv.
+# 3e. claude-swap CLI: install or update the stable PyPI package through uv.
 #     Claude launches require a working cswap account. A missing uv or failed
 #     transaction leaves any existing install untouched and keeps non-Claude
 #     Keeper setup available.
@@ -273,7 +315,7 @@ else
   fi
 fi
 
-# 3e. ripgrep: install or update the stable Homebrew formula on every run.
+# 3f. ripgrep: install or update the stable Homebrew formula on every run.
 #     Search tooling remains non-critical: a missing Homebrew or failed formula
 #     transaction leaves any existing rg installation available.
 if ! command -v brew >/dev/null 2>&1; then

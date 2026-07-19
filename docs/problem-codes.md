@@ -143,6 +143,25 @@ CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                                                                                                       | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.                 | Retry; if it persists, confirm the daemon and CLI are the same version.                                                                                                                   | conditional       |
 
+## Pi Codex pool (`keeper agent accounts codex-pool`)
+
+The Codex workflow uses a bounded version-1 JSON result with
+`{schema_version, ok, operation, state, problem_code, proof}`. Read-only status and verdict never create
+routing pressure. Enrollment is the exception: it requires inherited terminal streams and rejects
+`--json`. Every non-active or uncertain state makes native `openai-codex` authoritative.
+
+| code | meaning | recovery | retry-safe |
+| --- | --- | --- | --- |
+| `activation-pending` | No passing live proof has activated the current revision/configuration/opaque alias set. | Complete the separate live proof, stage it with `proof capture`, inspect `proof verdict`, then run `activate`. | yes after new evidence |
+| `companion-missing`, `companion-incompatible` | The repository-owned manifest/source is absent or fails its pinned Pi contract. The launcher omits that `-e` source and reports native fallback. | Re-run the installer from a complete compatible checkout; inspect `accounts check --json` before retrying activation. | yes after repair |
+| `activation-config-invalid`, `activation-binding-stale` | Activation state is malformed or belongs to another code revision, configuration binding, or alias set. | Run `rollback` (or `recover` if a transaction remains), obtain a new bound proof, and activate deliberately. | yes after rollback/new proof |
+| `observation-missing`, `observation-stale`, `pool-unavailable`, `pressure-contended`, `routing-error` | Capacity or the transient launch-pressure ledger cannot supply a healthy initial session route. | Restore the observer/aliases or let the bounded contention clear, then inspect fresh `accounts check --json`; native Codex remains authoritative meanwhile. | yes after fresh evidence |
+| `proof-missing`, `proof-invalid`, `proof-incomplete`, `proof-failed` | The report is absent, malformed/unknown/unsanitized, incomplete/stale/interrupted, or explicitly failed. No activation write occurs. | Preserve the refusal, restore healthy native state, repeat the live proof, and stage the new allowlisted report. | yes with new evidence |
+| `activation-busy` | Another operator owns the host-local activation lock. | Let that operation finish, read `status`, then decide whether another mutation is needed. | conditional; inspect first |
+| `verification-failed` | Explicit `verify` cannot prove the effective active state. | Run `rollback`; inspect companion and Capacity health before obtaining new proof. | conditional; rollback first |
+| `rollback-complete` | Activation reload or immediate verification failed and the transaction restored native mode. | Read `status`; repair the named health failure before a new proof and activation. | yes after repair/new proof |
+| `recovery-required` | Interruption or rollback failure left the private transaction marker. The marker itself forces native mode. | Run `recover`, confirm native `status`, repair storage/permissions if recovery still fails, then collect new proof. | conditional; recover first |
+
 ## Fable focus routing (`keeper agent accounts fable-focus`)
 
 `show --json` is a PII-free read of durable policy and effective routing state. `set` and `clear` return a

@@ -1,9 +1,10 @@
 # plugin composition map — what each launch channel loads
 
-This note maps the Claude Code plugin layer under keeper by launch channel.
+This note maps Claude plugins and Pi launch-scoped extension sources under Keeper.
 Work launches add one compiler-owned worker cell; their `plugin_scan_dirs`
 composition follows the config-gated worker isolation setting. The Claude worker
-cohort is separate from Pi's static prompt-artifact cohort.
+cohort, Pi static prompt-artifact cohort, tracked Pi extension, and Pi Codex companion
+remain separate source islands.
 
 ## The base set
 
@@ -58,6 +59,9 @@ agent` passes it as `--settings` on Claude launches that do not already supply
 | Interactive (human) | configured Claude launcher | configured plugins | — |
 | `keeper agent` manual dispatch / pair | `keeper agent claude …` | configured plugins | — |
 | Autopilot / manual work dispatch | shared work-launch seam | configured plugins; scan results remain with an absent or `off` gate, or are stripped with `strip-scan-dirs` | exact verified cell via additive `--plugin-dir <cell>` |
+| Tracked Pi root / inherited child | configured `keeper agent pi …` | tracked node-only Keeper `-e` source | repository-owned Codex companion as a second explicit `-e` source; Pi children inherit the parent's Provider runtime |
+| Pi metadata or package command | native Pi passthrough | none | none |
+| Standalone Pi | native Pi | Pi's own ambient configuration only | no Keeper companion, marker, aliases, or activation context |
 
 Both work-launch producers — the autopilot reconciler and manual `keeper
 dispatch work::<id>` — use one shared resolution seam. Its precedence is
@@ -109,6 +113,27 @@ byte/mode, hook, signing, and CAS protections
 ([ADR 0050](./adr/0050-wrapped-delegation-guard.md)).
 The required host matrix ([ADR 0036](./adr/0036-required-host-matrix-v2-with-launch-id-entries.md))
 remains the composition input for every worker cell.
+
+## Pi Codex Provider composition
+
+The Codex companion is loaded from `integrations/pi-codex-pool/src/index.ts` only at the configured
+tracked-Pi launch choke point. It is not folded into
+`plugins/keeper/pi-extension/keeper-events.ts`: that extension remains node-only, fail-open, and owns
+tracking/Task/skill surfaces independently. The installer verifies the companion's private package
+manifest, compat-root delegate marker, Pi loader seam, and the live pi-subagents Provider-runtime
+inheritance markers without registering the companion globally.
+
+The launcher overwrites any inherited pool carriers with a sanitized initial context: activation mode,
+opaque alias array, one pressure-reserved opaque initial route candidate for a Codex workload, SHA-256
+configuration binding, and fixed fallback reason. Pending, stale, missing, or
+incompatible state sets native mode. When active, the companion overrides only `openai-codex`; every other
+model keeps its existing Provider. Root and child sessions select independently within the shared runtime,
+and a logical call retries one different alias only before Substantive output. A companion/runtime failure
+warns and delegates to Pi's native Codex credential.
+
+Pi package commands, metadata commands, and standalone Pi never traverse this source-loading branch.
+Interactive enrollment is a distinct inherited-stdio operator command: it loads only the companion so Pi's
+native `/login <opaque-alias>` flow owns OAuth material.
 
 Static plan agents are a separate prompt-artifact surface. Their canonical identities — each
 `plan:<role>` and the named bundles that collect them — live in

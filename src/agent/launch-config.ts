@@ -609,3 +609,75 @@ export function piExtensionArgs(
   const path = piExtensionPath();
   return exists(path) ? ["-e", path] : [];
 }
+
+export const PI_CODEX_POOL_PACKAGE_NAME =
+  "@earendil-works/keeper-pi-codex-pool";
+export const PI_CODEX_POOL_PACKAGE_VERSION = "0.1.0";
+
+export interface PiCodexPoolExtensionResolution {
+  args: string[];
+  health: "ready" | "missing" | "incompatible";
+  problem_code: "companion-missing" | "companion-incompatible" | null;
+}
+
+export function piCodexPoolPackagePath(): string {
+  return resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "integrations",
+    "pi-codex-pool",
+  );
+}
+
+export function resolvePiCodexPoolExtension(
+  packageRoot = piCodexPoolPackagePath(),
+  exists: (path: string) => boolean = existsSync,
+  read: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): PiCodexPoolExtensionResolution {
+  const manifestPath = join(packageRoot, "package.json");
+  const sourcePath = join(packageRoot, "src", "index.ts");
+  if (!exists(manifestPath) || !exists(sourcePath)) {
+    return {
+      args: [],
+      health: "missing",
+      problem_code: "companion-missing",
+    };
+  }
+  try {
+    const manifest = JSON.parse(read(manifestPath)) as Record<string, unknown>;
+    const pi = manifest.pi as { extensions?: unknown } | undefined;
+    const peers = manifest.peerDependencies as
+      | Record<string, unknown>
+      | undefined;
+    const source = read(sourcePath);
+    const compatible =
+      manifest.name === PI_CODEX_POOL_PACKAGE_NAME &&
+      manifest.version === PI_CODEX_POOL_PACKAGE_VERSION &&
+      manifest.private === true &&
+      JSON.stringify(pi?.extensions) === JSON.stringify(["./src/index.ts"]) &&
+      typeof peers?.["@earendil-works/pi-ai"] === "string" &&
+      typeof peers?.["@earendil-works/pi-coding-agent"] === "string" &&
+      source.includes("openAICodexResponsesApi") &&
+      source.includes("KEEPER_PI_CODEX_POOL_MODE") &&
+      source.includes("KEEPER_PI_CODEX_POOL_INITIAL_ALIAS");
+    if (!compatible) {
+      return {
+        args: [],
+        health: "incompatible",
+        problem_code: "companion-incompatible",
+      };
+    }
+    return {
+      args: ["-e", sourcePath],
+      health: "ready",
+      problem_code: null,
+    };
+  } catch {
+    return {
+      args: [],
+      health: "incompatible",
+      problem_code: "companion-incompatible",
+    };
+  }
+}

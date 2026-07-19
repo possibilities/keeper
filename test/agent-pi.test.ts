@@ -11,6 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgsForAgent } from "../src/agent/args";
 import type { PresetCatalog } from "../src/agent/config";
+import {
+  PI_CODEX_POOL_PACKAGE_NAME,
+  PI_CODEX_POOL_PACKAGE_VERSION,
+  resolvePiCodexPoolExtension,
+} from "../src/agent/launch-config";
 import { main } from "../src/agent/main";
 import {
   KEEPER_AGENT_PI_PROMPT_CLI_ENV,
@@ -61,6 +66,54 @@ describe("Pi parse signals", () => {
 
     expect(parseArgsForAgent(["--print", "hello"], "pi").hasPrint).toBe(true);
     expect(parseArgsForAgent(["--mode", "json"], "pi").hasPrint).toBe(true);
+  });
+});
+
+describe("Pi Codex companion contract", () => {
+  test("the repository manifest and source resolve to one explicit extension", () => {
+    const resolved = resolvePiCodexPoolExtension();
+    expect(resolved.health).toBe("ready");
+    expect(resolved.problem_code).toBeNull();
+    expect(resolved.args).toHaveLength(2);
+    expect(resolved.args[0]).toBe("-e");
+    expect(resolved.args[1]).toEndWith(
+      "/integrations/pi-codex-pool/src/index.ts",
+    );
+    expect(PI_CODEX_POOL_PACKAGE_NAME).toBe(
+      "@earendil-works/keeper-pi-codex-pool",
+    );
+    expect(PI_CODEX_POOL_PACKAGE_VERSION).toBe("0.1.0");
+  });
+
+  test("missing and incompatible source contracts return no argv", () => {
+    expect(
+      resolvePiCodexPoolExtension(
+        "/missing",
+        () => false,
+        () => "",
+      ),
+    ).toEqual({
+      args: [],
+      health: "missing",
+      problem_code: "companion-missing",
+    });
+    expect(
+      resolvePiCodexPoolExtension(
+        "/fake",
+        () => true,
+        (path) =>
+          path.endsWith("package.json")
+            ? JSON.stringify({
+                name: PI_CODEX_POOL_PACKAGE_NAME,
+                version: "9.9.9",
+              })
+            : "openAICodexResponsesApi KEEPER_PI_CODEX_POOL_MODE",
+      ),
+    ).toEqual({
+      args: [],
+      health: "incompatible",
+      problem_code: "companion-incompatible",
+    });
   });
 });
 
@@ -138,8 +191,119 @@ describe("Pi command assembly", () => {
     expect(flagValues(cmd, "-e")).toEqual(["/fake/keeper-events.ts"]);
   });
 
-  test("omits -e when the extension resolver fails open to []", async () => {
-    // The harness default resolver returns [] (extension absent / partial checkout).
+  test("loads the tracked extension and Codex companion as separate explicit sources", async () => {
+    const reservations: Array<boolean | undefined> = [];
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog("openai-codex/gpt-5.2-codex", "high"),
+      resolvePiExtensionArgs: () => ["-e", "/fake/keeper-events.ts"],
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: (reserve?: boolean) => {
+        reservations.push(reserve);
+        return {
+          mode: "active",
+          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          config_binding: "b".repeat(64),
+          initial_alias: "keeper-codex-b",
+          problem_code: null,
+        };
+      },
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "-e")).toEqual([
+      "/fake/keeper-events.ts",
+      "/fake/pi-codex-pool.ts",
+    ]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("active");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
+      '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBe(
+      "keeper-codex-b",
+    );
+    expect(reservations).toEqual([true]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBeUndefined();
+  });
+
+  test("missing or incompatible companion stays native with a bounded warning", async () => {
+    for (const unavailable of [
+      {
+        health: "missing" as const,
+        problem_code: "companion-missing" as const,
+      },
+      {
+        health: "incompatible" as const,
+        problem_code: "companion-incompatible" as const,
+      },
+    ]) {
+      const h = piHarness(["--x-no-confirm", "hello"], {
+        resolvePiCodexPoolExtension: () => ({ args: [], ...unavailable }),
+        codexPoolLaunchContext: () => ({
+          mode: "active",
+          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          config_binding: "c".repeat(64),
+          initial_alias: "keeper-codex-a",
+          problem_code: null,
+        }),
+      });
+      const cmd = await runAndCapture(h, main);
+      expect(cmd).not.toContain("/fake/pi-codex-pool.ts");
+      expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+      expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
+      expect(h.err.join("")).toBe(
+        `Warning: [${unavailable.problem_code}] [keeper-codex-pool] pool-unavailable; using native openai-codex\n`,
+      );
+    }
+  });
+
+  test("a non-Codex model loads the scoped source without reserving Codex pressure", async () => {
+    const reservations: Array<boolean | undefined> = [];
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      presetCatalog: piDefaultCatalog("anthropic/claude-sonnet", "high"),
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: (reserve?: boolean) => {
+        reservations.push(reserve);
+        return {
+          mode: "active",
+          aliases: ["keeper-codex-a", "keeper-codex-b"],
+          config_binding: "d".repeat(64),
+          initial_alias: null,
+          problem_code: null,
+        };
+      },
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "--model")).toEqual(["anthropic/claude-sonnet"]);
+    expect(flagValues(cmd, "-e")).toEqual(["/fake/pi-codex-pool.ts"]);
+    expect(reservations).toEqual([false]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS).toBeUndefined();
+  });
+
+  test("activation-pending context loads the companion but keeps native Codex authoritative", async () => {
+    const h = piHarness(["--x-no-confirm", "hello"], {
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+    });
+    const cmd = await runAndCapture(h, main);
+    expect(flagValues(cmd, "-e")).toEqual(["/fake/pi-codex-pool.ts"]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
+      "activation-pending",
+    );
+  });
+
+  test("omits -e when both explicit extension sources are absent", async () => {
     const h = piHarness(["--x-no-confirm", "hello"]);
     const cmd = await runAndCapture(h, main);
     expect(cmd).not.toContain("-e");
@@ -252,6 +416,7 @@ describe("Pi passthrough commands", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "list"]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBeUndefined();
     expect(h.piLaunchOrder).toEqual(["preflight", "state", "spawn"]);
   });
 
@@ -261,6 +426,7 @@ describe("Pi passthrough commands", () => {
     });
     const cmd = await runAndCapture(h, main);
     expect(cmd).toEqual([h.deps.piBin, "--list-models"]);
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBeUndefined();
   });
 
   test("a package-command-shaped --print prompt is not passthrough", async () => {

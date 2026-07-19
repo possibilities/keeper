@@ -1816,7 +1816,7 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
       ].map(nameOnlyVerb),
       {
         name: "accounts",
-        summary: "Inspect account routing and manage durable Fable focus",
+        summary: "Inspect Claude and Codex routing and manage account policy",
         visibility: "public",
         mutates: true,
         requires_daemon: false,
@@ -1831,6 +1831,25 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
             requires_daemon: false,
             requires_tty: false,
             flags: [FLAG_JSON_ALIAS],
+          },
+          {
+            name: "codex-pool",
+            summary:
+              "Enroll aliases and operate proof-gated Codex pool activation",
+            visibility: "public",
+            mutates: true,
+            requires_daemon: false,
+            requires_tty: false,
+            flags: [FLAG_JSON_ALIAS],
+            verbs: [
+              "enroll",
+              "status",
+              "proof",
+              "activate",
+              "verify",
+              "rollback",
+              "recover",
+            ].map(nameOnlyVerb),
           },
           {
             name: "fable-focus",

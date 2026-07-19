@@ -34,6 +34,19 @@ export type Dispatch =
   // Read-only claude-swap account-routing diagnostics.
   | { kind: "accounts-check"; json: boolean }
   | {
+      kind: "accounts-codex-pool";
+      operation:
+        | "enroll"
+        | "status"
+        | "proof-capture"
+        | "proof-verdict"
+        | "activate"
+        | "verify"
+        | "rollback"
+        | "recover";
+      rest: string[];
+    }
+  | {
       kind: "accounts-fable-focus";
       operation: "show" | "set" | "clear";
       rest: string[];
@@ -78,8 +91,14 @@ Usage:
                                     Launch the preset's harness (harnessless).
   keeper agent presets resolve <name>  Emit the resolved preset/panel JSON.
   keeper agent presets list [--json]   List configured presets + panels.
-  keeper agent accounts check [--json] Report claude-swap inventory health + the
-                                    managed route policy would choose (read-only).
+  keeper agent accounts check [--json] Report separate Claude launch-routing and
+                                    Codex session-routing health (read-only).
+  keeper agent accounts codex-pool enroll <opaque-alias>
+  keeper agent accounts codex-pool status|verify|rollback|recover [--json]
+  keeper agent accounts codex-pool proof capture <report> [--json]
+  keeper agent accounts codex-pool proof verdict [report] [--json]
+  keeper agent accounts codex-pool activate [report] [--json]
+                                    Operate the versioned proof-gated Codex pool.
   keeper agent accounts fable-focus show|clear [--json]
   keeper agent accounts fable-focus set <route|cN> <permanent|absolute|current-reset|cycle-end> [deadline] [--expect-reset <UTC>] [--json]
                                     Inspect or atomically replace durable Fable focus.
@@ -438,6 +457,34 @@ export function splitSubcommand(argv: string[]): Dispatch {
         return { kind: "usage", unknown: "accounts check" };
       }
       return { kind: "accounts-check", json: rest.includes("--json") };
+    }
+    if (argv[1] === "codex-pool") {
+      const verb = argv[2];
+      if (
+        verb === "enroll" ||
+        verb === "status" ||
+        verb === "activate" ||
+        verb === "verify" ||
+        verb === "rollback" ||
+        verb === "recover"
+      ) {
+        return {
+          kind: "accounts-codex-pool",
+          operation: verb,
+          rest: argv.slice(3),
+        };
+      }
+      if (
+        verb === "proof" &&
+        (argv[3] === "capture" || argv[3] === "verdict")
+      ) {
+        return {
+          kind: "accounts-codex-pool",
+          operation: argv[3] === "capture" ? "proof-capture" : "proof-verdict",
+          rest: argv.slice(4),
+        };
+      }
+      return { kind: "usage", unknown: "accounts codex-pool" };
     }
     if (argv[1] === "fable-focus") {
       const operation = argv[2];
