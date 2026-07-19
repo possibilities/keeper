@@ -1,0 +1,31 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [
+      "fn-1364-fix-fable-focus-boot-wipe.1"
+    ],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Gnarly debugging with no statically-pinnable hypothesis (root cause is live-DB-state-dependent, requires boot-path instrumentation across branching theories) touching a subtle event-sourcing correctness invariant \u2014 deterministic-replayed projection column mutated outside a fold \u2014 which is a hard opus gate, and the no-clear-hypothesis diagnosis warrants the max ceiling.",
+      "task_id": "fn-1364-fix-fable-focus-boot-wipe.1",
+      "tier": "max"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T03:54:03.305000Z",
+  "epic_id": "fn-1364-fix-fable-focus-boot-wipe",
+  "input_hash": "fdf09c528f7726ac82d69ed2679746a3e9332f611ff89ba9aeacf607c076bcf2",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4260404306,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1364-fix-fable-focus-boot-wipe.1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Gnarly debugging with no statically-pinnable hypothesis (root cause is live-DB-state-dependent, requires boot-path instrumentation across branching theories) touching a subtle event-sourcing correctness invariant \u2014 deterministic-replayed projection column mutated outside a fold \u2014 which is a hard opus gate, and the no-clear-hypothesis diagnosis warrants the max ceiling.\",\"confidence\":0.8}]}\n"
+}
