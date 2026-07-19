@@ -66,6 +66,25 @@ export interface SchemaStep {
   apply: (ctx: MigrationContext) => void;
 }
 
+export const AUTOPILOT_STATE_REBUILD_COPY_LISTS = {
+  adoptionColumnDrop: [
+    "id",
+    "paused",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+    "max_concurrent_jobs",
+    "mode",
+    "max_concurrent_per_root",
+    "worktree_mode",
+    "worktree_multi_repo",
+    "worker_provider",
+    "drift_behind_threshold",
+    "drift_age_threshold_days",
+    "fable_focus",
+  ],
+} as const;
+
 export const SCHEMA_STEPS: readonly SchemaStep[] = [
   {
     version: 2,
@@ -4347,18 +4366,16 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
             "CREATE TABLE autopilot_state_v129_tmp",
           ),
         );
+        const sourceColumnNames = new Set(
+          stateColumns.map((column) => column.name),
+        );
+        const copyColumns =
+          AUTOPILOT_STATE_REBUILD_COPY_LISTS.adoptionColumnDrop
+            .filter((column) => sourceColumnNames.has(column))
+            .join(", ");
         db.run(`
-          INSERT INTO autopilot_state_v129_tmp (
-            id, paused, last_event_id, created_at, updated_at,
-            max_concurrent_jobs, mode, max_concurrent_per_root,
-            worktree_mode, worktree_multi_repo, worker_provider,
-            drift_behind_threshold, drift_age_threshold_days
-          )
-          SELECT
-            id, paused, last_event_id, created_at, updated_at,
-            max_concurrent_jobs, mode, max_concurrent_per_root,
-            worktree_mode, worktree_multi_repo, worker_provider,
-            drift_behind_threshold, drift_age_threshold_days
+          INSERT INTO autopilot_state_v129_tmp (${copyColumns})
+          SELECT ${copyColumns}
           FROM autopilot_state
           ORDER BY rowid
         `);
