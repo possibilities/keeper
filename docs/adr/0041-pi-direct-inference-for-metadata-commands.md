@@ -14,7 +14,7 @@ Keeper's Pi event extension is deliberately fail-open and dependency-light becau
 
 ## Decision
 
-Pi metadata commands invoke inference directly through Pi's runtime model boundary. This decision is Pi-specific; Claude metadata inference uses the separate managed-process boundary in [ADR 0093](./0093-harness-specific-session-rename-inference.md).
+Pi metadata commands invoke inference directly through Pi's runtime model boundary. This decision is Pi-specific; Claude uses its native rename command under [ADR 0096](./0096-harness-native-session-rename-paths.md).
 
 - resolve the fixed model through the command context's model registry;
 - resolve request authentication and provider configuration through Pi so OAuth refresh and account selection retain Pi's semantics;

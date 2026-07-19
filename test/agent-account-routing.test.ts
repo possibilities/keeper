@@ -43,57 +43,6 @@ function managed(slot: number, accountOrdinal?: number): () => RouteResolution {
 }
 
 describe("mandatory Claude account routing", () => {
-  test("metadata inference selects a fresh non-Fable route through cswap", async () => {
-    const routed: Array<[string | null, boolean | null | undefined]> = [];
-    const spawned: string[][] = [];
-    const h = makeHarness({
-      argv: [
-        "claude",
-        "--x-metadata-inference",
-        "User: Improve project search ranking",
-      ],
-      rawArgv: true,
-      selectAccountRoute: (model, fableIntent) => {
-        routed.push([model, fableIntent]);
-        return { ok: true, selection: selection(6) };
-      },
-    });
-    h.deps.metadataInferenceRuntime = {
-      spawn: (argv) => {
-        spawned.push(argv);
-        return {
-          exited: Promise.resolve(0),
-          captureStdout: async () => ({
-            text: JSON.stringify({
-              structured_output: { name: "Project Search Ranking" },
-            }),
-            overflow: false,
-          }),
-          captureStderr: async () => ({ text: "", overflow: false }),
-          terminateTree: () => {},
-        };
-      },
-      setTimeout: () => 1,
-      clearTimeout: () => {},
-      createCancellation: () => ({
-        signal: new AbortController().signal,
-        dispose() {},
-      }),
-    };
-
-    expect(await expectExit(main(h.deps))).toBe(0);
-    expect(routed).toEqual([["haiku", false]]);
-    expect(spawned).toHaveLength(1);
-    expect(spawned[0]?.slice(0, 5)).toEqual([
-      CSWAP,
-      "run",
-      "6",
-      "--share-history",
-      "--",
-    ]);
-    expect(h.spawned).toEqual([]);
-  });
-
   test("every successful launch uses cswap run --share-history", async () => {
     const h = makeHarness({
       argv: ["claude", "hello"],
@@ -792,10 +741,10 @@ describe("keeper agent accounts codex-pool", () => {
         problem_code: null,
       }),
     });
-    const spawn = h.deps.spawn;
+    const delegate = h.deps.spawn;
     h.deps.spawn = (argv, options) => {
       expect(h.err.join("")).toContain(warning);
-      return spawn(argv, options);
+      return delegate(argv, options);
     };
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.spawned).toEqual([

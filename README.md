@@ -5,9 +5,9 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 (`keeperd`) folds it into live projections and serves them over a subscribe/RPC socket.
 
 - **Session tracking** — every prompt, tool call, and file mutation across Claude and
-  Pi sessions lands in one queryable log; managed sessions expose `/rename` through
-  each harness's native title surface, with bare bounded inference, canonical explicit
-  slugs, and title-preserving failure
+  Pi sessions lands in one queryable log; Claude uses its native `/rename`, while Pi's
+  Keeper command provides bounded inference and canonical explicit slugs, and both
+  native title sources feed Keeper's title history and Tmux renamer
 - **Live board** — plan epics/tasks, jobs, and git state served as live-updating
   collections (`keeper status`, `keeper board`, `keeper query`)
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree

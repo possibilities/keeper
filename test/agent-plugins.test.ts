@@ -7,6 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -60,7 +61,7 @@ describe("plugin_dirs (fail-loud)", () => {
     );
     expect(d.args).toEqual(["--plugin-dir", p]);
   });
-  test("the Keeper plugin remains discoverable with its rename skill", () => {
+  test("the Keeper plugin leaves Claude's native rename unshadowed", () => {
     const keeperPlugin = resolve(import.meta.dir, "../plugins/keeper");
     const cwd = join(tmpDir, "bare");
     mkdirSync(cwd, { recursive: true });
@@ -70,9 +71,12 @@ describe("plugin_dirs (fail-loud)", () => {
       "plugins.yaml",
     );
     expect(d.args).toEqual(["--plugin-dir", keeperPlugin]);
-    expect(
-      readFileSync(join(keeperPlugin, "skills/rename/SKILL.md"), "utf8"),
-    ).toContain("\nname: rename\n");
+    expect(existsSync(join(keeperPlugin, "skills/rename/SKILL.md"))).toBe(
+      false,
+    );
+    const hooks = readFileSync(join(keeperPlugin, "hooks/hooks.json"), "utf8");
+    expect(hooks).toContain("/hooks/events-writer.ts");
+    expect(hooks).not.toContain("/hooks/rename.ts");
   });
   test("a missing manifest throws PluginError", () => {
     const p = join(tmpDir, "broken");

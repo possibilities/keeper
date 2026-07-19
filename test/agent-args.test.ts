@@ -95,53 +95,13 @@ describe("parseArgs", () => {
     expect(parsed.launcherAccountError).toBeNull();
   });
 
-  test("internal metadata inference consumes one bounded Claude input", () => {
-    const split = parseArgs([
-      "--x-metadata-inference",
-      "User: Improve project search",
-    ]);
-    expect(split.launcherMetadataInferenceRequested).toBe(true);
-    expect(split.launcherMetadataInferenceInput).toBe(
-      "User: Improve project search",
-    );
-    expect(split.launcherMetadataInferenceError).toBeNull();
-    expect(split.remainingArgs).toEqual([]);
-
-    const joined = parseArgs(["--x-metadata-inference=User: Fix ranking"]);
-    expect(joined.launcherMetadataInferenceInput).toBe("User: Fix ranking");
-    expect(joined.launcherMetadataInferenceError).toBeNull();
-    expect(parseArgs(["hello"]).launcherMetadataInferenceRequested).toBe(false);
-  });
-
-  test("internal metadata inference rejects Pi, missing, NUL, and oversized input", () => {
-    for (const args of [
-      ["--x-metadata-inference"],
-      ["--x-metadata-inference="],
-      ["--x-metadata-inference=  "],
-      ["--x-metadata-inference=a\0b"],
-      [`--x-metadata-inference=${"é".repeat(8_193)}`],
-    ]) {
-      const parsed = parseArgs(args);
-      expect(parsed.launcherMetadataInferenceRequested).toBe(true);
-      expect(parsed.launcherMetadataInferenceInput).toBeNull();
-      expect(parsed.launcherMetadataInferenceError).not.toBeNull();
-    }
-    const duplicate = parseArgs([
-      "--x-metadata-inference=User: one",
-      "--x-metadata-inference=User: two",
-    ]);
-    expect(duplicate.launcherMetadataInferenceInput).toBeNull();
-    expect(duplicate.launcherMetadataInferenceError).toContain("only once");
-
-    const pi = parseArgsForAgent(
-      ["--x-metadata-inference", "User: hello"],
-      "pi",
-    );
-    expect(pi.launcherMetadataInferenceRequested).toBe(true);
-    expect(pi.launcherMetadataInferenceInput).toBeNull();
-    expect(pi.launcherMetadataInferenceError).toContain(
-      "only valid for Claude",
-    );
+  test("retired metadata inference flags pass through to the harness", () => {
+    expect(
+      parseArgs(["--x-metadata-inference", "title input"]).remainingArgs,
+    ).toEqual(["--x-metadata-inference", "title input"]);
+    expect(
+      parseArgs(["--x-metadata-inference=title input"]).remainingArgs,
+    ).toEqual(["--x-metadata-inference=title input"]);
   });
 
   test("Fable intent lineage carrier is consumed only for Claude", () => {

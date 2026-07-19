@@ -381,19 +381,21 @@ names the exact identities maintenance continues to reconcile; operator action i
 persistent fail-closed control diagnosis. The canonical test commands and budget policy are in
 [docs/testing.md](./testing.md).
 
-Every keeper-launched Claude or Pi session gets `/rename` on managed launch. Bare `/rename`
-derives a short Session title from the active branch's bounded, compaction-aware conversation
-context, gives extra weight to human requests, and safely expands eligible project-file references.
-A canonical lowercase slug sets the title directly (`/rename project-search-ranking`); any other
-argument, including an `@path`, leaves the existing title unchanged. Empty context, cancellation,
-stale Session state, unavailable auth/model/routing, timeout, or malformed output likewise fails
-open with content-free feedback.
+Claude sessions use Claude Code's built-in `/rename`, including its native bare-title inference
+and explicit-name syntax. Keeper does not shadow that command or launch a second Claude process for
+naming.
 
-Pi performs its fixed cheap inference through its own OAuth-aware host API and commits with
-`setSessionName()`. Claude uses the managed Account route for one non-persistent Haiku metadata
-process and commits through the `UserPromptSubmit` hook's native `sessionTitle`. Either native title
-reaches Keeper's title projection and the tmux renamer asynchronously through the existing
-`TranscriptTitle` event, never a direct database or tmux write.
+Keeper-launched Pi sessions load Keeper's custom `/rename`. Bare `/rename` derives a short Session
+title from bounded, compaction-aware conversation context, gives extra weight to human requests,
+and safely expands eligible project-file references. A canonical lowercase slug sets the title
+directly (`/rename project-search-ranking`); any other argument, including an `@path`, leaves the
+existing title unchanged. Empty context, cancellation, stale Session state, unavailable auth or
+model, timeout, or malformed output likewise fails open with content-free feedback. Pi performs its
+fixed cheap inference through its OAuth-aware host API and commits with `setSessionName()`.
+
+Claude's native `custom-title` records and Pi's `session_info_changed` title bridge feed Keeper's
+`TranscriptTitle` events, title projection, and Tmux renamer asynchronously, never a direct database
+or Tmux write.
 
 ## Host worker matrix (required)
 
