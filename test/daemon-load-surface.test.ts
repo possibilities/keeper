@@ -53,6 +53,7 @@ describe("daemon load-surface boundary", () => {
     // presence proves worker-edge discovery actually fired, not just that the
     // count is positive.
     expect(rels).toContain("src/bus-worker.ts");
+    expect(rels).toContain("src/codex-account-observer-worker.ts");
   });
 
   test("worker-spawn edges are discovered (count positive)", () => {
@@ -61,6 +62,9 @@ describe("daemon load-surface boundary", () => {
     // spawn block would silently drop most of them.
     expect(closure.workerEdges).toContain("src/bus-worker.ts");
     expect(closure.workerEdges).toContain("src/autopilot-worker.ts");
+    expect(closure.workerEdges).toContain(
+      "src/codex-account-observer-worker.ts",
+    );
   });
 
   test("attribute-import edges are parsed by the walker (synthetic)", () => {
@@ -140,6 +144,7 @@ describe("daemon-fingerprint seam (pure core)", () => {
   test("the committed manifest is non-empty and parses", () => {
     expect(roots.length).toBeGreaterThan(0);
     expect(roots).toContain("src");
+    expect(roots).toContain("src/codex-account-observer-worker.ts");
     expect(roots).toContain("plugins/plan/src");
   });
 

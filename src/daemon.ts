@@ -37,6 +37,7 @@ import type { AccountObserverWorkerData } from "./account-observer-worker";
 import {
   fableFocusPolicyPath,
   resolveAccountRoutingRoot,
+  resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
 import type {
   AutocloseWorkerData,
@@ -108,6 +109,7 @@ import {
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
+import type { CodexAccountObserverWorkerData } from "./codex-account-observer-worker";
 import {
   type HarnessProcess,
   type HarnessProcessObservation,
@@ -8184,6 +8186,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // handle exposes it for `waitForDaemon`.
   const sockPath = resolveSockPath();
   const accountRoutingRoot = resolveAccountRoutingRoot();
+  const codexAccountRoutingRoot = resolveCodexAccountRoutingRoot();
 
   const dbPath = resolveDbPath();
   // 256MB page cache on the writer connection: folds run here under the write
@@ -10997,6 +11000,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (accountObserverWorker)`
+
+  const codexAccountObserverWorker = want("accountObserver")
+    ? new Worker(
+        new URL("./codex-account-observer-worker.ts", import.meta.url).href,
+        {
+          workerData: {
+            stateDir: codexAccountRoutingRoot,
+          } satisfies CodexAccountObserverWorkerData,
+        } as WorkerOptions & { workerData: unknown },
+      )
+    : null;
+
+  if (codexAccountObserverWorker) {
+    const cow = codexAccountObserverWorker;
+    cow.onerror = (err: ErrorEvent): void => {
+      console.error(
+        "[keeperd] codex-account-observer worker error:",
+        err.message ?? err,
+      );
+      if (!shuttingDown) fatalExit();
+    };
+    cow.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
 
   // Watches the dead-letters dir and posts a contentless
   // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
@@ -15992,6 +16020,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       statuslineWorker,
       buildsWorker,
       accountObserverWorker,
+      codexAccountObserverWorker,
       deadLetterWorker,
       eventsIngestWorker,
       birthIngestWorker,
