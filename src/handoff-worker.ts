@@ -301,12 +301,11 @@ export async function dispatchOneHandoff(
   const spec: LaunchSpec = {
     prompt: deps.buildPrompt(row.doc, capture),
     claudeName: `handoff::${row.handoff_id}`,
-    // Handoff historically ignores a dispatch-table harness pin (only its
-    // model/effort flow onto the default Claude launch). Preserve that exact
-    // non-capture surface; capture is the new autonomous result contract that
-    // can honor a resolved launch triple's harness.
-    ...(capture && handoffLaunch.harness !== undefined
+    ...(handoffLaunch.harness !== undefined
       ? { harness: handoffLaunch.harness }
+      : {}),
+    ...(handoffLaunch.preset !== undefined
+      ? { preset: handoffLaunch.preset }
       : {}),
     ...(handoffLaunch.model !== undefined
       ? { model: handoffLaunch.model }
@@ -406,14 +405,13 @@ export function buildHandoffPrompt(
 export function resolveHandoffLaunchConfig(
   row: Pick<HandoffDispatchRow, "preset" | "model" | "effort">,
   dispatchConfig: { harness?: string; model?: string; effort?: string },
-): { harness?: string; model?: string; effort?: string } {
+): { harness?: string; preset?: string; model?: string; effort?: string } {
   if (row.preset != null && row.preset !== "") {
     const parsed = parseTriple(row.preset);
     if (parsed.ok) {
       return {
         harness: parsed.triple.harness,
-        model: parsed.triple.model,
-        effort: parsed.triple.effort,
+        preset: row.preset,
       };
     }
   }

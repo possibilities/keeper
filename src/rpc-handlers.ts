@@ -626,7 +626,8 @@ export interface RequestHandoffParams {
   initiator_pane: string | null;
   /** Whether the handoff worker must produce a terminal answer envelope. */
   capture: boolean;
-  /** Optional explicit launch-cell override. Both fields are present together. */
+  /** Optional explicit launch-cell override. Both fields are present together;
+   *  launch selection is independent from capture. */
   model: string | null;
   effort: string | null;
   /** Optional raw launch triple, mutually exclusive with model/effort. */
@@ -709,11 +710,6 @@ function validateRequestHandoffParams(params: unknown): RequestHandoffParams {
         `request_handoff: \`${field}\` must be non-empty when present`,
       );
     }
-  }
-  if (!capture && (model !== null || effort !== null || preset !== null)) {
-    throw new BadParamsError(
-      "request_handoff: `model`, `effort`, and `preset` require `capture: true`",
-    );
   }
   if (preset !== null && (model !== null || effort !== null)) {
     throw new BadParamsError(

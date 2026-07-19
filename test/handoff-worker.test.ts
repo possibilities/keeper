@@ -274,7 +274,7 @@ test("dispatchOneHandoff carries the dispatch.handoff pin's model/effort onto th
   expect(rec.launches[0]?.spec.effort).toBe("high");
 });
 
-test("a capture row launches with its requested triple, autonomous prompt, and envelope carrier", async () => {
+test("a captured row launches with its raw triple, autonomous prompt, and envelope carrier", async () => {
   const { deps, rec } = makeDeps({
     buildPrompt: (doc, capture) =>
       capture ? `AUTONOMOUS ${doc}` : `PARK ${doc}`,
@@ -304,19 +304,65 @@ test("a capture row launches with its requested triple, autonomous prompt, and e
         prompt: "AUTONOMOUS brief",
         claudeName: "handoff::h-capture",
         harness: "pi",
-        model: "gpt-5.4",
-        effort: "high",
+        preset: "pi::gpt-5.4::high",
         handoffEnvelope: "/durable/handoffs/h-capture.json",
       },
     },
   ]);
 });
 
-test("a non-capture row's complete launch spec remains byte-identical", async () => {
+test("an ordinary Pi Launch triple reaches the launcher intact without creating an envelope", async () => {
   const { deps, rec } = makeDeps({
-    buildPrompt: (doc, capture) => `${capture ? "UNEXPECTED" : "/hack"} ${doc}`,
-    // The legacy dispatch path used model/effort but deliberately ignored a
-    // harness pin; capture must not alter that default surface.
+    resolveDispatchConfig: () => ({
+      harness: "claude",
+      model: "fallback",
+      effort: "low",
+    }),
+  });
+  await dispatchOneHandoff(
+    row({
+      handoff_id: "h-ordinary-pi",
+      capture: 0,
+      preset: "pi::gpt-5.4::high",
+    }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.spec).toEqual({
+    prompt: "/hack brief",
+    claudeName: "handoff::h-ordinary-pi",
+    harness: "pi",
+    preset: "pi::gpt-5.4::high",
+  });
+  expect(rec.launches[0]?.spec.handoffEnvelope).toBeUndefined();
+});
+
+test("an explicit model/effort pair overrides the cell but retains the dispatch.handoff harness", async () => {
+  const { deps, rec } = makeDeps({
+    resolveDispatchConfig: () => ({
+      harness: "pi",
+      model: "fallback",
+      effort: "low",
+    }),
+  });
+  await dispatchOneHandoff(
+    row({ handoff_id: "h-pair", model: "gpt-5.4", effort: "max" }),
+    "/repo",
+    noAbort,
+    deps,
+  );
+  expect(rec.launches[0]?.spec).toEqual({
+    prompt: "/hack brief",
+    claudeName: "handoff::h-pair",
+    harness: "pi",
+    model: "gpt-5.4",
+    effort: "max",
+  });
+});
+
+test("an ordinary row preserves the configured dispatch.handoff harness and cell", async () => {
+  const { deps, rec } = makeDeps({
     resolveDispatchConfig: () => ({
       harness: "pi",
       model: "sonnet",
@@ -336,6 +382,7 @@ test("a non-capture row's complete launch spec remains byte-identical", async ()
       spec: {
         prompt: "/hack brief",
         claudeName: "handoff::h-plain",
+        harness: "pi",
         model: "sonnet",
         effort: "high",
       },
@@ -351,6 +398,12 @@ test("resolveHandoffLaunchConfig falls back safely for malformed or partial row 
       dispatch,
     ),
   ).toEqual(dispatch);
+  expect(
+    resolveHandoffLaunchConfig(
+      { preset: "pi::gpt-5.4::high", model: null, effort: null },
+      dispatch,
+    ),
+  ).toEqual({ harness: "pi", preset: "pi::gpt-5.4::high" });
   expect(
     resolveHandoffLaunchConfig(
       { preset: null, model: "opus", effort: null },

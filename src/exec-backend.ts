@@ -117,6 +117,11 @@ export interface LaunchSpec {
   /** `--name <claudeName>` plus the matching tmux window name (the
    *  reap/classify correlation key and inspectable launch identity). Omitted when absent. */
   readonly claudeName?: string;
+  /** Raw Launch triple (`<harness>::<model>::<effort>`), forwarded as
+   *  `--x-preset <triple>` so the launcher owns model/effort resolution.
+   *  The producer also supplies the triple's harness through {@link harness}.
+   *  Omitted when explicit model/effort or configured defaults select launch. */
+  readonly preset?: string;
   /** `--model <m>`. Omitted when absent. */
   readonly model?: string;
   /** `--effort <e>`. Omitted when absent. */
@@ -1202,6 +1207,10 @@ export interface KeeperAgentLaunchOpts {
   /** Matching tmux window name plus harness-native `--name <claudeName>`.
    *  Omitted when absent. */
   readonly claudeName?: string;
+  /** Raw Launch triple forwarded as `--x-preset <triple>`. The selected
+   *  {@link harness} must match the triple's harness; the launcher validates the
+   *  pair and owns model/effort resolution. */
+  readonly preset?: string;
   /** `--model <m>`. Omitted when absent. */
   readonly model?: string;
   /** `--effort <e>`. Omitted when absent. */
@@ -1280,8 +1289,8 @@ export interface KeeperAgentLaunchOpts {
  * folded launcher owns the tmux window, so keeper delegates session-create +
  * handoff to it:
  *
- *   `<bun> <abs cli/keeper.ts> agent claude --x-tmux
- *     --x-tmux-detached --x-tmux-session <session>
+ *   `<bun> <abs cli/keeper.ts> agent <harness> --x-tmux
+ *     --x-tmux-detached [--x-preset <triple>] --x-tmux-session <session>
  *     [--x-tmux-window-name <claudeName>]
  *     --x-tmux-env KEEPER_TMUX_SESSION=<session>
  *     --x-tmux-env KEEPER_PLAN_WORKTREE=<lane>
@@ -1376,6 +1385,9 @@ export function buildKeeperAgentLaunchArgv(
     harness,
     "--x-tmux",
     "--x-tmux-detached",
+    ...(opts.preset !== undefined && opts.preset !== ""
+      ? ["--x-preset", opts.preset]
+      : []),
     "--x-tmux-session",
     opts.session,
     ...(opts.claudeName !== undefined && opts.claudeName !== ""
@@ -1658,6 +1670,7 @@ export async function keeperAgentLaunch(
       ...(deps.spec.claudeName !== undefined
         ? { claudeName: deps.spec.claudeName }
         : {}),
+      ...(deps.spec.preset !== undefined ? { preset: deps.spec.preset } : {}),
       ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
       ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
       ...(deps.spec.pluginDir !== undefined
