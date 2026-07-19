@@ -10297,6 +10297,122 @@ test("base refresh producer: a live claim defers visibly before the driver can m
   ]);
 });
 
+test("lane maintenance hold attributes every cycle pass and prevents provision/finalize mutation", async () => {
+  const taskId = "fn-1-foo.1";
+  const baseLane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const liveWorker = makeJob({
+    job_id: "live-lane-worker",
+    plan_verb: "work",
+    plan_ref: taskId,
+    cwd: baseLane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[liveWorker.job_id, liveWorker]]),
+    new Map(),
+    new Set(),
+  );
+  const { driver: activeDriver, log: activeLog } = makeFakeWorktreeDriver();
+  const { deps: activeDeps } = makeFakeDeps({ worktree: activeDriver });
+  const activeEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: taskId })],
+  });
+  const activeDecision = reconcile(
+    makeSnapshot({
+      epics: [activeEpic],
+      worktreeMode: true,
+      baseDriftEntries: [
+        {
+          epic_id: "fn-1-foo",
+          repo_dir: "/repo",
+          behind_count: 20,
+          merge_base_age_seconds: 90_000,
+        },
+      ],
+    }),
+    makeState(),
+    0,
+  );
+
+  const { driver: closeDriver, log: closeLog } = makeFakeWorktreeDriver();
+  const { deps: closeDeps } = makeFakeDeps({ worktree: closeDriver });
+  const doneEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const closeDecision = reconcile(
+    multiRepoSnap([doneEpic], abResolve),
+    makeState(),
+    0,
+  );
+
+  const lines: string[] = [];
+  const originalError = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    await runReconcileCycle(
+      activeDecision,
+      makeState(),
+      new Map(),
+      "/bin/zsh",
+      new AbortController().signal,
+      activeDeps,
+      new Map(),
+      undefined,
+      probe,
+    );
+    await runReconcileCycle(
+      closeDecision,
+      makeState(),
+      new Map(),
+      "/bin/zsh",
+      new AbortController().signal,
+      closeDeps,
+      new Map(),
+      undefined,
+      probe,
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(activeLog.calls).toEqual([]);
+  expect(closeLog.calls).toEqual([]);
+  expect(lines).toHaveLength(4);
+  expect(lines[0]).toContain(
+    "worktree-base-refresh-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[1]).toContain(
+    "worktree-provision-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[2]).toContain(
+    "worktree-sink-provision-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[3]).toContain(
+    "worktree-finalize-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines.every((line) => line.length <= 531)).toBe(true);
+});
+
 test("base refresh producer: conflict uses the existing bare close merge-conflict row and suppresses same-cycle lane launch", async () => {
   const reason =
     "worktree-merge-conflict: merging main into keeper/epic/fn-1-foo — CONFLICT";

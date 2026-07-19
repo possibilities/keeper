@@ -59,8 +59,8 @@ hand_tuned: |
   Claude/opus gates, apply the Spark burn preference: `gpt-5.3-codex-spark` has
   independent, non-conserved quota. When its capability guidance says it can
   reliably complete the task, choose it ahead of every other model that could
-  also complete the task. This ranks models after the capability gate; it never
-  widens that gate. Otherwise continue normal best-fit routing. Anti-anchor
+  also complete the task. This ranks models after the capability gate; it never widens
+  that gate. Otherwise continue normal best-fit routing. Anti-anchor
   clause: spec length and difficulty adjectives are not difficulty — a short spec
   can be intelligence-bound and a long spec mechanical. Model and effort are
   independent axes: cranking a cheaper tier's effort is not a substitute for a
