@@ -5309,6 +5309,7 @@ function autopilotConfigSetEvent(
     worker_provider?: "claude" | "gpt" | "codex" | null;
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
+    fable_focus?: unknown;
   },
   sessionId = "autopilot",
 ): number {
@@ -5334,6 +5335,7 @@ function getAutopilotStateConfig() {
     worker_provider: string | null;
     drift_behind_threshold: number | null;
     drift_age_threshold_days: number | null;
+    fable_focus: string | null;
   } | null;
 }
 
@@ -5435,6 +5437,56 @@ test("AutopilotConfigSet malformed/empty/non-positive payloads behave like the c
     autopilotConfigSetEvent({ max_concurrent_jobs: 6 });
     drainAll();
   }
+});
+
+test("AutopilotConfigSet atomically sets, preserves, clears, and re-folds Fable focus", () => {
+  const firstId = autopilotConfigSetEvent({
+    fable_focus: {
+      target_route: "claude-swap:2",
+      lifetime: { kind: "permanent" },
+    },
+  });
+  drainAll();
+  expect(
+    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
+  ).toMatchObject({
+    schema_version: 1,
+    policy_id: `event:${firstId}`,
+    target_route: "claude-swap:2",
+    fable_intent: true,
+    lifetime: { kind: "permanent" },
+  });
+
+  // An unrelated patch and a malformed structured field preserve the whole cell;
+  // the malformed event still advances the global cursor.
+  autopilotConfigSetEvent({ max_concurrent_jobs: 9 });
+  const malformedId = autopilotConfigSetEvent({
+    fable_focus: {
+      target_route: "person@example.com",
+      lifetime: { kind: "permanent" },
+    },
+  });
+  drainAll();
+  expect(getCursor()).toBe(malformedId);
+  expect(
+    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
+  ).toMatchObject({
+    policy_id: `event:${firstId}`,
+    target_route: "claude-swap:2",
+  });
+  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+
+  autopilotConfigSetEvent({ fable_focus: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.fable_focus).toBeNull();
+
+  const before = db.query("SELECT * FROM autopilot_state ORDER BY id").all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  expect(db.query("SELECT * FROM autopilot_state ORDER BY id").all()).toEqual(
+    before,
+  );
 });
 
 test("from-scratch re-fold reproduces autopilot_state byte-identically with mixed paused/mode/config events (fn-953)", () => {

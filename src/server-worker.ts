@@ -66,6 +66,7 @@ import {
   resolveSockPath,
 } from "./db";
 import type { RetryDispatchVerb } from "./dispatch-command";
+import type { NormalizedFableFocusInput } from "./fable-focus";
 import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
 import { NotadbTolerance } from "./notadb-tolerance";
@@ -298,6 +299,11 @@ export interface SetAutopilotConfigRequestMessage {
     max_concurrent_jobs?: number | null;
     max_concurrent_per_root?: number | null;
     worktree_mode?: boolean;
+    worktree_multi_repo?: boolean;
+    worker_provider?: "claude" | "gpt" | null;
+    drift_behind_threshold?: number | null;
+    drift_age_threshold_days?: number | null;
+    fable_focus?: NormalizedFableFocusInput | null;
   };
 }
 
@@ -4034,6 +4040,11 @@ function main(): void {
       max_concurrent_jobs?: number | null;
       max_concurrent_per_root?: number | null;
       worktree_mode?: boolean;
+      worktree_multi_repo?: boolean;
+      worker_provider?: "claude" | "gpt" | null;
+      drift_behind_threshold?: number | null;
+      drift_age_threshold_days?: number | null;
+      fable_focus?: NormalizedFableFocusInput | null;
     }): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();

@@ -32,6 +32,11 @@ import {
   SHARED_DIRTY_DISTRESS_VERB,
 } from "./dispatch-failure-key";
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
+import {
+  materializeFableFocusPolicy,
+  normalizeFableFocusInput,
+  serializeFableFocusPolicy,
+} from "./fable-focus";
 import { allGatedRootsSeeded } from "./gated-roots";
 import {
   ATTRIBUTION_FLOOR_PATH,
@@ -6785,6 +6790,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   worker_provider: "worker_provider",
   drift_behind_threshold: "drift_behind_threshold",
   drift_age_threshold_days: "drift_age_threshold_days",
+  fable_focus: "fable_focus",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -6845,6 +6851,9 @@ interface AutopilotConfigSetPayload {
    *  it. Both drift thresholds resolving `null` is the OFF default: `.2`'s
    *  drift probe and `.4`'s refresh pass both stay inert. */
   drift_age_threshold_days?: number | null;
+  /** Canonical policy JSON, or NULL for an idempotent clear. The whole policy
+   *  occupies one cell so a fold can never expose a partial target/lifetime. */
+  fable_focus?: string | null;
 }
 
 /**
@@ -6940,6 +6949,22 @@ function extractAutopilotConfigSetPayload(
         typeof raw === "number" && Number.isInteger(raw) && raw > 0
           ? raw
           : null;
+    }
+    if ("fable_focus" in parsed) {
+      const raw = parsed.fable_focus;
+      if (raw === null) {
+        patch.fable_focus = null;
+      } else {
+        const input = normalizeFableFocusInput(raw);
+        const policy =
+          input === null
+            ? null
+            : materializeFableFocusPolicy(input, event.id, event.ts);
+        // Malformed structured policies are a no-op, never a partial clear.
+        if (policy !== null) {
+          patch.fable_focus = serializeFableFocusPolicy(policy);
+        }
+      }
     }
     // An empty patch (no recognized field) folds to a safe no-op.
     return Object.keys(patch).length === 0 ? null : patch;

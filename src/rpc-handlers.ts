@@ -42,6 +42,10 @@ import {
   parseDispatchKey as parseDispatchKeyResult,
   type RetryDispatchVerb,
 } from "./dispatch-command";
+import {
+  type NormalizedFableFocusInput,
+  normalizeFableFocusInput,
+} from "./fable-focus";
 import { validateHandoffSlug } from "./handoff-slug";
 import {
   DURABLE_AWAIT_CONDITION_KINDS,
@@ -368,6 +372,8 @@ export interface SetAutopilotConfigParams {
    *  integer, or `null` to disable that axis (the byte-identical default).
    *  Both drift thresholds `null` is the base-freshness gate's OFF state. */
   drift_age_threshold_days?: number | null;
+  /** Atomic Fable-focus replacement, or null for an idempotent clear. */
+  fable_focus?: NormalizedFableFocusInput | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch.
@@ -400,6 +406,7 @@ function validateSetAutopilotConfigParams(
     "worker_provider",
     "drift_behind_threshold",
     "drift_age_threshold_days",
+    "fable_focus",
   ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
@@ -503,6 +510,19 @@ function validateSetAutopilotConfigParams(
       throw new BadParamsError(
         `set_autopilot_config: \`drift_age_threshold_days\` must be a positive integer or null (got ${JSON.stringify(raw)})`,
       );
+    }
+  }
+  if ("fable_focus" in obj) {
+    if (obj.fable_focus === null) {
+      patch.fable_focus = null;
+    } else {
+      const focus = normalizeFableFocusInput(obj.fable_focus);
+      if (focus === null) {
+        throw new BadParamsError(
+          "set_autopilot_config: `fable_focus` must be null or a PII-free managed route with a valid tagged lifetime",
+        );
+      }
+      patch.fable_focus = focus;
     }
   }
   // An empty patch is a no-op request — reject so a caller gets a clear signal

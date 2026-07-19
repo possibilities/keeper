@@ -77,6 +77,11 @@ export function observationSidecarPath(root: string): string {
   return join(root, "observation.json");
 }
 
+/** Durable-Projection delivery leaf consumed by the SQLite-free launcher. */
+export function fableFocusPolicyPath(root: string): string {
+  return join(root, "fable-focus-policy.json");
+}
+
 export function ledgerPath(root: string): string {
   return join(root, "reservations.json");
 }

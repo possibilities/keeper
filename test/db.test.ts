@@ -332,7 +332,7 @@ test("openDb adds the six nullable v100 session-telemetry columns to jobs (fn-10
   db.close();
 });
 
-test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v109 harness/resume_target + v110 adopted + v113 last_lifecycle_ts + v114 escalation_instance + v119 account_route are the byte-identical tail on fresh vs migrated jobs (fn-1024 task .1, fn-1075 task .2, fn-1107 task .1, fn-1103 task .3, fn-1131 task .1, fn-1164 task .1, fn-1171 task .2, fn-1239 task .3)", () => {
+test("migration-only jobs columns, including Fable intent, have byte-identical fresh and upgrade order", () => {
   // Kept OUT of the `CREATE_JOBS` literal and appended as the LAST
   // `addColumnIfMissing` calls in `migrate()`, so these columns land as the
   // trailing columns of `table_info(jobs)`, in the same order, on both the fresh
@@ -357,6 +357,7 @@ test("the v100 telemetry columns + v103 kill_reason + v108 dispatch_origin + v10
     "last_lifecycle_ts",
     "escalation_instance",
     "account_route",
+    "fable_intent",
   ];
   const tailOf = (database: Database): string[] => {
     const names = (
@@ -796,6 +797,39 @@ test("openDb adds nullable adopted to BOTH events and jobs (fn-1131 task .1)", (
   db.close();
 });
 
+test("Fable focus schema defaults are nullable on fresh and upgraded projections", () => {
+  const { db } = openDb(":memory:");
+  const state = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    type: string;
+    dflt_value: string | null;
+  }[];
+  expect(state.find((column) => column.name === "fable_focus")).toEqual(
+    expect.objectContaining({ type: "TEXT", dflt_value: null }),
+  );
+  const jobs = db.prepare("PRAGMA table_info(jobs)").all() as {
+    name: string;
+    type: string;
+    dflt_value: string | null;
+  }[];
+  expect(jobs.find((column) => column.name === "fable_intent")).toEqual(
+    expect.objectContaining({ type: "INTEGER", dflt_value: null }),
+  );
+  db.run(
+    "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at) VALUES ('legacy', 1, 0, 1)",
+  );
+  expect(
+    (
+      db
+        .prepare("SELECT fable_intent FROM jobs WHERE job_id = 'legacy'")
+        .get() as {
+        fable_intent: number | null;
+      }
+    ).fable_intent,
+  ).toBeNull();
+  db.close();
+});
+
 test("autopilot_state adoption-column drop preserves every surviving value and fresh-schema order", () => {
   const seeded = openDb(dbPath);
   seeded.db.run(
@@ -816,6 +850,7 @@ test("autopilot_state adoption-column drop preserves every surviving value and f
     worker_provider: "gpt",
     drift_behind_threshold: 23,
     drift_age_threshold_days: 11,
+    fable_focus: null,
   };
   seeded.db
     .prepare(`
@@ -3287,7 +3322,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // pace-free fold-work rate the full-replay projection derives from) — an
   // additive ALTER on that operational singleton, not a touch of the epics
   // SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(135);
+  expect(SCHEMA_VERSION).toBe(136);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

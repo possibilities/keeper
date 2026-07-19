@@ -193,6 +193,8 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
     // derives from `config_dir` or email. Display-only — never a `sortable` /
     // `filters` / `jsonColumns` key.
     "account_route",
+    // Nullable 0/1 process-lineage routing purpose. Distinct from account_route.
+    "fable_intent",
     // `dispatch_origin`: the keeper-DISPATCH provenance discriminator —
     // `'autopilot'` for an autopilot work/close worker, `'escalation'` for an
     // unblock/deconflict/resolve/repair session, NULL for a manual/adopted/
@@ -695,6 +697,8 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // docs/adr/0047), served so `keeper query autopilot_state` reflects the
     // real durable pin. NOT a jsonColumn — decoding a scalar as JSON corrupts it.
     "worker_provider",
+    // Atomic canonical Fable-focus policy JSON; NULL means policy off.
+    "fable_focus",
   ],
   pk: "id",
   version: "last_event_id",
@@ -703,7 +707,7 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
   filters: {
     id: "id",
   },
-  jsonColumns: new Set(),
+  jsonColumns: new Set(["fable_focus"]),
 };
 
 /**

@@ -1,5 +1,53 @@
 /** Shared types for the keeper reducer + hook. */
 
+/** Stable, PII-free managed Claude route accepted by Fable focus. */
+export type ManagedAccountRouteId = `claude-swap:${number}`;
+
+/** Operator input accepted by the generic config mutation. */
+export interface FableFocusInput {
+  target_route: ManagedAccountRouteId;
+  lifetime:
+    | { kind: "permanent" }
+    | { kind: "absolute"; deadline_at: string }
+    | { kind: "current-reset"; reset_at: string }
+    | { kind: "cycle-end"; reset_at: string };
+}
+
+/** Canonical durable Fable-focus policy stored in the Projection and launch leaf. */
+export interface FableFocusPolicy {
+  schema_version: 1;
+  policy_id: string;
+  target_route: ManagedAccountRouteId;
+  /** Routing-purpose metadata; independent from per-process launch attribution. */
+  fable_intent: true;
+  set_at: string;
+  lifetime:
+    | { kind: "permanent" }
+    | { kind: "absolute"; deadline_at: string }
+    | { kind: "cycle-end"; reset_at: string };
+}
+
+export type FableFocusEffectiveState =
+  | "off"
+  | "active"
+  | "expired"
+  | "completed"
+  | "invalid"
+  | "unavailable";
+
+export interface FableFocusStatus {
+  state: FableFocusEffectiveState;
+  policy: FableFocusPolicy | null;
+  diagnostic:
+    | "none"
+    | "policy-invalid"
+    | "delivery-missing"
+    | "delivery-malformed"
+    | "delivery-unsupported"
+    | "delivery-insecure"
+    | "delivery-unreachable";
+}
+
 /**
  * One entry in {@link Job.epic_links} — a per-job cross-reference to an epic
  * the job's plan footprint touched inside a `/plan:plan` window. `kind`:
@@ -629,13 +677,11 @@ export interface Job {
    * surfaces render as not-resumable for a non-claude harness.
    */
   resume_target: string | null;
-  // NOTE: the migration-only jobs columns `kill_reason` (v103) and
-  // `account_route` (v119, the PII-free per-launch account route folded from
-  // {@link Event.account_route}) are DELIBERATELY absent here — this interface
-  // mirrors only the fields Job-typed reads consume today. Both ride the row and
-  // are read ad-hoc (a scoped SELECT / the raw JOBS_DESCRIPTOR wire) by the
-  // folds / producers / query surfaces that own them; a later typed read surface
-  // adds one when needed.
+  // NOTE: the migration-only jobs columns `kill_reason` (v103),
+  // `account_route` (v119), and `fable_intent` are DELIBERATELY absent here —
+  // this interface mirrors only fields Job-typed reads consume today. They ride
+  // the row and are read ad-hoc by the folds/producers/query surfaces that own
+  // them; a later typed read surface adds one when needed.
 }
 
 /**
