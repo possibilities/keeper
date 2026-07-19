@@ -88,7 +88,10 @@ read-path notification above.
 
 The send returns an immediate, honest result and sets the exit code:
 
-- **`delivered`** — prints `delivered to <target>`, exit 0. Delivered live.
+- **`delivered`** — prints `delivered to <target>`, exit 0. The recipient socket
+  accepted the live message. When a valid pre-fanout Harness activity snapshot is
+  available, the line adds `recipient activity at send time: active`, `quiescent`,
+  or `unknown` plus conservative timing guidance.
 - **`queued_for_wake`** — a `planner@<epic_id>` send whose creator is known but
   OFFLINE: the escalation is durably persisted and replayed when that creator
   resubscribes. Exit 0 (a success, NOT a miss). To resume the offline creator
@@ -110,6 +113,14 @@ A miss (`not_connected` / `unknown_target` / `ambiguous_target` /
 If a send fails, handle it (re-send, pick another target, or surface it); do
 not assume it landed. `delivered` and `queued_for_wake` are the two exit-0
 successes.
+
+The activity suffix is one observation sampled immediately before fanout from
+canonical Harness state. `active` warns that a reply may already be in progress
+and may not include the new message; `quiescent` is not an availability promise;
+`unknown` preserves inconclusive evidence. Absence means no valid snapshot was
+available. None of these values proves that the recipient read or is processing
+the message. The Bus sends no later lifecycle-derived receipt, so wait for an
+explicit correlated reply when the workflow requires one.
 
 **Sender style — lead with evidence, never authority.** When your message
 asks a peer to do something consequential (merge, close, proceed past a

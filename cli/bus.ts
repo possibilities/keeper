@@ -52,6 +52,7 @@ import {
   type BUS_ARTIFACT_REF_TAG,
   type BUS_ARTIFACT_REF_VERSION,
   type BusArtifactRef,
+  type BusRecipientActivity,
   decodeBusArtifactRef,
   type PublishedBusArtifact,
   publishBusArtifact,
@@ -148,7 +149,8 @@ Send blindly:
   name, session id, channel id, ANY former name, or a role address
   'planner@<epic_id>' (the epic's creator session). A send is synchronous and
   honest: it prints the outcome and sets the exit code.
-    delivered          → printed, exit 0 (delivered live)
+    delivered          → printed, exit 0 (socket accepted live); may include a
+                         pre-fanout activity snapshot, never a read receipt
     queued_for_wake    → planner@<epic> creator known but offline; the escalation
                          is persisted and replayed when the creator returns, exit 0
     not_connected      → target known but offline; nothing delivered, exit 1
@@ -897,10 +899,20 @@ export function sendResultIsSuccess(result: PublishResult): boolean {
 export function sendSuccessMessage(
   result: "delivered" | "queued_for_wake",
   target: string,
+  activity?: BusRecipientActivity,
 ): string {
-  return result === "queued_for_wake"
-    ? `queued_for_wake for ${target}`
-    : `delivered to ${target}`;
+  if (result === "queued_for_wake") return `queued_for_wake for ${target}`;
+  const base = `delivered to ${target}`;
+  switch (activity?.status) {
+    case "active":
+      return `${base} (recipient activity at send time: active; a reply already in progress may not include this message)`;
+    case "quiescent":
+      return `${base} (recipient activity at send time: quiescent; this does not confirm the message was read)`;
+    case "unknown":
+      return `${base} (recipient activity at send time: unknown; this does not confirm the message was read)`;
+    default:
+      return base;
+  }
 }
 
 /** Human-facing one-liner for a non-delivered send result (the `die()` text). */
@@ -1336,7 +1348,11 @@ export async function main(argv: string[]): Promise<void> {
         return die(sendErrorMessage(res.result, cmd.target));
       }
       process.stdout.write(
-        `${sendSuccessMessage(res.result as "delivered" | "queued_for_wake", cmd.target)}\n`,
+        `${sendSuccessMessage(
+          res.result as "delivered" | "queued_for_wake",
+          cmd.target,
+          res.recipient_activity,
+        )}\n`,
       );
       return process.exit(0);
     }

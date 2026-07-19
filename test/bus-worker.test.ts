@@ -60,13 +60,16 @@ import {
   MAX_CLIENT_QUEUE,
   offlineSendPersist,
   payloadFromMessage,
+  publishAckBody,
   publishOutcome,
+  RECIPIENT_ACTIVITY_CHILD_CAP,
   type RegistryEntry,
   readBoundedPsOutput,
   registrationPresenceEffects,
   requeueTail,
   resolveHarnessIdentity,
   retireSocketlessChannel,
+  sampleRecipientActivity,
   selectFanoutTargets,
   sweepChannelRetention,
   takeoverVictim,
@@ -215,6 +218,133 @@ test("publishOutcome maps resolution + delivered-count to the true result", () =
   // Resolved + connected but nothing got fully written (partial/evicted) →
   // delivery_failed (the false-negative the epic accepts without L2 receipts).
   expect(publishOutcome("ok", true, 0)).toBe("delivery_failed");
+});
+
+test("recipient activity snapshots canonical parent, child, and resource evidence", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "recipient",
+    state: "working",
+    updated_at: 1_000,
+  });
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "active",
+    reason: "main-turn",
+    observed_at: 1_000,
+  });
+
+  db.query(
+    "UPDATE jobs SET state = 'stopped', monitors = '[]' WHERE job_id = ?",
+  ).run("recipient");
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "quiescent",
+    reason: "parent-quiescent",
+    observed_at: 1_000,
+  });
+
+  db.query(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, subagent_type, status, duration_ms,
+        last_event_id, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run("recipient", "child-1", 0, 990, "Explore", "running", null, 1, 990);
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "active",
+    reason: "open-child",
+    observed_at: 1_000,
+  });
+
+  db.query(
+    "UPDATE subagent_invocations SET updated_at = 800 WHERE job_id = ?",
+  ).run("recipient");
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "unknown",
+    reason: "child-evidence-stale",
+    observed_at: 1_000,
+  });
+
+  db.query(
+    "UPDATE subagent_invocations SET duration_ms = 10, status = 'ok' WHERE job_id = ?",
+  ).run("recipient");
+  db.query("UPDATE jobs SET monitors = ?, updated_at = ? WHERE job_id = ?").run(
+    '[{"kind":"monitor"}]',
+    995,
+    "recipient",
+  );
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "active",
+    reason: "worker-resource",
+    observed_at: 1_000,
+  });
+  db.close();
+});
+
+test("recipient activity preserves canonical unknown but omits unavailable or partial reads", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "recipient",
+    state: "stopped",
+    monitors: "not-json",
+    updated_at: 1_000,
+  });
+  expect(sampleRecipientActivity(db, "recipient", 1_000)).toEqual({
+    status: "unknown",
+    reason: "resource-evidence-incomplete",
+    observed_at: 1_000,
+  });
+  expect(sampleRecipientActivity(db, null, 1_000)).toBeNull();
+  expect(sampleRecipientActivity(db, "missing", 1_000)).toBeNull();
+  expect(
+    sampleRecipientActivity(db, "recipient", 1_000, () => {
+      throw new Error("child projection read failed");
+    }),
+  ).toBeNull();
+  expect(
+    sampleRecipientActivity(db, "recipient", 1_000, () => ({
+      parent: { job_id: "recipient", state: "stopped", monitors: "[]" },
+      children: [{ job_id: "other" }],
+    })),
+  ).toBeNull();
+  db.close();
+});
+
+test("recipient activity omits an oversized child history", () => {
+  const { db } = freshMemDb();
+  seedJob(db, { job_id: "recipient", state: "stopped" });
+  const insert = db.query(
+    `INSERT INTO subagent_invocations
+       (job_id, agent_id, turn_seq, ts, subagent_type, status, duration_ms,
+        last_event_id, updated_at)
+     VALUES (?, ?, ?, 1, 'Explore', 'ok', 1, 1, 1)`,
+  );
+  db.transaction(() => {
+    for (let i = 0; i <= RECIPIENT_ACTIVITY_CHILD_CAP; i++) {
+      insert.run("recipient", `child-${i}`, i);
+    }
+  })();
+  expect(sampleRecipientActivity(db, "recipient", 10)).toBeNull();
+  db.close();
+});
+
+test("activity metadata is attached only after a delivered outcome", () => {
+  const activity = {
+    status: "active" as const,
+    reason: "main-turn" as const,
+    observed_at: 1_000,
+  };
+  expect(publishAckBody("delivered", 1, activity)).toEqual({
+    result: "delivered",
+    recipients: 1,
+    recipient_activity: activity,
+  });
+  expect(publishAckBody("delivery_failed", 0, activity)).toEqual({
+    result: "delivery_failed",
+    recipients: 0,
+  });
+  expect(publishAckBody("queued_for_wake", 0, activity)).toEqual({
+    result: "queued_for_wake",
+    recipients: 0,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -863,19 +993,25 @@ function seedJob(
     title?: string | null;
     name_history?: string[];
     updated_at?: number;
+    state?: string;
+    monitors?: string;
   },
 ): void {
   db.query(
-    `INSERT INTO jobs (job_id, created_at, updated_at, state, pid, start_time, title, name_history)
-     VALUES (?, ?, ?, 'stopped', ?, ?, ?, ?)`,
+    `INSERT INTO jobs
+       (job_id, created_at, updated_at, state, pid, start_time, title,
+        name_history, monitors)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     job.job_id,
     1,
     job.updated_at ?? 1,
+    job.state ?? "stopped",
     job.pid ?? null,
     job.start_time ?? null,
     job.title ?? null,
     JSON.stringify(job.name_history ?? []),
+    job.monitors ?? "[]",
   );
 }
 

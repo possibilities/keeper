@@ -53,6 +53,12 @@ The final assistant message is the captured deliverable. It is one complete, sel
 
 `agent run` injects this directive in its one always-on prompt block. That block is the sole injection point: callers and prompt composition do not inject another copy.
 
+## Agent Bus publish acknowledgement
+
+A `delivered` publish acknowledgement means the recipient socket accepted the message frame. It may add `recipient_activity: {status, reason, observed_at}`, sampled from the recipient's canonical Harness activity immediately before fanout. This point-in-time `active`, `quiescent`, or `unknown` observation is not availability, readiness, a read receipt, or evidence that the recipient is processing the message. In particular, an active recipient may already be composing a reply that cannot include the new message.
+
+The activity object is optional and informational. A missing stable Keeper identity or any incomplete projection read omits it; a complete but inconclusive canonical derivation reports `unknown`. Old acknowledgements remain valid, and consumers ignore malformed or future activity metadata without changing the result, recipient count, exit status, or answer boundary. Non-delivered and queued outcomes carry no activity. The Bus persists no activity history and emits no automatic activity-transition follow-up; a message-specific receipt requires a separate explicit correlated protocol.
+
 ## Panel-start idempotency
 
 `keeper agent panel start` is idempotent by slug. Re-issuing the same slug and prompt reconciles the durable run: it reuses terminal legs, leaves running legs in place, and relaunches legs without a result. It never re-fans-out an already-admitted request. A colliding prompt or member set fails with exit `2`.

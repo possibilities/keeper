@@ -553,7 +553,9 @@ send-outcome semantics — this section references, does not restate):
   NOT queued, re-send when it returns) and `delivery_failed` (connected but the
   write did not complete) are first-class inputs, never swallowed errors. A
   `queued_for_wake` on a `planner@<epic>` page is a SUCCESS (persisted, replays on
-  the creator's return — `keeper bus wake` resumes it now).
+  the creator's return — `keeper bus wake` resumes it now). A delivered send's
+  optional activity suffix is timing context only; follow `keeper:bus`'s canonical
+  no-receipt contract rather than treating it as processing evidence.
 - **Peer delivery-failure audit** — the append-only `messages` log in bus.db is a
   READ-ONLY audit of peer delivery failures across the team; consult it (via
   `keeper:query`'s read-only sqlite tier) only when a specific relay is suspect,

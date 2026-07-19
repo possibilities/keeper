@@ -157,9 +157,34 @@ export type BusPublishResult =
   | "ambiguous_target"
   | "delivery_failed";
 
+export type BusRecipientActivity =
+  | {
+      status: "active";
+      reason: "main-turn" | "open-child" | "worker-resource";
+      observed_at: number;
+    }
+  | {
+      status: "quiescent";
+      reason: "parent-terminal" | "parent-quiescent" | "ambient-resource";
+      observed_at: number;
+    }
+  | {
+      status: "unknown";
+      reason:
+        | "parent-missing"
+        | "parent-state-incomplete"
+        | "child-evidence-incomplete"
+        | "child-evidence-stale"
+        | "resource-evidence-incomplete"
+        | "resource-evidence-stale";
+      observed_at: number;
+    };
+
 export interface BusSendResult {
   result: BusPublishResult;
   recipients: number;
+  /** Point-in-time pre-fanout evidence, never a delivery or read receipt. */
+  recipient_activity?: BusRecipientActivity;
 }
 
 export class BusSendAttemptError extends Error {
@@ -562,6 +587,67 @@ export function busSendTransportIsAmbiguous(
   return publishStarted && !serverRejected;
 }
 
+const RECIPIENT_ACTIVITY_REASONS = {
+  active: new Set(["main-turn", "open-child", "worker-resource"]),
+  quiescent: new Set([
+    "parent-terminal",
+    "parent-quiescent",
+    "ambient-resource",
+  ]),
+  unknown: new Set([
+    "parent-missing",
+    "parent-state-incomplete",
+    "child-evidence-incomplete",
+    "child-evidence-stale",
+    "resource-evidence-incomplete",
+    "resource-evidence-stale",
+  ]),
+} as const;
+
+/** Decode optional acknowledgement enrichment without changing base send truth. */
+export function decodeBusRecipientActivity(
+  value: unknown,
+): BusRecipientActivity | undefined {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const row = value as Record<string, unknown>;
+  const status = row.status;
+  const reason = row.reason;
+  const observedAt = row.observed_at;
+  if (
+    (status !== "active" && status !== "quiescent" && status !== "unknown") ||
+    typeof reason !== "string" ||
+    !RECIPIENT_ACTIVITY_REASONS[status].has(reason) ||
+    typeof observedAt !== "number" ||
+    !Number.isSafeInteger(observedAt) ||
+    observedAt < 0
+  ) {
+    return undefined;
+  }
+  return {
+    status,
+    reason,
+    observed_at: observedAt,
+  } as BusRecipientActivity;
+}
+
+/** Decode a publish acknowledgement while preserving its additive compatibility. */
+export function decodeBusSendResultFrame(
+  frame: Record<string, unknown>,
+): BusSendResult {
+  const result = frame.result as BusPublishResult;
+  const base: BusSendResult = {
+    result,
+    recipients: typeof frame.recipients === "number" ? frame.recipients : 0,
+  };
+  if (result !== "delivered") return base;
+  const activity = decodeBusRecipientActivity(frame.recipient_activity);
+  return activity === undefined
+    ? base
+    : { ...base, recipient_activity: activity };
+}
+
 async function busRoundTrip<T>(
   sockPath: string,
   drive: (
@@ -672,11 +758,7 @@ export async function sendBusArtifact(
             publishStarted = true;
             send(buildBusPublishFrame(artifact, target, mediaType));
           } else if (frame.type === "ack" && frame.op === "publish") {
-            resolve({
-              result: frame.result as BusPublishResult,
-              recipients:
-                typeof frame.recipients === "number" ? frame.recipients : 0,
-            });
+            resolve(decodeBusSendResultFrame(frame));
           } else if (frame.type === "error") {
             serverRejected = true;
             reject(new Error(`${frame.code}: ${frame.message}`));

@@ -24,9 +24,10 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   lossless provenance without a daemon or harness runtime
 - **Crash restore** — `keeper tabs restore` re-opens managed agent windows; a rolling
   cadence of verified DB snapshots guards the log
-- **Agent Bus** — `keeper bus chat send <target> "message"` stores new content in a
-  Bus message artifact; receivers explicitly read its confined path from the
-  metadata-only notification. See the [bus skill](./plugins/keeper/skills/bus/SKILL.md).
+- **Agent Bus** — `keeper bus chat send <target> "message"` stores content in a
+  confined artifact and reports socket acceptance; a delivered send may also show the
+  recipient's pre-fanout Harness activity, never a read receipt. See the
+  [bus skill](./plugins/keeper/skills/bus/SKILL.md).
 - **Owned panels** — each request admits one bounded fan-out and one generic Task-owned judge;
   retries join the durable request, cancellation settles exact registered children, and daemon
   maintenance resumes pending or failed cleanup without reconstructing targets. See
