@@ -47,9 +47,11 @@ It never contains raw provider responses, headers, errors, credentials, account 
 
 ## Live proof
 
-`src/proof.ts` defines the allowlisted collector, artifact scanner, private atomic writer, and classifier used by the live rollout. A report proves routing only when every clause is present and true, revision/configuration/alias bindings are fresh and exact, root and child routes are represented, restoration is complete, and every artifact surface scans clean. Missing fields, unknown fields, stale bindings, interrupted runs, scanner errors, or sanitation findings never classify as `proven`.
+An armed managed Pi session registers `codex_pool_proof`, a sequential no-argument tool that runs the complete proof once and atomically writes its private report. Models do not assemble proof primitives: the tool drives every required route and records the observed per-clause transcript.
 
-The proof report is evidence only. It does not register providers, change configuration, or activate the pool.
+The forced-refresh seam in the credential layer performs a bounded normal OAuth refresh for enrolled aliases even when expiry does not require one. The fault-injection seam at the pooled-stream delegate emits an allowed classified fault before output or after Substantive output, exercising the production classification, retry, cooldown, and fallback path. Both seams are inert outside an armed managed proof window.
+
+The report is an attestation, not a self-reported result. Verification re-derives the verdict from the recorded transcript and the exact revision, configuration, and alias bindings; it also requires root and child routes, completed restoration, and a clean artifact scan. A report that is not derived from an actually recorded run fails verification structurally. The report is evidence only: it does not register providers, change configuration, or activate the pool.
 
 ## Pi compatibility seam
 
