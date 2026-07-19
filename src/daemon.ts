@@ -947,6 +947,15 @@ export interface OrphanedDispatchClaimRow {
   deadline_ms: number;
 }
 
+export interface TerminalSessionDispatchClaimRow {
+  verb: string;
+  id: string;
+  attempt_id: number;
+  session_id: string;
+  terminal_state: "ended" | "killed";
+  dir: string | null;
+}
+
 function orphanedClaimJitterMs(
   verb: string,
   id: string,
@@ -1091,6 +1100,75 @@ export function orphanedClaimIsReleaseable(
             )`,
       )
       .get(row.verb, row.id, row.attempt_id) != null
+  );
+}
+
+/**
+ * Plan a bounded heartbeat batch of exact claims whose bound owner has durable
+ * terminal evidence. Provider legs and cascade intents must already be settled;
+ * the release fold repeats every predicate before changing the claim.
+ */
+export function planTerminalSessionClaimReleases(
+  db: Database,
+  limit = ORPHANED_CLAIM_REAP_BATCH,
+): TerminalSessionDispatchClaimRow[] {
+  return db
+    .query(
+      `SELECT c.verb, c.id, c.attempt_id, c.session_id,
+              j.state AS terminal_state, c.dir
+         FROM dispatch_claims c
+         JOIN jobs j ON j.job_id = c.session_id
+        WHERE c.state IN ('bound', 'resume_requested')
+          AND c.session_id IS NOT NULL
+          AND c.legacy_unfenced = 0
+          AND c.attempt_id IS NOT NULL
+          AND j.state IN ('ended', 'killed')
+          AND NOT EXISTS (
+            SELECT 1 FROM provider_leg_ownership o
+             WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+               AND o.state = 'live'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM provider_leg_cascades pc
+             WHERE pc.wrapper_dispatch_attempt_id = c.attempt_id
+               AND pc.state != 'confirmed'
+          )
+        ORDER BY j.last_event_id, c.verb, c.id, c.attempt_id
+        LIMIT ?`,
+    )
+    .all(Math.max(0, Math.floor(limit))) as TerminalSessionDispatchClaimRow[];
+}
+
+export function terminalSessionClaimIsReleaseable(
+  db: Database,
+  row: Pick<
+    TerminalSessionDispatchClaimRow,
+    "verb" | "id" | "attempt_id" | "session_id"
+  >,
+): boolean {
+  return (
+    db
+      .query(
+        `SELECT 1
+           FROM dispatch_claims c
+           JOIN jobs j ON j.job_id = c.session_id
+          WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
+            AND c.session_id = ?
+            AND c.state IN ('bound', 'resume_requested')
+            AND c.legacy_unfenced = 0
+            AND j.state IN ('ended', 'killed')
+            AND NOT EXISTS (
+              SELECT 1 FROM provider_leg_ownership o
+               WHERE o.wrapper_dispatch_attempt_id = c.attempt_id
+                 AND o.state = 'live'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM provider_leg_cascades pc
+               WHERE pc.wrapper_dispatch_attempt_id = c.attempt_id
+                 AND pc.state != 'confirmed'
+            )`,
+      )
+      .get(row.verb, row.id, row.attempt_id, row.session_id) != null
   );
 }
 
@@ -12526,6 +12604,56 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  function handleTerminalSessionClaimRelease(
+    row: TerminalSessionDispatchClaimRow,
+  ): void {
+    if (!terminalSessionClaimIsReleaseable(db, row)) return;
+    try {
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+         VALUES (?, ?, 'DispatchClaimReleased', 'dispatch_claims', ?)`,
+        [
+          Date.now() / 1000,
+          `${row.verb}::${row.id}`,
+          JSON.stringify({
+            verb: row.verb,
+            id: row.id,
+            expected_attempt_id: row.attempt_id,
+            session_id: row.session_id,
+            terminal_session_only: true,
+          }),
+        ],
+      );
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] terminal-session claim release threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  function sweepTerminalSessionClaimReleases(): void {
+    try {
+      for (const row of planTerminalSessionClaimReleases(db)) {
+        handleTerminalSessionClaimRelease(row);
+      }
+    } catch (err) {
+      console.error(
+        `[keeperd] terminal-session claim release scan threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  function sweepRestrictedClaimReleases(): void {
+    sweepOwnerlessOrphanedClaimReleases();
+    sweepTerminalSessionClaimReleases();
+  }
+
   /**
    * Mint one synthetic `BlockEscalation{Requested,Attempted}` event onto the
    * writable connection — the producer's only write path into the
@@ -13303,7 +13431,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     if (aged.length === 0 && orphanedClaims.length === 0) {
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", false);
-      sweepOwnerlessOrphanedClaimReleases();
+      sweepRestrictedClaimReleases();
       return;
     }
     const sweepRecords = buildPendingDispatchSweepRecords(
@@ -13337,7 +13465,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       });
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
     }
-    sweepOwnerlessOrphanedClaimReleases();
+    sweepRestrictedClaimReleases();
     for (const rec of sweepRecords) {
       appendBackstopRecord(rec, backstopLogPath);
     }

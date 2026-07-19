@@ -196,6 +196,9 @@ code transitions and rate-limits each target/code pair.
 | `failed-key` | An open dispatch failure suppresses the target. |
 | `claim-fence` | A durable, unreleased Dispatch claim owns the exact target. |
 | `activity-collision` | Current Harness activity or a legacy occupying job conflicts with the target. |
+| `occupancy-held` | A stopped session still holds the target's Dispatch occupancy and is not reap-eligible this sweep. |
+| `occupancy-reaping` | A stopped session holds the target's Dispatch occupancy and the bounded TERM→KILL reaper selected it this sweep. |
+| `occupancy-probe-degraded` | A stopped session may hold the target, but the tmux pane probe is unavailable; dispatch and destructive cleanup stay conservative until a healthy probe. |
 | `live-tab` | A live managed tab covers the pre-SessionStart binding window. |
 | `cooldown` | The fold-lag-safe redispatch cooldown is active. |
 | `finalizer-guard` | The epic finalizer guard suppresses a duplicate close. |
