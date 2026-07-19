@@ -172,6 +172,7 @@ import {
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
   runMergeEscalationSweep,
+  runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
   runSharedCheckoutPageSweep,
@@ -2914,6 +2915,78 @@ test("planNativeCrashEnrichLines is idempotent, backfills the window, and record
       nowMs: 12,
     }),
   ).toEqual([]);
+});
+
+test("runNativeCrashAttributionProbe backfills long-runtime predecessors and logs scanned/matched/marked", () => {
+  const ledgerPath = join(tmpDir, "restart-ledger.ndjson");
+  const reportsDir = join(tmpDir, "DiagnosticReports");
+  mkdirSync(reportsDir);
+
+  const nowMs = Date.parse("Wed Jun 18 12:00:00 2025");
+  const oldStart = nowMs - 90 * 60_000;
+  const recentStart = nowMs - 35 * 60_000;
+  const darwin = (ms: number) => `darwin:${new Date(ms).toISOString()}`;
+
+  writeRestartLedger(ledgerPath, [
+    {
+      ...bootLine("old", oldStart, "launchd", null),
+      pid: 101,
+      start_time: darwin(oldStart),
+    },
+    {
+      ...bootLine("recent", recentStart, "launchd", 55 * 60_000),
+      pid: 202,
+      start_time: darwin(recentStart),
+    },
+    {
+      ...bootLine("current", nowMs, "launchd", 35 * 60_000),
+      pid: 303,
+      start_time: darwin(nowMs),
+    },
+  ]);
+
+  writeFileSync(
+    join(reportsDir, "keeperd-2025-06-18-112520.ips"),
+    crashReportBody({
+      pid: 202,
+      launchTime: new Date(recentStart).toISOString(),
+      crashTime: new Date(recentStart + 20_000).toISOString(),
+      processPath: "/opt/keeper/keeperd",
+      incident: "recent-incident",
+    }),
+  );
+
+  const logs: string[] = [];
+  const summary = runNativeCrashAttributionProbe({
+    ledgerPath,
+    reportsDir,
+    exhausted: true,
+    nowMs,
+    log: (line) => logs.push(line),
+  });
+
+  expect(summary).toMatchObject({ scanned: 2, matched: 1, marked: 1 });
+  expect(summary.timedOut).toBe(false);
+  expect(logs).toEqual([
+    "[keeperd] native-crash attribution probe: scanned=2 matched=1 marked=1",
+  ]);
+
+  expect(collapseRestartLedger(readRestartLedger(ledgerPath))).toEqual([
+    expect.objectContaining({
+      boot_id: "old",
+      native_crash_no_report: true,
+    }),
+    expect.objectContaining({
+      boot_id: "recent",
+      native_crash_report_id: "recent-incident",
+      native_crash_signal: "SIGSEGV",
+      native_crash_exception: "EXC_BAD_ACCESS",
+      native_crash_faulting_image: "/opt/keeper/bin/bun",
+    }),
+    expect.objectContaining({
+      boot_id: "current",
+    }),
+  ]);
 });
 
 test("decideRepeatedNativeCrash mints at two, drains below two, and coexists with crash-loop", () => {
