@@ -4,7 +4,7 @@
   "created_at": "2026-07-19T03:52:00.534000Z",
   "depends_on_epics": [],
   "id": "fn-1364-fix-fable-focus-boot-wipe",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T03:54:35.838000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T03:54:03.511000Z"
+  "updated_at": "2026-07-19T03:54:35.839000Z"
 }
