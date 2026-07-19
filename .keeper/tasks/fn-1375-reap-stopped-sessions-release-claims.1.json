@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reap stopped sessions past grace",
-  "updated_at": "2026-07-19T14:31:50.641000Z"
+  "updated_at": "2026-07-19T18:57:17.582000Z",
+  "worker_done_at": "2026-07-19T18:57:17.582000Z"
 }

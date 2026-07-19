@@ -57,5 +57,7 @@ zombieDecisionInput factories). Named gates only.
 - [ ] The named focused gates and the typecheck are green.
 
 ## Done summary
-
+Occupancy pass now reaps positively-stopped sessions of any tracked verb past grace via an identity-rechecked TERM -> grace -> KILL ladder, blast-capped per sweep; working rows are never candidates and a degraded pane probe leaves the pass inert. A stopped close session joins its epic's latest durable close-finalize receipt, so a fatal_halt verdict at or after session start releases the slot with zero grace. The session-terminate command-unowned refusal now names the daemon reap path as the recovery. Surface: cli/session.ts, src/autopilot-worker.ts, src/reconcile-core.ts, test/autopilot-worker.test.ts.
 ## Evidence
+- Commits: 6ac155f03e65af3ef3d314052624f07a398720ee
+- Tests: bun run typecheck (lane worktree): clean, tsc --noEmit emitted no diagnostics, bun test ./test/autopilot-worker.test.ts: 671 pass / 0 fail, 2156 expect() calls, bun test ./test/reclaim.test.ts: 8 pass / 0 fail, 33 expect() calls, Pre-existing unrelated failure inherited from the base commit: test/agent-account-routing.test.ts:798 fast-test policy calls-spawn; that file is unmodified in this lane and outside this task file surface
