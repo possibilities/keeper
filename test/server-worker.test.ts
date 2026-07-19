@@ -9,6 +9,7 @@ import {
   newConnState,
   newResultMemo,
   RPC_REGISTRY,
+  readBootStatus,
   registerAsyncRpc,
   registerRpc,
   resetRpcRegistryForTests,
@@ -35,6 +36,49 @@ function fakeDb(): Database {
     },
   } as unknown as Database;
 }
+
+describe("readBootStatus", () => {
+  test("ready gate ignores a one-event rev<head telemetry tail once git is seeded", () => {
+    const { db } = freshMemDb();
+    db.run("UPDATE git_projection_state SET seed_required = 0 WHERE id = 1");
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [1, "test", null, "TestEvent", "TestEvent", null, "{}"],
+    );
+
+    expect(readBootStatus(db, { ready: true })).toMatchObject({
+      rev: 0,
+      head_event_id: 1,
+      git_seed_required: false,
+      catching_up: false,
+    });
+  });
+
+  test("unready gate keeps catching_up true even at rev/head parity", () => {
+    const { db } = freshMemDb();
+    db.run("UPDATE git_projection_state SET seed_required = 0 WHERE id = 1");
+
+    expect(readBootStatus(db, { ready: false })).toMatchObject({
+      rev: 0,
+      head_event_id: 0,
+      git_seed_required: false,
+      catching_up: true,
+    });
+  });
+
+  test("pending git seed keeps catching_up true", () => {
+    const { db } = freshMemDb();
+    db.run("UPDATE git_projection_state SET seed_required = 1 WHERE id = 1");
+
+    expect(readBootStatus(db, { ready: true })).toMatchObject({
+      rev: 0,
+      head_event_id: 0,
+      git_seed_required: true,
+      catching_up: true,
+    });
+  });
+});
 
 describe("server-worker RPC composition", () => {
   test("a plain main-thread import leaves both registries empty", () => {

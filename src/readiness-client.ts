@@ -474,8 +474,9 @@ export type LifecycleCallback = (
 ) => void;
 
 /**
- * Catching-up transition callback (the TUI readiness gate). Fired ONLY when the
- * per-connection catching-up latch FLIPS — a transition, never per frame.
+ * Catching-up transition callback (the TUI readiness gate). The first valid
+ * `result` on EVERY connection publishes the per-connection latch (including
+ * ready `false`); later frames fire only when that initialized value FLIPS.
  * `catchingUp` is the gate signal: `true` while the daemon is down / draining /
  * seeding (a display harness paints only its loading indicator), `false` once
  * the daemon reports ready (resume painting). `boot` is the freshest
@@ -871,9 +872,10 @@ interface MultiOptions {
    */
   readonly onEventStore?: (eventStore: EventStoreStatus) => void;
   /**
-   * Catching-up transition callback (see {@link CatchingUpCallback}). Fired on
-   * every latch FLIP, delivering the readiness boolean + freshest header. Drives
-   * a display harness's readiness gate; headless callers omit it.
+   * Catching-up transition callback (see {@link CatchingUpCallback}). Fires on
+   * the first valid result of each connection, then on latch flips, delivering
+   * the readiness boolean + freshest header. Drives a display harness's
+   * readiness gate; headless callers omit it.
    */
   readonly onCatchingUp?: CatchingUpCallback;
   /** Opt-in bounded give-up. Absent → reconnect-forever. */
@@ -980,14 +982,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   // guard inert — the always-re-baseline-on-reconnect contract still holds).
   let lastSeenGeneration: string | undefined;
   // ---- catching-up latch + backstop (see CatchingUpCallback) ----
-  // Per-connection value-latch. Starts READY (`false`). A served `result`
-  // carrying a boot header sets it to that header's `catching_up` (strict
-  // boolean — a malformed value mutates nothing); a headerless `result` observed
-  // WHILE latched clears it (the server bypasses its pre-serialized memo during
-  // catch-up, so a headerless result is positive steady-state evidence);
-  // `patch`/`meta` never touch it; teardown resets it to ready and the next
-  // connection's first result re-derives it.
-  let catchingUp = false;
+  // Per-connection tri-state latch. Starts UNKNOWN (`undefined`) so the first
+  // valid `result` on EVERY connection publishes its state, including ready
+  // `false`. A served result carrying a boot header sets it from that header's
+  // `catching_up` (strict boolean — a malformed value mutates nothing); a
+  // headerless result is positive steady-state evidence and establishes/clears
+  // ready `false`. `patch`/`meta` never touch it; teardown silently resets it to
+  // unknown so the next connection must publish its first valid result anew.
+  let catchingUp: boolean | undefined;
   // The freshest boot header seen on THIS connection — the payload a transition
   // hands the gate for its loading-indicator progress. Reset on teardown.
   let freshestBoot: BootStatus | undefined;
@@ -1146,25 +1148,26 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
   /**
    * Fold one `result` frame into the catching-up latch, arming/disarming the
-   * backstop and firing `onCatchingUp` on a FLIP only. Called for every `result`
-   * (header-carrying or not); `patch`/`meta` bypass it so they never mutate the
-   * latch.
+   * backstop and firing `onCatchingUp` on first initialization or a later FLIP.
+   * Called for every `result` (header-carrying or not); `patch`/`meta` bypass it
+   * so they never mutate the latch.
    */
   function updateCatchingUpLatch(frame: ServerFrame): void {
-    let next = catchingUp;
+    let next: boolean | undefined;
     if (frame.type === "result" && frame.boot !== undefined) {
       freshestBoot = frame.boot;
-      // Strict boolean — a malformed `catching_up` mutates nothing.
+      // Strict boolean — a malformed `catching_up` mutates nothing, including
+      // leaving a fresh connection UNKNOWN until a valid result arrives.
       if (typeof frame.boot.catching_up === "boolean") {
         next = frame.boot.catching_up;
       }
-    } else if (catchingUp) {
-      // A headerless `result` while latched is positive steady-state evidence
-      // (catch-up stamps every served frame; the memo path — headerless — only
-      // re-engages once `catching_up` is false). Clear.
+    } else {
+      // A headerless `result` is positive steady-state evidence (catch-up stamps
+      // every served frame; the memo path — headerless — only re-engages once
+      // `catching_up` is false). It establishes or clears ready `false`.
       next = false;
     }
-    if (next === catchingUp) {
+    if (next === undefined || next === catchingUp) {
       return;
     }
     catchingUp = next;
@@ -1214,6 +1217,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       age_ms: ageMs,
     });
     teardownConnection();
+    if (everPainted && unpaintedAnchor === null) {
+      armGiveUp();
+    }
+    // Timeout teardown owns this lifecycle transition. A resulting close is
+    // stale after `teardownConnection` nulls `currentSock`, so its socket-
+    // identity guard must not (and does not) publish a duplicate disconnect.
+    emit("disconnected");
     // A synchronous close callback may already have opened the replacement.
     if (currentSock === null) {
       scheduleReconnect();
@@ -1583,12 +1593,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     // `open` re-arms at `POLL_MS` regardless, but resetting here too keeps
     // the state consistent for any read between teardown and the next open.
     currentPollDelayMs = POLL_MS;
-    // Reset the catching-up latch to READY and disarm the backstop — the next
-    // connection's first `result` re-derives both. Silent (no `onCatchingUp`):
-    // a disconnect surfaces via the `disconnected` lifecycle event, not a latch
-    // flip, and the reconnect re-derives the true state from the wire.
+    // Reset the catching-up latch to UNKNOWN and disarm the backstop — the next
+    // connection's first valid `result` must publish and re-derive both. Silent
+    // (no `onCatchingUp`): a disconnect surfaces via the `disconnected`
+    // lifecycle event, not a fake latch transition.
     disarmBackstop();
-    catchingUp = false;
+    catchingUp = undefined;
     freshestBoot = undefined;
     // Reset connection state before destroying the socket because terminate may
     // synchronously re-drive close; that callback may open the next connection.

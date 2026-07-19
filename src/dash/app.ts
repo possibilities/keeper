@@ -605,6 +605,8 @@ export interface DashAppDeps {
   };
   /** Socket connect for the subscription. Default: the real UDS connect. */
   readonly connect?: ConnectFactory;
+  /** Subscription seam for process-shell tests. Default: subscribeReadiness. */
+  readonly subscribe?: typeof subscribeReadiness;
   /** Process exit. Default: `process.exit`. Tests inject a thrower. */
   readonly exit?: (code: number) => void;
   /** Fatal-path stderr sink. Default: `process.stderr.write`. */
@@ -673,6 +675,7 @@ export async function createDashApp(
     });
   const connectOpt =
     deps.connect === undefined ? {} : { connect: deps.connect };
+  const subscribe = deps.subscribe ?? subscribeReadiness;
 
   const { renderer, runtime } = await buildRenderer();
 
@@ -694,6 +697,11 @@ export async function createDashApp(
   // of its per-connection latch — no
   // latest-wins merge needed.
   let catchingUp = false;
+  // Set on each connection attempt and cleared only by the first complete
+  // composite from that connection. While pending, keep the current body during
+  // the short grace; if grace expires, the loading gate takes over. A raw ready
+  // header must never repaint the prior connection's snapshot as fresh.
+  let awaitingFreshSnapshot = false;
   let freshestBoot: BootStatus | undefined;
   // Monotonic floor for the displayed re-fold percentage — never regresses
   // within a run.
@@ -758,6 +766,11 @@ export async function createDashApp(
       );
       return;
     }
+    if (awaitingFreshSnapshot) {
+      // Preserve the current body through the reconnect grace, but never repaint
+      // the retained snapshot in response to a new connection's partial header.
+      return;
+    }
     const snap = inputs.snapshot;
     app.render(buildDashModel(snap?.jobs ?? new Map(), inputs.showTerminal));
   }
@@ -770,34 +783,48 @@ export async function createDashApp(
   // capped at a bounded first page so the snapshot stays under the 1 MiB NDJSON
   // line cap. The `t` toggle / `showTerminal` is inert against this live-only
   // feed — a future bounded terminal page re-enables it.
-  const readinessHandle = subscribeReadiness({
+  const readinessHandle = subscribe({
     sockPath,
     idPrefix: "dash",
     jobsLimit: DASH_JOBS_PAGE,
     ...connectOpt,
     onSnapshot: (snap) => {
       inputs.snapshot = snap;
+      awaitingFreshSnapshot = false;
+      disarmCatchupGrace();
       paint();
     },
     onLifecycle: (event) => {
-      // A snapshot is retained across a drop so the last-good list freezes
-      // until the conn comes back (or, past grace, the gate takes over).
-      if (event === "disconnected" || event === "connecting") {
-        paint();
-      }
+      // Retain the last-good list through the short reconnect grace. The grace
+      // stays armed after transport-open and clears only when this connection
+      // delivers a complete readiness composite; a partial ready header cannot
+      // certify the retained snapshot as fresh.
       if (event === "connecting") {
-        armCatchupGrace();
+        awaitingFreshSnapshot = true;
+        if (inputs.snapshot === null) {
+          // Cold start has no last-good body to retain: show loading immediately
+          // instead of presenting an empty dashboard as a fresh snapshot.
+          graceExpiredUnreachable = true;
+        } else {
+          armCatchupGrace();
+        }
       }
-      if (event === "connected") {
-        // A fresh connection is no longer "unreachable" — its own
-        // catching-up latch (reset to ready on reconnect) takes the gate
-        // from here.
-        disarmCatchupGrace();
+      if (
+        event === "disconnected" ||
+        event === "connecting" ||
+        event === "connected"
+      ) {
         paint();
       }
     },
     onBootStatus: (boot) => {
       freshestBoot = boot;
+      // Raw boot telemetry arrives immediately before the matching latch
+      // callback; mirror a valid boolean so this intermediate paint cannot reuse
+      // the prior connection's gate state.
+      if (typeof boot.catching_up === "boolean") {
+        catchingUp = boot.catching_up;
+      }
       paint();
     },
     onCatchingUp: (next, boot) => {
@@ -832,6 +859,7 @@ export async function createDashApp(
     } catch {
       // best-effort
     }
+    disarmCatchupGrace();
     app.destroy();
     exit(0);
   }
@@ -865,6 +893,7 @@ export async function createDashApp(
       } catch {
         // best-effort
       }
+      disarmCatchupGrace();
       app.destroy();
     }
     try {

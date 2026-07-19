@@ -486,7 +486,7 @@ export async function runGit(config: RunGitConfig): Promise<void> {
     // indicator's re-fold % / git-seed branch advances during catch-up.
     onBootStatus: (boot) => {
       view.noteCursor(String(boot.rev));
-      view.noteCatchingUp(boot.catching_up, boot);
+      view.noteBootStatus(boot);
     },
     // Gate live rendering on daemon readiness (the latched catch-up transition).
     onCatchingUp: (catchingUp, boot) => view.noteCatchingUp(catchingUp, boot),

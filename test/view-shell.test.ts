@@ -1585,6 +1585,205 @@ test("live gate: a catch-up result holds the frame and paints the re-fold indica
   expect(view.getFrameCount()).toBe(1);
 });
 
+test("live gate: a byte-identical ready flip clears only the readiness overlay", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.emit({ body: ["steady"] });
+  const clears: string[] = [];
+  const realClear = view.liveShell.clearLiveOverlay.bind(view.liveShell);
+  (
+    view.liveShell as unknown as { clearLiveOverlay: () => void }
+  ).clearLiveOverlay = () => {
+    clears.push("clear");
+    realClear();
+  };
+
+  view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+  view.emit({ body: ["steady"] });
+  intervals.tick();
+  view.noteCatchingUp(false, makeBoot());
+
+  expect(clears).toEqual(["clear"]);
+  expect(view.getFrameCount()).toBe(1);
+});
+
+test("live gate: false readiness with no held render waits for the next accepted full render", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.emit({ body: ["steady"] });
+  let clears = 0;
+  const realClear = view.liveShell.clearLiveOverlay.bind(view.liveShell);
+  (
+    view.liveShell as unknown as { clearLiveOverlay: () => void }
+  ).clearLiveOverlay = () => {
+    clears += 1;
+    realClear();
+  };
+
+  view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+  intervals.tick(); // readiness now owns the one-slot overlay
+  view.noteCatchingUp(false, makeBoot());
+  expect(clears).toBe(0); // no accepted full render yet: no freshness proof
+
+  expect(view.emit({ body: ["steady"] })).toBe(false);
+  expect(clears).toBe(1);
+  expect(view.getFrameCount()).toBe(1);
+});
+
+test("live gate: a changed held frame pushes normally on the ready flip", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.emit({ body: ["old"] });
+  view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+  view.emit({ body: ["new"] });
+  view.noteCatchingUp(false, makeBoot());
+
+  expect(view.getFrameCount()).toBe(2);
+  expect(stdoutCap.writes.at(-1)).toContain("new");
+});
+
+test("live gate: a sub-tick catch-up blip does not clear a local overlay", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.emit({ body: ["data"] });
+  view.repaintLocal({ body: ["selection"] });
+  let clears = 0;
+  const realClear = view.liveShell.clearLiveOverlay.bind(view.liveShell);
+  (
+    view.liveShell as unknown as { clearLiveOverlay: () => void }
+  ).clearLiveOverlay = () => {
+    clears += 1;
+    realClear();
+  };
+
+  view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+  view.noteCatchingUp(false, makeBoot());
+
+  expect(clears).toBe(0);
+  expect(view.getFrameCount()).toBe(1);
+});
+
+test("live gate: a spinner-overwritten local overlay is restored without growing history", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  const refreshes: string[][] = [];
+  const realRefresh = view.liveShell.refreshLive.bind(view.liveShell);
+  (
+    view.liveShell as unknown as {
+      refreshLive: (lines: string[]) => void;
+    }
+  ).refreshLive = (lines) => {
+    refreshes.push(lines.slice());
+    realRefresh(lines);
+  };
+
+  view.emit({ body: ["history"] });
+  view.repaintLocal({ body: ["selection"] });
+  view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+  view.emit({ body: ["selection"] }); // accepted and held, byte-identical locally
+  intervals.tick(); // spinner displaces the local overlay
+  const beforeReady = refreshes.length;
+
+  view.noteCatchingUp(false, makeBoot());
+  expect(refreshes).toHaveLength(beforeReady + 1);
+  expect(refreshes.at(-1)).toEqual(["selection"]);
+  expect(view.getFrameCount()).toBe(1);
+
+  // The restored accepted render is also the byte-cache baseline.
+  expect(view.emit({ body: ["selection"] })).toBe(false);
+  expect(refreshes).toHaveLength(beforeReady + 1);
+});
+
+test("live gate: stale overlay clears on an identical held render before a spinner tick", () => {
+  const timeouts = patchTimeouts();
+  try {
+    view = createViewShell<{ body: string[] }>({
+      script: sidecarBase,
+      renderBody,
+      refoldProgressPoller: makeFakePoller([]),
+    });
+    view.emit({ body: ["steady"] });
+    let clears = 0;
+    const realClear = view.liveShell.clearLiveOverlay.bind(view.liveShell);
+    (
+      view.liveShell as unknown as { clearLiveOverlay: () => void }
+    ).clearLiveOverlay = () => {
+      clears += 1;
+      realClear();
+    };
+
+    view.emitLifecycle("disconnected", {});
+    timeouts.fireLast(); // stale presentation owns the overlay
+    view.noteCatchingUp(true, makeBoot({ catching_up: true }));
+    view.emit({ body: ["steady"] });
+    // Ready arrives before the already-armed spinner gets a tick. The accepted
+    // held render must still resolve the stale overlay.
+    view.noteCatchingUp(false, makeBoot());
+
+    expect(clears).toBe(1);
+    expect(view.getFrameCount()).toBe(1);
+  } finally {
+    timeouts.restore();
+  }
+});
+
+test("noteBootStatus records telemetry without gating live rendering", () => {
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.noteBootStatus(makeBoot({ catching_up: true }));
+
+  expect(view.emit({ body: ["still paints"] })).toBe(true);
+  expect(view.getFrameCount()).toBe(1);
+});
+
+test("noteBootStatus keeps malformed catching_up out of machine metadata while retaining raw telemetry", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  const malformed = {
+    ...makeBoot({ rev: 25, head_event_id: 100 }),
+    catching_up: "yes",
+  } as unknown as BootStatus;
+  view.noteBootStatus(malformed);
+  view.emit({ body: ["row"] });
+  expect(() => view?.runSnapshot(() => {})).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(parseSnapshotTrailer(h.stdout.join("")).catching_up).toBeNull();
+
+  // The raw header still owns progress telemetry in a live shell.
+  view = createViewShell<{ body: string[] }>({
+    script: `${sidecarBase}-telemetry`,
+    renderBody,
+    refoldProgressPoller: makeFakePoller([]),
+  });
+  view.noteBootStatus(malformed);
+  view.noteCatchingUp(true, undefined);
+  intervals.tick();
+  expect(stdoutCap.writes.at(-1)).toContain("25.0%");
+});
+
 test("live gate: the git-seed branch renders the roots, and generic wording when the roots list is empty", () => {
   const poller = makeFakePoller([]);
   view = createViewShell<{ body: string[] }>({

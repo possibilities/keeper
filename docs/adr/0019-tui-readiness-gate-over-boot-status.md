@@ -8,9 +8,9 @@ Accepted.
 
 The daemon deliberately binds its read socket right after `migrate()`, before
 the boot drain, so headless consumers (`keeper status`, `keeper await`, the
-autopilot CLI) can read throughout a multi-minute re-fold; every served
-`result`/`rpc_result`/`error` frame carries a boot-status header
-(`{rev, head_event_id, catching_up, git_seed_required, git_unseeded_roots}`).
+autopilot CLI) can read throughout a multi-minute re-fold; every served frame
+carries `{rev, head_event_id, catching_up, git_seed_required,
+git_unseeded_roots}` boot status.
 Human-facing viewers, however, treated "first frame painted" as "server
 ready": the shared view-shell's connecting indicator self-stopped on the first
 data frame, so a viewer launched (or reconnecting) mid re-fold painted every
@@ -28,19 +28,16 @@ hold `catching_up: true` forever on a quiet board.
 
 ## Decision
 
-Human-facing viewers full-gate on `catching_up`: while it holds they render
-only a loading indicator — re-fold progress while the fold cursor trails
-head, a distinct non-spinning git-seed wait once at head, a plain catching-up
-line for the residual boot window — and never paint provisional rows. The
-gate is a client-side value-latch in the shared subscribe client: initially
-ready, set by each boot-carrying result, cleared by a `catching_up: false`
-header OR by a boot-less `result` observed while latched (the pre-serialized
-result memo is bypassed during catch-up, so a headerless result is positive
-steady-state evidence). While latched, a catch-up-scoped slow poll refetches
-one idle collection through the existing coalescer until it clears; a
-server-side boot-complete push was rejected (a dropped push re-strands a
-reconnecting client) in favor of the level-triggered poll, which converges
-unconditionally.
+Human-facing viewers full-gate on `catching_up`, which follows the main boot
+gate plus pending git seed; `rev`/`head_event_id` are progress telemetry only.
+While gated they render re-fold progress, git-seed wait, or plain catch-up text
+and never paint provisional rows. The shared client keeps a per-connection
+tri-state latch: the first valid `result` publishes its state, including ready
+`false`, and later results publish flips only. A boot-less result establishes
+or clears ready `false`; memo bypass during catch-up makes it positive
+steady-state evidence. While true, a slow poll refetches one idle collection
+until it clears. This level-triggered path converges without a boot-complete
+push that could drop and strand a reconnecting client.
 
 A post-paint transport drop has three presentation states. The short grace
 holds the last-good frame behind the unchanged `reconnecting…` pill. After

@@ -47,7 +47,12 @@ import {
   type DashRendererBundle,
 } from "../src/dash/app";
 import { armViewerExitTriggers } from "../src/dash/exit-triggers";
-import type { ConnectFactory } from "../src/readiness-client";
+import type { BootStatus } from "../src/protocol";
+import type {
+  ConnectFactory,
+  ReadinessClientSnapshot,
+  subscribeReadiness,
+} from "../src/readiness-client";
 
 const APP_RUNTIME = {
   TextRenderable,
@@ -277,6 +282,71 @@ test("createDashApp: a fatal after a clean exit does not double-exit", async () 
   // but does NOT re-run the destroy/dispose body (guarded by `exited`).
   expect(rig.events).toContain("exit:1");
   expect(rig.stderrWrites.join("")).toContain("late");
+});
+
+test("createDashApp: raw boot then latch callbacks resolve the gate in client order", async () => {
+  const setup = await createTestRenderer({
+    width: 80,
+    height: 20,
+    exitSignals: [],
+  });
+  const subscriptionRef: {
+    current: Parameters<typeof subscribeReadiness>[0] | null;
+  } = { current: null };
+  const subscribe: typeof subscribeReadiness = ((opts) => {
+    subscriptionRef.current = opts;
+    return { dispose() {}, reconnect() {} };
+  }) as typeof subscribeReadiness;
+  try {
+    await createDashApp("/tmp/dash-test.sock", {
+      buildRenderer: async () => ({
+        renderer: setup.renderer,
+        runtime: APP_RUNTIME,
+      }),
+      subscribe,
+      armExitTriggers: () => ({ disarm() {} }),
+      exit: () => {},
+      onProcess: () => {},
+    });
+    const boot = (catching_up: boolean): BootStatus => ({
+      rev: 1,
+      head_event_id: 1,
+      catching_up,
+      git_seed_required: false,
+    });
+    const opts = subscriptionRef.current;
+    if (opts === null) {
+      throw new Error("subscription options were not captured");
+    }
+
+    opts.onLifecycle?.("connecting");
+    await setup.renderOnce();
+    // Cold start has no retained body, so connecting gates immediately rather
+    // than presenting an empty dashboard as a fresh snapshot.
+    expect(setup.captureCharFrame()).toContain("catching up…");
+
+    opts.onLifecycle?.("connected");
+    opts.onCatchingUp?.(true, boot(true));
+    await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("catching up…");
+
+    // `readiness-client` publishes raw telemetry first, then the initialized /
+    // flipped latch for the same result. Neither partial callback may certify
+    // the retained prior-connection snapshot as fresh: loading remains until
+    // the first complete composite arrives.
+    opts.onBootStatus?.(boot(false));
+    opts.onCatchingUp?.(false, boot(false));
+    await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("catching up…");
+
+    opts.onSnapshot?.({
+      jobs: new Map(),
+    } as unknown as ReadinessClientSnapshot);
+    await setup.renderOnce();
+    expect(setup.captureCharFrame()).not.toContain("catching up…");
+  } finally {
+    setup.renderer.destroy();
+  }
 });
 
 // ---------------------------------------------------------------------------
