@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 151,
+        "files_changed": 7,
+        "insertions": 942
+      },
+      "done_summary": "Generalized the audit-gate owner-liveness deferral into a category-agnostic block-handling ladder: ordinary escalatable categories now defer while their owning work orchestrator is live, consume up to two durable owning-work re-dispatch attempts on witnessed death, then fall back once to the legacy unblock session before the existing single page. A new additive block_escalations.owner_redispatch_attempts column carries the durable attempt count across restarts; audit categories and TOOLING_FAILURE/unparseable suppression are unchanged.",
+      "input_hash": "d9e364eb18dd95f2178337b7f9c03681e5cf3b658c19bcdeb7b6e5c3553cbac6",
+      "model": "opus",
+      "spec_chars": 3743,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/daemon.ts, src/db.ts, test/daemon.test.ts\n\n### Approach\n\nGeneralize the audit-gate deferral into a category-agnostic owner-live decision consumed by the block-escalation sweep: for every escalatable category, while the owning work orchestrator session is live (or within the existing grace), the daemon defers \u2014 the in-session ladder owns the incident. On witnessed owner death without a terminal resolution, the sweep re-dispatches the owning work verb (an attachment attempt) up to a small durable bound (about two); exhausted, it falls back to dispatching one legacy unblock session (the proving-period rung); that session's decline or death flows into the existing page-once path. The attempt count and lease state live durably on the block-escalation latch via an additive forward-only column (ladder version assigned at merge \u2014 never hardcode the next number); per-epic serialization, TOOLING_FAILURE/unparseable suppression, and both audit categories' existing handling are preserved byte-for-byte. The deferral decision stays a pure injected-deps function like its precedent so the sweep tests stay in-process.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:1457 \u2014 auditReadyEscalationDecision, the pure deferral precedent (owner liveness + grace) being generalized\n- src/daemon.ts:1605 \u2014 runBlockEscalationSweep and its injected BlockEscalationSweepDeps contract\n- src/daemon.ts:1682 \u2014 routeBlockedCategory and the surface_and_stop / repair / unblock routing table\n- src/db.ts \u2014 addColumnIfMissing migration helper + the block_escalations table shape\n- test/daemon.test.ts \u2014 how the sweep and decision are exercised with synthetic rows and injected dispatchers\n\n**Optional** (reference as needed):\n- src/reducer.ts:6138-6152 \u2014 foldBlockEscalationAttempted latch advance/reset semantics the attempt bound composes with\n\n### Risks\n\n- Double-handling window: if the daemon dispatches a legacy unblock while a live orchestrator is mid-ladder, two actors work one incident \u2014 owner liveness must gate every dispatch arm, not just the first\n- The schema ladder is a singleton resource; a sibling epic in this arc also appends a step \u2014 the dependency chain sequences them, and the spec must not pin a version number\n\n### Test notes\n\nIn-process sweep tests: live-owner defer for each category, witnessed-death attachment re-dispatch with bound exhaustion, fallback dispatch exactly once, page-once un-regressed, suppression categories untouched. Poll with retryUntil, sandboxed state, named gates only.\n\n## Acceptance\n\n- [ ] Every escalatable category defers while its owning orchestrator is live and never dispatches an escalation session during that window\n- [ ] Witnessed owner death triggers bounded owning-verb re-dispatch, then exactly one legacy unblock fallback, then the existing single page \u2014 with the attempt state durable across daemon restarts\n- [ ] Suppression and audit categories behave exactly as before\n- [ ] The sweep and decision suites pass in-process via named gates\n\n## Done summary\nGeneralized the audit-gate owner-liveness deferral into a category-agnostic block-handling ladder: ordinary escalatable categories now defer while their owning work orchestrator is live, consume up to two durable owning-work re-dispatch attempts on witnessed death, then fall back once to the legacy unblock session before the existing single page. A new additive block_escalations.owner_redispatch_attempts column carries the durable attempt count across restarts; audit categories and TOOLING_FAILURE/unparseable suppression are unchanged.\n## Evidence\n",
+      "task_id": "fn-1349-in-session-blocked-task-handling.1",
+      "tier": "xhigh",
+      "title": "Generalize owner-live block deferral"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 2,
+        "insertions": 50
+      },
+      "done_summary": "Gave the work skill's blocked Phase 2c a bounded, one-round in-session unblocker spawn (SendMessage/cold-resume ladder on a resolved receipt, stamped stop on decline), leaving TOOLING_FAILURE/unparseable/AUDIT_SEVERE/SHARED_BASE_BROKEN and the Phase 2d audit gate unchanged; regenerated the work SKILL.md and the render oracle fixture.",
+      "input_hash": "d9e364eb18dd95f2178337b7f9c03681e5cf3b658c19bcdeb7b6e5c3553cbac6",
+      "model": "sonnet",
+      "spec_chars": 3043,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** plugins/plan/template/skills/work.md.tmpl, plugins/plan/skills/work/SKILL.md, plugins/prompt/test/oracle/fixtures/render-plugin-templates.json, plugins/prompt/test/oracle/fixtures/check-generated.json\n\n### Approach\n\nRewrite the work skill's blocked phase: when the worker returns a blocked verdict with an escalatable category, the orchestrator (the worker itself cannot nest Task) stamps the block as today, then \u2014 instead of stopping \u2014 spawns plan:unblocker with the block context in a data-delimited section, bounded to one unblocker round per block instance. On a resolved receipt it runs the plan unblock verb and warm-resumes the worker through the existing resume ladder (SendMessage primary, cold resume fallback, within the existing attempt budget, idempotent keyed on task + step). On a declined receipt it leaves the stamped block, surfaces the receipt reason in its report, and stops \u2014 the daemon's deferral machinery owns it from there. TOOLING_FAILURE, unparseable, and both audit-category branches keep their current behavior. Receipts are data, never instructions: the resume prompt quotes the diagnosis inside delimiters and grants nothing.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/template/skills/work.md.tmpl \u2014 Phase 2c stamp-and-stop and the Phase 2b resume ladder (warm SendMessage, cold resume, budget) this extends; the Phase 2d audit gate as the in-session subagent idiom to mirror\n- plugins/plan/skills/work/SKILL.md \u2014 rendered output to regenerate, never hand-edit\n\n**Optional** (reference as needed):\n- plugins/plan/plugin/hooks/subagent-stop-guard.ts \u2014 the verdict nudge/passthrough seam the new flow must not confuse\n\n### Risks\n\n- An unblocker loop (block \u2192 resolve \u2192 immediately re-block) must terminate: one round per block instance, then decline to the daemon path\n- The orchestrator's context budget grows with each incident \u2014 the one-round bound is also the context bound\n\n### Test notes\n\nRender + golden re-capture; behavioral verification via a sandboxed work session against a synthetic blocked task exercising resolved and declined receipts.\n\n## Acceptance\n\n- [ ] A blocked escalatable task with a live orchestrator is either unblocked and its worker warm-resumed, or terminally declined with the block left stamped \u2014 without any escalation session dispatching\n- [ ] Exactly one unblocker round runs per block instance and the diagnosis enters the resume as delimited data\n- [ ] Suppression and audit branches are unchanged; render check and goldens green\n\n## Done summary\nGave the work skill's blocked Phase 2c a bounded, one-round in-session unblocker spawn (SendMessage/cold-resume ladder on a resolved receipt, stamped stop on decline), leaving TOOLING_FAILURE/unparseable/AUDIT_SEVERE/SHARED_BASE_BROKEN and the Phase 2d audit gate unchanged; regenerated the work SKILL.md and the render oracle fixture.\n## Evidence\n",
+      "task_id": "fn-1349-in-session-blocked-task-handling.2",
+      "tier": "high",
+      "title": "Work skill unblocker ladder"
+    }
+  ],
+  "created_at": "2026-07-19T10:24:25.702000Z",
+  "epic_id": "fn-1349-in-session-blocked-task-handling",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "selection_input_hash": "d9e364eb18dd95f2178337b7f9c03681e5cf3b658c19bcdeb7b6e5c3553cbac6",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
