@@ -2171,6 +2171,39 @@ test("BlockEscalationAttempted with the non-terminal dispatch_failed outcome res
   expect(getBlockLatch("fn-be-2", "fn-be-2.1")?.status).toBe("pending");
 });
 
+test("owning-work attempt outcomes increment the durable attachment lease and remain pending across a re-fold", () => {
+  const epicId = "fn-be-owner";
+  const taskId = "fn-be-owner.1";
+  armBlockLatch(epicId, taskId, 1700);
+  blockRequestedEvent(epicId, taskId, 1710);
+  blockAttemptedEvent(epicId, taskId, "owner_redispatched", 1720);
+  blockRequestedEvent(epicId, taskId, 1730);
+  blockAttemptedEvent(epicId, taskId, "owner_redispatch_failed", 1740);
+  drainAll();
+
+  const readLease = () =>
+    db
+      .query(
+        "SELECT status, outcome, owner_redispatch_attempts FROM block_escalations WHERE epic_id = ? AND task_id = ?",
+      )
+      .get(epicId, taskId);
+  expect(readLease()).toEqual({
+    status: "pending",
+    outcome: "owner_redispatch_failed",
+    owner_redispatch_attempts: 2,
+  });
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM block_escalations");
+  db.run("DELETE FROM epics");
+  drainAll();
+  expect(readLease()).toEqual({
+    status: "pending",
+    outcome: "owner_redispatch_failed",
+    owner_redispatch_attempts: 2,
+  });
+});
+
 test("BlockHumanNotified stamps the latch human_notified_at on terminal notified; non-terminal leaves it NULL", () => {
   armBlockLatch("fn-be-3", "fn-be-3.1");
   blockAttemptedEvent("fn-be-3", "fn-be-3.1", "dispatched", 1800);

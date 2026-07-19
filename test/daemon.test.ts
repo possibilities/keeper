@@ -51,16 +51,20 @@ import {
   auditReadyEscalationDecision,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
+  BLOCK_OWNER_GRACE_MS,
+  BLOCK_OWNER_REDISPATCH_LIMIT,
   type BlockCandidateDropClass,
   type BlockEscalationOutcome,
   type BlockEscalationSweepDeps,
   type BlockHumanNotifiedOutcome,
   type BlockHumanNotifySweepDeps,
+  type BlockOwnerLiveness,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   baselineRedIsConfirmed,
   baselineRepairFailingTestsDigest,
   baselineRepairFingerprint,
+  blockOwnerEscalationDecision,
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
@@ -134,6 +138,7 @@ import {
   planNativeCrashEnrichLines,
   prewarmWatcherAddon,
   probeAuditOrchestrator,
+  probeBlockOwner,
   probeReplyProvesLife,
   probeSettleStep,
   pruneRecoveredDeadLetters,
@@ -4828,7 +4833,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(136);
+  expect(SCHEMA_VERSION).toBe(137);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5434,6 +5439,8 @@ function seedEpicWithTasks(
     task_id: string;
     runtime_status?: string;
     target_repo?: string | null;
+    model?: string | null;
+    tier?: string | null;
   }[],
 ): void {
   db.run(
@@ -5449,11 +5456,12 @@ function seedBlockLatch(
   taskId: string,
   status = "pending",
   outcome: string | null = null,
+  ownerRedispatchAttempts = 0,
 ): void {
   db.run(
-    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id)
-       VALUES (?, ?, 1, ?, ?, 1)`,
-    [epicId, taskId, status, outcome],
+    `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id, owner_redispatch_attempts)
+       VALUES (?, ?, 1, ?, ?, 1, ?)`,
+    [epicId, taskId, status, outcome, ownerRedispatchAttempts],
   );
 }
 
@@ -5464,6 +5472,8 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
       task_id: "fn-1-foo.1",
       runtime_status: "blocked",
       target_repo: "/repo/x",
+      model: "opus",
+      tier: "xhigh",
     },
     { task_id: "fn-1-foo.2", runtime_status: "todo", target_repo: null },
   ]);
@@ -5478,9 +5488,12 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
     task_id: "fn-1-foo.1",
     status: "pending",
     outcome: null,
+    owner_redispatch_attempts: 0,
     project_dir: "/proj/foo",
     runtime_status: "blocked",
     target_repo: "/repo/x",
+    model: "opus",
+    tier: "xhigh",
   });
   db.close();
 });
@@ -5506,9 +5519,12 @@ test("selectPendingBlockEscalations: attempted skipped_category remains eligible
       task_id: "fn-1-rearm.1",
       status: "attempted",
       outcome: "skipped_category",
+      owner_redispatch_attempts: 0,
       project_dir: "/proj/rearm",
       runtime_status: "blocked",
       target_repo: null,
+      model: null,
+      tier: null,
     },
   ]);
   db.close();
@@ -5531,9 +5547,12 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
     task_id: "fn-2-ghost.1",
     status: "pending",
     outcome: null,
+    owner_redispatch_attempts: 0,
     project_dir: null,
     runtime_status: null,
     target_repo: null,
+    model: null,
+    tier: null,
   });
   const missingEl = rows.find((r) => r.task_id === "fn-3-bar.1");
   expect(missingEl).toEqual({
@@ -5541,9 +5560,12 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
     task_id: "fn-3-bar.1",
     status: "pending",
     outcome: null,
+    owner_redispatch_attempts: 0,
     project_dir: "/proj/bar",
     runtime_status: null,
     target_repo: null,
+    model: null,
+    tier: null,
   });
   db.close();
 });
@@ -5631,7 +5653,8 @@ interface MintCall {
   outcome?: BlockEscalationOutcome;
 }
 
-/** One blocked pending row with sensible defaults (blocked + `/proj`). */
+/** One blocked pending row at the legacy-fallback rung. Owner-ladder tests
+ * override `owner_redispatch_attempts` explicitly. */
 function blockedRow(
   epicId: string,
   taskId: string,
@@ -5642,9 +5665,12 @@ function blockedRow(
     task_id: taskId,
     status: "pending",
     outcome: null,
+    owner_redispatch_attempts: BLOCK_OWNER_REDISPATCH_LIMIT,
     project_dir: "/proj",
     runtime_status: "blocked",
     target_repo: null,
+    model: null,
+    tier: null,
     ...overrides,
   };
 }
@@ -5660,23 +5686,33 @@ function fakeSweepDeps(opts: {
   /** Epic ids for which an `unblock::<task>` session is already LIVE — drives the
    *  per-epic serialization (across-sweep) guard. */
   epicLive?: Set<string>;
+  /** Owning-work liveness keyed by task id — drives the ordinary attachment gate.
+   *  A task with no entry reads witnessed-dead past grace for legacy-path fixtures. */
+  owner?: Record<string, BlockOwnerLiveness>;
+  /** Optional dynamic owner probe for dispatch-boundary race fixtures. */
+  ownerProbe?: (row: PendingBlockEscalation) => BlockOwnerLiveness;
   /** Owning-orchestrator liveness keyed by task id — drives the AUDIT_READY gate.
    *  A task with no entry reads `absent`. */
   orchestrator?: Record<string, AuditOrchestratorLiveness>;
-  /** Fixed wall-clock (ms) for the AUDIT_READY grace comparison. */
+  /** Fixed wall-clock (ms) for both owner-death grace comparisons. */
   nowMs?: number;
   dispatch?: (
+    row: PendingBlockEscalation,
+  ) => Promise<EscalationDispatchOutcome>;
+  dispatchOwner?: (
     row: PendingBlockEscalation,
   ) => Promise<EscalationDispatchOutcome>;
 }): {
   deps: BlockEscalationSweepDeps;
   mints: MintCall[];
   dispatches: { epicId: string; taskId: string }[];
+  ownerDispatches: { epicId: string; taskId: string }[];
   suppressions: { taskId: string; reason: string; dir: string | null }[];
   notes: string[];
 } {
   const mints: MintCall[] = [];
   const dispatches: { epicId: string; taskId: string }[] = [];
+  const ownerDispatches: { epicId: string; taskId: string }[] = [];
   const suppressions: { taskId: string; reason: string; dir: string | null }[] =
     [];
   const notes: string[] = [];
@@ -5691,15 +5727,29 @@ function fakeSweepDeps(opts: {
       dispatches.push({ epicId: row.epic_id, taskId: row.task_id });
       return (await opts.dispatch?.(row)) ?? "dispatched";
     },
-    isEpicUnblockLive: (epicId) => opts.epicLive?.has(epicId) ?? false,
+    dispatchOwner: async (row) => {
+      ownerDispatches.push({ epicId: row.epic_id, taskId: row.task_id });
+      return (await opts.dispatchOwner?.(row)) ?? "dispatched";
+    },
+    isEpicBlockHandlingLive: (epicId) => opts.epicLive?.has(epicId) ?? false,
+    ownerLiveness: (row) =>
+      opts.ownerProbe?.(row) ??
+      opts.owner?.[row.task_id] ?? { state: "dead", diedAtMs: 0 },
     auditOrchestratorLiveness: (row) =>
       opts.orchestrator?.[row.task_id] ?? { state: "absent" },
-    now: () => opts.nowMs ?? Date.now(),
+    now: () => opts.nowMs ?? 1_000_000,
     hasOpenWorkFailure: (taskId) => opts.alreadyFailed?.has(taskId) ?? false,
     suppressRedispatch: (args) => suppressions.push(args),
     noteLine: (line) => notes.push(line),
   };
-  return { deps, mints, dispatches, suppressions, notes };
+  return {
+    deps,
+    mints,
+    dispatches,
+    ownerDispatches,
+    suppressions,
+    notes,
+  };
 }
 
 test("runBlockEscalationSweep: an escalatable block DISPATCHES one unblock and mints Requested→Attempted{dispatched} (no planner@ send)", async () => {
@@ -6120,6 +6170,186 @@ test("runBlockEscalationSweep: an empty pending set is a no-op (no mints, no dis
   expect(dispatches).toEqual([]);
 });
 
+const IN_SESSION_BLOCK_CATEGORIES = [
+  "SPEC_UNCLEAR",
+  "DEPENDENCY_BLOCKED",
+  "DESIGN_CONFLICT",
+  "SCOPE_EXCEEDED",
+  "EXTERNAL_BLOCKED",
+  "RESUME_EXHAUSTED",
+] as const;
+
+test("runBlockEscalationSweep: every ordinary escalatable category defers while its owning work orchestrator is live", async () => {
+  const pending = IN_SESSION_BLOCK_CATEGORIES.map((category, index) =>
+    blockedRow(
+      `fn-${index + 20}-${category.toLowerCase()}`,
+      `fn-${index + 20}-${category.toLowerCase()}.1`,
+      {
+        owner_redispatch_attempts: 0,
+      },
+    ),
+  );
+  const reasons = Object.fromEntries(
+    pending.map((row, index) => [
+      row.task_id,
+      `${IN_SESSION_BLOCK_CATEGORIES[index]}: fixture`,
+    ]),
+  );
+  const owner = Object.fromEntries(
+    pending.map((row) => [row.task_id, { state: "live" as const }]),
+  );
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
+    pending,
+    reasons,
+    owner,
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(ownerDispatches).toEqual([]);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: witnessed owner deaths consume two durable attachment attempts before one legacy fallback", async () => {
+  const taskId = "fn-30-lease.1";
+  const row = blockedRow("fn-30-lease", taskId, {
+    owner_redispatch_attempts: 0,
+  });
+  const owner: Record<string, BlockOwnerLiveness> = {
+    [taskId]: { state: "dead", diedAtMs: 0 },
+  };
+  const options = {
+    pending: [row],
+    reasons: { [taskId]: "SPEC_UNCLEAR: fixture" },
+    owner,
+    nowMs: BLOCK_OWNER_GRACE_MS,
+  };
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps(options);
+
+  await runBlockEscalationSweep(deps);
+  expect(ownerDispatches).toEqual([{ epicId: "fn-30-lease", taskId }]);
+  expect(dispatches).toEqual([]);
+  expect(mints.slice(-2)).toEqual([
+    { kind: "requested", epicId: "fn-30-lease", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-30-lease",
+      taskId,
+      outcome: "owner_redispatched",
+    },
+  ]);
+
+  // Simulate the deterministic fold surviving a daemon restart.
+  row.owner_redispatch_attempts = 1;
+  row.outcome = "owner_redispatched";
+  await runBlockEscalationSweep(deps);
+  expect(ownerDispatches).toHaveLength(2);
+  expect(dispatches).toEqual([]);
+
+  row.owner_redispatch_attempts = BLOCK_OWNER_REDISPATCH_LIMIT;
+  await runBlockEscalationSweep(deps);
+  expect(ownerDispatches).toHaveLength(2);
+  expect(dispatches).toEqual([{ epicId: "fn-30-lease", taskId }]);
+  expect(mints.slice(-2)).toEqual([
+    { kind: "requested", epicId: "fn-30-lease", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-30-lease",
+      taskId,
+      outcome: "dispatched",
+    },
+  ]);
+
+  // The fallback fold is terminal, so the same block instance cannot dispatch it twice.
+  row.status = "attempted";
+  row.outcome = "dispatched";
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toHaveLength(1);
+});
+
+test("runBlockEscalationSweep: an owner launch failure consumes a bounded attachment attempt", async () => {
+  const taskId = "fn-31-failed-owner.1";
+  const { deps, mints, dispatches } = fakeSweepDeps({
+    pending: [
+      blockedRow("fn-31-failed-owner", taskId, {
+        owner_redispatch_attempts: 0,
+      }),
+    ],
+    reasons: { [taskId]: "EXTERNAL_BLOCKED: fixture" },
+    owner: { [taskId]: { state: "dead", diedAtMs: 0 } },
+    nowMs: BLOCK_OWNER_GRACE_MS,
+    dispatchOwner: async () => "dispatch_failed",
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(dispatches).toEqual([]);
+  expect(mints.at(-1)).toEqual({
+    kind: "attempted",
+    epicId: "fn-31-failed-owner",
+    taskId,
+    outcome: "owner_redispatch_failed",
+  });
+});
+
+test("runBlockEscalationSweep: an exhausted attachment lease still defers every dispatch while the owner is live", async () => {
+  const taskId = "fn-32-live-owner.1";
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-32-live-owner", taskId)],
+    reasons: { [taskId]: "DESIGN_CONFLICT: fixture" },
+    owner: { [taskId]: { state: "live" } },
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(ownerDispatches).toEqual([]);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: a newly-live owner closes the fallback dispatch race", async () => {
+  const taskId = "fn-33-race.1";
+  let probes = 0;
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
+    pending: [blockedRow("fn-33-race", taskId)],
+    reasons: { [taskId]: "SPEC_UNCLEAR: fixture" },
+    ownerProbe: () =>
+      ++probes === 1 ? { state: "dead", diedAtMs: 0 } : { state: "live" },
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(probes).toBe(2);
+  expect(ownerDispatches).toEqual([]);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: owner attachment attempts remain serialized per epic", async () => {
+  const pending = [
+    blockedRow("fn-33-serialized", "fn-33-serialized.1", {
+      owner_redispatch_attempts: 0,
+    }),
+    blockedRow("fn-33-serialized", "fn-33-serialized.2", {
+      owner_redispatch_attempts: 0,
+    }),
+  ];
+  const { deps, ownerDispatches } = fakeSweepDeps({
+    pending,
+    reasons: {
+      "fn-33-serialized.1": "SPEC_UNCLEAR: first",
+      "fn-33-serialized.2": "DEPENDENCY_BLOCKED: second",
+    },
+  });
+
+  await runBlockEscalationSweep(deps);
+
+  expect(ownerDispatches).toEqual([
+    { epicId: "fn-33-serialized", taskId: "fn-33-serialized.1" },
+  ]);
+});
+
 // ---- AUDIT_READY / AUDIT_SEVERE gate (the variable-depth per-task audit) -----
 
 const AUDIT_READY_REASON = "AUDIT_READY: per-task audit parked this task";
@@ -6365,6 +6595,56 @@ test("auditReadyEscalationDecision: escalate only on a dead orchestrator past gr
   // Absent → defer (no witnessed death).
   expect(
     auditReadyEscalationDecision({ state: "absent" }, 10 * grace, grace),
+  ).toBe("defer");
+});
+
+test("probeBlockOwner: only the exact work::<task> orchestrator owns an ordinary blocked task", () => {
+  const jobs = [
+    orchJob("close", "fn-1-foo", "working", 100),
+    orchJob("work", "fn-1-foo.2", "working", 200),
+    orchJob("work", "fn-1-foo.1", "ended", 300),
+  ];
+  expect(probeBlockOwner(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "dead",
+    diedAtMs: 300_000,
+  });
+  jobs.push(orchJob("work", "fn-1-foo.1", "working", 400));
+  expect(probeBlockOwner(jobs, "fn-1-foo", "fn-1-foo.1")).toEqual({
+    state: "live",
+  });
+});
+
+test("blockOwnerEscalationDecision: witnessed death advances attachment attempts then fallback; every uncertain/live state defers", () => {
+  const dead: BlockOwnerLiveness = { state: "dead", diedAtMs: 0 };
+  expect(blockOwnerEscalationDecision(dead, 0, BLOCK_OWNER_GRACE_MS)).toBe(
+    "redispatch_owner",
+  );
+  expect(blockOwnerEscalationDecision(dead, 1, BLOCK_OWNER_GRACE_MS)).toBe(
+    "redispatch_owner",
+  );
+  expect(
+    blockOwnerEscalationDecision(
+      dead,
+      BLOCK_OWNER_REDISPATCH_LIMIT,
+      BLOCK_OWNER_GRACE_MS,
+    ),
+  ).toBe("dispatch_legacy_unblock");
+  expect(blockOwnerEscalationDecision(dead, 0, BLOCK_OWNER_GRACE_MS - 1)).toBe(
+    "defer",
+  );
+  expect(
+    blockOwnerEscalationDecision(
+      { state: "live" },
+      BLOCK_OWNER_REDISPATCH_LIMIT,
+      10 * BLOCK_OWNER_GRACE_MS,
+    ),
+  ).toBe("defer");
+  expect(
+    blockOwnerEscalationDecision(
+      { state: "absent" },
+      BLOCK_OWNER_REDISPATCH_LIMIT,
+      10 * BLOCK_OWNER_GRACE_MS,
+    ),
   ).toBe("defer");
 });
 

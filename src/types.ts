@@ -1163,8 +1163,9 @@ export interface Task {
  * producer's escalate-once latch, one row per currently-blocked plan task keyed
  * by `(epic_id, task_id)`. Subscribed by the board / `keeper await` as a coarse
  * "escalation in flight" signal (a row's PRESENCE for a task, not its internal
- * `status` state machine). The `status` advances `pending → requested →
- * attempted`; `outcome` records the helper's result on the `attempted` row.
+ * `status` state machine). The legacy fallback advances `pending → requested →
+ * attempted`; owning-work outcomes return it to pending and increment the durable
+ * attachment count. `outcome` records the latest helper result.
  * `blocked_since` / `last_event_id` are event ids, never wall-clock.
  * `human_notified_at` is the terminal once-marker (epoch seconds, `event.ts`)
  * stamped when the `unblock::<task>` escalation session declines or dies and the
@@ -1179,6 +1180,8 @@ export interface BlockEscalation {
   outcome: string | null;
   last_event_id: number;
   human_notified_at: number | null;
+  /** Bounded owning-work attachment attempts consumed by this block instance. */
+  owner_redispatch_attempts: number;
 }
 
 /**
@@ -1225,7 +1228,9 @@ export interface BlockEscalationRequestedPayload {
  * bus-send `"sent"` / `"queued_for_wake"`) advances the latch to `attempted`; a
  * NON-TERMINAL outcome (`"dispatch_failed"` — the escalation launch failed — or
  * the bus-send `"send_failed"`) RESETS the latch to `pending` so the sweep
- * re-attempts on the next tick. The reducer fold reads this event (KEEP-SET
+ * re-attempts on the next tick. Owning-work outcomes (`"owner_redispatched"` /
+ * `"owner_redispatch_failed"`) also reset to `pending` while incrementing the
+ * durable attachment-attempt count. The reducer fold reads this event (KEEP-SET
  * inline forever — never added to the retention shed predicate).
  */
 export interface BlockEscalationAttemptedPayload {

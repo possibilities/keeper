@@ -4485,6 +4485,19 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "jobs", "fable_intent", "INTEGER");
     },
   },
+  {
+    // Provisional tail version; fan-in renumbers this singleton ladder entry.
+    version: 137,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "block_escalations",
+        "owner_redispatch_attempts",
+        "INTEGER NOT NULL DEFAULT 0",
+      );
+    },
+  },
 ];
 
 /**
@@ -4505,7 +4518,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v136:2654a0a5086e2ba30db957e22dfedfe473ac483255a48120270bff5791c6ec7e";
+  "v137:10674ec48efce92fc6f8c3b516e4b46ece73044986aa43516fdbf0a7f522fdc3";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6113,10 +6126,10 @@ const CREATE_PROVIDER_LEG_CASCADES_INDEXES = [
  * (`status='pending'`, `blocked_since=event.id`) on the transition INTO blocked
  * and DELETEs it on the transition OUT, so an unblock→re-block re-arms the latch
  * exactly once — the `dispatch_never_bound` bind/clear reset analog. The producer
- * (task 3) walks the `pending` rows, mints `BlockEscalationRequested` (→
- * `status='requested'`) then `BlockEscalationAttempted` (→ `status='attempted'`,
- * `outcome` recorded), so the latch advances pending→requested→attempted and the
- * escalation fires exactly once per block instance.
+ * walks `pending` rows and mints `BlockEscalationRequested` followed by
+ * `BlockEscalationAttempted`. Owning-work outcomes return the latch to pending and
+ * increment the bounded attachment count; the legacy fallback advances it to
+ * attempted. The whole row is reset only when the task leaves blocked.
  *
  * Category-AGNOSTIC: the fold tracks only the blocked transition + the escalation
  * events; the `TOOLING_FAILURE`-skip category gate lives in the PRODUCER, never
