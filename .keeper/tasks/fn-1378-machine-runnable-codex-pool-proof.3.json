@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Lint gate for bun free extensions",
-  "updated_at": "2026-07-19T21:44:06.490000Z"
+  "updated_at": "2026-07-19T22:20:47.460000Z",
+  "worker_done_at": "2026-07-19T22:20:47.460000Z"
 }

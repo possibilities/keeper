@@ -38,5 +38,5 @@ live tree passes; a type-only bun import does not trip.
 - [ ] The gate runs inside the standard lint invocation commit-work executes
 
 ## Done summary
-
+Extended scripts/lint-source.ts with a static, transitive import-graph gate rooted at every integrations/pi-*/src/** entry that fails on any bun: builtin import (dynamic import() strings included, type-only imports excluded), covered by fixture tests for bun:sqlite reachability, dynamic imports, type-only imports, and the live tree.
 ## Evidence
