@@ -11,10 +11,18 @@ resets a live-claimed lane (recover cleanliness handling, the
 base-freshness producer, and the seed sweep are the suspects, in that
 order). Then hold: the identified pass (and any sibling with the same
 shape) must check the task's live-claim state and defer — visibly, with
-a bounded reason — rather than mutate; a lane with MERGE_HEAD present
-is never reset by any maintenance pass regardless of claim state.
-Model the exclusion as a producer-side probe (never a fold read); an
-inconclusive liveness probe defers.
+a bounded reason — rather than mutate. MERGE_HEAD handling is TRI-STATE, never a blanket
+hold: a lane with a LIVE claim holds (defer, visible bounded reason); a
+lane with a DEAD or absent claim carrying sole-owned keeper/epic residue
+takes the existing flock-guarded abort self-heal exactly as before this
+epic; an abort failure mints the per-lane wedge row exactly as before.
+The hold must never suppress the wedge escalation or the
+positive-evidence level-clear for unheld surfaces; a held lane's open
+row simply persists unchanged until the hold lifts. Model the exclusion
+as a producer-side probe (never a fold read); an inconclusive liveness
+probe defers. Reuse the existing stopped-job liveness helper rather than
+re-implementing it; latch deferral logging once per episode per lane;
+keep unrelated fixes out of this epic's commits.
 
 ### Investigation targets
 
