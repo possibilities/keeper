@@ -7,7 +7,6 @@ import {
   lstatSync,
   openSync,
   readSync,
-  unlinkSync,
 } from "node:fs";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import {
@@ -127,7 +126,6 @@ const MAX_ADOPTION_TOTAL_PATH_BYTES = 1_048_576;
 const PUBLICATION_MAX_ATTEMPTS = 3;
 const PUBLICATION_RETRY_JITTER_MIN_MS = 10;
 const PUBLICATION_RETRY_JITTER_SPAN_MS = 20;
-export const COMMIT_WORK_STALE_LOCK_AGE_MS = 10 * 60 * 1000;
 /** Atomic nonblocking open: FIFOs/devices cannot hang before descriptor fstat. */
 export const BOUNDED_INPUT_OPEN_FLAGS =
   constants.O_RDONLY | constants.O_NONBLOCK;
@@ -659,13 +657,7 @@ export interface CommitWorkDeps {
   ) => boolean | Promise<boolean>;
 }
 
-type CommitWorkLockProbe =
-  | "absent"
-  | "available"
-  | "held"
-  | "present"
-  | "probe_failed"
-  | "reaped";
+type CommitWorkLockProbe = "absent" | "available" | "held" | "probe_failed";
 
 function isMissingPathError(error: unknown): boolean {
   return (
@@ -675,51 +667,15 @@ function isMissingPathError(error: unknown): boolean {
   );
 }
 
-function auditStaleLockReap(
-  lockPath: string,
-  ageMs: number,
-  deps: CommitWorkDeps,
-): void {
-  const line = JSON.stringify({
-    schema_version: 1,
-    kind: "commit-work-lock-reaped",
-    lock_path: lockPath,
-    age_ms: Math.floor(ageMs),
-  });
-  try {
-    (deps.lockAudit ?? ((entry: string) => process.stderr.write(`${entry}\n`)))(
-      line,
-    );
-  } catch {
-    // The stale inode is already gone; audit transport cannot safely restore it.
-  }
-}
-
-/**
- * Reap only an old empty lock inode that a real non-blocking flock proves has
- * no holder. Preview additionally probes every present inode so it can report a
- * live holder without taking the advisory lock for the preview duration.
- */
 function probeCommitWorkLock(
   lockPath: string,
   deps: CommitWorkDeps,
-  probeAvailability: boolean,
 ): CommitWorkLockProbe {
-  let initial: ReturnType<typeof lstatSync>;
   try {
-    initial = lstatSync(lockPath);
+    lstatSync(lockPath);
   } catch (error) {
     return isMissingPathError(error) ? "absent" : "probe_failed";
   }
-
-  const now = (deps.now ?? Date.now)();
-  const ageMs = now - initial.mtimeMs;
-  const stale =
-    initial.isFile() &&
-    initial.size === 0 &&
-    Number.isFinite(ageMs) &&
-    ageMs >= COMMIT_WORK_STALE_LOCK_AGE_MS;
-  if (!stale && !probeAvailability) return "present";
 
   let probe: { release: () => void } | null;
   try {
@@ -730,27 +686,7 @@ function probeCommitWorkLock(
   if (probe === null) return "held";
 
   try {
-    if (!stale) return "available";
-    let current: ReturnType<typeof lstatSync>;
-    try {
-      current = lstatSync(lockPath);
-    } catch (error) {
-      return isMissingPathError(error) ? "available" : "probe_failed";
-    }
-    if (
-      !current.isFile() ||
-      current.dev !== initial.dev ||
-      current.ino !== initial.ino
-    ) {
-      return "available";
-    }
-    try {
-      unlinkSync(lockPath);
-    } catch (error) {
-      return isMissingPathError(error) ? "available" : "probe_failed";
-    }
-    auditStaleLockReap(lockPath, ageMs, deps);
-    return "reaped";
+    return "available";
   } finally {
     probe.release();
   }
@@ -1377,7 +1313,7 @@ async function runAttempt(
 
   if (args.previewFiles) {
     const lockPath = await commitWorkLockPath(worktree, git);
-    const lockState = probeCommitWorkLock(lockPath, deps, true);
+    const lockState = probeCommitWorkLock(lockPath, deps);
     if (lockState === "held" || lockState === "probe_failed") {
       return {
         code: 1,
@@ -1468,7 +1404,6 @@ async function runAttempt(
   }
 
   const lockPath = await commitWorkLockPath(worktree, git);
-  probeCommitWorkLock(lockPath, deps, false);
   const acquire =
     deps.acquireLock ?? ((path: string) => CommitWorkLock.acquire(path));
   let lock: { release: () => void } | null;

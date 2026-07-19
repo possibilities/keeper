@@ -1552,24 +1552,21 @@ function useLockGitDir(d: CommitWorkDeps, gitDir: string): void {
   };
 }
 
-describe("commit-work: stale lock reap", () => {
-  test("an old empty lock with no holder is reaped once and preview completes normally", async () => {
-    const root = mkdtempSync(join(tmpdir(), "keeper-stale-commit-lock-"));
+describe("commit-work: lock availability", () => {
+  test("an old empty lock remains available and preview leaves it in place", async () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-old-commit-lock-"));
     const gitDir = join(root, ".git");
     const lockPath = join(gitDir, "keeper-commit-work.lock");
-    const nowMs = 2_000_000_000_000;
-    const oldMs = 1_999_998_800_000;
     const audit: string[] = [];
     try {
       mkdirSync(gitDir);
       writeFileSync(lockPath, "");
-      utimesSync(lockPath, oldMs / 1000, oldMs / 1000);
+      utimesSync(lockPath, 1_000_000_000, 1_000_000_000);
       const { d } = deps({
         files: [],
         rules: successRules({ stagedNames: [] }),
       });
       useLockGitDir(d, gitDir);
-      d.now = () => nowMs;
       d.lockAudit = (line) => audit.push(line);
 
       const { code, stdout } = await runForTest(
@@ -1582,41 +1579,34 @@ describe("commit-work: stale lock reap", () => {
         outcome: "preview",
         success: true,
         lock_path: lockPath,
-        lock_state: "reaped",
+        lock_state: "available",
       });
-      expect(existsSync(lockPath)).toBe(false);
-      expect(audit).toHaveLength(1);
-      expect(JSON.parse(audit[0] ?? "")).toEqual({
-        schema_version: 1,
-        kind: "commit-work-lock-reaped",
-        lock_path: lockPath,
-        age_ms: 1_200_000,
-      });
+      expect(existsSync(lockPath)).toBe(true);
+      expect(audit).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a normal commit proceeds after reaping a stale lock", async () => {
-    const root = mkdtempSync(join(tmpdir(), "keeper-stale-commit-run-"));
+  test("a normal commit re-locks an old empty lock file", async () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-old-commit-run-"));
     const gitDir = join(root, ".git");
     const lockPath = join(gitDir, "keeper-commit-work.lock");
     const audit: string[] = [];
     try {
       mkdirSync(gitDir);
       writeFileSync(lockPath, "");
-      utimesSync(lockPath, 1_999_998_800, 1_999_998_800);
+      utimesSync(lockPath, 1_000_000_000, 1_000_000_000);
       const { d, calls } = deps({
         files: ["a.txt"],
         rules: successRules({ stagedNames: ["a.txt"] }),
       });
       useLockGitDir(d, gitDir);
-      d.now = () => 2_000_000_000_000;
       d.acquireLock = undefined;
       d.lockAudit = (line) => audit.push(line);
 
       const { code, stdout } = await runForTest(
-        ["feat: after stale lock", "--session-id", "s1"],
+        ["feat: with existing lock file", "--session-id", "s1"],
         d,
       );
 
@@ -1625,13 +1615,74 @@ describe("commit-work: stale lock reap", () => {
         outcome: "committed_pushed",
         success: true,
       });
-      expect(audit).toHaveLength(1);
-      expect(JSON.parse(audit[0] ?? "")).toMatchObject({
-        kind: "commit-work-lock-reaped",
-        lock_path: lockPath,
-        age_ms: 1_200_000,
-      });
+      expect(existsSync(lockPath)).toBe(true);
+      expect(audit).toEqual([]);
       expect(calls.some((call) => call.args[0] === "commit-tree")).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preview reports an absent lock path", async () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-absent-commit-lock-"));
+    const gitDir = join(root, ".git");
+    const lockPath = join(gitDir, "keeper-commit-work.lock");
+    try {
+      mkdirSync(gitDir);
+      const { d } = deps({
+        files: [],
+        rules: successRules({ stagedNames: [] }),
+      });
+      useLockGitDir(d, gitDir);
+
+      const { code, stdout } = await runForTest(
+        ["--preview-files", "--session-id", "s1"],
+        d,
+      );
+
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({
+        outcome: "preview",
+        success: true,
+        lock_path: lockPath,
+        lock_state: "absent",
+      });
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preview reports a failed availability probe with the lock cause", async () => {
+    const root = mkdtempSync(join(tmpdir(), "keeper-failed-commit-lock-"));
+    const gitDir = join(root, ".git");
+    const lockPath = join(gitDir, "keeper-commit-work.lock");
+    try {
+      mkdirSync(gitDir);
+      writeFileSync(lockPath, "");
+      const { d } = deps({
+        files: [],
+        rules: successRules({ stagedNames: [] }),
+      });
+      useLockGitDir(d, gitDir);
+      d.tryAcquireLock = () => {
+        throw new Error("probe failed");
+      };
+
+      const { code, stdout } = await runForTest(
+        ["--preview-files", "--session-id", "s1"],
+        d,
+      );
+
+      expect(code).toBe(1);
+      expect(JSON.parse(stdout)).toMatchObject({
+        outcome: "lock_timeout",
+        success: false,
+        lock_path: lockPath,
+        lock_state: "probe_failed",
+        cause: `commit-work lock ${lockPath} could not be acquired`,
+      });
+      expect(existsSync(lockPath)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
