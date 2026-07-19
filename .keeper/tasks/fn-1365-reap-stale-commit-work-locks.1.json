@@ -1,4 +1,5 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-19T04:23:54.407000Z",
   "depends_on": [],
@@ -10,5 +11,5 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Name and reap stale commit-work locks",
-  "updated_at": "2026-07-19T04:23:54.407000Z"
+  "updated_at": "2026-07-19T04:29:52.424000Z"
 }

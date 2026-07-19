@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Reaping a live-held lock would break repo-wide staging mutual exclusion including daemon fan-in merge holders, a subtle concurrency-correctness invariant that clears the opus gate, at xhigh for the flock-vs-exclusive lock semantics a wrong abstraction propagates from.",
+      "task_id": "fn-1365-reap-stale-commit-work-locks.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T04:29:52.424000Z",
+  "epic_id": "fn-1365-reap-stale-commit-work-locks",
+  "input_hash": "42cc95313f63ff2a9d841e387164bb54fabd056b5c94e53efc7ee10764ee92c5",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1120703793,
+  "verdict_raw": "{\"cells\": [{\"task_id\": \"fn-1365-reap-stale-commit-work-locks.1\", \"tier\": \"xhigh\", \"model\": \"opus\", \"rationale\": \"Reaping a live-held lock would break repo-wide staging mutual exclusion including daemon fan-in merge holders, a subtle concurrency-correctness invariant that clears the opus gate, at xhigh for the flock-vs-exclusive lock semantics a wrong abstraction propagates from.\", \"confidence\": 0.78}]}\n"
+}
