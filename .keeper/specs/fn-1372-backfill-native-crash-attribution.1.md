@@ -29,5 +29,5 @@ Deterministic ledger fixtures through the existing probe seam: a >30-min-runtime
 - [ ] daemon gates green
 
 ## Done summary
-
+Separated the native-crash backfill horizon (24h) from the crash-loop window; added a per-boot scanned/matched/marked summary log line and a locked long-runtime-predecessor test.
 ## Evidence
