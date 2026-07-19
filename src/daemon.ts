@@ -1420,7 +1420,8 @@ export function shouldEscalateBlockedCategory(
  *    write-capable `repair::<repo-token>` dispatch, so the block sweep skips the row
  *    (latch left `pending`, re-sweeps; a successful repair unblocks the task,
  *    deleting the latch).
- *  - `work` — `AUDIT_READY`: resume the audit-owning work orchestrator.
+ *  - `work` — `AUDIT_READY`: resume the audit-owning work orchestrator through
+ *    the bounded owner ladder.
  *  - `unblock` — every other escalatable category enters the per-epic block
  *    handling ladder (owning-work attachment, then legacy unblock fallback).
  */
@@ -1573,7 +1574,7 @@ export function probeBlockOwner(
 }
 
 /**
- * Decide the next ordinary block-handling rung. Only a witnessed owner death
+ * Decide the next bounded block-handling rung. Only a witnessed owner death
  * beyond grace can act: live, grace-held, and absent owners all defer. A dead
  * owner receives a bounded number of `work::<task>` attachment attempts before
  * the legacy `unblock::<task>` fallback becomes eligible. Pure.
@@ -1708,9 +1709,9 @@ export type BlockCandidateDropClass =
  * Run one daemon block-escalation sweep (stage 2) — the producer half of the
  * blocked-task handling ladder. Walk pending latches, preserve the category routes,
  * defer ordinary escalatable blocks while their owning work orchestrator is live or
- * death-grace-held, resume dead AUDIT_READY owners through `work::<task>`, then
- * consume bounded attachment attempts before the legacy `unblock::<task>` fallback
- * for non-audit categories. Every launch rung is serialized per epic.
+ * death-grace-held, and consume bounded `work::<task>` attempts before the legacy
+ * `unblock::<task>` fallback for both dead AUDIT_READY owners and ordinary blocks.
+ * Every launch rung is serialized per epic.
  *
  * Each row resolves to one of:
  *  - `skipped_unblocked` (terminal) — the cancellation guard fired (task left
@@ -1788,6 +1789,7 @@ export async function runBlockEscalationSweep(
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
     const category = parseBlockedCategory(reason);
     const route = routeBlockedCategory(category);
+    let auditLiveness: AuditOrchestratorLiveness | null = null;
 
     // A terminal category skip records the surface-and-stop reason CLASS, not the
     // worker-authored prose. Rewording TOOLING_FAILURE (or another unparseable
@@ -1809,13 +1811,13 @@ export async function runBlockEscalationSweep(
     // route so a fresh orchestrator can resume the persisted audit handoff.
     // AUDIT_SEVERE rides the ordinary unblock path immediately.
     if (category === AUDIT_READY_CATEGORY) {
-      const liveness = deps.auditOrchestratorLiveness?.(row) ?? {
+      auditLiveness = deps.auditOrchestratorLiveness?.(row) ?? {
         state: "absent",
       };
       const nowMs = (deps.now ?? Date.now)();
       if (
         auditReadyEscalationDecision(
-          liveness,
+          auditLiveness,
           nowMs,
           AUDIT_READY_ORCHESTRATOR_GRACE_MS,
         ) === "defer"
@@ -1867,13 +1869,18 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
-    // AUDIT_READY resumes through the same owner-fenced work launch used by the
-    // attachment ladder. AUDIT_SEVERE keeps the immediate legacy unblock route;
-    // every ordinary unblock category uses the bounded owner ladder.
+    // AUDIT_READY and ordinary blocks share the bounded owner-fenced work ladder.
+    // AUDIT_SEVERE keeps the immediate legacy unblock route.
+    const usesBoundedOwnerRung =
+      route === "work" ||
+      (route === "unblock" && category !== AUDIT_SEVERE_CATEGORY);
     let handlingRung: "redispatch_owner" | "dispatch_legacy_unblock" =
-      route === "work" ? "redispatch_owner" : "dispatch_legacy_unblock";
-    if (route === "unblock" && category !== AUDIT_SEVERE_CATEGORY) {
-      const liveness = deps.ownerLiveness?.(row) ?? { state: "absent" };
+      "dispatch_legacy_unblock";
+    if (usesBoundedOwnerRung) {
+      const liveness: BlockOwnerLiveness =
+        route === "work"
+          ? (auditLiveness ?? { state: "absent" })
+          : (deps.ownerLiveness?.(row) ?? { state: "absent" });
       const decision = blockOwnerEscalationDecision(
         liveness,
         row.owner_redispatch_attempts,
@@ -1916,11 +1923,15 @@ export async function runBlockEscalationSweep(
     claimedEpics.add(row.epic_id);
 
     // Re-probe at the dispatch boundary. The owner may have attached after the
-    // first decision but before this row won per-epic serialization; every rung
-    // takes the defer direction on that race instead of double-handling the block.
-    if (route === "unblock" && category !== AUDIT_SEVERE_CATEGORY) {
+    // first decision but before this row won per-epic serialization; every bounded
+    // rung takes the defer direction on that race instead of double-handling the block.
+    if (usesBoundedOwnerRung) {
+      const liveness: BlockOwnerLiveness =
+        route === "work"
+          ? (deps.auditOrchestratorLiveness?.(row) ?? { state: "absent" })
+          : (deps.ownerLiveness?.(row) ?? { state: "absent" });
       const refreshed = blockOwnerEscalationDecision(
-        deps.ownerLiveness?.(row) ?? { state: "absent" },
+        liveness,
         row.owner_redispatch_attempts,
         (deps.now ?? Date.now)(),
       );
@@ -1967,7 +1978,7 @@ export async function runBlockEscalationSweep(
       continue;
     }
 
-    // The non-audit serialization-winner row. Launch the `unblock::<task>` session,
+    // The legacy serialization-winner row. Launch the `unblock::<task>` session,
     // then record the outcome. A SKIP (`at_cap` / `already_live`) mints nothing — the
     // latch stays `pending` and re-sweeps (at cap, or once the in-flight session
     // folds). Only a real attempt (`dispatched` / `dispatch_failed`) mints
@@ -14349,8 +14360,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Producer-side block-handling sweep. Each heartbeat walks pending latches plus
   // re-armable category skips, preserves the surface-and-stop and repair routes,
-  // defers ordinary blocks to live owners, resumes dead audit owners through work,
-  // and advances the bounded owning-work → legacy-unblock ladder for other categories.
+  // defers blocks to live owners and advances the bounded owning-work →
+  // legacy-unblock ladder for dead audit owners and ordinary categories.
   // Every launch is per-epic serialized;
   // all wall-clock, filesystem, and spawn work stays producer-side.
   async function runBlockEscalationSweepTick(): Promise<void> {

@@ -5819,7 +5819,9 @@ test("runBlockEscalationSweep: an absent/unparseable reason never dispatches (su
 
 test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and dispatches once after grace", async () => {
   const taskId = "fn-1-rearm.1";
-  const row = blockedRow("fn-1-rearm", taskId);
+  const row = blockedRow("fn-1-rearm", taskId, {
+    owner_redispatch_attempts: 0,
+  });
   const reasons: Record<string, string | null> = {
     [taskId]: "TOOLING_FAILURE: runner unavailable",
   };
@@ -6377,7 +6379,11 @@ test("runBlockEscalationSweep: AUDIT_READY with a LIVE orchestrator defers — n
 
 test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace dispatches one work resume", async () => {
   const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
-    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    pending: [
+      blockedRow("fn-1-foo", "fn-1-foo.1", {
+        owner_redispatch_attempts: 0,
+      }),
+    ],
     reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
     // Died 200s ago, grace is 120s — past grace → escalate.
     orchestrator: { "fn-1-foo.1": { state: "dead", diedAtMs: 800_000 } },
@@ -6408,7 +6414,11 @@ test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator PAST grace d
 
 test("runBlockEscalationSweep: an AUDIT_READY work resume at cap stays pending", async () => {
   const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps({
-    pending: [blockedRow("fn-1-foo", "fn-1-foo.1")],
+    pending: [
+      blockedRow("fn-1-foo", "fn-1-foo.1", {
+        owner_redispatch_attempts: 0,
+      }),
+    ],
     reasons: { "fn-1-foo.1": AUDIT_READY_REASON },
     orchestrator: { "fn-1-foo.1": { state: "dead", diedAtMs: 800_000 } },
     nowMs: 1_000_000,
@@ -6422,6 +6432,74 @@ test("runBlockEscalationSweep: an AUDIT_READY work resume at cap stays pending",
     { epicId: "fn-1-foo", taskId: "fn-1-foo.1" },
   ]);
   expect(mints).toEqual([]);
+});
+
+test("runBlockEscalationSweep: repeated AUDIT_READY replacement deaths exhaust the owner bound and page the human", async () => {
+  const epicId = "fn-1-audit-loop";
+  const taskId = `${epicId}.1`;
+  const row = blockedRow(epicId, taskId, {
+    owner_redispatch_attempts: 0,
+  });
+  const orchestrator: Record<string, AuditOrchestratorLiveness> = {
+    [taskId]: { state: "dead", diedAtMs: 0 },
+  };
+  const options = {
+    pending: [row],
+    reasons: { [taskId]: AUDIT_READY_REASON },
+    orchestrator,
+    nowMs: AUDIT_READY_ORCHESTRATOR_GRACE_MS,
+  };
+  const { deps, mints, dispatches, ownerDispatches } = fakeSweepDeps(options);
+
+  for (let attempt = 0; attempt < BLOCK_OWNER_REDISPATCH_LIMIT; attempt += 1) {
+    await runBlockEscalationSweep(deps);
+    expect(ownerDispatches).toHaveLength(attempt + 1);
+    expect(dispatches).toEqual([]);
+
+    row.owner_redispatch_attempts += 1;
+    row.outcome = "owner_redispatched";
+    orchestrator[taskId] = { state: "live" };
+    await runBlockEscalationSweep(deps);
+    expect(ownerDispatches).toHaveLength(attempt + 1);
+
+    const replacementDiedAtMs = options.nowMs + 1;
+    orchestrator[taskId] = {
+      state: "dead",
+      diedAtMs: replacementDiedAtMs,
+    };
+    options.nowMs = replacementDiedAtMs + AUDIT_READY_ORCHESTRATOR_GRACE_MS - 1;
+    await runBlockEscalationSweep(deps);
+    expect(ownerDispatches).toHaveLength(attempt + 1);
+    options.nowMs += 1;
+  }
+
+  await runBlockEscalationSweep(deps);
+  expect(ownerDispatches).toHaveLength(BLOCK_OWNER_REDISPATCH_LIMIT);
+  expect(dispatches).toEqual([{ epicId, taskId }]);
+  expect(mints.slice(-2)).toEqual([
+    { kind: "requested", epicId, taskId },
+    { kind: "attempted", epicId, taskId, outcome: "dispatched" },
+  ]);
+
+  const pages: { taskId: string; verdict: "declined" | "died" }[] = [];
+  const notifyMints: BlockHumanNotifyMintCall[] = [];
+  await runBlockHumanNotifySweep({
+    selectPending: () => [{ epic_id: epicId, task_id: taskId }],
+    stillPending: () => true,
+    unblockOutcome: () => ({ terminal: true, verdict: "died" }),
+    notifyHuman: async (pending, verdict) => {
+      pages.push({ taskId: pending.task_id, verdict });
+      return "notified";
+    },
+    mintAttempted: (notifiedEpicId, notifiedTaskId, outcome) =>
+      notifyMints.push({
+        epicId: notifiedEpicId,
+        taskId: notifiedTaskId,
+        outcome,
+      }),
+  });
+  expect(pages).toEqual([{ taskId, verdict: "died" }]);
+  expect(notifyMints).toEqual([{ epicId, taskId, outcome: "notified" }]);
 });
 
 test("runBlockEscalationSweep: AUDIT_READY with a DEAD orchestrator WITHIN grace defers (no page yet)", async () => {
