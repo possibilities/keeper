@@ -4471,6 +4471,7 @@ interface DispatchClaimMutationPayload extends DispatchClaimTarget {
   expectedAttemptId: number | null;
   sessionId: string | null;
   ownerlessAcquiredOnly: boolean;
+  terminalSessionOnly: boolean;
 }
 
 interface DispatchClaimSupersedePayload extends DispatchClaimTarget {
@@ -4570,11 +4571,13 @@ function extractDispatchClaimMutationPayload(
         ? parsed.session_id
         : null;
     const ownerlessAcquiredOnly = parsed.ownerless_acquired_only === true;
+    const terminalSessionOnly = parsed.terminal_session_only === true;
     return {
       ...target,
       expectedAttemptId,
       sessionId,
       ownerlessAcquiredOnly,
+      terminalSessionOnly,
     };
   } catch {
     return null;
@@ -4868,7 +4871,13 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
     return;
   }
   if (payload.ownerlessAcquiredOnly) {
-    if (payload.expectedAttemptId == null || payload.sessionId != null) return;
+    if (
+      payload.terminalSessionOnly ||
+      payload.expectedAttemptId == null ||
+      payload.sessionId != null
+    ) {
+      return;
+    }
     const exactOwnerlessAcquire = db
       .query(
         `SELECT 1 FROM dispatch_claims c
@@ -4886,6 +4895,26 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
       )
       .get(payload.verb, payload.id, payload.expectedAttemptId);
     if (exactOwnerlessAcquire == null) return;
+  }
+  if (payload.terminalSessionOnly) {
+    if (payload.expectedAttemptId == null || payload.sessionId == null) return;
+    const exactTerminalOwner = db
+      .query(
+        `SELECT 1 FROM dispatch_claims c
+           JOIN jobs j ON j.job_id = c.session_id
+          WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
+            AND c.session_id = ?
+            AND c.state IN ('bound', 'resume_requested')
+            AND c.legacy_unfenced = 0
+            AND j.state IN ('ended', 'killed')`,
+      )
+      .get(
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+        payload.sessionId,
+      );
+    if (exactTerminalOwner == null) return;
   }
   const sessionClause = payload.sessionId == null ? "" : " AND session_id = ?";
   const bindings: Array<string | number> = [
@@ -10350,6 +10379,7 @@ function projectJobsRow(db: Database, event: Event): void {
                   expectedAttemptId: dispatchAttemptId,
                   sessionId: jobId,
                   ownerlessAcquiredOnly: false,
+                  terminalSessionOnly: false,
                 });
           if (claimAuthorized) {
             const dischargeRes =

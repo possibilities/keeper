@@ -149,6 +149,9 @@ export type WithholdReasonCode =
   | "failed-key"
   | "claim-fence"
   | "activity-collision"
+  | "occupancy-held"
+  | "occupancy-reaping"
+  | "occupancy-probe-degraded"
   | "live-tab"
   | "cooldown"
   | "finalizer-guard"
@@ -163,6 +166,8 @@ export interface WithholdReason {
   /** Churny target-specific context, deliberately separate from the stable code. */
   detail: string | null;
 }
+
+const OCCUPANCY_PROBE_DEGRADED_DETAIL = "tmux pane probe unavailable";
 
 function withhold(
   code: WithholdReasonCode,
@@ -1673,7 +1678,21 @@ export function dispatchTargetWithholdCode(
   >,
   verb: Verb | "resolve",
   id: string,
-): "claim-fence" | "activity-collision" | null {
+): "claim-fence" | "activity-collision" | "occupancy-probe-degraded" | null {
+  if (
+    dispatchClaimBlocksReplacement(
+      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
+    )
+  ) {
+    return "claim-fence";
+  }
+  const stoppedOccupant = [...snapshot.jobs.values()].some(
+    (job) =>
+      job.state === "stopped" && job.plan_verb === verb && job.plan_ref === id,
+  );
+  if (stoppedOccupant && snapshot.livePaneIds === null) {
+    return "occupancy-probe-degraded";
+  }
   if (
     snapshot.dispatchClaims === undefined &&
     snapshot.harnessActivityByJobId === undefined
@@ -1681,13 +1700,6 @@ export function dispatchTargetWithholdCode(
     return isOccupyingJob(snapshot.jobs, verb, id, snapshot.livePaneIds)
       ? "activity-collision"
       : null;
-  }
-  if (
-    dispatchClaimBlocksReplacement(
-      snapshot.dispatchClaims?.get(dispatchKey(verb as Verb, id)),
-    )
-  ) {
-    return "claim-fence";
   }
   return dispatchTargetHasActivityCollision(
     snapshot.jobs,
@@ -2467,7 +2479,15 @@ export function reconcile(
         taskId,
       );
       if (ownershipWithhold !== null) {
-        withholds.set(taskId, withhold(ownershipWithhold));
+        withholds.set(
+          taskId,
+          withhold(
+            ownershipWithhold,
+            ownershipWithhold === "occupancy-probe-degraded"
+              ? OCCUPANCY_PROBE_DEGRADED_DETAIL
+              : null,
+          ),
+        );
         continue;
       }
       if (snapshot.liveTabKeys.has(key)) {
@@ -2679,7 +2699,12 @@ export function reconcile(
           epicId,
         );
         if (ownershipCode !== null) {
-          closeWithhold = withhold(ownershipCode);
+          closeWithhold = withhold(
+            ownershipCode,
+            ownershipCode === "occupancy-probe-degraded"
+              ? OCCUPANCY_PROBE_DEGRADED_DETAIL
+              : null,
+          );
         } else if (snapshot.liveTabKeys.has(closeKey)) {
           closeWithhold = withhold("live-tab");
         } else if (isInCooldown(state.redispatchCooldown, closeKey, now)) {
@@ -2868,6 +2893,37 @@ export function reconcile(
     paused: state.paused,
     now,
   });
+  for (const signal of slot.failures) {
+    withholds.set(
+      signal.id,
+      withhold(
+        signal.reapTarget === null ? "occupancy-held" : "occupancy-reaping",
+        signal.reason,
+      ),
+    );
+  }
+  if (!state.paused && snapshot.livePaneIds === null) {
+    const degradedTargets = new Set<string>();
+    for (const job of snapshot.jobs.values()) {
+      const verb = job.plan_verb;
+      const id = job.plan_ref;
+      if (job.state !== "stopped" || id == null || id === "") continue;
+      if (
+        (verb === "work" &&
+          verbForVerdict("task", readiness.perTask.get(id)) !== null) ||
+        (verb === "close" &&
+          verbForVerdict("close", readiness.perCloseRow.get(id)) !== null)
+      ) {
+        degradedTargets.add(id);
+      }
+    }
+    for (const id of [...degradedTargets].sort()) {
+      withholds.set(
+        id,
+        withhold("occupancy-probe-degraded", OCCUPANCY_PROBE_DEGRADED_DETAIL),
+      );
+    }
+  }
 
   return {
     launches,

@@ -229,8 +229,10 @@ import {
   PENDING_DISPATCH_TTL_MS,
   planOrphanedClaimReaper,
   planPendingDispatchSweep,
+  planTerminalSessionClaimReleases,
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
+  terminalSessionClaimIsReleaseable,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "../src/db";
 import {
@@ -3173,6 +3175,61 @@ test("post-reap snapshots clear the occupancy refusal and mint without operator 
   ]);
 });
 
+test("occupancy declines use stable held, reaping, and degraded-probe withholds", () => {
+  const taskId = "fn-1-foo.1";
+  const epic = makeEpic({ tasks: [makeTask({ task_id: taskId })] });
+  const occupant = makeJob({
+    job_id: "occupant",
+    plan_verb: "work",
+    plan_ref: taskId,
+    state: "stopped",
+    backend_exec_pane_id: "%9",
+    created_at: 1,
+    updated_at: 90,
+  });
+  const observed = {
+    epics: [epic],
+    jobs: new Map([[occupant.job_id, occupant]]),
+    livePaneIds: new Set(["%9"]),
+    paneCommandById: new Map([["%9", "claude"]]),
+  };
+
+  const held = reconcile(makeSnapshot(observed), makeState(), 100);
+  const heldAgain = reconcile(makeSnapshot(observed), makeState(), 101);
+  expect(held.withholds.get(taskId)).toEqual({
+    code: "occupancy-held",
+    severity: "normal",
+    detail:
+      "slot-occupied: stopped work session holds the slot (pane %9 claude)",
+  });
+  expect(heldAgain.withholds.get(taskId)).toEqual(held.withholds.get(taskId));
+
+  const reaping = reconcile(makeSnapshot(observed), makeState(), 1_000);
+  expect(reaping.withholds.get(taskId)).toEqual({
+    code: "occupancy-reaping",
+    severity: "normal",
+    detail: "slot-reclaimed: reaping stopped work session (pane %9 claude)",
+  });
+
+  const degraded = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: observed.jobs,
+      livePaneIds: null,
+      paneCommandById: null,
+    }),
+    makeState(),
+    1_000,
+  );
+  expect(degraded.launches).toEqual([]);
+  expect(degraded.slotOccupancy).toEqual([]);
+  expect(degraded.withholds.get(taskId)).toEqual({
+    code: "occupancy-probe-degraded",
+    severity: "normal",
+    detail: "tmux pane probe unavailable",
+  });
+});
+
 test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky failure)", () => {
   const epic = makeEpic({
     tasks: [makeTask({ task_id: "fn-1-foo.1" })],
@@ -5201,6 +5258,194 @@ test("durable orphan Reaper deterministically jitters a reboot cohort and caps e
     expect(new Set(first.map((row) => row.deadline_ms)).size).toBeGreaterThan(
       1,
     );
+  });
+});
+
+test("terminal-session claim planner selects only dead owners with settled-or-absent legs", async () => {
+  await withSeededDb((db) => {
+    const insertClaim = (
+      id: string,
+      attemptId: number,
+      jobState: string,
+      claimState = "bound",
+    ): void => {
+      const sessionId = `session-${id}`;
+      db.run(
+        `INSERT INTO jobs
+           (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+         VALUES (?, 1, 2, ?, ?, 'work', ?)`,
+        [sessionId, attemptId, jobState, id],
+      );
+      db.run(
+        `INSERT INTO dispatch_claims
+           (verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+            acquired_at, bound_at, last_event_id, updated_at)
+         VALUES ('work', ?, ?, ?, ?, '/repo', 0, 1, 1, ?, 2)`,
+        [id, attemptId, claimState, sessionId, attemptId],
+      );
+    };
+    const insertLeg = (id: string, attemptId: number, state: string): void => {
+      db.run(
+        `INSERT INTO provider_leg_ownership
+           (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+            ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 2)`,
+        [`leg-${id}`, `session-${id}`, attemptId, attemptId, state, attemptId],
+      );
+    };
+
+    insertClaim("dead-no-legs.1", 101, "killed");
+    insertClaim("ended-settled.1", 102, "ended", "resume_requested");
+    insertLeg("ended-settled.1", 102, "terminal");
+    insertClaim("stopped-owner.1", 103, "stopped");
+    insertClaim("dead-live-leg.1", 104, "killed");
+    insertLeg("dead-live-leg.1", 104, "live");
+    insertClaim("dead-cascade.1", 105, "ended");
+    insertLeg("dead-cascade.1", 105, "terminal");
+    db.run(
+      `INSERT INTO provider_leg_cascades
+         (leg_launch_id, ownership_epoch_event_id, wrapper_job_id,
+          wrapper_dispatch_attempt_id, state, last_event_id, created_at, updated_at)
+       VALUES ('leg-dead-cascade.1', 105, 'session-dead-cascade.1', 105,
+               'armed', 105, 1, 2)`,
+    );
+
+    const planned = planTerminalSessionClaimReleases(db);
+    expect(planned.map((row) => row.id)).toEqual([
+      "dead-no-legs.1",
+      "ended-settled.1",
+    ]);
+    expect(
+      planTerminalSessionClaimReleases(db, 1).map((row) => row.id),
+    ).toEqual(["dead-no-legs.1"]);
+    const firstPlanned = planned[0];
+    if (firstPlanned === undefined) throw new Error("expected planned claim");
+    expect(terminalSessionClaimIsReleaseable(db, firstPlanned)).toBe(true);
+    expect(
+      terminalSessionClaimIsReleaseable(db, {
+        verb: "work",
+        id: "dead-live-leg.1",
+        attempt_id: 104,
+        session_id: "session-dead-live-leg.1",
+      }),
+    ).toBe(false);
+  });
+});
+
+test("terminal-session release fold rechecks revival, late bind, supersede, and leg enrollment", async () => {
+  await withSeededDb((db) => {
+    const seed = (
+      id: string,
+      attemptId: number,
+      state: "bound" | "resume_requested" = "bound",
+    ): void => {
+      db.run(
+        `INSERT INTO jobs
+           (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+         VALUES (?, 1, 2, ?, 'killed', 'work', ?)`,
+        [`dead-${id}`, attemptId, id],
+      );
+      db.run(
+        `INSERT INTO dispatch_claims
+           (verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+            acquired_at, bound_at, last_event_id, updated_at)
+         VALUES ('work', ?, ?, ?, ?, '/repo', 0, 1, 1, ?, 2)`,
+        [id, attemptId, state, `dead-${id}`, attemptId],
+      );
+    };
+    const ids = [
+      "release.1",
+      "settled.1",
+      "revived.1",
+      "late-bind.1",
+      "superseded.1",
+      "late-leg.1",
+      "late-cascade.1",
+    ];
+    for (const [index, id] of ids.entries()) {
+      seed(id, 201 + index);
+    }
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('settled-leg', 'dead-settled.1', 202, 202,
+               'terminal', 202, 1, 2)`,
+    );
+
+    const planned = planTerminalSessionClaimReleases(db);
+    expect(planned.map((row) => row.id)).toEqual(ids);
+
+    db.run("UPDATE jobs SET state = 'stopped' WHERE job_id = 'dead-revived.1'");
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+       VALUES ('late-bound-live', 3, 3, 999, 'stopped', 'work', 'late-bind.1')`,
+    );
+    db.run(
+      `UPDATE dispatch_claims SET session_id = 'late-bound-live'
+        WHERE verb = 'work' AND id = 'late-bind.1'`,
+    );
+    db.run(
+      `UPDATE dispatch_claims
+          SET attempt_id = 999, state = 'acquired', session_id = NULL
+        WHERE verb = 'work' AND id = 'superseded.1'`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-live-leg', 'dead-late-leg.1', 206, 206,
+               'live', 206, 1, 2)`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-terminal-leg', 'dead-late-cascade.1', 207, 207,
+               'terminal', 207, 1, 2)`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_cascades
+         (leg_launch_id, ownership_epoch_event_id, wrapper_job_id,
+          wrapper_dispatch_attempt_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-terminal-leg', 207, 'dead-late-cascade.1', 207,
+               'terming', 207, 1, 2)`,
+    );
+
+    for (const row of planned) {
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+         VALUES (10, ?, 'DispatchClaimReleased', 'dispatch_claims', ?)`,
+        [
+          `${row.verb}::${row.id}`,
+          JSON.stringify({
+            verb: row.verb,
+            id: row.id,
+            expected_attempt_id: row.attempt_id,
+            session_id: row.session_id,
+            terminal_session_only: true,
+          }),
+        ],
+      );
+    }
+    expect(drain(db)).toBe(planned.length);
+
+    const claimState = (id: string): string | null =>
+      (
+        db
+          .query(
+            "SELECT state FROM dispatch_claims WHERE verb = 'work' AND id = ?",
+          )
+          .get(id) as { state: string } | null
+      )?.state ?? null;
+    expect(claimState("release.1")).toBe("released");
+    expect(claimState("settled.1")).toBe("released");
+    expect(claimState("revived.1")).toBe("bound");
+    expect(claimState("late-bind.1")).toBe("bound");
+    expect(claimState("superseded.1")).toBe("acquired");
+    expect(claimState("late-leg.1")).toBe("bound");
+    expect(claimState("late-cascade.1")).toBe("bound");
   });
 });
 
