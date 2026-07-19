@@ -41,5 +41,5 @@ listing with (a) a byte-identical plant only → cleanable; (b) plant + real unt
 - [ ] worktree-isolation gates green
 
 ## Done summary
-
+isWorktreeDepPlant now backs the fan-in/recover lossless-cleanability probe: a byte-identical ADR-0074 dep plant no longer produces a would-clobber/wedge verdict, while retargeted links or real work at the plant path still block. Added deterministic worktree-isolation coverage for all three cases.
 ## Evidence
