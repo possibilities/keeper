@@ -9,7 +9,7 @@
     "fn-1379-hold-live-lanes-against-resets"
   ],
   "id": "fn-1350-owner-mediated-merge-integration",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T23:07:48.466000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-19T23:07:47.819000Z"
+  "updated_at": "2026-07-19T23:07:48.466000Z"
 }
