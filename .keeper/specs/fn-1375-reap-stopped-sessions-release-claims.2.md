@@ -56,5 +56,5 @@ green untouched. Named gates only.
 - [ ] The named focused gates and the typecheck are green.
 
 ## Done summary
-
+Added a capped producer sweep releasing acquired claims whose owning session is terminally dead (killed/ended) with settled-or-absent Provider-leg ownership, re-checked in the fold so late binds/leg enrollment are no-ops; routed every reconciler ready-target decline through the withholds map with stable codes and cycle-stable detail including occupancy-pass and a degraded-probe sentinel, documented in problem-codes.md.
 ## Evidence
