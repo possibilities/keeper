@@ -43,5 +43,5 @@ Reproduce the wipe first, then fix the exact write. The durable `autopilot_state
 - [ ] The named gates are green: `bun test ./test/reducer-projections.test.ts ./test/refold-equivalence.test.ts ./test/db.test.ts` + `bun run typecheck`.
 
 ## Done summary
-
+Fixed the boot-cycle wipe of autopilot_state.fable_focus: the codex_adoption column was re-added by an older additive migration step and immediately dropped again by the v129 rebuild every boot (all SCHEMA_STEPS run every boot), and the v129 copy-list omitted fable_focus, silently nulling it each cycle. Made the rebuild copy-list an exhaustive, presence-filtered superset of the current schema (including fable_focus), added a regression test proving a populated policy survives an openDb reopen boot cycle (column + published leaf), and added a forward guard test asserting every autopilot_state rebuild copy-list covers every current schema column.
 ## Evidence
