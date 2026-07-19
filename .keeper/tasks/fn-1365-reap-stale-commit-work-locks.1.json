@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-19T04:23:54.407000Z",
+  "depends_on": [],
+  "epic": "fn-1365-reap-stale-commit-work-locks",
+  "id": "fn-1365-reap-stale-commit-work-locks.1",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Name and reap stale commit-work locks",
+  "updated_at": "2026-07-19T04:23:54.407000Z"
+}
