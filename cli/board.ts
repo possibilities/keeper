@@ -380,8 +380,6 @@ export function boardSummaryLines(counts: BoardSummaryCounts): string[] {
   ];
 }
 
-export const BOARD_HEADER_NARROW_WIDTH = 80;
-export const BOARD_HEADER_MIN_WIDTH = 60;
 export const BOARD_HEADER_NON_TTY_WIDTH = 100;
 
 export interface BoardHeaderAutopilot {
@@ -415,52 +413,80 @@ export function boardHeaderDisplayWidth(value: string): number {
   return Bun.stringWidth(stripHeaderAnsi(value));
 }
 
-export function truncateBoardHeader(value: string, width: number): string {
-  const bounded = Math.max(0, Math.floor(width));
-  const plain = stripHeaderAnsi(value);
-  if (bounded === 0 || plain === "") {
-    return "";
-  }
-  if (boardHeaderDisplayWidth(plain) <= bounded) {
-    return plain;
-  }
-  if (bounded === 1) {
-    return "…";
-  }
-  let out = "";
-  for (const unit of plain) {
-    if (boardHeaderDisplayWidth(`${out}${unit}…`) > bounded) {
-      break;
+function splitHeaderToken(token: string, width: number): string[] {
+  const rows: string[] = [];
+  let row = "";
+  for (const unit of token) {
+    if (row !== "" && boardHeaderDisplayWidth(`${row}${unit}`) > width) {
+      rows.push(row);
+      row = unit;
+    } else {
+      row += unit;
     }
-    out += unit;
   }
-  return `${out}…`;
+  if (row !== "") {
+    rows.push(row);
+  }
+  return rows;
 }
 
-function compactFocusTarget(target: string | null): string {
-  if (target === null) {
-    return "off";
+/** Wrap one complete semantic row without abbreviating or dropping text. */
+export function wrapBoardHeaderLine(value: string, width: number): string[] {
+  const bounded = Math.max(1, Math.floor(width));
+  const plain = stripHeaderAnsi(value);
+  if (plain === "" || boardHeaderDisplayWidth(plain) <= bounded) {
+    return [plain];
   }
-  const slot = /^claude-swap:(\d+)$/u.exec(target)?.[1];
-  return slot === undefined ? target : `c${slot}`;
+
+  const indent = /^\s*/u.exec(plain)?.[0] ?? "";
+  const available = Math.max(1, bounded - boardHeaderDisplayWidth(indent));
+  const words = plain.trimStart().split(/\s+/u);
+  const rows: string[] = [];
+  let row = indent;
+
+  for (const word of words) {
+    const separator = row.trim() === "" ? "" : " ";
+    if (boardHeaderDisplayWidth(`${row}${separator}${word}`) <= bounded) {
+      row = `${row}${separator}${word}`;
+      continue;
+    }
+    if (row.trim() !== "") {
+      rows.push(row);
+      row = indent;
+    }
+    if (boardHeaderDisplayWidth(`${indent}${word}`) <= bounded) {
+      row = `${indent}${word}`;
+      continue;
+    }
+    const pieces = splitHeaderToken(word, available);
+    for (const piece of pieces.slice(0, -1)) {
+      rows.push(`${indent}${piece}`);
+    }
+    row = `${indent}${pieces.at(-1) ?? ""}`;
+  }
+
+  if (row.trim() !== "") {
+    rows.push(row);
+  }
+  return rows;
 }
 
 function focusLifetime(focus: FableFocusRoutingView): string {
   const lifetime = focus.lifetime;
   if (lifetime === null) {
-    return "off";
+    return "unavailable";
   }
   if (lifetime.kind === "permanent") {
     return "permanent";
   }
   return lifetime.kind === "absolute"
-    ? `absolute ${lifetime.deadline_at}`
-    : `cycle-end ${lifetime.reset_at}`;
+    ? `until ${lifetime.deadline_at}`
+    : `until the Fable cycle ending ${lifetime.reset_at}`;
 }
 
 function focusState(focus: FableFocusRoutingView, now: number): string {
   if (focus.state === "unavailable" || focus.state === "invalid") {
-    return "unavailable";
+    return "unavailable; using normal account balancing";
   }
   if (focus.state === "off") {
     return "off";
@@ -475,49 +501,65 @@ function focusState(focus: FableFocusRoutingView, now: number): string {
       lifetime.kind === "absolute" ? lifetime.deadline_at : lifetime.reset_at,
     ) <= now
   ) {
-    return "fallback";
+    return "fallback to normal account balancing";
   }
   return focus.state === "active" && focus.outcome === "focused"
     ? "focused"
-    : "fallback";
+    : "fallback to normal account balancing";
+}
+
+function fableFocusHeaderLines(
+  focus: FableFocusRoutingView,
+  now: number,
+): string[] {
+  if (!focus.configured && focus.state === "off") {
+    return ["Fable focus: off"];
+  }
+  const lines = ["Fable focus"];
+  if (focus.configured) {
+    lines.push(
+      `  target account route: ${focus.target_route ?? "unavailable"}`,
+      `  lifetime: ${focusLifetime(focus)}`,
+      `  target currently eligible: ${focus.target_eligible === null ? "unknown" : focus.target_eligible ? "yes" : "no"}`,
+    );
+  } else {
+    lines.push("  configured: no");
+  }
+  lines.push(`  effective routing state: ${focusState(focus, now)}`);
+  if (focus.diagnostic !== "none") {
+    lines.push(`  diagnostic: ${focus.diagnostic}`);
+  }
+  return lines;
 }
 
 export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
   const { autopilot, fableFocus, needsHumanCount, summary } = input.viewModel;
   const width = Math.max(1, Math.floor(input.width));
-  const target = compactFocusTarget(fableFocus.target_route);
-  const lifetime = focusLifetime(fableFocus);
-  const state = focusState(fableFocus, input.now);
   const cap =
     autopilot.maxConcurrentJobs === null
-      ? "∞"
+      ? "unlimited"
       : String(autopilot.maxConcurrentJobs);
-  const root = autopilot.worktreeMode
-    ? "lanes"
-    : String(autopilot.maxConcurrentPerRoot);
-  const armed =
-    autopilot.mode === "armed" ? ` · armed ${autopilot.armedCount}` : "";
-  const compactArmed =
-    autopilot.mode === "armed" ? `:${autopilot.armedCount}` : "";
-  const summaryText = `tasks ${summary.tasksOpen}/${summary.tasksRunning} · epics ${summary.epicsOpen}/${summary.epicsRunning}/${summary.epicsClosing}`;
-  const normalAutopilot = `autopilot: ${autopilot.paused ? "paused" : "playing"} · ${autopilot.mode}${armed} · cap ${cap} · root ${root}`;
-  const compactAutopilot = `AP: ${autopilot.paused ? "paused" : "playing"} · ${autopilot.mode}${compactArmed} · cap ${cap} · root ${root}`;
-  const normalDetail = `human ${needsHumanCount} · tree ${autopilot.worktreeMode ? "on" : "off"} · prov ${autopilot.workerProvider ?? "cell"}`;
-  const compactDetail = `human ${needsHumanCount} · tree ${autopilot.worktreeMode ? "on" : "off"} · prov ${autopilot.workerProvider ?? "cell"}`;
-  const normal = [
-    `Fable focus: ${target} · ${lifetime} · ${state} | ${summaryText}`,
-    `${normalAutopilot} | ${normalDetail}`,
+  const autopilotLines = [
+    "autopilot",
+    `  state: ${autopilot.paused ? "paused" : "playing"}`,
+    `  mode: ${autopilot.mode}`,
+    ...(autopilot.mode === "armed"
+      ? [`  armed epics: ${autopilot.armedCount}`]
+      : []),
+    `  maximum concurrent jobs: ${cap}`,
+    autopilot.worktreeMode
+      ? "  per-root concurrency: managed by worktree lanes"
+      : `  maximum concurrent jobs per root: ${autopilot.maxConcurrentPerRoot}`,
+    `  needs human: ${needsHumanCount}`,
+    `  worktree mode: ${autopilot.worktreeMode ? "on" : "off"}`,
+    `  worker provider: ${autopilot.workerProvider ?? "assigned task cell"}`,
   ];
-  const compact = [
-    `Fable focus: ${target} · ${lifetime}`,
-    `state: ${state} | ${compactAutopilot}`,
-    `${summaryText} | ${compactDetail}`,
+  const logicalLines = [
+    ...fableFocusHeaderLines(fableFocus, input.now),
+    ...boardSummaryLines(summary),
+    ...autopilotLines,
   ];
-  if (width < BOARD_HEADER_MIN_WIDTH) {
-    return compact.map((row) => truncateBoardHeader(row, width));
-  }
-  const rows = width >= BOARD_HEADER_NARROW_WIDTH ? normal : compact;
-  return rows.map((row) => truncateBoardHeader(row, width));
+  return logicalLines.flatMap((line) => wrapBoardHeaderLine(line, width));
 }
 
 export function boardHeaderWidth(
