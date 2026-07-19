@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 6,
+        "insertions": 429
+      },
+      "done_summary": "Added an explicit, 15-minute launch-scoped Codex pool proof window bound to the launcher pid: --x-codex-pool-proof-window=arm on a fresh managed keeper agent pi launch makes the companion build the pooled delegate and route across enrolled aliases (mode=proof) exactly as active mode would, while the activation gate's thirteen-clause fresh-report refusal is untouched. The window lives only in the launch env, is rejected on resume/passthrough or malformed markers, is re-validated on wall clock plus parent pid on every stream call, and never persists past its deadline or a restart.",
+      "input_hash": "b7156789bd6d404444559d27c96a33f84d971d8bf0e51486c9b0fb2e36e2953f",
+      "model": "opus",
+      "spec_chars": 2529,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** integrations/pi-codex-pool/src/index.ts, src/agent/main.ts, src/codex-pool-activation.ts, test/codex-pool-activation.test.ts, test/agent-account-routing.test.ts\n\n### Approach\n\nIntroduce an explicitly-armed, duration-bounded proof-window state (a CLI verb or an\noperator-set marker the launch path reads \u2014 worker's judgment, but it must be impossible to\narm accidentally and impossible to persist past its deadline or a restart). While armed, the\ncompanion on the real `keeper agent pi` launch path builds the pooled delegate exactly as\nactive mode would, routing across enrolled aliases, so the proof collector can observe the\nrouting/stream clauses honestly. The activation gate itself does not weaken: thirteen clauses,\nfresh report, refusal on any invalidation \u2014 the window exists only to make observation\npossible. Env/config binding must reach the launched session the same way active mode's does.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs come from the fn-1356 operator's live verdict.*\n\n**Required** (read before coding):\n- integrations/pi-codex-pool/src/index.ts:138-146 \u2014 the native-mode branch that skips pooledDelegate\n- src/agent/main.ts:4304 \u2014 where MODE=active is derived from persisted activation.json\n- src/codex-pool-activation.ts:518-534 \u2014 the proven-report refusal (must stay intact)\n\n### Risks\n\n- A proof window that survives restart or arms silently becomes a backdoor activation; the bound and explicit arming are load-bearing.\n- The window must not touch credential material or weaken the sanitized-observer contract.\n\n## Acceptance\n\n- [ ] armed window \u21d2 pooled routing observable on the real launch path; expired/absent window \u21d2 native behavior byte-identical to today\n- [ ] window state never survives its deadline, a daemon restart, or a session restart\n- [ ] activation gate refusal behavior unchanged; suites green\n\n## Done summary\nAdded an explicit, 15-minute launch-scoped Codex pool proof window bound to the launcher pid: --x-codex-pool-proof-window=arm on a fresh managed keeper agent pi launch makes the companion build the pooled delegate and route across enrolled aliases (mode=proof) exactly as active mode would, while the activation gate's thirteen-clause fresh-report refusal is untouched. The window lives only in the launch env, is rejected on resume/passthrough or malformed markers, is re-validated on wall clock plus parent pid on every stream call, and never persists past its deadline or a restart.\n## Evidence\n",
+      "task_id": "fn-1374-add-codex-pool-proof-window.1",
+      "tier": "xhigh",
+      "title": "Bounded pre activation proof window"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "medium",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 5,
+        "files_changed": 4,
+        "insertions": 41
+      },
+      "done_summary": "Enroll now warns of grant revocation before OAuth; docs/install.md and ADR 0090 amended with the transition ordering and one-grant-per-account end state.",
+      "input_hash": "b7156789bd6d404444559d27c96a33f84d971d8bf0e51486c9b0fb2e36e2953f",
+      "model": "sonnet",
+      "spec_chars": 1507,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/agent/main.ts, docs/install.md, docs/adr/0090-keeper-managed-pi-codex-account-pool.md, test/agent-account-routing.test.ts\n\n### Approach\n\nThe enroll verb prints a blast-radius warning before starting OAuth: enrolling an alias\nrevokes that account's other live grants (legacy leg + bare-pi), producing a native codex\noutage until activation. docs/install.md orders the transition explicitly (enroll both\naliases \u21d2 expected outage \u21d2 arm proof window \u21d2 prove \u21d2 activate, promptly). Amend ADR 0090\nwith the observed one-grant-per-account provider behavior and the accepted end state:\nbare-pi codex stays unauthenticated by design; keeper-launched Pi is the codex path.\nPresent-tense docs only; the outage history lives in the commit message.\n\n### Investigation targets\n\n*Verify before relying.*\n\n**Required** (read before coding):\n- src/agent/main.ts \u2014 the enroll verb's interactive preamble (near the \"/login\" instruction print)\n- docs/adr/0090-keeper-managed-pi-codex-account-pool.md \u2014 amendment style: extend, don't rewrite history\n\n## Acceptance\n\n- [ ] enroll prints the revocation warning before launching the interactive Pi\n- [ ] docs/install.md carries the ordered transition; ADR 0090 records the provider behavior and end-state decision\n- [ ] agent-account-routing suite green\n\n## Done summary\nEnroll now warns of grant revocation before OAuth; docs/install.md and ADR 0090 amended with the transition ordering and one-grant-per-account end state.\n## Evidence\n",
+      "task_id": "fn-1374-add-codex-pool-proof-window.2",
+      "tier": "medium",
+      "title": "Transition doctrine and enroll warning"
+    }
+  ],
+  "created_at": "2026-07-19T14:26:09.975000Z",
+  "epic_id": "fn-1374-add-codex-pool-proof-window",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "b7156789bd6d404444559d27c96a33f84d971d8bf0e51486c9b0fb2e36e2953f",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
