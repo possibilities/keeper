@@ -29,6 +29,7 @@ import {
   decideGrantGuardInput,
   evaluateGrantBash,
   type GrantGuardDeps,
+  productionDeps,
   type RoleConfig,
 } from "../plugins/keeper/plugin/hooks/grant-guard.ts";
 import {
@@ -325,12 +326,16 @@ describe("decideGrantGuard — jurisdiction (payload identity)", () => {
     expect(decideGrantGuard(42, deps())).toBeNull();
   });
 
-  test("all four confined agent types establish jurisdiction", () => {
+  test("bare and plan-qualified confined agent types establish jurisdiction", () => {
     for (const agentType of [
       "merge-resolver",
       "deconflicter",
       "unblocker",
       "repairer",
+      "plan:merge-resolver",
+      "plan:deconflicter",
+      "plan:unblocker",
+      "plan:repairer",
     ]) {
       // With no grant, a mutating Edit is denied — proof the guard is enforcing.
       expect(
@@ -339,6 +344,68 @@ describe("decideGrantGuard — jurisdiction (payload identity)", () => {
           deps(),
         ),
       ).not.toBeNull();
+    }
+  });
+});
+
+describe("decideGrantGuardInput — plan-qualified Task agent", () => {
+  const planRepairerAgentType = "plan:repairer";
+
+  function planRepairerGrant(writableRoot: string): GrantLeaf {
+    return {
+      schema_version: 1,
+      parent_job_id: "job-1",
+      agent_type: planRepairerAgentType,
+      incident_id: "repair::keeper",
+      attempt_id: "att-1",
+      instance_event_id: 42,
+      writable_root: writableRoot,
+      role: "repair",
+      expires_at: 10_000,
+      fencing_token: 7,
+    };
+  }
+
+  function planRepairerEnv(dir: string) {
+    return {
+      KEEPER_GRANT_DIR: dir,
+      KEEPER_GRANT_PARENT_JOB: "job-1",
+      KEEPER_GRANT_INCIDENT: "repair::keeper",
+      KEEPER_GRANT_FENCING_TOKEN: "7",
+      KEEPER_GRANT_ATTEMPT: "att-1",
+      KEEPER_GRANT_INSTANCE_EVENT: "42",
+    };
+  }
+
+  function spawnedWritePayload(root: string, target: string): string {
+    return JSON.stringify({
+      tool_name: "Edit",
+      agent_id: "task-1",
+      agent_type: planRepairerAgentType,
+      cwd: root,
+      tool_input: { file_path: target },
+    });
+  }
+
+  test('Task(subagent_type="plan:repairer") writes are denied without a grant leaf and allowed with one', () => {
+    const dir = mkdtempSync(join(tmpdir(), "keeper-plan-repairer-grant-"));
+    try {
+      const root = join(dir, "checkout");
+      const target = join(root, "src", "x.ts");
+      mkdirSync(join(root, "src"), { recursive: true });
+      writeFileSync(target, "export const x = 1;\n");
+      const env = planRepairerEnv(join(dir, "grants"));
+      const payload = spawnedWritePayload(root, target);
+      const deps = () => productionDeps(env, () => 5_000);
+
+      const denied = decideGrantGuardInput(payload, deps());
+      expect(denied?.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(
+        writeGrantLeaf(env.KEEPER_GRANT_DIR, planRepairerGrant(root)),
+      ).toBe(true);
+      expect(decideGrantGuardInput(payload, deps())).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

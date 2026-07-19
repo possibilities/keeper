@@ -30,14 +30,19 @@ import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 export const GRANT_LEAF_SCHEMA_VERSION = 1 as const;
 
 /** The four confined escalation roles and their agent types. Role names match the
- *  legacy escalation vocabulary (`unblock`/`resolve`/`deconflict`/`repair`); agent
- *  types are the `agent_type` the hook payload carries for each Task subagent. */
+ *  escalation vocabulary (`unblock`/`resolve`/`deconflict`/`repair`); agent types
+ *  are the bare and plugin-qualified `agent_type` values the hook payload carries
+ *  for each Task subagent. */
 export type EscalationRole = "unblock" | "resolve" | "deconflict" | "repair";
-export type EscalationAgentType =
+type BareEscalationAgentType =
   | "unblocker"
   | "merge-resolver"
   | "deconflicter"
   | "repairer";
+
+export type EscalationAgentType =
+  | BareEscalationAgentType
+  | `plan:${BareEscalationAgentType}`;
 
 export const ESCALATION_AGENT_ROLE: Readonly<
   Record<EscalationAgentType, EscalationRole>
@@ -46,6 +51,10 @@ export const ESCALATION_AGENT_ROLE: Readonly<
   "merge-resolver": "resolve",
   deconflicter: "deconflict",
   repairer: "repair",
+  "plan:unblocker": "unblock",
+  "plan:merge-resolver": "resolve",
+  "plan:deconflicter": "deconflict",
+  "plan:repairer": "repair",
 };
 
 /** The roles permitted to write source under a valid grant. `unblock` is
@@ -57,7 +66,7 @@ const WRITE_CAPABLE_ROLES: ReadonlySet<EscalationRole> = new Set([
 ]);
 
 /** Resolve a payload `agent_type` to its escalation role, or null when it is not
- *  one of the four confined agents (outside the grant guard's jurisdiction). */
+ *  one of the confined agent identities (outside the grant guard's jurisdiction). */
 export function escalationRoleFor(
   agentType: string | undefined,
 ): EscalationRole | null {
@@ -233,12 +242,14 @@ function parseGrant(bytes: string): GrantLeaf | null {
   const g = raw as Record<string, unknown>;
   const agentType = g.agent_type;
   const role = g.role;
+  const expectedRole =
+    typeof agentType === "string" ? escalationRoleFor(agentType) : null;
   if (
     g.schema_version !== GRANT_LEAF_SCHEMA_VERSION ||
     typeof g.parent_job_id !== "string" ||
     g.parent_job_id === "" ||
     typeof agentType !== "string" ||
-    escalationRoleFor(agentType) === null ||
+    expectedRole === null ||
     typeof g.incident_id !== "string" ||
     g.incident_id === "" ||
     typeof g.attempt_id !== "string" ||
@@ -248,7 +259,7 @@ function parseGrant(bytes: string): GrantLeaf | null {
     typeof g.writable_root !== "string" ||
     !isAbsolute(g.writable_root) ||
     typeof role !== "string" ||
-    role !== ESCALATION_AGENT_ROLE[agentType as EscalationAgentType] ||
+    role !== expectedRole ||
     typeof g.expires_at !== "number" ||
     !Number.isFinite(g.expires_at) ||
     typeof g.fencing_token !== "number" ||
@@ -313,9 +324,10 @@ const MAX_GRANT_BYTES = 8192;
  *  Returns false (never throws) on any failure — the daemon is the sole caller. */
 export function writeGrantLeaf(grantsDir: string, grant: GrantLeaf): boolean {
   if (grantsDir === "" || !isAbsolute(grantsDir)) return false;
+  const expectedRole = escalationRoleFor(grant.agent_type);
   if (
-    escalationRoleFor(grant.agent_type) === null ||
-    grant.role !== ESCALATION_AGENT_ROLE[grant.agent_type] ||
+    expectedRole === null ||
+    grant.role !== expectedRole ||
     !isAbsolute(grant.writable_root)
   ) {
     return false;
