@@ -80,8 +80,11 @@ import {
 } from "../codex-account-router";
 import {
   activateCodexPool,
+  armCodexPoolProofWindow,
+  CODEX_POOL_PROOF_WINDOW_ENV,
   type CodexPoolActivationDeps,
   type CodexPoolProblemCode,
+  type CodexPoolProofWindowState,
   type CodexPoolWorkflowResult,
   captureCodexPoolProof,
   codexPoolAliasesFromEnvironment,
@@ -1348,6 +1351,31 @@ function isBinaryReachable(bin: string): boolean {
  */
 function hasFlagToken(args: string[], flag: string): boolean {
   return args.some((a) => a === flag || a.startsWith(`${flag}=`));
+}
+
+const CODEX_POOL_PROOF_WINDOW_FLAG = "--x-codex-pool-proof-window=arm";
+
+function consumeCodexPoolProofWindowFlag(args: string[]): {
+  remainingArgs: string[];
+  armed: boolean;
+  error: string | null;
+} {
+  const prefix = "--x-codex-pool-proof-window";
+  const matching = args.filter(
+    (arg) => arg === prefix || arg.startsWith(`${prefix}=`),
+  );
+  return {
+    remainingArgs: args.filter(
+      (arg) => arg !== prefix && !arg.startsWith(`${prefix}=`),
+    ),
+    armed:
+      matching.length === 1 && matching[0] === CODEX_POOL_PROOF_WINDOW_FLAG,
+    error:
+      matching.length === 0 ||
+      (matching.length === 1 && matching[0] === CODEX_POOL_PROOF_WINDOW_FLAG)
+        ? null
+        : `${prefix} must appear once as ${CODEX_POOL_PROOF_WINDOW_FLAG}`,
+  };
 }
 
 /** Format the run command with line continuations for readability (>80 chars). */
@@ -3370,6 +3398,10 @@ async function runCodexPoolCommand(
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(context.aliases);
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = context.config_binding;
     deps.writeErr(
+      "Warning: enrolling this alias revokes that account's other live grants " +
+        "(legacy leg and bare Pi), causing a native Codex outage until activation.\n",
+    );
+    deps.writeErr(
       `Codex pool enrollment is interactive; in Pi run /login ${alias}, then exit.\n`,
     );
     return runPassthrough(
@@ -3907,6 +3939,12 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
+  const proofWindowRequest = consumeCodexPoolProofWindowFlag(argv);
+  if (proofWindowRequest.error !== null) {
+    deps.writeErr(`Error: ${proofWindowRequest.error}.\n`);
+    return deps.exit(2);
+  }
+  argv = proofWindowRequest.remainingArgs;
   const parsed = parseArgsForAgent(argv, agent);
   const { remainingArgs, hasContinueOrResume, hasForkSession, hasPrint } =
     parsed;
@@ -3966,6 +4004,20 @@ export async function main(deps: MainDeps): Promise<never> {
     actionLog.push(`Detected passthrough subcommand: ${passthroughCommand}`);
   } else if (shouldPassthrough) {
     actionLog.push("Detected passthrough informational flag");
+  }
+  if (
+    proofWindowRequest.armed &&
+    (agent !== "pi" || hasContinueOrResume || shouldPassthrough)
+  ) {
+    deps.writeErr(
+      "Error: --x-codex-pool-proof-window=arm requires a fresh managed Pi session.\n",
+    );
+    return deps.exit(2);
+  }
+  let codexProofWindow: CodexPoolProofWindowState | null = null;
+  if (proofWindowRequest.armed) {
+    codexProofWindow = armCodexPoolProofWindow(deps.now(), process.pid);
+    actionLog.push("Armed the launch-scoped Codex pool proof window");
   }
 
   // Harness default + fresh-launch fail-loud. A FRESH launch (not a
@@ -4298,14 +4350,44 @@ export async function main(deps: MainDeps): Promise<never> {
     const codexContext = deps.codexPoolLaunchContextFn(
       companion.health === "ready" && codexWorkload,
     );
+    if (codexProofWindow !== null) {
+      if (!codexWorkload) {
+        deps.writeErr(
+          "Error: the Codex pool proof window requires an openai-codex startup model.\n",
+        );
+        return deps.exit(2);
+      }
+      if (
+        companion.health !== "ready" ||
+        codexContext.problem_code === "activation-config-invalid" ||
+        codexContext.problem_code === "recovery-required"
+      ) {
+        deps.writeErr(
+          `Error: [${companion.problem_code ?? codexContext.problem_code ?? "pool-unavailable"}] ${CODEX_NATIVE_FALLBACK_WARNING}\n`,
+        );
+        return deps.exit(1);
+      }
+    }
     const codexMode =
-      companion.health === "ready" ? codexContext.mode : "native";
-    const codexProblem = companion.problem_code ?? codexContext.problem_code;
+      companion.health !== "ready"
+        ? "native"
+        : codexProofWindow !== null && codexContext.mode !== "active"
+          ? "proof"
+          : codexContext.mode;
+    const codexProblem =
+      codexMode === "proof"
+        ? null
+        : (companion.problem_code ?? codexContext.problem_code);
     deps.env.KEEPER_PI_CODEX_POOL_MODE = codexMode;
     deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(
       codexContext.aliases,
     );
     deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = codexContext.config_binding;
+    if (codexMode === "proof" && codexProofWindow !== null) {
+      deps.env[CODEX_POOL_PROOF_WINDOW_ENV] = JSON.stringify(codexProofWindow);
+    } else {
+      delete deps.env[CODEX_POOL_PROOF_WINDOW_ENV];
+    }
     if (codexMode === "active" && codexContext.initial_alias !== null) {
       deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = codexContext.initial_alias;
     } else {

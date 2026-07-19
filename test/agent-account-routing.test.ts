@@ -685,7 +685,104 @@ describe("keeper agent accounts fable-focus", () => {
 });
 
 describe("keeper agent accounts codex-pool", () => {
-  test("interactive enrollment inherits the terminal and loads only the companion", async () => {
+  test("an explicitly armed fresh Pi launch receives one bounded pooled proof window", async () => {
+    const h = makeHarness({
+      argv: [
+        "pi",
+        "--x-codex-pool-proof-window=arm",
+        "--model",
+        "openai-codex/gpt-5.4-mini",
+        "--thinking",
+        "high",
+        "prove routing",
+      ],
+      rawArgv: true,
+      now: () => 1_000_000,
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+      codexPoolLaunchContext: () => ({
+        mode: "native",
+        aliases: ["keeper-codex-a", "keeper-codex-b"],
+        config_binding: "b".repeat(64),
+        initial_alias: null,
+        problem_code: "activation-pending",
+      }),
+    });
+    const command = await runAndCapture(h, main);
+    expect(command).toContain("/fake/pi-codex-pool.ts");
+    expect(command).not.toContain("--x-codex-pool-proof-window=arm");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("proof");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
+      '["keeper-codex-a","keeper-codex-b"]',
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING).toBe("b".repeat(64));
+    expect(
+      JSON.parse(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW ?? "null"),
+    ).toEqual({
+      schema_version: 1,
+      armed_at_ms: 1_000_000,
+      expires_at_ms: 1_900_000,
+      launcher_pid: process.pid,
+    });
+    expect(h.spawnOptions[0]?.env?.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBe(
+      h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBeUndefined();
+  });
+
+  test("an absent arm clears inherited proof state and leaves native launch behavior", async () => {
+    const h = makeHarness({
+      argv: [
+        "pi",
+        "--model",
+        "openai-codex/gpt-5.4-mini",
+        "--thinking",
+        "high",
+        "resume natively",
+      ],
+      rawArgv: true,
+      env: {
+        KEEPER_PI_CODEX_POOL_PROOF_WINDOW: JSON.stringify({
+          schema_version: 1,
+          armed_at_ms: 1_000_000,
+          expires_at_ms: 1_900_000,
+          launcher_pid: process.pid,
+        }),
+      },
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+    });
+    const command = await runAndCapture(h, main);
+    expect(command).toContain("/fake/pi-codex-pool.ts");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON).toBe(
+      "activation-pending",
+    );
+  });
+
+  test("proof arming rejects resumed sessions and malformed markers", async () => {
+    for (const argv of [
+      ["pi", "--x-codex-pool-proof-window=arm", "--resume", UUID],
+      ["pi", "--x-codex-pool-proof-window=yes", "prove routing"],
+    ]) {
+      const h = makeHarness({ argv, rawArgv: true });
+      expect(await expectExit(main(h.deps))).toBe(2);
+      expect(h.spawned).toEqual([]);
+      expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBeUndefined();
+    }
+  });
+
+  test("interactive enrollment warns before starting Pi and loads only the companion", async () => {
+    const warning =
+      "Warning: enrolling this alias revokes that account's other live grants " +
+      "(legacy leg and bare Pi), causing a native Codex outage until activation.\n";
     const h = makeHarness({
       argv: ["accounts", "codex-pool", "enroll", "keeper-codex-b"],
       rawArgv: true,
@@ -695,6 +792,11 @@ describe("keeper agent accounts codex-pool", () => {
         problem_code: null,
       }),
     });
+    const spawn = h.deps.spawn;
+    h.deps.spawn = (argv, options) => {
+      expect(h.err.join("")).toContain(warning);
+      return spawn(argv, options);
+    };
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.spawned).toEqual([
       [
@@ -706,7 +808,8 @@ describe("keeper agent accounts codex-pool", () => {
       ],
     ]);
     expect(h.err.join("")).toBe(
-      "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
+      warning +
+        "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
     );
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
     expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(

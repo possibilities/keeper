@@ -224,6 +224,9 @@ keeper agent accounts check --json
 keeper agent accounts codex-pool status --json
 ```
 
+Make the transition promptly and in this order: **enroll both aliases → expect the native Codex outage →
+arm a proof window → prove → activate**.
+
 Enroll each configured opaque alias in a real terminal. The command starts an inherited-stdio Pi with the
 companion loaded and tells the operator which `/login <alias>` command to run; it rejects JSON/captured
 enrollment. Alias names must match the configured `keeper-codex-*` set and contain no identity. The host
@@ -236,9 +239,20 @@ keeper agent accounts codex-pool enroll keeper-codex-a
 keeper agent accounts codex-pool enroll keeper-codex-b
 ```
 
-The live-proof run produces one bounded report using the companion's versioned schema. Stage and classify
-that exact file before activation; unknown fields, sanitation findings, stale revision/configuration/alias
-bindings, interruption, incomplete root/child routes, or incomplete restoration cannot pass:
+Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
+Codex on those surfaces to remain unavailable until activation.
+
+Arm one proof window in a fresh managed Pi session, then use that bounded session to complete the live
+proof and produce its report:
+
+```sh
+keeper agent pi --x-codex-pool-proof-window=arm \
+  --model openai-codex/gpt-5.4-mini --thinking high '<live-proof-prompt>'
+```
+
+Stage and classify that exact report, then activate promptly. Unknown fields, sanitation findings, stale
+revision/configuration/alias bindings, interruption, incomplete root/child routes, or incomplete restoration
+cannot pass:
 
 ```sh
 keeper agent accounts codex-pool proof capture /path/to/live-proof.json --json

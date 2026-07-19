@@ -86,10 +86,18 @@ function credentials(expires = 10_000) {
   };
 }
 
-const nativeStream = () => ({
-  async *[Symbol.asyncIterator]() {},
-  result: async () => message(),
-});
+const extensionDelegateApiKeys: Array<string | undefined> = [];
+const nativeStream = (
+  _model: unknown,
+  _context: unknown,
+  options?: { apiKey?: string },
+) => {
+  extensionDelegateApiKeys.push(options?.apiKey);
+  return {
+    async *[Symbol.asyncIterator]() {},
+    result: async () => message(),
+  };
+};
 
 mock.module("@earendil-works/pi-ai", () => ({
   openAICodexResponsesApi: () => ({ streamSimple: nativeStream }),
@@ -119,9 +127,12 @@ const savedEnv = {
     process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING,
   KEEPER_PI_CODEX_POOL_INITIAL_ALIAS:
     process.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS,
+  KEEPER_PI_CODEX_POOL_PROOF_WINDOW:
+    process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,
 };
 
 afterEach(() => {
+  extensionDelegateApiKeys.length = 0;
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -158,6 +169,105 @@ describe("provider registration and compatibility", () => {
     ]);
     expect(commands).toEqual(["codex-pool-observe"]);
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  test("a valid proof window installs the real pooled delegate and consumes its carrier", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-proof-window-"));
+    try {
+      const now = Date.now();
+      process.env.KEEPER_JOB_ID = "keeper-proof-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES =
+        '["keeper-codex-a","keeper-codex-b"]';
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+        ["keeper-codex-a", "keeper-codex-b"],
+        null,
+        () => now,
+      ).binding;
+      process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
+        schema_version: 1,
+        armed_at_ms: now,
+        expires_at_ms: now + 900_000,
+        launcher_pid: process.ppid,
+      });
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(now + 120_000)["keeper-codex-a"],
+        "keeper-codex-b": credentials(now + 120_000)["keeper-codex-b"],
+      });
+      let openaiStream: any;
+      installCodexPool({
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand() {},
+      } as never);
+
+      expect(process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
+      await collect(
+        openaiStream(MODEL, CONTEXT, { sessionId: "proof-root-session" }),
+      );
+      expect(extensionDelegateApiKeys).toHaveLength(2);
+      expect(new Set(extensionDelegateApiKeys)).toEqual(
+        new Set(["fake-access-a", "fake-access-b"]),
+      );
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("an installed proof delegate falls back natively at its deadline", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-proof-expiry-"));
+    const originalNow = Date.now;
+    const originalWarn = console.warn;
+    let now = 1_000_000;
+    const warnings: string[] = [];
+    try {
+      Date.now = () => now;
+      console.warn = (message?: unknown) => warnings.push(String(message));
+      process.env.KEEPER_JOB_ID = "keeper-expiring-proof-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES =
+        '["keeper-codex-a","keeper-codex-b"]';
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+        ["keeper-codex-a", "keeper-codex-b"],
+        null,
+        () => now,
+      ).binding;
+      process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
+        schema_version: 1,
+        armed_at_ms: 1_000_000,
+        expires_at_ms: 1_900_000,
+        launcher_pid: process.ppid,
+      });
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(3_000_000)["keeper-codex-a"],
+        "keeper-codex-b": credentials(3_000_000)["keeper-codex-b"],
+      });
+      let openaiStream: any;
+      installCodexPool({
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand() {},
+      } as never);
+
+      now = 1_900_000;
+      await collect(
+        openaiStream(MODEL, CONTEXT, { sessionId: "expired-proof-session" }),
+      );
+      expect(extensionDelegateApiKeys).toEqual([undefined]);
+      expect(warnings).toEqual([
+        "[keeper-codex-pool] pool-unavailable; using native openai-codex",
+      ]);
+    } finally {
+      Date.now = originalNow;
+      console.warn = originalWarn;
+      rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 
   test("pins the compat-root delegate source and independent root/child routes", () => {

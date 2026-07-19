@@ -8,6 +8,10 @@ import * as piAi from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  CODEX_POOL_PROOF_WINDOW_ENV,
+  codexPoolProofWindowActive,
+} from "../../../src/codex-pool-activation.ts";
+import {
   aliasesFromEnvironment,
   type CanonicalOAuth,
   CredentialVault,
@@ -94,7 +98,15 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     aliases = [];
   }
 
-  const mode = process.env[MODE_ENV] === "active" ? "active" : "native";
+  const requestedMode = process.env[MODE_ENV];
+  const mode =
+    requestedMode === "active" || requestedMode === "proof"
+      ? requestedMode
+      : "native";
+  const proofWindow = process.env[CODEX_POOL_PROOF_WINDOW_ENV];
+  delete process.env[CODEX_POOL_PROOF_WINDOW_ENV];
+  const proofWindowActive = (): boolean =>
+    codexPoolProofWindowActive(proofWindow, Date.now(), process.ppid);
   if (!oauth || aliases.length === 0) {
     pi.registerProvider("openai-codex", {
       api: "openai-codex-responses",
@@ -136,7 +148,8 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     process.env[INITIAL_ALIAS_ENV],
   );
   const active =
-    mode === "active" && process.env[CONFIG_BINDING_ENV] === routes.binding;
+    process.env[CONFIG_BINDING_ENV] === routes.binding &&
+    (mode === "active" || (mode === "proof" && proofWindowActive()));
   if (!active) {
     pi.registerProvider("openai-codex", {
       api: "openai-codex-responses",
@@ -171,8 +184,11 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     model: Model<"openai-codex-responses">,
     context: Context,
     options?: SimpleStreamOptions,
-  ): AssistantMessageEventStream =>
-    createPooledCodexStream(
+  ): AssistantMessageEventStream => {
+    if (mode === "proof" && !proofWindowActive()) {
+      return fallbackStream(nativeDelegate, model, context, options);
+    }
+    return createPooledCodexStream(
       {
         vault,
         routes,
@@ -184,6 +200,7 @@ export function installCodexPool(pi: PoolExtensionApi): void {
       context,
       options,
     );
+  };
 
   pi.registerProvider("openai-codex", {
     api: "openai-codex-responses",
