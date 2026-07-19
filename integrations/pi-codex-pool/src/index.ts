@@ -12,16 +12,15 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   CODEX_POOL_PROOF_WINDOW_ENV,
+  codexPoolProofSeamActive,
   codexPoolProofWindowActive,
 } from "../../../src/codex-pool-proof-window.ts";
 import {
   aliasesFromEnvironment,
   type CanonicalOAuth,
-  type CredentialStorage,
   CredentialVault,
   extensionOAuthFromCanonical,
   FileCredentialStorage,
-  type StoredOAuthCredential,
 } from "./auth.ts";
 import { observePool, renderObserverEnvelope } from "./observer.ts";
 import {
@@ -395,38 +394,6 @@ class ProofEvidence {
   }
 }
 
-class ProofCredentialStorage implements CredentialStorage {
-  constructor(
-    private readonly storage: CredentialStorage,
-    private readonly evidence: ProofEvidence,
-  ) {}
-
-  read(alias: string): Promise<StoredOAuthCredential | undefined> {
-    return this.storage.read(alias);
-  }
-
-  async modify(
-    alias: string,
-    update: (
-      current: StoredOAuthCredential | undefined,
-    ) => Promise<StoredOAuthCredential | undefined>,
-    options?: { signal?: AbortSignal; deadlineMs?: number },
-  ): Promise<StoredOAuthCredential | undefined> {
-    let refreshed = false;
-    const result = await this.storage.modify(
-      alias,
-      async (current) => {
-        const next = await update(current);
-        refreshed = next !== undefined && next !== current;
-        return next;
-      },
-      options,
-    );
-    if (refreshed) this.evidence.credentialRefreshed(alias);
-    return result;
-  }
-}
-
 function tapStream(
   source: AssistantMessageEventStream,
   onEvent: (event: AssistantMessageEvent) => void,
@@ -512,6 +479,14 @@ export function installCodexPool(pi: PoolExtensionApi): void {
   delete process.env[REVISION_ENV];
   const proofWindowActive = (): boolean =>
     codexPoolProofWindowActive(proofWindow, Date.now(), process.ppid);
+  const proofRefreshActive = (): boolean =>
+    codexPoolProofSeamActive(
+      proofWindow,
+      "forced_refresh",
+      Date.now(),
+      process.ppid,
+      process.env[KEEPER_MARKER],
+    );
   if (!oauth || aliases.length === 0) {
     pi.registerProvider("openai-codex", {
       api: "openai-codex-responses",
@@ -544,12 +519,13 @@ export function installCodexPool(pi: PoolExtensionApi): void {
 
   const evidence =
     mode === "proof" && proofWindowActive() ? new ProofEvidence() : null;
-  const fileStorage = new FileCredentialStorage();
   const vault = new CredentialVault(
-    evidence === null
-      ? fileStorage
-      : new ProofCredentialStorage(fileStorage, evidence),
+    new FileCredentialStorage(),
     (credential, signal) => oauth.refresh(credential, signal),
+    Date.now,
+    proofRefreshActive,
+    aliases,
+    (alias) => evidence?.credentialRefreshed(alias),
   );
   const routes = new PoolRouteState(
     aliases,

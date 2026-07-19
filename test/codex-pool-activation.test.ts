@@ -166,6 +166,10 @@ describe("Codex pool launch-scoped proof window", () => {
       armed_at_ms: 1_000_000,
       expires_at_ms: 1_900_000,
       launcher_pid: 4242,
+      seams: {
+        forced_refresh: true,
+        fault_injection: true,
+      },
     });
     const encoded = JSON.stringify(state);
     expect(codexPoolProofWindowActive(encoded, 1_000_000, 4242)).toBe(true);

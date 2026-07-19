@@ -6,6 +6,10 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import {
+  boundedCodexPoolProofRecord,
+  exactKeys,
+} from "../../../src/codex-pool-proof-window.ts";
 import { type CredentialVault, PoolCredentialError } from "./auth.ts";
 import type { PoolFailureClass, PoolRouteState } from "./state.ts";
 
@@ -15,6 +19,49 @@ export type CodexDelegate = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
+export type CodexPoolProofFaultClass = Exclude<PoolFailureClass, "other">;
+export type CodexPoolProofFaultPhase = "pre-output" | "mid-stream";
+
+export interface CodexPoolProofFaultRequest {
+  schema_version: 1;
+  failure_class: CodexPoolProofFaultClass;
+  phase: CodexPoolProofFaultPhase;
+}
+
+export type CodexPoolProofFaultOutcome =
+  | {
+      status: "injected";
+      failure_class: CodexPoolProofFaultClass;
+      phase: CodexPoolProofFaultPhase;
+    }
+  | {
+      status: "inconclusive";
+      failure_class: CodexPoolProofFaultClass;
+      phase: "mid-stream";
+      reason: "substantive-output-not-observed";
+    }
+  | {
+      status: "inactive";
+      failure_class: CodexPoolProofFaultClass;
+      phase: "mid-stream";
+      reason: "proof-seam-inactive";
+    };
+
+export class CodexPoolProofFaultError extends Error {
+  readonly code = "proof-fault-request-invalid";
+
+  constructor() {
+    super("proof-fault-request-invalid");
+    this.name = "CodexPoolProofFaultError";
+  }
+}
+
+export interface CodexPoolProofFaultOptions {
+  request: unknown;
+  active(): boolean;
+  onOutcome?(outcome: CodexPoolProofFaultOutcome): void;
+}
+
 export interface PoolStreamDependencies {
   vault: CredentialVault;
   routes: PoolRouteState;
@@ -23,6 +70,7 @@ export interface PoolStreamDependencies {
   warn(reason: "pool-unavailable"): void;
   retryBackoffMs?: number;
   now?: () => number;
+  proofFault?: CodexPoolProofFaultOptions;
 }
 
 class ForwardingEventStream implements AsyncIterable<AssistantMessageEvent> {
@@ -178,6 +226,164 @@ function sanitizedErrorEvent(
   };
 }
 
+function parseProofFaultRequest(input: unknown): CodexPoolProofFaultRequest {
+  const request = boundedCodexPoolProofRecord(input);
+  if (
+    request === null ||
+    !exactKeys(request, ["schema_version", "failure_class", "phase"]) ||
+    request.schema_version !== 1 ||
+    !["quota", "rate", "auth", "transport"].includes(
+      String(request.failure_class),
+    ) ||
+    !["pre-output", "mid-stream"].includes(String(request.phase))
+  ) {
+    throw new CodexPoolProofFaultError();
+  }
+  return {
+    schema_version: 1,
+    failure_class: request.failure_class as CodexPoolProofFaultClass,
+    phase: request.phase as CodexPoolProofFaultPhase,
+  };
+}
+
+function proofFaultActive(options: CodexPoolProofFaultOptions): boolean {
+  try {
+    return options.active();
+  } catch {
+    return false;
+  }
+}
+
+function reportProofFaultOutcome(
+  options: CodexPoolProofFaultOptions,
+  outcome: CodexPoolProofFaultOutcome,
+): void {
+  try {
+    options.onOutcome?.(outcome);
+  } catch {
+    // Evidence collection cannot change provider-stream behavior.
+  }
+}
+
+function proofFaultEvent(
+  model: Model<"openai-codex-responses">,
+  failureClass: CodexPoolProofFaultClass,
+): Extract<AssistantMessageEvent, { type: "error" }> {
+  const messages: Record<CodexPoolProofFaultClass, string> = {
+    quota: "codex pool proof quota exceeded",
+    rate: "codex pool proof rate limit",
+    auth: "codex pool proof unauthorized",
+    transport: "codex pool proof network timeout",
+  };
+  return {
+    type: "error",
+    reason: "error",
+    error: terminalMessage(model, "error", messages[failureClass]),
+  };
+}
+
+function createMidStreamProofFault(
+  upstream: AssistantMessageEventStream,
+  fault: AssistantMessageEvent & { type: "error" },
+  request: CodexPoolProofFaultRequest,
+  options: CodexPoolProofFaultOptions,
+): AssistantMessageEventStream {
+  let resolveFinal!: (message: AssistantMessage) => void;
+  let rejectFinal!: (error: unknown) => void;
+  let settled = false;
+  const final = new Promise<AssistantMessage>((resolve, reject) => {
+    resolveFinal = resolve;
+    rejectFinal = reject;
+  });
+  void final.catch(() => {});
+  const resolve = (message: AssistantMessage): void => {
+    if (settled) return;
+    settled = true;
+    resolveFinal(message);
+  };
+  const reject = (error: unknown): void => {
+    if (settled) return;
+    settled = true;
+    rejectFinal(error);
+  };
+  return {
+    result: () => final,
+    async *[Symbol.asyncIterator]() {
+      let injected = false;
+      let inactive = false;
+      try {
+        for await (const event of upstream) {
+          if (event.type === "done") resolve(event.message);
+          if (event.type === "error") resolve(event.error);
+          yield event;
+          if (!substantive(event) || injected || inactive) continue;
+          if (!proofFaultActive(options)) {
+            inactive = true;
+            reportProofFaultOutcome(options, {
+              status: "inactive",
+              failure_class: request.failure_class,
+              phase: "mid-stream",
+              reason: "proof-seam-inactive",
+            });
+            continue;
+          }
+          injected = true;
+          resolve(fault.error);
+          reportProofFaultOutcome(options, {
+            status: "injected",
+            failure_class: request.failure_class,
+            phase: request.phase,
+          });
+          yield fault;
+          return;
+        }
+        if (!settled) void upstream.result().then(resolve, reject);
+      } catch (error) {
+        reject(error);
+        throw error;
+      } finally {
+        if (!injected && !inactive) {
+          reportProofFaultOutcome(options, {
+            status: "inconclusive",
+            failure_class: request.failure_class,
+            phase: "mid-stream",
+            reason: "substantive-output-not-observed",
+          });
+        }
+      }
+    },
+  } as AssistantMessageEventStream;
+}
+
+export function createCodexPoolProofFaultDelegate(
+  delegate: CodexDelegate,
+  options: CodexPoolProofFaultOptions,
+): CodexDelegate {
+  if (!proofFaultActive(options)) return delegate;
+  const request = parseProofFaultRequest(options.request);
+  let consumed = false;
+  return (model, context, streamOptions) => {
+    if (consumed || !proofFaultActive(options)) {
+      return delegate(model, context, streamOptions);
+    }
+    consumed = true;
+    const fault = proofFaultEvent(model, request.failure_class);
+    if (request.phase === "pre-output") {
+      const output = new ForwardingEventStream();
+      reportProofFaultOutcome(options, {
+        status: "injected",
+        failure_class: request.failure_class,
+        phase: request.phase,
+      });
+      output.push(fault);
+      output.end();
+      return output as unknown as AssistantMessageEventStream;
+    }
+    const upstream = delegate(model, context, streamOptions);
+    return createMidStreamProofFault(upstream, fault, request, options);
+  };
+}
+
 function remainingTimeout(
   original: number | undefined,
   deadlineMs: number | undefined,
@@ -229,6 +435,10 @@ export function createPooledCodexStream(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  const delegate =
+    deps.proofFault === undefined
+      ? deps.delegate
+      : createCodexPoolProofFaultDelegate(deps.delegate, deps.proofFault);
   const output = new ForwardingEventStream();
   const now = deps.now ?? Date.now;
   const sessionId = options?.sessionId;
@@ -324,7 +534,7 @@ export function createPooledCodexStream(
       let exposedSubstantive = false;
       let terminal = false;
       try {
-        const upstream = deps.delegate(model, context, attemptOptions);
+        const upstream = delegate(model, context, attemptOptions);
         for await (const rawEvent of upstream as AsyncIterable<AssistantMessageEvent>) {
           const event = rawEvent as AssistantMessageEvent & { type: string };
           if (event.type === "start") {

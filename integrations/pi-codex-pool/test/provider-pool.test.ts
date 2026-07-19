@@ -129,7 +129,12 @@ mock.module("@earendil-works/pi-ai/providers/all", () => ({
         oauth: {
           name: "Codex",
           login: async () => credentials()["keeper-codex-a"],
-          refresh: async (credential: unknown) => credential,
+          refresh: async (credential: any) => ({
+            ...credential,
+            access: `refreshed-${credential.access}`,
+            refresh: `rotated-${credential.refresh}`,
+            expires: credential.expires + 3_600_000,
+          }),
           toAuth: async () => ({ apiKey: "fake" }),
         },
       },
