@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The cross-cutting acknowledgement contract requires preserving subtle pre-fanout, fail-soft, and backward-compatibility invariants across worker, decoder, CLI, consumers, tests, and docs.",
+      "task_id": "fn-1361-add-state-aware-bus-feedback.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-19T00:18:42.957000Z",
+  "epic_id": "fn-1361-add-state-aware-bus-feedback",
+  "input_hash": "2b4ebf1afa66f8da8c0b6caab6010ac02cd863ecca20f221b3a551e72ebf2754",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 726581018,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1361-add-state-aware-bus-feedback.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The cross-cutting acknowledgement contract requires preserving subtle pre-fanout, fail-soft, and backward-compatibility invariants across worker, decoder, CLI, consumers, tests, and docs.\",\"confidence\":0.96}]}\n"
+}
