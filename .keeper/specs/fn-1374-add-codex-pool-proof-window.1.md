@@ -35,5 +35,5 @@ possible. Env/config binding must reach the launched session the same way active
 - [ ] activation gate refusal behavior unchanged; suites green
 
 ## Done summary
-
+Added an explicit, 15-minute launch-scoped Codex pool proof window bound to the launcher pid: --x-codex-pool-proof-window=arm on a fresh managed keeper agent pi launch makes the companion build the pooled delegate and route across enrolled aliases (mode=proof) exactly as active mode would, while the activation gate's thirteen-clause fresh-report refusal is untouched. The window lives only in the launch env, is rejected on resume/passthrough or malformed markers, is re-validated on wall clock plus parent pid on every stream call, and never persists past its deadline or a restart.
 ## Evidence
