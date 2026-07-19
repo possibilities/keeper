@@ -1258,6 +1258,10 @@ export const SHARED_BASE_BROKEN_CATEGORY = "SHARED_BASE_BROKEN";
 export interface PendingBlockEscalation {
   epic_id: string;
   task_id: string;
+  /** Current latch state; terminal category skips remain eligible for re-arm. */
+  status: string;
+  /** Current terminal/retry outcome, or null before the first attempt. */
+  outcome: string | null;
   /** Owning epic's `project_dir` — the plan state-file root for the reason read. */
   project_dir: string | null;
   /** The embedded task's live `runtime_status` — the cancellation-guard signal. */
@@ -1267,25 +1271,36 @@ export interface PendingBlockEscalation {
 }
 
 /**
- * Select every `block_escalations` row in `status='pending'`, joined to its epic
- * row for `project_dir` and to the embedded task element (decoded from the epic's
- * `tasks` JSON) for the live `runtime_status` + `target_repo`. The cancellation
- * guard re-checks `runtime_status` at sweep time against the live projection — a
- * task unblocked between arm and sweep reads non-`blocked` here and is skipped
- * (the `TaskSnapshot` leave-blocked fold DELETEs its latch on its own). A pending
- * latch with no surviving epic / task element returns null fields; the producer
- * treats that as "no longer escalatable" and skips. Reads the projection on the
- * passed connection — production passes main's writable connection so the read is
- * sequenced inside the same writer that mints.
+ * Select every fresh pending latch plus terminal `skipped_category` latch, joined
+ * to its epic row for `project_dir` and to the embedded task element (decoded from
+ * the epic's `tasks` JSON) for the live `runtime_status` + `target_repo`. The
+ * terminal rows let the producer compare the CURRENT parsed reason class with the
+ * surface-and-stop class that settled them; an unchanged class remains terminal,
+ * while an escalatable class rides the ordinary dispatch path and its normal
+ * guards. The cancellation guard re-checks `runtime_status` at sweep time against
+ * the live projection — a task unblocked between arm and sweep reads non-`blocked`
+ * here and is skipped (the `TaskSnapshot` leave-blocked fold DELETEs its latch on
+ * its own). An eligible latch with no surviving epic / task element returns null
+ * fields; the producer treats that as "no longer escalatable" and skips. Reads the
+ * projection on the passed connection — production passes main's writable
+ * connection so the read is sequenced inside the same writer that mints.
  */
 export function selectPendingBlockEscalations(
   db: Database,
 ): PendingBlockEscalation[] {
   const latches = db
     .query(
-      `SELECT epic_id, task_id FROM block_escalations WHERE status = 'pending'`,
+      `SELECT epic_id, task_id, status, outcome
+         FROM block_escalations
+        WHERE status = 'pending'
+           OR (status = 'attempted' AND outcome = 'skipped_category')`,
     )
-    .all() as { epic_id: string; task_id: string }[];
+    .all() as {
+    epic_id: string;
+    task_id: string;
+    status: string;
+    outcome: string | null;
+  }[];
   if (latches.length === 0) return [];
   const out: PendingBlockEscalation[] = [];
   for (const latch of latches) {
@@ -1321,6 +1336,8 @@ export function selectPendingBlockEscalations(
     out.push({
       epic_id: latch.epic_id,
       task_id: latch.task_id,
+      status: latch.status,
+      outcome: latch.outcome,
       project_dir: epicRow?.project_dir ?? null,
       runtime_status: runtimeStatus,
       target_repo: targetRepo,
@@ -1493,10 +1510,11 @@ export function auditReadyEscalationDecision(
 /** The outcome the producer records on the `block_escalations` latch (the
  *  `BlockEscalationAttempted.outcome` column). The TERMINAL `dispatched` (the
  *  `unblock::<task>` session launched) and the two skip terminals advance the latch
- *  to `attempted`; the non-terminal `dispatch_failed` (the launch missed) RESETS it
- *  to `pending` so the sweep re-attempts (`foldBlockEscalationAttempted`). A
- *  cap/occupancy SKIP (`at_cap` / `already_live`) mints NOTHING at all — the latch
- *  stays `pending` and re-sweeps. */
+ *  to `attempted`; a later parsed reason-class change can re-arm
+ *  `skipped_category` through the producer. The non-terminal `dispatch_failed` (the
+ *  launch missed) RESETS it to `pending` so the sweep re-attempts
+ *  (`foldBlockEscalationAttempted`). A cap/occupancy SKIP (`at_cap` /
+ *  `already_live`) mints NOTHING at all — the latch stays eligible and re-sweeps. */
 export type BlockEscalationOutcome =
   | "dispatched"
   | "dispatch_failed"
@@ -1653,6 +1671,14 @@ export async function runBlockEscalationSweep(
   // and stays latched `pending` — it re-sweeps once the live session goes terminal.
   const claimedEpics = new Set<string>();
   for (const row of pending) {
+    const rearmFromSkippedCategory =
+      row.status === "attempted" && row.outcome === "skipped_category";
+    // The production selector admits only these two states. Keep the injected
+    // producer seam fail-closed if a stale or malformed row slips through.
+    if (row.status !== "pending" && !rearmFromSkippedCategory) {
+      continue;
+    }
+
     // Cancellation guard: the task left `blocked` between arm and sweep. The
     // leave-blocked `TaskSnapshot` fold DELETEs the latch on its own, so mint
     // Requested→Attempted{skipped_unblocked} is a belt-and-braces terminal — if
@@ -1669,6 +1695,16 @@ export async function runBlockEscalationSweep(
     }
 
     const reason = deps.readBlockedReason(row.project_dir, row.task_id);
+    const category = parseBlockedCategory(reason);
+    const route = routeBlockedCategory(category);
+
+    // A terminal category skip records the surface-and-stop reason CLASS, not the
+    // worker-authored prose. Rewording TOOLING_FAILURE (or another unparseable
+    // reason) therefore stays suppressed; only a current route outside that class
+    // re-enters the ordinary escalation pipeline.
+    if (rearmFromSkippedCategory && route === "surface_and_stop") {
+      continue;
+    }
     if (reason == null) {
       drop(
         row.task_id,
@@ -1676,7 +1712,6 @@ export async function runBlockEscalationSweep(
         `project_dir=${row.project_dir ?? "null"}`,
       );
     }
-    const category = parseBlockedCategory(reason);
 
     // AUDIT_READY: a per-task audit deliberately parked this task; the owning
     // orchestrator runs the audit and resumes the worker. Self-handled — mint
@@ -1704,7 +1739,6 @@ export async function runBlockEscalationSweep(
       // escalatable dispatch path (AUDIT_READY routes "unblock" below).
     }
 
-    const route = routeBlockedCategory(category);
     if (route === "repair") {
       // SHARED_BASE_BROKEN: authority follows the repo surface, not this one task.
       // The sibling repair sweep owns the (repo, fingerprint)-keyed
@@ -2233,7 +2267,7 @@ function emitRepairCandidateDrop(
 }
 
 /**
- * Build the repair candidate set from the pending `SHARED_BASE_BROKEN` blocked tasks:
+ * Build the repair candidate set from eligible `SHARED_BASE_BROKEN` blocked tasks:
  * reuse {@link selectPendingBlockEscalations} + the injected fs reason read, keep only
  * the shared-base route, and resolve each to (repo_dir, repo_token, fingerprint).
  * Producer-side fs reads (via `readReason`) are legal outside any fold.
@@ -2273,6 +2307,9 @@ export function selectRepairCandidates(
     }
     const reason = readReason(row.project_dir, row.task_id);
     if (reason == null) {
+      if (row.status === "attempted" && row.outcome === "skipped_category") {
+        continue;
+      }
       drop(
         row.task_id,
         "reason_unreadable",
@@ -2281,7 +2318,15 @@ export function selectRepairCandidates(
       continue;
     }
     const category = parseBlockedCategory(reason);
-    if (routeBlockedCategory(category) !== "repair") {
+    const route = routeBlockedCategory(category);
+    if (
+      row.status === "attempted" &&
+      row.outcome === "skipped_category" &&
+      route !== "repair"
+    ) {
+      continue;
+    }
+    if (route !== "repair") {
       drop(
         row.task_id,
         "non_repair_category",
@@ -13812,10 +13857,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Producer-side block/unblock-dispatch sweep (fn-1129 stage 2), the rewired successor to
-  // the block-escalation planner@ notify. Each heartbeat tick walks the pending
-  // `block_escalations` latch rows, gates each by the cancellation guard + the
-  // TOOLING_FAILURE denylist (surface-and-stop still suppresses `work::<task>` re-dispatch,
-  // never dispatching an agent), and DISPATCHES one `unblock::<task>` escalation session
+  // the block-escalation planner@ notify. Each heartbeat tick walks fresh pending latches
+  // plus terminal category skips whose current reason class may re-arm them, gates each by
+  // the cancellation guard + the TOOLING_FAILURE denylist (surface-and-stop still
+  // suppresses `work::<task>` re-dispatch, never dispatching an agent), and DISPATCHES one
+  // `unblock::<task>` escalation session
   // per escalatable block — SERIALIZED per epic (at most one live unblock per epic). A
   // terminal `dispatched` stamps the latch to `attempted` (the reducer fold); a
   // `dispatch_failed` resets it to `pending`, and a cap/occupancy or same-epic

@@ -26,6 +26,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectAutopilotPaused } from "../cli/autopilot";
+import { checkRaceGuard, type QueryFn } from "../cli/dispatch";
 import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
 import {
   appendBackstopRecord,
@@ -249,7 +250,7 @@ import {
   resolveAgentbotBinaryPath,
   sendAgentbotPage,
 } from "../src/integrity-probe";
-import { MAX_LINE_LENGTH } from "../src/protocol";
+import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
 import type { ResolverOutcome } from "../src/reconcile-core";
 import { classifyResolverOutcome } from "../src/reconcile-core";
 import {
@@ -5447,11 +5448,12 @@ function seedBlockLatch(
   epicId: string,
   taskId: string,
   status = "pending",
+  outcome: string | null = null,
 ): void {
   db.run(
     `INSERT INTO block_escalations (epic_id, task_id, blocked_since, status, outcome, last_event_id)
-       VALUES (?, ?, 1, ?, NULL, 1)`,
-    [epicId, taskId, status],
+       VALUES (?, ?, 1, ?, ?, 1)`,
+    [epicId, taskId, status, outcome],
   );
 }
 
@@ -5466,7 +5468,7 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
     { task_id: "fn-1-foo.2", runtime_status: "todo", target_repo: null },
   ]);
   seedBlockLatch(db, "fn-1-foo", "fn-1-foo.1");
-  // A non-pending (already-attempted) latch is NOT returned.
+  // An attempted latch without the re-armable category outcome is NOT returned.
   seedBlockLatch(db, "fn-1-foo", "fn-1-foo.2", "attempted");
 
   const rows = selectPendingBlockEscalations(db);
@@ -5474,10 +5476,41 @@ test("selectPendingBlockEscalations: joins pending latch to epic project_dir + e
   expect(rows[0]).toEqual({
     epic_id: "fn-1-foo",
     task_id: "fn-1-foo.1",
+    status: "pending",
+    outcome: null,
     project_dir: "/proj/foo",
     runtime_status: "blocked",
     target_repo: "/repo/x",
   });
+  db.close();
+});
+
+test("selectPendingBlockEscalations: attempted skipped_category remains eligible, other terminals do not", () => {
+  const { db } = freshMemDb();
+  seedEpicWithTasks(db, "fn-1-rearm", "/proj/rearm", [
+    { task_id: "fn-1-rearm.1", runtime_status: "blocked" },
+    { task_id: "fn-1-rearm.2", runtime_status: "blocked" },
+  ]);
+  seedBlockLatch(
+    db,
+    "fn-1-rearm",
+    "fn-1-rearm.1",
+    "attempted",
+    "skipped_category",
+  );
+  seedBlockLatch(db, "fn-1-rearm", "fn-1-rearm.2", "attempted", "dispatched");
+
+  expect(selectPendingBlockEscalations(db)).toEqual([
+    {
+      epic_id: "fn-1-rearm",
+      task_id: "fn-1-rearm.1",
+      status: "attempted",
+      outcome: "skipped_category",
+      project_dir: "/proj/rearm",
+      runtime_status: "blocked",
+      target_repo: null,
+    },
+  ]);
   db.close();
 });
 
@@ -5496,6 +5529,8 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
   expect(ghost).toEqual({
     epic_id: "fn-2-ghost",
     task_id: "fn-2-ghost.1",
+    status: "pending",
+    outcome: null,
     project_dir: null,
     runtime_status: null,
     target_repo: null,
@@ -5504,6 +5539,8 @@ test("selectPendingBlockEscalations: a pending latch with no surviving epic/task
   expect(missingEl).toEqual({
     epic_id: "fn-3-bar",
     task_id: "fn-3-bar.1",
+    status: "pending",
+    outcome: null,
     project_dir: "/proj/bar",
     runtime_status: null,
     target_repo: null,
@@ -5515,6 +5552,74 @@ test("selectPendingBlockEscalations: empty table returns []", () => {
   const { db } = freshMemDb();
   expect(selectPendingBlockEscalations(db)).toEqual([]);
   db.close();
+});
+
+// ---- dispatch unblock collision guard --------------------------------------
+
+function unblockRaceQuery(rows: {
+  latch?: Row[];
+  pending?: Row[];
+  jobs?: Row[];
+}): QueryFn {
+  return async (collection) => {
+    if (collection === "pending_dispatches") return rows.pending ?? [];
+    if (collection === "autopilot_state") return [{ id: 1, paused: 0 }];
+    if (collection === "block_escalations") return rows.latch ?? [];
+    if (collection === "jobs") return rows.jobs ?? [];
+    return [];
+  };
+}
+
+test("checkRaceGuard: an unpaused terminal unblock latch bypasses only the falsified autopilot premise", async () => {
+  const taskId = "fn-1-rearm.1";
+
+  const absent = await checkRaceGuard(unblockRaceQuery({}), "unblock", taskId);
+  expect(absent).toContain("autopilot is unpaused");
+
+  const pending = await checkRaceGuard(
+    unblockRaceQuery({
+      latch: [{ status: "pending", outcome: null }],
+    }),
+    "unblock",
+    taskId,
+  );
+  expect(pending).toContain("autopilot is unpaused");
+
+  const terminal = await checkRaceGuard(
+    unblockRaceQuery({
+      latch: [{ status: "attempted", outcome: "skipped_category" }],
+    }),
+    "unblock",
+    taskId,
+  );
+  expect(terminal).toBeNull();
+});
+
+test("checkRaceGuard: pending and live collisions still win over a terminal unblock latch", async () => {
+  const taskId = "fn-1-rearm.1";
+  const latch: Row[] = [{ status: "attempted", outcome: "skipped_category" }];
+
+  const pending = await checkRaceGuard(
+    unblockRaceQuery({
+      latch,
+      pending: [{ verb: "unblock", id: taskId }],
+    }),
+    "unblock",
+    taskId,
+  );
+  expect(pending).toContain("pending_dispatches");
+  expect(pending).not.toContain("autopilot is unpaused");
+
+  const live = await checkRaceGuard(
+    unblockRaceQuery({
+      latch,
+      jobs: [{ plan_verb: "unblock", plan_ref: taskId, state: "working" }],
+    }),
+    "unblock",
+    taskId,
+  );
+  expect(live).toContain(`a live worker for unblock::${taskId} is running`);
+  expect(live).not.toContain("autopilot is unpaused");
 });
 
 // ---- runBlockEscalationSweep (the dispatch core, injected deps) -------------
@@ -5535,6 +5640,8 @@ function blockedRow(
   return {
     epic_id: epicId,
     task_id: taskId,
+    status: "pending",
+    outcome: null,
     project_dir: "/proj",
     runtime_status: "blocked",
     target_repo: null,
@@ -5657,6 +5764,113 @@ test("runBlockEscalationSweep: an absent/unparseable reason never dispatches (su
   // gate per cycle).
   expect(notes).toEqual([
     "# block-escalation-drop task=fn-1-foo.1 class=reason_unreadable project_dir=/proj",
+  ]);
+});
+
+test("runBlockEscalationSweep: a skipped category re-arms under AUDIT_READY and dispatches once after grace", async () => {
+  const taskId = "fn-1-rearm.1";
+  const row = blockedRow("fn-1-rearm", taskId);
+  const reasons: Record<string, string | null> = {
+    [taskId]: "TOOLING_FAILURE: runner unavailable",
+  };
+  const orchestrator: Record<string, AuditOrchestratorLiveness> = {};
+  const diedAtMs = 1_000_000;
+  const options: {
+    pending: PendingBlockEscalation[];
+    reasons: Record<string, string | null>;
+    orchestrator: Record<string, AuditOrchestratorLiveness>;
+    nowMs: number;
+  } = {
+    pending: [row],
+    reasons,
+    orchestrator,
+    nowMs: diedAtMs,
+  };
+  const { deps, mints, dispatches } = fakeSweepDeps(options);
+
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints.at(-1)).toEqual({
+    kind: "attempted",
+    epicId: "fn-1-rearm",
+    taskId,
+    outcome: "skipped_category",
+  });
+
+  // The fold has settled the first cycle. A later worker park rewrites the parsed
+  // category while the task remains blocked, so the same row becomes re-armable.
+  row.status = "attempted";
+  row.outcome = "skipped_category";
+  reasons[taskId] = AUDIT_READY_REASON;
+  orchestrator[taskId] = { state: "dead", diedAtMs };
+  options.nowMs = diedAtMs + AUDIT_READY_ORCHESTRATOR_GRACE_MS - 1;
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+
+  options.nowMs = diedAtMs + AUDIT_READY_ORCHESTRATOR_GRACE_MS;
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([
+    { epicId: "fn-1-rearm", taskId: "fn-1-rearm.1" },
+  ]);
+  expect(mints.slice(-2)).toEqual([
+    { kind: "requested", epicId: "fn-1-rearm", taskId },
+    {
+      kind: "attempted",
+      epicId: "fn-1-rearm",
+      taskId,
+      outcome: "dispatched",
+    },
+  ]);
+
+  // Simulate those events folding before the next heartbeat: the terminal
+  // dispatched row is outside both eligible selector states.
+  row.outcome = "dispatched";
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toHaveLength(1);
+});
+
+test("runBlockEscalationSweep: repeat surface-and-stop reason classes stay terminal without re-emitting", async () => {
+  const { deps, mints, dispatches, suppressions, notes } = fakeSweepDeps({
+    pending: [
+      blockedRow("fn-1-repeat", "fn-1-repeat.1", {
+        status: "attempted",
+        outcome: "skipped_category",
+      }),
+      blockedRow("fn-1-repeat", "fn-1-repeat.2", {
+        status: "attempted",
+        outcome: "skipped_category",
+      }),
+    ],
+    reasons: {
+      "fn-1-repeat.1": "TOOLING_FAILURE: differently worded failure",
+      "fn-1-repeat.2": "free text remains unparseable",
+    },
+  });
+
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+  expect(suppressions).toEqual([]);
+  expect(notes).toEqual([]);
+});
+
+test("runBlockEscalationSweep: a re-armable category change still defers to a live unblock", async () => {
+  const { deps, mints, dispatches, notes } = fakeSweepDeps({
+    pending: [
+      blockedRow("fn-1-rearm", "fn-1-rearm.1", {
+        status: "attempted",
+        outcome: "skipped_category",
+      }),
+    ],
+    reasons: { "fn-1-rearm.1": "DESIGN_CONFLICT: incompatible contracts" },
+    epicLive: new Set(["fn-1-rearm"]),
+  });
+
+  await runBlockEscalationSweep(deps);
+  expect(dispatches).toEqual([]);
+  expect(mints).toEqual([]);
+  expect(notes).toEqual([
+    "# block-escalation-skip epic=fn-1-rearm task=fn-1-rearm.1 class=epic_serialized",
   ]);
 });
 
