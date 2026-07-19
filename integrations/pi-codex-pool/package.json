@@ -1,0 +1,22 @@
+{
+  "name": "@earendil-works/keeper-pi-codex-pool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Route Keeper-marked Pi Codex requests across opaque account aliases",
+  "keywords": [
+    "pi-package"
+  ],
+  "bin": {
+    "keeper-pi-codex-observe": "./src/observer.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

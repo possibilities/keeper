@@ -1,0 +1,442 @@
+import type {
+  AssistantMessage,
+  AssistantMessageEvent,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import { type CredentialVault, PoolCredentialError } from "./auth.ts";
+import type { PoolFailureClass, PoolRouteState } from "./state.ts";
+
+export type CodexDelegate = (
+  model: Model<"openai-codex-responses">,
+  context: Context,
+  options?: SimpleStreamOptions,
+) => AssistantMessageEventStream;
+
+export interface PoolStreamDependencies {
+  vault: CredentialVault;
+  routes: PoolRouteState;
+  delegate: CodexDelegate;
+  nativeDelegate: CodexDelegate;
+  warn(reason: "pool-unavailable"): void;
+  retryBackoffMs?: number;
+  now?: () => number;
+}
+
+class ForwardingEventStream implements AsyncIterable<AssistantMessageEvent> {
+  private readonly queue: AssistantMessageEvent[] = [];
+  private readonly waiters: Array<
+    (value: IteratorResult<AssistantMessageEvent>) => void
+  > = [];
+  private ended = false;
+  private readonly final: Promise<AssistantMessage>;
+  private resolveFinal!: (message: AssistantMessage) => void;
+
+  constructor() {
+    this.final = new Promise((resolve) => {
+      this.resolveFinal = resolve;
+    });
+  }
+
+  push(event: AssistantMessageEvent): void {
+    if (this.ended) return;
+    if (event.type === "done") this.resolveFinal(event.message);
+    if (event.type === "error") this.resolveFinal(event.error);
+    const waiter = this.waiters.shift();
+    if (waiter) waiter({ value: event, done: false });
+    else this.queue.push(event);
+  }
+
+  end(): void {
+    this.ended = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter({ value: undefined, done: true });
+    }
+  }
+
+  result(): Promise<AssistantMessage> {
+    return this.final;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<AssistantMessageEvent> {
+    while (true) {
+      const queued = this.queue.shift();
+      if (queued) {
+        yield queued;
+        continue;
+      }
+      if (this.ended) return;
+      const next = await new Promise<IteratorResult<AssistantMessageEvent>>(
+        (resolve) => this.waiters.push(resolve),
+      );
+      if (next.done) return;
+      yield next.value;
+    }
+  }
+}
+
+function failureMessage(event: AssistantMessageEvent): string {
+  if (event.type !== "error") return "";
+  return event.error.errorMessage ?? "";
+}
+
+export function classifyPoolFailure(message: string): PoolFailureClass {
+  if (/usage limit|quota|billing|out of budget|insufficient/i.test(message)) {
+    return "quota";
+  }
+  if (/rate.?limit|too many requests|\b429\b|throttl/i.test(message)) {
+    return "rate";
+  }
+  if (
+    /unauthori[sz]ed|forbidden|invalid.?token|expired.?token|\b40[13]\b/i.test(
+      message,
+    )
+  ) {
+    return "auth";
+  }
+  if (
+    /network|fetch|socket|websocket|connection|timed? ?out|timeout|econn|dns|service unavailable|\b50[0234]\b/i.test(
+      message,
+    )
+  ) {
+    return "transport";
+  }
+  return "other";
+}
+
+function retryable(failureClass: PoolFailureClass): boolean {
+  return failureClass !== "other";
+}
+
+function substantive(
+  event: AssistantMessageEvent | { type?: unknown },
+): boolean {
+  if (
+    event.type === "start" ||
+    event.type === "done" ||
+    event.type === "error"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function zeroUsage(): AssistantMessage["usage"] {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function terminalMessage(
+  model: Model<"openai-codex-responses">,
+  reason: "error" | "aborted",
+  code: string,
+  source?: AssistantMessage,
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content: source?.content ?? [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    ...(source?.responseModel === undefined
+      ? {}
+      : { responseModel: source.responseModel }),
+    ...(source?.responseId === undefined
+      ? {}
+      : { responseId: source.responseId }),
+    usage: source?.usage ?? zeroUsage(),
+    stopReason: reason,
+    errorMessage: code,
+    timestamp: source?.timestamp ?? Date.now(),
+  };
+}
+
+function sanitizedErrorEvent(
+  model: Model<"openai-codex-responses">,
+  reason: "error" | "aborted",
+  failureClass: PoolFailureClass | "deadline",
+  source?: AssistantMessage,
+): AssistantMessageEvent {
+  const code =
+    reason === "aborted"
+      ? "request-aborted"
+      : failureClass === "deadline"
+        ? "pool-deadline-exceeded"
+        : `pool-${failureClass}-failure`;
+  return {
+    type: "error",
+    reason,
+    error: terminalMessage(model, reason, code, source),
+  };
+}
+
+function remainingTimeout(
+  original: number | undefined,
+  deadlineMs: number | undefined,
+  now: () => number,
+): number | undefined {
+  if (deadlineMs === undefined) return original;
+  return Math.max(1, Math.floor(deadlineMs - now()));
+}
+
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  if (signal?.aborted) return Promise.reject(new Error("request-aborted"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new Error("request-aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function startNativeFallback(
+  output: ForwardingEventStream,
+  deps: PoolStreamDependencies,
+  model: Model<"openai-codex-responses">,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+): void {
+  deps.warn("pool-unavailable");
+  void (async () => {
+    try {
+      const native = deps.nativeDelegate(model, context, options);
+      for await (const event of native) output.push(event);
+    } catch {
+      output.push(sanitizedErrorEvent(model, "error", "other"));
+    } finally {
+      output.end();
+    }
+  })();
+}
+
+export function createPooledCodexStream(
+  deps: PoolStreamDependencies,
+  model: Model<"openai-codex-responses">,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const output = new ForwardingEventStream();
+  const now = deps.now ?? Date.now;
+  const sessionId = options?.sessionId;
+  if (!sessionId || deps.routes.aliases.length === 0) {
+    startNativeFallback(output, deps, model, context, options);
+    return output as unknown as AssistantMessageEventStream;
+  }
+  const timeoutMs = options?.timeoutMs;
+  const deadlineMs =
+    timeoutMs !== undefined && timeoutMs > 0 ? now() + timeoutMs : undefined;
+
+  void (async () => {
+    const excluded = new Set<string>();
+    let delegatedAttempts = 0;
+    let lastFailure: PoolFailureClass = "other";
+    let lastErrorMessage: AssistantMessage | undefined;
+
+    while (delegatedAttempts < 2) {
+      if (options?.signal?.aborted) {
+        output.push(
+          sanitizedErrorEvent(model, "aborted", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      if (deadlineMs !== undefined && now() >= deadlineMs) {
+        output.push(
+          sanitizedErrorEvent(model, "error", "deadline", lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+
+      let alias: string;
+      try {
+        alias = deps.routes.select(sessionId, excluded);
+      } catch {
+        if (delegatedAttempts === 0) {
+          startNativeFallback(output, deps, model, context, options);
+          return;
+        }
+        output.push(
+          sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+
+      let apiKey: string;
+      try {
+        const credential = await deps.vault.resolve(alias, {
+          signal: options?.signal,
+          ...(deadlineMs === undefined ? {} : { deadlineMs }),
+        });
+        apiKey = credential.access;
+      } catch (error) {
+        if (options?.signal?.aborted) {
+          output.push(sanitizedErrorEvent(model, "aborted", "auth"));
+          output.end();
+          return;
+        }
+        if (
+          deadlineMs !== undefined &&
+          (now() >= deadlineMs ||
+            (error instanceof PoolCredentialError &&
+              error.code === "credential-aborted"))
+        ) {
+          output.push(sanitizedErrorEvent(model, "error", "deadline"));
+          output.end();
+          return;
+        }
+        deps.routes.recordFailure(sessionId, alias, "auth");
+        excluded.add(alias);
+        lastFailure = "auth";
+        if (excluded.size < deps.routes.aliases.length) continue;
+        if (delegatedAttempts === 0) {
+          startNativeFallback(output, deps, model, context, options);
+          return;
+        }
+        output.push(sanitizedErrorEvent(model, "error", "auth"));
+        output.end();
+        return;
+      }
+
+      delegatedAttempts += 1;
+      const attemptOptions: SimpleStreamOptions = {
+        ...options,
+        apiKey,
+        maxRetries: 0,
+        timeoutMs: remainingTimeout(timeoutMs, deadlineMs, now),
+      };
+      let bufferedStart: AssistantMessageEvent | undefined;
+      let exposedSubstantive = false;
+      let terminal = false;
+      try {
+        const upstream = deps.delegate(model, context, attemptOptions);
+        for await (const rawEvent of upstream as AsyncIterable<AssistantMessageEvent>) {
+          const event = rawEvent as AssistantMessageEvent & { type: string };
+          if (event.type === "start") {
+            bufferedStart ??= event;
+            continue;
+          }
+          if (substantive(event)) {
+            if (bufferedStart) {
+              output.push(bufferedStart);
+              bufferedStart = undefined;
+            }
+            exposedSubstantive = true;
+            output.push(event);
+            continue;
+          }
+          if (event.type === "done") {
+            if (bufferedStart) output.push(bufferedStart);
+            output.push(event);
+            deps.routes.recordSuccess(sessionId, alias);
+            terminal = true;
+            break;
+          }
+          if (event.type === "error") {
+            const reason = event.reason === "aborted" ? "aborted" : "error";
+            const failureClass = classifyPoolFailure(failureMessage(event));
+            lastFailure = failureClass;
+            lastErrorMessage = event.error;
+            if (reason === "aborted" || options?.signal?.aborted) {
+              if (bufferedStart) output.push(bufferedStart);
+              output.push(
+                sanitizedErrorEvent(
+                  model,
+                  "aborted",
+                  failureClass,
+                  event.error,
+                ),
+              );
+              deps.routes.recordFailure(sessionId, alias, failureClass);
+              terminal = true;
+              break;
+            }
+            if (!exposedSubstantive && retryable(failureClass)) {
+              deps.routes.recordFailure(sessionId, alias, failureClass);
+              excluded.add(alias);
+              break;
+            }
+            if (bufferedStart) output.push(bufferedStart);
+            output.push(
+              sanitizedErrorEvent(model, "error", failureClass, event.error),
+            );
+            deps.routes.recordFailure(sessionId, alias, failureClass);
+            terminal = true;
+            break;
+          }
+        }
+        if (!terminal && !excluded.has(alias)) {
+          lastFailure = "transport";
+          deps.routes.recordFailure(sessionId, alias, lastFailure);
+          excluded.add(alias);
+          if (exposedSubstantive) {
+            output.push(sanitizedErrorEvent(model, "error", lastFailure));
+            terminal = true;
+          }
+        }
+      } catch (error) {
+        const failureClass = classifyPoolFailure(
+          error instanceof Error ? error.message : "",
+        );
+        lastFailure = failureClass;
+        deps.routes.recordFailure(sessionId, alias, failureClass);
+        excluded.add(alias);
+        if (options?.signal?.aborted) {
+          output.push(sanitizedErrorEvent(model, "aborted", failureClass));
+          terminal = true;
+        } else if (exposedSubstantive || !retryable(failureClass)) {
+          output.push(sanitizedErrorEvent(model, "error", failureClass));
+          terminal = true;
+        }
+      }
+
+      if (terminal) {
+        output.end();
+        return;
+      }
+      if (
+        delegatedAttempts >= 2 ||
+        excluded.size >= deps.routes.aliases.length
+      ) {
+        output.push(
+          sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+      try {
+        await waitForRetry(deps.retryBackoffMs ?? 0, options?.signal);
+      } catch {
+        output.push(
+          sanitizedErrorEvent(model, "aborted", lastFailure, lastErrorMessage),
+        );
+        output.end();
+        return;
+      }
+    }
+    output.push(
+      sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),
+    );
+    output.end();
+  })().catch(() => {
+    output.push(sanitizedErrorEvent(model, "error", "other"));
+    output.end();
+  });
+
+  return output as unknown as AssistantMessageEventStream;
+}
