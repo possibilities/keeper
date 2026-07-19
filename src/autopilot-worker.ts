@@ -150,6 +150,7 @@ import {
   type BaseDriftEntry,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
+  type CloseReceipt,
   closerJobFinished,
   type DispatchKey,
   dispatchKey,
@@ -159,6 +160,7 @@ import {
   epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
   type HostMatrixSnapshot,
+  isBareShellCommand,
   isFinalizerVerb,
   isStoppedJobLive,
   isWrappedCell,
@@ -173,6 +175,8 @@ import {
   type ResourceHoldObservation,
   reconcile,
   recoverFailureDispatchId,
+  SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   type StaleBaseLaneEntry,
   type Verb,
   type WithholdReason,
@@ -317,6 +321,7 @@ export {
 } from "./dispatch-failure-key";
 export type {
   BaseDriftEntry,
+  CloseReceipt,
   DispatchKey,
   EpicRecoverVerdict,
   HostMatrixSnapshot,
@@ -845,15 +850,6 @@ export interface ConfirmRunningDeps {
    * deferred/failed removal — the sweep must not drop a still-present path.
    */
   nudgeVanishedSweep?(): void;
-  /**
-   * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
-   * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
-   * effect the slot-occupancy reclaim takes, gated behind the strict
-   * bare-shell-past-grace criterion in the pure decision. Optional — a partial
-   * test deps stays visibility-only. NEVER throws (killWindow degrades to a logged
-   * `{ ok: false }` on a TOCTOU window-already-gone, itself the desired end state).
-   */
-  reclaimSlotPane?(paneId: string): Promise<void>;
   /**
    * Emit the FULL current worktree-disabled set to main (fn-1013) for the
    * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
@@ -1517,10 +1513,23 @@ export interface ZombieSessionCandidate {
   updatedAt: number;
 }
 
+interface ReapCandidate extends ZombieSessionCandidate {
+  reapClass: "monitor" | "occupancy";
+  immediate: boolean;
+  paneId: string | null;
+}
+
+interface PendingReapTerm {
+  sentAt: number;
+  stoppedAt: number;
+  candidate: ReapCandidate;
+}
+
 export interface OpenZombieSessionDistress {
   id: string;
   jobId: string;
   dir: string;
+  scope: "monitor" | "occupancy";
 }
 
 export interface ZombieReaperSnapshot {
@@ -1626,20 +1635,26 @@ export function decideZombieSessionReaper(input: {
   termSentAt?: number;
   thresholdSec?: number;
   termGraceSec?: number;
+  reapClass?: "monitor" | "occupancy";
+  immediate?: boolean;
 }): ZombieSessionReaperDecision {
   const thresholdSec = input.thresholdSec ?? ZOMBIE_SESSION_REAPER_GRACE_SEC;
-  const stale =
-    input.activity?.status === "unknown" &&
-    input.activity.reason === "resource-evidence-stale" &&
-    Number.isFinite(input.updatedAt) &&
-    input.nowSec - input.updatedAt > thresholdSec;
+  const occupancyReap = input.reapClass === "occupancy";
+  const stale = occupancyReap
+    ? input.immediate === true ||
+      (Number.isFinite(input.updatedAt) &&
+        input.nowSec - input.updatedAt >= thresholdSec)
+    : input.activity?.status === "unknown" &&
+      input.activity.reason === "resource-evidence-stale" &&
+      Number.isFinite(input.updatedAt) &&
+      input.nowSec - input.updatedAt > thresholdSec;
   if (input.jobState !== "stopped" || !stale) {
     return {
       action: "none",
       reason: input.jobState === "stopped" ? "activity" : "outside-scope",
     };
   }
-  if (!input.taskDone) {
+  if (!occupancyReap && !input.taskDone) {
     return { action: "backstop", reason: "task-not-done" };
   }
   if (
@@ -1682,8 +1697,14 @@ export function isKeeperLaunchedZombieCommand(
   planVerb: string | null,
   planRef: string | null,
 ): boolean {
-  if (planVerb !== "work" || planRef == null || planRef === "") return false;
-  const expected = `work::${planRef}`;
+  if (
+    (planVerb !== "work" && planVerb !== "close") ||
+    planRef == null ||
+    planRef === ""
+  ) {
+    return false;
+  }
+  const expected = `${planVerb}::${planRef}`;
   const tokens = command.trim().split(/\s+/);
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
@@ -4881,13 +4902,9 @@ export async function runReconcileCycle(
     physicalize,
   });
   // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
-  // Surface every wedged slot (a stopped-but-live session blocking a wanted mint)
-  // as a visible `DispatchFailed` through the change-gate, and KILL the pane of a
-  // provably-dead occupant (`reclaimPaneId`) to free its slot. The kill re-issues
-  // every cycle the condition persists (until the pane is gone) INDEPENDENT of the
-  // gate's emit-suppression, so a first-cycle TOCTOU miss self-heals. Clears fire
-  // symmetrically off the pure decision. All reason-scoped upstream, so a genuine
-  // `close::<epic>` conflict on the shared key is never touched.
+  // Surface every wedged slot through the change-gate. The worker drive consumes
+  // each exact `reapTarget` through the identity-rechecking TERM→KILL ladder before
+  // this producer runs; this seam owns only the reason-scoped failure/clear events.
   for (const sig of decision.slotOccupancy) {
     if (signal.aborted) {
       return;
@@ -4900,9 +4917,6 @@ export async function runReconcileCycle(
       conflictedFiles: null,
       ts: deps.now(),
     });
-    if (sig.reclaimPaneId !== null) {
-      await deps.reclaimSlotPane?.(sig.reclaimPaneId);
-    }
   }
   for (const clr of decision.slotOccupancyClears) {
     if (signal.aborted) {
@@ -9012,6 +9026,75 @@ export function deriveResourceHoldObservations(
   return out;
 }
 
+/** Parse one durable close-finalize tool receipt without trusting its shape. */
+export function extractCloseFinalizeReceipt(
+  data: string | null,
+  ts: number,
+): CloseReceipt | null {
+  if (data == null || data.length === 0 || !Number.isFinite(ts)) return null;
+  try {
+    const outer = JSON.parse(data) as unknown;
+    if (outer == null || typeof outer !== "object") return null;
+    const record = outer as Record<string, unknown>;
+    let receipt: unknown = record;
+    const toolResponse = record.tool_response;
+    if (toolResponse != null && typeof toolResponse === "object") {
+      const stdout = (toolResponse as Record<string, unknown>).stdout;
+      if (typeof stdout !== "string" || stdout.length === 0) return null;
+      receipt = JSON.parse(stdout);
+    }
+    if (receipt == null || typeof receipt !== "object") return null;
+    const outcome = (receipt as Record<string, unknown>).outcome;
+    return typeof outcome === "string" && outcome.length > 0
+      ? { outcome, ts }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Join each live close target to its newest durable close-finalize receipt. The
+ * events projection is indexed by `plan_target`; one bounded point lookup runs per
+ * distinct live close epic. A malformed newest receipt yields no terminal fact —
+ * an older fatal outcome may not leak across a later failed attempt.
+ */
+export function loadLatestCloseReceipts(
+  db: Parameters<typeof runQuery>[0],
+  jobs: ReadonlyMap<string, Job>,
+): Map<string, CloseReceipt> {
+  const epicIds = new Set<string>();
+  for (const job of jobs.values()) {
+    if (
+      job.plan_verb === "close" &&
+      job.plan_ref != null &&
+      job.plan_ref !== "" &&
+      (job.state === "working" || job.state === "stopped")
+    ) {
+      epicIds.add(job.plan_ref);
+    }
+  }
+  const receipts = new Map<string, CloseReceipt>();
+  for (const epicId of [...epicIds].sort()) {
+    try {
+      const row = db
+        .query(
+          `SELECT ts, data
+             FROM events
+            WHERE plan_target = ? AND plan_op = 'close-finalize'
+            ORDER BY id DESC LIMIT 1`,
+        )
+        .get(epicId) as { ts: number; data: string | null } | null;
+      if (row == null) continue;
+      const receipt = extractCloseFinalizeReceipt(row.data, row.ts);
+      if (receipt != null) receipts.set(epicId, receipt);
+    } catch {
+      // Missing/inconclusive receipt evidence keeps the ordinary grace.
+    }
+  }
+  return receipts;
+}
+
 /**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
@@ -9089,6 +9172,7 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery, nowSec);
+  const latestCloseReceiptByEpicId = loadLatestCloseReceipts(db, jobs);
 
   // The shared jobs descriptor intentionally omits the live-only generation
   // column; exact Resource holds require it, so enrich the producer snapshot
@@ -9222,6 +9306,9 @@ export async function loadReconcileSnapshot(
             id,
             jobId,
             dir: typeof dir === "string" ? dir : "",
+            scope: reasonStr.includes("stopped occupancy-holding session")
+              ? "occupancy"
+              : "monitor",
           });
         }
       }
@@ -9580,13 +9667,22 @@ export async function loadReconcileSnapshot(
       job?.plan_verb === "work" &&
       job.plan_ref != null &&
       doneTaskIds.has(job.plan_ref);
+    const occupancySettled =
+      row.scope === "occupancy" &&
+      (job == null ||
+        job.state !== "stopped" ||
+        !isStoppedJobLive(job, livePaneIds));
+    const monitorSettled =
+      row.scope === "monitor" &&
+      (job?.state === "working" ||
+        activity?.status === "active" ||
+        activity?.status === "quiescent" ||
+        !taskStillDone);
     if (
       terminalOrAbsent ||
-      job?.state === "working" ||
-      activity?.status === "active" ||
-      activity?.status === "quiescent" ||
-      (job != null && probeJobPid(job) === false) ||
-      !taskStillDone
+      occupancySettled ||
+      monitorSettled ||
+      (job != null && probeJobPid(job) === false)
     ) {
       zombieSessionClearActions.push({ id: row.id, dir: row.dir });
     }
@@ -9789,6 +9885,7 @@ export async function loadReconcileSnapshot(
     livePaneIds,
     paneCommandById,
     provenDeadJobIds,
+    latestCloseReceiptByEpicId,
     pendingDispatches,
     providerLegActivityByWrapperJobId,
     mode,
@@ -9957,7 +10054,7 @@ function main(): void {
   // every cycle. In-worker memory only; a restart re-arms it. Distinct surface so the rows
   // never cross-clear the shared-checkout / lane / stale-base siblings.
   const dupEpicNumberTracker = createDupEpicNumberTracker();
-  const zombieTermSentAt = new Map<string, number>();
+  const pendingReapTerms = new Map<string, PendingReapTerm>();
   const zombieKillSent = new Set<string>();
   // The EVENT-SEEDED desync latch: repo dirs a base→default merge (finalize / recover
   // pass-2) advanced-then-left-trailing this run, fed by `createWorktreeDriver`'s
@@ -10149,16 +10246,6 @@ function main(): void {
       parentPort?.postMessage({
         kind: "nudge-vanished-sweep",
       } satisfies VanishedSweepNudgeMessage);
-    },
-    reclaimSlotPane: async (paneId) => {
-      // Kill the dead session's window to free its slot. Fire-and-log: killWindow
-      // never throws, and a nonzero exit is the benign TOCTOU (the window already
-      // died — the outcome we wanted). The visible `slot-reclaimed` failure carries
-      // the operator signal regardless.
-      const res = await paneOps.killWindow(paneId);
-      if (!res.ok && res.error) {
-        noteLine(`[autopilot-worker] slot reclaim kill-window: ${res.error}`);
-      }
     },
     // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
     // changes, so a stable board mints zero `WorktreeRepoStatus` events. The
@@ -10452,96 +10539,6 @@ function main(): void {
           } catch (err) {
             console.error(
               "[autopilot-worker] monitor-slot wedge distress step threw (non-fatal):",
-              err,
-            );
-          }
-        }
-        // The done-stamped subset is disjoint from the monitor-slot backstop.
-        // Every signal step re-probes pid/start-time, ownership, and defunct state.
-        if (!state.paused) {
-          try {
-            const candidateIds = new Set(
-              snapshot.zombieSessionCandidates.map(
-                (candidate) => candidate.jobId,
-              ),
-            );
-            for (const jobId of zombieTermSentAt.keys()) {
-              if (!candidateIds.has(jobId)) zombieTermSentAt.delete(jobId);
-            }
-            for (const jobId of zombieKillSent) {
-              if (!candidateIds.has(jobId)) zombieKillSent.delete(jobId);
-            }
-            for (const action of snapshot.zombieSessionClearActions) {
-              deps.clearSharedWedgeDistress?.(
-                claimlessDistressClear(
-                  snapshot.dispatchFailureFences,
-                  action.id,
-                  action.dir,
-                ),
-              );
-            }
-            for (const candidate of snapshot.zombieSessionCandidates) {
-              const job = snapshot.jobs.get(candidate.jobId);
-              if (job == null) continue;
-              let decision: ZombieSessionReaperDecision;
-              if (zombieKillSent.has(candidate.jobId)) {
-                decision = { action: "page", reason: "signal-failed" };
-              } else {
-                decision = runZombieSessionReaperStep(
-                  {
-                    jobState: job.state,
-                    taskDone: true,
-                    pid: job.pid,
-                    storedStartTime: job.start_time,
-                    updatedAt: candidate.updatedAt,
-                    nowSec: deps.now(),
-                    activity: snapshot.harnessActivityByJobId?.get(job.job_id),
-                    termSentAt: zombieTermSentAt.get(job.job_id),
-                  },
-                  {
-                    probe: probeZombieProcess,
-                    signal: (pid, signal) => process.kill(pid, signal),
-                  },
-                  job.plan_verb,
-                  job.plan_ref,
-                );
-              }
-              if (decision.action === "signal") {
-                if (decision.signal === "SIGTERM") {
-                  const sentAt = deps.now();
-                  zombieTermSentAt.set(job.job_id, sentAt);
-                  const timer = setTimeout(
-                    () => requestCycle(),
-                    ZOMBIE_SESSION_TERM_GRACE_SEC * 1000,
-                  );
-                  timer.unref();
-                } else {
-                  zombieKillSent.add(job.job_id);
-                  const timer = setTimeout(() => requestCycle(), 1_000);
-                  timer.unref();
-                }
-                continue;
-              }
-              if (
-                decision.action === "page" &&
-                !snapshot.openZombieSessionDistresses.has(
-                  zombieSessionDistressId(job.job_id),
-                )
-              ) {
-                deps.emitSharedWedgeDistress?.({
-                  id: zombieSessionDistressId(job.job_id),
-                  dir: candidate.dir,
-                  reason:
-                    `${ZOMBIE_SESSION_DISTRESS_REASON}: stopped done-stamped ` +
-                    `session ${job.job_id} could not be safely reaped ` +
-                    `(${decision.reason}) — inspect the process identity`,
-                  ts: deps.now(),
-                });
-              }
-            }
-          } catch (err) {
-            console.error(
-              "[autopilot-worker] zombie-session reaper step threw (non-fatal):",
               err,
             );
           }
@@ -11052,6 +11049,230 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
+        // Reap the union of the done-monitor candidates and this cycle's
+        // exact occupancy targets. Slot targets take precedence for a shared job
+        // because their stopped proof needs no monitor-staleness inference. The
+        // act-time jobs read plus the process probe adjacent to each signal prevent
+        // a later working transition or recycled pid from inheriting authority.
+        if (!state.paused) {
+          try {
+            const reapCandidates = new Map<string, ReapCandidate>();
+            for (const candidate of snapshot.zombieSessionCandidates) {
+              reapCandidates.set(candidate.jobId, {
+                ...candidate,
+                reapClass: "monitor",
+                immediate: false,
+                paneId: null,
+              });
+            }
+            for (const signal of decision.slotOccupancy) {
+              const target = signal.reapTarget;
+              if (target == null) continue;
+              const job = snapshot.jobs.get(target.jobId);
+              if (job == null) continue;
+              reapCandidates.set(target.jobId, {
+                jobId: target.jobId,
+                dir: signal.dir ?? "",
+                updatedAt: job.updated_at,
+                reapClass: "occupancy",
+                immediate: target.immediate,
+                paneId: target.paneId,
+              });
+            }
+
+            // Once TERM is sent, retain that exact ladder until current evidence
+            // proves the stopped episode ended. A transient degraded pane probe may
+            // pause the occupancy pass, but it must not erase the queued KILL.
+            for (const [jobId, pending] of pendingReapTerms) {
+              const job = snapshot.jobs.get(jobId);
+              if (job == null || job.state !== "stopped") {
+                pendingReapTerms.delete(jobId);
+                zombieKillSent.delete(jobId);
+                continue;
+              }
+              if (
+                !reapCandidates.has(jobId) &&
+                (pending.candidate.reapClass !== "occupancy" ||
+                  (snapshot.livePaneIds !== null &&
+                    snapshot.paneCommandById !== null))
+              ) {
+                reapCandidates.set(jobId, pending.candidate);
+              }
+            }
+            for (const jobId of zombieKillSent) {
+              const job = snapshot.jobs.get(jobId);
+              if (job == null || job.state !== "stopped") {
+                zombieKillSent.delete(jobId);
+                pendingReapTerms.delete(jobId);
+              }
+            }
+            for (const action of snapshot.zombieSessionClearActions) {
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  action.id,
+                  action.dir,
+                ),
+              );
+            }
+
+            const ordered = [...reapCandidates.values()].sort((a, b) => {
+              const aPending = pendingReapTerms.has(a.jobId);
+              const bPending = pendingReapTerms.has(b.jobId);
+              if (aPending !== bPending) return aPending ? -1 : 1;
+              if (a.reapClass !== b.reapClass) {
+                return a.reapClass === "occupancy" ? -1 : 1;
+              }
+              return a.jobId.localeCompare(b.jobId);
+            });
+            for (const candidate of ordered.slice(
+              0,
+              SLOT_RECLAIM_MAX_PER_SWEEP,
+            )) {
+              const job = db
+                .query(
+                  `SELECT job_id, state, pid, start_time, plan_verb, plan_ref,
+                          backend_exec_pane_id, updated_at
+                     FROM jobs WHERE job_id = ?`,
+                )
+                .get(candidate.jobId) as {
+                job_id: string;
+                state: string;
+                pid: number | null;
+                start_time: string | null;
+                plan_verb: string | null;
+                plan_ref: string | null;
+                backend_exec_pane_id: string | null;
+                updated_at: number;
+              } | null;
+              if (job == null) continue;
+              if (
+                candidate.paneId != null &&
+                job.backend_exec_pane_id !== candidate.paneId
+              ) {
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                continue;
+              }
+
+              let pendingTerm = pendingReapTerms.get(job.job_id);
+              if (
+                pendingTerm !== undefined &&
+                job.updated_at > pendingTerm.stoppedAt
+              ) {
+                // A newer fold may include a working→stopped episode. Restart the
+                // ladder rather than inheriting kill authority.
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                pendingTerm = undefined;
+              }
+
+              let reapDecision: ZombieSessionReaperDecision;
+              if (zombieKillSent.has(candidate.jobId)) {
+                reapDecision = { action: "page", reason: "signal-failed" };
+              } else {
+                reapDecision = runZombieSessionReaperStep(
+                  {
+                    jobState: job.state,
+                    taskDone: candidate.reapClass === "monitor",
+                    pid: job.pid,
+                    storedStartTime: job.start_time,
+                    updatedAt:
+                      candidate.reapClass === "occupancy"
+                        ? job.updated_at
+                        : candidate.updatedAt,
+                    nowSec: deps.now(),
+                    activity: snapshot.harnessActivityByJobId?.get(job.job_id),
+                    termSentAt: pendingTerm?.sentAt,
+                    thresholdSec:
+                      candidate.reapClass === "occupancy"
+                        ? SLOT_RECLAIM_GRACE_SEC
+                        : undefined,
+                    reapClass: candidate.reapClass,
+                    immediate: candidate.immediate,
+                  },
+                  {
+                    probe: probeZombieProcess,
+                    signal: (pid, signal) => process.kill(pid, signal),
+                  },
+                  job.plan_verb,
+                  job.plan_ref,
+                );
+              }
+              if (reapDecision.action === "signal") {
+                if (reapDecision.signal === "SIGTERM") {
+                  pendingReapTerms.set(job.job_id, {
+                    sentAt: deps.now(),
+                    stoppedAt: job.updated_at,
+                    candidate,
+                  });
+                  const timer = setTimeout(
+                    () => requestCycle(),
+                    ZOMBIE_SESSION_TERM_GRACE_SEC * 1000,
+                  );
+                  timer.unref();
+                } else {
+                  zombieKillSent.add(job.job_id);
+                  const timer = setTimeout(() => requestCycle(), 1_000);
+                  timer.unref();
+                }
+                continue;
+              }
+              const paneId = candidate.paneId;
+              const paneOnlyReap =
+                candidate.reapClass === "occupancy" &&
+                paneId !== null &&
+                ((reapDecision.action === "none" &&
+                  reapDecision.reason === "pid-dead") ||
+                  (reapDecision.action === "page" &&
+                    reapDecision.reason === "pid-unproven" &&
+                    isBareShellCommand(snapshot.paneCommandById?.get(paneId))));
+              if (paneOnlyReap && paneId !== null) {
+                const result = await paneOps.killWindow(paneId);
+                if (!result.ok && result.error) {
+                  noteLine(
+                    `[autopilot-worker] slot residual-pane reap: ${result.error}`,
+                  );
+                }
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                continue;
+              }
+              if (
+                reapDecision.action === "none" &&
+                reapDecision.reason === "outside-scope"
+              ) {
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+              }
+              if (
+                reapDecision.action === "page" &&
+                !snapshot.openZombieSessionDistresses.has(
+                  zombieSessionDistressId(job.job_id),
+                )
+              ) {
+                const source =
+                  candidate.reapClass === "occupancy"
+                    ? "occupancy-holding"
+                    : "done-stamped";
+                deps.emitSharedWedgeDistress?.({
+                  id: zombieSessionDistressId(job.job_id),
+                  dir: candidate.dir,
+                  reason:
+                    `${ZOMBIE_SESSION_DISTRESS_REASON}: stopped ${source} ` +
+                    `session ${job.job_id} could not be safely reaped ` +
+                    `(${reapDecision.reason}) — inspect the process identity`,
+                  ts: deps.now(),
+                });
+              }
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] zombie-session reaper step threw (non-fatal):",
+              err,
+            );
+          }
+        }
         updateWithholdFrameState(
           withholdFrameState,
           decision.withholds,

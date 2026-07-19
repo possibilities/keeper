@@ -102,6 +102,7 @@ import {
   epicHasActiveResolver,
   epicPresentAndNotDone,
   epicRecoverVerdictById,
+  extractCloseFinalizeReceipt,
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
@@ -135,6 +136,7 @@ import {
   laneFailuresToClear,
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
+  loadLatestCloseReceipts,
   loadReconcileSnapshot,
   logMergeGateDeferral,
   logWrappedDelegationSkip,
@@ -406,6 +408,47 @@ test("zombie-session decision partitions signals, pages, backstop, and no-op sta
       expected: { action: "signal", signal: "SIGKILL" },
     },
     {
+      input: {
+        taskDone: false,
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 220,
+        activity: { status: "active", reason: "main-turn", reservation: null },
+      },
+      expected: { action: "signal", signal: "SIGTERM" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 230,
+        termSentAt: 220,
+        activity: { status: "active", reason: "main-turn", reservation: null },
+      },
+      expected: { action: "signal", signal: "SIGKILL" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 219,
+      },
+      expected: { action: "none", reason: "activity" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 100,
+        immediate: true,
+      },
+      expected: { action: "signal", signal: "SIGTERM" },
+    },
+    {
       input: { jobState: "working" },
       expected: { action: "none", reason: "outside-scope" },
     },
@@ -551,7 +594,7 @@ test("zombie-session signal failure degrades to a page-only verdict", () => {
   ).toEqual({ action: "page", reason: "signal-failed" });
 });
 
-test("zombie-session command ownership requires the exact work dispatch name", () => {
+test("zombie-session command ownership requires the exact tracked dispatch name", () => {
   expect(
     isKeeperLaunchedZombieCommand(
       "claude --name work::fn-1-foo.1 prompt",
@@ -566,6 +609,13 @@ test("zombie-session command ownership requires the exact work dispatch name", (
       "fn-1-foo.1",
     ),
   ).toBe(false);
+  expect(
+    isKeeperLaunchedZombieCommand(
+      "claude --name close::fn-1-foo prompt",
+      "close",
+      "fn-1-foo",
+    ),
+  ).toBe(true);
 });
 
 function makeSnapshot(
@@ -1413,9 +1463,7 @@ test("isBareShellCommand: known shells (incl. login `-` forms) are bare shells",
   }
 });
 
-test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclaim)", () => {
-  // The catastrophic over-match guard: a running claude reads as its own process,
-  // never a shell, so the criterion can never classify a live session as dead.
+test("isBareShellCommand: worker commands are not bare-shell duplicate preferences", () => {
   for (const cmd of [
     "claude",
     "node",
@@ -1440,9 +1488,11 @@ test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclai
 function oneOccupant(over: {
   verb?: "work" | "close";
   id?: string;
+  jobId?: string;
   state?: string;
   pane?: string;
   command?: string;
+  created_at?: number;
   updated_at?: number;
   active_since?: number | null;
 }): {
@@ -1451,15 +1501,17 @@ function oneOccupant(over: {
   paneCommandById: Map<string, string>;
 } {
   const pane = over.pane ?? "%7";
+  const jobId = over.jobId ?? "j";
   const jobs = new Map<string, Job>([
     [
-      "j",
+      jobId,
       makeJob({
-        job_id: "j",
+        job_id: jobId,
         plan_verb: over.verb ?? "close",
         plan_ref: over.id ?? "fn-1-foo",
         state: over.state ?? "stopped",
         backend_exec_pane_id: pane,
+        created_at: over.created_at ?? 100,
         updated_at: over.updated_at ?? 800,
         active_since: over.active_since ?? null,
       }),
@@ -1488,46 +1540,39 @@ function slotInput(
   };
 }
 
-test("computeSlotOccupancy: dead (stopped + bare shell + grace elapsed) → reclaim + slot-reclaimed", () => {
-  // idle 200s ≥ the 120s default grace, pane foreground is the bare shell tail.
+test("computeSlotOccupancy: stopped bare shell past grace selects the exact reap target", () => {
   const occ = oneOccupant({ command: "zsh", updated_at: 800 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
   const sig: SlotOccupancySignal = out.failures[0];
   expect(sig.verb).toBe("close");
   expect(sig.id).toBe("fn-1-foo");
-  expect(sig.reclaimPaneId).toBe("%7"); // the kill is issued
+  expect(sig.reapTarget).toEqual({
+    jobId: "j",
+    paneId: "%7",
+    immediate: false,
+  });
   expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
   expect(out.clears).toEqual([]);
 });
 
-test("computeSlotOccupancy: bare shell but WITHIN grace → slot-occupied, NO kill", () => {
-  // idle 50s < 120s grace — a bare shell that JUST appeared could be a teardown
-  // frame, so surface only; never kill inside the grace window.
+test("computeSlotOccupancy: stopped bare shell within grace stays visibility-only", () => {
   const occ = oneOccupant({ command: "zsh", updated_at: 950 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
-test("computeSlotOccupancy: a live/parked claude pane → slot-occupied, NEVER killed (even past grace)", () => {
-  // NEVER-started: `oneOccupant`'s default `active_since` is null, so this row never
-  // ran a turn — the derived-idle arm skips it (it is a still-binding launch, not a
-  // finished session), and its `claude` foreground command is neither a bare shell
-  // nor a proven-dead verdict. Surfaced only, never killed.
+test("computeSlotOccupancy: stopped claude pane past grace is reaped without a cosmetic death proof", () => {
   const occ = oneOccupant({ command: "claude", updated_at: 0 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim + slot-reclaimed", () => {
-  // ADR 0052 core case: a session that WENT working (`active_since` set) then ended
-  // its turn but stays resident holding a wanted slot. Its pane still reads `claude`
-  // (not a bare shell, no proven-dead verdict), yet past grace it is derived-idle →
-  // reclaimed, unlike the never-started row above.
+test("computeSlotOccupancy: active_since does not weaken stopped-past-grace evidence", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 800,
@@ -1535,14 +1580,11 @@ test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim +
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  const sig: SlotOccupancySignal = out.failures[0];
-  expect(sig.reclaimPaneId).toBe("%7");
-  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupied, NO kill", () => {
-  // idle 50s < 120s grace: a just-ended turn could be a transient frame, so the
-  // derived-idle arm waits out the grace exactly like the bare-shell arm.
+test("computeSlotOccupancy: a started stopped session within grace is not reaped", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 950,
@@ -1550,14 +1592,11 @@ test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupie
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
-test("computeSlotOccupancy: never-started (active_since null) + idle pane past grace → derived-idle arm NEVER reclaims", () => {
-  // The startup-grace guard for the derived-idle arm specifically: a row that never
-  // went `working` is a still-binding launch, not a finished turn — killing it would
-  // race a booting session. Only the proven-dead / bare-shell arms may reclaim it.
+test("computeSlotOccupancy: never-started stopped row is still reaped after the full grace", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 800,
@@ -1565,13 +1604,78 @@ test("computeSlotOccupancy: never-started (active_since null) + idle pane past g
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: fatal_halt close receipt at session start bypasses grace", () => {
+  const occ = oneOccupant({ created_at: 900, updated_at: 999 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      latestCloseReceiptByEpicId: new Map([
+        ["fn-1-foo", { outcome: "fatal_halt", ts: 900 }],
+      ]),
+    }),
+  );
+  expect(out.failures[0].reapTarget).toEqual({
+    jobId: "j",
+    paneId: "%7",
+    immediate: true,
+  });
+});
+
+test("computeSlotOccupancy: stale fatal receipt and ordinary close retain normal grace", () => {
+  for (const latestCloseReceiptByEpicId of [
+    new Map([["fn-1-foo", { outcome: "fatal_halt", ts: 899 }]]),
+    new Map([["fn-1-foo", { outcome: "partial_followup", ts: 999 }]]),
+    new Map<string, { outcome: string; ts: number }>(),
+  ]) {
+    const occ = oneOccupant({ created_at: 900, updated_at: 999 });
+    const out = computeSlotOccupancy(
+      slotInput({ ...occ, latestCloseReceiptByEpicId }),
+    );
+    expect(out.failures[0].reapTarget).toBeNull();
+  }
+});
+
+test("computeSlotOccupancy: duplicate key returns the exact fatal session and pane", () => {
+  const old = oneOccupant({
+    jobId: "old",
+    pane: "%7",
+    created_at: 100,
+    updated_at: 999,
+  });
+  const recent = oneOccupant({
+    jobId: "recent",
+    pane: "%8",
+    created_at: 200,
+    updated_at: 999,
+  });
+  const out = computeSlotOccupancy(
+    slotInput({
+      jobs: new Map([...old.jobs, ...recent.jobs]),
+      livePaneIds: new Set(["%7", "%8"]),
+      paneCommandById: new Map([
+        ["%7", "claude"],
+        ["%8", "claude"],
+      ]),
+      latestCloseReceiptByEpicId: new Map([
+        ["fn-1-foo", { outcome: "fatal_halt", ts: 150 }],
+      ]),
+    }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reapTarget).toEqual({
+    jobId: "old",
+    paneId: "%7",
+    immediate: true,
+  });
 });
 
 test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgrades to visibility-only", () => {
-  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct started + derived-idle + wanted zombies
-  // past grace. At most the cap are real kills (lowest `(verb, id)` key wins,
+  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct stopped, wanted occupants past grace.
+  // At most the cap are real reaps (lowest `(verb, id)` key wins,
   // deterministic); the rest surface as slot-occupied — never dropped from failures.
   const n = SLOT_RECLAIM_MAX_PER_SWEEP + 3;
   const jobs = new Map<string, Job>();
@@ -1602,8 +1706,8 @@ test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgr
   );
   // Every candidate is surfaced — nothing silently dropped.
   expect(out.failures).toHaveLength(n);
-  const reclaimed = out.failures.filter((f) => f.reclaimPaneId !== null);
-  const occupied = out.failures.filter((f) => f.reclaimPaneId === null);
+  const reclaimed = out.failures.filter((f) => f.reapTarget !== null);
+  const occupied = out.failures.filter((f) => f.reapTarget === null);
   expect(reclaimed).toHaveLength(SLOT_RECLAIM_MAX_PER_SWEEP);
   expect(occupied).toHaveLength(n - SLOT_RECLAIM_MAX_PER_SWEEP);
   // Deterministic selection: the lowest `(verb, id)` keys are the real reclaims.
@@ -1614,7 +1718,7 @@ test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgr
 test("computeSlotOccupancy: login `-zsh` past grace is still reclaimed (dash stripped)", () => {
   const occ = oneOccupant({ command: "-zsh", updated_at: 800 });
   const out = computeSlotOccupancy(slotInput(occ));
-  expect(out.failures[0].reclaimPaneId).toBe("%7");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
 });
 
 test("computeSlotOccupancy: grace boundary — idle === grace reclaims, idle < grace occupies", () => {
@@ -1624,14 +1728,14 @@ test("computeSlotOccupancy: grace boundary — idle === grace reclaims, idle < g
       now: 1000,
     }),
   );
-  expect(atBoundary.failures[0].reclaimPaneId).toBe("%7"); // 120 ≥ 120
+  expect(atBoundary.failures[0].reapTarget?.paneId).toBe("%7"); // 120 ≥ 120
   const justUnder = computeSlotOccupancy(
     slotInput({
       ...oneOccupant({ command: "zsh", updated_at: 881 }),
       now: 1000,
     }),
   );
-  expect(justUnder.failures[0].reclaimPaneId).toBeNull(); // 119 < 120
+  expect(justUnder.failures[0].reapTarget).toBeNull(); // 119 < 120
 });
 
 test("computeSlotOccupancy: a dead work-task slot reclaims on (work, task)", () => {
@@ -1645,7 +1749,7 @@ test("computeSlotOccupancy: a dead work-task slot reclaims on (work, task)", () 
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures[0].verb).toBe("work");
   expect(out.failures[0].id).toBe("fn-1-foo.2");
-  expect(out.failures[0].reclaimPaneId).toBe("%3");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%3");
 });
 
 test("computeSlotOccupancy: pane gone (absent from the sweep) → not occupying → no signal", () => {
@@ -1746,21 +1850,16 @@ test("computeSlotOccupancy: SLOT_RECLAIM_GRACE_SEC is the default grace, overrid
   // With a tiny injected grace, a just-stopped bare shell reclaims immediately.
   const occ = oneOccupant({ command: "zsh", updated_at: 999 }); // idle 1s
   const out = computeSlotOccupancy(slotInput({ ...occ, graceSec: 1 }));
-  expect(out.failures[0].reclaimPaneId).toBe("%7");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
 });
 
 // ---------------------------------------------------------------------------
-// fn-1200 computeSlotOccupancy — slot authority from the JOB LIFECYCLE
-// (proven-dead verdict), not pane cosmetics
+// fn-1200 computeSlotOccupancy — lifecycle evidence and duplicate preference
 // ---------------------------------------------------------------------------
 
 test("fn-1200 computeSlotOccupancy: proven-dead job + live WRAPPER pane past grace → reclaim (pane command is NOT a bare shell)", () => {
-  // The wedge fix: claude exited but the launch-wrapper shell / a lingering
-  // launcher process holds the pane, so its foreground command is `bun` — neither
-  // `claude` nor the bare `exec $SHELL` tail. `isBareShellCommand` cannot classify
-  // it dead, so the pre-fn-1200 reaper left the slot wedged forever. With the
-  // exit-watcher's proven-dead verdict in hand (`provenDeadJobIds`), the reaper
-  // reclaims it regardless of the pane command.
+  // A proven-dead lifecycle fact remains a deterministic preference even when
+  // the lingering wrapper command is not a bare shell.
   const occ = oneOccupant({ command: "bun", updated_at: 800 }); // idle 200s ≥ 120
   expect(isBareShellCommand("bun")).toBe(false); // pin: NOT reclaimable by cosmetics
   const out = computeSlotOccupancy(
@@ -1768,22 +1867,18 @@ test("fn-1200 computeSlotOccupancy: proven-dead job + live WRAPPER pane past gra
   );
   expect(out.failures).toHaveLength(1);
   const sig: SlotOccupancySignal = out.failures[0];
-  expect(sig.reclaimPaneId).toBe("%7"); // the reaper targets the residual pane
+  expect(sig.reapTarget?.paneId).toBe("%7");
   expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("fn-1200 computeSlotOccupancy: a live-session job with the SAME wrapper pane shape → NO reclaim (reaper never targets a job lacking a proven-dead verdict)", () => {
-  // The catastrophic-failure guard: identical pane shape (live pane, `bun`
-  // foreground, past grace) but the job is NOT proven dead — a live worker whose
-  // pane momentarily foregrounds a child process. It must surface only, never be
-  // killed, so a false-dead read can never destroy a live session.
+test("fn-1200 computeSlotOccupancy: stopped live wrapper needs no proven-dead flag after grace", () => {
   const occ = oneOccupant({ command: "bun", updated_at: 800 });
   const out = computeSlotOccupancy(
     slotInput({ ...occ, provenDeadJobIds: new Set<string>() }),
   );
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
 test("fn-1200 computeSlotOccupancy: proven-dead but WITHIN grace → slot-occupied, NO kill (reclaim is grace-aged, never immediate)", () => {
@@ -1795,7 +1890,7 @@ test("fn-1200 computeSlotOccupancy: proven-dead but WITHIN grace → slot-occupi
     slotInput({ ...occ, provenDeadJobIds: new Set(["j"]) }),
   );
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
@@ -1812,7 +1907,7 @@ test("fn-1200 computeSlotOccupancy: proven-dead work-task with a launcher pane r
   );
   expect(out.failures[0].verb).toBe("work");
   expect(out.failures[0].id).toBe("fn-1-foo.2");
-  expect(out.failures[0].reclaimPaneId).toBe("%3");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%3");
   expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
@@ -3021,6 +3116,61 @@ test("fn-811 reconcile dedup: stopped job whose pane is LIVE still blocks re-dis
   });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
+});
+
+test("post-reap snapshots clear the occupancy refusal and mint without operator retry", () => {
+  const taskId = "fn-1-foo.1";
+  const epic = makeEpic({ tasks: [makeTask({ task_id: taskId })] });
+  const occupant = makeJob({
+    job_id: "reap-me",
+    plan_verb: "work",
+    plan_ref: taskId,
+    state: "stopped",
+    backend_exec_pane_id: "%9",
+    created_at: 1,
+    updated_at: 1,
+  });
+  const held = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map([[occupant.job_id, occupant]]),
+      livePaneIds: new Set(["%9"]),
+      paneCommandById: new Map([["%9", "claude"]]),
+    }),
+    makeState(),
+    1_000,
+  );
+  expect(held.launches).toEqual([]);
+  expect(held.slotOccupancy[0]?.reapTarget?.jobId).toBe("reap-me");
+
+  const cleared = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map(),
+      livePaneIds: new Set(),
+      paneCommandById: new Map(),
+      failedKeys: new Set([`work::${taskId}`]),
+      slotOccupancyFailures: [{ verb: "work", id: taskId }],
+    }),
+    makeState(),
+    1_001,
+  );
+  expect(cleared.slotOccupancy).toEqual([]);
+  expect(cleared.slotOccupancyClears).toEqual([{ verb: "work", id: taskId }]);
+
+  const reminted = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map(),
+      livePaneIds: new Set(),
+      paneCommandById: new Map(),
+    }),
+    makeState(),
+    1_002,
+  );
+  expect(reminted.launches.map((launch) => launch.key)).toEqual([
+    `work::${taskId}`,
+  ]);
 });
 
 test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky failure)", () => {
@@ -6011,6 +6161,81 @@ async function withSeededDb(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("close-finalize receipt parser accepts the hook envelope and rejects malformed output", () => {
+  const data = JSON.stringify({
+    tool_response: {
+      stdout: JSON.stringify({ success: true, outcome: "fatal_halt" }),
+    },
+  });
+  expect(extractCloseFinalizeReceipt(data, 42)).toEqual({
+    outcome: "fatal_halt",
+    ts: 42,
+  });
+  expect(extractCloseFinalizeReceipt("{", 42)).toBeNull();
+  expect(
+    extractCloseFinalizeReceipt(
+      JSON.stringify({ tool_response: { stdout: "{}" } }),
+      42,
+    ),
+  ).toBeNull();
+});
+
+test("latest close receipts join by epic and do not leak an older fatal past a newer failed receipt", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
+       VALUES ('close-job', 10, 20, 'stopped', 'close', 'fn-1-close')`,
+    );
+    const hookData = (stdout: string): string =>
+      JSON.stringify({ tool_response: { stdout } });
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (30, 'close-job', 'PostToolUse', 'post_tool_use', ?,
+               'close-finalize', 'fn-1-close')`,
+      [hookData(JSON.stringify({ outcome: "fatal_halt" }))],
+    );
+    expect(
+      loadLatestCloseReceipts(
+        db,
+        new Map([
+          [
+            "close-job",
+            makeJob({
+              job_id: "close-job",
+              created_at: 10,
+              updated_at: 20,
+              state: "stopped",
+              plan_verb: "close",
+              plan_ref: "fn-1-close",
+            }),
+          ],
+        ]),
+      ),
+    ).toEqual(new Map([["fn-1-close", { outcome: "fatal_halt", ts: 30 }]]));
+
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (31, 'close-job', 'PostToolUse', 'post_tool_use', ?,
+               'close-finalize', 'fn-1-close')`,
+      [hookData(JSON.stringify({ success: false }))],
+    );
+    const jobs = new Map([
+      [
+        "close-job",
+        makeJob({
+          job_id: "close-job",
+          state: "stopped",
+          plan_verb: "close",
+          plan_ref: "fn-1-close",
+        }),
+      ],
+    ]);
+    expect(loadLatestCloseReceipts(db, jobs).size).toBe(0);
+  });
+});
 
 function errorReadinessQuery(collection: string): ReadinessQuery {
   return (db, worldRev, frame, out, nowSec) => {

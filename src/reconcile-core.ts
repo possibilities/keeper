@@ -827,17 +827,13 @@ export interface ReconcileSnapshot {
    */
   paneCommandById: ReadonlyMap<string, string> | null;
   /**
-   * Job ids whose owning session the daemon has PROVEN dead — the recorded claude
-   * pid re-proved gone by a producer-side `isPidAlive` probe at snapshot load,
-   * mirroring the exit-watcher's own pid-death reprobe. The slot-occupancy reaper
-   * ({@link computeSlotOccupancy}) reclaims a proven-dead occupant regardless of
-   * its pane's foreground command, reaping the residual pane a lingering wrapper
-   * shell or launcher process holds alive after claude exits — the gap the
-   * pane-command heuristic and the pane-nulling `Killed` fold both miss. EMPTY on
-   * a degraded probe. Assembled in {@link loadReconcileSnapshot}; NEVER read in a
-   * fold (producer-side liveness only, so re-fold stays deterministic).
+   * Job ids whose owning process was already proven dead at snapshot load. The
+   * occupancy selector uses this only to choose deterministically between duplicate
+   * stopped rows; the process reaper still re-probes adjacent to every signal.
    */
   provenDeadJobIds: ReadonlySet<string>;
+  /** Latest close-finalize receipt per epic, read from durable event receipts. */
+  latestCloseReceiptByEpicId?: ReadonlyMap<string, CloseReceipt>;
   /**
    * The open `pending_dispatches` rows projected into the {@link PendingDispatch}[]
    * shape `computeReadiness` consumes for the cross-sibling `dispatch-pending`
@@ -1496,10 +1492,8 @@ export interface ReconcileDecision {
   finalizeFailureIds: Set<string>;
   /**
    * The slot-occupancy signals this cycle: one per wanted `(verb, id)` key whose
-   * mint is blocked by a stopped-but-LIVE occupant. Each is a visible `DispatchFailed`
-   * the producer routes through the change-gate; a non-null `reclaimPaneId` also
-   * tells the producer to KILL that pane (a provably-dead session — bare shell tail
-   * past its grace). EMPTY when paused or the liveness probe is degraded.
+   * mint is blocked by a stopped-but-LIVE occupant. A non-null `reapTarget` names
+   * the exact stopped job the TERM→KILL process reaper may act on this sweep.
    */
   slotOccupancy: SlotOccupancySignal[];
   /**
@@ -1902,19 +1896,16 @@ export function isStoppedJobLive(
 // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
 
 /**
- * Producer-`ts` seconds a `stopped` job's dead shell-tail pane must persist before
- * the reconciler AUTO-RECLAIMS its slot. The bare-shell foreground command already
- * proves claude exited (a live/parked claude reads `claude`/`node`/`bun`); the grace
- * is the secondary guard against a transient teardown/startup frame where the pane
- * momentarily shows the shell. Anchored on `job.updated_at` (the last fold instant —
- * frozen once the session stopped), compared to the reconcile `now`.
+ * Producer-`ts` seconds a positively stopped occupant must remain stopped before
+ * the reconciler reaps its process. Anchored on `job.updated_at`; a current
+ * `working` row never enters the candidate set.
  */
 export const SLOT_RECLAIM_GRACE_SEC = 120;
 
 /**
- * Blast-radius bound on pane KILLS a single occupancy sweep may issue — mirrors
- * autoclose's {@link AUTOCLOSE_MAX_KILLS_PER_PULSE} so one bad projection frame
- * cannot cascade into a mass window close. Over-cap dead candidates DOWNGRADE to
+ * Blast-radius bound on process-reap ladders a single occupancy sweep may issue.
+ * One bad projection frame cannot cascade into a mass session close. Over-cap
+ * eligible candidates DOWNGRADE to
  * visibility-only `slot-occupied` (never dropped) and are reconsidered next cycle,
  * since their `updated_at`/`state` persist — no local grace map is needed. The
  * kept set is chosen deterministically (lowest `(verb, id)` slot key wins) so it is
@@ -1924,11 +1915,8 @@ export const SLOT_RECLAIM_MAX_PER_SWEEP = 5;
 
 /**
  * The idle-shell foreground command names the launch wrapper's trailing
- * `exec $SHELL -l -i` tail reports via tmux `pane_current_command` once the hosted
- * claude exits. CONSERVATIVE by construction — every entry is unambiguously a shell,
- * never a claude worker (`claude`/`node`/`bun`) — so a probe missing a shell name
- * UNDER-matches (ambiguous → visibility only), never the catastrophic over-match
- * that would kill a live session.
+ * `exec $SHELL -l -i` tail. It remains a deterministic duplicate-candidate
+ * preference, while stopped age is the reap authority.
  */
 const BARE_SHELL_COMMANDS: ReadonlySet<string> = new Set([
   "sh",
@@ -1945,8 +1933,8 @@ const BARE_SHELL_COMMANDS: ReadonlySet<string> = new Set([
  * Is a tmux `pane_current_command` the bare `exec $SHELL -l -i` tail — i.e. claude
  * has exited and only the trailing login shell holds the pane? A leading `-` (the
  * login-shell argv0 convention) is stripped first. `undefined` (pane absent from the
- * command map — probe degraded, or pane gone) is NOT a bare shell: the conservative
- * answer is "cannot prove dead." Pure — exported for the dead/live/ambiguous matrix.
+ * command map — probe degraded, or pane gone) is NOT a bare shell. Pure and used
+ * only to order duplicate stopped candidates.
  */
 export function isBareShellCommand(command: string | undefined): boolean {
   if (command === undefined) {
@@ -1957,14 +1945,23 @@ export function isBareShellCommand(command: string | undefined): boolean {
 }
 
 /** One slot-occupancy signal — a visible `DispatchFailed` on a wedged `(verb, id)`,
- *  plus (when provably dead) the pane to kill. `reclaimPaneId === null` is
- *  visibility-only (a possibly-resumable occupant). */
+ * plus the exact stopped session to reap when the grace gate opens. */
 export interface SlotOccupancySignal {
   verb: Verb;
   id: string;
   reason: string;
   dir: string | null;
-  reclaimPaneId: string | null;
+  reapTarget: {
+    jobId: string;
+    paneId: string;
+    immediate: boolean;
+  } | null;
+}
+
+/** Latest terminal close receipt for one epic, loaded from durable event receipts. */
+export interface CloseReceipt {
+  outcome: string;
+  ts: number;
 }
 
 /** The pure inputs the slot-occupancy pass reads — all liveness enters via the
@@ -1973,19 +1970,10 @@ export interface SlotOccupancyInput {
   jobs: Map<string, Job>;
   livePaneIds: ReadonlySet<string> | null;
   paneCommandById: ReadonlyMap<string, string> | null;
-  /**
-   * Job ids whose owning session the daemon has PROVEN dead — the exit-watcher's
-   * kernel-truth verdict (its recorded claude pid no longer exists), re-proved
-   * producer-side at snapshot load. A proven-dead occupant is reclaimable
-   * REGARDLESS of its pane's foreground command: after claude exits, a lingering
-   * launch-wrapper shell or launcher process can keep the pane alive showing a
-   * command that is neither `claude` nor the bare `exec $SHELL` tail, which the
-   * pane-command heuristic ({@link isBareShellCommand}) cannot classify dead.
-   * Keying reclaim on the lifecycle verdict — not pane cosmetics — reaps that
-   * residual pane. EMPTY/absent (the degraded-probe default) falls back to the
-   * bare-shell-only proof, never a mere stopped read.
-   */
+  /** Producer-proven dead jobs, used only to order duplicate stopped candidates. */
   provenDeadJobIds?: ReadonlySet<string>;
+  /** Latest close-finalize receipt per epic, joined at reconcile read time. */
+  latestCloseReceiptByEpicId?: ReadonlyMap<string, CloseReceipt>;
   /** OPEN slot-reason `dispatch_failures` keys (reason-scoped at read time). */
   openSlotFailures: readonly { verb: Verb; id: string }[];
   /** True IFF `reconcile` would dispatch `(verb, id)` if the slot were free (the
@@ -1997,8 +1985,7 @@ export interface SlotOccupancyInput {
   graceSec?: number;
 }
 
-/** The slot-occupancy pass output: the failures to surface (+ optional reclaim) and
- *  the open rows to clear. */
+/** The slot-occupancy pass output: failures with optional reap targets, and clears. */
 export interface SlotOccupancyDecision {
   failures: SlotOccupancySignal[];
   clears: { verb: Verb; id: string }[];
@@ -2007,28 +1994,21 @@ export interface SlotOccupancyDecision {
 const slotKey = (verb: Verb, id: string): string => `${verb}\x00${id}`;
 
 /**
- * Surface — and, when dead, reclaim — a slot held by a stopped-but-LIVE session, so
- * a wedged dispatch slot is never silent. For each `stopped` job whose pane is still
- * live AND whose key `reconcile` still wants to dispatch (the mint is blocked), a
- * pane past its grace is DEAD → kill it and mint `slot-reclaimed` when ANY of three
- * proofs hold: the daemon's proven-dead pid verdict, a bare-shell tail command, or
- * DERIVED IDLE — a session that went `working` (`active_since` non-null) and ended
- * its turn but stays resident. A NEVER-started row (`active_since` null) is not
- * derived-idle: it never ran a turn, so the derived arm never reclaims it (the
- * proven-dead / bare-shell arms still fire on their own evidence). Anything else (a
- * live/parked `claude` still mid-turn, or any candidate still in grace) is
- * `slot-occupied` visibility-only. Every OPEN slot row whose key got no fresh signal
- * (occupant gone / resumed to `working` / verdict completed) is cleared.
+ * Surface — and, past grace, reap — a slot held by a stopped-but-LIVE session,
+ * so a wedged dispatch slot is never silent. A current `stopped` row is the
+ * positive turn-ended fact; pane cosmetics and `active_since` do not weaken it.
+ * The exact session is sent through the process reaper, which re-proves identity
+ * immediately before TERM and again before KILL. A `fatal_halt` close receipt at
+ * or after that session's start bypasses only the age grace.
  *
- * Reclaims are blast-capped at {@link SLOT_RECLAIM_MAX_PER_SWEEP} per sweep, chosen
- * by lowest `(verb, id)` key; over-cap dead candidates downgrade to `slot-occupied`
- * (never dropped) and are reconsidered next cycle.
+ * Reaps are blast-capped at {@link SLOT_RECLAIM_MAX_PER_SWEEP} per sweep, chosen
+ * by lowest `(verb, id)` key. Duplicate rows for one key are ordered by positive
+ * terminal evidence and age, then exact job id, so the returned target always
+ * identifies the pane and process belonging to the selected stopped row.
  *
- * Pure + re-fold-safe: reads only the snapshot's liveness fields and the readiness-
- * derived `wantsDispatch` gate. INERT (empty) when paused or the probe is degraded
- * (`livePaneIds`/`paneCommandById` null) — the conservative silent-occupy fallback.
- * A killed session mid-turn is the catastrophic failure, so a `working` row is never
- * a candidate and every DEAD criterion is grace-aged; when in doubt it surfaces only.
+ * Pure + re-fold-safe: reads only snapshot facts and the readiness-derived
+ * `wantsDispatch` gate. INERT when paused or the pane probe is degraded. A
+ * `working` row is never a candidate.
  */
 export function computeSlotOccupancy(
   input: SlotOccupancyInput,
@@ -2036,105 +2016,105 @@ export function computeSlotOccupancy(
   const failures: SlotOccupancySignal[] = [];
   const clears: { verb: Verb; id: string }[] = [];
   const { livePaneIds, paneCommandById } = input;
-  // Paused or degraded probe → no slot side effects at all.
   if (input.paused || livePaneIds === null || paneCommandById === null) {
     return { failures, clears };
   }
   const graceSec = input.graceSec ?? SLOT_RECLAIM_GRACE_SEC;
   const activeKeys = new Set<string>();
-  // Per-key candidates collected before any signal is pushed, so the reclaim blast
-  // cap selects deterministically across the WHOLE sweep, not per iteration.
-  const candidates: {
+  const allCandidates: {
     key: string;
     verb: Verb;
     id: string;
+    jobId: string;
+    createdAt: number;
     paneId: string;
     command: string | undefined;
     dir: string | null;
-    dead: boolean;
+    immediate: boolean;
+    provenDead: boolean;
+    bareShell: boolean;
+    reapEligible: boolean;
   }[] = [];
   for (const job of input.jobs.values()) {
-    if (job.state !== "stopped") {
-      continue;
-    }
+    if (job.state !== "stopped") continue;
     const verb = job.plan_verb;
     const id = job.plan_ref;
     if ((verb !== "work" && verb !== "close") || id == null || id === "") {
       continue;
     }
     const paneId = job.backend_exec_pane_id;
-    // The stopped arm of `isOccupyingJob`, inlined so a definite live pane id is in
-    // hand: no pane / a pane gone from the sweep is not a live-provable occupant.
     if (paneId == null || paneId === "" || !livePaneIds.has(paneId)) {
       continue;
     }
-    // Slot not needed → leave it. A completed row keeps its post-run inspection
-    // window (the trailing shell); an unarmed / not-ready row holds nothing worth
-    // reclaiming this cycle.
-    if (!input.wantsDispatch(verb, id)) {
-      continue;
-    }
+    if (!input.wantsDispatch(verb, id)) continue;
+
     const key = slotKey(verb, id);
-    if (activeKeys.has(key)) {
-      continue; // one signal per key even if two stopped rows share it
-    }
     activeKeys.add(key);
     const command = paneCommandById.get(paneId);
-    // Slot authority is the JOB LIFECYCLE, not pane cosmetics: a session the
-    // daemon has PROVEN dead (its recorded claude pid gone) is reclaimable
-    // whatever its pane's foreground command shows — a lingering launch-wrapper
-    // shell or launcher process holding the pane never masks the verdict. The
-    // bare-shell tail stays a SECONDARY proof for the degraded-probe cycle that
-    // carries no pid verdict. Grace-aged every way (never immediate): the kill
-    // waits `graceSec` past the last fold so a transient teardown frame is never
-    // reaped, and the `wantsDispatch` gate already scopes it to a slot in demand.
-    const provenDead = input.provenDeadJobIds?.has(job.job_id) ?? false;
+    const receipt =
+      verb === "close" ? input.latestCloseReceiptByEpicId?.get(id) : undefined;
+    const immediate =
+      receipt?.outcome === "fatal_halt" && receipt.ts >= job.created_at;
     const graceElapsed = input.now - job.updated_at >= graceSec;
-    // Derived idle: a session that went `working` (`active_since` non-null) and
-    // ended its turn but stays resident — the residual, once the pid verdict and
-    // bare-shell tail are excluded. A NEVER-started row (`active_since` null) never
-    // ran a turn (a still-binding launch, not a finished one), so it is NOT
-    // derived-idle; only the pid/bare-shell arms may reclaim it. `active_since` is
-    // held across turn end (never cleared / backfilled), so it reads solely as a
-    // never-started gate here, never as a turn-activity signal.
-    const neverStarted = job.active_since == null;
-    const derivedIdle =
-      !neverStarted && !provenDead && !isBareShellCommand(command);
-    const dead =
-      graceElapsed &&
-      (provenDead || isBareShellCommand(command) || derivedIdle);
-    candidates.push({ key, verb, id, paneId, command, dir: job.cwd, dead });
+    allCandidates.push({
+      key,
+      verb,
+      id,
+      jobId: job.job_id,
+      createdAt: job.created_at,
+      paneId,
+      command,
+      dir: job.cwd,
+      immediate,
+      provenDead: input.provenDeadJobIds?.has(job.job_id) ?? false,
+      bareShell: isBareShellCommand(command),
+      reapEligible: immediate || graceElapsed,
+    });
   }
-  // Blast cap: at most SLOT_RECLAIM_MAX_PER_SWEEP dead candidates become real kills
-  // this sweep (lowest `(verb, id)` key wins, deterministic); the rest downgrade to
-  // visibility-only `slot-occupied`, retried next cycle.
-  const reclaimKeys = new Set(
+
+  allCandidates.sort((a, b) => {
+    if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+    if (a.reapEligible !== b.reapEligible) return a.reapEligible ? -1 : 1;
+    if (a.immediate !== b.immediate) return a.immediate ? -1 : 1;
+    if (a.provenDead !== b.provenDead) return a.provenDead ? -1 : 1;
+    if (a.bareShell !== b.bareShell) return a.bareShell ? -1 : 1;
+    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+    return a.jobId.localeCompare(b.jobId);
+  });
+  const candidates: typeof allCandidates = [];
+  let previousKey: string | null = null;
+  for (const candidate of allCandidates) {
+    if (candidate.key === previousKey) continue;
+    candidates.push(candidate);
+    previousKey = candidate.key;
+  }
+
+  const reapKeys = new Set(
     candidates
-      .filter((c) => c.dead)
-      .map((c) => c.key)
-      .sort()
-      .slice(0, SLOT_RECLAIM_MAX_PER_SWEEP),
+      .filter((candidate) => candidate.reapEligible)
+      .slice(0, SLOT_RECLAIM_MAX_PER_SWEEP)
+      .map((candidate) => candidate.key),
   );
-  for (const c of candidates) {
-    // Reason text is STABLE across cycles (pane id + command only, never the growing
-    // idle age) so the producer change-gate suppresses re-emits — one event per
-    // condition, not one per cycle. The row's `ts` carries the age. The
-    // occupied→dead transition IS a reason change, so it re-emits (actionable).
-    if (c.dead && reclaimKeys.has(c.key)) {
+  for (const candidate of candidates) {
+    if (candidate.reapEligible && reapKeys.has(candidate.key)) {
       failures.push({
-        verb: c.verb,
-        id: c.id,
-        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaped dead ${c.verb} session (pane ${c.paneId} ${c.command ?? "?"})`,
-        dir: c.dir,
-        reclaimPaneId: c.paneId,
+        verb: candidate.verb,
+        id: candidate.id,
+        reason: `${SLOT_RECLAIMED_REASON_PREFIX}: reaping stopped ${candidate.verb} session (pane ${candidate.paneId} ${candidate.command ?? "?"})`,
+        dir: candidate.dir,
+        reapTarget: {
+          jobId: candidate.jobId,
+          paneId: candidate.paneId,
+          immediate: candidate.immediate,
+        },
       });
     } else {
       failures.push({
-        verb: c.verb,
-        id: c.id,
-        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${c.verb} session holds the slot (pane ${c.paneId} ${c.command ?? "?"})`,
-        dir: c.dir,
-        reclaimPaneId: null,
+        verb: candidate.verb,
+        id: candidate.id,
+        reason: `${SLOT_OCCUPIED_REASON_PREFIX}: stopped ${candidate.verb} session holds the slot (pane ${candidate.paneId} ${candidate.command ?? "?"})`,
+        dir: candidate.dir,
+        reapTarget: null,
       });
     }
   }
@@ -2879,6 +2859,7 @@ export function reconcile(
     livePaneIds: snapshot.livePaneIds,
     paneCommandById: snapshot.paneCommandById,
     provenDeadJobIds: snapshot.provenDeadJobIds,
+    latestCloseReceiptByEpicId: snapshot.latestCloseReceiptByEpicId,
     openSlotFailures: snapshot.slotOccupancyFailures,
     wantsDispatch: (verb, id) =>
       verb === "work"

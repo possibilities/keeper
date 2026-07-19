@@ -145,7 +145,7 @@ export async function terminateMain(argv: string[]): Promise<void> {
       message:
         "the recorded process does not identify as the Session's harness command",
       recovery:
-        "Do not signal the pid; inspect the Session record for stale or recycled process identity.",
+        "Do not signal the pid; inspect the Session record for stale or recycled process identity. A stopped managed Session remains eligible for the daemon's identity-rechecked reap path.",
     },
     signal_failed: {
       code: "session_signal_failed",
