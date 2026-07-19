@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Canonical path containment, symlink and read-race safety, exact byte budgeting, and cross-harness parity create subtle security and correctness invariants.",
+      "task_id": "fn-1363-add-harness-specific-rename-parity.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Credential scrubbing, independent account routing, process-tree termination, and artifact suppression form a security-critical launcher boundary across multiple core modules.",
+      "task_id": "fn-1363-add-harness-specific-rename-parity.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The hook must preserve native-title authority under overlapping stale operations while remaining fail-open, redacted, lifecycle-neutral, and dependency-light across several integration surfaces.",
+      "task_id": "fn-1363-add-harness-specific-rename-parity.3",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
+  "created_at": "2026-07-19T00:33:35.122000Z",
+  "epic_id": "fn-1363-add-harness-specific-rename-parity",
+  "input_hash": "289e56336debb337d54170e9b590459b5507ec3b3f19f5b5351ec98658ceef7b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 681465395,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1363-add-harness-specific-rename-parity.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Canonical path containment, symlink and read-race safety, exact byte budgeting, and cross-harness parity create subtle security and correctness invariants.\",\"confidence\":0.96},{\"task_id\":\"fn-1363-add-harness-specific-rename-parity.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Credential scrubbing, independent account routing, process-tree termination, and artifact suppression form a security-critical launcher boundary across multiple core modules.\",\"confidence\":0.97},{\"task_id\":\"fn-1363-add-harness-specific-rename-parity.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The hook must preserve native-title authority under overlapping stale operations while remaining fail-open, redacted, lifecycle-neutral, and dependency-light across several integration surfaces.\",\"confidence\":0.95}]}\n"
+}
