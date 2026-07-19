@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Decouple handoff launch selection",
-  "updated_at": "2026-07-19T00:32:33.783000Z"
+  "updated_at": "2026-07-19T03:30:14.118000Z",
+  "worker_done_at": "2026-07-19T03:30:14.118000Z"
 }

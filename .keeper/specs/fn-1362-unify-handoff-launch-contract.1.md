@@ -42,5 +42,5 @@ Exercise the complete selector matrix for both capture values at the CLI and RPC
 - [ ] Focused Handoff and launch-backend tests pass.
 
 ## Done summary
-
+Decoupled Handoff launch selection from capture: both ordinary and captured requests accept a raw Launch triple or a complete model/effort pair with identical XOR/pair-completeness validation at the CLI and RPC boundaries, an ordinary Pi triple's harness now survives launch, and capture remains the sole cause of an envelope path.
 ## Evidence
