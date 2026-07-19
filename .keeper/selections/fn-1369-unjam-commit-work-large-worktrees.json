@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Restructuring the publication baseline fingerprint must preserve a subtle concurrency invariant \u2014 a selected-path mutation between freeze and publish must still fail the CAS \u2014 a nameable correctness-invariant opus gate on a contract-shaped change.",
+      "task_id": "fn-1369-unjam-commit-work-large-worktrees.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T07:01:49.334000Z",
+  "epic_id": "fn-1369-unjam-commit-work-large-worktrees",
+  "input_hash": "8518993bac687fddcb2e395c41befc39014eefcbe77ed3cdb8e3d9fa1e842d29",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2232981819,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1369-unjam-commit-work-large-worktrees.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Restructuring the publication baseline fingerprint must preserve a subtle concurrency invariant \u2014 a selected-path mutation between freeze and publish must still fail the CAS \u2014 a nameable correctness-invariant opus gate on a contract-shaped change.\",\"confidence\":0.83}]}\n"
+}
