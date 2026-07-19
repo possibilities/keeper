@@ -18,7 +18,13 @@ import type {
 } from "../../src/account-router";
 import type { PanelSelections, PresetCatalog } from "../../src/agent/config";
 import type { HarnessName } from "../../src/agent/harness";
-import type { MainDeps } from "../../src/agent/main";
+import type { PiCodexPoolExtensionResolution } from "../../src/agent/launch-config";
+import type {
+  CodexPoolLaunchContext,
+  CodexPoolOperatorOperation,
+  CodexSessionRoutingInspection,
+  MainDeps,
+} from "../../src/agent/main";
 import {
   MatrixConfigError,
   type MatrixV2,
@@ -35,6 +41,7 @@ import type {
   PartnerCaptureLease,
   PublishedBusArtifact,
 } from "../../src/bus-artifact";
+import type { CodexPoolWorkflowResult } from "../../src/codex-pool-activation";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -172,6 +179,13 @@ export interface HarnessOptions {
    *  argv byte-pins stay path-independent). Pass `["-e", "<fake>"]` to exercise
    *  the injection. */
   resolvePiExtensionArgs?: () => string[];
+  resolvePiCodexPoolExtension?: () => PiCodexPoolExtensionResolution;
+  codexPoolLaunchContext?: (reserve?: boolean) => CodexPoolLaunchContext;
+  inspectCodexSessionRouting?: () => CodexSessionRoutingInspection;
+  runCodexPoolWorkflow?: (
+    operation: CodexPoolOperatorOperation,
+    source?: string,
+  ) => CodexPoolWorkflowResult;
   /** Pi prompt-artifact preflight seam; may throw a typed launcher failure. */
   ensurePiPromptArtifacts?: (actionLog: string[]) => void;
   /** `resume` verb + `run --resume` decision seam (default: `{kind:"unknown",
@@ -347,6 +361,59 @@ export function makeHarness(opts: HarnessOptions): Harness {
       opts.resolveStatuslineSettingsPath ??
       (() => "/fake-home/code/keeper/plugins/keeper/settings.json"),
     resolvePiExtensionArgsFn: opts.resolvePiExtensionArgs ?? (() => []),
+    resolvePiCodexPoolExtensionFn:
+      opts.resolvePiCodexPoolExtension ??
+      (() => ({
+        args: [],
+        health: "missing",
+        problem_code: "companion-missing",
+      })),
+    codexPoolLaunchContextFn:
+      opts.codexPoolLaunchContext ??
+      (() => ({
+        mode: "native",
+        aliases: ["keeper-codex-a", "keeper-codex-b"],
+        config_binding: "a".repeat(64),
+        initial_alias: null,
+        problem_code: "activation-pending",
+      })),
+    inspectCodexSessionRoutingFn:
+      opts.inspectCodexSessionRouting ??
+      (() => ({
+        activation: {
+          mode: "native",
+          problem_code: "activation-pending",
+        },
+        companion: {
+          health: "missing",
+          problem_code: "companion-missing",
+        },
+        capacity: {
+          provider: "openai-codex",
+          health: "missing",
+          config_binding: null,
+          observed_at_ms: null,
+          fresh: false,
+          verdict: {
+            kind: "native-fallback",
+            provider: "openai-codex",
+            reason: "observation-missing",
+            warning:
+              "[keeper-codex-pool] pool-unavailable; using native openai-codex",
+          },
+          candidates: [],
+        },
+      })),
+    runCodexPoolWorkflowFn:
+      opts.runCodexPoolWorkflow ??
+      ((operation) => ({
+        schema_version: 1,
+        ok: false,
+        operation,
+        state: "native",
+        problem_code: "activation-pending",
+        proof: null,
+      })),
     resolveResumeDecisionFn: (target: string, requireHarness?: HarnessName) => {
       const decision = opts.resolveResumeDecision;
       if (typeof decision === "function") {

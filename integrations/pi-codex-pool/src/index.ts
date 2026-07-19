@@ -23,6 +23,9 @@ const { openAICodexResponsesApi } = piAi as unknown as CompatPiAi;
 
 const KEEPER_MARKER = "KEEPER_JOB_ID";
 const ALIASES_ENV = "KEEPER_PI_CODEX_POOL_ALIASES";
+const MODE_ENV = "KEEPER_PI_CODEX_POOL_MODE";
+const CONFIG_BINDING_ENV = "KEEPER_PI_CODEX_POOL_CONFIG_BINDING";
+const INITIAL_ALIAS_ENV = "KEEPER_PI_CODEX_POOL_INITIAL_ALIAS";
 const WARNING =
   "[keeper-codex-pool] pool-unavailable; using native openai-codex";
 
@@ -91,6 +94,7 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     aliases = [];
   }
 
+  const mode = process.env[MODE_ENV] === "active" ? "active" : "native";
   if (!oauth || aliases.length === 0) {
     pi.registerProvider("openai-codex", {
       api: "openai-codex-responses",
@@ -125,7 +129,44 @@ export function installCodexPool(pi: PoolExtensionApi): void {
     new FileCredentialStorage(),
     (credential, signal) => oauth.refresh(credential, signal),
   );
-  const routes = new PoolRouteState(aliases, new PoolStateStore());
+  const routes = new PoolRouteState(
+    aliases,
+    new PoolStateStore(),
+    Date.now,
+    process.env[INITIAL_ALIAS_ENV],
+  );
+  const active =
+    mode === "active" && process.env[CONFIG_BINDING_ENV] === routes.binding;
+  if (!active) {
+    pi.registerProvider("openai-codex", {
+      api: "openai-codex-responses",
+      streamSimple: (model, context, options) =>
+        fallbackStream(nativeDelegate, model, context, options),
+    });
+    pi.registerCommand("codex-pool-observe", {
+      description: "Report bounded Keeper Codex pool capacity",
+      async handler(_args, ctx) {
+        try {
+          ctx.ui.notify(
+            renderObserverEnvelope(
+              await observePool({ aliases, vault, routes, signal: ctx.signal }),
+            ),
+            "info",
+          );
+        } catch {
+          ctx.ui.notify(
+            JSON.stringify({
+              schema_version: 1,
+              status: "unavailable",
+              reason: "pool-unavailable",
+            }),
+            "warning",
+          );
+        }
+      },
+    });
+    return;
+  }
   const pooledDelegate = (
     model: Model<"openai-codex-responses">,
     context: Context,

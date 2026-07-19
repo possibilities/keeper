@@ -72,6 +72,30 @@ import {
   resolveBusArtifactRoot,
   sendBusArtifact,
 } from "../bus-artifact";
+import {
+  CODEX_NATIVE_FALLBACK_WARNING,
+  type CodexRoutingInspection,
+  inspectCodexRouting,
+  selectCodexRoute,
+} from "../codex-account-router";
+import {
+  activateCodexPool,
+  type CodexPoolActivationDeps,
+  type CodexPoolProblemCode,
+  type CodexPoolWorkflowResult,
+  captureCodexPoolProof,
+  codexPoolAliasesFromEnvironment,
+  codexPoolBindings,
+  codexPoolObservationVerifies,
+  codexPoolStatus,
+  effectiveCodexPoolActivation,
+  FileCodexPoolActivationStore,
+  recoverCodexPool,
+  resolveKeeperRevision,
+  rollbackCodexPool,
+  verdictCodexPoolProof,
+  verifyCodexPool,
+} from "../codex-pool-activation";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
 import { normalizeUtcTimestamp } from "../fable-focus";
@@ -125,8 +149,10 @@ import {
   composeManagedClaudeArgv,
   FINAL_MESSAGE_DIRECTIVE,
   mergeClaudeWorkspaceTrust,
+  type PiCodexPoolExtensionResolution,
   piExtensionArgs,
   READ_ONLY_DIRECTIVE,
+  resolvePiCodexPoolExtension,
 } from "./launch-config";
 import {
   type LaunchHandleDeps,
@@ -267,6 +293,35 @@ export interface MetadataInferenceRuntime {
   createCancellation: () => MetadataInferenceCancellation;
 }
 
+export interface CodexPoolLaunchContext {
+  mode: "native" | "active";
+  aliases: string[];
+  config_binding: string;
+  initial_alias: string | null;
+  problem_code: CodexPoolProblemCode | null;
+}
+
+export interface CodexSessionRoutingInspection {
+  activation: {
+    mode: "native" | "active";
+    problem_code: CodexPoolProblemCode | null;
+  };
+  companion: {
+    health: PiCodexPoolExtensionResolution["health"];
+    problem_code: PiCodexPoolExtensionResolution["problem_code"];
+  };
+  capacity: CodexRoutingInspection;
+}
+
+export type CodexPoolOperatorOperation =
+  | "status"
+  | "proof-capture"
+  | "proof-verdict"
+  | "activate"
+  | "verify"
+  | "rollback"
+  | "recover";
+
 export interface MainDeps {
   argv: string[];
   env: NodeJS.ProcessEnv;
@@ -390,6 +445,13 @@ export interface MainDeps {
    * `realDeps()` binds it to {@link piExtensionArgs} (fail-open existence check).
    */
   resolvePiExtensionArgsFn: () => string[];
+  resolvePiCodexPoolExtensionFn: () => PiCodexPoolExtensionResolution;
+  codexPoolLaunchContextFn: (reserve?: boolean) => CodexPoolLaunchContext;
+  inspectCodexSessionRoutingFn: () => CodexSessionRoutingInspection;
+  runCodexPoolWorkflowFn: (
+    operation: CodexPoolOperatorOperation,
+    source?: string,
+  ) => CodexPoolWorkflowResult;
   /**
    * Resolve `target` (a current name, former name, session id, id prefix, or
    * current-title substring) to a {@link ResumeDecision} for the `resume` verb and
@@ -883,6 +945,131 @@ function readYamlFileIfPresent(path: string): unknown {
   return parseYaml(readFileSync(path, "utf8"));
 }
 
+function productionCodexPoolActivationDeps(
+  env: NodeJS.ProcessEnv,
+): CodexPoolActivationDeps {
+  const aliases = codexPoolAliasesFromEnvironment(env);
+  const bindings = codexPoolBindings(resolveKeeperRevision(), aliases);
+  const store = new FileCodexPoolActivationStore();
+  const verifies = (
+    candidate: Parameters<CodexPoolActivationDeps["verify"]>[0],
+  ) =>
+    resolvePiCodexPoolExtension().health === "ready" &&
+    codexPoolObservationVerifies(candidate, inspectCodexRouting());
+  return {
+    store,
+    bindings,
+    nowMs: () => Date.now(),
+    reload: verifies,
+    verify: verifies,
+  };
+}
+
+function productionCodexPoolWorkflow(
+  env: NodeJS.ProcessEnv,
+  operation: CodexPoolOperatorOperation,
+  source?: string,
+): CodexPoolWorkflowResult {
+  try {
+    const deps = productionCodexPoolActivationDeps(env);
+    switch (operation) {
+      case "status":
+        return codexPoolStatus(deps);
+      case "proof-capture":
+        return source
+          ? captureCodexPoolProof(deps, source)
+          : {
+              schema_version: 1,
+              ok: false,
+              operation,
+              state: "native",
+              problem_code: "proof-missing",
+              proof: null,
+            };
+      case "proof-verdict":
+        return verdictCodexPoolProof(deps, source);
+      case "activate":
+        return activateCodexPool(deps, source);
+      case "verify":
+        return verifyCodexPool(deps);
+      case "rollback":
+        return rollbackCodexPool(deps);
+      case "recover":
+        return recoverCodexPool(deps);
+    }
+  } catch {
+    return {
+      schema_version: 1,
+      ok: false,
+      operation,
+      state: "native",
+      problem_code: "activation-config-invalid",
+      proof: null,
+    };
+  }
+}
+
+function productionCodexPoolLaunchContext(
+  env: NodeJS.ProcessEnv,
+  reserve = false,
+): CodexPoolLaunchContext {
+  try {
+    const deps = productionCodexPoolActivationDeps(env);
+    const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
+    const inspection = inspectCodexRouting();
+    const ready =
+      effective.mode === "active" &&
+      effective.state !== null &&
+      codexPoolObservationVerifies(effective.state, inspection);
+    const route = ready && reserve ? selectCodexRoute() : null;
+    const routed = route === null || route.kind === "pooled";
+    return {
+      mode: ready && routed ? "active" : "native",
+      aliases: [...deps.bindings.aliases],
+      config_binding: deps.bindings.config_binding,
+      initial_alias: route?.kind === "pooled" ? route.alias : null,
+      problem_code:
+        ready && routed
+          ? null
+          : (effective.problem_code ??
+            (route?.kind === "native-fallback"
+              ? route.reason
+              : inspection.health === "missing"
+                ? "observation-missing"
+                : inspection.health === "stale"
+                  ? "observation-stale"
+                  : "pool-unavailable")),
+    };
+  } catch {
+    return {
+      mode: "native",
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      config_binding: "0".repeat(64),
+      initial_alias: null,
+      problem_code: "activation-config-invalid",
+    };
+  }
+}
+
+function productionCodexSessionInspection(
+  env: NodeJS.ProcessEnv,
+): CodexSessionRoutingInspection {
+  const companion = resolvePiCodexPoolExtension();
+  const capacity = inspectCodexRouting();
+  const launch = productionCodexPoolLaunchContext(env);
+  return {
+    activation: {
+      mode: companion.health === "ready" ? launch.mode : "native",
+      problem_code: companion.problem_code ?? launch.problem_code,
+    },
+    companion: {
+      health: companion.health,
+      problem_code: companion.problem_code,
+    },
+    capacity,
+  };
+}
+
 /** Production deps — the real collaborators. */
 export function realDeps(): MainDeps {
   // Relocate the legacy launcher state dir before the launcher's tmux-runs/
@@ -957,6 +1144,13 @@ export function realDeps(): MainDeps {
     runTmuxCommandFn: defaultTmuxCommandRunner,
     resolveStatuslineSettingsPathFn: resolveKeeperPluginStatuslineSettingsPath,
     resolvePiExtensionArgsFn: () => piExtensionArgs(),
+    resolvePiCodexPoolExtensionFn: () => resolvePiCodexPoolExtension(),
+    codexPoolLaunchContextFn: (reserve) =>
+      productionCodexPoolLaunchContext(process.env, reserve),
+    inspectCodexSessionRoutingFn: () =>
+      productionCodexSessionInspection(process.env),
+    runCodexPoolWorkflowFn: (operation, source) =>
+      productionCodexPoolWorkflow(process.env, operation, source),
     resolveResumeDecisionFn: (target, requireHarness) =>
       resolveResumeDecisionViaSubprocess(
         process.execPath,
@@ -3142,6 +3336,85 @@ async function runFableFocusCommand(
   return deps.exit(0);
 }
 
+async function runCodexPoolCommand(
+  deps: MainDeps,
+  operation: CodexPoolOperatorOperation | "enroll",
+  rawArgs: string[],
+): Promise<never> {
+  const json = rawArgs.includes("--json");
+  const args = rawArgs.filter((arg) => arg !== "--json");
+  if (operation === "enroll") {
+    const alias = args[0];
+    const context = deps.codexPoolLaunchContextFn();
+    const companion = deps.resolvePiCodexPoolExtensionFn();
+    if (
+      json ||
+      args.length !== 1 ||
+      alias === undefined ||
+      !context.aliases.includes(alias)
+    ) {
+      deps.writeErr(
+        "accounts codex-pool enroll expects one configured opaque alias and an interactive terminal\n",
+      );
+      return deps.exit(2);
+    }
+    if (companion.health !== "ready") {
+      deps.writeErr(
+        `Error: [${companion.problem_code ?? "companion-incompatible"}] ${CODEX_NATIVE_FALLBACK_WARNING}\n`,
+      );
+      return deps.exit(1);
+    }
+    deps.env.KEEPER_JOB_ID =
+      (deps.env.KEEPER_JOB_ID ?? "").trim() || "codex-pool-enrollment";
+    deps.env.KEEPER_PI_CODEX_POOL_MODE = "native";
+    deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(context.aliases);
+    deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = context.config_binding;
+    deps.writeErr(
+      `Codex pool enrollment is interactive; in Pi run /login ${alias}, then exit.\n`,
+    );
+    return runPassthrough(
+      [deps.piBin, ...companion.args, "--model", "openai-codex"],
+      deps.spawn,
+      deps.exit,
+      { env: deps.env, cwd: deps.cwd },
+    );
+  }
+
+  const takesSource =
+    operation === "proof-capture" ||
+    operation === "proof-verdict" ||
+    operation === "activate";
+  const source = args[0];
+  if (
+    (!takesSource && args.length !== 0) ||
+    (takesSource && args.length > 1) ||
+    (operation === "proof-capture" && source === undefined)
+  ) {
+    deps.writeErr(`accounts codex-pool ${operation} has invalid arguments\n`);
+    return deps.exit(2);
+  }
+  const outcome = deps.runCodexPoolWorkflowFn(operation, source);
+  if (json) {
+    deps.write(`${JSON.stringify(outcome)}\n`);
+  } else {
+    deps.write(
+      `codex pool: operation=${outcome.operation} state=${outcome.state} ` +
+        `result=${outcome.ok ? "ok" : (outcome.problem_code ?? "failed")}\n`,
+    );
+    if (outcome.proof !== null) {
+      deps.write(
+        `proof: verdict=${outcome.proof.verdict} ` +
+          `reasons=${outcome.proof.reasons.join(",") || "none"}\n`,
+      );
+    }
+  }
+  const readOnlyStatus =
+    operation === "status" || operation === "proof-verdict";
+  return deps.exit(
+    outcome.ok || (readOnlyStatus && operation === "status") ? 0 : 1,
+  );
+}
+
 /**
  * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
  * integration health, observation age, PII-free candidates, and the generic-
@@ -3151,30 +3424,51 @@ async function runFableFocusCommand(
  * integration is a reported state, not an error.
  */
 function runAccountsCheck(deps: MainDeps, json: boolean): never {
-  const inspection = deps.inspectRoutingFn();
+  const claude = deps.inspectRoutingFn();
+  const codex = deps.inspectCodexSessionRoutingFn();
   if (json) {
-    deps.write(`${JSON.stringify(inspection)}\n`);
+    deps.write(
+      `${JSON.stringify({
+        schema_version: 1,
+        claude_launch_routing: claude,
+        codex_session_routing: codex,
+      })}\n`,
+    );
     return deps.exit(0);
   }
   deps.write(
-    `account routing: health=${inspection.health} ` +
-      `fresh=${inspection.fresh} enabled=${inspection.enabled} ` +
-      `model-scope=${inspection.model_scope ?? "generic-only"}\n`,
+    `claude launch routing: health=${claude.health} ` +
+      `fresh=${claude.fresh} enabled=${claude.enabled} ` +
+      `model-scope=${claude.model_scope ?? "generic-only"}\n`,
   );
-  if (inspection.would_choose === null) {
-    deps.write(
-      `would choose: unavailable (${inspection.error ?? "unknown"})\n`,
-    );
+  if (claude.would_choose === null) {
+    deps.write(`would choose: unavailable (${claude.error ?? "unknown"})\n`);
   } else {
     deps.write(
-      `would choose: ${inspection.would_choose.id} ` +
-        `(${inspection.would_choose.reason})\n`,
+      `would choose: ${claude.would_choose.id} ` +
+        `(${claude.would_choose.reason})\n`,
     );
   }
-  for (const c of inspection.candidates) {
+  for (const c of claude.candidates) {
     deps.write(
       `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)} ` +
         `fable-left=${c.fable_remaining === null ? "none" : c.fable_remaining.toFixed(3)}\n`,
+    );
+  }
+  deps.write(
+    `codex session routing: activation=${codex.activation.mode} ` +
+      `companion=${codex.companion.health} capacity=${codex.capacity.health} ` +
+      `fresh=${codex.capacity.fresh}\n`,
+  );
+  if (codex.capacity.verdict.kind === "pooled") {
+    deps.write(
+      `session route candidate: ${codex.capacity.verdict.alias} ` +
+        `(${codex.capacity.verdict.reason})\n`,
+    );
+  } else {
+    deps.write(
+      `session route candidate: native openai-codex ` +
+        `(${codex.activation.problem_code ?? codex.capacity.verdict.reason})\n`,
     );
   }
   return deps.exit(0);
@@ -3462,6 +3756,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "accounts-check") {
     return runAccountsCheck(deps, dispatch.json);
+  }
+  if (dispatch.kind === "accounts-codex-pool") {
+    return runCodexPoolCommand(deps, dispatch.operation, dispatch.rest);
   }
   if (dispatch.kind === "accounts-fable-focus") {
     return runFableFocusCommand(deps, dispatch.operation, dispatch.rest);
@@ -3905,8 +4202,8 @@ export async function main(deps: MainDeps): Promise<never> {
     }
   }
 
-  // The account router owns every Claude launch. Pi launches against its one
-  // canonical account.
+  // Claude chooses one launch route. Pi defers Codex session routing to its
+  // launch-scoped companion while leaving every non-Codex Provider unchanged.
 
   // Build agent command.
   let runCmd = [bin, ...remainingArgs];
@@ -3987,16 +4284,47 @@ export async function main(deps: MainDeps): Promise<never> {
       note(`model: ${startupModel}`);
     }
 
-    // Arm keeper's ephemeral pi extension (`-e <path>`) so this session shows
-    // live working/stopped churn — the M3b live-state channel, paired with the
-    // birth record armed below. EPHEMERAL per-launch only (never a persistent pi
-    // install). Fail-open: `resolvePiExtensionArgsFn` returns `[]` when the
-    // extension file is absent, degrading pi to presence-only. Both interactive
-    // and detached launches pass through this managed-launch choke point.
     const piExtArgs = deps.resolvePiExtensionArgsFn();
     if (piExtArgs.length > 0) {
       runCmd.push(...piExtArgs);
       actionLog.push(`Armed keeper pi extension: ${piExtArgs.join(" ")}`);
+    }
+
+    const companion = deps.resolvePiCodexPoolExtensionFn();
+    const codexWorkload =
+      startupModel === null ||
+      startupModel === "openai-codex" ||
+      startupModel.startsWith("openai-codex/");
+    const codexContext = deps.codexPoolLaunchContextFn(
+      companion.health === "ready" && codexWorkload,
+    );
+    const codexMode =
+      companion.health === "ready" ? codexContext.mode : "native";
+    const codexProblem = companion.problem_code ?? codexContext.problem_code;
+    deps.env.KEEPER_PI_CODEX_POOL_MODE = codexMode;
+    deps.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(
+      codexContext.aliases,
+    );
+    deps.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = codexContext.config_binding;
+    if (codexMode === "active" && codexContext.initial_alias !== null) {
+      deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = codexContext.initial_alias;
+    } else {
+      delete deps.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS;
+    }
+    if (codexProblem === null) {
+      delete deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON;
+    } else {
+      deps.env.KEEPER_PI_CODEX_POOL_FALLBACK_REASON = codexProblem;
+    }
+    if (companion.args.length > 0) {
+      runCmd.push(...companion.args);
+      actionLog.push(
+        `Armed Pi Codex pool companion: ${companion.args.join(" ")}`,
+      );
+    } else {
+      deps.writeErr(
+        `Warning: [${codexProblem ?? "companion-incompatible"}] ${CODEX_NATIVE_FALLBACK_WARNING}\n`,
+      );
     }
   }
 

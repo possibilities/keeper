@@ -110,6 +110,7 @@ export interface CodexRoutingCandidate {
 export interface CodexRoutingInspection {
   provider: typeof CODEX_PROVIDER;
   health: "missing" | "stale" | "ready" | "unavailable";
+  config_binding: string | null;
   observed_at_ms: number | null;
   fresh: boolean;
   verdict: CodexRouteVerdict;
@@ -491,6 +492,7 @@ export function inspectCodexRouting(
       return {
         provider: CODEX_PROVIDER,
         health: current.failure === "observation-missing" ? "missing" : "stale",
+        config_binding: current.observation?.config_binding ?? null,
         observed_at_ms: current.observation?.observed_at_ms ?? null,
         fresh: false,
         verdict: fallback(current.failure),
@@ -539,6 +541,7 @@ export function inspectCodexRouting(
     return {
       provider: CODEX_PROVIDER,
       health: available.length > 0 ? "ready" : "unavailable",
+      config_binding: observation.config_binding,
       observed_at_ms: observation.observed_at_ms,
       fresh: true,
       verdict,
@@ -548,6 +551,7 @@ export function inspectCodexRouting(
     return {
       provider: CODEX_PROVIDER,
       health: "unavailable",
+      config_binding: null,
       observed_at_ms: null,
       fresh: false,
       verdict: fallback("routing-error"),

@@ -1,16 +1,9 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: Structural Pi stream doubles avoid loading peer modules in correctness tests.
 // biome-ignore-all lint/style/noNonNullAssertion: Fixture guards and deferred callbacks establish values before use.
-import { afterEach, describe, expect, test } from "bun:test";
-import {
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  statSync,
-} from "node:fs";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join } from "node:path";
 import {
   CredentialVault,
   FileCredentialStorage,
@@ -93,10 +86,39 @@ function credentials(expires = 10_000) {
   };
 }
 
+const nativeStream = () => ({
+  async *[Symbol.asyncIterator]() {},
+  result: async () => message(),
+});
+
+mock.module("@earendil-works/pi-ai", () => ({
+  openAICodexResponsesApi: () => ({ streamSimple: nativeStream }),
+}));
+mock.module("@earendil-works/pi-ai/providers/all", () => ({
+  builtinProviders: () => [
+    {
+      id: "openai-codex",
+      auth: {
+        oauth: {
+          name: "Codex",
+          login: async () => credentials()["keeper-codex-a"],
+          refresh: async (credential: unknown) => credential,
+          toAuth: async () => ({ apiKey: "fake" }),
+        },
+      },
+    },
+  ],
+}));
+
 const savedEnv = {
   KEEPER_JOB_ID: process.env.KEEPER_JOB_ID,
   PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
   KEEPER_PI_CODEX_POOL_ALIASES: process.env.KEEPER_PI_CODEX_POOL_ALIASES,
+  KEEPER_PI_CODEX_POOL_MODE: process.env.KEEPER_PI_CODEX_POOL_MODE,
+  KEEPER_PI_CODEX_POOL_CONFIG_BINDING:
+    process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING,
+  KEEPER_PI_CODEX_POOL_INITIAL_ALIAS:
+    process.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS,
 };
 
 afterEach(() => {
@@ -107,77 +129,49 @@ afterEach(() => {
 });
 
 describe("provider registration and compatibility", () => {
-  test("standalone Pi is inert while a Keeper-marked instance registers aliases and the wrapper", async () => {
-    const piExecutable = Bun.which("pi");
-    expect(piExecutable).toBeTruthy();
-    const packageRoot = dirname(dirname(realpathSync(piExecutable!)));
-    const loaderUrl = pathToFileURL(
-      join(packageRoot, "dist/core/extensions/loader.js"),
-    ).href;
-    const { loadExtensions } = (await import(loaderUrl)) as {
-      loadExtensions(
-        paths: string[],
-        cwd: string,
-      ): Promise<{
-        extensions: Array<{ commands: Map<string, unknown> }>;
-        errors: unknown[];
-        runtime: {
-          pendingProviderRegistrations: Array<{
-            name: string;
-            config: unknown;
-          }>;
-        };
-      }>;
-    };
-    const extensionPath = resolve("integrations/pi-codex-pool/src/index.ts");
+  test("standalone Pi is inert while a Keeper-marked native-mode instance registers aliases and fallback", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
     const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-extension-"));
     process.env.PI_CODING_AGENT_DIR = sandbox;
+    const providers: string[] = [];
+    const commands: string[] = [];
+    const pi = {
+      registerProvider(name: string) {
+        providers.push(name);
+      },
+      registerCommand(name: string) {
+        commands.push(name);
+      },
+    };
     delete process.env.KEEPER_JOB_ID;
-    const standalone = await loadExtensions([extensionPath], process.cwd());
-    expect(standalone.errors).toEqual([]);
-    expect(standalone.runtime.pendingProviderRegistrations).toEqual([]);
-    expect(standalone.extensions[0]?.commands.size).toBe(0);
+    installCodexPool(pi as never);
+    expect(providers).toEqual([]);
+    expect(commands).toEqual([]);
 
     process.env.KEEPER_JOB_ID = "keeper-session";
-    const marked = await loadExtensions([extensionPath], process.cwd());
-    expect(marked.errors).toEqual([]);
-    expect(
-      marked.runtime.pendingProviderRegistrations.map((entry) => entry.name),
-    ).toEqual(["keeper-codex-a", "keeper-codex-b", "openai-codex"]);
-    expect(marked.extensions[0]?.commands.has("codex-pool-observe")).toBe(true);
+    process.env.KEEPER_PI_CODEX_POOL_MODE = "native";
+    installCodexPool(pi as never);
+    expect(providers).toEqual([
+      "keeper-codex-a",
+      "keeper-codex-b",
+      "openai-codex",
+    ]);
+    expect(commands).toEqual(["codex-pool-observe"]);
     rmSync(sandbox, { recursive: true, force: true });
   });
 
-  test("pins the installed compat-root delegate and pi-subagents runtime inheritance seam", async () => {
-    const piExecutable = Bun.which("pi");
-    expect(piExecutable).toBeTruthy();
-    const packageRoot = dirname(dirname(realpathSync(piExecutable!)));
-    const loaderSource = readFileSync(
-      join(packageRoot, "dist/core/extensions/loader.js"),
+  test("pins the compat-root delegate source and independent root/child routes", () => {
+    const source = readFileSync(
+      join(import.meta.dir, "../src/index.ts"),
       "utf8",
     );
-    expect(loaderSource).toContain(
-      '"@earendil-works/pi-ai": _bundledPiAiCompat',
+    expect(source).toContain(
+      'type CompatPiAi = typeof import("@earendil-works/pi-ai/compat")',
     );
-    expect(loaderSource).not.toContain(
-      '"@earendil-works/pi-ai/api/openai-codex-responses"',
+    expect(source).toContain("openAICodexResponsesApi()");
+    expect(source).not.toContain(
+      "@earendil-works/pi-ai/api/openai-codex-responses",
     );
-    const compat = (await import(
-      pathToFileURL(
-        join(packageRoot, "node_modules/@earendil-works/pi-ai/dist/compat.js"),
-      ).href
-    )) as { openAICodexResponsesApi?: () => unknown };
-    expect(typeof compat.openAICodexResponsesApi).toBe("function");
-    expect(compat.openAICodexResponsesApi?.()).toEqual(
-      expect.objectContaining({ streamSimple: expect.any(Function) }),
-    );
-
-    const subagentsSource = readFileSync(
-      "/Users/mike/src/possibilities--pi-subagents/src/agent-runner.ts",
-      "utf8",
-    );
-    expect(subagentsSource).toContain("modelRegistry: ctx.modelRegistry");
-    expect(subagentsSource).toContain("modelRuntime: parentModelRuntime");
 
     const routes = new PoolRouteState(
       ["keeper-codex-a", "keeper-codex-b"],
@@ -283,6 +277,18 @@ describe("credential and route state", () => {
     });
     expect(readFileSync(authPath, "utf8")).not.toContain(".tmp");
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("consumes the sanitized launch route once before independent child selection", () => {
+    const routes = new PoolRouteState(
+      ["keeper-codex-a", "keeper-codex-b"],
+      null,
+      () => 100,
+      "keeper-codex-b",
+    );
+    expect(routes.select("root")).toBe("keeper-codex-b");
+    expect(routes.select("child")).toBe("keeper-codex-a");
+    expect(routes.select("root")).toBe("keeper-codex-b");
   });
 
   test("selects deterministically, keeps sessions sticky, and reacts to pressure and cooldown", () => {

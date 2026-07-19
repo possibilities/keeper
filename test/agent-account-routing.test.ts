@@ -684,6 +684,70 @@ describe("keeper agent accounts fable-focus", () => {
   });
 });
 
+describe("keeper agent accounts codex-pool", () => {
+  test("interactive enrollment inherits the terminal and loads only the companion", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "codex-pool", "enroll", "keeper-codex-b"],
+      rawArgv: true,
+      resolvePiCodexPoolExtension: () => ({
+        args: ["-e", "/fake/pi-codex-pool.ts"],
+        health: "ready",
+        problem_code: null,
+      }),
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(h.spawned).toEqual([
+      [h.deps.piBin, "-e", "/fake/pi-codex-pool.ts", "--model", "openai-codex"],
+    ]);
+    expect(h.err.join("")).toBe(
+      "Codex pool enrollment is interactive; in Pi run /login keeper-codex-b, then exit.\n",
+    );
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_MODE).toBe("native");
+    expect(h.deps.env.KEEPER_PI_CODEX_POOL_ALIASES).toBe(
+      '["keeper-codex-a","keeper-codex-b"]',
+    );
+  });
+
+  test("noninteractive workflow commands preserve the versioned result", async () => {
+    const calls: Array<{ operation: string; source?: string }> = [];
+    const h = makeHarness({
+      argv: [
+        "accounts",
+        "codex-pool",
+        "proof",
+        "capture",
+        "/fake/report.json",
+        "--json",
+      ],
+      rawArgv: true,
+      runCodexPoolWorkflow: (operation, source) => {
+        calls.push({ operation, ...(source ? { source } : {}) });
+        return {
+          schema_version: 1,
+          ok: true,
+          operation,
+          state: "native",
+          problem_code: null,
+          proof: { verdict: "proven", reasons: [] },
+        };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(calls).toEqual([
+      { operation: "proof-capture", source: "/fake/report.json" },
+    ]);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      schema_version: 1,
+      ok: true,
+      operation: "proof-capture",
+      state: "native",
+      problem_code: null,
+      proof: { verdict: "proven", reasons: [] },
+    });
+    expect(h.spawned).toEqual([]);
+  });
+});
+
 describe("keeper agent accounts check", () => {
   const inspection = {
     model_scope: null,
@@ -732,7 +796,11 @@ describe("keeper agent accounts check", () => {
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.routerCalls()).toBe(0);
     expect(h.spawned).toEqual([]);
-    expect(JSON.parse(h.out.join(""))).toEqual(inspection);
+    expect(JSON.parse(h.out.join(""))).toEqual({
+      schema_version: 1,
+      claude_launch_routing: inspection,
+      codex_session_routing: h.deps.inspectCodexSessionRoutingFn(),
+    });
   });
 
   test("disabled human output reports unavailable without a fake default", async () => {
@@ -764,5 +832,63 @@ describe("keeper agent accounts check", () => {
     expect(await expectExit(main(h.deps))).toBe(0);
     expect(h.out.join("")).toContain("model-scope=generic-only");
     expect(h.out.join("")).toContain("would choose: unavailable");
+    expect(h.out.join("")).toContain("codex session routing:");
+  });
+
+  test("reports Codex session routing separately without selecting or creating pressure", async () => {
+    let codexReads = 0;
+    const codex = {
+      activation: { mode: "active" as const, problem_code: null },
+      companion: { health: "ready" as const, problem_code: null },
+      capacity: {
+        provider: "openai-codex" as const,
+        health: "ready" as const,
+        config_binding: "a".repeat(64),
+        observed_at_ms: 1000,
+        fresh: true,
+        verdict: {
+          kind: "pooled" as const,
+          provider: "openai-codex" as const,
+          alias: "keeper-codex-b",
+          reason: "selected" as const,
+        },
+        candidates: [
+          {
+            alias: "keeper-codex-a",
+            worst_used_percent: 80,
+            pressure: 0,
+            cooldown_until_ms: 0,
+            eligible: true,
+          },
+          {
+            alias: "keeper-codex-b",
+            worst_used_percent: 10,
+            pressure: 0,
+            cooldown_until_ms: 0,
+            eligible: true,
+          },
+        ],
+      },
+    };
+    const h = makeHarness({
+      argv: ["accounts", "check", "--json"],
+      rawArgv: true,
+      inspectRouting: () => inspection,
+      inspectCodexSessionRouting: () => {
+        codexReads += 1;
+        return codex;
+      },
+      selectAccountRoute: () => {
+        throw new Error("diagnostics must not reserve Claude capacity");
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const output = JSON.parse(h.out.join(""));
+    expect(output.codex_session_routing).toEqual(codex);
+    expect(output.claude_launch_routing.would_choose.id).toBe("claude-swap:2");
+    expect(codexReads).toBe(1);
+    expect(h.routerCalls()).toBe(0);
+    expect(h.spawned).toEqual([]);
+    expect(JSON.stringify(output)).not.toContain("@example");
   });
 });

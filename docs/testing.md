@@ -12,6 +12,7 @@ phase, or test set is absent.
 | Root default gate | `bun run test` | Root fast gate, then the serial OpenTUI phase. |
 | Repository gate | `bun run test:full` | Root default gate, plan gate, and prompt gate, serially. |
 | One root test | `bun test ./test/test-gate.test.ts` | An explicit `*.test.ts` target. |
+| Pi Codex companion | `bun run test:pi-codex-pool` | Provider wrapper, observer, proof schema, native fallback, and retry cutoff. |
 
 Do not invoke bare `bun test`: the entrypoint rejects aggregate discovery before test
 discovery. A direct `bun test` command is permitted only with one or more explicit
@@ -35,6 +36,20 @@ bun run test:opentui
 The plan and prompt `test` scripts run their respective named fast gates. `test:opentui`
 runs the explicit OpenTUI files in a serial, non-isolated phase because their native
 runtime requires one shared loader context.
+
+The Pi Codex launch and activation checks are also explicit and sandboxed:
+
+```sh
+bun test ./test/agent-pi.test.ts ./test/agent-account-routing.test.ts ./test/install.test.ts
+bun test ./test/codex-pool-activation.test.ts ./test/codex-account-observation.test.ts ./test/codex-account-router.test.ts ./test/codex-account-observer-worker.test.ts
+bun run test:pi-codex-pool
+```
+
+These tests use fake reports, in-memory activation stores, injected routing inspections, and source
+fixtures. They never read host Pi auth, Codex credentials/usage, the live pi-subagents checkout, a daemon,
+a socket, tmux, or a subprocess. The pure activation cases pin fresh success, every proof refusal class,
+concurrent activation, interruption, rollback-complete, and recovery-required behavior. Live two-account
+proof and activation remain a separate rollout gate, not a correctness-test claim.
 
 ## What the gates prove
 

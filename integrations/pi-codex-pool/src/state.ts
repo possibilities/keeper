@@ -185,15 +185,20 @@ export class PoolRouteState {
   readonly binding: string;
   private state: PersistedPoolState;
   private readonly routes = new Map<string, SessionRoute>();
+  private initialAlias: string | undefined;
 
   constructor(
     readonly aliases: readonly string[],
     private readonly store: PoolStateStore | null = null,
     private readonly now: () => number = Date.now,
+    initialAlias?: string,
   ) {
     const normalized = normalizeAliases([...aliases]);
     this.aliases = normalized;
     this.binding = poolConfigBinding(normalized);
+    this.initialAlias = normalized.includes(initialAlias ?? "")
+      ? initialAlias
+      : undefined;
     this.state = store?.load(normalized, this.binding) ?? {
       schema_version: POOL_STATE_SCHEMA_VERSION,
       config_binding: this.binding,
@@ -238,22 +243,27 @@ export class PoolRouteState {
         ? eligible
         : this.state.accounts.filter((account) => !excluded.has(account.alias));
     if (candidates.length === 0) throw new Error("account-pool-exhausted");
-    const selected = [...candidates].sort((left, right) => {
-      const leftPressure =
-        left.pressure_expires_at_ms > now ? left.pressure : 0;
-      const rightPressure =
-        right.pressure_expires_at_ms > now ? right.pressure : 0;
-      const leftUsage = left.usage_expires_at_ms > now ? left.used_percent : 50;
-      const rightUsage =
-        right.usage_expires_at_ms > now ? right.used_percent : 50;
-      const score =
-        leftUsage + leftPressure * 10 - (rightUsage + rightPressure * 10);
-      if (score !== 0) return score;
-      if (left.last_selected_at_ms !== right.last_selected_at_ms) {
-        return left.last_selected_at_ms - right.last_selected_at_ms;
-      }
-      return left.alias.localeCompare(right.alias);
-    })[0];
+    const initialAlias = this.initialAlias;
+    this.initialAlias = undefined;
+    const selected =
+      candidates.find((account) => account.alias === initialAlias) ??
+      [...candidates].sort((left, right) => {
+        const leftPressure =
+          left.pressure_expires_at_ms > now ? left.pressure : 0;
+        const rightPressure =
+          right.pressure_expires_at_ms > now ? right.pressure : 0;
+        const leftUsage =
+          left.usage_expires_at_ms > now ? left.used_percent : 50;
+        const rightUsage =
+          right.usage_expires_at_ms > now ? right.used_percent : 50;
+        const score =
+          leftUsage + leftPressure * 10 - (rightUsage + rightPressure * 10);
+        if (score !== 0) return score;
+        if (left.last_selected_at_ms !== right.last_selected_at_ms) {
+          return left.last_selected_at_ms - right.last_selected_at_ms;
+        }
+        return left.alias.localeCompare(right.alias);
+      })[0];
     selected.last_selected_at_ms = now;
     selected.pressure = Math.min(100, selected.pressure + 1);
     selected.pressure_expires_at_ms = now + PRESSURE_TTL_MS;

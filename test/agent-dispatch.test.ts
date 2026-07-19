@@ -39,6 +39,7 @@ test("native descriptor exposes the nested accounts command family", () => {
   expect(accounts?.mutates).toBe(true);
   expect(accounts?.verbs?.map((verb) => verb.name)).toEqual([
     "check",
+    "codex-pool",
     "fable-focus",
   ]);
   expect(accounts?.verbs?.find((verb) => verb.name === "check")?.mutates).toBe(
@@ -150,6 +151,27 @@ describe("splitSubcommand", () => {
     expect(splitSubcommand(["accounts", "check"])).toEqual({
       kind: "accounts-check",
       json: false,
+    });
+    expect(
+      splitSubcommand([
+        "accounts",
+        "codex-pool",
+        "proof",
+        "capture",
+        "/tmp/report",
+        "--json",
+      ]),
+    ).toEqual({
+      kind: "accounts-codex-pool",
+      operation: "proof-capture",
+      rest: ["/tmp/report", "--json"],
+    });
+    expect(
+      splitSubcommand(["accounts", "codex-pool", "rollback", "--json"]),
+    ).toEqual({
+      kind: "accounts-codex-pool",
+      operation: "rollback",
+      rest: ["--json"],
     });
     expect(
       splitSubcommand(["accounts", "fable-focus", "show", "--json"]),
