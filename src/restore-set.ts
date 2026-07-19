@@ -145,6 +145,8 @@ interface KilledJobRow {
    *  session, NULL otherwise. Read at the coordless-skip path to surface an
    *  adopted coordless job rather than silently drop it. */
   adopted: number | null;
+  fable_intent: number | null;
+  current_model_id: string | null;
 }
 
 /**
@@ -175,6 +177,8 @@ export interface RestoreCandidate {
    * back-filled — see {@link isRestorableCandidate}.
    */
   harness?: string;
+  /** Stored/inherited routing purpose; null means legacy unknown. */
+  fable_intent?: boolean | null;
 }
 
 /**
@@ -242,6 +246,15 @@ export interface CurrentSetResult {
 }
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
+
+function storedFableIntent(row: {
+  fable_intent?: number | null;
+  current_model_id?: string | null;
+}): boolean | null {
+  if (row.fable_intent === 1) return true;
+  if (row.fable_intent === 0) return false;
+  return row.current_model_id?.trim().toLowerCase() === "fable" ? true : null;
+}
 
 function batchHarnessOrNull(
   name: string | null | undefined,
@@ -522,7 +535,8 @@ function loadRows(db: Database): {
               window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              plan_verb, dispatch_origin, last_event_id, harness, resume_target, adopted
+              plan_verb, dispatch_origin, last_event_id, harness, resume_target,
+              adopted, fable_intent, current_model_id
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -716,6 +730,7 @@ function collectCrashCandidates(
         cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
         backend_exec_session_id: backendSession,
         created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+        fable_intent: harness === "claude" ? storedFableIntent(row) : null,
       },
       last_event_id:
         typeof row.last_event_id === "number" &&
@@ -899,6 +914,8 @@ interface TopologyJobRow {
   dispatch_origin: string | null;
   harness: string | null;
   resume_target: string | null;
+  fable_intent: number | null;
+  current_model_id: string | null;
 }
 
 interface PostTerminalBackendRow {
@@ -910,6 +927,8 @@ interface PostTerminalBackendRow {
   backend_exec_session_id: string | null;
   harness: string | null;
   resume_target: string | null;
+  fable_intent: number | null;
+  current_model_id: string | null;
   pid: number;
   event_backend_exec_session_id: string | null;
   event_backend_exec_pane_id: string;
@@ -1522,6 +1541,7 @@ function buildCandidatesFromSnapshot(
       cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
       backend_exec_session_id: backendSession,
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+      fable_intent: harness === "claude" ? storedFableIntent(row) : null,
     });
   }
   return {
@@ -1597,7 +1617,8 @@ function loadTopologyJobRow(
         `SELECT job_id, created_at, title, cwd,
                 COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                   AS backend_exec_session_id,
-                plan_verb, dispatch_origin, harness, resume_target
+                plan_verb, dispatch_origin, harness, resume_target,
+                fable_intent, current_model_id
            FROM jobs
           WHERE job_id = ?
           LIMIT 1`,
@@ -1683,7 +1704,8 @@ function derivePostTerminalCurrentSet(
         `SELECT j.job_id, j.created_at, j.title, j.window_index, j.cwd,
                 COALESCE(j.backend_exec_session_id, j.backend_exec_birth_session_id)
                   AS backend_exec_session_id,
-                j.harness, j.resume_target, j.pid,
+                j.harness, j.resume_target, j.fable_intent,
+                j.current_model_id, j.pid,
                 e.backend_exec_session_id AS event_backend_exec_session_id,
                 e.backend_exec_pane_id AS event_backend_exec_pane_id
            FROM jobs j
@@ -1762,6 +1784,7 @@ function derivePostTerminalCurrentSet(
       cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
       backend_exec_session_id: backendSession,
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+      fable_intent: harness === "claude" ? storedFableIntent(row) : null,
     });
     seenJobIds.add(jobId);
   }
@@ -1858,7 +1881,8 @@ export function deriveCurrentSetWithSkips(
       `SELECT job_id, created_at, title, window_index, cwd,
               COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
                 AS backend_exec_session_id,
-              harness, resume_target, pid, start_time
+              harness, resume_target, fable_intent, current_model_id,
+              pid, start_time
          FROM jobs
         WHERE state IN ('working', 'stopped')
           AND COALESCE(backend_exec_session_id, backend_exec_birth_session_id)
@@ -1875,6 +1899,8 @@ export function deriveCurrentSetWithSkips(
     backend_exec_session_id: string;
     harness: string | null;
     resume_target: string | null;
+    fable_intent: number | null;
+    current_model_id: string | null;
     pid: number | null;
     start_time: string | null;
   }[];
@@ -1916,6 +1942,7 @@ export function deriveCurrentSetWithSkips(
       cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
       backend_exec_session_id: backendSession,
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+      fable_intent: harness === "claude" ? storedFableIntent(row) : null,
     });
   }
 

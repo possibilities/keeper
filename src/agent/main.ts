@@ -20,13 +20,16 @@ import {
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { queryCollection } from "../../cli/control-rpc";
+import { queryCollection, roundTrip } from "../../cli/control-rpc";
 import {
+  constructObservedFableFocus,
   inspectRouting,
+  modelHasFableIntent,
   type RequestedRouteResolution,
   type RouteResolution,
   type RouteSelection,
   type RoutingInspection,
+  resolveObservedManagedRoute,
   selectRoute,
   selectRouteByAccountOrdinal,
 } from "../account-router";
@@ -71,11 +74,13 @@ import {
 } from "../bus-artifact";
 import { DISPATCH_FLOORS, type DispatchVerb } from "../dispatch-launch-config";
 import { isDefaultTmuxEnvValue } from "../exec-backend";
+import { normalizeUtcTimestamp } from "../fable-focus";
 import {
   buildLauncherArgvPrefix,
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
+import type { FableFocusInput } from "../types";
 import { parseArgsForAgent } from "./args";
 import {
   ConfigError,
@@ -381,7 +386,10 @@ export interface MainDeps {
    * independent per start/resume/restore and fails before process creation when
    * no fresh routeable claude-swap account exists.
    */
-  selectAccountRouteFn: (model: string | null) => RouteResolution;
+  selectAccountRouteFn: (
+    model: string | null,
+    fableIntent: boolean | null,
+  ) => RouteResolution;
   /**
    * Resolve a human-requested zero-based Claude account index exactly. Unlike
    * automatic routing this is fail-loud and never substitutes another account.
@@ -389,14 +397,20 @@ export interface MainDeps {
   selectAccountRouteByOrdinalFn: (
     ordinal: number,
     model: string | null,
+    fableIntent: boolean | null,
   ) => RequestedRouteResolution;
+  /** Resolve stored process-lineage intent for an agent-native continuation. */
+  resolveFableIntentFn: (target: string) => Promise<boolean | null>;
+  setFableFocusFn: (
+    focus: FableFocusInput | null,
+  ) => Promise<{ ok: true } | { ok: false; code: string; message: string }>;
   /**
    * Read-only account-routing diagnostic behind `accounts check` — reports
    * integration health, snapshot age, PII-free candidates, and the route policy
    * would choose WITHOUT recording a reservation. `realDeps()` binds
    * {@link inspectRouting}.
    */
-  inspectRoutingFn: () => RoutingInspection;
+  inspectRoutingFn: (fable?: boolean) => RoutingInspection;
   /** Read one exact jobs row through the daemon. Transport uncertainty remains
    *  unknown and can never be promoted to partner death. */
   probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
@@ -506,10 +520,16 @@ export function realDeps(): MainDeps {
     sendBusArtifactFn: sendBusArtifact,
     acquirePartnerCaptureLeaseFn: acquirePartnerCaptureLease,
     resolveBusArtifactRootFn: resolveBusArtifactRoot,
-    selectAccountRouteFn: (model) => selectRoute({ model }),
-    selectAccountRouteByOrdinalFn: (ordinal, model) =>
-      selectRouteByAccountOrdinal(ordinal, { model }),
-    inspectRoutingFn: () => inspectRouting(),
+    selectAccountRouteFn: (model, fableIntent) =>
+      selectRoute({ model, fableIntent }),
+    selectAccountRouteByOrdinalFn: (ordinal, model, fableIntent) =>
+      selectRouteByAccountOrdinal(ordinal, { model, fableIntent }),
+    resolveFableIntentFn: (target) =>
+      resolveStoredFableIntent(resolveAgentSockPath(process.env), target),
+    setFableFocusFn: (focus) =>
+      setFableFocus(resolveAgentSockPath(process.env), focus),
+    inspectRoutingFn: (fable = false) =>
+      inspectRouting(fable ? { model: "fable", fableIntent: true } : {}),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin,
@@ -1055,6 +1075,78 @@ function resolveAgentSockPath(env: NodeJS.ProcessEnv): string {
   return override !== ""
     ? override
     : join(homedir(), ".local", "state", "keeper", "keeperd.sock");
+}
+
+function continuationTarget(args: string[]): string | null {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--resume" || arg === "-r") {
+      const value = args[i + 1];
+      return value === undefined || value.startsWith("-") ? null : value;
+    }
+    if (arg?.startsWith("--resume=")) {
+      return arg.slice("--resume=".length) || null;
+    }
+  }
+  return null;
+}
+
+async function resolveStoredFableIntent(
+  sockPath: string,
+  target: string,
+): Promise<boolean | null> {
+  try {
+    const rows = await queryCollection<Record<string, unknown>>(
+      sockPath,
+      "jobs",
+      { job_id: target },
+    );
+    const row = rows[0];
+    if (row?.fable_intent === 1 || row?.fable_intent === true) return true;
+    if (row?.fable_intent === 0 || row?.fable_intent === false) return false;
+    return modelHasFableIntent(
+      typeof row?.current_model_id === "string" ? row.current_model_id : null,
+    )
+      ? true
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function setFableFocus(
+  sockPath: string,
+  focus: FableFocusInput | null,
+): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  const id = crypto.randomUUID();
+  try {
+    const response = await roundTrip(
+      sockPath,
+      {
+        type: "rpc",
+        id,
+        method: "set_autopilot_config",
+        params: { fable_focus: focus },
+      },
+      id,
+    );
+    if (response.type === "rpc_result") return { ok: true };
+    return {
+      ok: false,
+      code: response.type === "error" ? response.code : "focus_rpc_unexpected",
+      message:
+        response.type === "error"
+          ? response.message
+          : "unexpected daemon response while setting Fable focus",
+    };
+  } catch {
+    return {
+      ok: false,
+      code: "focus_rpc_unreachable",
+      message:
+        "the daemon did not acknowledge the Fable focus update; inspect state before retrying",
+    };
+  }
 }
 
 function resolveBusSockPath(env: NodeJS.ProcessEnv): string {
@@ -2382,6 +2474,225 @@ function runProvidersCheck(deps: MainDeps): never {
   );
 }
 
+const FABLE_FOCUS_COMMAND_SCHEMA_VERSION = 1;
+
+function focusEnvelope(
+  ok: boolean,
+  data: unknown,
+  error: { code: string; message: string; recovery: string } | null = null,
+): string {
+  return `${JSON.stringify({
+    schema_version: FABLE_FOCUS_COMMAND_SCHEMA_VERSION,
+    ok,
+    error,
+    data: ok ? data : null,
+  })}\n`;
+}
+
+async function runFableFocusCommand(
+  deps: MainDeps,
+  operation: "show" | "set" | "clear",
+  rest: string[],
+): Promise<never> {
+  const jsonCount = rest.filter((arg) => arg === "--json").length;
+  const json = jsonCount === 1;
+  const args = rest.filter((arg) => arg !== "--json");
+  if (jsonCount > 1) {
+    deps.writeErr("accounts fable-focus accepts --json at most once\n");
+    return deps.exit(2);
+  }
+  const inspection = deps.inspectRoutingFn(true);
+  const status = inspection.fable_focus ?? {
+    configured: false,
+    state: "unavailable",
+    target_route: null,
+    lifetime: null,
+    target_eligible: null,
+    outcome: "fallback",
+    reason: "policy-unavailable",
+    diagnostic: "delivery-unreachable",
+  };
+  const emitStatus = (): void => {
+    if (json) deps.write(focusEnvelope(true, status));
+    else {
+      deps.write(
+        `Fable focus: ${status.state} target=${status.target_route ?? "none"} ` +
+          `outcome=${status.outcome} reason=${status.reason}\n`,
+      );
+    }
+  };
+  if (operation === "show") {
+    if (args.length !== 0) {
+      deps.writeErr("accounts fable-focus show accepts only --json\n");
+      return deps.exit(2);
+    }
+    emitStatus();
+    return deps.exit(0);
+  }
+  if (operation === "clear") {
+    if (args.length !== 0) {
+      deps.writeErr("accounts fable-focus clear accepts only --json\n");
+      return deps.exit(2);
+    }
+    if (!status.configured && status.state === "off") {
+      emitStatus();
+      return deps.exit(0);
+    }
+    const result = await deps.setFableFocusFn(null);
+    if (!result.ok) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: result.code,
+          message: result.message,
+          recovery:
+            "Re-read with 'keeper agent accounts fable-focus show --json' before retrying.",
+        }),
+      );
+      return deps.exit(1);
+    }
+    deps.write(
+      focusEnvelope(true, {
+        ...status,
+        configured: false,
+        state: "off",
+        target_route: null,
+        lifetime: null,
+        outcome: "off",
+        reason: "policy-off",
+      }),
+    );
+    return deps.exit(0);
+  }
+
+  const targetValue = args[0];
+  const lifetimeKind = args[1];
+  let expectedReset: string | null = null;
+  const expectIndex = args.indexOf("--expect-reset");
+  if (expectIndex >= 0) {
+    expectedReset = args[expectIndex + 1] ?? null;
+    args.splice(expectIndex, 2);
+  }
+  if (
+    targetValue === undefined ||
+    lifetimeKind === undefined ||
+    args.length < 2 ||
+    args.length > 3
+  ) {
+    deps.writeErr(
+      "accounts fable-focus set expects <route|cN> <permanent|absolute|current-reset|cycle-end> [UTC deadline]\n",
+    );
+    return deps.exit(2);
+  }
+  let focus: FableFocusInput;
+  if (lifetimeKind === "current-reset" || lifetimeKind === "cycle-end") {
+    if (args.length !== 2 || (expectIndex >= 0 && expectedReset === null)) {
+      deps.writeErr("invalid current reset guard grammar\n");
+      return deps.exit(2);
+    }
+    const built = constructObservedFableFocus(
+      targetValue,
+      lifetimeKind,
+      expectedReset,
+      {
+        stateDir: deps.env.KEEPER_ACCOUNT_ROUTING_ROOT,
+        nowMs: deps.now(),
+      },
+    );
+    if (!built.ok) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: built.code,
+          message: "the guarded Fable reset boundary could not be accepted",
+          recovery:
+            "Refresh account observations and re-read the target reset before retrying.",
+        }),
+      );
+      return deps.exit(2);
+    }
+    focus = built.focus;
+  } else {
+    if (expectIndex >= 0) {
+      deps.writeErr("--expect-reset requires current-reset or cycle-end\n");
+      return deps.exit(2);
+    }
+    const target = resolveObservedManagedRoute(targetValue, {
+      stateDir: deps.env.KEEPER_ACCOUNT_ROUTING_ROOT,
+      nowMs: deps.now(),
+    });
+    if (!target.ok) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: target.code,
+          message: "the Fable focus target could not be resolved",
+          recovery:
+            "Use a stable claude-swap:<slot> route or refresh the cN inventory.",
+        }),
+      );
+      return deps.exit(2);
+    }
+    if (lifetimeKind === "permanent" && args.length === 2) {
+      focus = {
+        target_route: target.target_route,
+        lifetime: { kind: "permanent" },
+      };
+    } else if (lifetimeKind === "absolute" && args.length === 3) {
+      const deadline = normalizeUtcTimestamp(args[2]);
+      if (deadline === null) {
+        deps.writeErr(
+          "absolute Fable focus requires a timezone-bearing UTC deadline\n",
+        );
+        return deps.exit(2);
+      }
+      focus = {
+        target_route: target.target_route,
+        lifetime: { kind: "absolute", deadline_at: deadline },
+      };
+    } else {
+      deps.writeErr("invalid Fable focus lifetime grammar\n");
+      return deps.exit(2);
+    }
+  }
+  if (
+    status.configured &&
+    status.target_route === focus.target_route &&
+    JSON.stringify(status.lifetime) ===
+      JSON.stringify(
+        focus.lifetime.kind === "current-reset"
+          ? { kind: "absolute", deadline_at: focus.lifetime.reset_at }
+          : focus.lifetime,
+      )
+  ) {
+    emitStatus();
+    return deps.exit(0);
+  }
+  const result = await deps.setFableFocusFn(focus);
+  if (!result.ok) {
+    deps.write(
+      focusEnvelope(false, null, {
+        code: result.code,
+        message: result.message,
+        recovery:
+          "Re-read Fable focus state before retrying an uncertain update.",
+      }),
+    );
+    return deps.exit(1);
+  }
+  deps.write(
+    focusEnvelope(true, {
+      configured: true,
+      target_route: focus.target_route,
+      lifetime:
+        focus.lifetime.kind === "current-reset"
+          ? {
+              kind: "absolute",
+              deadline_at: focus.lifetime.reset_at,
+            }
+          : focus.lifetime,
+    }),
+  );
+  return deps.exit(0);
+}
+
 /**
  * `accounts check [--json]`: the read-only account-routing diagnostic. Reports
  * integration health, observation age, PII-free candidates, and the generic-
@@ -2542,6 +2853,13 @@ function runResumeSubcommand(
       resumeTarget: decision.resume_target,
       resumeSessionId,
     });
+    if (decision.harness === "claude" && decision.fable_intent != null) {
+      launchArgv.splice(
+        1,
+        0,
+        `--x-fable-intent=${decision.fable_intent ? "1" : "0"}`,
+      );
+    }
   } catch (exc) {
     if (exc instanceof ResumeLaunchUnsupportedError) {
       deps.writeErr(`Error: keeper agent resume: ${exc.message}\n`);
@@ -2696,6 +3014,9 @@ export async function main(deps: MainDeps): Promise<never> {
   if (dispatch.kind === "accounts-check") {
     return runAccountsCheck(deps, dispatch.json);
   }
+  if (dispatch.kind === "accounts-fable-focus") {
+    return runFableFocusCommand(deps, dispatch.operation, dispatch.rest);
+  }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);
   }
@@ -2825,6 +3146,10 @@ export async function main(deps: MainDeps): Promise<never> {
   const { launcherVerbose, launcherVeryVerbose, launcherNoConfirm } = parsed;
   if (parsed.launcherAccountError !== null) {
     deps.writeErr(`Error: ${parsed.launcherAccountError}.\n`);
+    return deps.exit(2);
+  }
+  if (parsed.launcherFableIntentError !== null) {
+    deps.writeErr(`Error: ${parsed.launcherFableIntentError}.\n`);
     return deps.exit(2);
   }
 
@@ -2999,13 +3324,32 @@ export async function main(deps: MainDeps): Promise<never> {
       : hasExplicitModelArg(remainingArgs)
         ? modelArgValue(remainingArgs)
         : (resolvedPreset?.model ?? null);
+    let fableIntent: boolean | null = shouldPassthrough
+      ? false
+      : routingModel !== null
+        ? modelHasFableIntent(routingModel)
+        : parsed.launcherFableIntent;
+    if (fableIntent === null && hasContinueOrResume) {
+      const target =
+        continuationTarget(remainingArgs) ??
+        (deps.env.KEEPER_JOB_ID ?? "").trim();
+      if (target !== "") {
+        fableIntent = await deps.resolveFableIntentFn(target);
+      }
+    }
+    if (fableIntent === null) {
+      delete deps.env.KEEPER_FABLE_INTENT;
+    } else {
+      deps.env.KEEPER_FABLE_INTENT = fableIntent ? "1" : "0";
+    }
     const resolution =
       parsed.launcherAccountOrdinal !== null
         ? deps.selectAccountRouteByOrdinalFn(
             parsed.launcherAccountOrdinal,
             routingModel,
+            fableIntent,
           )
-        : deps.selectAccountRouteFn(routingModel);
+        : deps.selectAccountRouteFn(routingModel, fableIntent);
     if (!resolution.ok) {
       const routingError = resolution.error.trimEnd();
       const punctuation = /[.!?]$/u.test(routingError) ? "" : ".";

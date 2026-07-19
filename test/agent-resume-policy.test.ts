@@ -25,11 +25,14 @@ interface JobSeed {
   harness?: string | null;
   resume_target?: string | null;
   cwd?: string | null;
+  fable_intent?: number | null;
+  current_model_id?: string | null;
 }
 function seedJob(db: Database, job: JobSeed): void {
   db.query(`INSERT INTO jobs (job_id, created_at, updated_at, state, pid, start_time,
-                        title, name_history, harness, resume_target, cwd)
-     VALUES (?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?)`).run(
+                        title, name_history, harness, resume_target, cwd,
+                        fable_intent, current_model_id)
+     VALUES (?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     job.job_id,
     job.created_at ?? 1,
     job.updated_at ?? 1,
@@ -40,6 +43,8 @@ function seedJob(db: Database, job: JobSeed): void {
     job.harness ?? null,
     job.resume_target ?? null,
     job.cwd ?? null,
+    job.fable_intent ?? null,
+    job.current_model_id ?? null,
   );
 }
 /** Never-live deps by default (no pid seeded → isLive short-circuits false
@@ -71,8 +76,52 @@ test("resolves a current name (title) to ok with harness/resume_target/cwd/title
     resume_target: "native-1",
     cwd: "/repo",
     title: "alpha",
+    fable_intent: null,
   });
 });
+test("inherits stored intent and only canonical Fable telemetry seeds legacy intent", () => {
+  const { db } = freshMemDb();
+  seedJob(db, {
+    job_id: "stored-fable",
+    title: "stored-fable",
+    harness: "claude",
+    resume_target: "native-fable",
+    fable_intent: 1,
+  });
+  seedJob(db, {
+    job_id: "legacy-fable",
+    title: "legacy-fable",
+    harness: "claude",
+    resume_target: "native-legacy",
+    current_model_id: "Fable",
+  });
+  seedJob(db, {
+    job_id: "legacy-unknown",
+    title: "legacy-unknown",
+    harness: "claude",
+    resume_target: "native-unknown",
+    current_model_id: "claude-fable-preview",
+  });
+  expect(
+    resolveResumeDecision("stored-fable", db, undefined, deps()),
+  ).toMatchObject({
+    kind: "ok",
+    fable_intent: true,
+  });
+  expect(
+    resolveResumeDecision("legacy-fable", db, undefined, deps()),
+  ).toMatchObject({
+    kind: "ok",
+    fable_intent: true,
+  });
+  expect(
+    resolveResumeDecision("legacy-unknown", db, undefined, deps()),
+  ).toMatchObject({
+    kind: "ok",
+    fable_intent: null,
+  });
+});
+
 test("resolves a full session id exactly", () => {
   const { db } = freshMemDb();
   seedJob(db, {
@@ -126,6 +175,7 @@ test("a live process (pid + start-time identity match) is refused, naming the ca
     cwd: null,
     pid: 4242,
     start_time: "t-live",
+    fable_intent: null,
   });
 });
 test("a recycled pid (same pid, different OS start_time) is NOT treated as live", () => {

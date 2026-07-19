@@ -36,8 +36,11 @@ function harness(argv: string[]) {
 test("native descriptor exposes the nested accounts command family", () => {
   const agent = NATIVE_COMMANDS.find((command) => command.name === "agent");
   const accounts = agent?.verbs?.find((verb) => verb.name === "accounts");
-  expect(accounts?.mutates).toBe(false);
-  expect(accounts?.verbs?.map((verb) => verb.name)).toEqual(["check"]);
+  expect(accounts?.mutates).toBe(true);
+  expect(accounts?.verbs?.map((verb) => verb.name)).toEqual([
+    "check",
+    "fable-focus",
+  ]);
   expect(accounts?.verbs?.find((verb) => verb.name === "check")?.mutates).toBe(
     false,
   );
@@ -143,10 +146,41 @@ describe("splitSubcommand", () => {
       unknown: "presets frobnicate",
     });
   });
-  test("accounts exposes only the read-only check verb", () => {
+  test("accounts exposes check and strict Fable focus verbs", () => {
     expect(splitSubcommand(["accounts", "check"])).toEqual({
       kind: "accounts-check",
       json: false,
+    });
+    expect(
+      splitSubcommand(["accounts", "fable-focus", "show", "--json"]),
+    ).toEqual({
+      kind: "accounts-fable-focus",
+      operation: "show",
+      rest: ["--json"],
+    });
+    expect(
+      splitSubcommand([
+        "accounts",
+        "fable-focus",
+        "set",
+        "claude-swap:2",
+        "current-reset",
+        "--expect-reset",
+        "2026-07-19T00:00:00Z",
+      ]),
+    ).toEqual({
+      kind: "accounts-fable-focus",
+      operation: "set",
+      rest: [
+        "claude-swap:2",
+        "current-reset",
+        "--expect-reset",
+        "2026-07-19T00:00:00Z",
+      ],
+    });
+    expect(splitSubcommand(["accounts", "fable-focus", "oops"])).toEqual({
+      kind: "usage",
+      unknown: "accounts fable-focus",
     });
     expect(splitSubcommand(["accounts", "authorize"])).toEqual({
       kind: "usage",

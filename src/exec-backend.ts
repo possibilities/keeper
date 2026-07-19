@@ -196,6 +196,8 @@ export interface LaunchSpec {
   /** Exact Dispatch-attempt identity admitted before this launch. Present only
    *  for reconciler-managed dispatch; manual and legacy launches omit it. */
   readonly dispatchAttemptId?: number;
+  /** Inherited Claude routing purpose for a continuation or restore. */
+  readonly fableIntent?: boolean;
 }
 
 /** One row of a `list-panes -a` sweep: the tmux server generation, the
@@ -1268,6 +1270,8 @@ export interface KeeperAgentLaunchOpts {
   readonly handoffEnvelope?: string;
   /** Exact Dispatch-attempt identity carried as generic launch metadata. */
   readonly dispatchAttemptId?: number;
+  /** Inherited Claude routing purpose for a continuation or restore. */
+  readonly fableIntent?: boolean;
 }
 
 /**
@@ -1317,6 +1321,8 @@ export interface KeeperAgentLaunchOpts {
 export function buildKeeperAgentLaunchArgv(
   opts: KeeperAgentLaunchOpts,
 ): string[] {
+  const harness = harnessOrClaude(opts.harness);
+  const isClaude = harness === "claude";
   const flags: string[] = [];
   if (opts.model !== undefined) {
     flags.push("--model", opts.model);
@@ -1326,6 +1332,9 @@ export function buildKeeperAgentLaunchArgv(
   }
   if (opts.noConfirm) {
     flags.push("--x-no-confirm");
+  }
+  if (isClaude && opts.fableIntent !== undefined) {
+    flags.push(`--x-fable-intent=${opts.fableIntent ? "1" : "0"}`);
   }
   if (opts.claudeName !== undefined) {
     flags.push("--name", opts.claudeName);
@@ -1337,11 +1346,6 @@ export function buildKeeperAgentLaunchArgv(
   if (opts.pluginDir !== undefined && opts.pluginDir !== "") {
     flags.push("--plugin-dir", opts.pluginDir);
   }
-  // Normalize at the final argv seam: NULL/empty legacy rows are Claude, while
-  // every non-empty unregistered value is rejected before an executable argv
-  // can be returned.
-  const harness = harnessOrClaude(opts.harness);
-  const isClaude = harness === "claude";
   // Resume mode drops the trailing prompt positional and emits the harness's OWN
   // resume argv (Claude `--resume <t>`, Pi `--session <t>`) sourced from
   // the descriptor registry — never a re-inlined switch.
@@ -1688,6 +1692,9 @@ export async function keeperAgentLaunch(
         : {}),
       ...(deps.spec.dispatchAttemptId !== undefined
         ? { dispatchAttemptId: deps.spec.dispatchAttemptId }
+        : {}),
+      ...(deps.spec.fableIntent !== undefined
+        ? { fableIntent: deps.spec.fableIntent }
         : {}),
       noConfirm: true,
     });

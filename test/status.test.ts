@@ -424,8 +424,8 @@ describe("readEventStoreStatus wiring", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version is v13", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(13);
+  test("status schema version is v14", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(14);
   });
 
   test("envelope carries every documented field", () => {
@@ -504,6 +504,22 @@ describe("buildStatusEnvelope shape", () => {
     });
     expect(d.needs_human.total).toBe(0);
     expect(d.needs_human.parked_questions).toBe(0);
+  });
+
+  test("status exposes the canonical PII-free Fable focus model", () => {
+    const focus = {
+      configured: true,
+      state: "active" as const,
+      target_route: "claude-swap:2" as const,
+      lifetime: { kind: "permanent" as const },
+      target_eligible: false,
+      outcome: "fallback" as const,
+      reason: "target-ineligible" as const,
+      diagnostic: "none",
+    };
+    const data = buildStatusEnvelope(makeSnap(), BOOT, [], null, focus).data;
+    expect(data?.fable_focus).toEqual(focus);
+    expect(JSON.stringify(data?.fable_focus)).not.toContain("@");
   });
 
   test("per-root: worktree off publishes effective 1 with the stored intent distinct", () => {

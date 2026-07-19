@@ -909,6 +909,9 @@ function buildRestoreIntent(
     resumeTarget: candidate.resume_target,
     jobId: candidate.job_id,
     harness,
+    ...(candidate.fable_intent == null
+      ? {}
+      : { fableIntent: candidate.fable_intent }),
     noConfirm: true,
   });
   const nowIso = new Date().toISOString();

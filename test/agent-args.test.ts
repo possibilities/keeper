@@ -95,6 +95,20 @@ describe("parseArgs", () => {
     expect(parsed.launcherAccountError).toBeNull();
   });
 
+  test("Fable intent lineage carrier is consumed only for Claude", () => {
+    const inherited = parseArgs(["--x-fable-intent=1", "--resume", "abc"]);
+    expect(inherited.launcherFableIntent).toBe(true);
+    expect(inherited.launcherFableIntentError).toBeNull();
+    expect(inherited.remainingArgs).toEqual(["--resume", "abc"]);
+    expect(parseArgs(["--x-fable-intent=0"]).launcherFableIntent).toBe(false);
+    expect(
+      parseArgsForAgent(["--x-fable-intent=1"], "pi").launcherFableIntentError,
+    ).toContain("only valid for Claude");
+    expect(
+      parseArgs(["--x-fable-intent=maybe"]).launcherFableIntentError,
+    ).toContain("expects 0 or 1");
+  });
+
   test("legacy profile selection is an inert compatibility flag", () => {
     const split = parseArgs([
       "--x-profile",

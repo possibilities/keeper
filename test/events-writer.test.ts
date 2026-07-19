@@ -1202,6 +1202,24 @@ test("a non-SessionStart event leaves account_route NULL even when the env is se
   expect(b.account_route).toBeNull();
 });
 
+test("Fable intent rides event data independently from Launch attribution", () => {
+  const b = build(
+    {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "sess-fable",
+      prompt: "continue",
+    },
+    {
+      env: {
+        KEEPER_FABLE_INTENT: "1",
+        KEEPER_ACCOUNT_ROUTE: "claude-swap:9",
+      },
+    },
+  );
+  expect(JSON.parse(String(b.data))).toMatchObject({ fable_intent: true });
+  expect(b.account_route).toBeNull();
+});
+
 // ---------------------------------------------------------------------------
 // Record build — harness stamp (buildEventBindings) — fn-1103 task .3
 // ---------------------------------------------------------------------------

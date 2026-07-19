@@ -59,6 +59,7 @@ export type ResumeDecision =
       resume_target: string;
       cwd: string | null;
       title: string | null;
+      fable_intent?: boolean | null;
     }
   /** Refused for re-attach — the newest match is currently live. */
   | {
@@ -70,6 +71,7 @@ export type ResumeDecision =
       cwd: string | null;
       pid: number;
       start_time: string;
+      fable_intent?: boolean | null;
     }
   /** An exact tie for newest among the matched candidates. */
   | { kind: "ambiguous"; candidates: ResumeCandidate[] }
@@ -108,13 +110,16 @@ interface JobsSecondLookup {
   cwd: string | null;
   updated_at: number;
   created_at: number;
+  fable_intent: number | null;
+  current_model_id: string | null;
 }
 
 /** The second read-only `jobs` lookup by resolved `job_id` — never a re-resolve. */
 function lookupJobsRow(db: Database, jobId: string): JobsSecondLookup | null {
   const row = db
     .query(
-      `SELECT harness, resume_target, cwd, updated_at, created_at
+      `SELECT harness, resume_target, cwd, updated_at, created_at,
+              fable_intent, current_model_id
          FROM jobs WHERE job_id = ?`,
     )
     .get(jobId) as JobsSecondLookup | null;
@@ -133,6 +138,13 @@ interface FullCandidate {
   cwd: string | null;
   updated_at: number;
   created_at: number;
+  fable_intent: boolean | null;
+}
+
+function inheritedFableIntent(row: JobsSecondLookup): boolean | null {
+  if (row.fable_intent === 1) return true;
+  if (row.fable_intent === 0) return false;
+  return row.current_model_id?.trim().toLowerCase() === "fable" ? true : null;
 }
 
 /** The recycle-identity liveness check — mirrors `bus-worker.ts`'s
@@ -200,6 +212,7 @@ export function resolveResumeDecision(
       cwd: row.cwd,
       updated_at: row.updated_at,
       created_at: row.created_at,
+      fable_intent: inheritedFableIntent(row),
     });
   }
   if (candidates.length === 0) {
@@ -241,6 +254,7 @@ export function resolveResumeDecision(
       cwd: top.cwd,
       pid: top.pid as number,
       start_time: top.start_time as string,
+      fable_intent: top.fable_intent,
     };
   }
 
@@ -252,6 +266,7 @@ export function resolveResumeDecision(
       resume_target: top.resume_target,
       cwd: top.cwd,
       title: top.title,
+      fable_intent: top.fable_intent,
     };
   }
 

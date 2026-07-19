@@ -49,6 +49,10 @@ export interface ParsedArgs {
   launcherAccountOrdinal: number | null;
   /** Invalid/missing selector diagnostic; main exits 2 before launching. */
   launcherAccountError: string | null;
+  /** Inherited Fable intent carried by a continuation producer. */
+  launcherFableIntent: boolean | null;
+  /** Invalid hidden lineage carrier diagnostic. */
+  launcherFableIntentError: string | null;
 }
 
 /**
@@ -77,6 +81,8 @@ export function parseArgsForAgent(
   let launcherPreset: string | null = null;
   let launcherAccountOrdinal: number | null = null;
   let launcherAccountError: string | null = null;
+  let launcherFableIntent: boolean | null = null;
+  let launcherFableIntentError: string | null = null;
   let parsingIgnoredProfile = false;
   let parsingLauncherPreset = false;
   let parsingLauncherAccount = false;
@@ -132,6 +138,16 @@ export function parseArgsForAgent(
       parsingLauncherAccount = true;
     } else if (arg.startsWith("--x-account=")) {
       setLauncherAccount(arg.slice("--x-account=".length));
+    } else if (arg.startsWith("--x-fable-intent=")) {
+      const value = arg.slice("--x-fable-intent=".length);
+      if (agent !== "claude" || (value !== "0" && value !== "1")) {
+        launcherFableIntent = null;
+        launcherFableIntentError =
+          "--x-fable-intent expects 0 or 1 and is only valid for Claude";
+      } else {
+        launcherFableIntent = value === "1";
+        launcherFableIntentError = null;
+      }
     } else {
       remainingArgs.push(arg);
       if (isContinueOrResumeArg(arg, agent)) {
@@ -161,6 +177,8 @@ export function parseArgsForAgent(
     launcherPreset,
     launcherAccountOrdinal,
     launcherAccountError,
+    launcherFableIntent,
+    launcherFableIntentError,
   };
 }
 

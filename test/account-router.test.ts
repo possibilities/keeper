@@ -363,6 +363,153 @@ describe("mandatory managed account selection", () => {
   });
 });
 
+describe("durable Fable focus", () => {
+  const policy = {
+    schema_version: 1 as const,
+    policy_id: "event:7",
+    target_route: "claude-swap:2" as const,
+    fable_intent: true as const,
+    set_at: "2026-07-17T00:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+
+  test("eligible target serves every Fable launch despite reservation pressure", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.01, 0.01), routeWithFable(2, 0.9, 0.9)]),
+    );
+    const deps = {
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
+      focusDelivery: { available: true as const, policy },
+    };
+    expect(selectRoute(deps)).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "fable-focus" },
+    });
+    expect(selectRoute({ ...deps, nowMs: NOW + 1 })).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "fable-focus" },
+    });
+    expect(inspectRouting(deps).fable_focus).toMatchObject({
+      state: "active",
+      target_route: "claude-swap:2",
+      target_eligible: true,
+      outcome: "focused",
+      reason: "target-focused",
+    });
+  });
+
+  test("ineligible target visibly falls back to unchanged balancing", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([
+        routeWithFable(1, 0.2, 0.2),
+        routeWithFable(2, 0.1, 1),
+        routeWithFable(3, 0.8, 0.8),
+      ]),
+    );
+    const deps = {
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
+      focusDelivery: { available: true as const, policy },
+    };
+    expect(selectRoute(deps)).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "fable-focus-fallback" },
+    });
+    expect(inspectRouting(deps).fable_focus).toMatchObject({
+      target_eligible: false,
+      outcome: "fallback",
+      reason: "target-ineligible",
+    });
+  });
+
+  test("non-Fable avoids the target with an alternative and uses it alone", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.9, 0.9), routeWithFable(2, 0.01, 0.01)]),
+    );
+    const focusDelivery = { available: true as const, policy };
+    expect(
+      selectRoute({
+        stateDir: dir,
+        nowMs: NOW,
+        model: "opus",
+        focusDelivery,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "fable-focus-avoided" },
+    });
+
+    publish(dir, observation([routeWithFable(2, 0.1, 0.1)]));
+    expect(
+      selectRoute({
+        stateDir: dir,
+        nowMs: NOW + 1,
+        model: "opus",
+        focusDelivery,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "sole-candidate" },
+    });
+  });
+
+  test("stale capacity still exposes configured policy without claiming eligibility", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(2, 0.2, 0.2)], {
+        observedAtMs: NOW - 300_001,
+      }),
+    );
+    expect(
+      inspectRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        model: "fable",
+        focusDelivery: { available: true, policy },
+      }),
+    ).toMatchObject({
+      enabled: false,
+      fable_focus: {
+        configured: true,
+        state: "active",
+        target_route: "claude-swap:2",
+        target_eligible: null,
+        outcome: "fallback",
+        reason: "target-ineligible",
+      },
+    });
+  });
+
+  test("explicit account resolution remains exact under focus", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.2, 0.2), routeWithFable(2, 0.2, 0.2)]),
+    );
+    expect(
+      selectRouteByAccountOrdinal(0, {
+        stateDir: dir,
+        nowMs: NOW,
+        model: "fable",
+        focusDelivery: { available: true, policy },
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "requested-account" },
+    });
+  });
+});
+
 describe("explicit account resolution", () => {
   test("the active account is an ordinary managed route", () => {
     const dir = root();

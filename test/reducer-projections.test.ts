@@ -2551,6 +2551,32 @@ test("DispatchFailed without a prior Dispatched is still a safe no-op on pending
   expect(getPendingDispatch("plan-plan", "fn-orphan.1")).toBeNull();
 });
 
+test("SessionStart and fork-seed events preserve Fable intent independently from account route", () => {
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "fable-session",
+    account_route: "claude-swap:2",
+    data: JSON.stringify({ fable_intent: true }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fable-fork",
+    account_route: null,
+    data: JSON.stringify({ prompt: "continue", fable_intent: true }),
+  });
+  drainAll();
+  expect(
+    db
+      .query("SELECT account_route, fable_intent FROM jobs WHERE job_id = ?")
+      .get("fable-session"),
+  ).toEqual({ account_route: null, fable_intent: 1 });
+  expect(
+    db
+      .query("SELECT account_route, fable_intent FROM jobs WHERE job_id = ?")
+      .get("fable-fork"),
+  ).toEqual({ account_route: null, fable_intent: 1 });
+});
+
 test("discharge-on-bind: SessionStart spawn-INSERT clears the matching pending_dispatches row (fn-678)", () => {
   // Outbox flow: autopilot mints `Dispatched` then `launch()`s a worker
   // whose spawn name is `work::fn-678-foo.1`. The worker's first
