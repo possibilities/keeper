@@ -12,7 +12,9 @@ bash scripts/install.sh          # deps -> bun link -> keeperd bootstrap
 ```
 
 Edit `plist/arthack.keeperd.plist` before the first bootstrap if your username, checkout path, or bun
-path differ (Apple Silicon `/opt/homebrew/bin/bun`, Intel `/usr/local/bin/bun`); the plist must be
+path differ. The daemon runtime is pinned: install the exact version named by `package.json`'s
+`engines.bun` via the official installer (`curl -fsSL https://bun.sh/install | bash -s "bun-v<version>"`,
+landing at `~/.bun/bin/bun` — the path the plist references); the plist must be
 owned by you and mode `644` or macOS silently ignores it. Keeper-launched Claude requires the
 installer-managed claude-swap CLI and at least one registered account; Pi and non-Claude surfaces remain
 available without it, and there is no account-routing config map to author.

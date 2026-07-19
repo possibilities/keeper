@@ -9,8 +9,9 @@
 
   Paths are hard-coded absolute because launchd does NOT source your shell rc,
   so `bun` cannot be found by name. The values below assume:
-    - bun installed via Homebrew on Apple Silicon: /opt/homebrew/bin/bun
-      (Intel Macs: /usr/local/bin/bun — edit ProgramArguments + PATH below)
+    - bun pinned via the official versioned installer at /Users/mike/.bun/bin/bun;
+      keep the installed version in lockstep with package.json's engines/packageManager
+      pin (edit ProgramArguments + PATH below for your own paths)
     - the repo checked out at /Users/mike/code/keeper
     - state under /Users/mike/.local/state/keeper
   Edit these for your own username / arch before bootstrapping.
@@ -27,7 +28,7 @@
 	<string>arthack.keeperd</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/bun</string>
+		<string>/Users/mike/.bun/bin/bun</string>
 		<string>run</string>
 		<string>/Users/mike/code/keeper/src/daemon.ts</string>
 	</array>
@@ -37,7 +38,7 @@
 		<!-- ~/.local/bin carries the operator paging binaries (agentbot,
 		  notifyctl); without it every daemon page spawn fails ENOENT and the
 		  paging-channel-down probe latches. -->
-		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<string>/Users/mike/.bun/bin:/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 		<!--
 		  Verbose server-worker diagnostic logging. Default `0` (off) writes
 		  only the rare `[server-worker]` error class to server.stderr. Flip

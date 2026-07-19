@@ -3,6 +3,10 @@
   "version": "0.0.0",
   "description": "Fold Claude Code hook events into a SQLite jobs projection via a long-running Bun reducer daemon",
   "private": true,
+  "packageManager": "bun@1.3.13",
+  "engines": {
+    "bun": "1.3.13"
+  },
   "bin": {
     "keeper": "cli/keeper.ts"
   },
