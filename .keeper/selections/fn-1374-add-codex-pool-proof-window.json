@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security-critical invariant work: a bounded proof window that must never arm silently or survive restart without becoming a backdoor activation, touching the credential-observer contract and the activation gate across three source files \u2014 a nameable subtle-correctness/security gate that overrides the GPT-first default.",
+      "task_id": "fn-1374-add-codex-pool-proof-window.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Small, bounded work whose payload is user-facing warning wording, ordered install docs, and an ADR amendment \u2014 judgment-and-taste on phrasing rather than intelligence-bound, so sonnet at the bounded-single-surface band fits.",
+      "task_id": "fn-1374-add-codex-pool-proof-window.2",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T13:57:59.311000Z",
+  "epic_id": "fn-1374-add-codex-pool-proof-window",
+  "input_hash": "b7156789bd6d404444559d27c96a33f84d971d8bf0e51486c9b0fb2e36e2953f",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3071633289,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1374-add-codex-pool-proof-window.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security-critical invariant work: a bounded proof window that must never arm silently or survive restart without becoming a backdoor activation, touching the credential-observer contract and the activation gate across three source files \u2014 a nameable subtle-correctness/security gate that overrides the GPT-first default.\",\"confidence\":0.83},{\"task_id\":\"fn-1374-add-codex-pool-proof-window.2\",\"tier\":\"medium\",\"model\":\"sonnet\",\"rationale\":\"Small, bounded work whose payload is user-facing warning wording, ordered install docs, and an ADR amendment \u2014 judgment-and-taste on phrasing rather than intelligence-bound, so sonnet at the bounded-single-surface band fits.\",\"confidence\":0.78}]}\n"
+}
