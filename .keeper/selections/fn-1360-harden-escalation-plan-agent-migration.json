@@ -1,32 +1,37 @@
 {
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
   "cells": [
     {
-      "confidence": 0.82,
-      "label_source": "heuristic-guided",
-      "model": "gpt-5.6-terra",
-      "rationale": "Two well-specified single-surface markdown skill edits with an exact acceptance (reorder HEAD capture after the ff-only pull; restore a dropped page-and-decline line) and no design choice, routing GPT-first at the do-exactly-this band.",
+      "confidence": 0.96,
+      "label_source": "human-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Human-approved Spark burn fit: two fully-specified, reversible Markdown edits with no design choice; preserve medium effort.",
       "task_id": "fn-1360-harden-escalation-plan-agent-migration.1",
       "tier": "medium"
     },
     {
       "confidence": 0.72,
-      "label_source": "heuristic-guided",
+      "label_source": "preserved-guided",
       "model": "gpt-5.5",
-      "rationale": "Straight test additions but spanning a few surfaces (render/compile default_pin fallback plus effort-axis throw, and a grant-guard confinement integration seam over plan:* agent_types) with named acceptance, fitting the GPT workhorse for substantial well-specified multi-file work; the enforcement itself is out of scope so no opus gate.",
+      "rationale": "Preserve the prior selector assignment for substantial cross-surface confinement and fallback tests.",
       "task_id": "fn-1360-harden-escalation-plan-agent-migration.2",
       "tier": "high"
     }
   ],
-  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
-  "created_at": "2026-07-18T23:42:35.814000Z",
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T03:56:38.476000Z",
   "epic_id": "fn-1360-harden-escalation-plan-agent-migration",
-  "input_hash": "1f9112e5219b8ae550128c1551fad7883e72a959901b973340f23840a797e423",
-  "outcome": "completed",
+  "input_hash": "b5a6f8d0fee0e59d5e57e1eabc47af6be73a624ca962ec6447155e9981a299fe",
+  "outcome": "completed:human-spark-reassignment",
   "schema_version": 1,
   "selector": {
-    "harness": "subagent",
-    "model": "plan:model-selector"
+    "harness": "human",
+    "model": "spark-burn-policy"
   },
-  "shuffle_seed": 529601253,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Two well-specified single-surface markdown skill edits with an exact acceptance (reorder HEAD capture after the ff-only pull; restore a dropped page-and-decline line) and no design choice, routing GPT-first at the do-exactly-this band.\",\"confidence\":0.82},{\"task_id\":\"2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Straight test additions but spanning a few surfaces (render/compile default_pin fallback plus effort-axis throw, and a grant-guard confinement integration seam over plan:* agent_types) with named acceptance, fitting the GPT workhorse for substantial well-specified multi-file work; the enforcement itself is out of scope so no opus gate.\",\"confidence\":0.72}]}\n"
+  "shuffle_seed": 3047618768,
+  "verdict_raw": null
 }
