@@ -1429,7 +1429,14 @@ export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
  * skip the pass-1 abort while that epic's autonomous merge-resolver is mid-merge).
  * Pure.
  */
-export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
+export interface KeeperLaneIdentity {
+  epicId: string;
+  taskId: string | null;
+}
+
+export function keeperLaneIdentity(
+  entry: WorktreeEntry,
+): KeeperLaneIdentity | null {
   if (entry.branch === null) {
     return null;
   }
@@ -1442,8 +1449,14 @@ export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
     return null;
   }
   const sep = rest.indexOf("--");
-  if (sep === 0) return null;
-  return sep === -1 ? rest : rest.slice(0, sep);
+  if (sep === 0 || (sep !== -1 && sep === rest.length - 2)) return null;
+  return sep === -1
+    ? { epicId: rest, taskId: null }
+    : { epicId: rest.slice(0, sep), taskId: rest.slice(sep + 2) };
+}
+
+export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
+  return keeperLaneIdentity(entry)?.epicId ?? null;
 }
 
 /**
