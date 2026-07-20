@@ -1,0 +1,45 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A cross-cutting main-event-loop scheduling seam with a subtle correctness invariant \u2014 wall-clock-budgeted yield/resume from durable watermarks with no lost or repeated work and re-fold determinism preserved \u2014 is a nameable intelligence-bound opus gate at the contract-shaped xhigh band.",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.72,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Substantial but well-specified throughput work atop task-1's budget seam with a nameable acceptance (drain to watermark, keep-set invariants already test-guarded, sub-5s ingest freshness) routes GPT-first to the multi-file workhorse at the model-default band.",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.71,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Multi-surface but well-specified observability work \u2014 a status lag field, a bounded distress mint/clear following established projection patterns, and one attributed breach log line, each with a pinned deterministic test \u2014 routes GPT-first to the substantial-implementation tier at high.",
+      "task_id": "fn-1389-scale-event-store-maintenance-off-the.3",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T19:52:27.952000Z",
+  "epic_id": "fn-1389-scale-event-store-maintenance-off-the",
+  "input_hash": "51e15f7c477f97d6a8125dbfc55d0509eb075d7b72233e147c2bbb4b03dad2ca",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1373724540,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1389-scale-event-store-maintenance-off-the.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A cross-cutting main-event-loop scheduling seam with a subtle correctness invariant \u2014 wall-clock-budgeted yield/resume from durable watermarks with no lost or repeated work and re-fold determinism preserved \u2014 is a nameable intelligence-bound opus gate at the contract-shaped xhigh band.\",\"confidence\":0.79},{\"task_id\":\"fn-1389-scale-event-store-maintenance-off-the.2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Substantial but well-specified throughput work atop task-1's budget seam with a nameable acceptance (drain to watermark, keep-set invariants already test-guarded, sub-5s ingest freshness) routes GPT-first to the multi-file workhorse at the model-default band.\",\"confidence\":0.72},{\"task_id\":\"fn-1389-scale-event-store-maintenance-off-the.3\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Multi-surface but well-specified observability work \u2014 a status lag field, a bounded distress mint/clear following established projection patterns, and one attributed breach log line, each with a pinned deterministic test \u2014 routes GPT-first to the substantial-implementation tier at high.\",\"confidence\":0.71}]}\n"
+}
