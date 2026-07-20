@@ -85,7 +85,24 @@ function claudeObservation(): Observation {
         rateLimitMultiplier: 20,
       },
     },
-    account_issues: { "claude-swap:1": "relogin-required" },
+    account_measurements: {
+      "claude-swap:1": {
+        measuredAtMs: NOW - 85 * 60_000,
+        windows: [
+          {
+            key: "session",
+            utilization: 0.25,
+            resetsAt: new Date(NOW + 2 * 60 * 60_000).toISOString(),
+          },
+          {
+            key: "week",
+            utilization: 0.5,
+            resetsAt: new Date(NOW + 24 * 60 * 60_000).toISOString(),
+          },
+        ],
+      },
+    },
+    account_issues: { "claude-swap:1": "usage-unavailable" },
     notes: [],
   };
 }
@@ -139,8 +156,9 @@ describe("usage observation view", () => {
     const text = renderUsageLines(snapshot).join("\n");
 
     expect(text).toContain("[claude] fresh 0s");
-    expect(text).toContain("Claude 1 · Pro 1×  [issue] · relogin-required");
+    expect(text).toContain("Claude 1 · Pro 1×  [unavailable] · measured 1h");
     expect(text).toContain("Claude 2 · Max 20×  measured 0s");
+    expect(text).toContain("25%");
     expect(text).toContain("weekly");
     expect(text).toContain("Fable");
     expect(text).toContain("[codex] fresh 0s");

@@ -3,6 +3,7 @@ import {
   type CapacityMultiplier,
   type ClaudeSubscriptionType,
   isObservationFresh,
+  type NormalizedWindow,
   type Observation,
   readObservationSidecar,
 } from "./account-observation";
@@ -110,6 +111,15 @@ function resetAtFromIso(value: string | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function claudeMeters(windows: NormalizedWindow[]): UsageMeter[] {
+  return windows.map((window) => ({
+    key: window.key,
+    label: claudeMeterLabel(window.key),
+    usedPercent: window.utilization * 100,
+    resetAtMs: resetAtFromIso(window.resetsAt),
+  }));
+}
+
 function buildClaudeSource(
   observation: Observation,
   nowMs: number,
@@ -134,6 +144,7 @@ function buildClaudeSource(
   const accounts = ordered.map(([routeId, ordinal]): UsageAccount => {
     const issue = observation.account_issues[routeId] ?? null;
     const route = routes.get(routeId);
+    const measurement = observation.account_measurements?.[routeId];
     const capacity = observation.account_capacity?.[routeId];
     const capacityFields = {
       ...(capacity?.subscriptionType === undefined
@@ -144,14 +155,20 @@ function buildClaudeSource(
         : { capacityMultiplier: capacity.rateLimitMultiplier }),
     };
     if (issue !== null || route === undefined) {
+      const usageUnavailable = issue === "usage-unavailable";
       return {
         id: `Claude ${ordinal + 1}`,
         sourceId: routeId,
-        status: "issue",
-        detail: issue ?? "account unavailable",
+        status: usageUnavailable ? "unavailable" : "issue",
+        detail: usageUnavailable ? null : (issue ?? "account unavailable"),
         ...capacityFields,
-        measuredAtMs: null,
-        meters: [],
+        measuredAtMs: usageUnavailable
+          ? (measurement?.measuredAtMs ?? null)
+          : null,
+        meters:
+          usageUnavailable && measurement !== undefined
+            ? claudeMeters(measurement.windows)
+            : [],
       };
     }
     return {
@@ -161,12 +178,7 @@ function buildClaudeSource(
       detail: null,
       ...capacityFields,
       measuredAtMs: route.measuredAtMs,
-      meters: route.windows.map((window) => ({
-        key: window.key,
-        label: claudeMeterLabel(window.key),
-        usedPercent: window.utilization * 100,
-        resetAtMs: resetAtFromIso(window.resetsAt),
-      })),
+      meters: claudeMeters(route.windows),
     };
   });
   return {

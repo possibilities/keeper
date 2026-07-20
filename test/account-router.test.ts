@@ -778,7 +778,7 @@ describe("explicit account resolution", () => {
       dir,
       observation([route(9, 0.1)], {
         count: 2,
-        accountIssues: { "claude-swap:21": "account-unavailable" },
+        accountIssues: { "claude-swap:21": "usage-unavailable" },
       }),
     );
     const unavailable = selectRouteByAccountOrdinal(1, {
@@ -787,7 +787,7 @@ describe("explicit account resolution", () => {
     });
     expect(unavailable.ok).toBe(false);
     expect(!unavailable.ok && unavailable.error).toContain(
-      "Requested account c1 cannot serve this Claude launch.\n  c1: is unavailable according to claude-swap.",
+      "Requested account c1 cannot serve this Claude launch.\n  c1: has unavailable usage according to claude-swap.",
     );
     expect(
       selectRouteByAccountOrdinal(2, { stateDir: dir, nowMs: NOW }),

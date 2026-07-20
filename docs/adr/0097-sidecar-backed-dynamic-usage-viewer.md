@@ -29,9 +29,11 @@ stable key and display label, optional bounded duration, utilization, and reset 
 
 Provider account metadata is independently optional and display-only. Claude-swap admits
 `subscriptionType` only as `pro` or `max` and maps exact known `rateLimitTier` values to
-multipliers `1`, `5`, or `20`. The Codex companion maps known classes only to `free`, `go`,
-`plus`, `pro`, `pro-lite`, `business`, `enterprise`, or `edu`; it exposes no multiplier
-because the usage response reports no authoritative numeric class. Invalid or unavailable
+multipliers `1`, `5`, or `20`. When usage is no longer decision-trusted, its JSON keeps
+`usageStatus: unavailable` and `usage: null` while carrying separately aged last-good meters;
+Keeper preserves those as display-only account measurements without making a route eligible.
+The Codex companion maps known classes only to `free`, `go`, `plus`, `pro`, `pro-lite`,
+`business`, `enterprise`, or `edu`; it exposes no inferred multiplier. Invalid or unavailable
 metadata is omitted without invalidating meters, and the viewer never infers a value.
 
 A Codex `limit_name` in the bounded public GPT/Codex/OpenAI namespace may label a meter.
@@ -42,9 +44,10 @@ fields never cross the boundary; canonical account category is the sole plan-adj
 
 The viewer polls once per second. Meter, value, and status changes emit history; heartbeat,
 reset, and countdown movement repaint locally without forging frames. Missing, invalid,
-stale, unavailable, exhausted, and auth states remain explicit. Headers append available
-metadata, such as `Claude 1 · Max 20×`, with no placeholder for unknown fields. Non-TTY
-output emits one snapshot through the shared view shell.
+stale, unavailable, exhausted, and auth states remain explicit. An unavailable Claude row
+with last-good data renders its aged meters under `[unavailable]`; other account failures keep
+fixed PII-free reasons. Headers append metadata such as `Claude 1 · Max 20×`, with no
+placeholder for unknown fields. Non-TTY output emits one snapshot through the shared view shell.
 
 The viewer does not join `keeper frames`: sidecars lack a daemon Fold cursor and reconnect
 coverage claim, so inclusion would misrepresent provenance.

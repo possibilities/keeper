@@ -169,6 +169,60 @@ describe("parseCswapList", () => {
     expect(JSON.stringify(parsed)).not.toContain("private-enterprise-plan");
   });
 
+  test("keeps display-grade last-good usage separate from routing", () => {
+    const fetchedAt = "2026-07-17T22:30:00Z";
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(5, {
+            usageStatus: "unavailable",
+            usage: undefined,
+            usageFetchedAt: undefined,
+            usageAgeSeconds: undefined,
+            lastGoodUsage: {
+              fiveHour: { pct: 25, resetsAt: "2026-07-18T02:00:00Z" },
+              sevenDay: { pct: 50, resetsAt: "2026-07-20T00:00:00Z" },
+              scoped: [],
+            },
+            lastGoodFetchedAt: fetchedAt,
+            lastGoodAgeSeconds: 5_400,
+          }),
+          account(6, {
+            usageStatus: "unavailable",
+            usage: undefined,
+            usageFetchedAt: undefined,
+            lastGoodUsage: { fiveHour: { pct: "owner@example.test" } },
+            lastGoodFetchedAt: "owner@example.test",
+          }),
+        ]),
+      ),
+      NOW,
+    );
+    expect(parsed.routes).toEqual([]);
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:5": "usage-unavailable",
+      "claude-swap:6": "usage-unavailable",
+    });
+    expect(parsed.accountMeasurements).toEqual({
+      "claude-swap:5": {
+        measuredAtMs: Date.parse(fetchedAt),
+        windows: [
+          {
+            key: "session",
+            utilization: 0.25,
+            resetsAt: "2026-07-18T02:00:00.000Z",
+          },
+          {
+            key: "week",
+            utilization: 0.5,
+            resetsAt: "2026-07-20T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("owner@example.test");
+  });
+
   test("maps unknown provider statuses without retaining provider text", () => {
     const parsed = parseCswapList(
       outcome(
@@ -439,6 +493,17 @@ describe("schema-v7 observation sidecar", () => {
           "claude-swap:99": {
             subscriptionType: "max",
             rateLimitMultiplier: 20,
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_measurements: {
+          "claude-swap:6": {
+            measuredAtMs: NOW - 5_400_000,
+            windows: observation.routes[0]?.windows,
           },
         },
       }),

@@ -16,7 +16,7 @@ A Capacity observation's freshness is the age of Keeper's completed, validated c
 
 Keeper admits an Account route only when its row has a positive stable slot, `usageStatus: ok`, valid measurement provenance, structurally valid quota windows, and the required session and weekly meters. Fable work additionally requires a valid Fable meter. Known non-`ok` statuses, malformed or unsupported responses, missing required fields, stale Capacity observations, and exhausted raw quota values remain fail-closed.
 
-Keeper does not apply an independent maximum age to an admitted measurement and does not reinterpret an emitted utilization after its reset timestamp. Reset timestamps remain available for Usage view countdowns and Account focus lifetime checks. When both claude-swap freshness fields are valid, `usageFetchedAt` is canonical; clock skew affects diagnostics rather than eligibility.
+Keeper does not apply an independent maximum age to an admitted measurement and does not reinterpret an emitted utilization after its reset timestamp. Reset timestamps remain available for Usage view countdowns and Account focus lifetime checks. When both claude-swap freshness fields are valid, `usageFetchedAt` is canonical; clock skew affects diagnostics rather than eligibility. Separately marked last-good fields may supply aged Usage view meters for a non-`ok` row, but never an Account route.
 
 The transient Capacity observation schema changes with this semantic boundary so an observation produced under a different admission policy is incompatible rather than ambiguously reusable.
 

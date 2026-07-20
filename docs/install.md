@@ -125,11 +125,12 @@ target, lifetime, eligibility, outcome, reason, and delivery diagnostic independ
 
 Use the read-only account check for Capacity observation health, candidate Account routes, and the
 ordinary route choice; it records no Launch reservation. Use the focus view for durable policy, effective
-state, target, lifetime, fallback, and delivery diagnostic. `keeper usage` renders the admitted raw meters:
-the source age is whole-snapshot Capacity freshness, while each Claude account's `measured` age is
-provenance only. Account headers also show a bounded provider account category and, only when the producer
-reports one explicitly, a capacity multiplier such as `Claude 1 · Max 20×`. Unknown values are omitted,
-never guessed. These surfaces are PII-free.
+state, target, lifetime, fallback, and delivery diagnostic. `keeper usage` renders provider meters: only
+cswap's decision-trusted `usage` can supply an Account route, while separately marked last-good data remains
+visible under `[unavailable]` with its `measured` age and cannot authorize a launch. The source age is
+whole-snapshot Capacity freshness. Account headers also show a bounded provider account category and, only
+when the producer reports one explicitly, a capacity multiplier such as `Claude 1 · Max 20×`. Unknown values
+are omitted, never guessed. These surfaces are PII-free.
 
 ```sh
 keeper agent accounts check --json

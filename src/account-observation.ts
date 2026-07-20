@@ -39,6 +39,11 @@ export interface AccountCapacityMetadata {
   rateLimitMultiplier?: CapacityMultiplier;
 }
 
+export interface AccountUsageMeasurement {
+  windows: NormalizedWindow[];
+  measuredAtMs: number;
+}
+
 /** Every current Claude route is a claude-swap managed slot. */
 export type RouteKind = "managed";
 
@@ -64,6 +69,7 @@ export type AccountObservationIssue =
   | "keychain-unavailable"
   | "no-credentials"
   | "api-key"
+  | "usage-unavailable"
   | "account-unavailable"
   | "missing-freshness"
   | "missing-windows"
@@ -83,6 +89,8 @@ export interface Observation {
   claude_accounts: ClaudeAccountDisplay;
   /** Optional managed route id → bounded account-category/capacity metadata. */
   account_capacity?: Record<string, AccountCapacityMetadata>;
+  /** Display-grade last-good usage for unavailable, unrouteable accounts. */
+  account_measurements?: Record<string, AccountUsageMeasurement>;
   /** Managed route id → bounded PII-free reason the account was excluded. */
   account_issues: Record<string, AccountObservationIssue>;
   notes: string[];
@@ -101,6 +109,7 @@ export interface CswapInventory {
   routes: Route[];
   accountOrdinals: Record<string, number>;
   accountCapacity: Record<string, AccountCapacityMetadata>;
+  accountMeasurements: Record<string, AccountUsageMeasurement>;
   accountIssues: Record<string, AccountObservationIssue>;
   notes: string[];
 }
@@ -178,6 +187,8 @@ function statusIssue(status: unknown): AccountObservationIssue {
       return "no-credentials";
     case "api_key":
       return "api-key";
+    case "unavailable":
+      return "usage-unavailable";
     default:
       return "account-unavailable";
   }
@@ -205,6 +216,7 @@ function emptyInventory(
     routes: [],
     accountOrdinals: {},
     accountCapacity: {},
+    accountMeasurements: {},
     accountIssues: {},
     notes: [note],
   };
@@ -247,6 +259,7 @@ export function parseCswapList(
   const notes: string[] = [];
   const accountOrdinals: Record<string, number> = {};
   const accountCapacity: Record<string, AccountCapacityMetadata> = {};
+  const accountMeasurements: Record<string, AccountUsageMeasurement> = {};
   const accountIssues: Record<string, AccountObservationIssue> = {};
   const seenAccounts = new Set<number>();
   const seenRoutes = new Set<number>();
@@ -265,6 +278,8 @@ export function parseCswapList(
         accountOrdinals[routeId] = seenAccounts.size - 1;
         const capacity = parseAccountCapacity(row);
         if (capacity !== null) accountCapacity[routeId] = capacity;
+        const measurement = parseLastGoodMeasurement(row, nowMs);
+        if (measurement !== null) accountMeasurements[routeId] = measurement;
       }
     }
 
@@ -295,6 +310,7 @@ export function parseCswapList(
     routes,
     accountOrdinals,
     accountCapacity,
+    accountMeasurements,
     accountIssues,
     notes: boundNotes(notes),
   };
@@ -317,6 +333,22 @@ function parseAccountCapacity(
   return Object.keys(capacity).length === 0 ? null : capacity;
 }
 
+function parseLastGoodMeasurement(
+  row: Record<string, unknown>,
+  nowMs: number,
+): AccountUsageMeasurement | null {
+  if (row.usageStatus !== "unavailable") return null;
+  const measuredAtMs = measuredAtMsFrom(
+    row.lastGoodFetchedAt,
+    row.lastGoodAgeSeconds,
+    nowMs,
+  );
+  if (measuredAtMs === null) return null;
+  const parsed = parseCswapWindows(row.lastGoodUsage);
+  if (parsed.scopedMalformed || parsed.windows.length === 0) return null;
+  return { windows: parsed.windows, measuredAtMs };
+}
+
 function parseCswapAccount(
   row: unknown,
   nowMs: number,
@@ -332,7 +364,11 @@ function parseCswapAccount(
       issue: statusIssue(row.usageStatus),
     };
   }
-  const measuredAtMs = cswapMeasuredAtMs(row, nowMs);
+  const measuredAtMs = measuredAtMsFrom(
+    row.usageFetchedAt,
+    row.usageAgeSeconds,
+    nowMs,
+  );
   if (measuredAtMs === null) {
     return {
       note: `cswap: slot ${slot} has no freshness signal`,
@@ -367,13 +403,14 @@ function parseCswapAccount(
   };
 }
 
-function cswapMeasuredAtMs(
-  row: Record<string, unknown>,
+function measuredAtMsFrom(
+  fetchedAt: unknown,
+  ageSeconds: unknown,
   nowMs: number,
 ): number | null {
-  const fetched = tzAwareEpochMs(row.usageFetchedAt);
+  const fetched = tzAwareEpochMs(fetchedAt);
   if (fetched !== null) return fetched;
-  const age = row.usageAgeSeconds;
+  const age = ageSeconds;
   if (typeof age === "number" && Number.isFinite(age) && age >= 0) {
     const measuredAtMs = nowMs - age * 1000;
     return Number.isFinite(measuredAtMs) ? measuredAtMs : null;
@@ -456,6 +493,9 @@ export function buildObservation(input: {
     ...(Object.keys(cswap.accountCapacity).length === 0
       ? {}
       : { account_capacity: { ...cswap.accountCapacity } }),
+    ...(Object.keys(cswap.accountMeasurements).length === 0
+      ? {}
+      : { account_measurements: { ...cswap.accountMeasurements } }),
     account_issues: { ...cswap.accountIssues },
     notes: boundNotes(cswap.notes),
   };
@@ -509,8 +549,16 @@ export function validateObservation(data: unknown): Observation | null {
     display,
   );
   if (accountCapacity === null) return null;
+  const accountMeasurements = validateAccountMeasurements(
+    data.account_measurements,
+    display,
+  );
+  if (accountMeasurements === null) return null;
   const accountIssues = validateAccountIssues(data.account_issues, display);
   if (accountIssues === null) return null;
+  for (const routeId of Object.keys(accountMeasurements)) {
+    if (accountIssues[routeId] !== "usage-unavailable") return null;
+  }
 
   const routes: Route[] = [];
   const routeIds = new Set<string>();
@@ -543,9 +591,46 @@ export function validateObservation(data: unknown): Observation | null {
     ...(Object.keys(accountCapacity).length === 0
       ? {}
       : { account_capacity: accountCapacity }),
+    ...(Object.keys(accountMeasurements).length === 0
+      ? {}
+      : { account_measurements: accountMeasurements }),
     account_issues: accountIssues,
     notes: boundNotes(notes),
   };
+}
+
+function validateAccountMeasurements(
+  data: unknown,
+  display: ClaudeAccountDisplay,
+): Record<string, AccountUsageMeasurement> | null {
+  if (data === undefined) return {};
+  if (!isRecord(data)) return null;
+  const measurements: Record<string, AccountUsageMeasurement> = {};
+  for (const [routeId, value] of Object.entries(data)) {
+    if (
+      display.ordinals[routeId] === undefined ||
+      !isRecord(value) ||
+      typeof value.measuredAtMs !== "number" ||
+      !Number.isFinite(value.measuredAtMs) ||
+      !Array.isArray(value.windows) ||
+      value.windows.length === 0
+    ) {
+      return null;
+    }
+    const windows: NormalizedWindow[] = [];
+    const keys = new Set<string>();
+    for (const raw of value.windows) {
+      const window = validateWindow(raw);
+      if (window === null || keys.has(window.key.toLowerCase())) return null;
+      keys.add(window.key.toLowerCase());
+      windows.push(window);
+    }
+    measurements[routeId] = {
+      measuredAtMs: value.measuredAtMs,
+      windows,
+    };
+  }
+  return measurements;
 }
 
 function validateAccountCapacity(
@@ -610,6 +695,7 @@ function isAccountObservationIssue(
     value === "keychain-unavailable" ||
     value === "no-credentials" ||
     value === "api-key" ||
+    value === "usage-unavailable" ||
     value === "account-unavailable" ||
     value === "missing-freshness" ||
     value === "missing-windows" ||

@@ -354,6 +354,8 @@ function issueMessage(issue: LaunchRouteIssue, route: Route | null): string {
       return "has no usable credentials";
     case "api-key":
       return "has no subscription quota (API-key account)";
+    case "usage-unavailable":
+      return "has unavailable usage according to claude-swap";
     case "account-unavailable":
       return "is unavailable according to claude-swap";
     case "missing-freshness":
