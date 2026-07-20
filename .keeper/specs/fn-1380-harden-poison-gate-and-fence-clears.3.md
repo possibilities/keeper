@@ -64,5 +64,5 @@ resolve is idempotent.
 - [ ] The operator verb refuses double-resolution idempotently
 
 ## Done summary
-
+Added a full poison dead-letter lifecycle: current-parser re-classification preserving original event ts, an audited force-gated resolve_dead_letter RPC + keeper dead-letter CLI verb, both commit-gate predicates and retention prune taught the full terminal-status vocabulary, and the CLAUDE.md RPC-surface guardrail updated to nine surfaces.
 ## Evidence
