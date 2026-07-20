@@ -23,5 +23,5 @@ the breach window.
   active-pass marker and asserts the single line.
 
 ## Done summary
-
+Surfaced ingest lag (keeper status --json), a bounded events-ingest-stalled distress mint/clear, and a one-shot busy-lag breach-streak attribution log naming the active maintenance pass.
 ## Evidence

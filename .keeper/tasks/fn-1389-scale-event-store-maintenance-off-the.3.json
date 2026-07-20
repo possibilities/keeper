@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Surface ingest lag and breach-time cause",
-  "updated_at": "2026-07-20T19:52:27.952000Z"
+  "updated_at": "2026-07-20T20:48:49.515000Z",
+  "worker_done_at": "2026-07-20T20:48:49.515000Z"
 }
