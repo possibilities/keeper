@@ -56,5 +56,5 @@ and that a genuinely unparseable birth still mints poison.
 - [ ] The retention prune ages out the new status; re-parking the same record is idempotent
 
 ## Done summary
-
+Parseable stuck birth records (grant denied immediately, or wait past the existing grace, or a perpetually-throwing mint) now park under a new non-blocking birth-stuck dead-letters status with real session_id/cwd/pid preserved, exported as BIRTH_STUCK_STATUS for the later commit-work-gate task; only genuinely unparseable birth-tree bytes still mint poison, and the retention prune ages out birth-stuck rows.
 ## Evidence
