@@ -19,7 +19,10 @@ export type CodexDelegate = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
-export type CodexPoolProofFaultClass = Exclude<PoolFailureClass, "other">;
+export type CodexPoolProofFaultClass = Exclude<
+  PoolFailureClass,
+  "context" | "other"
+>;
 export type CodexPoolProofFaultPhase = "pre-output" | "mid-stream";
 
 export interface CodexPoolProofFaultRequest {
@@ -140,6 +143,13 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
     return "rate";
   }
   if (
+    /context.?window|context.?length|prompt (?:is )?too long|input (?:is )?too long|maximum prompt length|reduce the length of (?:the )?messages|request_too_large|model_context_window_exceeded|token limit exceeded/i.test(
+      message,
+    )
+  ) {
+    return "context";
+  }
+  if (
     /unauthori[sz]ed|forbidden|invalid.?token|expired.?token|\b40[13]\b/i.test(
       message,
     )
@@ -147,7 +157,7 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
     return "auth";
   }
   if (
-    /network|fetch|socket|websocket|connection|timed? ?out|timeout|econn|dns|service unavailable|\b50[0234]\b/i.test(
+    /network|fetch|socket|websocket|connection|timed? ?out|timeout|econn|dns|service unavailable|overload|upstream|internal server|server error|temporar(?:y|ily)|try again|request failed|response failed|something went wrong|error processing|\b50[0234]\b/i.test(
       message,
     )
   ) {
@@ -157,7 +167,20 @@ export function classifyPoolFailure(message: string): PoolFailureClass {
 }
 
 function retryable(failureClass: PoolFailureClass): boolean {
-  return failureClass !== "other";
+  return ["quota", "rate", "auth", "transport"].includes(failureClass);
+}
+
+function shouldRetrySameAlias(
+  failureClass: PoolFailureClass,
+  delegatedAttempts: number,
+  routes: PoolRouteState,
+  excluded: ReadonlySet<string>,
+): boolean {
+  return (
+    failureClass === "transport" &&
+    delegatedAttempts < 2 &&
+    !routes.hasEligibleRoute(excluded)
+  );
 }
 
 function substantive(
@@ -220,7 +243,9 @@ function sanitizedErrorEvent(
       ? "request-aborted"
       : failureClass === "deadline"
         ? "pool-deadline-exceeded"
-        : `pool-${failureClass}-failure`;
+        : failureClass === "context"
+          ? "context_length_exceeded"
+          : `pool-${failureClass}-failure`;
   return {
     type: "error",
     reason,
@@ -455,6 +480,7 @@ export function createPooledCodexStream(
   void (async () => {
     const excluded = new Set<string>();
     let delegatedAttempts = 0;
+    let retryAlias: string | undefined;
     let lastFailure: PoolFailureClass = "other";
     let lastErrorMessage: AssistantMessage | undefined;
 
@@ -476,7 +502,8 @@ export function createPooledCodexStream(
 
       let alias: string;
       try {
-        alias = deps.routes.select(sessionId, excluded);
+        alias = retryAlias ?? deps.routes.select(sessionId, excluded);
+        retryAlias = undefined;
       } catch {
         if (delegatedAttempts === 0) {
           startNativeFallback(output, deps, model, context, options);
@@ -582,6 +609,16 @@ export function createPooledCodexStream(
             if (!exposedSubstantive && retryable(failureClass)) {
               deps.routes.recordFailure(sessionId, alias, failureClass);
               excluded.add(alias);
+              if (
+                shouldRetrySameAlias(
+                  failureClass,
+                  delegatedAttempts,
+                  deps.routes,
+                  excluded,
+                )
+              ) {
+                retryAlias = alias;
+              }
               break;
             }
             if (bufferedStart) output.push(bufferedStart);
@@ -597,6 +634,17 @@ export function createPooledCodexStream(
           lastFailure = "transport";
           deps.routes.recordFailure(sessionId, alias, lastFailure);
           excluded.add(alias);
+          if (
+            !exposedSubstantive &&
+            shouldRetrySameAlias(
+              lastFailure,
+              delegatedAttempts,
+              deps.routes,
+              excluded,
+            )
+          ) {
+            retryAlias = alias;
+          }
           if (exposedSubstantive) {
             output.push(sanitizedErrorEvent(model, "error", lastFailure));
             terminal = true;
@@ -609,6 +657,17 @@ export function createPooledCodexStream(
         lastFailure = failureClass;
         deps.routes.recordFailure(sessionId, alias, failureClass);
         excluded.add(alias);
+        if (
+          !exposedSubstantive &&
+          shouldRetrySameAlias(
+            failureClass,
+            delegatedAttempts,
+            deps.routes,
+            excluded,
+          )
+        ) {
+          retryAlias = alias;
+        }
         if (options?.signal?.aborted) {
           output.push(sanitizedErrorEvent(model, "aborted", failureClass));
           terminal = true;
@@ -624,7 +683,8 @@ export function createPooledCodexStream(
       }
       if (
         delegatedAttempts >= 2 ||
-        excluded.size >= deps.routes.aliases.length
+        (retryAlias === undefined &&
+          excluded.size >= deps.routes.aliases.length)
       ) {
         output.push(
           sanitizedErrorEvent(model, "error", lastFailure, lastErrorMessage),

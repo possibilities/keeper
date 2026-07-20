@@ -23,7 +23,10 @@ import {
   MemoryCredentialStorage,
   writePrivateJsonAtomic,
 } from "../src/auth.ts";
-import { createPooledCodexStream } from "../src/pool.ts";
+import {
+  classifyPoolFailure,
+  createPooledCodexStream,
+} from "../src/pool.ts";
 import { PoolRouteState, PoolStateStore } from "../src/state.ts";
 
 const MODEL = {
@@ -1049,6 +1052,215 @@ describe("pooled Codex stream", () => {
       ]);
       expect(JSON.stringify(events)).not.toContain("hidden-secret");
     }
+  });
+
+  test("surfaces context overflow for Pi recovery without cooling the account", async () => {
+    let calls = 0;
+    const routes = new PoolRouteState(
+      ["keeper-codex-a", "keeper-codex-b"],
+      null,
+      () => 100,
+    );
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes,
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: () => {
+          calls += 1;
+          return stream([
+            { type: "start", partial: message() },
+            {
+              type: "error",
+              reason: "error",
+              error: message(
+                "error",
+                "Your input exceeds the context window Bearer private-value",
+              ),
+            },
+          ]) as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "context-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(calls).toBe(1);
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      "context_length_exceeded",
+    );
+    expect(JSON.stringify(events)).not.toContain("private-value");
+    expect(routes.routeFor("context-session")).toBe("keeper-codex-a");
+    expect(
+      routes.snapshot().accounts.every((account) => account.cooldown_until_ms === 0),
+    ).toBe(true);
+  });
+
+  test("retries recognized transient provider failures on another account", async () => {
+    let calls = 0;
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes: new PoolRouteState(
+          ["keeper-codex-a", "keeper-codex-b"],
+          null,
+          () => 100,
+        ),
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: () => {
+          calls += 1;
+          return calls === 1
+            ? (stream([
+                { type: "start", partial: message() },
+                {
+                  type: "error",
+                  reason: "error",
+                  error: message(
+                    "error",
+                    "Codex error: internal server error Bearer private-value",
+                  ),
+                },
+              ]) as any)
+            : (stream([
+                { type: "start", partial: message() },
+                { type: "done", reason: "stop", message: message() },
+              ]) as any);
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "transient-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(calls).toBe(2);
+    expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+    expect(JSON.stringify(events)).not.toContain("private-value");
+    for (const message of [
+      "Codex response failed",
+      "server overloaded; try again",
+      "upstream connect error",
+    ]) {
+      expect(classifyPoolFailure(message)).toBe("transport");
+    }
+  });
+
+  test("retries the same alias once when no healthy alternate exists", async () => {
+    const aliases = ["keeper-codex-a", "keeper-codex-b"];
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => 100,
+      "keeper-codex-b",
+    );
+    routes.recordFailure("depleted", "keeper-codex-a", "quota");
+    const apiKeys: Array<string | undefined> = [];
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes,
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: (_model, _context, options) => {
+          apiKeys.push(options?.apiKey);
+          return apiKeys.length === 1
+            ? (stream([
+                { type: "start", partial: message() },
+                {
+                  type: "error",
+                  reason: "error",
+                  error: message("error", "server overloaded; please retry"),
+                },
+              ]) as any)
+            : (stream([
+                { type: "start", partial: message() },
+                { type: "done", reason: "stop", message: message() },
+              ]) as any);
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "degraded-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(apiKeys).toEqual(["fake-access-b", "fake-access-b"]);
+    expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+  });
+
+  test("keeps the retried alias sticky when its second attempt overflows context", async () => {
+    const aliases = ["keeper-codex-a", "keeper-codex-b"];
+    const routes = new PoolRouteState(
+      aliases,
+      null,
+      () => 100,
+      "keeper-codex-b",
+    );
+    routes.recordFailure("depleted", "keeper-codex-a", "quota");
+    const apiKeys: Array<string | undefined> = [];
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes,
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: (_model, _context, options) => {
+          apiKeys.push(options?.apiKey);
+          return stream([
+            { type: "start", partial: message() },
+            {
+              type: "error",
+              reason: "error",
+              error: message(
+                "error",
+                apiKeys.length === 1
+                  ? "server overloaded; please retry"
+                  : "Your input exceeds the context window Bearer private-value",
+              ),
+            },
+          ]) as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "degraded-overflow-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(apiKeys).toEqual(["fake-access-b", "fake-access-b"]);
+    expect((events.at(-1) as any).error.errorMessage).toBe(
+      "context_length_exceeded",
+    );
+    expect(routes.routeFor("degraded-overflow-session")).toBe(
+      "keeper-codex-b",
+    );
+    expect(
+      routes
+        .snapshot()
+        .accounts.find((account) => account.alias === "keeper-codex-b")
+        ?.cooldown_until_ms,
+    ).toBe(60_100);
+    expect(JSON.stringify(events)).not.toContain("private-value");
   });
 
   test("does not retry an unclassified failure before output", async () => {

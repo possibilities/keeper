@@ -132,7 +132,9 @@ interface RouteEvidence {
 function eventFailureClass(event: AssistantMessageEvent): ReportFailureClass {
   if (event.type !== "error") return "none";
   const classified = classifyPoolFailure(event.error.errorMessage ?? "");
-  return classified === "other" ? "none" : classified;
+  return classified === "other" || classified === "context"
+    ? "none"
+    : classified;
 }
 
 function isSubstantiveEvent(event: AssistantMessageEvent): boolean {

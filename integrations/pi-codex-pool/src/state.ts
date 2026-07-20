@@ -20,6 +20,7 @@ export type PoolFailureClass =
   | "rate"
   | "auth"
   | "transport"
+  | "context"
   | "other";
 
 export interface AccountState {
@@ -272,6 +273,14 @@ export class PoolRouteState {
     return selected.alias;
   }
 
+  hasEligibleRoute(excluded: ReadonlySet<string> = new Set()): boolean {
+    const now = this.now();
+    return this.state.accounts.some(
+      (account) =>
+        !excluded.has(account.alias) && account.cooldown_until_ms <= now,
+    );
+  }
+
   recordSuccess(sessionId: string, alias: string): void {
     const account = this.account(alias);
     if (!account) return;
@@ -292,15 +301,18 @@ export class PoolRouteState {
       account.pressure = Math.max(0, account.pressure - 1);
       account.pressure_expires_at_ms =
         account.pressure === 0 ? 0 : account.pressure_expires_at_ms;
-      if (failureClass !== "other") {
+      if (failureClass !== "other" && failureClass !== "context") {
         account.cooldown_until_ms = Math.max(
           account.cooldown_until_ms,
           this.now() + FAILURE_COOLDOWN_MS,
         );
       }
     }
-    if (this.routes.get(sessionId)?.alias === alias)
+    if (failureClass === "context") {
+      this.touchRoute(sessionId, { alias, touched_at_ms: this.now() });
+    } else if (this.routes.get(sessionId)?.alias === alias) {
       this.routes.delete(sessionId);
+    }
     this.persist();
   }
 
