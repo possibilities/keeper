@@ -75,7 +75,9 @@ import {
   sendBusArtifact,
 } from "../bus-artifact";
 import {
+  type CodexObservationRefreshFailureState,
   makeCodexBoundedRunner,
+  readCodexObservationRefreshFailureState,
   refreshCodexObservationIfStale,
 } from "../codex-account-observation-refresh";
 import {
@@ -288,7 +290,9 @@ export interface CodexSessionRoutingInspection {
     health: PiCodexPoolExtensionResolution["health"];
     problem_code: PiCodexPoolExtensionResolution["problem_code"];
   };
-  capacity: CodexRoutingInspection;
+  capacity: CodexRoutingInspection & {
+    refresh_failure_state?: CodexObservationRefreshFailureState | null;
+  };
 }
 
 export type CodexPoolOperatorOperation =
@@ -641,7 +645,12 @@ function productionCodexSessionInspection(
   env: NodeJS.ProcessEnv,
 ): CodexSessionRoutingInspection {
   const companion = resolvePiCodexPoolExtension();
-  const capacity = inspectCodexRouting();
+  const capacity = {
+    ...inspectCodexRouting(),
+    refresh_failure_state: readCodexObservationRefreshFailureState(
+      resolveCodexAccountRoutingRoot(),
+    ),
+  };
   const launch = productionCodexPoolLaunchContext(env);
   return {
     activation: {
@@ -3114,10 +3123,15 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
         `fable-left=${c.fable_remaining === null ? "none" : c.fable_remaining.toFixed(3)}\n`,
     );
   }
+  const refreshFailure = codex.capacity.refresh_failure_state;
+  const refreshFailureText =
+    refreshFailure === undefined || refreshFailure === null
+      ? "none"
+      : `count=${refreshFailure.consecutive_failures} last=${refreshFailure.last_failure_class ?? "none"}@${refreshFailure.last_failure_at_ms ?? "none"}`;
   deps.write(
     `codex session routing: activation=${codex.activation.mode} ` +
       `companion=${codex.companion.health} capacity=${codex.capacity.health} ` +
-      `fresh=${codex.capacity.fresh}\n`,
+      `fresh=${codex.capacity.fresh} refresh-failures=${refreshFailureText}\n`,
   );
   if (codex.activation.mode === "active-degraded") {
     deps.write(

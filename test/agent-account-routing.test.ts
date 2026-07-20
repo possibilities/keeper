@@ -990,6 +990,12 @@ describe("keeper agent accounts check", () => {
         config_binding: "a".repeat(64),
         observed_at_ms: 1000,
         fresh: true,
+        refresh_failure_state: {
+          schema_version: 1 as const,
+          consecutive_failures: 3,
+          last_failure_class: "timeout" as const,
+          last_failure_at_ms: 1_234,
+        },
         verdict: {
           kind: "pooled" as const,
           provider: "openai-codex" as const,
@@ -1029,6 +1035,14 @@ describe("keeper agent accounts check", () => {
     expect(await expectExit(main(h.deps))).toBe(0);
     const output = JSON.parse(h.out.join(""));
     expect(output.codex_session_routing).toEqual(codex);
+    expect(output.codex_session_routing.capacity.refresh_failure_state).toEqual(
+      {
+        schema_version: 1,
+        consecutive_failures: 3,
+        last_failure_class: "timeout",
+        last_failure_at_ms: 1_234,
+      },
+    );
     expect(output.claude_launch_routing.would_choose.id).toBe("claude-swap:2");
     expect(codexReads).toBe(1);
     expect(h.routerCalls()).toBe(0);

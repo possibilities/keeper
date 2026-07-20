@@ -1,4 +1,17 @@
-import { mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import {
   CODEX_MAX_OBSERVER_OUTPUT_BYTES,
   CODEX_OBSERVER_TIMEOUT_MS,
@@ -10,6 +23,7 @@ import {
   type CodexCapacityObservation,
   type CodexObserverRunOutcome,
   isCodexObservationFresh,
+  parseCodexObserverEnvelope,
   parseCodexObserverOutcome,
   readCodexObservationSidecar,
   writeCodexObservationSidecar,
@@ -19,6 +33,187 @@ import { FileLock } from "./file-lock";
 export type CodexExactArgvRunner = (
   argv: readonly string[],
 ) => Promise<CodexObserverRunOutcome>;
+
+export type CodexObservationRefreshFailureClass =
+  | "spawn"
+  | "timeout"
+  | "unavailable-envelope"
+  | "parse";
+
+export interface CodexObservationRefreshFailureState {
+  schema_version: 1;
+  consecutive_failures: number;
+  last_failure_class: CodexObservationRefreshFailureClass | null;
+  last_failure_at_ms: number | null;
+}
+
+const CODEX_REFRESH_FAILURE_SCHEMA_VERSION = 1;
+const CODEX_REFRESH_FAILURE_MAX_BYTES = 512;
+
+export function codexObservationRefreshFailureSidecarPath(
+  stateDir: string,
+): string {
+  return join(stateDir, "observation-refresh-failures.json");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRefreshFailureClass(
+  value: unknown,
+): value is CodexObservationRefreshFailureClass {
+  return (
+    value === "spawn" ||
+    value === "timeout" ||
+    value === "unavailable-envelope" ||
+    value === "parse"
+  );
+}
+
+function parseRefreshFailureState(
+  value: unknown,
+): CodexObservationRefreshFailureState | null {
+  if (
+    !isRecord(value) ||
+    value.schema_version !== CODEX_REFRESH_FAILURE_SCHEMA_VERSION
+  ) {
+    return null;
+  }
+  const count = value.consecutive_failures;
+  const failureClass = value.last_failure_class;
+  const failureAt = value.last_failure_at_ms;
+  if (
+    typeof count !== "number" ||
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    count > Number.MAX_SAFE_INTEGER ||
+    (failureClass !== null && !isRefreshFailureClass(failureClass)) ||
+    (failureAt !== null &&
+      (typeof failureAt !== "number" ||
+        !Number.isSafeInteger(failureAt) ||
+        failureAt < 0)) ||
+    (count === 0 && (failureClass !== null || failureAt !== null)) ||
+    (count > 0 && (failureClass === null || failureAt === null))
+  ) {
+    return null;
+  }
+  return {
+    schema_version: CODEX_REFRESH_FAILURE_SCHEMA_VERSION,
+    consecutive_failures: count,
+    last_failure_class:
+      failureClass as CodexObservationRefreshFailureClass | null,
+    last_failure_at_ms: failureAt as number | null,
+  };
+}
+
+export function readCodexObservationRefreshFailureState(
+  stateDir: string,
+): CodexObservationRefreshFailureState | null {
+  try {
+    const path = codexObservationRefreshFailureSidecarPath(stateDir);
+    if (!existsSync(path)) return null;
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size > CODEX_REFRESH_FAILURE_MAX_BYTES) {
+      return null;
+    }
+    return parseRefreshFailureState(JSON.parse(readFileSync(path, "utf8")));
+  } catch {
+    return null;
+  }
+}
+
+export function writeCodexObservationRefreshFailureState(
+  stateDir: string,
+  state: CodexObservationRefreshFailureState,
+): void {
+  const validated = parseRefreshFailureState(state);
+  if (validated === null)
+    throw new Error("invalid Codex refresh failure state");
+  const content = `${JSON.stringify(validated)}\n`;
+  if (Buffer.byteLength(content, "utf8") > CODEX_REFRESH_FAILURE_MAX_BYTES) {
+    throw new Error("Codex refresh failure state exceeds size limit");
+  }
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  chmodSync(stateDir, 0o700);
+  const path = codexObservationRefreshFailureSidecarPath(stateDir);
+  const temporary = join(
+    stateDir,
+    `.observation-refresh-failures.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      temporary,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+      0o600,
+    );
+    writeFileSync(fd, content, "utf8");
+    closeSync(fd);
+    fd = undefined;
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+function validTimestamp(nowMs: number): number {
+  return Number.isSafeInteger(nowMs) && nowMs >= 0 ? nowMs : 0;
+}
+
+function recordCodexObservationRefreshFailure(
+  stateDir: string,
+  failureClass: CodexObservationRefreshFailureClass,
+  nowMs: number,
+): CodexObservationRefreshFailureState {
+  const previous = readCodexObservationRefreshFailureState(stateDir);
+  const state: CodexObservationRefreshFailureState = {
+    schema_version: CODEX_REFRESH_FAILURE_SCHEMA_VERSION,
+    consecutive_failures: Math.min(
+      Number.MAX_SAFE_INTEGER,
+      (previous?.consecutive_failures ?? 0) + 1,
+    ),
+    last_failure_class: failureClass,
+    last_failure_at_ms: validTimestamp(nowMs),
+  };
+  writeCodexObservationRefreshFailureState(stateDir, state);
+  return state;
+}
+
+function resetCodexObservationRefreshFailures(stateDir: string): void {
+  writeCodexObservationRefreshFailureState(stateDir, {
+    schema_version: CODEX_REFRESH_FAILURE_SCHEMA_VERSION,
+    consecutive_failures: 0,
+    last_failure_class: null,
+    last_failure_at_ms: null,
+  });
+}
+
+function classifyCodexObservationFailure(
+  outcome: CodexObserverRunOutcome,
+): CodexObservationRefreshFailureClass {
+  if (outcome.failure === "timeout") return "timeout";
+  if (outcome.failure !== undefined) return "spawn";
+  if (outcome.code !== 0 || outcome.stdout.trim().length === 0) {
+    return "unavailable-envelope";
+  }
+  if (
+    Buffer.byteLength(outcome.stdout, "utf8") > CODEX_MAX_OBSERVER_OUTPUT_BYTES
+  ) {
+    return "parse";
+  }
+  try {
+    return parseCodexObserverEnvelope(JSON.parse(outcome.stdout)) === null
+      ? "unavailable-envelope"
+      : "parse";
+  } catch {
+    return "parse";
+  }
+}
 
 export interface CodexObserveDeps {
   runner: CodexExactArgvRunner;
@@ -59,6 +254,7 @@ export interface RefreshCodexObservationDeps extends CodexObserveDeps {
   sleep?: (ms: number) => Promise<void>;
   contentionWaitMs?: number;
   contentionTimeoutMs?: number;
+  onRefreshFailure?: (state: CodexObservationRefreshFailureState) => void;
 }
 
 const DEFAULT_CONTENTION_WAIT_MS = 100;
@@ -107,11 +303,34 @@ export async function refreshCodexObservationIfStale(
   try {
     const underLock = readFresh();
     if (underLock) return underLock;
-    const observation = await observeCodexOnce(deps);
+    let outcome: CodexObserverRunOutcome;
+    try {
+      outcome = await deps.runner(deps.observerArgv ?? codexObserverArgv());
+    } catch {
+      const failure = recordCodexObservationRefreshFailure(
+        deps.stateDir,
+        "spawn",
+        deps.nowMs(),
+      );
+      try {
+        deps.onRefreshFailure?.(failure);
+      } catch {}
+      return readCodexObservationSidecar(sidecarPath);
+    }
+    const observation = parseCodexObserverOutcome(outcome);
     if (observation === null) {
+      const failure = recordCodexObservationRefreshFailure(
+        deps.stateDir,
+        classifyCodexObservationFailure(outcome),
+        deps.nowMs(),
+      );
+      try {
+        deps.onRefreshFailure?.(failure);
+      } catch {}
       return readCodexObservationSidecar(sidecarPath);
     }
     publishCodexObservation(deps.stateDir, observation);
+    resetCodexObservationRefreshFailures(deps.stateDir);
     return observation;
   } finally {
     lock.release();
