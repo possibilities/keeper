@@ -311,7 +311,7 @@ describe("Pi command assembly", () => {
 });
 
 describe("Pi prompt-artifact preflight", () => {
-  test("managed Pi launches overwrite spoofed compiler stamps before preflight", async () => {
+  test("managed Pi canonicalizes storage and overwrites compiler stamps before preflight", async () => {
     const launcherArgvPrefix = [
       "/trusted/bin/bun",
       "/trusted/keeper/cli/keeper.ts",
@@ -321,6 +321,7 @@ describe("Pi prompt-artifact preflight", () => {
       launcherArgvPrefix,
       env: {
         PI_CODING_AGENT_DIR: "/tmp/pi-override",
+        PI_CODING_AGENT_SESSION_DIR: "/tmp/pi-sessions",
         [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: "/spoof/bun",
         [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: "/spoof/keeper.ts",
       },
@@ -330,10 +331,17 @@ describe("Pi prompt-artifact preflight", () => {
 
     expect(h.piPromptArtifactEnvSnapshots).toHaveLength(1);
     expect(h.piPromptArtifactEnvSnapshots[0]).toMatchObject({
-      PI_CODING_AGENT_DIR: "/tmp/pi-override",
       [KEEPER_AGENT_PI_PROMPT_EXECUTABLE_ENV]: launcherArgvPrefix[0],
       [KEEPER_AGENT_PI_PROMPT_CLI_ENV]: launcherArgvPrefix[1],
     });
+    expect(h.piPromptArtifactEnvSnapshots[0]).not.toHaveProperty(
+      "PI_CODING_AGENT_DIR",
+    );
+    expect(h.piPromptArtifactEnvSnapshots[0]).not.toHaveProperty(
+      "PI_CODING_AGENT_SESSION_DIR",
+    );
+    expect(h.deps.env.PI_CODING_AGENT_DIR).toBeUndefined();
+    expect(h.deps.env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
   });
 
   test("managed Pi launches preflight before state discovery and spawn", async () => {
@@ -374,6 +382,10 @@ describe("Pi prompt-artifact preflight", () => {
     const outer = piHarness(
       ["--x-tmux", "--x-tmux-detached", "--x-no-confirm", "hello"],
       {
+        env: {
+          PI_CODING_AGENT_DIR: "/tmp/pi-override",
+          PI_CODING_AGENT_SESSION_DIR: "/tmp/pi-sessions",
+        },
         launcherStateDir: mkdtempSync(join(tmpdir(), "keeper-pi-tmux-")),
         tmuxCommand: (cmd) =>
           cmd.includes("new-window")
@@ -395,6 +407,8 @@ describe("Pi prompt-artifact preflight", () => {
     expect(launchScript).toContain(
       `export ${KEEPER_AGENT_PI_PROMPT_CLI_ENV}='/fake-home/code/keeper/cli/keeper.ts'`,
     );
+    expect(launchScript).not.toContain("PI_CODING_AGENT_DIR");
+    expect(launchScript).not.toContain("PI_CODING_AGENT_SESSION_DIR");
 
     const inner = piHarness(["--x-no-confirm", "hello"]);
     await runAndCapture(inner, main);
