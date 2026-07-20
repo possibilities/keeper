@@ -106,23 +106,9 @@ export type BackstopWorker =
  *   the field is carried explicitly so the line is self-describing and a
  *   future no-op-line variant stays schema-compatible.
  * - `staleness_ms` — missed-wake: `now − last_fast_path_at`; timeout:
- *   elapsed-since-dispatch; `null` when unknown (e.g. cold boot). Kept emitting
- *   alongside `change_to_rescue_ms` (fn-771) for a before/after shakeout
- *   comparison — `staleness_ms` measures idleness-since-last-fast-path (inflates
- *   with quiet minutes), `change_to_rescue_ms` measures true change-to-rescue
- *   latency (the honest freshness signal).
+ *   elapsed-since-dispatch; `null` when unknown (e.g. cold boot).
  * - `last_fast_path_at` — epoch ms of the last confirmed fast-path fire;
  *   `null` for the `timeout` class and cold boot.
- * - `change_to_rescue_ms` — fn-771: for a `missed-wake` rescue that discharged
- *   a HEAD-oid delta, the true `now − committed_at_ms` latency from the rescued
- *   change actually landing to the heartbeat catching it (worst-case / oldest
- *   commit when several discharge in one rescue). `null` when there is no commit
- *   anchor (a dirty-tree-only rescue) or the value would be negative (clock
- *   skew — clamped, never emitted negative; a negative would poison the
- *   histogram exactly like the `staleness_ms` idle-inflation bug being fixed).
- *   OPTIONAL — the field is OMITTED entirely for the other backstop-emitting
- *   call sites (non-git backstops never fabricate a latency); a record without
- *   it parses as `null`, so mixed-version ndjson is the steady state.
  * - `reflog_watch` — fn-737 per-wake-path attribution: was a `.git/logs/HEAD`
  *   reflog watch ARMED for the rescued repo at fire time (`present`) or not
  *   (`absent`)? The prime-suspect slow path is a commit in a no-pending repo →
@@ -147,7 +133,6 @@ export type BackstopRecord = {
   rescued: boolean;
   staleness_ms: number | null;
   last_fast_path_at: number | null;
-  change_to_rescue_ms?: number | null;
   reflog_watch?: "present" | "absent";
   recent_fast_paths?: string[];
   detail?: Record<string, string>;
@@ -216,18 +201,6 @@ export function buildMissedWakeRecord(args: {
   now: number;
   lastFastPathAt: number | null;
   /**
-   * fn-771: the true change-to-rescue latency (`now − committed_at_ms` of the
-   * rescued change, worst-case / oldest commit). OPTIONAL — omitted (`undefined`)
-   * by every non-git backstop call site so the legacy record shape stays exact
-   * and no non-commit backstop fabricates a latency. `null` when the producer
-   * had no commit anchor (dirty-tree-only rescue). A NEGATIVE value (clock skew:
-   * `committed_at_ms > now`) is CLAMPED to `null` — never emitted negative,
-   * which would poison the histogram exactly like the idle-inflation bug this
-   * field replaces. The field is emitted (present, possibly `null`) whenever the
-   * arg is provided at all, so a git-heartbeat rescue always carries it.
-   */
-  changeToRescueMs?: number | null;
-  /**
    * fn-737 per-wake-path attribution: whether a `.git/logs/HEAD` reflog watch
    * was ARMED for the rescued repo at fire time. Omitted (field absent) when
    * the backstop has no per-repo notion — keeps the legacy record shape exact
@@ -255,14 +228,6 @@ export function buildMissedWakeRecord(args: {
     staleness_ms: staleness,
     last_fast_path_at: args.lastFastPathAt,
   };
-  if (args.changeToRescueMs !== undefined) {
-    // Present-with-value whenever the producer supplied the arg. Clamp a
-    // negative (clock skew) to null — never emit a negative latency.
-    rec.change_to_rescue_ms =
-      args.changeToRescueMs !== null && args.changeToRescueMs >= 0
-        ? args.changeToRescueMs
-        : null;
-  }
   if (args.reflogWatch !== undefined) {
     rec.reflog_watch = args.reflogWatch;
   }

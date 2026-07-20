@@ -1258,7 +1258,7 @@ test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loo
 test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk climbs to the TRUE parent agent", async () => {
   // The 4th send subprocess inherited pid 89510 — a number a dead agent's
   // lingering jobs row still holds. The TRUE sender is the parent harness (pid
-  // 100, sitter-system-overview). The single opRegister path governs BOTH a send
+  // 100, harness-system-overview). The single opRegister path governs BOTH a send
   // (send_only:true) and a watch (send_only:false), so one guard fixes both:
   // assert the resolved chain for each registration form.
   const { db } = freshMemDb();
@@ -1272,20 +1272,20 @@ test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk cl
   });
   // The TRUE parent agent (the harness that actually issued the send).
   seedJob(db, {
-    job_id: "sitter-sess",
+    job_id: "harness-sess",
     pid: 100,
     start_time: "darwin:Mon Jun 23 09:00:00 2026",
-    title: "sitter-system-overview",
+    title: "harness-system-overview",
     updated_at: 50,
   });
   // peer (send/watch subprocess, pid 89510) → zsh (200) → harness (100).
   const parents: Record<number, number> = { 89510: 200, 200: 100, 100: 1 };
   // The live probe returns the CURRENT process start_time for whichever pid is
   // probed: pid 89510 is now a recycled, unrelated process (mismatch → skip);
-  // pid 100 is the live sitter harness (match → enrich).
+  // pid 100 is the live parent harness (match → enrich).
   const liveStartTime: Record<number, string> = {
     89510: "darwin:Mon Jun 23 11:00:00 2026", // recycled — NOT the dead boot
-    100: "darwin:Mon Jun 23 09:00:00 2026", // the real sitter harness
+    100: "darwin:Mon Jun 23 09:00:00 2026", // the real parent harness
   };
   const probe = (pid: number): string | null => liveStartTime[pid] ?? null;
 
@@ -1299,8 +1299,8 @@ test("recycled-pid send/watch: a stale dead-agent row is skipped and the walk cl
     );
     expect(res).not.toBeNull();
     expect(res?.pid).toBe(100);
-    expect(res?.identity.job_id).toBe("sitter-sess");
-    expect(res?.identity.title).toBe("sitter-system-overview");
+    expect(res?.identity.job_id).toBe("harness-sess");
+    expect(res?.identity.title).toBe("harness-system-overview");
     // Crucially NOT the dead agent the bare-pid match would have bound.
     expect(res?.identity.title).not.toBe("fix-duplicate-approve-bug");
   }

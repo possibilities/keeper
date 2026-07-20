@@ -55,22 +55,6 @@ export interface StatsRow {
   p95: number | null;
   p99: number | null;
   max: number | null;
-  /**
-   * Per-rescue samples for this bucket — each rescue line's `ts` (finite-
-   * guarded; a NaN/Infinity `ts` is dropped so it can't poison a `max(ts)`
-   * watermark) alongside its `staleness_ms` (`null` for a cold-boot rescue) and
-   * its `change_to_rescue_ms` (fn-771: the TRUE change-to-rescue latency, `null`
-   * for a dirty-only/cold-boot rescue OR an old-format line that predates the
-   * field — mixed-version ndjson is the steady state, so an absent/non-finite
-   * value reads as `null`, never a finding-poisoning sentinel).
-   * WATERMARK-AGNOSTIC: every sample is surfaced — `keeper-watch`'s detector
-   * does the `ts > watermark` windowing, not `computeStats`. Additive only.
-   */
-  samples: {
-    ts: number;
-    staleness_ms: number | null;
-    change_to_rescue_ms: number | null;
-  }[];
 }
 
 export interface StatsResult {
@@ -119,16 +103,6 @@ export function computeStats(text: string): StatsResult {
   const lines = text.split("\n");
   // staleness samples per bucket
   const staleness = new Map<string, number[]>();
-  // per-rescue (ts, staleness_ms) samples per bucket — fed to StatsRow.samples
-  // for the detector's windowing. WATERMARK-AGNOSTIC: every finite-ts rescue.
-  const rescueSamples = new Map<
-    string,
-    {
-      ts: number;
-      staleness_ms: number | null;
-      change_to_rescue_ms: number | null;
-    }[]
-  >();
   // latest rollup per bucket (take-last — running totals are monotonic)
   const rollups = new Map<string, BackstopRollup>();
   // rescue-line count per bucket (the no-denominator fallback)
@@ -187,30 +161,6 @@ export function computeStats(text: string): StatsResult {
         }
         arr.push(stalenessMs);
       }
-      // fn-771: the TRUE change-to-rescue latency, finite-guarded the same way
-      // as `staleness_ms`. An old-format line that predates the field, or a
-      // dirty-only/cold-boot rescue that carries `null`, or a non-finite value
-      // all read as `null` — mixed-version ndjson is the steady state, so an
-      // absent field is never a finding-poisoning sentinel.
-      const changeToRescueMs =
-        typeof rec.change_to_rescue_ms === "number" &&
-        Number.isFinite(rec.change_to_rescue_ms)
-          ? rec.change_to_rescue_ms
-          : null;
-      // Per-rescue sample for the detector's windowing — only with a finite
-      // `ts` (a NaN/Infinity `ts` must not poison the watermark `max(ts)`).
-      if (typeof rec.ts === "number" && Number.isFinite(rec.ts)) {
-        let s = rescueSamples.get(key);
-        if (!s) {
-          s = [];
-          rescueSamples.set(key, s);
-        }
-        s.push({
-          ts: rec.ts,
-          staleness_ms: stalenessMs,
-          change_to_rescue_ms: changeToRescueMs,
-        });
-      }
       parsed++;
       rescues++;
     } else if (kind === "backstop-rollup") {
@@ -246,7 +196,6 @@ export function computeStats(text: string): StatsResult {
       p95: samples.length ? percentile(samples, 95) : null,
       p99: samples.length ? percentile(samples, 99) : null,
       max: samples.length ? samples[samples.length - 1] : null,
-      samples: rescueSamples.get(key) ?? [],
     });
   }
   // Deterministic order: backstop asc, class asc.

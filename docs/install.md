@@ -549,11 +549,6 @@ active to archived history. Sending hands the body to the selected harness throu
 so process visibility and that harness's transcript policy apply beyond the mode-0600 local store.
 `keeper note --help` carries the interaction and failure semantics.
 
-## Sitter scanners (optional)
-
-One manual step has no code home: the read-only sitter set lives in its own repo at `~/code/sitter`;
-install and uninstall it per that repo's `README.md`.
-
 ## Uninstall
 
 ```sh
@@ -570,7 +565,6 @@ rm -f ~/.config/fish/completions/keeper.fish
 rm -f ~/.local/share/bash-completion/completions/keeper
 rm -f ~/.local/share/zsh/site-functions/_keeper
 rm -f "$(brew --prefix 2>/dev/null)/share/zsh/site-functions/_keeper"
-# Uninstall the sitter scanners per ~/code/sitter's README.
 rm -rf ~/.local/state/keeper   # optional — drops all captured state
 ```
 
