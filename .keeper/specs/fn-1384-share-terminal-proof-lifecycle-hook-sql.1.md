@@ -24,5 +24,5 @@ import it, and delete the inline copies. Files: `src/lifecycle-terminal-proof.ts
 - [ ] Existing `saga-unblock` and commit-work terminal-proof tests pass unchanged.
 
 ## Done summary
-
+Promoted TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL into src/lifecycle-terminal-proof.ts and had src/commit-work/surface.ts and plugins/plan/src/verbs/unblock.ts import it, deleting the inline duplicate lifecycle hook-set SQL from both callers.
 ## Evidence
