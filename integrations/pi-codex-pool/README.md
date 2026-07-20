@@ -38,10 +38,11 @@ Run `/codex-pool-observe` inside a marked Pi instance, or invoke the package's `
 - schema and configuration bindings;
 - opaque aliases;
 - bounded observation and expiration timestamps;
-- normalized usage percentages and reset times; and
+- normalized usage percentages and reset times;
+- an optional canonical provider account category from a fixed allowlist; and
 - fixed health or failure classes.
 
-It never contains raw provider responses, headers, errors, credentials, account IDs, plan labels, or free-form account data.
+It never contains raw provider responses, headers, errors, credentials, account IDs, raw plan labels, inferred capacity multipliers, or free-form account data.
 
 `keeper-codex-pool-state.json` stores only opaque aliases, bounded usage, pressure, cooldown, selection timestamps, expirations, and the configuration binding. Session routes remain memory-only. This surface is transient routing state, not a keeperd Projection, RPC mutation, lease, or claim.
 

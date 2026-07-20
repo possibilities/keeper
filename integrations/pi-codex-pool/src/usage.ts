@@ -8,6 +8,15 @@ const MAX_METER_LABEL_LENGTH = 64;
 
 export type UsageStatus = "healthy" | "exhausted" | "unavailable";
 export type UsageWindowRole = "primary" | "secondary" | "additional";
+export type CodexAccountCategory =
+  | "free"
+  | "go"
+  | "plus"
+  | "pro"
+  | "pro-lite"
+  | "business"
+  | "enterprise"
+  | "edu";
 
 export interface SanitizedUsageWindow {
   role: UsageWindowRole;
@@ -24,6 +33,7 @@ export interface SanitizedUsageSnapshot {
   schema_version: 1;
   alias: string;
   status: UsageStatus;
+  account_category?: CodexAccountCategory;
   observed_at_ms: number;
   expires_at_ms: number;
   windows: SanitizedUsageWindow[];
@@ -40,6 +50,33 @@ function percent(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   if (value < 0 || value > 100) return undefined;
   return Math.round(value * 10) / 10;
+}
+
+function accountCategory(value: unknown): CodexAccountCategory | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.toLowerCase();
+  switch (normalized) {
+    case "free":
+    case "go":
+    case "plus":
+    case "pro":
+      return normalized;
+    case "prolite":
+      return "pro-lite";
+    case "team":
+    case "self_serve_business_usage_based":
+      return "business";
+    case "business":
+    case "enterprise_cbp_usage_based":
+    case "enterprise":
+    case "hc":
+      return "enterprise";
+    case "education":
+    case "edu":
+      return "edu";
+    default:
+      return undefined;
+  }
 }
 
 function resetAtMs(value: unknown, nowMs: number): number | null | undefined {
@@ -231,10 +268,12 @@ export function parseUsageResponse(
     topRateLimit?.allowed === false || topRateLimit?.limit_reached === true;
   const exhausted =
     explicitlyLimited || windows.some((window) => window.used_percent >= 100);
+  const category = accountCategory(record.plan_type);
   return {
     schema_version: USAGE_SCHEMA_VERSION,
     alias,
     status: exhausted ? "exhausted" : "healthy",
+    ...(category === undefined ? {} : { account_category: category }),
     observed_at_ms: Math.floor(nowMs),
     expires_at_ms: Math.floor(nowMs + ttlMs),
     windows,

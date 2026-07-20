@@ -25,11 +25,25 @@ const RETIRED_CLEANUP = between(
 );
 
 describe("mandatory claude-swap installation", () => {
-  test("installs or upgrades the stable tool without blocking non-Claude setup", () => {
-    expect(INSTALL).toContain("# 3e. claude-swap CLI:");
-    expect(INSTALL).toContain("uv tool install --upgrade claude-swap");
+  test("rebases the fork branch before installing its local checkout", () => {
+    expect(INSTALL).toContain("claude_swap_fork=");
+    expect(INSTALL).toContain("/src/possibilities--claude-swap");
     expect(INSTALL).toContain(
-      "claude-swap install failed; leaving any existing installation unchanged (non-fatal)",
+      'claude_swap_branch="feat/json-account-capacity-metadata"',
+    );
+    expect(INSTALL).toContain("realiti4/claude-swap.git");
+    expect(INSTALL).toContain("git clone --quiet --branch");
+    expect(INSTALL).toContain("git status --porcelain");
+    expect(INSTALL).toContain("git fetch upstream main --quiet");
+    expect(INSTALL).toContain("git rebase upstream/main");
+    expect(INSTALL).toContain("git rebase --abort");
+    expect(INSTALL).toContain("git reset --hard");
+    expect(INSTALL).toContain("git push --force-with-lease origin");
+    expect(INSTALL).toContain("notifyctl show-message");
+    expect(INSTALL).toContain("uv tool install --force");
+    expect(INSTALL).not.toContain("uv tool install --upgrade claude-swap");
+    expect(INSTALL.indexOf("git rebase upstream/main")).toBeLessThan(
+      INSTALL.indexOf("uv tool install --force"),
     );
   });
 

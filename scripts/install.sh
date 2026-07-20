@@ -316,20 +316,94 @@ retire_keeper_codexbar_cli() {
 retire_keeper_codexbar_cli
 unset -f retire_keeper_codexbar_cli
 
-# 3e. claude-swap CLI: install or update the stable PyPI package through uv.
-#     Claude launches require a working cswap account. A missing uv or failed
-#     transaction leaves any existing install untouched and keeps non-Claude
-#     Keeper setup available.
+# 3e. claude-swap CLI: install the rebased integration branch from the local
+#     fork checkout. Every run fetches upstream/main and rebases before uv sees
+#     the source. A clone, checkout, dirty-tree, fetch, or rebase failure leaves
+#     the existing tool untouched and notifies the operator; an unrebased tree
+#     is never installed.
+claude_swap_fork="${HOME}/src/possibilities--claude-swap"
+claude_swap_branch="feat/json-account-capacity-metadata"
+claude_swap_origin="https://github.com/possibilities/claude-swap.git"
+claude_swap_upstream="https://github.com/realiti4/claude-swap.git"
+claude_swap_notify() {
+  echo "install: claude-swap fork sync: $1" >&2
+  if command -v notifyctl >/dev/null 2>&1; then
+    notifyctl show-message -t "claude-swap out of sync with upstream" \
+      -m "$1 (${claude_swap_fork})" >/dev/null 2>&1 || true
+  fi
+}
+claude_swap_sync() {
+  (
+    set -Eeuo pipefail
+    if ! cd "${claude_swap_fork}"; then
+      claude_swap_notify "cannot enter the fork checkout — skipping install"
+      exit 1
+    fi
+    if ! git remote get-url upstream >/dev/null 2>&1 && \
+       ! git remote add upstream "${claude_swap_upstream}"; then
+      claude_swap_notify "cannot register the upstream remote — skipping install"
+      exit 1
+    fi
+    if ! git remote set-url upstream "${claude_swap_upstream}"; then
+      claude_swap_notify "cannot configure the upstream remote — skipping install"
+      exit 1
+    fi
+    if ! current_branch="$(git branch --show-current)"; then
+      claude_swap_notify "cannot inspect the checkout branch — skipping install"
+      exit 1
+    fi
+    if [ "${current_branch}" != "${claude_swap_branch}" ]; then
+      claude_swap_notify "checkout is on '${current_branch:-<detached>}', expected '${claude_swap_branch}' — skipping install"
+      exit 1
+    fi
+    if ! checkout_status="$(git status --porcelain)"; then
+      claude_swap_notify "cannot inspect checkout changes — skipping install"
+      exit 1
+    fi
+    if [ -n "${checkout_status}" ]; then
+      claude_swap_notify "checkout has local changes — skipping rebase and install"
+      exit 1
+    fi
+    if ! safe_tip="$(git rev-parse HEAD)"; then
+      claude_swap_notify "cannot resolve the pre-rebase tip — skipping install"
+      exit 1
+    fi
+    if ! git fetch upstream main --quiet; then
+      claude_swap_notify "git fetch upstream/main failed — skipping rebase and install"
+      exit 1
+    fi
+    if ! git rebase upstream/main >/dev/null 2>&1; then
+      git rebase --abort >/dev/null 2>&1 || true
+      git reset --hard "${safe_tip}" >/dev/null 2>&1 || true
+      claude_swap_notify "rebase onto upstream/main conflicted; rolled back to pre-rebase tip ${safe_tip:0:10} and skipped install"
+      exit 1
+    fi
+    if ! git push --force-with-lease origin "${claude_swap_branch}" >/dev/null 2>&1; then
+      claude_swap_notify "rebased locally but could not republish '${claude_swap_branch}' to origin"
+    fi
+    echo "install: claude-swap fork rebased cleanly onto upstream/main"
+  )
+}
+if [ ! -d "${claude_swap_fork}/.git" ]; then
+  echo "install: claude-swap fork not present; cloning ${claude_swap_origin}"
+  mkdir -p "$(dirname "${claude_swap_fork}")"
+  git clone --quiet --branch "${claude_swap_branch}" \
+    "${claude_swap_origin}" "${claude_swap_fork}" 2>/dev/null || \
+    claude_swap_notify "clone of '${claude_swap_branch}' failed — skipping install"
+fi
 if ! command -v uv >/dev/null 2>&1; then
   echo "install: uv unavailable; leaving claude-swap unchanged (non-fatal)" >&2
-else
-  echo "install: install or update claude-swap"
-  if uv tool install --upgrade claude-swap; then
-    echo "install: claude-swap installed"
+elif [ -d "${claude_swap_fork}/.git" ] && claude_swap_sync; then
+  echo "install: install rebased claude-swap fork"
+  if uv tool install --force "${claude_swap_fork}"; then
+    echo "install: rebased claude-swap fork installed"
   else
-    echo "install: claude-swap install failed; leaving any existing installation unchanged (non-fatal)" >&2
+    claude_swap_notify "uv installation failed — leaving the existing tool unchanged"
   fi
+else
+  echo "install: claude-swap fork was not installed (non-fatal)" >&2
 fi
+unset -f claude_swap_sync claude_swap_notify
 
 # 3f. ripgrep: install or update the stable Homebrew formula on every run.
 #     Search tooling remains non-critical: a missing Homebrew or failed formula

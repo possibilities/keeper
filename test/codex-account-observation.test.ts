@@ -37,6 +37,7 @@ function envelope(overrides: Record<string, unknown> = {}): unknown {
           schema_version: 1,
           alias: "keeper-codex-a",
           status: "healthy",
+          account_category: "pro",
           observed_at_ms: NOW,
           expires_at_ms: NOW + 60_000,
           windows: [
@@ -80,6 +81,7 @@ describe("Codex observer envelope", () => {
         {
           alias: "keeper-codex-a",
           status: "healthy",
+          account_category: "pro",
           observed_at_ms: NOW,
           expires_at_ms: NOW + 60_000,
           windows: [
@@ -131,7 +133,7 @@ describe("Codex observer envelope", () => {
     ).toBeNull();
   });
 
-  test("accepts only fixed status classes, opaque aliases, and bounded windows", () => {
+  test("accepts only fixed status classes, categories, opaque aliases, and bounded windows", () => {
     const invalidAlias = envelope() as Record<string, unknown>;
     invalidAlias.aliases = [
       {
@@ -147,6 +149,15 @@ describe("Codex observer envelope", () => {
       },
     ];
     expect(parse(invalidAlias)).toBeNull();
+
+    const invalidCategory = envelope() as Record<string, unknown>;
+    const categoryAliases = invalidCategory.aliases as Array<{
+      usage: Record<string, unknown>;
+    }>;
+    if (categoryAliases[0]) {
+      categoryAliases[0].usage.account_category = "private-enterprise-plan";
+    }
+    expect(parse(invalidCategory)).toBeNull();
 
     const unavailable = envelope() as Record<string, unknown>;
     unavailable.aliases = [

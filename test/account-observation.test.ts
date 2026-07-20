@@ -34,6 +34,8 @@ function account(
     number,
     email: `private-${number}@example.test`,
     organizationUuid: `secret-${number}`,
+    subscriptionType: "max",
+    rateLimitMultiplier: 20,
     usageStatus: "ok",
     usageFetchedAt: "2026-07-17T23:59:30Z",
     usage: {
@@ -98,6 +100,16 @@ describe("parseCswapList", () => {
       "claude-swap:7": 0,
       "claude-swap:2": 1,
     });
+    expect(parsed.accountCapacity).toEqual({
+      "claude-swap:7": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+      "claude-swap:2": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+    });
   });
 
   test("keeps stable ordinals for known but unrouteable rows", () => {
@@ -121,9 +133,40 @@ describe("parseCswapList", () => {
     expect(parsed.accountIssues).toEqual({
       "claude-swap:4": "relogin-required",
     });
+    expect(parsed.accountCapacity["claude-swap:4"]).toEqual({
+      subscriptionType: "max",
+      rateLimitMultiplier: 20,
+    });
     expect(parsed.notes).toContain(
       "cswap: slot 4 not routeable (relogin_required)",
     );
+  });
+
+  test("admits only bounded account capacity metadata", () => {
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(1, { subscriptionType: "pro", rateLimitMultiplier: 1 }),
+          account(2, {
+            subscriptionType: "private-enterprise-plan",
+            rateLimitMultiplier: 100,
+          }),
+          account(3, { subscriptionType: "max", rateLimitMultiplier: 5 }),
+        ]),
+      ),
+      NOW,
+    );
+    expect(parsed.accountCapacity).toEqual({
+      "claude-swap:1": {
+        subscriptionType: "pro",
+        rateLimitMultiplier: 1,
+      },
+      "claude-swap:3": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 5,
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("private-enterprise-plan");
   });
 
   test("maps unknown provider statuses without retaining provider text", () => {
@@ -340,6 +383,12 @@ describe("schema-v7 observation sidecar", () => {
         count: 1,
         ordinals: { "claude-swap:5": 0 },
       },
+      account_capacity: {
+        "claude-swap:5": {
+          subscriptionType: "max",
+          rateLimitMultiplier: 20,
+        },
+      },
       account_issues: {},
     });
     expect(JSON.stringify(observation)).not.toContain('"default"');
@@ -381,6 +430,17 @@ describe("schema-v7 observation sidecar", () => {
       validateObservation({
         ...observation,
         account_issues: { "claude-swap:6": "account-unavailable" },
+      }),
+    ).toBeNull();
+    expect(
+      validateObservation({
+        ...observation,
+        account_capacity: {
+          "claude-swap:99": {
+            subscriptionType: "max",
+            rateLimitMultiplier: 20,
+          },
+        },
       }),
     ).toBeNull();
     expect(

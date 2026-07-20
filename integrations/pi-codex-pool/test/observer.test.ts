@@ -437,6 +437,48 @@ describe("Codex usage observer", () => {
     expect(rendered).not.toContain("private-token");
   });
 
+  test("normalizes only known provider account categories", () => {
+    const categories = [
+      ["free", "free"],
+      ["go", "go"],
+      ["plus", "plus"],
+      ["pro", "pro"],
+      ["prolite", "pro-lite"],
+      ["team", "business"],
+      ["self_serve_business_usage_based", "business"],
+      ["business", "enterprise"],
+      ["enterprise_cbp_usage_based", "enterprise"],
+      ["hc", "enterprise"],
+      ["education", "edu"],
+    ] as const;
+    for (const [planType, expected] of categories) {
+      const parsed = parseUsageResponse(
+        "keeper-codex-a",
+        {
+          plan_type: planType,
+          rate_limit: {
+            primary_window: { used_percent: 12, reset_at: null },
+          },
+        },
+        100,
+      );
+      expect(parsed.account_category).toBe(expected);
+    }
+
+    const unknown = parseUsageResponse(
+      "keeper-codex-a",
+      {
+        plan_type: "private-enterprise-plan",
+        rate_limit: {
+          primary_window: { used_percent: 12, reset_at: null },
+        },
+      },
+      100,
+    );
+    expect(unknown.account_category).toBeUndefined();
+    expect(JSON.stringify(unknown)).not.toContain("private-enterprise-plan");
+  });
+
   test("rejects malformed and unbounded usage fields instead of copying them", () => {
     expect(() =>
       parseUsageResponse(

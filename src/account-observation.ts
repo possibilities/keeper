@@ -31,6 +31,14 @@ export interface NormalizedWindow {
   resetsAt: string | null;
 }
 
+export type ClaudeSubscriptionType = "pro" | "max";
+export type CapacityMultiplier = 1 | 5 | 20;
+
+export interface AccountCapacityMetadata {
+  subscriptionType?: ClaudeSubscriptionType;
+  rateLimitMultiplier?: CapacityMultiplier;
+}
+
 /** Every current Claude route is a claude-swap managed slot. */
 export type RouteKind = "managed";
 
@@ -73,6 +81,8 @@ export interface Observation {
   health: ObservationHealth;
   routes: Route[];
   claude_accounts: ClaudeAccountDisplay;
+  /** Optional managed route id → bounded account-category/capacity metadata. */
+  account_capacity?: Record<string, AccountCapacityMetadata>;
   /** Managed route id → bounded PII-free reason the account was excluded. */
   account_issues: Record<string, AccountObservationIssue>;
   notes: string[];
@@ -90,6 +100,7 @@ export interface CswapInventory {
   health: ObservationHealth;
   routes: Route[];
   accountOrdinals: Record<string, number>;
+  accountCapacity: Record<string, AccountCapacityMetadata>;
   accountIssues: Record<string, AccountObservationIssue>;
   notes: string[];
 }
@@ -193,6 +204,7 @@ function emptyInventory(
     health,
     routes: [],
     accountOrdinals: {},
+    accountCapacity: {},
     accountIssues: {},
     notes: [note],
   };
@@ -234,6 +246,7 @@ export function parseCswapList(
   const routes: Route[] = [];
   const notes: string[] = [];
   const accountOrdinals: Record<string, number> = {};
+  const accountCapacity: Record<string, AccountCapacityMetadata> = {};
   const accountIssues: Record<string, AccountObservationIssue> = {};
   const seenAccounts = new Set<number>();
   const seenRoutes = new Set<number>();
@@ -248,7 +261,10 @@ export function parseCswapList(
         !seenAccounts.has(slot)
       ) {
         seenAccounts.add(slot);
-        accountOrdinals[managedRouteId(slot)] = seenAccounts.size - 1;
+        const routeId = managedRouteId(slot);
+        accountOrdinals[routeId] = seenAccounts.size - 1;
+        const capacity = parseAccountCapacity(row);
+        if (capacity !== null) accountCapacity[routeId] = capacity;
       }
     }
 
@@ -278,9 +294,27 @@ export function parseCswapList(
     health: "ok",
     routes,
     accountOrdinals,
+    accountCapacity,
     accountIssues,
     notes: boundNotes(notes),
   };
+}
+
+function parseAccountCapacity(
+  row: Record<string, unknown>,
+): AccountCapacityMetadata | null {
+  const capacity: AccountCapacityMetadata = {};
+  if (row.subscriptionType === "pro" || row.subscriptionType === "max") {
+    capacity.subscriptionType = row.subscriptionType;
+  }
+  if (
+    row.rateLimitMultiplier === 1 ||
+    row.rateLimitMultiplier === 5 ||
+    row.rateLimitMultiplier === 20
+  ) {
+    capacity.rateLimitMultiplier = row.rateLimitMultiplier;
+  }
+  return Object.keys(capacity).length === 0 ? null : capacity;
 }
 
 function parseCswapAccount(
@@ -419,6 +453,9 @@ export function buildObservation(input: {
       count: Object.keys(cswap.accountOrdinals).length,
       ordinals: { ...cswap.accountOrdinals },
     },
+    ...(Object.keys(cswap.accountCapacity).length === 0
+      ? {}
+      : { account_capacity: { ...cswap.accountCapacity } }),
     account_issues: { ...cswap.accountIssues },
     notes: boundNotes(cswap.notes),
   };
@@ -467,6 +504,11 @@ export function validateObservation(data: unknown): Observation | null {
   }
   const display = validateClaudeAccountDisplay(data.claude_accounts);
   if (display === null) return null;
+  const accountCapacity = validateAccountCapacity(
+    data.account_capacity,
+    display,
+  );
+  if (accountCapacity === null) return null;
   const accountIssues = validateAccountIssues(data.account_issues, display);
   if (accountIssues === null) return null;
 
@@ -498,9 +540,29 @@ export function validateObservation(data: unknown): Observation | null {
     health: data.health,
     routes,
     claude_accounts: display,
+    ...(Object.keys(accountCapacity).length === 0
+      ? {}
+      : { account_capacity: accountCapacity }),
     account_issues: accountIssues,
     notes: boundNotes(notes),
   };
+}
+
+function validateAccountCapacity(
+  data: unknown,
+  display: ClaudeAccountDisplay,
+): Record<string, AccountCapacityMetadata> | null {
+  if (data === undefined) return {};
+  if (!isRecord(data)) return null;
+  const capacity: Record<string, AccountCapacityMetadata> = {};
+  for (const [routeId, value] of Object.entries(data)) {
+    if (display.ordinals[routeId] === undefined || !isRecord(value))
+      return null;
+    const metadata = parseAccountCapacity(value);
+    if (metadata === null) return null;
+    capacity[routeId] = metadata;
+  }
+  return capacity;
 }
 
 function validateClaudeAccountDisplay(

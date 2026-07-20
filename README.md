@@ -14,9 +14,10 @@ single DB. Every agent session feeds an append-only event log; a long-running da
   lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
   Resource holds remain independently observable and recoverable
 - **Account routing** — Claude launches use process-bound claude-swap Account routes from
-  a fresh Capacity observation. claude-swap owns `usageStatus` and raw quota values;
-  per-account Measurement age remains provenance in `keeper usage`, not an eligibility
-  gate. Keeper-launched Pi sessions use an isolated Codex companion with its own visible native
+  a fresh Capacity observation. claude-swap owns `usageStatus`, raw quota values, and
+  bounded account-capacity metadata; `keeper usage` shows available provider account
+  categories and explicit multipliers while keeping per-account Measurement age diagnostic
+  only. Keeper-launched Pi sessions use an isolated Codex companion with its own visible native
   fallback and proof-gated activation. `keeper agent accounts check --json` reports both
   without reading credentials; see the [routing operations guide](./docs/install.md#pi-codex-account-pool)
 - **Account focuses** — independent, PII-free stable-route preferences: Fable focus matches

@@ -75,6 +75,16 @@ function claudeObservation(): Observation {
       count: 2,
       ordinals: { "claude-swap:1": 0, "claude-swap:2": 1 },
     },
+    account_capacity: {
+      "claude-swap:1": {
+        subscriptionType: "pro",
+        rateLimitMultiplier: 1,
+      },
+      "claude-swap:2": {
+        subscriptionType: "max",
+        rateLimitMultiplier: 20,
+      },
+    },
     account_issues: { "claude-swap:1": "relogin-required" },
     notes: [],
   };
@@ -90,6 +100,7 @@ function codexObservation(): CodexCapacityObservation {
       {
         alias: "keeper-codex-a",
         status: "healthy",
+        account_category: "pro",
         observed_at_ms: NOW,
         expires_at_ms: NOW + 60_000,
         windows: [
@@ -128,16 +139,32 @@ describe("usage observation view", () => {
     const text = renderUsageLines(snapshot).join("\n");
 
     expect(text).toContain("[claude] fresh 0s");
-    expect(text).toContain("Claude 1  [issue] · relogin-required");
-    expect(text).toContain("Claude 2  measured 0s");
+    expect(text).toContain("Claude 1 · Pro 1×  [issue] · relogin-required");
+    expect(text).toContain("Claude 2 · Max 20×  measured 0s");
     expect(text).toContain("weekly");
     expect(text).toContain("Fable");
     expect(text).toContain("[codex] fresh 0s");
-    expect(text).toContain("Codex 1");
+    expect(text).toContain("Codex 1 · Pro");
     expect(text).not.toContain("Codex 1  measured");
     expect(text).toContain("GPT-5.3-Codex-Spark");
     expect(text).toContain("38%");
     expect(text).toContain("5%");
+  });
+
+  test("omits unavailable account metadata without placeholders", () => {
+    const target = paths();
+    const claude = claudeObservation();
+    delete claude.account_capacity;
+    const codex = codexObservation();
+    if (codex.aliases[0]) delete codex.aliases[0].account_category;
+    writeObservationSidecar(target.claude, claude);
+    writeCodexObservationSidecar(target.codex, codex);
+
+    const text = renderUsageLines(loadUsageSnapshot(target, NOW)).join("\n");
+    expect(text).toContain("Claude 2  measured 0s");
+    expect(text).not.toContain("Claude 2 ·");
+    expect(text).not.toContain("Codex 1 ·");
+    expect(text).not.toContain("?×");
   });
 
   test("renders admitted Claude meters with old and clock-skewed Measurement provenance", () => {
@@ -156,7 +183,7 @@ describe("usage observation view", () => {
       measuredAtMs: NOW - 3 * 60 * 60_000,
     });
     let text = renderUsageLines(snapshot).join("\n");
-    expect(text).toContain("Claude 2  measured 3h");
+    expect(text).toContain("Claude 2 · Max 20×  measured 3h");
     expect(text).not.toContain("Claude 2  [stale]");
     expect(text).toContain("weekly");
     expect(text).toContain("Fable");
@@ -166,7 +193,7 @@ describe("usage observation view", () => {
     snapshot = loadUsageSnapshot(target, NOW);
     expect(snapshot.claude.accounts[1]?.status).toBe("ok");
     text = renderUsageLines(snapshot).join("\n");
-    expect(text).toContain("Claude 2  measured clock skew");
+    expect(text).toContain("Claude 2 · Max 20×  measured clock skew");
   });
 
   test("disambiguates two windows carried by one named Codex meter", () => {
@@ -223,7 +250,7 @@ describe("usage observation view", () => {
     expect(snapshot.codex.status).toBe("stale");
     const text = renderUsageLines(snapshot).join("\n");
     expect(text).toContain("[claude] [stale] · 6m");
-    expect(text).toContain("Claude 2  [stale] · measured 6m");
+    expect(text).toContain("Claude 2 · Max 20×  [stale] · measured 6m");
     expect(text).toContain("Fable");
   });
 

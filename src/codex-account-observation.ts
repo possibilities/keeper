@@ -25,6 +25,15 @@ import {
 export const CODEX_PROVIDER = "openai-codex" as const;
 
 export type CodexCapacityStatus = "healthy" | "exhausted" | "unavailable";
+export type CodexAccountCategory =
+  | "free"
+  | "go"
+  | "plus"
+  | "pro"
+  | "pro-lite"
+  | "business"
+  | "enterprise"
+  | "edu";
 
 export type CodexFailureClass = "auth" | "network" | "response" | "schema";
 export type CodexWindowRole = "primary" | "secondary" | "additional";
@@ -42,6 +51,7 @@ export interface CodexCapacityWindow {
 export interface CodexCapacityAlias {
   alias: string;
   status: CodexCapacityStatus;
+  account_category?: CodexAccountCategory;
   observed_at_ms: number;
   expires_at_ms: number;
   windows: CodexCapacityWindow[];
@@ -107,6 +117,19 @@ function depthExceeds(value: unknown, limit: number): boolean {
       : false;
   };
   return visit(value, 0);
+}
+
+function accountCategory(value: unknown): CodexAccountCategory | null {
+  return value === "free" ||
+    value === "go" ||
+    value === "plus" ||
+    value === "pro" ||
+    value === "pro-lite" ||
+    value === "business" ||
+    value === "enterprise" ||
+    value === "edu"
+    ? value
+    : null;
 }
 
 function failureClass(value: unknown): CodexFailureClass | null {
@@ -181,9 +204,14 @@ function parseAlias(value: unknown): CodexCapacityAlias | null {
   }
   const observedAt = safeTimestamp(input.observed_at_ms);
   const expiresAt = safeTimestamp(input.expires_at_ms);
+  const category =
+    input.account_category === undefined
+      ? undefined
+      : accountCategory(input.account_category);
   if (
     observedAt === null ||
     expiresAt === null ||
+    category === null ||
     expiresAt < observedAt ||
     !Array.isArray(input.windows) ||
     input.windows.length > CODEX_MAX_WINDOWS_PER_ALIAS
@@ -202,6 +230,7 @@ function parseAlias(value: unknown): CodexCapacityAlias | null {
   return {
     alias: input.alias,
     status,
+    ...(category === undefined ? {} : { account_category: category }),
     observed_at_ms: observedAt,
     expires_at_ms: expiresAt,
     windows: parsedWindows,

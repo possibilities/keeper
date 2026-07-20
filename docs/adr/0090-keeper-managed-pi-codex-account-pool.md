@@ -24,7 +24,7 @@ The companion owns the Codex credential and request boundary:
 - the wrapper delegates to Pi's built-in Codex transport and preserves abort, timeout, headers, callbacks, transport, session, and event-order semantics; and
 - provider or SDK retries beneath the wrapper do not multiply the companion's account attempts.
 
-Keeperd invokes a bounded observer command exposed by the companion and publishes a separate, versioned Codex capacity observation. The command emits only validated quota windows, opaque aliases, freshness, and bounded status classes. OAuth material, token-derived identity, provider headers, raw errors, and account PII never cross this boundary. Publication remains DB-free, transient, private, and atomic; routing pressure is likewise an expiring file-backed coordination surface rather than a Projection, RPC mutation, lease, or claim.
+Keeperd invokes a bounded observer command exposed by the companion and publishes a separate, versioned Codex capacity observation. The command emits only validated quota windows, opaque aliases, freshness, bounded status classes, and an optional canonical provider account category from a fixed allowlist. Raw plan strings, OAuth material, token-derived identity, provider headers, raw errors, and account PII never cross this boundary; no numeric multiplier is inferred from a category. Publication remains DB-free, transient, private, and atomic; routing pressure is likewise an expiring file-backed coordination surface rather than a Projection, RPC mutation, lease, or claim.
 
 Selection excludes invalid, exhausted, or cooling aliases, then combines worst-window headroom with routing pressure and deterministic least-recently-used tie-breaking. A Codex session route remains sticky while healthy. Missing or unusable pool state fails open with a visible sanitized warning to Pi's native `openai-codex` credential; non-Codex models remain unaffected.
 
@@ -47,7 +47,7 @@ The local pi-subagents checkout used by Keeper stays on a dedicated integration 
 ## Consequences
 
 - Keeper gains capacity-aware Codex placement and safe pre-output account failover across root and child Pi sessions without widening reducer or RPC writes.
-- Credential storage remains Pi-owned, while Keeper owns only sanitized transient observations and coordination pressure.
+- Credential storage remains Pi-owned, while Keeper owns only sanitized transient observations and coordination pressure; account category is display metadata and does not affect routing.
 - The companion becomes a compatibility boundary against Pi's provider and extension-loader APIs; supported Pi upgrades require explicit wrapper and root/child integration tests.
 - Pool degradation may concentrate work on the native credential, but it cannot silently claim balanced operation because the fallback is visible.
 - Real multi-account evidence, abort/error classification, stream-event ordering, transport isolation, and secret scanning are release obligations rather than best-effort checks.

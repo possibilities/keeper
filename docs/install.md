@@ -62,14 +62,19 @@ Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidenc
 
 ### Claude account routing and Account focuses
 
-Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). Every installer run executes
-`uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal to Keeper's
-non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
-registered.
+Claude launches require the `feat/json-account-capacity-metadata` branch of the
+[`possibilities/claude-swap`](https://github.com/possibilities/claude-swap) fork. The installer keeps its
+checkout at `~/src/possibilities--claude-swap`, fetches `realiti4/claude-swap` as `upstream`, rebases the
+clean integration branch onto `upstream/main`, attempts to republish it with force-with-lease, then installs
+that exact checkout through `uv`. A wrong branch, dirty checkout, fetch/rebase conflict, or clone failure skips
+installation and sends a best-effort `notifyctl` alert rather than installing unrebased source. Missing
+`uv`, a failed sync, or a failed installation is nonfatal to Keeper's non-Claude surfaces, but Claude
+remains unavailable until `cswap` works and at least one account is registered.
 
 The daemon publishes one private Capacity observation from each completed `cswap list --json` response;
-only a fresh observation supplies routing or focus-setup advice. claude-swap owns each row's `usageStatus`
-and raw quota values, including its last-good and backoff policy. Keeper admits only `usageStatus: ok`
+only a fresh observation supplies routing or focus-setup advice. claude-swap owns each row's `usageStatus`,
+raw quota values, bounded provider account category, and explicit capacity multiplier, including its
+last-good and backoff policy. Keeper admits only `usageStatus: ok`
 routes with valid provenance, required session and weekly windows, and remaining raw quota; Fable work
 also requires remaining Fable quota. Per-account Measurement age is diagnostic provenance shown by
 `keeper usage`, never a second eligibility gate. A fresh non-`ok` row removes the route immediately, while
@@ -122,7 +127,9 @@ Use the read-only account check for Capacity observation health, candidate Accou
 ordinary route choice; it records no Launch reservation. Use the focus view for durable policy, effective
 state, target, lifetime, fallback, and delivery diagnostic. `keeper usage` renders the admitted raw meters:
 the source age is whole-snapshot Capacity freshness, while each Claude account's `measured` age is
-provenance only. These surfaces are PII-free.
+provenance only. Account headers also show a bounded provider account category and, only when the producer
+reports one explicitly, a capacity multiplier such as `Claude 1 · Max 20×`. Unknown values are omitted,
+never guessed. These surfaces are PII-free.
 
 ```sh
 keeper agent accounts check --json

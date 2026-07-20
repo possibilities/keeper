@@ -1,5 +1,7 @@
 import { existsSync } from "node:fs";
 import {
+  type CapacityMultiplier,
+  type ClaudeSubscriptionType,
   isObservationFresh,
   type Observation,
   readObservationSidecar,
@@ -13,6 +15,7 @@ import {
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
 import {
+  type CodexAccountCategory,
   type CodexCapacityObservation,
   type CodexCapacityWindow,
   isCodexAliasFresh,
@@ -41,11 +44,17 @@ export interface UsageMeter {
   resetAtMs: number | null;
 }
 
+export type UsageAccountCategory =
+  | ClaudeSubscriptionType
+  | CodexAccountCategory;
+
 export interface UsageAccount {
   id: string;
   sourceId: string;
   status: UsageAccountStatus;
   detail: string | null;
+  accountCategory?: UsageAccountCategory;
+  capacityMultiplier?: CapacityMultiplier;
   measuredAtMs: number | null;
   meters: UsageMeter[];
 }
@@ -125,12 +134,22 @@ function buildClaudeSource(
   const accounts = ordered.map(([routeId, ordinal]): UsageAccount => {
     const issue = observation.account_issues[routeId] ?? null;
     const route = routes.get(routeId);
+    const capacity = observation.account_capacity?.[routeId];
+    const capacityFields = {
+      ...(capacity?.subscriptionType === undefined
+        ? {}
+        : { accountCategory: capacity.subscriptionType }),
+      ...(capacity?.rateLimitMultiplier === undefined
+        ? {}
+        : { capacityMultiplier: capacity.rateLimitMultiplier }),
+    };
     if (issue !== null || route === undefined) {
       return {
         id: `Claude ${ordinal + 1}`,
         sourceId: routeId,
         status: "issue",
         detail: issue ?? "account unavailable",
+        ...capacityFields,
         measuredAtMs: null,
         meters: [],
       };
@@ -140,6 +159,7 @@ function buildClaudeSource(
       sourceId: routeId,
       status: status === "stale" ? "stale" : "ok",
       detail: null,
+      ...capacityFields,
       measuredAtMs: route.measuredAtMs,
       meters: route.windows.map((window) => ({
         key: window.key,
@@ -234,6 +254,9 @@ function buildCodexSource(
         sourceId: alias.alias,
         status,
         detail,
+        ...(alias.account_category === undefined
+          ? {}
+          : { accountCategory: alias.account_category }),
         measuredAtMs: null,
         meters: alias.windows.map((window, meterIndex) =>
           codexMeter(
@@ -327,6 +350,32 @@ function sourceHeading(source: UsageSource, nowMs: number): string {
   return `[${source.provider}] [${source.status}]${detail}${ageSuffix}`;
 }
 
+function accountCategoryLabel(category: UsageAccountCategory): string {
+  switch (category) {
+    case "pro-lite":
+      return "Pro Lite";
+    case "business":
+      return "Business";
+    case "enterprise":
+      return "Enterprise";
+    case "edu":
+      return "Edu";
+    default:
+      return `${category.slice(0, 1).toUpperCase()}${category.slice(1)}`;
+  }
+}
+
+function accountCapacitySuffix(account: UsageAccount): string {
+  const fields: string[] = [];
+  if (account.accountCategory !== undefined) {
+    fields.push(accountCategoryLabel(account.accountCategory));
+  }
+  if (account.capacityMultiplier !== undefined) {
+    fields.push(`${account.capacityMultiplier}×`);
+  }
+  return fields.length === 0 ? "" : ` · ${fields.join(" ")}`;
+}
+
 function accountSuffix(account: UsageAccount, nowMs: number): string {
   const parts: string[] = [];
   if (account.status !== "ok") {
@@ -355,7 +404,9 @@ function renderSource(source: UsageSource, nowMs: number): string[] {
   );
   for (const [accountIndex, account] of source.accounts.entries()) {
     if (accountIndex > 0) lines.push("");
-    lines.push(`  ${account.id}${accountSuffix(account, nowMs)}`);
+    lines.push(
+      `  ${account.id}${accountCapacitySuffix(account)}${accountSuffix(account, nowMs)}`,
+    );
     for (const meter of account.meters) {
       const label = boundedLabel(meter.label, "meter").slice(0, labelWidth);
       const reset =
@@ -389,6 +440,8 @@ export function usageSemanticFingerprint(snapshot: UsageSnapshot): string {
       id: account.id,
       status: account.status,
       detail: account.detail,
+      accountCategory: account.accountCategory,
+      capacityMultiplier: account.capacityMultiplier,
       meters: account.meters.map((meter) => ({
         label: meter.label,
         usedPercent: meter.usedPercent,
