@@ -56,7 +56,7 @@ The carried facts preserve the fresh branches exactly: `phase_resume.findings ==
 
 ## Phase 1b — Resolve a trunk-integration incident
 
-Run this phase only when preflight's `incident` is non-null. Require `incident.incident_id === "close::<epic_id>"`, `incident.kind === "deconflict"`, a positive `instance_event_id`, and a matching `brief_ref`; otherwise surface the escaped envelope and stop. Claim that exact instance, then re-read its full brief until the folded claim names this session:
+Run this phase only when preflight's `incident` is non-null. Require `incident.incident_id === "close::<epic_id>"`, `incident.kind === "deconflict"`, a positive `instance_event_id`, and `incident.brief_ref === incident.incident_id` — the incident's `brief_ref` IS the dispatch key itself, the handle `keeper escalation-brief` resolves, and is NEVER a filesystem path (only the close-phase brief in Phase 1 is a path); otherwise surface the escaped envelope and stop. Claim that exact instance, then re-read its full brief until the folded claim names this session:
 
 ```bash
 keeper incident claim <incident_id> --instance <instance_event_id>
