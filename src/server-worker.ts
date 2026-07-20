@@ -2279,7 +2279,8 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
  *     pacing is real experienced catch-up latency.
  *   - The FULL-REPLAY projection derives ONLY from the pace-free fold-work
  *     rate (`stats.workMs / events_folded`) scaled by the CURRENT total
- *     `eventCount`: an estimator of a from-scratch rebuild, whose folds run
+ *     `eventCount` (an id-derived upper bound of the retained-row count —
+ *     never an exact table walk): an estimator of a from-scratch rebuild, whose folds run
  *     unpaced. It is `null` unless `workMs` is a positive measurement — a
  *     missing, zero, or negative `workMs` reads as "not measured", NEVER a
  *     zero or the paced-rate extrapolation. It is also `null` when
@@ -2363,15 +2364,12 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
   } catch {
     head = 0;
   }
-  let eventCount = 0;
-  try {
-    const c = db.query("SELECT COUNT(*) AS n FROM events").get() as {
-      n: number;
-    } | null;
-    eventCount = c ? c.n : 0;
-  } catch {
-    eventCount = 0;
-  }
+  // `head` doubles as the event-count figure: an id-derived upper bound of the
+  // retained-row count (retention row-deletes leave gaps) that keeps the
+  // full-replay estimator conservative. An exact COUNT(*) walks the whole
+  // multi-GB events b-tree on every status read — a cost this serve path must
+  // never pay.
+  const eventCount = head;
   let dbBytes = 0;
   try {
     const pc = db.query("PRAGMA page_count").get() as {
