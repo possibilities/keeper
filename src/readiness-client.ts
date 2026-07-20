@@ -267,6 +267,9 @@ export interface ReadinessClientSnapshot {
   readonly scheduledTasks: ScheduledTask[];
   readonly gitStatus: GitStatus[];
   readonly deadLetters: DeadLetter[];
+  /** Poison rows are a distinct opt-in collection so the waiting backlog and
+   * replay selection remain unchanged. */
+  readonly poisonDeadLetters?: DeadLetter[];
   // The open `pending_dispatches` rows fed into `computeReadiness` so the
   // board/CLI path agrees with the reconciler on the `dispatch-pending`
   // occupant; rides on the snapshot for a renderer that wants the in-flight
@@ -2124,6 +2127,9 @@ export interface SubscribeOptions {
   readonly includeDispatchFailures?: boolean;
   /** Also subscribe durable Provider-leg ownership for status drain gauges. */
   readonly includeProviderLegOwnership?: boolean;
+  /** Subscribe the poison-only dead-letter sibling and carry its rows on the
+   * snapshot without broadening the waiting dead-letter collection. */
+  readonly includePoisonDeadLetters?: boolean;
   /**
    * ADR 0018 OPT-IN: also subscribe the `epics_pinned` collection (UNBOUNDED —
    * `limit: 0`, a pin nags until its `dispatch_failures` row clears) and (1)
@@ -2162,6 +2168,7 @@ export function subscribeReadiness(
   const subsSubId = `${idPrefix}-subagent-invocations`;
   const gitSubId = `${idPrefix}-git`;
   const deadLettersSubId = `${idPrefix}-dead-letters`;
+  const poisonDeadLettersSubId = `${idPrefix}-poison-dead-letters`;
   const pendingDispatchesSubId = `${idPrefix}-pending-dispatches`;
   const autopilotStateSubId = `${idPrefix}-autopilot-state`;
   const armedEpicsSubId = `${idPrefix}-armed-epics`;
@@ -2222,6 +2229,15 @@ export function subscribeReadiness(
     id: deadLettersSubId,
     limit: DEAD_LETTERS_PAGE_LIMIT,
   });
+  const poisonDeadLetters =
+    opts.includePoisonDeadLetters === true
+      ? makeState("poison_dead_letters", poisonDeadLettersSubId, "dl_id", {
+          type: "query",
+          collection: "poison_dead_letters",
+          id: poisonDeadLettersSubId,
+          limit: DEAD_LETTERS_PAGE_LIMIT,
+        })
+      : null;
   // `pending_dispatches` feeds the `dispatch-pending` occupant. The wire pk is
   // `verb` (the descriptor's composite-pk workaround), but readiness reads from
   // `state.rows` via `projectRows`, so every row reaches the projection despite
@@ -2403,6 +2419,9 @@ export function subscribeReadiness(
     blockEscalations,
     tmuxClientFocus,
   ];
+  if (poisonDeadLetters !== null) {
+    states.push(poisonDeadLetters);
+  }
   if (epicsRecentDone !== null) {
     states.push(epicsRecentDone);
   }
@@ -2426,6 +2445,7 @@ export function subscribeReadiness(
       !subagentInvocations.gotResult ||
       !gitStatus.gotResult ||
       !deadLetters.gotResult ||
+      (poisonDeadLetters !== null && !poisonDeadLetters.gotResult) ||
       // Gate on every collection — a partial snapshot must not flip the
       // `dispatch-pending` occupancy or paint the WRONG armed-mode per-root
       // winner on the pre-paint blank state. Empty `pending_dispatches` /
@@ -2651,6 +2671,10 @@ export function subscribeReadiness(
       providerLegActivityByWrapperJobId,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
+    const poisonDeadLettersTyped =
+      poisonDeadLetters === null
+        ? undefined
+        : projectRows<DeadLetter>(poisonDeadLetters);
     // Read from `state.rows` (not `byId.values()`) — the composite
     // `(job_id, cron_id)` identity rides a single-column `job_id` wire pk, so
     // `byId` would collapse a multi-cron session to one row.
@@ -2706,6 +2730,9 @@ export function subscribeReadiness(
       subagentInvocations: subsTyped,
       gitStatus: gitTyped,
       deadLetters: deadLettersTyped,
+      ...(poisonDeadLettersTyped === undefined
+        ? {}
+        : { poisonDeadLetters: poisonDeadLettersTyped }),
       pendingDispatches: pendingDispatchesTyped,
       scheduledTasks: scheduledTasksTyped,
       blockEscalations: blockEscalationsTyped,

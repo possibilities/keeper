@@ -61,6 +61,7 @@ import {
   renderTaskPills,
   startedPill,
   subagentLinesFor,
+  summarizePoisonDeadLetters,
   validatedPill,
 } from "../src/board-render";
 import {
@@ -1877,6 +1878,34 @@ test("renderDeadLetterPill: positive N renders `[dead-letter:N]` verbatim (nativ
   expect(renderDeadLetterPill(1)).toBe(pill("dead-letter:1"));
   expect(renderDeadLetterPill(3)).toBe(pill("dead-letter:3"));
   expect(renderDeadLetterPill(42)).toBe(pill("dead-letter:42"));
+});
+
+test("renderDeadLetterPill: poison renders a distinct count with bounded blocking scope", () => {
+  const poison = [
+    {
+      dl_id: "global",
+      session_id: "poison",
+      bindings: { raw: "bad", file: "/events/1.ndjson" },
+    },
+    {
+      dl_id: "scoped",
+      session_id: "session-a",
+      bindings: { mutation_path: "/repo/a.ts" },
+    },
+  ] as unknown as Parameters<typeof summarizePoisonDeadLetters>[0];
+  const summary = summarizePoisonDeadLetters(poison);
+  expect(summary).toEqual({
+    count: 2,
+    global: 1,
+    scoped: 1,
+    scopes: ["global", "session:session-a path:/repo/a.ts"],
+  });
+  expect(renderDeadLetterPill(0, poison)).toBe(
+    pill(`poison:2 scope:${summary.scopes.join("|")}`),
+  );
+  expect(renderDeadLetterPill(3, poison)).toBe(
+    `${pill("dead-letter:3")} ${pill(`poison:2 scope:${summary.scopes.join("|")}`)}`,
+  );
 });
 
 test("renderDeadLetterPill: zero / negative / NaN collapse to empty (banner drops the pill cleanly)", () => {

@@ -39,6 +39,7 @@ import {
 } from "../src/account-router";
 import { parseWrappedProviderTaskId } from "../src/autoclose-worker";
 import { isBoardWorkJob } from "../src/await-conditions";
+import { summarizePoisonDeadLetters } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
 import {
   classifyDispatchFailure,
@@ -84,11 +85,11 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * adds the display-only legacy Provider-leg drain gauge; v12 adds the
  * display-only `event_store` block — event count, DB bytes, and durations
  * projected from the most recent boot's measured catch-up rate; the current
- * schema revision adds `stale_running` count partitions and `last_evidence_at`
- * on stale board views.
+ * schema revision adds the distinct poison count and bounded commit-rail scope
+ * context under `needs_human`.
  * `in_flight.running_jobs` remains emitted but is deprecated in favor of
  * `in_flight.board_work_jobs`. */
-export const STATUS_SCHEMA_VERSION = 14;
+export const STATUS_SCHEMA_VERSION = 15;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -230,6 +231,8 @@ export interface StatusData {
   };
   needs_human: {
     dead_letters: number;
+    poison_dead_letters: number;
+    poison_blocking_scopes: readonly string[];
     block_escalations: number;
     stuck_dispatches: number;
     finalize_non_ff: number;
@@ -508,9 +511,11 @@ export function buildStatusEnvelope(
   // subsets (surfaced separately, never double-counted), and the umbrella total.
   // Parked-closer questions are a needs-human family that mints no
   // `dispatch_failures` row, so they feed the projector by epic id directly.
+  const poisonDeadLetters = snap.poisonDeadLetters ?? [];
+  const poison = summarizePoisonDeadLetters(poisonDeadLetters, snap.jobs);
   const needsHuman = projectNeedsHuman({
     dispatchFailures,
-    deadLetters: snap.deadLetters.length,
+    deadLetters: snap.deadLetters.length + poison.count,
     blockEscalations: snap.blockEscalations.length,
     parkedQuestionEpicIds: snap.epics
       .filter((e) => (e.question ?? null) !== null)
@@ -567,7 +572,9 @@ export function buildStatusEnvelope(
       total: inFlightTotal,
     },
     needs_human: {
-      dead_letters: needsHuman.deadLetters,
+      dead_letters: snap.deadLetters.length,
+      poison_dead_letters: poison.count,
+      poison_blocking_scopes: poison.scopes,
       block_escalations: needsHuman.blockEscalations,
       stuck_dispatches: needsHuman.stuckDispatches,
       finalize_non_ff: needsHuman.finalizeNonFf,
@@ -767,6 +774,7 @@ export async function runStatus(
     // painted snapshot always carries the real jam rows.
     includeDispatchFailures: true,
     includeProviderLegOwnership: true,
+    includePoisonDeadLetters: true,
     // ADR 0018: opt into the pinned-epics window too — a plan-closed epic with
     // a live close/work dispatch failure merges open-wins into `epics`, so
     // `board.epics` (built off `snap.epics`) carries its close verdict and

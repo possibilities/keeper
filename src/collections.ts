@@ -620,6 +620,15 @@ export const DEAD_LETTERS_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(["bindings"]),
 };
 
+/** Poison-only sibling of the waiting replay collection. Keeping a distinct
+ * wire name preserves `dead_letters`' waiting default and oldest-first replay
+ * semantics while attention surfaces subscribe to poison independently. */
+export const POISON_DEAD_LETTERS_DESCRIPTOR: CollectionDescriptor = {
+  ...DEAD_LETTERS_DESCRIPTOR,
+  name: "poison_dead_letters",
+  defaultFilter: { status: "poison" },
+};
+
 /**
  * The `dispatch_failures` descriptor — the reconciler's sticky-failure surface,
  * one row per `(verb, id)` dispatch stamped failed and not yet cleared via a
@@ -1084,6 +1093,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
   [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],
+  [POISON_DEAD_LETTERS_DESCRIPTOR.name, POISON_DEAD_LETTERS_DESCRIPTOR],
   [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
   [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],

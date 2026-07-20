@@ -697,6 +697,8 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
   // snapshot, BEFORE the body byte-compare short-circuit, so the pill
   // reflects every snapshot regardless of body stability.
   let waitingDeadLetterCount = 0;
+  let poisonDeadLetters: ReadinessClientSnapshot["poisonDeadLetters"] = [];
+  let bannerJobs: ReadinessClientSnapshot["jobs"] = new Map();
   // fn-952: the latest `tmux_client_focus` singleton row, refreshed in
   // `emitFrame` on every snapshot (BEFORE the body byte-compare short-circuit)
   // so the composed focus pill reflects every snapshot regardless of body
@@ -719,7 +721,11 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
   // rebuild on restore for free.
   function persistentBannerPill(): string {
     const focusRaw = renderTmuxFocusPill(tmuxFocus);
-    const deadLetterRaw = renderDeadLetterPill(waitingDeadLetterCount);
+    const deadLetterRaw = renderDeadLetterPill(
+      waitingDeadLetterCount,
+      poisonDeadLetters ?? [],
+      bannerJobs,
+    );
     const raw =
       deadLetterRaw === "" ? focusRaw : `${focusRaw} ${deadLetterRaw}`;
     return colorEnabled ? colorizePillsInLine(raw) : raw;
@@ -1030,6 +1036,7 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
           subagentInvocations: snap.subagentInvocations,
           scheduledTasks: snap.scheduledTasks,
           deadLetters: snap.deadLetters,
+          poisonDeadLetters: snap.poisonDeadLetters ?? [],
         },
       };
     },
@@ -1049,6 +1056,8 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
     // reflects every snapshot. `setStatus` is itself a no-op when the
     // string is unchanged.
     waitingDeadLetterCount = snap.deadLetters.length;
+    poisonDeadLetters = snap.poisonDeadLetters ?? [];
+    bannerJobs = snap.jobs;
     // fn-952: refresh the focus backing-store alongside the dead-letter count,
     // BEFORE the byte-compare short-circuit — the focus pill can change while
     // the rendered job rows stay byte-stable (a window switch never touches the
@@ -1063,6 +1072,7 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
     idPrefix: "jobs",
     onSnapshot: emitFrame,
     onLifecycle: view.emitLifecycle,
+    includePoisonDeadLetters: true,
     // Thread the daemon fold cursor into the frames resume-cursor seam
     // (fn-1161), and the freshest header into the readiness gate so the loading
     // indicator's re-fold % advances during catch-up.

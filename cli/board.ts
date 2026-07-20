@@ -44,6 +44,7 @@ import { projectFableFocus } from "../src/autopilot-projection";
 import {
   apiErrorPillSeg,
   armedPill,
+  colorizePillsInLine,
   epicHeaderLabel,
   iconizePills,
   inputRequestPillSeg,
@@ -52,6 +53,7 @@ import {
   pillOrEmpty,
   planVerbLabel,
   renderClosePills,
+  renderDeadLetterPill,
   renderDispatchFailurePill,
   renderTaskCellPills,
   renderTaskPills,
@@ -1007,6 +1009,21 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
   // Retain the last readiness snapshot so secondary stream edges can repaint
   // the rows immediately. Null until the first frame.
   let lastSnap: ReadinessClientSnapshot | null = null;
+  let waitingDeadLetterCount = 0;
+  let poisonDeadLetters: ReadinessClientSnapshot["poisonDeadLetters"] = [];
+  let bannerJobs: ReadinessClientSnapshot["jobs"] = new Map();
+  const colorEnabled =
+    process.stdout.isTTY === true &&
+    process.stdin.isTTY === true &&
+    process.env.NO_COLOR == null;
+  function persistentBannerPill(): string {
+    const raw = renderDeadLetterPill(
+      waitingDeadLetterCount,
+      poisonDeadLetters ?? [],
+      bannerJobs,
+    );
+    return colorEnabled ? colorizePillsInLine(raw) : raw;
+  }
 
   // Semantic-header state sourced from the `autopilot_state` singleton; the
   // armed count reuses `armedSet` above. Boot-safe defaults hold until its first
@@ -1329,6 +1346,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     // explicit `reportSnapshotStream` calls below).
     mode,
     streamCount: 4,
+    persistentBannerPill,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(framesEmitter !== null
       ? {
@@ -1404,6 +1422,10 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
     lastSnap = snap;
+    waitingDeadLetterCount = snap.deadLetters.length;
+    poisonDeadLetters = snap.poisonDeadLetters ?? [];
+    bannerJobs = snap.jobs;
+    view.liveShell.setStatus(persistentBannerPill());
     // Drain diagnostics per-snapshot (not per-emit) so every observed ambiguity
     // is recorded even when the render is byte-stable and the view-shell's
     // `lastBody` short-circuits. Best-effort — `appendDiagnostic` swallows I/O
@@ -1427,6 +1449,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
     // `closeFailureReasonFor`'s epic-id join both see it too — the exactly
     // -one-place invariant needs no extra merge logic here.
     includePinnedEpics: true,
+    includePoisonDeadLetters: true,
     // Thread the freshest daemon fold cursor into the frames resume-cursor seam
     // (fn-1161) — every frames envelope + the trailer stamp `String(rev)`. The
     // header rides every `result`, so this tracks catch-up: a frame minted

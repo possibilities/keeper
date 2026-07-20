@@ -91,6 +91,7 @@ interface SnapOverrides {
   subagentInvocations?: unknown[];
   pendingDispatches?: number;
   deadLetters?: number;
+  poisonDeadLetters?: Record<string, unknown>[];
   blockEscalations?: number;
   perEpic?: Record<string, Verdict>;
   perTask?: Record<string, Verdict>;
@@ -145,6 +146,8 @@ function makeSnap(o: SnapOverrides = {}): ReadinessClientSnapshot {
       { length: o.deadLetters ?? 0 },
       () => ({}),
     ) as unknown as ReadinessClientSnapshot["deadLetters"],
+    poisonDeadLetters: (o.poisonDeadLetters ??
+      []) as unknown as ReadinessClientSnapshot["poisonDeadLetters"],
     pendingDispatches: Array.from(
       { length: o.pendingDispatches ?? 0 },
       () => ({}),
@@ -424,8 +427,8 @@ describe("readEventStoreStatus wiring", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version is v14", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(14);
+  test("status schema version includes poison visibility", () => {
+    expect(STATUS_SCHEMA_VERSION).toBe(15);
   });
 
   test("envelope carries every documented field", () => {
@@ -825,6 +828,36 @@ describe("buildStatusEnvelope drained/jammed", () => {
     expect(d?.jammed).toBe(true);
   });
 
+  test("poison dead letters stay distinct, expose bounded scope, and force needs-human nonzero", () => {
+    const oversizedPath = `/repo/${"x".repeat(300)}.ts`;
+    const snap = makeSnap({
+      poisonDeadLetters: [
+        {
+          dl_id: "poison-global",
+          session_id: "poison",
+          bindings: { raw: "bad", file: "/state/events.ndjson" },
+        },
+        {
+          dl_id: "poison-scoped",
+          session_id: "session-a",
+          bindings: { mutation_path: oversizedPath },
+        },
+      ],
+    });
+    const d = buildStatusEnvelope(snap, BOOT, []).data;
+    expect(d?.needs_human.dead_letters).toBe(0);
+    expect(d?.needs_human.poison_dead_letters).toBe(2);
+    expect(d?.needs_human.poison_blocking_scopes[0]).toBe("global");
+    expect(
+      d?.needs_human.poison_blocking_scopes[1]?.startsWith(
+        "session:session-a path:/repo/",
+      ),
+    ).toBe(true);
+    expect(d?.needs_human.poison_blocking_scopes[1]?.length).toBeLessThan(130);
+    expect(d?.needs_human.total).toBe(2);
+    expect(d?.jammed).toBe(true);
+  });
+
   test("a parked epic question feeds needs-human and forces jammed at rest, even with no other signal (fn-1083.2)", () => {
     const snap = makeSnap({
       epics: [
@@ -966,6 +999,8 @@ describe("buildStatusEnvelope drained/jammed", () => {
     const d = buildStatusEnvelope(snap, BOOT, failures).data;
     expect(Object.keys(d?.needs_human ?? {})).toEqual([
       "dead_letters",
+      "poison_dead_letters",
+      "poison_blocking_scopes",
       "block_escalations",
       "stuck_dispatches",
       "finalize_non_ff",
@@ -978,6 +1013,8 @@ describe("buildStatusEnvelope drained/jammed", () => {
     ]);
     expect(d?.needs_human).toEqual({
       dead_letters: 2,
+      poison_dead_letters: 0,
+      poison_blocking_scopes: [],
       block_escalations: 1,
       stuck_dispatches: 5,
       finalize_non_ff: 1,
@@ -1151,6 +1188,7 @@ function statusReadinessFrames(
   dispatchFailures: Record<string, unknown>[],
   epics: Record<string, unknown>[] = [],
   pinnedEpics: Record<string, unknown>[] = [],
+  poisonDeadLetters: Record<string, unknown>[] = [],
 ): ServerFrame[] {
   const empty = (collection: string): ServerFrame => ({
     type: "result",
@@ -1173,6 +1211,14 @@ function statusReadinessFrames(
     empty("subagent_invocations"),
     empty("git"),
     empty("dead_letters"),
+    {
+      type: "result",
+      id: "poison_dead_letters",
+      collection: "poison_dead_letters",
+      rev: 1,
+      total: poisonDeadLetters.length,
+      rows: poisonDeadLetters,
+    },
     empty("pending_dispatches"),
     empty("autopilot_state"),
     empty("armed_epics"),
@@ -1252,6 +1298,7 @@ describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
     // snapshot, so there is no out-of-band queryCollection.
     expect(collections).toContain("dispatch_failures");
     expect(collections).toContain("provider_leg_ownership");
+    expect(collections).toContain("poison_dead_letters");
 
     // A jam sticky delivered on the snapshot flows into the envelope's
     // needs-human / jammed math (board otherwise at rest).
@@ -1273,6 +1320,53 @@ describe("runStatus dispatch_failures snapshot sourcing (ADR 0011)", () => {
     expect(env.ok).toBe(true);
     expect(env.data.needs_human.stuck_dispatches).toBe(1);
     expect(env.data.needs_human.total).toBe(1);
+    expect(env.data.jammed).toBe(true);
+    expect(env.data.drained).toBe(false);
+  });
+
+  test("poison rows ride the distinct snapshot collection and keep needs-human nonzero", async () => {
+    const { factory, sockets } = makeStatusMockConnect();
+    const { deps, cap } = makeStatusDeps(factory);
+
+    await runStatus(statusArgs(), deps);
+    const sock = sockets[0];
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+    sock.deliver(
+      statusReadinessFrames(
+        [],
+        [],
+        [],
+        [
+          {
+            dl_id: "poison-live",
+            session_id: "poison",
+            bindings: { raw: "bad", file: "/events/1.ndjson" },
+          },
+        ],
+      ),
+    );
+    const env = JSON.parse(cap.stdout[0] ?? "{}") as {
+      data: {
+        jammed: boolean;
+        drained: boolean;
+        needs_human: {
+          dead_letters: number;
+          poison_dead_letters: number;
+          poison_blocking_scopes: string[];
+          total: number;
+        };
+      };
+    };
+    expect(env.data.needs_human).toEqual(
+      expect.objectContaining({
+        dead_letters: 0,
+        poison_dead_letters: 1,
+        poison_blocking_scopes: ["global"],
+        total: 1,
+      }),
+    );
     expect(env.data.jammed).toBe(true);
     expect(env.data.drained).toBe(false);
   });
