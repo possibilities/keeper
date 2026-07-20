@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "sonnet",
+      "rationale": null,
+      "task_id": "fn-1385-prove-tmux-control-degrade-and-true-the.1",
+      "tier": "high"
+    },
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "sonnet",
+      "rationale": null,
+      "task_id": "fn-1385-prove-tmux-control-degrade-and-true-the.2",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T12:18:22.395000Z",
+  "epic_id": "fn-1385-prove-tmux-control-degrade-and-true-the",
+  "input_hash": "d2aa2a1890bb3075a83d916a13332994c56c15245d50a3f33e8c77157acb5190",
+  "outcome": "degraded:selector returned prose-prefixed then structurally malformed JSON (missing array close) across the one sanctioned retry; re-asserting scaffold cells per the select-before-arm degrade rung",
+  "schema_version": 1,
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}
