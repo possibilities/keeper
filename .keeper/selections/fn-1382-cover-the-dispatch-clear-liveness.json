@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.4-mini",
+      "rationale": "Well-specified test-only hardening with a named surface and exact line references, coverage-only with no behavior change, so GPT-first; the seam extraction plus freshMemDb-seeded assertions carry real bounded reasoning that would strand spark, landing on the strongest light GPT tier at the medium band for straight test additions.",
+      "task_id": "fn-1382-cover-the-dispatch-clear-liveness.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T08:13:49.233000Z",
+  "epic_id": "fn-1382-cover-the-dispatch-clear-liveness",
+  "input_hash": "bcc7106af7872bfa94ace69a59e8b5eb8206110c6a6703a2185d86437736404a",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3167162474,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.4-mini\",\"rationale\":\"Well-specified test-only hardening with a named surface and exact line references, coverage-only with no behavior change, so GPT-first; the seam extraction plus freshMemDb-seeded assertions carry real bounded reasoning that would strand spark, landing on the strongest light GPT tier at the medium band for straight test additions.\",\"confidence\":0.79}]}\n"
+}
