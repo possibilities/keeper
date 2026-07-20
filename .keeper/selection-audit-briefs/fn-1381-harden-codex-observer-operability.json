@@ -1,0 +1,75 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.5",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 33,
+        "files_changed": 2,
+        "insertions": 471
+      },
+      "done_summary": "Observer now resolves the pi-ai codex catalog via an ordered chain (KEEPER_PI_CODEX_CATALOG_DIR override, package-relative lookup, home bun/nvm package-manager scan, then legacy PATH scan) so it no longer hard-depends on a literal pi executable on PATH; full-chain failure still yields the bounded pool-unavailable envelope. Verified end-to-end against the real repo checkout under a minimal PATH.",
+      "input_hash": "c4f9a6b1193fa2693173816cec3dac790289269e34c11f0894c0cc1744ea2a2c",
+      "model": "gpt-5.5",
+      "spec_chars": 3296,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** integrations/pi-codex-pool/src/observer.ts, integrations/pi-codex-pool/test/observer.test.ts\n\n### Approach\n\nThe observer command resolves the pi-ai provider catalog today by walking\nPATH entries looking for a literal `pi` executable and importing\n`node_modules/@earendil-works/pi-ai/dist/providers/all.js` relative to the\nresolved package root. On the daemon's LaunchAgent PATH no `pi` file exists\n(the real CLI lives under an nvm version dir), so `loadInstalledCodexOAuth`\nthrows and every invocation returns the `pool-unavailable` envelope. The\ncontract after this task: the observer resolves the catalog through an\nordered chain that does not require a PATH `pi` \u2014 (1) an explicit\n`KEEPER_PI_CODEX_CATALOG_DIR`-style override when set, (2) resolution\nrelative to the observer's own package root (the bun-linked global install\nand the repo checkout both place the pool package where a sibling/parent\nlookup can be defined deterministically \u2014 verify what the installed layout\nactually offers before committing to the rule), (3) the existing PATH scan\nas the final fallback. Failure of the whole chain keeps the current bounded\nunavailable envelope. Every probe stays read-only and diagnostics stay\nnon-exposing, matching the current catch-and-continue style.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- integrations/pi-codex-pool/src/observer.ts:200-238 \u2014 loadInstalledCodexOAuth PATH scan + catalog import\n- integrations/pi-codex-pool/src/observer.ts:241-275 \u2014 runObserverCommand gates (KEEPER_JOB_ID, alias env, catch-all envelope)\n- integrations/pi-codex-pool/test/observer.test.ts \u2014 existing observer test seams\n\n**Optional** (reference as needed):\n- ~/.bun/bin/keeper-pi-codex-observe \u2014 the bun-link symlink whose target dir shape the package-relative rule must handle\n- src/account-routing-config.ts:144-153 \u2014 how keeperd resolves the observer command (env override precedent)\n\n### Risks\n\nThe installed (bun-link) layout and the in-repo layout may differ in where\npi-ai is reachable; the package-relative rule must be verified against both\nor the override key becomes the primary fix.\n\n### Test notes\n\nUnit-test the resolution chain through an injectable seam (env override\nhit, package-relative hit, PATH fallback hit, full-chain miss) without\nspawning real processes.\n\n## Acceptance\n\n- [ ] Running the installed observer under a minimal PATH containing no `pi` executable emits a real observation envelope for the configured aliases\n- [ ] An explicit catalog-dir override env var is honored ahead of discovery\n- [ ] Full-chain resolution failure still emits the bounded unavailable envelope, never a crash or partial output\n- [ ] Focused observer tests cover all four chain outcomes and pass\n\n## Done summary\nObserver now resolves the pi-ai codex catalog via an ordered chain (KEEPER_PI_CODEX_CATALOG_DIR override, package-relative lookup, home bun/nvm package-manager scan, then legacy PATH scan) so it no longer hard-depends on a literal pi executable on PATH; full-chain failure still yields the bounded pool-unavailable envelope. Verified end-to-end against the real repo checkout under a minimal PATH.\n## Evidence\n",
+      "task_id": "fn-1381-harden-codex-observer-operability.1",
+      "tier": "high",
+      "title": "Resolve observer catalog without PATH pi"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 6,
+        "insertions": 335
+      },
+      "done_summary": "Failed codex observation refresh cycles now log one bounded reason-classed line and persist a durable consecutive-failure sidecar (reset on success); keeper agent accounts check surfaces that state in the codex capacity block.",
+      "input_hash": "c4f9a6b1193fa2693173816cec3dac790289269e34c11f0894c0cc1744ea2a2c",
+      "model": "sonnet",
+      "spec_chars": 3106,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/codex-account-observation-refresh.ts, src/codex-account-observer-worker.ts, src/agent/main.ts, test/codex-account-observation-refresh.test.ts, test/codex-account-observer-worker.test.ts\n\n### Approach\n\nToday a refresh cycle whose observer run yields no observation returns the\nstale sidecar silently \u2014 no log, no counter, nothing an operator can read;\nthe production consequence was an invisible pool collapse. The contract\nafter this task: (1) each failed refresh attempt logs ONE bounded line\n(reason-classed: spawn/timeout/unavailable-envelope/parse) from the\nobserver worker cycle; (2) consecutive-failure state is durably readable \u2014\na small sidecar (e.g. next to the observation sidecar, worker-owned,\nproducer-side, never a fold input) recording consecutive failure count and\nlast failure class/time; (3) `keeper agent accounts check` surfaces that\nstate in the codex capacity block so a stale observation is diagnosable\nfrom the operator's standing health read. Do not mint daemon distress rows\nor touch reducer/daemon surfaces \u2014 that integration is an explicit\nfollow-up; this task keeps to the refresh/worker/CLI-inspection files.\nRespect the existing worker log discipline (one bounded console.error per\nevent, no payload echo).\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/codex-account-observation-refresh.ts:71-120 \u2014 refreshCodexObservationIfStale silent null-return path\n- src/codex-account-observer-worker.ts:55-90 \u2014 the 30s cycle + its catch\n- src/agent/main.ts:620-660 \u2014 codex session-routing inspection assembled for accounts check\n\n**Optional** (reference as needed):\n- src/codex-account-router.ts:480-560 \u2014 how health/fresh/verdict are derived for the capacity block\n- test/codex-observer-envelope-landing.test.ts \u2014 end-to-end envelope landing seam\n\n### Risks\n\nThe refresh function is shared by the CLI pre-refresh path (activate/verify)\nand the daemon worker; failure-state writes must be safe under both callers\nand under the existing refresh flock.\n\n### Test notes\n\nDrive the refresh seam with an injected always-failing runner and assert\nthe failure sidecar increments, the log line is bounded and single, and a\nsubsequent success resets the counter; assert the accounts-check\ninspection includes the failure state via its unit seam.\n\n## Acceptance\n\n- [ ] A failed refresh cycle produces exactly one bounded reason-classed log line and increments a durable consecutive-failure record\n- [ ] A successful refresh resets that record\n- [ ] `keeper agent accounts check --json` exposes the consecutive-failure state in the codex capacity block\n- [ ] No daemon, reducer, or dead-letter surface is touched; focused tests for the refresh and worker files pass\n\n## Done summary\nFailed codex observation refresh cycles now log one bounded reason-classed line and persist a durable consecutive-failure sidecar (reset on success); keeper agent accounts check surfaces that state in the codex capacity block.\n## Evidence\n",
+      "task_id": "fn-1381-harden-codex-observer-operability.2",
+      "tier": "high",
+      "title": "Surface failed observation refreshes"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 6,
+        "files_changed": 6,
+        "insertions": 118
+      },
+      "done_summary": "Consumed the codex-pool proof-window launcher flag before generic run-arg parsing so keeper agent run pi --x-codex-pool-proof-window=arm reaches the launch argv; restricted to a fresh managed Pi launch and reused the existing launch-scoped proof-window plumbing. Docs and CLI help now agree on one canonical arming form; added focused tests covering forwarding, rejection of arbitrary --x flags, and docs/help agreement.",
+      "input_hash": "c4f9a6b1193fa2693173816cec3dac790289269e34c11f0894c0cc1744ea2a2c",
+      "model": "sonnet",
+      "spec_chars": 2620,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/agent/main.ts, docs/install.md, test/agent-run.test.ts\n\n### Approach\n\nThe install docs document arming the codex-pool proof window via the run\nwrapper (`keeper agent run pi --x-codex-pool-proof-window=arm ...`), but\nthe run wrapper's argument handling rejects that launcher flag \u2014 only the\ndirect `keeper agent pi --x-...` form works. The full 13-clause proof\nre-run (standing item ~2026-07-26, when the exhausted alias's weekly\nwindow resets) follows the documented form, so either the wrapper must\npass `--x-*` launcher flags through to the launched harness argv, or the\ndocs must be rewritten onto the direct form. Prefer the passthrough if it\nis a bounded argv-handling fix (launcher flags are already a defined\nnamespace on the direct path); fall back to a docs-only correction if\npassthrough would widen the wrapper's contract in ways its guards assume\nclosed. Reproduce the parse failure first and record the exact error in\nthe task evidence.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- docs/install.md:245-250 \u2014 the documented arming ritual\n- src/agent/main.ts \u2014 run-verb argv parsing (locate the run handler and where unknown flags are rejected)\n\n**Optional** (reference as needed):\n- src/agent/main.ts:3040-3060 \u2014 where activate/verify consume launcher-adjacent flags (degraded-flag precedent for strict flag validation)\n\n### Risks\n\nThe run wrapper deliberately validates argv tightly (wrapped-guard\ninterplay); a blanket passthrough must not create an injection or\ncontract-widening surface \u2014 keep it to the `--x-` namespace.\n\n### Test notes\n\nA focused test drives the run-verb argv path with the documented flag and\nasserts it reaches the launch argv (or, on the docs-only outcome, the\ndocs and any agent-help text agree on the direct form).\n\n## Acceptance\n\n- [ ] The command form documented in the install docs for arming the proof window parses and arms without error\n- [ ] Docs and CLI help agree on exactly one canonical arming form\n- [ ] Focused tests covering the chosen fix pass\n\n## Done summary\nConsumed the codex-pool proof-window launcher flag before generic run-arg parsing so keeper agent run pi --x-codex-pool-proof-window=arm reaches the launch argv; restricted to a fresh managed Pi launch and reused the existing launch-scoped proof-window plumbing. Docs and CLI help now agree on one canonical arming form; added focused tests covering forwarding, rejection of arbitrary --x flags, and docs/help agreement.\n## Evidence\n",
+      "task_id": "fn-1381-harden-codex-observer-operability.3",
+      "tier": "high",
+      "title": "Fix proof window arming ritual form"
+    }
+  ],
+  "created_at": "2026-07-20T08:14:50.179000Z",
+  "epic_id": "fn-1381-harden-codex-observer-operability",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "c4f9a6b1193fa2693173816cec3dac790289269e34c11f0894c0cc1744ea2a2c",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
