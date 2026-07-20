@@ -46,6 +46,7 @@ import {
   ATTRIBUTION_FLOOR_PATH,
   ATTRIBUTION_FLOOR_SESSION_ID,
 } from "../git-attribution-floor";
+import { hasOrderedTerminalProof } from "../lifecycle-terminal-proof";
 import type { GitRunner } from "./git-exec";
 import { isUuid } from "./identity";
 import {
@@ -1061,37 +1062,6 @@ function unresolvedDeadLetterEvidence(
 
 const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
   "'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest', 'Notification'";
-
-interface OrderedTerminalProofInput {
-  mutationEventId: number | null;
-  state: string | null;
-  sessionLifecycleTailEventId: number | null;
-  sessionLifecycleTailHook: string | null;
-  reducerCursorEventId: number;
-}
-
-/**
- * A claim is terminally proven only from the session's own lifecycle tail: the
- * last lifecycle word must be a terminal one, ordered after the mutation and
- * already consumed by the reducer so the projected state reflects it. The
- * jobs row's last_event_id is NOT the witness — any later fold touching the
- * row (a GitSnapshot, an enrich) moves it past the terminal event, and a
- * pointer that drifts must not be able to un-prove a real death. Cross-pairing
- * is accepted (a killed projection whose tail is SessionEnd, or vice versa):
- * either terminal word ends the session; which one won the race to disk does
- * not change that.
- */
-function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
-  return (
-    row.mutationEventId !== null &&
-    row.sessionLifecycleTailEventId !== null &&
-    row.sessionLifecycleTailEventId > row.mutationEventId &&
-    row.reducerCursorEventId >= row.sessionLifecycleTailEventId &&
-    (row.sessionLifecycleTailHook === "SessionEnd" ||
-      row.sessionLifecycleTailHook === "Killed") &&
-    (row.state === "ended" || row.state === "killed")
-  );
-}
 
 /**
  * Read folded claims plus exact tool mutations newer than the root's last Git
