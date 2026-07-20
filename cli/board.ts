@@ -39,8 +39,12 @@ import { parseArgs } from "node:util";
 import {
   type FableFocusRoutingView,
   inspectRouting,
+  type NonFableFocusRoutingView,
 } from "../src/account-router";
-import { projectFableFocus } from "../src/autopilot-projection";
+import {
+  projectFableFocus,
+  projectNonFableFocus,
+} from "../src/autopilot-projection";
 import {
   apiErrorPillSeg,
   armedPill,
@@ -399,6 +403,7 @@ export interface BoardHeaderViewModel {
   readonly autopilot: BoardHeaderAutopilot;
   readonly needsHumanCount: number;
   readonly fableFocus: FableFocusRoutingView;
+  readonly nonFableFocus: NonFableFocusRoutingView;
 }
 
 export interface BoardHeaderFormatInput {
@@ -473,7 +478,9 @@ export function wrapBoardHeaderLine(value: string, width: number): string[] {
   return rows;
 }
 
-function focusLifetime(focus: FableFocusRoutingView): string {
+type HeaderFocusRoutingView = FableFocusRoutingView | NonFableFocusRoutingView;
+
+function focusLifetime(focus: HeaderFocusRoutingView): string {
   const lifetime = focus.lifetime;
   if (lifetime === null) {
     return "unavailable";
@@ -486,7 +493,15 @@ function focusLifetime(focus: FableFocusRoutingView): string {
     : `until the Fable cycle ending ${lifetime.reset_at}`;
 }
 
-function focusState(focus: FableFocusRoutingView, now: number): string {
+function focusEligibility(focus: HeaderFocusRoutingView): string {
+  return focus.target_eligible === null
+    ? "unknown"
+    : focus.target_eligible
+      ? "yes"
+      : "no";
+}
+
+function focusState(focus: HeaderFocusRoutingView, now: number): string {
   if (focus.state === "unavailable" || focus.state === "invalid") {
     return "unavailable; using normal account balancing";
   }
@@ -522,7 +537,7 @@ function fableFocusHeaderLines(
     lines.push(
       `  target account route: ${focus.target_route ?? "unavailable"}`,
       `  lifetime: ${focusLifetime(focus)}`,
-      `  target currently eligible: ${focus.target_eligible === null ? "unknown" : focus.target_eligible ? "yes" : "no"}`,
+      `  target currently eligible: ${focusEligibility(focus)}`,
     );
   } else {
     lines.push("  configured: no");
@@ -534,8 +549,30 @@ function fableFocusHeaderLines(
   return lines;
 }
 
+function nonFableFocusHeaderLines(
+  focus: NonFableFocusRoutingView,
+  now: number,
+): string[] {
+  if (
+    !focus.configured &&
+    focus.state === "off" &&
+    focus.diagnostic === "none"
+  ) {
+    return ["Non-Fable focus: off"];
+  }
+  return [
+    "Non-Fable focus",
+    `  target account route: ${focus.target_route ?? "unavailable"}`,
+    `  lifetime: ${focusLifetime(focus)}`,
+    `  target currently eligible: ${focusEligibility(focus)}`,
+    `  effective routing state: ${focusState(focus, now)}`,
+    `  diagnostic: ${focus.diagnostic}`,
+  ];
+}
+
 export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
-  const { autopilot, fableFocus, needsHumanCount, summary } = input.viewModel;
+  const { autopilot, fableFocus, needsHumanCount, nonFableFocus, summary } =
+    input.viewModel;
   const width = Math.max(1, Math.floor(input.width));
   const cap =
     autopilot.maxConcurrentJobs === null
@@ -558,6 +595,7 @@ export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
   ];
   const logicalLines = [
     ...fableFocusHeaderLines(fableFocus, input.now),
+    ...nonFableFocusHeaderLines(nonFableFocus, input.now),
     ...boardSummaryLines(summary),
     ...autopilotLines,
   ];
@@ -1047,6 +1085,16 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       reason: "policy-off",
       diagnostic: "none",
     } as FableFocusRoutingView,
+    nonFableFocus: {
+      configured: false,
+      state: "off",
+      target_route: null,
+      lifetime: null,
+      target_eligible: null,
+      outcome: "off",
+      reason: "policy-off",
+      diagnostic: "none",
+    } as NonFableFocusRoutingView,
   };
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -1401,6 +1449,7 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
         },
         needsHumanCount,
         fableFocus: apState.fableFocus,
+        nonFableFocus: apState.nonFableFocus,
       };
       const renderedAtMs = Date.now();
       const width = boardHeaderWidth();
@@ -1529,13 +1578,35 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       apState.mode = projectAutopilotMode(rows) ?? "yolo";
       apState.worktreeMode = projectWorktreeMode(rows) ?? false;
       apState.workerProvider = projectWorkerProvider(rows);
-      const focus = projectFableFocus(rows);
-      apState.fableFocus = focus.valid
+      const fableFocus = projectFableFocus(rows);
+      apState.fableFocus = fableFocus.valid
         ? inspectRouting({
             model: "fable",
             fableIntent: true,
-            focusDelivery: { available: true, policy: focus.policy },
+            focusDelivery: { available: true, policy: fableFocus.policy },
+            nonFableFocusDelivery: { available: true, policy: null },
           }).fable_focus
+        : {
+            configured: false,
+            state: "unavailable",
+            target_route: null,
+            lifetime: null,
+            target_eligible: null,
+            outcome: "fallback",
+            reason: "policy-unavailable",
+            diagnostic: "policy-invalid",
+          };
+      const nonFableFocus = projectNonFableFocus(rows);
+      apState.nonFableFocus = nonFableFocus.valid
+        ? inspectRouting({
+            model: null,
+            fableIntent: false,
+            focusDelivery: { available: true, policy: null },
+            nonFableFocusDelivery: {
+              available: true,
+              policy: nonFableFocus.policy,
+            },
+          }).non_fable_focus
         : {
             configured: false,
             state: "unavailable",
