@@ -7,7 +7,7 @@
     "fn-1380-harden-poison-gate-and-fence-clears"
   ],
   "id": "fn-1382-cover-the-dispatch-clear-liveness",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-20T08:13:51.066000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-20T08:13:48.623000Z"
+  "updated_at": "2026-07-20T08:13:51.066000Z"
 }
