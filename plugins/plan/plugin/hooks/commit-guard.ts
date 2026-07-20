@@ -1,16 +1,15 @@
 #!/usr/bin/env bun
 // PreToolUse(Bash) commit hard-deny dispatcher.
 //
-// Denies a MAIN-context `keeper commit-work` / `git commit` while the session's
-// claimed task is in_progress: the orchestrator never commits — it resumes the
-// worker. Worker-context calls (agent_id present) always pass; that check is
-// load-bearing and precedes everything but the bypass/tool gate. Fail open on
-// every path (exit 0, no deny) — a false deny against the worker bricks the
-// whole work loop.
+// Denies `keeper commit-work` / `git commit` while a session's claimed task is
+// in progress, except for two exact close-out shapes: the selected work:worker,
+// or a main-context operator invoking commit-work with the claim's literal Task
+// id so Keeper can mint the mechanical trailer. A generic subagent cannot turn
+// itself into either shape. Fail open on internal errors (exit 0, no deny); a
+// policy refusal is emitted only through the hook envelope.
 
 import {
   emitDeny,
-  isBypassed,
   readMarker,
   readStdin,
   runPlanCli,
@@ -21,14 +20,46 @@ import {
  * start-of-string or after a shell command separator (`&&`, `;`, `||`, `|`,
  * `$(`, `(`, newline), tolerating leading `VAR=val`, `sudo`, and `env`
  * prefixes. Anchoring on a real command boundary skips quoted false positives
- * like `echo "git commit"` (the `"` is not a boundary char). The documented
- * gap is `sh -c '...'` payloads, which carry the command inside a quoted
- * string the parser never enters. */
-const COMMIT_PATTERN =
-  /(?:^|[;&|\n(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env)[ \t]+)*(?:git[ \t]+commit|keeper[ \t]+commit-work)\b/;
+ * like `echo "git commit"` (the `"` is not a boundary char). A conservative
+ * companion token catches wrapped spellings before the policy decision. */
+const GIT_COMMIT_PATTERN =
+  /(?:^|[;&|\n(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env)[ \t]+)*git[ \t]+commit\b/;
+const KEEPER_COMMIT_WORK_PATTERN =
+  /(?:^|[;&|\n(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env)[ \t]+)*keeper[ \t]+commit-work\b/;
+const KEEPER_COMMIT_WORK_INVOCATION =
+  /(?:^|[;&|\n(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env)[ \t]+)*keeper[ \t]+commit-work\b([^;&|\n)]*)/g;
+const CONSERVATIVE_COMMIT_TOKEN =
+  /(?:^|[\s'"`/])(?:git[ \t]+commit|keeper[ \t]+commit-work)\b/;
 
 export function isCommitCommand(command: string): boolean {
-  return COMMIT_PATTERN.test(command);
+  return (
+    GIT_COMMIT_PATTERN.test(command) || KEEPER_COMMIT_WORK_PATTERN.test(command)
+  );
+}
+
+function regexEscape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** The deliberately narrow operator seam: one commit-work invocation, no raw
+ * git commit, with the exact claimed Task id as its first argument. Requiring
+ * the authority flag first keeps a quoted message from masquerading as it. */
+export function isClaimedTaskCommitWork(
+  command: string,
+  taskId: string,
+): boolean {
+  if (GIT_COMMIT_PATTERN.test(command)) return false;
+  const invocations = [...command.matchAll(KEEPER_COMMIT_WORK_INVOCATION)];
+  if (invocations.length !== 1) return false;
+  const escaped = regexEscape(taskId);
+  const taskToken = `(?:${escaped}|"${escaped}"|'${escaped}')`;
+  return new RegExp(
+    `^[ \\t]+--task-id(?:[ \\t]+${taskToken}|=${taskToken})(?=[ \\t]|$)`,
+  ).test(invocations[0]?.[1] ?? "");
+}
+
+function isWorkWorker(agentType: string | undefined): boolean {
+  return agentType === "work:worker";
 }
 
 /** Reconcile verdicts that prove the marker's task is genuinely mid-flight —
@@ -43,24 +74,24 @@ const IN_FLIGHT_VERDICTS = new Set([
 ]);
 
 async function main(): Promise<void> {
-  if (isBypassed()) return;
-
   const raw = await readStdin();
   const payload = JSON.parse(raw) as {
     session_id?: string;
     tool_name?: string;
     agent_id?: string;
+    agent_type?: string;
     tool_input?: { command?: string };
   };
 
   if (payload.tool_name !== "Bash") return;
-  // Load-bearing: a worker (subagent) call MUST never be denied. `agent_id` is
-  // the canonical subagent discriminant — present means worker context. Only a
-  // truly-absent field counts as main context (an empty string is not present).
-  if (payload.agent_id) return;
-
   const command = payload.tool_input?.command ?? "";
-  if (!isCommitCommand(command)) return;
+  if (!isCommitCommand(command) && !CONSERVATIVE_COMMIT_TOKEN.test(command)) {
+    return;
+  }
+
+  // The generated worker role is the only subagent close-out authority;
+  // agent_id alone is insufficient.
+  if (payload.agent_id && isWorkWorker(payload.agent_type)) return;
 
   const sessionId = payload.session_id ?? "";
   const marker = await readMarker(sessionId);
@@ -79,10 +110,15 @@ async function main(): Promise<void> {
   }
   if (!IN_FLIGHT_VERDICTS.has(verdict as string)) return;
 
+  if (!payload.agent_id && isClaimedTaskCommitWork(command, marker.task_id)) {
+    return;
+  }
+
   emitDeny(
-    `Refusing to commit from the orchestrator's main context: task ${marker.task_id} ` +
-      "is in-flight. Resume the worker — the orchestrator never commits. " +
-      "Set KEEPER_PLAN_GUARD_BYPASS=1 to override as a human.",
+    `Refusing an unattributed commit while task ${marker.task_id} is in-flight. ` +
+      `A free-form operator must invoke keeper commit-work --task-id ${marker.task_id} ` +
+      "directly from the session that holds the live claim; raw git, a generic " +
+      "subagent, and a mismatched or absent Task id remain denied.",
   );
 }
 

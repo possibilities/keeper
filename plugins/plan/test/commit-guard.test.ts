@@ -19,7 +19,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { isCommitCommand } from "../plugin/hooks/commit-guard.ts";
+import {
+  isClaimedTaskCommitWork,
+  isCommitCommand,
+} from "../plugin/hooks/commit-guard.ts";
 
 describe("isCommitCommand", () => {
   const positives = [
@@ -59,6 +62,33 @@ describe("isCommitCommand", () => {
   for (const cmd of negatives) {
     test(`rejects: ${cmd}`, () => {
       expect(isCommitCommand(cmd)).toBe(false);
+    });
+  }
+});
+
+describe("isClaimedTaskCommitWork", () => {
+  const taskId = "fn-1383-rail.1";
+
+  for (const command of [
+    `keeper commit-work --task-id ${taskId} "feat: land work"`,
+    `keeper commit-work --task-id=${taskId} --message-file /tmp/message`,
+    `cd /lane && keeper commit-work --task-id '${taskId}' --preview-files`,
+  ]) {
+    test(`admits exact operator shape: ${command}`, () => {
+      expect(isClaimedTaskCommitWork(command, taskId)).toBe(true);
+    });
+  }
+
+  for (const command of [
+    `keeper commit-work "feat: no attribution"`,
+    `keeper commit-work "--task-id ${taskId}"`,
+    `keeper commit-work --task-id fn-1383-rail.10 "feat: wrong task"`,
+    `keeper commit-work --message-file /tmp/message --task-id ${taskId}`,
+    `keeper commit-work --task-id ${taskId} x && git commit -m forged`,
+    `keeper commit-work --task-id ${taskId} x; keeper commit-work --task-id ${taskId} y`,
+  ]) {
+    test(`rejects non-exact operator shape: ${command}`, () => {
+      expect(isClaimedTaskCommitWork(command, taskId)).toBe(false);
     });
   }
 });
@@ -168,20 +198,26 @@ describe("commit-guard ladder", () => {
     );
   });
 
-  test("denies a compound `cd x && git commit` command", async () => {
+  test("denies compound and wrapped main-context commit commands", async () => {
     writeWorkMarker("fn-1-x.2");
     writePlanCliShim({ verdict: "in_progress_committed", task_id: "fn-1-x.2" });
 
-    const { stdout, code } = await run(
-      bashPayload({ tool_input: { command: "cd sub && git commit -m y" } }),
-    );
-    expect(code).toBe(0);
-    expect(
-      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
-    ).toBe("deny");
+    for (const command of [
+      "cd sub && git commit -m y",
+      `sh -c 'keeper commit-work --task-id fn-1-x.2 "fix: x"'`,
+    ]) {
+      rmSync(sentinel, { force: true });
+      const { stdout, code } = await run(
+        bashPayload({ tool_input: { command } }),
+      );
+      expect(code).toBe(0);
+      expect(
+        JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    }
   });
 
-  test("passes when agent_id is present, regardless of marker/command", async () => {
+  test("passes for the selected work:worker without a reconcile call", async () => {
     writeWorkMarker("fn-1-x.2");
     writePlanCliShim({
       verdict: "in_progress_uncommitted",
@@ -189,11 +225,85 @@ describe("commit-guard ladder", () => {
     });
 
     const { stdout, code, planCliCalled } = await run(
-      bashPayload({ agent_id: "agent-7" }),
+      bashPayload({ agent_id: "agent-7", agent_type: "work:worker" }),
     );
     expect(code).toBe(0);
     expect(stdout).toBe("");
     expect(planCliCalled).toBe(false);
+  });
+
+  for (const [label, command] of [
+    ["direct Git", "git commit -m y"],
+    [
+      "command plus absolute Keeper path",
+      'command /usr/local/bin/keeper commit-work --task-id fn-1-x.2 "fix: x"',
+    ],
+    ["sh -c", `sh -c 'keeper commit-work --task-id fn-1-x.2 "fix: x"'`],
+    ["backticks", '`keeper commit-work --task-id fn-1-x.2 "fix: x"`'],
+  ]) {
+    test(`denies generic-subagent laundering via ${label}`, async () => {
+      writeWorkMarker("fn-1-x.2");
+      writePlanCliShim({
+        verdict: "in_progress_uncommitted",
+        task_id: "fn-1-x.2",
+      });
+
+      const { stdout, code, planCliCalled } = await run(
+        bashPayload({
+          agent_id: "agent-7",
+          agent_type: "general-purpose",
+          tool_input: { command },
+        }),
+      );
+      expect(code).toBe(0);
+      expect(planCliCalled).toBe(true);
+      expect(
+        JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    });
+  }
+
+  test("admits a main-context operator with the live exact-task claim", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_uncommitted",
+      task_id: "fn-1-x.2",
+    });
+
+    const { stdout, code, planCliCalled } = await run(
+      bashPayload({
+        tool_input: {
+          command:
+            'keeper commit-work --task-id fn-1-x.2 "fix(rail): land verified work"',
+        },
+      }),
+    );
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(planCliCalled).toBe(true);
+  });
+
+  test("denies main-context commit-work without the exact claimed Task id", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanCliShim({
+      verdict: "in_progress_uncommitted",
+      task_id: "fn-1-x.2",
+    });
+
+    for (const command of [
+      'keeper commit-work "fix(rail): unattributed"',
+      'keeper commit-work --task-id fn-1-x.3 "fix(rail): wrong task"',
+    ]) {
+      rmSync(sentinel, { force: true });
+      const { stdout, code, planCliCalled } = await run(
+        bashPayload({ tool_input: { command } }),
+      );
+      expect(code).toBe(0);
+      expect(planCliCalled).toBe(true);
+      expect(
+        JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+      ).toBe("deny");
+    }
   });
 
   test("done reconcile allows AND unlinks the stale marker", async () => {
@@ -232,7 +342,7 @@ describe("commit-guard ladder", () => {
     expect(stdout).toBe("");
   });
 
-  test("bypass allows before any I/O — no keeper call", async () => {
+  test("KEEPER_PLAN_GUARD_BYPASS cannot bypass the commit rail", async () => {
     writeWorkMarker("fn-1-x.2");
     writePlanCliShim({
       verdict: "in_progress_uncommitted",
@@ -242,8 +352,10 @@ describe("commit-guard ladder", () => {
     const { stdout, planCliCalled } = await run(bashPayload(), {
       KEEPER_PLAN_GUARD_BYPASS: "1",
     });
-    expect(stdout).toBe("");
-    expect(planCliCalled).toBe(false);
+    expect(planCliCalled).toBe(true);
+    expect(
+      JSON.parse(stdout.trim()).hookSpecificOutput.permissionDecision,
+    ).toBe("deny");
   });
 
   test("non-commit Bash payload produces zero keeper subprocesses", async () => {

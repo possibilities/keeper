@@ -573,6 +573,61 @@ function decide(
   return decideWrappedGuard(payload, env, fakeProbe());
 }
 
+describe("decideWrappedGuard — bounded bus chat send", () => {
+  const busDenyReason =
+    "Wrapped-cell worker BLOCKED: this Bash command is off the delegation + " +
+    "close-out allowlist: wrapped `keeper bus` permits only `keeper bus chat " +
+    "send <target> <message>`. Permitted: `keeper agent` (run/--resume/wait/" +
+    "wait-for-stop/show-last-message/providers), `keeper commit-work`, " +
+    "task-bound `keeper plan done`/AUDIT_READY `block` + bounded reads, " +
+    "`keeper session state`, and the read-only git surface (log / status / diff / " +
+    "show / rev-parse). Repository-defined tests/scripts execute only inside the " +
+    "provider leg. Every source-editing vector — redirects, heredocs, tee, sed -i, " +
+    "patch, cp/mv/tar, git apply/am, interpreters, and re-entrant shells — is denied.";
+  const cases: Array<{ command: string; expectedReason: string | null }> = [
+    {
+      command:
+        'keeper bus chat send work::fn-1-claimant.3 "please release the contested paths after commit-work refusal"',
+      expectedReason: null,
+    },
+    {
+      command: "keeper bus watch work::fn-1-x.2",
+      expectedReason: busDenyReason,
+    },
+    { command: "keeper bus list", expectedReason: busDenyReason },
+    {
+      command: "keeper bus chat send work::fn-1-claimant.3",
+      expectedReason: busDenyReason,
+    },
+    {
+      command:
+        'keeper bus chat send work::fn-1-claimant.3 "please release" extra',
+      expectedReason: busDenyReason,
+    },
+    {
+      command: "keeper bus chat receive work::fn-1-claimant.3 message",
+      expectedReason: busDenyReason,
+    },
+  ];
+
+  for (const { command, expectedReason } of cases) {
+    test(`${expectedReason === null ? "allows" : "denies"}: ${command}`, () => {
+      const decision = decide(bashPayload(command));
+      if (expectedReason === null) {
+        expect(decision).toBeNull();
+      } else {
+        expect(decision).toEqual({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: expectedReason,
+          },
+        });
+      }
+    });
+  }
+});
+
 describe("decideWrappedGuard — jurisdiction ladder", () => {
   test("inert (null) when unmarked — a human / native worker is never blocked", () => {
     expect(decide(editPayload("Edit", `${REPO}/src/x.ts`), {})).toBeNull();

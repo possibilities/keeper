@@ -46,6 +46,7 @@ import {
   ATTRIBUTION_FLOOR_PATH,
   ATTRIBUTION_FLOOR_SESSION_ID,
 } from "../git-attribution-floor";
+import { hasOrderedTerminalProof } from "../lifecycle-terminal-proof";
 import type { GitRunner } from "./git-exec";
 import { isUuid } from "./identity";
 import {
@@ -133,6 +134,7 @@ export interface RequestReleaseDeclineAnnotation {
 
 export interface RequestReleaseClaimantPointer {
   claimant_session_id: string;
+  worktree: string;
   paths: string[];
   path_total: number;
   paths_truncated: boolean;
@@ -154,6 +156,7 @@ export interface RequestReleasePointer {
 
 export interface RequestReleaseConflict {
   claimantSessionId: string;
+  worktree: string;
   path: string;
   decline?: ReleaseDeclineEvidence;
 }
@@ -215,9 +218,11 @@ export interface AdoptionRejection {
 }
 
 export interface SurfaceDiscoveryResult {
+  worktree: string;
   selected: string[];
   automatic: string[];
   adopted: string[];
+  ambiguous: string[];
   rejections: AdoptionRejection[];
   summary: CommitWorkSurfaceSummary;
   claimsByPath: Map<string, OwnershipClaim[]>;
@@ -1058,37 +1063,6 @@ function unresolvedDeadLetterEvidence(
 const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
   "'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest', 'Notification'";
 
-interface OrderedTerminalProofInput {
-  mutationEventId: number | null;
-  state: string | null;
-  sessionLifecycleTailEventId: number | null;
-  sessionLifecycleTailHook: string | null;
-  reducerCursorEventId: number;
-}
-
-/**
- * A claim is terminally proven only from the session's own lifecycle tail: the
- * last lifecycle word must be a terminal one, ordered after the mutation and
- * already consumed by the reducer so the projected state reflects it. The
- * jobs row's last_event_id is NOT the witness — any later fold touching the
- * row (a GitSnapshot, an enrich) moves it past the terminal event, and a
- * pointer that drifts must not be able to un-prove a real death. Cross-pairing
- * is accepted (a killed projection whose tail is SessionEnd, or vice versa):
- * either terminal word ends the session; which one won the race to disk does
- * not change that.
- */
-function hasOrderedTerminalProof(row: OrderedTerminalProofInput): boolean {
-  return (
-    row.mutationEventId !== null &&
-    row.sessionLifecycleTailEventId !== null &&
-    row.sessionLifecycleTailEventId > row.mutationEventId &&
-    row.reducerCursorEventId >= row.sessionLifecycleTailEventId &&
-    (row.sessionLifecycleTailHook === "SessionEnd" ||
-      row.sessionLifecycleTailHook === "Killed") &&
-    (row.state === "ended" || row.state === "killed")
-  );
-}
-
 /**
  * Read folded claims plus exact tool mutations newer than the root's last Git
  * observation. The pending tail closes the producer-lag window synchronously at
@@ -1495,7 +1469,7 @@ export function readOwnershipClaims(
   }
 }
 
-function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
+export function defaultReadClaims(worktree: string): OwnershipClaim[] | null {
   return readOwnershipClaims(worktree);
 }
 
@@ -2153,13 +2127,15 @@ export function unsafeForeignSessions(
   };
 }
 
-function requestReleaseConflictsForPath(
+export function requestReleaseConflictsForPath(
+  worktree: string,
   path: string,
   claims: readonly OwnershipClaim[],
   sessions: readonly string[],
 ): RequestReleaseConflict[] {
   return sessions.map((session) => ({
     claimantSessionId: session,
+    worktree,
     path,
     decline: claims.find(
       (claim) =>
@@ -2233,6 +2209,8 @@ export function buildRequestReleasePointer(
   const byClaimant = new Map<
     string,
     {
+      claimant: string;
+      worktree: string;
       paths: Set<string>;
       declinedPaths: Set<string>;
       declines: ReleaseDeclineEvidence[];
@@ -2240,8 +2218,15 @@ export function buildRequestReleasePointer(
   >();
   for (const conflict of conflicts) {
     const claimant = truncateUtf8(conflict.claimantSessionId, 256);
+    const worktree = truncateUtf8(
+      conflict.worktree,
+      REQUEST_RELEASE_TEXT_BYTES,
+    );
     const path = truncateUtf8(conflict.path, RELEASE_PATH_LENGTH_LIMIT);
-    const bucket = byClaimant.get(claimant) ?? {
+    const key = `${claimant}\0${worktree}`;
+    const bucket = byClaimant.get(key) ?? {
+      claimant,
+      worktree,
       paths: new Set<string>(),
       declinedPaths: new Set<string>(),
       declines: [],
@@ -2251,11 +2236,14 @@ export function buildRequestReleasePointer(
       bucket.declinedPaths.add(path);
       bucket.declines.push(conflict.decline);
     }
-    byClaimant.set(claimant, bucket);
+    byClaimant.set(key, bucket);
   }
-  const claimants = [...byClaimant.entries()].sort(([left], [right]) =>
-    left.localeCompare(right),
-  );
+  const claimants = [...byClaimant.values()].sort((left, right) => {
+    const claimantOrder = left.claimant.localeCompare(right.claimant);
+    return claimantOrder !== 0
+      ? claimantOrder
+      : left.worktree.localeCompare(right.worktree);
+  });
   const visible = claimants.slice(0, limit);
   return {
     schema_version: 1,
@@ -2264,7 +2252,7 @@ export function buildRequestReleasePointer(
     requester_protocol: REQUEST_RELEASE_PROTOCOL,
     claimant_total: claimants.length,
     claimants_truncated: claimants.length > visible.length,
-    claimants: visible.map(([claimant, bucket]) => {
+    claimants: visible.map((bucket) => {
       const paths = [...bucket.paths].sort();
       const pathSample = paths
         .slice(0, limit)
@@ -2274,13 +2262,16 @@ export function buildRequestReleasePointer(
         "session",
         "release",
         "--session-id",
-        claimant,
+        bucket.claimant,
+        "--worktree",
+        bucket.worktree,
         "--",
         ...pathSample,
       ];
       const invocation = boundedText(releaseArgv.map(shellQuote).join(" "));
       return {
-        claimant_session_id: claimant,
+        claimant_session_id: bucket.claimant,
+        worktree: bucket.worktree,
         paths: pathSample,
         path_total: paths.length,
         paths_truncated: paths.length > pathSample.length,
@@ -2483,7 +2474,12 @@ export async function discoverCommitWorkSurface(
         code: "ownership_conflict",
         conflicting_sessions: blockers.conflicts.slice(0, limit),
         request_release: buildRequestReleasePointer(
-          requestReleaseConflictsForPath(path, pathClaims, blockers.conflicts),
+          requestReleaseConflictsForPath(
+            worktree,
+            path,
+            pathClaims,
+            blockers.conflicts,
+          ),
           identity,
           limit,
         ),
@@ -2520,6 +2516,7 @@ export async function discoverCommitWorkSurface(
           conflicting_sessions: peerBlockers.conflicts.slice(0, limit),
           request_release: buildRequestReleasePointer(
             requestReleaseConflictsForPath(
+              worktree,
               peer,
               peerClaims,
               peerBlockers.conflicts,
@@ -2556,9 +2553,11 @@ export async function discoverCommitWorkSurface(
   // foreign claimant, which must remain visible after adoption).
   caller.push(...adopted);
   return {
+    worktree,
     selected,
     automatic: resolvedAutomatic,
     adopted: [...adopted].sort(),
+    ambiguous: [...new Set(ambiguous)].sort(),
     rejections,
     summary: {
       dirty_total: dirtyByPath.size,

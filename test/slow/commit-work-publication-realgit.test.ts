@@ -15,7 +15,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runForTest as runCommitWorkForTest } from "../../cli/commit-work";
+import {
+  runForTest as runCommitWorkForTest,
+  taskBoundToIdentity,
+} from "../../cli/commit-work";
+import { realGitVcs } from "../../plugins/plan/src/vcs";
 import {
   GIT_OUTPUT_LIMIT_CODE,
   GIT_SPAWN_TIMEOUT_CODE,
@@ -36,6 +40,7 @@ import {
 } from "../../src/commit-work/private-index";
 import { pushExactCommit } from "../../src/commit-work/push";
 import { retryUntil } from "../helpers/retry-until";
+import { freshDbFile } from "../helpers/template-db";
 
 const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const roots: string[] = [];
@@ -195,6 +200,76 @@ test("commit-work rejects an actual FIFO input without waiting for a writer", as
     code: 2,
     outcome: "argument_error",
   });
+});
+
+test("claimed operator commit is attributed by the close-preflight trailer scan", async () => {
+  const taskId = "fn-1383-rail.1";
+  const { root, repo } = await repoWithBase();
+  writeFileSync(join(repo, "selected.txt"), "operator change\n");
+
+  const dbPath = join(root, "keeper.db");
+  const { db } = freshDbFile(dbPath);
+  const sessionsDir = join(root, "sessions");
+  mkdirSync(sessionsDir);
+  db.run(
+    `INSERT INTO jobs
+       (job_id, created_at, state, updated_at, harness, plan_verb, plan_ref)
+     VALUES (?, 1, 'working', 1, 'claude', NULL, NULL)`,
+    [JOB_ID],
+  );
+  writeFileSync(
+    join(sessionsDir, `${JOB_ID}.json`),
+    JSON.stringify({
+      schema_version: 1,
+      session_id: JOB_ID,
+      kind: "work",
+      task_id: taskId,
+      created_at: "2026-07-20T00:00:00.000Z",
+    }),
+  );
+
+  try {
+    const landed = await runCommitWorkForTest(
+      [
+        "--task-id",
+        taskId,
+        "--session-id",
+        JOB_ID,
+        "fix(rail): land operator remediation",
+      ],
+      {
+        cwd: repo,
+        env: {},
+        gitRunner: gitExec,
+        directEvidence: () => ({
+          currentSessionPaths: ["selected.txt"],
+          complete: true,
+        }),
+        readClaims: () => [],
+        runLint: async () => {},
+        acquireLock: () => ({ release: () => {} }),
+        detectInProgress: async () => null,
+        checkSharedCheckoutJam: () => false,
+        validateIdentity: () => true,
+        validateTaskBinding: (identity, candidate) =>
+          taskBoundToIdentity(identity, candidate, dbPath, { sessionsDir }),
+        push: async () => ({
+          success: true,
+          pushed: false,
+          skipped: "worktree",
+          branch: "main",
+        }),
+      },
+    );
+    expect(landed.code).toBe(0);
+    expect(JSON.parse(landed.stdout).success).toBe(true);
+
+    const sha = await git(repo, ["rev-parse", "HEAD"]);
+    expect(realGitVcs.trailerCommitShas(taskId, repo)).toContain(sha);
+    expect(realGitVcs.sourceCommitShas(taskId, repo)).toContain(sha);
+  } finally {
+    db.close();
+  }
 });
 
 test("git-exec drains but fails closed on bounded output overflow", async () => {

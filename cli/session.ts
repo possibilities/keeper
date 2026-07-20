@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * `keeper session <state|files|events|summary>` — the session-scoped read group.
  * Each verb maps to its own leaf main (`cli/{session-state,show-session-files,
@@ -11,6 +12,7 @@
  * unknown verb is an argument fault (exit 2).
  */
 
+import type { OwnershipClaim } from "../src/commit-work/surface";
 import {
   type EnvelopeSink,
   emitEnvelope,
@@ -38,6 +40,9 @@ export interface ReleaseDeps {
   dir?: string;
   sink?: EnvelopeSink;
   gitToplevel?: (cwd: string) => string | null;
+  readClaims?: (
+    worktree: string,
+  ) => OwnershipClaim[] | null | Promise<OwnershipClaim[] | null>;
   readAuthority?: (
     identity: string,
   ) => ReleaseAuthorityRow | null | Promise<ReleaseAuthorityRow | null>;
@@ -157,7 +162,7 @@ export async function terminateMain(argv: string[]): Promise<void> {
   emitEnvelope(errorEnvelope(1, problems[result.reason]), processEnvelopeSink);
 }
 
-const RELEASE_HELP = `keeper session release <path> [<path>...] [--session-id <uuid>]
+const RELEASE_HELP = `keeper session release <path> [<path>...] [--session-id <uuid>] [--worktree <path>]
 
 Voluntarily release named paths held under this session's Exclusive file claim
 so a blocked peer's next commit-work classifies exactly those paths adoptable —
@@ -246,6 +251,8 @@ export async function releaseMain(
   const cwd = deps.cwd ?? process.cwd();
 
   let sessionIdFlag: string | null = null;
+  let worktreeFlag: string | null = null;
+  let worktreeSupplied = false;
   const inputs: string[] = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] as string;
@@ -254,6 +261,13 @@ export async function releaseMain(
       i += 1;
     } else if (arg.startsWith("--session-id=")) {
       sessionIdFlag = arg.slice("--session-id=".length);
+    } else if (arg === "--worktree") {
+      worktreeSupplied = true;
+      worktreeFlag = argv[i + 1] ?? null;
+      i += 1;
+    } else if (arg.startsWith("--worktree=")) {
+      worktreeSupplied = true;
+      worktreeFlag = arg.slice("--worktree=".length);
     } else if (arg === "--") {
       inputs.push(...argv.slice(i + 1));
       break;
@@ -342,13 +356,42 @@ export async function releaseMain(
 
   const {
     canonicalizeAdoptedPath,
+    claimIsExclusiveOwnership,
+    defaultReadClaims,
     writeReleaseRecord,
     defaultReleaseRecordDir,
   } = await import("../src/commit-work/surface");
   const { isAbsolute, resolve } = await import("node:path");
-  const worktree = (deps.gitToplevel ?? defaultGitToplevel)(cwd) ?? cwd;
+  const gitToplevel = deps.gitToplevel ?? defaultGitToplevel;
+  const cwdWorktree = gitToplevel(cwd);
+  let worktree = cwdWorktree ?? cwd;
+  if (worktreeSupplied) {
+    const requestedWorktree =
+      worktreeFlag === null || worktreeFlag.length === 0
+        ? null
+        : resolve(cwd, worktreeFlag);
+    if (
+      cwdWorktree === null ||
+      requestedWorktree === null ||
+      requestedWorktree !== resolve(cwd, cwdWorktree)
+    ) {
+      emitEnvelope(
+        errorEnvelope(
+          1,
+          releaseProblem(
+            "worktree_mismatch",
+            "--worktree does not match the invoking cwd's git worktree",
+            "Run the release from the claimant's worktree and pass that same worktree with --worktree.",
+          ),
+        ),
+        sink,
+      );
+      return;
+    }
+    worktree = cwdWorktree;
+  }
 
-  const released: string[] = [];
+  const canonicalized: Array<{ input: string; path: string }> = [];
   const rejected: Array<{ input: string; code: string }> = [];
   for (const input of inputs) {
     const absolute = isAbsolute(input) ? input : resolve(cwd, input);
@@ -357,9 +400,9 @@ export async function releaseMain(
       rejected.push({ input, code: result.code });
       continue;
     }
-    released.push(result.path);
+    canonicalized.push({ input, path: result.path });
   }
-  if (released.length === 0) {
+  if (canonicalized.length === 0) {
     emitEnvelope(
       errorEnvelope(
         1,
@@ -367,6 +410,57 @@ export async function releaseMain(
           "no_releasable_paths",
           "no named path canonicalized inside this worktree",
           "Name paths inside the current worktree; nothing was released.",
+        ),
+      ),
+      sink,
+    );
+    return;
+  }
+
+  let claims: OwnershipClaim[] | null;
+  try {
+    claims = await (deps.readClaims ?? defaultReadClaims)(worktree);
+  } catch {
+    claims = null;
+  }
+  if (claims === null) {
+    emitEnvelope(
+      errorEnvelope(
+        1,
+        releaseProblem(
+          "claim_evidence_unavailable",
+          "exclusive ownership claims could not be read for this worktree",
+          "Retry when claim evidence is available; nothing was released.",
+        ),
+      ),
+      sink,
+    );
+    return;
+  }
+
+  const released: string[] = [];
+  for (const candidate of canonicalized) {
+    const claimed = claims.some(
+      (claim) =>
+        claim.path === candidate.path &&
+        claim.sessionId === identity &&
+        claim.liveness === "live" &&
+        claimIsExclusiveOwnership(claim),
+    );
+    if (!claimed) {
+      rejected.push({ input: candidate.input, code: "no_live_owned_claim" });
+      continue;
+    }
+    released.push(candidate.path);
+  }
+  if (released.length === 0) {
+    emitEnvelope(
+      errorEnvelope(
+        1,
+        releaseProblem(
+          "no_live_owned_claims",
+          `none of the named paths has a live exclusive claim held by this session in worktree ${worktree}`,
+          "Run the release from the worktree holding this session's live claims; nothing was released.",
         ),
       ),
       sink,
