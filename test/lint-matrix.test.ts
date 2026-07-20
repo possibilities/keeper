@@ -263,6 +263,34 @@ describe("runScopedLint — staged-path-conditional drift gates", () => {
     expect(failure.files).toEqual(["plugins/plan/src/example.txt"]);
   });
 
+  test("npm lint passes package-local relative file paths for root and nested packages", async () => {
+    const { runTool, calls } = fakeRunTool();
+    await runScopedLint(
+      ["src/cli.ts", "plugins/plan/src/worker.ts"],
+      REPO_ROOT,
+      {
+        runTool,
+      },
+    );
+
+    const npmCalls = calls.filter((c) => c.cmd[0] === "npm");
+    expect(npmCalls).toHaveLength(2);
+
+    expect(npmCalls).toEqual([
+      {
+        cmd: ["npm", "run", "lint", "--", "src/cli.ts"],
+        cwd: REPO_ROOT,
+      },
+      {
+        cmd: ["npm", "run", "lint", "--", "src/worker.ts"],
+        cwd: join(REPO_ROOT, "plugins", "plan"),
+      },
+    ]);
+
+    expect(npmCalls[1].cmd).not.toContain("plugins/plan/src/worker.ts");
+    expect(npmCalls[0].cmd).not.toContain("/plugins/plan/");
+  });
+
   test('two simultaneous drift failures aggregate as linter="multiple" with labelled blocks', async () => {
     const { runTool } = fakeRunTool((cmd) => {
       if (cmd.some((c) => c.includes("vendor-corpus"))) {

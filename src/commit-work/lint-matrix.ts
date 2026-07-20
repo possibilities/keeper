@@ -51,7 +51,7 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import {
   isAdrPath,
   isContextDocPath,
@@ -459,13 +459,21 @@ export async function runScopedLint(
         // timeout, so matrix duration is bounded by one tool window rather than
         // package-count × timeout when --max-files disables cardinality refusal.
         const results = await Promise.all(
-          sortedDirs.map(async (pkgDir) => ({
-            pkgDir,
-            result: await runTool(
-              ["npm", "run", "lint", "--", ...(pkgGroups.get(pkgDir) ?? [])],
+          sortedDirs.map(async (pkgDir) => {
+            const packageFiles = pkgGroups.get(pkgDir) ?? [];
+            const relPaths = packageFiles.map((fileRel) => {
+              const absPath = resolve(cwd, fileRel);
+              const relPath = relative(pkgDir, absPath);
+              return relPath.replace(/\\/g, "/");
+            });
+            return {
               pkgDir,
-            ),
-          })),
+              result: await runTool(
+                ["npm", "run", "lint", "--", ...relPaths],
+                pkgDir,
+              ),
+            };
+          }),
         );
         const npmStderrs = results
           .filter(({ result }) => result.code !== 0)
