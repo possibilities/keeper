@@ -118,6 +118,22 @@ else
   echo "install: Pi unavailable; Codex companion provisioned but not runtime-verified" >&2
 fi
 
+# 3b2. Put `keeper-pi-codex-observe` on PATH so a Keeper-marked environment's
+#      CodexAccountObserver spawn (`resolveCodexObserverCommand` in
+#      src/account-routing-config.ts) can find it — the same `bun link`
+#      mechanism step 2 uses for the `keeper` CLI itself, run against the
+#      pi-codex-pool package's own `bin` declaration. Idempotent — skip when
+#      the link exists. A durable KEEPER_PI_CODEX_OBSERVER_BIN override means
+#      the operator already resolved this some other way; leave it alone.
+if [ -n "${KEEPER_PI_CODEX_OBSERVER_BIN:-}" ]; then
+  echo "install: KEEPER_PI_CODEX_OBSERVER_BIN override set (${KEEPER_PI_CODEX_OBSERVER_BIN}); skipping observer link"
+elif [ -L "${HOME}/.bun/bin/keeper-pi-codex-observe" ]; then
+  echo "install: keeper-pi-codex-observe already linked (${HOME}/.bun/bin/keeper-pi-codex-observe)"
+else
+  echo "install: bun link (pi-codex-pool observer)"
+  ( cd "${repo_root}/integrations/pi-codex-pool" && bun link )
+fi
+
 # 3c. pi-subagents fork: ensure installed, then sync against upstream. pi loads
 #     @tintinweb/pi-subagents LIVE from the local fork checkout (a local-path
 #     package source in ~/.pi/agent/settings.json) so local patches and

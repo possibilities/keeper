@@ -48,6 +48,18 @@ describe("Pi Codex companion installation contract", () => {
     expect(INSTALL).not.toContain("next.push(process.env.PI_CODEX_POOL_ROOT)");
   });
 
+  test("provisions the observer executable onto PATH via the same bun-link mechanism as the keeper CLI", () => {
+    expect(INSTALL).toContain(
+      '( cd "$' + '{repo_root}/integrations/pi-codex-pool" && bun link )',
+    );
+    expect(INSTALL).toContain(
+      '[ -L "$' + '{HOME}/.bun/bin/keeper-pi-codex-observe" ]',
+    );
+    expect(INSTALL).toContain(
+      'if [ -n "$' + '{KEEPER_PI_CODEX_OBSERVER_BIN:-}" ]; then',
+    );
+  });
+
   test("keeps the loaded pi-subagents tree on its integration lineage and verifies child runtime inheritance", () => {
     expect(INSTALL).toContain('pi_subagents_branch="master"');
     expect(INSTALL).toContain('current_branch="$(git branch --show-current)"');
