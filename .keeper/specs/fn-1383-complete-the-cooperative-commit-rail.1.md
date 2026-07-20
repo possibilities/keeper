@@ -46,5 +46,5 @@ trailer minted matches commitsForTask's grep; forged trailer still rejected. Nam
 - [ ] Docs name the sanctioned operator ritual; guard + attribution suites green via named gates
 
 ## Done summary
-
+Added a sanctioned free-form operator commit path: the plan commit-guard now admits a main-context keeper commit-work --task-id call from the session holding the exact task's live claim marker, and commit-work mints the mechanical Task: trailer for that claim without requiring a bound work job. Raw git, subagent laundering, KEEPER_PLAN_GUARD_BYPASS, and forged trailers stay denied; the ritual is documented in docs/problem-codes.md and plugins/plan/README.md.
 ## Evidence
