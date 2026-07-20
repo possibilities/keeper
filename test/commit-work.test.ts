@@ -430,6 +430,9 @@ describe("commit-work: session id", () => {
     const { db } = freshDbFile(path);
     const sibling = "44444444-4444-4444-8444-444444444444";
     const legacy = "55555555-5555-4555-8555-555555555555";
+    const operator = "66666666-6666-4666-8666-666666666666";
+    const sessionsDir = join(root, "sessions");
+    mkdirSync(sessionsDir);
     const processOptions = {
       currentPid: 9000,
       read: (pid: number) => {
@@ -448,13 +451,15 @@ describe("commit-work: session id", () => {
                 (?, 1, 'working', 1, 'pi', 'work', 'fn-1-task.1', 4242, 'linux:100'),
                 (?, 1, 'stopped', 1, 'claude', 'work', 'fn-1-task.1', 4242, 'linux:100'),
                 (?, 1, 'working', 1, 'claude', 'work', 'fn-1-task.1', 5252, 'linux:200'),
-                (?, 1, 'working', 1, NULL, 'work', 'fn-1-task.1', 4242, 'linux:100')`,
+                (?, 1, 'working', 1, NULL, 'work', 'fn-1-task.1', 4242, 'linux:100'),
+                (?, 1, 'working', 1, 'claude', NULL, NULL, 4242, 'linux:100')`,
         [
           TEST_ID,
           "22222222-2222-4222-8222-222222222222",
           "33333333-3333-4333-8333-333333333333",
           sibling,
           legacy,
+          operator,
         ],
       );
       expect(
@@ -500,6 +505,52 @@ describe("commit-work: session id", () => {
         await trustedCommitWorkIdentity(legacy, path, processOptions),
       ).toBe(false);
       expect(taskBoundToIdentity(legacy, "fn-1-task.1", path)).toBe(false);
+
+      expect(
+        await trustedCommitWorkAuthority(operator, "fn-1-task.1", path, {
+          ...processOptions,
+          sessionsDir,
+        }),
+      ).toBe("task_unbound");
+      writeFileSync(
+        join(sessionsDir, `${operator}.json`),
+        JSON.stringify({
+          schema_version: 1,
+          session_id: operator,
+          kind: "work",
+          task_id: "fn-1-task.1",
+          created_at: "2026-07-20T00:00:00.000Z",
+        }),
+      );
+      expect(
+        await trustedCommitWorkAuthority(operator, "fn-1-task.1", path, {
+          ...processOptions,
+          sessionsDir,
+        }),
+      ).toBe("ok");
+      expect(
+        await trustedCommitWorkAuthority(operator, "fn-1-other.1", path, {
+          ...processOptions,
+          sessionsDir,
+        }),
+      ).toBe("task_unbound");
+      expect(
+        taskBoundToIdentity(operator, "fn-1-task.1", path, { sessionsDir }),
+      ).toBe(true);
+      expect(
+        taskBoundToIdentity(operator, "fn-1-other.1", path, { sessionsDir }),
+      ).toBe(false);
+      const stale = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      utimesSync(join(sessionsDir, `${operator}.json`), stale, stale);
+      expect(
+        taskBoundToIdentity(operator, "fn-1-task.1", path, { sessionsDir }),
+      ).toBe(false);
+      expect(
+        await trustedCommitWorkAuthority(operator, "fn-1-task.1", path, {
+          ...processOptions,
+          sessionsDir,
+        }),
+      ).toBe("task_unbound");
 
       let rebound = false;
       expect(

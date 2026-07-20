@@ -115,7 +115,7 @@ Mutating verbs emit a `plan_invocation` NDJSON envelope on stdout scoped to that
 
 `init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor a tracked harness identity. It lands a `chore(plan): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
-For source-code commits from worker agents, use `keeper commit-work`:
+For source-code commits from workers and free-form operators, use `keeper commit-work`:
 
 ```bash
 # Preview what will be staged
@@ -124,6 +124,16 @@ keeper commit-work --preview-files
 # Commit with a message (auto-pushes to origin on success)
 keeper commit-work --task-id fn-N-slug.M "feat(scope): add the feature"
 ```
+
+A free-form operator first runs `keeper plan claim fn-N-slug.M` in the same
+tracked operator session, then previews with
+`keeper commit-work --task-id fn-N-slug.M --preview-files` and lands with
+`keeper commit-work --task-id fn-N-slug.M "<message>"`. The literal `--task-id`
+must be the first option. The live exact-task marker admits that main-context
+call and authorizes Keeper to append the mechanical `Task:` trailer even though
+the operator job is not a bound `work` job. Do not supply a `Task:` line,
+delegate the landing to a generic subagent, or set
+`KEEPER_PLAN_GUARD_BYPASS`; each remains outside the operator commit rail.
 
 Every invocation emits one versioned `commit-work-result` JSON line. Preview
 explains the complete dirty surface and ownership categories; success carries
@@ -206,7 +216,7 @@ These slash commands handle epic creation, refinement, single-task execution, th
 | Command | When to use |
 |---------|------------|
 | `/plan <request>` | Any new feature — spawns scouts, runs gap-analyst, full outer-loop quality pass. Stamps the mechanical default `{tier, model}` cell at scaffold, then runs the post-scaffold selector beat to overwrite the cells before arming. Use for anything non-trivial. |
-| `/plan:work <fn-N-slug.M>` | Drive a single claimed task to `done` by spawning the constant `work:worker` subagent — the launcher selects the tier-matched per-cell `work` plugin at launch via `--plugin-dir`, so `work:worker` resolves to it — and switching on `keeper plan reconcile`'s typed verdict. A content-blind orchestrator under hook-enforced no-commit constraints: it never edits, lints, or commits — every non-`done` verdict routes back into the worker as a resume directive, and the plugin's PreToolUse commit hard-deny blocks any commit attempt from the main context (bypassable per-session with `KEEPER_PLAN_GUARD_BYPASS=1`). |
+| `/plan:work <fn-N-slug.M>` | Drive a single claimed task to `done` by spawning the constant `work:worker` subagent — the launcher selects the tier-matched per-cell `work` plugin at launch via `--plugin-dir`, so `work:worker` resolves to it — and switching on `keeper plan reconcile`'s typed verdict. A content-blind orchestrator under hook-enforced no-commit constraints: it never edits, lints, or commits — every non-`done` verdict routes back into the worker as a resume directive, and the plugin's PreToolUse commit hard-deny permits only the selected worker or the separate exact-claim operator ritual. |
 | `/plan:defer <subject>` | The sole single-task scaffolder. Mainlines the actionable work in the conversation into a single-task epic at normal epic-number order — no priority jump — and stops on overrun rather than silently scaling up. Runs the same default-stamp plus selector beat over its single task before arming. Member of the `/plan:plan` family (not a job-launcher). Hand-written tracked skill. |
 | `/plan:hack <request>` | Investigate a request, answer in the right shape, then route or execute the next move. Read-only by default — investigate, answer, stop; with plain-text greenlight it executes tight inline work, sketches a direction in chat, or funnels larger work to `/plan:plan` or `/plan:defer`. Slash-only (`disable-model-invocation: true`). Hand-authored static skill — no template, no `.managed-file-dont-edit` sidecar. |
 | `/plan:panel <hard question>` | Fan a hard question out to a configured described panel of models answering in parallel and blind, then fuse their answers via the `plan:panel-judge` subagent with consensus, contradictions, and blind spots surfaced. Choose from the live roster's authored strength bands and descriptions (`keeper agent presets list --json`); never infer fit from a panel name or member count. Model-invokable for non-tiny judgment-decided inquiries where being confidently wrong is expensive (mechanical retrieval stays solo); `/plan:hack` routes to it before sketching above-inline work. Hand-authored static skill — no template, no `.managed-file-dont-edit` sidecar. |
@@ -219,12 +229,12 @@ These slash commands handle epic creation, refinement, single-task execution, th
 
 The plugin ships four bun hook dispatchers under `hooks/` that keep the `/plan:work` and `/plan:close` orchestrators content-blind — coordinating with the worker/auditor subagents through typed refs, hashes, counts, and enums only, never a spec or a findings artifact opened from the main context:
 
-- **PreToolUse commit hard-deny** — denies `keeper commit-work` / `git commit` from the main context while the session's claimed task is in progress; worker-context commits (an `agent_id` is present) always pass.
+- **PreToolUse commit hard-deny** — while the session's claimed task is in progress, permits commits only from the selected `work:worker` or from the marker-owning main-context operator calling `keeper commit-work --task-id <exact-claimed-task>` directly. Raw Git, generic subagents, missing/mismatched Task ids, and `KEEPER_PLAN_GUARD_BYPASS` remain denied.
 - **SubagentStop worker guard** — a worker stopping in a non-`done`, non-`BLOCKED:` state gets exactly one corrective round.
 - **Stop checklist guard** — a work-session Stop with a still-in-progress claimed task, or a close-session Stop where `close-finalize` never ran, blocks once with a resume checklist. The close branch blocks only when neither of its two zero-subprocess allow gates fires — a sanctioned typed-stop message, or an in-flight subagent the closer spawned and is awaiting (a `background_tasks` entry with `type:"subagent"` + `status:"running"`). The sanctioned typed stops are the `BLOCKED:` / `QUESTION:` escalations, a surfaced `{"success": false}` envelope, and the terminal outcome reports — the fatal-halt, partial-follow-up, and blocking-follow-up deferred-close (`… held open by blocking follow-up …`) surfaces — each kept in lockstep with the close SKILL phrasing.
 - **PreToolUse state-read guard** — denies Read/Write/Edit/Bash access to the `.keeper/state/briefs` and `.keeper/state/audits` trees from a work/close session's main context (a subagent — worker, auditor, close-planner — always passes, mirroring the commit guard's discriminant); a Bash command naming those trees is a best-effort companion check. Advisory context hygiene, not a security boundary — it mechanically holds the line once no legitimate orchestrator read of that state remains.
 
-The work guard verifies live task state with a read-only `keeper plan reconcile` call before blocking; the close branch decides from the Stop payload alone (its typed-stop message and `background_tasks`), spawning no subprocess. All four fail open on any internal error. Session state is one JSON marker per session at `~/.local/state/keeper/sessions/<session_id>.json`. Set `KEEPER_PLAN_GUARD_BYPASS=1` to disable all four guards.
+The work guard verifies live task state with a read-only `keeper plan reconcile` call before blocking; the close branch decides from the Stop payload alone (its typed-stop message and `background_tasks`), spawning no subprocess. All four fail open on internal errors. Session state is one JSON marker per session at `~/.local/state/keeper/sessions/<session_id>.json`. `KEEPER_PLAN_GUARD_BYPASS=1` disables the context-read and stop guards, not the commit rail.
 
 ## Help for Agents
 

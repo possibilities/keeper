@@ -8,6 +8,8 @@ import {
   openSync,
   readSync,
 } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { CommitWorkLock } from "../src/commit-work/flock";
 import {
   GIT_LOCAL_TIMEOUT_MS,
@@ -17,6 +19,7 @@ import {
 import {
   IdentityConflictError,
   InvalidIdentityError,
+  isUuid,
   resolveInvocationIdentity,
 } from "../src/commit-work/identity";
 import { LintFailure, runScopedLint } from "../src/commit-work/lint-matrix";
@@ -72,7 +75,7 @@ import { defaultDbPath, openDb } from "../src/db";
 import { parsePlanRef } from "../src/derivers";
 import { commitWorkLockPath } from "../src/worktree-git";
 
-const HELP = `keeper commit-work [MSG] [options]
+const HELP = `keeper commit-work [options] [MSG]
 
 Commit exact work selected by ownership or explicit invocation-local adoption.
 Preview explains the complete dirty surface. Attribution gaps are covered with
@@ -84,7 +87,7 @@ Options:
   --adopt-from <file>  Read paths from a versioned JSON adoption manifest
   --message-file <file>
                        Read the commit message without shell interpolation
-  --task-id <task>     Append the active work job's bound Task trailer
+  --task-id <task>     Append the bound worker or claimed operator Task trailer
   --preview-files      Emit an advisory surface envelope; make no commit
   --max-files <n>      Refuse a selected set larger than n (default 500; 0 disables)
   --allow-stale-unstage
@@ -105,8 +108,11 @@ const AGENT_HELP = `keeper commit-work — operator runbook
 Run --preview-files first. Automatic selection is attribution-backed; add an
 exact missing dirty path with repeatable --adopt <path> or a versioned
 --adopt-from manifest. Adoption is local to this invocation and refuses a live
-foreign owner. Fix lint failures in the live worktree and re-run the same
-command. Commit hooks and signing remain on.
+foreign owner. A free-form operator first claims the Task in this same tracked
+session, then previews and lands with that literal Task as the first commit-work
+option: --task-id <task> --preview-files, then --task-id <task> <message>.
+Fix lint failures in the live worktree and re-run the same command. Commit hooks
+and signing remain on.
 `;
 
 const FORBIDDEN_TRAILER_RE =
@@ -1034,6 +1040,129 @@ function finalOwnershipFailure(
   return null;
 }
 
+const TASK_CLAIM_MARKER_SCHEMA_VERSION = 1;
+const TASK_CLAIM_MARKER_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+const TASK_CLAIM_MARKER_MAX_BYTES = 16 * 1024;
+
+export interface TaskClaimOptions {
+  sessionsDir?: string;
+  nowMs?: () => number;
+}
+
+interface TaskClaimSnapshot {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  createdAt: string;
+}
+
+function taskClaimSessionsDir(options: TaskClaimOptions): string {
+  return (
+    options.sessionsDir ??
+    join(process.env.HOME || homedir(), ".local", "state", "keeper", "sessions")
+  );
+}
+
+function readTaskClaimSnapshot(
+  identity: string,
+  taskId: string,
+  options: TaskClaimOptions,
+): TaskClaimSnapshot | null {
+  if (!isUuid(identity)) return null;
+  const path = join(taskClaimSessionsDir(options), `${identity}.json`);
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = fstatSync(fd);
+    const ageMs = (options.nowMs ?? Date.now)() - before.mtimeMs;
+    if (
+      !before.isFile() ||
+      before.size <= 0 ||
+      before.size > TASK_CLAIM_MARKER_MAX_BYTES ||
+      !Number.isFinite(ageMs) ||
+      ageMs < -1_000 ||
+      ageMs > TASK_CLAIM_MARKER_STALE_MS
+    ) {
+      return null;
+    }
+    const bytes = Buffer.alloc(before.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (read === 0) break;
+      offset += read;
+    }
+    const after = fstatSync(fd);
+    if (
+      offset !== before.size ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs ||
+      after.ctimeMs !== before.ctimeMs
+    ) {
+      return null;
+    }
+    const record = JSON.parse(bytes.subarray(0, offset).toString("utf8")) as {
+      schema_version?: unknown;
+      session_id?: unknown;
+      kind?: unknown;
+      task_id?: unknown;
+      created_at?: unknown;
+    };
+    if (
+      record === null ||
+      typeof record !== "object" ||
+      record.schema_version !== TASK_CLAIM_MARKER_SCHEMA_VERSION ||
+      record.session_id !== identity ||
+      record.kind !== "work" ||
+      record.task_id !== taskId ||
+      typeof record.created_at !== "string" ||
+      record.created_at.length === 0
+    ) {
+      return null;
+    }
+    return {
+      dev: before.dev,
+      ino: before.ino,
+      size: before.size,
+      mtimeMs: before.mtimeMs,
+      ctimeMs: before.ctimeMs,
+      createdAt: record.created_at,
+    };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function sameTaskClaim(
+  before: TaskClaimSnapshot | null,
+  after: TaskClaimSnapshot | null,
+): boolean {
+  return (
+    before !== null &&
+    after !== null &&
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.size === after.size &&
+    before.mtimeMs === after.mtimeMs &&
+    before.ctimeMs === after.ctimeMs &&
+    before.createdAt === after.createdAt
+  );
+}
+
+export function taskClaimedByIdentity(
+  identity: string,
+  taskId: string,
+  options: TaskClaimOptions = {},
+): boolean {
+  return readTaskClaimSnapshot(identity, taskId, options) !== null;
+}
+
 interface CommitWorkAuthorityRow {
   state: unknown;
   harness: unknown;
@@ -1092,11 +1221,18 @@ export async function trustedCommitWorkAuthority(
     currentPid?: number;
     read?: ProcessIdentityReader;
     maxDepth?: number;
+    sessionsDir?: string;
+    nowMs?: () => number;
   } = {},
 ): Promise<CommitWorkAuthorityVerdict> {
   try {
     const before = readCommitWorkAuthorityRow(identity, dbPath);
     if (!validCommitWorkAuthorityRow(before)) return "identity_untrusted";
+    const operatorShape =
+      taskId !== null && before.plan_verb === null && before.plan_ref === null;
+    const claimBefore = operatorShape
+      ? readTaskClaimSnapshot(identity, taskId, processOptions)
+      : null;
     if (
       !(await invocationDescendsFrom(
         before.pid,
@@ -1108,6 +1244,8 @@ export async function trustedCommitWorkAuthority(
     }
     // PID identity and task authority are one generation-bound row. Sandwich
     // the ancestry walk with every authority field, not two independent reads.
+    // A free-form operator's exact Task claim is generation-bound by the same
+    // sandwich, so replacing or rewriting its marker never grants authority.
     const after = readCommitWorkAuthorityRow(identity, dbPath);
     if (
       !validCommitWorkAuthorityRow(after) ||
@@ -1120,10 +1258,13 @@ export async function trustedCommitWorkAuthority(
     ) {
       return "identity_untrusted";
     }
-    return taskId !== null &&
-      (after.plan_verb !== "work" || after.plan_ref !== taskId)
-      ? "task_unbound"
-      : "ok";
+    if (taskId === null) return "ok";
+    if (after.plan_verb === "work" && after.plan_ref === taskId) return "ok";
+    if (after.plan_verb !== null || after.plan_ref !== null) {
+      return "task_unbound";
+    }
+    const claimAfter = readTaskClaimSnapshot(identity, taskId, processOptions);
+    return sameTaskClaim(claimBefore, claimAfter) ? "ok" : "task_unbound";
   } catch {
     return "identity_untrusted";
   }
@@ -1152,6 +1293,7 @@ export function taskBoundToIdentity(
   identity: string,
   taskId: string,
   dbPath = defaultDbPath(),
+  claimOptions: TaskClaimOptions = {},
 ): boolean {
   try {
     const { db } = openDb(dbPath, { readonly: true });
@@ -1168,11 +1310,19 @@ export function taskBoundToIdentity(
         state: unknown;
         harness: unknown;
       } | null;
+      if (
+        row?.state !== "working" ||
+        (row.harness !== "claude" && row.harness !== "pi")
+      ) {
+        return false;
+      }
+      if (row.plan_verb === "work" && row.plan_ref === taskId) {
+        return true;
+      }
       return (
-        row?.plan_verb === "work" &&
-        row.plan_ref === taskId &&
-        row.state === "working" &&
-        (row.harness === "claude" || row.harness === "pi")
+        row.plan_verb === null &&
+        row.plan_ref === null &&
+        taskClaimedByIdentity(identity, taskId, claimOptions)
       );
     } finally {
       db.close();
@@ -1276,7 +1426,7 @@ async function runAttempt(
       result: result(invocationKind, "task_unbound", false, {
         identity,
         task_id: args.taskId,
-        hint: "--task-id must equal this active work session's bound plan task.",
+        hint: "--task-id must equal this active work job's bound Task or this free-form operator session's live exact-task claim.",
       }),
     };
   }
