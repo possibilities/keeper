@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
   hasOrderedTerminalProof,
   type OrderedTerminalProofInput,
+  TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL,
 } from "../../../../src/lifecycle-terminal-proof.ts";
 import { emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
@@ -47,19 +48,11 @@ function claimantSessionIsLiveOrRecent(taskId: string): boolean {
                 (SELECT MAX(tail.id)
                    FROM events tail
                   WHERE tail.session_id = claim.session_id
-                    AND tail.hook_event IN (
-                      'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd',
-                      'Killed', 'RateLimited', 'ApiError', 'InputRequest',
-                      'Notification'
-                    )) AS sessionLifecycleTailEventId,
+                    AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})) AS sessionLifecycleTailEventId,
                 (SELECT tail.hook_event
                    FROM events tail
                   WHERE tail.session_id = claim.session_id
-                    AND tail.hook_event IN (
-                      'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd',
-                      'Killed', 'RateLimited', 'ApiError', 'InputRequest',
-                      'Notification'
-                    )
+                    AND tail.hook_event IN (${TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL})
                   ORDER BY tail.id DESC
                   LIMIT 1) AS sessionLifecycleTailHook,
                 (SELECT last_event_id FROM reducer_state WHERE id = 1)
