@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Test dispatch-clear liveness closure",
-  "updated_at": "2026-07-20T08:13:48.623000Z"
+  "updated_at": "2026-07-20T08:42:00.315000Z",
+  "worker_done_at": "2026-07-20T08:42:00.315000Z"
 }

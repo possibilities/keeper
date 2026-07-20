@@ -34,5 +34,5 @@ test/daemon.test.ts and/or test/rpc-handlers.test.ts.
 - [ ] Tests are deterministic, in-process, behind a named `*.test.ts` gate; no real daemon/Worker/socket/subprocess.
 
 ## Done summary
-
+Extracted the probeLiveness closure into a pure probeDispatchClearClaimLiveness helper and the retry-dispatch reply construction into buildRetryDispatchResultMessage; added direct daemon tests covering the null/empty-session, absent-job, and partial-job inconclusive arms, the gone-clears arm, and the refused_live/refused_identity/cleared reply paths against the real handler seams.
 ## Evidence
