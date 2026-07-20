@@ -65,7 +65,10 @@ import {
   readGitProjectionFloor,
   resolveSockPath,
 } from "./db";
-import type { RetryDispatchVerb } from "./dispatch-command";
+import type {
+  DispatchClearOutcome,
+  RetryDispatchVerb,
+} from "./dispatch-command";
 import type { NormalizedFableFocusInput } from "./fable-focus";
 import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
@@ -251,6 +254,12 @@ export interface RetryDispatchRequestMessage {
   /** The keeper plan id (epic id for `close`; task id for `work`). Handler-validated
    *  non-empty; main treats it as an opaque token. */
   dispatch_id: string;
+  /** Break-glass: override the claimant-liveness fence ONLY. The attempt-identity
+   *  CAS at the write site stays load-bearing under force. */
+  force: boolean;
+  /** The acting operator identity, stamped into the audit trail of an appended
+   *  clear. Null when the CLI could not resolve a session. */
+  caller_session: string | null;
 }
 
 /** Main→worker reply paired with {@link RetryDispatchRequestMessage}. */
@@ -259,6 +268,9 @@ export interface RetryDispatchResultMessage {
   id: string;
   ok: boolean;
   error?: string;
+  /** The typed clear verdict — present on every non-error reply so the CLI shows
+   *  cleared / refused_live / refused_identity instead of a bare `ok`. */
+  outcome?: DispatchClearOutcome;
 }
 
 /**
@@ -3878,6 +3890,14 @@ function main(): void {
     conflict?: boolean;
     note?: string;
   };
+  /** The `retry_dispatch` bridge resolution — the `SimpleResolution` shape plus
+   *  the typed clear `outcome` so the handler threads refused_live /
+   *  refused_identity through to the CLI instead of a bare `ok`. */
+  type RetryDispatchResolution = {
+    ok: boolean;
+    error?: string;
+    outcome?: DispatchClearOutcome;
+  };
   const pendingReplays = new Map<
     string,
     {
@@ -3900,7 +3920,7 @@ function main(): void {
   const pendingRetryDispatch = new Map<
     string,
     {
-      resolve: (r: SimpleResolution) => void;
+      resolve: (r: RetryDispatchResolution) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -3995,8 +4015,10 @@ function main(): void {
     retryDispatch(
       verb: RetryDispatchVerb,
       dispatch_id: string,
-    ): Promise<SimpleResolution> {
-      return new Promise<SimpleResolution>((resolve, reject) => {
+      force: boolean,
+      caller_session: string | null,
+    ): Promise<RetryDispatchResolution> {
+      return new Promise<RetryDispatchResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();
         const timer = setTimeout(() => {
           if (pendingRetryDispatch.delete(reqId)) {
@@ -4014,6 +4036,8 @@ function main(): void {
           id: reqId,
           verb,
           dispatch_id,
+          force,
+          caller_session,
         } satisfies RetryDispatchRequestMessage);
       });
     },
@@ -4340,7 +4364,7 @@ function main(): void {
         if (!entry) return;
         pendingRetryDispatch.delete(r.id);
         clearTimeout(entry.timer);
-        entry.resolve({ ok: r.ok, error: r.error });
+        entry.resolve({ ok: r.ok, error: r.error, outcome: r.outcome });
         return;
       }
       if (

@@ -721,6 +721,31 @@ test("buildRetryFrame — passes the dispatch key verbatim (server validates the
   );
 });
 
+test("buildRetryFrame — --force + caller_session ride only when present (clear fence)", () => {
+  const paramsOf = (frame: ReturnType<typeof buildRetryFrame>): unknown =>
+    (frame as unknown as { params: unknown }).params;
+  // A bare retry keeps its id-only payload (no force, no caller_session).
+  expect(paramsOf(buildRetryFrame("r0", "work::fn-1.1"))).toEqual({
+    id: "work::fn-1.1",
+  });
+  // A forced retry by an identified operator threads both fields for the fence
+  // + audit trail.
+  expect(paramsOf(buildRetryFrame("r1", "work::fn-1.1", true, "work"))).toEqual(
+    {
+      id: "work::fn-1.1",
+      force: true,
+      caller_session: "work",
+    },
+  );
+  // caller_session rides without force; force:false never ships a `force` key.
+  expect(
+    paramsOf(buildRetryFrame("r2", "work::fn-1.1", false, "work")),
+  ).toEqual({
+    id: "work::fn-1.1",
+    caller_session: "work",
+  });
+});
+
 // ---------------------------------------------------------------------------
 // buildSetModeFrame / buildSetArmedFrame — fn-751 control-RPC frame builders.
 // ---------------------------------------------------------------------------

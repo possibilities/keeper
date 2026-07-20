@@ -264,7 +264,11 @@ test("replay_dead_letter throws a generic message when ok:false carries no error
  */
 function autopilotStubBridge(opts: {
   setPaused?: { ok: boolean; error?: string };
-  retry?: { ok: boolean; error?: string };
+  retry?: {
+    ok: boolean;
+    error?: string;
+    outcome?: "cleared" | "refused_live" | "refused_identity";
+  };
   setMode?: { ok: boolean; error?: string };
   setConfig?: { ok: boolean; error?: string; note?: string };
   setArmed?: { ok: boolean; error?: string };
@@ -274,7 +278,12 @@ function autopilotStubBridge(opts: {
   bridge: ReplayBridge;
   state: {
     setPausedCalls: boolean[];
-    retryCalls: Array<{ verb: string; id: string }>;
+    retryCalls: Array<{
+      verb: string;
+      id: string;
+      force: boolean;
+      caller_session: string | null;
+    }>;
     setModeCalls: string[];
     setConfigCalls: Array<{
       max_concurrent_jobs?: number | null;
@@ -304,7 +313,12 @@ function autopilotStubBridge(opts: {
 } {
   const state = {
     setPausedCalls: [] as boolean[],
-    retryCalls: [] as Array<{ verb: string; id: string }>,
+    retryCalls: [] as Array<{
+      verb: string;
+      id: string;
+      force: boolean;
+      caller_session: string | null;
+    }>,
     setModeCalls: [] as string[],
     setConfigCalls: [] as Array<{
       max_concurrent_jobs?: number | null;
@@ -336,9 +350,9 @@ function autopilotStubBridge(opts: {
       state.setPausedCalls.push(paused);
       return opts.setPaused ?? { ok: true };
     },
-    async retryDispatch(verb, id) {
-      state.retryCalls.push({ verb, id });
-      return opts.retry ?? { ok: true };
+    async retryDispatch(verb, id, force, caller_session) {
+      state.retryCalls.push({ verb, id, force, caller_session });
+      return opts.retry ?? { ok: true, outcome: "cleared" };
     },
     async setAutopilotMode(mode) {
       state.setModeCalls.push(mode);
@@ -1299,11 +1313,36 @@ test("parseDispatchKey: re-wraps a leaf `{ok:false}` into BadParamsError", () =>
   }
 });
 
-test("retry_dispatch forwards the split (verb, id) to the bridge and returns ok+verb+id", async () => {
+test("retry_dispatch forwards the split (verb, id) to the bridge and returns ok+verb+id+outcome", async () => {
   const { bridge, state } = autopilotStubBridge({});
   const result = await retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge);
-  expect(result).toEqual({ ok: true, verb: "work", id: "fn-1-foo.3" });
-  expect(state.retryCalls).toEqual([{ verb: "work", id: "fn-1-foo.3" }]);
+  expect(result).toEqual({
+    ok: true,
+    verb: "work",
+    id: "fn-1-foo.3",
+    outcome: "cleared",
+  });
+  // A bare clear defaults force=false, caller_session=null (no operator identity).
+  expect(state.retryCalls).toEqual([
+    { verb: "work", id: "fn-1-foo.3", force: false, caller_session: null },
+  ]);
+});
+
+test("retry_dispatch threads --force + caller_session to the bridge for the audit trail", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await retryDispatchHandler(
+    { id: "work::fn-1-foo.3", force: true, caller_session: "work" },
+    bridge,
+  );
+  expect(result).toEqual({
+    ok: true,
+    verb: "work",
+    id: "fn-1-foo.3",
+    outcome: "cleared",
+  });
+  expect(state.retryCalls).toEqual([
+    { verb: "work", id: "fn-1-foo.3", force: true, caller_session: "work" },
+  ]);
 });
 
 test("retry_dispatch accepts an `approve::id` clear and forwards it to the bridge (fn-870)", async () => {
@@ -1315,8 +1354,20 @@ test("retry_dispatch accepts an `approve::id` clear and forwards it to the bridg
     { id: "approve::fn-870-clear.1" },
     bridge,
   );
-  expect(result).toEqual({ ok: true, verb: "approve", id: "fn-870-clear.1" });
-  expect(state.retryCalls).toEqual([{ verb: "approve", id: "fn-870-clear.1" }]);
+  expect(result).toEqual({
+    ok: true,
+    verb: "approve",
+    id: "fn-870-clear.1",
+    outcome: "cleared",
+  });
+  expect(state.retryCalls).toEqual([
+    {
+      verb: "approve",
+      id: "fn-870-clear.1",
+      force: false,
+      caller_session: null,
+    },
+  ]);
 });
 
 test("retry_dispatch accepts a `repair::<token>` re-arm and forwards it to the bridge", async () => {
@@ -1329,8 +1380,15 @@ test("retry_dispatch accepts a `repair::<token>` re-arm and forwards it to the b
     { id: "repair::keeper-qzvs8i" },
     bridge,
   );
-  expect(result).toEqual({ ok: true, verb: "repair", id: "keeper-qzvs8i" });
-  expect(state.retryCalls).toEqual([{ verb: "repair", id: "keeper-qzvs8i" }]);
+  expect(result).toEqual({
+    ok: true,
+    verb: "repair",
+    id: "keeper-qzvs8i",
+    outcome: "cleared",
+  });
+  expect(state.retryCalls).toEqual([
+    { verb: "repair", id: "keeper-qzvs8i", force: false, caller_session: null },
+  ]);
 });
 
 test("retry_dispatch rejects params with extra keys (no command/param injection)", async () => {
@@ -1356,6 +1414,28 @@ test("retry_dispatch rejects non-object / missing-id params", async () => {
   }
 });
 
+test("retry_dispatch accepts the fence fields force + caller_session (not stray keys)", async () => {
+  const { bridge } = autopilotStubBridge({});
+  // Both forms are well-formed; neither trips the stray-key injection guard.
+  await retryDispatchHandler({ id: "work::fn-1-foo.3", force: true }, bridge);
+  await retryDispatchHandler(
+    { id: "work::fn-1-foo.3", caller_session: null },
+    bridge,
+  );
+});
+
+test("retry_dispatch rejects a mistyped force / caller_session (bad_params)", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [
+    { id: "work::fn-1-foo.3", force: "yes" },
+    { id: "work::fn-1-foo.3", caller_session: 7 },
+  ]) {
+    expect(retryDispatchHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
 test("retry_dispatch surfaces bridge ok:false as a thrown error (rpc_failed framing)", async () => {
   const { bridge } = autopilotStubBridge({
     retry: { ok: false, error: "insertEvent failed" },
@@ -1363,6 +1443,36 @@ test("retry_dispatch surfaces bridge ok:false as a thrown error (rpc_failed fram
   expect(
     retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge),
   ).rejects.toThrow(/insertEvent failed/);
+});
+
+test("retry_dispatch surfaces a refused_live liveness refusal as a thrown typed outcome (never ok:true)", async () => {
+  const { bridge } = autopilotStubBridge({
+    retry: {
+      ok: false,
+      outcome: "refused_live",
+      error:
+        "refused_live: work::fn-1-foo.3 is bound to a live dispatch claim; pass --force",
+    },
+  });
+  // The refusal reaches the caller as an error (non-ok), carrying the typed
+  // outcome token — the operator sees refused/needs-force, not false success.
+  expect(
+    retryDispatchHandler({ id: "work::fn-1-foo.3" }, bridge),
+  ).rejects.toThrow(/refused_live/);
+});
+
+test("retry_dispatch surfaces a refused_identity CAS refusal as a thrown typed outcome", async () => {
+  const { bridge } = autopilotStubBridge({
+    retry: {
+      ok: false,
+      outcome: "refused_identity",
+      error:
+        "refused_identity: the dispatch attempt changed at the write site; --force does not override",
+    },
+  });
+  expect(
+    retryDispatchHandler({ id: "work::fn-1-foo.3", force: true }, bridge),
+  ).rejects.toThrow(/refused_identity/);
 });
 
 test("set_autopilot_config forwards a drift_behind_threshold patch (fn-1252 task .3)", async () => {

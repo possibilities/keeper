@@ -22,7 +22,7 @@
  *   keeper autopilot pause [--sock <path>]      # control
  *   keeper autopilot play  [--sock <path>]      # control
  *   keeper autopilot config <key> <value> [--sock <path>]  # control
- *   keeper autopilot retry <verb::id> [--sock <path>]  # control
+ *   keeper autopilot retry <verb::id> [--force] [--sock <path>]  # control
  *   keeper autopilot --help
  */
 
@@ -66,6 +66,7 @@ import type { Epic, Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 import { queryCollection, sendControlRpc } from "./control-rpc";
 import { AUTOPILOT_FLAGS, buildParseOptions } from "./descriptor";
+import { resolveSession } from "./dispatch";
 import { parseDuration } from "./duration";
 import {
   type Envelope,
@@ -89,7 +90,7 @@ Usage:
   keeper autopilot arm <epic-id> [--sock <path>]
   keeper autopilot disarm <epic-id> [--sock <path>]
   keeper autopilot worktree <on|off> [--force] [--sock <path>]
-  keeper autopilot retry <verb::id> [--sock <path>]
+  keeper autopilot retry <verb::id> [--force] [--sock <path>]
   keeper autopilot show [--sock <path>]
   keeper autopilot --help
 
@@ -164,6 +165,9 @@ Subcommands:
            itself); repair re-arms a stranded repair::<repo-token> sticky
            after a dispatched repair session declined or died (the sweep
            re-dispatches on persisting candidates once the row clears).
+           A key still bound to a live worker refuses (refused_live) — pass
+           --force to override the liveness fence ONLY; a re-minted attempt
+           refuses (refused_identity) that --force never overrides.
 
 Options:
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
@@ -172,7 +176,8 @@ Options:
   --watch        (viewer only) Force the live subscribe stream even when piped
   --timeout <dur>  (viewer only) Snapshot wait before the timeout escape (~2s;
                  unit required, e.g. 500ms, 2s)
-  --force        (worktree only) Bypass the started-epic toggle guard
+  --force        (worktree) Bypass the started-epic toggle guard; (retry)
+                 override the claimant-liveness fence ONLY, never identity
   --help         Show this help
 
 By default the viewer's stdout that is NOT a TTY (piped into an agent)
@@ -195,7 +200,7 @@ Control the server-side reconciler (the viewer is read-only). It boots PAUSED.
   keeper autopilot pause | play
   keeper autopilot mode <yolo|armed>      # armed works ONLY armed epics + their dep-closure
   keeper autopilot arm <epic> | disarm <epic>
-  keeper autopilot retry <verb::id>       # clear a sticky dispatch-failure row
+  keeper autopilot retry <verb::id> [--force]  # clear a sticky row (--force overrides the live-claim fence only)
   keeper autopilot config <key> <value>   # max_concurrent_jobs | max_concurrent_per_root | worktree_multi_repo | worker_provider
   keeper autopilot worktree <on|off> [--force]
 
@@ -713,14 +718,25 @@ export function buildSetPausedFrame(id: string, paused: boolean): ClientFrame {
 
 /**
  * Build a well-formed RPC client frame for `retry_dispatch`. Pure —
- * exported so tests can assert the wire shape.
+ * exported so tests can assert the wire shape. `force` (break-glass over the
+ * claimant-liveness fence) and `callerSession` (the audited acting identity)
+ * ride only when present, so a bare retry keeps its `{ id }`-only payload.
  */
-export function buildRetryFrame(id: string, dispatchKey: string): ClientFrame {
+export function buildRetryFrame(
+  id: string,
+  dispatchKey: string,
+  force = false,
+  callerSession: string | null = null,
+): ClientFrame {
   return {
     type: "rpc",
     id,
     method: "retry_dispatch",
-    params: { id: dispatchKey },
+    params: {
+      id: dispatchKey,
+      ...(force ? { force: true } : {}),
+      ...(callerSession !== null ? { caller_session: callerSession } : {}),
+    },
   };
 }
 
@@ -1342,9 +1358,13 @@ export async function main(argv: string[]): Promise<void> {
       die("'retry' requires a non-empty <verb::id> key");
     }
     const id = crypto.randomUUID();
+    // Resolve the acting identity for the clear's audit trail (same precedence
+    // as `keeper await cancel`); `--force` lifts the claimant-liveness fence
+    // only — a live bound claim otherwise refuses with a typed outcome.
+    const { session } = resolveSession({ sessionFlag: undefined });
     await sendControlRpc(
       sockPath,
-      buildRetryFrame(id, dispatchKey),
+      buildRetryFrame(id, dispatchKey, parsed.values.force ?? false, session),
       id,
       AUTOPILOT_CONTROL_SCHEMA_VERSION,
     );

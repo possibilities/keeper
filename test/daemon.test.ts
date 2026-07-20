@@ -39,6 +39,7 @@ import type {
   TimeoutResult,
   ToolchainFingerprint,
 } from "../src/baseline-store";
+import type { RecordedProcessIdentityVerdict } from "../src/commit-work/process-identity";
 import {
   ALL_WORKERS,
   AUDIT_READY_ORCHESTRATOR_GRACE_MS,
@@ -68,6 +69,7 @@ import {
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
+  buildDispatchClearedData,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildSharedCheckoutPageBody,
@@ -90,6 +92,7 @@ import {
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
+  decideDispatchClearLiveness,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
@@ -5320,6 +5323,212 @@ test("retry_dispatch append-point snapshot binds the current incident and newest
     expected_attempt_id: 81,
     expected_instance_event_id: 71,
   });
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// decideDispatchClearLiveness — the operator dispatch-clear liveness fence.
+// Pure decision, driven with seeded claim rows + a pid probe seam (PROBE
+// verdicts mirror `recordedProcessIdentity`).
+// ---------------------------------------------------------------------------
+
+const BOUND_CLAIM = { state: "bound", bound_at: 123 } as const;
+// A probe that fails the test if it is ever consulted — proves the lazy
+// short-circuit (unbound / forced paths never spawn a process probe).
+const PROBE_NEVER = (): RecordedProcessIdentityVerdict => {
+  throw new Error("liveness probe must not be consulted on this path");
+};
+
+test("decideDispatchClearLiveness: an absent / released / unbound claim clears without probing", () => {
+  // No claim at all.
+  expect(decideDispatchClearLiveness(undefined, false, PROBE_NEVER)).toEqual({
+    kind: "clear",
+  });
+  // A released claim protects nothing live.
+  expect(
+    decideDispatchClearLiveness(
+      { state: "released", bound_at: 123 },
+      false,
+      PROBE_NEVER,
+    ),
+  ).toEqual({ kind: "clear" });
+  // Acquired-but-not-yet-bound: no worker occupies it.
+  expect(
+    decideDispatchClearLiveness(
+      { state: "acquired", bound_at: null },
+      false,
+      PROBE_NEVER,
+    ),
+  ).toEqual({ kind: "clear" });
+});
+
+test("decideDispatchClearLiveness: a bound claim refuses on a live OR uncertain probe (over-refusal is the safe side)", () => {
+  expect(
+    decideDispatchClearLiveness(BOUND_CLAIM, false, () => "matching"),
+  ).toEqual({ kind: "refuse-live" });
+  // Uncertain (reused pid / unreadable identity / missing witness) refuses too.
+  expect(
+    decideDispatchClearLiveness(BOUND_CLAIM, false, () => "inconclusive"),
+  ).toEqual({ kind: "refuse-live" });
+});
+
+test("decideDispatchClearLiveness: a bound claim clears ONLY when the claimant probes provably gone", () => {
+  expect(decideDispatchClearLiveness(BOUND_CLAIM, false, () => "gone")).toEqual(
+    { kind: "clear" },
+  );
+});
+
+test("decideDispatchClearLiveness: --force lifts the liveness gate before any probe runs", () => {
+  // Force short-circuits ahead of the probe — a live bound claim clears, and
+  // the probe is never consulted.
+  expect(decideDispatchClearLiveness(BOUND_CLAIM, true, PROBE_NEVER)).toEqual({
+    kind: "clear",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDispatchClearedData — audit trail in the DispatchCleared event data,
+// stored byte-identically for re-fold.
+// ---------------------------------------------------------------------------
+
+test("buildDispatchClearedData: internal sweeps keep the historical shape; an operator clear stamps the audit trail", () => {
+  const fences = { expected_attempt_id: 41, expected_instance_event_id: 51 };
+  // No audit → the pre-fence shape, unchanged byte-for-byte.
+  expect(
+    JSON.parse(buildDispatchClearedData("work", "fn-1-foo.1", fences)),
+  ).toEqual({
+    verb: "work",
+    id: "fn-1-foo.1",
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+  });
+  // Operator clear → the acting identity + forced flag ride alongside.
+  expect(
+    JSON.parse(
+      buildDispatchClearedData("work", "fn-1-foo.1", fences, {
+        forced: true,
+        caller_session: "work",
+      }),
+    ),
+  ).toEqual({
+    verb: "work",
+    id: "fn-1-foo.1",
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+    forced: true,
+    caller_session: "work",
+  });
+});
+
+test("audit-carrying DispatchCleared folds byte-identically to a plain one (audit fields are re-fold-inert)", () => {
+  const fences = { expected_attempt_id: 41, expected_instance_event_id: 51 };
+  // Two DBs, identical seeded failure rows; one clear carries the operator audit
+  // trail, the other the internal-sweep shape. The fold reads only verb/id/fence
+  // fields, so both must delete the row identically — the audit never perturbs
+  // the deterministic-replayed projection.
+  const seedFailure = (db: ReturnType<typeof freshMemDb>["db"]): void => {
+    db.query(
+      `INSERT INTO dispatch_failures
+         (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+          attempt_id, instance_event_id)
+       VALUES ('work', 'fn-1-foo.1', 'failure', '/repo', 1, 51, 1, 1, 41, 51)`,
+    ).run();
+  };
+  const seedClear = (
+    db: ReturnType<typeof freshMemDb>["db"],
+    data: string,
+  ): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+         VALUES (1, 'work::fn-1-foo.1', NULL, 'DispatchCleared', 'dispatch_failures', ?)`,
+      [data],
+    );
+  };
+  const failuresLeft = (db: ReturnType<typeof freshMemDb>["db"]): number =>
+    (
+      db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+        n: number;
+      }
+    ).n;
+
+  const withAudit = freshMemDb().db;
+  seedFailure(withAudit);
+  const auditData = buildDispatchClearedData("work", "fn-1-foo.1", fences, {
+    forced: true,
+    caller_session: "work",
+  });
+  seedClear(withAudit, auditData);
+  drainToCompletion(withAudit);
+
+  const plain = freshMemDb().db;
+  seedFailure(plain);
+  seedClear(plain, buildDispatchClearedData("work", "fn-1-foo.1", fences));
+  drainToCompletion(plain);
+
+  // Both clears deleted the row; the audit shape changed nothing.
+  expect(failuresLeft(withAudit)).toBe(0);
+  expect(failuresLeft(plain)).toBe(0);
+  // The audit event's data survives verbatim in the log — re-fold reads the same
+  // bytes, so the audit trail replays byte-identically.
+  const storedData = (
+    withAudit
+      .query(
+        "SELECT data FROM events WHERE hook_event = 'DispatchCleared' LIMIT 1",
+      )
+      .get() as { data: string }
+  ).data;
+  expect(storedData).toBe(auditData);
+  withAudit.close();
+  plain.close();
+});
+
+test("regression: an internal orphan sweep clearing a stale failure row never deletes a live bound attempt's mint gate", () => {
+  const { db } = freshMemDb();
+  const verb = "work";
+  // A leading-dot / path token is un-retryable by the wire validator, so the
+  // orphan sweep is the ONLY producer that can clear it — an internal sweep, not
+  // the operator surface. It matches no distress-key skip, so it IS swept.
+  const id = "../evil";
+  const key = `${verb}::${id}`;
+  // The stale failure row records the OLD attempt (41).
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES (?, ?, 'orphaned', NULL, 1, 51, 1, 1, 41, 51)`,
+  ).run(verb, id);
+  // A LIVE newer attempt (99) has re-bound the same key and owns the mint gate.
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, acquired_at, bound_at,
+        last_event_id, updated_at)
+     VALUES (?, ?, 99, 'bound', 'sess-live', 1, 2, 61, 2)`,
+  ).run(verb, id);
+  upsertDispatchMintGate(db, key, 99, 61);
+
+  // Drive the REAL orphan sweep through the exact fenced-append CAS every clear
+  // (operator + internal) routes through. The append is a no-op stand-in for the
+  // folded DispatchCleared event.
+  let appends = 0;
+  const swept = gcUnretryableDispatchFailures(db, (v, i, fences) => {
+    appendFencedDispatchClear({
+      db,
+      verb: v,
+      id: i,
+      fences,
+      append: () => {
+        appends++;
+      },
+    });
+  });
+
+  // The sweep processed the stale row (fences pinned the OLD attempt 41)...
+  expect(swept).toBe(1);
+  // ...but the CAS re-snapshot saw the live attempt 99 own the key, so it
+  // refused: no event appended, and the live mint gate is intact. No
+  // double-dispatch window opens behind the live worker.
+  expect(appends).toBe(0);
+  expect(readDispatchMintGate(db, key)).toBe(99);
   db.close();
 });
 

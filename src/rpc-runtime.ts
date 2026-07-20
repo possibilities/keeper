@@ -1,5 +1,8 @@
 import type { Database } from "bun:sqlite";
-import type { RetryDispatchVerb } from "./dispatch-command";
+import type {
+  DispatchClearOutcome,
+  RetryDispatchVerb,
+} from "./dispatch-command";
 import type { NormalizedFableFocusInput } from "./fable-focus";
 import type { RequestAwaitRpcParams } from "./protocol";
 
@@ -31,9 +34,12 @@ export interface ReplayBridge {
   retryDispatch(
     verb: RetryDispatchVerb,
     dispatch_id: string,
+    force: boolean,
+    caller_session: string | null,
   ): Promise<{
     ok: boolean;
     error?: string;
+    outcome?: DispatchClearOutcome;
   }>;
   setAutopilotMode(mode: "yolo" | "armed"): Promise<{
     ok: boolean;

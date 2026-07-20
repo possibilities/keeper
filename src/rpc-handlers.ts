@@ -39,6 +39,7 @@
 import { isAbsolute } from "node:path";
 import { parseTriple } from "./agent/triple";
 import {
+  type DispatchClearOutcome,
   parseDispatchKey as parseDispatchKeyResult,
   type RetryDispatchVerb,
 } from "./dispatch-command";
@@ -968,6 +969,11 @@ export async function requestAwaitHandler(
 export interface RetryDispatchParams {
   /** Composite dispatch key — exactly `${verb}::${id}`. */
   id: string;
+  /** Break-glass override of the claimant-liveness fence ONLY (never the
+   *  attempt-identity CAS). Absent means false. */
+  force?: boolean;
+  /** The acting operator identity, recorded in the clear's audit trail. */
+  caller_session?: string | null;
 }
 
 /** Successful return shape for `retry_dispatch`. */
@@ -975,6 +981,8 @@ export interface RetryDispatchResult {
   ok: true;
   verb: RetryDispatchVerb;
   id: string;
+  /** Typed clear verdict (always `cleared` on the ok path — a refusal throws). */
+  outcome: DispatchClearOutcome;
 }
 
 /**
@@ -1003,18 +1011,36 @@ function validateRetryDispatchParams(params: unknown): RetryDispatchParams {
     );
   }
   const obj = params as Record<string, unknown>;
-  // Reject any field other than `id` — the spec says "launch params
-  // come from the projection read, never the RPC payload"; a stray
-  // `cwd` / `tier` / `verb` / `command` field is a sign of param
-  // injection and gets surfaced as a typed bad_params rather than
-  // silently ignored.
-  const stray = Object.keys(obj).filter((k) => k !== "id");
+  // Launch params still come from the projection read, never the RPC payload —
+  // so `cwd` / `tier` / `verb` / `command` stay rejected as param injection. The
+  // clear-fence surface adds exactly two operator-supplied fields: `force` (the
+  // liveness break-glass) and `caller_session` (the audited acting identity).
+  const known = new Set(["id", "force", "caller_session"]);
+  const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
     throw new BadParamsError(
-      `retry_dispatch: params must contain ONLY \`id\` (got stray keys: ${stray.join(", ")})`,
+      `retry_dispatch: params must contain only \`id\` (+ optional \`force\` / \`caller_session\`); got stray keys: ${stray.join(", ")}`,
     );
   }
-  return { id: obj.id as string };
+  if (obj.force !== undefined && typeof obj.force !== "boolean") {
+    throw new BadParamsError("retry_dispatch: `force` must be a boolean");
+  }
+  if (
+    obj.caller_session !== undefined &&
+    obj.caller_session !== null &&
+    typeof obj.caller_session !== "string"
+  ) {
+    throw new BadParamsError(
+      "retry_dispatch: `caller_session` must be a string or null",
+    );
+  }
+  return {
+    id: obj.id as string,
+    ...(obj.force !== undefined ? { force: obj.force as boolean } : {}),
+    ...(obj.caller_session !== undefined
+      ? { caller_session: obj.caller_session as string | null }
+      : {}),
+  };
 }
 
 /**
@@ -1034,13 +1060,26 @@ export async function retryDispatchHandler(
   params: unknown,
   bridge: ReplayBridge,
 ): Promise<RetryDispatchResult> {
-  const { id } = validateRetryDispatchParams(params);
+  const { id, force, caller_session } = validateRetryDispatchParams(params);
   const { verb, id: dispatchId } = parseDispatchKey(id);
-  const result = await bridge.retryDispatch(verb, dispatchId);
+  const result = await bridge.retryDispatch(
+    verb,
+    dispatchId,
+    force ?? false,
+    caller_session ?? null,
+  );
   if (!result.ok) {
+    // A liveness or identity refusal (or an insert failure) surfaces as a
+    // thrown error → the dispatcher frames it `rpc_failed`, so the operator
+    // sees the typed outcome text and a non-ok exit rather than false success.
     throw new Error(result.error ?? "retry_dispatch: main reported failure");
   }
-  return { ok: true, verb, id: dispatchId };
+  return {
+    ok: true,
+    verb,
+    id: dispatchId,
+    outcome: result.outcome ?? "cleared",
+  };
 }
 
 const RPC_HANDLER_REGISTRATIONS = [

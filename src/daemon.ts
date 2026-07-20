@@ -119,6 +119,8 @@ import {
   isHarnessProcessCommand,
   probeHarnessProcess,
   processStartTimesWithinOneSecond,
+  type RecordedProcessIdentityVerdict,
+  recordedProcessIdentity,
 } from "./commit-work/process-identity";
 import {
   countAbsentBlobs,
@@ -566,6 +568,41 @@ export function dispatchClearFencesAtAppend(
   };
 }
 
+/** The audit trail an operator dispatch-clear stamps into its `DispatchCleared`
+ *  event data: the acting identity and whether `--force` overrode the liveness
+ *  fence. Internal sweeps carry none. */
+export interface DispatchClearAudit {
+  forced: boolean;
+  caller_session: string | null;
+}
+
+/**
+ * Build the `data` blob for a `DispatchCleared` synthetic event. An operator
+ * clear passes an {@link DispatchClearAudit} trail; internal sweeps omit it and
+ * keep their historical `{ verb, id, ...fences }` shape byte-for-byte. The fold
+ * ({@link extractDispatchClearedPayload}) reads only `verb` / `id` / the two
+ * fence fields, so the audit fields are audit-only and re-fold-inert. Pure —
+ * exported so tests can pin the shape and its re-fold determinism.
+ */
+export function buildDispatchClearedData(
+  verb: string,
+  id: string,
+  fences: DispatchClearFences,
+  audit?: DispatchClearAudit,
+): string {
+  return JSON.stringify(
+    audit === undefined
+      ? { verb, id, ...fences }
+      : {
+          verb,
+          id,
+          ...fences,
+          forced: audit.forced,
+          caller_session: audit.caller_session,
+        },
+  );
+}
+
 /** Revalidate immutable producer authority, append, then release only the gate
  * owned by that exact attempt. A stale clear is a fail-closed no-op. */
 export function appendFencedDispatchClear(args: {
@@ -615,6 +652,40 @@ export function appendFencedDispatchClear(args: {
       .run(`${args.verb}::${args.id}`, args.fences.expected_attempt_id);
   }
   return true;
+}
+
+/** The producer-side verdict for one operator dispatch-clear liveness gate.
+ *  `clear` proceeds to the append + identity CAS; `refuse-live` denies because
+ *  the target's claim is bound to a worker whose process probes live or
+ *  uncertain. */
+export type DispatchClearLivenessDecision = { kind: "clear" | "refuse-live" };
+
+/**
+ * Owner-liveness fence for an operator dispatch-clear (`retry_dispatch`), decided
+ * producer-side (ADR 0099, mirroring {@link decideAwaitCancel}'s shape). Pure: main
+ * reads the committed claim + the claimant's process-identity verdict, then this
+ * decides whether the clear may append. A released/absent/unbound claim clears
+ * freely (nothing live to protect). A bound, unreleased claim consults the process
+ * probe: only a `gone` verdict (ESRCH / start-time mismatch — the recorded claimant
+ * is provably dead) clears; `matching` (live) and `inconclusive` (uncertain — a
+ * reused pid, an unreadable identity, or a missing witness) both refuse, so
+ * over-refusing is the safe direction. `force` lifts THIS liveness gate only and is
+ * evaluated before the probe (no wasted `ps`); the attempt-identity CAS at the write
+ * site stays load-bearing under force. The probe seam is lazy so an unbound clear
+ * never spawns a process probe.
+ */
+export function decideDispatchClearLiveness(
+  claim: { state: string; bound_at: number | null } | undefined,
+  force: boolean,
+  probeLiveness: () => RecordedProcessIdentityVerdict,
+): DispatchClearLivenessDecision {
+  const bound =
+    claim !== undefined && claim.state !== "released" && claim.bound_at != null;
+  if (!bound) return { kind: "clear" };
+  if (force) return { kind: "clear" };
+  return probeLiveness() === "gone"
+    ? { kind: "clear" }
+    : { kind: "refuse-live" };
 }
 
 /**
@@ -9208,6 +9279,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     fences: DispatchClearFences,
     recoverable = false,
     allowUnfoldedIncident = false,
+    audit?: DispatchClearAudit,
   ): boolean {
     return appendFencedDispatchClear({
       db,
@@ -9230,7 +9302,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $agent_id: null,
           $agent_type: null,
           $stop_hook_active: null,
-          $data: JSON.stringify({ verb, id, ...fences }),
+          // The operator clear path stamps its audit trail (acting identity +
+          // whether force overrode the liveness fence) into the event data; the
+          // fold ({@link extractDispatchClearedPayload}) never reads these fields,
+          // so they are audit-only and re-fold byte-identically. Internal sweeps
+          // pass no audit and keep their historical data shape unchanged.
+          $data: buildDispatchClearedData(verb, id, fences, audit),
           $subagent_agent_id: null,
           $spawn_name: null,
           $start_time: null,
@@ -10041,22 +10118,96 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       if (msg.kind === "retry-dispatch-request") {
         // Append a `DispatchCleared` synthetic event so the reducer's fold arm
-        // DELETEs the matching `dispatch_failures` row on the next drain. The
-        // wire `verb` / `dispatch_id` are validated handler-side; main treats
-        // both as opaque payload tokens.
+        // DELETEs the matching `dispatch_failures` row on the next drain — BUT
+        // never behind a live worker's back. The operator clear first fences on
+        // claimant liveness (producer-side, never in a fold): a bound, unreleased
+        // claim whose worker probes live or uncertain refuses with a typed
+        // outcome instead of the old silent `ok:true`; `--force` lifts only that
+        // liveness gate. The attempt-identity CAS inside
+        // `appendFencedDispatchClear` stays load-bearing (force included), so a
+        // fenced no-op reports `refused_identity` rather than false success.
         const id = msg.id;
         let reply: RetryDispatchResultMessage;
         try {
-          // The wire `verb` / `dispatch_id` are validated handler-side; main treats
-          // both as opaque payload tokens.
-          mintDispatchClearedEvent(
-            msg.verb,
-            msg.dispatch_id,
-            dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+          const claim = db
+            .query(
+              "SELECT state, bound_at, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+            )
+            .get(msg.verb, msg.dispatch_id) as {
+            state: string;
+            bound_at: number | null;
+            session_id: string | null;
+          } | null;
+          // Recycle-safe process probe for the claimant. An absent session,
+          // job, or process witness is `inconclusive` (refuse on uncertainty),
+          // never a false `gone`. Evaluated lazily — an unbound clear never
+          // spawns a probe.
+          const probeLiveness = (): RecordedProcessIdentityVerdict => {
+            const sid = claim?.session_id;
+            if (sid == null || sid.length === 0) return "inconclusive";
+            const job = db
+              .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+              .get(sid) as {
+              pid: number | null;
+              start_time: string | null;
+            } | null;
+            if (
+              job == null ||
+              job.pid == null ||
+              job.start_time == null ||
+              job.start_time.length === 0
+            ) {
+              return "inconclusive";
+            }
+            return recordedProcessIdentity(job.pid, job.start_time);
+          };
+          const decision = decideDispatchClearLiveness(
+            claim ?? undefined,
+            msg.force,
+            probeLiveness,
           );
-          wakePending = true;
-          pumpWakes();
-          reply = { type: "retry-dispatch-result", id, ok: true };
+          if (decision.kind === "refuse-live") {
+            reply = {
+              type: "retry-dispatch-result",
+              id,
+              ok: false,
+              outcome: "refused_live",
+              error:
+                `refused_live: ${msg.verb}::${msg.dispatch_id} is bound to a live ` +
+                `dispatch claim${claim?.session_id ? ` (session ${claim.session_id})` : ""}; ` +
+                "pass --force to override the liveness refusal (the attempt-identity fence still applies).",
+            };
+          } else {
+            const applied = mintDispatchClearedEvent(
+              msg.verb,
+              msg.dispatch_id,
+              dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+              false,
+              false,
+              { forced: msg.force, caller_session: msg.caller_session },
+            );
+            if (applied) {
+              wakePending = true;
+              pumpWakes();
+              reply = {
+                type: "retry-dispatch-result",
+                id,
+                ok: true,
+                outcome: "cleared",
+              };
+            } else {
+              reply = {
+                type: "retry-dispatch-result",
+                id,
+                ok: false,
+                outcome: "refused_identity",
+                error:
+                  `refused_identity: the dispatch attempt for ${msg.verb}::${msg.dispatch_id} ` +
+                  "changed at the write site (a newer attempt re-minted the claim); " +
+                  "--force does not override an identity mismatch — re-read state and retry.",
+              };
+            }
+          }
         } catch (err) {
           reply = {
             type: "retry-dispatch-result",

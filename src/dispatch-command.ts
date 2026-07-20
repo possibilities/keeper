@@ -57,6 +57,20 @@ export function formatDispatchAttemptCarrier(
  */
 export type RetryDispatchVerb = "work" | "close" | "approve" | "repair";
 
+/**
+ * The typed verdict an operator dispatch-clear (`retry_dispatch`) returns through
+ * the reply chain to the CLI. `cleared` applied; `refused_live` means the target
+ * key's claim is bound to a worker whose process probed live or uncertain
+ * (override with `--force`, which lifts ONLY the liveness gate); `refused_identity`
+ * means the exact attempt does not own the claim at the write site (a newer
+ * attempt holds it) — `--force` never overrides an identity mismatch. A
+ * refusal is surfaced as a non-ok reply, never a silent `ok:true`.
+ */
+export type DispatchClearOutcome =
+  | "cleared"
+  | "refused_live"
+  | "refused_identity";
+
 const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
   "work",
   "close",
