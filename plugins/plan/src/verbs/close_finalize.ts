@@ -57,6 +57,17 @@ import { join, resolve as resolveAbs } from "node:path";
 
 import { stringify as stringifyYaml } from "yaml";
 
+import { CommitWorkLock } from "../../../../src/commit-work/flock.ts";
+import {
+  decideTrunkIntegrationFence,
+  readTrunkLeaseLeaf,
+  TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+  trunkLeaseIsValid,
+  writeTrunkLeaseRequest,
+} from "../../../../src/grant-leaf.ts";
+import { keeperStateDir } from "../../../../src/keeper-state-dir.ts";
+
 import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import {
   computeCommitSetHash,
@@ -87,6 +98,7 @@ import {
   type SelectionSidecar,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
+import { resolvePlanSessionId } from "../session_id.ts";
 import { clearCloseMarker } from "../session_markers.ts";
 import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
@@ -567,6 +579,477 @@ function synthesizeVerdictIfZeroFindings(
   };
 }
 
+interface TrunkGitResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function trunkGit(args: string[], cwd: string): TrunkGitResult {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+  ]) {
+    delete env[key];
+  }
+  try {
+    const proc = Bun.spawnSync(["git", ...args], {
+      cwd,
+      env,
+      timeout: 30_000,
+    });
+    return {
+      code: proc.exitCode,
+      stdout: proc.stdout.toString(),
+      stderr: proc.stderr.toString(),
+    };
+  } catch (err) {
+    return {
+      code: 1,
+      stdout: "",
+      stderr: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function waitBriefly(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireTrunkLock(repoRoot: string): CommitWorkLock | null {
+  const gitDir = trunkGit(
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    repoRoot,
+  );
+  const path =
+    gitDir.code === 0 && gitDir.stdout.trim() !== ""
+      ? join(gitDir.stdout.trim(), "keeper-commit-work.lock")
+      : join(repoRoot, ".git", "keeper-commit-work.lock");
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const lock = CommitWorkLock.tryAcquire(path);
+    if (lock !== null) return lock;
+    waitBriefly(50);
+  }
+  return null;
+}
+
+function requestTrunkLease(
+  stateDir: string,
+  epicId: string,
+  repoRoot: string,
+  sourceBranch: string,
+  claimantSessionId: string,
+  minimumToken: number,
+  format: OutputFormat | null,
+): TrunkLeaseLeaf {
+  const requestId = randomBytes(16).toString("hex");
+  const requested = writeTrunkLeaseRequest(stateDir, {
+    schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+    action: "acquire",
+    epic_id: epicId,
+    repo_root: repoRoot,
+    source_branch: sourceBranch,
+    claimant_session_id: claimantSessionId,
+    request_id: requestId,
+    fencing_token: null,
+    requested_at: Date.now(),
+  });
+  if (requested === null) {
+    emitFinalizeError(
+      "TRUNK_LEASE_REQUEST_FAILED",
+      `could not publish the trunk-integration lease request for ${repoRoot}`,
+      format,
+      { repo_root: repoRoot },
+    );
+  }
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const leaf = readTrunkLeaseLeaf(stateDir, repoRoot);
+    if (
+      leaf !== null &&
+      leaf.fencing_token >= minimumToken &&
+      leaf.acquisition_id === requestId &&
+      trunkLeaseIsValid(
+        leaf,
+        {
+          epicId,
+          repoRoot,
+          sourceBranch,
+          claimantSessionId,
+        },
+        Date.now(),
+      )
+    ) {
+      return leaf;
+    }
+    waitBriefly(100);
+  }
+  emitFinalizeError(
+    "TRUNK_LEASE_PENDING",
+    `the trunk-integration lease for ${repoRoot} was not published before the bounded wait expired; release any live holder and re-run /plan:close ${epicId}`,
+    format,
+    { repo_root: repoRoot },
+  );
+}
+
+function releaseTrunkLease(stateDir: string, lease: TrunkLeaseLeaf): boolean {
+  const requested = writeTrunkLeaseRequest(stateDir, {
+    schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+    action: "release",
+    epic_id: lease.epic_id,
+    repo_root: lease.repo_root,
+    source_branch: lease.source_branch,
+    claimant_session_id: lease.claimant_session_id,
+    request_id: randomBytes(16).toString("hex"),
+    fencing_token: lease.fencing_token,
+    requested_at: Date.now(),
+  });
+  if (requested === null) return false;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const current = readTrunkLeaseLeaf(stateDir, lease.repo_root);
+    if (
+      current !== null &&
+      (current.fencing_token !== lease.fencing_token || !current.active)
+    ) {
+      return true;
+    }
+    waitBriefly(100);
+  }
+  return false;
+}
+
+function ancestryProbe(
+  repoRoot: string,
+  sourceBranch: string,
+  defaultBranch: string,
+): "ancestor" | "not-ancestor" | "inconclusive" {
+  const probe = trunkGit(
+    ["merge-base", "--is-ancestor", sourceBranch, defaultBranch],
+    repoRoot,
+  );
+  return probe.code === 0
+    ? "ancestor"
+    : probe.code === 1
+      ? "not-ancestor"
+      : "inconclusive";
+}
+
+function integrateRepoUnderLease(
+  epicId: string,
+  repoRoot: string,
+  sourceBranch: string,
+  claimantSessionId: string,
+  format: OutputFormat | null,
+): void {
+  const stateDir = keeperStateDir();
+  let minimumToken = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const lease = requestTrunkLease(
+      stateDir,
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+      minimumToken,
+      format,
+    );
+    const releaseOrFail = (): void => {
+      if (!releaseTrunkLease(stateDir, lease)) {
+        emitFinalizeError(
+          "TRUNK_LEASE_RELEASE_FAILED",
+          `the daemon did not acknowledge release of trunk lease ${lease.fencing_token} for ${repoRoot}; no successor may integrate until claimant death is observed`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+    };
+
+    const lock = acquireTrunkLock(repoRoot);
+    if (lock === null) {
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_LOCK_TIMEOUT",
+        `the commit-work lock for ${repoRoot} stayed occupied through the bounded deadline; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    const head = trunkGit(["symbolic-ref", "--short", "HEAD"], repoRoot);
+    if (head.code !== 0 || head.stdout.trim() !== lease.default_branch) {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_OFF_BRANCH",
+        `${repoRoot} HEAD is ${head.stdout.trim() || "detached"}, expected ${lease.default_branch}; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, expected_branch: lease.default_branch },
+      );
+    }
+    const mergeHead = trunkGit(
+      ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+      repoRoot,
+    );
+    if (mergeHead.code === 0 && mergeHead.stdout.trim() !== "") {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_RESIDUE",
+        `${repoRoot} is already mid-merge (MERGE_HEAD=${mergeHead.stdout.trim()}); the residue must be resolved before trunk integration can resume`,
+        format,
+        { repo_root: repoRoot, merge_head: mergeHead.stdout.trim() },
+      );
+    }
+    const dirty = trunkGit(
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      repoRoot,
+    );
+    if (dirty.code !== 0 || dirty.stdout.trim() !== "") {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DIRTY",
+        `${repoRoot} must be clean before the closer can integrate ${sourceBranch}; no merge was attempted`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const sourceTip = trunkGit(
+      ["rev-parse", "--verify", `refs/heads/${sourceBranch}^{commit}`],
+      repoRoot,
+    );
+    const sourceOid = sourceTip.stdout.trim();
+    if (sourceTip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(sourceOid)) {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `the in-fence source tip for ${sourceBranch} could not be resolved; no merge was attempted`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    const liveTip = trunkGit(
+      ["rev-parse", "--verify", `refs/heads/${lease.default_branch}^{commit}`],
+      repoRoot,
+    );
+    const reprobe = ancestryProbe(repoRoot, sourceBranch, lease.default_branch);
+    const fence = readTrunkLeaseLeaf(stateDir, repoRoot);
+    const decision = decideTrunkIntegrationFence({
+      leaseValid:
+        fence !== null &&
+        trunkLeaseIsValid(
+          fence,
+          {
+            epicId,
+            repoRoot,
+            sourceBranch,
+            claimantSessionId,
+            fencingToken: lease.fencing_token,
+          },
+          Date.now(),
+        ),
+      ancestry: reprobe,
+      observedDefaultTip: lease.observed_default_tip,
+      liveDefaultTip: liveTip.code === 0 ? liveTip.stdout.trim() : null,
+    });
+    if (decision.kind === "already-integrated") {
+      lock.release();
+      releaseOrFail();
+      return;
+    }
+    if (decision.kind === "defer") {
+      lock.release();
+      releaseOrFail();
+      if (decision.reason === "ancestry-inconclusive") {
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_DEFERRED",
+          `the in-fence ancestry re-probe for ${sourceBranch} and ${lease.default_branch} was inconclusive; no merge was attempted`,
+          format,
+          { repo_root: repoRoot, fencing_token: lease.fencing_token },
+        );
+      }
+      minimumToken = lease.fencing_token + 1;
+      waitBriefly(150);
+      continue;
+    }
+
+    const merged = trunkGit(["merge", "--no-edit", sourceOid], repoRoot);
+    if (merged.code !== 0) {
+      const conflictHead = trunkGit(
+        ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+        repoRoot,
+      );
+      const conflicts = trunkGit(
+        ["diff", "--name-only", "--diff-filter=U"],
+        repoRoot,
+      );
+      if (conflictHead.code === 0 && conflictHead.stdout.trim() !== "") {
+        lock.release();
+        emitFinalizeError(
+          "TRUNK_INTEGRATION_CONFLICT",
+          `merging ${sourceBranch} into ${lease.default_branch} conflicted under trunk lease ${lease.fencing_token}; route the typed receipt through plan:deconflicter`,
+          format,
+          {
+            repo_root: repoRoot,
+            source_branch: sourceBranch,
+            default_branch: lease.default_branch,
+            fencing_token: lease.fencing_token,
+            merge_head: conflictHead.stdout.trim(),
+            conflicted_files: conflicts.stdout
+              .split("\n")
+              .map((p) => p.trim())
+              .filter(Boolean),
+          },
+        );
+      }
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_FAILED",
+        `git merge failed without merge residue in ${repoRoot}: ${(merged.stdout + merged.stderr).trim()}`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    const objective = ancestryProbe(
+      repoRoot,
+      sourceBranch,
+      lease.default_branch,
+    );
+    if (objective !== "ancestor") {
+      lock.release();
+      releaseOrFail();
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_UNVERIFIED",
+        `git merge returned success but ${sourceBranch} is not provably contained in ${lease.default_branch}; teardown remains fenced off`,
+        format,
+        { repo_root: repoRoot, fencing_token: lease.fencing_token },
+      );
+    }
+    lock.release();
+    releaseOrFail();
+    return;
+  }
+  emitFinalizeError(
+    "TRUNK_TIP_DRIFT",
+    `${repoRoot} default advanced during three independently fenced lease attempts; no stale merge was attempted`,
+    format,
+    { repo_root: repoRoot },
+  );
+}
+
+function resolveTrunkDefaultBranch(repoRoot: string): string | null {
+  const symbolic = trunkGit(
+    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    repoRoot,
+  );
+  const fromOrigin =
+    symbolic.code === 0 ? symbolic.stdout.trim().replace(/^origin\//, "") : "";
+  if (fromOrigin !== "") return fromOrigin;
+  for (const candidate of ["main", "master", "trunk"]) {
+    if (
+      trunkGit(
+        ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+        repoRoot,
+      ).code === 0
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function integrateEpicBases(
+  epicId: string,
+  primaryRepo: string,
+  touchedRepos: string[] | null | undefined,
+  format: OutputFormat | null,
+): void {
+  if ((process.env.KEEPER_PLAN_WORKTREE ?? "").trim() === "") return;
+  const claimantSessionId = resolvePlanSessionId();
+  if (claimantSessionId === null) {
+    emitFinalizeError(
+      "TRUNK_LEASE_IDENTITY_MISSING",
+      `worktree close for ${epicId} has no tracked session identity; refusing ownerless trunk integration`,
+      format,
+    );
+  }
+  const sourceBranch = `keeper/epic/${epicId}`;
+  const repos = new Set<string>([primaryRepo]);
+  for (const repo of touchedRepos ?? []) {
+    try {
+      repos.add(realpathOr(repo));
+    } catch {
+      // The source probe below owns the typed defer for a usable repo.
+    }
+  }
+  for (const repoRoot of [...repos].sort()) {
+    const toplevel = trunkGit(["rev-parse", "--show-toplevel"], repoRoot);
+    const observedRoot = toplevel.stdout.trim();
+    if (
+      toplevel.code !== 0 ||
+      observedRoot === "" ||
+      realpathOr(observedRoot) !== repoRoot
+    ) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not verify ${repoRoot} as an available git checkout; refusing to grade its epic base as absent`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const source = trunkGit(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${sourceBranch}^{commit}`,
+      ],
+      repoRoot,
+    );
+    if (source.code === 1) continue;
+    if (source.code !== 0) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not resolve ${sourceBranch} in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const defaultBranch = resolveTrunkDefaultBranch(repoRoot);
+    if (defaultBranch === null) {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not resolve the local default branch in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    const grade = ancestryProbe(repoRoot, sourceBranch, defaultBranch);
+    if (grade === "ancestor") continue;
+    if (grade === "inconclusive") {
+      emitFinalizeError(
+        "TRUNK_INTEGRATION_DEFERRED",
+        `could not grade ${sourceBranch} against ${defaultBranch} in ${repoRoot}; no trunk lease was acquired`,
+        format,
+        { repo_root: repoRoot },
+      );
+    }
+    integrateRepoUnderLease(
+      epicId,
+      repoRoot,
+      sourceBranch,
+      claimantSessionId,
+      format,
+    );
+  }
+}
+
 export interface CloseFinalizeArgs {
   epicId: string;
   project: string | null;
@@ -652,6 +1135,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     if (gatedFollowup.status === "done") {
       // The follow-up landed — adopt it and close the source (the ordinary
       // closed_with_followup terminal).
+      integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
       closeEpic(stateCtx, epicId);
       emitOutcome(
         CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -773,6 +1257,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   // 7. zero surviving decisions → clean close.
   const expected = expectedClusterOrdinals(verdict);
   if (expected.size === 0) {
+    integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
     closeEpic(stateCtx, epicId);
     emitOutcome(CLOSE_OUTCOMES.CLOSED_CLEAN, epicId, ctx, format, stateCtx);
     return;
@@ -784,6 +1269,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
   const existing = findFollowupEpic(stateCtx.dataDir, epicId);
   if (existing !== null) {
     if (existing.actualTasks === expectedCount) {
+      integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
       closeEpic(stateCtx, epicId);
       emitOutcome(
         CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,
@@ -891,6 +1377,7 @@ export function runCloseFinalize(args: CloseFinalizeArgs): void {
     return;
   }
 
+  integrateEpicBases(epicId, primaryRepo, touchedRepos, format);
   closeEpic(stateCtx, epicId);
   emitOutcome(
     CLOSE_OUTCOMES.CLOSED_WITH_FOLLOWUP,

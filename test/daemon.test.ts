@@ -71,6 +71,7 @@ import {
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
   buildDispatchClearedData,
+  buildIncidentOwnerPageBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildRetryDispatchResultMessage,
@@ -113,6 +114,9 @@ import {
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
+  INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
+  type IncidentClaimSweepDeps,
+  type IncidentOwnerPageSweepDeps,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
@@ -127,6 +131,7 @@ import {
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingBlockHumanNotify,
+  type PendingIncidentOwnerPage,
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
@@ -179,11 +184,14 @@ import {
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
+  runIncidentClaimSweep,
+  runIncidentOwnerPageSweep,
   runMergeEscalationSweep,
   runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
   runResolverDispatchSweep,
   runSharedCheckoutPageSweep,
+  runTrunkLeaseSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -204,6 +212,7 @@ import {
   selectPendingBlockEscalations,
   selectPendingBlockHumanNotifications,
   selectPendingHumanNotifications,
+  selectPendingIncidentOwnerPages,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   selectPendingWorkMergeEscalations,
@@ -215,6 +224,7 @@ import {
   serializeSessionTelemetry,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
+  type TrunkLeaseSweepDeps,
   WAL_AUTOCHECKPOINT_PAGES,
   WORK_RESOLVER_LEASE_SEC,
   type WorkMergeHumanNotifySweepDeps,
@@ -260,13 +270,31 @@ import {
   serializeFableFocusPolicy,
 } from "../src/fable-focus";
 import {
+  decideTrunkIntegrationFence,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+} from "../src/grant-leaf";
+import {
   classifyAgentbotPageOutcome,
   resolveAgentbotBinaryPath,
   sendAgentbotPage,
 } from "../src/integrity-probe";
 import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
-import type { ResolverOutcome } from "../src/reconcile-core";
-import { classifyResolverOutcome } from "../src/reconcile-core";
+import type {
+  ReconcileSnapshot,
+  ReconcileState,
+  ResolverOutcome,
+} from "../src/reconcile-core";
+import {
+  classifyResolverOutcome,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  nextIncidentOwnerAttachmentMarker,
+  reconcile,
+  WORKER_EFFORT,
+  WORKER_MODEL,
+} from "../src/reconcile-core";
 import {
   __resetEpicIndexMemoForTest,
   drain,
@@ -284,7 +312,7 @@ import {
   runQuery,
   sliceFanout,
 } from "../src/server-worker";
-import type { Event, Job } from "../src/types";
+import type { Epic, Event, Job, Task } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
@@ -5134,7 +5162,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(137);
+  expect(SCHEMA_VERSION).toBe(138);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5995,6 +6023,751 @@ test("pending-dispatch sweep telemetry round-trips to the sidecar; empty sweep b
   expect(rollups[0]?.class).toBe("timeout");
   expect(rollups[0]?.fires_total).toBe(2);
   expect(rollups[0]?.rescues_total).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Incident claim producer
+// ---------------------------------------------------------------------------
+
+type IncidentSpoolEntry = ReturnType<
+  IncidentClaimSweepDeps["readRequests"]
+>[number];
+
+function incidentSpoolEntry(
+  action: "claim" | "release",
+  overrides: Partial<IncidentSpoolEntry["request"]> = {},
+): IncidentSpoolEntry {
+  return {
+    path: `/spool/${action}-${overrides.id ?? "fn-3-incident.1"}.json`,
+    request: {
+      schema_version: 1,
+      action,
+      verb: "work",
+      id: "fn-3-incident.1",
+      instance_event_id: 41,
+      claimant_session_id: "session-new",
+      requested_at: 1_700_000_000_000,
+      ...overrides,
+    },
+  };
+}
+
+function incidentSweepDeps(
+  overrides: Partial<IncidentClaimSweepDeps> = {},
+): IncidentClaimSweepDeps {
+  return {
+    readRequests: () => [],
+    removeRequest: () => {},
+    lookupIncident: () => ({
+      instanceEventId: 41,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    }),
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    mintClaimed: () => {},
+    mintReleased: () => {},
+    selectClaimed: () => [],
+    now: () => 1_700_000_001,
+    ...overrides,
+  };
+}
+
+test("incident claim sweep mints one claim for a live verified claimant and removes the request", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result).toEqual({
+    claimed: 1,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  });
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "work",
+      id: "fn-3-incident.1",
+      instanceEventId: 41,
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+      ts: 1_700_000_001,
+    },
+  ]);
+});
+
+test("incident claim sweep refuses dead and unverifiable claimants", () => {
+  for (const verification of [
+    null,
+    { pid: 4242, startTime: "proc:4242:1", live: false },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        verifyClaimant: () => verification,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.refused).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep verifies the claimant against the owning verb and id", () => {
+  const entry = incidentSpoolEntry("claim");
+  const seen: string[][] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      verifyClaimant: (sessionId, verb, id) => {
+        seen.push([sessionId, verb, id]);
+        return null;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(seen).toEqual([["session-new", "work", "fn-3-incident.1"]]);
+});
+
+test("incident claim sweep discards missing and mismatched incident fences as stale", () => {
+  for (const incident of [
+    null,
+    {
+      instanceEventId: 42,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        lookupIncident: () => incident,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.stale).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep refuses takeover while a different claimant is still live", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: () => true,
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep permits takeover after positive evidence that the prior claimant died", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-dead",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: (pid) => pid !== 3131,
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.refused).toBe(0);
+  expect(minted).toHaveLength(1);
+});
+
+test("incident claim sweep mints one fenced release and removes the request", () => {
+  const entry = incidentSpoolEntry("release", {
+    verb: "close",
+    id: "fn-3-incident-close",
+    claimant_session_id: "session-owner",
+  });
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintReleased: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.released).toBe(1);
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "close",
+      id: "fn-3-incident-close",
+      instanceEventId: 41,
+      claimSessionId: "session-owner",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    },
+  ]);
+});
+
+test("pending fan-in incident claim and release round-trip keeps the same fence", () => {
+  let incident = {
+    instanceEventId: 41,
+    claimSessionId: null as string | null,
+    claimPid: null as number | null,
+    claimStartTime: null as string | null,
+  };
+  const claim = incidentSpoolEntry("claim");
+  const claimed = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [claim],
+      lookupIncident: () => incident,
+      mintClaimed: (payload) => {
+        incident = {
+          instanceEventId: payload.instanceEventId,
+          claimSessionId: payload.claimSessionId,
+          claimPid: payload.claimPid,
+          claimStartTime: payload.claimStartTime,
+        };
+      },
+    }),
+  );
+
+  expect(claimed.claimed).toBe(1);
+  expect(incident).toEqual({
+    instanceEventId: 41,
+    claimSessionId: "session-new",
+    claimPid: 4242,
+    claimStartTime: "proc:4242:1",
+  });
+
+  const release = incidentSpoolEntry("release");
+  const released = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [release],
+      lookupIncident: () => incident,
+      mintReleased: (payload) => {
+        expect(payload.instanceEventId).toBe(41);
+        incident = {
+          instanceEventId: 41,
+          claimSessionId: null,
+          claimPid: null,
+          claimStartTime: null,
+        };
+      },
+    }),
+  );
+
+  expect(released.released).toBe(1);
+  expect(incident.claimSessionId).toBeNull();
+});
+
+test("incident release refuses a dead or non-owning claimant", () => {
+  const entry = incidentSpoolEntry("release", {
+    claimant_session_id: "session-owner",
+  });
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      verifyClaimant: () => null,
+      mintReleased: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.released).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep consumes duplicate claims without growing the event log", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.stale).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+  expect(removed).toEqual([entry.path]);
+});
+
+test("incident claim sweep coalesces duplicate spooled tuples before projection refresh", () => {
+  const first = incidentSpoolEntry("claim");
+  const second = {
+    ...incidentSpoolEntry("claim"),
+    path: "/spool/duplicate.json",
+  };
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [first, second],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.stale).toBe(1);
+  expect(mints).toBe(1);
+  expect(removed).toEqual([first.path, second.path]);
+});
+
+test("incident claim sweep refreshes a resumed claimant's process generation", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(minted).toEqual([
+    expect.objectContaining({
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    }),
+  ]);
+});
+
+test("incident claim sweep preserves requests when the synthetic mint fails", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => false,
+    }),
+  );
+
+  expect(result.claimed).toBe(0);
+  expect(removed).toEqual([]);
+});
+
+test("incident claim sweep refuses takeover when the recorded holder generation is unverifiable", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: null,
+        claimStartTime: null,
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(mints).toBe(0);
+});
+
+test("incident claim expiry releases dead claimants and leaves live claimants alone", () => {
+  const released: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      selectClaimed: () => [
+        {
+          verb: "work",
+          id: "fn-4-dead.1",
+          instanceEventId: 50,
+          claimSessionId: "session-dead",
+          claimPid: 5000,
+          claimStartTime: "proc:5000:1",
+        },
+        {
+          verb: "close",
+          id: "fn-5-live",
+          instanceEventId: 60,
+          claimSessionId: "session-live",
+          claimPid: 6000,
+          claimStartTime: "proc:6000:1",
+        },
+      ],
+      probeClaimantLive: (pid) => pid === 6000,
+      mintReleased: (payload) => {
+        released.push(payload);
+      },
+    }),
+  );
+
+  expect(result.expired).toBe(1);
+  expect(released).toEqual([
+    {
+      verb: "work",
+      id: "fn-4-dead.1",
+      instanceEventId: 50,
+      claimSessionId: "session-dead",
+      claimPid: 5000,
+      claimStartTime: "proc:5000:1",
+    },
+  ]);
+});
+
+test("incident claim sweep isolates a throwing request and continues processing siblings", () => {
+  const broken = incidentSpoolEntry("claim", { id: "fn-6-broken.1" });
+  const healthy = incidentSpoolEntry("claim", { id: "fn-7-healthy.1" });
+  const removed: string[] = [];
+  const minted: string[] = [];
+  const results: ReturnType<typeof runIncidentClaimSweep>[] = [];
+
+  expect(() => {
+    results.push(
+      runIncidentClaimSweep(
+        incidentSweepDeps({
+          readRequests: () => [broken, healthy],
+          removeRequest: (path) => removed.push(path),
+          lookupIncident: (_verb, id) => {
+            if (id === "fn-6-broken.1") throw new Error("fixture failure");
+            return {
+              instanceEventId: 41,
+              claimSessionId: null,
+              claimPid: null,
+              claimStartTime: null,
+            };
+          },
+          mintClaimed: (payload) => {
+            minted.push(payload.id);
+          },
+        }),
+      ),
+    );
+  }).not.toThrow();
+
+  expect(results[0]?.claimed).toBe(1);
+  expect(minted).toEqual(["fn-7-healthy.1"]);
+  expect(removed).toEqual([healthy.path]);
+});
+
+test("INCIDENT_CLAIM_SWEEP_INTERVAL_MS is a prompt positive cadence", () => {
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBe(3_000);
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Trunk-integration lease producer
+// ---------------------------------------------------------------------------
+
+function trunkRequest(
+  action: "acquire" | "release",
+  repoRoot: string,
+  token: number | null = null,
+): SpooledTrunkLeaseRequest {
+  return {
+    path: `/spool/${action}-${repoRoot.slice(1)}.json`,
+    request: {
+      schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+      action,
+      epic_id: "fn-1350-owner",
+      repo_root: repoRoot,
+      source_branch: "keeper/epic/fn-1350-owner",
+      claimant_session_id: "close-session",
+      request_id: "11111111111111111111111111111111",
+      fencing_token: token,
+      requested_at: 1_700_000_000_000,
+    },
+  };
+}
+
+function trunkLeaseSweepHarness(initialRequests: SpooledTrunkLeaseRequest[]) {
+  const requests = [...initialRequests];
+  const leases = new Map<string, TrunkLeaseLeaf>();
+  const removed: string[] = [];
+  const residues: Array<{ repo: string; detail: string }> = [];
+  const deps: TrunkLeaseSweepDeps = {
+    readRequests: () => [...requests],
+    removeRequest: (path) => {
+      removed.push(path);
+      const index = requests.findIndex((entry) => entry.path === path);
+      if (index >= 0) requests.splice(index, 1);
+    },
+    readLeases: () => [...leases.values()],
+    readLease: (repoRoot) => leases.get(repoRoot) ?? null,
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    observeRepo: (request) => ({
+      repoRoot: request.repo_root,
+      defaultBranch: "main",
+      defaultTip:
+        request.repo_root === "/repo-a"
+          ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }),
+    publishLease: (leaf) => {
+      leases.set(leaf.repo_root, { ...leaf });
+      return true;
+    },
+    probeResidue: () => null,
+    recordResidue: (leaf, detail) =>
+      residues.push({ repo: leaf.repo_root, detail }),
+    now: () => 1_700_000_001_000,
+    ttlMs: 60_000,
+  };
+  return { requests, leases, removed, residues, deps };
+}
+
+test("trunk lease round-trip preserves per-repo monotonic fencing tokens", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  const first = h.leases.get("/repo-a");
+  expect(first).toMatchObject({
+    schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+    active: true,
+    fencing_token: 1,
+    writable_root: "/repo-a",
+    observed_default_tip: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  expect(runTrunkLeaseSweep(h.deps).released).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+});
+
+test("trunk leases fence multi-repo groups independently", () => {
+  const h = trunkLeaseSweepHarness([
+    trunkRequest("acquire", "/repo-a"),
+    trunkRequest("acquire", "/repo-b"),
+  ]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(1);
+  expect(h.leases.get("/repo-b")?.fencing_token).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).not.toBe(
+    h.leases.get("/repo-b")?.fencing_token,
+  );
+  expect(h.leases.get("/repo-a")?.observed_default_tip).not.toBe(
+    h.leases.get("/repo-b")?.observed_default_tip,
+  );
+});
+
+test("trunk integration fence defers inconclusive ancestry and tip drift", () => {
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "inconclusive",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "defer", reason: "ancestry-inconclusive" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "bbbbbbbb",
+    }),
+  ).toEqual({ kind: "defer", reason: "tip-drift" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "merge" });
+});
+
+test("an expired live trunk lease remains authoritative and renews through a fresh fencing token", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+
+  const expired = runTrunkLeaseSweep(h.deps);
+  expect(expired).toMatchObject({ dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+    expires_at: 1,
+  });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+    expires_at: 1_700_000_061_000,
+  });
+});
+
+test("an expired live holder cannot be replaced by another claimant", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+  const rival = trunkRequest("acquire", "/repo-a");
+  rival.request.claimant_session_id = "rival-close-session";
+  h.requests.push(rival);
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.deferred).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    claimant_session_id: "close-session",
+    fencing_token: 1,
+  });
+});
+
+test("a live trunk owner retains its lease while merge residue becomes an incident", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result).toMatchObject({ residues: 1, dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+  });
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+});
+
+test("dead trunk lease holder releases and records merge residue", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeClaimantLive = () => false;
+  h.deps.probeResidue = () => "MERGE_HEAD=deadbeef";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.dead).toBe(1);
+  expect(result.residues).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=deadbeef" },
+  ]);
+});
+
+test("fenced release with residue routes one conflict receipt and stale release cannot clear a successor", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=cafebabe";
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const released = runTrunkLeaseSweep(h.deps);
+  expect(released).toMatchObject({ released: 1, residues: 1 });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  runTrunkLeaseSweep(h.deps);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const stale = runTrunkLeaseSweep(h.deps);
+  expect(stale.stale).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9048,6 +9821,278 @@ function seedMergeFailureRow(
     ],
   );
 }
+
+function ownerIncidentPage(
+  overrides: Partial<PendingIncidentOwnerPage> = {},
+): PendingIncidentOwnerPage {
+  return {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: mergeConflictReason(
+      "keeper/epic/fn-1350-owner--fn-1350-owner.2",
+      "keeper/epic/fn-1350-owner",
+    ),
+    dir: "/repo/lane",
+    claimSessionId: null,
+    instanceEventId: 50,
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+    humanNotifiedAt: null,
+    ...overrides,
+  };
+}
+
+function routerTask(overrides: Partial<Task> = {}): Task {
+  return {
+    task_id: "fn-1350-owner.1",
+    epic_id: "fn-1350-owner",
+    task_number: 1,
+    title: "integrate",
+    target_repo: null,
+    tier: null,
+    model: null,
+    worker_phase: "open",
+    runtime_status: "todo",
+    depends_on: [],
+    jobs: [],
+    ...overrides,
+  };
+}
+
+function routerEpic(overrides: Partial<Epic> = {}): Epic {
+  return {
+    epic_id: "fn-1350-owner",
+    epic_number: 1350,
+    title: "owner router",
+    project_dir: "/repo",
+    status: "open",
+    last_event_id: 1,
+    updated_at: 1,
+    depends_on_epics: [],
+    tasks: [routerTask()],
+    jobs: [],
+    job_links: [],
+    resolved_epic_deps: null,
+    last_validated_at: "2026-07-19T00:00:00Z",
+    question: null,
+    blocks_closing_of: null,
+    ...overrides,
+  };
+}
+
+function routerSnapshot(
+  epics: Epic[],
+  incidentOwnerKeys: Set<string>,
+  failedKeys: Set<string> = new Set(incidentOwnerKeys),
+): ReconcileSnapshot {
+  return {
+    readinessDegraded: false,
+    epics,
+    jobs: new Map(),
+    subagentInvocations: [],
+    gitStatusByProjectDir: new Map(),
+    failedKeys,
+    incidentOwnerKeys,
+    claimedIncidentKeys: new Set(),
+    recoverFailureIds: new Set(),
+    finalizeFailureIds: new Set(),
+    slotOccupancyFailures: [],
+    liveTabKeys: new Set(),
+    dispatchClaims: new Map(),
+    harnessActivityByJobId: new Map(),
+    livePaneIds: new Set(),
+    paneCommandById: new Map(),
+    provenDeadJobIds: new Set(),
+    pendingDispatches: [],
+    mode: "yolo",
+    armedIds: new Set(),
+    unseededRoots: new Set(),
+    workModel: WORKER_MODEL,
+    workEffort: WORKER_EFFORT,
+    closeModel: WORKER_MODEL,
+    closeEffort: WORKER_EFFORT,
+    hostMatrix: {
+      ok: true,
+      models: ["opus", "sonnet"],
+      effortsByModel: new Map(),
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map([
+        ["opus", "native"],
+        ["sonnet", "native"],
+      ]),
+    },
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+    worktreeMode: false,
+    worktreeRepoByEpicId: new Map(),
+  };
+}
+
+function routerState(paused = false): ReconcileState {
+  return {
+    paused,
+    inFlight: new Set(),
+    redispatchCooldown: new Map(),
+    finalizerGuard: new Map(),
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+  };
+}
+
+test("owner incident attachment slots are classified by typed row route and bounded durably", () => {
+  const first = ownerIncidentPage({
+    resolverDispatchedAt: null,
+    mergeEscalatedAt: null,
+  });
+  expect(nextIncidentOwnerAttachmentMarker(first)).toBe("resolver");
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      resolverDispatchedAt: 10,
+    }),
+  ).toBe("merge");
+  expect(nextIncidentOwnerAttachmentMarker(ownerIncidentPage())).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      reason: "tooling-failure: surface and stop",
+    }),
+  ).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      claimSessionId: "live-owner",
+    }),
+  ).toBeNull();
+  expect(INCIDENT_OWNER_ATTACHMENT_LIMIT).toBe(2);
+});
+
+test("reconcile routes only exact owner incidents through ordinary work/close dispatch and pause holds both", () => {
+  const workKey = "work::fn-1350-owner.1";
+  const work = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(work.launches.map((launch) => launch.key)).toEqual([workKey]);
+  expect(work.launches[0]?.verb).toBe("work");
+
+  const paused = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(true),
+    100,
+  );
+  expect(paused.launches).toEqual([]);
+  expect(paused.withholds.get("fn-1350-owner.1")?.code).toBe(
+    "autopilot-paused",
+  );
+
+  const suppressed = reconcile(
+    routerSnapshot([routerEpic()], new Set(), new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(suppressed.launches).toEqual([]);
+  expect(suppressed.withholds.get("fn-1350-owner.1")?.code).toBe("failed-key");
+
+  const closeKey = "close::fn-1350-owner";
+  const done = routerEpic({
+    status: "done",
+    tasks: [
+      routerTask({
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const close = reconcile(
+    routerSnapshot([done], new Set([closeKey])),
+    routerState(),
+    100,
+  );
+  expect(close.launches.map((launch) => launch.key)).toEqual([closeKey]);
+  expect(close.launches[0]?.verb).toBe("close");
+});
+
+test("exhausted incident attachments page once after the owner yields and never dispatch an escalation verb", async () => {
+  const row = ownerIncidentPage();
+  const paged = new Set<string>();
+  const notified: string[] = [];
+  const minted: string[] = [];
+  const deps: IncidentOwnerPageSweepDeps = {
+    selectPending: () => (paged.has(`${row.verb}::${row.id}`) ? [] : [row]),
+    stillPending: () => true,
+    ownerActive: () => false,
+    notifyHuman: async (candidate) => {
+      notified.push(buildIncidentOwnerPageBody(candidate));
+      return "notified";
+    },
+    mintNotified: (candidate, outcome) => {
+      minted.push(`${candidate.verb}::${candidate.id}:${outcome}`);
+      if (outcome === "notified") {
+        paged.add(`${candidate.verb}::${candidate.id}`);
+      }
+    },
+  };
+  await runIncidentOwnerPageSweep(deps);
+  await runIncidentOwnerPageSweep(deps);
+  expect(minted).toEqual(["work::fn-1350-owner.1:notified"]);
+  expect(notified).toHaveLength(1);
+  expect(notified[0]).toContain("No escalation session was launched");
+  expect(notified[0]).not.toContain("resolve::");
+  expect(notified[0]).not.toContain("deconflict::");
+});
+
+test("incident owner page selector excludes claims, non-incidents, and unexhausted attachments", () => {
+  const { db } = freshMemDb();
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: ownerIncidentPage().reason,
+    dir: "/repo/lane",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-1350-owner",
+    reason: ownerIncidentPage({ verb: "close" }).reason,
+    resolverDispatchedAt: 10,
+  });
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-other.1",
+    reason: "launch_failed: not an incident",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = 'owner' WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db)).toEqual([]);
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = NULL WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db).map((row) => row.id)).toEqual([
+    "fn-1350-owner.1",
+  ]);
+  db.close();
+});
+
+test("incident owner page sweep defers while the final ordinary owner is active", async () => {
+  const notified: string[] = [];
+  await runIncidentOwnerPageSweep({
+    selectPending: () => [ownerIncidentPage()],
+    stillPending: () => true,
+    ownerActive: () => true,
+    notifyHuman: async () => {
+      notified.push("unexpected");
+      return "notified";
+    },
+    mintNotified: () => notified.push("unexpected-mint"),
+  });
+  expect(notified).toEqual([]);
+});
 
 test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token, a NULL escalate marker, and a dispatched resolver", () => {
   const { db } = freshMemDb();

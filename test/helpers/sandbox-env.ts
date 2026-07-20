@@ -123,6 +123,10 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   // State paths LAST so `extra` can never strand them at production defaults
   // (CLAUDE.md isolation rule; the leak class fn-657 closed).
   env.KEEPER_DB = dbPath;
+  // Shared filesystem-only state root (panels, incident-claim spool, and future
+  // keeper-state-dir consumers). os.homedir() ignores $HOME on macOS, so the
+  // root itself must be explicit rather than relying on the individual leaves.
+  env.KEEPER_STATE_DIR = join(tmpDir, "keeper-state");
   env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
   env.KEEPER_LANE_DIRT_SPOOL_DIR = join(tmpDir, "lane-dirt-spool");
   env.KEEPER_EVENTS_LOG = join(tmpDir, "events-log");

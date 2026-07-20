@@ -7989,6 +7989,9 @@ function makeFakeWorktreeDriver(opts?: {
   provisionFail?: (info: WorktreeLaunchInfo) => string | null;
   provisionConflictedFiles?: (info: WorktreeLaunchInfo) => string[];
   provisionRetry?: (info: WorktreeLaunchInfo) => string | null;
+  provisionPending?: (
+    info: WorktreeLaunchInfo,
+  ) => { sourceBranch: string; baseBranch: string; laneDir: string } | null;
   // A fan-in LANE pre-merge failure — the self-clearing shape `{ ok:false, reason,
   // dir }` (a `worktree-lane-premerge` reason + the base lane worktree path), NEVER
   // `retry:true`. The real driver returns `dir: worktreePath` for it.
@@ -8047,7 +8050,14 @@ function makeFakeWorktreeDriver(opts?: {
           conflictedFiles: opts?.provisionConflictedFiles?.(info),
         };
       }
-      return { ok: true, cwd: info.assignment.worktreePath };
+      const pendingIntegration = opts?.provisionPending?.(info) ?? null;
+      return pendingIntegration === null
+        ? { ok: true, cwd: info.assignment.worktreePath }
+        : {
+            ok: true,
+            cwd: info.assignment.worktreePath,
+            pendingIntegration,
+          };
     },
     async finalizeEpic(info) {
       log.calls.push(`finalize:${info.baseBranch}`);
@@ -9830,6 +9840,53 @@ test("fn-959 runReconcileCycle: worktree ON → provision runs BEFORE Dispatched
   expect(depsLog.emissions).toEqual([]); // no DispatchFailed
 });
 
+test("runReconcileCycle: pending fan-in is recorded before the owning work launch", async () => {
+  const laneDir = worktreePathFor("/home/me/repo", "keeper/epic/fn-1-foo");
+  const sourceBranch = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const { driver } = makeFakeWorktreeDriver({
+    provisionPending: () => ({
+      sourceBranch,
+      baseBranch: "keeper/epic/fn-1-foo",
+      laneDir,
+    }),
+  });
+  const { deps, log, setJobByKey } = makeFakeDeps({ worktree: driver });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 200 });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/home/me/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+
+  await runReconcileCycle(
+    reconcile(
+      makeSnapshot({ epics: [epic], worktreeMode: true }),
+      makeState(),
+      0,
+    ),
+    makeState(),
+    new Map(),
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.emissions).toEqual([
+    {
+      verb: "work",
+      id: "fn-1-foo.1",
+      reason:
+        "worktree-merge-conflict: merging keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo — pending owner integration",
+      dir: laneDir,
+      conflictedFiles: null,
+      ts: 1_700_000_000,
+    },
+  ]);
+  expect(log.dispatchedEmissions).toHaveLength(1);
+  expect(log.launches).toHaveLength(1);
+  expect(log.launches[0]?.cwd).toBe(laneDir);
+});
+
 test("runReconcileCycle: final provisioned worktree cwd is refreshed for auto-plugin shadowing", async () => {
   const { driver, log: worktreeLog } = makeFakeWorktreeDriver();
   const inventoriedCwds: string[] = [];
@@ -10413,14 +10470,18 @@ test("lane maintenance hold attributes every cycle pass and prevents provision/f
   expect(lines.every((line) => line.length <= 531)).toBe(true);
 });
 
-test("base refresh producer: conflict uses the existing bare close merge-conflict row and suppresses same-cycle lane launch", async () => {
+test("base refresh producer: conflict defers without a sticky and lets the owning fan-in proceed", async () => {
   const reason =
-    "worktree-merge-conflict: merging main into keeper/epic/fn-1-foo — CONFLICT";
+    "worktree-base-refresh-conflict: default drift deferred — CONFLICT";
   const { driver, log } = makeFakeWorktreeDriver({
-    refreshFail: () => reason,
+    refreshRetry: () => reason,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
-  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
+  });
   const decision = reconcile(
     makeSnapshot({
       epics: [epic],
@@ -10449,13 +10510,8 @@ test("base refresh producer: conflict uses the existing bare close merge-conflic
   );
 
   expect(log.refreshes).toHaveLength(1);
-  expect(log.provisions).toEqual([]);
-  expect(depsLog.emissions).toHaveLength(1);
-  expect(depsLog.emissions[0]).toMatchObject({
-    verb: "close",
-    id: "fn-1-foo",
-    reason,
-  });
+  expect(log.provisions).toHaveLength(1);
+  expect(depsLog.emissions).toEqual([]);
 });
 
 function makeBaseRefreshGitRun(
@@ -10504,6 +10560,12 @@ function makeBaseRefreshGitRun(
     if (args[0] === "merge-base") return { code: 1, stdout: "", stderr: "" };
     if (command === "rev-parse --git-common-dir") {
       return { code: 0, stdout: "/repo/.git\n", stderr: "" };
+    }
+    if (command === "diff --name-only --diff-filter=U") {
+      return { code: 0, stdout: "src/conflict.ts\n", stderr: "" };
+    }
+    if (command === "merge --abort") {
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "merge") {
       return {
@@ -10555,6 +10617,30 @@ test("base refresh driver: MERGE_HEAD defers without touching the lane", async (
   expect(commands.some((args) => args[0] === "merge")).toBe(false);
   expect(commands.some((args) => args[0] === "reset")).toBe(false);
   expect(commands.some((args) => args[0] === "restore")).toBe(false);
+});
+
+test("base refresh driver: a content conflict remains drift and never opens a resolver incident", async () => {
+  const { run } = makeBaseRefreshGitRun({ mergeCode: 1 });
+  const result = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).refreshBase(
+    {
+      epic_id: "fn-1-foo",
+      repo_dir: "/repo",
+      behind_count: 20,
+      merge_base_age_seconds: 90_000,
+    },
+    10_000,
+  );
+
+  expect(result).toEqual({
+    ok: false,
+    retry: true,
+    reason: expect.stringContaining("worktree-base-refresh-conflict"),
+  });
+  expect((result as { reason: string }).reason).not.toStartWith(
+    "worktree-merge-conflict:",
+  );
 });
 
 test("base refresh driver: cooldown skips churn; after expiry merges local default into the base worktree exactly once", async () => {
@@ -11313,6 +11399,9 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
         ? { code: 0, stdout: `${MG_MERGE_HEAD}\n`, stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
     }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("status --porcelain")) {
       // Inert for the catch-up gate (no longer clean-gated); kept for finalize teardown.
       return { code: 0, stdout: "", stderr: "" };
@@ -11349,7 +11438,10 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
           }
         : { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === `push origin ${def}`) {
+    if (
+      joined === `push origin ${def}` ||
+      joined === `push origin ${MG_DEFAULT_TIP}:refs/heads/${def}`
+    ) {
       pushed = true;
       if (opts.pushTimeout) {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
@@ -11391,6 +11483,73 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
   };
   return { run, cmds, calls };
 }
+
+test("owner-mediated finalize only verifies, gates, and pushes an already-integrated base", async () => {
+  const { run, cmds } = makeMergeGit({ baseAncestorOfDefault: true });
+  const { probe, calls } = makeSuiteProbe({ kind: "green" });
+  const result = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    true,
+    probe,
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+
+  expect(result).toEqual({ ok: true });
+  expect(calls).toEqual([
+    {
+      repoDir: "/repo",
+      mergedCommit: MG_DEFAULT_TIP,
+      runsPlanSuite: false,
+    },
+  ]);
+  expect(cmds.some((cmd) => cmd.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("merge-tree"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("update-ref"))).toBe(false);
+  expect(cmds).toContain(`push origin ${MG_DEFAULT_TIP}:refs/heads/main`);
+});
+
+test("owner-mediated finalize re-grades when default drifts after the suite verdict", async () => {
+  const base = makeMergeGit({ baseAncestorOfDefault: true });
+  let defaultTipReads = 0;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (
+    args,
+    opts,
+  ) => {
+    if (
+      args.join(" ") ===
+      "rev-parse --verify --quiet --end-of-options refs/heads/main^{commit}"
+    ) {
+      defaultTipReads += 1;
+      if (defaultTipReads > 1) {
+        return {
+          code: 0,
+          stdout: "9999999999999999999999999999999999999999\n",
+          stderr: "",
+        };
+      }
+    }
+    return base.run(args, opts);
+  };
+  const { probe } = makeSuiteProbe({ kind: "green" });
+  const result = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    true,
+    probe,
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.retry).toBe(true);
+    expect(result.reason).toStartWith("worktree-finalize-cas-stale:");
+  }
+  expect(base.cmds.some((cmd) => cmd.startsWith("push origin"))).toBe(false);
+  expect(base.cmds.some((cmd) => cmd.startsWith("worktree remove"))).toBe(
+    false,
+  );
+});
 
 test("fn-1140 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → lock-timeout AFTER the merge is computed, NO ref advance, NO push", async () => {
   // The bounded flock acquirer times out (a null-returning acquirer). The plumbing
@@ -12166,6 +12325,68 @@ test("fn-959 createWorktreeDriver: finalizeEpic skips a never-forked epic (no ba
   expect(cmds.some((c) => c.startsWith("worktree remove"))).toBe(false);
 });
 
+test("createWorktreeDriver: finalize defers while a provisioned rib is not integrated into the base", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const rib = `${base}--fn-1-foo.2`;
+  const cmds: string[] = [];
+  const fakeRun: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
+    const joined = args.join(" ");
+    cmds.push(joined);
+    if (joined === `rev-parse --verify --quiet refs/heads/${base}`) {
+      return { code: 0, stdout: "base\n", stderr: "" };
+    }
+    if (joined.startsWith("symbolic-ref")) {
+      return { code: 0, stdout: "origin/main\n", stderr: "" };
+    }
+    if (joined === `rev-parse --verify --quiet refs/heads/${rib}`) {
+      return { code: 0, stdout: "rib\n", stderr: "" };
+    }
+    if (joined === `merge-base --is-ancestor ${rib} ${base}`) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const driver = createWorktreeDriver(fakeRun);
+  const info: WorktreeLaunchInfo = {
+    assignment: {
+      nodeId: "__close__",
+      isCloseSink: true,
+      branch: base,
+      worktreePath: "/repo.worktrees/base",
+      inherited: true,
+      preMerges: [],
+      assertBranch: base,
+    },
+    baseBranch: base,
+    baseWorktreePath: "/repo.worktrees/base",
+    repoDir: "/repo",
+    laneOrder: [
+      {
+        nodeId: "fn-1-foo.1",
+        branch: base,
+        worktreePath: "/repo.worktrees/base",
+      },
+      {
+        nodeId: "fn-1-foo.2",
+        branch: rib,
+        worktreePath: "/repo.worktrees/rib",
+      },
+    ],
+    parentBranch: base,
+  };
+
+  const result = await driver.finalizeEpic(info, async () => true);
+
+  expect(result).toEqual({
+    ok: false,
+    retry: true,
+    reason: `worktree-finalize-pending-integration: ${rib} is not an ancestor of ${base}`,
+  });
+  expect(cmds.some((cmd) => cmd.startsWith("update-ref"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("push"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("worktree remove"))).toBe(false);
+});
+
 test("fn-959 createWorktreeDriver: provision ensures the worktree off the parent tip, then asserts HEAD == branch", async () => {
   // Drive the real driver against a fake GitRunner — no real git. The driver must
   // ensure (add), list (registered check), and rev-parse HEAD against the branch.
@@ -12347,32 +12568,19 @@ test("fn-959 createWorktreeDriver: provision forks a RIB off its parent lane (de
 });
 
 // ---------------------------------------------------------------------------
-// fn-979 — the fan-in pre-merge loop tolerates a PHANTOM lane source (a branch
-// never created because its task's work landed on the default branch) as a
-// lossless `missing-source` no-op, while a genuine conflict still fails loud.
+// Fan-in provision records an owner integration manifest without merging.
 // ---------------------------------------------------------------------------
 
 /**
- * A fake GitRunner for `createWorktreeDriver.provision` tests exercising the
- * fan-in pre-merge loop. `phantomSources` resolve their `^{commit}` probe to
- * non-zero (the lane was never created → `missing-source`); `conflictSources`
- * resolve but their `merge --no-edit` conflicts (a MERGE_HEAD is present so the
- * abort runs). Any other source merges cleanly. `lockDir` (a real temp dir)
- * backs the per-worktree flock the conflict path acquires via the real
- * `defaultLockAcquirer`. Records each joined argv for assertion.
+ * A fake GitRunner for `createWorktreeDriver.provision` fan-in tests.
+ * `phantomSources` do not resolve; every other source is pending integration.
  */
 function makePhantomFanInRun(opts: {
   phantomSources: string[];
-  conflictSources?: string[];
-  lockDir?: string;
+  ancestryCode?: number;
 }): { run: Parameters<typeof createWorktreeDriver>[0]; cmds: string[] } {
   const cmds: string[] = [];
   let added = false;
-  // Stateful MERGE_HEAD: absent until a `merge --no-edit` conflicts, so the pre-merge
-  // readiness probe sees a CLEAN base and only the guarded post-conflict abort finds
-  // the in-flight merge. Cleared by `merge --abort`.
-  let midMerge = false;
-  const conflicts = new Set(opts.conflictSources ?? []);
   const phantoms = opts.phantomSources;
   const run: Parameters<typeof createWorktreeDriver>[0] = async (args) => {
     const joined = args.join(" ");
@@ -12381,38 +12589,15 @@ function makePhantomFanInRun(opts: {
       return { code: 0, stdout: "origin/main\n", stderr: "" };
     }
     if (joined.includes("^{commit}")) {
-      // The pre-merge ref probe (`rev-parse --quiet --verify --end-of-options
-      // refs/heads/<src>^{commit}`). A phantom lane does not resolve → exit 1.
       const ref = args[args.length - 1] ?? "";
       const isPhantom = phantoms.some((p) => ref.includes(p));
       return { code: isPhantom ? 1 : 0, stdout: "", stderr: "" };
     }
     if (joined.startsWith("merge-base --is-ancestor")) {
-      return { code: 1, stdout: "", stderr: "" }; // not an ancestor → must merge
-    }
-    if (joined.startsWith("rev-parse --path-format=absolute --git-dir")) {
-      return {
-        code: 0,
-        stdout: `${opts.lockDir ?? "/repo/.git"}\n`,
-        stderr: "",
-      };
-    }
-    if (joined.startsWith("merge --no-edit")) {
-      const source = args[2] ?? "";
-      if (conflicts.has(source)) {
-        midMerge = true; // a conflict leaves MERGE_HEAD for the guarded abort
-        return { code: 1, stdout: "CONFLICT (content)\n", stderr: "" };
-      }
-      return { code: 0, stdout: "", stderr: "" };
+      return { code: opts.ancestryCode ?? 1, stdout: "", stderr: "" };
     }
     if (joined === "rev-parse --verify --quiet MERGE_HEAD") {
-      return midMerge
-        ? { code: 0, stdout: "head\n", stderr: "" } // in-flight → abort runs
-        : { code: 1, stdout: "", stderr: "" }; // clean base → readiness sees no merge
-    }
-    if (joined.startsWith("merge --abort")) {
-      midMerge = false;
-      return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
     }
     if (joined.startsWith("worktree add")) {
       added = true;
@@ -12480,60 +12665,60 @@ test("fn-979 createWorktreeDriver: provision skips a phantom pre-merge (missing-
   ).toBe(false);
 });
 
-test("fn-979 createWorktreeDriver: provision skips a phantom but a LATER real conflict still fails loud (phantom-then-conflict)", async () => {
+test("createWorktreeDriver: provision leaves a real source unmerged and returns its manifest after a phantom", async () => {
   const phantom = "keeper/epic/fn-1-foo--fn-1-foo.2";
-  const conflict = "keeper/epic/fn-1-foo--fn-1-foo.3";
-  const lockDir = mkdtempSync(join(tmpdir(), "kpr-wt-phantom-"));
-  try {
-    const { run, cmds } = makePhantomFanInRun({
-      phantomSources: [phantom],
-      conflictSources: [conflict],
-      lockDir,
-    });
-    const driver = createWorktreeDriver(run);
-    const res = await driver.provision(
-      makeFanInInfo([phantom, conflict]),
-      null,
-    );
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.reason).toContain("worktree-merge-conflict");
-      expect(res.reason).toContain(conflict);
-    }
-    // The phantom never attempted a merge; the real conflict did, then aborted.
-    expect(cmds).not.toContain(`merge --no-edit ${phantom}`);
-    expect(cmds).toContain(`merge --no-edit ${conflict}`);
-    expect(cmds.some((c) => c.startsWith("merge --abort"))).toBe(true);
-  } finally {
-    rmSync(lockDir, { recursive: true, force: true });
-  }
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.3";
+  const { run, cmds } = makePhantomFanInRun({ phantomSources: [phantom] });
+  const driver = createWorktreeDriver(run);
+  const res = await driver.provision(makeFanInInfo([phantom, source]), null);
+
+  expect(res).toEqual({
+    ok: true,
+    cwd: "/repo.worktrees/keeper-epic-fn-1-foo",
+    pendingIntegration: {
+      sourceBranch: source,
+      baseBranch: "keeper/epic/fn-1-foo",
+      laneDir: "/repo.worktrees/keeper-epic-fn-1-foo",
+    },
+  });
+  expect(cmds).not.toContain(`merge --no-edit ${phantom}`);
+  expect(cmds).not.toContain(`merge --no-edit ${source}`);
+  expect(cmds.some((c) => c.startsWith("merge --abort"))).toBe(false);
 });
 
-test("fn-979 createWorktreeDriver: a real conflict BEFORE a phantom fails loud immediately (conflict-then-phantom)", async () => {
-  const conflict = "keeper/epic/fn-1-foo--fn-1-foo.2";
-  const phantom = "keeper/epic/fn-1-foo--fn-1-foo.3";
-  const lockDir = mkdtempSync(join(tmpdir(), "kpr-wt-phantom-"));
-  try {
-    const { run, cmds } = makePhantomFanInRun({
-      phantomSources: [phantom],
-      conflictSources: [conflict],
-      lockDir,
-    });
-    const driver = createWorktreeDriver(run);
-    const res = await driver.provision(
-      makeFanInInfo([conflict, phantom]),
-      null,
-    );
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.reason).toContain("worktree-merge-conflict");
-      expect(res.reason).toContain(conflict);
-    }
-    // The conflict short-circuits the loop — the phantom source is never probed.
-    expect(cmds.some((c) => c.includes(`${phantom}^{commit}`))).toBe(false);
-  } finally {
-    rmSync(lockDir, { recursive: true, force: true });
+test("createWorktreeDriver: provision prepares only the first unresolved source in one dispatch", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const later = "keeper/epic/fn-1-foo--fn-1-foo.3";
+  const { run, cmds } = makePhantomFanInRun({ phantomSources: [] });
+  const driver = createWorktreeDriver(run);
+  const res = await driver.provision(makeFanInInfo([source, later]), null);
+
+  expect(res.ok).toBe(true);
+  if (res.ok) {
+    expect(res.pendingIntegration?.sourceBranch).toBe(source);
   }
+  expect(cmds.some((c) => c.includes(`${later}^{commit}`))).toBe(false);
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
+});
+
+test("createWorktreeDriver: an inconclusive ancestry probe never mints a pending integration manifest", async () => {
+  const source = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const { run, cmds } = makePhantomFanInRun({
+    phantomSources: [],
+    ancestryCode: 124,
+  });
+  const res = await createWorktreeDriver(run).provision(
+    makeFanInInfo([source]),
+    null,
+  );
+
+  expect(res).toEqual({
+    ok: false,
+    dir: "/repo.worktrees/keeper-epic-fn-1-foo",
+    reason:
+      "worktree-lane-premerge-not-ready: ancestry probe for keeper/epic/fn-1-foo--fn-1-foo.2 into keeper/epic/fn-1-foo exited 124 — deferring the fan-in",
+  });
+  expect(cmds.some((c) => c.startsWith("merge --no-edit"))).toBe(false);
 });
 
 test("fn-959 createWorktreeDriver: assertOnDefaultBranch fails loud off the default branch", async () => {
@@ -14295,6 +14480,75 @@ test("fn-993 recoverWorktrees pass-2: a lock-timeout acquirer (null) → worktre
   );
 });
 
+test("owner-mediated recovery backstops a closed base only when no closer is dispatchable", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const fixture = () =>
+    makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [base],
+      defaultBranch: "main",
+      ancestors: new Set(),
+      repoHead: "main",
+    });
+
+  const held = fixture();
+  const heldOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    held.run,
+    held.lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+    undefined,
+    undefined,
+    () => true,
+  );
+  expect(heldOutcome.failures).toEqual([]);
+  expect(held.calls.some((call) => call.args.startsWith("merge-tree"))).toBe(
+    false,
+  );
+  expect(held.calls.some((call) => call.args.startsWith("update-ref"))).toBe(
+    false,
+  );
+
+  const backstop = fixture();
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    backstop.run,
+    backstop.lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+  expect(outcome.failures).toEqual([]);
+  expect(
+    backstop.calls.some((call) => call.args.startsWith("merge-tree")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args.startsWith("update-ref")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args.startsWith("push origin")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args === `worktree remove ${basePath}`),
+  ).toBe(false);
+});
+
 test("fn-993 recoverWorktrees pass-2: a local merge timeout (124) → worktree-recover-local-timeout (a recover reason), NOT conflict, NO push", async () => {
   // EDGE-2b recover side: a blocking git hook times out the local merge spawn →
   // a TRANSIENT recover defer, never mistaken for a content conflict.
@@ -15214,6 +15468,38 @@ test("fn-1119 recoverWorktrees pass-2: a backstop content conflict → an ESCALA
   expect(calls.some((c) => c.args === "push")).toBe(false);
 });
 
+test("owner-mediated recovery keeps a backstop conflict recover-scoped and mints no owner incident", async () => {
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    mergeConflict: true,
+  });
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => "done",
+    run,
+    lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+
+  expect(outcome.escalations).toEqual([]);
+  expect(outcome.failures).toHaveLength(1);
+  expect(outcome.failures[0]?.reason).toStartWith(
+    "worktree-recover-backstop-conflict:",
+  );
+  expect(isWorktreeRecoverReason(outcome.failures[0]?.reason ?? "")).toBe(true);
+});
+
 test("fn-1119 recoverWorktrees pass-2: a done epic with a LIVE merge-resolver is NOT merge-attempted (gated skip, no observation, rows retained)", async () => {
   // A retargeted conflict dispatched a `resolve::fn-1-foo` worker for this now-done
   // epic; it is mid-`git merge`. Pass-2 must skip re-attempting the same base→default
@@ -15935,6 +16221,52 @@ test("fn-1119 deploy transition: an old-scheme bare-epic recover row is RETAINED
     expect(
       recoverFailuresToClear(snap.recoverFailureIds, [], resolved),
     ).toEqual([]);
+  });
+});
+
+test("loadReconcileSnapshot routes only unclaimed incident rows with an attachment slot", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (
+      id: string,
+      claim: string | null,
+      resolverAt: number | null,
+      mergeAt: number | null,
+    ): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+            claim_session_id, resolver_dispatched_at, merge_escalated_at)
+         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?, ?)`,
+        [
+          id,
+          "worktree-merge-conflict: merging source into base — pending owner integration",
+          claim,
+          resolverAt,
+          mergeAt,
+        ],
+      );
+    };
+    insert("fn-1-open.1", null, null, null);
+    insert("fn-2-claimed.1", "live-owner", null, null);
+    insert("fn-3-exhausted.1", null, 10, 20);
+
+    const snapshot = await loadReconcileSnapshot(db);
+    expect([...(snapshot.incidentOwnerKeys ?? [])]).toEqual([
+      "work::fn-1-open.1",
+    ]);
+    expect([...(snapshot.claimedIncidentKeys ?? [])]).toEqual([
+      "work::fn-2-claimed.1",
+    ]);
+    expect(snapshot.incidentOwnerKeys?.has("work::fn-3-exhausted.1")).toBe(
+      false,
+    );
+    expect(snapshot.failedKeys).toEqual(
+      new Set([
+        "work::fn-1-open.1",
+        "work::fn-2-claimed.1",
+        "work::fn-3-exhausted.1",
+      ]),
+    );
   });
 });
 

@@ -653,6 +653,10 @@ function getDispatchFailure(verb: string, id: string) {
     updated_at: number;
     instance_event_id: number | null;
     attempt_id: number | null;
+    claim_session_id: string | null;
+    claim_pid: number | null;
+    claim_start_time: string | null;
+    claimed_at: number | null;
   } | null;
 }
 
@@ -890,6 +894,341 @@ test("from-scratch re-fold reproduces the dispatch_failures projection byte-iden
     .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
     .all();
   expect(after).toEqual(before);
+});
+
+function incidentClaimedEvent(
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimantSessionId: string,
+  ts: number,
+  claimPid = 4242,
+  claimStartTime: string | null = "proc:1",
+): number {
+  return insertEvent({
+    hook_event: "IncidentClaimed",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      instance_event_id: instanceEventId,
+      claim_session_id: claimantSessionId,
+      claim_pid: claimPid,
+      claim_start_time: claimStartTime,
+      ts,
+    }),
+  });
+}
+
+function incidentReleasedEvent(
+  verb: string,
+  id: string,
+  instanceEventId: number,
+  claimantSessionId: string,
+  claimPid = 4242,
+  claimStartTime = "proc:1",
+): number {
+  return insertEvent({
+    hook_event: "IncidentReleased",
+    session_id: `${verb}::${id}`,
+    data: JSON.stringify({
+      verb,
+      id,
+      instance_event_id: instanceEventId,
+      claim_session_id: claimantSessionId,
+      claim_pid: claimPid,
+      claim_start_time: claimStartTime,
+    }),
+  });
+}
+
+test("IncidentClaimed records claimant identity, process generation, and freshness on the fenced incident", () => {
+  const fence = dispatchFailedEvent(
+    "work",
+    "fn-950-incident-claim.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-950-incident-claim.1",
+    fence,
+    "session-owner",
+    1750,
+    9876,
+    "proc:9876:1",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("work", "fn-950-incident-claim.1")).toMatchObject({
+    instance_event_id: fence,
+    claim_session_id: "session-owner",
+    claim_pid: 9876,
+    claim_start_time: "proc:9876:1",
+    claimed_at: 1750,
+  });
+});
+
+test("IncidentClaimed malformed, mismatched, and missing-row payloads are safe no-ops", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-951-incident-fence",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-951-incident-fence",
+    fence + 1,
+    "stale-owner",
+    1750,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-952-missing-incident",
+    fence,
+    "missing-owner",
+    1751,
+  );
+  const malformedId = insertEvent({
+    hook_event: "IncidentClaimed",
+    session_id: "close::fn-951-incident-fence",
+    data: JSON.stringify({
+      verb: "close",
+      id: "fn-951-incident-fence",
+      instance_event_id: fence,
+      claim_session_id: "bad-owner",
+      claim_pid: 0,
+      ts: 1752,
+    }),
+  });
+
+  expect(() => drainAll()).not.toThrow();
+  expect(getDispatchFailure("close", "fn-951-incident-fence")).toMatchObject({
+    claim_session_id: null,
+    claim_pid: null,
+    claim_start_time: null,
+    claimed_at: null,
+  });
+  expect(getDispatchFailure("close", "fn-952-missing-incident")).toBeNull();
+  expect(getCursor()).toBe(malformedId);
+});
+
+test("IncidentReleased clears only the claimant named by the current incident fence", () => {
+  const fence = dispatchFailedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "first-owner",
+    1740,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "fresh-owner",
+    1750,
+    5252,
+    "proc:5252:2",
+  );
+  incidentReleasedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "first-owner",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("work", "fn-953-incident-release.1")).toMatchObject(
+    {
+      claim_session_id: "fresh-owner",
+      claim_pid: 5252,
+      claim_start_time: "proc:5252:2",
+      claimed_at: 1750,
+    },
+  );
+
+  incidentReleasedEvent(
+    "work",
+    "fn-953-incident-release.1",
+    fence,
+    "fresh-owner",
+    5252,
+    "proc:5252:2",
+  );
+  drainAll();
+  expect(getDispatchFailure("work", "fn-953-incident-release.1")).toMatchObject(
+    {
+      claim_session_id: null,
+      claim_pid: null,
+      claim_start_time: null,
+      claimed_at: null,
+    },
+  );
+});
+
+test("IncidentReleased cannot clear a resumed claimant's fresh process generation", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-953-resumed-release",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    1740,
+    3131,
+    "proc:3131:1",
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    1750,
+    4242,
+    "proc:4242:2",
+  );
+  incidentReleasedEvent(
+    "close",
+    "fn-953-resumed-release",
+    fence,
+    "session-owner",
+    3131,
+    "proc:3131:1",
+  );
+  drainAll();
+
+  expect(getDispatchFailure("close", "fn-953-resumed-release")).toMatchObject({
+    claim_session_id: "session-owner",
+    claim_pid: 4242,
+    claim_start_time: "proc:4242:2",
+    claimed_at: 1750,
+  });
+});
+
+test("DispatchFailed re-emits preserve all claim columns on the same open incident", () => {
+  const fence = dispatchFailedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+    "reconciler",
+    10,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    fence,
+    "session-owner",
+    1750,
+    7777,
+    "proc:7777:3",
+  );
+  drainAll();
+
+  dispatchFailedEvent(
+    "close",
+    "fn-954-incident-upsert",
+    "worktree-merge-conflict",
+    "/repo-new",
+    1800,
+    "reconciler",
+    11,
+  );
+  drainAll();
+
+  expect(getDispatchFailure("close", "fn-954-incident-upsert")).toMatchObject({
+    instance_event_id: fence,
+    attempt_id: 11,
+    claim_session_id: "session-owner",
+    claim_pid: 7777,
+    claim_start_time: "proc:7777:3",
+    claimed_at: 1750,
+  });
+});
+
+test("incident claim and release folds reproduce dispatch_failures byte-identically", () => {
+  const workFence = dispatchFailedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    "worktree-merge-conflict",
+    "/repo",
+    1700,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "old-owner",
+    1710,
+  );
+  incidentClaimedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "current-owner",
+    1720,
+  );
+  incidentReleasedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    workFence,
+    "old-owner",
+  );
+  dispatchFailedEvent(
+    "work",
+    "fn-955-incident-refold.1",
+    "worktree-merge-conflict",
+    "/repo-new",
+    1730,
+  );
+
+  const closeFence = dispatchFailedEvent(
+    "close",
+    "fn-955-incident-refold",
+    "worktree-merge-conflict",
+    "/repo",
+    1740,
+  );
+  incidentClaimedEvent(
+    "close",
+    "fn-955-incident-refold",
+    closeFence,
+    "closing-owner",
+    1750,
+  );
+  incidentReleasedEvent(
+    "close",
+    "fn-955-incident-refold",
+    closeFence,
+    "closing-owner",
+  );
+  drainAll();
+
+  const before = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb, id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_failures");
+  drainAll();
+  expect(
+    db.query("SELECT * FROM dispatch_failures ORDER BY verb, id").all(),
+  ).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ import {
   ownerTupleFromBirthRecord,
   parseBirthIntent,
   parseBirthRecord,
+  probeChildStartTime,
   writeProviderLegGrant,
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
@@ -263,6 +264,17 @@ import type {
   GitWorkerMessage,
   NudgeVanishedSweepMessage,
 } from "./git-worker";
+import {
+  listTrunkLeaseLeaves,
+  readTrunkLeaseLeaf,
+  readTrunkLeaseRequests,
+  removeTrunkLeaseRequest,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  TRUNK_LEASE_TTL_MS,
+  type TrunkLeaseLeaf,
+  writeTrunkLeaseLeaf,
+} from "./grant-leaf";
 import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
 import { handoffSlugExists } from "./handoff-slug";
 import type {
@@ -272,6 +284,11 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
+import {
+  readSpool as readIncidentClaimSpool,
+  removeRequest as removeIncidentClaimRequest,
+  type SpooledRequest as SpooledIncidentClaimRequest,
+} from "./incident-claim-store";
 import {
   type AgentbotPageAbsenceLogLatch,
   type AgentbotPageOutcome,
@@ -313,8 +330,13 @@ import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   type HostMatrixAxes,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  type IncidentOwnerFailureFacts,
+  incidentOwnerAttachmentCount,
+  isOwnerRoutableIncident,
   isStoppedJobLive,
   isWrappedCell,
+  nextIncidentOwnerAttachmentMarker,
   REPAIR_TERMINAL_GRACE_SEC,
   withDispatchAttempt,
   wrappedEnvelopePath,
@@ -1493,6 +1515,15 @@ export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
 export const PI_RESUME_REPAIR_SWEEP_INTERVAL_MS = 5_000;
 
 /**
+ * Cadence for the incident-claim producer sweep. A session claims a
+ * merge incident and then proceeds, so the claim wants prompt (few-second, not
+ * minute) round-trip visibility; the sweep is cheap (a spool readdir + point
+ * reads + at most one liveness probe per request), and the dead-claimant expiry
+ * pass it also runs is not latency-sensitive.
+ */
+export const INCIDENT_CLAIM_SWEEP_INTERVAL_MS = 3_000;
+
+/**
  * The ONE blocked category that does NOT escalate to the planner: a
  * `TOOLING_FAILURE` is surface-and-stop (a broken runner / env, not a question a
  * planner can answer on the board). DENYLIST shape — every other worker category
@@ -1792,7 +1823,7 @@ export function auditReadyEscalationDecision(
 export type BlockOwnerLiveness = AuditOrchestratorLiveness;
 
 /** Number of owning-work attachment attempts before the legacy unblock fallback. */
-export const BLOCK_OWNER_REDISPATCH_LIMIT = 2;
+export const BLOCK_OWNER_REDISPATCH_LIMIT = INCIDENT_OWNER_ATTACHMENT_LIMIT;
 
 /** The ordinary blocked-task owner uses the audit gate's established death grace. */
 export const BLOCK_OWNER_GRACE_MS = AUDIT_READY_ORCHESTRATOR_GRACE_MS;
@@ -4080,6 +4111,7 @@ export function selectPendingResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'close'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -4477,6 +4509,674 @@ export async function runResolverDispatchSweep(
 }
 
 // ---------------------------------------------------------------------------
+// Incident-claim producer (owner-mediated merge integration).
+// ---------------------------------------------------------------------------
+//
+// A live owning session pulls a merge incident and records its ownership through
+// the SAME spool-request contract as the
+// suite-baseline store: the session writes ONE request leaf, THIS producer
+// validates claimant liveness and mints the synthetic `IncidentClaimed` /
+// `IncidentReleased` event, the fold records the claim. No socket, no RPC, no
+// session DB write. The liveness probe lives ONLY here in the producer, never in
+// a fold, so a re-fold never re-probes a process.
+
+/** The incident row facts the producer reads to fence a claim/release: the sticky
+ *  row's `instance_event_id` and its CURRENT claim (all null when unclaimed). */
+export interface IncidentRowFacts {
+  instanceEventId: number | null;
+  claimSessionId: string | null;
+  claimPid: number | null;
+  claimStartTime: string | null;
+}
+
+/** What the producer learns about a would-be claimant from its owning `jobs`
+ *  row + a liveness probe. A missing/mismatched owner tuple or process generation
+ *  is unverifiable and the request is refused. */
+export interface ClaimantLiveness {
+  pid: number;
+  /** The claimant's RECORDED start_time (the recycle-safe generation). */
+  startTime: string;
+  /** True iff the pid is alive AND its live start_time exactly matches. */
+  live: boolean;
+}
+
+/** A claimed incident row the expiry pass re-probes. */
+export interface ClaimedIncidentRow {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string | null;
+}
+
+/** The `IncidentClaimed` mint payload the producer hands the writable connection. */
+export interface IncidentClaimMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+  ts: number;
+}
+
+/** The `IncidentReleased` mint payload (self-release or dead-claimant expiry). */
+export interface IncidentReleaseMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+}
+
+export interface IncidentClaimSweepDeps {
+  /** Read the spool (fail-open empty when absent). */
+  readRequests: () => SpooledIncidentClaimRequest[];
+  /** Unlink a processed / discarded request (idempotent). */
+  removeRequest: (path: string) => void;
+  /** Read the sticky incident row's fence + current claim, or null when absent. */
+  lookupIncident: (verb: string, id: string) => IncidentRowFacts | null;
+  /** Resolve the owning job tuple and liveness-probe the would-be claimant;
+   *  null when the session is not this incident's owner or is unverifiable. */
+  verifyClaimant: (
+    sessionId: string,
+    verb: string,
+    id: string,
+  ) => ClaimantLiveness | null;
+  /** Positive-evidence liveness probe of a RECORDED (pid, start_time): false ONLY
+   *  on positive evidence of death (pid gone, or start_time recycled). */
+  probeClaimantLive: (pid: number, startTime: string | null) => boolean;
+  /** Mint `IncidentClaimed`; explicit false means the write failed and the
+   *  request must remain spooled. */
+  mintClaimed: (p: IncidentClaimMint) => unknown;
+  /** Mint `IncidentReleased`; explicit false means the write failed and the
+   *  request/expiry remains retryable. */
+  mintReleased: (p: IncidentReleaseMint) => unknown;
+  /** Every currently-claimed incident row (for the dead-claimant expiry pass). */
+  selectClaimed: () => ClaimedIncidentRow[];
+  /** Unix-seconds clock for the claim freshness stamp. */
+  now: () => number;
+  /** Warn sink for non-fatal diagnostics. */
+  noteLine?: (line: string) => void;
+}
+
+/** What one sweep did — surfaced for the daemon.test seam, never a wire value. */
+export interface IncidentClaimSweepResult {
+  claimed: number;
+  released: number;
+  refused: number;
+  stale: number;
+  expired: number;
+}
+
+/**
+ * Run one incident-claim producer sweep. Two passes:
+ *
+ *  1. REQUESTS — for each spooled request, fence it against the live incident row
+ *     (the row must still exist AND carry the request's `instance_event_id`; a
+ *     cleared / re-minted incident discards the request as stale). A CLAIM mints
+ *     `IncidentClaimed` ONLY when the claimant verifies live AND the row is not
+ *     already held by a DIFFERENT live or unverifiable claimant (a positively
+ *     dead prior holder is taken over); an unverifiable / dead new claimant is
+ *     REFUSED. A RELEASE mints only for the recorded holder. Duplicate claims and
+ *     releases are consumed without growing the event log. A failed mint leaves
+ *     its request spooled for retry.
+ *
+ *  2. EXPIRY — for each currently-claimed row, re-probe the RECORDED claimant
+ *     `(pid, start_time)`; on positive evidence of death, mint `IncidentReleased`
+ *     so stale ownership does not survive its process generation.
+ *
+ * NEVER throws — every request is guarded so one malformed entry cannot abort the
+ * sweep. The mint + probe live ONLY here (never reachable from `applyEvent`), so a
+ * re-fold never re-fires a mint or re-probes a process.
+ */
+export function runIncidentClaimSweep(
+  deps: IncidentClaimSweepDeps,
+): IncidentClaimSweepResult {
+  const note = deps.noteLine ?? (() => {});
+  const result: IncidentClaimSweepResult = {
+    claimed: 0,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  };
+  // A successful mint is immediately folded in production, but keep the
+  // request contract idempotent even when a test/custom mint seam delays its
+  // projection update until after this batch.
+  const fulfilledRequests = new Set<string>();
+
+  let requests: SpooledIncidentClaimRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: incident-claim spool read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    requests = [];
+  }
+
+  for (const { path, request } of requests) {
+    try {
+      const requestKey = JSON.stringify([
+        request.action,
+        request.verb,
+        request.id,
+        request.instance_event_id,
+        request.claimant_session_id,
+      ]);
+      if (fulfilledRequests.has(requestKey)) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+      const incident = deps.lookupIncident(request.verb, request.id);
+      // The incident is gone (cleared) or re-minted under a fresh fence — the
+      // request can never attach to it. Discard it as stale.
+      if (
+        incident == null ||
+        incident.instanceEventId == null ||
+        incident.instanceEventId !== request.instance_event_id
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Both actions require the exact owning job tuple and a live,
+      // generation-verifiable process. A pid without an exact start-time match
+      // is not authority to mutate the incident.
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.verb,
+        request.id,
+      );
+      if (claimant == null || !claimant.live) {
+        note(
+          `# incident-claim refused ${request.verb}::${request.id}: claimant ` +
+            `${request.claimant_session_id} is dead or unverifiable`,
+        );
+        result.refused += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      if (request.action === "release") {
+        // A duplicate/non-owner release is an idempotent stale request, not a
+        // synthetic no-op event. Snapshot the complete recorded generation so a
+        // delayed release cannot clear the same session after it resumes.
+        if (
+          incident.claimSessionId !== request.claimant_session_id ||
+          incident.claimPid == null ||
+          incident.claimStartTime == null
+        ) {
+          result.stale += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+        const minted = deps.mintReleased({
+          verb: request.verb,
+          id: request.id,
+          instanceEventId: incident.instanceEventId,
+          claimSessionId: request.claimant_session_id,
+          claimPid: incident.claimPid,
+          claimStartTime: incident.claimStartTime,
+        });
+        if (minted === false) continue;
+        fulfilledRequests.add(requestKey);
+        result.released += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Same incident + same claimant + same process generation is already
+      // satisfied. A resumed claimant with a fresh generation re-stamps the
+      // claim below so expiry never releases it using the dead prior process.
+      if (
+        incident.claimSessionId === request.claimant_session_id &&
+        incident.claimPid === claimant.pid &&
+        incident.claimStartTime === claimant.startTime
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Takeover from a different holder requires positive evidence of death.
+      // Missing generation facts are inconclusive and therefore refuse takeover.
+      if (
+        incident.claimSessionId != null &&
+        incident.claimSessionId !== request.claimant_session_id
+      ) {
+        if (
+          incident.claimPid == null ||
+          deps.probeClaimantLive(incident.claimPid, incident.claimStartTime)
+        ) {
+          note(
+            `# incident-claim refused ${request.verb}::${request.id}: already ` +
+              `held by live or unverifiable claimant ${incident.claimSessionId}`,
+          );
+          result.refused += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+      }
+
+      const minted = deps.mintClaimed({
+        verb: request.verb,
+        id: request.id,
+        instanceEventId: incident.instanceEventId,
+        claimSessionId: request.claimant_session_id,
+        claimPid: claimant.pid,
+        claimStartTime: claimant.startTime,
+        ts: deps.now(),
+      });
+      if (minted === false) continue;
+      fulfilledRequests.add(requestKey);
+      result.claimed += 1;
+      deps.removeRequest(path);
+    } catch (err) {
+      // Defense-in-depth: a surprise throw for ONE request records nothing and
+      // moves on — the request stays spooled for the next tick.
+      note(
+        `# warn: incident-claim request ${request.verb}::${request.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Expiry pass — a dead claimant's claim expires on positive evidence of death.
+  let claimed: ClaimedIncidentRow[];
+  try {
+    claimed = deps.selectClaimed();
+  } catch (err) {
+    note(
+      `# warn: incident-claim expiry read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    claimed = [];
+  }
+  for (const row of claimed) {
+    try {
+      if (deps.probeClaimantLive(row.claimPid, row.claimStartTime)) continue;
+      if (row.claimStartTime == null) continue;
+      const minted = deps.mintReleased({
+        verb: row.verb,
+        id: row.id,
+        instanceEventId: row.instanceEventId,
+        claimSessionId: row.claimSessionId,
+        claimPid: row.claimPid,
+        claimStartTime: row.claimStartTime,
+      });
+      if (minted !== false) result.expired += 1;
+    } catch (err) {
+      note(
+        `# warn: incident-claim expiry for ${row.verb}::${row.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Ownerless merge-incident attachment + page router.
+// ---------------------------------------------------------------------------
+
+/** An exhausted natural-key merge incident waiting for its single human page. */
+export interface PendingIncidentOwnerPage extends IncidentOwnerFailureFacts {
+  verb: "work" | "close";
+  dir: string | null;
+  instanceEventId: number | null;
+}
+
+/** Current exhausted, unclaimed, unpaged merge incidents. */
+export function selectPendingIncidentOwnerPages(
+  db: Database,
+): PendingIncidentOwnerPage[] {
+  const rows = db
+    .query(
+      `SELECT verb, id, reason, dir, claim_session_id, instance_event_id,
+              resolver_dispatched_at, merge_escalated_at, human_notified_at
+         FROM dispatch_failures
+        WHERE verb IN ('work', 'close')
+          AND claim_session_id IS NULL
+          AND resolver_dispatched_at IS NOT NULL
+          AND merge_escalated_at IS NOT NULL
+          AND human_notified_at IS NULL`,
+    )
+    .all() as Array<{
+    verb: "work" | "close";
+    id: string;
+    reason: string;
+    dir: string | null;
+    claim_session_id: string | null;
+    instance_event_id: number | null;
+    resolver_dispatched_at: number | null;
+    merge_escalated_at: number | null;
+    human_notified_at: number | null;
+  }>;
+  return rows
+    .map((row) => ({
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      instanceEventId: row.instance_event_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    }))
+    .filter(
+      (row) =>
+        isOwnerRoutableIncident(row) &&
+        incidentOwnerAttachmentCount(row) >= INCIDENT_OWNER_ATTACHMENT_LIMIT,
+    );
+}
+
+export interface IncidentOwnerPageSweepDeps {
+  readonly selectPending: () => PendingIncidentOwnerPage[];
+  readonly stillPending: (row: PendingIncidentOwnerPage) => boolean;
+  /** True while an ordinary work/close admission or owner turn is active. */
+  readonly ownerActive: (row: PendingIncidentOwnerPage) => boolean;
+  readonly notifyHuman: (
+    row: PendingIncidentOwnerPage,
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  readonly mintNotified: (
+    row: PendingIncidentOwnerPage,
+    outcome: MergeHumanNotifiedOutcome,
+  ) => void;
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Page each exhausted ownerless merge incident once, but only after the final
+ * owning work/close attachment has yielded. Every uncertain read defers through
+ * injected predicates; a failed notification leaves the durable once-marker null.
+ */
+export async function runIncidentOwnerPageSweep(
+  deps: IncidentOwnerPageSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let rows: PendingIncidentOwnerPage[];
+  try {
+    rows = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: incident-owner page sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const row of rows) {
+    if (!isOwnerRoutableIncident(row)) continue;
+    if (!deps.stillPending(row) || deps.ownerActive(row)) continue;
+    let outcome: MergeHumanNotifiedOutcome;
+    try {
+      outcome = await deps.notifyHuman(row);
+    } catch (err) {
+      note(
+        `# warn: incident-owner page threw for ${row.verb}::${row.id} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      outcome = "notify_failed";
+    }
+    // The async transport yields the main loop. Re-fence before stamping so a
+    // clear + fresh incident cannot inherit this older episode's page marker.
+    if (!deps.stillPending(row)) continue;
+    deps.mintNotified(row, outcome);
+  }
+}
+
+/** Human page emitted after the bounded owning-session attachment lease expires. */
+export function buildIncidentOwnerPageBody(
+  row: PendingIncidentOwnerPage,
+): string {
+  return [
+    `🔴 keeper: ${row.verb}::${row.id} needs you — the merge incident remains open`,
+    `after ${INCIDENT_OWNER_ATTACHMENT_LIMIT} owning-session attachment attempts.`,
+    `No escalation session was launched; the sticky incident remains visible.`,
+    `Resolve both intents in ${row.dir ?? "the owning checkout"}, then clear the incident:`,
+    `  keeper autopilot retry ${row.verb}::${row.id}`,
+    ``,
+    `Failure reason: ${row.reason.trim()}`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Trunk-integration lease producer.
+// ---------------------------------------------------------------------------
+
+export interface TrunkLeaseClaimant {
+  pid: number;
+  startTime: string;
+  live: boolean;
+}
+
+export interface TrunkLeaseRepoObservation {
+  repoRoot: string;
+  defaultBranch: string;
+  defaultTip: string;
+}
+
+export interface TrunkLeaseSweepDeps {
+  readRequests: () => SpooledTrunkLeaseRequest[];
+  removeRequest: (path: string) => void;
+  readLeases: () => TrunkLeaseLeaf[];
+  readLease: (repoRoot: string) => TrunkLeaseLeaf | null;
+  verifyClaimant: (
+    sessionId: string,
+    epicId: string,
+  ) => TrunkLeaseClaimant | null;
+  probeClaimantLive: (pid: number, startTime: string) => boolean;
+  observeRepo: (
+    request: SpooledTrunkLeaseRequest["request"],
+  ) => TrunkLeaseRepoObservation | null;
+  publishLease: (leaf: TrunkLeaseLeaf) => boolean;
+  probeResidue: (leaf: TrunkLeaseLeaf) => string | null;
+  recordResidue: (leaf: TrunkLeaseLeaf, detail: string) => void;
+  now: () => number;
+  ttlMs?: number;
+  noteLine?: (line: string) => void;
+}
+
+export interface TrunkLeaseSweepResult {
+  acquired: number;
+  released: number;
+  expired: number;
+  dead: number;
+  stale: number;
+  deferred: number;
+  residues: number;
+}
+
+/**
+ * Publish per-repo closer leases from the filesystem spool. Active leaves are
+ * released only by an exact fenced release or positive process-death evidence;
+ * expiry is diagnostic and never permits a live holder to be replaced. A release
+ * keeps the leaf as a tombstone, so the next acquisition increments that repo's
+ * token instead of recycling it after a daemon restart.
+ */
+export function runTrunkLeaseSweep(
+  deps: TrunkLeaseSweepDeps,
+): TrunkLeaseSweepResult {
+  const result: TrunkLeaseSweepResult = {
+    acquired: 0,
+    released: 0,
+    expired: 0,
+    dead: 0,
+    stale: 0,
+    deferred: 0,
+    residues: 0,
+  };
+  const note = deps.noteLine ?? (() => {});
+  const now = deps.now();
+  const ttlMs = deps.ttlMs ?? TRUNK_LEASE_TTL_MS;
+  const residueRecorded = new Set<string>();
+
+  let leases: TrunkLeaseLeaf[];
+  try {
+    leases = deps.readLeases();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease leaf scan threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    leases = [];
+  }
+  let fencingToken = leases.reduce(
+    (max, lease) => Math.max(max, lease.fencing_token),
+    0,
+  );
+  for (const lease of leases) {
+    if (!lease.active) continue;
+    try {
+      const residue = deps.probeResidue(lease);
+      if (residue !== null) {
+        deps.recordResidue(lease, residue);
+        residueRecorded.add(`${lease.repo_root}\0${lease.fencing_token}`);
+        result.residues += 1;
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease residue probe threw for ${lease.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let live = true;
+    try {
+      live = deps.probeClaimantLive(
+        lease.claimant_pid,
+        lease.claimant_start_time,
+      );
+    } catch {
+      live = true;
+    }
+    if (live) continue;
+    if (deps.publishLease({ ...lease, active: false, expires_at: now })) {
+      result.dead += 1;
+    }
+  }
+
+  let requests: SpooledTrunkLeaseRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease spool read threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    requests = [];
+  }
+  for (const entry of requests) {
+    const request = entry.request;
+    try {
+      const current = deps.readLease(request.repo_root);
+      if (request.action === "release") {
+        if (
+          current === null ||
+          !current.active ||
+          current.epic_id !== request.epic_id ||
+          current.claimant_session_id !== request.claimant_session_id ||
+          current.fencing_token !== request.fencing_token
+        ) {
+          result.stale += 1;
+          deps.removeRequest(entry.path);
+          continue;
+        }
+        const residueKey = `${current.repo_root}\0${current.fencing_token}`;
+        if (!residueRecorded.has(residueKey)) {
+          try {
+            const residue = deps.probeResidue(current);
+            if (residue !== null) {
+              deps.recordResidue(current, residue);
+              residueRecorded.add(residueKey);
+              result.residues += 1;
+            }
+          } catch (err) {
+            note(
+              `# warn: trunk-lease release residue probe threw for ${current.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        if (deps.publishLease({ ...current, active: false, expires_at: now })) {
+          result.released += 1;
+          deps.removeRequest(entry.path);
+        }
+        continue;
+      }
+
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.epic_id,
+      );
+      if (claimant === null || !claimant.live) {
+        result.stale += 1;
+        deps.removeRequest(entry.path);
+        continue;
+      }
+      if (current?.active) {
+        const sameHolder =
+          current.epic_id === request.epic_id &&
+          current.claimant_session_id === request.claimant_session_id &&
+          current.claimant_pid === claimant.pid &&
+          current.claimant_start_time === claimant.startTime;
+        let holderLive = true;
+        try {
+          holderLive = deps.probeClaimantLive(
+            current.claimant_pid,
+            current.claimant_start_time,
+          );
+        } catch {
+          holderLive = true;
+        }
+        if (holderLive && !sameHolder) {
+          result.deferred += 1;
+          continue;
+        }
+      }
+      const observation = deps.observeRepo(request);
+      if (observation === null || observation.repoRoot !== request.repo_root) {
+        result.deferred += 1;
+        continue;
+      }
+      const token = Math.max(fencingToken, current?.fencing_token ?? 0) + 1;
+      fencingToken = token;
+      const leaf: TrunkLeaseLeaf = {
+        schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+        active: true,
+        epic_id: request.epic_id,
+        claimant_session_id: request.claimant_session_id,
+        claimant_pid: claimant.pid,
+        claimant_start_time: claimant.startTime,
+        acquisition_id: request.request_id,
+        repo_root: observation.repoRoot,
+        writable_root: observation.repoRoot,
+        source_branch: request.source_branch,
+        default_branch: observation.defaultBranch,
+        observed_default_tip: observation.defaultTip,
+        expires_at: now + ttlMs,
+        fencing_token: token,
+      };
+      if (deps.publishLease(leaf)) {
+        result.acquired += 1;
+        deps.removeRequest(entry.path);
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease request for ${request.repo_root} threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // fn-1240 — work-verb fan-in resolver + deconflict inputs (tier-2 stages 1–2)
 // ---------------------------------------------------------------------------
 //
@@ -4521,6 +5221,7 @@ export function selectPendingWorkResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'work'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -12824,11 +13525,96 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  function incidentOwnerFailureForAdmission(
+    verb: string,
+    id: string,
+  ): IncidentOwnerFailureFacts | null {
+    const row = db
+      .query(
+        `SELECT verb, id, reason, dir, claim_session_id,
+                resolver_dispatched_at, merge_escalated_at, human_notified_at
+           FROM dispatch_failures
+          WHERE verb = ? AND id = ?`,
+      )
+      .get(verb, id) as {
+      verb: string;
+      id: string;
+      reason: string;
+      dir: string | null;
+      claim_session_id: string | null;
+      resolver_dispatched_at: number | null;
+      merge_escalated_at: number | null;
+      human_notified_at: number | null;
+    } | null;
+    if (row == null) return null;
+    return {
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    };
+  }
+
+  /** Append one owner-attachment marker inside the admission transaction. */
+  function insertIncidentOwnerAttachmentMarker(
+    row: IncidentOwnerFailureFacts,
+    marker: "resolver" | "merge",
+    ts: number,
+  ): void {
+    const verb = row.verb === "work" ? "work" : "close";
+    stmts.insertEvent.run({
+      $ts: ts,
+      $session_id: row.id,
+      $pid: null,
+      $hook_event:
+        marker === "resolver"
+          ? "ResolverDispatchAttempted"
+          : "MergeEscalationAttempted",
+      $event_type: "dispatch_failures",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({
+        id: row.id,
+        outcome: "dispatched",
+        ...(verb === "close" ? {} : { verb }),
+      }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+    });
+  }
+
   /**
    * Admit one `Dispatched` attempt through the durable mint gate. Both the
    * reconciler bridge and the blocked-owner attachment path call this before
    * launch, so every `work::<task>` side effect carries an exact Event-derived
-   * attempt fence and a crash leaves a bounded `pending_dispatches` lease.
+   * attempt fence and a crash leaves a bounded `pending_dispatches` lease. A
+   * routed merge incident consumes its next attachment marker in the SAME
+   * transaction, so a restart cannot launch an uncounted owner.
    */
   function admitDispatched(payload: DispatchedPayload): DispatchedAck {
     const dispatchKey = `${payload.verb}::${payload.id}`;
@@ -12849,6 +13635,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         expected_attempt_id: currentClaim?.attempt_id ?? null,
       });
       const nowMs = Date.now();
+      const incident = incidentOwnerFailureForAdmission(
+        payload.verb,
+        payload.id,
+      );
+      const incidentMarker =
+        incident == null ? null : nextIncidentOwnerAttachmentMarker(incident);
+      if (
+        incident != null &&
+        isOwnerRoutableIncident(incident) &&
+        incidentMarker == null
+      ) {
+        return { ok: false, suppressed: true };
+      }
       // The gate read + the conditional insert run atomically in ONE
       // `BEGIN IMMEDIATE`. `onFreshMint` runs only on the mint branch (gate empty
       // or window elapsed); a re-mint inside the window suppresses without
@@ -12906,6 +13705,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // derives the same value from the marker in `data`; the ack carries it
           // into the launch metadata envelope before any backend execution.
           attemptId = insertedId;
+          if (incident != null && incidentMarker != null) {
+            insertIncidentOwnerAttachmentMarker(
+              incident,
+              incidentMarker,
+              nowMs / 1000,
+            );
+          }
           ok = true;
         },
       ));
@@ -13427,6 +14233,151 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
+  }
+
+  /**
+   * Mint one synthetic `IncidentClaimed` event onto the writable connection
+   * — the ONLY write path into the `dispatch_failures` claim columns. The
+   * producer has already validated the claimant is live and verifiable; the fold
+   * records the claim WITHOUT re-probing. The row `(verb, id)` rides the entity-key
+   * overload on `session_id` so a re-fold correlates it WITHOUT re-parsing `data`;
+   * the full payload rides `data` for the strict fold parser. NON-FATAL on insert
+   * failure — the next sweep re-attempts (the request stays spooled until minted).
+   */
+  function mintIncidentClaimedEvent(p: IncidentClaimMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentClaimed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+          ts: p.ts,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    // The event is durable now. A drain failure must NOT report mint failure —
+    // leaving the request spooled would insert a duplicate on every retry.
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Mint one synthetic `IncidentReleased` event onto the writable connection
+   * — clears the claim on a self-release OR positive dead-claimant
+   * evidence (the producer's expiry pass). Sibling of {@link
+   * mintIncidentClaimedEvent}; the fold's claimant-fence no-ops a stale release.
+   * NON-FATAL on insert failure — the next expiry sweep re-attempts.
+   */
+  function mintIncidentReleasedEvent(p: IncidentReleaseMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentReleased",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
   }
 
   /**
@@ -14198,7 +15149,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // re-sweepable. All wall-clock + spawn lives HERE in the producer; the spawn lives only
   // here, so a re-fold never re-fires a launch. Rides the SAME 60s heartbeat as the block
   // tick. `void` + `.catch`: the async launch must not block the heartbeat.
-  async function runMergeEscalationSweepTick(): Promise<void> {
+  async function _runMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a paused
     // board never auto-dispatches a NEW escalation session, mirroring the resolver-
@@ -14233,20 +15184,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
-  // launcher is reachable (a server-only boot never dispatches). Rides the same 60s
-  // heartbeat as the resolver-dispatch sweep.
-  const mergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  // Owner-mediated incidents never launch a top-level deconflict session. Keep
+  // the legacy sweep callable for bounded compatibility tests, but do not arm it.
+  const mergeEscalationSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   // The stage-3 board-state gate for the deconflict notify: is the epic's sticky
   // `close::<epic>` merge-conflict row still present? A successful deconflict clears it
@@ -14297,7 +15237,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires. Same pause + autopilot-role gating as the
   // dispatch sweep.
-  async function runDeconflictHumanNotifySweepTick(): Promise<void> {
+  async function _runDeconflictHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runDeconflictHumanNotifySweep({
@@ -14332,17 +15272,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const deconflictHumanNotifySweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runDeconflictHumanNotifySweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const deconflictHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // The sticky work row's `instance_event_id` — the block-instance anchor the work-verb
   // resolver-outcome probe (stage 2) and the work human-notify (stage 3) scope their jobs
@@ -14447,7 +15378,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires; `retry_dispatch` also re-arms the whole chain
   // for a genuine re-conflict. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeHumanNotifySweepTick(): Promise<void> {
+  async function _runWorkMergeHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runWorkMergeHumanNotifySweep({
@@ -14484,11 +15415,75 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeHumanNotifySweepTimer = want("autopilot")
+  const workMergeHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
+
+  function incidentOwnerActive(row: PendingIncidentOwnerPage): boolean {
+    try {
+      if (
+        db
+          .query(
+            "SELECT 1 FROM pending_dispatches WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(row.verb, row.id) != null ||
+        db
+          .query(
+            "SELECT 1 FROM dispatch_claims WHERE verb = ? AND id = ? AND state != 'released' LIMIT 1",
+          )
+          .get(row.verb, row.id) != null
+      ) {
+        return true;
+      }
+      const jobs = db
+        .query("SELECT * FROM jobs WHERE plan_verb = ? AND plan_ref = ?")
+        .all(row.verb, row.id) as unknown as Job[];
+      const activities = ownerActivities(jobs);
+      return jobs.some(
+        (job) =>
+          (activities.get(job.job_id) ?? deriveHarnessActivity({ parent: job }))
+            .status !== "quiescent",
+      );
+    } catch {
+      // An inconclusive ownership read must never page over a potentially-live owner.
+      return true;
+    }
+  }
+
+  async function runIncidentOwnerPageSweepTick(): Promise<void> {
+    if (shuttingDown || autopilotPaused) return;
+    await runIncidentOwnerPageSweep({
+      selectPending: () => selectPendingIncidentOwnerPages(db),
+      stillPending: (row) => {
+        try {
+          return (
+            db
+              .query(
+                `SELECT 1 FROM dispatch_failures
+                  WHERE verb = ? AND id = ? AND instance_event_id IS ?
+                    AND claim_session_id IS NULL
+                    AND resolver_dispatched_at IS NOT NULL
+                    AND merge_escalated_at IS NOT NULL
+                    AND human_notified_at IS NULL
+                  LIMIT 1`,
+              )
+              .get(row.verb, row.id, row.instanceEventId) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      ownerActive: (row) => incidentOwnerActive(row),
+      notifyHuman: (row) => notifyHuman(buildIncidentOwnerPageBody(row)),
+      mintNotified: (row, outcome) =>
+        mintMergeHumanNotifiedEvent(row.id, outcome, row.verb),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const incidentOwnerPageSweepTimer = want("autopilot")
     ? setInterval(() => {
-        void runWorkMergeHumanNotifySweepTick().catch((err) => {
+        void runIncidentOwnerPageSweepTick().catch((err) => {
           console.error(
-            `[keeperd] work fan-in human-notify sweep tick threw (non-fatal): ${
+            `[keeperd] incident-owner page sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -14520,7 +15515,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows whose resolver reached a TERMINAL verdict (leased so a crashed resolver never
   // deadlocks) and dispatches ONE `deconflict::<taskId>` session, stamping `merge_escalated_at`
   // on a terminal `dispatched`. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeEscalationSweepTick(): Promise<void> {
+  async function _runWorkMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runMergeEscalationSweep({
@@ -14552,17 +15547,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workMergeEscalationSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // Launch ONE autonomous `resolve::<taskId>` merge-resolver worker for a stuck work
   // fan-in conflict (fn-1240 tier-2 stage 1), the work-verb twin of `dispatchResolver`.
@@ -14631,7 +15617,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows with a NULL resolver latch and launches ONE `resolve::<taskId>` worker, stamping
   // `resolver_dispatched_at` on a terminal `dispatched`. Same pause + autopilot-role gating
   // as the sibling sweeps: a paused board defers the launch (the human is in control).
-  async function runWorkResolverDispatchSweepTick(): Promise<void> {
+  async function _runWorkResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runResolverDispatchSweep({
@@ -14641,7 +15627,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -14655,17 +15641,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workResolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workResolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   function readWorkerProvider(): WorkerProvider | null {
     try {
@@ -15752,7 +16729,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return result.ok ? "dispatched" : "dispatch_failed";
   }
 
-  async function runResolverDispatchSweepTick(): Promise<void> {
+  async function _runResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a
     // paused board never auto-dispatches a NEW resolver, mirroring the reconciler's own
@@ -15768,7 +16745,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -15784,20 +16761,286 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a worker, so it runs only where
-  // the launcher is reachable (a server-only boot never dispatches). Rides the same
-  // 60s heartbeat as the merge-escalation sweep.
-  const resolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
+  // Merge incidents reattach their ordinary owner; no top-level resolver is armed.
+  const resolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
+
+  // Incident-claim producer. Validates a session's spooled claim/release
+  // against the live incident row + claimant liveness and mints the synthetic
+  // `IncidentClaimed` / `IncidentReleased` event; also expires a dead claimant's
+  // claim on positive evidence. It never launches a worker (unlike the resolver /
+  // deconflict sweeps), so it is NOT pause-gated — a live session must be able to
+  // claim, and a dead claimant's lock must be able to expire, regardless of the
+  // autopilot pause banner. The probe (`pidAlive` + `probeChildStartTime`) lives
+  // ONLY here in the producer, never in a fold.
+  function verifyIncidentClaimant(
+    sessionId: string,
+    verb: string,
+    id: string,
+  ): ClaimantLiveness | null {
+    const row = db
+      .query(
+        "SELECT pid, start_time, plan_verb, plan_ref FROM jobs WHERE job_id = ?",
+      )
+      .get(sessionId) as {
+      pid: number | null;
+      start_time: string | null;
+      plan_verb: string | null;
+      plan_ref: string | null;
+    } | null;
+    if (
+      row == null ||
+      row.plan_verb !== verb ||
+      row.plan_ref !== id ||
+      row.pid == null ||
+      row.start_time == null
+    ) {
+      // The session must be the incident's exact owning verb/ref and carry a
+      // recorded process generation; every mismatch is unverifiable authority.
+      return null;
+    }
+    if (!pidAlive(row.pid)) {
+      return { pid: row.pid, startTime: row.start_time, live: false };
+    }
+    const probed = probeChildStartTime(row.pid);
+    if (probed == null) {
+      // A live pid without a readable generation could be recycled. Refuse.
+      return null;
+    }
+    return {
+      pid: row.pid,
+      startTime: row.start_time,
+      live: probed === row.start_time,
+    };
+  }
+  function probeIncidentClaimantLive(
+    pid: number,
+    startTime: string | null,
+  ): boolean {
+    if (!pidAlive(pid)) return false;
+    if (startTime != null) {
+      const probed = probeChildStartTime(pid);
+      if (probed != null && probed !== startTime) return false;
+    }
+    return true;
+  }
+  function runIncidentClaimSweepTick(): void {
+    if (shuttingDown) return;
+    runIncidentClaimSweep({
+      readRequests: () => readIncidentClaimSpool(),
+      removeRequest: (path) => removeIncidentClaimRequest(path),
+      lookupIncident: (verb, id) => {
+        const row = db
+          .query(
+            `SELECT reason, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures WHERE verb = ? AND id = ?`,
+          )
+          .get(verb, id) as {
+          reason: string;
+          instance_event_id: number | null;
+          claim_session_id: string | null;
+          claim_pid: number | null;
+          claim_start_time: string | null;
+        } | null;
+        if (row == null || !isMergeEscalationReason(row.reason)) return null;
+        return {
+          instanceEventId: row.instance_event_id,
+          claimSessionId: row.claim_session_id,
+          claimPid: row.claim_pid,
+          claimStartTime: row.claim_start_time,
+        };
+      },
+      verifyClaimant: (sessionId, verb, id) =>
+        verifyIncidentClaimant(sessionId, verb, id),
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      mintClaimed: (p) => mintIncidentClaimedEvent(p),
+      mintReleased: (p) => mintIncidentReleasedEvent(p),
+      selectClaimed: () => {
+        const rows = db
+          .query(
+            `SELECT verb, id, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures
+              WHERE claim_session_id IS NOT NULL AND claim_pid IS NOT NULL
+                AND instance_event_id IS NOT NULL`,
+          )
+          .all() as Array<{
+          verb: string;
+          id: string;
+          instance_event_id: number;
+          claim_session_id: string;
+          claim_pid: number;
+          claim_start_time: string | null;
+        }>;
+        return rows.map((r) => ({
+          verb: r.verb,
+          id: r.id,
+          instanceEventId: r.instance_event_id,
+          claimSessionId: r.claim_session_id,
+          claimPid: r.claim_pid,
+          claimStartTime: r.claim_start_time,
+        }));
+      },
+      now: () => Date.now() / 1000,
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  // Main owns this spool producer regardless of the optional worker selector:
+  // claim/release is a daemon data surface, not an autopilot-worker actuation.
+  // This also lets a server-only diagnostic boot expire a provably-dead owner.
+  const incidentClaimSweepTimer = setInterval(() => {
+    try {
+      runIncidentClaimSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] incident-claim sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
+
+  const trunkLeaseStateDir = keeperStateDir();
+  const runTrunkLeaseGit = (
+    args: string[],
+    cwd: string,
+  ): { code: number; stdout: string; stderr: string } => {
+    try {
+      const proc = Bun.spawnSync(["git", ...args], { cwd });
+      return {
+        code: proc.exitCode,
+        stdout: proc.stdout.toString(),
+        stderr: proc.stderr.toString(),
+      };
+    } catch (err) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+  const observeTrunkLeaseRepo = (
+    request: SpooledTrunkLeaseRequest["request"],
+  ): TrunkLeaseRepoObservation | null => {
+    let repoRoot: string;
+    try {
+      repoRoot = realpathSync(request.repo_root);
+    } catch {
+      return null;
+    }
+    if (repoRoot !== request.repo_root) return null;
+    const source = runTrunkLeaseGit(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${request.source_branch}^{commit}`,
+      ],
+      repoRoot,
+    );
+    if (source.code !== 0) return null;
+    const symbolic = runTrunkLeaseGit(
+      ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      repoRoot,
+    );
+    let defaultBranch =
+      symbolic.code === 0
+        ? symbolic.stdout.trim().replace(/^origin\//, "")
+        : "";
+    if (defaultBranch === "") {
+      for (const candidate of ["main", "master", "trunk"]) {
+        if (
+          runTrunkLeaseGit(
+            ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+            repoRoot,
+          ).code === 0
+        ) {
+          defaultBranch = candidate;
+          break;
+        }
+      }
+    }
+    if (defaultBranch === "") return null;
+    const tip = runTrunkLeaseGit(
+      ["rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`],
+      repoRoot,
+    );
+    const defaultTip = tip.stdout.trim();
+    if (tip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(defaultTip)) return null;
+    return { repoRoot, defaultBranch, defaultTip };
+  };
+  function runTrunkLeaseSweepTick(): void {
+    if (shuttingDown) return;
+    runTrunkLeaseSweep({
+      readRequests: () => readTrunkLeaseRequests(trunkLeaseStateDir),
+      removeRequest: (path) => removeTrunkLeaseRequest(path),
+      readLeases: () => listTrunkLeaseLeaves(trunkLeaseStateDir),
+      readLease: (repoRoot) => readTrunkLeaseLeaf(trunkLeaseStateDir, repoRoot),
+      verifyClaimant: (sessionId, epicId) => {
+        const claimant = verifyIncidentClaimant(sessionId, "close", epicId);
+        return claimant === null
+          ? null
+          : {
+              pid: claimant.pid,
+              startTime: claimant.startTime,
+              live: claimant.live,
+            };
+      },
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      observeRepo: (request) => observeTrunkLeaseRepo(request),
+      publishLease: (leaf) => writeTrunkLeaseLeaf(trunkLeaseStateDir, leaf),
+      probeResidue: (leaf) => {
+        const mergeHead = runTrunkLeaseGit(
+          ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+          leaf.repo_root,
+        );
+        if (mergeHead.code !== 0) return null;
+        const oid = mergeHead.stdout.trim();
+        return oid === "" ? null : `MERGE_HEAD=${oid}`;
+      },
+      recordResidue: (leaf, detail) => {
+        const conflicts = runTrunkLeaseGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          leaf.repo_root,
+        );
+        handleDispatchFailedMint({
+          verb: "close",
+          id: leaf.epic_id,
+          reason:
+            `worktree-merge-conflict: merging ${leaf.source_branch} into ` +
+            `${leaf.default_branch} — trunk-integration owner ` +
+            `${leaf.claimant_session_id} left residue in ${leaf.repo_root} ` +
+            `(token=${leaf.fencing_token}, ${detail})`,
+          dir: leaf.repo_root,
+          conflictedFiles:
+            conflicts.code === 0
+              ? conflicts.stdout
+                  .split("\n")
+                  .map((path) => path.trim())
+                  .filter(Boolean)
+              : null,
+          ts: Date.now() / 1000,
         });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+      },
+      now: () => Date.now(),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const trunkLeaseSweepTimer = setInterval(() => {
+    try {
+      runTrunkLeaseSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] trunk-lease sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
 
   // Pi resume-target repair producer. Heals a live pi job whose recorded
   // resume target names no on-disk artifact by disk-anchoring a same-cwd session
@@ -17054,6 +18297,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (workMergeHumanNotifySweepTimer !== null) {
       clearInterval(workMergeHumanNotifySweepTimer);
     }
+    if (incidentOwnerPageSweepTimer !== null) {
+      clearInterval(incidentOwnerPageSweepTimer);
+    }
     if (workMergeEscalationSweepTimer !== null) {
       clearInterval(workMergeEscalationSweepTimer);
     }
@@ -17063,6 +18309,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
     }
+    if (incidentClaimSweepTimer !== null) {
+      clearInterval(incidentClaimSweepTimer);
+    }
+    clearInterval(trunkLeaseSweepTimer);
     if (piResumeRepairSweepTimer !== null) {
       clearInterval(piResumeRepairSweepTimer);
     }

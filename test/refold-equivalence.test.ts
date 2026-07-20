@@ -151,6 +151,8 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "BuildDeleted",
   "DispatchFailed",
   "DispatchCleared",
+  "IncidentClaimed",
+  "IncidentReleased",
   "Dispatched",
   "DispatchExpired",
   "BlockEscalationRequested",
