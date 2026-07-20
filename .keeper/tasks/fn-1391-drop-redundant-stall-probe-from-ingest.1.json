@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-07-20T21:05:09.279000Z",
+  "depends_on": [],
+  "epic": "fn-1391-drop-redundant-stall-probe-from-ingest",
+  "id": "fn-1391-drop-redundant-stall-probe-from-ingest.1",
+  "model": "gpt-5.3-codex-spark",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Remove onmessage stall probe",
+  "updated_at": "2026-07-20T21:05:09.279000Z"
+}
