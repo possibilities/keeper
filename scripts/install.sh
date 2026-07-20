@@ -403,6 +403,13 @@ else
   echo "install: keeperd plist/source changed or not loaded; relink + reload"
   mkdir -p "${HOME}/Library/LaunchAgents"
   ln -sfn "${repo_plist}" "${live_plist}"
+  # Attribution leaf: record that THIS install is about to bounce keeperd, so
+  # restart-ledger forensics can attribute the daemon end it causes — an
+  # external launchctl bootout is otherwise invisible to keeper and reads as an
+  # unattributed quiet death.
+  printf '{"schema_version":1,"source":"install.sh","action":"launchctl-reload","ts_ms":%s,"fingerprint":"%s"}\n' \
+    "$(($(date +%s) * 1000))" "${current_fp}" \
+    > "${fingerprint_dir}/install-reload-attribution.json" || true
   # Modern launchctl surface. bootout-first (|| true — bootstrap over an already
   # loaded agent errors); enable clears any prior `disable`; bootstrap re-reads
   # the plist. kickstart -k is deliberately NOT used: it re-spawns the process
