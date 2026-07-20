@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Editing a fail-closed security guard's admission plus a forgery-resistant attribution route across guard/CLI/vcs/close-preflight is a subtle security invariant with cross-file blast radius \u2014 a hard opus gate at contract-touching effort.",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Well-specified, bounded validation tightening plus a mechanical request_release pointer attach with named line numbers and reusable terminal-proof semantics is judgment-heavy but not opus-tier, fitting sonnet at the clear-path high band.",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.66,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "A state-machine correctness fix across two plan verbs \u2014 preserving done's evidence-discipline contract and a design choice between two sanctioned points where a wrong abstraction propagates \u2014 is judgment-heavy well-specified work with reusable proof semantics, warranting sonnet at contract-touching effort.",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.68,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Widening a fail-closed security guard's allowlist to admit only a send-only bus shape while denying all subscribing verbs guards the nameable single-watcher bus invariant \u2014 a security gate to opus, small enough for the medium band.",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.4",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T09:49:28.399000Z",
+  "epic_id": "fn-1383-complete-the-cooperative-commit-rail",
+  "input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3860025361,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1383-complete-the-cooperative-commit-rail.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Editing a fail-closed security guard's admission plus a forgery-resistant attribution route across guard/CLI/vcs/close-preflight is a subtle security invariant with cross-file blast radius \u2014 a hard opus gate at contract-touching effort.\",\"confidence\":0.82},{\"task_id\":\"fn-1383-complete-the-cooperative-commit-rail.2\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Well-specified, bounded validation tightening plus a mechanical request_release pointer attach with named line numbers and reusable terminal-proof semantics is judgment-heavy but not opus-tier, fitting sonnet at the clear-path high band.\",\"confidence\":0.7},{\"task_id\":\"fn-1383-complete-the-cooperative-commit-rail.3\",\"tier\":\"xhigh\",\"model\":\"sonnet\",\"rationale\":\"A state-machine correctness fix across two plan verbs \u2014 preserving done's evidence-discipline contract and a design choice between two sanctioned points where a wrong abstraction propagates \u2014 is judgment-heavy well-specified work with reusable proof semantics, warranting sonnet at contract-touching effort.\",\"confidence\":0.66},{\"task_id\":\"fn-1383-complete-the-cooperative-commit-rail.4\",\"tier\":\"medium\",\"model\":\"opus\",\"rationale\":\"Widening a fail-closed security guard's allowlist to admit only a send-only bus shape while denying all subscribing verbs guards the nameable single-watcher bus invariant \u2014 a security gate to opus, small enough for the medium band.\",\"confidence\":0.68}]}"
+}
