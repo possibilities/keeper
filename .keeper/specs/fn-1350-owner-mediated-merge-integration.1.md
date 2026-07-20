@@ -34,5 +34,5 @@ In-process: envelope carries the incident for a synthetic sticky row; claim spoo
 - [ ] The fold records claim state (claimant identity, generation, freshness) on the incident row; the producer refuses claims from dead or unverifiable claimants; a dead claimant's recorded claim expires on positive evidence
 - [ ] Brief lookup by incident id works read-only; all touched suites green via named gates
 ## Done summary
-
+Added pull-based incident surface: claim/close-preflight envelopes carry a nullable incident field (fenced identities, brief ref, grant ref) sourced via bounded read-only escalation-brief subprocess; a new incident-claim spool + daemon producer validates claimant liveness and mints IncidentClaimed/IncidentReleased synthetic events; the fold records claim state and preserves it across dispatch-failure re-emits; dead claimants expire on positive evidence.
 ## Evidence
