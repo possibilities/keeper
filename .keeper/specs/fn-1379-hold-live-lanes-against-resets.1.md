@@ -46,12 +46,10 @@ the deferral emits its reason; a dead-claim lane still gets normal
 recover handling.
 
 ## Acceptance
-
 - [ ] The resetting pass is named with correlated evidence in the task's Done summary
-- [ ] Maintenance passes defer on live-claimed lanes and on any lane with an in-progress merge, proven by deterministic tests
-- [ ] Deferral is visible (bounded log or reason), never a silent skip
-- [ ] Sanctioned teardown of dead lanes still works (regression-proven)
-
+- [ ] Maintenance passes defer on live-claimed lanes and on lanes whose in-progress merge is owned by a live or inconclusive claim (tri-state: live/inconclusive claim holds; a dead sole-owned MERGE_HEAD residue keeps the flock-guarded abort+prune self-heal; an abort failure escalates an IMMEDIATE worktree-lane-wedge), proven by deterministic tests
+- [ ] Deferral is visible (bounded log or reason), never a silent skip; the hold latch logs once per episode
+- [ ] Sanctioned teardown of dead lanes still works, and the dead-residue abort self-heal plus wedge escalation remain regression-proven (the fn-1123.2 and fn-1095 guard tests stay present and asserting their documented direction)
 ## Done summary
 
 ## Evidence
