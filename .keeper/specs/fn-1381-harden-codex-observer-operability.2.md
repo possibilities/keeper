@@ -55,5 +55,5 @@ inspection includes the failure state via its unit seam.
 - [ ] No daemon, reducer, or dead-letter surface is touched; focused tests for the refresh and worker files pass
 
 ## Done summary
-
+Failed codex observation refresh cycles now log one bounded reason-classed line and persist a durable consecutive-failure sidecar (reset on success); keeper agent accounts check surfaces that state in the codex capacity block.
 ## Evidence

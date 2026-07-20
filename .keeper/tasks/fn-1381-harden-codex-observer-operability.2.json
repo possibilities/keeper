@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Surface failed observation refreshes",
-  "updated_at": "2026-07-20T06:25:33.413000Z"
+  "updated_at": "2026-07-20T06:43:17.173000Z",
+  "worker_done_at": "2026-07-20T06:43:17.173000Z"
 }
