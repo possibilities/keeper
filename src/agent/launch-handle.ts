@@ -105,6 +105,7 @@ export interface LaunchPosture {
   effort?: string;
   session?: string;
   preset?: string;
+  codexPoolProofWindow?: boolean;
   /** Launch NAME — lands on the tmux window name for every harness and on the
    *  harness-native `--name` for claude/pi. Omitted = no name. */
   name?: string;
@@ -228,6 +229,7 @@ export function launchToResolvedHandle(
       effort: posture.effort,
       session: posture.session,
       preset: posture.preset,
+      codexPoolProofWindow: posture.codexPoolProofWindow,
       name: posture.name,
       resumeTarget: resume?.target,
       resumeSessionId: resume?.childSessionId,

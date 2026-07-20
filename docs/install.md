@@ -247,9 +247,10 @@ keeper agent accounts codex-pool enroll keeper-codex-b
 Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
 Codex on those surfaces to remain unavailable until activation.
 
-Arm one proof window and run the managed Pi proof probe. The probe directs Pi to invoke the
-`codex_pool_proof` tool exactly once; the tool runs the bounded proof and atomically writes its private
-report to `~/.config/keeper/codex-pool/live-proof.json` before the window closes:
+Arm one proof window and run the managed Pi proof probe. The run wrapper accepts this exact Pi-only
+launcher flag and forwards it to the managed launch. The probe directs Pi to invoke the `codex_pool_proof`
+tool exactly once; the tool runs the bounded proof and atomically writes its private report to
+`~/.config/keeper/codex-pool/live-proof.json` before the window closes:
 
 ```sh
 keeper agent run pi --x-codex-pool-proof-window=arm \

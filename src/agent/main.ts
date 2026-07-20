@@ -1715,7 +1715,15 @@ async function runRunCaptureSubcommand(
   deps: MainDeps,
   rest: string[],
 ): Promise<never> {
-  const parsed = parseRunArgs(rest);
+  const proofWindowRequest = consumeCodexPoolProofWindowFlag(rest);
+  if (proofWindowRequest.error !== null) {
+    deps.writeErr(`agent: ${proofWindowRequest.error}\n`);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+    );
+  }
+  const parsed = parseRunArgs(proofWindowRequest.remainingArgs);
   if (!parsed.ok) {
     deps.writeErr(`agent: ${parsed.error}\n`);
     return emitRunCapture(
@@ -1731,6 +1739,12 @@ async function runRunCaptureSubcommand(
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
       parsed.output,
     );
+  if (proofWindowRequest.armed && (agent !== "pi" || parsed.resume !== null)) {
+    deps.writeErr(
+      "agent: --x-codex-pool-proof-window=arm requires a fresh managed Pi session.\n",
+    );
+    return runBadArgs();
+  }
   // RESUME: `agent run <cli> "<ask>" --resume <name-or-id>` continues a prior
   // partner conversation instead of a fresh launch. It is a wholly separate path
   // — resolve the target, run the refuse-live / harness-match / cwd checks, then
@@ -1828,6 +1842,7 @@ async function runRunCaptureSubcommand(
               model: parsed.model ?? undefined,
               effort: parsed.effort ?? undefined,
               session: parsed.session ?? undefined,
+              codexPoolProofWindow: proofWindowRequest.armed || undefined,
               name: parsed.name ?? undefined,
             },
             stopTimeoutMs: parsed.stopTimeoutMs,

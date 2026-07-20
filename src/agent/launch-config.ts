@@ -155,6 +155,7 @@ export interface AgentLaunchOpts {
    *  re-derives them. Omitted = no triple flag (model/effort fall to the explicit
    *  `--model`/`--effort`). */
   preset?: string;
+  codexPoolProofWindow?: boolean;
   /** Launch NAME. Rides as `--x-tmux-window-name <name>` (the tmux window name,
    *  EVERY harness) and as the harness-native `--name <name>`. Omitted/empty = no name flag. */
   name?: string;
@@ -230,6 +231,9 @@ export function buildAgentLaunchArgv(opts: AgentLaunchOpts): string[] {
   // re-derives model/effort from the triple — it only reads the triple's harness.
   if (opts.preset !== undefined && opts.preset !== "") {
     wrapperFlags.push("--x-preset", opts.preset);
+  }
+  if (opts.codexPoolProofWindow) {
+    wrapperFlags.push("--x-codex-pool-proof-window=arm");
   }
   if (opts.session !== undefined && opts.session !== "") {
     wrapperFlags.push("--x-tmux-session", opts.session);
