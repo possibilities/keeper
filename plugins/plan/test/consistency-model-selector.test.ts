@@ -27,6 +27,14 @@ import { effectiveMatrix } from "../src/host_matrix.ts";
 
 const PLAN_ROOT = resolve(import.meta.dir, "..");
 
+// `hand_tuned` is a YAML literal block scalar and the agent prompt is wrapped
+// markdown, so any reflow moves a line break through the prose. Compare on
+// whitespace-collapsed text: these gates pin the POLICY WORDING, and a phrase must
+// match whether or not it straddles a wrap.
+function prose(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ");
+}
+
 // A committed claude-only v2 host matrix seeded into a scratch KEEPER_CONFIG_DIR so
 // `--state` (which reads the required host matrix axes) resolves opus + sonnet
 // without touching the live ~/.config/keeper.
@@ -121,7 +129,7 @@ describe("on-disk selector config", () => {
       join(PLAN_ROOT, "model-selector.yaml"),
     );
     expect(config.hand_tuned.length).toBeGreaterThan(0);
-    const lower = config.hand_tuned.toLowerCase();
+    const lower = prose(config.hand_tuned);
     expect(lower).toContain("burden of proof");
     expect(lower).toContain("sonnet");
     expect(lower).toContain("opus");
@@ -151,24 +159,25 @@ describe("on-disk selector config", () => {
       "route up",
       "when in doubt",
     ];
-    const configProse = [
-      config.usage,
-      config.hand_tuned,
-      ...Object.values(config.efforts),
-      ...Object.values(config.models),
-    ]
-      .join("\n")
-      .toLowerCase();
-    const agentLower = agentPrompt.toLowerCase();
+    const configProse = prose(
+      [
+        config.usage,
+        config.hand_tuned,
+        ...Object.values(config.efforts),
+        ...Object.values(config.models),
+      ].join("\n"),
+    );
+    const agentLower = prose(agentPrompt);
     for (const phrase of forbiddenPhrases) {
       expect(configProse).not.toContain(phrase);
       expect(agentLower).not.toContain(phrase);
     }
     // Positive: both surfaces state the burden-of-proof rule, the Spark-first
     // capability gate, and the anti-anchor clause.
-    expect(config.hand_tuned.toLowerCase()).toContain("burden of proof");
-    expect(config.hand_tuned.toLowerCase()).toContain("gpt-5.3-codex-spark");
-    expect(config.hand_tuned.toLowerCase()).toContain("never widens");
+    const handTuned = prose(config.hand_tuned);
+    expect(handTuned).toContain("burden of proof");
+    expect(handTuned).toContain("gpt-5.3-codex-spark");
+    expect(handTuned).toContain("never widens");
     expect(agentLower).toContain("burden of proof");
     expect(agentLower).toContain("intelligence-bound");
     expect(agentLower).toContain("gpt-5.3-codex-spark");
