@@ -10470,14 +10470,18 @@ test("lane maintenance hold attributes every cycle pass and prevents provision/f
   expect(lines.every((line) => line.length <= 531)).toBe(true);
 });
 
-test("base refresh producer: conflict uses the existing bare close merge-conflict row and suppresses same-cycle lane launch", async () => {
+test("base refresh producer: conflict defers without a sticky and lets the owning fan-in proceed", async () => {
   const reason =
-    "worktree-merge-conflict: merging main into keeper/epic/fn-1-foo — CONFLICT";
+    "worktree-base-refresh-conflict: default drift deferred — CONFLICT";
   const { driver, log } = makeFakeWorktreeDriver({
-    refreshFail: () => reason,
+    refreshRetry: () => reason,
   });
   const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
-  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
+  });
   const decision = reconcile(
     makeSnapshot({
       epics: [epic],
@@ -10506,13 +10510,8 @@ test("base refresh producer: conflict uses the existing bare close merge-conflic
   );
 
   expect(log.refreshes).toHaveLength(1);
-  expect(log.provisions).toEqual([]);
-  expect(depsLog.emissions).toHaveLength(1);
-  expect(depsLog.emissions[0]).toMatchObject({
-    verb: "close",
-    id: "fn-1-foo",
-    reason,
-  });
+  expect(log.provisions).toHaveLength(1);
+  expect(depsLog.emissions).toEqual([]);
 });
 
 function makeBaseRefreshGitRun(
@@ -10561,6 +10560,12 @@ function makeBaseRefreshGitRun(
     if (args[0] === "merge-base") return { code: 1, stdout: "", stderr: "" };
     if (command === "rev-parse --git-common-dir") {
       return { code: 0, stdout: "/repo/.git\n", stderr: "" };
+    }
+    if (command === "diff --name-only --diff-filter=U") {
+      return { code: 0, stdout: "src/conflict.ts\n", stderr: "" };
+    }
+    if (command === "merge --abort") {
+      return { code: 0, stdout: "", stderr: "" };
     }
     if (args[0] === "merge") {
       return {
@@ -10612,6 +10617,30 @@ test("base refresh driver: MERGE_HEAD defers without touching the lane", async (
   expect(commands.some((args) => args[0] === "merge")).toBe(false);
   expect(commands.some((args) => args[0] === "reset")).toBe(false);
   expect(commands.some((args) => args[0] === "restore")).toBe(false);
+});
+
+test("base refresh driver: a content conflict remains drift and never opens a resolver incident", async () => {
+  const { run } = makeBaseRefreshGitRun({ mergeCode: 1 });
+  const result = await createWorktreeDriver(run, () => ({
+    release() {},
+  })).refreshBase(
+    {
+      epic_id: "fn-1-foo",
+      repo_dir: "/repo",
+      behind_count: 20,
+      merge_base_age_seconds: 90_000,
+    },
+    10_000,
+  );
+
+  expect(result).toEqual({
+    ok: false,
+    retry: true,
+    reason: expect.stringContaining("worktree-base-refresh-conflict"),
+  });
+  expect((result as { reason: string }).reason).not.toStartWith(
+    "worktree-merge-conflict:",
+  );
 });
 
 test("base refresh driver: cooldown skips churn; after expiry merges local default into the base worktree exactly once", async () => {
@@ -14451,24 +14480,52 @@ test("fn-993 recoverWorktrees pass-2: a lock-timeout acquirer (null) → worktre
   );
 });
 
-test("owner-mediated recovery never merges an unintegrated done base or retires its lane", async () => {
+test("owner-mediated recovery backstops a closed base only when no closer is dispatchable", async () => {
   const base = "keeper/epic/fn-1-foo";
   const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
-  const { run, calls, lock } = makeRecoveryGit({
-    worktreeList:
-      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
-      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
-    mergeHeadAt: new Set(),
-    epicBases: [base],
-    defaultBranch: "main",
-    ancestors: new Set(),
-    repoHead: "main",
-  });
+  const fixture = () =>
+    makeRecoveryGit({
+      worktreeList:
+        "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+        `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+      mergeHeadAt: new Set(),
+      epicBases: [base],
+      defaultBranch: "main",
+      ancestors: new Set(),
+      repoHead: "main",
+    });
+
+  const held = fixture();
+  const heldOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    held.run,
+    held.lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+    undefined,
+    undefined,
+    () => true,
+  );
+  expect(heldOutcome.failures).toEqual([]);
+  expect(held.calls.some((call) => call.args.startsWith("merge-tree"))).toBe(
+    false,
+  );
+  expect(held.calls.some((call) => call.args.startsWith("update-ref"))).toBe(
+    false,
+  );
+
+  const backstop = fixture();
   const outcome = await recoverWorktrees(
     ["/repo"],
     async () => true,
-    run,
-    lock,
+    backstop.run,
+    backstop.lock,
     undefined,
     undefined,
     undefined,
@@ -14477,19 +14534,18 @@ test("owner-mediated recovery never merges an unintegrated done base or retires 
     undefined,
     true,
   );
-
-  expect(outcome.failures).toHaveLength(1);
-  expect(outcome.failures[0]?.reason).toStartWith(
-    "worktree-recover-awaiting-owner-integration:",
-  );
-  expect(calls.some((call) => call.args.startsWith("merge --no-edit"))).toBe(
-    false,
-  );
-  expect(calls.some((call) => call.args.startsWith("merge-tree"))).toBe(false);
-  expect(calls.some((call) => call.args.startsWith("update-ref"))).toBe(false);
-  expect(calls.some((call) => call.args.startsWith("push origin"))).toBe(false);
+  expect(outcome.failures).toEqual([]);
   expect(
-    calls.some((call) => call.args === `worktree remove ${basePath}`),
+    backstop.calls.some((call) => call.args.startsWith("merge-tree")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args.startsWith("update-ref")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args.startsWith("push origin")),
+  ).toBe(true);
+  expect(
+    backstop.calls.some((call) => call.args === `worktree remove ${basePath}`),
   ).toBe(false);
 });
 
@@ -15412,6 +15468,38 @@ test("fn-1119 recoverWorktrees pass-2: a backstop content conflict → an ESCALA
   expect(calls.some((c) => c.args === "push")).toBe(false);
 });
 
+test("owner-mediated recovery keeps a backstop conflict recover-scoped and mints no owner incident", async () => {
+  const { run, lock } = makeRecoveryGit({
+    worktreeList: "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n",
+    mergeHeadAt: new Set(),
+    epicBases: ["keeper/epic/fn-1-foo"],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+    mergeConflict: true,
+  });
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => "done",
+    run,
+    lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+
+  expect(outcome.escalations).toEqual([]);
+  expect(outcome.failures).toHaveLength(1);
+  expect(outcome.failures[0]?.reason).toStartWith(
+    "worktree-recover-backstop-conflict:",
+  );
+  expect(isWorktreeRecoverReason(outcome.failures[0]?.reason ?? "")).toBe(true);
+});
+
 test("fn-1119 recoverWorktrees pass-2: a done epic with a LIVE merge-resolver is NOT merge-attempted (gated skip, no observation, rows retained)", async () => {
   // A retargeted conflict dispatched a `resolve::fn-1-foo` worker for this now-done
   // epic; it is mid-`git merge`. Pass-2 must skip re-attempting the same base→default
@@ -16133,6 +16221,52 @@ test("fn-1119 deploy transition: an old-scheme bare-epic recover row is RETAINED
     expect(
       recoverFailuresToClear(snap.recoverFailureIds, [], resolved),
     ).toEqual([]);
+  });
+});
+
+test("loadReconcileSnapshot routes only unclaimed incident rows with an attachment slot", async () => {
+  await withSeededDb(async (db) => {
+    const insert = (
+      id: string,
+      claim: string | null,
+      resolverAt: number | null,
+      mergeAt: number | null,
+    ): void => {
+      db.run(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+            claim_session_id, resolver_dispatched_at, merge_escalated_at)
+         VALUES ('work', ?, ?, '/repo/lane', 1, 1, 1, 1, ?, ?, ?)`,
+        [
+          id,
+          "worktree-merge-conflict: merging source into base — pending owner integration",
+          claim,
+          resolverAt,
+          mergeAt,
+        ],
+      );
+    };
+    insert("fn-1-open.1", null, null, null);
+    insert("fn-2-claimed.1", "live-owner", null, null);
+    insert("fn-3-exhausted.1", null, 10, 20);
+
+    const snapshot = await loadReconcileSnapshot(db);
+    expect([...(snapshot.incidentOwnerKeys ?? [])]).toEqual([
+      "work::fn-1-open.1",
+    ]);
+    expect([...(snapshot.claimedIncidentKeys ?? [])]).toEqual([
+      "work::fn-2-claimed.1",
+    ]);
+    expect(snapshot.incidentOwnerKeys?.has("work::fn-3-exhausted.1")).toBe(
+      false,
+    );
+    expect(snapshot.failedKeys).toEqual(
+      new Set([
+        "work::fn-1-open.1",
+        "work::fn-2-claimed.1",
+        "work::fn-3-exhausted.1",
+      ]),
+    );
   });
 });
 

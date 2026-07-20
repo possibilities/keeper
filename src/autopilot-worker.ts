@@ -171,10 +171,12 @@ import {
   type HostMatrixSnapshot,
   isBareShellCommand,
   isFinalizerVerb,
+  isOwnerRoutableIncident,
   isStoppedJobLive,
   isWrappedCell,
   KEEPER_ROOT,
   type LaneMergedEntry,
+  nextIncidentOwnerAttachmentMarker,
   type PlannedLaunch,
   prepareWorktreeGeometry,
   REDISPATCH_COOLDOWN_S,
@@ -716,9 +718,30 @@ export function createLaneMaintenanceProbe(
   jobs: ReadonlyMap<string, Job>,
   dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> | undefined,
   livePaneIds: ReadonlySet<string> | null,
+  claimedIncidentKeys: ReadonlySet<DispatchKey> = new Set(),
 ): LaneMaintenanceProbe {
   return (target) => {
     const lanePath = normalizeLanePath(target.path);
+    for (const key of claimedIncidentKeys) {
+      const split = key.indexOf("::");
+      if (split < 1) continue;
+      const verb = key.slice(0, split);
+      const id = key.slice(split + 2);
+      const holdsTarget =
+        (verb === "close" && id === target.epicId) ||
+        (verb === "work" &&
+          (target.taskId !== null
+            ? id === target.taskId
+            : id.startsWith(`${target.epicId}.`)));
+      if (holdsTarget) {
+        return {
+          kind: "defer",
+          reason: boundedLaneMaintenanceReason(
+            `live incident claim ${key} holds ${lanePath}`,
+          ),
+        };
+      }
+    }
     for (const claim of dispatchClaims?.values() ?? []) {
       if (claim.state === "released") continue;
       const claimsPath =
@@ -1246,9 +1269,9 @@ export function pendingIntegrationReason(
 export interface WorktreeDriver {
   /**
    * Refresh one drifted, quiescent epic base by merging the local default branch
-   * into the base branch in the base's own linked worktree. A content conflict is
-   * a genuine block routed through the existing merge-conflict escalation; every
-   * inconclusive/readiness/lock/timeout outcome is a non-sticky retry-skip.
+   * into the base branch in the base's own linked worktree. Every unsuccessful
+   * refresh, including content conflict, is a non-sticky defer: drift remains
+   * observable and the next owning fan-in integration handles it.
    */
   refreshBase(
     entry: BaseDriftEntry,
@@ -1358,11 +1381,12 @@ export interface WorktreeDriver {
    *     self-heal). An abort that FAILS records `worktree-recover-abort-failed` and
    *     its surviving `MERGE_HEAD` surfaces as an IMMEDIATE lane wedge — a hold
    *     never suppresses that escalation.
-   *  2. DONE-BUT-UNMERGED BACKSTOP: enumerate `keeper/epic/<id>` base branches
-   *     from git; for each whose epic `isEpicDone` reports done but whose base is
-   *     NOT yet an ancestor of the resolved default branch, merge it to default +
-   *     push (idempotent: an already-merged base is skipped). DECOUPLED from
-   *     `DONE_EPICS_REAP_WINDOW_SEC`.
+   *  2. CLOSED-BASE BACKSTOP: enumerate `keeper/epic/<id>` base branches from
+   *     git. Owner-mediated mode first verifies owner integration and leaves an
+   *     unintegrated base to a dispatchable closer; only a closed/tombstoned epic
+   *     with no dispatchable closer falls back to daemon merge + push. An already-
+   *     integrated base is only verified/pushed. DECOUPLED from the recent-done
+   *     window.
    *
    *  3. ORPHAN-LANE PRUNE: tear down each `keeper/epic/<id>` lane (base AND rib)
    *     whose epic `epicPresentAndNotDone` reports inactive (ABSENT or done),
@@ -1390,6 +1414,7 @@ export interface WorktreeDriver {
     epicHasOccupyingJob: (epicId: string) => boolean,
     laneTeardown?: LaneTeardownRecoveryOptions,
     laneMaintenanceProbe?: LaneMaintenanceProbe,
+    hasDispatchableCloser?: (epicId: string) => boolean,
   ): Promise<WorktreeRecoveryOutcome>;
 }
 
@@ -6337,10 +6362,9 @@ export function createWorktreeDriver(
             return { ok: true };
           case "conflict":
           case "abort-failed":
-            return {
-              ok: false,
-              reason: `worktree-merge-conflict: merging ${defaultBranch} into ${baseBranch} — ${merge.stderr}`,
-            };
+            return retry(
+              `worktree-base-refresh-${merge.kind}: default drift into ${baseBranch} deferred — ${merge.stderr}`,
+            );
           case "lock-timeout":
           case "local-timeout":
           case "missing-source":
@@ -6900,6 +6924,7 @@ export function createWorktreeDriver(
       epicHasOccupyingJob,
       laneTeardown,
       laneMaintenanceProbe,
+      hasDispatchableCloser,
     ) {
       return recoverWorktrees(
         repos,
@@ -6915,6 +6940,7 @@ export function createWorktreeDriver(
         ownerMediatedFinalize,
         recoverMergeSuite,
         mergeSuiteMemo,
+        hasDispatchableCloser,
       );
     },
   };
@@ -8257,12 +8283,11 @@ async function recoverSharedCheckoutMidMerge(
  * and re-surfaces below as an IMMEDIATE wedge. The SHARED MAIN checkout — not a
  * lane — keeps its separate {@link recoverSharedCheckoutMidMerge} policy.
  *
- * Pass 2 (done-but-unmerged backstop): every `keeper/epic/<id>` base branch in
- * each repo whose epic `isEpicDone` reports done but whose base is NOT yet an
- * ancestor of the resolved default branch is merged into default (in the MAIN
- * worktree, on the default branch) + pushed once. Idempotent: an already-merged
- * base is skipped via `merge-base --is-ancestor`. DECOUPLED from the 1800s
- * recent-done window — git is the authority for which bases still need merging.
+ * Pass 2 (closed-base backstop): every `keeper/epic/<id>` base branch is graded
+ * against a closed/tombstoned epic. In owner-mediated mode an unintegrated base
+ * waits while a closer remains dispatchable; otherwise recover performs the
+ * idempotent merge + push backstop. An owner-integrated base is only verified and
+ * pushed. Git remains the authority outside the recent-done window.
  *
  * Pass 3 (orphan-lane prune): tri-state on epic activity — every `keeper/epic/<id>`
  * lane (base AND rib) whose epic is ABSENT (reaped / EpicDeleted) OR done, gated
@@ -8308,6 +8333,7 @@ export async function recoverWorktrees(
   ownerMediatedIntegration = false,
   runMergeSuite?: MergeSuiteProbe,
   mergeSuiteMemo: Map<string, MergeSuiteVerdict> = new Map(),
+  hasDispatchableCloser: (epicId: string) => boolean = () => false,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -8557,29 +8583,27 @@ export async function recoverWorktrees(
         //   inconclusive → a non-result (error) read frame; DEFER — no merge, no
         //                  observation, so an open recover row for (epic,repo) is
         //                  RETAINED (absence of a read is never resolution).
-        //   absent       → authoritatively reaped (the pk-lookup bypasses every scope
-        //                  / recency floor); the base no longer needs merging — record
-        //                  a POSITIVE resolved observation and skip.
+        //   absent       → authoritatively tombstoned; owner-mediated mode may
+        //                  still land its surviving base through this backstop.
         //   done         → verify owner integration, then finish push recovery.
         const verdict = normalizeEpicVerdict(await isEpicDone(base.epicId));
         if (verdict === "open" || verdict === "inconclusive") {
           continue;
         }
-        if (verdict === "absent") {
+        const tombstoned = verdict === "absent";
+        if (tombstoned && !ownerMediatedIntegration) {
           resolved.push({ epicId: base.epicId, dir: repo });
           continue;
         }
-        // A LIVE autonomous merge-resolver owns this base→default merge (a retargeted
-        // conflict dispatched it for this now-done epic). Skip so pass-2 never races it
-        // mid-`git merge`. The gated skip yields no
-        // observation, so an open row is retained for free.
+        // A live claim or owner owns this base→default merge. Skip so pass-2 never
+        // races it; absence of an observation retains any open recover row.
         if (ownerActive(base.epicId)) {
           continue;
         }
         if (ownerMediatedIntegration && epicHasOccupyingJob(base.epicId)) {
           continue;
         }
-        if (ownerMediatedIntegration) {
+        if (ownerMediatedIntegration && !tombstoned) {
           const integrated = await verifyAndPushOwnerIntegration(
             repo,
             base.branch,
@@ -8593,69 +8617,70 @@ export async function recoverWorktrees(
             resolved.push({ epicId: base.epicId, dir: repo });
             continue;
           }
-          let reason: string;
-          switch (integrated.kind) {
-            case "not-integrated":
-              reason = `worktree-recover-awaiting-owner-integration: ${base.branch} is not an ancestor of ${defaultBranch}; a live closer must integrate it under the per-repo trunk lease`;
-              break;
-            case "integration-inconclusive":
-              reason = `worktree-recover-integration-inconclusive: could not prove ${base.branch} is an ancestor of ${defaultBranch} (exit ${integrated.exitCode}); refusing push and teardown`;
-              break;
-            case "off-branch":
-              reason = `worktree-recover-not-on-default: ${repo} HEAD is ${integrated.head}, expected ${defaultBranch} — deferring push and teardown`;
-              break;
-            case "dirty":
-              reason = `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — deferring push and teardown — ${integrated.detail}`;
-              break;
-            case "mid-merge":
-              reason = `worktree-recover-mid-merge: ${repo} is mid-merge (owner=${integrated.owner}, autostash=${integrated.autostash}, MERGE_HEAD=${integrated.mergeHead}) — deferring push and teardown`;
-              break;
-            case "would-clobber":
-              reason = `worktree-recover-would-clobber: ${repo} has untracked path collisions — ${integrated.paths.join(", ")} — deferring push and teardown`;
-              break;
-            case "tip-drift":
-              reason = `worktree-recover-cas-stale: refs/heads/${defaultBranch} advanced after the merge-suite verdict — re-grading before any push`;
-              break;
-            case "lock-timeout":
-              reason = `worktree-recover-lock-timeout: could not acquire the commit-work lock for ${repo} — deferring push and teardown`;
-              break;
-            case "suite-red":
-              reason = `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repo} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`;
-              break;
-            case "suite-unavailable":
-              reason = `worktree-recover-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repo} could not run (${integrated.detail}) — deferring push and teardown`;
-              break;
-            case "non-ff":
-              reason = `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`;
-              break;
-            case "not-turn-key":
-              reason = `worktree-recover-push-not-turn-key: ${describePushNotReady(integrated.reason)} — deferring push and teardown`;
-              break;
-            case "push-timeout":
-              reason = `worktree-recover-push-timeout: pushing ${defaultBranch} to origin timed out — deferring teardown`;
-              break;
-            case "push-failed":
-              reason = `worktree-recover-push-failed: ${integrated.detail}`;
-              break;
-            case "push-unconfirmed":
-              reason = `worktree-recover-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${base.branch} — deferring teardown`;
-              break;
-            default:
-              assertNever(integrated);
+          if (integrated.kind === "not-integrated") {
+            // An ownerless incident with a remaining attachment slot belongs to
+            // the closer. Only after no closer is dispatchable does recover take
+            // the merge-and-push backstop below.
+            if (hasDispatchableCloser(base.epicId)) continue;
+          } else {
+            let reason: string;
+            switch (integrated.kind) {
+              case "integration-inconclusive":
+                reason = `worktree-recover-integration-inconclusive: could not prove ${base.branch} is an ancestor of ${defaultBranch} (exit ${integrated.exitCode}); refusing push and teardown`;
+                break;
+              case "off-branch":
+                reason = `worktree-recover-not-on-default: ${repo} HEAD is ${integrated.head}, expected ${defaultBranch} — deferring push and teardown`;
+                break;
+              case "dirty":
+                reason = `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — deferring push and teardown — ${integrated.detail}`;
+                break;
+              case "mid-merge":
+                reason = `worktree-recover-mid-merge: ${repo} is mid-merge (owner=${integrated.owner}, autostash=${integrated.autostash}, MERGE_HEAD=${integrated.mergeHead}) — deferring push and teardown`;
+                break;
+              case "would-clobber":
+                reason = `worktree-recover-would-clobber: ${repo} has untracked path collisions — ${integrated.paths.join(", ")} — deferring push and teardown`;
+                break;
+              case "tip-drift":
+                reason = `worktree-recover-cas-stale: refs/heads/${defaultBranch} advanced after the merge-suite verdict — re-grading before any push`;
+                break;
+              case "lock-timeout":
+                reason = `worktree-recover-lock-timeout: could not acquire the commit-work lock for ${repo} — deferring push and teardown`;
+                break;
+              case "suite-red":
+                reason = `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repo} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`;
+                break;
+              case "suite-unavailable":
+                reason = `worktree-recover-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repo} could not run (${integrated.detail}) — deferring push and teardown`;
+                break;
+              case "non-ff":
+                reason = `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`;
+                break;
+              case "not-turn-key":
+                reason = `worktree-recover-push-not-turn-key: ${describePushNotReady(integrated.reason)} — deferring push and teardown`;
+                break;
+              case "push-timeout":
+                reason = `worktree-recover-push-timeout: pushing ${defaultBranch} to origin timed out — deferring teardown`;
+                break;
+              case "push-failed":
+                reason = `worktree-recover-push-failed: ${integrated.detail}`;
+                break;
+              case "push-unconfirmed":
+                reason = `worktree-recover-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${base.branch} — deferring teardown`;
+                break;
+              default:
+                assertNever(integrated);
+            }
+            failures.push({ epicId: base.epicId, reason, dir: repo });
+            continue;
           }
-          failures.push({ epicId: base.epicId, reason, dir: repo });
-          continue;
         }
 
-        // Legacy mode retains the shared merge-and-push routine.
+        // Legacy mode and owner-mediated backstop share the merge-and-push routine.
         // `not-ahead` is the idempotency skip (an already-merged base is an ancestor
-        // of default). Every TRANSIENT degrade maps to a `worktree-recover-*` reason:
-        // the recover prefix keeps the level-triggered auto-clear scope, so the block
-        // lifts the moment the underlying git settles (no `retry_dispatch` needed) —
-        // the recover-side analogue of finalize's `retry` skip. A CONTENT CONFLICT is
-        // terminal instead: it escalates (below). The shared core stamps NO reason
-        // strings; recover owns the `worktree-recover-*` mapping exactly as finalize
-        // owns `worktree-finalize-*`.
+        // of default). Every transient degrade maps to a `worktree-recover-*` reason.
+        // A legacy content conflict still opens the bare close incident; the demoted
+        // owner-mediated backstop keeps its conflict in the recover-scoped surface
+        // because no dispatchable closer remains.
         const merge = await mergeLaneBaseIntoDefault(
           repo,
           base.branch,
@@ -8729,18 +8754,19 @@ export async function recoverWorktrees(
             });
             continue;
           case "conflict":
-            // TERMINAL. A content conflict leaves the recover auto-clear scope
-            // entirely: it escalates on the BARE `close::<epic>` id with finalize's
-            // EXACT close-sink reason (`worktree-merge-conflict: …`), so routing
-            // classifies it merge-escalation, the resolver-dispatch + merge-escalation
-            // sweeps engage, a same-epic finalize close-sink row UPSERT-converges, and
-            // only `retry_dispatch` drops it. NOT a `worktree-recover-*` reason — the
-            // absence-based auto-clear must never silently dismiss a real conflict.
-            escalations.push({
-              epicId: base.epicId,
-              reason: `worktree-merge-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
-              dir: repo,
-            });
+            if (ownerMediatedIntegration) {
+              failures.push({
+                epicId: base.epicId,
+                reason: `worktree-recover-backstop-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+                dir: repo,
+              });
+            } else {
+              escalations.push({
+                epicId: base.epicId,
+                reason: `worktree-merge-conflict: merging ${base.branch} into ${defaultBranch} — ${merge.stderr}`,
+                dir: repo,
+              });
+            }
             continue;
           case "push-timeout":
             failures.push({
@@ -10161,6 +10187,30 @@ export async function loadReconcileSnapshot(
   }
 
   const failedKeys = new Set<DispatchKey>();
+  const incidentOwnerKeys = new Set<DispatchKey>();
+  const claimedIncidentKeys = new Set<DispatchKey>();
+  const incidentClaimByKey = new Map<DispatchKey, string>();
+  let incidentClaimsReadable = true;
+  try {
+    const claims = db
+      .query(
+        `SELECT verb, id, claim_session_id FROM dispatch_failures
+          WHERE verb IN ('work', 'close') AND claim_session_id IS NOT NULL`,
+      )
+      .all() as {
+      verb: "work" | "close";
+      id: string;
+      claim_session_id: string;
+    }[];
+    for (const claim of claims) {
+      incidentClaimByKey.set(
+        dispatchKey(claim.verb, claim.id),
+        claim.claim_session_id,
+      );
+    }
+  } catch {
+    incidentClaimsReadable = false;
+  }
   const dispatchFailureFences = new Map<DispatchKey, DispatchFailureFence>();
   const recoverFailureIds = new Set<string>();
   const finalizeFailureIds = new Set<string>();
@@ -10341,6 +10391,53 @@ export async function loadReconcileSnapshot(
         reason: reasonStr,
         dir: "",
       });
+      if (
+        isOwnerRoutableIncident({
+          verb,
+          id,
+          reason: reasonStr,
+          dir:
+            typeof (row as { dir?: unknown }).dir === "string"
+              ? ((row as { dir: string }).dir ?? "")
+              : "",
+        })
+      ) {
+        const claimSessionId = incidentClaimByKey.get(key) ?? null;
+        const resolverDispatchedAt = (
+          row as { resolver_dispatched_at?: unknown }
+        ).resolver_dispatched_at;
+        const mergeEscalatedAt = (row as { merge_escalated_at?: unknown })
+          .merge_escalated_at;
+        const humanNotifiedAt = (row as { human_notified_at?: unknown })
+          .human_notified_at;
+        const facts = {
+          verb,
+          id,
+          reason: reasonStr,
+          dir:
+            typeof (row as { dir?: unknown }).dir === "string"
+              ? (row as { dir: string }).dir
+              : null,
+          claimSessionId,
+          resolverDispatchedAt:
+            typeof resolverDispatchedAt === "number"
+              ? resolverDispatchedAt
+              : null,
+          mergeEscalatedAt:
+            typeof mergeEscalatedAt === "number" ? mergeEscalatedAt : null,
+          humanNotifiedAt:
+            typeof humanNotifiedAt === "number" ? humanNotifiedAt : null,
+        };
+        if (!incidentClaimsReadable || facts.claimSessionId != null) {
+          claimedIncidentKeys.add(key);
+        }
+        if (
+          incidentClaimsReadable &&
+          nextIncidentOwnerAttachmentMarker(facts) != null
+        ) {
+          incidentOwnerKeys.add(key);
+        }
+      }
       switch (route.kind) {
         case "worktree-recover":
           recoverFailureIds.add(id);
@@ -10824,6 +10921,8 @@ export async function loadReconcileSnapshot(
     subagentInvocations,
     gitStatusByProjectDir,
     failedKeys,
+    incidentOwnerKeys,
+    claimedIncidentKeys,
     dispatchFailureFences,
     recoverFailureIds,
     finalizeFailureIds,
@@ -11442,6 +11541,7 @@ function main(): void {
           snapshot.jobs,
           snapshot.dispatchClaims,
           snapshot.livePaneIds,
+          snapshot.claimedIncidentKeys,
         );
         dispatchFailedGate.observeProjection(snapshot.dispatchFailureFences);
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
@@ -11607,16 +11707,29 @@ function main(): void {
               // `isEpicDoneById`, which collapses both to skip).
               (epicId) => epicRecoverVerdictById(db, epicId),
               (epicId) => epicPresentAndNotDone(db, epicId),
-              // Per-epic resolver exclusion (from the SAME snapshot the cycle
-              // reconciled): shared-checkout recovery and pass 2 skip an epic with
-              // a live `resolve::<epic>` worker.
-              // A pure projection read (jobs + read-time liveness) — never a fold.
-              (epicId) =>
-                epicHasActiveResolver(
-                  snapshot.jobs,
-                  epicId,
-                  snapshot.livePaneIds,
-                ),
+              // Per-epic integration exclusion from the SAME snapshot: recovery
+              // skips a live legacy resolver or any active work/close incident
+              // claim. Pure projection data plus read-time liveness, never a fold.
+              (epicId) => {
+                if (
+                  epicHasActiveResolver(
+                    snapshot.jobs,
+                    epicId,
+                    snapshot.livePaneIds,
+                  )
+                ) {
+                  return true;
+                }
+                for (const key of snapshot.claimedIncidentKeys ?? []) {
+                  if (
+                    key === dispatchKey("close", epicId) ||
+                    key.startsWith(`work::${epicId}.`)
+                  ) {
+                    return true;
+                  }
+                }
+                return false;
+              },
               // Per-epic occupancy gate (ADR 0031): pass-3 preserves a lane whose
               // epic has an OCCUPYING close/work job so a done epic's mid-turn closer
               // never has its cwd torn down. An absent epic (no snapshot row) has no
@@ -11646,6 +11759,11 @@ function main(): void {
                 openBackupPaths: snapshot.laneBackupDistressDirs ?? new Set(),
               },
               laneMaintenanceProbe,
+              (epicId) =>
+                snapshot.epics.some((epic) => epic.epic_id === epicId) &&
+                snapshot.incidentOwnerKeys?.has(
+                  dispatchKey("close", epicId),
+                ) === true,
             );
             // A COMPLETED pass-3 lane teardown: nudge the git vanished sweep so it
             // retires the torn-down lane's git_status row promptly, not at the next

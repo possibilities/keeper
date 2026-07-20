@@ -318,8 +318,13 @@ import {
   ESCALATION_EFFORT,
   ESCALATION_MODEL,
   type HostMatrixAxes,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  type IncidentOwnerFailureFacts,
+  incidentOwnerAttachmentCount,
+  isOwnerRoutableIncident,
   isStoppedJobLive,
   isWrappedCell,
+  nextIncidentOwnerAttachmentMarker,
   REPAIR_TERMINAL_GRACE_SEC,
   withDispatchAttempt,
   wrappedEnvelopePath,
@@ -1653,7 +1658,7 @@ export function auditReadyEscalationDecision(
 export type BlockOwnerLiveness = AuditOrchestratorLiveness;
 
 /** Number of owning-work attachment attempts before the legacy unblock fallback. */
-export const BLOCK_OWNER_REDISPATCH_LIMIT = 2;
+export const BLOCK_OWNER_REDISPATCH_LIMIT = INCIDENT_OWNER_ATTACHMENT_LIMIT;
 
 /** The ordinary blocked-task owner uses the audit gate's established death grace. */
 export const BLOCK_OWNER_GRACE_MS = AUDIT_READY_ORCHESTRATOR_GRACE_MS;
@@ -4653,6 +4658,132 @@ export function runIncidentClaimSweep(
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Ownerless merge-incident attachment + page router.
+// ---------------------------------------------------------------------------
+
+/** An exhausted natural-key merge incident waiting for its single human page. */
+export interface PendingIncidentOwnerPage extends IncidentOwnerFailureFacts {
+  verb: "work" | "close";
+  dir: string | null;
+  instanceEventId: number | null;
+}
+
+/** Current exhausted, unclaimed, unpaged merge incidents. */
+export function selectPendingIncidentOwnerPages(
+  db: Database,
+): PendingIncidentOwnerPage[] {
+  const rows = db
+    .query(
+      `SELECT verb, id, reason, dir, claim_session_id, instance_event_id,
+              resolver_dispatched_at, merge_escalated_at, human_notified_at
+         FROM dispatch_failures
+        WHERE verb IN ('work', 'close')
+          AND claim_session_id IS NULL
+          AND resolver_dispatched_at IS NOT NULL
+          AND merge_escalated_at IS NOT NULL
+          AND human_notified_at IS NULL`,
+    )
+    .all() as Array<{
+    verb: "work" | "close";
+    id: string;
+    reason: string;
+    dir: string | null;
+    claim_session_id: string | null;
+    instance_event_id: number | null;
+    resolver_dispatched_at: number | null;
+    merge_escalated_at: number | null;
+    human_notified_at: number | null;
+  }>;
+  return rows
+    .map((row) => ({
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      instanceEventId: row.instance_event_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    }))
+    .filter(
+      (row) =>
+        isOwnerRoutableIncident(row) &&
+        incidentOwnerAttachmentCount(row) >= INCIDENT_OWNER_ATTACHMENT_LIMIT,
+    );
+}
+
+export interface IncidentOwnerPageSweepDeps {
+  readonly selectPending: () => PendingIncidentOwnerPage[];
+  readonly stillPending: (row: PendingIncidentOwnerPage) => boolean;
+  /** True while an ordinary work/close admission or owner turn is active. */
+  readonly ownerActive: (row: PendingIncidentOwnerPage) => boolean;
+  readonly notifyHuman: (
+    row: PendingIncidentOwnerPage,
+  ) => Promise<MergeHumanNotifiedOutcome>;
+  readonly mintNotified: (
+    row: PendingIncidentOwnerPage,
+    outcome: MergeHumanNotifiedOutcome,
+  ) => void;
+  readonly noteLine?: (line: string) => void;
+}
+
+/**
+ * Page each exhausted ownerless merge incident once, but only after the final
+ * owning work/close attachment has yielded. Every uncertain read defers through
+ * injected predicates; a failed notification leaves the durable once-marker null.
+ */
+export async function runIncidentOwnerPageSweep(
+  deps: IncidentOwnerPageSweepDeps,
+): Promise<void> {
+  const note = deps.noteLine ?? (() => {});
+  let rows: PendingIncidentOwnerPage[];
+  try {
+    rows = deps.selectPending();
+  } catch (err) {
+    note(
+      `# warn: incident-owner page sweep read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+  for (const row of rows) {
+    if (!isOwnerRoutableIncident(row)) continue;
+    if (!deps.stillPending(row) || deps.ownerActive(row)) continue;
+    let outcome: MergeHumanNotifiedOutcome;
+    try {
+      outcome = await deps.notifyHuman(row);
+    } catch (err) {
+      note(
+        `# warn: incident-owner page threw for ${row.verb}::${row.id} ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      outcome = "notify_failed";
+    }
+    // The async transport yields the main loop. Re-fence before stamping so a
+    // clear + fresh incident cannot inherit this older episode's page marker.
+    if (!deps.stillPending(row)) continue;
+    deps.mintNotified(row, outcome);
+  }
+}
+
+/** Human page emitted after the bounded owning-session attachment lease expires. */
+export function buildIncidentOwnerPageBody(
+  row: PendingIncidentOwnerPage,
+): string {
+  return [
+    `🔴 keeper: ${row.verb}::${row.id} needs you — the merge incident remains open`,
+    `after ${INCIDENT_OWNER_ATTACHMENT_LIMIT} owning-session attachment attempts.`,
+    `No escalation session was launched; the sticky incident remains visible.`,
+    `Resolve both intents in ${row.dir ?? "the owning checkout"}, then clear the incident:`,
+    `  keeper autopilot retry ${row.verb}::${row.id}`,
+    ``,
+    `Failure reason: ${row.reason.trim()}`,
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -12949,11 +13080,96 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
+  function incidentOwnerFailureForAdmission(
+    verb: string,
+    id: string,
+  ): IncidentOwnerFailureFacts | null {
+    const row = db
+      .query(
+        `SELECT verb, id, reason, dir, claim_session_id,
+                resolver_dispatched_at, merge_escalated_at, human_notified_at
+           FROM dispatch_failures
+          WHERE verb = ? AND id = ?`,
+      )
+      .get(verb, id) as {
+      verb: string;
+      id: string;
+      reason: string;
+      dir: string | null;
+      claim_session_id: string | null;
+      resolver_dispatched_at: number | null;
+      merge_escalated_at: number | null;
+      human_notified_at: number | null;
+    } | null;
+    if (row == null) return null;
+    return {
+      verb: row.verb,
+      id: row.id,
+      reason: row.reason,
+      dir: row.dir,
+      claimSessionId: row.claim_session_id,
+      resolverDispatchedAt: row.resolver_dispatched_at,
+      mergeEscalatedAt: row.merge_escalated_at,
+      humanNotifiedAt: row.human_notified_at,
+    };
+  }
+
+  /** Append one owner-attachment marker inside the admission transaction. */
+  function insertIncidentOwnerAttachmentMarker(
+    row: IncidentOwnerFailureFacts,
+    marker: "resolver" | "merge",
+    ts: number,
+  ): void {
+    const verb = row.verb === "work" ? "work" : "close";
+    stmts.insertEvent.run({
+      $ts: ts,
+      $session_id: row.id,
+      $pid: null,
+      $hook_event:
+        marker === "resolver"
+          ? "ResolverDispatchAttempted"
+          : "MergeEscalationAttempted",
+      $event_type: "dispatch_failures",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: JSON.stringify({
+        id: row.id,
+        outcome: "dispatched",
+        ...(verb === "close" ? {} : { verb }),
+      }),
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
+      $config_dir: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $plan_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+      $worktree: null,
+    });
+  }
+
   /**
    * Admit one `Dispatched` attempt through the durable mint gate. Both the
    * reconciler bridge and the blocked-owner attachment path call this before
    * launch, so every `work::<task>` side effect carries an exact Event-derived
-   * attempt fence and a crash leaves a bounded `pending_dispatches` lease.
+   * attempt fence and a crash leaves a bounded `pending_dispatches` lease. A
+   * routed merge incident consumes its next attachment marker in the SAME
+   * transaction, so a restart cannot launch an uncounted owner.
    */
   function admitDispatched(payload: DispatchedPayload): DispatchedAck {
     const dispatchKey = `${payload.verb}::${payload.id}`;
@@ -12974,6 +13190,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         expected_attempt_id: currentClaim?.attempt_id ?? null,
       });
       const nowMs = Date.now();
+      const incident = incidentOwnerFailureForAdmission(
+        payload.verb,
+        payload.id,
+      );
+      const incidentMarker =
+        incident == null ? null : nextIncidentOwnerAttachmentMarker(incident);
+      if (
+        incident != null &&
+        isOwnerRoutableIncident(incident) &&
+        incidentMarker == null
+      ) {
+        return { ok: false, suppressed: true };
+      }
       // The gate read + the conditional insert run atomically in ONE
       // `BEGIN IMMEDIATE`. `onFreshMint` runs only on the mint branch (gate empty
       // or window elapsed); a re-mint inside the window suppresses without
@@ -13031,6 +13260,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // derives the same value from the marker in `data`; the ack carries it
           // into the launch metadata envelope before any backend execution.
           attemptId = insertedId;
+          if (incident != null && incidentMarker != null) {
+            insertIncidentOwnerAttachmentMarker(
+              incident,
+              incidentMarker,
+              nowMs / 1000,
+            );
+          }
           ok = true;
         },
       ));
@@ -14468,7 +14704,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // re-sweepable. All wall-clock + spawn lives HERE in the producer; the spawn lives only
   // here, so a re-fold never re-fires a launch. Rides the SAME 60s heartbeat as the block
   // tick. `void` + `.catch`: the async launch must not block the heartbeat.
-  async function runMergeEscalationSweepTick(): Promise<void> {
+  async function _runMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a paused
     // board never auto-dispatches a NEW escalation session, mirroring the resolver-
@@ -14503,20 +14739,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a session, so it runs only where the
-  // launcher is reachable (a server-only boot never dispatches). Rides the same 60s
-  // heartbeat as the resolver-dispatch sweep.
-  const mergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  // Owner-mediated incidents never launch a top-level deconflict session. Keep
+  // the legacy sweep callable for bounded compatibility tests, but do not arm it.
+  const mergeEscalationSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   // The stage-3 board-state gate for the deconflict notify: is the epic's sticky
   // `close::<epic>` merge-conflict row still present? A successful deconflict clears it
@@ -14567,7 +14792,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // a `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires. Same pause + autopilot-role gating as the
   // dispatch sweep.
-  async function runDeconflictHumanNotifySweepTick(): Promise<void> {
+  async function _runDeconflictHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runDeconflictHumanNotifySweep({
@@ -14602,17 +14827,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const deconflictHumanNotifySweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runDeconflictHumanNotifySweepTick().catch((err) => {
-          console.error(
-            `[keeperd] deconflict human-notify sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const deconflictHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // The sticky work row's `instance_event_id` — the block-instance anchor the work-verb
   // resolver-outcome probe (stage 2) and the work human-notify (stage 3) scope their jobs
@@ -14717,7 +14933,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `notify_failed` re-sweeps. A successful deconflict clears the sticky (its own
   // `retry_dispatch`) before this ever fires; `retry_dispatch` also re-arms the whole chain
   // for a genuine re-conflict. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeHumanNotifySweepTick(): Promise<void> {
+  async function _runWorkMergeHumanNotifySweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runWorkMergeHumanNotifySweep({
@@ -14754,11 +14970,75 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeHumanNotifySweepTimer = want("autopilot")
+  const workMergeHumanNotifySweepTimer: ReturnType<typeof setInterval> | null =
+    null;
+
+  function incidentOwnerActive(row: PendingIncidentOwnerPage): boolean {
+    try {
+      if (
+        db
+          .query(
+            "SELECT 1 FROM pending_dispatches WHERE verb = ? AND id = ? LIMIT 1",
+          )
+          .get(row.verb, row.id) != null ||
+        db
+          .query(
+            "SELECT 1 FROM dispatch_claims WHERE verb = ? AND id = ? AND state != 'released' LIMIT 1",
+          )
+          .get(row.verb, row.id) != null
+      ) {
+        return true;
+      }
+      const jobs = db
+        .query("SELECT * FROM jobs WHERE plan_verb = ? AND plan_ref = ?")
+        .all(row.verb, row.id) as unknown as Job[];
+      const activities = ownerActivities(jobs);
+      return jobs.some(
+        (job) =>
+          (activities.get(job.job_id) ?? deriveHarnessActivity({ parent: job }))
+            .status !== "quiescent",
+      );
+    } catch {
+      // An inconclusive ownership read must never page over a potentially-live owner.
+      return true;
+    }
+  }
+
+  async function runIncidentOwnerPageSweepTick(): Promise<void> {
+    if (shuttingDown || autopilotPaused) return;
+    await runIncidentOwnerPageSweep({
+      selectPending: () => selectPendingIncidentOwnerPages(db),
+      stillPending: (row) => {
+        try {
+          return (
+            db
+              .query(
+                `SELECT 1 FROM dispatch_failures
+                  WHERE verb = ? AND id = ? AND instance_event_id IS ?
+                    AND claim_session_id IS NULL
+                    AND resolver_dispatched_at IS NOT NULL
+                    AND merge_escalated_at IS NOT NULL
+                    AND human_notified_at IS NULL
+                  LIMIT 1`,
+              )
+              .get(row.verb, row.id, row.instanceEventId) != null
+          );
+        } catch {
+          return false;
+        }
+      },
+      ownerActive: (row) => incidentOwnerActive(row),
+      notifyHuman: (row) => notifyHuman(buildIncidentOwnerPageBody(row)),
+      mintNotified: (row, outcome) =>
+        mintMergeHumanNotifiedEvent(row.id, outcome, row.verb),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const incidentOwnerPageSweepTimer = want("autopilot")
     ? setInterval(() => {
-        void runWorkMergeHumanNotifySweepTick().catch((err) => {
+        void runIncidentOwnerPageSweepTick().catch((err) => {
           console.error(
-            `[keeperd] work fan-in human-notify sweep tick threw (non-fatal): ${
+            `[keeperd] incident-owner page sweep tick threw (non-fatal): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -14790,7 +15070,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows whose resolver reached a TERMINAL verdict (leased so a crashed resolver never
   // deadlocks) and dispatches ONE `deconflict::<taskId>` session, stamping `merge_escalated_at`
   // on a terminal `dispatched`. Same pause + autopilot-role gating as the sibling sweeps.
-  async function runWorkMergeEscalationSweepTick(): Promise<void> {
+  async function _runWorkMergeEscalationSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runMergeEscalationSweep({
@@ -14822,17 +15102,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workMergeEscalationSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkMergeEscalationSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work deconflict-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workMergeEscalationSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // Launch ONE autonomous `resolve::<taskId>` merge-resolver worker for a stuck work
   // fan-in conflict (fn-1240 tier-2 stage 1), the work-verb twin of `dispatchResolver`.
@@ -14901,7 +15172,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // rows with a NULL resolver latch and launches ONE `resolve::<taskId>` worker, stamping
   // `resolver_dispatched_at` on a terminal `dispatched`. Same pause + autopilot-role gating
   // as the sibling sweeps: a paused board defers the launch (the human is in control).
-  async function runWorkResolverDispatchSweepTick(): Promise<void> {
+  async function _runWorkResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     if (autopilotPaused) return;
     await runResolverDispatchSweep({
@@ -14925,17 +15196,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  const workResolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runWorkResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] work resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  const workResolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   function readWorkerProvider(): WorkerProvider | null {
     try {
@@ -16022,7 +16284,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     return result.ok ? "dispatched" : "dispatch_failed";
   }
 
-  async function runResolverDispatchSweepTick(): Promise<void> {
+  async function _runResolverDispatchSweepTick(): Promise<void> {
     if (shuttingDown) return;
     // Paused = the human is in control (the `[paused]` banner is authoritative); a
     // paused board never auto-dispatches a NEW resolver, mirroring the reconciler's own
@@ -16054,20 +16316,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       noteLine: (line) => console.error(`[keeperd] ${line}`),
     });
   }
-  // Gated on the autopilot role — the sweep LAUNCHES a worker, so it runs only where
-  // the launcher is reachable (a server-only boot never dispatches). Rides the same
-  // 60s heartbeat as the merge-escalation sweep.
-  const resolverDispatchSweepTimer = want("autopilot")
-    ? setInterval(() => {
-        void runResolverDispatchSweepTick().catch((err) => {
-          console.error(
-            `[keeperd] resolver-dispatch sweep tick threw (non-fatal): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          );
-        });
-      }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
-    : null;
+  // Merge incidents reattach their ordinary owner; no top-level resolver is armed.
+  const resolverDispatchSweepTimer: ReturnType<typeof setInterval> | null =
+    null;
 
   // Incident-claim producer. Validates a session's spooled claim/release
   // against the live incident row + claimant liveness and mints the synthetic
@@ -17600,6 +17851,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     if (workMergeHumanNotifySweepTimer !== null) {
       clearInterval(workMergeHumanNotifySweepTimer);
+    }
+    if (incidentOwnerPageSweepTimer !== null) {
+      clearInterval(incidentOwnerPageSweepTimer);
     }
     if (workMergeEscalationSweepTimer !== null) {
       clearInterval(workMergeEscalationSweepTimer);

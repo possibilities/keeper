@@ -68,6 +68,7 @@ import {
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
+  buildIncidentOwnerPageBody,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildSharedCheckoutPageBody,
@@ -110,6 +111,7 @@ import {
   gcUnretryableDispatchFailures,
   INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
   type IncidentClaimSweepDeps,
+  type IncidentOwnerPageSweepDeps,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
@@ -124,6 +126,7 @@ import {
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
   type PendingBlockHumanNotify,
+  type PendingIncidentOwnerPage,
   type PendingMergeEscalation,
   type PendingRepairRow,
   type PendingResolverDispatch,
@@ -174,6 +177,7 @@ import {
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
   runIncidentClaimSweep,
+  runIncidentOwnerPageSweep,
   runMergeEscalationSweep,
   runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
@@ -200,6 +204,7 @@ import {
   selectPendingBlockEscalations,
   selectPendingBlockHumanNotifications,
   selectPendingHumanNotifications,
+  selectPendingIncidentOwnerPages,
   selectPendingMergeEscalations,
   selectPendingResolverDispatches,
   selectPendingWorkMergeEscalations,
@@ -269,8 +274,19 @@ import {
   sendAgentbotPage,
 } from "../src/integrity-probe";
 import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
-import type { ResolverOutcome } from "../src/reconcile-core";
-import { classifyResolverOutcome } from "../src/reconcile-core";
+import type {
+  ReconcileSnapshot,
+  ReconcileState,
+  ResolverOutcome,
+} from "../src/reconcile-core";
+import {
+  classifyResolverOutcome,
+  INCIDENT_OWNER_ATTACHMENT_LIMIT,
+  nextIncidentOwnerAttachmentMarker,
+  reconcile,
+  WORKER_EFFORT,
+  WORKER_MODEL,
+} from "../src/reconcile-core";
 import {
   __resetEpicIndexMemoForTest,
   drain,
@@ -288,7 +304,7 @@ import {
   runQuery,
   sliceFanout,
 } from "../src/server-worker";
-import type { Event, Job } from "../src/types";
+import type { Epic, Event, Job, Task } from "../src/types";
 import { repoToken, worktreePathFor } from "../src/worktree-plan";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshDbFile, freshMemDb } from "./helpers/template-db";
@@ -9260,6 +9276,278 @@ function seedMergeFailureRow(
     ],
   );
 }
+
+function ownerIncidentPage(
+  overrides: Partial<PendingIncidentOwnerPage> = {},
+): PendingIncidentOwnerPage {
+  return {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: mergeConflictReason(
+      "keeper/epic/fn-1350-owner--fn-1350-owner.2",
+      "keeper/epic/fn-1350-owner",
+    ),
+    dir: "/repo/lane",
+    claimSessionId: null,
+    instanceEventId: 50,
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+    humanNotifiedAt: null,
+    ...overrides,
+  };
+}
+
+function routerTask(overrides: Partial<Task> = {}): Task {
+  return {
+    task_id: "fn-1350-owner.1",
+    epic_id: "fn-1350-owner",
+    task_number: 1,
+    title: "integrate",
+    target_repo: null,
+    tier: null,
+    model: null,
+    worker_phase: "open",
+    runtime_status: "todo",
+    depends_on: [],
+    jobs: [],
+    ...overrides,
+  };
+}
+
+function routerEpic(overrides: Partial<Epic> = {}): Epic {
+  return {
+    epic_id: "fn-1350-owner",
+    epic_number: 1350,
+    title: "owner router",
+    project_dir: "/repo",
+    status: "open",
+    last_event_id: 1,
+    updated_at: 1,
+    depends_on_epics: [],
+    tasks: [routerTask()],
+    jobs: [],
+    job_links: [],
+    resolved_epic_deps: null,
+    last_validated_at: "2026-07-19T00:00:00Z",
+    question: null,
+    blocks_closing_of: null,
+    ...overrides,
+  };
+}
+
+function routerSnapshot(
+  epics: Epic[],
+  incidentOwnerKeys: Set<string>,
+  failedKeys: Set<string> = new Set(incidentOwnerKeys),
+): ReconcileSnapshot {
+  return {
+    readinessDegraded: false,
+    epics,
+    jobs: new Map(),
+    subagentInvocations: [],
+    gitStatusByProjectDir: new Map(),
+    failedKeys,
+    incidentOwnerKeys,
+    claimedIncidentKeys: new Set(),
+    recoverFailureIds: new Set(),
+    finalizeFailureIds: new Set(),
+    slotOccupancyFailures: [],
+    liveTabKeys: new Set(),
+    dispatchClaims: new Map(),
+    harnessActivityByJobId: new Map(),
+    livePaneIds: new Set(),
+    paneCommandById: new Map(),
+    provenDeadJobIds: new Set(),
+    pendingDispatches: [],
+    mode: "yolo",
+    armedIds: new Set(),
+    unseededRoots: new Set(),
+    workModel: WORKER_MODEL,
+    workEffort: WORKER_EFFORT,
+    closeModel: WORKER_MODEL,
+    closeEffort: WORKER_EFFORT,
+    hostMatrix: {
+      ok: true,
+      models: ["opus", "sonnet"],
+      effortsByModel: new Map(),
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+      driverByModel: new Map([
+        ["opus", "native"],
+        ["sonnet", "native"],
+      ]),
+    },
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+    worktreeMode: false,
+    worktreeRepoByEpicId: new Map(),
+  };
+}
+
+function routerState(paused = false): ReconcileState {
+  return {
+    paused,
+    inFlight: new Set(),
+    redispatchCooldown: new Map(),
+    finalizerGuard: new Map(),
+    maxConcurrentJobs: null,
+    maxConcurrentPerRoot: 1,
+  };
+}
+
+test("owner incident attachment slots are classified by typed row route and bounded durably", () => {
+  const first = ownerIncidentPage({
+    resolverDispatchedAt: null,
+    mergeEscalatedAt: null,
+  });
+  expect(nextIncidentOwnerAttachmentMarker(first)).toBe("resolver");
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      resolverDispatchedAt: 10,
+    }),
+  ).toBe("merge");
+  expect(nextIncidentOwnerAttachmentMarker(ownerIncidentPage())).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      reason: "tooling-failure: surface and stop",
+    }),
+  ).toBeNull();
+  expect(
+    nextIncidentOwnerAttachmentMarker({
+      ...first,
+      claimSessionId: "live-owner",
+    }),
+  ).toBeNull();
+  expect(INCIDENT_OWNER_ATTACHMENT_LIMIT).toBe(2);
+});
+
+test("reconcile routes only exact owner incidents through ordinary work/close dispatch and pause holds both", () => {
+  const workKey = "work::fn-1350-owner.1";
+  const work = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(work.launches.map((launch) => launch.key)).toEqual([workKey]);
+  expect(work.launches[0]?.verb).toBe("work");
+
+  const paused = reconcile(
+    routerSnapshot([routerEpic()], new Set([workKey])),
+    routerState(true),
+    100,
+  );
+  expect(paused.launches).toEqual([]);
+  expect(paused.withholds.get("fn-1350-owner.1")?.code).toBe(
+    "autopilot-paused",
+  );
+
+  const suppressed = reconcile(
+    routerSnapshot([routerEpic()], new Set(), new Set([workKey])),
+    routerState(),
+    100,
+  );
+  expect(suppressed.launches).toEqual([]);
+  expect(suppressed.withholds.get("fn-1350-owner.1")?.code).toBe("failed-key");
+
+  const closeKey = "close::fn-1350-owner";
+  const done = routerEpic({
+    status: "done",
+    tasks: [
+      routerTask({
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+  const close = reconcile(
+    routerSnapshot([done], new Set([closeKey])),
+    routerState(),
+    100,
+  );
+  expect(close.launches.map((launch) => launch.key)).toEqual([closeKey]);
+  expect(close.launches[0]?.verb).toBe("close");
+});
+
+test("exhausted incident attachments page once after the owner yields and never dispatch an escalation verb", async () => {
+  const row = ownerIncidentPage();
+  const paged = new Set<string>();
+  const notified: string[] = [];
+  const minted: string[] = [];
+  const deps: IncidentOwnerPageSweepDeps = {
+    selectPending: () => (paged.has(`${row.verb}::${row.id}`) ? [] : [row]),
+    stillPending: () => true,
+    ownerActive: () => false,
+    notifyHuman: async (candidate) => {
+      notified.push(buildIncidentOwnerPageBody(candidate));
+      return "notified";
+    },
+    mintNotified: (candidate, outcome) => {
+      minted.push(`${candidate.verb}::${candidate.id}:${outcome}`);
+      if (outcome === "notified") {
+        paged.add(`${candidate.verb}::${candidate.id}`);
+      }
+    },
+  };
+  await runIncidentOwnerPageSweep(deps);
+  await runIncidentOwnerPageSweep(deps);
+  expect(minted).toEqual(["work::fn-1350-owner.1:notified"]);
+  expect(notified).toHaveLength(1);
+  expect(notified[0]).toContain("No escalation session was launched");
+  expect(notified[0]).not.toContain("resolve::");
+  expect(notified[0]).not.toContain("deconflict::");
+});
+
+test("incident owner page selector excludes claims, non-incidents, and unexhausted attachments", () => {
+  const { db } = freshMemDb();
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-owner.1",
+    reason: ownerIncidentPage().reason,
+    dir: "/repo/lane",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  seedMergeFailureRow(db, {
+    verb: "close",
+    id: "fn-1350-owner",
+    reason: ownerIncidentPage({ verb: "close" }).reason,
+    resolverDispatchedAt: 10,
+  });
+  seedMergeFailureRow(db, {
+    verb: "work",
+    id: "fn-1350-other.1",
+    reason: "launch_failed: not an incident",
+    resolverDispatchedAt: 10,
+    mergeEscalatedAt: 20,
+  });
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = 'owner' WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db)).toEqual([]);
+  db.run(
+    "UPDATE dispatch_failures SET claim_session_id = NULL WHERE verb = 'work' AND id = 'fn-1350-owner.1'",
+  );
+  expect(selectPendingIncidentOwnerPages(db).map((row) => row.id)).toEqual([
+    "fn-1350-owner.1",
+  ]);
+  db.close();
+});
+
+test("incident owner page sweep defers while the final ordinary owner is active", async () => {
+  const notified: string[] = [];
+  await runIncidentOwnerPageSweep({
+    selectPending: () => [ownerIncidentPage()],
+    stillPending: () => true,
+    ownerActive: () => true,
+    notifyHuman: async () => {
+      notified.push("unexpected");
+      return "notified";
+    },
+    mintNotified: () => notified.push("unexpected-mint"),
+  });
+  expect(notified).toEqual([]);
+});
 
 test("selectPendingMergeEscalations: picks only close rows with an exact worktree-merge-conflict token, a NULL escalate marker, and a dispatched resolver", () => {
   const { db } = freshMemDb();
