@@ -78,6 +78,11 @@
 import type { Database } from "bun:sqlite";
 import { BACKFILL_WATERMARK_KEY } from "./backfill-mutation-path";
 import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
+import {
+  createMaintenanceTimeBudget,
+  type MaintenanceTimeBudget,
+  runBudgetedMaintenanceLoop,
+} from "./maintenance-budget";
 
 /**
  * Keep the most-recent N events' bodies inline UNCONDITIONALLY, regardless of
@@ -106,13 +111,13 @@ export const DEFAULT_RETENTION_BATCH_SIZE = 500;
 export const DEFAULT_RETENTION_SCAN_FACTOR = 4;
 
 /**
- * Max batches per pass. Caps a single timer-scheduled pass at
- * `maxBatches * batchSize` rows so the pass can't monopolize the writer for an
- * unbounded stretch; the cold tail drains across successive passes. The first
- * post-deploy pass over the historical backlog takes many passes to fully drain
- * — that's intentional pacing, not a stall.
+ * Max transactions per scheduled pass. The shared wall-clock budget is the
+ * primary guard; this ceiling stays high enough that cheap batches keep using
+ * the budget instead of stopping early on a row-count cap. Each transaction still
+ * mutates at most {@link DEFAULT_RETENTION_BATCH_SIZE} rows and yields before the
+ * next step, so the writer lock is released throughout a catch-up pass.
  */
-export const DEFAULT_RETENTION_MAX_BATCHES = 20;
+export const DEFAULT_RETENTION_MAX_BATCHES = 200;
 
 /**
  * Pages returned to the file tail per `incremental_vacuum` call. Small on
@@ -353,6 +358,12 @@ export interface RetentionResult {
   cursor: number;
   /** Pages returned to the file tail by per-batch `incremental_vacuum`. */
   reclaimedPages: number;
+  /** Highest event id fully examined by the persisted body-shed scan. */
+  scanWatermark: number;
+  /** Estimated event-id rows left to examine below this pass's active ceiling. */
+  remainingScanRows: number;
+  /** Estimated scan batches left at the current scan-window size. */
+  estimatedRemainingBatches: number;
   /** `true` while the persisted scan watermark remains below this pass's ceiling. */
   moreLikely: boolean;
 }
@@ -370,6 +381,9 @@ interface ColdScanMutationResult {
   moved: number;
   batches: number;
   reclaimedPages: number;
+  scanWatermark: number;
+  remainingScanRows: number;
+  estimatedRemainingBatches: number;
   moreLikely: boolean;
 }
 
@@ -385,6 +399,8 @@ export interface YieldingRetentionBatchResult {
 export interface YieldingRetentionBatchOptions {
   /** Maximum one-transaction steps in this event-loop turn sequence. */
   maxBatches?: number;
+  /** Shared wall-clock budget checked between transactions. */
+  budget?: MaintenanceTimeBudget;
   /** Event-loop yield seam. Tests inject a deterministic observer. */
   yieldTurn?: () => Promise<void>;
   /** Cancellation seam checked before every transaction. */
@@ -397,40 +413,15 @@ export interface YieldingRetentionBatchOptions {
  * yielding separately lets MAIN service worker-bridged control RPCs while a
  * historical retention backlog advances.
  */
-function defaultRetentionYieldTurn(): Promise<void> {
-  return new Promise<void>((resolve) => setImmediate(resolve));
-}
-
 export async function runYieldingRetentionBatches<
   T extends YieldingRetentionBatchResult,
 >(step: () => T, options: YieldingRetentionBatchOptions = {}): Promise<T[]> {
-  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
-  if (!Number.isSafeInteger(maxBatches) || maxBatches < 0) {
-    throw new RangeError("maxBatches must be a safe non-negative integer");
-  }
-  const yieldTurn = options.yieldTurn ?? defaultRetentionYieldTurn;
-  const shouldContinue = options.shouldContinue ?? (() => true);
-  const results: T[] = [];
-
-  for (let i = 0; i < maxBatches && shouldContinue(); i++) {
-    const result = step();
-    if (
-      !Number.isSafeInteger(result.batches) ||
-      result.batches < 0 ||
-      result.batches > 1
-    ) {
-      throw new Error(
-        "yielding retention step must execute at most one transaction",
-      );
-    }
-    results.push(result);
-    if (result.batches === 0 || !result.moreLikely || i + 1 >= maxBatches) {
-      break;
-    }
-    await yieldTurn();
-  }
-
-  return results;
+  return runBudgetedMaintenanceLoop(step, {
+    maxBatches: options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES,
+    budget: options.budget,
+    yieldTurn: options.yieldTurn,
+    shouldContinue: options.shouldContinue,
+  });
 }
 
 function readMetaValue(db: Database, key: string): string | null {
@@ -506,10 +497,14 @@ function mutateColdRowsByScan(
 
   let scanWatermark = readScanProgress(db, input.progressKey, input.signature);
   if (scanWatermark >= input.idCeiling || maxBatches === 0) {
+    const remainingScanRows = Math.max(0, input.idCeiling - scanWatermark);
     return {
       moved: 0,
       batches: 0,
       reclaimedPages: 0,
+      scanWatermark,
+      remainingScanRows,
+      estimatedRemainingBatches: Math.ceil(remainingScanRows / scanBatchSize),
       moreLikely: scanWatermark < input.idCeiling,
     };
   }
@@ -614,10 +609,14 @@ function mutateColdRowsByScan(
     }
   }
 
+  const remainingScanRows = Math.max(0, input.idCeiling - scanWatermark);
   return {
     moved,
     batches,
     reclaimedPages,
+    scanWatermark,
+    remainingScanRows,
+    estimatedRemainingBatches: Math.ceil(remainingScanRows / scanBatchSize),
     moreLikely: scanWatermark < input.idCeiling,
   };
 }
@@ -689,6 +688,9 @@ export function retainColdPayloads(
       coldWatermark,
       cursor,
       reclaimedPages: 0,
+      scanWatermark: 0,
+      remainingScanRows: 0,
+      estimatedRemainingBatches: 0,
       moreLikely: false,
     };
   }
@@ -711,6 +713,9 @@ export function retainColdPayloads(
     coldWatermark,
     cursor,
     reclaimedPages: result.reclaimedPages,
+    scanWatermark: result.scanWatermark,
+    remainingScanRows: result.remainingScanRows,
+    estimatedRemainingBatches: result.estimatedRemainingBatches,
     moreLikely: result.moreLikely,
   };
 }
@@ -761,23 +766,20 @@ export interface DrainResult {
 export const DEFAULT_DRAIN_MAX_PASSES = 1_000;
 
 /**
- * Batch count per catch-up pass — far larger than the steady-state
- * {@link DEFAULT_RETENTION_MAX_BATCHES} (20) because the one-shot catch-up wants
- * to clear the historical backlog promptly, not pace across slack ticks. Still
- * one ≤`batchSize`-row transaction per batch, so the writer lock is released
- * between batches and a concurrent hook INSERT is never starved — only the
- * per-PASS cap is elevated, never the per-TX row count.
+ * Batch count per catch-up pass. The operator drain reuses the high steady-state
+ * ceiling but loops full passes synchronously until the persisted scan reaches
+ * the cold/cursor ceiling. Still one ≤`batchSize`-row transaction per batch, so
+ * the writer lock is released between batches and a concurrent hook INSERT is
+ * never starved.
  */
 export const DEFAULT_DRAIN_MAX_BATCHES = 200;
 
 /**
  * One-shot catch-up drain: drive {@link retainColdPayloads} to completion,
  * NULLing the entire cold shed-class backlog in ≤`batchSize`-row transactions.
- * For the OPERATOR catch-up after a predicate widening (fn-837) — the
- * steady-state 300s timer (≤`DEFAULT_RETENTION_MAX_BATCHES` batches/pass) would
- * take hours to drain a ~600k-row historical backlog. This loops the same paced
- * scan with an elevated per-pass batch cap until its persisted watermark reaches
- * the cold/cursor ceiling.
+ * Operator catch-up loops the same paced scan until its persisted watermark
+ * reaches the cold/cursor ceiling, instead of waiting for scheduled slack
+ * heartbeats.
  *
  * Idempotent + resumable by construction: each transaction advances the scan
  * watermark atomically with its body updates, so a re-run continues from the
@@ -841,6 +843,12 @@ export interface DeleteResult {
   cursor: number;
   /** Pages returned to the file tail by per-batch `incremental_vacuum`. */
   reclaimedPages: number;
+  /** Highest event id fully examined by the persisted delete scan. */
+  scanWatermark: number;
+  /** Estimated event-id rows left to examine below this pass's active ceiling. */
+  remainingScanRows: number;
+  /** Estimated scan batches left at the current scan-window size. */
+  estimatedRemainingBatches: number;
   /** `true` while the persisted scan watermark remains below this pass's ceiling. */
   moreLikely: boolean;
 }
@@ -927,6 +935,9 @@ function deleteColdRowsByPredicate(
       coldWatermark,
       cursor,
       reclaimedPages: 0,
+      scanWatermark: 0,
+      remainingScanRows: 0,
+      estimatedRemainingBatches: 0,
       moreLikely: false,
     };
   }
@@ -953,11 +964,16 @@ function deleteColdRowsByPredicate(
     coldWatermark,
     cursor,
     reclaimedPages: result.reclaimedPages,
+    scanWatermark: result.scanWatermark,
+    remainingScanRows: result.remainingScanRows,
+    estimatedRemainingBatches: result.estimatedRemainingBatches,
     moreLikely: result.moreLikely,
   };
 }
 
 export interface YieldingRetentionPassOptions extends RetentionOptions {
+  /** Shared wall-clock budget checked between transactions and surfaces. */
+  budget?: MaintenanceTimeBudget;
   /** Event-loop yield seam. Defaults to `setImmediate`. */
   yieldTurn?: () => Promise<void>;
   /** Cancellation seam checked between transactions and surfaces. */
@@ -968,6 +984,7 @@ export interface YieldingRetentionPassResult {
   bodies: RetentionResult;
   noopSnapshots: DeleteResult;
   tmuxFocus: DeleteResult;
+  budgetExhausted: boolean;
 }
 
 function aggregateRetentionResults(
@@ -994,6 +1011,26 @@ function aggregateDeleteResults(results: DeleteResult[]): DeleteResult | null {
   };
 }
 
+function deferredDeleteResult(
+  reference: RetentionResult | DeleteResult,
+): DeleteResult {
+  return {
+    deleted: 0,
+    batches: 0,
+    coldWatermark: reference.coldWatermark,
+    cursor: reference.cursor,
+    reclaimedPages: 0,
+    scanWatermark: reference.scanWatermark,
+    remainingScanRows: reference.remainingScanRows,
+    estimatedRemainingBatches: reference.estimatedRemainingBatches,
+    moreLikely: true,
+  };
+}
+
+function defaultRetentionYieldTurn(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 /**
  * Advance all three event-retention surfaces, one transaction per event-loop
  * turn. A yield also separates surfaces when one reaches its ceiling in a
@@ -1006,12 +1043,14 @@ export async function runYieldingRetentionPass(
 ): Promise<YieldingRetentionPassResult | null> {
   const {
     maxBatches = DEFAULT_RETENTION_MAX_BATCHES,
+    budget = createMaintenanceTimeBudget(),
     yieldTurn = defaultRetentionYieldTurn,
     shouldContinue = () => true,
     ...retentionOptions
   } = options;
   const driverOptions: YieldingRetentionBatchOptions = {
     maxBatches,
+    budget,
     yieldTurn,
     shouldContinue,
   };
@@ -1024,7 +1063,17 @@ export async function runYieldingRetentionPass(
     () => retainColdPayloads(db, stepOptions),
     driverOptions,
   );
-  if (!shouldContinue()) return null;
+  const bodies = aggregateRetentionResults(bodyResults);
+  if (!bodies || !shouldContinue()) return null;
+  if (budget.exhausted()) {
+    const deferred = deferredDeleteResult(bodies);
+    return {
+      bodies,
+      noopSnapshots: deferred,
+      tmuxFocus: deferred,
+      budgetExhausted: true,
+    };
+  }
   await yieldTurn();
   if (!shouldContinue()) return null;
 
@@ -1032,6 +1081,16 @@ export async function runYieldingRetentionPass(
     () => deleteNoopSnapshotRows(db, stepOptions),
     driverOptions,
   );
+  const noopSnapshots =
+    aggregateDeleteResults(noopResults) ?? deferredDeleteResult(bodies);
+  if (budget.exhausted()) {
+    return {
+      bodies,
+      noopSnapshots,
+      tmuxFocus: deferredDeleteResult(noopSnapshots),
+      budgetExhausted: true,
+    };
+  }
   if (!shouldContinue()) return null;
   await yieldTurn();
   if (!shouldContinue()) return null;
@@ -1040,15 +1099,18 @@ export async function runYieldingRetentionPass(
     () => deleteColdTmuxFocusRows(db, stepOptions),
     driverOptions,
   );
+  const tmuxFocus =
+    aggregateDeleteResults(focusResults) ?? deferredDeleteResult(noopSnapshots);
   if (!shouldContinue()) return null;
-  await yieldTurn();
+  if (!budget.exhausted()) await yieldTurn();
   if (!shouldContinue()) return null;
 
-  const bodies = aggregateRetentionResults(bodyResults);
-  const noopSnapshots = aggregateDeleteResults(noopResults);
-  const tmuxFocus = aggregateDeleteResults(focusResults);
-  if (!bodies || !noopSnapshots || !tmuxFocus) return null;
-  return { bodies, noopSnapshots, tmuxFocus };
+  return {
+    bodies,
+    noopSnapshots,
+    tmuxFocus,
+    budgetExhausted: budget.exhausted(),
+  };
 }
 
 /** Current freelist page count — the pool `incremental_vacuum` drains. */
@@ -1092,6 +1154,36 @@ export function reclaimableLogStep(
 ): { shouldLog: boolean; step: number } {
   const step = Math.floor(Math.max(0, reclaimableBytes) / stepBytes);
   return { shouldLog: step > lastLoggedStep, step };
+}
+
+/** Body-shed progress log cadence, in committed scan transactions. */
+export const RETENTION_SHED_PROGRESS_LOG_BATCHES = 100;
+
+/**
+ * Step-latch decision for large body-shed backlog progress. Pure and monotone:
+ * callers accumulate committed body-shed batches and log only on a fresh upward
+ * step while `moreLikely` remains true, then reset once the scan reaches its
+ * ceiling.
+ */
+export function retentionShedProgressLogStep(
+  completedBatches: number,
+  lastLoggedStep: number,
+  stepBatches: number = RETENTION_SHED_PROGRESS_LOG_BATCHES,
+): { shouldLog: boolean; step: number } {
+  const step = Math.floor(Math.max(0, completedBatches) / stepBatches);
+  return { shouldLog: step > lastLoggedStep, step };
+}
+
+/** Bounded daemon log line for large body-shed backlog progress. */
+export function formatRetentionShedProgressLogLine(
+  result: RetentionResult,
+  completedBatches: number,
+): string {
+  const activeCeiling = Math.max(
+    0,
+    Math.min(result.coldWatermark, result.cursor - 1),
+  );
+  return `[keeperd] retention: shed progress ${completedBatches} body batch(es), scan id<=${result.scanWatermark}/${activeCeiling}, ~${result.remainingScanRows} cold row(s) remain (~${result.estimatedRemainingBatches} scan batch(es))`;
 }
 
 /**

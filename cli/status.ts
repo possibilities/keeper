@@ -87,7 +87,8 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * display-only `event_store` block — event count, DB bytes, and durations
  * projected from the most recent boot's measured catch-up rate; the current
  * The current schema includes the independent Non-Fable focus view, distinct
- * poison count, and bounded commit-rail scope context under `needs_human`.
+ * poison count, bounded commit-rail scope context under `needs_human`, and
+ * `ingest_lag_seconds`.
  * `in_flight.running_jobs` remains emitted but is deprecated in favor of
  * `in_flight.board_work_jobs`. */
 export const STATUS_SCHEMA_VERSION = 16;
@@ -267,6 +268,7 @@ export interface StatusData {
   };
   rev: number | null;
   catching_up: boolean;
+  ingest_lag_seconds: number | null;
   // fn-1311 — total event count, DB byte size, and durations projected from
   // the most recent boot's measured catch-up rate. `null` only when the
   // daemon hasn't served a boot header yet (never happens on a real snapshot;
@@ -602,6 +604,7 @@ export function buildStatusEnvelope(
     },
     rev: boot.rev,
     catching_up: boot.catching_up,
+    ingest_lag_seconds: boot.event_store?.ingest_lag_seconds ?? null,
     event_store: boot.event_store,
   });
 }

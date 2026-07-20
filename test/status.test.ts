@@ -46,6 +46,7 @@ import type {
 } from "../src/readiness-client";
 import {
   computeEventStoreStatus,
+  computeIngestLagSeconds,
   readEventStoreStatus,
 } from "../src/server-worker";
 import { freshMemDb } from "./helpers/template-db";
@@ -202,6 +203,7 @@ describe("computeEventStoreStatus", () => {
     expect(out).toEqual({
       event_count: 1000,
       db_bytes: 65536,
+      ingest_lag_seconds: 0,
       last_boot_catchup: null,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
@@ -352,11 +354,29 @@ describe("readEventStoreStatus wiring", () => {
     expect(eventStore).toEqual({
       event_count: 0,
       db_bytes: expect.any(Number),
+      ingest_lag_seconds: 0,
       last_boot_catchup: null,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
     });
     expect(eventStore.db_bytes).toBeGreaterThan(0);
+  });
+
+  test("ingest lag derives from the reducer cursor's event timestamp", () => {
+    const { db } = freshMemDb();
+    db.run(
+      "INSERT INTO events (ts, session_id, hook_event, event_type) VALUES (?, ?, ?, ?)",
+      [
+        1_000,
+        "01234567-89ab-cdef-0123-456789abcdef",
+        "SessionStart",
+        "SessionStart",
+      ],
+    );
+    db.run("UPDATE reducer_state SET last_event_id = 1 WHERE id = 1");
+    expect(readEventStoreStatus(db, 1_000.4).ingest_lag_seconds).toBe(0);
+    expect(readEventStoreStatus(db, 1_042.7).ingest_lag_seconds).toBe(42);
+    expect(computeIngestLagSeconds(1_050, 1_060)).toBe(0);
   });
 
   test("a recorded boot measurement surfaces on the block, scaled against live event_count", () => {
@@ -427,7 +447,7 @@ describe("readEventStoreStatus wiring", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildStatusEnvelope shape", () => {
-  test("status schema version includes poison visibility", () => {
+  test("status schema version includes ingest lag", () => {
     expect(STATUS_SCHEMA_VERSION).toBe(16);
   });
 
@@ -492,6 +512,7 @@ describe("buildStatusEnvelope shape", () => {
     // boot header passthrough
     expect(d.rev).toBe(4242);
     expect(d.catching_up).toBe(false);
+    expect(d.ingest_lag_seconds).toBeNull();
     expect(d.event_store).toBeNull();
     // count + flag + in_flight + needs_human blocks present
     expect(d.counts.epics.total).toBe(1);
@@ -1505,6 +1526,7 @@ describe("runStatus pinned-epics snapshot sourcing (ADR 0018, fn-1175.2)", () =>
 const FIXTURE_EVENT_STORE: EventStoreStatus = {
   event_count: 4242,
   db_bytes: 1_048_576,
+  ingest_lag_seconds: 12,
   last_boot_catchup: { duration_ms: 3000, events_folded: 600 },
   projected_catchup_duration_ms: 0,
   projected_full_replay_duration_ms: 21_210,
@@ -1554,7 +1576,11 @@ describe("runStatus event-store delivery (fn-1312)", () => {
 
     expect(cap.exitCode).toBe(0);
     const env = JSON.parse(cap.stdout[0] ?? "{}") as {
-      data: { event_store: EventStoreStatus | null; catching_up: boolean };
+      data: {
+        event_store: EventStoreStatus | null;
+        catching_up: boolean;
+        ingest_lag_seconds: number | null;
+      };
     };
     expect(boot).toMatchObject({
       boot_id: "boot-steady",
@@ -1563,6 +1589,7 @@ describe("runStatus event-store delivery (fn-1312)", () => {
       catching_up: false,
     });
     expect(env.data.event_store).toEqual(FIXTURE_EVENT_STORE);
+    expect(env.data.ingest_lag_seconds).toBe(12);
     expect(env.data.catching_up).toBe(false);
   });
 

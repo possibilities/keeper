@@ -2295,16 +2295,32 @@ function readBootCatchupStats(db: Database): BootCatchupStats | null {
  * projected durations `null`: the shared denominator is undefined. A
  * non-positive `duration_ms` additionally nulls just the catch-up leg.
  */
+export function computeIngestLagSeconds(
+  nowSec: number,
+  newestFoldedEventTs: number | null,
+): number {
+  if (
+    newestFoldedEventTs === null ||
+    !Number.isFinite(nowSec) ||
+    !Number.isFinite(newestFoldedEventTs)
+  ) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(nowSec - newestFoldedEventTs));
+}
+
 export function computeEventStoreStatus(
   stats: BootCatchupStats | null,
   eventCount: number,
   dbBytes: number,
   headEventId: number,
+  ingestLagSeconds = 0,
 ): EventStoreStatus {
   if (stats === null) {
     return {
       event_count: eventCount,
       db_bytes: dbBytes,
+      ingest_lag_seconds: ingestLagSeconds,
       last_boot_catchup: null,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
@@ -2320,6 +2336,7 @@ export function computeEventStoreStatus(
     return {
       event_count: eventCount,
       db_bytes: dbBytes,
+      ingest_lag_seconds: ingestLagSeconds,
       last_boot_catchup: lastBootCatchup,
       projected_catchup_duration_ms: null,
       projected_full_replay_duration_ms: null,
@@ -2340,6 +2357,7 @@ export function computeEventStoreStatus(
   return {
     event_count: eventCount,
     db_bytes: dbBytes,
+    ingest_lag_seconds: ingestLagSeconds,
     last_boot_catchup: lastBootCatchup,
     projected_catchup_duration_ms: projectedCatchupMs,
     projected_full_replay_duration_ms: projectedFullReplayMs,
@@ -2356,7 +2374,10 @@ export function computeEventStoreStatus(
  * independently defended so a missing/corrupt piece degrades to the null-honest
  * shape rather than throwing into the no-self-heal serve path.
  */
-export function readEventStoreStatus(db: Database): EventStoreStatus {
+export function readEventStoreStatus(
+  db: Database,
+  nowSec = Date.now() / 1000,
+): EventStoreStatus {
   let head = 0;
   try {
     const h = db.prepare("SELECT MAX(id) AS head FROM events").get() as {
@@ -2390,7 +2411,27 @@ export function readEventStoreStatus(db: Database): EventStoreStatus {
   } catch {
     catchupStats = null;
   }
-  return computeEventStoreStatus(catchupStats, eventCount, dbBytes, head);
+  let newestFoldedEventTs: number | null = null;
+  try {
+    const row = db
+      .query(
+        `SELECT e.ts AS ts
+           FROM reducer_state r
+           JOIN events e ON e.id = r.last_event_id
+          WHERE r.id = 1`,
+      )
+      .get() as { ts: number } | null;
+    newestFoldedEventTs = row?.ts ?? null;
+  } catch {
+    newestFoldedEventTs = null;
+  }
+  return computeEventStoreStatus(
+    catchupStats,
+    eventCount,
+    dbBytes,
+    head,
+    computeIngestLagSeconds(nowSec, newestFoldedEventTs),
+  );
 }
 
 /**
