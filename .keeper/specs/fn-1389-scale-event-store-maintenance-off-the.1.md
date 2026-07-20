@@ -23,5 +23,5 @@ pathological cold-page batch cannot blow through it.
   a test pinning the arithmetic).
 
 ## Done summary
-
+Added a shared 250ms wall-clock maintenance-budget seam (src/maintenance-budget.ts) consulted by retention shed, cold-row compaction, and mutation_path backfill; each pass yields between bounded transactions and resumes from its durable watermark on the next tick. Added tests proving oversized-workload yield/resume with no lost or repeated work, re-fold determinism untouched, and a test pinning the budget constant's arithmetic relation to SERVE_LAG_MAX_CONSECUTIVE_BREACHES.
 ## Evidence
