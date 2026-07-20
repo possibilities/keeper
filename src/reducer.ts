@@ -17,6 +17,11 @@
 
 import type { Database, SQLQueryBindings, Statement } from "bun:sqlite";
 import {
+  materializeNonFableFocusPolicy,
+  normalizeNonFableFocusInput,
+  serializeNonFableFocusPolicy,
+} from "./account-focus";
+import {
   extractBackgroundTasks,
   extractCommit,
   handoffIdFromSpawnName,
@@ -7069,6 +7074,7 @@ const AUTOPILOT_CONFIG_COLUMNS = {
   drift_behind_threshold: "drift_behind_threshold",
   drift_age_threshold_days: "drift_age_threshold_days",
   fable_focus: "fable_focus",
+  non_fable_focus: "non_fable_focus",
 } as const satisfies Record<string, string>;
 
 type AutopilotConfigField = keyof typeof AUTOPILOT_CONFIG_COLUMNS;
@@ -7132,6 +7138,8 @@ interface AutopilotConfigSetPayload {
   /** Canonical policy JSON, or NULL for an idempotent clear. The whole policy
    *  occupies one cell so a fold can never expose a partial target/lifetime. */
   fable_focus?: string | null;
+  /** A separate cell prevents malformed input from clearing Fable intent. */
+  non_fable_focus?: string | null;
 }
 
 /**
@@ -7241,6 +7249,21 @@ function extractAutopilotConfigSetPayload(
         // Malformed structured policies are a no-op, never a partial clear.
         if (policy !== null) {
           patch.fable_focus = serializeFableFocusPolicy(policy);
+        }
+      }
+    }
+    if ("non_fable_focus" in parsed) {
+      const raw = parsed.non_fable_focus;
+      if (raw === null) {
+        patch.non_fable_focus = null;
+      } else {
+        const input = normalizeNonFableFocusInput(raw);
+        const policy =
+          input === null
+            ? null
+            : materializeNonFableFocusPolicy(input, event.id, event.ts);
+        if (policy !== null) {
+          patch.non_fable_focus = serializeNonFableFocusPolicy(policy);
         }
       }
     }

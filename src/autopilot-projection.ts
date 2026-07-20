@@ -7,9 +7,13 @@
  * `../cli/autopilot`.
  */
 
+import {
+  parseNonFableFocusPolicy,
+  validateNonFableFocusPolicy,
+} from "./account-focus";
 import { DEFAULT_MAX_CONCURRENT_PER_ROOT } from "./db";
 import { parseFableFocusPolicy, validateFableFocusPolicy } from "./fable-focus";
-import type { FableFocusPolicy } from "./types";
+import type { FableFocusPolicy, NonFableFocusPolicy } from "./types";
 
 /**
  * Coerce a singleton `autopilot_state` wire row's `paused` column (INTEGER:
@@ -117,6 +121,21 @@ export function projectFableFocus(
     typeof raw === "string"
       ? parseFableFocusPolicy(raw)
       : validateFableFocusPolicy(raw);
+  return policy === null ? { valid: false } : { valid: true, policy };
+}
+
+/** Invalid Non-Fable state must not contaminate the Fable projection. */
+export function projectNonFableFocus(
+  rows: Record<string, unknown>[],
+): { valid: true; policy: NonFableFocusPolicy | null } | { valid: false } {
+  if (rows.length === 0 || rows[0]?.non_fable_focus == null) {
+    return { valid: true, policy: null };
+  }
+  const raw = rows[0]?.non_fable_focus;
+  const policy =
+    typeof raw === "string"
+      ? parseNonFableFocusPolicy(raw)
+      : validateNonFableFocusPolicy(raw);
   return policy === null ? { valid: false } : { valid: true, policy };
 }
 

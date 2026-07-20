@@ -5760,6 +5760,7 @@ function autopilotConfigSetEvent(
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
     fable_focus?: unknown;
+    non_fable_focus?: unknown;
   },
   sessionId = "autopilot",
 ): number {
@@ -5786,6 +5787,7 @@ function getAutopilotStateConfig() {
     drift_behind_threshold: number | null;
     drift_age_threshold_days: number | null;
     fable_focus: string | null;
+    non_fable_focus: string | null;
   } | null;
 }
 
@@ -5889,46 +5891,57 @@ test("AutopilotConfigSet malformed/empty/non-positive payloads behave like the c
   }
 });
 
-test("AutopilotConfigSet atomically sets, preserves, clears, and re-folds Fable focus", () => {
+test("AutopilotConfigSet independently sets, preserves, clears, and re-folds both Account focuses", () => {
   const firstId = autopilotConfigSetEvent({
     fable_focus: {
       target_route: "claude-swap:2",
       lifetime: { kind: "permanent" },
     },
+    non_fable_focus: {
+      target_route: "claude-swap:3",
+      lifetime: {
+        kind: "absolute",
+        deadline_at: "2026-07-20T23:59:59Z",
+      },
+    },
   });
   drainAll();
-  expect(
-    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
-  ).toMatchObject({
-    schema_version: 1,
+  const initial = getAutopilotStateConfig();
+  expect(JSON.parse(initial?.fable_focus ?? "null")).toMatchObject({
     policy_id: `event:${firstId}`,
     target_route: "claude-swap:2",
     fable_intent: true,
-    lifetime: { kind: "permanent" },
+  });
+  expect(JSON.parse(initial?.non_fable_focus ?? "null")).toMatchObject({
+    policy_id: `event:${firstId}`,
+    target_route: "claude-swap:3",
+    fable_intent: false,
+    lifetime: {
+      kind: "absolute",
+      deadline_at: "2026-07-20T23:59:59.000Z",
+    },
   });
 
-  // An unrelated patch and a malformed structured field preserve the whole cell;
-  // the malformed event still advances the global cursor.
-  autopilotConfigSetEvent({ max_concurrent_jobs: 9 });
+  const fableBefore = initial?.fable_focus;
+  const nonFableBefore = initial?.non_fable_focus;
   const malformedId = autopilotConfigSetEvent({
-    fable_focus: {
+    non_fable_focus: {
       target_route: "person@example.com",
       lifetime: { kind: "permanent" },
     },
   });
   drainAll();
   expect(getCursor()).toBe(malformedId);
-  expect(
-    JSON.parse(getAutopilotStateConfig()?.fable_focus ?? "null"),
-  ).toMatchObject({
-    policy_id: `event:${firstId}`,
-    target_route: "claude-swap:2",
-  });
-  expect(getAutopilotStateConfig()?.max_concurrent_jobs).toBe(9);
+  expect(getAutopilotStateConfig()?.fable_focus).toBe(fableBefore);
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBe(nonFableBefore);
 
   autopilotConfigSetEvent({ fable_focus: null });
   drainAll();
   expect(getAutopilotStateConfig()?.fable_focus).toBeNull();
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBe(nonFableBefore);
+  autopilotConfigSetEvent({ non_fable_focus: null });
+  drainAll();
+  expect(getAutopilotStateConfig()?.non_fable_focus).toBeNull();
 
   const before = db.query("SELECT * FROM autopilot_state ORDER BY id").all();
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");

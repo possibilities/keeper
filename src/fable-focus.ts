@@ -1,17 +1,18 @@
 import {
-  closeSync,
-  constants,
-  existsSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeSync,
-} from "node:fs";
-import { dirname } from "node:path";
+  ACCOUNT_FOCUS_LEAF_SCHEMA_VERSION,
+  type AccountFocusDelivery,
+  type AccountFocusLeaf,
+  type AccountFocusPublishDeps,
+  effectiveAccountFocus,
+  MAX_ACCOUNT_FOCUS_LEAF_BYTES,
+  materializeAccountFocusPolicy,
+  normalizeAccountFocusInput,
+  normalizeManagedRouteId,
+  normalizeUtcTimestamp,
+  publishValidatedAccountFocusLeaf,
+  readValidatedAccountFocusLeaf,
+  serializeAccountFocusLeaf,
+} from "./account-focus";
 import {
   isObservationFresh,
   isRouteMeasurementFresh,
@@ -24,25 +25,14 @@ import type {
   ManagedAccountRouteId,
 } from "./types";
 
-export const FABLE_FOCUS_LEAF_SCHEMA_VERSION = 1;
-export const MAX_FABLE_FOCUS_LEAF_BYTES = 8_192;
+export { normalizeManagedRouteId, normalizeUtcTimestamp };
 
-export interface FableFocusLeaf {
-  schema_version: 1;
-  policy: FableFocusPolicy | null;
-}
+export const FABLE_FOCUS_LEAF_SCHEMA_VERSION =
+  ACCOUNT_FOCUS_LEAF_SCHEMA_VERSION;
+export const MAX_FABLE_FOCUS_LEAF_BYTES = MAX_ACCOUNT_FOCUS_LEAF_BYTES;
 
-export type FableFocusDelivery =
-  | { available: true; policy: FableFocusPolicy | null }
-  | {
-      available: false;
-      diagnostic:
-        | "delivery-missing"
-        | "delivery-malformed"
-        | "delivery-unsupported"
-        | "delivery-insecure"
-        | "delivery-unreachable";
-    };
+export type FableFocusLeaf = AccountFocusLeaf<FableFocusPolicy>;
+export type FableFocusDelivery = AccountFocusDelivery<FableFocusPolicy>;
 
 export interface NormalizedFableFocusInput {
   target_route: ManagedAccountRouteId;
@@ -61,39 +51,12 @@ function hasOnlyKeys(
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
-export function normalizeManagedRouteId(
-  value: unknown,
-): ManagedAccountRouteId | null {
-  if (typeof value !== "string") return null;
-  const match = /^claude-swap:([1-9]\d*)$/u.exec(value);
-  if (match === null) return null;
-  const slot = Number(match[1]);
-  return Number.isSafeInteger(slot) ? (`claude-swap:${slot}` as const) : null;
-}
-
-function hasTimezone(value: string): boolean {
-  if (/[zZ]$/u.test(value)) return true;
-  const time = value.includes("T")
-    ? value.slice(value.indexOf("T") + 1)
-    : value;
-  return /[+-]\d{2}:?\d{2}$/u.test(time);
-}
-
-export function normalizeUtcTimestamp(value: unknown): string | null {
-  if (typeof value !== "string" || !hasTimezone(value)) return null;
-  const ms = Date.parse(value);
-  if (!Number.isFinite(ms)) return null;
-  try {
-    return new Date(ms).toISOString();
-  } catch {
-    return null;
-  }
-}
-
 /** Strictly validate and canonicalize the one atomic generic-config field. */
 export function normalizeFableFocusInput(
   value: unknown,
 ): NormalizedFableFocusInput | null {
+  const common = normalizeAccountFocusInput(value);
+  if (common !== null) return common;
   if (!isRecord(value) || !hasOnlyKeys(value, ["target_route", "lifetime"])) {
     return null;
   }
@@ -105,21 +68,6 @@ export function normalizeFableFocusInput(
     typeof lifetime.kind !== "string"
   ) {
     return null;
-  }
-  if (lifetime.kind === "permanent") {
-    return hasOnlyKeys(lifetime, ["kind"])
-      ? { target_route: targetRoute, lifetime: { kind: "permanent" } }
-      : null;
-  }
-  if (lifetime.kind === "absolute") {
-    if (!hasOnlyKeys(lifetime, ["kind", "deadline_at"])) return null;
-    const deadline = normalizeUtcTimestamp(lifetime.deadline_at);
-    return deadline === null
-      ? null
-      : {
-          target_route: targetRoute,
-          lifetime: { kind: "absolute", deadline_at: deadline },
-        };
   }
   if (lifetime.kind === "current-reset") {
     if (!hasOnlyKeys(lifetime, ["kind", "reset_at"])) return null;
@@ -150,6 +98,14 @@ export function materializeFableFocusPolicy(
   eventId: number,
   eventTsSeconds: number,
 ): FableFocusPolicy | null {
+  if (input.lifetime.kind !== "cycle-end") {
+    return materializeAccountFocusPolicy(
+      { target_route: input.target_route, lifetime: input.lifetime },
+      eventId,
+      eventTsSeconds,
+      true,
+    );
+  }
   if (!Number.isSafeInteger(eventId) || eventId <= 0) return null;
   let eventStamp: string;
   try {
@@ -204,7 +160,6 @@ export function validateFableFocusPolicy(
     lifetime: value.lifetime,
   });
   if (normalized === null) return null;
-  // A persisted current-reset construction must already be canonical absolute.
   if (normalized.lifetime.kind !== value.lifetime.kind) return null;
   return {
     schema_version: 1,
@@ -284,25 +239,22 @@ export function effectiveFableFocus(
       diagnostic: "policy-invalid",
     };
   }
-  if (policy.lifetime.kind === "absolute") {
-    return {
-      state:
-        nowMs < Date.parse(policy.lifetime.deadline_at) ? "active" : "expired",
-      policy,
-      diagnostic: "none",
-    };
+  if (policy.lifetime.kind !== "cycle-end") {
+    return effectiveAccountFocus(
+      { available: true, policy: { ...policy, lifetime: policy.lifetime } },
+      observation,
+      nowMs,
+      true,
+    );
   }
-  if (policy.lifetime.kind === "cycle-end") {
-    const completed =
-      nowMs >= Date.parse(policy.lifetime.reset_at) ||
-      matchingFableWindowCompleted(policy, observation, nowMs);
-    return {
-      state: completed ? "completed" : "active",
-      policy,
-      diagnostic: "none",
-    };
-  }
-  return { state: "active", policy, diagnostic: "none" };
+  const completed =
+    nowMs >= Date.parse(policy.lifetime.reset_at) ||
+    matchingFableWindowCompleted(policy, observation, nowMs);
+  return {
+    state: completed ? "completed" : "active",
+    policy,
+    diagnostic: "none",
+  };
 }
 
 export type CurrentResetFocusResult =
@@ -370,15 +322,10 @@ export function buildCurrentResetFableFocus(
 export function serializeFableFocusLeaf(
   policy: FableFocusPolicy | null,
 ): string {
-  return `${JSON.stringify({
-    schema_version: FABLE_FOCUS_LEAF_SCHEMA_VERSION,
-    policy,
-  } satisfies FableFocusLeaf)}\n`;
+  return serializeAccountFocusLeaf(policy);
 }
 
-export interface FableFocusPublishDeps {
-  rename?: typeof renameSync;
-}
+export interface FableFocusPublishDeps extends AccountFocusPublishDeps {}
 
 /** Atomically publish one owner-only launch leaf. */
 export function publishFableFocusLeaf(
@@ -389,74 +336,15 @@ export function publishFableFocusLeaf(
   if (policy !== null && validateFableFocusPolicy(policy) === null) {
     throw new Error("refusing to publish an invalid Fable-focus policy");
   }
-  const parent = dirname(path);
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  let fd: number | null = null;
-  try {
-    fd = openSync(
-      tmp,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      0o600,
-    );
-    writeSync(fd, serializeFableFocusLeaf(policy));
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = null;
-    (deps.rename ?? renameSync)(tmp, path);
-  } catch (error) {
-    if (fd !== null) {
-      try {
-        closeSync(fd);
-      } catch {
-        // already closed
-      }
-    }
-    try {
-      rmSync(tmp, { force: true });
-    } catch {
-      // best-effort cleanup; the authoritative Projection is unchanged
-    }
-    throw error;
-  }
+  publishValidatedAccountFocusLeaf(
+    path,
+    policy,
+    validateFableFocusPolicy,
+    deps,
+  );
 }
 
 /** Bounded, mode-restricted cold-launch read. It never throws. */
 export function readFableFocusLeaf(path: string): FableFocusDelivery {
-  if (!existsSync(path)) {
-    return { available: false, diagnostic: "delivery-missing" };
-  }
-  let text: string;
-  try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0) {
-      return { available: false, diagnostic: "delivery-insecure" };
-    }
-    if (stat.size <= 0 || stat.size > MAX_FABLE_FOCUS_LEAF_BYTES) {
-      return { available: false, diagnostic: "delivery-malformed" };
-    }
-    text = readFileSync(path, "utf8");
-  } catch {
-    return { available: false, diagnostic: "delivery-unreachable" };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return { available: false, diagnostic: "delivery-malformed" };
-  }
-  if (!isRecord(parsed)) {
-    return { available: false, diagnostic: "delivery-malformed" };
-  }
-  if (parsed.schema_version !== FABLE_FOCUS_LEAF_SCHEMA_VERSION) {
-    return { available: false, diagnostic: "delivery-unsupported" };
-  }
-  if (!hasOnlyKeys(parsed, ["schema_version", "policy"])) {
-    return { available: false, diagnostic: "delivery-malformed" };
-  }
-  if (parsed.policy === null) return { available: true, policy: null };
-  const policy = validateFableFocusPolicy(parsed.policy);
-  return policy === null
-    ? { available: false, diagnostic: "delivery-malformed" }
-    : { available: true, policy };
+  return readValidatedAccountFocusLeaf(path, validateFableFocusPolicy);
 }

@@ -708,6 +708,8 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     "worker_provider",
     // Atomic canonical Fable-focus policy JSON; NULL means policy off.
     "fable_focus",
+    // Separate cells keep either scope's malformed delivery from contaminating its sibling.
+    "non_fable_focus",
   ],
   pk: "id",
   version: "last_event_id",
@@ -716,7 +718,7 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
   filters: {
     id: "id",
   },
-  jsonColumns: new Set(["fable_focus"]),
+  jsonColumns: new Set(["fable_focus", "non_fable_focus"]),
 };
 
 /**

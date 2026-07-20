@@ -39,6 +39,10 @@
  */
 
 import { isAbsolute } from "node:path";
+import {
+  type NormalizedNonFableFocusInput,
+  normalizeNonFableFocusInput,
+} from "./account-focus";
 import { parseTriple } from "./agent/triple";
 import type {
   DeadLetterOperatorOutcome,
@@ -485,6 +489,8 @@ export interface SetAutopilotConfigParams {
   drift_age_threshold_days?: number | null;
   /** Atomic Fable-focus replacement, or null for an idempotent clear. */
   fable_focus?: NormalizedFableFocusInput | null;
+  /** Separate validation prevents a bad Non-Fable policy from mutating Fable focus. */
+  non_fable_focus?: NormalizedNonFableFocusInput | null;
 }
 
 /** Successful return shape for `set_autopilot_config` — echoes the applied patch.
@@ -518,6 +524,7 @@ function validateSetAutopilotConfigParams(
     "drift_behind_threshold",
     "drift_age_threshold_days",
     "fable_focus",
+    "non_fable_focus",
   ]);
   const stray = Object.keys(obj).filter((k) => !known.has(k));
   if (stray.length > 0) {
@@ -634,6 +641,19 @@ function validateSetAutopilotConfigParams(
         );
       }
       patch.fable_focus = focus;
+    }
+  }
+  if ("non_fable_focus" in obj) {
+    if (obj.non_fable_focus === null) {
+      patch.non_fable_focus = null;
+    } else {
+      const focus = normalizeNonFableFocusInput(obj.non_fable_focus);
+      if (focus === null) {
+        throw new BadParamsError(
+          "set_autopilot_config: `non_fable_focus` must be null or a PII-free managed route with a permanent or absolute lifetime",
+        );
+      }
+      patch.non_fable_focus = focus;
     }
   }
   // An empty patch is a no-op request — reject so a caller gets a clear signal

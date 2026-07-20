@@ -33,9 +33,16 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import {
+  type NonFableFocusDelivery,
+  type NonFableFocusLeaf,
+  publishNonFableFocusLeaf,
+  readNonFableFocusLeaf,
+} from "./account-focus";
 import type { AccountObserverWorkerData } from "./account-observer-worker";
 import {
   fableFocusPolicyPath,
+  nonFableFocusPolicyPath,
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
@@ -47,6 +54,7 @@ import type {
 import {
   projectAutopilotPaused,
   projectFableFocus,
+  projectNonFableFocus,
 } from "./autopilot-projection";
 import type {
   AutopilotWorkerData,
@@ -9424,6 +9432,40 @@ export function publishFableFocusProjection(
   return { schema_version: 1, policy: projected.policy };
 }
 
+export interface NonFableFocusProjectionPublishDeps {
+  publish?: (path: string, policy: NonFableFocusLeaf["policy"]) => void;
+  read?: (path: string) => NonFableFocusDelivery;
+}
+
+/** Verification fences acknowledgement without coupling sibling delivery. */
+export function publishNonFableFocusProjection(
+  db: Database,
+  routingRoot: string,
+  deps: NonFableFocusProjectionPublishDeps = {},
+): NonFableFocusLeaf {
+  const row = db
+    .query("SELECT non_fable_focus FROM autopilot_state WHERE id = 1")
+    .get() as { non_fable_focus: string | null } | null;
+  const projected = projectNonFableFocus(
+    row === null ? [] : [row as Record<string, unknown>],
+  );
+  if (!projected.valid) {
+    throw new Error("authoritative Non-Fable-focus Projection is invalid");
+  }
+  const path = nonFableFocusPolicyPath(routingRoot);
+  (deps.publish ?? publishNonFableFocusLeaf)(path, projected.policy);
+  const delivered = (deps.read ?? readNonFableFocusLeaf)(path);
+  if (
+    !delivered.available ||
+    JSON.stringify(delivered.policy) !== JSON.stringify(projected.policy)
+  ) {
+    throw new Error(
+      "Non-Fable-focus launch leaf does not match the Projection",
+    );
+  }
+  return { schema_version: 1, policy: projected.policy };
+}
+
 const NATIVE_CRASH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 type NativeCrashAttributionProbeOutcome = {
@@ -10727,6 +10769,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           if ("fable_focus" in msg.patch) {
             publishFableFocusProjection(db, accountRoutingRoot);
           }
+          if ("non_fable_focus" in msg.patch) {
+            publishNonFableFocusProjection(db, accountRoutingRoot);
+          }
           // `pumpWakes` drains synchronously, so the `AutopilotConfigSet` event is
           // now folded — this read reflects the worktree mode AS OF the applied
           // patch (the folded mode at reply time). A per-root cap stored while
@@ -11265,6 +11310,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   } catch (error) {
     console.error(
       `[keeperd] Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    publishNonFableFocusProjection(db, accountRoutingRoot);
+  } catch (error) {
+    console.error(
+      `[keeperd] Non-Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   scheduleProviderLegDeathNoticeSweep();

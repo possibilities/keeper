@@ -46,6 +46,7 @@ import {
 import { dirname } from "node:path";
 import { createHistogram, monitorEventLoopDelay } from "node:perf_hooks";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import type { NormalizedNonFableFocusInput } from "./account-focus";
 import { type BackstopMessage, buildTimeoutRecord } from "./backstop-telemetry";
 import {
   type CollectionDescriptor,
@@ -334,6 +335,7 @@ export interface SetAutopilotConfigRequestMessage {
     drift_behind_threshold?: number | null;
     drift_age_threshold_days?: number | null;
     fable_focus?: NormalizedFableFocusInput | null;
+    non_fable_focus?: NormalizedNonFableFocusInput | null;
   };
 }
 
@@ -4125,6 +4127,7 @@ function main(): void {
       drift_behind_threshold?: number | null;
       drift_age_threshold_days?: number | null;
       fable_focus?: NormalizedFableFocusInput | null;
+      non_fable_focus?: NormalizedNonFableFocusInput | null;
     }): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();

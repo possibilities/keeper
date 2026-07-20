@@ -1261,7 +1261,7 @@ test("autopilot_state: a durable AutopilotPaused{paused:false} survives, and the
   ).toBe(0);
 });
 
-test("autopilot_state: Fable-focus identity and approved boundary re-fold byte-identically", () => {
+test("autopilot_state: both Account-focus identities and boundaries re-fold byte-identically", () => {
   insertEvent({
     hook_event: "AutopilotConfigSet",
     session_id: "autopilot",
@@ -1273,6 +1273,10 @@ test("autopilot_state: Fable-focus identity and approved boundary re-fold byte-i
           kind: "absolute",
           deadline_at: "2026-07-20T23:59:59Z",
         },
+      },
+      non_fable_focus: {
+        target_route: "claude-swap:4",
+        lifetime: { kind: "permanent" },
       },
     }),
   });
@@ -1288,6 +1292,16 @@ test("autopilot_state: Fable-focus identity and approved boundary re-fold byte-i
       kind: "absolute",
       deadline_at: "2026-07-20T23:59:59.000Z",
     },
+  });
+  const nonFableEncoded = (
+    first[0] as { non_fable_focus?: unknown } | undefined
+  )?.non_fable_focus;
+  expect(typeof nonFableEncoded).toBe("string");
+  expect(JSON.parse(nonFableEncoded as string)).toMatchObject({
+    policy_id: "event:1",
+    target_route: "claude-swap:4",
+    fable_intent: false,
+    lifetime: { kind: "permanent" },
   });
   rewindAndWipeProjections();
   drainAll();
