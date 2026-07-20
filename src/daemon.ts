@@ -127,8 +127,10 @@ import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
   DEFAULT_RETENTION_MAX_BATCHES,
+  formatRetentionShedProgressLogLine,
   reclaimableFreelistBytes,
   reclaimableLogStep,
+  retentionShedProgressLogStep,
   runYieldingRetentionPass,
 } from "./compaction";
 import {
@@ -17155,6 +17157,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // step-latch below emits the pool size ONLY on a fresh 100MB step crossing — an
   // unconditional per-pass line would grow the very server.stderr this epic bounds.
   let lastLoggedReclaimStep = 0;
+  let retentionShedProgressBatches = 0;
+  let lastLoggedRetentionShedProgressStep = 0;
   let retentionRunning = false;
   async function runRetentionPass(): Promise<void> {
     if (shuttingDown || retentionRunning) return;
@@ -17183,6 +17187,27 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         console.error(
           `[keeperd] retention: shed ${shed} cold body/bodies in ${bodies.batches} batch(es), reclaimed ${bodies.reclaimedPages} page(s) (watermark id<=${bodies.coldWatermark}, cursor<${bodies.cursor}${bodies.moreLikely ? ", more remain" : ""})`,
         );
+      }
+      if (bodies.batches > 0) {
+        retentionShedProgressBatches += bodies.batches;
+        if (bodies.moreLikely) {
+          const { shouldLog, step } = retentionShedProgressLogStep(
+            retentionShedProgressBatches,
+            lastLoggedRetentionShedProgressStep,
+          );
+          if (shouldLog) {
+            console.error(
+              formatRetentionShedProgressLogLine(
+                bodies,
+                retentionShedProgressBatches,
+              ),
+            );
+          }
+          lastLoggedRetentionShedProgressStep = step;
+        } else {
+          retentionShedProgressBatches = 0;
+          lastLoggedRetentionShedProgressStep = 0;
+        }
       }
       if (noopSnapshots.deleted > 0) {
         console.error(
