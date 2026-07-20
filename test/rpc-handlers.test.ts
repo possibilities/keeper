@@ -841,6 +841,62 @@ test("set_autopilot_config atomically validates, canonicalizes, and clears Fable
   expect(state.setConfigCalls).toEqual([set.patch, { fable_focus: null }]);
 });
 
+test("set_autopilot_config atomically validates and clears Non-Fable focus without Fable-only lifetimes", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const set = await setAutopilotConfigHandler(
+    {
+      fable_focus: {
+        target_route: "claude-swap:2",
+        lifetime: { kind: "permanent" },
+      },
+      non_fable_focus: {
+        target_route: "claude-swap:3",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2026-07-20T19:59:59-04:00",
+        },
+      },
+    },
+    bridge,
+  );
+  expect(set).toEqual({
+    ok: true,
+    patch: {
+      fable_focus: {
+        target_route: "claude-swap:2",
+        lifetime: { kind: "permanent" },
+      },
+      non_fable_focus: {
+        target_route: "claude-swap:3",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2026-07-20T23:59:59.000Z",
+        },
+      },
+    },
+  });
+  const cleared = await setAutopilotConfigHandler(
+    { non_fable_focus: null },
+    bridge,
+  );
+  expect(cleared).toEqual({ ok: true, patch: { non_fable_focus: null } });
+  await expect(
+    setAutopilotConfigHandler(
+      {
+        non_fable_focus: {
+          target_route: "claude-swap:3",
+          lifetime: {
+            kind: "cycle-end",
+            reset_at: "2026-07-20T23:59:59Z",
+          },
+        },
+      },
+      bridge,
+    ),
+  ).rejects.toBeInstanceOf(BadParamsError);
+  expect(state.setConfigCalls).toEqual([set.patch, { non_fable_focus: null }]);
+});
+
 test("set_autopilot_config rejects malformed or PII-bearing Fable focus as one field", async () => {
   const { bridge, state } = autopilotStubBridge({});
   for (const fable_focus of [

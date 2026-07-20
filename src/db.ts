@@ -82,6 +82,7 @@ export const AUTOPILOT_STATE_REBUILD_COPY_LISTS = {
     "drift_behind_threshold",
     "drift_age_threshold_days",
     "fable_focus",
+    "non_fable_focus",
   ],
 } as const;
 
@@ -4532,6 +4533,13 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "dispatch_failures", "claimed_at", "REAL");
     },
   },
+  {
+    version: 139,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(ctx.db, "autopilot_state", "non_fable_focus", "TEXT");
+    },
+  },
 ];
 
 /**
@@ -4552,7 +4560,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v138:d0cf783b36d251999f4b70a4b3795bce1dff8b3d79ee938daecb0bf3ed4e4cb0";
+  "v139:19e05ccf2bcbce82de32080aee335e217ea657ccbb81edd58f506bacf4137b97";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -6326,7 +6334,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     worker_provider TEXT,
     drift_behind_threshold INTEGER,
     drift_age_threshold_days INTEGER,
-    fable_focus TEXT
+    fable_focus TEXT,
+    non_fable_focus TEXT
 )
 `;
 

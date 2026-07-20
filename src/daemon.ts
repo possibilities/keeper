@@ -33,9 +33,16 @@ import {
   sep,
 } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import {
+  type NonFableFocusDelivery,
+  type NonFableFocusLeaf,
+  publishNonFableFocusLeaf,
+  readNonFableFocusLeaf,
+} from "./account-focus";
 import type { AccountObserverWorkerData } from "./account-observer-worker";
 import {
   fableFocusPolicyPath,
+  nonFableFocusPolicyPath,
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
@@ -47,6 +54,7 @@ import type {
 import {
   projectAutopilotPaused,
   projectFableFocus,
+  projectNonFableFocus,
 } from "./autopilot-projection";
 import type {
   AutopilotWorkerData,
@@ -9430,6 +9438,40 @@ export function publishFableFocusProjection(
   return { schema_version: 1, policy: projected.policy };
 }
 
+export interface NonFableFocusProjectionPublishDeps {
+  publish?: (path: string, policy: NonFableFocusLeaf["policy"]) => void;
+  read?: (path: string) => NonFableFocusDelivery;
+}
+
+/** Verification fences acknowledgement without coupling sibling delivery. */
+export function publishNonFableFocusProjection(
+  db: Database,
+  routingRoot: string,
+  deps: NonFableFocusProjectionPublishDeps = {},
+): NonFableFocusLeaf {
+  const row = db
+    .query("SELECT non_fable_focus FROM autopilot_state WHERE id = 1")
+    .get() as { non_fable_focus: string | null } | null;
+  const projected = projectNonFableFocus(
+    row === null ? [] : [row as Record<string, unknown>],
+  );
+  if (!projected.valid) {
+    throw new Error("authoritative Non-Fable-focus Projection is invalid");
+  }
+  const path = nonFableFocusPolicyPath(routingRoot);
+  (deps.publish ?? publishNonFableFocusLeaf)(path, projected.policy);
+  const delivered = (deps.read ?? readNonFableFocusLeaf)(path);
+  if (
+    !delivered.available ||
+    JSON.stringify(delivered.policy) !== JSON.stringify(projected.policy)
+  ) {
+    throw new Error(
+      "Non-Fable-focus launch leaf does not match the Projection",
+    );
+  }
+  return { schema_version: 1, policy: projected.policy };
+}
+
 const NATIVE_CRASH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 type NativeCrashAttributionProbeOutcome = {
@@ -10692,8 +10734,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // it (the shared checkout safety invariant lives at the consumption
           // seams via `effectivePerRootCap`, which is strictly stronger — a stale
           // > 1 row can no longer over-dispatch).
+          const eventTs = Date.now() / 1000;
+          const nonFableFocus = msg.patch.non_fable_focus;
+          if (
+            nonFableFocus !== undefined &&
+            nonFableFocus !== null &&
+            nonFableFocus.lifetime.kind === "absolute" &&
+            Date.parse(nonFableFocus.lifetime.deadline_at) <= eventTs * 1_000
+          ) {
+            throw new Error("Non-Fable focus deadline has elapsed");
+          }
           stmts.insertEvent.run({
-            $ts: Date.now() / 1000,
+            $ts: eventTs,
             $session_id: "autopilot",
             $pid: null,
             $hook_event: "AutopilotConfigSet",
@@ -10732,6 +10784,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // the owner-only launch leaf verifies the exact same policy identity.
           if ("fable_focus" in msg.patch) {
             publishFableFocusProjection(db, accountRoutingRoot);
+          }
+          if ("non_fable_focus" in msg.patch) {
+            publishNonFableFocusProjection(db, accountRoutingRoot);
           }
           // `pumpWakes` drains synchronously, so the `AutopilotConfigSet` event is
           // now folded — this read reflects the worktree mode AS OF the applied
@@ -11271,6 +11326,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   } catch (error) {
     console.error(
       `[keeperd] Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    publishNonFableFocusProjection(db, accountRoutingRoot);
+  } catch (error) {
+    console.error(
+      `[keeperd] Non-Fable-focus launch leaf unavailable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   scheduleProviderLegDeathNoticeSweep();

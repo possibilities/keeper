@@ -5,6 +5,7 @@ test("debug snapshots retain the accepted plain semantic header", () => {
   const frame = [
     "---",
     "\x1b[31mFable focus: c2 · permanent · focused\x1b[0m",
+    "Non-Fable focus: off",
     "autopilot: playing · yolo · cap ∞ · root 1",
     "1. board body",
   ].join("\n");
@@ -19,7 +20,7 @@ test("debug snapshots retain the accepted plain semantic header", () => {
   });
 
   expect(snapshot).toContain(
-    "---\nFable focus: c2 · permanent · focused\nautopilot: playing · yolo · cap ∞ · root 1\n1. board body",
+    "---\nFable focus: c2 · permanent · focused\nNon-Fable focus: off\nautopilot: playing · yolo · cap ∞ · root 1\n1. board body",
   );
   expect(snapshot).not.toContain("\x1b[");
 });

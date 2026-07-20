@@ -1,43 +1,60 @@
 /** Shared types for the keeper reducer + hook. */
 
-/** Stable, PII-free managed Claude route accepted by Fable focus. */
+/** Stable, PII-free managed Claude route accepted by Account focus. */
 export type ManagedAccountRouteId = `claude-swap:${number}`;
 
+export type AccountFocusLifetime =
+  | { kind: "permanent" }
+  | { kind: "absolute"; deadline_at: string };
+
 /** Operator input accepted by the generic config mutation. */
+export interface AccountFocusInput {
+  target_route: ManagedAccountRouteId;
+  lifetime: AccountFocusLifetime;
+}
+
+export interface NonFableFocusInput extends AccountFocusInput {}
+
 export interface FableFocusInput {
   target_route: ManagedAccountRouteId;
   lifetime:
-    | { kind: "permanent" }
-    | { kind: "absolute"; deadline_at: string }
+    | AccountFocusLifetime
     | { kind: "current-reset"; reset_at: string }
     | { kind: "cycle-end"; reset_at: string };
 }
 
-/** Canonical durable Fable-focus policy stored in the Projection and launch leaf. */
-export interface FableFocusPolicy {
+export interface AccountFocusPolicy<TIntent extends boolean = boolean> {
   schema_version: 1;
   policy_id: string;
   target_route: ManagedAccountRouteId;
   /** Routing-purpose metadata; independent from per-process launch attribution. */
-  fable_intent: true;
+  fable_intent: TIntent;
   set_at: string;
-  lifetime:
-    | { kind: "permanent" }
-    | { kind: "absolute"; deadline_at: string }
-    | { kind: "cycle-end"; reset_at: string };
+  lifetime: AccountFocusLifetime;
 }
 
-export type FableFocusEffectiveState =
+/** Canonical durable Fable-focus policy stored in the Projection and launch leaf. */
+export interface FableFocusPolicy
+  extends Omit<AccountFocusPolicy<true>, "lifetime"> {
+  lifetime: AccountFocusLifetime | { kind: "cycle-end"; reset_at: string };
+}
+
+export interface NonFableFocusPolicy extends AccountFocusPolicy<false> {}
+
+export type AccountFocusEffectiveState =
   | "off"
   | "active"
   | "expired"
-  | "completed"
   | "invalid"
   | "unavailable";
 
-export interface FableFocusStatus {
-  state: FableFocusEffectiveState;
-  policy: FableFocusPolicy | null;
+export type FableFocusEffectiveState = AccountFocusEffectiveState | "completed";
+
+export interface AccountFocusStatus<
+  TPolicy extends AccountFocusPolicy = AccountFocusPolicy,
+> {
+  state: AccountFocusEffectiveState;
+  policy: TPolicy | null;
   diagnostic:
     | "none"
     | "policy-invalid"
@@ -47,6 +64,14 @@ export interface FableFocusStatus {
     | "delivery-insecure"
     | "delivery-unreachable";
 }
+
+export interface FableFocusStatus
+  extends Omit<AccountFocusStatus, "state" | "policy"> {
+  state: FableFocusEffectiveState;
+  policy: FableFocusPolicy | null;
+}
+
+export type NonFableFocusStatus = AccountFocusStatus<NonFableFocusPolicy>;
 
 /**
  * One entry in {@link Job.epic_links} — a per-job cross-reference to an epic

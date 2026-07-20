@@ -428,7 +428,7 @@ describe("readEventStoreStatus wiring", () => {
 
 describe("buildStatusEnvelope shape", () => {
   test("status schema version includes poison visibility", () => {
-    expect(STATUS_SCHEMA_VERSION).toBe(15);
+    expect(STATUS_SCHEMA_VERSION).toBe(16);
   });
 
   test("envelope carries every documented field", () => {
@@ -509,8 +509,8 @@ describe("buildStatusEnvelope shape", () => {
     expect(d.needs_human.parked_questions).toBe(0);
   });
 
-  test("status exposes the canonical PII-free Fable focus model", () => {
-    const focus = {
+  test("status exposes canonical PII-free sibling Account focus models", () => {
+    const fableFocus = {
       configured: true,
       state: "active" as const,
       target_route: "claude-swap:2" as const,
@@ -520,9 +520,30 @@ describe("buildStatusEnvelope shape", () => {
       reason: "target-ineligible" as const,
       diagnostic: "none",
     };
-    const data = buildStatusEnvelope(makeSnap(), BOOT, [], null, focus).data;
-    expect(data?.fable_focus).toEqual(focus);
-    expect(JSON.stringify(data?.fable_focus)).not.toContain("@");
+    const nonFableFocus = {
+      configured: true,
+      state: "active" as const,
+      target_route: "claude-swap:3" as const,
+      lifetime: {
+        kind: "absolute" as const,
+        deadline_at: "2026-07-20T00:00:00.000Z",
+      },
+      target_eligible: true,
+      outcome: "focused" as const,
+      reason: "target-focused" as const,
+      diagnostic: "none",
+    };
+    const data = buildStatusEnvelope(
+      makeSnap(),
+      BOOT,
+      [],
+      null,
+      fableFocus,
+      nonFableFocus,
+    ).data;
+    expect(data?.fable_focus).toEqual(fableFocus);
+    expect(data?.non_fable_focus).toEqual(nonFableFocus);
+    expect(JSON.stringify(data?.non_fable_focus)).not.toContain("@");
   });
 
   test("per-root: worktree off publishes effective 1 with the stored intent distinct", () => {

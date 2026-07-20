@@ -96,6 +96,11 @@ export function fableFocusPolicyPath(root: string): string {
   return join(root, "fable-focus-policy.json");
 }
 
+/** Kept separate so a delivery fault cannot disable Fable focus. */
+export function nonFableFocusPolicyPath(root: string): string {
+  return join(root, "non-fable-focus-policy.json");
+}
+
 export function ledgerPath(root: string): string {
   return join(root, "reservations.json");
 }

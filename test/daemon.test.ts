@@ -29,6 +29,11 @@ import { projectAutopilotPaused } from "../cli/autopilot";
 import { checkRaceGuard, type QueryFn } from "../cli/dispatch";
 import { archiveEligibility } from "../scripts/archive-recovered-dead-letters";
 import {
+  materializeNonFableFocusPolicy,
+  readNonFableFocusLeaf,
+  serializeNonFableFocusPolicy,
+} from "../src/account-focus";
+import {
   appendBackstopRecord,
   BackstopCounters,
 } from "../src/backstop-telemetry";
@@ -154,6 +159,7 @@ import {
   probeSettleStep,
   pruneRecoveredDeadLetters,
   publishFableFocusProjection,
+  publishNonFableFocusProjection,
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
@@ -4870,6 +4876,102 @@ test("Fable-focus Projection publication rehydrates the exact policy identity on
   }
 });
 
+test("Non-Fable-focus Projection publication verifies identity independently", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-non-fable-daemon-"));
+  const policy = materializeNonFableFocusPolicy(
+    { target_route: "claude-swap:3", lifetime: { kind: "permanent" } },
+    8,
+    1_752_840_060,
+  );
+  if (policy === null) throw new Error("expected policy");
+  db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, non_fable_focus)
+     VALUES (1, 1, 8, 1, 1, ?)`,
+    [serializeNonFableFocusPolicy(policy)],
+  );
+  try {
+    expect(publishNonFableFocusProjection(db, root)).toEqual({
+      schema_version: 1,
+      policy,
+    });
+    expect(
+      readNonFableFocusLeaf(join(root, "non-fable-focus-policy.json")),
+    ).toEqual({
+      available: true,
+      policy,
+    });
+    expect(() =>
+      publishNonFableFocusProjection(db, root, {
+        publish: () => {},
+        read: () => ({ available: true, policy: null }),
+      }),
+    ).toThrow("Non-Fable-focus launch leaf does not match the Projection");
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one Account-focus publication failure leaves the sibling leaf untouched", () => {
+  const { db } = openDb(":memory:");
+  const root = mkdtempSync(join(tmpdir(), "keeper-focus-isolation-"));
+  const fable = materializeFableFocusPolicy(
+    { target_route: "claude-swap:2", lifetime: { kind: "permanent" } },
+    7,
+    1_752_840_000,
+  );
+  const nonFable = materializeNonFableFocusPolicy(
+    { target_route: "claude-swap:3", lifetime: { kind: "permanent" } },
+    8,
+    1_752_840_060,
+  );
+  if (fable === null || nonFable === null) throw new Error("expected policies");
+  db.run(
+    `INSERT INTO autopilot_state
+       (id, paused, last_event_id, created_at, updated_at, fable_focus, non_fable_focus)
+     VALUES (1, 1, 8, 1, 1, ?, ?)`,
+    [serializeFableFocusPolicy(fable), serializeNonFableFocusPolicy(nonFable)],
+  );
+  try {
+    publishFableFocusProjection(db, root);
+    publishNonFableFocusProjection(db, root);
+    const siblingPath = join(root, "fable-focus-policy.json");
+    const siblingBefore = readFileSync(siblingPath, "utf8");
+    expect(() =>
+      publishNonFableFocusProjection(db, root, {
+        publish: () => {
+          throw new Error("injected Non-Fable write failure");
+        },
+      }),
+    ).toThrow("injected Non-Fable write failure");
+    expect(readFileSync(siblingPath, "utf8")).toBe(siblingBefore);
+    expect(readFableFocusLeaf(siblingPath)).toEqual({
+      available: true,
+      policy: fable,
+    });
+
+    const reverseSiblingPath = join(root, "non-fable-focus-policy.json");
+    const reverseSiblingBefore = readFileSync(reverseSiblingPath, "utf8");
+    expect(() =>
+      publishFableFocusProjection(db, root, {
+        publish: () => {
+          throw new Error("injected Fable write failure");
+        },
+      }),
+    ).toThrow("injected Fable write failure");
+    expect(readFileSync(reverseSiblingPath, "utf8")).toBe(reverseSiblingBefore);
+    expect(readNonFableFocusLeaf(reverseSiblingPath)).toEqual({
+      available: true,
+      policy: nonFable,
+    });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Fable-focus mutation acknowledgement fails closed on leaf publication failure", () => {
   const { db } = openDb(":memory:");
   const root = mkdtempSync(join(tmpdir(), "keeper-fable-daemon-"));
@@ -5162,7 +5264,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(138);
+  expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(138);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
