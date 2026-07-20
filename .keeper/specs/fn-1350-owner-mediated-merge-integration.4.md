@@ -38,5 +38,5 @@ In-process router tests: unclaimed incident with dead owner dispatches owning ve
 - [ ] Recover and base-freshness honor claims and the demoted roles; all suites green via named gates
 
 ## Done summary
-
+Add a level-triggered owner-router in reconcile that bypasses failedKeys suppression only for exact incident-classified work/close keys, so an unclaimed merge incident with no live owner and an unexhausted attachment slot gets an ordinary work/close dispatch (never an escalation verb) while autopilot-paused and other suppressed keys still hold. Demote the worktree recover pass to a backstop keyed on live claims (pass-1 never aborts under a claim; pass-2 merges a closed/tombstoned base only once no dispatchable closer remains) and make base-freshness defer instead of escalating on a refresh conflict. Named gates green: daemon.test.ts, reducer-projections.test.ts, autopilot-worker.test.ts, refold-equivalence.test.ts (1616 passed, 0 failed).
 ## Evidence
