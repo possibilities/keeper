@@ -37,5 +37,5 @@ In-process driver tests: provision leaves siblings unmerged and mints the manife
 - [ ] Driver, skill render, and golden suites green via named gates
 
 ## Done summary
-
+Provision no longer pre-merges fan-in siblings; it records a pending-integration manifest that blocks finalize from treating the base as assembled. The work skill gains an integrate phase that claims the incident and runs merge-resolver/deconflicter in-session on typed receipts, releasing on resolved/declined/stale outcomes. Driver, daemon, reducer, refold, and template-render suites are green.
 ## Evidence
