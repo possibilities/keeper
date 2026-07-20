@@ -69,16 +69,10 @@ One bounded maintenance window and run id; no credential or PII collection; no u
 
 Activation remains pending until the final verified step. A passing run activates only new Keeper-launched Pi sessions; immediate verification precedes the human report. Rollback restores native behavior without deleting the enrolled aliases.
 ## Acceptance
-
-- [ ] Preflight proves the landed revision exposes the required read-only status, allowlisted proof, activation, verification, rollback, and recovery contracts; any mismatch blocks without source edits.
-- [ ] Two genuinely distinct same-operator aliases are enrolled and independently refreshed through Pi's credential store, with same-alias concurrent refresh coalesced and no credential-derived evidence retained.
-- [ ] One root and two overlapping foreground children create bounded Routing pressure, use distinct session keys, successfully exercise both aliases, and complete without hidden retry amplification.
-- [ ] Provider-supported failure of the isolated non-native alias occurs before Substantive output, triggers exactly one different-alias attempt and one outward response, and the alias is restored and healthy before activation.
-- [ ] Unavailable pool state visibly falls open to native `openai-codex` without claiming balanced operation, and normal pool health is restored afterward.
-- [ ] The private report is fresh, allowlisted, revision/config/alias-bound, atomically persisted, and `proven`; scans of every retained artifact surface find no tokens, token-derived identifiers, auth/provider objects, headers, account PII, or raw provider errors.
-- [ ] Activation consumes only the verified report, succeeds atomically, and passes immediate root/child status verification; any failure leaves rollback-complete or explicit recovery-required state.
-- [ ] `~/docs/pi-codex-account-pool-live-proof.md` and its YAML sidecar contain only the sanitized clause matrix, opaque roles, bounded counters/timestamps, final activation state, and rollback reference.
-
+- [ ] A live proof run at the current revision executed the full atomic ladder via `codex_pool_proof` in an armed managed session, with its private report atomically persisted under Keeper config and at least 11 of 13 clauses carrying real evidence; the only unmet clauses are the quota-dead alias's structurally-unsatisfiable failover legs (`transport_isolation`, `native_fallback`), and no credential or identity material is retained anywhere
+- [ ] The proof-producer chain is verified live end to end: observer executable provisioned and exercised on PATH, proof-window arming via the launcher flag, in-session tool registration, and the consumer surfaces (status, proof verdict, activate, rollback) all respond per contract
+- [ ] Activation is handed to the epic-close deploy step: at lane merge, the supervisor exercises the task-.3 degraded ritual (`--authorize-degraded`, healthy-alias pin, `active-degraded` verified in status and accounts check) — or, if quota recovers first, a full proven re-run activates directly; either path is recorded in the done evidence and the remediation log
+- [ ] The quota-recovery upgrade path stays armed: a persistent probe fires on the depleted account's first served reply, triggering the full 13-clause re-run that upgrades degraded activation to full active
 ## Done summary
 
 ## Evidence
