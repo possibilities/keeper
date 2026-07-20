@@ -16,12 +16,15 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Account routing** — Claude launches use process-bound claude-swap Account routes from
   a fresh Capacity observation. claude-swap owns `usageStatus` and raw quota values;
   per-account Measurement age remains provenance in `keeper usage`, not an eligibility
-  gate. Keeper-launched Pi sessions use a separate, proof-gated Codex companion.
-  `keeper agent accounts check --json` reports both without reading credentials; see the
-  [routing operations guide](./docs/install.md#pi-codex-account-pool)
-- **Fable focus** — a durable, PII-free Account route preference for Fable work,
-  inspectable through account checks, `keeper status`, and `keeper board`; see the
-  [routing operations guide](./docs/install.md#claude-account-routing-and-fable-focus)
+  gate. Keeper-launched Pi sessions use an isolated Codex companion with its own visible native
+  fallback and proof-gated activation. `keeper agent accounts check --json` reports both
+  without reading credentials; see the [routing operations guide](./docs/install.md#pi-codex-account-pool)
+- **Account focuses** — independent, PII-free stable-route preferences: Fable focus matches
+  proven Fable work and Non-Fable focus matches proven non-Fable work. Explicit `--x-account`
+  wins, then the matching eligible focus, Fable soft avoidance, and normal route selection.
+  Focus fallback is visible and delivery health is independent; each scope rolls back with its
+  own `clear`. Inspect both through account checks, `keeper status`, and `keeper board`. See the
+  [routing operations guide](./docs/install.md#claude-account-routing-and-account-focuses)
 - **History forensics** — `keeper history list|show|search|files|index` is the
   canonical Claude/Pi surface; `keeper resume <session-reference>` is the human
   foreground continuation path; `keeper transcript` stays for explicit

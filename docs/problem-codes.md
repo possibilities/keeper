@@ -168,22 +168,23 @@ routing pressure. Enrollment is the exception: it requires inherited terminal st
 | `rollback-complete` | Activation reload or immediate verification failed and the transaction restored native mode. | Read `status`; repair the named health failure before a new proof and activation. | yes after repair/new proof |
 | `recovery-required` | Interruption or rollback failure left the private transaction marker. The marker itself forces native mode. | Run `recover`, confirm native `status`, repair storage/permissions if recovery still fails, then collect new proof. | conditional; recover first |
 
-## Fable focus routing (`keeper agent accounts fable-focus`)
+## Account focus routing (`keeper agent accounts {fable,non-fable}-focus`)
 
-`show --json` is a PII-free read of durable policy and effective routing state. `set` and `clear` return a
-JSON envelope on stdout; a guarded `current-reset` refusal exits before any policy update. Re-read `show`
-before repeating a mutation whose acknowledgement is uncertain. `clear` is idempotent when the policy is
-off and is the rollback for every lifetime.
+`show --json` is a PII-free read of one scope's durable policy and effective routing state. `set` and `clear`
+return a JSON envelope on stdout. Fable and Non-Fable focus have independent policies and delivery health:
+repair or clear only the affected scope. `clear` is that scope's idempotent rollback when it is already off.
+For any uncertain mutation acknowledgement, inspect the affected `show --json` result before retrying.
 
-| code / diagnostic | meaning | recovery | retry-safe |
+| code / diagnostic | scope and meaning | recovery | retry-safe |
 | --- | --- | --- | --- |
-| `policy-invalid` | The delivered policy fails validation, so it is not used for routing. | Inspect with `show --json`; clear the invalid policy, then set a valid stable `claude-swap:<slot>` Account route and lifetime. | yes after inspection |
-| `delivery-missing`, `delivery-malformed`, `delivery-unsupported`, `delivery-insecure`, `delivery-unreachable` | The launcher cannot use the delivered policy. Routing visibly falls back to normal balancing rather than blocking Claude. | Re-read `show --json`; repair the delivery path through a normal `clear` or `set` operation, never by editing launch state directly. | conditional; inspect first |
-| `focus_observation_unavailable`, `focus_observation_stale` | Guarded activation has no healthy fresh Capacity observation. | Refresh the observation, confirm it is fresh with `accounts check --json`, then construct a new guarded request. The current policy is unchanged. | yes; no update applied |
-| `focus_target_unavailable`, `focus_reset_unavailable` | The requested stable Account route is absent or cannot supply a fresh `model:Fable` reset boundary. | Select an eligible stable route and obtain fresh reset evidence before retrying. The current policy is unchanged. | yes; no update applied |
-| `focus_reset_mismatch` | `--expect-reset` does not match the currently observed target reset boundary. | Treat the boundary as changed; inspect fresh evidence and submit a new deliberate request. The current policy is unchanged. | yes; no update applied |
-| `focus_reset_elapsed` | The observed reset boundary has already elapsed. | Do not reuse it or roll focus into a later cycle. Inspect a fresh boundary and make a new deliberate choice. The current policy is unchanged. | yes; no update applied |
-| `focus_rpc_unreachable`, `focus_rpc_unexpected`, or a daemon-provided RPC code | Keeper cannot prove that a set or clear acknowledgement completed. The intended update may already be durable. | Run `keeper agent accounts fable-focus show --json`; stop if it reports the intended state, otherwise retry the deliberate mutation. | conditional; inspect first |
+| `policy-invalid` | A delivered Fable or Non-Fable policy fails validation and is not used for routing. | Inspect the affected `show --json`; clear or replace only that policy with a valid stable `claude-swap:<slot>` route and supported lifetime. | yes after inspection |
+| `delivery-missing`, `delivery-malformed`, `delivery-unsupported`, `delivery-insecure`, `delivery-unreachable` | The affected launcher delivery cannot be used. Its scope visibly falls back to normal Account-route balancing; the sibling focus remains independently usable. | Re-read the affected `show --json`; repair through its normal `clear` or `set`, never by editing launch state directly. | conditional; inspect first |
+| `focus_observation_unavailable`, `focus_observation_stale` | A guarded Fable reset or guarded Non-Fable activation lacks healthy, fresh Capacity evidence. | Refresh, confirm fresh capacity with `keeper agent accounts check --json`, then construct a new deliberate guarded request. The current policy is unchanged. | yes; no update applied |
+| `focus_target_unavailable`, `focus_reset_unavailable`, `focus_reset_mismatch` | Either scope cannot resolve its stable target, or a Fable guarded request cannot obtain its required fresh Fable reset boundary. | Inspect current capacity and reset evidence, then submit a new deliberate request only if it remains appropriate. The current policy is unchanged. | yes; no update applied |
+| `focus_target_ineligible` | A guarded Non-Fable activation's stable target is present but cannot currently serve the launch. | Choose an eligible stable route or wait for capacity, inspect again, then retry deliberately. The current policy is unchanged. | yes; no update applied |
+| `focus_deadline_elapsed`, `focus_reset_elapsed` | An absolute Non-Fable deadline or Fable reset boundary is not strictly future. | Do not turn it into a relative window or clear either focus. Inspect the current policy first; a later activation needs a newly authorized fixed deadline or reset boundary. | no mutation applied |
+| `outcome: fallback` with `reason: target-ineligible`, `policy-inactive`, or `policy-unavailable` | A configured focus does not apply, so normal Account-route selection remains available and visible. This is Account-route fallback, not a model change or Pi/Codex native fallback. | Read `show --json`, `accounts check --json`, `status --json`, or `board` to identify the target, state, eligibility, and diagnostic; repair only when the desired policy is still current. | read-only inspection |
+| `focus_rpc_unreachable`, `focus_rpc_unexpected`, or a daemon-provided RPC code | Keeper cannot prove that the affected `set` or `clear` acknowledgement completed; the intended update may already be durable. | Run the matching `keeper agent accounts fable-focus show --json` or `keeper agent accounts non-fable-focus show --json`. Stop if it reports the intended state; otherwise retry only the deliberate mutation. | conditional; inspect first |
 
 ## Autopilot withhold reasons
 

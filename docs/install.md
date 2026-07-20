@@ -60,7 +60,7 @@ use the normal status/query surfaces to verify the same identifiers against the 
 treat moving live counts as an acceptance threshold.
 Recovery by reason is in [problem-codes.md](./problem-codes.md#lifecycle-evidence-diagnostics).
 
-### Claude account routing and Fable focus
+### Claude account routing and Account focuses
 
 Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). Every installer run executes
 `uv tool install --upgrade claude-swap`; a missing `uv` or failed transaction is nonfatal to Keeper's
@@ -80,33 +80,41 @@ and zero eligible routes fail before Claude starts.
 #### Routing model
 
 An **Account route** is the PII-free stable identity `claude-swap:<slot>`. Persist and operate on that
-route, not on a display ordinal: `cN` is only the current zero-based inventory label shown by Claude and
-can name a different Account route after inventory changes. An explicit per-launch `--x-account` request
-uses that display label and takes precedence for that one process; it never changes Fable focus.
+route, not a display ordinal. `cN` is only Claude's current zero-based inventory label and can name a
+different route after inventory changes: `c1` is the second displayed account, while `claude-swap:2` is
+stable durable intent. An explicit `keeper agent claude --x-account cN` request uses the current display
+label for that launch only; it never changes either focus and refuses rather than selecting another route
+when its requested account is unavailable.
 
-Every fresh, resumed, restored, or forked Claude process is selected independently from current eligible
-routes. Without an effective Fable focus, normal balancing selects the route from current quota pressure,
-Fable availability, recency, and short-lived Launch reservations. Launch attribution records the selected
-Account route for that process only; it never creates account affinity for later work.
+An **Account focus** is a durable preference over one stable Account route. The two focuses are independent:
 
-**Fable focus** is one optional durable preference for a stable Account route. For Fable work, an eligible
-focus target wins after normal eligibility filtering. If that target cannot serve the launch, Keeper reports
-`fallback` and uses normal eligible-route balancing; focus never makes an ineligible route viable. For
-non-Fable Claude work, the target is soft-avoided whenever another route is eligible, but remains eligible
-as the sole route. This preserves availability while reserving the target's Fable capacity when possible.
+- **Fable focus** matches only proven Fable intent. It supports `permanent`, `absolute`, `current-reset`,
+  and `cycle-end` lifetimes.
+- **Non-Fable focus** matches only proven non-Fable intent. It supports `permanent` and `absolute`
+  lifetimes.
 
-**Fable intent** is process-lineage routing metadata, not Launch attribution. An explicit effective model
-sets or overrides it; a continuation, resume, restore, or fork inherits it when no explicit override is
-present. An interactive model change cannot move an already-running process to another Account route.
+An absolute lifetime is active only while `now < deadline`; `permanent` lasts until replaced or cleared.
+Fresh launches and passthrough commands establish explicit intent. Continuation, resume, restore, and fork
+inherit process-lineage Fable intent unless an explicit model overrides it. Unknown intent matches neither
+focus. Launch attribution records the route used by one process; it is not intent or Account affinity.
 
-A focus lifetime is one of:
+Selection uses one eligible-route set and this complete precedence:
 
-- `permanent`, effective until replacement or clear;
-- `absolute`, effective strictly before its timezone-bearing UTC deadline;
-- `current-reset`, which snapshots the selected route's fresh `model:Fable` reset boundary as an absolute
-  deadline; or
-- `cycle-end`, which completes when that same reset boundary passes or a fresh target observation proves
-  full Fable utilization.
+1. an explicit per-launch `--x-account` request;
+2. the eligible focus matching proven Fable or proven non-Fable intent;
+3. for non-Fable work with no matching target, soft avoidance of the active Fable target while another
+   eligible route exists; then
+4. normal Account-route scoring, reservation pressure, least-recently-used order, and stable tie-breaking.
+
+A matching eligible target wins even under reservation pressure. A Fable focus soft-avoids its target only
+for non-Fable work; a Non-Fable focus neither affects Fable work nor changes that scope's Fable policy. An
+inactive, expired, unavailable, absent, or ineligible matching target visibly falls through the remaining
+precedence. This **focus fallback** is visible Account-route fallback, not model fallback or Pi/Codex
+native fallback; it never makes an ineligible route viable or bypasses mandatory claude-swap routing.
+
+Each focus has its own durable policy and launch-delivery health. A malformed or unavailable Non-Fable
+delivery cannot disable a valid Fable focus, and vice versa. Inspection reports each scope's configured state,
+target, lifetime, eligibility, outcome, reason, and delivery diagnostic independently.
 
 #### Inspect routing state
 
@@ -120,49 +128,86 @@ provenance only. These surfaces are PII-free.
 keeper agent accounts check --json
 keeper agent accounts fable-focus show --json
 keeper usage
+keeper agent accounts non-fable-focus show --json
 keeper status --json
 keeper board
 ```
 
-`keeper status --json` includes `data.fable_focus`. `keeper board` presents the same effective Fable focus
-state in its semantic header, including the target, lifetime, and focused or fallback outcome; its snapshot
-and copied diagnostics retain that header.
+`accounts check --json` reports `claude_launch_routing.fable_focus` and
+`claude_launch_routing.non_fable_focus`, alongside current capacity and the route it would choose without
+creating a reservation. `keeper status --json` exposes the same views as `data.fable_focus` and
+`data.non_fable_focus`. `keeper board` renders full `Fable focus` and `Non-Fable focus` sections in its
+live, snapshot, frame, sidecar, and copied output. Off focuses collapse to one line; configured sections
+show target, lifetime, current eligibility, and effective routing state, while unavailable sections preserve
+the effective state and delivery diagnostic.
 
-#### Activate, verify, and clear Fable focus
+#### Operate Account focuses
 
-Use a stable Account route from a fresh inspection. For a guarded current-reset activation, set the
-expected value to the fresh target `model:Fable` reset boundary in timezone-bearing UTC; the placeholders
-below are values to substitute, not account identities or a rollout schedule.
+Use a stable route from fresh inspection. Ordinary changes are scope-specific: setting or clearing one
+focus leaves the other focus intact.
 
 ```sh
 route='claude-swap:<stable-slot>'
+deadline='<fixed-timezone-bearing-UTC-deadline>'
 expected_reset='<fresh-model-Fable-reset-in-UTC>'
+
+keeper agent accounts fable-focus set "$route" permanent --json
+keeper agent accounts fable-focus set "$route" absolute "$deadline" --json
 keeper agent accounts fable-focus set "$route" current-reset \
   --expect-reset "$expected_reset" --json
-keeper agent accounts fable-focus show --json
+keeper agent accounts non-fable-focus set "$route" permanent --json
 ```
 
-The command atomically snapshots the observed boundary before setting policy. An expected-boundary
-mismatch, stale or missing reset evidence, or an already elapsed boundary is a refusal: it leaves the
-existing policy unchanged and never advances the focus into a later reset cycle. Re-read `show` after any
-refusal or uncertain acknowledgement before choosing another action.
+`current-reset` snapshots the fresh Fable reset boundary and refuses a stale, missing, elapsed, or
+mismatched boundary rather than rolling into a later cycle. `cycle-end` is the Fable-only companion to
+that snapshot. Use an absolute deadline for a fixed Non-Fable window.
 
-Other durable lifetimes use the same stable route form:
+##### Guarded Non-Fable activation
+
+Use this runbook only while the fixed deadline is still authoritative. It does not create a relative window.
+Inspect the policy and capacity first; confirm that `$route` appears in the current candidates and is eligible,
+and independently establish `now < $deadline`. Then issue the guarded absolute update and verify every
+read surface:
 
 ```sh
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' permanent --json
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' absolute '<timezone-bearing-UTC-deadline>' --json
-keeper agent accounts fable-focus set 'claude-swap:<stable-slot>' cycle-end --json
+route='claude-swap:<stable-slot>'
+deadline='<fixed-timezone-bearing-UTC-deadline>'
+
+keeper agent accounts non-fable-focus show --json
+keeper agent accounts fable-focus show --json
+keeper agent accounts check --json
+# Require: $route is present and eligible, and now < $deadline.
+keeper agent accounts non-fable-focus set "$route" absolute "$deadline" \
+  --require-eligible --json
+keeper agent accounts non-fable-focus show --json
+keeper agent accounts check --json
+keeper status --json
+keeper board
 ```
 
-Clear is the rollback and is idempotent when the policy is already off. It also repairs an unavailable
-delivery view by publishing the durable clear; if its acknowledgement is uncertain, inspect before
-repeating it.
+`--require-eligible` requires fresh global capacity evidence and an eligible target. An elapsed deadline,
+missing or ineligible target, stale capacity, or refusal makes no policy update. Do not turn a missed
+deadline into a new relative window, and do not clear, replace, or retry either focus merely to recover from
+a missed or refused activation: inspect first so a concurrent human policy remains intact. If the mutation
+acknowledgement is uncertain, re-read the affected `show --json` view before deciding whether a deliberate
+retry is needed.
+
+##### Roll back one scope
+
+Clear is the rollback and is idempotent when that scope is already off. It also repairs an unavailable
+launch-delivery view by publishing the durable clear. Inspect first after an uncertain acknowledgement; do
+not repeat a mutation blindly.
 
 ```sh
 keeper agent accounts fable-focus clear --json
 keeper agent accounts fable-focus show --json
+keeper agent accounts non-fable-focus clear --json
+keeper agent accounts non-fable-focus show --json
 ```
+
+Account focuses affect only Keeper-launched Claude routing. Pi and Codex session routing are isolated:
+Non-Codex Pi providers keep their native path, and the Pi Codex pool has its own visible native
+`openai-codex` fallback and proof-gated activation.
 
 Claude `settings.json` is seeded at install time from the Keeper stow source only when the live file is
 absent. After that seed, the local file is canonical and claude-swap shares it into managed sessions.
