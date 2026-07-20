@@ -16,7 +16,6 @@ import {
 import {
   type AccountObservationIssue,
   isObservationFresh,
-  isRouteMeasurementFresh,
   type NormalizedWindow,
   type Observation,
   type ObservationHealth,
@@ -200,30 +199,18 @@ function isFableRequest(
     : modelHasFableIntent(model);
 }
 
-function effectiveUtilization(window: NormalizedWindow, nowMs: number): number {
-  if (window.resetsAt !== null) {
-    const resetMs = new Date(window.resetsAt).getTime();
-    if (!Number.isNaN(resetMs) && resetMs <= nowMs) return 0;
-  }
-  return window.utilization;
-}
-
-function worstUtilizationForKey(
-  route: Route,
-  key: string,
-  nowMs: number,
-): number | null {
+function worstUtilizationForKey(route: Route, key: string): number | null {
   let found = false;
   let worst = 0;
   for (const window of route.windows) {
     if (window.key !== key) continue;
     found = true;
-    worst = Math.max(worst, effectiveUtilization(window, nowMs));
+    worst = Math.max(worst, window.utilization);
   }
   return found ? worst : null;
 }
 
-function fableUtilization(route: Route, nowMs: number): number | null {
+function fableUtilization(route: Route): number | null {
   let found = false;
   let worst = 0;
   for (const window of route.windows) {
@@ -235,7 +222,7 @@ function fableUtilization(route: Route, nowMs: number): number | null {
       continue;
     }
     found = true;
-    worst = Math.max(worst, effectiveUtilization(window, nowMs));
+    worst = Math.max(worst, window.utilization);
   }
   return found ? worst : null;
 }
@@ -252,21 +239,17 @@ type LaunchRouteIssue =
 function routeIssues(
   route: Route,
   model: string | null | undefined,
-  nowMs: number,
   fableIntent?: boolean | null,
 ): LaunchRouteIssue[] {
   const issues: LaunchRouteIssue[] = [];
-  if (!isRouteMeasurementFresh(route, nowMs)) {
-    issues.push("measurement-stale");
-  }
-  const session = worstUtilizationForKey(route, SESSION_WINDOW, nowMs);
-  const week = worstUtilizationForKey(route, WEEK_WINDOW, nowMs);
+  const session = worstUtilizationForKey(route, SESSION_WINDOW);
+  const week = worstUtilizationForKey(route, WEEK_WINDOW);
   if (session === null) issues.push("session-quota-missing");
   else if (session >= 1) issues.push("session-quota-exhausted");
   if (week === null) issues.push("weekly-quota-missing");
   else if (week >= 1) issues.push("weekly-quota-exhausted");
   if (isFableRequest(model, fableIntent)) {
-    const fable = fableUtilization(route, nowMs);
+    const fable = fableUtilization(route);
     if (fable === null) issues.push("fable-entitlement-missing");
     else if (fable >= 1) issues.push("fable-quota-exhausted");
   }
@@ -276,10 +259,9 @@ function routeIssues(
 function routeIsEligible(
   route: Route,
   model: string | null | undefined,
-  nowMs: number,
   fableIntent?: boolean | null,
 ): boolean {
-  return routeIssues(route, model, nowMs, fableIntent).length === 0;
+  return routeIssues(route, model, fableIntent).length === 0;
 }
 
 function launchModelLabel(
@@ -321,16 +303,14 @@ function inventoryWideError(
 function quotaResetSuffix(
   route: Route,
   matches: (window: NormalizedWindow) => boolean,
-  nowMs: number,
 ): string {
   let worst: NormalizedWindow | null = null;
   let worstUtilization = -1;
   for (const window of route.windows) {
     if (!matches(window)) continue;
-    const utilization = effectiveUtilization(window, nowMs);
-    if (utilization > worstUtilization) {
+    if (window.utilization > worstUtilization) {
       worst = window;
-      worstUtilization = utilization;
+      worstUtilization = window.utilization;
     }
   }
   const reset = worst?.resetsAt;
@@ -339,11 +319,7 @@ function quotaResetSuffix(
     : "";
 }
 
-function issueMessage(
-  issue: LaunchRouteIssue,
-  route: Route | null,
-  nowMs: number,
-): string {
+function issueMessage(issue: LaunchRouteIssue, route: Route | null): string {
   switch (issue) {
     case "relogin-required":
       return "needs sign-in again";
@@ -359,8 +335,6 @@ function issueMessage(
       return "is unavailable according to claude-swap";
     case "missing-freshness":
       return "has no quota freshness timestamp";
-    case "measurement-stale":
-      return "quota measurement is stale";
     case "missing-windows":
       return "has no usable quota windows";
     case "malformed-scoped-windows":
@@ -368,11 +342,11 @@ function issueMessage(
     case "session-quota-missing":
       return "has no session quota data";
     case "session-quota-exhausted":
-      return `session quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === SESSION_WINDOW, nowMs) : ""}`;
+      return `session quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === SESSION_WINDOW) : ""}`;
     case "weekly-quota-missing":
       return "has no weekly quota data";
     case "weekly-quota-exhausted":
-      return `weekly quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === WEEK_WINDOW, nowMs) : ""}`;
+      return `weekly quota is exhausted${route ? quotaResetSuffix(route, (window) => window.key === WEEK_WINDOW) : ""}`;
     case "fable-entitlement-missing":
       return "has no Fable quota";
     case "fable-quota-exhausted":
@@ -385,7 +359,6 @@ function issueMessage(
                 normalizedModelName(
                   window.key.slice(MODEL_WINDOW_PREFIX.length),
                 ) === FABLE_MODEL,
-              nowMs,
             )
           : ""
       }`;
@@ -407,7 +380,6 @@ function accountFailureDetail(
   observation: Observation,
   ordinal: number,
   model: string | null | undefined,
-  nowMs: number,
   fableIntent?: boolean | null,
 ): string {
   const routeId = accountRouteIdAtOrdinal(observation, ordinal);
@@ -416,17 +388,16 @@ function accountFailureDetail(
     (candidate) => candidate.id === routeId,
   );
   const issues = route
-    ? routeIssues(route, model, nowMs, fableIntent)
+    ? routeIssues(route, model, fableIntent)
     : [observation.account_issues[routeId] ?? "account-unavailable"];
   return `c${ordinal}: ${issues
-    .map((issue) => issueMessage(issue, route ?? null, nowMs))
+    .map((issue) => issueMessage(issue, route ?? null))
     .join(", ")}`;
 }
 
 function routeUnavailableError(
   observation: Observation,
   model: string | null | undefined,
-  nowMs: number,
   fableIntent?: boolean | null,
 ): string {
   const modelLabel = launchModelLabel(model, fableIntent);
@@ -439,7 +410,7 @@ function routeUnavailableError(
   const details = Array.from(
     { length: observation.claude_accounts.count },
     (_, ordinal) =>
-      accountFailureDetail(observation, ordinal, model, nowMs, fableIntent),
+      accountFailureDetail(observation, ordinal, model, fableIntent),
   );
   return [
     `Claude cannot start${modelLabel ? ` with ${modelLabel}` : ""}.`,
@@ -516,12 +487,11 @@ function doSelectRouteByAccountOrdinal(
       candidate.slot > 0 &&
       managedRouteId(candidate.slot) === candidate.id,
   );
-  if (!route || !routeIsEligible(route, deps.model, nowMs, deps.fableIntent)) {
+  if (!route || !routeIsEligible(route, deps.model, deps.fableIntent)) {
     const detail = accountFailureDetail(
       observation,
       ordinal,
       deps.model,
-      nowMs,
       deps.fableIntent,
     );
     const modelLabel = launchModelLabel(deps.model, deps.fableIntent);
@@ -577,7 +547,7 @@ function focusView(
     policy === null
       ? null
       : target !== null &&
-        routeIsEligible(target, deps.model, nowMs, deps.fableIntent);
+        routeIsEligible(target, deps.model, deps.fableIntent);
   return {
     state: effective.state,
     policy,
@@ -603,17 +573,12 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
   if (!fresh.ok) return fresh;
   const observation = fresh.observation;
   const candidates = observation.routes.filter((route) =>
-    routeIsEligible(route, deps.model, nowMs, deps.fableIntent),
+    routeIsEligible(route, deps.model, deps.fableIntent),
   );
   if (candidates.length === 0) {
     return {
       ok: false,
-      error: routeUnavailableError(
-        observation,
-        deps.model,
-        nowMs,
-        deps.fableIntent,
-      ),
+      error: routeUnavailableError(observation, deps.model, deps.fableIntent),
     };
   }
 
@@ -638,7 +603,7 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
           (route) => route.id !== focus.activeTarget?.id,
         );
       }
-      chosen = scoreAndPick(pool, ledger, nowMs, deps.model, deps.fableIntent);
+      chosen = scoreAndPick(pool, ledger, deps.model, deps.fableIntent);
       reason =
         focus.state === "active" &&
         focus.policy !== null &&
@@ -781,7 +746,6 @@ function inspectionFocusView(
   observation: Observation | null,
   fableRequest: boolean,
   deps: SelectRouteDeps = {},
-  nowMs: number = deps.nowMs ?? Date.now(),
 ): FableFocusRoutingView {
   const policy = effective.policy;
   if (policy === null) {
@@ -794,7 +758,7 @@ function inspectionFocusView(
     observation === null
       ? null
       : target !== undefined &&
-        routeIsEligible(target, deps.model, nowMs, deps.fableIntent);
+        routeIsEligible(target, deps.model, deps.fableIntent);
   if (effective.state !== "active") {
     return {
       configured: true,
@@ -833,7 +797,7 @@ function inspectionFocusView(
   }
   const eligibleCount =
     observation?.routes.filter((route) =>
-      routeIsEligible(route, deps.model, nowMs, deps.fableIntent),
+      routeIsEligible(route, deps.model, deps.fableIntent),
     ).length ?? 0;
   return {
     configured: true,
@@ -933,7 +897,6 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       usableObservation,
       isFableRequest(deps.model, deps.fableIntent),
       deps,
-      nowMs,
     ),
   };
   if (!fresh) {
@@ -951,12 +914,12 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     );
   }
   const routeable = observation.routes.filter((route) =>
-    routeIsEligible(route, deps.model, nowMs, deps.fableIntent),
+    routeIsEligible(route, deps.model, deps.fableIntent),
   );
   if (routeable.length === 0) {
     return disabledInspection(
       observation.health,
-      routeUnavailableError(observation, deps.model, nowMs, deps.fableIntent),
+      routeUnavailableError(observation, deps.model, deps.fableIntent),
       {
         ...extras,
         fable_focus: inspectionFocusView(
@@ -964,7 +927,6 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
           observation,
           isFableRequest(deps.model, deps.fableIntent),
           deps,
-          nowMs,
         ),
       },
     );
@@ -974,12 +936,12 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   const candidates: RoutingCandidateView[] = routeable.map((route) => {
     const entry = ledger.routes[route.id];
     const pending = entry?.reservations.length ?? 0;
-    const fable = fableUtilization(route, nowMs);
+    const fable = fableUtilization(route);
     return {
       id: route.id,
       kind: "managed",
       slot: route.slot,
-      worst_utilization: genericPressure(route, pending, nowMs),
+      worst_utilization: genericPressure(route, pending),
       fable_remaining:
         fable === null ? null : Number(Math.max(0, 1 - fable).toFixed(6)),
     };
@@ -1006,13 +968,7 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
         (route) => route.id !== focus.activeTarget?.id,
       );
     }
-    chosen = scoreAndPick(
-      choicePool,
-      ledger,
-      nowMs,
-      deps.model,
-      deps.fableIntent,
-    );
+    chosen = scoreAndPick(choicePool, ledger, deps.model, deps.fableIntent);
     reason =
       focus.state === "active" && focus.policy !== null && focus.fableRequest
         ? "fable-focus-fallback"
@@ -1037,17 +993,15 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       observation,
       focus.fableRequest,
       deps,
-      nowMs,
     ),
   };
 }
 
-function genericPressure(route: Route, pending: number, nowMs: number): number {
+function genericPressure(route: Route, pending: number): number {
   let worst = 0;
   for (const window of route.windows) {
     if (window.key.startsWith(MODEL_WINDOW_PREFIX)) continue;
-    const utilization = effectiveUtilization(window, nowMs);
-    if (utilization > worst) worst = utilization;
+    if (window.utilization > worst) worst = window.utilization;
   }
   return worst + pending * RESERVATION_UTILIZATION_STEP;
 }
@@ -1061,12 +1015,11 @@ interface RouteScore {
 function routeScore(
   route: Route,
   pending: number,
-  nowMs: number,
   model: string | null | undefined,
   fableIntent?: boolean | null,
 ): RouteScore {
-  const fable = fableUtilization(route, nowMs);
-  const pressure = genericPressure(route, pending, nowMs);
+  const fable = fableUtilization(route);
+  const pressure = genericPressure(route, pending);
   if (isFableRequest(model, fableIntent)) {
     return {
       fableTier: 0,
@@ -1097,7 +1050,6 @@ function compareScores(a: RouteScore, b: RouteScore): number {
 function scoreAndPick(
   candidates: Route[],
   ledger: Ledger,
-  nowMs: number,
   model: string | null | undefined,
   fableIntent?: boolean | null,
 ): Route {
@@ -1108,7 +1060,7 @@ function scoreAndPick(
     const entry = ledger.routes[route.id];
     const pending = entry?.reservations.length ?? 0;
     const lastSelected = entry?.last_selected_at ?? Number.NEGATIVE_INFINITY;
-    const score = routeScore(route, pending, nowMs, model, fableIntent);
+    const score = routeScore(route, pending, model, fableIntent);
     const scoreOrder =
       bestScore === null ? -1 : compareScores(score, bestScore);
     if (

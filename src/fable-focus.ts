@@ -12,11 +12,7 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import {
-  isObservationFresh,
-  isRouteMeasurementFresh,
-  type Observation,
-} from "./account-observation";
+import { isObservationFresh, type Observation } from "./account-observation";
 import type {
   FableFocusInput,
   FableFocusPolicy,
@@ -247,9 +243,7 @@ function matchingFableWindowCompleted(
   const route = observation.routes.find(
     (candidate) => candidate.id === policy.target_route,
   );
-  if (route === undefined || !isRouteMeasurementFresh(route, nowMs)) {
-    return false;
-  }
+  if (route === undefined) return false;
   const boundaryMs = Date.parse(policy.lifetime.reset_at);
   return route.windows.some((window) => {
     if (window.key.toLowerCase() !== "model:fable") return false;
@@ -335,11 +329,7 @@ export function buildCurrentResetFableFocus(
   const route = observation.routes.find(
     (candidate) => candidate.id === targetRoute,
   );
-  if (
-    targetRoute === null ||
-    route === undefined ||
-    !isRouteMeasurementFresh(route, nowMs)
-  ) {
+  if (targetRoute === null || route === undefined) {
     return { ok: false, reason: "target-unavailable" };
   }
   const window = route.windows.find(
