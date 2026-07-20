@@ -388,6 +388,7 @@ describe("degraded single-alias verdict", () => {
     expect(report.degraded).toEqual({
       cause: "quota",
       waived_clauses: ["native_fallback", "transport_isolation"],
+      pinned_alias: "keeper-codex-b",
     });
     expect(classifyLiveProof(report, EXPECTED).verdict).toBe(
       "proven-degraded-single-alias",
@@ -395,7 +396,33 @@ describe("degraded single-alias verdict", () => {
     expect(reportDegradedVerdict(report)).toEqual({
       cause: "quota",
       waived_clauses: ["native_fallback", "transport_isolation"],
+      pinned_alias: "keeper-codex-b",
     });
+  });
+
+  test("no degraded marker when quota faults span both session roles", () => {
+    const routes: LiveProofReport["routes"] = [
+      {
+        session_role: "root",
+        attempts: 2,
+        failure_class: "quota",
+        substantive_output: false,
+        restored: true,
+      },
+      {
+        session_role: "child",
+        attempts: 2,
+        failure_class: "quota",
+        substantive_output: false,
+        restored: true,
+      },
+    ];
+    const report = collectLiveProof(
+      proofInput(["native_fallback", "transport_isolation"], routes),
+      EXPECTED,
+    );
+    expect(report.verdict).toBe("incomplete");
+    expect(report.degraded).toBeNull();
   });
 
   test("waives a single quota-waivable clause", () => {
@@ -460,6 +487,7 @@ describe("degraded single-alias verdict", () => {
     understated.degraded = {
       cause: "quota",
       waived_clauses: ["transport_isolation"],
+      pinned_alias: "keeper-codex-b",
     };
     expect(classifyLiveProof(understated, EXPECTED)).toEqual(
       expect.objectContaining({
@@ -474,6 +502,7 @@ describe("degraded single-alias verdict", () => {
     proven.degraded = {
       cause: "quota",
       waived_clauses: ["transport_isolation"],
+      pinned_alias: "keeper-codex-b",
     };
     proven.verdict = "proven-degraded-single-alias";
     expect(classifyLiveProof(proven, EXPECTED)).toEqual({
@@ -502,6 +531,7 @@ describe("degraded single-alias verdict", () => {
     report.degraded = {
       cause: "quota",
       waived_clauses: ["session_stickiness" as LiveProofClause],
+      pinned_alias: "keeper-codex-b",
     };
     expect(classifyLiveProof(report, EXPECTED).verdict).toBe("failed");
   });

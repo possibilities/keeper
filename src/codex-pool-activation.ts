@@ -623,8 +623,12 @@ export function activateCodexPool(
         );
       }
       const degradedVerdict = reportDegradedVerdict(input);
-      const pinnedAlias = deps.bindings.aliases[0];
-      if (degradedVerdict === null || pinnedAlias === undefined) {
+      const pinnedAlias = degradedVerdict?.pinned_alias;
+      if (
+        degradedVerdict === null ||
+        pinnedAlias === undefined ||
+        !deps.bindings.aliases.includes(pinnedAlias)
+      ) {
         return result("activate", false, "native", "proof-failed", proof);
       }
       candidate = stateFor("active-degraded", deps.bindings, deps.nowMs(), {

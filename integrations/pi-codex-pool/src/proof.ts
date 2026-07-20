@@ -51,6 +51,7 @@ export type ProofClassification =
 export interface DegradedProofVerdict {
   cause: "quota";
   waived_clauses: LiveProofClause[];
+  pinned_alias: string;
 }
 
 export const LIVE_PROOF_REQUIRED_EVIDENCE = {
@@ -409,11 +410,17 @@ function schemaShape(input: unknown): {
   if (degraded !== undefined && degraded !== null) {
     const marker = record(degraded);
     if (!marker) return { unknown };
-    unknown ||= hasUnknownKeys(marker, ["cause", "waived_clauses"]);
+    unknown ||= hasUnknownKeys(marker, [
+      "cause",
+      "waived_clauses",
+      "pinned_alias",
+    ]);
     const waived = marker.waived_clauses;
     if (
-      !hasExactKeys(marker, ["cause", "waived_clauses"]) ||
+      !hasExactKeys(marker, ["cause", "waived_clauses", "pinned_alias"]) ||
       marker.cause !== "quota" ||
+      typeof marker.pinned_alias !== "string" ||
+      !isOpaqueAlias(marker.pinned_alias) ||
       !Array.isArray(waived) ||
       waived.length === 0 ||
       waived.length > QUOTA_WAIVABLE_CLAUSES.length ||
@@ -601,6 +608,7 @@ export function reportDegradedVerdict(
   return {
     cause: "quota",
     waived_clauses: [...degraded.waived_clauses],
+    pinned_alias: degraded.pinned_alias,
   };
 }
 
@@ -699,11 +707,29 @@ export function collectLiveProof(
   report.verdict = classifyWithoutDeclaredVerdict(report, expected, reasons);
   if (report.verdict === "incomplete") {
     const transcriptClauses = clausesFromProofTranscript(report.transcript);
+    const quotaRoles = new Set(
+      report.routes
+        .filter((route) => route.failure_class === "quota")
+        .map((route) => route.session_role),
+    );
+    const pinRole =
+      quotaRoles.has("root") && !quotaRoles.has("child")
+        ? "alternate"
+        : quotaRoles.has("child") && !quotaRoles.has("root")
+          ? "primary"
+          : null;
+    const pinnedAlias =
+      pinRole === null
+        ? null
+        : (report.alias_roles.find((entry) => entry.role === pinRole)?.alias ??
+          null);
+    if (pinnedAlias === null) return report;
     const candidate: DegradedProofVerdict = {
       cause: "quota",
       waived_clauses: LIVE_PROOF_CLAUSES.filter(
         (clause) => !transcriptClauses[clause],
       ),
+      pinned_alias: pinnedAlias,
     };
     const degradedReasons: ProofVerdict["reasons"] = [];
     const upgraded = classifyWithoutDeclaredVerdict(

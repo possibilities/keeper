@@ -175,6 +175,7 @@ function degradedReport(): LiveProofReport {
   report.degraded = {
     cause: "quota",
     waived_clauses: ["native_fallback", "transport_isolation"],
+    pinned_alias: "keeper-codex-a",
   };
   report.verdict = "proven-degraded-single-alias";
   return report;
