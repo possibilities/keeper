@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.96,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "This cross-cutting admission and sidecar-contract change carries subtle fail-closed correctness invariants across parsing, routing, scoring, and reservations.",
+      "task_id": "fn-1388-trust-claude-swap-eligibility-status.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Preserving focus lifetime rules and semantic-history stability while removing only measurement-age vetoes is a subtle cross-surface correctness invariant.",
+      "task_id": "fn-1388-trust-claude-swap-eligibility-status.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T15:24:11.646000Z",
+  "epic_id": "fn-1388-trust-claude-swap-eligibility-status",
+  "input_hash": "b4abac85982c317760f098357285dd5a3bafe6e4a11fda3937033217dab7d5eb",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3031149701,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1388-trust-claude-swap-eligibility-status.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"This cross-cutting admission and sidecar-contract change carries subtle fail-closed correctness invariants across parsing, routing, scoring, and reservations.\",\"confidence\":0.96},{\"task_id\":\"fn-1388-trust-claude-swap-eligibility-status.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Preserving focus lifetime rules and semantic-history stability while removing only measurement-age vetoes is a subtle cross-surface correctness invariant.\",\"confidence\":0.9}]}\n"
+}
