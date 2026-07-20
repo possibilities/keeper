@@ -41,7 +41,10 @@ import type {
   PartnerCaptureLease,
   PublishedBusArtifact,
 } from "../../src/bus-artifact";
-import type { CodexPoolWorkflowResult } from "../../src/codex-pool-activation";
+import type {
+  CodexPoolActivationAuthorization,
+  CodexPoolWorkflowResult,
+} from "../../src/codex-pool-activation";
 
 /** The default host launch triples the harness injects when a test names none: an
  *  empty set (no defaults, no dispatch verbs, no panels). Triple-verb tests
@@ -185,6 +188,7 @@ export interface HarnessOptions {
   runCodexPoolWorkflow?: (
     operation: CodexPoolOperatorOperation,
     source?: string,
+    authorization?: CodexPoolActivationAuthorization | null,
   ) => CodexPoolWorkflowResult;
   /** Pi prompt-artifact preflight seam; may throw a typed launcher failure. */
   ensurePiPromptArtifacts?: (actionLog: string[]) => void;

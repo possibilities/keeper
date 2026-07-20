@@ -811,6 +811,85 @@ describe("keeper agent accounts codex-pool", () => {
     });
     expect(h.spawned).toEqual([]);
   });
+
+  test("activate forwards degraded authorization only for the exact flag", async () => {
+    const calls: Array<{
+      operation: string;
+      source?: string;
+      authorization: unknown;
+    }> = [];
+    const h = makeHarness({
+      argv: [
+        "accounts",
+        "codex-pool",
+        "activate",
+        "--authorize-degraded=proven-degraded-single-alias",
+        "--json",
+      ],
+      rawArgv: true,
+      runCodexPoolWorkflow: (operation, source, authorization) => {
+        calls.push({
+          operation,
+          ...(source ? { source } : {}),
+          authorization: authorization ?? null,
+        });
+        return {
+          schema_version: 1,
+          ok: true,
+          operation,
+          state: "active-degraded",
+          problem_code: null,
+          proof: {
+            verdict: "proven-degraded-single-alias",
+            reasons: ["clause-incomplete"],
+          },
+        };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    expect(calls).toEqual([
+      {
+        operation: "activate",
+        authorization: { degraded_verdict: "proven-degraded-single-alias" },
+      },
+    ]);
+    expect(JSON.parse(h.out.join("")).state).toBe("active-degraded");
+  });
+
+  test("rejects a degraded flag naming the wrong verdict", async () => {
+    const h = makeHarness({
+      argv: [
+        "accounts",
+        "codex-pool",
+        "activate",
+        "--authorize-degraded=proven",
+      ],
+      rawArgv: true,
+      runCodexPoolWorkflow: () => {
+        throw new Error("must not reach the workflow");
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.err.join("")).toContain("invalid arguments");
+    expect(h.spawned).toEqual([]);
+  });
+
+  test("rejects the degraded flag on a non-activate operation", async () => {
+    const h = makeHarness({
+      argv: [
+        "accounts",
+        "codex-pool",
+        "status",
+        "--authorize-degraded=proven-degraded-single-alias",
+      ],
+      rawArgv: true,
+      runCodexPoolWorkflow: () => {
+        throw new Error("must not reach the workflow");
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.err.join("")).toContain("invalid arguments");
+  });
 });
 
 describe("keeper agent accounts check", () => {
@@ -955,5 +1034,44 @@ describe("keeper agent accounts check", () => {
     expect(h.routerCalls()).toBe(0);
     expect(h.spawned).toEqual([]);
     expect(JSON.stringify(output)).not.toContain("@example");
+  });
+
+  test("human output surfaces the degraded single-alias state loudly", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "check"],
+      rawArgv: true,
+      inspectRouting: () => inspection,
+      inspectCodexSessionRouting: () => ({
+        activation: { mode: "active-degraded" as const, problem_code: null },
+        companion: { health: "ready" as const, problem_code: null },
+        capacity: {
+          provider: "openai-codex" as const,
+          health: "ready" as const,
+          config_binding: "a".repeat(64),
+          observed_at_ms: 1000,
+          fresh: true,
+          verdict: {
+            kind: "pooled" as const,
+            provider: "openai-codex" as const,
+            alias: "keeper-codex-a",
+            reason: "selected" as const,
+          },
+          candidates: [
+            {
+              alias: "keeper-codex-a",
+              worst_used_percent: 10,
+              pressure: 0,
+              cooldown_until_ms: 0,
+              eligible: true,
+            },
+          ],
+        },
+      }),
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const rendered = h.out.join("");
+    expect(rendered).toContain("activation=active-degraded");
+    expect(rendered).toContain("DEGRADED single-alias operation");
+    expect(rendered).toContain("NOT balanced");
   });
 });

@@ -25,7 +25,33 @@ export const LIVE_PROOF_CLAUSES = [
 ] as const;
 
 export type LiveProofClause = (typeof LIVE_PROOF_CLAUSES)[number];
-export type ProofClassification = "proven" | "incomplete" | "failed";
+
+/**
+ * The only clauses a degraded verdict may waive: their evidence structurally
+ * requires a second serving alias — distinct root/child routing and the
+ * pool-exhaustion native-fallback leg — which a quota-dead alias refuses. Any
+ * unmet clause outside this set makes the run genuinely incomplete, never
+ * degraded-eligible.
+ */
+export const QUOTA_WAIVABLE_CLAUSES = [
+  "native_fallback",
+  "transport_isolation",
+] as const satisfies readonly LiveProofClause[];
+
+export type ProofClassification =
+  | "proven"
+  | "incomplete"
+  | "failed"
+  | "proven-degraded-single-alias";
+
+/**
+ * A degraded verdict's recorded justification: the classified interruption cause
+ * and the exact clauses waived because the quota-dead alias refused to serve.
+ */
+export interface DegradedProofVerdict {
+  cause: "quota";
+  waived_clauses: LiveProofClause[];
+}
 
 export const LIVE_PROOF_REQUIRED_EVIDENCE = {
   independent_credentials: [
@@ -112,6 +138,7 @@ export interface LiveProofReport {
     completed: boolean;
   };
   artifact_scan: ArtifactScanResult;
+  degraded: DegradedProofVerdict | null;
   verdict: ProofClassification;
 }
 
@@ -184,6 +211,20 @@ function hasUnknownKeys(
   return Object.keys(value).some((key) => !allowed.has(key));
 }
 
+/**
+ * Every required report key present and no key outside the required set plus the
+ * optional `degraded` marker — a legacy full report omitting `degraded` reads as
+ * a non-degraded report, while an extra unknown key is rejected upstream.
+ */
+function hasReportKeys(value: Record<string, unknown>): boolean {
+  const keys = new Set(Object.keys(value));
+  const allowed = new Set<string>([...REPORT_KEYS, "degraded"]);
+  return (
+    REPORT_KEYS.every((key) => keys.has(key)) &&
+    [...keys].every((key) => allowed.has(key))
+  );
+}
+
 function finiteTimestamp(value: unknown): value is number {
   return (
     typeof value === "number" &&
@@ -216,8 +257,8 @@ function schemaShape(input: unknown): {
 } {
   const top = record(input);
   if (!top) return { unknown: false };
-  let unknown = hasUnknownKeys(top, REPORT_KEYS);
-  if (!hasExactKeys(top, REPORT_KEYS)) return { unknown };
+  let unknown = hasUnknownKeys(top, [...REPORT_KEYS, "degraded"]);
+  if (!hasReportKeys(top)) return { unknown };
   const roles = top.alias_roles;
   const transcript = top.transcript;
   const clauses = record(top.clauses);
@@ -244,7 +285,8 @@ function schemaShape(input: unknown): {
     !scan ||
     (top.verdict !== "proven" &&
       top.verdict !== "incomplete" &&
-      top.verdict !== "failed")
+      top.verdict !== "failed" &&
+      top.verdict !== "proven-degraded-single-alias")
   ) {
     return { unknown };
   }
@@ -363,7 +405,82 @@ function schemaShape(input: unknown): {
   ) {
     return { unknown };
   }
+  const degraded = top.degraded;
+  if (degraded !== undefined && degraded !== null) {
+    const marker = record(degraded);
+    if (!marker) return { unknown };
+    unknown ||= hasUnknownKeys(marker, ["cause", "waived_clauses"]);
+    const waived = marker.waived_clauses;
+    if (
+      !hasExactKeys(marker, ["cause", "waived_clauses"]) ||
+      marker.cause !== "quota" ||
+      !Array.isArray(waived) ||
+      waived.length === 0 ||
+      waived.length > QUOTA_WAIVABLE_CLAUSES.length ||
+      new Set(waived).size !== waived.length ||
+      waived.some(
+        (clause) =>
+          !(QUOTA_WAIVABLE_CLAUSES as readonly string[]).includes(
+            String(clause),
+          ),
+      )
+    ) {
+      return { unknown };
+    }
+  }
   return { report: input as LiveProofReport, unknown };
+}
+
+/**
+ * The residual reasons a legitimate quota degradation may still carry: the
+ * waived clauses register `clause-incomplete`, the quota refusal may mark the
+ * run `interrupted`, and the refused native-fallback leg may leave restoration
+ * incomplete. Any other reason (binding, staleness, sanitation, missing routes)
+ * disqualifies the degraded verdict outright.
+ */
+const DEGRADED_ALLOWED_REASONS = new Set<ProofVerdict["reasons"][number]>([
+  "clause-incomplete",
+  "interrupted",
+  "restoration-incomplete",
+]);
+
+/**
+ * True only when the run's sole shortfall is the quota-dead alias refusing its
+ * waivable legs: every unmet clause is quota-waivable, the declared waiver names
+ * exactly those clauses, a route recorded a genuine quota failure, and no reason
+ * outside the allowed residual set remains.
+ */
+function degradedEligible(
+  routes: LiveProofReport["routes"],
+  transcriptClauses: Record<LiveProofClause, boolean>,
+  reasons: ProofVerdict["reasons"],
+  waivedClauses: readonly LiveProofClause[],
+): boolean {
+  const unmet = LIVE_PROOF_CLAUSES.filter(
+    (clause) => !transcriptClauses[clause],
+  );
+  if (unmet.length === 0) return false;
+  if (
+    !unmet.every((clause) =>
+      (QUOTA_WAIVABLE_CLAUSES as readonly string[]).includes(clause),
+    )
+  ) {
+    return false;
+  }
+  const waivedSet = new Set(waivedClauses);
+  if (
+    waivedSet.size !== waivedClauses.length ||
+    waivedClauses.length !== unmet.length ||
+    !unmet.every((clause) => waivedSet.has(clause)) ||
+    !waivedClauses.every((clause) =>
+      (QUOTA_WAIVABLE_CLAUSES as readonly string[]).includes(clause),
+    )
+  ) {
+    return false;
+  }
+  if (!routes.some((route) => route.failure_class === "quota")) return false;
+  if (!reasons.includes("clause-incomplete")) return false;
+  return reasons.every((reason) => DEGRADED_ALLOWED_REASONS.has(reason));
 }
 
 function classifyWithoutDeclaredVerdict(
@@ -428,7 +545,21 @@ function classifyWithoutDeclaredVerdict(
   ) {
     return "failed";
   }
-  return reasons.length === 0 ? "proven" : "incomplete";
+  if (reasons.length === 0) return "proven";
+  const declaredDegraded = report.degraded ?? null;
+  if (
+    declaredDegraded !== null &&
+    declaredDegraded.cause === "quota" &&
+    degradedEligible(
+      report.routes,
+      transcriptClauses,
+      reasons,
+      declaredDegraded.waived_clauses,
+    )
+  ) {
+    return "proven-degraded-single-alias";
+  }
+  return "incomplete";
 }
 
 export function classifyLiveProof(
@@ -453,6 +584,24 @@ export function classifyLiveProof(
     return { verdict: "failed", reasons };
   }
   return { verdict: computed, reasons };
+}
+
+/**
+ * The validated degraded marker of a schema-valid report, or null when the
+ * report carries none. Callers that have already confirmed a
+ * `proven-degraded-single-alias` verdict via {@link classifyLiveProof} use this
+ * to read the waived clauses the activation pin must record.
+ */
+export function reportDegradedVerdict(
+  input: unknown,
+): DegradedProofVerdict | null {
+  const parsed = schemaShape(input);
+  const degraded = parsed.report?.degraded ?? null;
+  if (degraded === null || degraded.cause !== "quota") return null;
+  return {
+    cause: "quota",
+    waived_clauses: [...degraded.waived_clauses],
+  };
 }
 
 export function buildProofTranscript(
@@ -506,7 +655,7 @@ export function aliasRoleBinding(
 }
 
 export function collectLiveProof(
-  input: Omit<LiveProofReport, "schema_version" | "verdict">,
+  input: Omit<LiveProofReport, "schema_version" | "verdict" | "degraded">,
   expected: ExpectedProofBindings,
 ): LiveProofReport {
   const report = {
@@ -543,10 +692,30 @@ export function collectLiveProof(
       scanned_bytes: input.artifact_scan.scanned_bytes,
       finding_classes: [...input.artifact_scan.finding_classes],
     },
+    degraded: null as DegradedProofVerdict | null,
     verdict: "incomplete" as ProofClassification,
   } satisfies LiveProofReport;
   const reasons: ProofVerdict["reasons"] = [];
   report.verdict = classifyWithoutDeclaredVerdict(report, expected, reasons);
+  if (report.verdict === "incomplete") {
+    const transcriptClauses = clausesFromProofTranscript(report.transcript);
+    const candidate: DegradedProofVerdict = {
+      cause: "quota",
+      waived_clauses: LIVE_PROOF_CLAUSES.filter(
+        (clause) => !transcriptClauses[clause],
+      ),
+    };
+    const degradedReasons: ProofVerdict["reasons"] = [];
+    const upgraded = classifyWithoutDeclaredVerdict(
+      { ...report, degraded: candidate },
+      expected,
+      degradedReasons,
+    );
+    if (upgraded === "proven-degraded-single-alias") {
+      report.degraded = candidate;
+      report.verdict = upgraded;
+    }
+  }
   return report;
 }
 

@@ -9,8 +9,11 @@ import {
   collectLiveProof,
   type ExpectedProofBindings,
   LIVE_PROOF_CLAUSES,
+  type LiveProofClause,
   type LiveProofReport,
   type ProofTranscriptEntry,
+  QUOTA_WAIVABLE_CLAUSES,
+  reportDegradedVerdict,
   scanProofArtifacts,
   writeLiveProofReport,
 } from "../src/proof.ts";
@@ -147,6 +150,57 @@ function passingReport(): LiveProofReport {
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+const QUOTA_ROUTES: LiveProofReport["routes"] = [
+  {
+    session_role: "root",
+    attempts: 2,
+    failure_class: "quota",
+    substantive_output: false,
+    restored: true,
+  },
+  {
+    session_role: "child",
+    attempts: 1,
+    failure_class: "none",
+    substantive_output: true,
+    restored: true,
+  },
+];
+
+/** A collectLiveProof input with the named clauses dropped and routes overridden. */
+function proofInput(
+  dropClauses: readonly LiveProofClause[] = [],
+  routes: LiveProofReport["routes"] = QUOTA_ROUTES,
+): Omit<LiveProofReport, "schema_version" | "verdict" | "degraded"> {
+  const drop = new Set(dropClauses);
+  return {
+    revision: REVISION,
+    config_binding: CONFIG_BINDING,
+    alias_binding: ALIAS_BINDING,
+    started_at_ms: 990_000,
+    completed_at_ms: 999_000,
+    interrupted: false,
+    alias_roles: [
+      { alias: "keeper-codex-a", role: "primary" },
+      { alias: "keeper-codex-b", role: "alternate" },
+    ],
+    transcript: clone(PASSING_TRANSCRIPT).map((entry) =>
+      drop.has(entry.clause) ? { ...entry, evidence: [] } : entry,
+    ),
+    clauses: Object.fromEntries(
+      LIVE_PROOF_CLAUSES.map((clause) => [clause, !drop.has(clause)]),
+    ) as LiveProofReport["clauses"],
+    routes,
+    restoration: { required: true, completed: true },
+    artifact_scan: {
+      status: "clean",
+      scanned_count: 7,
+      scanned_bytes: 700,
+      finding_classes: [],
+    },
+  };
 }
 
 describe("live proof bindings and classifier", () => {
@@ -324,6 +378,135 @@ describe("live proof bindings and classifier", () => {
   });
 });
 
+describe("degraded single-alias verdict", () => {
+  test("classifies when only quota-waivable clauses are unmet with quota evidence", () => {
+    const report = collectLiveProof(
+      proofInput(["native_fallback", "transport_isolation"]),
+      EXPECTED,
+    );
+    expect(report.verdict).toBe("proven-degraded-single-alias");
+    expect(report.degraded).toEqual({
+      cause: "quota",
+      waived_clauses: ["native_fallback", "transport_isolation"],
+    });
+    expect(classifyLiveProof(report, EXPECTED).verdict).toBe(
+      "proven-degraded-single-alias",
+    );
+    expect(reportDegradedVerdict(report)).toEqual({
+      cause: "quota",
+      waived_clauses: ["native_fallback", "transport_isolation"],
+    });
+  });
+
+  test("waives a single quota-waivable clause", () => {
+    const report = collectLiveProof(
+      proofInput(["transport_isolation"]),
+      EXPECTED,
+    );
+    expect(report.verdict).toBe("proven-degraded-single-alias");
+    expect(report.degraded?.waived_clauses).toEqual(["transport_isolation"]);
+  });
+
+  test("only native_fallback and transport_isolation are waivable", () => {
+    expect([...QUOTA_WAIVABLE_CLAUSES]).toEqual([
+      "native_fallback",
+      "transport_isolation",
+    ]);
+  });
+
+  test("refuses when any non-waivable clause is also unmet", () => {
+    const report = collectLiveProof(
+      proofInput(["transport_isolation", "session_stickiness"]),
+      EXPECTED,
+    );
+    expect(report.verdict).toBe("incomplete");
+    expect(report.degraded).toBeNull();
+    expect(reportDegradedVerdict(report)).toBeNull();
+  });
+
+  test("refuses a waivable shortfall without a genuine quota route failure", () => {
+    const report = collectLiveProof(
+      proofInput(
+        ["native_fallback", "transport_isolation"],
+        [
+          {
+            session_role: "root",
+            attempts: 1,
+            failure_class: "rate",
+            substantive_output: false,
+            restored: true,
+          },
+          {
+            session_role: "child",
+            attempts: 1,
+            failure_class: "none",
+            substantive_output: true,
+            restored: true,
+          },
+        ],
+      ),
+      EXPECTED,
+    );
+    expect(report.verdict).toBe("incomplete");
+    expect(report.degraded).toBeNull();
+  });
+
+  test("refuses a degraded verdict whose waiver does not match the actual unmet clauses", () => {
+    const report = collectLiveProof(
+      proofInput(["native_fallback", "transport_isolation"]),
+      EXPECTED,
+    );
+    const understated = clone(report);
+    understated.degraded = {
+      cause: "quota",
+      waived_clauses: ["transport_isolation"],
+    };
+    expect(classifyLiveProof(understated, EXPECTED)).toEqual(
+      expect.objectContaining({
+        verdict: "failed",
+        reasons: expect.arrayContaining(["declared-verdict-mismatch"]),
+      }),
+    );
+  });
+
+  test("refuses a degraded claim on an otherwise proven report", () => {
+    const proven = clone(passingReport());
+    proven.degraded = {
+      cause: "quota",
+      waived_clauses: ["transport_isolation"],
+    };
+    proven.verdict = "proven-degraded-single-alias";
+    expect(classifyLiveProof(proven, EXPECTED)).toEqual({
+      verdict: "failed",
+      reasons: ["declared-verdict-mismatch"],
+    });
+  });
+
+  test("a sanitation finding fails rather than degrades", () => {
+    const input = proofInput(["native_fallback", "transport_isolation"]);
+    input.artifact_scan = {
+      status: "findings",
+      scanned_count: 7,
+      scanned_bytes: 700,
+      finding_classes: ["bearer-token"],
+    };
+    const report = collectLiveProof(input, EXPECTED);
+    expect(report.verdict).toBe("failed");
+    expect(report.degraded).toBeNull();
+  });
+
+  test("rejects a degraded marker naming a non-waivable clause", () => {
+    const report = clone(
+      collectLiveProof(proofInput(["transport_isolation"]), EXPECTED),
+    );
+    report.degraded = {
+      cause: "quota",
+      waived_clauses: ["session_stickiness" as LiveProofClause],
+    };
+    expect(classifyLiveProof(report, EXPECTED).verdict).toBe("failed");
+  });
+});
+
 describe("proof artifact sanitation and persistence", () => {
   test("scans every persisted and rendered boundary for credentials, identities, headers, and PII", () => {
     const result = scanProofArtifacts(
@@ -428,6 +611,7 @@ describe("proof artifact sanitation and persistence", () => {
         "clauses",
         "completed_at_ms",
         "config_binding",
+        "degraded",
         "interrupted",
         "restoration",
         "revision",

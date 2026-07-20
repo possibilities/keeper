@@ -81,7 +81,9 @@ import {
 import {
   activateCodexPool,
   armCodexPoolProofWindow,
+  CODEX_POOL_DEGRADED_VERDICT,
   CODEX_POOL_PROOF_WINDOW_ENV,
+  type CodexPoolActivationAuthorization,
   type CodexPoolActivationDeps,
   type CodexPoolProblemCode,
   type CodexPoolProofWindowState,
@@ -258,6 +260,12 @@ import { readSingleChar } from "./tty";
 
 export interface CodexPoolLaunchContext {
   mode: "native" | "active";
+  /**
+   * The pool is active but pinned to a single healthy alias while the other is
+   * quota-dead — launched as `active` routing, surfaced as `active-degraded` to
+   * operators. Defaults to a balanced (non-degraded) active pool when absent.
+   */
+  degraded?: boolean;
   aliases: string[];
   config_binding: string;
   revision?: string;
@@ -267,7 +275,7 @@ export interface CodexPoolLaunchContext {
 
 export interface CodexSessionRoutingInspection {
   activation: {
-    mode: "native" | "active";
+    mode: "native" | "active" | "active-degraded";
     problem_code: CodexPoolProblemCode | null;
   };
   companion: {
@@ -414,6 +422,7 @@ export interface MainDeps {
   runCodexPoolWorkflowFn: (
     operation: CodexPoolOperatorOperation,
     source?: string,
+    authorization?: CodexPoolActivationAuthorization | null,
   ) => CodexPoolWorkflowResult;
   /**
    * Resolve `target` (a current name, former name, session id, id prefix, or
@@ -525,6 +534,7 @@ function productionCodexPoolWorkflow(
   env: NodeJS.ProcessEnv,
   operation: CodexPoolOperatorOperation,
   source?: string,
+  authorization?: CodexPoolActivationAuthorization | null,
 ): CodexPoolWorkflowResult {
   try {
     const deps = productionCodexPoolActivationDeps(env);
@@ -545,7 +555,7 @@ function productionCodexPoolWorkflow(
       case "proof-verdict":
         return verdictCodexPoolProof(deps, source);
       case "activate":
-        return activateCodexPool(deps, source);
+        return activateCodexPool(deps, source, authorization);
       case "verify":
         return verifyCodexPool(deps);
       case "rollback":
@@ -573,18 +583,24 @@ function productionCodexPoolLaunchContext(
     const deps = productionCodexPoolActivationDeps(env);
     const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
     const inspection = inspectCodexRouting();
+    const degraded = effective.mode === "active-degraded";
     const ready =
-      effective.mode === "active" &&
+      (effective.mode === "active" || degraded) &&
       effective.state !== null &&
       codexPoolObservationVerifies(effective.state, inspection);
     const route = ready && reserve ? selectCodexRoute() : null;
     const routed = route === null || route.kind === "pooled";
+    const pinnedAlias = degraded
+      ? (effective.state?.degraded?.pinned_alias ?? null)
+      : null;
     return {
       mode: ready && routed ? "active" : "native",
+      degraded: ready && routed && degraded,
       aliases: [...deps.bindings.aliases],
       config_binding: deps.bindings.config_binding,
       revision: deps.bindings.revision,
-      initial_alias: route?.kind === "pooled" ? route.alias : null,
+      initial_alias:
+        route?.kind === "pooled" ? route.alias : degraded ? pinnedAlias : null,
       problem_code:
         ready && routed
           ? null
@@ -616,7 +632,12 @@ function productionCodexSessionInspection(
   const launch = productionCodexPoolLaunchContext(env);
   return {
     activation: {
-      mode: companion.health === "ready" ? launch.mode : "native",
+      mode:
+        companion.health !== "ready"
+          ? "native"
+          : launch.degraded === true
+            ? "active-degraded"
+            : launch.mode,
       problem_code: companion.problem_code ?? launch.problem_code,
     },
     companion: {
@@ -705,8 +726,13 @@ export function realDeps(): MainDeps {
       productionCodexPoolLaunchContext(process.env, reserve),
     inspectCodexSessionRoutingFn: () =>
       productionCodexSessionInspection(process.env),
-    runCodexPoolWorkflowFn: (operation, source) =>
-      productionCodexPoolWorkflow(process.env, operation, source),
+    runCodexPoolWorkflowFn: (operation, source, authorization) =>
+      productionCodexPoolWorkflow(
+        process.env,
+        operation,
+        source,
+        authorization,
+      ),
     resolveResumeDecisionFn: (target, requireHarness) =>
       resolveResumeDecisionViaSubprocess(
         process.execPath,
@@ -2966,20 +2992,39 @@ async function runCodexPoolCommand(
     );
   }
 
+  // The degraded waiver is deliberately explicit: only `activate` accepts
+  // `--authorize-degraded=<verdict>`, and only when the value names the exact
+  // degraded verdict. Anything else is rejected rather than silently ignored.
+  const degradedFlagName = "--authorize-degraded";
+  const degradedFlag = args.find(
+    (arg) => arg === degradedFlagName || arg.startsWith(`${degradedFlagName}=`),
+  );
+  const positional = args.filter((arg) => arg !== degradedFlag);
+  let authorization: CodexPoolActivationAuthorization | null = null;
+  if (degradedFlag !== undefined) {
+    if (
+      operation !== "activate" ||
+      degradedFlag !== `${degradedFlagName}=${CODEX_POOL_DEGRADED_VERDICT}`
+    ) {
+      deps.writeErr(`accounts codex-pool ${operation} has invalid arguments\n`);
+      return deps.exit(2);
+    }
+    authorization = { degraded_verdict: CODEX_POOL_DEGRADED_VERDICT };
+  }
   const takesSource =
     operation === "proof-capture" ||
     operation === "proof-verdict" ||
     operation === "activate";
-  const source = args[0];
+  const source = positional[0];
   if (
-    (!takesSource && args.length !== 0) ||
-    (takesSource && args.length > 1) ||
+    (!takesSource && positional.length !== 0) ||
+    (takesSource && positional.length > 1) ||
     (operation === "proof-capture" && source === undefined)
   ) {
     deps.writeErr(`accounts codex-pool ${operation} has invalid arguments\n`);
     return deps.exit(2);
   }
-  const outcome = deps.runCodexPoolWorkflowFn(operation, source);
+  const outcome = deps.runCodexPoolWorkflowFn(operation, source, authorization);
   if (json) {
     deps.write(`${JSON.stringify(outcome)}\n`);
   } else {
@@ -3046,6 +3091,12 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
       `companion=${codex.companion.health} capacity=${codex.capacity.health} ` +
       `fresh=${codex.capacity.fresh}\n`,
   );
+  if (codex.activation.mode === "active-degraded") {
+    deps.write(
+      "codex session routing: DEGRADED single-alias operation " +
+        "(pinned to one healthy alias, NOT balanced)\n",
+    );
+  }
   if (codex.capacity.verdict.kind === "pooled") {
     deps.write(
       `session route candidate: ${codex.capacity.verdict.alias} ` +

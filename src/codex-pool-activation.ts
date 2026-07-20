@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_ACCOUNT_ALIASES,
+  isOpaqueAlias,
   normalizeAliases,
   writePrivateJsonAtomic,
 } from "../integrations/pi-codex-pool/src/auth.ts";
@@ -14,6 +15,8 @@ import {
   classifyLiveProof,
   type ExpectedProofBindings,
   type LiveProofReport,
+  QUOTA_WAIVABLE_CLAUSES,
+  reportDegradedVerdict,
 } from "../integrations/pi-codex-pool/src/proof.ts";
 import { poolConfigBinding } from "../integrations/pi-codex-pool/src/state.ts";
 import type { CodexRoutingInspection } from "./codex-account-router.ts";
@@ -36,7 +39,33 @@ export {
 export const CODEX_POOL_MAX_REPORT_BYTES = 256 * 1024;
 export const CODEX_POOL_MAX_STATE_BYTES = 32 * 1024;
 
-export type CodexPoolActivationMode = "native" | "active" | "recovery-required";
+export type CodexPoolActivationMode =
+  | "native"
+  | "active"
+  | "active-degraded"
+  | "recovery-required";
+
+export const CODEX_POOL_DEGRADED_VERDICT = "proven-degraded-single-alias";
+
+/**
+ * The pin an `active-degraded` activation records: the classified quota cause,
+ * the exact clauses the proof waived, and the single healthy alias routing is
+ * pinned to while the other alias is quota-dead.
+ */
+export interface CodexPoolDegradedMarker {
+  cause: "quota";
+  waived_clauses: string[];
+  pinned_alias: string;
+}
+
+/**
+ * Explicit operator authorization naming the degraded verdict. Activation admits
+ * a `proven-degraded-single-alias` report ONLY when this is present; absent it,
+ * a degraded report is refused rather than silently activated.
+ */
+export interface CodexPoolActivationAuthorization {
+  degraded_verdict: typeof CODEX_POOL_DEGRADED_VERDICT;
+}
 
 export interface CodexPoolBindings {
   revision: string;
@@ -56,6 +85,7 @@ export interface CodexPoolActivationState {
   config_binding: string;
   alias_binding: string;
   aliases: string[];
+  degraded: CodexPoolDegradedMarker | null;
   updated_at_ms: number;
 }
 
@@ -83,6 +113,7 @@ export type CodexPoolProblemCode =
   | "proof-invalid"
   | "proof-incomplete"
   | "proof-failed"
+  | "proof-degraded-unauthorized"
   | "verification-failed"
   | "rollback-complete"
   | "recovery-required";
@@ -101,7 +132,11 @@ export interface CodexPoolWorkflowResult {
   state: CodexPoolActivationMode;
   problem_code: CodexPoolProblemCode | null;
   proof: {
-    verdict: "proven" | "incomplete" | "failed";
+    verdict:
+      | "proven"
+      | "incomplete"
+      | "failed"
+      | "proven-degraded-single-alias";
     reasons: string[];
   } | null;
 }
@@ -133,23 +168,61 @@ function isRevision(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{7,64}$/.test(value);
 }
 
+function parseCodexPoolDegradedMarker(
+  value: unknown,
+  aliases: readonly string[],
+): CodexPoolDegradedMarker | null {
+  const marker = record(value);
+  if (marker === null) return null;
+  const waived = marker.waived_clauses;
+  if (
+    !exactKeys(marker, ["cause", "waived_clauses", "pinned_alias"]) ||
+    marker.cause !== "quota" ||
+    typeof marker.pinned_alias !== "string" ||
+    !isOpaqueAlias(marker.pinned_alias) ||
+    !aliases.includes(marker.pinned_alias) ||
+    !Array.isArray(waived) ||
+    waived.length === 0 ||
+    waived.length > QUOTA_WAIVABLE_CLAUSES.length ||
+    new Set(waived).size !== waived.length ||
+    waived.some(
+      (clause) =>
+        !(QUOTA_WAIVABLE_CLAUSES as readonly string[]).includes(String(clause)),
+    )
+  ) {
+    return null;
+  }
+  return {
+    cause: "quota",
+    waived_clauses: waived.map(String),
+    pinned_alias: marker.pinned_alias,
+  };
+}
+
 export function parseCodexPoolActivationState(
   value: unknown,
 ): CodexPoolActivationState | null {
   const input = record(value);
+  if (input === null) return null;
+  const hasDegraded = "degraded" in input;
+  const allowedKeys = [
+    "schema_version",
+    "mode",
+    "revision",
+    "config_binding",
+    "alias_binding",
+    "aliases",
+    "updated_at_ms",
+  ];
   if (
-    input === null ||
-    !exactKeys(input, [
-      "schema_version",
-      "mode",
-      "revision",
-      "config_binding",
-      "alias_binding",
-      "aliases",
-      "updated_at_ms",
-    ]) ||
+    !exactKeys(
+      input,
+      hasDegraded ? [...allowedKeys, "degraded"] : allowedKeys,
+    ) ||
     input.schema_version !== CODEX_POOL_WORKFLOW_SCHEMA_VERSION ||
-    !["native", "active", "recovery-required"].includes(String(input.mode)) ||
+    !["native", "active", "active-degraded", "recovery-required"].includes(
+      String(input.mode),
+    ) ||
     !isRevision(input.revision) ||
     !isBinding(input.config_binding) ||
     !isBinding(input.alias_binding) ||
@@ -164,6 +237,14 @@ export function parseCodexPoolActivationState(
   } catch {
     return null;
   }
+  const rawDegraded = hasDegraded ? input.degraded : null;
+  let degraded: CodexPoolDegradedMarker | null = null;
+  if (input.mode === "active-degraded") {
+    degraded = parseCodexPoolDegradedMarker(rawDegraded, aliases);
+    if (degraded === null) return null;
+  } else if (rawDegraded !== null && rawDegraded !== undefined) {
+    return null;
+  }
   return {
     schema_version: CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
     mode: input.mode as CodexPoolActivationMode,
@@ -171,6 +252,7 @@ export function parseCodexPoolActivationState(
     config_binding: input.config_binding,
     alias_binding: input.alias_binding,
     aliases,
+    degraded,
     updated_at_ms: input.updated_at_ms as number,
   };
 }
@@ -288,6 +370,7 @@ function stateFor(
   mode: CodexPoolActivationMode,
   bindings: CodexPoolBindings,
   nowMs: number,
+  degraded: CodexPoolDegradedMarker | null = null,
 ): CodexPoolActivationState {
   return {
     schema_version: CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
@@ -296,6 +379,7 @@ function stateFor(
     config_binding: bindings.config_binding,
     alias_binding: bindings.alias_binding,
     aliases: [...bindings.aliases],
+    degraded,
     updated_at_ms: Math.floor(nowMs),
   };
 }
@@ -358,7 +442,7 @@ export function effectiveCodexPoolActivation(
   store: Pick<CodexPoolActivationStore, "readActivation" | "transactionExists">,
   bindings: CodexPoolBindings,
 ): {
-  mode: "native" | "active";
+  mode: "native" | "active" | "active-degraded";
   problem_code: CodexPoolProblemCode | null;
   state: CodexPoolActivationState | null;
 } {
@@ -391,6 +475,9 @@ export function effectiveCodexPoolActivation(
   if (state.mode === "active") {
     return { mode: "active", problem_code: null, state };
   }
+  if (state.mode === "active-degraded" && state.degraded !== null) {
+    return { mode: "active-degraded", problem_code: null, state };
+  }
   return {
     mode: "native",
     problem_code:
@@ -411,7 +498,10 @@ export function codexPoolStatus(
     deps.nowMs(),
   );
   let healthy = false;
-  if (effective.mode === "active" && effective.state !== null) {
+  if (
+    (effective.mode === "active" || effective.mode === "active-degraded") &&
+    effective.state !== null
+  ) {
     try {
       healthy = deps.verify(effective.state);
     } catch {
@@ -421,7 +511,7 @@ export function codexPoolStatus(
   return result(
     "status",
     healthy,
-    healthy ? "active" : "native",
+    healthy ? effective.mode : "native",
     healthy ? null : (effective.problem_code ?? "verification-failed"),
     proof,
   );
@@ -501,6 +591,7 @@ function rollbackAfterFailure(
 export function activateCodexPool(
   deps: CodexPoolActivationDeps,
   source?: string,
+  authorization?: CodexPoolActivationAuthorization | null,
 ): CodexPoolWorkflowResult {
   const lock = deps.store.tryLock();
   if (lock === null) {
@@ -510,15 +601,38 @@ export function activateCodexPool(
     if (deps.store.transactionExists()) {
       return result("activate", false, "native", "recovery-required");
     }
-    const proof = proofResult(
-      deps.store.readReport(source),
-      deps.bindings,
-      deps.nowMs(),
-    );
+    const input = deps.store.readReport(source);
+    const proof = proofResult(input, deps.bindings, deps.nowMs());
     if (proof === null) {
       return result("activate", false, "native", "proof-missing");
     }
-    if (proof.verdict !== "proven") {
+    // A full proven report activates (and upgrades any prior degraded state);
+    // a degraded verdict activates ONLY behind the explicit operator flag; an
+    // incomplete or failed verdict is refused.
+    let candidate: CodexPoolActivationState;
+    if (proof.verdict === "proven") {
+      candidate = stateFor("active", deps.bindings, deps.nowMs());
+    } else if (proof.verdict === CODEX_POOL_DEGRADED_VERDICT) {
+      if (authorization?.degraded_verdict !== CODEX_POOL_DEGRADED_VERDICT) {
+        return result(
+          "activate",
+          false,
+          "native",
+          "proof-degraded-unauthorized",
+          proof,
+        );
+      }
+      const degradedVerdict = reportDegradedVerdict(input);
+      const pinnedAlias = deps.bindings.aliases[0];
+      if (degradedVerdict === null || pinnedAlias === undefined) {
+        return result("activate", false, "native", "proof-failed", proof);
+      }
+      candidate = stateFor("active-degraded", deps.bindings, deps.nowMs(), {
+        cause: degradedVerdict.cause,
+        waived_clauses: [...degradedVerdict.waived_clauses],
+        pinned_alias: pinnedAlias,
+      });
+    } else {
       return result(
         "activate",
         false,
@@ -527,7 +641,6 @@ export function activateCodexPool(
         proof,
       );
     }
-    const candidate = stateFor("active", deps.bindings, deps.nowMs());
     try {
       deps.store.beginTransaction();
     } catch {
@@ -547,13 +660,13 @@ export function activateCodexPool(
     if (
       persisted === null ||
       !matchesBindings(persisted, deps.bindings) ||
-      persisted.mode !== "active" ||
+      persisted.mode !== candidate.mode ||
       !deps.verify(candidate)
     ) {
       return rollbackAfterFailure(deps, "activate");
     }
     deps.store.endTransaction();
-    return result("activate", true, "active", null, proof);
+    return result("activate", true, candidate.mode, null, proof);
   } catch {
     if (deps.store.transactionExists()) {
       return rollbackAfterFailure(deps, "activate");
@@ -596,7 +709,10 @@ export function verifyCodexPool(
   deps: CodexPoolActivationDeps,
 ): CodexPoolWorkflowResult {
   const effective = effectiveCodexPoolActivation(deps.store, deps.bindings);
-  if (effective.mode !== "active" || effective.state === null) {
+  if (
+    (effective.mode !== "active" && effective.mode !== "active-degraded") ||
+    effective.state === null
+  ) {
     return result(
       "verify",
       false,
@@ -613,7 +729,7 @@ export function verifyCodexPool(
   return result(
     "verify",
     verified,
-    verified ? "active" : "native",
+    verified ? effective.mode : "native",
     verified ? null : "verification-failed",
   );
 }
@@ -622,12 +738,28 @@ export function codexPoolObservationVerifies(
   candidate: CodexPoolActivationState,
   inspection: CodexRoutingInspection,
 ): boolean {
+  if (
+    inspection.config_binding !== candidate.config_binding ||
+    inspection.health !== "ready" ||
+    !inspection.fresh ||
+    inspection.verdict.kind !== "pooled"
+  ) {
+    return false;
+  }
+  // A degraded activation must route to exactly the pinned healthy alias — the
+  // quota-dead alias is enrolled but never the live route, so a single healthy
+  // candidate is expected rather than the two a full activation requires.
+  if (candidate.mode === "active-degraded") {
+    const pinned = candidate.degraded?.pinned_alias;
+    return (
+      pinned !== undefined &&
+      inspection.verdict.alias === pinned &&
+      candidate.aliases.includes(pinned) &&
+      inspection.candidates.some((entry) => entry.alias === pinned)
+    );
+  }
   return (
     candidate.mode === "active" &&
-    inspection.config_binding === candidate.config_binding &&
-    inspection.health === "ready" &&
-    inspection.fresh &&
-    inspection.verdict.kind === "pooled" &&
     candidate.aliases.includes(inspection.verdict.alias) &&
     inspection.candidates.length >= 2 &&
     inspection.candidates.every((entry) =>
