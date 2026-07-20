@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.97,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Cross-cutting schema, replay, secure leaf publication, and byte-compatible failure isolation create subtle correctness and security invariants.",
+      "task_id": "fn-1387-add-non-fable-account-focus.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.95,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The routing precedence matrix and guarded mutation authority are subtle correctness invariants spanning router, CLI, status, and tests.",
+      "task_id": "fn-1387-add-non-fable-account-focus.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is substantial but well-specified multi-file template-following with explicit rendering, geometry, and parity acceptance.",
+      "task_id": "fn-1387-add-non-fable-account-focus.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.92,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Operator-facing prose requires careful terminology, command fidelity, and concise in-repo documentation judgment across three surfaces.",
+      "task_id": "fn-1387-add-non-fable-account-focus.4",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T14:53:31.468000Z",
+  "epic_id": "fn-1387-add-non-fable-account-focus",
+  "input_hash": "f3b953de50fd4372ee2dad62c0f185805a902fb88cd40841f391420f5f450607",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 4089009118,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1387-add-non-fable-account-focus.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting schema, replay, secure leaf publication, and byte-compatible failure isolation create subtle correctness and security invariants.\",\"confidence\":0.97},{\"task_id\":\"fn-1387-add-non-fable-account-focus.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The routing precedence matrix and guarded mutation authority are subtle correctness invariants spanning router, CLI, status, and tests.\",\"confidence\":0.95},{\"task_id\":\"fn-1387-add-non-fable-account-focus.3\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"This is substantial but well-specified multi-file template-following with explicit rendering, geometry, and parity acceptance.\",\"confidence\":0.9},{\"task_id\":\"fn-1387-add-non-fable-account-focus.4\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Operator-facing prose requires careful terminology, command fidelity, and concise in-repo documentation judgment across three surfaces.\",\"confidence\":0.92}]}"
+}
