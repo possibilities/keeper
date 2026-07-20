@@ -47,5 +47,5 @@ Cover an old-but-provider-trusted focus target, fresh non-`ok` fallback and late
 - [ ] The named Account-focus and Usage view test files pass.
 
 ## Done summary
-
+Removed the Usage view's secondary route-age veto so an admitted Claude account renders usable meters with Measurement age as diagnostic provenance only; added focus fallback/resumption and reset-boundary test coverage and clarified Capacity-observation freshness vs Measurement age in README/install docs.
 ## Evidence
