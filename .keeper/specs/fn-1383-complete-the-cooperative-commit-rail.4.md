@@ -40,5 +40,5 @@ non-bus deny behavior unchanged. Named gates (the wrapped-guard suite).
 - [ ] Wrapped-guard suite green via its named gate; fail-closed posture unchanged
 
 ## Done summary
-
+Added a bounded bus classifier so a marked wrapped cell may run keeper bus chat send (send-only cooperative-release notice) while every other keeper bus verb stays denied; wrapped-guard suite covers allow/deny cases.
 ## Evidence
