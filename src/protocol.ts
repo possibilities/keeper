@@ -181,6 +181,8 @@ export interface EventStoreLastBootCatchup {
 export interface EventStoreStatus {
   event_count: number;
   db_bytes: number;
+  /** Age in whole seconds of the newest event the reducer cursor has folded. */
+  ingest_lag_seconds: number;
   last_boot_catchup: EventStoreLastBootCatchup | null;
   projected_catchup_duration_ms: number | null;
   projected_full_replay_duration_ms: number | null;
