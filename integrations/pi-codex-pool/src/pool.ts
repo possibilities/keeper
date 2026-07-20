@@ -68,6 +68,8 @@ export interface PoolStreamDependencies {
   delegate: CodexDelegate;
   nativeDelegate: CodexDelegate;
   warn(reason: "pool-unavailable"): void;
+  /** Stable managed identity for provider calls, such as compaction, that omit one. */
+  fallbackSessionId?: string;
   retryBackoffMs?: number;
   now?: () => number;
   proofFault?: CodexPoolProofFaultOptions;
@@ -441,7 +443,7 @@ export function createPooledCodexStream(
       : createCodexPoolProofFaultDelegate(deps.delegate, deps.proofFault);
   const output = new ForwardingEventStream();
   const now = deps.now ?? Date.now;
-  const sessionId = options?.sessionId;
+  const sessionId = options?.sessionId ?? deps.fallbackSessionId;
   if (!sessionId || deps.routes.aliases.length === 0) {
     startNativeFallback(output, deps, model, context, options);
     return output as unknown as AssistantMessageEventStream;
@@ -526,6 +528,7 @@ export function createPooledCodexStream(
       delegatedAttempts += 1;
       const attemptOptions: SimpleStreamOptions = {
         ...options,
+        ...(options?.sessionId === undefined ? { sessionId } : {}),
         apiKey,
         maxRetries: 0,
         timeoutMs: remainingTimeout(timeoutMs, deadlineMs, now),

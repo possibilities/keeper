@@ -658,7 +658,8 @@ export function installCodexPool(
   pi: PoolExtensionApi,
   options: CodexPoolInstallOptions = {},
 ): void {
-  if ((process.env[KEEPER_MARKER] ?? "").trim() === "") return;
+  const launchSessionId = (process.env[KEEPER_MARKER] ?? "").trim();
+  if (launchSessionId === "") return;
 
   const nativeDelegate =
     options.nativeDelegate ??
@@ -779,11 +780,12 @@ export function installCodexPool(
     return;
   }
 
-  if (evidence !== null) {
-    pi.on?.("session_start", (_event, ctx) => {
-      evidence.setRootSession(ctx.sessionManager.getSessionId());
-    });
-  }
+  let rootSessionId = launchSessionId;
+  pi.on?.("session_start", (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (sessionId.trim() !== "") rootSessionId = sessionId;
+    evidence?.setRootSession(sessionId);
+  });
 
   type ProofInvocation = {
     model: Model<"openai-codex-responses">;
@@ -816,6 +818,7 @@ export function installCodexPool(
           delegate: nativeDelegate,
           nativeDelegate,
           warn: () => warn(),
+          ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
         },
         model,
         context,
@@ -904,6 +907,7 @@ export function installCodexPool(
         delegate: instrumentedDelegate,
         nativeDelegate: instrumentedNativeDelegate,
         warn: () => warn(),
+        ...(mode === "active" ? { fallbackSessionId: rootSessionId } : {}),
       },
       model,
       context,

@@ -526,6 +526,61 @@ describe("provider registration and compatibility", () => {
     }
   });
 
+  test("active mode keeps sessionless compaction traffic on the root route", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-compaction-"));
+    try {
+      const now = Date.now();
+      const aliases = ["keeper-codex-a", "keeper-codex-b"];
+      process.env.KEEPER_JOB_ID = "keeper-launch-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "active";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(aliases);
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+        aliases,
+        null,
+        () => now,
+      ).binding;
+      process.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS = "keeper-codex-b";
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(now + 120_000)["keeper-codex-a"],
+        "keeper-codex-b": credentials(now + 120_000)["keeper-codex-b"],
+      });
+
+      let openaiStream: any;
+      let sessionStart: any;
+      const delegatedSessionIds: Array<string | undefined> = [];
+      extensionDelegateImpl = (_model, _context, options) => {
+        delegatedSessionIds.push(options?.sessionId);
+        return stream([
+          { type: "start", partial: message() },
+          { type: "done", reason: "stop", message: message() },
+        ]);
+      };
+      installCodexPool({
+        on(_event: string, handler: unknown) {
+          sessionStart = handler;
+        },
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand() {},
+      } as never);
+
+      sessionStart(
+        { reason: "startup" },
+        { sessionManager: { getSessionId: () => "root-session" } },
+      );
+      await collect(openaiStream(MODEL, CONTEXT));
+
+      expect(delegatedSessionIds).toEqual(["root-session"]);
+      expect(extensionDelegateApiKeys).toEqual(["fake-access-b"]);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
   test("keeps the extension import graph free of Bun-only builtins", () => {
     const root = resolve(import.meta.dir, "../src/index.ts");
     const closure = walkClosure(root).files;
@@ -1256,6 +1311,45 @@ describe("pooled Codex stream", () => {
     expect(streamCalls).toBe(1);
     expect((streamEvents.at(-1) as any).reason).toBe("aborted");
     expect(JSON.stringify(streamEvents)).not.toContain("private-stream-token");
+  });
+
+  test("routes sessionless managed calls with the supplied root identity", async () => {
+    const delegatedSessionIds: Array<string | undefined> = [];
+    let nativeCalls = 0;
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials(Date.now() + 120_000)),
+          async (credential) => credential,
+        ),
+        routes: new PoolRouteState(
+          ["keeper-codex-a", "keeper-codex-b"],
+          null,
+          Date.now,
+        ),
+        fallbackSessionId: "root-session",
+        warn: () => {
+          throw new Error("must-not-warn");
+        },
+        delegate: (_model, _context, options) => {
+          delegatedSessionIds.push(options?.sessionId);
+          return stream([
+            { type: "start", partial: message() },
+            { type: "done", reason: "stop", message: message() },
+          ]) as any;
+        },
+        nativeDelegate: () => {
+          nativeCalls += 1;
+          return stream([]) as any;
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+    );
+
+    await collect(pooled);
+    expect(delegatedSessionIds).toEqual(["root-session"]);
+    expect(nativeCalls).toBe(0);
   });
 
   test("falls visibly back to native Codex when pool credentials are unavailable", async () => {
