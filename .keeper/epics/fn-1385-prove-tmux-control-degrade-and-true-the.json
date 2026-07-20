@@ -1,0 +1,16 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-20T12:13:59.773000Z",
+  "depends_on_epics": [],
+  "id": "fn-1385-prove-tmux-control-degrade-and-true-the",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Prove tmux control degrade and true the 3.7b host contract",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-20T12:13:59.773000Z"
+}
