@@ -9,7 +9,7 @@
     "fn-1378-machine-runnable-codex-pool-proof"
   ],
   "id": "fn-1356-activate-pi-codex-account-pool",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-20T03:25:11.389000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-20T03:25:10.778000Z"
+  "updated_at": "2026-07-20T03:25:11.389000Z"
 }
