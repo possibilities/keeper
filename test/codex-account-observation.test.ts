@@ -42,6 +42,9 @@ function envelope(overrides: Record<string, unknown> = {}): unknown {
           windows: [
             {
               role: "primary",
+              key: "week",
+              label: "weekly",
+              window_seconds: 604_800,
               used_percent: 12.3,
               reset_at_ms: NOW + 30_000,
               private_plan: "enterprise-secret",
@@ -82,6 +85,9 @@ describe("Codex observer envelope", () => {
           windows: [
             {
               role: "primary",
+              key: "week",
+              label: "weekly",
+              window_seconds: 604_800,
               used_percent: 12.3,
               reset_at_ms: NOW + 30_000,
             },

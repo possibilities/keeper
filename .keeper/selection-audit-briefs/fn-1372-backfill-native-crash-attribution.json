@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "medium",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 40,
+        "files_changed": 2,
+        "insertions": 161
+      },
+      "done_summary": "Separated the native-crash backfill horizon (24h) from the crash-loop window; added a per-boot scanned/matched/marked summary log line and a locked long-runtime-predecessor test.",
+      "input_hash": "280677e72cffc6a99a931cf7f9b302d1d5f64b327598cb9898ed1834664f44e7",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1408,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nSeparate the backfill candidate horizon from the crash-loop rate constant: the probe scans\nledger rows bounded by the ledger cap (or ~24h), while the crash-loop distress decision keeps\nits own window untouched. Emit one bounded log line per boot with scanned/matched/marked\ncounts. The enrich-row mechanics (producer-side sidecar, never a fold) stay as they are.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:9823 \u2014 the compactRestartLedger(..., CRASH_LOOP_WINDOW_MS) candidate-set build to re-scope\n- src/daemon.ts:310-314 \u2014 the constants/import surface\n\n### Test notes\n\nDeterministic ledger fixtures through the existing probe seam: a >30-min-runtime predecessor with a matching .ips fixture gets enriched; one without gets the no-report marker; counts land in the summary line.\n\n## Acceptance\n\n- [ ] a long-runtime predecessor is attributed or no-report-marked at successor boot\n- [ ] the per-boot summary line carries scanned/matched/marked\n- [ ] daemon gates green\n\n## Done summary\nSeparated the native-crash backfill horizon (24h) from the crash-loop window; added a per-boot scanned/matched/marked summary log line and a locked long-runtime-predecessor test.\n## Evidence\n",
+      "task_id": "fn-1372-backfill-native-crash-attribution.1",
+      "tier": "medium",
+      "title": "Probe horizon and summary"
+    }
+  ],
+  "created_at": "2026-07-19T11:20:47.959000Z",
+  "epic_id": "fn-1372-backfill-native-crash-attribution",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "280677e72cffc6a99a931cf7f9b302d1d5f64b327598cb9898ed1834664f44e7",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

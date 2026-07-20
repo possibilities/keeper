@@ -1068,7 +1068,7 @@ export async function runJobs(config: RunJobsConfig): Promise<void> {
     // indicator's re-fold % advances during catch-up.
     onBootStatus: (boot) => {
       view.noteCursor(String(boot.rev));
-      view.noteCatchingUp(boot.catching_up, boot);
+      view.noteBootStatus(boot);
     },
     // Gate live rendering on daemon readiness (the latched catch-up transition).
     onCatchingUp: (catchingUp, boot) => view.noteCatchingUp(catchingUp, boot),

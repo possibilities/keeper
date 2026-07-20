@@ -4,10 +4,12 @@
   "created_at": "2026-07-18T21:04:06.094000Z",
   "depends_on_epics": [
     "fn-1349-in-session-blocked-task-handling",
-    "fn-1346-retire-torn-down-lane-git-rows"
+    "fn-1346-retire-torn-down-lane-git-rows",
+    "fn-1375-reap-stopped-sessions-release-claims",
+    "fn-1379-hold-live-lanes-against-resets"
   ],
   "id": "fn-1350-owner-mediated-merge-integration",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-19T23:07:48.466000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-18T21:28:22.975000Z"
+  "updated_at": "2026-07-20T01:36:22.424000Z"
 }

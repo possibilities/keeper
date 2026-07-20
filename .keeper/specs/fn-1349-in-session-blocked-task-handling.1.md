@@ -38,5 +38,5 @@ In-process sweep tests: live-owner defer for each category, witnessed-death atta
 - [ ] The sweep and decision suites pass in-process via named gates
 
 ## Done summary
-
+Generalized the audit-gate owner-liveness deferral into a category-agnostic block-handling ladder: ordinary escalatable categories now defer while their owning work orchestrator is live, consume up to two durable owning-work re-dispatch attempts on witnessed death, then fall back once to the legacy unblock session before the existing single page. A new additive block_escalations.owner_redispatch_attempts column carries the durable attempt count across restarts; audit categories and TOOLING_FAILURE/unparseable suppression are unchanged.
 ## Evidence

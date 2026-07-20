@@ -40,6 +40,7 @@ export const SUBCOMMANDS = [
   "git",
   "autopilot",
   "builds",
+  "usage",
   "frames",
   "dash",
   "status",
@@ -289,7 +290,7 @@ Flags:
   --help, -h     Show this help (\`--help --json\` → machine-readable command index)
   --version, -V  Show keeper version
 
-The five snapshot-capable viewer subcommands (board/jobs/git/autopilot/builds)
+The six snapshot-capable viewer subcommands (board/jobs/git/autopilot/builds/usage)
 auto-detect a non-TTY stdout (piped, redirected, CI) and emit ONE current frame
 followed by a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of
 streaming forever. Override per subcommand with \`--snapshot\` (force one-shot on a
@@ -573,6 +574,7 @@ export async function main(): Promise<void> {
     git: async (argv) => (await import("./git")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
     builds: async (argv) => (await import("./builds")).main(argv),
+    usage: async (argv) => (await import("./usage")).main(argv),
     frames: async (argv) => (await import("./frames")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
     status: async (argv) => (await import("./status")).main(argv),

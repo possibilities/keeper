@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": null,
+      "task_id": "fn-1377-tear-down-panes-on-session-end.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T17:32:12.816000Z",
+  "epic_id": "fn-1377-tear-down-panes-on-session-end",
+  "input_hash": "44b8af26cae3e5690600c8f255f3ae25ac0d3950f7f26f07a379fd5e81d5fbb2",
+  "outcome": "degraded:refine-reselect-single-cell-defaults",
+  "schema_version": 1,
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}

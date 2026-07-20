@@ -366,7 +366,10 @@ function parseCswapWindows(usage: unknown): ParsedCswapWindows {
   add(usage.sevenDay, "week");
   add(usage.spend, "spend");
 
-  if (!Object.hasOwn(usage, "scoped") || !Array.isArray(usage.scoped)) {
+  if (!Object.hasOwn(usage, "scoped")) {
+    return { windows, scopedMalformed: false };
+  }
+  if (!Array.isArray(usage.scoped)) {
     return { windows, scopedMalformed: true };
   }
   const seenScopes = new Set<string>();
@@ -378,6 +381,8 @@ function parseCswapWindows(usage: unknown): ParsedCswapWindows {
     const normalizedName = name.toLowerCase();
     if (
       normalizedName.length === 0 ||
+      name.length > 64 ||
+      !/^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$/u.test(name) ||
       seenScopes.has(normalizedName) ||
       !add(entry, `model:${name}`)
     ) {
@@ -599,7 +604,9 @@ function validateWindow(data: unknown): NormalizedWindow | null {
   if (
     !isRecord(data) ||
     typeof data.key !== "string" ||
-    data.key.length === 0 ||
+    !/^(?:session|week|spend|model:[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,63})$/u.test(
+      data.key,
+    ) ||
     typeof data.utilization !== "number" ||
     !Number.isFinite(data.utilization) ||
     data.utilization < 0 ||

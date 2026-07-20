@@ -13,6 +13,10 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  boundedCodexPoolProofRecord,
+  exactKeys,
+} from "../../../src/codex-pool-proof-window.ts";
 
 export const MAX_POOL_ALIASES = 8;
 export const DEFAULT_ACCOUNT_ALIASES = [
@@ -36,6 +40,26 @@ export interface ResolvedCredential {
   access: string;
   expires: number;
 }
+
+export interface ForcedRefreshRequest {
+  schema_version: 1;
+  alias: string;
+}
+
+export type ForcedRefreshOutcome =
+  | { status: "inactive" }
+  | { status: "rotated"; alias: string; expires: number }
+  | {
+      status: "inconclusive";
+      alias: string;
+      outcome: "already-fresh";
+      reason: "credential-unchanged";
+    }
+  | {
+      status: "failed";
+      alias: string;
+      reason: PoolCredentialError["code"];
+    };
 
 export interface CredentialStorage {
   read(alias: string): Promise<StoredOAuthCredential | undefined>;
@@ -137,7 +161,8 @@ export class PoolCredentialError extends Error {
     | "credential-invalid"
     | "credential-login-failed"
     | "credential-refresh-failed"
-    | "credential-storage-failed";
+    | "credential-storage-failed"
+    | "credential-proof-seam-invalid";
 
   constructor(code: PoolCredentialError["code"]) {
     super(code);
@@ -200,6 +225,17 @@ function isStoredOAuthCredential(
     typeof record.expires === "number" &&
     Number.isFinite(record.expires) &&
     record.expires > 0
+  );
+}
+
+export function storedOAuthCredentialsEqual(
+  left: StoredOAuthCredential,
+  right: StoredOAuthCredential,
+): boolean {
+  return (
+    left.access === right.access &&
+    left.refresh === right.refresh &&
+    Math.floor(left.expires) === Math.floor(right.expires)
   );
 }
 
@@ -423,8 +459,34 @@ export class MemoryCredentialStorage implements CredentialStorage {
   }
 }
 
+type CredentialRotation = "not-needed" | "rotated" | "unchanged";
+
+interface CredentialResolution {
+  credential: ResolvedCredential;
+  rotation: CredentialRotation;
+}
+
+interface CredentialOperation {
+  forced: boolean;
+  promise: Promise<CredentialResolution>;
+}
+
+function forcedRefreshRequest(input: unknown): ForcedRefreshRequest {
+  const request = boundedCodexPoolProofRecord(input);
+  if (
+    request === null ||
+    !exactKeys(request, ["schema_version", "alias"]) ||
+    request.schema_version !== 1 ||
+    !isOpaqueAlias(request.alias)
+  ) {
+    throw new PoolCredentialError("credential-proof-seam-invalid");
+  }
+  return { schema_version: 1, alias: request.alias };
+}
+
 export class CredentialVault {
-  private readonly refreshes = new Map<string, Promise<ResolvedCredential>>();
+  private readonly refreshes = new Map<string, CredentialOperation>();
+  private readonly proofRefreshAliases: ReadonlySet<string>;
 
   constructor(
     private readonly storage: CredentialStorage,
@@ -433,7 +495,14 @@ export class CredentialVault {
       signal?: AbortSignal,
     ) => Promise<StoredOAuthCredential>,
     private readonly now: () => number = Date.now,
-  ) {}
+    private readonly proofRefreshActive: () => boolean = () => false,
+    proofRefreshAliases: readonly string[] = [],
+    private readonly onCredentialRotated?: (alias: string) => void,
+  ) {
+    this.proofRefreshAliases = new Set(
+      proofRefreshAliases.filter(isOpaqueAlias),
+    );
+  }
 
   resolve(
     alias: string,
@@ -443,18 +512,111 @@ export class CredentialVault {
       return Promise.reject(new PoolCredentialError("credential-invalid"));
     }
     const active = this.refreshes.get(alias);
-    if (active) return this.waitForCaller(active, options);
-    const operation = this.resolveLocked(alias, options).finally(() => {
-      if (this.refreshes.get(alias) === operation) this.refreshes.delete(alias);
-    });
-    this.refreshes.set(alias, operation);
-    return this.waitForCaller(operation, options);
+    const operation = active ?? this.startResolution(alias, options, false);
+    return this.waitForCaller(operation.promise, options).then(
+      (result) => result.credential,
+    );
   }
 
-  private waitForCaller(
-    operation: Promise<ResolvedCredential>,
+  async forceRefresh(
+    input: unknown,
+    options: { signal?: AbortSignal; deadlineMs?: number } = {},
+  ): Promise<ForcedRefreshOutcome> {
+    if (!this.seamActive()) return { status: "inactive" };
+    const request = forcedRefreshRequest(input);
+    if (!this.proofRefreshAliases.has(request.alias)) {
+      throw new PoolCredentialError("credential-proof-seam-invalid");
+    }
+    while (true) {
+      if (!this.seamActive()) return { status: "inactive" };
+      const active = this.refreshes.get(request.alias);
+      if (active !== undefined && !active.forced) {
+        try {
+          const result = await this.waitForCaller(active.promise, options);
+          if (result.rotation === "rotated") {
+            return {
+              status: "rotated",
+              alias: request.alias,
+              expires: result.credential.expires,
+            };
+          }
+        } catch (error) {
+          return {
+            status: "failed",
+            alias: request.alias,
+            reason:
+              error instanceof PoolCredentialError
+                ? error.code
+                : "credential-refresh-failed",
+          };
+        }
+        continue;
+      }
+      const operation =
+        active ?? this.startResolution(request.alias, options, true);
+      try {
+        const result = await this.waitForCaller(operation.promise, options);
+        if (result.rotation === "rotated") {
+          return {
+            status: "rotated",
+            alias: request.alias,
+            expires: result.credential.expires,
+          };
+        }
+        return {
+          status: "inconclusive",
+          alias: request.alias,
+          outcome: "already-fresh",
+          reason: "credential-unchanged",
+        };
+      } catch (error) {
+        return {
+          status: "failed",
+          alias: request.alias,
+          reason:
+            error instanceof PoolCredentialError
+              ? error.code
+              : "credential-refresh-failed",
+        };
+      }
+    }
+  }
+
+  private seamActive(): boolean {
+    try {
+      return this.proofRefreshActive();
+    } catch {
+      return false;
+    }
+  }
+
+  private observeRotation(alias: string): void {
+    try {
+      this.onCredentialRotated?.(alias);
+    } catch {
+      // Evidence collection cannot change credential resolution.
+    }
+  }
+
+  private startResolution(
+    alias: string,
     options: { signal?: AbortSignal; deadlineMs?: number },
-  ): Promise<ResolvedCredential> {
+    forced: boolean,
+  ): CredentialOperation {
+    const entry = {} as CredentialOperation;
+    const promise = this.resolveLocked(alias, options, forced).finally(() => {
+      if (this.refreshes.get(alias) === entry) this.refreshes.delete(alias);
+    });
+    entry.forced = forced;
+    entry.promise = promise;
+    this.refreshes.set(alias, entry);
+    return entry;
+  }
+
+  private waitForCaller<T>(
+    operation: Promise<T>,
+    options: { signal?: AbortSignal; deadlineMs?: number },
+  ): Promise<T> {
     if (options.signal?.aborted) {
       return Promise.reject(new PoolCredentialError("credential-aborted"));
     }
@@ -475,10 +637,10 @@ export class CredentialVault {
         remaining === undefined ? undefined : setTimeout(onAbort, remaining);
       options.signal?.addEventListener("abort", onAbort, { once: true });
       operation.then(
-        (credential) => {
+        (result) => {
           if (timer !== undefined) clearTimeout(timer);
           options.signal?.removeEventListener("abort", onAbort);
-          resolve(credential);
+          resolve(result);
         },
         (error: unknown) => {
           if (timer !== undefined) clearTimeout(timer);
@@ -492,7 +654,8 @@ export class CredentialVault {
   private async resolveLocked(
     alias: string,
     options: { signal?: AbortSignal; deadlineMs?: number },
-  ): Promise<ResolvedCredential> {
+    forced: boolean,
+  ): Promise<CredentialResolution> {
     if (options.signal?.aborted) {
       throw new PoolCredentialError("credential-aborted");
     }
@@ -506,10 +669,17 @@ export class CredentialVault {
     if (!isStoredOAuthCredential(current)) {
       throw new PoolCredentialError("credential-invalid");
     }
-    if (current.expires > this.now() + REFRESH_SKEW_MS) {
-      return { access: current.access, expires: current.expires };
+    if (!forced && current.expires > this.now() + REFRESH_SKEW_MS) {
+      return {
+        credential: { access: current.access, expires: current.expires },
+        rotation: "not-needed",
+      };
     }
     let refreshed: StoredOAuthCredential | undefined;
+    const refreshState: {
+      prior?: StoredOAuthCredential;
+      rotation: CredentialRotation;
+    } = { rotation: "unchanged" };
     try {
       refreshed = await this.storage.modify(
         alias,
@@ -517,16 +687,27 @@ export class CredentialVault {
           if (!latest || !isStoredOAuthCredential(latest)) {
             throw new PoolCredentialError("credential-missing");
           }
-          if (latest.expires > this.now() + REFRESH_SKEW_MS) return latest;
+          if (!forced && latest.expires > this.now() + REFRESH_SKEW_MS) {
+            refreshState.rotation = "not-needed";
+            return undefined;
+          }
           if (options.signal?.aborted) {
             throw new PoolCredentialError("credential-aborted");
           }
+          refreshState.prior = privateCredential(latest);
           try {
-            const refreshed = await this.refresh(latest, options.signal);
+            const candidate = privateCredential(
+              await this.refresh({ ...refreshState.prior }, options.signal),
+            );
             if (options.signal?.aborted) {
               throw new PoolCredentialError("credential-aborted");
             }
-            return privateCredential(refreshed);
+            if (storedOAuthCredentialsEqual(refreshState.prior, candidate)) {
+              refreshState.rotation = "unchanged";
+              return undefined;
+            }
+            refreshState.rotation = "rotated";
+            return candidate;
           } catch (error) {
             if (
               options.signal?.aborted ||
@@ -547,7 +728,18 @@ export class CredentialVault {
     if (!refreshed || !isStoredOAuthCredential(refreshed)) {
       throw new PoolCredentialError("credential-invalid");
     }
-    return { access: refreshed.access, expires: refreshed.expires };
+    if (
+      refreshState.rotation === "rotated" &&
+      refreshState.prior !== undefined &&
+      storedOAuthCredentialsEqual(refreshState.prior, refreshed)
+    ) {
+      refreshState.rotation = "unchanged";
+    }
+    if (refreshState.rotation === "rotated") this.observeRotation(alias);
+    return {
+      credential: { access: refreshed.access, expires: refreshed.expires },
+      rotation: refreshState.rotation,
+    };
   }
 }
 

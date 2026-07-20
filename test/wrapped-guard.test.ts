@@ -231,6 +231,49 @@ describe("evaluateWrappedBash — the delegation + close-out allowlist", () => {
   }
 });
 
+describe("evaluateWrappedBash — launch-bound AUDIT_READY block", () => {
+  const context = {
+    taskId: "fn-1-x.2",
+    envelopeReference: "$KEEPER_WRAPPED_ENVELOPE",
+  };
+
+  test("allows the launch-bound task with an AUDIT_READY-prefixed reason", () => {
+    expect(
+      evaluateWrappedBash(
+        "keeper plan block fn-1-x.2 --reason 'AUDIT_READY: abc123 committed'",
+        context,
+      ),
+    ).toBeNull();
+  });
+
+  test("denies an AUDIT_READY block for a foreign task", () => {
+    const reason = evaluateWrappedBash(
+      "keeper plan block fn-1-other.9 --reason 'AUDIT_READY: abc123 committed'",
+      context,
+    );
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("launch-bound task");
+  });
+
+  test("denies a launch-bound block whose reason is not AUDIT_READY", () => {
+    const reason = evaluateWrappedBash(
+      "keeper plan block fn-1-x.2 --reason 'TOOLING_FAILURE: provider failed'",
+      context,
+    );
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("must start with `AUDIT_READY:`");
+  });
+
+  test("denies --force on an otherwise valid launch-bound AUDIT_READY block", () => {
+    const reason = evaluateWrappedBash(
+      "keeper plan block fn-1-x.2 --reason 'AUDIT_READY: abc123 committed' --force",
+      context,
+    );
+    expect(reason).not.toBeNull();
+    expect(reason).toContain("plan block --force");
+  });
+});
+
 describe("evaluateWrappedBash — observed launch shapes and static POSIX word reference", () => {
   const context = {
     taskId: "fn-1-x.2",

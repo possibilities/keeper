@@ -150,13 +150,15 @@ function insertKilledEvent(
   startTime: string | null,
   closeKind: string | null,
   reason: KillReason,
+  paneId: string | null,
 ): void {
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-       subagent_agent_id, spawn_name, start_time
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, spawn_name, start_time, backend_exec_type,
+       backend_exec_pane_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       Date.now() / 1000, // unix seconds as REAL, matching the hook
       sessionId,
@@ -183,6 +185,8 @@ function insertKilledEvent(
       null,
       null,
       null,
+      paneId == null ? null : "tmux",
+      paneId,
     ],
   );
 }
@@ -259,6 +263,7 @@ export function seedKilledSweep(
           row.start_time,
           closeKind,
           "boot_unwatchable",
+          row.backend_exec_pane_id,
         );
         continue;
       }
@@ -275,6 +280,7 @@ export function seedKilledSweep(
           row.start_time,
           closeKind,
           "boot_pid_dead",
+          row.backend_exec_pane_id,
         );
         continue;
       }
@@ -305,6 +311,7 @@ export function seedKilledSweep(
         row.start_time,
         closeKind,
         "boot_pid_recycled",
+        row.backend_exec_pane_id,
       );
     } catch (err) {
       // Per-row isolation: one bad probe never aborts the sweep.

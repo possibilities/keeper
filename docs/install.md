@@ -215,9 +215,9 @@ Activation is intentionally pending until the separate live two-account proof is
 missing, incompatible, stale, interrupted, or unhealthy machinery uses Pi's native `openai-codex`
 credential and emits the fixed warning
 `[keeper-codex-pool] pool-unavailable; using native openai-codex`; it never claims a balanced route.
-The launch environment carries only `native|active`, opaque aliases, an optional opaque initial route
-candidate for Codex work, a SHA-256 configuration binding, and a bounded reason code. OAuth credentials
-remain in Pi's private `auth.json`; account ids, provider
+The launch environment carries only a bounded mode and proof-window state, opaque aliases, an optional
+opaque initial route candidate for Codex work, revision and configuration bindings, and a bounded reason
+code. OAuth credentials remain in Pi's private `auth.json`; account ids, provider
 headers, raw errors, tokens, plan labels, and account PII do not enter Keeper diagnostics, proof reports,
 launch environments, the daemon database, or a Projection.
 
@@ -228,6 +228,9 @@ Launch reservation or Codex pressure:
 keeper agent accounts check --json
 keeper agent accounts codex-pool status --json
 ```
+
+Make the transition promptly and in this order: **enroll both aliases → expect the native Codex outage →
+arm a proof window → prove → activate**.
 
 Enroll each configured opaque alias in a real terminal. The command starts an inherited-stdio Pi with the
 companion loaded and tells the operator which `/login <alias>` command to run; it rejects JSON/captured
@@ -241,12 +244,25 @@ keeper agent accounts codex-pool enroll keeper-codex-a
 keeper agent accounts codex-pool enroll keeper-codex-b
 ```
 
-The live-proof run produces one bounded report using the companion's versioned schema. Stage and classify
-that exact file before activation; unknown fields, sanitation findings, stale revision/configuration/alias
-bindings, interruption, incomplete root/child routes, or incomplete restoration cannot pass:
+Enrollment revokes that account's other live grants, including the legacy leg and bare Pi. Expect native
+Codex on those surfaces to remain unavailable until activation.
+
+Arm one proof window and run the managed Pi proof probe. The probe directs Pi to invoke the
+`codex_pool_proof` tool exactly once; the tool runs the bounded proof and atomically writes its private
+report to `~/.config/keeper/codex-pool/live-proof.json` before the window closes:
 
 ```sh
-keeper agent accounts codex-pool proof capture /path/to/live-proof.json --json
+keeper agent run pi --x-codex-pool-proof-window=arm \
+  'Call the codex_pool_proof tool exactly once and return its JSON result.'
+```
+
+Stage and classify that exact report, then activate promptly. Unknown fields, sanitation findings, stale
+revision/configuration/alias bindings, interruption, incomplete root/child routes, or incomplete restoration
+cannot pass:
+
+```sh
+keeper agent accounts codex-pool proof capture \
+  ~/.config/keeper/codex-pool/live-proof.json --json
 keeper agent accounts codex-pool proof verdict --json
 keeper agent accounts codex-pool activate --json
 keeper agent accounts codex-pool verify --json
@@ -372,19 +388,21 @@ names the exact identities maintenance continues to reconcile; operator action i
 persistent fail-closed control diagnosis. The canonical test commands and budget policy are in
 [docs/testing.md](./testing.md).
 
-Every keeper-launched Claude or Pi session gets `/rename` on managed launch. Bare `/rename`
-derives a short Session title from the active branch's bounded, compaction-aware conversation
-context, gives extra weight to human requests, and safely expands eligible project-file references.
-A canonical lowercase slug sets the title directly (`/rename project-search-ranking`); any other
-argument, including an `@path`, leaves the existing title unchanged. Empty context, cancellation,
-stale Session state, unavailable auth/model/routing, timeout, or malformed output likewise fails
-open with content-free feedback.
+Claude sessions use Claude Code's built-in `/rename`, including its native bare-title inference
+and explicit-name syntax. Keeper does not shadow that command or launch a second Claude process for
+naming.
 
-Pi performs its fixed cheap inference through its own OAuth-aware host API and commits with
-`setSessionName()`. Claude uses the managed Account route for one non-persistent Haiku metadata
-process and commits through the `UserPromptSubmit` hook's native `sessionTitle`. Either native title
-reaches Keeper's title projection and the tmux renamer asynchronously through the existing
-`TranscriptTitle` event, never a direct database or tmux write.
+Keeper-launched Pi sessions load Keeper's custom `/rename`. Bare `/rename` derives a short Session
+title from bounded, compaction-aware conversation context, gives extra weight to human requests,
+and safely expands eligible project-file references. A canonical lowercase slug sets the title
+directly (`/rename project-search-ranking`); any other argument, including an `@path`, leaves the
+existing title unchanged. Empty context, cancellation, stale Session state, unavailable auth or
+model, timeout, or malformed output likewise fails open with content-free feedback. Pi performs its
+fixed cheap inference through its OAuth-aware host API and commits with `setSessionName()`.
+
+Claude's native `custom-title` records and Pi's `session_info_changed` title bridge feed Keeper's
+`TranscriptTitle` events, title projection, and Tmux renamer asynchronously, never a direct database
+or Tmux write.
 
 ## Host worker matrix (required)
 

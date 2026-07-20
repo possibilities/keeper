@@ -192,6 +192,7 @@ export interface SafetyNetTarget {
 export interface LiveShell {
   pushFrame(lines: string[], header?: LiveShellHeader): void;
   refreshLive(lines: string[], header?: LiveShellHeader): void;
+  clearLiveOverlay(): void;
   setStatus(status: string): void;
   dispose(): void;
 }
@@ -237,6 +238,7 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
     return {
       pushFrame: (lines, header) => core.pushFrame(lines, header),
       refreshLive: (lines, header) => core.refreshLive(lines, header),
+      clearLiveOverlay: () => core.clearLiveOverlay(),
       setStatus: (status) => core.setStatus(status),
       dispose: () => core.dispose(),
     };
@@ -399,6 +401,12 @@ export function createLiveShell(opts: LiveShellOptions): LiveShell {
         return;
       }
       core.refreshLive(lines, header);
+    },
+    clearLiveOverlay: (): void => {
+      if (disposed || setupErrored) {
+        return;
+      }
+      core.clearLiveOverlay();
     },
     setStatus: (status: string): void => {
       if (disposed || setupErrored) {

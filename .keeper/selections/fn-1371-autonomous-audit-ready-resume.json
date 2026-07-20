@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.78,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "A fail-closed permission-guard allowance where own-task binding plus reason-prefix gating are load-bearing security invariants mirrored byte-identically across two guards is a hard opus gate, and the contract-shaped blast radius of a wrong allowance warrants xhigh.",
+      "task_id": "fn-1371-autonomous-audit-ready-resume.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Rerouting dead-orchestrator AUDIT_READY escalation to a work:: dispatch touches subtle daemon correctness invariants \u2014 collision-guard interaction, escalation-cap amplification, and owner-tuple fidelity \u2014 which is an intelligence-bound, contract-shaped change warranting opus at xhigh.",
+      "task_id": "fn-1371-autonomous-audit-ready-resume.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T10:26:16.971000Z",
+  "epic_id": "fn-1371-autonomous-audit-ready-resume",
+  "input_hash": "8159325b3f9f60819a74daa318feb3f2498fde84a1fff21b5778ed5e3ddbb175",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 2170106459,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1371-autonomous-audit-ready-resume.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"A fail-closed permission-guard allowance where own-task binding plus reason-prefix gating are load-bearing security invariants mirrored byte-identically across two guards is a hard opus gate, and the contract-shaped blast radius of a wrong allowance warrants xhigh.\",\"confidence\":0.78},{\"task_id\":\"fn-1371-autonomous-audit-ready-resume.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Rerouting dead-orchestrator AUDIT_READY escalation to a work:: dispatch touches subtle daemon correctness invariants \u2014 collision-guard interaction, escalation-cap amplification, and owner-tuple fidelity \u2014 which is an intelligence-bound, contract-shaped change warranting opus at xhigh.\",\"confidence\":0.8}]}\n"
+}

@@ -58,7 +58,7 @@ Universal moves, in any mode:
 - Check recent movement: `git log --oneline -20`, `git log -S <symbol>`, `git blame`, `keeper history list`.
 - Mine session history when the question is who/when/what-happened: the unified Claude/Pi history surface catalogs readable native conversations, optional Keeper aliases, and provenance-graded file evidence; `keeper resume <session-reference>` is the continuation path, not a read.
 - Delegate when wide: if the investigation spans more than one subsystem or repo, or balloons past ~10 reads, fan out parallel read-only Explore agents (Agent tool, one per surface) and keep this context for synthesis and the conversation. Brief each agent to reproduce before theorizing, quote exact evidence with `path:line`, and return conclusions, not file dumps.
-- Bring in `/keeper:pair` for a quick second opinion when your mental model feels sticky — a single partner, lightweight, narrow. This is **not** the panel: the panel (the routing gate below) is a heavier multi-model fan-out plus a judge, reserved for answering the inquiry itself, not for unsticking a mid-investigation hunch.
+- Use `/keeper:pair` as the intermediate escalation when your mental model feels sticky and one independent critic could materially change the answer — a single partner, lightweight, narrow. A full panel is the exceptional escalation defined by the gate below, not the default second opinion.
 
 Mode-specific moves:
 
@@ -108,16 +108,19 @@ The reflex below fires on any non-trivial design answer — during investigation
 
 <!-- BAKE:END keeper prompt render engineering/domain-docs -->
 
-## Prefer the panel for judgment-heavy inquiries
+## Escalate solo → pair → exceptional panel
 
-Before answering solo, gate on what the answer turns on, then on size: **strongly prefer `/plan:panel`** for any non-tiny inquiry decided by judgment — weighing trade-offs, interpreting ambiguous evidence, choosing a direction — where independent models can genuinely disagree and a confidently wrong answer is expensive. The panel fans the question out to a configured spread of models in parallel and fuses their answers with a judge — higher confidence, surfaced blind spots, contradictions caught. Judgment questions route there by default; a question decided by retrieval or mechanical verification stays solo at any size — thoroughness there comes from the Explore fan-out above, not from consensus.
+**Start solo.** Ordinary judgment, ambiguity, and above-inline size do not independently justify outside consultation. Investigate first, use tools or Explore agents when evidence can decide the question, and form the answer in your own judgment. Escalation is available when the evidence earns it; it is not prepaid insurance against every possible mistake.
+
+- **Solo — the default**: answer tiny and mechanical questions directly, and also own ordinary design, architecture, troubleshooting, reports, and work-shaped direction-setting yourself. Size never turns retrieval into a consensus problem, and judgment alone never requires a second model.
+- **Pair — the intermediate check**: use `/keeper:pair` when one independent critic can test a sticky hypothesis, compare the two credible directions you are actually considering, or catch a specific blind spot. Keep the ask narrow and advisory; synthesize the answer yourself.
+- **Panel — the exceptional check**: convene `/plan:panel` when the human explicitly asks for a panel, multi-model answer, or unusually high confidence. Otherwise, panel only when **all three** hold after investigation: multiple credible answers or root-cause hypotheses remain; the decision is high-consequence or hard to reverse (for example a security or data-integrity boundary, irreversible migration, or wire contract); and independent disagreement would materially change the chosen action. A merely non-tiny, judgment-heavy, or above-inline question does not qualify.
+
+When a panel qualifies, invoke `/plan:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
 
 **Routing to the panel is silent internal cognition, not a relayed artifact.** Enter panel mode without announcing it — no "let me consult a panel," no progress narration. When the judged answer returns, absorb it as your own thinking and render it through `/hack`'s existing answer-shape taxonomy (quick-answer / troubleshoot / report / research / sketch — see "How to answer"). The judge's audit calibrates your confidence — consensus, state the conclusion plainly; contradictions or blind spots, hedge in your own voice — but is never relayed to the human unless they ask. Reveal-on-demand: only if the human asks about process or provenance (how you reached it, what contributed, to see the panel) do you surface the audit; a substance follow-up ("are you sure?", "why?") is answered substantively in your own voice, not with a panel reveal. As with the rest of the modes, don't say "I ran a panel" — let the answer's structure carry it.
 
-- **Solo (no panel)** — two families, answered directly here: *tiny* — a bounded factoid, a yes/no, a one-liner, a trivial lookup you'd answer from one or two local reads; and *mechanical* — the answer is an inventory, enumeration, or lookup the tools themselves verify ("find all X", "list every place that…", a status readout, a summary that collects rather than weighs). A second model re-running the same greps buys cost, not confidence. Size never promotes a mechanical question into a panel one.
-- **Panel** — a non-tiny question decided by judgment: a hard design/architecture call, multi-step reasoning over ambiguous evidence, troubleshooting where being confidently wrong is expensive, a report whose conclusions weigh sources or trade-offs rather than merely collecting them. Invoke `/plan:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
-
-Which panel to convene follows the strength rubric below — hack's everyday **Panel** case is its ordinary-question row, and an above-inline design question (*How to answer*) is its higher-stakes row:
+Once the exceptional gate admits a panel, choose its strength with the live roster rubric below:
 
 <!-- BAKE:BEGIN keeper prompt render engineering/panel-strength -->
 
@@ -136,9 +139,9 @@ Pick where a panel-worthy question lands:
 
 <!-- BAKE:END keeper prompt render engineering/panel-strength -->
 
-When in doubt whether judgment or retrieval decides it, route to the panel — a redundant fan-out is cheaper than a confidently wrong solo answer; doubt about size alone never promotes a mechanical question. (Distinct from the `/keeper:pair` hunch-unsticking second opinion drawn above: the panel answers the inquiry itself.)
+When uncertain about escalation, stay solo and escalate later only if a specific unresolved risk earns it. Use a pair before a panel when one independent challenge is enough; never convene a panel merely because the inquiry is substantial or judgment-heavy.
 
-**Work-shaped requests are not exempt.** "Add X," "build Y," "configure Z like the existing thing" reads like a directive with the direction already given — but above inline size the *approach* is still an open call, so route that design question to `/plan:panel` before you sketch. The panel answers the *inquiry* shape (what's true, what's the right approach); the sketch/route machinery below still governs how any resulting work lands.
+**Work-shaped requests use the same gate.** "Add X," "build Y," and "configure Z like the existing thing" may require an above-inline sketch, but scope does not mandate consultation. Choose the direction yourself by default, use a pair for one focused challenge, and reserve a panel for the exceptional criteria above.
 
 ## How to answer
 
@@ -150,7 +153,7 @@ The chat reply's shape follows the mode. Don't say "operating in X mode" — let
 - **External research** — start with key takeaways, organize into sections with headings, use concrete facts and quotes, note areas of uncertainty, end with a sources list.
 - **Work-shaped** — two tiers, gated by the same size clauses that decide where the work lands:
   - **Inline-sized** (fits one or two files, no schema / protocol / UX boundary change) — one short paragraph naming what would change, what's affected, what's not yet decided. Enough for the human to confirm direction so you can execute inline.
-  - **Above inline** — produce a full sketch block (schema below). Investigate first per the work-shaped moves — prior work, full surface, boundaries. Then, before you commit to a direction, **route the design question to `/plan:panel`** per the panel gate above — an above-inline change (new contract, multi-module scope, a partner / worker / migration / screen) is exactly the high-stakes architecture call it names. The panel's judgment is the sketch's backbone — the sketch is how that judged thinking surfaces for above-inline work. **Commit to one direction: pick the approach you would defend**, informed by the panel, and present it as your own chosen direction — not "the panel recommended X." Don't enumerate options as live equals — a single close alternative belongs in Risks & unknowns as one bullet, nowhere else.
+  - **Above inline** — produce a full sketch block (schema below). Investigate first per the work-shaped moves — prior work, full surface, boundaries — then commit to the direction you would defend in your own judgment. Use `/keeper:pair` only when one focused challenge can change that direction; use `/plan:panel` only when the exceptional gate above qualifies. Present the chosen direction as your own, never as a partner's or panel's recommendation. Don't enumerate options as live equals — a single close alternative belongs in Risks & unknowns as one bullet, nowhere else.
 
 A confident "I don't know yet, here's what I've ruled out" is more useful than a confident wrong answer. Say so when the evidence is thin.
 
@@ -232,7 +235,7 @@ When the route is `/plan:plan` — inferred, or because the human said "plan it"
 
 1. **Finish the exploration the sketch exposed.** Open the touchpoints you haven't read, run the command you were speculating about, delegate wide sweeps per the investigate rules. Scouts inside `/plan:plan` verify; they shouldn't discover.
 2. **Surface only unresolved load-bearing questions that cannot be inferred from the conversation** — one at a time, each with a short explainer (the tradeoff, why it matters, what each answer implies). Don't turn the handoff summary or settled defaults into questions. Update the sketch as answers land.
-3. **When nothing load-bearing remains open, fire `/plan:plan`**, passing forward what the conversation established as its instructions: the conclusion the inquiry reached, the sketch (goal, direction, touchpoints), the resolved decisions, and key evidence with `path:line` cites — so the plan session starts from this conversation's high-water mark instead of rediscovering it. This is an internal skill-to-skill handoff: suppressing the panel's display to the human does not suppress the judged conclusion downstream — your panel-informed thinking carries forward as the session's own. The panel runs once, here at the inquiry stage; plan inherits its judgment through this handoff rather than re-invoking it.
+3. **When nothing load-bearing remains open, fire `/plan:plan`**, passing forward what the conversation established as its instructions: the conclusion the inquiry reached, the sketch (goal, direction, touchpoints), the resolved decisions, and key evidence with `path:line` cites — so the plan session starts from this conversation's high-water mark instead of rediscovering it. This is an internal skill-to-skill handoff: carry the established conclusion — including any absorbed pair or panel advice — forward; `/plan:plan` does not convene another consultation merely because planning begins.
 
 "Plan it" often arrives with this beat spelled out — "explore, resolve questions, then plan", "ask anything you need first, when ready /plan:plan". That phrasing sets the sequence, not just the destination; honor the sequence even when it's left implicit.
 

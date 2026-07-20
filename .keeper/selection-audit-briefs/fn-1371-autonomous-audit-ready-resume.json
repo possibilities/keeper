@@ -1,0 +1,55 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 10,
+        "files_changed": 4,
+        "insertions": 183
+      },
+      "done_summary": "Wrapped-guard and grant-guard now allow a wrapped worker to self-park its own launch-bound task via keeper plan block --reason AUDIT_READY:...; foreign tasks, non-AUDIT_READY reasons, and --force stay denied.",
+      "input_hash": "8159325b3f9f60819a74daa318feb3f2498fde84a1fff21b5778ed5e3ddbb175",
+      "model": "opus",
+      "spec_chars": 1638,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/keeper/plugin/hooks/wrapped-guard.ts, plugins/keeper/plugin/hooks/grant-guard.ts, test/wrapped-guard.test.ts, test/grant-guard.test.ts\n\n### Approach\n\nExtend the wrapped keeper-plan surface so a wrapped worker may run\n`keeper plan block <task> --reason \"AUDIT_READY: \u2026\"` when and only when <task> is the\nlaunch-bound task the guard already validates for `plan done`, and the reason begins with\nthe AUDIT_READY prefix. Everything else about `plan block` stays denied, with the existing\nactionable-denial style. The two guard copies are byte-identical by contract \u2014 mirror the\nchange in both and keep the identity check green.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- plugins/keeper/plugin/hooks/wrapped-guard.ts:575-586 \u2014 the launch-bound `plan done` validation to model the block allowance on\n- test/wrapped-guard.test.ts \u2014 the deny corpus structure; add allow + deny cases for the new verb\n\n### Risks\n\n- The allowance must not open general blocking power: own-task binding + reason-prefix gating are both load-bearing.\n\n## Acceptance\n\n- [ ] own-task AUDIT_READY-prefixed block allowed in both guards; foreign task, other reasons, and --force stay denied\n- [ ] both guard suites green and the byte-identity contract holds\n\n## Done summary\nWrapped-guard and grant-guard now allow a wrapped worker to self-park its own launch-bound task via keeper plan block --reason AUDIT_READY:...; foreign tasks, non-AUDIT_READY reasons, and --force stay denied.\n## Evidence\n",
+      "task_id": "fn-1371-autonomous-audit-ready-resume.1",
+      "tier": "xhigh",
+      "title": "Wrapped self park allowance"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 62,
+        "files_changed": 2,
+        "insertions": 77
+      },
+      "done_summary": "Route dead-orchestrator AUDIT_READY blocks to a work:: dispatch (owner tuple carried) instead of unblock::; live orchestrators still defer and other categories keep their existing routing.",
+      "input_hash": "8159325b3f9f60819a74daa318feb3f2498fde84a1fff21b5778ed5e3ddbb175",
+      "model": "opus",
+      "spec_chars": 1803,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** src/daemon.ts, test/daemon.test.ts\n\n### Approach\n\nThe AUDIT_READY escalation gate defers while the owning orchestrator is live, then routes to\nthe unblock:: path once it is dead past grace \u2014 but the unblocker cannot advance an audit\nhandoff. Route the dead-orchestrator AUDIT_READY case to a work:: dispatch instead: a fresh\n/plan:work orchestrator reconciles an AUDIT_READY-parked task into its audit-gate phase\n(gate-check short-circuits on a persisted passing finding and resumes the worker to mark\ndone). Non-AUDIT_READY categories keep their existing routing. The dispatch must carry the\nnormal autopilot owner tuple so wrapped legs launch.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/daemon.ts:1426-1442 \u2014 AUDIT_READY category, orchestrator grace, and the liveness read\n- src/daemon.ts:1399 \u2014 the audit-category routing comment describing the extension point\n- test/daemon.test.ts \u2014 escalation-routing test seams (deterministic, no real processes)\n\n### Risks\n\n- The #50 collision guard reasons about autopilot-dispatchable keys; a daemon-minted work:: resume must not fight it.\n- Respect escalation caps (turn-active counting) so the resume does not amplify under churn.\n\n## Acceptance\n\n- [ ] a dead-orchestrator AUDIT_READY block past grace produces a work:: dispatch with a proper owner tuple\n- [ ] a live orchestrator still defers; non-audit categories keep their existing route\n- [ ] daemon gates green\n\n## Done summary\nRoute dead-orchestrator AUDIT_READY blocks to a work:: dispatch (owner tuple carried) instead of unblock::; live orchestrators still defer and other categories keep their existing routing.\n## Evidence\n",
+      "task_id": "fn-1371-autonomous-audit-ready-resume.2",
+      "tier": "xhigh",
+      "title": "Dead orchestrator audit resume"
+    }
+  ],
+  "created_at": "2026-07-19T10:54:49.958000Z",
+  "epic_id": "fn-1371-autonomous-audit-ready-resume",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "8159325b3f9f60819a74daa318feb3f2498fde84a1fff21b5778ed5e3ddbb175",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

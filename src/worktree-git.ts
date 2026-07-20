@@ -879,6 +879,7 @@ export async function mergeReadiness(
   run: GitRunner = gitExec,
   incomingBranch?: string,
   pathExists: PathProbe = defaultPathExists,
+  depLinkSource?: string,
 ): Promise<MergeReadiness> {
   // Mid-merge FIRST — a stopped merge leaves MERGE_HEAD AND a dirty tree, so the
   // MERGE_HEAD probe MUST precede the dirty check or the wedge folds into a
@@ -913,7 +914,12 @@ export async function mergeReadiness(
     return { kind: "off-branch", head };
   }
   if (incomingBranch !== undefined && incomingBranch.length > 0) {
-    const clobbered = await wouldClobberUntracked(cwd, incomingBranch, run);
+    const clobbered = await wouldClobberUntracked(
+      cwd,
+      incomingBranch,
+      run,
+      depLinkSource,
+    );
     // A timed-out clobber probe degrades to a not-ready retry-skip (`dirty`),
     // NEVER a false "no clobber" that could let a would-clobber merge through.
     if (clobbered.kind === "timeout") {
@@ -937,15 +943,20 @@ export async function mergeReadiness(
  * reads are bounded by GIT_LOCAL_TIMEOUT_MS (B4); a 124 SIGKILL surfaces as
  * `{ kind: "timeout" }` so the caller degrades to a not-ready retry-skip rather
  * than a false "no clobber" — an fsmonitor/FS stall must never let a would-
- * clobber merge through. Pure git reads.
+ * clobber merge through. Pure producer reads.
  */
 type ClobberProbe = { kind: "ok"; paths: string[] } | { kind: "timeout" };
 
-async function wouldClobberUntracked(
+type UntrackedWorkProductProbe =
+  | { kind: "ok"; paths: string[] }
+  | { kind: "timeout" }
+  | { kind: "failed" };
+
+async function untrackedWorkProduct(
   cwd: string,
-  incomingBranch: string,
   run: GitRunner,
-): Promise<ClobberProbe> {
+  depLinkSource?: string,
+): Promise<UntrackedWorkProductProbe> {
   const untrackedR = await run(["ls-files", "--others", "--exclude-standard"], {
     cwd,
     timeoutMs: GIT_LOCAL_TIMEOUT_MS,
@@ -954,14 +965,57 @@ async function wouldClobberUntracked(
     return { kind: "timeout" };
   }
   if (untrackedR.code !== 0) {
+    return { kind: "failed" };
+  }
+  const paths = untrackedR.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  if (depLinkSource === undefined) {
+    return { kind: "ok", paths };
+  }
+  const workProduct: string[] = [];
+  for (const relativePath of paths) {
+    if (!(await untrackedIsDepPlant(cwd, depLinkSource, relativePath))) {
+      workProduct.push(relativePath);
+    }
+  }
+  return { kind: "ok", paths: workProduct };
+}
+
+export type LosslessUntrackedReadiness =
+  | { kind: "cleanable" }
+  | { kind: "would-clobber"; paths: string[] }
+  | { kind: "inconclusive" };
+
+export async function probeLosslesslyCleanableUntracked(
+  cwd: string,
+  depLinkSource: string,
+  run: GitRunner = gitExec,
+): Promise<LosslessUntrackedReadiness> {
+  const probe = await untrackedWorkProduct(cwd, run, depLinkSource);
+  if (probe.kind !== "ok") {
+    return { kind: "inconclusive" };
+  }
+  return probe.paths.length === 0
+    ? { kind: "cleanable" }
+    : { kind: "would-clobber", paths: probe.paths };
+}
+
+async function wouldClobberUntracked(
+  cwd: string,
+  incomingBranch: string,
+  run: GitRunner,
+  depLinkSource?: string,
+): Promise<ClobberProbe> {
+  const untrackedR = await untrackedWorkProduct(cwd, run, depLinkSource);
+  if (untrackedR.kind === "timeout") {
+    return { kind: "timeout" };
+  }
+  if (untrackedR.kind === "failed") {
     return { kind: "ok", paths: [] };
   }
-  const untracked = new Set(
-    untrackedR.stdout
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0),
-  );
+  const untracked = new Set(untrackedR.paths);
   if (untracked.size === 0) {
     return { kind: "ok", paths: [] };
   }
@@ -1375,7 +1429,14 @@ export function isKeeperLaneEntry(entry: WorktreeEntry): boolean {
  * skip the pass-1 abort while that epic's autonomous merge-resolver is mid-merge).
  * Pure.
  */
-export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
+export interface KeeperLaneIdentity {
+  epicId: string;
+  taskId: string | null;
+}
+
+export function keeperLaneIdentity(
+  entry: WorktreeEntry,
+): KeeperLaneIdentity | null {
   if (entry.branch === null) {
     return null;
   }
@@ -1388,8 +1449,14 @@ export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
     return null;
   }
   const sep = rest.indexOf("--");
-  if (sep === 0) return null;
-  return sep === -1 ? rest : rest.slice(0, sep);
+  if (sep === 0 || (sep !== -1 && sep === rest.length - 2)) return null;
+  return sep === -1
+    ? { epicId: rest, taskId: null }
+    : { epicId: rest.slice(0, sep), taskId: rest.slice(sep + 2) };
+}
+
+export function epicIdFromKeeperLaneEntry(entry: WorktreeEntry): string | null {
+  return keeperLaneIdentity(entry)?.epicId ?? null;
 }
 
 /**

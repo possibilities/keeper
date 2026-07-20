@@ -156,7 +156,7 @@ routing pressure. Enrollment is the exception: it requires inherited terminal st
 | `companion-missing`, `companion-incompatible` | The repository-owned manifest/source is absent or fails its pinned Pi contract. The launcher omits that `-e` source and reports native fallback. | Re-run the installer from a complete compatible checkout; inspect `accounts check --json` before retrying activation. | yes after repair |
 | `activation-config-invalid`, `activation-binding-stale` | Activation state is malformed or belongs to another code revision, configuration binding, or alias set. | Run `rollback` (or `recover` if a transaction remains), obtain a new bound proof, and activate deliberately. | yes after rollback/new proof |
 | `observation-missing`, `observation-stale`, `pool-unavailable`, `pressure-contended`, `routing-error` | Capacity or the transient launch-pressure ledger cannot supply a healthy initial session route. | Restore the observer/aliases or let the bounded contention clear, then inspect fresh `accounts check --json`; native Codex remains authoritative meanwhile. | yes after fresh evidence |
-| `proof-missing`, `proof-invalid`, `proof-incomplete`, `proof-failed` | The report is absent, malformed/unknown/unsanitized, incomplete/stale/interrupted, or explicitly failed. No activation write occurs. | Preserve the refusal, restore healthy native state, repeat the live proof, and stage the new allowlisted report. | yes with new evidence |
+| `proof-missing`, `proof-invalid`, `proof-incomplete`, `proof-failed` | The attested report is absent, malformed/unknown/unsanitized, incomplete/stale/interrupted, or fails because its declared verdict cannot be re-derived from the recorded transcript and bindings. No activation write occurs. | Preserve the refusal, restore healthy native state, rerun the managed proof probe, and stage its new allowlisted report. | yes with new evidence |
 | `activation-busy` | Another operator owns the host-local activation lock. | Let that operation finish, read `status`, then decide whether another mutation is needed. | conditional; inspect first |
 | `verification-failed` | Explicit `verify` cannot prove the effective active state. | Run `rollback`; inspect companion and Capacity health before obtaining new proof. | conditional; rollback first |
 | `rollback-complete` | Activation reload or immediate verification failed and the transaction restored native mode. | Read `status`; repair the named health failure before a new proof and activation. | yes after repair/new proof |
@@ -196,6 +196,9 @@ code transitions and rate-limits each target/code pair.
 | `failed-key` | An open dispatch failure suppresses the target. |
 | `claim-fence` | A durable, unreleased Dispatch claim owns the exact target. |
 | `activity-collision` | Current Harness activity or a legacy occupying job conflicts with the target. |
+| `occupancy-held` | A stopped session still holds the target's Dispatch occupancy and is not reap-eligible this sweep. |
+| `occupancy-reaping` | A stopped session holds the target's Dispatch occupancy and the bounded TERM→KILL reaper selected it this sweep. |
+| `occupancy-probe-degraded` | A stopped session may hold the target, but the tmux pane probe is unavailable; dispatch and destructive cleanup stay conservative until a healthy probe. |
 | `live-tab` | A live managed tab covers the pre-SessionStart binding window. |
 | `cooldown` | The fold-lag-safe redispatch cooldown is active. |
 | `finalizer-guard` | The epic finalizer guard suppresses a duplicate close. |

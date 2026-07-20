@@ -17,9 +17,22 @@ import {
 } from "../integrations/pi-codex-pool/src/proof.ts";
 import { poolConfigBinding } from "../integrations/pi-codex-pool/src/state.ts";
 import type { CodexRoutingInspection } from "./codex-account-router.ts";
+import {
+  CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
+  exactKeys,
+  record,
+} from "./codex-pool-proof-window.ts";
 import { FileLock } from "./file-lock.ts";
 
-export const CODEX_POOL_WORKFLOW_SCHEMA_VERSION = 1;
+export {
+  armCodexPoolProofWindow,
+  CODEX_POOL_PROOF_WINDOW_DURATION_MS,
+  CODEX_POOL_PROOF_WINDOW_ENV,
+  CODEX_POOL_WORKFLOW_SCHEMA_VERSION,
+  type CodexPoolProofWindowState,
+  codexPoolProofWindowActive,
+} from "./codex-pool-proof-window.ts";
+
 export const CODEX_POOL_MAX_REPORT_BYTES = 256 * 1024;
 export const CODEX_POOL_MAX_STATE_BYTES = 32 * 1024;
 
@@ -110,24 +123,6 @@ export interface CodexPoolActivationDeps {
   nowMs: () => number;
   reload: (candidate: CodexPoolActivationState) => boolean;
   verify: (candidate: CodexPoolActivationState) => boolean;
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function exactKeys(
-  value: Record<string, unknown>,
-  expected: string[],
-): boolean {
-  const actual = Object.keys(value).sort();
-  const sortedExpected = [...expected].sort();
-  return (
-    actual.length === sortedExpected.length &&
-    actual.every((key, index) => key === sortedExpected[index])
-  );
 }
 
 function isBinding(value: unknown): value is string {

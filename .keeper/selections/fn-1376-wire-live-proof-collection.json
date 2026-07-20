@@ -1,0 +1,29 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": null,
+      "label_source": "heuristic-default",
+      "model": "opus",
+      "rationale": null,
+      "task_id": "fn-1376-wire-live-proof-collection.1",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T15:20:40.537000Z",
+  "epic_id": "fn-1376-wire-live-proof-collection",
+  "input_hash": "a1b925eb8cf07459e81953d335196915280edd6523ea3be068c1551510bf0464",
+  "outcome": "degraded:refine-reselect-skipped-same-single-cell",
+  "schema_version": 1,
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  },
+  "shuffle_seed": null,
+  "verdict_raw": null
+}

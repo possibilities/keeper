@@ -134,6 +134,8 @@ export interface LiveShellCore {
   readonly mode: "tui" | "passthrough";
   pushFrame(lines: string[], header?: LiveShellHeader): void;
   refreshLive(lines: string[], header?: LiveShellHeader): void;
+  /** Drop the ephemeral live overlay without changing frame history. */
+  clearLiveOverlay(): void;
   setStatus(status: string): void;
   feedStdin(chunk: string | Buffer): void;
   bannerText(): string;
@@ -206,6 +208,9 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
           return;
         }
         onPlainWrite(`${[...(header?.lines ?? []), ...lines].join("\n")}\n`);
+      },
+      clearLiveOverlay(): void {
+        // No retained overlay exists in passthrough mode.
       },
       setStatus(_status: string): void {
         // Silent no-op in passthrough: no banner to update.
@@ -551,6 +556,16 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     // picks it up via `visibleRows`.
   }
 
+  function clearLiveOverlay(): void {
+    if (disposed || liveOverlay === null) {
+      return;
+    }
+    liveOverlay = null;
+    if (viewIdx === "live") {
+      onRender();
+    }
+  }
+
   function setStatus(status: string): void {
     if (disposed) {
       return;
@@ -574,6 +589,7 @@ export function createLiveShellCore(opts: LiveShellCoreOptions): LiveShellCore {
     mode: "tui",
     pushFrame,
     refreshLive,
+    clearLiveOverlay,
     setStatus,
     feedStdin,
     bannerText,

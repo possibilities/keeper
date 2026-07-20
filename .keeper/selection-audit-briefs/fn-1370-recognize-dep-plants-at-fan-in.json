@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 29,
+        "files_changed": 3,
+        "insertions": 227
+      },
+      "done_summary": "isWorktreeDepPlant now backs the fan-in/recover lossless-cleanability probe: a byte-identical ADR-0074 dep plant no longer produces a would-clobber/wedge verdict, while retargeted links or real work at the plant path still block. Added deterministic worktree-isolation coverage for all three cases.",
+      "input_hash": "8dba0d5103199c93f09f168835798b7280a78b293889cb446f3c18c5e8324a7c",
+      "model": "opus",
+      "spec_chars": 2490,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** src/autopilot-worker.ts, src/worktree-git.ts, test/worktree-isolation.test.ts\n\n### Approach\n\nThe lossless-cleanability verdict that feeds the fan-in defer / recover / would-clobber\nclassification must classify a byte-identical ADR-0074 plant as keeper residue (ignorable,\nsafely removable before merge), reusing `isWorktreeDepPlant` so plant identity keeps its\nsingle definition. Whether the probe REMOVES the plant pre-merge or merely excludes it\nfrom the clobber set is the worker's judgment \u2014 preserve the invariant that anything\nNOT byte-identical (retargeted link, real dir/file at the path) stays work product and\nstill blocks. The wedge escalation path stays intact for genuine residue.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- src/worktree-git.ts:1610 \u2014 isWorktreeDepPlant, the sole plant-identity seam (byte-identity contract in its doc comment)\n- src/worktree-git.ts:2332-2353 \u2014 the teardown-side call pattern to mirror (read raw link target, hand to the seam)\n- src/autopilot-worker.ts:6012 \u2014 the would-clobber verdict branch in the base-readiness classification\n- src/autopilot-worker.ts:2300, :5771, :5970 \u2014 the not-losslessly-cleanable consumers (recover pass, fan-in defer)\n\n### Risks\n\n- The probe runs inside the producer (autopilot-worker), never a fold \u2014 keep filesystem reads producer-side per the event-sourcing invariants.\n- Removing a plant pre-merge must be crash-safe: a re-provision happens on next lane use; verify no consumer assumes the link persists mid-epic.\n\n### Test notes\n\nDeterministic, through the pure git-boundary seam per test doctrine: a fake untracked\nlisting with (a) a byte-identical plant only \u2192 cleanable; (b) plant + real untracked file\n\u2192 blocks naming only the real file; (c) retargeted link \u2192 blocks.\n\n## Acceptance\n\n- [ ] a lane whose only untracked entry is a byte-identical plant no longer produces a would-clobber/wedge verdict\n- [ ] non-identical residue at the plant path still blocks as work product\n- [ ] worktree-isolation gates green\n\n## Done summary\nisWorktreeDepPlant now backs the fan-in/recover lossless-cleanability probe: a byte-identical ADR-0074 dep plant no longer produces a would-clobber/wedge verdict, while retargeted links or real work at the plant path still block. Added deterministic worktree-isolation coverage for all three cases.\n## Evidence\n",
+      "task_id": "fn-1370-recognize-dep-plants-at-fan-in.1",
+      "tier": "xhigh",
+      "title": "Plant aware cleanability probe"
+    }
+  ],
+  "created_at": "2026-07-19T09:50:13.007000Z",
+  "epic_id": "fn-1370-recognize-dep-plants-at-fan-in",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "8dba0d5103199c93f09f168835798b7280a78b293889cb446f3c18c5e8324a7c",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

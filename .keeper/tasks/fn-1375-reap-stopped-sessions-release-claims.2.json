@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-19T14:30:46.116000Z",
+  "depends_on": [
+    "fn-1375-reap-stopped-sessions-release-claims.1"
+  ],
+  "epic": "fn-1375-reap-stopped-sessions-release-claims",
+  "id": "fn-1375-reap-stopped-sessions-release-claims.2",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Release dead-session claims surface withholds",
+  "updated_at": "2026-07-19T19:14:56.094000Z",
+  "worker_done_at": "2026-07-19T19:14:56.094000Z"
+}

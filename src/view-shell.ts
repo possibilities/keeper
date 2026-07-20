@@ -526,10 +526,10 @@ export interface ViewShell<TSnap> {
   noteCursor: (cursor: string | null) => void;
   /**
    * Daemon-readiness gate seam (mirror of {@link noteCursor}). Each view's
-   * subscription wiring feeds the shell the subscribe client's catching-up
-   * signal — the latched `onCatchingUp` transition AND the freshest boot header
-   * off `onBootStatus` — so live rendering can gate on daemon readiness instead
-   * of stopping the connecting indicator at the first painted frame.
+   * subscription wiring feeds the shell ONLY the subscribe client's latched
+   * `onCatchingUp` transition, so live rendering gates on readiness instead of
+   * stopping the connecting indicator at the first painted frame. Raw boot
+   * headers flow separately through `noteBootStatus` as telemetry.
    *
    *   - `catchingUp` true (daemon down / draining / seeding): live mode HOLDS
    *     data frames (retaining only the freshest) and paints the loading
@@ -544,6 +544,8 @@ export interface ViewShell<TSnap> {
    * headless data path (`keeper status`/`await`/autopilot CLI) never gates.
    */
   noteCatchingUp: (catchingUp: boolean, boot: BootStatus | undefined) => void;
+  /** Record raw boot telemetry without changing the readiness gate. */
+  noteBootStatus: (boot: BootStatus) => void;
   /**
    * Multi-stream snapshot readiness report (fn-772). `view.emit` auto-reports
    * the FIRST stream to the latch (covers single-stream views like git/jobs
@@ -699,6 +701,15 @@ export function createViewShell<TSnap>(
   // The freshest rendered composite held while gated (live mode). Retained so
   // the flip to ready paints it immediately; `null` when nothing is held.
   let heldRender: ViewRender | null = null;
+  // The live shell has one ephemeral overlay slot. Track which view-shell
+  // producer owns it so an accepted full render can resolve the overlay without
+  // erasing unrelated local UI. When the readiness spinner overwrites the slot,
+  // retain the displaced owner once for that spinner window: a displaced local
+  // overlay must be restored on a byte-identical ready render, while stale/none
+  // resolve back to history.
+  type OverlayOwner = "readiness" | "stale" | "local" | null;
+  let overlayOwner: OverlayOwner = null;
+  let readinessDisplacedOwner: OverlayOwner = null;
   // ---- post-paint disconnect presentation ----
   let reconnecting = false;
   let graceExpired = false;
@@ -927,6 +938,12 @@ export function createViewShell<TSnap>(
       }
     }
     liveShell.refreshLive([formatIndicatorLine(glyph)]);
+    // Record the displaced owner only on the spinner's first overwrite. Later
+    // animation ticks replace readiness with readiness and preserve that fact.
+    if (overlayOwner !== "readiness") {
+      readinessDisplacedOwner = overlayOwner;
+    }
+    overlayOwner = "readiness";
   }
 
   function armConnectingSpinner(): void {
@@ -1087,6 +1104,8 @@ export function createViewShell<TSnap>(
       [...toShellLines(lastLiveRender.bodyLines), staleBannerLine()],
       shellHeader(lastLiveRender.semanticHeader),
     );
+    overlayOwner = "stale";
+    readinessDisplacedOwner = null;
   }
 
   function armReconnectGrace(): void {
@@ -1172,6 +1191,9 @@ export function createViewShell<TSnap>(
     });
   }
 
+  // The shared teardown is installed just after each caller wires its streams.
+  // Before that brief synchronous window, preserve the shell's direct exit.
+  let requestShellExit = (): void => process.exit(0);
   const liveShell: LiveShell = createLiveShell({
     // Only LIVE mode paints. Snapshot and frames both pass `enabled: false` so
     // no OpenTUI renderer is constructed and the shell is a clean no-op (its
@@ -1183,6 +1205,7 @@ export function createViewShell<TSnap>(
     enabled: mode === "live",
     title,
     captureKeys: opts.captureKeys,
+    onExit: () => requestShellExit(),
     onUnhandledKey: (key) => {
       // Modal capture: the view owns every key — skip the shell's `c`
       // (copy) so the sub-mode is fully local.
@@ -1485,6 +1508,25 @@ export function createViewShell<TSnap>(
     const lines = frameLines(render);
     const body = lines.join("\n");
     if (body === lastBody && !wasStale) {
+      // A byte-identical accepted full render still resolves any connection-
+      // owned overlay. Readiness may have overwritten a local one-slot overlay;
+      // restore the accepted render through refreshLive so local UI remains an
+      // overlay and history does not grow. Stale/ordinary readiness overlays
+      // instead clear back to the accepted history frame. An untouched local
+      // overlay is unrelated to readiness and stays exactly as-is.
+      if (overlayOwner === "readiness" && readinessDisplacedOwner === "local") {
+        lastLiveRender = render;
+        liveShell.refreshLive(
+          toShellLines(render.bodyLines),
+          shellHeader(render.semanticHeader),
+        );
+        overlayOwner = "local";
+        readinessDisplacedOwner = null;
+      } else if (overlayOwner === "readiness" || overlayOwner === "stale") {
+        liveShell.clearLiveOverlay();
+        overlayOwner = null;
+        readinessDisplacedOwner = null;
+      }
       return false;
     }
     lastBody = body;
@@ -1495,6 +1537,9 @@ export function createViewShell<TSnap>(
       toShellLines(render.bodyLines),
       shellHeader(render.semanticHeader),
     );
+    // A real history frame supersedes the one-slot overlay in LiveShellCore.
+    overlayOwner = null;
+    readinessDisplacedOwner = null;
     writeSidecars(render.stateJson, sidecarFrameText(lines));
     // Steady painting resumed — (re-)arm the divergence poll and re-baseline its
     // window off this fresh frame.
@@ -1519,10 +1564,13 @@ export function createViewShell<TSnap>(
     lastBody = body;
     lastLiveRender = render;
     const shellLines = toShellLines(render.bodyLines);
+    const renderingStale = isStale();
     liveShell.refreshLive(
-      isStale() ? [...shellLines, staleBannerLine()] : shellLines,
+      renderingStale ? [...shellLines, staleBannerLine()] : shellLines,
       shellHeader(render.semanticHeader),
     );
+    overlayOwner = renderingStale ? "stale" : "local";
+    readinessDisplacedOwner = null;
     return true;
   }
 
@@ -1599,6 +1647,18 @@ export function createViewShell<TSnap>(
     }
   }
 
+  // Raw boot headers are telemetry only. The subscribe client's latched
+  // transition below is the sole owner of the readiness gate.
+  function noteBootStatus(boot: BootStatus): void {
+    // Raw telemetry is useful even when a malformed peer supplied invalid boot
+    // metadata, but the machine-facing tri-state must remain honest: only a
+    // runtime boolean is an observed readiness value.
+    latestBoot = boot;
+    if (typeof boot.catching_up === "boolean") {
+      catchingUpObserved = boot.catching_up;
+    }
+  }
+
   // Daemon-readiness gate seam (see the interface docstring on `noteCatchingUp`).
   function noteCatchingUp(
     catchingUpNext: boolean,
@@ -1625,6 +1685,9 @@ export function createViewShell<TSnap>(
         heldRender = null;
         paintLiveFrame(held);
       }
+      // With no accepted full render there is no freshness proof. Leave a
+      // readiness/stale overlay in place; the next accepted render resolves it
+      // through paintLiveFrame (ADR 0088).
     } else if (!was && catchingUp) {
       // Flip to catch-up (e.g. a reconnect reporting catch-up): the loading
       // indicator takes over the body, so drop the reconnecting pill.
@@ -1679,6 +1742,9 @@ export function createViewShell<TSnap>(
       log("...");
       process.exit(0);
     };
+    // Keyboard q/Ctrl-C and process-level exits share one teardown so caller
+    // pollers/subscriptions cannot survive the terminal renderer.
+    requestShellExit = exitCleanly;
     // SIGINT (Ctrl-C) is this view's canonical interactive exit; the
     // parent-death / TTY-close triggers (SIGHUP, stdin-EOF, ppid===1
     // poll) are the fn-723 self-reap path. All route through the one
@@ -1888,6 +1954,7 @@ export function createViewShell<TSnap>(
     runFrames,
     noteCursor,
     noteCatchingUp,
+    noteBootStatus,
     reportSnapshotStream,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,

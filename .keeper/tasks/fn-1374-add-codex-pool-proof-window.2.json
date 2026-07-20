@@ -1,0 +1,18 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-19T13:57:20.817000Z",
+  "depends_on": [
+    "fn-1374-add-codex-pool-proof-window.1"
+  ],
+  "epic": "fn-1374-add-codex-pool-proof-window",
+  "id": "fn-1374-add-codex-pool-proof-window.2",
+  "model": "sonnet",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Transition doctrine and enroll warning",
+  "updated_at": "2026-07-19T14:20:47.389000Z",
+  "worker_done_at": "2026-07-19T14:20:47.389000Z"
+}

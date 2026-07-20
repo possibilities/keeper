@@ -2074,10 +2074,12 @@ export interface BootGate {
  *   - `head_event_id` = `max(events.id)` (the newest ingested event; 0 on empty).
  *   - `git_seed_required` = `git_projection_state.seed_required != 0` (the live-only
  *     git surface has not been boot-seeded, so it reads EMPTY).
- * `catching_up` is true while the gate is un-`ready` (the durable signal main owns):
- * reads are served throughout the drain, and the header tells the client the data
- * may still be partial. Pure read; never throws into the dispatch path (the caller
- * is no-self-heal), so each read defends against a missing row.
+ * `catching_up` is driven only by the authoritative main-owned boot gate plus
+ * pending git seed. `rev`/`head_event_id` stay on the wire as telemetry, but a
+ * steady-state one-event `rev < head_event_id` tail is normal because append and
+ * fold are separate transactions; it is not itself a boot catch-up signal. Pure
+ * read; never throws into the dispatch path (the caller is no-self-heal), so each
+ * read defends against a missing row.
  */
 export function readBootStatus(db: Database, gate: BootGate): BootStatus {
   let rev = 0;
@@ -2161,11 +2163,11 @@ export function readBootStatus(db: Database, gate: BootGate): BootStatus {
     ...(gate.identity === undefined ? {} : gate.identity),
     rev,
     head_event_id: head,
-    // Catch-up persists while EITHER the fold is behind head OR the git surface
-    // is unseeded — both are "the board may still be partial" conditions. The
-    // gate (`!ready`) is the authoritative main-owned signal; the rev<head and
-    // seed checks are belt-and-suspenders for the window before boot-complete.
-    catching_up: !gate.ready || rev < head || seedRequired,
+    // Catch-up is owned by main's boot gate plus pending git seed. `rev<head`
+    // remains useful telemetry on the wire, but in steady state append and fold
+    // routinely straddle separate transactions for one event, so that tail is
+    // not itself a boot catch-up condition.
+    catching_up: !gate.ready || seedRequired,
     // Coarse boolean (drives `catching_up` + the coarse git-clean consumer).
     git_seed_required: seedRequired,
     // Per-root refinement so the board renders the SAME per-root `unknown` the

@@ -182,8 +182,15 @@ describe("parseCswapList", () => {
       NOW,
       60_000,
     );
-    expect(parsed.routes.map((route) => route.id)).toEqual(["claude-swap:1"]);
+    expect(parsed.routes.map((route) => route.id)).toEqual([
+      "claude-swap:1",
+      "claude-swap:3",
+    ]);
     expect(parsed.routes[0]?.windows.map((window) => window.key)).toEqual([
+      "session",
+      "week",
+    ]);
+    expect(parsed.routes[1]?.windows.map((window) => window.key)).toEqual([
       "session",
       "week",
     ]);
@@ -196,18 +203,39 @@ describe("parseCswapList", () => {
     });
     expect(parsed.accountIssues).toEqual({
       "claude-swap:2": "malformed-scoped-windows",
-      "claude-swap:3": "malformed-scoped-windows",
       "claude-swap:4": "malformed-scoped-windows",
       "claude-swap:5": "malformed-scoped-windows",
     });
     expect(parsed.notes).toEqual(
       expect.arrayContaining([
         "cswap: slot 2 has malformed scoped windows",
-        "cswap: slot 3 has malformed scoped windows",
         "cswap: slot 4 has malformed scoped windows",
         "cswap: slot 5 has malformed scoped windows",
       ]),
     );
+  });
+
+  test("rejects unsafe scoped names at the PII-free boundary", () => {
+    const parsed = parseCswapList(
+      outcome(
+        inventory([
+          account(8, {
+            usage: {
+              fiveHour: { pct: 20 },
+              sevenDay: { pct: 40 },
+              scoped: [{ name: "owner@example.test", pct: 50 }],
+            },
+          }),
+        ]),
+      ),
+      NOW,
+      60_000,
+    );
+    expect(parsed.routes).toEqual([]);
+    expect(parsed.accountIssues).toEqual({
+      "claude-swap:8": "malformed-scoped-windows",
+    });
+    expect(JSON.stringify(parsed)).not.toContain("owner@example.test");
   });
 
   test("drops malformed reset timestamps instead of emitting provider text", () => {

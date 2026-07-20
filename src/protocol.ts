@@ -81,12 +81,14 @@ export type Row = Record<string, unknown>;
  * projection; this header is how it knows.
  *
  * - `rev` — `reducer_state.last_event_id`, the global fold cursor (mirrors the
- *   frame's own `rev`). Carried here too so a single field carries the whole
- *   staleness verdict.
- * - `head_event_id` — `max(events.id)`, the newest INGESTED event. While the
- *   drain runs `rev < head_event_id`; at head they coincide.
- * - `catching_up` — `true` while the reducer is still draining toward head OR
- *   the git surface is unseeded. The client treats a snapshot read while
+ *   frame's own `rev`). Telemetry only: useful to show fold position, but not
+ *   itself the readiness verdict.
+ * - `head_event_id` — `max(events.id)`, the newest INGESTED event. Telemetry
+ *   for how far the fold cursor trails the ingest head; a routine steady-state
+ *   one-event `rev < head_event_id` tail is normal because append and fold are
+ *   separate transactions.
+ * - `catching_up` — `true` while the authoritative main boot gate is not ready
+ *   OR the git surface is unseeded. The client treats a snapshot read while
  *   `catching_up` is true as provisional (it MUST NOT cache an empty projection
  *   as ground truth — the header rides EVERY reply, not just the first).
  * - `git_seed_required` — `git_projection_state.seed_required !== 0`: the COARSE

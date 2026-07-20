@@ -1,0 +1,17 @@
+{
+  "audit_required": false,
+  "bundles": [],
+  "created_at": "2026-07-20T01:00:30.041000Z",
+  "depends_on": [
+    "fn-1380-harden-poison-gate-and-fence-clears.2"
+  ],
+  "epic": "fn-1380-harden-poison-gate-and-fence-clears",
+  "id": "fn-1380-harden-poison-gate-and-fence-clears.3",
+  "model": "opus",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Give poison rows a lifecycle",
+  "updated_at": "2026-07-20T01:03:02.096000Z"
+}

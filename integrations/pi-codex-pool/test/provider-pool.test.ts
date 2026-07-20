@@ -1,9 +1,22 @@
 // biome-ignore-all lint/suspicious/noExplicitAny: Structural Pi stream doubles avoid loading peer modules in correctness tests.
 // biome-ignore-all lint/style/noNonNullAssertion: Fixture guards and deferred callbacks establish values before use.
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import {
+  captureCodexPoolProof,
+  codexPoolBindings,
+  FileCodexPoolActivationStore,
+  resolveCodexPoolWorkflowPaths,
+} from "../../../src/codex-pool-activation.ts";
+import { walkClosure } from "../../../test/helpers/depgraph.ts";
 import {
   CredentialVault,
   FileCredentialStorage,
@@ -86,10 +99,24 @@ function credentials(expires = 10_000) {
   };
 }
 
-const nativeStream = () => ({
+const extensionDelegateApiKeys: Array<string | undefined> = [];
+const emptyNativeStream = () => ({
   async *[Symbol.asyncIterator]() {},
   result: async () => message(),
 });
+let extensionDelegateImpl: (
+  model: unknown,
+  context: unknown,
+  options?: { apiKey?: string; sessionId?: string },
+) => any = emptyNativeStream;
+const nativeStream = (
+  model: unknown,
+  context: unknown,
+  options?: { apiKey?: string; sessionId?: string },
+) => {
+  extensionDelegateApiKeys.push(options?.apiKey);
+  return extensionDelegateImpl(model, context, options);
+};
 
 mock.module("@earendil-works/pi-ai", () => ({
   openAICodexResponsesApi: () => ({ streamSimple: nativeStream }),
@@ -102,7 +129,12 @@ mock.module("@earendil-works/pi-ai/providers/all", () => ({
         oauth: {
           name: "Codex",
           login: async () => credentials()["keeper-codex-a"],
-          refresh: async (credential: unknown) => credential,
+          refresh: async (credential: any) => ({
+            ...credential,
+            access: `refreshed-${credential.access}`,
+            refresh: `rotated-${credential.refresh}`,
+            expires: credential.expires + 3_600_000,
+          }),
           toAuth: async () => ({ apiKey: "fake" }),
         },
       },
@@ -119,9 +151,16 @@ const savedEnv = {
     process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING,
   KEEPER_PI_CODEX_POOL_INITIAL_ALIAS:
     process.env.KEEPER_PI_CODEX_POOL_INITIAL_ALIAS,
+  KEEPER_PI_CODEX_POOL_PROOF_WINDOW:
+    process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW,
+  KEEPER_PI_CODEX_POOL_REVISION: process.env.KEEPER_PI_CODEX_POOL_REVISION,
+  KEEPER_PI_CODEX_POOL_CONFIG_ROOT:
+    process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT,
 };
 
 afterEach(() => {
+  extensionDelegateApiKeys.length = 0;
+  extensionDelegateImpl = emptyNativeStream;
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -158,6 +197,359 @@ describe("provider registration and compatibility", () => {
     ]);
     expect(commands).toEqual(["codex-pool-observe"]);
     rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  test("a valid proof window installs the real pooled delegate and consumes its carrier", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-proof-window-"));
+    try {
+      const now = Date.now();
+      process.env.KEEPER_JOB_ID = "keeper-proof-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES =
+        '["keeper-codex-a","keeper-codex-b"]';
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+        ["keeper-codex-a", "keeper-codex-b"],
+        null,
+        () => now,
+      ).binding;
+      process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
+        schema_version: 1,
+        armed_at_ms: now,
+        expires_at_ms: now + 900_000,
+        launcher_pid: process.ppid,
+      });
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(now + 120_000)["keeper-codex-a"],
+        "keeper-codex-b": credentials(now + 120_000)["keeper-codex-b"],
+      });
+      let openaiStream: any;
+      installCodexPool({
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand() {},
+      } as never);
+
+      expect(process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW).toBeUndefined();
+      await collect(
+        openaiStream(MODEL, CONTEXT, { sessionId: "proof-root-session" }),
+      );
+      expect(extensionDelegateApiKeys).toHaveLength(2);
+      expect(new Set(extensionDelegateApiKeys)).toEqual(
+        new Set(["fake-access-a", "fake-access-b"]),
+      );
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("an installed proof delegate falls back natively at its deadline", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-proof-expiry-"));
+    const originalNow = Date.now;
+    const originalWarn = console.warn;
+    let now = 1_000_000;
+    const warnings: string[] = [];
+    try {
+      Date.now = () => now;
+      console.warn = (message?: unknown) => warnings.push(String(message));
+      process.env.KEEPER_JOB_ID = "keeper-expiring-proof-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES =
+        '["keeper-codex-a","keeper-codex-b"]';
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+        ["keeper-codex-a", "keeper-codex-b"],
+        null,
+        () => now,
+      ).binding;
+      process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
+        schema_version: 1,
+        armed_at_ms: 1_000_000,
+        expires_at_ms: 1_900_000,
+        launcher_pid: process.ppid,
+      });
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(3_000_000)["keeper-codex-a"],
+        "keeper-codex-b": credentials(3_000_000)["keeper-codex-b"],
+      });
+      let openaiStream: any;
+      let proofCommand: any;
+      installCodexPool({
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand(name: string, options: unknown) {
+          if (name === "codex-pool-proof") proofCommand = options;
+        },
+      } as never);
+
+      now = 1_900_000;
+      await collect(
+        openaiStream(MODEL, CONTEXT, { sessionId: "expired-proof-session" }),
+      );
+      expect(extensionDelegateApiKeys).toEqual([undefined]);
+      expect(warnings).toEqual([
+        "[keeper-codex-pool] pool-unavailable; using native openai-codex",
+      ]);
+      await proofCommand.handler("", { ui: { notify() {} } });
+      expect(existsSync(join(sandbox, "live-proof.json"))).toBe(false);
+    } finally {
+      Date.now = originalNow;
+      console.warn = originalWarn;
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps manually assembled evidence diagnostic-only", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    const sandbox = mkdtempSync(join(tmpdir(), "codex-pool-live-proof-"));
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    const now = Date.now();
+    const aliases = ["keeper-codex-a", "keeper-codex-b"];
+    const binding = new PoolRouteState(aliases, null, () => now).binding;
+    const calls = new Map<string, number>();
+    let failNativeFallback = false;
+    extensionDelegateImpl = (_model, _context, options) => {
+      const sessionId = options?.sessionId ?? "native";
+      const count = (calls.get(sessionId) ?? 0) + 1;
+      calls.set(sessionId, count);
+      const start = { type: "start", partial: message() };
+      const text = {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: "ok",
+        partial: { ...message(), content: [{ type: "text", text: "ok" }] },
+      };
+      const done = { type: "done", reason: "stop", message: message() };
+      if (sessionId === "native" && failNativeFallback) {
+        return stream([
+          start,
+          {
+            type: "error",
+            reason: "error",
+            error: message("error", "native unavailable"),
+          },
+        ]);
+      }
+      if (sessionId === "retry-session" && count === 1) {
+        return stream([
+          start,
+          {
+            type: "error",
+            reason: "error",
+            error: message("error", "quota reached"),
+          },
+        ]);
+      }
+      if (sessionId === "cutoff-session") {
+        return stream([
+          start,
+          text,
+          {
+            type: "error",
+            reason: "error",
+            error: message("error", "quota reached"),
+          },
+        ]);
+      }
+      if (sessionId === "abort-session") {
+        return stream([
+          start,
+          {
+            type: "error",
+            reason: "aborted",
+            error: message("aborted", "request aborted"),
+          },
+        ]);
+      }
+      return stream([start, text, done]);
+    };
+
+    try {
+      process.env.KEEPER_JOB_ID = "keeper-live-proof-session";
+      process.env.PI_CODING_AGENT_DIR = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = sandbox;
+      process.env.KEEPER_PI_CODEX_POOL_MODE = "proof";
+      process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(aliases);
+      process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = binding;
+      process.env.KEEPER_PI_CODEX_POOL_REVISION = revision;
+      process.env.KEEPER_PI_CODEX_POOL_PROOF_WINDOW = JSON.stringify({
+        schema_version: 1,
+        armed_at_ms: now,
+        expires_at_ms: now + 900_000,
+        launcher_pid: process.ppid,
+      });
+      writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+        "keeper-codex-a": credentials(now + 1)["keeper-codex-a"],
+        "keeper-codex-b": credentials(now + 1)["keeper-codex-b"],
+      });
+      let openaiStream: any;
+      let sessionStart: any;
+      const commands = new Map<string, any>();
+      const notifications: Array<{ message: string; level: string }> = [];
+      installCodexPool({
+        on(_event: string, handler: unknown) {
+          sessionStart = handler;
+        },
+        registerProvider(name: string, config: { streamSimple?: unknown }) {
+          if (name === "openai-codex") openaiStream = config.streamSimple;
+        },
+        registerCommand(name: string, options: unknown) {
+          commands.set(name, options);
+        },
+      } as never);
+      const context = {
+        ui: {
+          notify(message: string, level: string) {
+            notifications.push({ message, level });
+          },
+        },
+      };
+
+      sessionStart(
+        { reason: "startup" },
+        { sessionManager: { getSessionId: () => "root-session" } },
+      );
+      await commands.get("codex-pool-observe").handler("", context);
+      await commands.get("codex-pool-proof").handler("", context);
+      expect(
+        JSON.parse(readFileSync(join(sandbox, "live-proof.json"), "utf8"))
+          .verdict,
+      ).not.toBe("proven");
+      await Promise.all([
+        collect(openaiStream(MODEL, CONTEXT, { sessionId: "root-session" })),
+        collect(openaiStream(MODEL, CONTEXT, { sessionId: "child-session" })),
+      ]);
+      await collect(
+        openaiStream(MODEL, CONTEXT, { sessionId: "root-session" }),
+      );
+      for (const sessionId of [
+        "retry-session",
+        "cutoff-session",
+        "abort-session",
+      ]) {
+        await collect(openaiStream(MODEL, CONTEXT, { sessionId }));
+      }
+      await collect(openaiStream(MODEL, CONTEXT));
+      await commands.get("codex-pool-proof").handler("", context);
+
+      const path = join(sandbox, "live-proof.json");
+      expect(existsSync(path)).toBe(true);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const report = JSON.parse(readFileSync(path, "utf8"));
+      expect(report.verdict).toBe("incomplete");
+      expect(report.artifact_scan.status).toBe("clean");
+      expect(notifications.at(-1)).toEqual({
+        message: JSON.stringify({
+          schema_version: 1,
+          status: "written",
+          verdict: "incomplete",
+        }),
+        level: "warning",
+      });
+
+      const store = new FileCodexPoolActivationStore(
+        resolveCodexPoolWorkflowPaths({
+          KEEPER_PI_CODEX_POOL_CONFIG_ROOT: sandbox,
+        }),
+      );
+      expect(
+        captureCodexPoolProof(
+          {
+            store,
+            bindings: codexPoolBindings(revision, aliases),
+            nowMs: () => Date.now(),
+          },
+          path,
+        ),
+      ).toEqual({
+        schema_version: 1,
+        ok: true,
+        operation: "proof-capture",
+        state: "native",
+        problem_code: "proof-incomplete",
+        proof: { verdict: "incomplete", reasons: ["clause-incomplete"] },
+      });
+
+      failNativeFallback = true;
+      await collect(openaiStream(MODEL, CONTEXT));
+      await commands.get("codex-pool-proof").handler("", context);
+      expect(JSON.parse(readFileSync(path, "utf8")).verdict).not.toBe("proven");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps collection inert in native and active modes", async () => {
+    const { installCodexPool } = await import("../src/index.ts");
+    for (const mode of ["native", "active"] as const) {
+      const sandbox = mkdtempSync(join(tmpdir(), `codex-pool-${mode}-`));
+      try {
+        const now = Date.now();
+        const aliases = ["keeper-codex-a", "keeper-codex-b"];
+        process.env.KEEPER_JOB_ID = `keeper-${mode}-session`;
+        process.env.PI_CODING_AGENT_DIR = sandbox;
+        process.env.KEEPER_PI_CODEX_POOL_CONFIG_ROOT = sandbox;
+        process.env.KEEPER_PI_CODEX_POOL_MODE = mode;
+        process.env.KEEPER_PI_CODEX_POOL_ALIASES = JSON.stringify(aliases);
+        process.env.KEEPER_PI_CODEX_POOL_CONFIG_BINDING = new PoolRouteState(
+          aliases,
+          null,
+          () => now,
+        ).binding;
+        writePrivateJsonAtomic(join(sandbox, "auth.json"), {
+          "keeper-codex-a": credentials(now + 120_000)["keeper-codex-a"],
+          "keeper-codex-b": credentials(now + 120_000)["keeper-codex-b"],
+        });
+        let openaiStream: any;
+        const commands: string[] = [];
+        installCodexPool({
+          registerProvider(name: string, config: { streamSimple?: unknown }) {
+            if (name === "openai-codex") openaiStream = config.streamSimple;
+          },
+          registerCommand(name: string) {
+            commands.push(name);
+          },
+        } as never);
+        expect(commands).toEqual(["codex-pool-observe"]);
+        await collect(
+          openaiStream(MODEL, CONTEXT, { sessionId: `${mode}-session` }),
+        );
+        expect(existsSync(join(sandbox, "live-proof.json"))).toBe(false);
+      } finally {
+        rmSync(sandbox, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("keeps the extension import graph free of Bun-only builtins", () => {
+    const root = resolve(import.meta.dir, "../src/index.ts");
+    const closure = walkClosure(root).files;
+    const rels = new Set(closure.map((file) => file.rel));
+    expect(rels).toContain("src/codex-pool-proof-window.ts");
+    expect(rels).not.toContain("src/codex-pool-activation.ts");
+    expect(
+      closure.flatMap((file) => [
+        ...file.valueSpecs
+          .filter((specifier) => specifier.startsWith("bun:"))
+          .map((specifier) => `${file.rel}: ${specifier}`),
+        ...(file.code.match(/\bBun\s*\./) === null
+          ? []
+          : [`${file.rel}: Bun API`]),
+      ]),
+    ).toEqual([]);
+    const index = closure.find(
+      (file) => file.rel === "integrations/pi-codex-pool/src/index.ts",
+    );
+    expect(
+      index?.valueSpecs.filter((specifier) =>
+        specifier.startsWith("../../../src/"),
+      ),
+    ).toEqual(["../../../src/codex-pool-proof-window.ts"]);
   });
 
   test("pins the compat-root delegate source and independent root/child routes", () => {

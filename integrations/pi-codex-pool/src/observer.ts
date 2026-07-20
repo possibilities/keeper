@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
 import { existsSync, realpathSync } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { delimiter, dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   aliasesFromEnvironment,
   type CanonicalOAuth,
@@ -274,7 +274,17 @@ export async function runObserverCommand(
   }
 }
 
-if (typeof Bun !== "undefined" && /(?:^|[/\\])observer\.ts$/.test(Bun.main)) {
+let observerEntrypoint = false;
+try {
+  observerEntrypoint =
+    process.argv[1] !== undefined &&
+    realpathSync(resolve(process.argv[1])) ===
+      realpathSync(fileURLToPath(import.meta.url));
+} catch {
+  observerEntrypoint = false;
+}
+
+if (observerEntrypoint) {
   runObserverCommand()
     .then((code) => {
       process.exitCode = code;

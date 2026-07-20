@@ -31,6 +31,10 @@ export type CodexWindowRole = "primary" | "secondary" | "additional";
 
 export interface CodexCapacityWindow {
   role: CodexWindowRole;
+  /** Optional for additive schema compatibility; producers publish both fields. */
+  key?: string;
+  label?: string;
+  window_seconds?: number | null;
   used_percent: number;
   reset_at_ms: number | null;
 }
@@ -126,18 +130,39 @@ function parseWindow(value: unknown): CodexCapacityWindow | null {
   const role = windowRole(input.role);
   const used = input.used_percent;
   const reset = input.reset_at_ms;
+  const key = input.key;
+  const label = input.label;
+  const seconds = input.window_seconds;
+  const hasIdentity = key !== undefined || label !== undefined;
   if (
     role === null ||
     typeof used !== "number" ||
     !Number.isFinite(used) ||
     used < 0 ||
     used > 100 ||
-    (reset !== null && safeTimestamp(reset) === null)
+    (reset !== null && safeTimestamp(reset) === null) ||
+    (hasIdentity &&
+      (typeof key !== "string" ||
+        !/^[a-z0-9][a-z0-9:.-]{0,127}$/u.test(key) ||
+        typeof label !== "string" ||
+        label.length < 1 ||
+        label.length > 64 ||
+        !/^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$/u.test(label))) ||
+    (seconds !== undefined &&
+      seconds !== null &&
+      (typeof seconds !== "number" ||
+        !Number.isSafeInteger(seconds) ||
+        seconds < 1 ||
+        seconds > 45 * 24 * 60 * 60))
   ) {
     return null;
   }
   return {
     role,
+    ...(hasIdentity ? { key: key as string, label: label as string } : {}),
+    ...(seconds === undefined
+      ? {}
+      : { window_seconds: seconds as number | null }),
     used_percent: used,
     reset_at_ms: reset === null ? null : (reset as number),
   };

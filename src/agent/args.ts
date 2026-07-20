@@ -17,8 +17,6 @@
 
 import type { AgentKind } from "./dispatch";
 
-export const CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES = 16 * 1024;
-
 export interface ParsedArgs {
   /** argv with launcher flags stripped — forwarded to the agent verbatim. */
   remainingArgs: string[];
@@ -55,12 +53,6 @@ export interface ParsedArgs {
   launcherFableIntent: boolean | null;
   /** Invalid hidden lineage carrier diagnostic. */
   launcherFableIntentError: string | null;
-  /** Internal one-shot Claude naming input; null outside metadata mode. */
-  launcherMetadataInferenceInput: string | null;
-  /** True when the internal metadata flag was present, including invalid uses. */
-  launcherMetadataInferenceRequested: boolean;
-  /** Invalid, missing, oversized, or wrong-harness metadata diagnostic. */
-  launcherMetadataInferenceError: string | null;
 }
 
 /**
@@ -91,43 +83,9 @@ export function parseArgsForAgent(
   let launcherAccountError: string | null = null;
   let launcherFableIntent: boolean | null = null;
   let launcherFableIntentError: string | null = null;
-  let launcherMetadataInferenceInput: string | null = null;
-  let launcherMetadataInferenceRequested = false;
-  let launcherMetadataInferenceError: string | null = null;
-  let metadataInferenceCount = 0;
   let parsingIgnoredProfile = false;
   let parsingLauncherPreset = false;
   let parsingLauncherAccount = false;
-  let parsingMetadataInference = false;
-
-  const setMetadataInference = (raw: string): void => {
-    launcherMetadataInferenceRequested = true;
-    metadataInferenceCount += 1;
-    if (metadataInferenceCount > 1) {
-      launcherMetadataInferenceInput = null;
-      launcherMetadataInferenceError =
-        "--x-metadata-inference may be provided only once";
-      return;
-    }
-    if (agent !== "claude") {
-      launcherMetadataInferenceInput = null;
-      launcherMetadataInferenceError =
-        "--x-metadata-inference is only valid for Claude";
-      return;
-    }
-    const bytes = Buffer.byteLength(raw, "utf8");
-    if (
-      raw.trim() === "" ||
-      bytes > CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES ||
-      raw.includes("\0")
-    ) {
-      launcherMetadataInferenceInput = null;
-      launcherMetadataInferenceError = `--x-metadata-inference expects 1 to ${CLAUDE_METADATA_INFERENCE_MAX_INPUT_BYTES} UTF-8 bytes without NUL`;
-      return;
-    }
-    launcherMetadataInferenceInput = raw;
-    launcherMetadataInferenceError = null;
-  };
 
   const setLauncherAccount = (raw: string): void => {
     if (agent !== "claude") {
@@ -162,11 +120,6 @@ export function parseArgsForAgent(
       parsingLauncherAccount = false;
       continue;
     }
-    if (parsingMetadataInference) {
-      setMetadataInference(arg);
-      parsingMetadataInference = false;
-      continue;
-    }
     if (arg === "--x-verbose") {
       launcherVerbose = true;
     } else if (arg === "--x-very-verbose") {
@@ -185,11 +138,6 @@ export function parseArgsForAgent(
       parsingLauncherAccount = true;
     } else if (arg.startsWith("--x-account=")) {
       setLauncherAccount(arg.slice("--x-account=".length));
-    } else if (arg === "--x-metadata-inference") {
-      launcherMetadataInferenceRequested = true;
-      parsingMetadataInference = true;
-    } else if (arg.startsWith("--x-metadata-inference=")) {
-      setMetadataInference(arg.slice("--x-metadata-inference=".length));
     } else if (arg.startsWith("--x-fable-intent=")) {
       const value = arg.slice("--x-fable-intent=".length);
       if (agent !== "claude" || (value !== "0" && value !== "1")) {
@@ -217,11 +165,6 @@ export function parseArgsForAgent(
     launcherAccountError =
       "--x-account expects cN or N (a zero-based cswap inventory index)";
   }
-  if (parsingMetadataInference) {
-    launcherMetadataInferenceError =
-      "--x-metadata-inference expects 1 to 16384 UTF-8 bytes without NUL";
-  }
-
   return {
     remainingArgs,
     hasContinueOrResume,
@@ -235,9 +178,6 @@ export function parseArgsForAgent(
     launcherAccountError,
     launcherFableIntent,
     launcherFableIntentError,
-    launcherMetadataInferenceInput,
-    launcherMetadataInferenceRequested,
-    launcherMetadataInferenceError,
   };
 }
 

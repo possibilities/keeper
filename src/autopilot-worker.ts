@@ -132,12 +132,14 @@ import {
 } from "./dispatch-failure-key";
 import { resolveDispatchLaunchConfig } from "./dispatch-launch-config";
 import {
+  classifyProcessIdentity,
   compareCanonicalGeneration,
   createTmuxPaneOps,
   keeperAgentLaunch,
   type LaunchSpec,
   MANAGED_EXEC_SESSION,
   type PaneInfo,
+  type TmuxPaneOps,
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
@@ -145,11 +147,16 @@ import {
   findLongUnknownMonitorOccupants,
   type LongUnknownMonitorOccupant,
 } from "./readiness";
-import { loadReadinessInputs, type ReadinessQuery } from "./readiness-inputs";
+import {
+  type DispatchClaim,
+  loadReadinessInputs,
+  type ReadinessQuery,
+} from "./readiness-inputs";
 import {
   type BaseDriftEntry,
   buildPlannedLaunchSpec,
   buildWorkerCommand,
+  type CloseReceipt,
   closerJobFinished,
   type DispatchKey,
   dispatchKey,
@@ -159,6 +166,7 @@ import {
   epicResourceTeardownBlocked,
   FINALIZER_GUARD_S,
   type HostMatrixSnapshot,
+  isBareShellCommand,
   isFinalizerVerb,
   isStoppedJobLive,
   isWrappedCell,
@@ -173,6 +181,8 @@ import {
   type ResourceHoldObservation,
   reconcile,
   recoverFailureDispatchId,
+  SLOT_RECLAIM_GRACE_SEC,
+  SLOT_RECLAIM_MAX_PER_SWEEP,
   type StaleBaseLaneEntry,
   type Verb,
   type WithholdReason,
@@ -243,6 +253,7 @@ import {
   mergeReadiness as gitMergeReadiness,
   parseWorktreeList as gitParseWorktreeList,
   probeLaneMergeHead as gitProbeLaneMergeHead,
+  probeLosslesslyCleanableUntracked as gitProbeLosslesslyCleanableUntracked,
   pruneWorktreeHusk as gitPruneWorktreeHusk,
   pruneWorktrees as gitPruneWorktrees,
   remotePushFastForwardable as gitRemotePushFastForwardable,
@@ -250,6 +261,7 @@ import {
   resolveDefaultBranch as gitResolveDefaultBranch,
   supportsMergeTreeWriteTree as gitSupportsMergeTreeWriteTree,
   isKeeperLaneEntry,
+  keeperLaneIdentity,
   type LockAcquirer,
   type MergeResult,
   provisionScratchWorktree,
@@ -316,6 +328,7 @@ export {
 } from "./dispatch-failure-key";
 export type {
   BaseDriftEntry,
+  CloseReceipt,
   DispatchKey,
   EpicRecoverVerdict,
   HostMatrixSnapshot,
@@ -674,6 +687,177 @@ function normalizeLanePath(p: string): string {
   return normalizeLanePathState(p).path;
 }
 
+export interface LaneMaintenanceTarget {
+  path: string;
+  epicId: string;
+  taskId: string | null;
+}
+
+export type LaneMaintenanceProbeResult =
+  | { kind: "clear" }
+  | { kind: "defer"; reason: string };
+
+export type LaneMaintenanceProbe = (
+  target: LaneMaintenanceTarget,
+) => LaneMaintenanceProbeResult;
+
+const LANE_MAINTENANCE_REASON_MAX = 512;
+
+function boundedLaneMaintenanceReason(reason: string): string {
+  return reason.length <= LANE_MAINTENANCE_REASON_MAX
+    ? reason
+    : `${reason.slice(0, LANE_MAINTENANCE_REASON_MAX - 1)}…`;
+}
+
+export function createLaneMaintenanceProbe(
+  jobs: ReadonlyMap<string, Job>,
+  dispatchClaims: ReadonlyMap<DispatchKey, DispatchClaim> | undefined,
+  livePaneIds: ReadonlySet<string> | null,
+): LaneMaintenanceProbe {
+  return (target) => {
+    const lanePath = normalizeLanePath(target.path);
+    for (const claim of dispatchClaims?.values() ?? []) {
+      if (claim.state === "released") continue;
+      const claimsPath =
+        claim.dir !== null && normalizeLanePath(claim.dir) === lanePath;
+      const claimsTask =
+        claim.verb === "work" &&
+        (target.taskId !== null
+          ? claim.id === target.taskId
+          : claim.id.startsWith(`${target.epicId}.`));
+      if (claimsPath || claimsTask) {
+        return {
+          kind: "defer",
+          reason: boundedLaneMaintenanceReason(
+            `live dispatch claim ${claim.verb}::${claim.id} holds ${lanePath}`,
+          ),
+        };
+      }
+    }
+    for (const job of jobs.values()) {
+      if (job.state === "ended" || job.state === "killed") continue;
+      const ownsPath =
+        job.cwd !== null && normalizeLanePath(job.cwd) === lanePath;
+      const ownsTask =
+        target.taskId !== null
+          ? job.plan_ref === target.taskId
+          : job.plan_ref === target.epicId ||
+            job.plan_ref?.startsWith(`${target.epicId}.`) === true;
+      if (!ownsPath && !ownsTask) continue;
+      const label = `${job.plan_verb ?? "job"}::${job.plan_ref ?? job.job_id}`;
+      if (job.state === "working") {
+        return {
+          kind: "defer",
+          reason: boundedLaneMaintenanceReason(
+            `live claimed session ${label} holds ${lanePath}`,
+          ),
+        };
+      }
+      if (job.state === "stopped") {
+        // The ONE centralized stopped-job liveness rule (`null` panes → assume
+        // live), shared with the occupancy gate and the dirty-attribution pass
+        // rather than forked here. `null` panes stay a DISTINCT reason: the hold
+        // is fail-closed on an unavailable probe, not a witnessed live owner.
+        if (!isStoppedJobLive(job, livePaneIds)) continue;
+        return {
+          kind: "defer",
+          reason: boundedLaneMaintenanceReason(
+            livePaneIds === null
+              ? `liveness probe inconclusive for claimed session ${label} on ${lanePath}`
+              : `live claimed session ${label} holds ${lanePath}`,
+          ),
+        };
+      }
+      return {
+        kind: "defer",
+        reason: boundedLaneMaintenanceReason(
+          `liveness probe inconclusive for claimed session ${label} on ${lanePath}`,
+        ),
+      };
+    }
+    return { kind: "clear" };
+  };
+}
+
+function probeLaneMaintenance(
+  probe: LaneMaintenanceProbe | undefined,
+  target: LaneMaintenanceTarget,
+): LaneMaintenanceProbeResult {
+  if (probe === undefined) return { kind: "clear" };
+  try {
+    return probe(target);
+  } catch (err) {
+    return {
+      kind: "defer",
+      reason: boundedLaneMaintenanceReason(
+        `liveness probe inconclusive for ${normalizeLanePath(target.path)}: ${errMsg(err)}`,
+      ),
+    };
+  }
+}
+
+/**
+ * Per-(pass, lane) latch for lane-maintenance deferral logging, keyed
+ * `<pass>\0<normalized lane path>` → the last reason logged. A held lane rides a
+ * `data_version`-level-triggered loop the live owner's OWN job updates keep
+ * ticking, so an unlatched line would repeat per pass per cycle for the whole
+ * hold. One line per EPISODE instead: {@link logLaneMaintenanceDeferralOnce}
+ * emits only when the reason is new or changed, and
+ * {@link pruneLaneMaintenanceDeferralLatch} ends the episode by dropping the keys
+ * a sweep did not re-defer, so a later hold reports afresh. Live-only process
+ * state — never a fold read, never persisted.
+ */
+const laneMaintenanceDeferralLatch = new Map<string, string>();
+
+function laneMaintenanceDeferralKey(pass: string, path: string): string {
+  return `${pass}\0${normalizeLanePath(path)}`;
+}
+
+function logLaneMaintenanceDeferralOnce(
+  pass: string,
+  path: string,
+  reason: string,
+  seen?: Set<string>,
+  // The recover sweep's reasons already carry their own `<pass>: <path> — ` head;
+  // pass the formed line so it is not prefixed twice.
+  message?: string,
+): void {
+  const key = laneMaintenanceDeferralKey(pass, path);
+  seen?.add(key);
+  if (laneMaintenanceDeferralLatch.get(key) === reason) return;
+  laneMaintenanceDeferralLatch.set(key, reason);
+  console.error(
+    `[autopilot-worker] ${boundedLaneMaintenanceReason(message ?? `${pass}: ${reason}`)}`,
+  );
+}
+
+/** The reconcile-cycle passes that hold a lane; the recover sweep owns its own. */
+const CYCLE_LANE_DEFERRAL_PASSES = [
+  "worktree-base-refresh-deferred",
+  "worktree-provision-deferred",
+  "worktree-sink-provision-deferred",
+  "worktree-finalize-deferred",
+] as const;
+
+/** The recover sweep's single deferral pass namespace. */
+const RECOVER_LANE_DEFERRAL_PASS = "worktree-maintenance-deferred";
+
+/**
+ * End every episode in `passes` whose (pass, lane) key was NOT re-deferred this
+ * sweep, so the next hold on that lane logs once again.
+ */
+function pruneLaneMaintenanceDeferralLatch(
+  passes: readonly string[],
+  seen: ReadonlySet<string>,
+): void {
+  for (const key of [...laneMaintenanceDeferralLatch.keys()]) {
+    const pass = key.slice(0, key.indexOf("\0"));
+    if (passes.includes(pass) && !seen.has(key)) {
+      laneMaintenanceDeferralLatch.delete(key);
+    }
+  }
+}
+
 /**
  * The `dispatch_failures` id a PER-REPO worktree-finalize failure keys on —
  * `worktree-finalize:<epicId>-<repoHash>` (composed
@@ -844,15 +1028,6 @@ export interface ConfirmRunningDeps {
    * deferred/failed removal — the sweep must not drop a still-present path.
    */
   nudgeVanishedSweep?(): void;
-  /**
-   * Kill the tmux window holding a provably-dead slot occupant's pane, releasing the
-   * wedged dispatch slot. Wired to `paneOps.killWindow`; the ONLY producer side
-   * effect the slot-occupancy reclaim takes, gated behind the strict
-   * bare-shell-past-grace criterion in the pure decision. Optional — a partial
-   * test deps stays visibility-only. NEVER throws (killWindow degrades to a logged
-   * `{ ok: false }` on a TOCTOU window-already-gone, itself the desired end state).
-   */
-  reclaimSlotPane?(paneId: string): Promise<void>;
   /**
    * Emit the FULL current worktree-disabled set to main (fn-1013) for the
    * LIVE-ONLY `worktree_repo_status` operator surface. Main is the sole writer of
@@ -1169,14 +1344,16 @@ export interface WorktreeDriver {
    * sweep). Two idempotent passes over LIVE git, never a window-bounded projection
    * read, so a restart between an epic-done and its merge-to-default cannot orphan
    * the work:
-   *  1. INTERRUPTED MERGE: for every registered linked worktree across `repos`,
-   *     detect a stale `MERGE_HEAD` (a crash mid-merge) → `git merge --abort` →
-   *     `git worktree prune --expire now`. The next cycle re-runs the merge from a
-   *     clean state (level-triggered retry, no in-process self-heal). SKIPPED for a
-   *     lane whose epic has a LIVE autonomous merge-resolver (`hasActiveResolver`):
-   *     that MERGE_HEAD is the resolver's deliberate in-progress merge, not crash
-   *     residue — the scoped per-epic exclusion that replaced the resolver's global
-   *     `keeper autopilot pause`.
+   *  1. INTERRUPTED MERGE, TRI-STATE: every registered linked lane is probed for a
+   *     live claim. A LIVE (or inconclusive) claim HOLDS the lane — its `MERGE_HEAD`
+   *     is the owner's own merge, so maintenance defers with a bounded reason and
+   *     mutates nothing, and the hold also excludes every later maintenance mutation
+   *     in that worktree. A DEAD or absent claim leaves crash residue instead:
+   *     `git merge --abort` → `git worktree prune --expire now`, so the next cycle
+   *     re-runs the merge from a clean state (level-triggered retry, no in-process
+   *     self-heal). An abort that FAILS records `worktree-recover-abort-failed` and
+   *     its surviving `MERGE_HEAD` surfaces as an IMMEDIATE lane wedge — a hold
+   *     never suppresses that escalation.
    *  2. DONE-BUT-UNMERGED BACKSTOP: enumerate `keeper/epic/<id>` base branches
    *     from git; for each whose epic `isEpicDone` reports done but whose base is
    *     NOT yet an ancestor of the resolved default branch, merge it to default +
@@ -1208,6 +1385,7 @@ export interface WorktreeDriver {
     hasActiveResolver: (epicId: string) => boolean,
     epicHasOccupyingJob: (epicId: string) => boolean,
     laneTeardown?: LaneTeardownRecoveryOptions,
+    laneMaintenanceProbe?: LaneMaintenanceProbe,
   ): Promise<WorktreeRecoveryOutcome>;
 }
 
@@ -1492,6 +1670,340 @@ export function sharedDesyncDistressId(repoDir: string): string {
   return `${SHARED_DESYNC_DISTRESS_ID_PREFIX}${repoDirHash(repoDir)}`;
 }
 
+// ── Terminal autopilot pane teardown ───────────────────────────────────────
+
+/** Board verbs whose autopilot-dispatched terminal panes Keeper owns. */
+export const TERMINAL_PANE_TEARDOWN_VERBS: ReadonlySet<string> = new Set([
+  "work",
+  "close",
+  "resolve",
+  "deconflict",
+  "repair",
+  "unblock",
+]);
+
+/** Maximum exact windows one terminal-pane sweep may tear down. */
+export const TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP = 5;
+
+/** Maximum pane-owner records one periodic pass admits to its DB join. */
+export const TERMINAL_PANE_TEARDOWN_SCAN_MAX = 256;
+
+/** Idle cadence for restart recovery when no DB commit wakes the worker. */
+export const TERMINAL_PANE_TEARDOWN_IDLE_MS = 5_000;
+
+export type TerminalPaneProcessIdentity =
+  | "alive"
+  | "dead"
+  | "recycled"
+  | "unknown";
+
+/** Terminal row joined to the immutable lifecycle event's pre-clear pane id. */
+export interface TerminalPaneTeardownJob {
+  job_id: string;
+  state: string;
+  pid: number | null;
+  start_time: string | null;
+  dispatch_origin: string | null;
+  plan_verb: string | null;
+  plan_ref: string | null;
+  adopted: number | null;
+  backend_exec_type: string | null;
+  terminal_pane_id: string | null;
+}
+
+export interface TerminalPaneTeardownDecision {
+  jobId: string;
+  paneId: string;
+}
+
+export interface TerminalPaneOwnerScan {
+  jobIds: string[];
+  nextCursor: string | null;
+}
+
+/**
+ * Select one bounded page of exact pane owners. The caller retains
+ * `nextCursor` across periodic passes, so a stable prefix of manual/live owners
+ * cannot starve terminal candidates later in the tmux server snapshot.
+ */
+export function selectTerminalPaneOwnerScan(
+  panes: readonly PaneInfo[] | null,
+  afterJobId: string | null = null,
+  limit: number = TERMINAL_PANE_TEARDOWN_SCAN_MAX,
+): TerminalPaneOwnerScan {
+  if (panes === null) return { jobIds: [], nextCursor: null };
+  const allOwnerIds = [
+    ...new Set(
+      panes
+        .filter(
+          (pane) =>
+            pane.sessionName === MANAGED_EXEC_SESSION &&
+            typeof pane.keeperJobId === "string" &&
+            pane.keeperJobId !== "",
+        )
+        .map((pane) => pane.keeperJobId as string),
+    ),
+  ].sort();
+  if (allOwnerIds.length === 0) return { jobIds: [], nextCursor: null };
+
+  const boundedLimit = Math.max(
+    1,
+    Math.min(TERMINAL_PANE_TEARDOWN_SCAN_MAX, Math.floor(limit)),
+  );
+  const firstAfter =
+    afterJobId === null
+      ? 0
+      : allOwnerIds.findIndex((jobId) => jobId > afterJobId);
+  const start = firstAfter < 0 ? 0 : firstAfter;
+  const jobIds = allOwnerIds.slice(start, start + boundedLimit);
+  const reachedEnd = start + jobIds.length >= allOwnerIds.length;
+  return {
+    jobIds,
+    nextCursor: reachedEnd ? null : (jobIds.at(-1) ?? null),
+  };
+}
+
+/**
+ * Pure fail-closed boundary for terminal pane teardown. Positive authority is
+ * the full conjunction: terminal state, literal autopilot provenance, a board
+ * verb/ref, non-adopted tmux job, exact lifecycle pane id, matching pane-local
+ * owner record, and proof that the recorded agent process is gone. A live
+ * foreground agent command also vetoes teardown, closing the resume-before-bind
+ * window even when the prior process identity is dead.
+ */
+export function decideTerminalPaneTeardowns(input: {
+  jobs: readonly TerminalPaneTeardownJob[];
+  panes: readonly PaneInfo[] | null;
+  processIdentityByJobId: ReadonlyMap<
+    string,
+    TerminalPaneProcessIdentity
+  > | null;
+  maxPerSweep?: number;
+  afterJobId?: string | null;
+}): TerminalPaneTeardownDecision[] {
+  if (input.panes === null || input.processIdentityByJobId === null) return [];
+  const paneById = new Map(input.panes.map((pane) => [pane.paneId, pane]));
+  const paneCountByWindow = new Map<string, number>();
+  for (const pane of input.panes) {
+    paneCountByWindow.set(
+      pane.windowId,
+      (paneCountByWindow.get(pane.windowId) ?? 0) + 1,
+    );
+  }
+  const decisions: TerminalPaneTeardownDecision[] = [];
+  const seenPanes = new Set<string>();
+
+  for (const job of input.jobs) {
+    if (
+      job.state !== "ended" &&
+      job.state !== "killed" &&
+      job.state !== "autoclosed"
+    ) {
+      continue;
+    }
+    if (job.dispatch_origin !== "autopilot") continue;
+    if (
+      job.plan_verb == null ||
+      !TERMINAL_PANE_TEARDOWN_VERBS.has(job.plan_verb) ||
+      job.plan_ref == null ||
+      job.plan_ref === ""
+    ) {
+      continue;
+    }
+    if (job.adopted === 1 || job.backend_exec_type !== "tmux") continue;
+    const paneId = job.terminal_pane_id;
+    if (paneId == null || paneId === "" || seenPanes.has(paneId)) continue;
+    const pane = paneById.get(paneId);
+    if (
+      pane == null ||
+      pane.keeperJobId !== job.job_id ||
+      pane.sessionName !== MANAGED_EXEC_SESSION ||
+      paneCountByWindow.get(pane.windowId) !== 1
+    ) {
+      continue;
+    }
+    const identity = input.processIdentityByJobId.get(job.job_id);
+    if (identity !== "dead" && identity !== "recycled") continue;
+    if (pane.paneDead !== "1" && !isBareShellCommand(pane.currentCommand)) {
+      continue;
+    }
+    seenPanes.add(paneId);
+    decisions.push({ jobId: job.job_id, paneId });
+  }
+
+  decisions.sort((a, b) => {
+    const byJob = a.jobId.localeCompare(b.jobId);
+    return byJob === 0 ? a.paneId.localeCompare(b.paneId) : byJob;
+  });
+  const afterJobId = input.afterJobId;
+  const firstAfter =
+    afterJobId == null
+      ? 0
+      : decisions.findIndex((decision) => decision.jobId > afterJobId);
+  const ordered =
+    firstAfter > 0
+      ? [...decisions.slice(firstAfter), ...decisions.slice(0, firstAfter)]
+      : decisions;
+  const cap = Math.max(
+    0,
+    Math.min(
+      TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP,
+      Math.floor(input.maxPerSweep ?? TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP),
+    ),
+  );
+  return ordered.slice(0, cap);
+}
+
+/**
+ * Read terminal rows only for pane-local owners in the current healthy tmux
+ * observation. The lifecycle event retains the pane id that the terminal jobs
+ * fold deliberately clears, and the pure seam requires it to match the current
+ * pane before authorizing any action.
+ */
+export function loadTerminalPaneTeardownJobs(
+  db: Parameters<typeof runQuery>[0],
+  panes: readonly PaneInfo[] | null,
+  scannedOwnerJobIds?: readonly string[],
+): TerminalPaneTeardownJob[] {
+  if (panes === null) return [];
+  const ownerIds = [
+    ...new Set(scannedOwnerJobIds ?? selectTerminalPaneOwnerScan(panes).jobIds),
+  ]
+    .sort()
+    .slice(0, TERMINAL_PANE_TEARDOWN_SCAN_MAX);
+  if (ownerIds.length === 0) return [];
+  const placeholders = ownerIds.map(() => "?").join(",");
+  return db
+    .query(
+      `SELECT j.job_id, j.state, j.pid, j.start_time, j.dispatch_origin,
+              j.plan_verb, j.plan_ref, j.adopted, j.backend_exec_type,
+              e.backend_exec_pane_id AS terminal_pane_id
+         FROM jobs j
+         JOIN events e ON e.id = (
+           SELECT e2.id
+             FROM events e2
+            WHERE e2.session_id = j.job_id
+              AND e2.id <= j.last_event_id
+              AND e2.hook_event IN ('SessionEnd', 'Killed')
+            ORDER BY e2.id DESC
+            LIMIT 1
+         )
+        WHERE j.job_id IN (${placeholders})
+          AND j.state IN ('ended', 'killed', 'autoclosed')
+          AND j.dispatch_origin = 'autopilot'
+          AND j.plan_verb IN ('work', 'close', 'resolve', 'deconflict', 'repair', 'unblock')
+          AND j.plan_ref IS NOT NULL AND j.plan_ref != ''
+          AND COALESCE(j.adopted, 0) != 1
+          AND j.backend_exec_type = 'tmux'
+          AND e.backend_exec_pane_id IS NOT NULL
+          AND e.backend_exec_pane_id != ''
+        ORDER BY e.id, j.job_id`,
+    )
+    .all(...ownerIds) as TerminalPaneTeardownJob[];
+}
+
+function terminalPaneProcessIdentities(
+  jobs: readonly TerminalPaneTeardownJob[],
+  deps: {
+    isPidAlive: (pid: number) => boolean;
+    readStartTime: (pid: number) => string | null;
+  },
+): Map<string, TerminalPaneProcessIdentity> {
+  const out = new Map<string, TerminalPaneProcessIdentity>();
+  for (const job of jobs) {
+    try {
+      out.set(
+        job.job_id,
+        classifyProcessIdentity(job.pid, job.start_time, deps),
+      );
+    } catch {
+      out.set(job.job_id, "unknown");
+    }
+  }
+  return out;
+}
+
+/**
+ * Run one periodic/transition-driven teardown pass. The second pane sweep, jobs
+ * read, and process-identity probe are adjacent to the kill and repeat every
+ * authority predicate; a stale plan can therefore only degrade to no action.
+ */
+export async function runTerminalPaneTeardownSweep(
+  db: Parameters<typeof runQuery>[0],
+  backend: Pick<TmuxPaneOps, "listPanes" | "killWindow">,
+  initialPanes: readonly PaneInfo[] | null,
+  deps: {
+    isPidAlive?: (pid: number) => boolean;
+    readStartTime?: (pid: number) => string | null;
+    noteLine?: (line: string) => void;
+    scannedOwnerJobIds?: readonly string[];
+    afterJobId?: string | null;
+  } = {},
+): Promise<TerminalPaneTeardownDecision[]> {
+  const probes = {
+    isPidAlive: deps.isPidAlive ?? isPidAlive,
+    readStartTime: deps.readStartTime ?? readOsStartTime,
+  };
+  const initialJobs = loadTerminalPaneTeardownJobs(
+    db,
+    initialPanes,
+    deps.scannedOwnerJobIds,
+  );
+  const planned = decideTerminalPaneTeardowns({
+    jobs: initialJobs,
+    panes: initialPanes,
+    processIdentityByJobId: terminalPaneProcessIdentities(initialJobs, probes),
+    afterJobId: deps.afterJobId,
+  });
+  if (planned.length === 0) return [];
+
+  const decided: TerminalPaneTeardownDecision[] = [];
+  for (const candidate of planned) {
+    let actPanes: readonly PaneInfo[] | null;
+    try {
+      actPanes = await backend.listPanes();
+    } catch {
+      break;
+    }
+    if (actPanes === null) break;
+    const actJobs = loadTerminalPaneTeardownJobs(db, actPanes, [
+      candidate.jobId,
+    ]).filter(
+      (job) =>
+        job.job_id === candidate.jobId &&
+        job.terminal_pane_id === candidate.paneId,
+    );
+    const revalidated = decideTerminalPaneTeardowns({
+      jobs: actJobs,
+      panes: actPanes,
+      processIdentityByJobId: terminalPaneProcessIdentities(actJobs, probes),
+      maxPerSweep: 1,
+    });
+    const decision = revalidated[0];
+    if (
+      decision == null ||
+      decision.jobId !== candidate.jobId ||
+      decision.paneId !== candidate.paneId
+    ) {
+      continue;
+    }
+    decided.push(decision);
+    try {
+      const result = await backend.killWindow(decision.paneId);
+      if (!result.ok && result.error != null) {
+        deps.noteLine?.(
+          `terminal pane teardown deferred job=${decision.jobId} pane=${decision.paneId}: ${result.error}`,
+        );
+      }
+    } catch (err) {
+      deps.noteLine?.(
+        `terminal pane teardown threw job=${decision.jobId} pane=${decision.paneId}: ${errMsg(err)}`,
+      );
+    }
+  }
+  return decided;
+}
+
 /** A long-unknown live monitor pages after this horizon; it never releases. */
 export const MONITOR_SLOT_WEDGE_PAGE_SEC = 30 * 60;
 
@@ -1516,10 +2028,23 @@ export interface ZombieSessionCandidate {
   updatedAt: number;
 }
 
+interface ReapCandidate extends ZombieSessionCandidate {
+  reapClass: "monitor" | "occupancy";
+  immediate: boolean;
+  paneId: string | null;
+}
+
+interface PendingReapTerm {
+  sentAt: number;
+  stoppedAt: number;
+  candidate: ReapCandidate;
+}
+
 export interface OpenZombieSessionDistress {
   id: string;
   jobId: string;
   dir: string;
+  scope: "monitor" | "occupancy";
 }
 
 export interface ZombieReaperSnapshot {
@@ -1625,20 +2150,26 @@ export function decideZombieSessionReaper(input: {
   termSentAt?: number;
   thresholdSec?: number;
   termGraceSec?: number;
+  reapClass?: "monitor" | "occupancy";
+  immediate?: boolean;
 }): ZombieSessionReaperDecision {
   const thresholdSec = input.thresholdSec ?? ZOMBIE_SESSION_REAPER_GRACE_SEC;
-  const stale =
-    input.activity?.status === "unknown" &&
-    input.activity.reason === "resource-evidence-stale" &&
-    Number.isFinite(input.updatedAt) &&
-    input.nowSec - input.updatedAt > thresholdSec;
+  const occupancyReap = input.reapClass === "occupancy";
+  const stale = occupancyReap
+    ? input.immediate === true ||
+      (Number.isFinite(input.updatedAt) &&
+        input.nowSec - input.updatedAt >= thresholdSec)
+    : input.activity?.status === "unknown" &&
+      input.activity.reason === "resource-evidence-stale" &&
+      Number.isFinite(input.updatedAt) &&
+      input.nowSec - input.updatedAt > thresholdSec;
   if (input.jobState !== "stopped" || !stale) {
     return {
       action: "none",
       reason: input.jobState === "stopped" ? "activity" : "outside-scope",
     };
   }
-  if (!input.taskDone) {
+  if (!occupancyReap && !input.taskDone) {
     return { action: "backstop", reason: "task-not-done" };
   }
   if (
@@ -1681,8 +2212,14 @@ export function isKeeperLaunchedZombieCommand(
   planVerb: string | null,
   planRef: string | null,
 ): boolean {
-  if (planVerb !== "work" || planRef == null || planRef === "") return false;
-  const expected = `work::${planRef}`;
+  if (
+    (planVerb !== "work" && planVerb !== "close") ||
+    planRef == null ||
+    planRef === ""
+  ) {
+    return false;
+  }
+  const expected = `${planVerb}::${planRef}`;
   const tokens = command.trim().split(/\s+/);
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
@@ -4828,6 +5365,7 @@ export async function runReconcileCycle(
     ReadonlySet<string>
   > | null = null,
   dispatchFailureFences?: DispatchFailureFenceMap,
+  laneMaintenanceProbe?: LaneMaintenanceProbe,
 ): Promise<void> {
   // Realpath-normalize the worktree lane before it rides the launch as the
   // KEEPER_PLAN_WORKTREE env (macOS /var→/private/var) — a PRODUCER fs read,
@@ -4842,6 +5380,9 @@ export async function runReconcileCycle(
         return p;
       }
     });
+  // (pass, lane) keys this cycle deferred — the episode-latch's seen set, pruned
+  // once the cycle's mutating passes settle.
+  const laneDeferralsSeen = new Set<string>();
   // The live-attributed dirty set for a launch's base lane worktree, keyed the SAME
   // way the snapshot built the map (realpath + trailing-slash normalized). `null` ⇒
   // do-not-discard (an OFF-mode launch with no geometry, or a failed attribution
@@ -4880,13 +5421,9 @@ export async function runReconcileCycle(
     physicalize,
   });
   // ── Slot-occupancy visibility + auto-reclaim ───────────────────────────────
-  // Surface every wedged slot (a stopped-but-live session blocking a wanted mint)
-  // as a visible `DispatchFailed` through the change-gate, and KILL the pane of a
-  // provably-dead occupant (`reclaimPaneId`) to free its slot. The kill re-issues
-  // every cycle the condition persists (until the pane is gone) INDEPENDENT of the
-  // gate's emit-suppression, so a first-cycle TOCTOU miss self-heals. Clears fire
-  // symmetrically off the pure decision. All reason-scoped upstream, so a genuine
-  // `close::<epic>` conflict on the shared key is never touched.
+  // Surface every wedged slot through the change-gate. The worker drive consumes
+  // each exact `reapTarget` through the identity-rechecking TERM→KILL ladder before
+  // this producer runs; this seam owns only the reason-scoped failure/clear events.
   for (const sig of decision.slotOccupancy) {
     if (signal.aborted) {
       return;
@@ -4899,9 +5436,6 @@ export async function runReconcileCycle(
       conflictedFiles: null,
       ts: deps.now(),
     });
-    if (sig.reclaimPaneId !== null) {
-      await deps.reclaimSlotPane?.(sig.reclaimPaneId);
-    }
   }
   for (const clr of decision.slotOccupancyClears) {
     if (signal.aborted) {
@@ -4925,6 +5459,20 @@ export async function runReconcileCycle(
         realpath(worktreePathFor(entry.repo_dir, baseBranch)),
       );
       if (liveAttributedDirtyByWorktree.has(basePath)) continue;
+      const hold = probeLaneMaintenance(laneMaintenanceProbe, {
+        path: basePath,
+        epicId: entry.epic_id,
+        taskId: null,
+      });
+      if (hold.kind === "defer") {
+        logLaneMaintenanceDeferralOnce(
+          "worktree-base-refresh-deferred",
+          basePath,
+          hold.reason,
+          laneDeferralsSeen,
+        );
+        continue;
+      }
       const refreshed = await deps.worktree.refreshBase(entry, deps.now());
       if (!refreshed.ok) {
         if (refreshed.retry === true) {
@@ -5014,6 +5562,22 @@ export async function runReconcileCycle(
         ts: deps.now(),
       });
       continue;
+    }
+    if (plan.worktree !== undefined) {
+      const hold = probeLaneMaintenance(laneMaintenanceProbe, {
+        path: plan.worktree.assignment.worktreePath,
+        epicId: closeKeyEpicId(plan.worktree),
+        taskId: plan.verb === "work" ? plan.id : null,
+      });
+      if (hold.kind === "defer") {
+        logLaneMaintenanceDeferralOnce(
+          "worktree-provision-deferred",
+          plan.worktree.assignment.worktreePath,
+          hold.reason,
+          laneDeferralsSeen,
+        );
+        continue;
+      }
     }
     // Fail-loud on a stale (renamed-away) launch cwd. The resolved cwd is
     // stamped into `plan.cwd` by the pure `reconcile`; the on-disk stat lives
@@ -5395,6 +5959,21 @@ export async function runReconcileCycle(
       if (signal.aborted) {
         return;
       }
+      const sinkHold = probeLaneMaintenance(laneMaintenanceProbe, {
+        path: sink.assignment.worktreePath,
+        epicId: closeKeyEpicId(sink),
+        taskId: null,
+      });
+      if (sinkHold.kind === "defer") {
+        provisionFailed.add(`${closeKeyEpicId(sink)}\0${sink.repoDir}`);
+        logLaneMaintenanceDeferralOnce(
+          "worktree-sink-provision-deferred",
+          sink.assignment.worktreePath,
+          sinkHold.reason,
+          laneDeferralsSeen,
+        );
+        continue;
+      }
       const provisioned = await deps.worktree.provision(
         sink,
         liveAttrFor(sink),
@@ -5446,6 +6025,20 @@ export async function runReconcileCycle(
         closeKeyEpicId(info),
         info.repoDir,
       );
+      const finalizeHold = probeLaneMaintenance(laneMaintenanceProbe, {
+        path: info.assignment.worktreePath,
+        epicId: closeKeyEpicId(info),
+        taskId: null,
+      });
+      if (finalizeHold.kind === "defer") {
+        logLaneMaintenanceDeferralOnce(
+          "worktree-finalize-deferred",
+          info.assignment.worktreePath,
+          finalizeHold.reason,
+          laneDeferralsSeen,
+        );
+        continue;
+      }
       const result = await deps.worktree.finalizeEpic(
         info,
         deps.isEpicDone,
@@ -5490,6 +6083,12 @@ export async function runReconcileCycle(
       }
     }
   }
+  // A lane this cycle stopped deferring ends its episode, so a LATER hold on the
+  // same lane reports afresh instead of staying silent behind the latch.
+  pruneLaneMaintenanceDeferralLatch(
+    CYCLE_LANE_DEFERRAL_PASSES,
+    laneDeferralsSeen,
+  );
 }
 
 /**
@@ -5618,6 +6217,8 @@ export function createWorktreeDriver(
           baseBranch,
           run,
           defaultBranch,
+          undefined,
+          entry.repo_dir,
         );
         if (ready.kind !== "ready") {
           return retry(
@@ -5749,6 +6350,8 @@ export function createWorktreeDriver(
               branch,
               run,
               source,
+              undefined,
+              repoDir,
             );
             if (ready.kind === "dirty") {
               const cleaned = await gitLosslessPremergeClean(
@@ -6254,6 +6857,7 @@ export function createWorktreeDriver(
       hasActiveResolver,
       epicHasOccupyingJob,
       laneTeardown,
+      laneMaintenanceProbe,
     ) {
       return recoverWorktrees(
         repos,
@@ -6265,6 +6869,7 @@ export function createWorktreeDriver(
         onResyncSkipped,
         epicHasOccupyingJob,
         laneTeardown,
+        laneMaintenanceProbe,
       );
     },
   };
@@ -7225,8 +7830,8 @@ export async function mergeLaneBaseIntoDefault(
 /**
  * The default bounded commit-work flock acquirer for the shared main-checkout git
  * writes that must serialize against a concurrent `keeper commit-work` — the
- * {@link mergeLaneBaseIntoDefault} plumbing ref advance + resync and the
- * {@link recoverWorktrees} pass-1 mid-merge abort. Used when the caller injects no
+ * {@link mergeLaneBaseIntoDefault} plumbing ref advance + resync and the shared
+ * checkout's mid-merge recovery. Used when the caller injects no
  * `acquireLock` (production); a bounded deadline degrades a stuck holder to a defer,
  * never a frozen cycle. The fast tier injects a stub instead.
  */
@@ -7469,14 +8074,12 @@ async function recoverSharedCheckoutMidMerge(
  * test. Pure of keeper.db / folds / the wall clock — it reads ONLY live git plus
  * the injected `isEpicDone` done-ness probe.
  *
- * Pass 1 (interrupted-merge abort): every linked worktree under each repo (the
- * registered base + ribs) is checked for a stale `MERGE_HEAD`; when present, abort
- * the merge then prune the repo's worktree admin entries. The next reconcile cycle
- * re-runs the merge from a clean tree (level-triggered retry). The SHARED MAIN
- * checkout — invisible to that lane loop (it is on the default branch, not a
- * `keeper/epic/*` lane) — gets its own {@link recoverSharedCheckoutMidMerge} probe:
- * a keeper-owned mid-merge there is self-healed with a flock-guarded abort, a
- * foreign/ambiguous one is named and left alone.
+ * Pass 1 (interrupted-merge, tri-state): every linked lane under each repo is
+ * probed for a live claim. A LIVE or inconclusive claim holds the lane — reported
+ * and left untouched. A DEAD or absent claim takes the crash self-heal: abort the
+ * merge, then prune the repo's worktree admin entries; an abort failure is recorded
+ * and re-surfaces below as an IMMEDIATE wedge. The SHARED MAIN checkout — not a
+ * lane — keeps its separate {@link recoverSharedCheckoutMidMerge} policy.
  *
  * Pass 2 (done-but-unmerged backstop): every `keeper/epic/<id>` base branch in
  * each repo whose epic `isEpicDone` reports done but whose base is NOT yet an
@@ -7503,10 +8106,13 @@ export async function recoverWorktrees(
   epicPresentAndNotDone: (epicId: string) => Promise<boolean> = () =>
     Promise.resolve(true),
   // Per-epic exclusion: true while an autonomous merge-resolver (`resolve::<epic>`)
-  // is LIVE for the lane's epic. Gates pass-1's interrupted-merge abort AND pass-2's
-  // base→default merge — the two actions that would race a resolver mid-`git merge`
-  // — so the resolver no longer needs a GLOBAL `keeper autopilot pause`. Defaults to
-  // "no resolver" so every existing caller (and the OFF path) is byte-identical. A
+  // is LIVE for the lane's epic. Holds pass-1's lane abort (that MERGE_HEAD is the
+  // resolver's deliberate in-progress merge, not crash residue) and gates
+  // shared-checkout recovery plus pass-2's base→default merge, so maintenance never
+  // races that resolver. It AUTO-LIFTS the instant the resolver job reaps (clean exit
+  // OR crash) — a dead resolver strands nothing, and the lane recovers next cycle.
+  // Defaults to "no resolver" so every existing caller (and the OFF path) is
+  // byte-identical. A
   // retargeted content conflict now dispatches a resolver for a DONE epic, so pass-2
   // must skip re-attempting the same merge while that resolver is live.
   hasActiveResolver: (epicId: string) => boolean = () => false,
@@ -7522,6 +8128,7 @@ export async function recoverWorktrees(
   // path) is byte-identical. A pure projection read (jobs + read-time liveness).
   epicHasOccupyingJob: (epicId: string) => boolean = () => false,
   laneTeardown?: LaneTeardownRecoveryOptions,
+  laneMaintenanceProbe?: LaneMaintenanceProbe,
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -7551,6 +8158,19 @@ export async function recoverWorktrees(
   const presentLanePaths = new Set<string>();
   const teardownCandidatePaths = new Set<string>();
   const backupFailedPaths = new Set<string>();
+  const laneHoldByPath = new Map<string, string>();
+  const maintenanceDeferralByPath = new Map<string, string>();
+  const noteMaintenanceDeferral = (path: string, reason: string): void => {
+    const key = normalizeLanePath(path);
+    if (!maintenanceDeferralByPath.has(key)) {
+      maintenanceDeferralByPath.set(
+        key,
+        boundedLaneMaintenanceReason(
+          `worktree-maintenance-deferred: ${key} — ${reason}`,
+        ),
+      );
+    }
+  };
   let laneEnumerationComplete = true;
   // De-dupe repos (multiple epics often share one repo dir) so each repo is swept
   // once. A repo whose main worktree is the same path is collapsed by the set.
@@ -7625,21 +8245,48 @@ export async function recoverWorktrees(
       }
       // Only KEEPER-managed lanes (`keeper/epic/*`). A foreign
       // linked worktree (e.g. a `.claude/worktrees/<name>` lane another tool
-      // registered) is never keeper's to abort-merge or prune, and if its dir was
-      // removed out from under git the abort-merge `git` spawn ENOENTs against the
-      // vanished cwd — minting a spurious recovery failure. Classify on the branch
+      // registered) is never keeper's to probe or prune. Classify on the branch
       // (a keeper lane IS its `keeper/epic/*` branch), not the path.
       if (!isKeeperLaneEntry(entry)) {
         continue;
       }
-      // A LIVE autonomous merge-resolver for this lane's epic is mid-`git merge`
-      // (MERGE_HEAD is set by design, not by a crash) — its resolution IS the
-      // work. Skip the abort so recover never races it out from under the
-      // resolver. The scoped per-epic exclusion that replaced the resolver's old
-      // global pause: it auto-lifts the instant that resolver job reaps (clean
-      // exit OR crash), and touches no OTHER epic's lane.
-      const laneEpicId = epicIdFromKeeperLaneEntry(entry);
-      if (laneEpicId !== null && hasActiveResolver(laneEpicId)) {
+      const identity = keeperLaneIdentity(entry);
+      if (identity === null) continue;
+      const target: LaneMaintenanceTarget = {
+        path: entry.path,
+        epicId: identity.epicId,
+        taskId: identity.taskId,
+      };
+      let hold = probeLaneMaintenance(laneMaintenanceProbe, target);
+      if (hold.kind === "clear" && hasActiveResolver(identity.epicId)) {
+        hold = {
+          kind: "defer",
+          reason: `live resolver resolve::${identity.epicId} holds ${normalizeLanePath(entry.path)}`,
+        };
+      }
+      // TRI-STATE, never a blanket hold on MERGE_HEAD.
+      //  (1) LIVE (or inconclusive) claim → HOLD. That MERGE_HEAD is the owner's
+      //      own in-progress merge; aborting it races the owner out from under
+      //      itself. Defer visibly and mutate nothing.
+      //  (2) DEAD or absent claim → the residue is a crash, not work in flight:
+      //      take the pre-existing sole-owned abort self-heal (keeper lanes only,
+      //      already filtered above) so the next cycle re-merges from a clean tree.
+      //  (3) The abort FAILING → a `worktree-recover-abort-failed` failure here,
+      //      and the surviving MERGE_HEAD surfaces below as the IMMEDIATE
+      //      `worktree-lane-wedge` escalation. A hold NEVER suppresses that.
+      if (hold.kind === "defer") {
+        laneHoldByPath.set(normalizeLanePath(entry.path), hold.reason);
+        const mergeHead = await gitProbeLaneMergeHead(entry.path, run);
+        noteMaintenanceDeferral(
+          entry.path,
+          mergeHead === "absent"
+            ? hold.reason
+            : `${hold.reason}; ${
+                mergeHead === "present"
+                  ? "MERGE_HEAD is present; maintenance never aborts a live owner's in-progress lane merge"
+                  : "MERGE_HEAD probe was inconclusive; maintenance defers fail-closed"
+              }`,
+        );
         continue;
       }
       try {
@@ -7733,7 +8380,7 @@ export async function recoverWorktrees(
         }
         // A LIVE autonomous merge-resolver owns this base→default merge (a retargeted
         // conflict dispatched it for this now-done epic). Skip so pass-2 never races it
-        // mid-`git merge` — mirrors pass-1's abort gate. The gated skip yields no
+        // mid-`git merge`. The gated skip yields no
         // observation, so an open row is retained for free.
         if (hasActiveResolver(base.epicId)) {
           continue;
@@ -8001,9 +8648,17 @@ export async function recoverWorktrees(
           continue;
         }
         const tombstoned = epicVerdict === "absent";
-        if (epicHasOccupyingJob(lane.epicId)) continue;
-
         const wt = wtByShortBranch.get(lane.branch);
+        if (epicHasOccupyingJob(lane.epicId)) {
+          if (wt !== undefined) {
+            noteMaintenanceDeferral(
+              wt.path,
+              `live occupying job holds epic ${lane.epicId}`,
+            );
+          }
+          continue;
+        }
+
         const merged = await gitIsAncestorOf(
           repo,
           lane.branch,
@@ -8016,6 +8671,11 @@ export async function recoverWorktrees(
           continue;
         }
         const wtKey = normalizeLanePath(wt.path);
+        const heldReason = laneHoldByPath.get(wtKey);
+        if (heldReason !== undefined) {
+          noteMaintenanceDeferral(wt.path, heldReason);
+          continue;
+        }
         const ownership = await gitClassifyLaneOwnership(repo, wt, run);
         if (ownership.kind !== "owned") {
           teardownCandidatePaths.add(wtKey);
@@ -8043,7 +8703,16 @@ export async function recoverWorktrees(
           }
           continue;
         }
-        if ((await gitProbeLaneMergeHead(wt.path, run)) !== "absent") continue;
+        const mergeHeadBeforeRemove = await gitProbeLaneMergeHead(wt.path, run);
+        if (mergeHeadBeforeRemove !== "absent") {
+          noteMaintenanceDeferral(
+            wt.path,
+            mergeHeadBeforeRemove === "present"
+              ? "MERGE_HEAD is present; teardown will not reset or remove an in-progress lane"
+              : "MERGE_HEAD probe was inconclusive; teardown defers fail-closed",
+          );
+          continue;
+        }
 
         if (
           !tombstoned &&
@@ -8121,9 +8790,28 @@ export async function recoverWorktrees(
             freshVerdict === "done" || rawFreshVerdict === false;
           if (
             (!freshClosed && !freshTombstoned) ||
-            epicHasOccupyingJob(lane.epicId) ||
-            (await gitProbeLaneMergeHead(fresh.path, run)) !== "absent"
+            epicHasOccupyingJob(lane.epicId)
           ) {
+            continue;
+          }
+          const freshIdentity = keeperLaneIdentity(fresh);
+          const freshHold = probeLaneMaintenance(laneMaintenanceProbe, {
+            path: fresh.path,
+            epicId: freshIdentity?.epicId ?? lane.epicId,
+            taskId: freshIdentity?.taskId ?? null,
+          });
+          if (freshHold.kind === "defer") {
+            noteMaintenanceDeferral(fresh.path, freshHold.reason);
+            continue;
+          }
+          const freshMergeHead = await gitProbeLaneMergeHead(fresh.path, run);
+          if (freshMergeHead !== "absent") {
+            noteMaintenanceDeferral(
+              fresh.path,
+              freshMergeHead === "present"
+                ? "MERGE_HEAD is present; forced teardown will not reset or remove an in-progress lane"
+                : "MERGE_HEAD probe was inconclusive; forced teardown defers fail-closed",
+            );
             continue;
           }
           const freshOwnership = await gitClassifyLaneOwnership(
@@ -8205,17 +8893,23 @@ export async function recoverWorktrees(
     }
 
     // --- Lane pre-merge base-readiness probe (fn-1123.2). --------------------
-    // AFTER the mutating passes settle the tree (pass-1 aborted keeper-owned lane
-    // mid-merges; pass-3 tore orphans down), re-classify each SURVIVING keeper lane's
+    // AFTER the mutating passes settle, re-classify each SURVIVING keeper lane's
     // base readiness so a persistent not-losslessly-mergeable base surfaces + a
     // resolved one clears — the level-clear that rides the recover pass rather than the
     // next dispatch, so a wedge self-clears even while the owning task is cap-gated /
     // cooled / paused. Reuses pass-1's `entries` (no extra list spawn) and skips the
     // lanes pass-3 tore down. Wrapped so a producer git error never wedges the cycle.
     try {
+      // ONLY a live-owner hold suppresses the re-classify — a held lane's open row
+      // persists unchanged until the hold lifts. Every UNHELD surface keeps both
+      // the mint and the positive-evidence clear, so an abort-failed residue or a
+      // teardown-skipped lane still surfaces its wedge instead of going quiet.
+      const maintenanceHeldPaths = new Set(laneHoldByPath.keys());
       const probe = await probeLaneBaseReadiness(
+        repo,
         entries,
         prunedLanePaths,
+        maintenanceHeldPaths,
         run,
         hasActiveResolver,
       );
@@ -8241,12 +8935,30 @@ export async function recoverWorktrees(
   })) {
     laneTeardownDistress.push({ action: "clear", ...clear });
   }
+  const maintenanceDeferrals = [...maintenanceDeferralByPath].map(
+    ([path, reason]) => ({ path, reason }),
+  );
+  const recoverDeferralsSeen = new Set<string>();
+  for (const deferral of maintenanceDeferrals) {
+    logLaneMaintenanceDeferralOnce(
+      RECOVER_LANE_DEFERRAL_PASS,
+      deferral.path,
+      deferral.reason,
+      recoverDeferralsSeen,
+      deferral.reason,
+    );
+  }
+  pruneLaneMaintenanceDeferralLatch(
+    [RECOVER_LANE_DEFERRAL_PASS],
+    recoverDeferralsSeen,
+  );
   return {
     failures,
     escalations,
     resolved,
     laneWedged,
     laneResolved,
+    maintenanceDeferrals,
     laneTeardownDistress,
     tornDownLane,
   };
@@ -8259,23 +8971,29 @@ export async function recoverWorktrees(
  * verb-agnostic reason-scoped clear. Reuses pass-1's already-fetched `entries` (no
  * second `git worktree list` spawn — the readiness of each lane is re-read LIVE per
  * path, so a lane pass-1 aborted reads clean here) and SKIPS `prunedLanePaths` (a
- * pass-3 teardown already recorded them `resolved`). Producer-only live-git READS,
- * never a fold; NEVER throws past here (a spawn error DEFERS the repo's lanes).
+ * pass-3 teardown already recorded them `resolved`) plus `maintenanceHeldPaths` (a
+ * LIVE owner holds the lane; its open row persists unchanged until the hold lifts).
+ * Every UNHELD lane is still classified, so neither the mint nor the clear is
+ * suppressed. Producer-only live-git READS, never a fold; NEVER throws past here (a
+ * spawn error DEFERS the repo's lanes).
  *
- * Classification per keeper lane (an active-resolver lane is skipped — its MERGE_HEAD
- * is the resolver's deliberate in-progress merge, not a wedge):
+ * Classification per keeper lane (a live-owner-held or active-resolver lane is
+ * skipped — its MERGE_HEAD is a deliberate in-progress merge, not a wedge):
  *  - `mid-merge` surviving pass-1's abort → `immediate` wedge (a hard `abort-failed`:
  *    git could not clear it), mints distress AT ONCE (matching finalize's precedent).
  *  - tracked-`dirty` / `off-branch` → graced wedge (a base a human must hand-resolve).
- *  - clean+on-branch but carrying UNTRACKED files → graced wedge: the would-clobber
- *    class {@link mergeReadiness} ignores (`--untracked-files=no`), probed here so a
- *    would-clobber lane row is CLEARED only once the untracked files are gone, never
- *    flap-cleared against a source-agnostic "ready".
- *  - fully clean + on-branch + no untracked → `resolved`.
+ *  - clean+on-branch but carrying UNTRACKED work product → graced wedge: the
+ *    would-clobber class {@link mergeReadiness} ignores (`--untracked-files=no`),
+ *    probed here so a would-clobber lane row is CLEARED only once the work product
+ *    is gone. A byte-identical dependency plant is losslessly cleanable residue;
+ *    replaced residue at that path remains work product.
+ *  - fully clean + on-branch + no untracked work product → `resolved`.
  */
 async function probeLaneBaseReadiness(
+  depLinkSource: string,
   entries: readonly WorktreeEntry[],
   prunedLanePaths: ReadonlySet<string>,
+  maintenanceHeldPaths: ReadonlySet<string>,
   run: WorktreeGitRunner,
   hasActiveResolver: (epicId: string) => boolean,
 ): Promise<{
@@ -8289,7 +9007,8 @@ async function probeLaneBaseReadiness(
       entry.bare ||
       entry.branch === null ||
       !isKeeperLaneEntry(entry) ||
-      prunedLanePaths.has(entry.path)
+      prunedLanePaths.has(entry.path) ||
+      maintenanceHeldPaths.has(normalizeLanePath(entry.path))
     ) {
       continue;
     }
@@ -8300,31 +9019,28 @@ async function probeLaneBaseReadiness(
     const expectedShort = shortBranchName(entry.branch);
     const ready = await gitMergeReadiness(entry.path, expectedShort, run);
     if (ready.kind === "ready") {
-      // Clean tracked tree on-branch — but a lingering UNTRACKED file is the
-      // would-clobber hazard `mergeReadiness` skips. One extra untracked probe so a
-      // would-clobber lane stays wedged until it is cleaned (no source needed here).
-      const untracked = await run(
-        ["status", "--porcelain", "--untracked-files=all"],
-        { cwd: entry.path, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+      const untracked = await gitProbeLosslesslyCleanableUntracked(
+        entry.path,
+        depLinkSource,
+        run,
       );
-      const hasUntracked =
-        untracked.code === 0 &&
-        untracked.stdout.split("\n").some((l) => l.startsWith("?? "));
-      if (untracked.code === 0 && !hasUntracked) {
+      if (untracked.kind === "cleanable") {
         resolved.push(entry.path);
-      } else if (hasUntracked) {
+      } else if (untracked.kind === "would-clobber") {
         wedged.push({
           path: entry.path,
-          reason: `would-clobber: ${entry.path} carries untracked files a fan-in merge could overwrite`,
+          reason: `would-clobber: ${entry.path} carries untracked work product a fan-in merge could overwrite — ${untracked.paths.join(", ")}`,
           immediate: false,
         });
       }
-      // A non-zero untracked probe (code !== 0) DEFERS this lane — neither wedged nor
+      // An inconclusive untracked probe DEFERS this lane — neither wedged nor
       // resolved (absence retains any open row), never a false clear.
       continue;
     }
     if (ready.kind === "mid-merge") {
-      // Survived pass-1's guarded abort → git could not clear it: a hard wedge.
+      // Survived pass-1's guarded abort → git could not clear it: a hard wedge. A
+      // lane a LIVE owner holds never reaches here (it is skipped above), so this
+      // is crash residue no one is working, never a healthy in-progress merge.
       wedged.push({
         path: entry.path,
         reason: `abort-failed: ${entry.path} is mid-merge (MERGE_HEAD=${ready.mergeHead}) and could not be cleared`,
@@ -9009,6 +9725,75 @@ export function deriveResourceHoldObservations(
   return out;
 }
 
+/** Parse one durable close-finalize tool receipt without trusting its shape. */
+export function extractCloseFinalizeReceipt(
+  data: string | null,
+  ts: number,
+): CloseReceipt | null {
+  if (data == null || data.length === 0 || !Number.isFinite(ts)) return null;
+  try {
+    const outer = JSON.parse(data) as unknown;
+    if (outer == null || typeof outer !== "object") return null;
+    const record = outer as Record<string, unknown>;
+    let receipt: unknown = record;
+    const toolResponse = record.tool_response;
+    if (toolResponse != null && typeof toolResponse === "object") {
+      const stdout = (toolResponse as Record<string, unknown>).stdout;
+      if (typeof stdout !== "string" || stdout.length === 0) return null;
+      receipt = JSON.parse(stdout);
+    }
+    if (receipt == null || typeof receipt !== "object") return null;
+    const outcome = (receipt as Record<string, unknown>).outcome;
+    return typeof outcome === "string" && outcome.length > 0
+      ? { outcome, ts }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Join each live close target to its newest durable close-finalize receipt. The
+ * events projection is indexed by `plan_target`; one bounded point lookup runs per
+ * distinct live close epic. A malformed newest receipt yields no terminal fact —
+ * an older fatal outcome may not leak across a later failed attempt.
+ */
+export function loadLatestCloseReceipts(
+  db: Parameters<typeof runQuery>[0],
+  jobs: ReadonlyMap<string, Job>,
+): Map<string, CloseReceipt> {
+  const epicIds = new Set<string>();
+  for (const job of jobs.values()) {
+    if (
+      job.plan_verb === "close" &&
+      job.plan_ref != null &&
+      job.plan_ref !== "" &&
+      (job.state === "working" || job.state === "stopped")
+    ) {
+      epicIds.add(job.plan_ref);
+    }
+  }
+  const receipts = new Map<string, CloseReceipt>();
+  for (const epicId of [...epicIds].sort()) {
+    try {
+      const row = db
+        .query(
+          `SELECT ts, data
+             FROM events
+            WHERE plan_target = ? AND plan_op = 'close-finalize'
+            ORDER BY id DESC LIMIT 1`,
+        )
+        .get(epicId) as { ts: number; data: string | null } | null;
+      if (row == null) continue;
+      const receipt = extractCloseFinalizeReceipt(row.data, row.ts);
+      if (receipt != null) receipts.set(epicId, receipt);
+    } catch {
+      // Missing/inconclusive receipt evidence keeps the ordinary grace.
+    }
+  }
+  return receipts;
+}
+
 /**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only connection.
  * Every collection is read through the SAME `runQuery` the server-worker answers
@@ -9086,6 +9871,7 @@ export async function loadReconcileSnapshot(
     unseededRoots,
     maxConcurrentPerRoot,
   } = loadReadinessInputs(db, readinessQuery, nowSec);
+  const latestCloseReceiptByEpicId = loadLatestCloseReceipts(db, jobs);
 
   // The shared jobs descriptor intentionally omits the live-only generation
   // column; exact Resource holds require it, so enrich the producer snapshot
@@ -9219,6 +10005,9 @@ export async function loadReconcileSnapshot(
             id,
             jobId,
             dir: typeof dir === "string" ? dir : "",
+            scope: reasonStr.includes("stopped occupancy-holding session")
+              ? "occupancy"
+              : "monitor",
           });
         }
       }
@@ -9577,13 +10366,22 @@ export async function loadReconcileSnapshot(
       job?.plan_verb === "work" &&
       job.plan_ref != null &&
       doneTaskIds.has(job.plan_ref);
+    const occupancySettled =
+      row.scope === "occupancy" &&
+      (job == null ||
+        job.state !== "stopped" ||
+        !isStoppedJobLive(job, livePaneIds));
+    const monitorSettled =
+      row.scope === "monitor" &&
+      (job?.state === "working" ||
+        activity?.status === "active" ||
+        activity?.status === "quiescent" ||
+        !taskStillDone);
     if (
       terminalOrAbsent ||
-      job?.state === "working" ||
-      activity?.status === "active" ||
-      activity?.status === "quiescent" ||
-      (job != null && probeJobPid(job) === false) ||
-      !taskStillDone
+      occupancySettled ||
+      monitorSettled ||
+      (job != null && probeJobPid(job) === false)
     ) {
       zombieSessionClearActions.push({ id: row.id, dir: row.dir });
     }
@@ -9786,6 +10584,7 @@ export async function loadReconcileSnapshot(
     livePaneIds,
     paneCommandById,
     provenDeadJobIds,
+    latestCloseReceiptByEpicId,
     pendingDispatches,
     providerLegActivityByWrapperJobId,
     mode,
@@ -9954,7 +10753,7 @@ function main(): void {
   // every cycle. In-worker memory only; a restart re-arms it. Distinct surface so the rows
   // never cross-clear the shared-checkout / lane / stale-base siblings.
   const dupEpicNumberTracker = createDupEpicNumberTracker();
-  const zombieTermSentAt = new Map<string, number>();
+  const pendingReapTerms = new Map<string, PendingReapTerm>();
   const zombieKillSent = new Set<string>();
   // The EVENT-SEEDED desync latch: repo dirs a base→default merge (finalize / recover
   // pass-2) advanced-then-left-trailing this run, fed by `createWorktreeDriver`'s
@@ -10042,6 +10841,54 @@ function main(): void {
   // it targets server-global tmux ids the hook stamps, independent of the launch
   // transport.
   const paneOps = createTmuxPaneOps({ noteLine });
+  let terminalPaneSweepRunning = false;
+  let terminalPaneSweepPending = false;
+  let terminalPaneOwnerScanCursor: string | null = null;
+  let terminalPaneDecisionCursor: string | null = null;
+  const driveTerminalPaneSweep = async (
+    initialPanes?: readonly PaneInfo[] | null,
+  ): Promise<void> => {
+    if (terminalPaneSweepRunning) {
+      terminalPaneSweepPending = true;
+      return;
+    }
+    terminalPaneSweepRunning = true;
+    let panes = initialPanes;
+    try {
+      do {
+        terminalPaneSweepPending = false;
+        if (panes === undefined) {
+          try {
+            panes = await paneOps.listPanes();
+          } catch (err) {
+            noteLine(`terminal pane observation failed: ${errMsg(err)}`);
+            panes = null;
+          }
+        }
+        const ownerScan = selectTerminalPaneOwnerScan(
+          panes,
+          terminalPaneOwnerScanCursor,
+        );
+        terminalPaneOwnerScanCursor = ownerScan.nextCursor;
+        const decisions = await runTerminalPaneTeardownSweep(
+          db,
+          paneOps,
+          panes,
+          {
+            noteLine,
+            scannedOwnerJobIds: ownerScan.jobIds,
+            afterJobId: terminalPaneDecisionCursor,
+          },
+        );
+        terminalPaneDecisionCursor = decisions.at(-1)?.jobId ?? null;
+        panes = undefined;
+      } while (terminalPaneSweepPending && !shutdown);
+    } catch (err) {
+      noteLine(`terminal pane teardown sweep failed: ${errMsg(err)}`);
+    } finally {
+      terminalPaneSweepRunning = false;
+    }
+  };
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
@@ -10146,16 +10993,6 @@ function main(): void {
       parentPort?.postMessage({
         kind: "nudge-vanished-sweep",
       } satisfies VanishedSweepNudgeMessage);
-    },
-    reclaimSlotPane: async (paneId) => {
-      // Kill the dead session's window to free its slot. Fire-and-log: killWindow
-      // never throws, and a nonzero exit is the benign TOCTOU (the window already
-      // died — the outcome we wanted). The visible `slot-reclaimed` failure carries
-      // the operator signal regardless.
-      const res = await paneOps.killWindow(paneId);
-      if (!res.ok && res.error) {
-        noteLine(`[autopilot-worker] slot reclaim kill-window: ${res.error}`);
-      }
     },
     // Semantic-dedupe emit (mirrors `git_status`): only post when the disabled set
     // changes, so a stable board mints zero `WorktreeRepoStatus` events. The
@@ -10311,15 +11148,31 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        // Pass the backend's `listPanes` as the read-time liveness probe so the
-        // stopped-arm occupancy gate (`isOccupyingJob`) sees which sessions are
-        // actually live — a stopped-dead pane no longer wedges its slot.
-        const snapshot = await loadReconcileSnapshot(db, () =>
-          paneOps.listPanes(),
+        // Share one whole-server pane observation between the occupancy snapshot
+        // and terminal-pane planner. A second observation happens only adjacent
+        // to an authorized teardown action.
+        let observedPanes: PaneInfo[] | null = null;
+        try {
+          observedPanes = await paneOps.listPanes();
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] terminal pane observation threw (non-fatal):",
+            err,
+          );
+        }
+        await driveTerminalPaneSweep(observedPanes);
+        const snapshot = await loadReconcileSnapshot(
+          db,
+          async () => observedPanes,
         );
         if (snapshot.readinessDegraded) {
           continue;
         }
+        const laneMaintenanceProbe = createLaneMaintenanceProbe(
+          snapshot.jobs,
+          snapshot.dispatchClaims,
+          snapshot.livePaneIds,
+        );
         dispatchFailedGate.observeProjection(snapshot.dispatchFailureFences);
         // fn-1013 — surface the FULL current worktree-disabled set to the LIVE-ONLY
         // operator projection. Once per cycle, regardless of paused/playing (the
@@ -10453,96 +11306,6 @@ function main(): void {
             );
           }
         }
-        // The done-stamped subset is disjoint from the monitor-slot backstop.
-        // Every signal step re-probes pid/start-time, ownership, and defunct state.
-        if (!state.paused) {
-          try {
-            const candidateIds = new Set(
-              snapshot.zombieSessionCandidates.map(
-                (candidate) => candidate.jobId,
-              ),
-            );
-            for (const jobId of zombieTermSentAt.keys()) {
-              if (!candidateIds.has(jobId)) zombieTermSentAt.delete(jobId);
-            }
-            for (const jobId of zombieKillSent) {
-              if (!candidateIds.has(jobId)) zombieKillSent.delete(jobId);
-            }
-            for (const action of snapshot.zombieSessionClearActions) {
-              deps.clearSharedWedgeDistress?.(
-                claimlessDistressClear(
-                  snapshot.dispatchFailureFences,
-                  action.id,
-                  action.dir,
-                ),
-              );
-            }
-            for (const candidate of snapshot.zombieSessionCandidates) {
-              const job = snapshot.jobs.get(candidate.jobId);
-              if (job == null) continue;
-              let decision: ZombieSessionReaperDecision;
-              if (zombieKillSent.has(candidate.jobId)) {
-                decision = { action: "page", reason: "signal-failed" };
-              } else {
-                decision = runZombieSessionReaperStep(
-                  {
-                    jobState: job.state,
-                    taskDone: true,
-                    pid: job.pid,
-                    storedStartTime: job.start_time,
-                    updatedAt: candidate.updatedAt,
-                    nowSec: deps.now(),
-                    activity: snapshot.harnessActivityByJobId?.get(job.job_id),
-                    termSentAt: zombieTermSentAt.get(job.job_id),
-                  },
-                  {
-                    probe: probeZombieProcess,
-                    signal: (pid, signal) => process.kill(pid, signal),
-                  },
-                  job.plan_verb,
-                  job.plan_ref,
-                );
-              }
-              if (decision.action === "signal") {
-                if (decision.signal === "SIGTERM") {
-                  const sentAt = deps.now();
-                  zombieTermSentAt.set(job.job_id, sentAt);
-                  const timer = setTimeout(
-                    () => requestCycle(),
-                    ZOMBIE_SESSION_TERM_GRACE_SEC * 1000,
-                  );
-                  timer.unref();
-                } else {
-                  zombieKillSent.add(job.job_id);
-                  const timer = setTimeout(() => requestCycle(), 1_000);
-                  timer.unref();
-                }
-                continue;
-              }
-              if (
-                decision.action === "page" &&
-                !snapshot.openZombieSessionDistresses.has(
-                  zombieSessionDistressId(job.job_id),
-                )
-              ) {
-                deps.emitSharedWedgeDistress?.({
-                  id: zombieSessionDistressId(job.job_id),
-                  dir: candidate.dir,
-                  reason:
-                    `${ZOMBIE_SESSION_DISTRESS_REASON}: stopped done-stamped ` +
-                    `session ${job.job_id} could not be safely reaped ` +
-                    `(${decision.reason}) — inspect the process identity`,
-                  ts: deps.now(),
-                });
-              }
-            }
-          } catch (err) {
-            console.error(
-              "[autopilot-worker] zombie-session reaper step threw (non-fatal):",
-              err,
-            );
-          }
-        }
         // Producer-only worktree crash/restart recovery, BEFORE the
         // dispatch decision (so the first boot cycle is the post-restart sweep).
         // Gated on worktree mode ON AND not-paused (recovery does git merges +
@@ -10575,8 +11338,8 @@ function main(): void {
               (epicId) => epicRecoverVerdictById(db, epicId),
               (epicId) => epicPresentAndNotDone(db, epicId),
               // Per-epic resolver exclusion (from the SAME snapshot the cycle
-              // reconciled): passes 1 AND 2 skip a lane whose epic has a live
-              // `resolve::<epic>` worker so its in-progress merge is never raced.
+              // reconciled): shared-checkout recovery and pass 2 skip an epic with
+              // a live `resolve::<epic>` worker.
               // A pure projection read (jobs + read-time liveness) — never a fold.
               (epicId) =>
                 epicHasActiveResolver(
@@ -10612,6 +11375,7 @@ function main(): void {
                   snapshot.laneTeardownDistressDirs ?? new Set(),
                 openBackupPaths: snapshot.laneBackupDistressDirs ?? new Set(),
               },
+              laneMaintenanceProbe,
             );
             // A COMPLETED pass-3 lane teardown: nudge the git vanished sweep so it
             // retires the torn-down lane's git_status row promptly, not at the next
@@ -11049,6 +11813,230 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
+        // Reap the union of the done-monitor candidates and this cycle's
+        // exact occupancy targets. Slot targets take precedence for a shared job
+        // because their stopped proof needs no monitor-staleness inference. The
+        // act-time jobs read plus the process probe adjacent to each signal prevent
+        // a later working transition or recycled pid from inheriting authority.
+        if (!state.paused) {
+          try {
+            const reapCandidates = new Map<string, ReapCandidate>();
+            for (const candidate of snapshot.zombieSessionCandidates) {
+              reapCandidates.set(candidate.jobId, {
+                ...candidate,
+                reapClass: "monitor",
+                immediate: false,
+                paneId: null,
+              });
+            }
+            for (const signal of decision.slotOccupancy) {
+              const target = signal.reapTarget;
+              if (target == null) continue;
+              const job = snapshot.jobs.get(target.jobId);
+              if (job == null) continue;
+              reapCandidates.set(target.jobId, {
+                jobId: target.jobId,
+                dir: signal.dir ?? "",
+                updatedAt: job.updated_at,
+                reapClass: "occupancy",
+                immediate: target.immediate,
+                paneId: target.paneId,
+              });
+            }
+
+            // Once TERM is sent, retain that exact ladder until current evidence
+            // proves the stopped episode ended. A transient degraded pane probe may
+            // pause the occupancy pass, but it must not erase the queued KILL.
+            for (const [jobId, pending] of pendingReapTerms) {
+              const job = snapshot.jobs.get(jobId);
+              if (job == null || job.state !== "stopped") {
+                pendingReapTerms.delete(jobId);
+                zombieKillSent.delete(jobId);
+                continue;
+              }
+              if (
+                !reapCandidates.has(jobId) &&
+                (pending.candidate.reapClass !== "occupancy" ||
+                  (snapshot.livePaneIds !== null &&
+                    snapshot.paneCommandById !== null))
+              ) {
+                reapCandidates.set(jobId, pending.candidate);
+              }
+            }
+            for (const jobId of zombieKillSent) {
+              const job = snapshot.jobs.get(jobId);
+              if (job == null || job.state !== "stopped") {
+                zombieKillSent.delete(jobId);
+                pendingReapTerms.delete(jobId);
+              }
+            }
+            for (const action of snapshot.zombieSessionClearActions) {
+              deps.clearSharedWedgeDistress?.(
+                claimlessDistressClear(
+                  snapshot.dispatchFailureFences,
+                  action.id,
+                  action.dir,
+                ),
+              );
+            }
+
+            const ordered = [...reapCandidates.values()].sort((a, b) => {
+              const aPending = pendingReapTerms.has(a.jobId);
+              const bPending = pendingReapTerms.has(b.jobId);
+              if (aPending !== bPending) return aPending ? -1 : 1;
+              if (a.reapClass !== b.reapClass) {
+                return a.reapClass === "occupancy" ? -1 : 1;
+              }
+              return a.jobId.localeCompare(b.jobId);
+            });
+            for (const candidate of ordered.slice(
+              0,
+              SLOT_RECLAIM_MAX_PER_SWEEP,
+            )) {
+              const job = db
+                .query(
+                  `SELECT job_id, state, pid, start_time, plan_verb, plan_ref,
+                          backend_exec_pane_id, updated_at
+                     FROM jobs WHERE job_id = ?`,
+                )
+                .get(candidate.jobId) as {
+                job_id: string;
+                state: string;
+                pid: number | null;
+                start_time: string | null;
+                plan_verb: string | null;
+                plan_ref: string | null;
+                backend_exec_pane_id: string | null;
+                updated_at: number;
+              } | null;
+              if (job == null) continue;
+              if (
+                candidate.paneId != null &&
+                job.backend_exec_pane_id !== candidate.paneId
+              ) {
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                continue;
+              }
+
+              let pendingTerm = pendingReapTerms.get(job.job_id);
+              if (
+                pendingTerm !== undefined &&
+                job.updated_at > pendingTerm.stoppedAt
+              ) {
+                // A newer fold may include a working→stopped episode. Restart the
+                // ladder rather than inheriting kill authority.
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                pendingTerm = undefined;
+              }
+
+              let reapDecision: ZombieSessionReaperDecision;
+              if (zombieKillSent.has(candidate.jobId)) {
+                reapDecision = { action: "page", reason: "signal-failed" };
+              } else {
+                reapDecision = runZombieSessionReaperStep(
+                  {
+                    jobState: job.state,
+                    taskDone: candidate.reapClass === "monitor",
+                    pid: job.pid,
+                    storedStartTime: job.start_time,
+                    updatedAt:
+                      candidate.reapClass === "occupancy"
+                        ? job.updated_at
+                        : candidate.updatedAt,
+                    nowSec: deps.now(),
+                    activity: snapshot.harnessActivityByJobId?.get(job.job_id),
+                    termSentAt: pendingTerm?.sentAt,
+                    thresholdSec:
+                      candidate.reapClass === "occupancy"
+                        ? SLOT_RECLAIM_GRACE_SEC
+                        : undefined,
+                    reapClass: candidate.reapClass,
+                    immediate: candidate.immediate,
+                  },
+                  {
+                    probe: probeZombieProcess,
+                    signal: (pid, signal) => process.kill(pid, signal),
+                  },
+                  job.plan_verb,
+                  job.plan_ref,
+                );
+              }
+              if (reapDecision.action === "signal") {
+                if (reapDecision.signal === "SIGTERM") {
+                  pendingReapTerms.set(job.job_id, {
+                    sentAt: deps.now(),
+                    stoppedAt: job.updated_at,
+                    candidate,
+                  });
+                  const timer = setTimeout(
+                    () => requestCycle(),
+                    ZOMBIE_SESSION_TERM_GRACE_SEC * 1000,
+                  );
+                  timer.unref();
+                } else {
+                  zombieKillSent.add(job.job_id);
+                  const timer = setTimeout(() => requestCycle(), 1_000);
+                  timer.unref();
+                }
+                continue;
+              }
+              const paneId = candidate.paneId;
+              const paneOnlyReap =
+                candidate.reapClass === "occupancy" &&
+                paneId !== null &&
+                ((reapDecision.action === "none" &&
+                  reapDecision.reason === "pid-dead") ||
+                  (reapDecision.action === "page" &&
+                    reapDecision.reason === "pid-unproven" &&
+                    isBareShellCommand(snapshot.paneCommandById?.get(paneId))));
+              if (paneOnlyReap && paneId !== null) {
+                const result = await paneOps.killWindow(paneId);
+                if (!result.ok && result.error) {
+                  noteLine(
+                    `[autopilot-worker] slot residual-pane reap: ${result.error}`,
+                  );
+                }
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+                continue;
+              }
+              if (
+                reapDecision.action === "none" &&
+                reapDecision.reason === "outside-scope"
+              ) {
+                pendingReapTerms.delete(job.job_id);
+                zombieKillSent.delete(job.job_id);
+              }
+              if (
+                reapDecision.action === "page" &&
+                !snapshot.openZombieSessionDistresses.has(
+                  zombieSessionDistressId(job.job_id),
+                )
+              ) {
+                const source =
+                  candidate.reapClass === "occupancy"
+                    ? "occupancy-holding"
+                    : "done-stamped";
+                deps.emitSharedWedgeDistress?.({
+                  id: zombieSessionDistressId(job.job_id),
+                  dir: candidate.dir,
+                  reason:
+                    `${ZOMBIE_SESSION_DISTRESS_REASON}: stopped ${source} ` +
+                    `session ${job.job_id} could not be safely reaped ` +
+                    `(${reapDecision.reason}) — inspect the process identity`,
+                  ts: deps.now(),
+                });
+              }
+            }
+          } catch (err) {
+            console.error(
+              "[autopilot-worker] zombie-session reaper step threw (non-fatal):",
+              err,
+            );
+          }
+        }
         updateWithholdFrameState(
           withholdFrameState,
           decision.withholds,
@@ -11068,6 +12056,7 @@ function main(): void {
           // running worker owns; `null` (a failed read) → do-not-discard.
           snapshot.liveAttributedDirtyByWorktree ?? null,
           snapshot.dispatchFailureFences,
+          laneMaintenanceProbe,
         );
       } while (wakePending && !shutdown);
     } catch (err) {
@@ -11092,6 +12081,9 @@ function main(): void {
       console.error("[autopilot-worker] backstop rollup flush failed:", err);
     }
   }, BACKSTOP_ROLLUP_FLUSH_MS);
+  const terminalPaneGcTimer = setInterval(() => {
+    if (!shutdown) void driveTerminalPaneSweep();
+  }, TERMINAL_PANE_TEARDOWN_IDLE_MS);
 
   // Bind the unpause/boot kick now that `driveCycle` exists, then run one cycle.
   // The boot cycle is a no-op for launches while paused; the play-edge kick
@@ -11111,6 +12103,7 @@ function main(): void {
   )
     .then(() => {
       clearInterval(rollupTimer);
+      clearInterval(terminalPaneGcTimer);
       // Final rollup flush so the on-shutdown denominator lands before exit.
       flushBackstopRollups();
       closeDb();
@@ -11119,6 +12112,7 @@ function main(): void {
     .catch((err) => {
       console.error("[autopilot-worker] watch loop crashed:", err);
       clearInterval(rollupTimer);
+      clearInterval(terminalPaneGcTimer);
       flushBackstopRollups();
       closeDb();
       process.exit(1);

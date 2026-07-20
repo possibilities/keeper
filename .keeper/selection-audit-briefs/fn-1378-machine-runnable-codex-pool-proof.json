@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 63,
+        "files_changed": 9,
+        "insertions": 1325
+      },
+      "done_summary": "Added forced-refresh and fault-injection proof seams to the pi-codex-pool companion, both gated on an armed proof window plus a keeper job id; forced refresh coalesces concurrent calls into one rotation with rotated/inconclusive/failed typed outcomes, the fault seam emits every classifiable fault class pre-output and mid-stream after substantive output, and companion tests plus the bun-free lint gate are green.",
+      "input_hash": "1f634ba0f0b7fd27aea400ffe7b6aa5f22c2b1fbec68b0053fb19cc481924c10",
+      "model": "opus",
+      "spec_chars": 4058,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** integrations/pi-codex-pool/src/auth.ts, integrations/pi-codex-pool/src/pool.ts, integrations/pi-codex-pool/src/index.ts, src/codex-pool-proof-window.ts, integrations/pi-codex-pool/test/provider-pool.test.ts, integrations/pi-codex-pool/test/seams.test.ts\n\n### Approach\n\nTwo bounded production seams, both inert unless the codex-pool proof\nwindow is armed and `KEEPER_JOB_ID` is set. The forced-refresh seam lives\nin the companion's credential layer: on demand it bypasses the near-expiry\nshort-circuit and drives a real token rotation through the existing\nsingle-flight coalescing, guaranteeing either an actual stored-credential\nchange (so the refresh-observation hook fires) or a loud typed\nseam-inconclusive outcome \u2014 never a silent no-op. The fault-injection seam\nwraps the pooled-stream delegate: it emits faults constrained to the\nclassifiable enum, both pre-output and mid-stream after substantive\noutput has been exposed (the delegate sits above transport, so a wrapper\ncan pass through genuine substantive events then yield a classified\nerror). Seam arming state extends the dep-free shared window leaf; seam\ninputs are bounded single JSON records treated as attacker-influenced.\nThe companion import graph stays node:*-only throughout.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- integrations/pi-codex-pool/src/auth.ts:509 \u2014 the near-expiry short-circuit the seam must bypass; single-flight coalescing at :445-450\n- integrations/pi-codex-pool/src/index.ts:408-427 \u2014 refresh observation fires only on an actual stored-credential change\n- integrations/pi-codex-pool/src/pool.ts:12-22,85-124 \u2014 CodexDelegate injection point; classifyPoolFailure enum; retryable/substantive helpers\n- src/codex-pool-proof-window.ts \u2014 the dep-free window leaf to extend with seam state\n- docs/adr/0098-machine-runnable-codex-pool-proof.md \u2014 the seam contract this task implements\n\n**Optional** (reference as needed):\n- integrations/pi-codex-pool/test/provider-pool.test.ts:577-602,739-795 \u2014 the stub refresh/fault patterns the production seams generalize\n\n### Risks\n\n- A forced refresh returning an identical credential silently fails the independent-credentials clause \u2014 the seam must distinguish rotated / already-fresh / failed and report each distinctly\n- Terminal fault classes (invalid_grant family) against a real account could require re-auth; the seam must never drive a terminal fault at a real credential store entry\n\n### Test notes\n\nCompanion suites via `bun run test:pi-codex-pool`. New seam tests assert:\ninertness when the window is unarmed or job-id absent; exactly one\nrefresh in flight per alias under concurrent forced refreshes; every\nclassifiable fault class emittable including mid-stream-after-substantive;\nseam-inconclusive surfaces as its own typed outcome.\n\n## Acceptance\n\n- [ ] Both seams are no-ops outside an armed proof window and outside a keeper job context\n- [ ] A forced refresh performs a real rotation observable by the refresh-observation hook, or reports a typed inconclusive outcome \u2014 never a silent no-op\n- [ ] Concurrent forced refreshes on one alias provoke exactly one in-flight refresh, asserted by test\n- [ ] The fault seam can emit every classifiable fault class, both pre-output and after substantive output has streamed\n- [ ] Seam inputs are bounded single JSON records; out-of-enum fault requests are rejected loudly\n- [ ] The companion test gate is green and the extension import graph reaches no bun builtin\n\n## Done summary\nAdded forced-refresh and fault-injection proof seams to the pi-codex-pool companion, both gated on an armed proof window plus a keeper job id; forced refresh coalesces concurrent calls into one rotation with rotated/inconclusive/failed typed outcomes, the fault seam emits every classifiable fault class pre-output and mid-stream after substantive output, and companion tests plus the bun-free lint gate are green.\n## Evidence\n",
+      "task_id": "fn-1378-machine-runnable-codex-pool-proof.1",
+      "tier": "xhigh",
+      "title": "Window gated refresh and fault seams"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 112,
+        "files_changed": 7,
+        "insertions": 1167
+      },
+      "done_summary": "Add a single model-callable codex_pool_proof orchestrator tool driving all 13 proof clauses, with transcript-derived, non-self-reportable verdicts, deliberate-vs-interrupting abort classification, and sanitation-clean transcript artifacts.",
+      "input_hash": "1f634ba0f0b7fd27aea400ffe7b6aa5f22c2b1fbec68b0053fb19cc481924c10",
+      "model": "opus",
+      "spec_chars": 3758,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** integrations/pi-codex-pool/src/index.ts, integrations/pi-codex-pool/src/proof.ts, integrations/pi-codex-pool/test/proof.test.ts, integrations/pi-codex-pool/test/orchestrator.test.ts\n\n### Approach\n\nOne model-callable Pi tool (registerTool, following the in-repo\ntask-facade precedent: job-id-gated, fail-open) exposing a single atomic\nrun-the-whole-proof orchestrator \u2014 no primitive kit for models to\nsequence. The orchestrator drives every clause: two forced refreshes\nacross two aliases, a retry route with a classified pre-output fault and\ncooldown, a mid-stream cutoff after substantive output, native fallback,\na deliberate child abort (distinguished from an interrupting abort that\nvoids the run), root and child sessions on distinct aliases, concurrent\npressure, and session stickiness. Every clause outcome is recorded as an\nevidence-transcript entry; the verdict re-derives from the transcript\nplus the existing revision/config/alias bindings, so clause booleans stop\nbeing self-reportable and a fabricated report fails verification\nstructurally. The report stays evidence-only at the env-derived path;\nevery artifact passes the sanitation scan. The human-typed commands\nremain for manual diagnosis but stop being the documented proof path.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- integrations/pi-codex-pool/src/index.ts:283-343 \u2014 the 13-clause gate and each clause's exact predicate\n- integrations/pi-codex-pool/src/index.ts:728-812 \u2014 the existing report assembly the tool reuses (collectLiveProof, writeLiveProofReport)\n- integrations/pi-codex-pool/src/proof.ts \u2014 verdict machinery, freshness/binding rejection (:83-98,332), scanProofArtifacts\n- plugins/keeper/pi-extension/task-facade.ts:37-56,822-836 \u2014 the registerTool shape and gating to copy\n- docs/adr/0098-machine-runnable-codex-pool-proof.md \u2014 the attestation contract\n\n**Optional** (reference as needed):\n- src/agent/main.ts:909-932,3541-3556 \u2014 proof-window arming at launch; the managed-session guard\n- src/codex-pool-activation.ts \u2014 the ladder that consumes the report (unchanged here)\n\n### Risks\n\n- The proof window budget must fit the whole orchestration; a mid-run expiry loses in-memory evidence \u2014 the run should fail fast toward the window deadline rather than straddle it\n- The deliberate-vs-interrupting abort distinction is subtle: an orchestrator-issued child abort must satisfy abort-preserved without tripping the interrupted-run rejection\n\n### Test notes\n\nOrchestrator tests drive the seams from task 1 end-to-end in-process;\nattestation tests assert a hand-written report (booleans without a\nmatching transcript) fails verification while a recorded run passes;\nsanitation tests extend the existing artifact scan to transcript\nartifacts.\n\n## Acceptance\n\n- [ ] A managed pi launch whose model calls the proof tool once produces a report reaching `proven` with all thirteen clauses genuinely driven\n- [ ] A report whose clause outcomes lack a matching recorded transcript fails verification and never reads `proven`\n- [ ] A run interrupted by the window deadline or an external abort classifies as interrupted, never `proven`\n- [ ] All proof artifacts, including transcripts, pass the credential/PII sanitation scan\n- [ ] The tool is absent outside a keeper job context and fail-open on registration errors\n- [ ] Companion suites green\n\n## Done summary\nAdd a single model-callable codex_pool_proof orchestrator tool driving all 13 proof clauses, with transcript-derived, non-self-reportable verdicts, deliberate-vs-interrupting abort classification, and sanitation-clean transcript artifacts.\n## Evidence\n",
+      "task_id": "fn-1378-machine-runnable-codex-pool-proof.2",
+      "tier": "xhigh",
+      "title": "Atomic proof tool with attestation"
+    },
+    {
+      "assigned_model": "gpt-5.4-mini",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 22,
+        "files_changed": 2,
+        "insertions": 335
+      },
+      "done_summary": "Extended scripts/lint-source.ts with a static, transitive import-graph gate rooted at every integrations/pi-*/src/** entry that fails on any bun: builtin import (dynamic import() strings included, type-only imports excluded), covered by fixture tests for bun:sqlite reachability, dynamic imports, type-only imports, and the live tree.",
+      "input_hash": "1f634ba0f0b7fd27aea400ffe7b6aa5f22c2b1fbec68b0053fb19cc481924c10",
+      "model": "gpt-5.4-mini",
+      "spec_chars": 1868,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** scripts/lint-source.ts, test/lint-source.test.ts\n\n### Approach\n\nExtend the source linter with an import-graph gate: resolve the\ntransitive module graph of every pi-extension entry (integrations/pi-*/src/**\nplus the shared dep-free leafs they import from src/) and fail when any\npath reaches a bun: builtin. The rule converts a discipline guardrail\ninto a failing gate \u2014 a bun-reaching import previously killed every pi\nleg at extension load with no lint coverage. Keep the walk cheap and\ndeterministic (static import parsing, no execution).\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- scripts/lint-source.ts \u2014 the existing linter structure and how rules report\n- src/codex-pool-proof-window.ts \u2014 the canonical dep-free shared leaf (its header states the constraint)\n- integrations/pi-codex-pool/src/ \u2014 the primary graph under the gate\n\n### Risks\n\n- Type-only imports must not trip the gate; dynamic import() strings should be flagged conservatively rather than executed\n\n### Test notes\n\nFixture test: a temporary module chain reaching bun:sqlite fails; the\nlive tree passes; a type-only bun import does not trip.\n\n## Acceptance\n\n- [ ] The linter fails when any pi-extension transitive import graph reaches a bun builtin\n- [ ] The current tree passes the gate\n- [ ] The gate runs inside the standard lint invocation commit-work executes\n\n## Done summary\nExtended scripts/lint-source.ts with a static, transitive import-graph gate rooted at every integrations/pi-*/src/** entry that fails on any bun: builtin import (dynamic import() strings included, type-only imports excluded), covered by fixture tests for bun:sqlite reachability, dynamic imports, type-only imports, and the live tree.\n## Evidence\n",
+      "task_id": "fn-1378-machine-runnable-codex-pool-proof.3",
+      "tier": "high",
+      "title": "Lint gate for bun free extensions"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 9,
+        "files_changed": 4,
+        "insertions": 11
+      },
+      "done_summary": "Rewrote the codex-pool proof docs for the managed machine-runnable path: install walkthrough drops slash commands for the managed proof probe, the companion README covers the tool/seams/attestation contract, problem-codes reflects re-derived verdicts, and CONTEXT.md gains the seam and genuineness glossary entries.",
+      "input_hash": "1f634ba0f0b7fd27aea400ffe7b6aa5f22c2b1fbec68b0053fb19cc481924c10",
+      "model": "sonnet",
+      "spec_chars": 2252,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** docs/install.md, integrations/pi-codex-pool/README.md, docs/problem-codes.md, CONTEXT.md\n\n### Approach\n\nRewrite the proof documentation to the machine-runnable path \u2014 delete the\nslash-command walkthrough steps rather than appending beside them. The\ninstall walkthrough covers arming a window and running the managed proof\nprobe; the companion README's live-proof section describes the tool, the\ntwo seams, and the attestation contract; the problem-codes table gains or\nrevises rows only where verdict production changed. CONTEXT.md gains\nglossary entries for the forced-refresh seam, the fault-injection seam,\nand the sharpened proof-window/genuineness vocabulary (a seam-driven\nprovider-boundary fault is genuine; a self-reported or replica-produced\nreport is not) consistent with ADR 0098. All prose forward-facing: no\nprovenance, no fn-ids.\n\n### Investigation targets\n\n*Verify before relying \u2014 these file:line refs are planner-verified at authoring time, but the repo moves.*\n\n**Required** (read before coding):\n- docs/install.md:245-262 \u2014 the walkthrough section to rewrite\n- integrations/pi-codex-pool/README.md:36,48-52 \u2014 the live-proof section\n- docs/problem-codes.md:146-163 \u2014 the Pi Codex pool table\n- docs/adr/0098-machine-runnable-codex-pool-proof.md \u2014 the vocabulary source\n\n### Risks\n\n- CONTEXT.md may carry unrelated in-flight edits at execution time; touch only the glossary entries this task owns\n\n### Test notes\n\n`bun scripts/lint-claude-md.ts` stays green; grep asserts no slash-command proof steps remain in install.md.\n\n## Acceptance\n\n- [ ] The install walkthrough documents only the machine-runnable proof path\n- [ ] The companion README describes the tool, seams, and attestation contract\n- [ ] CONTEXT.md defines both seams and the genuineness distinction consistently with the ADR\n- [ ] No doc gains provenance/history prose; doc linters green\n\n## Done summary\nRewrote the codex-pool proof docs for the managed machine-runnable path: install walkthrough drops slash commands for the managed proof probe, the companion README covers the tool/seams/attestation contract, problem-codes reflects re-derived verdicts, and CONTEXT.md gains the seam and genuineness glossary entries.\n## Evidence\n",
+      "task_id": "fn-1378-machine-runnable-codex-pool-proof.4",
+      "tier": "high",
+      "title": "Docs and glossary for machine proof"
+    }
+  ],
+  "created_at": "2026-07-19T23:10:45.988000Z",
+  "epic_id": "fn-1378-machine-runnable-codex-pool-proof",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "1f634ba0f0b7fd27aea400ffe7b6aa5f22c2b1fbec68b0053fb19cc481924c10",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}

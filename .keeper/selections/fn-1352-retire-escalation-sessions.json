@@ -6,40 +6,40 @@
   },
   "cells": [
     {
-      "confidence": 0.79,
+      "confidence": 0.78,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Cross-cutting multi-file removal across daemon internals where a shared page-once selector deleted with a dispatch path silently breaks a correctness invariant, and the change reshapes the dispatch verb/retry-wire contract.",
+      "rationale": "Cross-cutting multi-file removal cascade with ordering constraints where mistakenly deleting a shared selector silently breaks the page-once safety invariant, a nameable correctness-bound reason for opus at the contract-touching xhigh band.",
       "task_id": "fn-1352-retire-escalation-sessions.1",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.82,
+      "confidence": 0.8,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Hard opus gate: a forward-only schema migration that must compose with wipe-and-replay while carrying human_notified_at forward event-derivably, preserve sacred re-fold determinism, and avoid silent needs-human double-counting.",
+      "rationale": "Schema-ladder migration plus re-fold-deterministic incident folds with a subtle no-re-page carry-forward invariant and silent double-counting risk \u2014 a hard correctness/contract gate warranting opus at xhigh.",
       "task_id": "fn-1352-retire-escalation-sessions.2",
       "tier": "xhigh"
     },
     {
-      "confidence": 0.74,
+      "confidence": 0.72,
       "label_source": "heuristic-guided",
       "model": "sonnet",
-      "rationale": "Judgment-heavy but not intelligence-bound doc reshape spanning several surfaces with glossary taste, present-tense discipline, and describe-only-landed-behavior care under lint gates.",
+      "rationale": "Judgment- and taste-heavy docs/glossary reshape with user-facing wording and present-tense-only precision but no intelligence-bound reason, routing to the sonnet workhorse at the default high band.",
       "task_id": "fn-1352-retire-escalation-sessions.3",
       "tier": "high"
     }
   ],
-  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
-  "created_at": "2026-07-18T21:11:43.831000Z",
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T23:09:17.916000Z",
   "epic_id": "fn-1352-retire-escalation-sessions",
-  "input_hash": "c0b6f2ee675db959e1eca07343dc3ff634190e8c9075d36c5b08f9b29fd2e8ad",
+  "input_hash": "a1f186e426b8bc5df4aa48318c06d88dfdc0832b08b7a4d72bbc7ab54ba58a87",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 3233215214,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1352-retire-escalation-sessions.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file removal across daemon internals where a shared page-once selector deleted with a dispatch path silently breaks a correctness invariant, and the change reshapes the dispatch verb/retry-wire contract.\",\"confidence\":0.79},{\"task_id\":\"fn-1352-retire-escalation-sessions.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Hard opus gate: a forward-only schema migration that must compose with wipe-and-replay while carrying human_notified_at forward event-derivably, preserve sacred re-fold determinism, and avoid silent needs-human double-counting.\",\"confidence\":0.82},{\"task_id\":\"fn-1352-retire-escalation-sessions.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment-heavy but not intelligence-bound doc reshape spanning several surfaces with glossary taste, present-tense discipline, and describe-only-landed-behavior care under lint gates.\",\"confidence\":0.74}]}\n"
+  "shuffle_seed": 2716960484,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1352-retire-escalation-sessions.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Cross-cutting multi-file removal cascade with ordering constraints where mistakenly deleting a shared selector silently breaks the page-once safety invariant, a nameable correctness-bound reason for opus at the contract-touching xhigh band.\",\"confidence\":0.78},{\"task_id\":\"fn-1352-retire-escalation-sessions.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Schema-ladder migration plus re-fold-deterministic incident folds with a subtle no-re-page carry-forward invariant and silent double-counting risk \u2014 a hard correctness/contract gate warranting opus at xhigh.\",\"confidence\":0.8},{\"task_id\":\"fn-1352-retire-escalation-sessions.3\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Judgment- and taste-heavy docs/glossary reshape with user-facing wording and present-tense-only precision but no intelligence-bound reason, routing to the sonnet workhorse at the default high band.\",\"confidence\":0.72}]}\n"
 }

@@ -1919,18 +1919,21 @@ function installTimerHarness(startMs = 1_000_000): TimerHarness {
   };
 }
 
-test("reconnect evidence: terminate without close cannot strand the reconnect latch", () => {
+test("reconnect evidence: timeout without close publishes disconnected and reinitializes readiness once", () => {
   const harness = installTimerHarness();
   const timers = new ManualTimeouts();
   try {
     const { factory, sockets, connectCount } = makeMultiConnect();
     let fatalCalls = 0;
     const lifecycle: string[] = [];
+    const catchLog: CatchLog = [];
+    const subId = "test-no-close-reconnect-jobs";
     const handle = subscribeCollection({
       sockPath: "/tmp/keeper-mock.sock",
       idPrefix: "test-no-close-reconnect",
       collection: "jobs",
       onRows: () => {},
+      onCatchingUp: (catchingUp, boot) => catchLog.push({ catchingUp, boot }),
       onLifecycle: (event) => {
         lifecycle.push(event);
         if (event === "query_timeout") {
@@ -1946,22 +1949,111 @@ test("reconnect evidence: terminate without close cannot strand the reconnect la
     const first = sockets[0];
     if (!first) throw new Error("first socket never installed");
 
-    // The existing query-timeout threshold is sufficient: only reconnect
-    // scheduling is under test, so heartbeat and detection tuning stay intact.
+    // Establish catch-up true, then leave a meta-driven refetch unanswered so
+    // this served connection crosses the existing query-timeout threshold.
+    first.takeOutbound();
+    first.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+    expect(catchLog).toEqual([{ catchingUp: true, boot: bootHeader(true) }]);
+    first.deliver([
+      { type: "meta", id: subId, collection: "jobs", rev: 2, total: 0 },
+    ]);
+    expect(first.takeOutbound()).toHaveLength(1);
     harness.advance(QUERY_TIMEOUT_MS + 1);
     harness.pollHandler()();
 
     expect(first.terminated ?? 0).toBe(1);
     expect(connectCount()).toBe(1);
     expect(timers.count(0)).toBe(1);
-    expect(lifecycle).toContain("query_timeout");
+    // Timeout teardown itself publishes the honest disconnect; recovery does
+    // not depend on a transport close callback that may never arrive.
+    expect(lifecycle).toEqual([
+      "connecting",
+      "connected",
+      "query_timeout",
+      "disconnected",
+    ]);
 
     // This socket seam resolves terminate but deliberately never emits close.
     // The explicit fallback kick is therefore the only path to socket two.
     timers.fire(0);
     expect(connectCount()).toBe(2);
-    expect(sockets[1]).toBeDefined();
+    const second = sockets[1];
+    if (!second) throw new Error("second socket never installed");
+    expect(lifecycle).toEqual([
+      "connecting",
+      "connected",
+      "query_timeout",
+      "disconnected",
+      "connecting",
+      "connected",
+    ]);
+
+    // A HEADERLESS first result on the fresh connection establishes ready false
+    // and must publish it even though teardown did not publish a fake latch flip.
+    second.deliver([emptyResult("jobs", subId)]);
+    expect(catchLog).toEqual([
+      { catchingUp: true, boot: bootHeader(true) },
+      { catchingUp: false, boot: undefined },
+    ]);
+
+    // A delayed close from socket one is stale: no duplicate disconnected event,
+    // no second reconnect, and no parallel zero-delay kick.
+    first.closeFromServer();
+    expect(lifecycle.filter((event) => event === "disconnected")).toHaveLength(
+      1,
+    );
+    expect(connectCount()).toBe(2);
+    expect(timers.count(0)).toBe(0);
     expect(fatalCalls).toBe(0);
+
+    handle.dispose();
+  } finally {
+    harness.restore();
+  }
+});
+
+test("reconnect evidence: synchronous close during timeout terminate yields one disconnect and reconnect", () => {
+  const harness = installTimerHarness();
+  const timers = new ManualTimeouts();
+  try {
+    const { factory, sockets, connectCount } = makeMultiConnect({
+      closeSynchronouslyOnTerminate: true,
+    });
+    const lifecycle: string[] = [];
+    const handle = subscribeCollection({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-sync-close-timeout",
+      collection: "jobs",
+      onRows: () => {},
+      onLifecycle: (event) => lifecycle.push(event),
+      onFatal: () => {
+        throw new Error("timeout reconnect must not be fatal");
+      },
+      connect: factory,
+      timers,
+    });
+    const first = sockets[0];
+    if (!first) throw new Error("first socket never installed");
+
+    // Leave the initial query unanswered. Timeout teardown nulls currentSock
+    // before terminate(), whose test seam synchronously invokes close().
+    harness.advance(QUERY_TIMEOUT_MS + 1);
+    harness.pollHandler()();
+
+    expect(first.terminated ?? 0).toBe(1);
+    expect(lifecycle.filter((event) => event === "disconnected")).toHaveLength(
+      1,
+    );
+    expect(timers.count(0)).toBe(1);
+    expect(connectCount()).toBe(1);
+
+    timers.fire(0);
+    expect(connectCount()).toBe(2);
+    expect(sockets).toHaveLength(2);
+    expect(lifecycle.filter((event) => event === "disconnected")).toHaveLength(
+      1,
+    );
+    expect(timers.count(0)).toBe(0);
 
     handle.dispose();
   } finally {
@@ -3166,7 +3258,9 @@ test("subscribeReadiness: empty autopilot_state defaults to yolo — no eligibil
  * `makeMockConnect` but keeps EVERY socket (one per reconnect) so the
  * cap-reject reconnect chain is inspectable. `connectCount` tracks attempts.
  */
-function makeMultiConnect(): {
+function makeMultiConnect(
+  opts: { closeSynchronouslyOnTerminate?: boolean } = {},
+): {
   factory: ConnectFactory;
   sockets: MockSocket[];
   connectCount: () => number;
@@ -3195,6 +3289,9 @@ function makeMultiConnect(): {
       terminate(): void {
         sock.terminated = (sock.terminated ?? 0) + 1;
         sock.ended = true;
+        if (opts.closeSynchronouslyOnTerminate === true) {
+          handlers.close();
+        }
         resolveDone?.();
         resolveDone = null;
       },
@@ -3962,16 +4059,17 @@ test("subscribeReadiness: effective per-root cap derives off the folded autopilo
 // ===========================================================================
 // fn-1180.1 — the catching-up latch + backstop (the TUI readiness gate).
 //
-// The shared subscribe client owns a per-connection catching-up value-latch and
-// surfaces its transitions via `onCatchingUp` so a display harness can gate
-// rendering while headless consumers keep receiving data. Contract: starts
-// READY; a served `result` carrying a boot header sets it to that header's
-// `catching_up` (strict boolean — a malformed value mutates nothing); a
-// headerless `result` observed WHILE latched clears it (catch-up stamps EVERY
-// served frame, so the memo-path headerless result is positive steady-state
-// evidence); `patch`/`meta` never touch it; teardown resets it and the next
-// connection re-derives it. While latched, a slow backstop interval refetches
-// ONE idle collection so the settling flip is always observed.
+// The shared subscribe client owns a per-connection catching-up tri-state latch
+// and surfaces it via `onCatchingUp` so a display harness can gate rendering
+// while headless consumers keep receiving data. Contract: starts UNKNOWN; the
+// first valid `result` publishes its state, including ready false, and later
+// results publish flips only. A boot header supplies strict-boolean
+// `catching_up` (a malformed value mutates nothing); a headerless result
+// establishes/clears ready false (catch-up stamps every served frame, so the
+// memo path is positive steady-state evidence); `patch`/`meta` never touch it;
+// teardown resets it silently to unknown and the next connection publishes
+// anew. While true, a slow backstop interval refetches ONE idle collection so
+// the settling flip is always observed.
 // ===========================================================================
 
 /** A minimal catch-up / steady BootStatus header for the latch tests. */
@@ -4197,7 +4295,7 @@ test("catching-up latch: patch and meta frames never mutate it", () => {
   handle.dispose();
 });
 
-test("catching-up latch: teardown resets it silently and the reconnect re-derives", () => {
+test("catching-up latch: ordinary close resets to unknown and fresh ready false publishes", () => {
   const spy = installIntervalSpy();
   try {
     const { factory, socketRef } = makeMockConnect();
@@ -4222,9 +4320,9 @@ test("catching-up latch: teardown resets it silently and the reconnect re-derive
     expect(catchLog).toHaveLength(1);
     expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
 
-    // The daemon drops the connection. Teardown resets the latch to READY and
+    // The daemon drops the connection. Teardown resets the latch to UNKNOWN and
     // disarms the backstop SILENTLY — a disconnect is a lifecycle signal, not a
-    // latch flip, so `onCatchingUp` does NOT fire.
+    // fake latch flip, so `onCatchingUp` does NOT fire.
     sock1.closeFromServer();
     expect(catchLog).toHaveLength(1);
     expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
@@ -4237,11 +4335,15 @@ test("catching-up latch: teardown resets it silently and the reconnect re-derive
     expect(sock2).not.toBe(sock1);
     sock2.takeOutbound();
 
-    // The fresh connection's first result re-derives the latch: still catching up.
-    sock2.deliver([jobsResultBoot(subId, [], bootHeader(true))]);
+    // The fresh connection's first valid result reports READY. Unknown → false
+    // must publish even though the prior connection's teardown was silent.
+    sock2.deliver([jobsResultBoot(subId, [], bootHeader(false))]);
     expect(catchLog).toHaveLength(2);
-    expect(catchLog[1]?.catchingUp).toBe(true);
-    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
+    expect(catchLog[1]).toEqual({
+      catchingUp: false,
+      boot: bootHeader(false),
+    });
+    expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
 
     handle.dispose();
     expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
@@ -4387,7 +4489,7 @@ test("subscribeReadiness: catching-up backstop refetches exactly ONE idle collec
   }
 });
 
-test("subscribeReadiness: bare frames (no boot header) keep painting and never fire onCatchingUp", () => {
+test("subscribeReadiness: first bare frame publishes ready false once while painting continues", () => {
   const { factory, socketRef } = makeMockConnect();
   const snapshots: ReadinessClientSnapshot[] = [];
   const catchLog: boolean[] = [];
@@ -4419,10 +4521,11 @@ test("subscribeReadiness: bare frames (no boot header) keep painting and never f
   ]) {
     sock.deliver([emptyResult(c, `test-bare-${c.replace(/_/g, "-")}`)]);
   }
-  // Painted once (first-paint gate cleared) and the latch never left READY, so a
-  // headless consumer's data path is byte-identical to the pre-latch behavior.
+  // Painted once (first-paint gate cleared). The first headerless result
+  // initializes ready false; the remaining ten same-state results are flip-only.
+  // Headless consumers omit the callback and retain the same data path.
   expect(snapshots).toHaveLength(1);
-  expect(catchLog).toHaveLength(0);
+  expect(catchLog).toEqual([false]);
 
   handle.dispose();
 });
@@ -4623,7 +4726,7 @@ test("fn-1199 re-baseline: a bounce → reconnect → quiet catching-up board co
     });
     expect(snapshots).toHaveLength(1);
     expect(snapshots[0]?.epics.map((e) => e.epic_id)).toEqual(["fn-9"]);
-    expect(catchLog).toHaveLength(0);
+    expect(catchLog).toEqual([false]);
 
     // The daemon bounces: the socket drops (loss detected → reconnect).
     sock1.closeFromServer();
@@ -4638,7 +4741,7 @@ test("fn-1199 re-baseline: a bounce → reconnect → quiet catching-up board co
       epics: [epicRow("fn-9", "open")],
       boot: bootHeader(true),
     });
-    expect(catchLog).toEqual([true]);
+    expect(catchLog).toEqual([false, true]);
     // The backstop is armed while catching up.
     expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(1);
     sock2.takeOutbound();
@@ -4654,7 +4757,7 @@ test("fn-1199 re-baseline: a bounce → reconnect → quiet catching-up board co
     // result with epic fn-9 CLOSED-and-gone. The latch clears and the view
     // re-baselines to the fresh (empty) epic set — the stale epic is dropped.
     sock2.deliver([emptyResult("epics", "test-bounce-epics")]);
-    expect(catchLog).toEqual([true, false]);
+    expect(catchLog).toEqual([false, true, false]);
     expect(spy.count(CATCHUP_BACKSTOP_MS)).toBe(0);
     const last = snapshots.at(-1);
     expect(last?.epics.map((e) => e.epic_id)).toEqual([]);

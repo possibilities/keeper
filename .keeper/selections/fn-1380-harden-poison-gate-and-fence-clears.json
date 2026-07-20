@@ -1,0 +1,53 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.85,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Subtle concurrency correctness invariant: a TOCTOU liveness/identity CAS fence over a live claim where a false-dead release double-dispatches, plus re-fold determinism and a contract-touching RPC reply path \u2014 a nameable intelligence-bound reason.",
+      "task_id": "fn-1380-harden-poison-gate-and-fence-clears.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.7,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Well-specified single-surface producer reroute that template-follows an existing dead-letter status shape (deterministic dl_id, ON CONFLICT DO NOTHING, prune arm) with a named acceptance and no design judgment, so GPT-first at the default execution band.",
+      "task_id": "fn-1380-harden-poison-gate-and-fence-clears.2",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.82,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Contract-shaped design call \u2014 settling a new RPC surface vs extending replay_dead_letter and updating the guardrail \u2014 layered on re-fold determinism preserving original ts and two divergent gate predicates, a cross-cutting architectural cascade warranting opus.",
+      "task_id": "fn-1380-harden-poison-gate-and-fence-clears.3",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.8,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Security invariant task: narrowing a fail-closed commit-rail gate by trusted producer-derived evidence where a scoping bug flips it fail-open and attacker-influenced fields must not widen blast radius \u2014 a hard opus gate.",
+      "task_id": "fn-1380-harden-poison-gate-and-fence-clears.4",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T01:03:02.096000Z",
+  "epic_id": "fn-1380-harden-poison-gate-and-fence-clears",
+  "input_hash": "533f8a96ffb5775f400e9e6b3372118264d6b0a8dd154e6ae2404964fd4babd7",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1396673174,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1380-harden-poison-gate-and-fence-clears.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Subtle concurrency correctness invariant: a TOCTOU liveness/identity CAS fence over a live claim where a false-dead release double-dispatches, plus re-fold determinism and a contract-touching RPC reply path \u2014 a nameable intelligence-bound reason.\",\"confidence\":0.85},{\"task_id\":\"fn-1380-harden-poison-gate-and-fence-clears.2\",\"tier\":\"high\",\"model\":\"gpt-5.5\",\"rationale\":\"Well-specified single-surface producer reroute that template-follows an existing dead-letter status shape (deterministic dl_id, ON CONFLICT DO NOTHING, prune arm) with a named acceptance and no design judgment, so GPT-first at the default execution band.\",\"confidence\":0.7},{\"task_id\":\"fn-1380-harden-poison-gate-and-fence-clears.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Contract-shaped design call \u2014 settling a new RPC surface vs extending replay_dead_letter and updating the guardrail \u2014 layered on re-fold determinism preserving original ts and two divergent gate predicates, a cross-cutting architectural cascade warranting opus.\",\"confidence\":0.82},{\"task_id\":\"fn-1380-harden-poison-gate-and-fence-clears.4\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Security invariant task: narrowing a fail-closed commit-rail gate by trusted producer-derived evidence where a scoping bug flips it fail-open and attacker-influenced fields must not widen blast radius \u2014 a hard opus gate.\",\"confidence\":0.8}]}\n"
+}

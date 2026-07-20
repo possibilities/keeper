@@ -1,0 +1,37 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.86,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Killing a live session mid-turn is a catastrophic correctness invariant across reconcile-core/autopilot/daemon/reducer with a receipt-join fold extension that must stay re-fold deterministic \u2014 a nameable subtle-correctness opus gate at contract-touching xhigh.",
+      "task_id": "fn-1375-reap-stopped-sessions-release-claims.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.83,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "Dead-session claim release rides fold-restriction machinery where double-release and reviving sessions are the failure class and every condition must re-check idempotently in a deterministic fold \u2014 a subtle-correctness invariant warranting opus at contract-shaped xhigh.",
+      "task_id": "fn-1375-reap-stopped-sessions-release-claims.2",
+      "tier": "xhigh"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-19T14:31:50.641000Z",
+  "epic_id": "fn-1375-reap-stopped-sessions-release-claims",
+  "input_hash": "4623ee94eb973436eef807d785d7152e2b2b70da8802c269f54c0f4f87e1388b",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1176759956,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1375-reap-stopped-sessions-release-claims.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Killing a live session mid-turn is a catastrophic correctness invariant across reconcile-core/autopilot/daemon/reducer with a receipt-join fold extension that must stay re-fold deterministic \u2014 a nameable subtle-correctness opus gate at contract-touching xhigh.\",\"confidence\":0.86},{\"task_id\":\"fn-1375-reap-stopped-sessions-release-claims.2\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Dead-session claim release rides fold-restriction machinery where double-release and reviving sessions are the failure class and every condition must re-check idempotently in a deterministic fold \u2014 a subtle-correctness invariant warranting opus at contract-shaped xhigh.\",\"confidence\":0.83}]}\n"
+}

@@ -482,6 +482,19 @@ test("refreshLive updates the body in place without growing history", async () =
   expect(core.historyLen()).toBe(1);
 });
 
+test("clearLiveOverlay restores the history tip without growing it", async () => {
+  const { setup, core, paint } = await bootPaint();
+  core.pushFrame(["held frame"]);
+  core.refreshLive(["loading"]);
+  await setup.renderOnce();
+  expect(textContent(paint.body)).toBe("loading");
+
+  core.clearLiveOverlay();
+  await setup.renderOnce();
+  expect(textContent(paint.body)).toBe("held frame");
+  expect(core.historyLen()).toBe(1);
+});
+
 test("ScrollBox is unfocused — arrow keys reach the live-shell keymap, not the box", async () => {
   // The spec calls out that the ScrollBox must NOT steal arrow keys
   // (it captures them when focused). Verify by pressing left/right

@@ -51,3 +51,12 @@ The local pi-subagents checkout used by Keeper stays on a dedicated integration 
 - The companion becomes a compatibility boundary against Pi's provider and extension-loader APIs; supported Pi upgrades require explicit wrapper and root/child integration tests.
 - Pool degradation may concentrate work on the native credential, but it cannot silently claim balanced operation because the fallback is visible.
 - Real multi-account evidence, abort/error classification, stream-event ordering, transport isolation, and secret scanning are release obligations rather than best-effort checks.
+
+## Amendment — one live Codex grant per account
+
+The provider permits one live Codex grant per account. Enrolling a pooled delegate revokes that account's
+live grants held by the legacy leg and bare Pi; native Codex remains unavailable on those surfaces until
+activation.
+
+The accepted end state keeps bare Pi unauthenticated for Codex by design. Keeper-launched Pi, loaded with
+the companion, is the Codex path.

@@ -1,12 +1,21 @@
+import { createHash } from "node:crypto";
+
 export const USAGE_SCHEMA_VERSION = 1;
 export const MAX_USAGE_WINDOWS = 6;
 const MAX_RESET_FUTURE_MS = 45 * 24 * 60 * 60 * 1000;
+const MAX_WINDOW_SECONDS = 45 * 24 * 60 * 60;
+const MAX_METER_LABEL_LENGTH = 64;
 
 export type UsageStatus = "healthy" | "exhausted" | "unavailable";
 export type UsageWindowRole = "primary" | "secondary" | "additional";
 
 export interface SanitizedUsageWindow {
   role: UsageWindowRole;
+  /** Stable, PII-free identity used when a provider adds or removes meters. */
+  key: string;
+  /** Bounded display name from the quota contract, never account metadata. */
+  label: string;
+  window_seconds: number | null;
   used_percent: number;
   reset_at_ms: number | null;
 }
@@ -43,17 +52,94 @@ function resetAtMs(value: unknown, nowMs: number): number | null | undefined {
   return Math.floor(millis);
 }
 
+function windowSeconds(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > MAX_WINDOW_SECONDS
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
+function meterLabel(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const label = value.trim();
+  if (
+    label.length < 1 ||
+    label.length > MAX_METER_LABEL_LENGTH ||
+    !/^(?:GPT|Codex|OpenAI)(?:[- ._/][A-Za-z0-9][A-Za-z0-9 ._+:/()-]*)?$/iu.test(
+      label,
+    ) ||
+    /\b(?:account|email|key|owner|plan|secret|token)\b/iu.test(label) ||
+    /\d{6,}/u.test(label)
+  ) {
+    return null;
+  }
+  return label;
+}
+
+function meterKey(label: string, nativeRole: string): string {
+  const digest = createHash("sha256").update(label).digest("hex").slice(0, 24);
+  return `meter:${digest}:${nativeRole}`;
+}
+
+function durationIdentity(
+  seconds: number | null,
+  nativeRole: "primary" | "secondary",
+): { key: string; label: string } {
+  if (seconds === 5 * 60 * 60) return { key: "session", label: "session" };
+  if (seconds === 7 * 24 * 60 * 60) return { key: "week", label: "weekly" };
+  if (seconds === null) {
+    return { key: `window:${nativeRole}`, label: nativeRole };
+  }
+  const label =
+    seconds % (24 * 60 * 60) === 0
+      ? `${seconds / (24 * 60 * 60)}-day`
+      : seconds % (60 * 60) === 0
+        ? `${seconds / (60 * 60)}h`
+        : `${seconds}s`;
+  return { key: `window:${seconds}`, label };
+}
+
 function parseWindow(
   raw: unknown,
   role: UsageWindowRole,
+  nativeRole: "primary" | "secondary",
   nowMs: number,
+  name: string | null,
+  additionalOrdinal: number,
 ): SanitizedUsageWindow | undefined {
   const record = object(raw);
   if (!record) return undefined;
   const used = percent(record.used_percent);
   const reset = resetAtMs(record.reset_at, nowMs);
-  if (used === undefined || reset === undefined) return undefined;
-  return { role, used_percent: used, reset_at_ms: reset };
+  const seconds = windowSeconds(record.limit_window_seconds);
+  if (used === undefined || reset === undefined || seconds === undefined) {
+    return undefined;
+  }
+  const identity =
+    name === null
+      ? role === "additional"
+        ? {
+            key: `additional:${additionalOrdinal}:${nativeRole}`,
+            label: `additional ${additionalOrdinal}`,
+          }
+        : durationIdentity(seconds, nativeRole)
+      : {
+          key: meterKey(name, nativeRole),
+          label: name,
+        };
+  return {
+    role,
+    ...identity,
+    window_seconds: seconds,
+    used_percent: used,
+    reset_at_ms: reset,
+  };
 }
 
 function appendRateLimitWindows(
@@ -61,18 +147,26 @@ function appendRateLimitWindows(
   raw: unknown,
   nowMs: number,
   additional: boolean,
+  name: string | null,
+  additionalOrdinal: number,
 ): void {
   const rateLimit = object(raw);
   if (!rateLimit) return;
   const primary = parseWindow(
     rateLimit.primary_window,
     additional ? "additional" : "primary",
+    "primary",
     nowMs,
+    name,
+    additionalOrdinal,
   );
   const secondary = parseWindow(
     rateLimit.secondary_window,
     additional ? "additional" : "secondary",
+    "secondary",
     nowMs,
+    name,
+    additionalOrdinal,
   );
   if (primary && target.length < MAX_USAGE_WINDOWS) target.push(primary);
   if (secondary && target.length < MAX_USAGE_WINDOWS) target.push(secondary);
@@ -89,16 +183,50 @@ export function parseUsageResponse(
     throw new Error("usage-schema-invalid");
   }
   const windows: SanitizedUsageWindow[] = [];
-  appendRateLimitWindows(windows, record.rate_limit, nowMs, false);
+  const topRateLimit = object(record.rate_limit);
+  appendRateLimitWindows(
+    windows,
+    topRateLimit,
+    nowMs,
+    false,
+    meterLabel(topRateLimit?.limit_name),
+    0,
+  );
   const additional = record.additional_rate_limits;
   if (Array.isArray(additional)) {
-    for (const item of additional.slice(0, MAX_USAGE_WINDOWS)) {
-      appendRateLimitWindows(windows, object(item)?.rate_limit, nowMs, true);
+    for (const [index, item] of additional
+      .slice(0, MAX_USAGE_WINDOWS)
+      .entries()) {
+      const entry = object(item);
+      appendRateLimitWindows(
+        windows,
+        entry?.rate_limit,
+        nowMs,
+        true,
+        meterLabel(entry?.limit_name),
+        index + 1,
+      );
       if (windows.length >= MAX_USAGE_WINDOWS) break;
     }
   }
   if (windows.length === 0) throw new Error("usage-schema-invalid");
-  const topRateLimit = object(record.rate_limit);
+  const roleRank: Record<UsageWindowRole, number> = {
+    primary: 0,
+    secondary: 1,
+    additional: 2,
+  };
+  windows.sort(
+    (a, b) =>
+      roleRank[a.role] - roleRank[b.role] ||
+      a.label.localeCompare(b.label) ||
+      a.key.localeCompare(b.key),
+  );
+  const keyCounts = new Map<string, number>();
+  for (const window of windows) {
+    const count = keyCounts.get(window.key) ?? 0;
+    keyCounts.set(window.key, count + 1);
+    if (count > 0) window.key = `${window.key}:${count + 1}`;
+  }
   const explicitlyLimited =
     topRateLimit?.allowed === false || topRateLimit?.limit_reached === true;
   const exhausted =

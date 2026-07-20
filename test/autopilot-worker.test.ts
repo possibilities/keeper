@@ -77,6 +77,7 @@ import {
   confirmRunning,
   createDispatchFailedGate,
   createDupEpicNumberTracker,
+  createLaneMaintenanceProbe,
   createLaneTeardownGraceTracker,
   createLaneWedgeTracker,
   createSharedCheckoutDesyncTracker,
@@ -95,6 +96,7 @@ import {
   type DispatchKey,
   DUP_EPIC_NUMBER_DISTRESS_REASON,
   type DupEpicNumberObservation,
+  decideTerminalPaneTeardowns,
   decideZombieSessionReaper,
   deriveResourceHoldObservations,
   dupEpicNumberDistressId,
@@ -102,6 +104,7 @@ import {
   epicHasActiveResolver,
   epicPresentAndNotDone,
   epicRecoverVerdictById,
+  extractCloseFinalizeReceipt,
   FINALIZER_GUARD_S,
   type FoundJob,
   findShadowingWorkManifest,
@@ -129,13 +132,16 @@ import {
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
   LANE_WEDGE_GRACE_SEC,
+  type LaneMaintenanceProbe,
   type LaneWedgeObservation,
   type LaunchResult,
   type LiveDispatch,
   laneFailuresToClear,
   laneOwnerAliveAndProgressing,
   laneWedgeDistressId,
+  loadLatestCloseReceipts,
   loadReconcileSnapshot,
+  loadTerminalPaneTeardownJobs,
   logMergeGateDeferral,
   logWrappedDelegationSkip,
   type MergeSuiteProbe,
@@ -158,6 +164,7 @@ import {
   runMergeSuiteGate,
   runPackageSuiteGate,
   runReconcileCycle,
+  runTerminalPaneTeardownSweep,
   runZombieSessionReaperStep,
   SHARED_CHECKOUT_DESYNC_GRACE_SEC,
   SHARED_CHECKOUT_DIRTY_GRACE_SEC,
@@ -177,6 +184,7 @@ import {
   STUCK_SENTINEL_DISTRESS_ID_PREFIX,
   STUCK_SENTINEL_DISTRESS_VERB,
   type StaleBaseLaneObservation,
+  selectTerminalPaneOwnerScan,
   sharedCheckoutDistressObservations,
   sharedDesyncDistressId,
   sharedDirtyDistressId,
@@ -186,6 +194,10 @@ import {
   stuckSentinelOrphansToClear,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
+  TERMINAL_PANE_TEARDOWN_IDLE_MS,
+  TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP,
+  type TerminalPaneProcessIdentity,
+  type TerminalPaneTeardownJob,
   type TipObservation,
   updateWithholdFrameState,
   verbForVerdict,
@@ -227,8 +239,10 @@ import {
   PENDING_DISPATCH_TTL_MS,
   planOrphanedClaimReaper,
   planPendingDispatchSweep,
+  planTerminalSessionClaimReleases,
   runSharedCheckoutPageSweep,
   shouldEscalateMergeConflict,
+  terminalSessionClaimIsReleaseable,
 } from "../src/daemon";
 import { DEFAULT_MAX_CONCURRENT_JOBS } from "../src/db";
 import {
@@ -406,6 +420,47 @@ test("zombie-session decision partitions signals, pages, backstop, and no-op sta
       expected: { action: "signal", signal: "SIGKILL" },
     },
     {
+      input: {
+        taskDone: false,
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 220,
+        activity: { status: "active", reason: "main-turn", reservation: null },
+      },
+      expected: { action: "signal", signal: "SIGTERM" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 230,
+        termSentAt: 220,
+        activity: { status: "active", reason: "main-turn", reservation: null },
+      },
+      expected: { action: "signal", signal: "SIGKILL" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 219,
+      },
+      expected: { action: "none", reason: "activity" },
+    },
+    {
+      input: {
+        reapClass: "occupancy",
+        thresholdSec: 120,
+        updatedAt: 100,
+        nowSec: 100,
+        immediate: true,
+      },
+      expected: { action: "signal", signal: "SIGTERM" },
+    },
+    {
       input: { jobState: "working" },
       expected: { action: "none", reason: "outside-scope" },
     },
@@ -551,7 +606,7 @@ test("zombie-session signal failure degrades to a page-only verdict", () => {
   ).toEqual({ action: "page", reason: "signal-failed" });
 });
 
-test("zombie-session command ownership requires the exact work dispatch name", () => {
+test("zombie-session command ownership requires the exact tracked dispatch name", () => {
   expect(
     isKeeperLaunchedZombieCommand(
       "claude --name work::fn-1-foo.1 prompt",
@@ -566,6 +621,13 @@ test("zombie-session command ownership requires the exact work dispatch name", (
       "fn-1-foo.1",
     ),
   ).toBe(false);
+  expect(
+    isKeeperLaunchedZombieCommand(
+      "claude --name close::fn-1-foo prompt",
+      "close",
+      "fn-1-foo",
+    ),
+  ).toBe(true);
 });
 
 function makeSnapshot(
@@ -1413,9 +1475,7 @@ test("isBareShellCommand: known shells (incl. login `-` forms) are bare shells",
   }
 });
 
-test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclaim)", () => {
-  // The catastrophic over-match guard: a running claude reads as its own process,
-  // never a shell, so the criterion can never classify a live session as dead.
+test("isBareShellCommand: worker commands are not bare-shell duplicate preferences", () => {
   for (const cmd of [
     "claude",
     "node",
@@ -1432,6 +1492,286 @@ test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclai
 });
 
 // ---------------------------------------------------------------------------
+// terminal autopilot pane teardown — positive provenance + exact ownership
+// ---------------------------------------------------------------------------
+
+function terminalPaneJob(
+  overrides: Partial<TerminalPaneTeardownJob> = {},
+): TerminalPaneTeardownJob {
+  return {
+    job_id: "terminal-job",
+    state: "ended",
+    pid: 42,
+    start_time: "linux:1",
+    dispatch_origin: "autopilot",
+    plan_verb: "work",
+    plan_ref: "fn-1-foo.1",
+    adopted: null,
+    backend_exec_type: "tmux",
+    terminal_pane_id: "%7",
+    ...overrides,
+  };
+}
+
+function ownedTerminalPane(overrides: Partial<PaneInfo> = {}): PaneInfo {
+  return {
+    tmuxGenerationId: "10:20",
+    paneId: "%7",
+    windowId: "@7",
+    currentCommand: "zsh",
+    paneDead: "0",
+    sessionName: "autopilot",
+    keeperJobId: "terminal-job",
+    windowName: "work::fn-1-foo.1",
+    ...overrides,
+  };
+}
+
+function terminalPaneDecision(
+  job: TerminalPaneTeardownJob,
+  pane: PaneInfo,
+  identity: TerminalPaneProcessIdentity = "dead",
+) {
+  return decideTerminalPaneTeardowns({
+    jobs: [job],
+    panes: [pane],
+    processIdentityByJobId: new Map([[job.job_id, identity]]),
+  });
+}
+
+for (const entry of [
+  { state: "ended", verb: "work", ref: "fn-1-foo.1" },
+  { state: "killed", verb: "work", ref: "fn-1-foo.1" },
+  { state: "autoclosed", verb: "work", ref: "fn-1-foo.1" },
+  { state: "ended", verb: "close", ref: "fn-1-foo" },
+  { state: "killed", verb: "close", ref: "fn-1-foo" },
+  { state: "ended", verb: "resolve", ref: "fn-1-foo" },
+  { state: "killed", verb: "resolve", ref: "fn-1-foo" },
+  { state: "ended", verb: "deconflict", ref: "fn-1-foo" },
+  { state: "killed", verb: "deconflict", ref: "fn-1-foo" },
+  { state: "ended", verb: "repair", ref: "/repo" },
+  { state: "killed", verb: "repair", ref: "/repo" },
+  { state: "ended", verb: "unblock", ref: "fn-1-foo.1" },
+  { state: "killed", verb: "unblock", ref: "fn-1-foo.1" },
+] as const) {
+  test(`terminal pane teardown: ${entry.state} autopilot ${entry.verb} tears down its owned shell pane`, () => {
+    expect(
+      terminalPaneDecision(
+        terminalPaneJob({
+          state: entry.state,
+          plan_verb: entry.verb,
+          plan_ref: entry.ref,
+        }),
+        ownedTerminalPane(),
+      ),
+    ).toEqual([{ jobId: "terminal-job", paneId: "%7" }]);
+  });
+}
+
+test("terminal pane teardown: working and stopped autopilot jobs are resting or active, never terminal litter", () => {
+  for (const state of ["working", "stopped"] as const) {
+    expect(
+      terminalPaneDecision(terminalPaneJob({ state }), ownedTerminalPane()),
+    ).toEqual([]);
+  }
+});
+
+test("terminal pane teardown: an autoclosed killed row converges without double-killing an already-gone pane", () => {
+  const job = terminalPaneJob({ state: "killed" });
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [],
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+});
+
+const NON_AUTOPILOT_SESSION_CLASSES = [
+  {
+    name: "named",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "handoff",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "free-form operator dispatch",
+    overrides: { dispatch_origin: null, plan_verb: null, plan_ref: null },
+  },
+  {
+    name: "manual plan-form dispatch",
+    overrides: {
+      dispatch_origin: null,
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+    },
+  },
+  {
+    name: "adopted",
+    overrides: { dispatch_origin: "autopilot", adopted: 1 },
+  },
+] satisfies Array<{
+  name: string;
+  overrides: Partial<TerminalPaneTeardownJob>;
+}>;
+
+for (const sessionClass of NON_AUTOPILOT_SESSION_CLASSES) {
+  for (const state of [
+    "working",
+    "stopped",
+    "ended",
+    "killed",
+    "autoclosed",
+  ] as const) {
+    test(`terminal pane teardown: ${sessionClass.name} is never a candidate in ${state}`, () => {
+      expect(
+        terminalPaneDecision(
+          terminalPaneJob({ state, ...sessionClass.overrides }),
+          ownedTerminalPane(),
+        ),
+      ).toEqual([]);
+    });
+  }
+}
+
+test("terminal pane teardown: live, unknown, and foreground-agent process evidence fail closed", () => {
+  const job = terminalPaneJob();
+  expect(terminalPaneDecision(job, ownedTerminalPane(), "alive")).toEqual([]);
+  expect(terminalPaneDecision(job, ownedTerminalPane(), "unknown")).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      job,
+      ownedTerminalPane({ currentCommand: "claude" }),
+      "dead",
+    ),
+  ).toEqual([]);
+});
+
+test("terminal pane teardown: degraded probes and absent or mismatched ownership are inert", () => {
+  const job = terminalPaneJob();
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: null,
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [ownedTerminalPane()],
+      processIdentityByJobId: null,
+    }),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      terminalPaneJob({ terminal_pane_id: null }),
+      ownedTerminalPane(),
+    ),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(job, ownedTerminalPane({ keeperJobId: null })),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(
+      job,
+      ownedTerminalPane({ keeperJobId: "someone-else" }),
+    ),
+  ).toEqual([]);
+  expect(
+    terminalPaneDecision(job, ownedTerminalPane({ sessionName: "pair" })),
+  ).toEqual([]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: [job],
+      panes: [
+        ownedTerminalPane(),
+        ownedTerminalPane({
+          paneId: "%8",
+          keeperJobId: null,
+          currentCommand: "bash",
+        }),
+      ],
+      processIdentityByJobId: new Map([[job.job_id, "dead"]]),
+    }),
+  ).toEqual([]);
+});
+
+test("terminal pane teardown: periodic GC is deterministic and blast-capped", () => {
+  const jobs: TerminalPaneTeardownJob[] = [];
+  const panes: PaneInfo[] = [];
+  const identities = new Map<string, TerminalPaneProcessIdentity>();
+  for (const id of ["a", "b", "c", "d", "e", "f", "g"]) {
+    const jobId = `job-${id}`;
+    const paneId = `%${id}`;
+    jobs.push(terminalPaneJob({ job_id: jobId, terminal_pane_id: paneId }));
+    panes.push(
+      ownedTerminalPane({ paneId, windowId: `@${id}`, keeperJobId: jobId }),
+    );
+    identities.set(jobId, "dead");
+  }
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs: jobs.reverse(),
+      panes: panes.reverse(),
+      processIdentityByJobId: identities,
+    }),
+  ).toEqual([
+    { jobId: "job-a", paneId: "%a" },
+    { jobId: "job-b", paneId: "%b" },
+    { jobId: "job-c", paneId: "%c" },
+    { jobId: "job-d", paneId: "%d" },
+    { jobId: "job-e", paneId: "%e" },
+  ]);
+  expect(
+    decideTerminalPaneTeardowns({
+      jobs,
+      panes,
+      processIdentityByJobId: identities,
+      afterJobId: "job-e",
+    }),
+  ).toEqual([
+    { jobId: "job-f", paneId: "%f" },
+    { jobId: "job-g", paneId: "%g" },
+    { jobId: "job-a", paneId: "%a" },
+    { jobId: "job-b", paneId: "%b" },
+    { jobId: "job-c", paneId: "%c" },
+  ]);
+  expect(TERMINAL_PANE_TEARDOWN_MAX_PER_SWEEP).toBe(5);
+  expect(TERMINAL_PANE_TEARDOWN_IDLE_MS).toBe(5_000);
+});
+
+test("terminal pane teardown: bounded owner scan advances past a stable prefix", () => {
+  const panes = ["d", "b", "a", "c"].map((id) =>
+    ownedTerminalPane({
+      paneId: `%${id}`,
+      windowId: `@${id}`,
+      keeperJobId: `job-${id}`,
+    }),
+  );
+  panes.push(
+    ownedTerminalPane({
+      paneId: "%manual",
+      windowId: "@manual",
+      keeperJobId: "job-manual",
+      sessionName: "manual",
+    }),
+  );
+
+  const first = selectTerminalPaneOwnerScan(panes, null, 2);
+  expect(first).toEqual({
+    jobIds: ["job-a", "job-b"],
+    nextCursor: "job-b",
+  });
+  expect(selectTerminalPaneOwnerScan(panes, first.nextCursor, 2)).toEqual({
+    jobIds: ["job-c", "job-d"],
+    nextCursor: null,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // computeSlotOccupancy — visibility + provable-dead reclaim + level-clear
 // ---------------------------------------------------------------------------
 
@@ -1440,9 +1780,11 @@ test("isBareShellCommand: a live claude worker is NOT a bare shell (never reclai
 function oneOccupant(over: {
   verb?: "work" | "close";
   id?: string;
+  jobId?: string;
   state?: string;
   pane?: string;
   command?: string;
+  created_at?: number;
   updated_at?: number;
   active_since?: number | null;
 }): {
@@ -1451,15 +1793,17 @@ function oneOccupant(over: {
   paneCommandById: Map<string, string>;
 } {
   const pane = over.pane ?? "%7";
+  const jobId = over.jobId ?? "j";
   const jobs = new Map<string, Job>([
     [
-      "j",
+      jobId,
       makeJob({
-        job_id: "j",
+        job_id: jobId,
         plan_verb: over.verb ?? "close",
         plan_ref: over.id ?? "fn-1-foo",
         state: over.state ?? "stopped",
         backend_exec_pane_id: pane,
+        created_at: over.created_at ?? 100,
         updated_at: over.updated_at ?? 800,
         active_since: over.active_since ?? null,
       }),
@@ -1488,46 +1832,39 @@ function slotInput(
   };
 }
 
-test("computeSlotOccupancy: dead (stopped + bare shell + grace elapsed) → reclaim + slot-reclaimed", () => {
-  // idle 200s ≥ the 120s default grace, pane foreground is the bare shell tail.
+test("computeSlotOccupancy: stopped bare shell past grace selects the exact reap target", () => {
   const occ = oneOccupant({ command: "zsh", updated_at: 800 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
   const sig: SlotOccupancySignal = out.failures[0];
   expect(sig.verb).toBe("close");
   expect(sig.id).toBe("fn-1-foo");
-  expect(sig.reclaimPaneId).toBe("%7"); // the kill is issued
+  expect(sig.reapTarget).toEqual({
+    jobId: "j",
+    paneId: "%7",
+    immediate: false,
+  });
   expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
   expect(out.clears).toEqual([]);
 });
 
-test("computeSlotOccupancy: bare shell but WITHIN grace → slot-occupied, NO kill", () => {
-  // idle 50s < 120s grace — a bare shell that JUST appeared could be a teardown
-  // frame, so surface only; never kill inside the grace window.
+test("computeSlotOccupancy: stopped bare shell within grace stays visibility-only", () => {
   const occ = oneOccupant({ command: "zsh", updated_at: 950 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
-test("computeSlotOccupancy: a live/parked claude pane → slot-occupied, NEVER killed (even past grace)", () => {
-  // NEVER-started: `oneOccupant`'s default `active_since` is null, so this row never
-  // ran a turn — the derived-idle arm skips it (it is a still-binding launch, not a
-  // finished session), and its `claude` foreground command is neither a bare shell
-  // nor a proven-dead verdict. Surfaced only, never killed.
+test("computeSlotOccupancy: stopped claude pane past grace is reaped without a cosmetic death proof", () => {
   const occ = oneOccupant({ command: "claude", updated_at: 0 });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim + slot-reclaimed", () => {
-  // ADR 0052 core case: a session that WENT working (`active_since` set) then ended
-  // its turn but stays resident holding a wanted slot. Its pane still reads `claude`
-  // (not a bare shell, no proven-dead verdict), yet past grace it is derived-idle →
-  // reclaimed, unlike the never-started row above.
+test("computeSlotOccupancy: active_since does not weaken stopped-past-grace evidence", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 800,
@@ -1535,14 +1872,11 @@ test("computeSlotOccupancy: STARTED + derived-idle pane past grace → reclaim +
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  const sig: SlotOccupancySignal = out.failures[0];
-  expect(sig.reclaimPaneId).toBe("%7");
-  expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupied, NO kill", () => {
-  // idle 50s < 120s grace: a just-ended turn could be a transient frame, so the
-  // derived-idle arm waits out the grace exactly like the bare-shell arm.
+test("computeSlotOccupancy: a started stopped session within grace is not reaped", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 950,
@@ -1550,14 +1884,11 @@ test("computeSlotOccupancy: STARTED + derived-idle WITHIN grace → slot-occupie
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
-test("computeSlotOccupancy: never-started (active_since null) + idle pane past grace → derived-idle arm NEVER reclaims", () => {
-  // The startup-grace guard for the derived-idle arm specifically: a row that never
-  // went `working` is a still-binding launch, not a finished turn — killing it would
-  // race a booting session. Only the proven-dead / bare-shell arms may reclaim it.
+test("computeSlotOccupancy: never-started stopped row is still reaped after the full grace", () => {
   const occ = oneOccupant({
     command: "claude",
     updated_at: 800,
@@ -1565,13 +1896,78 @@ test("computeSlotOccupancy: never-started (active_since null) + idle pane past g
   });
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
+});
+
+test("computeSlotOccupancy: fatal_halt close receipt at session start bypasses grace", () => {
+  const occ = oneOccupant({ created_at: 900, updated_at: 999 });
+  const out = computeSlotOccupancy(
+    slotInput({
+      ...occ,
+      latestCloseReceiptByEpicId: new Map([
+        ["fn-1-foo", { outcome: "fatal_halt", ts: 900 }],
+      ]),
+    }),
+  );
+  expect(out.failures[0].reapTarget).toEqual({
+    jobId: "j",
+    paneId: "%7",
+    immediate: true,
+  });
+});
+
+test("computeSlotOccupancy: stale fatal receipt and ordinary close retain normal grace", () => {
+  for (const latestCloseReceiptByEpicId of [
+    new Map([["fn-1-foo", { outcome: "fatal_halt", ts: 899 }]]),
+    new Map([["fn-1-foo", { outcome: "partial_followup", ts: 999 }]]),
+    new Map<string, { outcome: string; ts: number }>(),
+  ]) {
+    const occ = oneOccupant({ created_at: 900, updated_at: 999 });
+    const out = computeSlotOccupancy(
+      slotInput({ ...occ, latestCloseReceiptByEpicId }),
+    );
+    expect(out.failures[0].reapTarget).toBeNull();
+  }
+});
+
+test("computeSlotOccupancy: duplicate key returns the exact fatal session and pane", () => {
+  const old = oneOccupant({
+    jobId: "old",
+    pane: "%7",
+    created_at: 100,
+    updated_at: 999,
+  });
+  const recent = oneOccupant({
+    jobId: "recent",
+    pane: "%8",
+    created_at: 200,
+    updated_at: 999,
+  });
+  const out = computeSlotOccupancy(
+    slotInput({
+      jobs: new Map([...old.jobs, ...recent.jobs]),
+      livePaneIds: new Set(["%7", "%8"]),
+      paneCommandById: new Map([
+        ["%7", "claude"],
+        ["%8", "claude"],
+      ]),
+      latestCloseReceiptByEpicId: new Map([
+        ["fn-1-foo", { outcome: "fatal_halt", ts: 150 }],
+      ]),
+    }),
+  );
+  expect(out.failures).toHaveLength(1);
+  expect(out.failures[0].reapTarget).toEqual({
+    jobId: "old",
+    paneId: "%7",
+    immediate: true,
+  });
 });
 
 test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgrades to visibility-only", () => {
-  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct started + derived-idle + wanted zombies
-  // past grace. At most the cap are real kills (lowest `(verb, id)` key wins,
+  // N > SLOT_RECLAIM_MAX_PER_SWEEP distinct stopped, wanted occupants past grace.
+  // At most the cap are real reaps (lowest `(verb, id)` key wins,
   // deterministic); the rest surface as slot-occupied — never dropped from failures.
   const n = SLOT_RECLAIM_MAX_PER_SWEEP + 3;
   const jobs = new Map<string, Job>();
@@ -1602,8 +1998,8 @@ test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgr
   );
   // Every candidate is surfaced — nothing silently dropped.
   expect(out.failures).toHaveLength(n);
-  const reclaimed = out.failures.filter((f) => f.reclaimPaneId !== null);
-  const occupied = out.failures.filter((f) => f.reclaimPaneId === null);
+  const reclaimed = out.failures.filter((f) => f.reapTarget !== null);
+  const occupied = out.failures.filter((f) => f.reapTarget === null);
   expect(reclaimed).toHaveLength(SLOT_RECLAIM_MAX_PER_SWEEP);
   expect(occupied).toHaveLength(n - SLOT_RECLAIM_MAX_PER_SWEEP);
   // Deterministic selection: the lowest `(verb, id)` keys are the real reclaims.
@@ -1614,7 +2010,7 @@ test("computeSlotOccupancy: blast cap bounds reclaims per sweep, over-cap downgr
 test("computeSlotOccupancy: login `-zsh` past grace is still reclaimed (dash stripped)", () => {
   const occ = oneOccupant({ command: "-zsh", updated_at: 800 });
   const out = computeSlotOccupancy(slotInput(occ));
-  expect(out.failures[0].reclaimPaneId).toBe("%7");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
 });
 
 test("computeSlotOccupancy: grace boundary — idle === grace reclaims, idle < grace occupies", () => {
@@ -1624,14 +2020,14 @@ test("computeSlotOccupancy: grace boundary — idle === grace reclaims, idle < g
       now: 1000,
     }),
   );
-  expect(atBoundary.failures[0].reclaimPaneId).toBe("%7"); // 120 ≥ 120
+  expect(atBoundary.failures[0].reapTarget?.paneId).toBe("%7"); // 120 ≥ 120
   const justUnder = computeSlotOccupancy(
     slotInput({
       ...oneOccupant({ command: "zsh", updated_at: 881 }),
       now: 1000,
     }),
   );
-  expect(justUnder.failures[0].reclaimPaneId).toBeNull(); // 119 < 120
+  expect(justUnder.failures[0].reapTarget).toBeNull(); // 119 < 120
 });
 
 test("computeSlotOccupancy: a dead work-task slot reclaims on (work, task)", () => {
@@ -1645,7 +2041,7 @@ test("computeSlotOccupancy: a dead work-task slot reclaims on (work, task)", () 
   const out = computeSlotOccupancy(slotInput(occ));
   expect(out.failures[0].verb).toBe("work");
   expect(out.failures[0].id).toBe("fn-1-foo.2");
-  expect(out.failures[0].reclaimPaneId).toBe("%3");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%3");
 });
 
 test("computeSlotOccupancy: pane gone (absent from the sweep) → not occupying → no signal", () => {
@@ -1746,21 +2142,16 @@ test("computeSlotOccupancy: SLOT_RECLAIM_GRACE_SEC is the default grace, overrid
   // With a tiny injected grace, a just-stopped bare shell reclaims immediately.
   const occ = oneOccupant({ command: "zsh", updated_at: 999 }); // idle 1s
   const out = computeSlotOccupancy(slotInput({ ...occ, graceSec: 1 }));
-  expect(out.failures[0].reclaimPaneId).toBe("%7");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%7");
 });
 
 // ---------------------------------------------------------------------------
-// fn-1200 computeSlotOccupancy — slot authority from the JOB LIFECYCLE
-// (proven-dead verdict), not pane cosmetics
+// fn-1200 computeSlotOccupancy — lifecycle evidence and duplicate preference
 // ---------------------------------------------------------------------------
 
 test("fn-1200 computeSlotOccupancy: proven-dead job + live WRAPPER pane past grace → reclaim (pane command is NOT a bare shell)", () => {
-  // The wedge fix: claude exited but the launch-wrapper shell / a lingering
-  // launcher process holds the pane, so its foreground command is `bun` — neither
-  // `claude` nor the bare `exec $SHELL` tail. `isBareShellCommand` cannot classify
-  // it dead, so the pre-fn-1200 reaper left the slot wedged forever. With the
-  // exit-watcher's proven-dead verdict in hand (`provenDeadJobIds`), the reaper
-  // reclaims it regardless of the pane command.
+  // A proven-dead lifecycle fact remains a deterministic preference even when
+  // the lingering wrapper command is not a bare shell.
   const occ = oneOccupant({ command: "bun", updated_at: 800 }); // idle 200s ≥ 120
   expect(isBareShellCommand("bun")).toBe(false); // pin: NOT reclaimable by cosmetics
   const out = computeSlotOccupancy(
@@ -1768,22 +2159,18 @@ test("fn-1200 computeSlotOccupancy: proven-dead job + live WRAPPER pane past gra
   );
   expect(out.failures).toHaveLength(1);
   const sig: SlotOccupancySignal = out.failures[0];
-  expect(sig.reclaimPaneId).toBe("%7"); // the reaper targets the residual pane
+  expect(sig.reapTarget?.paneId).toBe("%7");
   expect(sig.reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
-test("fn-1200 computeSlotOccupancy: a live-session job with the SAME wrapper pane shape → NO reclaim (reaper never targets a job lacking a proven-dead verdict)", () => {
-  // The catastrophic-failure guard: identical pane shape (live pane, `bun`
-  // foreground, past grace) but the job is NOT proven dead — a live worker whose
-  // pane momentarily foregrounds a child process. It must surface only, never be
-  // killed, so a false-dead read can never destroy a live session.
+test("fn-1200 computeSlotOccupancy: stopped live wrapper needs no proven-dead flag after grace", () => {
   const occ = oneOccupant({ command: "bun", updated_at: 800 });
   const out = computeSlotOccupancy(
     slotInput({ ...occ, provenDeadJobIds: new Set<string>() }),
   );
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
-  expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
+  expect(out.failures[0].reapTarget?.jobId).toBe("j");
+  expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
 test("fn-1200 computeSlotOccupancy: proven-dead but WITHIN grace → slot-occupied, NO kill (reclaim is grace-aged, never immediate)", () => {
@@ -1795,7 +2182,7 @@ test("fn-1200 computeSlotOccupancy: proven-dead but WITHIN grace → slot-occupi
     slotInput({ ...occ, provenDeadJobIds: new Set(["j"]) }),
   );
   expect(out.failures).toHaveLength(1);
-  expect(out.failures[0].reclaimPaneId).toBeNull();
+  expect(out.failures[0].reapTarget).toBeNull();
   expect(out.failures[0].reason.startsWith("slot-occupied")).toBe(true);
 });
 
@@ -1812,7 +2199,7 @@ test("fn-1200 computeSlotOccupancy: proven-dead work-task with a launcher pane r
   );
   expect(out.failures[0].verb).toBe("work");
   expect(out.failures[0].id).toBe("fn-1-foo.2");
-  expect(out.failures[0].reclaimPaneId).toBe("%3");
+  expect(out.failures[0].reapTarget?.paneId).toBe("%3");
   expect(out.failures[0].reason.startsWith("slot-reclaimed")).toBe(true);
 });
 
@@ -3021,6 +3408,116 @@ test("fn-811 reconcile dedup: stopped job whose pane is LIVE still blocks re-dis
   });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
+});
+
+test("post-reap snapshots clear the occupancy refusal and mint without operator retry", () => {
+  const taskId = "fn-1-foo.1";
+  const epic = makeEpic({ tasks: [makeTask({ task_id: taskId })] });
+  const occupant = makeJob({
+    job_id: "reap-me",
+    plan_verb: "work",
+    plan_ref: taskId,
+    state: "stopped",
+    backend_exec_pane_id: "%9",
+    created_at: 1,
+    updated_at: 1,
+  });
+  const held = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map([[occupant.job_id, occupant]]),
+      livePaneIds: new Set(["%9"]),
+      paneCommandById: new Map([["%9", "claude"]]),
+    }),
+    makeState(),
+    1_000,
+  );
+  expect(held.launches).toEqual([]);
+  expect(held.slotOccupancy[0]?.reapTarget?.jobId).toBe("reap-me");
+
+  const cleared = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map(),
+      livePaneIds: new Set(),
+      paneCommandById: new Map(),
+      failedKeys: new Set([`work::${taskId}`]),
+      slotOccupancyFailures: [{ verb: "work", id: taskId }],
+    }),
+    makeState(),
+    1_001,
+  );
+  expect(cleared.slotOccupancy).toEqual([]);
+  expect(cleared.slotOccupancyClears).toEqual([{ verb: "work", id: taskId }]);
+
+  const reminted = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: new Map(),
+      livePaneIds: new Set(),
+      paneCommandById: new Map(),
+    }),
+    makeState(),
+    1_002,
+  );
+  expect(reminted.launches.map((launch) => launch.key)).toEqual([
+    `work::${taskId}`,
+  ]);
+});
+
+test("occupancy declines use stable held, reaping, and degraded-probe withholds", () => {
+  const taskId = "fn-1-foo.1";
+  const epic = makeEpic({ tasks: [makeTask({ task_id: taskId })] });
+  const occupant = makeJob({
+    job_id: "occupant",
+    plan_verb: "work",
+    plan_ref: taskId,
+    state: "stopped",
+    backend_exec_pane_id: "%9",
+    created_at: 1,
+    updated_at: 90,
+  });
+  const observed = {
+    epics: [epic],
+    jobs: new Map([[occupant.job_id, occupant]]),
+    livePaneIds: new Set(["%9"]),
+    paneCommandById: new Map([["%9", "claude"]]),
+  };
+
+  const held = reconcile(makeSnapshot(observed), makeState(), 100);
+  const heldAgain = reconcile(makeSnapshot(observed), makeState(), 101);
+  expect(held.withholds.get(taskId)).toEqual({
+    code: "occupancy-held",
+    severity: "normal",
+    detail:
+      "slot-occupied: stopped work session holds the slot (pane %9 claude)",
+  });
+  expect(heldAgain.withholds.get(taskId)).toEqual(held.withholds.get(taskId));
+
+  const reaping = reconcile(makeSnapshot(observed), makeState(), 1_000);
+  expect(reaping.withholds.get(taskId)).toEqual({
+    code: "occupancy-reaping",
+    severity: "normal",
+    detail: "slot-reclaimed: reaping stopped work session (pane %9 claude)",
+  });
+
+  const degraded = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      jobs: observed.jobs,
+      livePaneIds: null,
+      paneCommandById: null,
+    }),
+    makeState(),
+    1_000,
+  );
+  expect(degraded.launches).toEqual([]);
+  expect(degraded.slotOccupancy).toEqual([]);
+  expect(degraded.withholds.get(taskId)).toEqual({
+    code: "occupancy-probe-degraded",
+    severity: "normal",
+    detail: "tmux pane probe unavailable",
+  });
 });
 
 test("reconcile dedup: open dispatch_failures row blocks re-dispatch (sticky failure)", () => {
@@ -5054,6 +5551,194 @@ test("durable orphan Reaper deterministically jitters a reboot cohort and caps e
   });
 });
 
+test("terminal-session claim planner selects only dead owners with settled-or-absent legs", async () => {
+  await withSeededDb((db) => {
+    const insertClaim = (
+      id: string,
+      attemptId: number,
+      jobState: string,
+      claimState = "bound",
+    ): void => {
+      const sessionId = `session-${id}`;
+      db.run(
+        `INSERT INTO jobs
+           (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+         VALUES (?, 1, 2, ?, ?, 'work', ?)`,
+        [sessionId, attemptId, jobState, id],
+      );
+      db.run(
+        `INSERT INTO dispatch_claims
+           (verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+            acquired_at, bound_at, last_event_id, updated_at)
+         VALUES ('work', ?, ?, ?, ?, '/repo', 0, 1, 1, ?, 2)`,
+        [id, attemptId, claimState, sessionId, attemptId],
+      );
+    };
+    const insertLeg = (id: string, attemptId: number, state: string): void => {
+      db.run(
+        `INSERT INTO provider_leg_ownership
+           (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+            ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 2)`,
+        [`leg-${id}`, `session-${id}`, attemptId, attemptId, state, attemptId],
+      );
+    };
+
+    insertClaim("dead-no-legs.1", 101, "killed");
+    insertClaim("ended-settled.1", 102, "ended", "resume_requested");
+    insertLeg("ended-settled.1", 102, "terminal");
+    insertClaim("stopped-owner.1", 103, "stopped");
+    insertClaim("dead-live-leg.1", 104, "killed");
+    insertLeg("dead-live-leg.1", 104, "live");
+    insertClaim("dead-cascade.1", 105, "ended");
+    insertLeg("dead-cascade.1", 105, "terminal");
+    db.run(
+      `INSERT INTO provider_leg_cascades
+         (leg_launch_id, ownership_epoch_event_id, wrapper_job_id,
+          wrapper_dispatch_attempt_id, state, last_event_id, created_at, updated_at)
+       VALUES ('leg-dead-cascade.1', 105, 'session-dead-cascade.1', 105,
+               'armed', 105, 1, 2)`,
+    );
+
+    const planned = planTerminalSessionClaimReleases(db);
+    expect(planned.map((row) => row.id)).toEqual([
+      "dead-no-legs.1",
+      "ended-settled.1",
+    ]);
+    expect(
+      planTerminalSessionClaimReleases(db, 1).map((row) => row.id),
+    ).toEqual(["dead-no-legs.1"]);
+    const firstPlanned = planned[0];
+    if (firstPlanned === undefined) throw new Error("expected planned claim");
+    expect(terminalSessionClaimIsReleaseable(db, firstPlanned)).toBe(true);
+    expect(
+      terminalSessionClaimIsReleaseable(db, {
+        verb: "work",
+        id: "dead-live-leg.1",
+        attempt_id: 104,
+        session_id: "session-dead-live-leg.1",
+      }),
+    ).toBe(false);
+  });
+});
+
+test("terminal-session release fold rechecks revival, late bind, supersede, and leg enrollment", async () => {
+  await withSeededDb((db) => {
+    const seed = (
+      id: string,
+      attemptId: number,
+      state: "bound" | "resume_requested" = "bound",
+    ): void => {
+      db.run(
+        `INSERT INTO jobs
+           (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+         VALUES (?, 1, 2, ?, 'killed', 'work', ?)`,
+        [`dead-${id}`, attemptId, id],
+      );
+      db.run(
+        `INSERT INTO dispatch_claims
+           (verb, id, attempt_id, state, session_id, dir, legacy_unfenced,
+            acquired_at, bound_at, last_event_id, updated_at)
+         VALUES ('work', ?, ?, ?, ?, '/repo', 0, 1, 1, ?, 2)`,
+        [id, attemptId, state, `dead-${id}`, attemptId],
+      );
+    };
+    const ids = [
+      "release.1",
+      "settled.1",
+      "revived.1",
+      "late-bind.1",
+      "superseded.1",
+      "late-leg.1",
+      "late-cascade.1",
+    ];
+    for (const [index, id] of ids.entries()) {
+      seed(id, 201 + index);
+    }
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('settled-leg', 'dead-settled.1', 202, 202,
+               'terminal', 202, 1, 2)`,
+    );
+
+    const planned = planTerminalSessionClaimReleases(db);
+    expect(planned.map((row) => row.id)).toEqual(ids);
+
+    db.run("UPDATE jobs SET state = 'stopped' WHERE job_id = 'dead-revived.1'");
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, last_event_id, state, plan_verb, plan_ref)
+       VALUES ('late-bound-live', 3, 3, 999, 'stopped', 'work', 'late-bind.1')`,
+    );
+    db.run(
+      `UPDATE dispatch_claims SET session_id = 'late-bound-live'
+        WHERE verb = 'work' AND id = 'late-bind.1'`,
+    );
+    db.run(
+      `UPDATE dispatch_claims
+          SET attempt_id = 999, state = 'acquired', session_id = NULL
+        WHERE verb = 'work' AND id = 'superseded.1'`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-live-leg', 'dead-late-leg.1', 206, 206,
+               'live', 206, 1, 2)`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_ownership
+         (leg_launch_id, wrapper_job_id, wrapper_dispatch_attempt_id,
+          ownership_epoch_event_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-terminal-leg', 'dead-late-cascade.1', 207, 207,
+               'terminal', 207, 1, 2)`,
+    );
+    db.run(
+      `INSERT INTO provider_leg_cascades
+         (leg_launch_id, ownership_epoch_event_id, wrapper_job_id,
+          wrapper_dispatch_attempt_id, state, last_event_id, created_at, updated_at)
+       VALUES ('late-terminal-leg', 207, 'dead-late-cascade.1', 207,
+               'terming', 207, 1, 2)`,
+    );
+
+    for (const row of planned) {
+      db.run(
+        `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+         VALUES (10, ?, 'DispatchClaimReleased', 'dispatch_claims', ?)`,
+        [
+          `${row.verb}::${row.id}`,
+          JSON.stringify({
+            verb: row.verb,
+            id: row.id,
+            expected_attempt_id: row.attempt_id,
+            session_id: row.session_id,
+            terminal_session_only: true,
+          }),
+        ],
+      );
+    }
+    expect(drain(db)).toBe(planned.length);
+
+    const claimState = (id: string): string | null =>
+      (
+        db
+          .query(
+            "SELECT state FROM dispatch_claims WHERE verb = 'work' AND id = ?",
+          )
+          .get(id) as { state: string } | null
+      )?.state ?? null;
+    expect(claimState("release.1")).toBe("released");
+    expect(claimState("settled.1")).toBe("released");
+    expect(claimState("revived.1")).toBe("bound");
+    expect(claimState("late-bind.1")).toBe("bound");
+    expect(claimState("superseded.1")).toBe("acquired");
+    expect(claimState("late-leg.1")).toBe("bound");
+    expect(claimState("late-cascade.1")).toBe("bound");
+  });
+});
+
 test("a bind before parked grace leaves nothing for the sweep to mint", async () => {
   await withSeededDb((db) => {
     const dispatchedAt = 1_700_000_000;
@@ -6011,6 +6696,221 @@ async function withSeededDb(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test("terminal pane loader joins the immutable terminal coordinate only for a current owner", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES
+         ('owned-terminal', 1, 2, 'ended', 42, 'linux:1', 'work',
+          'fn-1-foo.1', 'autopilot', NULL, 'tmux'),
+         ('manual-terminal', 1, 2, 'ended', 43, 'linux:2', 'work',
+          'fn-1-foo.1', NULL, NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES
+         (2, 'owned-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%21'),
+         (2, 'manual-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%22')`,
+    );
+    db.run(
+      `UPDATE jobs
+          SET last_event_id = COALESCE(
+            (SELECT MAX(id) FROM events WHERE session_id = jobs.job_id), 0
+          )
+        WHERE job_id IN ('owned-terminal', 'manual-terminal')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (3, 'owned-terminal', 'SessionEnd', 'session', '{}', 'tmux', '%99')`,
+    );
+
+    expect(
+      loadTerminalPaneTeardownJobs(db, [
+        ownedTerminalPane({ paneId: "%21", keeperJobId: "owned-terminal" }),
+        ownedTerminalPane({ paneId: "%22", keeperJobId: "manual-terminal" }),
+      ]),
+    ).toEqual([
+      {
+        job_id: "owned-terminal",
+        state: "ended",
+        pid: 42,
+        start_time: "linux:1",
+        dispatch_origin: "autopilot",
+        plan_verb: "work",
+        plan_ref: "fn-1-foo.1",
+        adopted: null,
+        backend_exec_type: "tmux",
+        terminal_pane_id: "%21",
+      },
+    ]);
+  });
+});
+
+test("terminal pane sweep re-proves process identity at act time", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES ('terminal-job', 1, 2, 'ended', 42, 'linux:1', 'work',
+               'fn-1-foo.1', 'autopilot', NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (2, 'terminal-job', 'SessionEnd', 'session', '{}', 'tmux', '%7')`,
+    );
+    db.run(
+      `UPDATE jobs SET last_event_id =
+        (SELECT MAX(id) FROM events WHERE session_id = 'terminal-job')
+        WHERE job_id = 'terminal-job'`,
+    );
+    const killed: string[] = [];
+    let identityProbe = 0;
+    const decided = await runTerminalPaneTeardownSweep(
+      db,
+      {
+        listPanes: async () => [ownedTerminalPane()],
+        killWindow: async (paneId) => {
+          killed.push(paneId);
+          return { ok: true };
+        },
+      },
+      [ownedTerminalPane()],
+      {
+        isPidAlive: () => {
+          identityProbe += 1;
+          return identityProbe > 1;
+        },
+        readStartTime: () => "linux:1",
+      },
+    );
+    expect(decided).toEqual([]);
+    expect(killed).toEqual([]);
+    expect(identityProbe).toBe(2);
+  });
+});
+
+test("terminal pane sweep kills the exact owned shell window after both proofs", async () => {
+  await withSeededDb(async (db) => {
+    db.run(
+      `INSERT INTO jobs
+         (job_id, created_at, updated_at, state, pid, start_time, plan_verb,
+          plan_ref, dispatch_origin, adopted, backend_exec_type)
+       VALUES ('terminal-job', 1, 2, 'killed', 42, 'linux:1', 'work',
+               'fn-1-foo.1', 'autopilot', NULL, 'tmux')`,
+    );
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, backend_exec_type,
+          backend_exec_pane_id)
+       VALUES (2, 'terminal-job', 'Killed', 'killed', '{}', 'tmux', '%7')`,
+    );
+    db.run(
+      `UPDATE jobs SET last_event_id =
+        (SELECT MAX(id) FROM events WHERE session_id = 'terminal-job')
+        WHERE job_id = 'terminal-job'`,
+    );
+    const killed: string[] = [];
+    const decided = await runTerminalPaneTeardownSweep(
+      db,
+      {
+        listPanes: async () => [ownedTerminalPane()],
+        killWindow: async (paneId) => {
+          killed.push(paneId);
+          return { ok: true };
+        },
+      },
+      [ownedTerminalPane()],
+      { isPidAlive: () => false, readStartTime: () => null },
+    );
+    expect(decided).toEqual([{ jobId: "terminal-job", paneId: "%7" }]);
+    expect(killed).toEqual(["%7"]);
+  });
+});
+
+test("close-finalize receipt parser accepts the hook envelope and rejects malformed output", () => {
+  const data = JSON.stringify({
+    tool_response: {
+      stdout: JSON.stringify({ success: true, outcome: "fatal_halt" }),
+    },
+  });
+  expect(extractCloseFinalizeReceipt(data, 42)).toEqual({
+    outcome: "fatal_halt",
+    ts: 42,
+  });
+  expect(extractCloseFinalizeReceipt("{", 42)).toBeNull();
+  expect(
+    extractCloseFinalizeReceipt(
+      JSON.stringify({ tool_response: { stdout: "{}" } }),
+      42,
+    ),
+  ).toBeNull();
+});
+
+test("latest close receipts join by epic and do not leak an older fatal past a newer failed receipt", async () => {
+  await withSeededDb((db) => {
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, plan_verb, plan_ref)
+       VALUES ('close-job', 10, 20, 'stopped', 'close', 'fn-1-close')`,
+    );
+    const hookData = (stdout: string): string =>
+      JSON.stringify({ tool_response: { stdout } });
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (30, 'close-job', 'PostToolUse', 'post_tool_use', ?,
+               'close-finalize', 'fn-1-close')`,
+      [hookData(JSON.stringify({ outcome: "fatal_halt" }))],
+    );
+    expect(
+      loadLatestCloseReceipts(
+        db,
+        new Map([
+          [
+            "close-job",
+            makeJob({
+              job_id: "close-job",
+              created_at: 10,
+              updated_at: 20,
+              state: "stopped",
+              plan_verb: "close",
+              plan_ref: "fn-1-close",
+            }),
+          ],
+        ]),
+      ),
+    ).toEqual(new Map([["fn-1-close", { outcome: "fatal_halt", ts: 30 }]]));
+
+    db.run(
+      `INSERT INTO events
+         (ts, session_id, hook_event, event_type, data, plan_op, plan_target)
+       VALUES (31, 'close-job', 'PostToolUse', 'post_tool_use', ?,
+               'close-finalize', 'fn-1-close')`,
+      [hookData(JSON.stringify({ success: false }))],
+    );
+    const jobs = new Map([
+      [
+        "close-job",
+        makeJob({
+          job_id: "close-job",
+          state: "stopped",
+          plan_verb: "close",
+          plan_ref: "fn-1-close",
+        }),
+      ],
+    ]);
+    expect(loadLatestCloseReceipts(db, jobs).size).toBe(0);
+  });
+});
 
 function errorReadinessQuery(collection: string): ReadinessQuery {
   return (db, worldRev, frame, out, nowSec) => {
@@ -9344,6 +10244,175 @@ test("base refresh producer: a live-worker lane defers with no merge and no dist
   expect(depsLog.emissions).toEqual([]);
 });
 
+test("base refresh producer: a live claim defers visibly before the driver can mutate", async () => {
+  const { driver, log } = makeFakeWorktreeDriver();
+  const { deps, log: depsLog } = makeFakeDeps({ worktree: driver });
+  const epic = makeEpic({ epic_id: "fn-1-foo", project_dir: "/repo" });
+  const decision = reconcile(
+    makeSnapshot({
+      epics: [epic],
+      worktreeMode: true,
+      baseDriftEntries: [
+        {
+          epic_id: epic.epic_id,
+          repo_dir: "/repo",
+          behind_count: 20,
+          merge_base_age_seconds: 90_000,
+        },
+      ],
+    }),
+    makeState(),
+    0,
+  );
+  decision.launches = [];
+  const probe: LaneMaintenanceProbe = () => ({
+    kind: "defer",
+    reason: "live dispatch claim work::fn-1-foo.1 holds the base lane",
+  });
+  const lines: string[] = [];
+  const originalError = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    await runReconcileCycle(
+      decision,
+      makeState(),
+      new Map(),
+      "/bin/zsh",
+      new AbortController().signal,
+      deps,
+      new Map(),
+      undefined,
+      probe,
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(log.refreshes).toEqual([]);
+  expect(depsLog.emissions).toEqual([]);
+  expect(lines).toEqual([
+    expect.stringContaining(
+      "worktree-base-refresh-deferred: live dispatch claim",
+    ),
+  ]);
+});
+
+test("lane maintenance hold attributes every cycle pass and prevents provision/finalize mutation", async () => {
+  const taskId = "fn-1-foo.1";
+  const baseLane = worktreePathFor("/repo", "keeper/epic/fn-1-foo");
+  const liveWorker = makeJob({
+    job_id: "live-lane-worker",
+    plan_verb: "work",
+    plan_ref: taskId,
+    cwd: baseLane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[liveWorker.job_id, liveWorker]]),
+    new Map(),
+    new Set(),
+  );
+  const { driver: activeDriver, log: activeLog } = makeFakeWorktreeDriver();
+  const { deps: activeDeps } = makeFakeDeps({ worktree: activeDriver });
+  const activeEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: taskId })],
+  });
+  const activeDecision = reconcile(
+    makeSnapshot({
+      epics: [activeEpic],
+      worktreeMode: true,
+      baseDriftEntries: [
+        {
+          epic_id: "fn-1-foo",
+          repo_dir: "/repo",
+          behind_count: 20,
+          merge_base_age_seconds: 90_000,
+        },
+      ],
+    }),
+    makeState(),
+    0,
+  );
+
+  const { driver: closeDriver, log: closeLog } = makeFakeWorktreeDriver();
+  const { deps: closeDeps } = makeFakeDeps({ worktree: closeDriver });
+  const doneEpic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo-a",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-1-foo.1",
+        task_number: 1,
+        target_repo: "/repo-a",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+      makeTask({
+        task_id: "fn-1-foo.2",
+        task_number: 2,
+        target_repo: "/repo-b",
+        runtime_status: "done",
+        worker_phase: "done",
+      }),
+    ],
+  });
+  const closeDecision = reconcile(
+    multiRepoSnap([doneEpic], abResolve),
+    makeState(),
+    0,
+  );
+
+  const lines: string[] = [];
+  const originalError = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    await runReconcileCycle(
+      activeDecision,
+      makeState(),
+      new Map(),
+      "/bin/zsh",
+      new AbortController().signal,
+      activeDeps,
+      new Map(),
+      undefined,
+      probe,
+    );
+    await runReconcileCycle(
+      closeDecision,
+      makeState(),
+      new Map(),
+      "/bin/zsh",
+      new AbortController().signal,
+      closeDeps,
+      new Map(),
+      undefined,
+      probe,
+    );
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(activeLog.calls).toEqual([]);
+  expect(closeLog.calls).toEqual([]);
+  expect(lines).toHaveLength(4);
+  expect(lines[0]).toContain(
+    "worktree-base-refresh-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[1]).toContain(
+    "worktree-provision-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[2]).toContain(
+    "worktree-sink-provision-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines[3]).toContain(
+    "worktree-finalize-deferred: live claimed session work::fn-1-foo.1",
+  );
+  expect(lines.every((line) => line.length <= 531)).toBe(true);
+});
+
 test("base refresh producer: conflict uses the existing bare close merge-conflict row and suppresses same-cycle lane launch", async () => {
   const reason =
     "worktree-merge-conflict: merging main into keeper/epic/fn-1-foo — CONFLICT";
@@ -9390,7 +10459,12 @@ test("base refresh producer: conflict uses the existing bare close merge-conflic
 });
 
 function makeBaseRefreshGitRun(
-  opts: { dirty?: boolean; lastRefreshAt?: number; mergeCode?: number } = {},
+  opts: {
+    dirty?: boolean;
+    mergeHead?: boolean;
+    lastRefreshAt?: number;
+    mergeCode?: number;
+  } = {},
 ): { run: GitRunner; commands: string[][] } {
   const commands: string[][] = [];
   const run: GitRunner = async (args) => {
@@ -9409,6 +10483,11 @@ function makeBaseRefreshGitRun(
     }
     if (command === "rev-parse --abbrev-ref HEAD") {
       return { code: 0, stdout: "keeper/epic/fn-1-foo\n", stderr: "" };
+    }
+    if (command === "rev-parse --verify --quiet MERGE_HEAD") {
+      return opts.mergeHead
+        ? { code: 0, stdout: "merge-head\n", stderr: "" }
+        : { code: 1, stdout: "", stderr: "" };
     }
     if (args[0] === "ls-files") return { code: 0, stdout: "", stderr: "" };
     if (args[0] === "log") {
@@ -9454,6 +10533,28 @@ test("base refresh driver: dirty lane is a retry-skip and never invokes merge", 
 
   expect(result).toMatchObject({ ok: false, retry: true });
   expect(commands.some((args) => args[0] === "merge")).toBe(false);
+});
+
+test("base refresh driver: MERGE_HEAD defers without touching the lane", async () => {
+  const { run, commands } = makeBaseRefreshGitRun({ mergeHead: true });
+  const result = await createWorktreeDriver(run).refreshBase(
+    {
+      epic_id: "fn-1-foo",
+      repo_dir: "/repo",
+      behind_count: 20,
+      merge_base_age_seconds: 90_000,
+    },
+    10_000,
+  );
+
+  expect(result).toMatchObject({
+    ok: false,
+    retry: true,
+    reason: expect.stringContaining("mid-merge"),
+  });
+  expect(commands.some((args) => args[0] === "merge")).toBe(false);
+  expect(commands.some((args) => args[0] === "reset")).toBe(false);
+  expect(commands.some((args) => args[0] === "restore")).toBe(false);
 });
 
 test("base refresh driver: cooldown skips churn; after expiry merges local default into the base worktree exactly once", async () => {
@@ -11886,19 +12987,158 @@ function makeRecoveryGit(state: {
   return { run, calls, lock };
 }
 
-test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane → abort + prune", async () => {
+function makeLaneClaim(overrides: Partial<DispatchClaim> = {}): DispatchClaim {
+  return {
+    verb: "work",
+    id: "fn-1-foo.2",
+    attempt_id: 1,
+    state: "acquired",
+    session_id: null,
+    dir: "/repo.worktrees/keeper-epic-fn-1-foo-B",
+    legacy_unfenced: 0,
+    acquired_at: 1,
+    bound_at: null,
+    resume_acknowledged_at: null,
+    released_at: null,
+    last_event_id: 1,
+    updated_at: 1,
+    ...overrides,
+  };
+}
+
+test("lane maintenance probe holds live claims and fails closed on inconclusive liveness, but releases dead claims", () => {
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const target = { path: lane, epicId: "fn-1-foo", taskId: "fn-1-foo.2" };
+  const liveClaim = makeLaneClaim();
+  const claimed = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([["work::fn-1-foo.2", liveClaim]]),
+    new Set(),
+  );
+  expect(claimed(target)).toMatchObject({
+    kind: "defer",
+    reason: expect.stringContaining("live dispatch claim"),
+  });
+
+  const released = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([
+      [
+        "work::fn-1-foo.2",
+        makeLaneClaim({ state: "released", released_at: 2 }),
+      ],
+    ]),
+    new Set(),
+  );
+  expect(released(target)).toEqual({ kind: "clear" });
+
+  const parked = makeJob({
+    job_id: "resolver",
+    plan_verb: "resolve",
+    plan_ref: "fn-1-foo.2",
+    cwd: lane,
+    state: "stopped",
+    backend_exec_pane_id: "%7",
+  });
+  const inconclusive = createLaneMaintenanceProbe(
+    new Map([[parked.job_id, parked]]),
+    new Map(),
+    null,
+  );
+  expect(inconclusive(target)).toMatchObject({
+    kind: "defer",
+    reason: expect.stringContaining("liveness probe inconclusive"),
+  });
+  const dead = createLaneMaintenanceProbe(
+    new Map([[parked.job_id, parked]]),
+    new Map(),
+    new Set(),
+  );
+  expect(dead(target)).toEqual({ kind: "clear" });
+
+  const activeResolver = makeJob({
+    job_id: "active-resolver",
+    plan_verb: "resolve",
+    plan_ref: "fn-1-foo.2",
+    cwd: "/repo",
+    state: "working",
+  });
+  const baseHeldByTask = createLaneMaintenanceProbe(
+    new Map([[activeResolver.job_id, activeResolver]]),
+    new Map(),
+    new Set(),
+  );
+  expect(
+    baseHeldByTask({
+      path: "/repo.worktrees/keeper-epic-fn-1-foo",
+      epicId: "fn-1-foo",
+      taskId: null,
+    }),
+  ).toMatchObject({ kind: "defer" });
+});
+
+test("recoverWorktrees: a task-scoped live claim plus MERGE_HEAD protects the lane from every recovery mutation", async () => {
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
+  const { run, calls } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${lane}\nHEAD y\nbranch refs/heads/${rib}\n\n`,
+    mergeHeadAt: new Set([lane]),
+    epicBases: [rib],
+    ancestors: new Set([rib]),
+  });
+  const resolver = makeJob({
+    job_id: "resolver",
+    plan_verb: "resolve",
+    plan_ref: "fn-1-foo.2",
+    cwd: lane,
+    state: "working",
+  });
+  const probe = createLaneMaintenanceProbe(
+    new Map([[resolver.job_id, resolver]]),
+    new Map(),
+    new Set(),
+  );
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    run,
+    undefined,
+    async () => false,
+    () => false,
+    undefined,
+    () => false,
+    undefined,
+    probe,
+  );
+  expect(outcome.maintenanceDeferrals).toEqual([
+    {
+      path: lane,
+      reason: expect.stringMatching(
+        /live claimed session.*MERGE_HEAD is present/,
+      ),
+    },
+  ]);
+  const mutating = ["merge --abort", "worktree remove", "branch -D"];
+  expect(
+    calls.some((call) =>
+      mutating.some((prefix) => call.args.startsWith(prefix)),
+    ),
+  ).toBe(false);
+});
+
+test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane with NO live claim → abort + prune", async () => {
+  // The tri-state's dead/absent-claim arm: nothing owns this lane, so its
+  // MERGE_HEAD is crash residue and the self-heal reclaims it.
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
   const { run, calls } = makeRecoveryGit({
     worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
     mergeHeadAt: new Set([lane]),
     epicBases: [], // no done-but-unmerged work in this scenario
   });
-  const { failures } = await recoverWorktrees(
-    ["/repo"],
-    async () => false,
-    run,
-  );
-  expect(failures).toEqual([]);
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(outcome.failures).toEqual([]);
   // The lane's stale merge was aborted, and the repo's worktrees pruned once.
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
     true,
@@ -11906,6 +13146,8 @@ test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane → abort + pr
   expect(
     calls.some((c) => c.cwd === "/repo" && c.args.startsWith("worktree prune")),
   ).toBe(true);
+  // An unclaimed lane is never "held" — nothing to report as deferred.
+  expect(outcome.maintenanceDeferrals ?? []).toEqual([]);
 });
 
 test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async () => {
@@ -11964,9 +13206,11 @@ test("recoverWorktrees: a healthy lane ON its own branch classifies resolved, ne
 });
 
 test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as an IMMEDIATE wedge", async () => {
-  // The lane is mid-merge AND its guarded abort keeps failing — git cannot clear it.
-  // Pass-1 records its own abort failure; the lane readiness re-probe then sees the
-  // surviving MERGE_HEAD and surfaces an IMMEDIATE (un-graced) wedge for the distress.
+  // The lane is UNCLAIMED and mid-merge AND its guarded abort keeps failing — git
+  // cannot clear it. Pass-1 records its own abort failure; the lane readiness
+  // re-probe then sees the surviving MERGE_HEAD and surfaces an IMMEDIATE
+  // (un-graced) wedge for the distress. The live-lane hold must NEVER swallow this:
+  // an unclaimed lane is not held, so the escalation still fires.
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
   const { run } = makeRecoveryGit({
     worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
@@ -11979,6 +13223,107 @@ test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as
   expect(laneObs).toBeDefined();
   expect(laneObs?.immediate).toBe(true);
   expect(laneObs?.reason.startsWith("abort-failed")).toBe(true);
+});
+
+test("recoverWorktrees: a LIVE claim over an abort-failed lane holds it and still never suppresses a later wedge", async () => {
+  // The hold's boundary: while the claim is live the lane is untouched and no wedge
+  // is minted (the owner's merge is the work). The instant the claim is gone the
+  // SAME lane escalates — the hold defers the escalation, it does not delete it.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const gitFor = () =>
+    makeRecoveryGit({
+      worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+      mergeHeadAt: new Set([lane]),
+      abortFailsAt: new Set([lane]),
+      epicBases: [],
+    });
+  const held = gitFor();
+  const heldOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    held.run,
+    undefined,
+    async () => false,
+    () => false,
+    undefined,
+    () => false,
+    undefined,
+    createLaneMaintenanceProbe(
+      new Map(),
+      new Map([["work::fn-1-foo.2", makeLaneClaim({ dir: lane })]]),
+      new Set(),
+    ),
+  );
+  expect(heldOutcome.laneWedged ?? []).toEqual([]);
+  expect(
+    held.calls.some((c) => c.cwd === lane && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(heldOutcome.maintenanceDeferrals?.[0]?.reason).toContain(
+    "live dispatch claim",
+  );
+
+  const released = gitFor();
+  const releasedOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    released.run,
+  );
+  expect(
+    releasedOutcome.laneWedged?.find((w) => w.path === lane)?.immediate,
+  ).toBe(true);
+});
+
+test("lane maintenance deferral logging latches once per episode and re-arms after the hold lifts", async () => {
+  // A held lane rides a level-triggered loop the owner's own job updates keep
+  // ticking, so the reason is logged ONCE per episode — not once per cycle — and
+  // the latch re-arms only after the lane stops deferring.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-latch-B";
+  const probe = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([
+      ["work::fn-1-latch.2", makeLaneClaim({ id: "fn-1-latch.2", dir: lane })],
+    ]),
+    new Set(),
+  );
+  // A FRESH git fixture per sweep — each sweep sees the same on-disk situation, so
+  // only the latch can explain a suppressed line.
+  const sweep = (laneProbe?: LaneMaintenanceProbe) =>
+    recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      makeRecoveryGit({
+        worktreeList:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-latch--fn-1-latch.2\n\n`,
+        mergeHeadAt: new Set([lane]),
+        epicBases: [],
+      }).run,
+      undefined,
+      async () => false,
+      () => false,
+      undefined,
+      () => false,
+      undefined,
+      laneProbe,
+    );
+
+  const lines: string[] = [];
+  const originalError = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    await sweep(probe); // episode 1 opens → logs
+    await sweep(probe); // same episode, same reason → silent
+    await sweep(undefined); // hold lifts → episode ends
+    await sweep(probe); // episode 2 → logs again
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(
+    lines.filter(
+      (line) => line.includes(lane) && line.includes("live dispatch claim"),
+    ),
+  ).toHaveLength(2);
 });
 
 test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktrees` lane, still recovers the keeper lane", async () => {
@@ -12028,23 +13373,31 @@ test("fn-1095 recoverWorktrees: pass-1 SKIPS the abort for a lane whose epic has
     mergeHeadAt: new Set([resolvingLane, idleLane]), // both carry a MERGE_HEAD
     epicBases: [],
   });
-  const { failures } = await recoverWorktrees(
+  const outcome = await recoverWorktrees(
     ["/repo"],
     async () => false,
     run,
     undefined,
     undefined,
-    (epicId) => epicId === "fn-1-foo", // ONLY fn-1-foo has a live resolver
+    (epicId) => epicId === "fn-1-foo",
   );
-  expect(failures).toEqual([]);
-  // The resolver's lane was left ALONE — no abort raced its in-progress merge.
+  expect(outcome.failures).toEqual([]);
+  // The resolver's lane was left ALONE — no abort raced its in-progress merge —
+  // and the hold is visible rather than a silent skip.
+  expect(
+    outcome.maintenanceDeferrals?.find((d) => d.path === resolvingLane)?.reason,
+  ).toContain("live resolver");
   expect(
     calls.some((c) => c.cwd === resolvingLane && c.args === "merge --abort"),
   ).toBe(false);
-  // Every OTHER epic still recovers normally — the exclusion is per-epic, not global.
+  // Every OTHER epic still recovers normally — the exclusion is per-epic, not
+  // global — and an unheld lane reports no deferral.
   expect(
     calls.some((c) => c.cwd === idleLane && c.args === "merge --abort"),
   ).toBe(true);
+  expect(outcome.maintenanceDeferrals?.map((d) => d.path)).toEqual([
+    resolvingLane,
+  ]);
 });
 
 test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once its resolver is NO LONGER live (auto-lift, no durable pause)", async () => {
@@ -12060,12 +13413,9 @@ test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once i
     mergeHeadAt: new Set([lane]),
     epicBases: [],
   });
-  const { failures } = await recoverWorktrees(
-    ["/repo"],
-    async () => false,
-    run,
-  );
-  expect(failures).toEqual([]);
+  const outcome = await recoverWorktrees(["/repo"], async () => false, run);
+  expect(outcome.failures).toEqual([]);
+  expect(outcome.maintenanceDeferrals ?? []).toEqual([]);
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
     true,
   );
@@ -12591,7 +13941,7 @@ test("fn-959.7 recoverWorktrees: already-merged base → idempotent skip (no mer
   expect(calls.some((c) => c.args === "push")).toBe(false);
 });
 
-test("fn-988 recoverWorktrees pass-3: a merged orphan rib (worktree + branch) is pruned, is-ancestor-gated, bases-only merge", async () => {
+test("recoverWorktrees pass 3: a released dead claim still permits sanctioned orphan teardown", async () => {
   const rib = "keeper/epic/fn-1-foo--fn-1-foo.2";
   const ribPath = "/repo.worktrees/keeper-epic-fn-1-foo--fn-1-foo.2";
   const { run, calls } = makeRecoveryGit({
@@ -12604,13 +13954,32 @@ test("fn-988 recoverWorktrees pass-3: a merged orphan rib (worktree + branch) is
     ancestors: new Set([rib]), // the rib is fully merged → safe to prune
     repoHead: "main",
   });
-  // The probe reports the rib's epic ABSENT (reaped) — eligible to sweep.
+  const releasedProbe = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([
+      [
+        "work::fn-1-foo.2",
+        makeLaneClaim({
+          id: "fn-1-foo.2",
+          dir: ribPath,
+          state: "released",
+          released_at: 2,
+        }),
+      ],
+    ]),
+    new Set(),
+  );
   const { failures } = await recoverWorktrees(
     ["/repo"],
     async () => false,
     run,
     undefined,
     async () => false,
+    () => false,
+    undefined,
+    () => false,
+    undefined,
+    releasedProbe,
   );
   expect(failures).toEqual([]);
   // The merge path is bases-only: a rib is NEVER merged to default.

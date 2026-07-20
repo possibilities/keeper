@@ -1,0 +1,19 @@
+{
+  "auditable_tasks": [],
+  "created_at": "2026-07-19T21:48:26.388000Z",
+  "epic_id": "fn-1377-tear-down-panes-on-session-end",
+  "excluded_tasks": [
+    {
+      "reason": "degraded-default",
+      "task_id": "fn-1377-tear-down-panes-on-session-end.1"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "44b8af26cae3e5690600c8f255f3ae25ac0d3950f7f26f07a379fd5e81d5fbb2",
+  "selector": {
+    "harness": "none",
+    "model": "none"
+  }
+}

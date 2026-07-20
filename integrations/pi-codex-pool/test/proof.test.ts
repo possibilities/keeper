@@ -10,6 +10,7 @@ import {
   type ExpectedProofBindings,
   LIVE_PROOF_CLAUSES,
   type LiveProofReport,
+  type ProofTranscriptEntry,
   scanProofArtifacts,
   writeLiveProofReport,
 } from "../src/proof.ts";
@@ -27,6 +28,77 @@ const EXPECTED: ExpectedProofBindings = {
   now_ms: 1_000_000,
   max_age_ms: 60_000,
 };
+const PASSING_TRANSCRIPT: ProofTranscriptEntry[] = [
+  {
+    sequence: 1,
+    clause: "independent_credentials",
+    evidence: ["primary-credential-rotated", "alternate-credential-rotated"],
+  },
+  {
+    sequence: 2,
+    clause: "sanitized_observer",
+    evidence: ["sanitized-observer-rendered"],
+  },
+  {
+    sequence: 3,
+    clause: "deterministic_routing",
+    evidence: ["routes-recorded", "attempt-aliases-recorded"],
+  },
+  {
+    sequence: 4,
+    clause: "session_stickiness",
+    evidence: ["completed-session-reused-alias"],
+  },
+  {
+    sequence: 5,
+    clause: "pressure_cooldown",
+    evidence: [
+      "concurrent-routes-observed",
+      "classified-retry-observed",
+      "cooldown-observed",
+    ],
+  },
+  {
+    sequence: 6,
+    clause: "single_retry",
+    evidence: ["two-attempt-route-observed", "all-routes-at-most-two-attempts"],
+  },
+  {
+    sequence: 7,
+    clause: "substantive_cutoff",
+    evidence: ["substantive-output-fault-not-retried"],
+  },
+  {
+    sequence: 8,
+    clause: "abort_preserved",
+    evidence: ["deliberate-child-abort-not-retried"],
+  },
+  {
+    sequence: 9,
+    clause: "request_contract",
+    evidence: ["all-attempts-preserved-request-contract"],
+  },
+  {
+    sequence: 10,
+    clause: "native_fallback",
+    evidence: ["native-fallback-completed"],
+  },
+  {
+    sequence: 11,
+    clause: "compat_root_delegate",
+    evidence: ["compat-root-delegate-used"],
+  },
+  {
+    sequence: 12,
+    clause: "root_child_sessions",
+    evidence: ["root-route-observed", "child-route-observed"],
+  },
+  {
+    sequence: 13,
+    clause: "transport_isolation",
+    evidence: ["root-child-distinct-aliases"],
+  },
+];
 
 function passingReport(): LiveProofReport {
   return collectLiveProof(
@@ -41,6 +113,7 @@ function passingReport(): LiveProofReport {
         { alias: "keeper-codex-a", role: "primary" },
         { alias: "keeper-codex-b", role: "alternate" },
       ],
+      transcript: clone(PASSING_TRANSCRIPT),
       clauses: Object.fromEntries(
         LIVE_PROOF_CLAUSES.map((clause) => [clause, true]),
       ) as LiveProofReport["clauses"],
@@ -101,6 +174,11 @@ describe("live proof bindings and classifier", () => {
   test("makes every missing or false live clause non-passing", () => {
     for (const clause of LIVE_PROOF_CLAUSES) {
       const report = clone(passingReport());
+      const entry = report.transcript?.find(
+        (candidate) => candidate.clause === clause,
+      );
+      if (!entry) throw new Error("missing-transcript-fixture");
+      entry.evidence.pop();
       report.clauses[clause] = false;
       report.verdict = "incomplete";
       expect(classifyLiveProof(report, EXPECTED).verdict).toBe("incomplete");
@@ -115,6 +193,33 @@ describe("live proof bindings and classifier", () => {
       ),
     };
     expect(classifyLiveProof(missing, EXPECTED).verdict).toBe("failed");
+  });
+
+  test("rejects self-reported clauses without matching transcript evidence", () => {
+    const report = passingReport();
+    const unrecorded: Partial<LiveProofReport> = clone(report);
+    delete unrecorded.transcript;
+    expect(classifyLiveProof(unrecorded, EXPECTED)).toEqual({
+      verdict: "failed",
+      reasons: ["schema-invalid"],
+    });
+
+    const mismatched = clone(report);
+    const retry = mismatched.transcript?.find(
+      (entry) => entry.clause === "single_retry",
+    );
+    if (!retry) throw new Error("missing-transcript-fixture");
+    retry.evidence = [];
+    mismatched.verdict = "failed";
+    expect(classifyLiveProof(mismatched, EXPECTED)).toEqual(
+      expect.objectContaining({
+        verdict: "failed",
+        reasons: expect.arrayContaining([
+          "transcript-mismatch",
+          "clause-incomplete",
+        ]),
+      }),
+    );
   });
 
   test("rejects stale bindings, interrupted runs, incomplete routes, and required restoration", () => {
@@ -239,12 +344,16 @@ describe("proof artifact sanitation and persistence", () => {
         },
         { surface: "session", content: "owner@example.test" },
         { surface: "tool", content: "token-derived-private-identity" },
+        {
+          surface: "transcript",
+          content: '{"evidence":"Bearer transcript-secret"}',
+        },
       ],
       ["token-derived-private-identity"],
     );
     expect(result).toEqual({
       status: "findings",
-      scanned_count: 7,
+      scanned_count: 8,
       scanned_bytes: result.scanned_bytes,
       finding_classes: [
         "account-header",
@@ -294,6 +403,10 @@ describe("proof artifact sanitation and persistence", () => {
       { surface: "error", content: "pool-rate-failure" },
       { surface: "session", content: "request-aborted" },
       { surface: "tool", content: "capacity unavailable" },
+      {
+        surface: "transcript",
+        content: '[{"clause":"native_fallback"}]',
+      },
     ]);
     expect(result.status).toBe("clean");
     expect(result.finding_classes).toEqual([]);
@@ -321,6 +434,7 @@ describe("proof artifact sanitation and persistence", () => {
         "routes",
         "schema_version",
         "started_at_ms",
+        "transcript",
         "verdict",
       ].sort(),
     );

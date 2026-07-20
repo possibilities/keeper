@@ -1,31 +1,29 @@
 {
   "audit_policy": {
-    "flagged_task_ids": [
-      "fn-1356-activate-pi-codex-account-pool.1"
-    ],
+    "flagged_task_ids": [],
     "reason": null,
     "status": "applied"
   },
   "cells": [
     {
-      "confidence": 0.98,
+      "confidence": 0.86,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Live OAuth fault injection, secret-sanitization invariants, and atomic activation recovery make this security-critical, long-horizon operator proof an explicit Opus/max case.",
-      "task_id": "fn-1356-activate-pi-codex-account-pool.1",
-      "tier": "max"
+      "rationale": "Deliberately weakening a safety/activation gate that must be impossible to trip implicitly is a subtle security-and-correctness invariant across the classifier, validator, and status surfaces \u2014 a hard opus gate at the contract-shaped xhigh band.",
+      "task_id": "fn-1356-activate-pi-codex-account-pool.3",
+      "tier": "xhigh"
     }
   ],
-  "config_hash": "3537a88634e79a3ab85b1440da7d1b1be09c92bd75b69d3a0a1354c88e0b97ef",
-  "created_at": "2026-07-18T21:41:16.162000Z",
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T03:25:10.646000Z",
   "epic_id": "fn-1356-activate-pi-codex-account-pool",
-  "input_hash": "4abe1249b3ddf8f86fe520ca1b9ea5381ca80b704d8ee97259486973dd47ca60",
+  "input_hash": "b1424997bf24ac27f5197110e35625f852f219dbc141e0a7b0608de7b2bbd4a9",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 1253970505,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1356-activate-pi-codex-account-pool.1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Live OAuth fault injection, secret-sanitization invariants, and atomic activation recovery make this security-critical, long-horizon operator proof an explicit Opus/max case.\",\"confidence\":0.98}]}\n"
+  "shuffle_seed": 2973911447,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1356-activate-pi-codex-account-pool.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Deliberately weakening a safety/activation gate that must be impossible to trip implicitly is a subtle security-and-correctness invariant across the classifier, validator, and status surfaces \u2014 a hard opus gate at the contract-shaped xhigh band.\",\"confidence\":0.86}]}\n"
 }

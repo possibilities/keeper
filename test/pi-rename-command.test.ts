@@ -10,10 +10,6 @@ import {
   type RenameInputFileSystem,
   type RenameInputStat,
 } from "../plugins/keeper/pi-extension/rename-command";
-import {
-  buildSessionRenameInputFromSections,
-  findSessionRenamePathReferences,
-} from "../src/session-rename-input";
 
 function parityFileSystem(): RenameInputFileSystem {
   const files = new Map([
@@ -163,7 +159,7 @@ describe("/rename conversation input", () => {
     expect(Buffer.byteLength(input ?? "", "utf8")).toBe(16 * 1024);
   });
 
-  test("matches the root path grammar and expanded allocation contract", () => {
+  test("expands safe human path references within the final allocation cap", () => {
     const prose = [
       'Use @"docs/name\u00a0file.md", not me@example.com.',
       "Ignore `@inline.ts` and:",
@@ -171,18 +167,8 @@ describe("/rename conversation input", () => {
       "@fenced.ts",
       "```",
     ].join("\n");
-    expect(findRenamePathReferences(prose)).toEqual(
-      findSessionRenamePathReferences(prose),
-    );
+    expect(findRenamePathReferences(prose)).toEqual(["docs/name\u00a0file.md"]);
 
-    const root = buildSessionRenameInputFromSections(
-      [
-        { role: "summary", text: "Earlier design work" },
-        { role: "user", text: prose },
-        { role: "assistant", text: "Assistant says @assistant.ts" },
-      ],
-      { projectDir: "/project", fileSystem: parityFileSystem() },
-    );
     const pi = buildRenameConversationInput(
       [
         { role: "compactionSummary", summary: "Earlier design work" },
@@ -198,7 +184,6 @@ describe("/rename conversation input", () => {
       `User: ${prose}\n\n[Referenced file: "docs/name file.md"]\ndesign context with @recursive.ts\n[End referenced file]`,
       "Assistant: Assistant says @assistant.ts",
     ].join("\n\n");
-    expect(root).toBe(expected);
     expect(pi).toBe(expected);
   });
 });

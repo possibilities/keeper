@@ -4471,6 +4471,7 @@ interface DispatchClaimMutationPayload extends DispatchClaimTarget {
   expectedAttemptId: number | null;
   sessionId: string | null;
   ownerlessAcquiredOnly: boolean;
+  terminalSessionOnly: boolean;
 }
 
 interface DispatchClaimSupersedePayload extends DispatchClaimTarget {
@@ -4570,11 +4571,13 @@ function extractDispatchClaimMutationPayload(
         ? parsed.session_id
         : null;
     const ownerlessAcquiredOnly = parsed.ownerless_acquired_only === true;
+    const terminalSessionOnly = parsed.terminal_session_only === true;
     return {
       ...target,
       expectedAttemptId,
       sessionId,
       ownerlessAcquiredOnly,
+      terminalSessionOnly,
     };
   } catch {
     return null;
@@ -4868,7 +4871,13 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
     return;
   }
   if (payload.ownerlessAcquiredOnly) {
-    if (payload.expectedAttemptId == null || payload.sessionId != null) return;
+    if (
+      payload.terminalSessionOnly ||
+      payload.expectedAttemptId == null ||
+      payload.sessionId != null
+    ) {
+      return;
+    }
     const exactOwnerlessAcquire = db
       .query(
         `SELECT 1 FROM dispatch_claims c
@@ -4886,6 +4895,26 @@ function foldDispatchClaimReleased(db: Database, event: Event): void {
       )
       .get(payload.verb, payload.id, payload.expectedAttemptId);
     if (exactOwnerlessAcquire == null) return;
+  }
+  if (payload.terminalSessionOnly) {
+    if (payload.expectedAttemptId == null || payload.sessionId == null) return;
+    const exactTerminalOwner = db
+      .query(
+        `SELECT 1 FROM dispatch_claims c
+           JOIN jobs j ON j.job_id = c.session_id
+          WHERE c.verb = ? AND c.id = ? AND c.attempt_id = ?
+            AND c.session_id = ?
+            AND c.state IN ('bound', 'resume_requested')
+            AND c.legacy_unfenced = 0
+            AND j.state IN ('ended', 'killed')`,
+      )
+      .get(
+        payload.verb,
+        payload.id,
+        payload.expectedAttemptId,
+        payload.sessionId,
+      );
+    if (exactTerminalOwner == null) return;
   }
   const sessionClause = payload.sessionId == null ? "" : " AND session_id = ?";
   const bindings: Array<string | number> = [
@@ -6126,23 +6155,31 @@ function extractBlockEscalationAttemptedPayload(
 }
 
 /**
- * Fold one synthetic `BlockEscalationAttempted` event with STAGED outcomes. For a
- * TERMINAL outcome (the escalation-dispatch `dispatched`, or any outcome that is
- * not in the non-terminal set) it advances the `block_escalations` latch
- * `requested → attempted` and records the `outcome`. For a NON-TERMINAL outcome
- * (`dispatch_failed` — the `unblock::<task>` launch failed — or the bus-send
- * `send_failed`) it instead RESETS the latch to `pending` so
- * `selectPendingBlockEscalations` re-sweeps it on the next heartbeat tick — a
- * transient dispatch failure retries instead of dropping the escalation forever
- * (the latch otherwise only re-arms on an unblock→re-block `TaskSnapshot`
- * transition). The `outcome` is still recorded on the row so the failure is
- * observable. The branch reads ONLY the payload `outcome` + the persisted row
- * (`event.id`, no wall-clock/fs/liveness), so re-fold stays byte-deterministic.
- * Idempotent on a missing latch row (the UPDATE matches zero rows).
+ * Fold one synthetic `BlockEscalationAttempted` event with staged outcomes. The
+ * terminal legacy-fallback outcome advances requested → attempted. Ordinary
+ * non-terminal launch failures reset to pending. Owning-work outcomes also reset
+ * to pending while incrementing the durable attachment count, whether the launch
+ * succeeded or failed. Every branch reads only the payload, event id, and persisted
+ * row, so replay is deterministic; a missing latch is a safe no-op.
  */
 function foldBlockEscalationAttempted(db: Database, event: Event): void {
   const payload = extractBlockEscalationAttemptedPayload(event);
   if (payload == null) {
+    return;
+  }
+  const ownerRedispatch =
+    payload.outcome === "owner_redispatched" ||
+    payload.outcome === "owner_redispatch_failed";
+  if (ownerRedispatch) {
+    db.run(
+      `UPDATE block_escalations
+          SET status = 'pending',
+              outcome = ?,
+              owner_redispatch_attempts = owner_redispatch_attempts + 1,
+              last_event_id = ?
+        WHERE epic_id = ? AND task_id = ?`,
+      [payload.outcome, event.id, payload.epic_id, payload.task_id],
+    );
     return;
   }
   const nonTerminal =
@@ -10342,6 +10379,7 @@ function projectJobsRow(db: Database, event: Event): void {
                   expectedAttemptId: dispatchAttemptId,
                   sessionId: jobId,
                   ownerlessAcquiredOnly: false,
+                  terminalSessionOnly: false,
                 });
           if (claimAuthorized) {
             const dischargeRes =
