@@ -7,11 +7,17 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { KEEPER_AGENT_HELP, USAGE } from "../src/agent/dispatch";
+import { main } from "../src/agent/main";
 import {
   runPassthrough,
   runWithJobControl,
   type SpawnedChild,
 } from "../src/agent/run";
+import { expectExit, makeHarness } from "./helpers/agent-main-harness";
 
 class ExitSignal extends Error {
   constructor(public code: number) {
@@ -141,5 +147,82 @@ describe("runPassthrough", () => {
     } catch (e) {
       expect((e as ExitSignal).code).toBe(3);
     }
+  });
+});
+
+describe("agent run proof-window forwarding", () => {
+  test("documents one run-wrapper proof-window form in install and CLI help", () => {
+    const canonical = "keeper agent run pi --x-codex-pool-proof-window=arm";
+    expect(
+      readFileSync(join(import.meta.dir, "..", "docs", "install.md"), "utf8"),
+    ).toContain(canonical);
+    expect(USAGE.replace(/\s+/g, " ")).toContain(canonical);
+    expect(KEEPER_AGENT_HELP.replace(/\s+/g, " ")).toContain(canonical);
+  });
+
+  test("forwards the documented proof-window flag into the managed Pi argv", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "agent-run-proof-state-"));
+    const home = mkdtempSync(join(tmpdir(), "agent-run-proof-home-"));
+    const cwd = "/fake-home/code/proof";
+    const sessionId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const sessionsDir = join(home, ".pi", "agent", "sessions", "proof");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, `${sessionId}.jsonl`),
+      `${[
+        JSON.stringify({ type: "session", id: sessionId, cwd }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "proof complete" }],
+          },
+        }),
+        JSON.stringify({ type: "turn.completed" }),
+      ].join("\n")}\n`,
+    );
+    const h = makeHarness({
+      argv: [
+        "run",
+        "pi",
+        "--x-codex-pool-proof-window=arm",
+        "--model",
+        "openai-codex/gpt-5.4-mini",
+        "--effort",
+        "high",
+        "Call the codex_pool_proof tool exactly once and return its JSON result.",
+      ],
+      rawArgv: true,
+      launcherStateDir: stateDir,
+      transcriptHomeDir: home,
+      cwd,
+      randomUuid: () => sessionId,
+      tmuxCommand: (cmd) =>
+        cmd.includes("has-session")
+          ? { exitCode: 1, stdout: "", stderr: "no session" }
+          : {
+              exitCode: 0,
+              stdout: "keeper agent\u0001@1\u0001%1\n",
+              stderr: "",
+            },
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const launch = readFileSync(
+      join(stateDir, "tmux-runs", `tmux-${sessionId}`, "launch.sh"),
+      "utf8",
+    );
+    expect(launch).toContain("'--x-codex-pool-proof-window=arm'");
+    expect(h.err.join("")).not.toContain("unknown flag");
+  });
+
+  test("does not pass arbitrary --x flags through agent run", async () => {
+    const h = makeHarness({
+      argv: ["run", "pi", "--x-not-a-launcher-flag", "prove routing"],
+      rawArgv: true,
+    });
+
+    expect(await expectExit(main(h.deps))).toBe(2);
+    expect(h.err.join("")).toContain("unknown flag: --x-not-a-launcher-flag");
   });
 });

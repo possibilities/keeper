@@ -9,6 +9,7 @@ import {
 } from "./account-routing-config";
 import {
   type CodexExactArgvRunner,
+  type CodexObservationRefreshFailureState,
   makeCodexBoundedRunner,
   refreshCodexObservationIfStale,
   type TryAcquireCodexRefreshLock,
@@ -42,6 +43,17 @@ export const REAL_CODEX_OBSERVER_CLOCK: CodexAccountObserverClock = {
     }),
 };
 
+const MAX_REFRESH_FAILURE_LOG_CHARS = 160;
+
+function logRefreshFailure(state: CodexObservationRefreshFailureState): void {
+  console.error(
+    (
+      `[codex-account-observer] refresh failed class=${state.last_failure_class ?? "unknown"} ` +
+      `consecutive=${state.consecutive_failures}`
+    ).slice(0, MAX_REFRESH_FAILURE_LOG_CHARS),
+  );
+}
+
 export interface CodexAccountObserverDeps {
   stateDir: string;
   runner: CodexExactArgvRunner;
@@ -67,6 +79,7 @@ export class CodexAccountObserver {
         tryAcquireLock: this.deps.tryAcquireLock,
         contentionWaitMs: this.deps.contentionWaitMs,
         contentionTimeoutMs: this.deps.contentionTimeoutMs,
+        onRefreshFailure: logRefreshFailure,
         sleep: (ms) => this.deps.clock.sleep(ms, this.deps.shutdownSignal),
       });
     } catch {

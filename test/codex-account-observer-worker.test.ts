@@ -11,7 +11,10 @@ import {
   readCodexObservationSidecar,
   writeCodexObservationSidecar,
 } from "../src/codex-account-observation";
-import type { CodexExactArgvRunner } from "../src/codex-account-observation-refresh";
+import {
+  type CodexExactArgvRunner,
+  readCodexObservationRefreshFailureState,
+} from "../src/codex-account-observation-refresh";
 import {
   CodexAccountObserver,
   type CodexAccountObserverClock,
@@ -110,7 +113,7 @@ describe("CodexAccountObserver", () => {
     });
   });
 
-  test("a bad cycle is fail-soft and leaves the last good bytes unchanged", async () => {
+  test("a bad cycle is fail-soft, records one bounded failure log, and preserves the last good bytes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "codex-worker-"));
     roots.push(dir);
     const path = codexObservationSidecarPath(dir);
@@ -124,8 +127,27 @@ describe("CodexAccountObserver", () => {
       observerArgv: ARGV,
       tryAcquireLock: () => fakeLock(),
     });
-    await observer.runCycleNoThrow();
-    expect(readFileSync(path, "utf8")).toBe(before);
+    const logs: string[] = [];
+    const originalError = console.error;
+    console.error = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    try {
+      await observer.runCycleNoThrow();
+      expect(readFileSync(path, "utf8")).toBe(before);
+      expect(readCodexObservationRefreshFailureState(dir)).toEqual({
+        schema_version: 1,
+        consecutive_failures: 1,
+        last_failure_class: "parse",
+        last_failure_at_ms: NOW,
+      });
+      expect(logs).toEqual([
+        "[codex-account-observer] refresh failed class=parse consecutive=1",
+      ]);
+      expect(logs[0]?.length).toBeLessThanOrEqual(160);
+    } finally {
+      console.error = originalError;
+    }
   });
 
   test("refresh-lock contention is bounded and does not invoke the command", async () => {
