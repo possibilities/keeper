@@ -52,5 +52,5 @@ a resolution test through the config seam proves PATH/override behavior.
 - [ ] Observer-bin resolution is covered by a deterministic test through the config seam (override set, override empty, default name)
 
 ## Done summary
-
+Provisioned keeper-pi-codex-observe onto PATH via bun link in install.sh (mirroring the keeper CLI's own link step, with a KEEPER_PI_CODEX_OBSERVER_BIN override escape hatch), and covered observer-bin resolution plus envelope-to-state-dir landing with in-process tests.
 ## Evidence
