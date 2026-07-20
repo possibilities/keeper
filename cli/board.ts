@@ -410,6 +410,7 @@ export interface BoardHeaderFormatInput {
   readonly viewModel: BoardHeaderViewModel;
   readonly width: number;
   readonly now: number;
+  readonly timeZone?: string;
 }
 
 function stripHeaderAnsi(value: string): string {
@@ -480,7 +481,58 @@ export function wrapBoardHeaderLine(value: string, width: number): string[] {
 
 type HeaderFocusRoutingView = FableFocusRoutingView | NonFableFocusRoutingView;
 
-function focusLifetime(focus: HeaderFocusRoutingView): string {
+function focusDeadlineDistance(deadlineMs: number, now: number): string {
+  const distanceMs = Math.abs(deadlineMs - now);
+  if (distanceMs < 60_000) {
+    return "less than 1 minute";
+  }
+
+  const totalMinutes = Math.max(1, Math.round(distanceMs / 60_000));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) {
+    parts.push(`${days} ${days === 1 ? "day" : "days"}`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+  }
+  if (days === 0 && minutes > 0) {
+    parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
+  }
+  return parts.slice(0, 2).join(" ");
+}
+
+function focusDeadline(value: string, now: number, timeZone: string): string {
+  const deadlineMs = Date.parse(value);
+  if (!Number.isFinite(deadlineMs) || !Number.isFinite(now)) {
+    return value;
+  }
+  const local = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(deadlineMs);
+  const distance = focusDeadlineDistance(deadlineMs, now);
+  const relative =
+    deadlineMs > now
+      ? `${distance} remaining`
+      : deadlineMs < now
+        ? `expired ${distance} ago`
+        : "expires now";
+  return `${local} (${relative})`;
+}
+
+function focusLifetime(
+  focus: HeaderFocusRoutingView,
+  now: number,
+  timeZone: string,
+): string {
   const lifetime = focus.lifetime;
   if (lifetime === null) {
     return "unavailable";
@@ -489,8 +541,8 @@ function focusLifetime(focus: HeaderFocusRoutingView): string {
     return "permanent";
   }
   return lifetime.kind === "absolute"
-    ? `until ${lifetime.deadline_at}`
-    : `until the Fable cycle ending ${lifetime.reset_at}`;
+    ? `until ${focusDeadline(lifetime.deadline_at, now, timeZone)}`
+    : `until the Fable cycle ending ${focusDeadline(lifetime.reset_at, now, timeZone)}`;
 }
 
 function focusEligibility(focus: HeaderFocusRoutingView): string {
@@ -528,6 +580,7 @@ function focusState(focus: HeaderFocusRoutingView, now: number): string {
 function fableFocusHeaderLines(
   focus: FableFocusRoutingView,
   now: number,
+  timeZone: string,
 ): string[] {
   if (!focus.configured && focus.state === "off") {
     return ["Fable focus: off"];
@@ -536,7 +589,7 @@ function fableFocusHeaderLines(
   if (focus.configured) {
     lines.push(
       `  target account route: ${focus.target_route ?? "unavailable"}`,
-      `  lifetime: ${focusLifetime(focus)}`,
+      `  lifetime: ${focusLifetime(focus, now, timeZone)}`,
       `  target currently eligible: ${focusEligibility(focus)}`,
     );
   } else {
@@ -552,6 +605,7 @@ function fableFocusHeaderLines(
 function nonFableFocusHeaderLines(
   focus: NonFableFocusRoutingView,
   now: number,
+  timeZone: string,
 ): string[] {
   if (
     !focus.configured &&
@@ -563,7 +617,7 @@ function nonFableFocusHeaderLines(
   return [
     "Non-Fable focus",
     `  target account route: ${focus.target_route ?? "unavailable"}`,
-    `  lifetime: ${focusLifetime(focus)}`,
+    `  lifetime: ${focusLifetime(focus, now, timeZone)}`,
     `  target currently eligible: ${focusEligibility(focus)}`,
     `  effective routing state: ${focusState(focus, now)}`,
     `  diagnostic: ${focus.diagnostic}`,
@@ -593,9 +647,10 @@ export function formatBoardHeader(input: BoardHeaderFormatInput): string[] {
     `  worktree mode: ${autopilot.worktreeMode ? "on" : "off"}`,
     `  worker provider: ${autopilot.workerProvider ?? "assigned task cell"}`,
   ];
+  const timeZone = input.timeZone ?? "UTC";
   const logicalLines = [
-    ...fableFocusHeaderLines(fableFocus, input.now),
-    ...nonFableFocusHeaderLines(nonFableFocus, input.now),
+    ...fableFocusHeaderLines(fableFocus, input.now, timeZone),
+    ...nonFableFocusHeaderLines(nonFableFocus, input.now, timeZone),
     ...boardSummaryLines(summary),
     ...autopilotLines,
   ];
@@ -888,6 +943,7 @@ export function boardFrameStateJson(
     readonly viewModel: BoardHeaderViewModel;
     readonly width: number;
     readonly renderedAtMs: number;
+    readonly timeZone: string;
   } | null = null,
 ): {
   epics: readonly unknown[];
@@ -896,6 +952,7 @@ export function boardFrameStateJson(
     readonly viewModel: BoardHeaderViewModel;
     readonly width: number;
     readonly renderedAtMs: number;
+    readonly timeZone: string;
   } | null;
 } {
   return { epics, subagents: serializeSubagentIndex(subagentIndex), header };
@@ -1004,6 +1061,8 @@ export async function runBoardFrames(config: {
 
 export async function runBoard(config: RunBoardConfig): Promise<void> {
   const { mode, sockPath, timeoutMs } = config;
+  const localTimeZone =
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   // Readiness diagnostics JSONL log, a sibling of the sock in the state dir.
   // Two processes (board + autopilot) can append concurrently; POSIX O_APPEND
   // under PIPE_BUF gives the atomicity guarantee, no flock.
@@ -1456,14 +1515,25 @@ export async function runBoard(config: RunBoardConfig): Promise<void> {
       return {
         bodyLines,
         semanticHeader: {
-          lines: formatBoardHeader({ viewModel, width, now: renderedAtMs }),
+          lines: formatBoardHeader({
+            viewModel,
+            width,
+            now: renderedAtMs,
+            timeZone: localTimeZone,
+          }),
           renderAtWidth: (nextWidth) =>
-            formatBoardHeader({ viewModel, width: nextWidth, now: Date.now() }),
+            formatBoardHeader({
+              viewModel,
+              width: nextWidth,
+              now: Date.now(),
+              timeZone: localTimeZone,
+            }),
         },
         stateJson: boardFrameStateJson(snap.epics, subagentIndex, {
           viewModel,
           width,
           renderedAtMs,
+          timeZone: localTimeZone,
         }),
       };
     },

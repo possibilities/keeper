@@ -417,14 +417,27 @@ test("board semantic header preserves Fable fallback and unavailable evidence", 
       },
     },
   } satisfies BoardHeaderViewModel;
-  expect(
-    formatBoardHeader({
-      viewModel: absolute,
-      width: 120,
-      now: 1_700_000_000_001,
-    }),
-  ).toContain(
+  const expiredRows = formatBoardHeader({
+    viewModel: absolute,
+    width: 120,
+    now: 1_700_000_000_001,
+    timeZone: "America/New_York",
+  });
+  expect(expiredRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (expired less than 1 minute ago)",
+  );
+  expect(expiredRows).toContain(
     "  effective routing state: fallback to normal account balancing",
+  );
+
+  const activeRows = formatBoardHeader({
+    viewModel: absolute,
+    width: 120,
+    now: 1_699_991_000_000,
+    timeZone: "America/New_York",
+  });
+  expect(activeRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (2 hours 30 minutes remaining)",
   );
 
   const unavailable = {
@@ -534,8 +547,11 @@ test("board semantic header renders Non-Fable off, active, expired, and unavaila
     viewModel: expired,
     width: 120,
     now: 1_700_000_000_001,
+    timeZone: "America/New_York",
   });
-  expect(expiredRows).toContain("  lifetime: until 2023-11-14T22:13:20.000Z");
+  expect(expiredRows).toContain(
+    "  lifetime: until Nov 14, 2023 at 5:13 PM EST (expired less than 1 minute ago)",
+  );
   expect(expiredRows).toContain(
     "  effective routing state: fallback to normal account balancing",
   );
@@ -575,11 +591,13 @@ test("board frame state records the exact semantic header inputs", () => {
     viewModel: HEADER_MODEL,
     width: 100,
     renderedAtMs: 1_700_000_000_000,
+    timeZone: "America/New_York",
   });
   expect(state.header).toEqual({
     viewModel: HEADER_MODEL,
     width: 100,
     renderedAtMs: 1_700_000_000_000,
+    timeZone: "America/New_York",
   });
 });
 

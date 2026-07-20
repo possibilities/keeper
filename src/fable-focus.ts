@@ -13,10 +13,7 @@ import {
   readValidatedAccountFocusLeaf,
   serializeAccountFocusLeaf,
 } from "./account-focus";
-import {
-  isObservationFresh,
-  type Observation,
-} from "./account-observation";
+import { isObservationFresh, type Observation } from "./account-observation";
 import type {
   FableFocusInput,
   FableFocusPolicy,
