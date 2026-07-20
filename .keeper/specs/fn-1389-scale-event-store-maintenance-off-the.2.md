@@ -20,5 +20,5 @@ stays current throughout.
   with watermark position and remaining-backlog estimate.
 
 ## Done summary
-
+Raised the scheduled retention shed ceiling (DEFAULT_RETENTION_MAX_BATCHES 20->200) so cheap batches consume the full 250ms maintenance budget instead of stopping early, added step-latched shed progress logging with scan watermark and remaining-backlog estimates, and added deterministic tests covering representative backlog drain to the cold boundary and interleaved ingest freshness under 5s.
 ## Evidence
