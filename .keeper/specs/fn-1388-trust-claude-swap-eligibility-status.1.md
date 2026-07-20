@@ -47,5 +47,5 @@ Cover a fresh `ok` response with arbitrarily old and future-skewed measurement p
 - [ ] The named account observation, refresh, router, and routed-launch test files pass.
 
 ## Done summary
-
+Made the normalized cswap parser the single Account admission boundary: a fresh usageStatus:ok row with valid required provenance/windows stays routeable regardless of Measurement age, while age is diagnostic-only. Removed the elapsed-reset zeroing of raw utilization from account-router.ts, bumped the transient observation schema to v7, and updated fable-focus.ts's shared eligibility use. Named account observation/refresh/router/agent-routing tests pass.
 ## Evidence
