@@ -3500,6 +3500,23 @@ export async function main(deps: MainDeps): Promise<never> {
     return deps.exit(0);
   }
 
+  // Managed Pi account aliases share one canonical state root. Ambient storage
+  // overrides can outlive the shell or pane that introduced them and silently
+  // split native session discovery; explicit native storage flags still pass
+  // through when a deliberately isolated launch is needed.
+  if (agent === "pi") {
+    for (const name of [
+      "PI_CODING_AGENT_DIR",
+      "PI_CODING_AGENT_SESSION_DIR",
+    ] as const) {
+      if (deps.env[name] === undefined) continue;
+      delete deps.env[name];
+      actionLog.push(
+        `Cleared inherited ${name}; managed Pi uses canonical state`,
+      );
+    }
+  }
+
   // Bind every Pi descendant to this launcher's already-resolved compiler
   // prefix. Stamp before the tmux split so an outer delegator forwards the same
   // executable + checkout to the inner launcher, which then preflights once.

@@ -605,6 +605,85 @@ test("fn-816 fork happy path: first pid-bearing UserPromptSubmit with no Session
   expect(plan.plan_ref).toBeNull();
 });
 
+test("pid-bearing TranscriptTitle survives an out-of-order Pi birth and re-folds byte-identical", () => {
+  // Production ordering can place Pi's session-start title replay before both
+  // the first prompt and the launcher's synthetic SessionStart. The title
+  // event carries a real process identity, so it seeds a stopped row; the
+  // prompt activates it and the delayed birth hydrates launch identity without
+  // discarding the title.
+  const titleId = insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "pi-title-race",
+    pid: 9250,
+    cwd: "/tmp/pi-title-race",
+    ts: 7500,
+    data: JSON.stringify({ session_title: "resumed-pi-title" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "pi-title-race",
+    pid: 9250,
+    cwd: "/tmp/pi-title-race",
+    ts: 7600,
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "work",
+    backend_exec_pane_id: "%42",
+  });
+  const birthId = insertEvent({
+    hook_event: "SessionStart",
+    session_id: "pi-title-race",
+    pid: 9250,
+    cwd: "/tmp/pi-title-race",
+    ts: 7400,
+    start_time: "darwin:pi-title-race",
+    harness: "pi",
+    resume_target: "native-pi-session",
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "work",
+    backend_exec_pane_id: "%42",
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const job = getJob("pi-title-race");
+  expect(job).not.toBeNull();
+  expect(job?.created_at).toBe(7500);
+  expect(job?.state).toBe("working");
+  expect(job?.title).toBe("resumed-pi-title");
+  expect(job?.title_source).toBe("transcript");
+  expect(job?.start_time).toBe("darwin:pi-title-race");
+  expect(job?.last_event_id).toBe(birthId);
+  expect(titleId).toBeLessThan(birthId);
+
+  const identity = db
+    .query(
+      "SELECT harness, resume_target, backend_exec_type, backend_exec_birth_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("pi-title-race") as {
+    harness: string | null;
+    resume_target: string | null;
+    backend_exec_type: string | null;
+    backend_exec_birth_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  };
+  expect(identity).toEqual({
+    harness: "pi",
+    resume_target: "native-pi-session",
+    backend_exec_type: "tmux",
+    backend_exec_birth_session_id: "work",
+    backend_exec_pane_id: "%42",
+  });
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+});
+
 test("fn-816 re-fold determinism: a fork-shaped (UPS-only) stream re-folds byte-identical", () => {
   // Keystone assertion: the seed reads ONLY event fields, so a from-scratch
   // re-fold reproduces the minted row byte-for-byte. A leak of wall-clock /
@@ -652,7 +731,7 @@ test("fn-816 a NULL-pid UserPromptSubmit mints NO row (guard skip)", () => {
   expect(getJob("fork-nopid")).toBeNull();
 });
 
-test("fn-816 a killed-task-notification UserPromptSubmit mints NO row, and a TranscriptTitle-only stream mints NO row", () => {
+test("fn-816 a killed-task-notification UserPromptSubmit mints NO row, and a NULL-pid TranscriptTitle-only stream mints NO row", () => {
   // The killed-task-notification early-break fires BEFORE the seed, so no row
   // is minted even with a real pid.
   insertEvent({

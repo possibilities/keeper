@@ -10784,6 +10784,26 @@ function projectJobsRow(db: Database, event: Event): void {
       syncIfPlanRef(db, jobId, event.id, ts);
       break;
 
+    case "TranscriptTitle": {
+      // Pi's session-start title replay and the launcher's birth record travel
+      // through independent ingest paths. A pid-bearing title can therefore
+      // fold before the synthetic SessionStart that normally seeds the job.
+      // Seed the same minimal standalone row used by first-prompt recovery so
+      // the post-switch title rule has a row to update; the later SessionStart
+      // hydrates harness, resume, and launch identity through its ON CONFLICT
+      // arm. Daemon-synthesized Claude titles carry a NULL pid and remain
+      // unable to mint an unwatchable ghost row.
+      if (event.pid != null) {
+        db.run(
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id) DO NOTHING`,
+          [jobId, ts, event.cwd, event.pid, event.id, ts],
+        );
+      }
+      break;
+    }
+
     case "UserPromptSubmit": {
       // Modest carve-out: Claude Code's shutdown sequence reports each killed
       // backgrounded task back to the model by injecting a
