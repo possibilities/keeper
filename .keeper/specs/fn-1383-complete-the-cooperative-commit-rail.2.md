@@ -43,5 +43,5 @@ carries worktree. Surface: multi_ambiguous envelope carries request_release with
 - [ ] Suites green via named gates
 
 ## Done summary
-
+Validated session-release worktree binding (claim-existence check + --worktree mismatch refusal) and attached a worktree-bound request_release pointer to commit-work's multi_ambiguous refusal.
 ## Evidence
