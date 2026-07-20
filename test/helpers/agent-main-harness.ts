@@ -134,6 +134,9 @@ export interface Harness {
   requestedAccountOrdinals: () => number[];
 }
 
+type HarnessRoutingInspection = Omit<RoutingInspection, "non_fable_focus"> &
+  Partial<Pick<RoutingInspection, "non_fable_focus">>;
+
 export interface HarnessOptions {
   argv: string[];
   /**
@@ -228,9 +231,10 @@ export interface HarnessOptions {
   ) => RequestedRouteResolution;
   /** Read-only routing snapshot the `accounts check` diagnostic returns. Default:
    *  a disabled `no-observation` snapshot. */
-  inspectRouting?: () => RoutingInspection;
+  inspectRouting?: (fableIntent?: boolean | null) => HarnessRoutingInspection;
   resolveFableIntent?: (target: string) => Promise<boolean | null>;
   setFableFocus?: MainDeps["setFableFocusFn"];
+  setNonFableFocus?: MainDeps["setNonFableFocusFn"];
   probePartnerLifecycle?: (jobId: string) => Promise<PartnerLifecycle>;
   /** claude-swap executable a managed route wraps through (default fake path). */
   cswapBin?: string;
@@ -472,11 +476,11 @@ export function makeHarness(opts: HarnessOptions): Harness {
     },
     resolveFableIntentFn: opts.resolveFableIntent ?? (async () => null),
     setFableFocusFn: opts.setFableFocus ?? (async () => ({ ok: true })),
-    inspectRoutingFn:
-      opts.inspectRouting ??
-      (() => ({
+    setNonFableFocusFn: opts.setNonFableFocus ?? (async () => ({ ok: true })),
+    inspectRoutingFn: (fableIntent) => {
+      const inspection = opts.inspectRouting?.(fableIntent) ?? {
         model_scope: null,
-        health: "no-observation",
+        health: "no-observation" as const,
         observed_at_ms: null,
         age_ms: null,
         fresh: false,
@@ -486,6 +490,18 @@ export function makeHarness(opts: HarnessOptions): Harness {
         candidates: [],
         fable_focus: {
           configured: false,
+          state: "off" as const,
+          target_route: null,
+          lifetime: null,
+          target_eligible: null,
+          outcome: "off" as const,
+          reason: "policy-off" as const,
+          diagnostic: "none",
+        },
+      };
+      return {
+        non_fable_focus: {
+          configured: false,
           state: "off",
           target_route: null,
           lifetime: null,
@@ -494,7 +510,9 @@ export function makeHarness(opts: HarnessOptions): Harness {
           reason: "policy-off",
           diagnostic: "none",
         },
-      })),
+        ...inspection,
+      };
+    },
     probePartnerLifecycleFn:
       opts.probePartnerLifecycle ?? (async () => ({ kind: "unknown" })),
     cswapBin: opts.cswapBin ?? "/fake-home/.local/bin/cswap",

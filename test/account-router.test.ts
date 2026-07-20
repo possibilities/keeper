@@ -510,6 +510,225 @@ describe("durable Fable focus", () => {
   });
 });
 
+describe("independent scoped Account focus", () => {
+  const fablePolicy = {
+    schema_version: 1 as const,
+    policy_id: "event:20",
+    target_route: "claude-swap:1" as const,
+    fable_intent: true as const,
+    set_at: "2026-07-17T00:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  const nonFablePolicy = {
+    schema_version: 1 as const,
+    policy_id: "event:21",
+    target_route: "claude-swap:2" as const,
+    fable_intent: false as const,
+    set_at: "2026-07-17T00:00:00.000Z",
+    lifetime: { kind: "permanent" as const },
+  };
+  const deliveries = {
+    focusDelivery: { available: true as const, policy: fablePolicy },
+    nonFableFocusDelivery: {
+      available: true as const,
+      policy: nonFablePolicy,
+    },
+  };
+
+  test("proven Non-Fable focus wins before Fable avoidance and reservation pressure", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([
+        routeWithFable(1, 0.01, 0.9),
+        routeWithFable(2, 0.95, 0.1),
+        routeWithFable(3, 0.02, null),
+      ]),
+    );
+    const first = selectRoute({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    });
+    const second = selectRoute({
+      stateDir: dir,
+      nowMs: NOW + 1,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "non-fable-focus" },
+    });
+    expect(second).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "non-fable-focus" },
+    });
+  });
+
+  test("proven Fable ignores Non-Fable focus and unknown intent matches neither", () => {
+    const fableDir = root();
+    publish(
+      fableDir,
+      observation([routeWithFable(1, 0.8, 0.8), routeWithFable(2, 0.01, 0.01)]),
+    );
+    expect(
+      selectRoute({
+        stateDir: fableDir,
+        nowMs: NOW,
+        model: "fable",
+        fableIntent: true,
+        ...deliveries,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "fable-focus" },
+    });
+
+    const unknownDir = root();
+    publish(
+      unknownDir,
+      observation([routeWithFable(1, 0.2, 0.9), routeWithFable(2, 0.2, 0.1)]),
+    );
+    expect(
+      selectRoute({
+        stateDir: unknownDir,
+        nowMs: NOW,
+        model: null,
+        fableIntent: null,
+        ...deliveries,
+      }),
+    ).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:1", reason: "selected" },
+    });
+  });
+
+  test("ineligible Non-Fable target visibly falls through Fable avoidance", () => {
+    const dir = root();
+    const ineligible = routeWithFable(2, 0.1, 0.1);
+    ineligible.windows = ineligible.windows.map((window) =>
+      window.key === "week" ? { ...window, utilization: 1 } : window,
+    );
+    publish(
+      dir,
+      observation([
+        routeWithFable(1, 0.1, 0.9),
+        ineligible,
+        routeWithFable(3, 0.9, 0.2),
+      ]),
+    );
+    const deps = {
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      ...deliveries,
+    };
+    expect(selectRoute(deps)).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:3", reason: "fable-focus-avoided" },
+    });
+    expect(inspectRouting(deps).non_fable_focus).toEqual({
+      configured: true,
+      state: "active",
+      target_route: "claude-swap:2",
+      lifetime: { kind: "permanent" },
+      target_eligible: false,
+      outcome: "fallback",
+      reason: "target-ineligible",
+      diagnostic: "none",
+    });
+  });
+
+  test("same target reports two independent focused outcomes", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.1, 0.1), routeWithFable(2, 0.9, 0.9)]),
+    );
+    const sameTargetFable = {
+      ...fablePolicy,
+      target_route: "claude-swap:2" as const,
+    };
+    const inspection = inspectRouting({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "opus",
+      fableIntent: false,
+      focusDelivery: { available: true, policy: sameTargetFable },
+      nonFableFocusDelivery: {
+        available: true,
+        policy: nonFablePolicy,
+      },
+    });
+    expect(inspection.fable_focus).toMatchObject({
+      target_route: "claude-swap:2",
+      outcome: "focused",
+      reason: "target-focused",
+    });
+    expect(inspection.non_fable_focus).toMatchObject({
+      target_route: "claude-swap:2",
+      outcome: "focused",
+      reason: "target-focused",
+    });
+    expect(inspection.would_choose).toMatchObject({
+      id: "claude-swap:2",
+      reason: "non-fable-focus",
+    });
+  });
+
+  test("expired and unavailable Non-Fable policy state stays isolated", () => {
+    const dir = root();
+    publish(
+      dir,
+      observation([routeWithFable(1, 0.2, 0.2), routeWithFable(2, 0.8, 0.8)]),
+    );
+    const expired = {
+      ...nonFablePolicy,
+      lifetime: {
+        kind: "absolute" as const,
+        deadline_at: "2026-07-18T00:00:00.000Z",
+      },
+    };
+    expect(
+      inspectRouting({
+        stateDir: dir,
+        nowMs: NOW,
+        model: "opus",
+        fableIntent: false,
+        focusDelivery: deliveries.focusDelivery,
+        nonFableFocusDelivery: { available: true, policy: expired },
+      }).non_fable_focus,
+    ).toMatchObject({
+      state: "expired",
+      outcome: "fallback",
+      reason: "policy-inactive",
+    });
+    const unavailable = inspectRouting({
+      stateDir: dir,
+      nowMs: NOW,
+      model: "fable",
+      fableIntent: true,
+      focusDelivery: deliveries.focusDelivery,
+      nonFableFocusDelivery: {
+        available: false,
+        diagnostic: "delivery-malformed",
+      },
+    });
+    expect(unavailable.fable_focus.outcome).toBe("focused");
+    expect(unavailable.non_fable_focus).toMatchObject({
+      state: "unavailable",
+      outcome: "fallback",
+      reason: "policy-unavailable",
+      diagnostic: "delivery-malformed",
+    });
+  });
+});
+
 describe("explicit account resolution", () => {
   test("the active account is an ordinary managed route", () => {
     const dir = root();

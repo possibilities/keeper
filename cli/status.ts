@@ -36,6 +36,7 @@ import { parseArgs } from "node:util";
 import {
   type FableFocusRoutingView,
   inspectRouting,
+  type NonFableFocusRoutingView,
 } from "../src/account-router";
 import { parseWrappedProviderTaskId } from "../src/autoclose-worker";
 import { isBoardWorkJob } from "../src/await-conditions";
@@ -85,11 +86,11 @@ import { emitEnvelopeFormatted, resolveFormat } from "./format";
  * adds the display-only legacy Provider-leg drain gauge; v12 adds the
  * display-only `event_store` block — event count, DB bytes, and durations
  * projected from the most recent boot's measured catch-up rate; the current
- * schema revision adds the distinct poison count and bounded commit-rail scope
- * context under `needs_human`.
+ * The current schema includes the independent Non-Fable focus view, distinct
+ * poison count, and bounded commit-rail scope context under `needs_human`.
  * `in_flight.running_jobs` remains emitted but is deprecated in favor of
  * `in_flight.board_work_jobs`. */
-export const STATUS_SCHEMA_VERSION = 15;
+export const STATUS_SCHEMA_VERSION = 16;
 
 /**
  * Default bounded connect deadline (~10s). A one-shot orient must give up
@@ -203,6 +204,7 @@ export interface StatusData {
     max_concurrent_per_root_stored: number | null;
   };
   fable_focus: FableFocusRoutingView;
+  non_fable_focus: NonFableFocusRoutingView;
   board: { epics: EpicView[] };
   counts: {
     epics: VerdictTally;
@@ -409,12 +411,24 @@ const OFF_FABLE_FOCUS: FableFocusRoutingView = {
   diagnostic: "none",
 };
 
+const OFF_NON_FABLE_FOCUS: NonFableFocusRoutingView = {
+  configured: false,
+  state: "off",
+  target_route: null,
+  lifetime: null,
+  target_eligible: null,
+  outcome: "off",
+  reason: "policy-off",
+  diagnostic: "none",
+};
+
 export function buildStatusEnvelope(
   snap: ReadinessClientSnapshot,
   boot: StatusBootInfo,
   dispatchFailures: readonly Row[],
   ownSessionId: string | null = null,
   fableFocus: FableFocusRoutingView = OFF_FABLE_FOCUS,
+  nonFableFocus: NonFableFocusRoutingView = OFF_NON_FABLE_FOCUS,
 ): StatusEnvelope {
   // Resolve + classify each sticky `dispatch_failures` row to its board target
   // (a `work::` row → its task, a `close::` row — bare or worktree-mode-keyed →
@@ -554,6 +568,7 @@ export function buildStatusEnvelope(
       max_concurrent_per_root_stored: snap.maxConcurrentPerRootStored ?? null,
     },
     fable_focus: fableFocus,
+    non_fable_focus: nonFableFocus,
     board,
     counts: {
       epics: epicTally,
@@ -726,12 +741,14 @@ export async function runStatus(
     // Absent (never null/empty) only if the flag were off; here it is always on,
     // so `?? []` is a belt-and-suspenders default the envelope treats as "no jam".
     const failures = snap.dispatchFailures ?? [];
+    const routing = deps.inspectRouting?.();
     const envelope = buildStatusEnvelope(
       snap,
       latestBoot,
       failures,
       deps.ownSessionId ?? null,
-      deps.inspectRouting?.().fable_focus ?? OFF_FABLE_FOCUS,
+      routing?.fable_focus ?? OFF_FABLE_FOCUS,
+      routing?.non_fable_focus ?? OFF_NON_FABLE_FOCUS,
     );
     emitEnvelopeFormatted(envelope, deps, args.format);
   };
@@ -825,7 +842,7 @@ export async function main(argv: string[]): Promise<void> {
     writeStderr: (s) => process.stderr.write(s),
     exit: (code) => process.exit(code),
     ownSessionId: process.env.CLAUDE_CODE_SESSION_ID ?? null,
-    inspectRouting: () => inspectRouting({ model: "fable", fableIntent: true }),
+    inspectRouting: () => inspectRouting(),
   });
 }
 

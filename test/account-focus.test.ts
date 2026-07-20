@@ -96,6 +96,19 @@ test("Non-Fable policy identity and timestamp are event-owned", () => {
       NOW / 1_000,
     ),
   ).toBeNull();
+  expect(
+    materializeNonFableFocusPolicy(
+      {
+        target_route: "claude-swap:2",
+        lifetime: {
+          kind: "absolute",
+          deadline_at: "2026-07-18T12:00:00.000Z",
+        },
+      },
+      43,
+      NOW / 1_000,
+    ),
+  ).toBeNull();
 });
 
 test("Non-Fable lifetime evaluation is permanent or half-open absolute", () => {

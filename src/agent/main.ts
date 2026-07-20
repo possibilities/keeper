@@ -117,7 +117,7 @@ import {
   resolveKeeperAgentPathDepFree,
 } from "../keeper-agent-path";
 import { runPanel } from "../pair/panel";
-import type { FableFocusInput } from "../types";
+import type { FableFocusInput, NonFableFocusInput } from "../types";
 import { parseArgsForAgent } from "./args";
 import {
   ConfigError,
@@ -496,13 +496,16 @@ export interface MainDeps {
   setFableFocusFn: (
     focus: FableFocusInput | null,
   ) => Promise<{ ok: true } | { ok: false; code: string; message: string }>;
+  setNonFableFocusFn: (
+    focus: NonFableFocusInput | null,
+  ) => Promise<{ ok: true } | { ok: false; code: string; message: string }>;
   /**
    * Read-only account-routing diagnostic behind `accounts check` — reports
    * integration health, snapshot age, PII-free candidates, and the route policy
    * would choose WITHOUT recording a reservation. `realDeps()` binds
    * {@link inspectRouting}.
    */
-  inspectRoutingFn: (fable?: boolean) => RoutingInspection;
+  inspectRoutingFn: (fableIntent?: boolean | null) => RoutingInspection;
   /** Read one exact jobs row through the daemon. Transport uncertainty remains
    *  unknown and can never be promoted to partner death. */
   probePartnerLifecycleFn: (jobId: string) => Promise<PartnerLifecycle>;
@@ -787,8 +790,18 @@ export function realDeps(): MainDeps {
       resolveStoredFableIntent(resolveAgentSockPath(process.env), target),
     setFableFocusFn: (focus) =>
       setFableFocus(resolveAgentSockPath(process.env), focus),
-    inspectRoutingFn: (fable = false) =>
-      inspectRouting(fable ? { model: "fable", fableIntent: true } : {}),
+    setNonFableFocusFn: (focus) =>
+      setNonFableFocus(resolveAgentSockPath(process.env), focus),
+    inspectRoutingFn: (fableIntent = null) =>
+      inspectRouting({
+        model:
+          fableIntent === true
+            ? "fable"
+            : fableIntent === false
+              ? "non-fable"
+              : null,
+        fableIntent,
+      }),
     probePartnerLifecycleFn: (jobId) =>
       probePartnerLifecycle(resolveAgentSockPath(process.env), jobId),
     cswapBin,
@@ -1429,6 +1442,41 @@ async function setFableFocus(
       code: "focus_rpc_unreachable",
       message:
         "the daemon did not acknowledge the Fable focus update; inspect state before retrying",
+    };
+  }
+}
+
+async function setNonFableFocus(
+  sockPath: string,
+  focus: NonFableFocusInput | null,
+): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
+  const id = crypto.randomUUID();
+  try {
+    const response = await roundTrip(
+      sockPath,
+      {
+        type: "rpc",
+        id,
+        method: "set_autopilot_config",
+        params: { non_fable_focus: focus },
+      },
+      id,
+    );
+    if (response.type === "rpc_result") return { ok: true };
+    return {
+      ok: false,
+      code: response.type === "error" ? response.code : "focus_rpc_unexpected",
+      message:
+        response.type === "error"
+          ? response.message
+          : "unexpected daemon response while setting Non-Fable focus",
+    };
+  } catch {
+    return {
+      ok: false,
+      code: "focus_rpc_unreachable",
+      message:
+        "the daemon did not acknowledge the Non-Fable focus update; inspect state before retrying",
     };
   }
 }
@@ -2992,6 +3040,213 @@ async function runFableFocusCommand(
   return deps.exit(0);
 }
 
+async function runNonFableFocusCommand(
+  deps: MainDeps,
+  operation: "show" | "set" | "clear",
+  rest: string[],
+): Promise<never> {
+  const jsonCount = rest.filter((arg) => arg === "--json").length;
+  const eligibleGuardCount = rest.filter(
+    (arg) => arg === "--require-eligible",
+  ).length;
+  const json = jsonCount === 1;
+  const args = rest.filter(
+    (arg) => arg !== "--json" && arg !== "--require-eligible",
+  );
+  if (jsonCount > 1 || eligibleGuardCount > 1) {
+    deps.writeErr(
+      "accounts non-fable-focus accepts --json and --require-eligible at most once\n",
+    );
+    return deps.exit(2);
+  }
+  if (operation !== "set" && eligibleGuardCount !== 0) {
+    deps.writeErr("--require-eligible is valid only for non-fable-focus set\n");
+    return deps.exit(2);
+  }
+
+  const nowMs = deps.now();
+  const inspection = deps.inspectRoutingFn(false);
+  const status = inspection.non_fable_focus ?? {
+    configured: false,
+    state: "unavailable",
+    target_route: null,
+    lifetime: null,
+    target_eligible: null,
+    outcome: "fallback",
+    reason: "policy-unavailable",
+    diagnostic: "delivery-unreachable",
+  };
+  const emitStatus = (): void => {
+    if (json) deps.write(focusEnvelope(true, status));
+    else {
+      deps.write(
+        `Non-Fable focus: ${status.state} target=${status.target_route ?? "none"} ` +
+          `outcome=${status.outcome} reason=${status.reason}\n`,
+      );
+    }
+  };
+
+  if (operation === "show") {
+    if (args.length !== 0) {
+      deps.writeErr("accounts non-fable-focus show accepts only --json\n");
+      return deps.exit(2);
+    }
+    emitStatus();
+    return deps.exit(0);
+  }
+  if (operation === "clear") {
+    if (args.length !== 0) {
+      deps.writeErr("accounts non-fable-focus clear accepts only --json\n");
+      return deps.exit(2);
+    }
+    if (!status.configured && status.state === "off") {
+      emitStatus();
+      return deps.exit(0);
+    }
+    const result = await deps.setNonFableFocusFn(null);
+    if (!result.ok) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: result.code,
+          message: result.message,
+          recovery:
+            "Re-read with 'keeper agent accounts non-fable-focus show --json' before retrying.",
+        }),
+      );
+      return deps.exit(1);
+    }
+    deps.write(
+      focusEnvelope(true, {
+        ...status,
+        configured: false,
+        state: "off",
+        target_route: null,
+        lifetime: null,
+        outcome: "off",
+        reason: "policy-off",
+      }),
+    );
+    return deps.exit(0);
+  }
+
+  if (args.length < 2 || args.length > 3) {
+    deps.writeErr(
+      "accounts non-fable-focus set expects <route|cN> <permanent|absolute> [timezone-bearing deadline] [--require-eligible]\n",
+    );
+    return deps.exit(2);
+  }
+  const target = resolveObservedManagedRoute(args[0] ?? "", {
+    stateDir: deps.env.KEEPER_ACCOUNT_ROUTING_ROOT,
+    nowMs,
+  });
+  if (!target.ok) {
+    deps.write(
+      focusEnvelope(false, null, {
+        code: target.code,
+        message: "the Non-Fable focus target could not be resolved",
+        recovery:
+          "Use a stable claude-swap:<slot> route or refresh the cN inventory.",
+      }),
+    );
+    return deps.exit(2);
+  }
+
+  let focus: NonFableFocusInput;
+  if (args[1] === "permanent" && args.length === 2) {
+    focus = {
+      target_route: target.target_route,
+      lifetime: { kind: "permanent" },
+    };
+  } else if (args[1] === "absolute" && args.length === 3) {
+    const deadline = normalizeUtcTimestamp(args[2]);
+    if (deadline === null) {
+      deps.writeErr(
+        "absolute Non-Fable focus requires a timezone-bearing deadline\n",
+      );
+      return deps.exit(2);
+    }
+    if (Date.parse(deadline) <= nowMs) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: "focus_deadline_elapsed",
+          message: "the Non-Fable focus deadline has elapsed",
+          recovery: "Choose a future absolute deadline before retrying.",
+        }),
+      );
+      return deps.exit(2);
+    }
+    focus = {
+      target_route: target.target_route,
+      lifetime: { kind: "absolute", deadline_at: deadline },
+    };
+  } else {
+    deps.writeErr("invalid Non-Fable focus lifetime grammar\n");
+    return deps.exit(2);
+  }
+
+  if (eligibleGuardCount === 1) {
+    if (
+      !inspection.enabled ||
+      !inspection.fresh ||
+      inspection.health !== "ok"
+    ) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: "focus_observation_unavailable",
+          message:
+            "guarded Non-Fable focus requires fresh global capacity evidence",
+          recovery: "Refresh account observations before retrying.",
+        }),
+      );
+      return deps.exit(2);
+    }
+    if (
+      !inspection.candidates.some(
+        (candidate) => candidate.id === focus.target_route,
+      )
+    ) {
+      deps.write(
+        focusEnvelope(false, null, {
+          code: "focus_target_ineligible",
+          message: "the Non-Fable focus target is not currently eligible",
+          recovery:
+            "Choose an eligible stable route or wait for capacity to recover.",
+        }),
+      );
+      return deps.exit(2);
+    }
+  }
+
+  if (
+    status.configured &&
+    status.target_route === focus.target_route &&
+    JSON.stringify(status.lifetime) === JSON.stringify(focus.lifetime)
+  ) {
+    emitStatus();
+    return deps.exit(0);
+  }
+  const result = await deps.setNonFableFocusFn(focus);
+  if (!result.ok) {
+    deps.write(
+      focusEnvelope(false, null, {
+        code: result.code,
+        message: result.message,
+        recovery:
+          "Re-read Non-Fable focus state before retrying an uncertain update.",
+      }),
+    );
+    return deps.exit(1);
+  }
+  deps.write(
+    focusEnvelope(true, {
+      configured: true,
+      target_route: focus.target_route,
+      lifetime: focus.lifetime,
+    }),
+  );
+  return deps.exit(0);
+}
+
 async function runCodexPoolCommand(
   deps: MainDeps,
   operation: CodexPoolOperatorOperation | "enroll",
@@ -3136,6 +3391,16 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
     deps.write(
       `  ${c.id} [${c.kind}] worst-util=${c.worst_utilization.toFixed(3)} ` +
         `fable-left=${c.fable_remaining === null ? "none" : c.fable_remaining.toFixed(3)}\n`,
+    );
+  }
+  for (const [label, focus] of [
+    ["Fable focus", claude.fable_focus],
+    ["Non-Fable focus", claude.non_fable_focus],
+  ] as const) {
+    deps.write(
+      `${label}: state=${focus.state} target=${focus.target_route ?? "none"} ` +
+        `eligible=${focus.target_eligible ?? "unknown"} outcome=${focus.outcome} ` +
+        `reason=${focus.reason} diagnostic=${focus.diagnostic}\n`,
     );
   }
   const refreshFailure = codex.capacity.refresh_failure_state;
@@ -3456,6 +3721,9 @@ export async function main(deps: MainDeps): Promise<never> {
   }
   if (dispatch.kind === "accounts-fable-focus") {
     return runFableFocusCommand(deps, dispatch.operation, dispatch.rest);
+  }
+  if (dispatch.kind === "accounts-non-fable-focus") {
+    return runNonFableFocusCommand(deps, dispatch.operation, dispatch.rest);
   }
   if (dispatch.kind === "resume") {
     return runResumeSubcommand(deps, dispatch.target, dispatch.rest);

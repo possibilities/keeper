@@ -41,6 +41,7 @@ test("native descriptor exposes the nested accounts command family", () => {
     "check",
     "codex-pool",
     "fable-focus",
+    "non-fable-focus",
   ]);
   expect(accounts?.verbs?.find((verb) => verb.name === "check")?.mutates).toBe(
     false,
@@ -203,6 +204,30 @@ describe("splitSubcommand", () => {
     expect(splitSubcommand(["accounts", "fable-focus", "oops"])).toEqual({
       kind: "usage",
       unknown: "accounts fable-focus",
+    });
+    expect(
+      splitSubcommand([
+        "accounts",
+        "non-fable-focus",
+        "set",
+        "c1",
+        "absolute",
+        "2026-07-19T00:00:00Z",
+        "--require-eligible",
+      ]),
+    ).toEqual({
+      kind: "accounts-non-fable-focus",
+      operation: "set",
+      rest: ["c1", "absolute", "2026-07-19T00:00:00Z", "--require-eligible"],
+    });
+    expect(splitSubcommand(["accounts", "non-fable-focus", "clear"])).toEqual({
+      kind: "accounts-non-fable-focus",
+      operation: "clear",
+      rest: [],
+    });
+    expect(splitSubcommand(["accounts", "non-fable-focus", "oops"])).toEqual({
+      kind: "usage",
+      unknown: "accounts non-fable-focus",
     });
     expect(splitSubcommand(["accounts", "authorize"])).toEqual({
       kind: "usage",

@@ -14,6 +14,11 @@ import {
   writeSync,
 } from "node:fs";
 import {
+  effectiveNonFableFocus,
+  type NonFableFocusDelivery,
+  readNonFableFocusLeaf,
+} from "./account-focus";
+import {
   type AccountObservationIssue,
   isObservationFresh,
   isRouteMeasurementFresh,
@@ -30,6 +35,7 @@ import {
   ledgerPath,
   MAX_RESERVATIONS_PER_ROUTE,
   managedRouteId,
+  nonFableFocusPolicyPath,
   OBSERVATION_FRESHNESS_CEILING_MS,
   observationSidecarPath,
   RESERVATION_TTL_MS,
@@ -45,10 +51,13 @@ import {
 } from "./fable-focus";
 import { FileLock } from "./file-lock";
 import type {
+  AccountFocusEffectiveState,
+  AccountFocusLifetime,
   FableFocusEffectiveState,
   FableFocusInput,
   FableFocusPolicy,
   ManagedAccountRouteId,
+  NonFableFocusPolicy,
 } from "./types";
 
 const MAX_LEDGER_ROUTES = 64;
@@ -78,8 +87,10 @@ export interface SelectRouteDeps {
   model?: string | null;
   /** Process-lineage routing purpose, independent from Launch attribution. */
   fableIntent?: boolean | null;
-  /** Injectable durable-policy delivery; the launcher reads the owner-only leaf by default. */
+  /** Injectable Fable-focus delivery; the launcher reads its owner-only leaf by default. */
   focusDelivery?: FableFocusDelivery;
+  /** Independently injectable Non-Fable-focus delivery. */
+  nonFableFocusDelivery?: NonFableFocusDelivery;
 }
 
 function displayOrdinal(
@@ -197,6 +208,18 @@ function isFableRequest(
 ): boolean {
   return typeof fableIntent === "boolean"
     ? fableIntent
+    : modelHasFableIntent(model);
+}
+
+/** Classify only proven process-lineage intent for scoped Account focus. */
+function scopedFableIntent(
+  model: string | null | undefined,
+  fableIntent?: boolean | null,
+): boolean | null {
+  if (typeof fableIntent === "boolean") return fableIntent;
+  if (fableIntent === null) return null;
+  return normalizedModelName(model) === null
+    ? null
     : modelHasFableIntent(model);
 }
 
@@ -546,27 +569,52 @@ function doSelectRouteByAccountOrdinal(
   };
 }
 
-interface EffectiveFocusView {
-  state: FableFocusEffectiveState;
-  policy: FableFocusPolicy | null;
+type ScopedFocusPolicy = FableFocusPolicy | NonFableFocusPolicy;
+type ScopedFocusState = FableFocusEffectiveState;
+
+interface EffectiveScopedFocusView<P extends ScopedFocusPolicy> {
+  state: ScopedFocusState;
+  policy: P | null;
   diagnostic: string;
-  fableRequest: boolean;
   activeTarget: Route | null;
   targetEligible: boolean | null;
 }
 
-function focusView(
+interface FocusDeliveries {
+  fable: FableFocusDelivery;
+  nonFable: NonFableFocusDelivery;
+}
+
+interface EffectiveFocusViews {
+  intent: boolean | null;
+  fable: EffectiveScopedFocusView<FableFocusPolicy>;
+  nonFable: EffectiveScopedFocusView<NonFableFocusPolicy>;
+}
+
+function readFocusDeliveries(
+  deps: SelectRouteDeps,
+  stateDir: string,
+): FocusDeliveries {
+  return {
+    fable:
+      deps.focusDelivery ?? readFableFocusLeaf(fableFocusPolicyPath(stateDir)),
+    nonFable:
+      deps.nonFableFocusDelivery ??
+      readNonFableFocusLeaf(nonFableFocusPolicyPath(stateDir)),
+  };
+}
+
+function effectiveScopedFocusView<P extends ScopedFocusPolicy>(
+  effective: {
+    state: ScopedFocusState;
+    policy: P | null;
+    diagnostic: string;
+  },
   deps: SelectRouteDeps,
   observation: Observation,
   eligible: Route[],
   nowMs: number,
-): EffectiveFocusView {
-  const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
-  const effective = effectiveFableFocus(
-    deps.focusDelivery ?? readFableFocusLeaf(fableFocusPolicyPath(stateDir)),
-    observation,
-    nowMs,
-  );
+): EffectiveScopedFocusView<P> {
   const policy = effective.policy;
   const target =
     policy === null
@@ -582,13 +630,95 @@ function focusView(
     state: effective.state,
     policy,
     diagnostic: effective.diagnostic,
-    fableRequest: isFableRequest(deps.model, deps.fableIntent),
     activeTarget:
       effective.state === "active" && targetEligible
         ? (eligible.find((route) => route.id === policy?.target_route) ?? null)
         : null,
     targetEligible,
   };
+}
+
+function focusViews(
+  deps: SelectRouteDeps,
+  observation: Observation,
+  eligible: Route[],
+  nowMs: number,
+  deliveries: FocusDeliveries,
+): EffectiveFocusViews {
+  return {
+    intent: scopedFableIntent(deps.model, deps.fableIntent),
+    fable: effectiveScopedFocusView(
+      effectiveFableFocus(deliveries.fable, observation, nowMs),
+      deps,
+      observation,
+      eligible,
+      nowMs,
+    ),
+    nonFable: effectiveScopedFocusView(
+      effectiveNonFableFocus(deliveries.nonFable, observation, nowMs),
+      deps,
+      observation,
+      eligible,
+      nowMs,
+    ),
+  };
+}
+
+function chooseRoute(
+  candidates: Route[],
+  focuses: EffectiveFocusViews,
+  ledger: Ledger,
+  nowMs: number,
+  deps: SelectRouteDeps,
+): { chosen: Route; reason: string } {
+  if (focuses.intent === true && focuses.fable.activeTarget !== null) {
+    return { chosen: focuses.fable.activeTarget, reason: "fable-focus" };
+  }
+  if (focuses.intent === false && focuses.nonFable.activeTarget !== null) {
+    return {
+      chosen: focuses.nonFable.activeTarget,
+      reason: "non-fable-focus",
+    };
+  }
+
+  let pool = candidates;
+  if (
+    focuses.intent === false &&
+    focuses.fable.activeTarget !== null &&
+    candidates.length > 1
+  ) {
+    pool = candidates.filter(
+      (route) => route.id !== focuses.fable.activeTarget?.id,
+    );
+  }
+  const chosen = scoreAndPick(
+    pool,
+    ledger,
+    nowMs,
+    deps.model,
+    deps.fableIntent,
+  );
+  const matchingFocus =
+    focuses.intent === true
+      ? focuses.fable
+      : focuses.intent === false
+        ? focuses.nonFable
+        : null;
+  const fallbackReason =
+    focuses.intent === true
+      ? "fable-focus-fallback"
+      : "non-fable-focus-fallback";
+  const reason =
+    pool.length !== candidates.length
+      ? "fable-focus-avoided"
+      : matchingFocus?.state === "active" &&
+          matchingFocus.policy !== null &&
+          matchingFocus.activeTarget === null
+        ? fallbackReason
+        : candidates.length === 1
+          ? "sole-candidate"
+          : "selected";
+  return { chosen, reason };
 }
 
 function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
@@ -617,40 +747,25 @@ function doSelectRoute(deps: SelectRouteDeps): RouteResolution {
     };
   }
 
+  const deliveries = readFocusDeliveries(deps, stateDir);
   mkdirSync(stateDir, { recursive: true });
   const lock = FileLock.acquire(ledgerLockPath(stateDir));
   try {
     const ledger = pruneLedger(loadLedger(stateDir), nowMs);
-    const focus = focusView(deps, observation, candidates, nowMs);
-    let pool = candidates;
-    let chosen: Route;
-    let reason: string;
-    if (focus.activeTarget !== null && focus.fableRequest) {
-      chosen = focus.activeTarget;
-      reason = "fable-focus";
-    } else {
-      if (
-        focus.activeTarget !== null &&
-        !focus.fableRequest &&
-        candidates.length > 1
-      ) {
-        pool = candidates.filter(
-          (route) => route.id !== focus.activeTarget?.id,
-        );
-      }
-      chosen = scoreAndPick(pool, ledger, nowMs, deps.model, deps.fableIntent);
-      reason =
-        focus.state === "active" &&
-        focus.policy !== null &&
-        focus.fableRequest &&
-        focus.activeTarget === null
-          ? "fable-focus-fallback"
-          : pool.length !== candidates.length
-            ? "fable-focus-avoided"
-            : candidates.length === 1
-              ? "sole-candidate"
-              : "selected";
-    }
+    const focuses = focusViews(
+      deps,
+      observation,
+      candidates,
+      nowMs,
+      deliveries,
+    );
+    const { chosen, reason } = chooseRoute(
+      candidates,
+      focuses,
+      ledger,
+      nowMs,
+      deps,
+    );
     recordReservation(ledger, chosen.id, nowMs);
     writeLedger(stateDir, ledger);
     return {
@@ -737,20 +852,27 @@ export interface RoutingCandidateView {
   fable_remaining: number | null;
 }
 
-export type FableFocusOutcome =
+export type AccountFocusOutcome =
   | "off"
   | "focused"
   | "avoided"
   | "sole-target"
   | "fallback";
 
-export interface FableFocusRoutingView {
+export interface AccountFocusRoutingView<
+  TState extends ScopedFocusState = ScopedFocusState,
+  TLifetime extends
+    | AccountFocusLifetime
+    | { kind: "cycle-end"; reset_at: string } =
+    | AccountFocusLifetime
+    | { kind: "cycle-end"; reset_at: string },
+> {
   configured: boolean;
-  state: FableFocusEffectiveState;
+  state: TState;
   target_route: ManagedAccountRouteId | null;
-  lifetime: FableFocusPolicy["lifetime"] | null;
+  lifetime: TLifetime | null;
   target_eligible: boolean | null;
-  outcome: FableFocusOutcome;
+  outcome: AccountFocusOutcome;
   reason:
     | "policy-off"
     | "target-focused"
@@ -761,6 +883,16 @@ export interface FableFocusRoutingView {
     | "policy-unavailable";
   diagnostic: string;
 }
+
+export type FableFocusOutcome = AccountFocusOutcome;
+export type FableFocusRoutingView = AccountFocusRoutingView<
+  FableFocusEffectiveState,
+  FableFocusPolicy["lifetime"]
+>;
+export type NonFableFocusRoutingView = AccountFocusRoutingView<
+  AccountFocusEffectiveState,
+  NonFableFocusPolicy["lifetime"]
+>;
 
 export interface RoutingInspection {
   /** Normalized model scope used for scoring, or null for generic windows only. */
@@ -774,15 +906,19 @@ export interface RoutingInspection {
   would_choose: RouteSelection | null;
   candidates: RoutingCandidateView[];
   fable_focus: FableFocusRoutingView;
+  non_fable_focus: NonFableFocusRoutingView;
 }
 
-function inspectionFocusView(
-  effective: ReturnType<typeof effectiveFableFocus>,
+function inspectionFocusView<
+  P extends ScopedFocusPolicy,
+  S extends ScopedFocusState,
+>(
+  effective: { state: S; policy: P | null; diagnostic: string },
   observation: Observation | null,
-  fableRequest: boolean,
+  focusIntent: boolean,
   deps: SelectRouteDeps = {},
   nowMs: number = deps.nowMs ?? Date.now(),
-): FableFocusRoutingView {
+): AccountFocusRoutingView<S, P["lifetime"]> {
   const policy = effective.policy;
   if (policy === null) {
     return unavailableFocusView(effective.state, effective.diagnostic);
@@ -794,7 +930,12 @@ function inspectionFocusView(
     observation === null
       ? null
       : target !== undefined &&
-        routeIsEligible(target, deps.model, nowMs, deps.fableIntent);
+        routeIsEligible(
+          target,
+          focusIntent ? "fable" : "non-fable",
+          nowMs,
+          focusIntent,
+        );
   if (effective.state !== "active") {
     return {
       configured: true,
@@ -819,38 +960,22 @@ function inspectionFocusView(
       diagnostic: effective.diagnostic,
     };
   }
-  if (fableRequest) {
-    return {
-      configured: true,
-      state: effective.state,
-      target_route: policy.target_route,
-      lifetime: policy.lifetime,
-      target_eligible: true,
-      outcome: "focused",
-      reason: "target-focused",
-      diagnostic: effective.diagnostic,
-    };
-  }
-  const eligibleCount =
-    observation?.routes.filter((route) =>
-      routeIsEligible(route, deps.model, nowMs, deps.fableIntent),
-    ).length ?? 0;
   return {
     configured: true,
     state: effective.state,
     target_route: policy.target_route,
     lifetime: policy.lifetime,
     target_eligible: true,
-    outcome: eligibleCount > 1 ? "avoided" : "sole-target",
-    reason: eligibleCount > 1 ? "target-avoided" : "sole-eligible-route",
+    outcome: "focused",
+    reason: "target-focused",
     diagnostic: effective.diagnostic,
   };
 }
 
-function unavailableFocusView(
-  state: FableFocusEffectiveState = "unavailable",
-  diagnostic = "delivery-unreachable",
-): FableFocusRoutingView {
+function unavailableFocusView<
+  S extends ScopedFocusState,
+  L extends AccountFocusLifetime | { kind: "cycle-end"; reset_at: string },
+>(state: S, diagnostic: string): AccountFocusRoutingView<S, L> {
   return {
     configured: false,
     state,
@@ -866,6 +991,14 @@ function unavailableFocusView(
           : "policy-inactive",
     diagnostic,
   };
+}
+
+function unavailableFableFocusView(): FableFocusRoutingView {
+  return unavailableFocusView("unavailable", "delivery-unreachable");
+}
+
+function unavailableNonFableFocusView(): NonFableFocusRoutingView {
+  return unavailableFocusView("unavailable", "delivery-unreachable");
 }
 
 export function inspectRouting(deps: SelectRouteDeps = {}): RoutingInspection {
@@ -884,7 +1017,12 @@ function disabledInspection(
   extras: Partial<
     Pick<
       RoutingInspection,
-      "model_scope" | "observed_at_ms" | "age_ms" | "fresh" | "fable_focus"
+      | "model_scope"
+      | "observed_at_ms"
+      | "age_ms"
+      | "fresh"
+      | "fable_focus"
+      | "non_fable_focus"
     >
   > = {},
 ): RoutingInspection {
@@ -898,24 +1036,36 @@ function disabledInspection(
     error,
     would_choose: null,
     candidates: [],
-    fable_focus: extras.fable_focus ?? unavailableFocusView(),
+    fable_focus: extras.fable_focus ?? unavailableFableFocusView(),
+    non_fable_focus: extras.non_fable_focus ?? unavailableNonFableFocusView(),
   };
 }
 
 function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
   const stateDir = deps.stateDir ?? resolveAccountRoutingRoot();
   const nowMs = deps.nowMs ?? Date.now();
-  const delivery =
-    deps.focusDelivery ?? readFableFocusLeaf(fableFocusPolicyPath(stateDir));
+  const deliveries = readFocusDeliveries(deps, stateDir);
   const observation = readObservationSidecar(observationSidecarPath(stateDir));
   if (observation === null) {
-    const effective = effectiveFableFocus(delivery, null, nowMs);
     return disabledInspection(
       "no-observation",
       "no claude-swap account inventory is available",
       {
         model_scope: normalizedModelName(deps.model),
-        fable_focus: inspectionFocusView(effective, null, false),
+        fable_focus: inspectionFocusView(
+          effectiveFableFocus(deliveries.fable, null, nowMs),
+          null,
+          true,
+          deps,
+          nowMs,
+        ),
+        non_fable_focus: inspectionFocusView(
+          effectiveNonFableFocus(deliveries.nonFable, null, nowMs),
+          null,
+          false,
+          deps,
+          nowMs,
+        ),
       },
     );
   }
@@ -929,9 +1079,16 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     age_ms: ageMs,
     fresh,
     fable_focus: inspectionFocusView(
-      effectiveFableFocus(delivery, observation, nowMs),
+      effectiveFableFocus(deliveries.fable, observation, nowMs),
       usableObservation,
-      isFableRequest(deps.model, deps.fableIntent),
+      true,
+      deps,
+      nowMs,
+    ),
+    non_fable_focus: inspectionFocusView(
+      effectiveNonFableFocus(deliveries.nonFable, observation, nowMs),
+      usableObservation,
+      false,
       deps,
       nowMs,
     ),
@@ -960,9 +1117,16 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
       {
         ...extras,
         fable_focus: inspectionFocusView(
-          effectiveFableFocus(delivery, observation, nowMs),
+          effectiveFableFocus(deliveries.fable, observation, nowMs),
           observation,
-          isFableRequest(deps.model, deps.fableIntent),
+          true,
+          deps,
+          nowMs,
+        ),
+        non_fable_focus: inspectionFocusView(
+          effectiveNonFableFocus(deliveries.nonFable, observation, nowMs),
+          observation,
+          false,
           deps,
           nowMs,
         ),
@@ -984,44 +1148,14 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
         fable === null ? null : Number(Math.max(0, 1 - fable).toFixed(6)),
     };
   });
-  const focus = focusView(
-    { ...deps, focusDelivery: delivery },
-    observation,
+  const focuses = focusViews(deps, observation, routeable, nowMs, deliveries);
+  const { chosen, reason } = chooseRoute(
     routeable,
+    focuses,
+    ledger,
     nowMs,
+    deps,
   );
-  let choicePool = routeable;
-  let chosen: Route;
-  let reason: string;
-  if (focus.activeTarget !== null && focus.fableRequest) {
-    chosen = focus.activeTarget;
-    reason = "fable-focus";
-  } else {
-    if (
-      focus.activeTarget !== null &&
-      !focus.fableRequest &&
-      routeable.length > 1
-    ) {
-      choicePool = routeable.filter(
-        (route) => route.id !== focus.activeTarget?.id,
-      );
-    }
-    chosen = scoreAndPick(
-      choicePool,
-      ledger,
-      nowMs,
-      deps.model,
-      deps.fableIntent,
-    );
-    reason =
-      focus.state === "active" && focus.policy !== null && focus.fableRequest
-        ? "fable-focus-fallback"
-        : choicePool.length !== routeable.length
-          ? "fable-focus-avoided"
-          : routeable.length === 1
-            ? "sole-candidate"
-            : "selected";
-  }
   return {
     model_scope: normalizedModelName(deps.model),
     health: observation.health,
@@ -1033,9 +1167,16 @@ function doInspectRouting(deps: SelectRouteDeps): RoutingInspection {
     would_choose: selectedRoute(chosen, reason, observation),
     candidates,
     fable_focus: inspectionFocusView(
-      effectiveFableFocus(delivery, observation, nowMs),
+      effectiveFableFocus(deliveries.fable, observation, nowMs),
       observation,
-      focus.fableRequest,
+      true,
+      deps,
+      nowMs,
+    ),
+    non_fable_focus: inspectionFocusView(
+      effectiveNonFableFocus(deliveries.nonFable, observation, nowMs),
+      observation,
+      false,
       deps,
       nowMs,
     ),

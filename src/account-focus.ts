@@ -161,6 +161,12 @@ export function materializeNonFableFocusPolicy(
   eventId: number,
   eventTsSeconds: number,
 ): NonFableFocusPolicy | null {
+  if (
+    input.lifetime.kind === "absolute" &&
+    Date.parse(input.lifetime.deadline_at) <= eventTsSeconds * 1_000
+  ) {
+    return null;
+  }
   return materializeAccountFocusPolicy(input, eventId, eventTsSeconds, false);
 }
 

@@ -362,6 +362,22 @@ describe("selection remains independent per invocation", () => {
     expect(explicit.deps.env.KEEPER_FABLE_INTENT).toBe("0");
   });
 
+  test("an unresolved continuation preserves unknown intent", async () => {
+    const observed: Array<boolean | null | undefined> = [];
+    const h = makeHarness({
+      argv: ["claude", "--resume", UUID],
+      rawArgv: true,
+      resolveFableIntent: async () => null,
+      selectAccountRoute: (_model, fableIntent) => {
+        observed.push(fableIntent);
+        return { ok: true, selection: selection(6) };
+      },
+    });
+    await runAndCapture(h, main);
+    expect(observed).toEqual([null]);
+    expect(h.deps.env.KEEPER_FABLE_INTENT).toBeUndefined();
+  });
+
   test("Pi launches never consult claude-swap routing", async () => {
     const h = makeHarness({ argv: ["pi", "hello"], rawArgv: true });
     const command = await runAndCapture(h, main);
@@ -630,6 +646,232 @@ describe("keeper agent accounts fable-focus", () => {
       },
     });
     expect(await expectExit(main(clear.deps))).toBe(0);
+  });
+});
+
+describe("keeper agent accounts non-fable-focus", () => {
+  const offFable = {
+    configured: false,
+    state: "off" as const,
+    target_route: null,
+    lifetime: null,
+    target_eligible: null,
+    outcome: "off" as const,
+    reason: "policy-off" as const,
+    diagnostic: "none",
+  };
+  const offNonFable = { ...offFable };
+  const baseInspection = {
+    model_scope: "non-fable",
+    health: "ok" as const,
+    observed_at_ms: Date.parse("2026-07-18T00:00:00Z"),
+    age_ms: 0,
+    fresh: true,
+    enabled: true,
+    error: null,
+    would_choose: null,
+    candidates: [
+      {
+        id: "claude-swap:2",
+        kind: "managed" as const,
+        slot: 2,
+        worst_utilization: 0.2,
+        fable_remaining: 0.6,
+      },
+    ],
+    fable_focus: offFable,
+    non_fable_focus: offNonFable,
+  };
+
+  test("show exposes the canonical PII-free sibling view", async () => {
+    const h = makeHarness({
+      argv: ["accounts", "non-fable-focus", "show", "--json"],
+      rawArgv: true,
+      inspectRouting: (intent) => {
+        expect(intent).toBe(false);
+        return {
+          ...baseInspection,
+          non_fable_focus: {
+            configured: true,
+            state: "active",
+            target_route: "claude-swap:2",
+            lifetime: { kind: "permanent" },
+            target_eligible: true,
+            outcome: "focused",
+            reason: "target-focused",
+            diagnostic: "none",
+          },
+        };
+      },
+    });
+    expect(await expectExit(main(h.deps))).toBe(0);
+    const envelope = JSON.parse(h.out.join(""));
+    expect(envelope).toMatchObject({
+      schema_version: 1,
+      ok: true,
+      data: {
+        target_route: "claude-swap:2",
+        outcome: "focused",
+        reason: "target-focused",
+      },
+    });
+    expect(JSON.stringify(envelope)).not.toContain("@");
+  });
+
+  test("stable and cN targets persist only stable routes with supported lifetimes", async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "keeper-non-fable-focus-"));
+    const now = Date.parse("2026-07-18T00:00:00Z");
+    const applied: unknown[] = [];
+    try {
+      writeObservationSidecar(observationSidecarPath(stateDir), {
+        schema_version: OBSERVATION_SCHEMA_VERSION,
+        observed_at_ms: now,
+        health: "ok",
+        routes: [
+          {
+            id: "claude-swap:2",
+            kind: "managed",
+            slot: 2,
+            measuredAtMs: now,
+            windows: [
+              { key: "session", utilization: 0.2, resetsAt: null },
+              { key: "week", utilization: 0.3, resetsAt: null },
+            ],
+          },
+        ],
+        claude_accounts: {
+          count: 1,
+          ordinals: { "claude-swap:2": 0 },
+        },
+        account_issues: {},
+        notes: [],
+      });
+      const runSet = async (args: string[]): Promise<void> => {
+        const h = makeHarness({
+          argv: ["accounts", "non-fable-focus", "set", ...args, "--json"],
+          rawArgv: true,
+          env: { KEEPER_ACCOUNT_ROUTING_ROOT: stateDir },
+          now: () => now,
+          inspectRouting: () => baseInspection,
+          setNonFableFocus: async (focus) => {
+            applied.push(focus);
+            return { ok: true };
+          },
+        });
+        expect(await expectExit(main(h.deps))).toBe(0);
+      };
+      await runSet(["claude-swap:2", "permanent"]);
+      await runSet([
+        "c0",
+        "absolute",
+        "2026-07-19T03:00:00+03:00",
+        "--require-eligible",
+      ]);
+      expect(applied).toEqual([
+        {
+          target_route: "claude-swap:2",
+          lifetime: { kind: "permanent" },
+        },
+        {
+          target_route: "claude-swap:2",
+          lifetime: {
+            kind: "absolute",
+            deadline_at: "2026-07-19T00:00:00.000Z",
+          },
+        },
+      ]);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  test("elapsed deadline and stale or ineligible guarded activation refuse before mutation", async () => {
+    const now = Date.parse("2026-07-18T00:00:00Z");
+    for (const testCase of [
+      {
+        args: ["claude-swap:2", "absolute", "2026-07-18T00:00:00Z"],
+        inspection: baseInspection,
+        code: "focus_deadline_elapsed",
+      },
+      {
+        args: ["claude-swap:2", "permanent", "--require-eligible"],
+        inspection: {
+          ...baseInspection,
+          fresh: false,
+          enabled: false,
+          health: "ok" as const,
+        },
+        code: "focus_observation_unavailable",
+      },
+      {
+        args: ["claude-swap:3", "permanent", "--require-eligible"],
+        inspection: baseInspection,
+        code: "focus_target_ineligible",
+      },
+    ]) {
+      let mutations = 0;
+      const h = makeHarness({
+        argv: [
+          "accounts",
+          "non-fable-focus",
+          "set",
+          ...testCase.args,
+          "--json",
+        ],
+        rawArgv: true,
+        now: () => now,
+        inspectRouting: () => testCase.inspection,
+        setNonFableFocus: async () => {
+          mutations += 1;
+          return { ok: true };
+        },
+      });
+      expect(await expectExit(main(h.deps))).toBe(2);
+      expect(mutations).toBe(0);
+      expect(JSON.parse(h.out.join("")).error.code).toBe(testCase.code);
+    }
+  });
+
+  test("clear is idempotent and uncertain mutation acknowledgement is explicit", async () => {
+    const clear = makeHarness({
+      argv: ["accounts", "non-fable-focus", "clear", "--json"],
+      rawArgv: true,
+      inspectRouting: () => baseInspection,
+      setNonFableFocus: async () => {
+        throw new Error("idempotent clear must not mutate");
+      },
+    });
+    expect(await expectExit(main(clear.deps))).toBe(0);
+
+    const uncertain = makeHarness({
+      argv: [
+        "accounts",
+        "non-fable-focus",
+        "set",
+        "claude-swap:2",
+        "permanent",
+        "--json",
+      ],
+      rawArgv: true,
+      inspectRouting: () => baseInspection,
+      setNonFableFocus: async () => ({
+        ok: false,
+        code: "focus_rpc_unreachable",
+        message: "acknowledgement unavailable",
+      }),
+    });
+    expect(await expectExit(main(uncertain.deps))).toBe(1);
+    expect(JSON.parse(uncertain.out.join(""))).toEqual({
+      schema_version: 1,
+      ok: false,
+      error: {
+        code: "focus_rpc_unreachable",
+        message: "acknowledgement unavailable",
+        recovery:
+          "Re-read Non-Fable focus state before retrying an uncertain update.",
+      },
+      data: null,
+    });
   });
 });
 
@@ -924,6 +1166,16 @@ describe("keeper agent accounts check", () => {
       target_eligible: null,
       outcome: "off" as const,
       reason: "policy-off" as const,
+      diagnostic: "none",
+    },
+    non_fable_focus: {
+      configured: true,
+      state: "active" as const,
+      target_route: "claude-swap:2" as const,
+      lifetime: { kind: "permanent" as const },
+      target_eligible: true,
+      outcome: "focused" as const,
+      reason: "target-focused" as const,
       diagnostic: "none",
     },
   };

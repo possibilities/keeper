@@ -10728,8 +10728,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // it (the shared checkout safety invariant lives at the consumption
           // seams via `effectivePerRootCap`, which is strictly stronger — a stale
           // > 1 row can no longer over-dispatch).
+          const eventTs = Date.now() / 1000;
+          const nonFableFocus = msg.patch.non_fable_focus;
+          if (
+            nonFableFocus !== undefined &&
+            nonFableFocus !== null &&
+            nonFableFocus.lifetime.kind === "absolute" &&
+            Date.parse(nonFableFocus.lifetime.deadline_at) <= eventTs * 1_000
+          ) {
+            throw new Error("Non-Fable focus deadline has elapsed");
+          }
           stmts.insertEvent.run({
-            $ts: Date.now() / 1000,
+            $ts: eventTs,
             $session_id: "autopilot",
             $pid: null,
             $hook_event: "AutopilotConfigSet",
