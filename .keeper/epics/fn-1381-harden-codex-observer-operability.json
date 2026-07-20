@@ -4,7 +4,7 @@
   "created_at": "2026-07-20T06:24:08.847000Z",
   "depends_on_epics": [],
   "id": "fn-1381-harden-codex-observer-operability",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-20T06:26:08.693000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -12,5 +12,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-20T06:25:33.485000Z"
+  "updated_at": "2026-07-20T06:26:08.693000Z"
 }
