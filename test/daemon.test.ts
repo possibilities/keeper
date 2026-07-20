@@ -12649,7 +12649,7 @@ test("runMergeEscalationSweep + classifyWorkResolverOutcome: a leased-out crashe
 
 test("worker selection defaults to the complete ordered worker set", () => {
   expect(selectWorkerNames()).toEqual([...ALL_WORKERS]);
-  expect(selectWorkerNames()).toHaveLength(22);
+  expect(selectWorkerNames()).toHaveLength(21);
 });
 
 test("worker selection retains only requested workers in production order", () => {

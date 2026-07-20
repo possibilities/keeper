@@ -1,7 +1,7 @@
 /**
- * `src/snapshot.ts` — shared snapshot-mode core for keeper's six TUI viewers:
- * five daemon streams (`board`, `jobs`, `git`, `autopilot`, `builds`) plus the
- * sidecar-backed `usage` view.
+ * `src/snapshot.ts` — shared snapshot-mode core for keeper's five TUI viewers:
+ * four daemon streams (`board`, `jobs`, `git`, `autopilot`) plus the sidecar-backed
+ * `usage` view.
  *
  * When `keeper <view>` runs with a non-TTY stdout (piped into an agent's
  * tool call), the live OpenTUI stream is the wrong shape: every `pushFrame`

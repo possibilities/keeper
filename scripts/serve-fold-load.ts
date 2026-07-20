@@ -887,7 +887,6 @@ function wipeDeterministicProjections(
     del("block_escalations");
     del("handoffs");
     del("armed_epics");
-    del("builds");
   })();
 }
 

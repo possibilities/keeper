@@ -119,7 +119,6 @@ import {
   probeChildStartTime,
   writeProviderLegGrant,
 } from "./birth-record";
-import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
 import type { BusWorkerData } from "./bus-worker";
 import type { CodexAccountObserverWorkerData } from "./codex-account-observer-worker";
 import {
@@ -152,7 +151,6 @@ import {
   recordBootCatchupStats,
   resolveAwaitSpillDir,
   resolveBackstopLogPath,
-  resolveBuildbotUrl,
   resolveBusSockPath,
   resolveClaudeProjectsRoot,
   resolveDbPath,
@@ -359,7 +357,6 @@ import {
   type DrainOptions,
   drain,
   readFoldWorkMsAccum,
-  serializeBuildSnapshot,
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
 import {
@@ -9100,7 +9097,6 @@ export type WorkerName =
   | "exit"
   | "git"
   | "statusline"
-  | "builds"
   | "accountObserver"
   | "deadLetter"
   | "eventsIngest"
@@ -9199,7 +9195,6 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "exit",
   "git",
   "statusline",
-  "builds",
   "accountObserver",
   "deadLetter",
   "eventsIngest",
@@ -12586,103 +12581,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (statuslineWorker)`
-
-  // Spawn the builds worker — keeperd's FIRST outbound-HTTP producer (not a
-  // file-watcher; NOT in WATCHER_WORKERS, so it never dlopens @parcel/watcher).
-  // It polls the local buildbot master's REST API on a fixed cadence and posts
-  // `{kind: "build-snapshot" | "build-deleted", ...}` messages — main turns each
-  // into a synthetic `BuildSnapshot`/`BuildDeleted` events row on its writable
-  // connection. Gated on the selector AND a configured `buildbot_url` (the
-  // config key has no default — an unconfigured
-  // buildbot leaves the worker un-spawned and the daemon boots normally).
-  const buildbotUrl = resolveBuildbotUrl();
-  const buildsWorker =
-    want("builds") && buildbotUrl !== null
-      ? new Worker(new URL("./builds-worker.ts", import.meta.url).href, {
-          workerData: {
-            dbPath,
-            buildbotUrl,
-          } satisfies BuildsWorkerData,
-        } as WorkerOptions & { workerData: unknown })
-      : null;
-
-  if (buildsWorker) {
-    const bw = buildsWorker;
-    // Main stays the SOLE writer: a `build-snapshot`/`build-deleted` message
-    // becomes a synthetic events row on the WRITABLE connection, then a wake
-    // pump folds it. The builder NAME rides in `session_id`; the flattened
-    // snapshot in `data` (empty for tombstones). Everything else is NULL.
-    bw.onmessage = (ev: MessageEvent<BuildsMessage | undefined>): void => {
-      const msg = ev.data;
-      if (!msg) return;
-      let hookEvent: string;
-      let data: string;
-      if (msg.kind === "build-snapshot") {
-        hookEvent = "BuildSnapshot";
-        // Pre-flattened payload — the reducer never re-reads the buildbot API.
-        // Forwarded via the exported `serializeBuildSnapshot` so the wire shape
-        // is pinned by the task-1 round-trip test.
-        data = serializeBuildSnapshot(msg);
-      } else if (msg.kind === "build-deleted") {
-        // Tombstone: the reducer DELETEs the `builds` row whose pk is the
-        // builder name. No payload beyond the pk in `session_id` — matches the
-        // UsageDeleted / EpicDeleted shape so re-fold reproduces the deletion.
-        hookEvent = "BuildDeleted";
-        data = "";
-      } else {
-        return;
-      }
-      // Tolerant mint: a transient writer-lock miss is logged-and-dropped
-      // (recoverable via change-gated re-emit on the next poll) instead of
-      // crashing the daemon; real corruption still throws through to fatalExit.
-      const minted = mintRecoverableSnapshotEvent({
-        $ts: Date.now() / 1000,
-        $session_id: msg.project, // the entity pk: builder name
-        $pid: null,
-        $hook_event: hookEvent,
-        $event_type: "build_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: data,
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $plan_op: null,
-        $plan_target: null,
-        $plan_epic_id: null,
-        $plan_task_id: null,
-        $plan_subject_present: null,
-        $config_dir: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $plan_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-        $worktree: null,
-      });
-      if (minted) {
-        wakePending = true;
-        pumpWakes();
-      }
-    };
-
-    bw.onerror = (err: ErrorEvent): void => {
-      console.error("[keeperd] builds worker error:", err.message ?? err);
-      if (!shuttingDown) fatalExit();
-    };
-
-    bw.addEventListener("close", () => {
-      if (!shuttingDown) fatalExit();
-    });
-  } // end `if (buildsWorker)`
 
   // Spawn the account-observation PRODUCER worker — the bounded
   // `cswap list --json` probe. It validates the payload and atomically publishes
@@ -18700,7 +18598,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       exitWorker,
       gitWorker,
       statuslineWorker,
-      buildsWorker,
       accountObserverWorker,
       codexAccountObserverWorker,
       deadLetterWorker,

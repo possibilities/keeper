@@ -61,8 +61,7 @@ Usage:
   keeper setup-tmux --help
 
 Rebuilds the deprecated 'dash' dashboard every run on its OWN dedicated
-'tmux -L dash' server (board + autopilot/jobs/git/builds panes,
-main-vertical) and provisions only the human 'work' session on the default
+'tmux -L dash' server (board + autopilot/jobs/git panes, main-vertical) and provisions only the human 'work' session on the default
 server (one shell window, stamped with KEEPER_TMUX_SESSION). 'autopilot' is
 daemon-minted on demand, so it is not created here — but it is still swept and
 torn down by --kill-sessions. An existing 'work' session is left untouched.
@@ -130,8 +129,8 @@ export const PROVISION_SESSIONS = ["work"] as const;
  *  by rebuildDash. */
 export const SWEEP_KILL_SESSIONS = ["work", MANAGED_EXEC_SESSION] as const;
 
-/** The four right-hand dash panes, in split order, after the board main pane. */
-export const DASH_SUB_PANES = ["autopilot", "jobs", "git", "builds"] as const;
+/** The three right-hand dash panes, in split order, after the board main pane. */
+export const DASH_SUB_PANES = ["autopilot", "jobs", "git"] as const;
 
 const HOME_DIR = keeperTmuxSessionCwd(process.env);
 const KEEPER_DIR = `${HOME_DIR}/code/keeper`;

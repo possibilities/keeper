@@ -24,8 +24,8 @@ import { resolveSockPath } from "../src/db";
 import { buildParseOptions, FRAMES_FLAGS } from "./descriptor";
 import { parseDuration } from "./duration";
 
-/** The five viewers `keeper frames` can stream, one process each. */
-export type FramesView = "board" | "jobs" | "git" | "autopilot" | "builds";
+/** The four viewers `keeper frames` can stream, one process each. */
+export type FramesView = "board" | "jobs" | "git" | "autopilot";
 
 /** The view set, in the canonical viewer order (`--view` allowlist + default). */
 export const FRAMES_VIEWS: readonly FramesView[] = [
@@ -33,7 +33,6 @@ export const FRAMES_VIEWS: readonly FramesView[] = [
   "jobs",
   "git",
   "autopilot",
-  "builds",
 ] as const;
 
 /**
@@ -82,7 +81,7 @@ JSON envelope per rendered-frame change, then an always-parseable trailer. For
 multi-view supervision run one process per view.
 
 Options:
-  --view <viewer>      board | jobs | git | autopilot | builds
+  --view <viewer>      board | jobs | git | autopilot
                        (default board)
   --for <dur>          Stream a bounded chunk for this long, then a trailer +
                        exit (unit required, e.g. 10s, 2m). Default ~30s when
@@ -163,7 +162,6 @@ export function defaultFramesEntries(): Record<FramesView, FramesEntry> {
     jobs: async (c) => (await import("./jobs")).runJobsFrames(c),
     git: async (c) => (await import("./git")).runGitFrames(c),
     autopilot: async (c) => (await import("./autopilot")).runAutopilotFrames(c),
-    builds: async (c) => (await import("./builds")).runBuildsFrames(c),
   };
 }
 

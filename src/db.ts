@@ -2203,11 +2203,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     kind: "additive",
     apply: (ctx) => {
       const { db } = ctx;
-      // v63→v64: add the empty `builds` projection table (the `keeper builds`
-      // buildbot dashboard surface). A reducer projection, in the
-      // rewind-and-redrain DELETE list; created unconditionally above so it
-      // exists before any earlier-version rewind that wipes it. No backfill —
-      // the live builds-worker poll repopulates it from the buildbot REST API.
       db.run(CREATE_BUILDS);
     },
   },
@@ -4540,6 +4535,13 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
       addColumnIfMissing(ctx.db, "autopilot_state", "non_fable_focus", "TEXT");
     },
   },
+  {
+    version: 140,
+    kind: "drop",
+    apply: (ctx) => {
+      ctx.db.run("DROP TABLE IF EXISTS builds");
+    },
+  },
 ];
 
 /**
@@ -4560,7 +4562,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v139:19e05ccf2bcbce82de32080aee335e217ea657ccbb81edd58f506bacf4137b97";
+  "v140:95c9ccd85b6d99d30c1874e3acd65a155a47e065d89dd1a416608a1cb49e27e4";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`
@@ -4695,10 +4697,6 @@ export interface KeeperConfig {
   repoCloneRoot: string;
   repoForkRoot: string;
   claudeProjectsRoot?: string;
-  // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
-  // builds` dashboard's poller. Independent best-effort key with NO default:
-  // absent/empty/garbage → undefined → the builds worker is not spawned.
-  buildbotUrl?: string;
   // Global prompt prefix for `keeper dispatch` FREE-FORM dispatches: when set
   // (e.g. `/hack`), it is prepended with a single space to a free-form prompt
   // so the worker launches with `<prefix> <prompt>`. Independent best-effort key
@@ -4840,9 +4838,6 @@ export function resolveConfig(): KeeperConfig {
   let repoCloneRoot = DEFAULT_REPO_CLONE_ROOT;
   let repoForkRoot = DEFAULT_REPO_FORK_ROOT;
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
-  // No default — absent leaves `buildbotUrl` undefined so the builds worker
-  // never spawns.
-  let buildbotUrl: string | undefined;
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
@@ -4893,12 +4888,6 @@ export function resolveConfig(): KeeperConfig {
         .claude_projects_root;
       if (typeof cpr === "string" && cpr.length > 0) {
         claudeProjectsRoot = cpr;
-      }
-      // Independent best-effort key — non-empty string only; garbage/absent
-      // leaves `buildbotUrl` undefined and the builds worker un-spawned.
-      const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
-      if (typeof bbu === "string" && bbu.length > 0) {
-        buildbotUrl = bbu;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `dispatchPromptPrefix` undefined and no free-form prompt prefix
@@ -4956,7 +4945,6 @@ export function resolveConfig(): KeeperConfig {
     repoCloneRoot,
     repoForkRoot,
     claudeProjectsRoot,
-    buildbotUrl,
     dispatchPromptPrefix,
     handoffPromptPrefix,
     keeperAgentPath,
@@ -5005,17 +4993,6 @@ function firstNonEmpty(
     }
   }
   return undefined;
-}
-
-/**
- * Resolve the buildbot master base URL for the `keeper builds` poller, or null
- * when it is unconfigured. Independent best-effort key with NO default — the
- * builds worker spawn is gated on a non-null return here. No tilde-expansion or
- * existence check (it's a URL, validated by the poller degrading to silent
- * staleness on any fetch failure).
- */
-export function resolveBuildbotUrl(): string | null {
-  return resolveConfig().buildbotUrl ?? null;
 }
 
 /** Expand a leading `~`/`~/` via `homedir()`; pass an absolute path through. */
@@ -6355,21 +6332,6 @@ CREATE TABLE IF NOT EXISTS armed_epics (
 )
 `;
 
-/**
- * `builds` projection table — one row per registered buildbot builder, the
- * `keeper builds` dashboard surface. Keyed by builder NAME (`project`), stable
- * across master DB rebuilds where the numeric `builder_id` is not. Produced by
- * synthetic `BuildSnapshot` (UPSERT) / `BuildDeleted` (tombstone DELETE) events
- * the builds-worker mints from the buildbot REST API. A reducer projection
- * (re-fold deterministic, in the rewind-and-redrain DELETE list); starts empty
- * on a fresh DB — no backfill, the live poll repopulates it.
- *
- * `results` is NULL while a build is running (`complete:false`); `complete_at`
- * is NULL until the build finishes. `state_string` is projected for display but
- * EXCLUDED from the worker change-gate so a running→finished transition emits
- * exactly two events (start, finish). `updated_at` is the event `ts`, never a
- * wall-clock read (re-fold determinism).
- */
 const CREATE_BUILDS = `
 CREATE TABLE IF NOT EXISTS builds (
     project TEXT PRIMARY KEY,
