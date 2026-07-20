@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "medium",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 14,
+        "files_changed": 3,
+        "insertions": 10
+      },
+      "done_summary": "Promoted TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL into src/lifecycle-terminal-proof.ts and had src/commit-work/surface.ts and plugins/plan/src/verbs/unblock.ts import it, deleting the inline duplicate lifecycle hook-set SQL from both callers.",
+      "input_hash": "4b3c5a78cd23938fd22d007da37cd1af7b78d6a160b0c700890265e0f6846578",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1654,
+      "spec_md": "## Description\n\nFinding F3 (evidence: `plugins/plan/src/verbs/unblock.ts` inlines a literal\ncopy of the lifecycle hook-set list \u2014 `'SessionStart', 'UserPromptSubmit',\n'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest',\n'Notification'` \u2014 twice inside `claimantSessionIsLiveOrRecent`'s query,\nwhile the identical list already exists as `TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL`\nat `src/commit-work/surface.ts:1059`). The `hasOrderedTerminalProof` predicate\nwas correctly extracted to `src/lifecycle-terminal-proof.ts`, but the hook-set\nSQL fragment it depends on was not \u2014 leaving three literal copies that must\nstay identical for the two callers to mean the same thing by \"terminally\nproven.\"\n\nPromote `TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL` into the shared\n`src/lifecycle-terminal-proof.ts` module (alongside the predicate it feeds),\nhave both `src/commit-work/surface.ts` and `plugins/plan/src/verbs/unblock.ts`\nimport it, and delete the inline copies. Files: `src/lifecycle-terminal-proof.ts`,\n`src/commit-work/surface.ts`, `plugins/plan/src/verbs/unblock.ts`.\n\n## Acceptance\n\n- [ ] The hook-set SQL literal exists in exactly one place (the shared module) and both callers import it.\n- [ ] No behavioral change: the terminal-proof queries select the same lifecycle-tail events as before.\n- [ ] Existing `saga-unblock` and commit-work terminal-proof tests pass unchanged.\n\n## Done summary\nPromoted TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL into src/lifecycle-terminal-proof.ts and had src/commit-work/surface.ts and plugins/plan/src/verbs/unblock.ts import it, deleting the inline duplicate lifecycle hook-set SQL from both callers.\n## Evidence\n",
+      "task_id": "fn-1384-share-terminal-proof-lifecycle-hook-sql.1",
+      "tier": "medium",
+      "title": "Share lifecycle hook-set SQL"
+    }
+  ],
+  "created_at": "2026-07-20T12:09:39.560000Z",
+  "epic_id": "fn-1384-share-terminal-proof-lifecycle-hook-sql",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "4b3c5a78cd23938fd22d007da37cd1af7b78d6a160b0c700890265e0f6846578",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
