@@ -139,6 +139,7 @@ function passingReport(): LiveProofReport {
     routes: [
       {
         session_role: "root",
+        aliases: ["keeper-codex-a", "keeper-codex-b"],
         attempts: 2,
         failure_class: "quota",
         substantive_output: false,
@@ -146,6 +147,7 @@ function passingReport(): LiveProofReport {
       },
       {
         session_role: "child",
+        aliases: ["keeper-codex-b"],
         attempts: 1,
         failure_class: "none",
         substantive_output: true,

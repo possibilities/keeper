@@ -130,6 +130,7 @@ export interface LiveProofReport {
   routes: Array<{
     session_role: "root" | "child";
     attempts: number;
+    aliases: string[];
     failure_class: "none" | "quota" | "rate" | "auth" | "transport";
     substantive_output: boolean;
     restored: boolean;
@@ -342,15 +343,23 @@ function schemaShape(input: unknown): {
     const routeKeys = [
       "session_role",
       "attempts",
+      "aliases",
       "failure_class",
       "substantive_output",
       "restored",
     ];
     if (!route) return { unknown };
     unknown ||= hasUnknownKeys(route, routeKeys);
+    const routeAliases = route.aliases;
     if (
       !hasExactKeys(route, routeKeys) ||
       (route.session_role !== "root" && route.session_role !== "child") ||
+      !Array.isArray(routeAliases) ||
+      routeAliases.length < 1 ||
+      routeAliases.length > 2 ||
+      routeAliases.some(
+        (alias) => !isOpaqueAlias(alias) || !seenAliases.has(String(alias)),
+      ) ||
       !Number.isInteger(route.attempts) ||
       (route.attempts as number) < 1 ||
       (route.attempts as number) > 2 ||
@@ -686,6 +695,7 @@ export function collectLiveProof(
     routes: input.routes.map((route) => ({
       session_role: route.session_role,
       attempts: route.attempts,
+      aliases: [...route.aliases],
       failure_class: route.failure_class,
       substantive_output: route.substantive_output,
       restored: route.restored,
@@ -707,23 +717,20 @@ export function collectLiveProof(
   report.verdict = classifyWithoutDeclaredVerdict(report, expected, reasons);
   if (report.verdict === "incomplete") {
     const transcriptClauses = clausesFromProofTranscript(report.transcript);
-    const quotaRoles = new Set(
-      report.routes
-        .filter((route) => route.failure_class === "quota")
-        .map((route) => route.session_role),
-    );
-    const pinRole =
-      quotaRoles.has("root") && !quotaRoles.has("child")
-        ? "alternate"
-        : quotaRoles.has("child") && !quotaRoles.has("root")
-          ? "primary"
-          : null;
+    const faulted = new Set<string>();
+    for (const route of report.routes) {
+      if (route.failure_class !== "quota") continue;
+      const first = route.aliases[0];
+      if (first !== undefined) faulted.add(first);
+    }
+    const healthyCandidates = report.alias_roles
+      .map((entry) => entry.alias)
+      .filter((alias) => !faulted.has(alias));
     const pinnedAlias =
-      pinRole === null
-        ? null
-        : (report.alias_roles.find((entry) => entry.role === pinRole)?.alias ??
-          null);
-    if (pinnedAlias === null) return report;
+      faulted.size >= 1 && healthyCandidates.length === 1
+        ? healthyCandidates[0]
+        : null;
+    if (pinnedAlias === undefined || pinnedAlias === null) return report;
     const candidate: DegradedProofVerdict = {
       cause: "quota",
       waived_clauses: LIVE_PROOF_CLAUSES.filter(

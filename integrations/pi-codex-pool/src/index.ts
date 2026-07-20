@@ -477,6 +477,7 @@ class ProofEvidence {
       .map((route) => ({
         session_role: route.sessionRole,
         attempts: Math.min(2, route.attempts),
+        aliases: [...route.aliases].slice(0, 2),
         failure_class: route.failureClass,
         substantive_output: route.substantiveOutput,
         restored: route.restored,

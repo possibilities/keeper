@@ -123,6 +123,7 @@ function passingReport(): LiveProofReport {
       routes: [
         {
           session_role: "root",
+          aliases: ["keeper-codex-a", "keeper-codex-b"],
           attempts: 2,
           failure_class: "quota",
           substantive_output: false,
@@ -130,6 +131,7 @@ function passingReport(): LiveProofReport {
         },
         {
           session_role: "child",
+          aliases: ["keeper-codex-b"],
           attempts: 1,
           failure_class: "none",
           substantive_output: true,
@@ -155,6 +157,7 @@ function clone<T>(value: T): T {
 const QUOTA_ROUTES: LiveProofReport["routes"] = [
   {
     session_role: "root",
+    aliases: ["keeper-codex-a", "keeper-codex-b"],
     attempts: 2,
     failure_class: "quota",
     substantive_output: false,
@@ -162,6 +165,7 @@ const QUOTA_ROUTES: LiveProofReport["routes"] = [
   },
   {
     session_role: "child",
+    aliases: ["keeper-codex-b"],
     attempts: 1,
     failure_class: "none",
     substantive_output: true,
@@ -404,6 +408,7 @@ describe("degraded single-alias verdict", () => {
     const routes: LiveProofReport["routes"] = [
       {
         session_role: "root",
+        aliases: ["keeper-codex-a", "keeper-codex-b"],
         attempts: 2,
         failure_class: "quota",
         substantive_output: false,
@@ -411,6 +416,7 @@ describe("degraded single-alias verdict", () => {
       },
       {
         session_role: "child",
+        aliases: ["keeper-codex-b", "keeper-codex-a"],
         attempts: 2,
         failure_class: "quota",
         substantive_output: false,
@@ -458,6 +464,7 @@ describe("degraded single-alias verdict", () => {
         [
           {
             session_role: "root",
+            aliases: ["keeper-codex-a"],
             attempts: 1,
             failure_class: "rate",
             substantive_output: false,
@@ -465,6 +472,7 @@ describe("degraded single-alias verdict", () => {
           },
           {
             session_role: "child",
+            aliases: ["keeper-codex-b"],
             attempts: 1,
             failure_class: "none",
             substantive_output: true,
