@@ -71,5 +71,5 @@ New and upgraded installations start with Non-Fable focus off. This task perform
 - [ ] Named account-focus, Fable-focus, schema, reducer, RPC, daemon, and collection tests pass.
 
 ## Done summary
-
+Added shared Account-focus primitives and an independent durable Non-Fable focus: nullable non_fable_focus autopilot_state cell, event-owned permanent/absolute policy identity, generic-config fold/RPC extension, and an independent owner-only launch leaf with boot republication, all while preserving Fable focus byte-for-byte via compatibility wrappers.
 ## Evidence
