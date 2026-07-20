@@ -1,14 +1,15 @@
 {
+  "audit_required": false,
   "bundles": [],
   "created_at": "2026-07-20T00:14:27.972000Z",
   "depends_on": [],
   "epic": "fn-1356-activate-pi-codex-account-pool",
   "id": "fn-1356-activate-pi-codex-account-pool.2",
-  "model": "opus",
+  "model": "gpt-5.6-terra",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
-  "tier": "xhigh",
+  "tier": "high",
   "title": "Provision codex observer executable",
-  "updated_at": "2026-07-20T00:14:27.972000Z"
+  "updated_at": "2026-07-20T00:16:03.482000Z"
 }
