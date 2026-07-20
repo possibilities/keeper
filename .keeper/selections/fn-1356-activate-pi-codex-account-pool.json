@@ -1,8 +1,6 @@
 {
   "audit_policy": {
-    "flagged_task_ids": [
-      "fn-1356-activate-pi-codex-account-pool.1"
-    ],
+    "flagged_task_ids": [],
     "reason": null,
     "status": "applied"
   },
@@ -11,29 +9,21 @@
       "confidence": 0.86,
       "label_source": "heuristic-guided",
       "model": "opus",
-      "rationale": "Security- and correctness-critical live activation: subtle secret/PII sanitation across every artifact, atomic activation with rollback/recovery invariants, and multi-phase failover judgment hit the hard opus gate, and max fits the security-shaped, restoration-precedence care.",
-      "task_id": "fn-1356-activate-pi-codex-account-pool.1",
-      "tier": "max"
-    },
-    {
-      "confidence": 0.72,
-      "label_source": "heuristic-guided",
-      "model": "gpt-5.6-terra",
-      "rationale": "Well-specified bounded provisioning across install.sh, a package bin, and seam tests with a named acceptance and no design ambiguity routes GPT-first, and high is the model-default band for a multi-file change in a known pattern.",
-      "task_id": "fn-1356-activate-pi-codex-account-pool.2",
-      "tier": "high"
+      "rationale": "Deliberately weakening a safety/activation gate that must be impossible to trip implicitly is a subtle security-and-correctness invariant across the classifier, validator, and status surfaces \u2014 a hard opus gate at the contract-shaped xhigh band.",
+      "task_id": "fn-1356-activate-pi-codex-account-pool.3",
+      "tier": "xhigh"
     }
   ],
   "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
-  "created_at": "2026-07-20T00:16:03.482000Z",
+  "created_at": "2026-07-20T03:25:10.646000Z",
   "epic_id": "fn-1356-activate-pi-codex-account-pool",
-  "input_hash": "a51f5f2d8c727c2d22373b21d8831b07aff99ff5a4a4959d0bcbd1d57d3890c5",
+  "input_hash": "b1424997bf24ac27f5197110e35625f852f219dbc141e0a7b0608de7b2bbd4a9",
   "outcome": "completed",
   "schema_version": 1,
   "selector": {
     "harness": "subagent",
     "model": "plan:model-selector"
   },
-  "shuffle_seed": 2770296621,
-  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1356-activate-pi-codex-account-pool.1\",\"tier\":\"max\",\"model\":\"opus\",\"rationale\":\"Security- and correctness-critical live activation: subtle secret/PII sanitation across every artifact, atomic activation with rollback/recovery invariants, and multi-phase failover judgment hit the hard opus gate, and max fits the security-shaped, restoration-precedence care.\",\"confidence\":0.86},{\"task_id\":\"fn-1356-activate-pi-codex-account-pool.2\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"Well-specified bounded provisioning across install.sh, a package bin, and seam tests with a named acceptance and no design ambiguity routes GPT-first, and high is the model-default band for a multi-file change in a known pattern.\",\"confidence\":0.72}]}\n"
+  "shuffle_seed": 2973911447,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1356-activate-pi-codex-account-pool.3\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"Deliberately weakening a safety/activation gate that must be impossible to trip implicitly is a subtle security-and-correctness invariant across the classifier, validator, and status surfaces \u2014 a hard opus gate at the contract-shaped xhigh band.\",\"confidence\":0.86}]}\n"
 }
