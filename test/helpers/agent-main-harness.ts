@@ -185,6 +185,7 @@ export interface HarnessOptions {
   resolvePiCodexPoolExtension?: () => PiCodexPoolExtensionResolution;
   codexPoolLaunchContext?: (reserve?: boolean) => CodexPoolLaunchContext;
   inspectCodexSessionRouting?: () => CodexSessionRoutingInspection;
+  refreshCodexObservation?: () => Promise<void>;
   runCodexPoolWorkflow?: (
     operation: CodexPoolOperatorOperation,
     source?: string,
@@ -408,6 +409,7 @@ export function makeHarness(opts: HarnessOptions): Harness {
           candidates: [],
         },
       })),
+    refreshCodexObservationFn: opts.refreshCodexObservation ?? (async () => {}),
     runCodexPoolWorkflowFn:
       opts.runCodexPoolWorkflow ??
       ((operation) => ({

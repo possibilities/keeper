@@ -34,11 +34,13 @@ import {
   selectRouteByAccountOrdinal,
 } from "../account-router";
 import {
+  CODEX_OBSERVATION_FRESHNESS_CEILING_MS,
   cswapListArgv,
   existingCswapAccountConfigDir,
   KEEPER_ACCOUNT_ORDINAL_ENV,
   KEEPER_ACCOUNT_ROUTE_ENV,
   MAX_OUTPUT_BYTES,
+  resolveCodexAccountRoutingRoot,
   resolveCswapCommand,
   SUBPROCESS_TIMEOUT_MS,
 } from "../account-routing-config";
@@ -72,6 +74,10 @@ import {
   resolveBusArtifactRoot,
   sendBusArtifact,
 } from "../bus-artifact";
+import {
+  makeCodexBoundedRunner,
+  refreshCodexObservationIfStale,
+} from "../codex-account-observation-refresh";
 import {
   CODEX_NATIVE_FALLBACK_WARNING,
   type CodexRoutingInspection,
@@ -425,6 +431,13 @@ export interface MainDeps {
     authorization?: CodexPoolActivationAuthorization | null,
   ) => CodexPoolWorkflowResult;
   /**
+   * Best-effort refresh of the codex routing observation sidecar before an
+   * activate/verify workflow reads it through `inspectCodexRouting` — the
+   * verification gate needs a fresh observation and nothing else in the CLI
+   * path produces one. A failed refresh is swallowed; verify still gates.
+   */
+  refreshCodexObservationFn: () => Promise<void>;
+  /**
    * Resolve `target` (a current name, former name, session id, id prefix, or
    * current-title substring) to a {@link ResumeDecision} for the `resume` verb and
    * `agent run --resume`. `requireHarness`, when set, restricts the match to that
@@ -525,7 +538,7 @@ function productionCodexPoolActivationDeps(
     store,
     bindings,
     nowMs: () => Date.now(),
-    reload: verifies,
+    reload: () => resolvePiCodexPoolExtension().health === "ready",
     verify: verifies,
   };
 }
@@ -733,6 +746,18 @@ export function realDeps(): MainDeps {
         source,
         authorization,
       ),
+    refreshCodexObservationFn: async () => {
+      try {
+        await refreshCodexObservationIfStale({
+          stateDir: resolveCodexAccountRoutingRoot(),
+          runner: makeCodexBoundedRunner(),
+          nowMs: () => Date.now(),
+          maxAgeMs: CODEX_OBSERVATION_FRESHNESS_CEILING_MS,
+        });
+      } catch {
+        // Verification gates on the observation; a failed refresh surfaces there.
+      }
+    },
     resolveResumeDecisionFn: (target, requireHarness) =>
       resolveResumeDecisionViaSubprocess(
         process.execPath,
@@ -3023,6 +3048,9 @@ async function runCodexPoolCommand(
   ) {
     deps.writeErr(`accounts codex-pool ${operation} has invalid arguments\n`);
     return deps.exit(2);
+  }
+  if (operation === "activate" || operation === "verify") {
+    await deps.refreshCodexObservationFn();
   }
   const outcome = deps.runCodexPoolWorkflowFn(operation, source, authorization);
   if (json) {
