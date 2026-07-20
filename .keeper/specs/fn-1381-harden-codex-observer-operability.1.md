@@ -55,5 +55,5 @@ spawning real processes.
 - [ ] Focused observer tests cover all four chain outcomes and pass
 
 ## Done summary
-
+Observer now resolves the pi-ai codex catalog via an ordered chain (KEEPER_PI_CODEX_CATALOG_DIR override, package-relative lookup, home bun/nvm package-manager scan, then legacy PATH scan) so it no longer hard-depends on a literal pi executable on PATH; full-chain failure still yields the bounded pool-unavailable envelope. Verified end-to-end against the real repo checkout under a minimal PATH.
 ## Evidence
