@@ -109,6 +109,7 @@ import {
   LANE_TEARDOWN_DISTRESS_REASON,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   LANE_WEDGE_DISTRESS_REASON,
+  MERGE_ESCALATION_REASON_TOKEN,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_REASON,
   monitorSlotWedgeJobId,
@@ -263,7 +264,6 @@ import {
   isKeeperLaneEntry,
   keeperLaneIdentity,
   type LockAcquirer,
-  type MergeResult,
   provisionScratchWorktree,
   removeScratchWorktree,
   shortBranchName,
@@ -1140,9 +1140,10 @@ export interface ConfirmRunningDeps {
    * The producer git driver for worktree mode. ABSENT whenever the
    * reconciler runs without worktree support (then every `worktree`/`worktreeReject`
    * launch field is inert and dispatch is byte-identical to today). PRESENT in
-   * worktree mode: `runReconcileCycle` calls it to provision a lane worktree, run
-   * fan-in pre-merges, assert HEAD, and — after a closer reaches done — merge the
-   * epic base into the default branch + push + tear down. Every method shells git
+   * worktree mode: `runReconcileCycle` calls it to provision a lane worktree,
+   * prepare any pending fan-in integration, assert HEAD, and — after a closer
+   * reaches done — merge the epic base into the default branch + push + tear down.
+   * Every method shells git
    * on the target repo (a producer side effect); none touches keeper.db or a fold.
    * Injected so the fast tier drives the same code paths with a fake.
    */
@@ -1225,6 +1226,21 @@ export type MergeSuiteProbe = (args: {
  * and NEVER writes keeper.db / runs in a fold. Injected so tests fake it; the
  * default impl wraps `src/worktree-git.ts`.
  */
+export interface PendingIntegrationManifest {
+  sourceBranch: string;
+  baseBranch: string;
+  laneDir: string;
+}
+
+export function pendingIntegrationReason(
+  manifest: PendingIntegrationManifest,
+): string {
+  return (
+    `${MERGE_ESCALATION_REASON_TOKEN}: merging ${manifest.sourceBranch} into ` +
+    `${manifest.baseBranch} — pending owner integration`
+  );
+}
+
 export interface WorktreeDriver {
   /**
    * Refresh one drifted, quiescent epic base by merging the local default branch
@@ -1238,38 +1254,27 @@ export interface WorktreeDriver {
   ): Promise<{ ok: true } | { ok: false; reason: string; retry?: boolean }>;
   /**
    * Provision the lane for one launch: ensure the worktree exists (lazily, off
-   * the parent lane's committed tip), run the assignment's fan-in pre-merges in
-   * order, then assert the worktree HEAD equals the derived branch. Returns the
-   * resolved worktree path on success (the producer overrides the launch cwd with it).
+   * the parent lane's committed tip), prepare the first unresolved fan-in source,
+   * then assert the worktree HEAD equals the derived branch. A prepared source is
+   * returned as `pendingIntegration`; the producer records that manifest on the
+   * owning dispatch key before launching into the bare base.
    *
-   * A failure carries a `reason` and, for a fan-in pre-merge failure, the base lane
-   * `dir` (so the producer keys the row on the lane path the recover pass matches on):
-   *  - `{ ok: false, reason }` — a GENUINE terminal block (a fan-in content merge
-   *    conflict, an unregistered/HEAD-mismatch worktree). The producer mints a STICKY
-   *    `DispatchFailed` a human clears with `retry_dispatch`.
-   *  - `{ ok: false, reason, dir }` with a {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX}
-   *    reason — a not-losslessly-mergeable base lane (dirty-but-not-cleanable /
-   *    off-branch / mid-merge / would-clobber / lock-timeout). NEVER a blind merge: the
-   *    producer mints a SELF-CLEARING `work::<taskId>` row the recover pass's
-   *    verb-agnostic reason-scoped level-clear drops once the base is ready (and a
-   *    persistent one escalates to a per-lane distress) — never the dead `work-task`
-   *    dead end. Consumes NO slot/cooldown (the mint precedes them).
-   *  - `{ ok: false, retry: true, reason }` — a transient the producer skips minting a
-   *    sticky for (used by finalize/close-sink; the pre-merge arm no longer emits it).
-   *
-   * Before each fan-in merge the driver probes {@link mergeReadiness}: a `ready` base
-   * merges unchanged; a DIRTY base is losslessly cleaned ONLY when the dirt is a
-   * provably-redundant leak of the incoming rib AND none of it is in
-   * `liveAttributedDirty` (the reconciler-supplied set of repo-relative paths a LIVE
-   * job holds an undischarged mutation for in this base worktree; `null` ⇒ the
-   * attribution read failed ⇒ do-not-discard). The driver never reads attribution
-   * itself.
+   * Preparation preserves the lane pre-merge safety boundary without performing
+   * the merge. A dirty base is losslessly cleaned only when its dirt is a
+   * provably-redundant leak of the incoming rib and none is in
+   * `liveAttributedDirty`; every other not-ready state returns the existing
+   * self-clearing {@link WORKTREE_LANE_PREMERGE_REASON_PREFIX} failure keyed by
+   * the lane path. The driver never reads attribution itself.
    */
   provision(
     info: WorktreeLaunchInfo,
     liveAttributedDirty: ReadonlySet<string> | null,
   ): Promise<
-    | { ok: true; cwd: string }
+    | {
+        ok: true;
+        cwd: string;
+        pendingIntegration?: PendingIntegrationManifest;
+      }
     | {
         ok: false;
         reason: string;
@@ -5758,6 +5763,16 @@ export async function runReconcileCycle(
         continue;
       }
       launchCwd = wt.cwd;
+      if (wt.pendingIntegration !== undefined) {
+        deps.emitDispatchFailed({
+          verb: plan.verb,
+          id: plan.id,
+          reason: pendingIntegrationReason(wt.pendingIntegration),
+          dir: wt.pendingIntegration.laneDir,
+          conflictedFiles: null,
+          ts: deps.now(),
+        });
+      }
       // A provisioned lane runs in its worktree, not the shared main checkout.
       // Carry the realpath-normalized lane so the worker's `keeper plan`
       // subprocesses resolve target/primary/state repo to it (and its
@@ -5948,12 +5963,9 @@ export async function runReconcileCycle(
   // (already-gone worktrees no-op).
   if (deps.worktree !== undefined) {
     // A CLUSTERED epic's NON-PRIMARY worktree groups have no close worker to
-    // trigger their rib→base fan-in, so assemble those bases HERE (via `provision`,
-    // idempotent + crash-recoverable) BEFORE their finalize merges an unassembled
-    // base to default. A fan-in failure (a content conflict merging a rib) mints
-    // the same sticky `close::<epic>` DispatchFailed a finalize block would, and
-    // SKIPS that group's finalize — never merges a half-assembled base. EMPTY for
-    // single-repo epics, so this is a byte-identical no-op there.
+    // provision their sink. Prepare those sinks here; a pending integration is
+    // recorded on `close::<epic>` and prevents finalize from treating the base as
+    // assembled. EMPTY for single-repo epics.
     const provisionFailed = new Set<string>();
     for (const sink of decision.worktreeSinkProvision) {
       if (signal.aborted) {
@@ -6004,6 +6016,16 @@ export async function runReconcileCycle(
             ts: deps.now(),
           });
         }
+      } else if (provisioned.pendingIntegration !== undefined) {
+        provisionFailed.add(`${closeKeyEpicId(sink)}\0${sink.repoDir}`);
+        deps.emitDispatchFailed({
+          verb: "close",
+          id: closeKeyEpicId(sink),
+          reason: pendingIntegrationReason(provisioned.pendingIntegration),
+          dir: provisioned.pendingIntegration.laneDir,
+          conflictedFiles: null,
+          ts: deps.now(),
+        });
       }
     }
     // Track the per-repo finalize keys that finalized CLEAN this cycle so the
@@ -6113,8 +6135,8 @@ function closeKeyEpicId(info: WorktreeLaunchInfo): string {
  * Two branches, mutually exclusive per the geometry the pure post-pass stamped
  * (a `worktreeReject` launch never reaches here — the caller short-circuits it
  * AHEAD of the cwd-missing stat):
- *  - `worktree` → provision the lane (ensure + pre-merges + assert HEAD), launch
- *    into the worktree path.
+ *  - `worktree` → provision the lane, record any pending fan-in integration, and
+ *    launch into the worktree path.
  *  - neither → OFF mode: assert the launch cwd is on the resolved default branch.
  */
 async function runWorktreeProducerStep(
@@ -6123,7 +6145,11 @@ async function runWorktreeProducerStep(
   driver: WorktreeDriver,
   liveAttributedDirty: ReadonlySet<string> | null,
 ): Promise<
-  | { ok: true; cwd: string }
+  | {
+      ok: true;
+      cwd: string;
+      pendingIntegration?: PendingIntegrationManifest;
+    }
   | {
       ok: false;
       reason: string;
@@ -6151,7 +6177,11 @@ async function runWorktreeProducerStep(
         conflictedFiles: provisioned.conflictedFiles,
       };
     }
-    return { ok: true, cwd: provisioned.cwd };
+    return {
+      ok: true,
+      cwd: provisioned.cwd,
+      pendingIntegration: provisioned.pendingIntegration,
+    };
   }
   // OFF mode (driver present, no worktree geometry): on-default-branch assertion.
   const onDefault = await driver.assertOnDefaultBranch(launchCwd);
@@ -6167,13 +6197,55 @@ async function runWorktreeProducerStep(
  * a fold). The `run` GitRunner is injectable so the slow real-git test drives the
  * lifecycle and the fast tier fakes it; production passes the default `gitExec`.
  *
- * Provision: assert the parent lane's worktree HEAD is on its branch (the fork
- * source must be the deterministic branch), ensure the node's worktree exists off
- * that parent's committed tip, run the fan-in pre-merges in order, then assert the
- * node's worktree HEAD equals the derived branch. Finalize: merge the epic base
+ * Provision: ensure the node's worktree exists off its deterministic parent tip,
+ * preserve the lossless-clean/readiness guard for the first pending fan-in, and
+ * return its manifest without merging. Finalize: merge the epic base
  * into the resolved default branch (in the MAIN worktree), push once, tear the
  * lanes down. assertOnDefaultBranch: `currentBranch(cwd) === resolveDefaultBranch`.
  */
+type FanInAssemblyProbe =
+  | { kind: "assembled" }
+  | { kind: "pending"; sourceBranch: string }
+  | { kind: "inconclusive"; sourceBranch: string; detail: string };
+
+async function probeFanInAssembly(
+  info: WorktreeLaunchInfo,
+  run: WorktreeGitRunner,
+): Promise<FanInAssemblyProbe> {
+  const seen = new Set<string>();
+  for (const lane of info.laneOrder) {
+    const source = lane.branch;
+    if (source === info.baseBranch || seen.has(source)) continue;
+    seen.add(source);
+    const present = await run(
+      ["rev-parse", "--verify", "--quiet", `refs/heads/${source}`],
+      { cwd: info.repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (present.code === 1) continue;
+    if (present.code !== 0) {
+      return {
+        kind: "inconclusive",
+        sourceBranch: source,
+        detail: `branch probe exited ${present.code}`,
+      };
+    }
+    const ancestor = await run(
+      ["merge-base", "--is-ancestor", source, info.baseBranch],
+      { cwd: info.repoDir, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (ancestor.code === 0) continue;
+    if (ancestor.code === 1) {
+      return { kind: "pending", sourceBranch: source };
+    }
+    return {
+      kind: "inconclusive",
+      sourceBranch: source,
+      detail: `ancestry probe exited ${ancestor.code}`,
+    };
+  }
+  return { kind: "assembled" };
+}
+
 export function createWorktreeDriver(
   run: WorktreeGitRunner = gitExec,
   // Optional commit-work flock acquirer for the base merge's ref advance + resync
@@ -6303,19 +6375,8 @@ export function createWorktreeDriver(
         // rely on bounded-teardown force removal. Sharing this mutable store is
         // deliberate: source and lane are on one host and filesystem.
         await gitEnsureWorktreeDepLink(repoDir, worktreePath);
-        // Run the fan-in pre-merges in order — sequential pairwise, each taking the
-        // shared commit-work flock. A content conflict aborts + fails loud + stops;
-        // a `missing-source` phantom lane (a branch never created because its task's
-        // work landed on the default branch) is a lossless no-op we skip.
+        let pendingIntegration: PendingIntegrationManifest | undefined;
         for (const source of preMerges) {
-          // Probe the base worktree BEFORE merging the rib in (as finalize/recover
-          // already do), but ONLY for a source that will ACTUALLY merge — a phantom
-          // (unresolvable) or already-merged (ancestor) source folds nothing, so
-          // probing the base for it would both add cost AND, on a dirty base, wrongly
-          // retry-skip against a no-op. These guards mirror gitMergeBranchInto's own
-          // (idempotent — it re-runs them); a probe TIMEOUT falls through to it, which
-          // surfaces the transient degrade. `resolves &&` short-circuits the ancestry
-          // probe for a phantom so it stays a single-read cheap skip.
           const srcRef = await run(
             [
               "rev-parse",
@@ -6326,100 +6387,71 @@ export function createWorktreeDriver(
             ],
             { cwd: worktreePath, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
           );
-          const resolves = srcRef.code === 0;
-          const alreadyMerged =
-            resolves &&
-            (
-              await run(["merge-base", "--is-ancestor", source, "HEAD"], {
-                cwd: worktreePath,
-                timeoutMs: GIT_LOCAL_TIMEOUT_MS,
-              })
-            ).code === 0;
-          if (resolves && !alreadyMerged) {
-            // A `ready` base merges unchanged (byte-identical clean path). A DIRTY base
-            // is LOSSLESSLY cleaned ONLY when its dirt is a provably-redundant leak of
-            // THIS rib and none is attributed to a live job — else every not-ready
-            // state degrades to a SELF-CLEARING (non-sticky) `worktree-lane-premerge`
-            // row so a dirty base never blind-conflicts (the wedge this arm fixes) yet
-            // is never the dead no-clear `work-task` dead end: the recover pass's
-            // verb-agnostic reason-scoped level-clear clears it by lane path once the
-            // base is ready, and a persistent one escalates to a per-lane distress.
-            // Genuine-conflict escalation of the merge ITSELF stays today's sticky.
-            const ready = await gitMergeReadiness(
+          if (srcRef.code === 1) {
+            continue;
+          }
+          if (srcRef.code !== 0) {
+            return {
+              ok: false,
+              dir: worktreePath,
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: source probe for ${source} exited ${srcRef.code} before merging into ${branch} — deferring the fan-in`,
+            };
+          }
+          const ancestor = await run(
+            ["merge-base", "--is-ancestor", source, "HEAD"],
+            {
+              cwd: worktreePath,
+              timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+            },
+          );
+          if (ancestor.code === 0) {
+            continue;
+          }
+          if (ancestor.code !== 1) {
+            return {
+              ok: false,
+              dir: worktreePath,
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: ancestry probe for ${source} into ${branch} exited ${ancestor.code} — deferring the fan-in`,
+            };
+          }
+
+          const ready = await gitMergeReadiness(
+            worktreePath,
+            branch,
+            run,
+            source,
+            undefined,
+            repoDir,
+          );
+          if (ready.kind === "dirty") {
+            const cleaned = await gitLosslessPremergeClean(
               worktreePath,
               branch,
-              run,
               source,
-              undefined,
-              repoDir,
+              liveAttributedDirty,
+              run,
             );
-            if (ready.kind === "dirty") {
-              const cleaned = await gitLosslessPremergeClean(
-                worktreePath,
-                branch,
-                source,
-                liveAttributedDirty,
-                run,
-              );
-              if (cleaned.kind === "retry") {
-                return {
-                  ok: false,
-                  dir: worktreePath,
-                  reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the fan-in merge of ${source} into ${branch} — ${cleaned.reason}`,
-                };
-              }
-              // cleaned.kind === "ready" → the redundant leak was restored to HEAD; the
-              // merge below re-applies exactly that content, a true no-op on it.
-            } else if (ready.kind !== "ready") {
-              // A not-ready base lane (off-branch / mid-merge / would-clobber) the merge
-              // would abort on — a self-clearing lane row, NEVER a blind merge.
+            if (cleaned.kind === "retry") {
               return {
                 ok: false,
                 dir: worktreePath,
-                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the fan-in`,
+                reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-dirty-base: deferring the fan-in merge of ${source} into ${branch} — ${cleaned.reason}`,
               };
             }
-          }
-          const merge: MergeResult = await gitMergeBranchInto(
-            worktreePath,
-            source,
-            run,
-          );
-          if (merge.kind === "missing-source") {
-            continue; // phantom lane: nothing to merge, never created
-          }
-          if (merge.kind === "conflict") {
+          } else if (ready.kind !== "ready") {
             return {
               ok: false,
-              reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
-              conflictedFiles: merge.conflictedFiles,
+              dir: worktreePath,
+              reason: `${WORKTREE_LANE_PREMERGE_REASON_PREFIX}-not-ready: base ${worktreePath} is ${ready.kind} before merging ${source} into ${branch} — deferring the fan-in`,
             };
           }
-          // The conflict/timeout abort itself failed, leaving the lane worktree
-          // mid-merge. Keep this distinct wedge shape free of conflictedFiles.
-          if (merge.kind === "abort-failed") {
-            return {
-              ok: false,
-              reason: `worktree-merge-conflict: merging ${source} into ${branch} — ${merge.stderr}`,
-            };
-          }
-          // A bounded-lock / local-op (blocking hook) timeout means the pre-merge
-          // did NOT land — surface it rather than fall through as if merged (which
-          // would launch the lane off an incomplete fan-in). Provision carries no
-          // retry flag, so this is a sticky `work::` block a human clears once the
-          // lock/hook frees; `worktree-merge-*` (NOT a recover/finalize reason).
-          if (merge.kind === "lock-timeout") {
-            return {
-              ok: false,
-              reason: `worktree-merge-lock-timeout: could not acquire the commit-work lock for ${worktreePath} within the deadline (a concurrent holder) merging ${source} into ${branch} — retry once the lock frees`,
-            };
-          }
-          if (merge.kind === "local-timeout") {
-            return {
-              ok: false,
-              reason: `worktree-merge-local-timeout: a local git op merging ${source} into ${branch} timed out (a blocking git hook) — retry once the hook clears`,
-            };
-          }
+
+          pendingIntegration = {
+            sourceBranch: source,
+            baseBranch: branch,
+            laneDir: worktreePath,
+          };
+          break;
         }
         // Assert HEAD == derived branch AND the worktree is registered.
         const registered = await gitListWorktrees(repoDir, run);
@@ -6441,7 +6473,9 @@ export function createWorktreeDriver(
             reason: `worktree-head-mismatch: ${worktreePath} HEAD is ${head}, expected ${branch}`,
           };
         }
-        return { ok: true, cwd: worktreePath };
+        return pendingIntegration === undefined
+          ? { ok: true, cwd: worktreePath }
+          : { ok: true, cwd: worktreePath, pendingIntegration };
       } catch (err) {
         return {
           ok: false,
@@ -6489,6 +6523,17 @@ export function createWorktreeDriver(
           console.error(`[autopilot-worker] finalize ${epicId}: ${reason}`);
           return { ok: false, retry: true, reason };
         };
+        const assembly = await probeFanInAssembly(info, run);
+        if (assembly.kind === "pending") {
+          return retrySkip(
+            `worktree-finalize-pending-integration: ${assembly.sourceBranch} is not an ancestor of ${baseBranch}`,
+          );
+        }
+        if (assembly.kind === "inconclusive") {
+          return retrySkip(
+            `worktree-finalize-pending-integration: could not prove ${assembly.sourceBranch} is integrated into ${baseBranch} — ${assembly.detail}`,
+          );
+        }
         // Merge-suite gate (fn-1204): BEFORE local default advances, test the
         // PROSPECTIVE lane→default merge result's fast suite on a scratch worktree, so
         // a lost-update merge (two individually-green sides whose merged tree fails the

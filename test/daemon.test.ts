@@ -5701,6 +5701,58 @@ test("incident claim sweep mints one fenced release and removes the request", ()
   ]);
 });
 
+test("pending fan-in incident claim and release round-trip keeps the same fence", () => {
+  let incident = {
+    instanceEventId: 41,
+    claimSessionId: null as string | null,
+    claimPid: null as number | null,
+    claimStartTime: null as string | null,
+  };
+  const claim = incidentSpoolEntry("claim");
+  const claimed = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [claim],
+      lookupIncident: () => incident,
+      mintClaimed: (payload) => {
+        incident = {
+          instanceEventId: payload.instanceEventId,
+          claimSessionId: payload.claimSessionId,
+          claimPid: payload.claimPid,
+          claimStartTime: payload.claimStartTime,
+        };
+      },
+    }),
+  );
+
+  expect(claimed.claimed).toBe(1);
+  expect(incident).toEqual({
+    instanceEventId: 41,
+    claimSessionId: "session-new",
+    claimPid: 4242,
+    claimStartTime: "proc:4242:1",
+  });
+
+  const release = incidentSpoolEntry("release");
+  const released = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [release],
+      lookupIncident: () => incident,
+      mintReleased: (payload) => {
+        expect(payload.instanceEventId).toBe(41);
+        incident = {
+          instanceEventId: 41,
+          claimSessionId: null,
+          claimPid: null,
+          claimStartTime: null,
+        };
+      },
+    }),
+  );
+
+  expect(released.released).toBe(1);
+  expect(incident.claimSessionId).toBeNull();
+});
+
 test("incident release refuses a dead or non-owning claimant", () => {
   const entry = incidentSpoolEntry("release", {
     claimant_session_id: "session-owner",
