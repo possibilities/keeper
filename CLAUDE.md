@@ -61,9 +61,9 @@ file is imperative guardrails only.
 ## Writes are tightly scoped — DO NOT widen them
 
 - **No general write path into the reducer.** The socket carries `query` (read) and `rpc` (mutate).
-  RPC may write ONLY these eight synthetic-event surfaces: `replay_dead_letter`, `retry_dispatch`,
+  RPC may write ONLY these nine surfaces: `replay_dead_letter`, `resolve_dead_letter`, `retry_dispatch`,
   `set_autopilot_paused`, `set_autopilot_mode`, `set_autopilot_config`, `set_epic_armed`, `request_handoff`,
-  `request_await` — `set_autopilot_config` is GENERIC (a partial `autopilot_state` config patch; a future setting = a column + patch field, no new RPC). Never write `jobs`/`epics` directly.
+  `request_await` — dead-letter actions mutate only main-owned operational rows (re-classification may append one real event); other mutations round-trip synthetic events. `set_autopilot_config` is GENERIC (a partial `autopilot_state` config patch; a future setting = a column + patch field, no new RPC). Never write `jobs`/`epics` directly.
 - **Plans are READ-ONLY.** Plan worker folds `.keeper/{epics,tasks}` snapshots into `epics`; no RPC writes plan fields. **Board-orient** with `keeper status`; task detail via `keeper query tasks` — never hand-parse `keeper plan <verb>`.
 - **Sole-writer rules.** The events-log per-pid NDJSON tree has a writer CLASS keyed on the keeper job id — the claude events-writer hook and pi extension each write ONLY their own `<pid>.ndjson`, never the DB; `keeper agent` is SOLE writer of the births tree. sidecar-writer + docs-pusher write ONLY the `~/docs` repo. The events-log ingester is sole writer of hook-sourced `events` rows; main writes all synthetic events + `dead_letters` + the replay path (birth-ingest producers feed it, never the DB), workers feed via main. `keeper statusline*` SOLE-write the statusLine leafs (never DB/socket); `keeper agent panel start` SOLE writer of `~/.local/state/keeper/panels/`. `keeper baseline` + the autopilot tip-triggered producer write the request spool, the baseline worker its result leafs; the plan CLI of the id ledger, max(scan,ledger)+1.
 

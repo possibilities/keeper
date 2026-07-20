@@ -50,6 +50,42 @@ export type DeadLetterBindings = Record<
   string | number | boolean | null
 >;
 
+export const DEAD_LETTER_WAITING_STATUS = "waiting";
+export const DEAD_LETTER_RECOVERED_STATUS = "recovered";
+export const DEAD_LETTER_POISON_STATUS = "poison";
+export const DEAD_LETTER_RESOLVED_STATUS = "resolved";
+export const BIRTH_STUCK_STATUS = "birth-stuck";
+
+export const DEAD_LETTER_TERMINAL_STATUSES = [
+  DEAD_LETTER_RECOVERED_STATUS,
+  DEAD_LETTER_RESOLVED_STATUS,
+  BIRTH_STUCK_STATUS,
+] as const;
+
+export function isDeadLetterTerminalStatus(
+  status: unknown,
+): status is (typeof DEAD_LETTER_TERMINAL_STATUSES)[number] {
+  return (DEAD_LETTER_TERMINAL_STATUSES as readonly unknown[]).includes(status);
+}
+
+export type DeadLetterOperatorRequest =
+  | { op: "reclassify"; dl_id: string }
+  | {
+      op: "resolve";
+      dl_id: string;
+      caller_session: string;
+      reason: string;
+      force: true;
+    };
+
+export type DeadLetterOperatorOutcome =
+  | "reclassified"
+  | "still_poison"
+  | "resolved"
+  | "refused_already_resolved"
+  | "refused_not_poison"
+  | "refused_not_found";
+
 /**
  * One dead-letter record — one line of NDJSON. Field semantics mirror the
  * matching columns on the `dead_letters` table (schema v37), so the import

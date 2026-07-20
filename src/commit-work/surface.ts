@@ -35,7 +35,12 @@ import {
   openDb,
   resolveSockPath,
 } from "../db";
-import { parseDeadLetterLine, parseEventLogLine } from "../dead-letter";
+import {
+  DEAD_LETTER_TERMINAL_STATUSES,
+  isDeadLetterTerminalStatus,
+  parseDeadLetterLine,
+  parseEventLogLine,
+} from "../dead-letter";
 import { extractMutationPath } from "../derivers";
 import {
   ATTRIBUTION_FLOOR_PATH,
@@ -778,7 +783,9 @@ function unresolvedDeadLetterEvidence(
   const observe = (
     bindings: Record<string, string | number | boolean | null>,
     fallbackSession: string | null,
-  ): void => {
+    sessionWorktree: string | null = null,
+    producerScopeOnly = false,
+  ): "global" | "scoped" | "none" => {
     const boundSession = bindings.session_id;
     const sessionId =
       typeof boundSession === "string" && boundSession.length > 0
@@ -789,15 +796,34 @@ function unresolvedDeadLetterEvidence(
     }
     if (receiptCanonicalizationUnavailable(bindings)) {
       blockingMutation = true;
-      return;
+      return "global";
     }
-    const mutationPath = mutationPathFromReceipt(bindings);
+    const mutationPath = producerScopeOnly
+      ? Object.hasOwn(bindings, "mutation_path") &&
+        typeof bindings.mutation_path === "string" &&
+        isAbsolute(bindings.mutation_path) &&
+        !bindings.mutation_path.includes("\0")
+        ? bindings.mutation_path
+        : null
+      : mutationPathFromReceipt(bindings);
+    if (mutationPath !== null) {
+      if (canonicalMutationPath(worktree, mutationPath) !== null) {
+        blockingMutation = true;
+      }
+      return "scoped";
+    }
     if (
-      mutationPath !== null &&
-      canonicalMutationPath(worktree, mutationPath) !== null
+      sessionWorktree !== null &&
+      isAbsolute(sessionWorktree) &&
+      !sessionWorktree.includes("\0")
     ) {
-      blockingMutation = true;
+      const scopeProbe = resolve(sessionWorktree, ".keeper-poison-scope");
+      if (canonicalMutationPath(worktree, scopeProbe) !== null) {
+        blockingMutation = true;
+      }
+      return "scoped";
     }
+    return "none";
   };
   const evidence = (): DeadLetterEvidence => ({
     blockingMutation,
@@ -810,31 +836,41 @@ function unresolvedDeadLetterEvidence(
       if (importBefore === null) return null;
       const unresolved = db
         .query(
-          `SELECT bindings, session_id, status
-             FROM dead_letters
-            WHERE status != 'recovered'
+          `SELECT d.bindings, d.session_id, d.status, j.cwd AS session_worktree
+             FROM dead_letters d
+             LEFT JOIN jobs j ON j.job_id = d.session_id
+            WHERE d.status NOT IN (?, ?, ?)
             LIMIT ?`,
         )
-        .all(RECEIPT_RECORD_LIMIT + 1) as Array<{
+        .all(
+          ...DEAD_LETTER_TERMINAL_STATUSES,
+          RECEIPT_RECORD_LIMIT + 1,
+        ) as Array<{
         bindings: unknown;
         session_id: unknown;
         status: unknown;
+        session_worktree: unknown;
       }>;
       if (unresolved.length > RECEIPT_RECORD_LIMIT) return null;
       for (const row of unresolved) {
-        // Poison means the original event could not be classified at all. Its
-        // parked `{raw,…}` envelope cannot prove which session/path it touched,
-        // so terminal adoption must fail closed globally until an operator
-        // resolves or removes the poison evidence.
-        if (row.status !== "waiting") {
-          blockingMutation = true;
+        if (isDeadLetterTerminalStatus(row.status)) {
           continue;
         }
-        if (typeof row.bindings !== "string") return null;
+        if (typeof row.bindings !== "string") {
+          if (row.status === "poison") {
+            blockingMutation = true;
+            continue;
+          }
+          return null;
+        }
         let parsed: unknown;
         try {
           parsed = JSON.parse(row.bindings);
         } catch {
+          if (row.status === "poison") {
+            blockingMutation = true;
+            continue;
+          }
           return null;
         }
         if (
@@ -842,12 +878,37 @@ function unresolvedDeadLetterEvidence(
           typeof parsed !== "object" ||
           Array.isArray(parsed)
         ) {
+          if (row.status === "poison") {
+            blockingMutation = true;
+            continue;
+          }
           return null;
         }
-        observe(
-          parsed as Record<string, string | number | boolean | null>,
-          typeof row.session_id === "string" ? row.session_id : null,
+        const bindings = parsed as Record<
+          string,
+          string | number | boolean | null
+        >;
+        const fallbackSession =
+          typeof row.session_id === "string" ? row.session_id : null;
+        if (row.status === "waiting") {
+          observe(bindings, fallbackSession);
+          continue;
+        }
+        if (row.status !== "poison") {
+          blockingMutation = true;
+          continue;
+        }
+        const scope = observe(
+          bindings,
+          fallbackSession,
+          typeof row.session_worktree === "string"
+            ? row.session_worktree
+            : null,
+          true,
         );
+        if (scope !== "scoped") {
+          blockingMutation = true;
+        }
       }
 
       duringRead?.();
@@ -869,7 +930,10 @@ function unresolvedDeadLetterEvidence(
       let totalBytes = 0;
       let totalRecords = 0;
       const status = db.query(
-        "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = ?",
+        `SELECT d.status, d.replayed_event_id, j.cwd AS session_worktree
+           FROM dead_letters d
+           LEFT JOIN jobs j ON j.job_id = d.session_id
+          WHERE d.dl_id = ?`,
       );
       for (const name of names) {
         const full = join(dir, name);
@@ -916,13 +980,35 @@ function unresolvedDeadLetterEvidence(
             const row = status.get(record.dl_id) as {
               status: unknown;
               replayed_event_id: unknown;
+              session_worktree: unknown;
             } | null;
             const recovered =
               row?.status === "recovered" &&
               typeof row.replayed_event_id === "number" &&
               Number.isSafeInteger(row.replayed_event_id);
+            if (
+              row !== null &&
+              isDeadLetterTerminalStatus(row.status) &&
+              row.status !== "recovered"
+            ) {
+              continue;
+            }
             if (row !== null && !recovered && row.status !== "waiting") {
-              blockingMutation = true;
+              if (row.status !== "poison") {
+                blockingMutation = true;
+                continue;
+              }
+              const scope = observe(
+                record.bindings,
+                record.session_id,
+                typeof row.session_worktree === "string"
+                  ? row.session_worktree
+                  : null,
+                true,
+              );
+              if (scope !== "scoped") {
+                blockingMutation = true;
+              }
               continue;
             }
             if (!recovered) observe(record.bindings, record.session_id);

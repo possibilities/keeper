@@ -1,10 +1,18 @@
 import type { Database } from "bun:sqlite";
-import type { RetryDispatchVerb } from "./dispatch-command";
+import type {
+  DeadLetterOperatorOutcome,
+  DeadLetterOperatorRequest,
+} from "./dead-letter";
+import type {
+  DispatchClearOutcome,
+  RetryDispatchVerb,
+} from "./dispatch-command";
 import type { NormalizedFableFocusInput } from "./fable-focus";
 import type { RequestAwaitRpcParams } from "./protocol";
 
 export const RPC_METHODS = [
   "replay_dead_letter",
+  "resolve_dead_letter",
   "set_autopilot_paused",
   "set_autopilot_mode",
   "set_autopilot_config",
@@ -24,6 +32,11 @@ export interface ReplayBridge {
     recovered_dl_id?: string | null;
     error?: string;
   }>;
+  resolveDeadLetter(request: DeadLetterOperatorRequest): Promise<{
+    ok: boolean;
+    outcome?: DeadLetterOperatorOutcome;
+    error?: string;
+  }>;
   setAutopilotPaused(paused: boolean): Promise<{
     ok: boolean;
     error?: string;
@@ -31,9 +44,12 @@ export interface ReplayBridge {
   retryDispatch(
     verb: RetryDispatchVerb,
     dispatch_id: string,
+    force: boolean,
+    caller_session: string | null,
   ): Promise<{
     ok: boolean;
     error?: string;
+    outcome?: DispatchClearOutcome;
   }>;
   setAutopilotMode(mode: "yolo" | "armed"): Promise<{
     ok: boolean;

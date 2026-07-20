@@ -119,6 +119,8 @@ import {
   isHarnessProcessCommand,
   probeHarnessProcess,
   processStartTimesWithinOneSecond,
+  type RecordedProcessIdentityVerdict,
+  recordedProcessIdentity,
 } from "./commit-work/process-identity";
 import {
   countAbsentBlobs,
@@ -158,7 +160,16 @@ import {
   selectWorldRev,
   truncateEphemeralProjections,
 } from "./db";
-import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
+import {
+  BIRTH_STUCK_STATUS,
+  DEAD_LETTER_RESOLVED_STATUS,
+  type DeadLetterOperatorOutcome,
+  parseDeadLetterLine,
+  parseEventLogLine,
+} from "./dead-letter";
+
+export { BIRTH_STUCK_STATUS } from "./dead-letter";
+
 import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
@@ -352,6 +363,8 @@ import {
   type RequestAwaitResultMessage,
   type RequestHandoffRequestMessage,
   type RequestHandoffResultMessage,
+  type ResolveDeadLetterRequestMessage,
+  type ResolveDeadLetterResultMessage,
   type RetryDispatchRequestMessage,
   type RetryDispatchResultMessage,
   type ServeHealthMessage,
@@ -566,6 +579,41 @@ export function dispatchClearFencesAtAppend(
   };
 }
 
+/** The audit trail an operator dispatch-clear stamps into its `DispatchCleared`
+ *  event data: the acting identity and whether `--force` overrode the liveness
+ *  fence. Internal sweeps carry none. */
+export interface DispatchClearAudit {
+  forced: boolean;
+  caller_session: string | null;
+}
+
+/**
+ * Build the `data` blob for a `DispatchCleared` synthetic event. An operator
+ * clear passes an {@link DispatchClearAudit} trail; internal sweeps omit it and
+ * keep their historical `{ verb, id, ...fences }` shape byte-for-byte. The fold
+ * ({@link extractDispatchClearedPayload}) reads only `verb` / `id` / the two
+ * fence fields, so the audit fields are audit-only and re-fold-inert. Pure —
+ * exported so tests can pin the shape and its re-fold determinism.
+ */
+export function buildDispatchClearedData(
+  verb: string,
+  id: string,
+  fences: DispatchClearFences,
+  audit?: DispatchClearAudit,
+): string {
+  return JSON.stringify(
+    audit === undefined
+      ? { verb, id, ...fences }
+      : {
+          verb,
+          id,
+          ...fences,
+          forced: audit.forced,
+          caller_session: audit.caller_session,
+        },
+  );
+}
+
 /** Revalidate immutable producer authority, append, then release only the gate
  * owned by that exact attempt. A stale clear is a fail-closed no-op. */
 export function appendFencedDispatchClear(args: {
@@ -615,6 +663,40 @@ export function appendFencedDispatchClear(args: {
       .run(`${args.verb}::${args.id}`, args.fences.expected_attempt_id);
   }
   return true;
+}
+
+/** The producer-side verdict for one operator dispatch-clear liveness gate.
+ *  `clear` proceeds to the append + identity CAS; `refuse-live` denies because
+ *  the target's claim is bound to a worker whose process probes live or
+ *  uncertain. */
+export type DispatchClearLivenessDecision = { kind: "clear" | "refuse-live" };
+
+/**
+ * Owner-liveness fence for an operator dispatch-clear (`retry_dispatch`), decided
+ * producer-side (ADR 0099, mirroring {@link decideAwaitCancel}'s shape). Pure: main
+ * reads the committed claim + the claimant's process-identity verdict, then this
+ * decides whether the clear may append. A released/absent/unbound claim clears
+ * freely (nothing live to protect). A bound, unreleased claim consults the process
+ * probe: only a `gone` verdict (ESRCH / start-time mismatch — the recorded claimant
+ * is provably dead) clears; `matching` (live) and `inconclusive` (uncertain — a
+ * reused pid, an unreadable identity, or a missing witness) both refuse, so
+ * over-refusing is the safe direction. `force` lifts THIS liveness gate only and is
+ * evaluated before the probe (no wasted `ps`); the attempt-identity CAS at the write
+ * site stays load-bearing under force. The probe seam is lazy so an unbound clear
+ * never spawns a process probe.
+ */
+export function decideDispatchClearLiveness(
+  claim: { state: string; bound_at: number | null } | undefined,
+  force: boolean,
+  probeLiveness: () => RecordedProcessIdentityVerdict,
+): DispatchClearLivenessDecision {
+  const bound =
+    claim !== undefined && claim.state !== "released" && claim.bound_at != null;
+  if (!bound) return { kind: "clear" };
+  if (force) return { kind: "clear" };
+  return probeLiveness() === "gone"
+    ? { kind: "clear" }
+    : { kind: "refuse-live" };
 }
 
 /**
@@ -5740,8 +5822,8 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 /**
  * Age window a `dead_letters` row must exceed before the retention prune removes
  * it — 7 days, matching the reclaim/backup sidecar retention horizon. The gate
- * compares against `recovered_at` (recovered rows) or `dl_written_at` (poison
- * rows), both stored as unix SECONDS (`Date.now() / 1000`).
+ * compares against `recovered_at` (recovered rows) or `dl_written_at`
+ * (terminal row-only statuses), both stored as unix SECONDS (`Date.now() / 1000`).
  */
 export const DEAD_LETTER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -5816,15 +5898,16 @@ function pidFromDeadLetterFile(filePath: string): number | null {
  *    skips them) and swept next pass (the file is gone, `unlinkSync` ENOENT is a
  *    no-op, the delete still runs).
  *  - ROW-ONLY (no file to resurrect them): `recovered` rows with `source_file
- *    IS NULL` (age on `recovered_at`) and `poison` rows (age on `dl_written_at`
- *    — poison park leaves `recovered_at` NULL). Poison rows' `source_file` points
- *    at an EVENTS-LOG file the ingester solely owns; its durable byte-offset
- *    already advanced past the poison line, so the ROW deletes with no re-ingest
- *    and the file is NEVER touched. Paced (≤500 rows/batch, ≤20 batches) so the
- *    writer lock never starves a concurrent hook INSERT.
+ *    IS NULL` (age on `recovered_at`), operator-resolved poison rows (age on
+ *    `recovered_at`), and birth-stuck rows (age on `dl_written_at`). Their
+ *    producers have already retired or advanced past the source, so the ROW
+ *    deletes with no re-ingest and the file is NEVER touched. Unresolved poison
+ *    rows never age out behind the operator's back.
+ *    Paced (≤500 rows/batch, ≤20 batches) so the writer lock never starves a
+ *    concurrent hook INSERT.
  *
  * The `status='waiting'` warn pill is unaffected — this prune removes only
- * `recovered`/`poison` rows. Never throws for a single-file unlink error
+ * non-blocking terminal rows. Never throws for a single-file unlink error
  * (per-file non-fatal, mirroring events-log cleanup); a DB-level error propagates
  * to the caller's non-fatal retention try.
  */
@@ -5903,7 +5986,8 @@ export function pruneRecoveredDeadLetters(
     `SELECT dl_id FROM dead_letters
       WHERE (status = 'recovered' AND source_file IS NULL
              AND recovered_at IS NOT NULL AND recovered_at <= ?)
-         OR (status = 'poison' AND dl_written_at <= ?)
+         OR (status = ? AND recovered_at IS NOT NULL AND recovered_at <= ?)
+         OR (status = ? AND dl_written_at <= ?)
       LIMIT ?`,
   );
   const deleteByIds = db.prepare(
@@ -5912,6 +5996,9 @@ export function pruneRecoveredDeadLetters(
   for (let i = 0; i < DEFAULT_RETENTION_MAX_BATCHES; i++) {
     const idRows = selectRowOnlyBatch.all(
       cutoffSec,
+      DEAD_LETTER_RESOLVED_STATUS,
+      cutoffSec,
+      BIRTH_STUCK_STATUS,
       cutoffSec,
       DEFAULT_RETENTION_BATCH_SIZE,
     ) as { dl_id: string }[];
@@ -6874,16 +6961,34 @@ export function resolvePiResumeRepairs(
   return repairs;
 }
 
+function emitBirthParkBackstop(
+  ctx: EventsIngestContext | undefined,
+  full: string,
+  dlId: string,
+  status: string,
+): void {
+  if (ctx === undefined) {
+    return;
+  }
+  const now = Date.now();
+  ctx.counters.bump("birth-ingest-poison", "timeout", true);
+  appendBackstopRecord(
+    buildTimeoutRecord({
+      backstop: "birth-ingest-poison",
+      worker: "main",
+      rescued: true,
+      now,
+      stalenessMs: null,
+      detail: { file: full, dl_id: dlId, status },
+    }),
+    ctx.backstopLogPath,
+  );
+}
+
 /**
- * Park a birth record that cannot be folded — a malformed (poison) record, or a
- * stale one whose mint perpetually throws — as a `dead_letters` row with
- * status='poison' (replay's `WHERE status='waiting'` skips it). Deterministic
- * `dl_id` keyed on the file path → `ON CONFLICT DO NOTHING` idempotent.
- * `ts`/`dl_written_at` are scan wall-clock (dead_letters is an operational
- * sidecar, never folded). Returns `true` when the row is durably parked (the
- * caller then retires the file); `false` on a transient DB error (the caller
- * LEAVES the file for the next scan). Emits one `birth-ingest-poison` backstop
- * record when the sink is wired.
+ * Park malformed birth bytes as a poison row. The parked payload stays bounded;
+ * replay skips every non-`waiting` status, and the deterministic `dl_id` keeps
+ * repeated scans idempotent.
  */
 function parkPoisonBirth(
   db: Database,
@@ -6918,30 +7023,58 @@ function parkPoisonBirth(
     );
     return false;
   }
-  if (ctx !== undefined) {
-    ctx.counters.bump("birth-ingest-poison", "timeout", true);
-    appendBackstopRecord(
-      buildTimeoutRecord({
-        backstop: "birth-ingest-poison",
-        worker: "main",
-        rescued: true,
-        now: Date.now(),
-        stalenessMs: null,
-        detail: { file: full, dl_id: dlId },
-      }),
-      ctx.backstopLogPath,
-    );
-  }
+  emitBirthParkBackstop(ctx, full, dlId, "poison");
   return true;
 }
 
-/** Grace before a mint-failing birth record is eligible for dead-pid GC. A
- *  transient write failure deserves several retries; only a record aged past
- *  this AND whose pid is provably dead is parked. */
+const BIRTH_STUCK_HOOK_EVENT = "StuckBirthRecord";
+
+function parkStuckBirth(
+  db: Database,
+  full: string,
+  record: BirthRecord,
+  ctx?: EventsIngestContext,
+): boolean {
+  const dlId = `birth-stuck:${full}`;
+  const nowSec = Date.now() / 1000;
+  try {
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid,
+          bindings, status, recovered_at, replayed_event_id, source_file)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+       ON CONFLICT(dl_id) DO NOTHING`,
+      [
+        dlId,
+        record.session_id,
+        BIRTH_STUCK_HOOK_EVENT,
+        birthEventTs(record),
+        nowSec,
+        record.pid,
+        JSON.stringify({ record, file: full }),
+        BIRTH_STUCK_STATUS,
+        full,
+      ],
+    );
+  } catch (err) {
+    console.error(
+      `[keeperd] births stuck-park failed for ${full}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+  emitBirthParkBackstop(ctx, full, dlId, BIRTH_STUCK_STATUS);
+  return true;
+}
+
+/** Grace before a parseable birth record is eligible for dead-pid GC. A
+ *  transient write or wait state deserves several retries; only a record aged
+ *  past this AND whose pid is provably dead is parked. */
 const BIRTH_STUCK_GRACE_MS = 5 * 60_000;
 
 /**
- * Bound the births tree against a record whose mint PERPETUALLY throws: once the
+ * Bound the births tree against a parseable record that cannot mint: once the
  * file has aged past {@link BIRTH_STUCK_GRACE_MS} AND its recorded pid is
  * provably dead (nothing left to track — a live pid still deserves a retry so
  * the session eventually appears), park it to `dead_letters` and retire it. A
@@ -6962,7 +7095,7 @@ function gcStuckBirthRecord(
   if (ageMs < BIRTH_STUCK_GRACE_MS || pidAlive(record.pid)) {
     return;
   }
-  if (parkPoisonBirth(db, full, JSON.stringify(record), record.pid, ctx)) {
+  if (parkStuckBirth(db, full, record, ctx)) {
     retireBirthFile(full);
   }
 }
@@ -6988,7 +7121,7 @@ function gcStuckBirthRecord(
  * A read that ENOENTs (the file vanished — a concurrent scan retired it) is
  * SKIPPED, never parked. NEVER THROWS out of the scan: every recoverable error
  * is swallowed to stderr so one bad file never wedges boot or the message loop.
- * When `ctx` is absent, poison records are STILL parked; only the backstop
+ * When `ctx` is absent, parked records are STILL written; only the backstop
  * record is skipped. MUST run on `db` = main's WRITER connection.
  */
 export function scanBirthDir(
@@ -7080,10 +7213,11 @@ export function scanBirthDir(
         continue;
       }
       if (grantStatus === "deny") {
-        // Keep the promoted identity as fail-closed evidence. A terminal or
-        // superseded owner can never become grantable, and the dead-shim GC
-        // eventually bounds the stranded record without creating authority.
-        gcStuckBirthRecord(db, full, record, ctx);
+        // A denied owner can never become grantable, so retire the record under
+        // its classifiable terminal status immediately.
+        if (parkStuckBirth(db, full, record, ctx)) {
+          retireBirthFile(full);
+        }
         continue;
       }
       if (committed && owner !== null && shouldIssueGrant) {
@@ -7737,9 +7871,58 @@ export async function runProviderLegCascadeSweep(
  * the events log stays untouched, and the next replay retries it. A recovered
  * row is never picked again (`WHERE status='waiting'` filters it out).
  */
+interface RecoverableDeadLetterRow {
+  dl_id: string;
+  bindings: string;
+  ts: number;
+  session_id: string;
+  hook_event: string;
+  pid: number | null;
+}
+
+function insertRecoveredDeadLetterEvent(
+  db: Database,
+  row: RecoverableDeadLetterRow,
+  bindings: Record<string, unknown>,
+): number {
+  bindings.ts = row.ts;
+  completeSparseEventBindings(bindings);
+  const presentCols = INGEST_EVENTS_COLUMNS.filter((column) =>
+    Object.hasOwn(bindings, column),
+  );
+  if (presentCols.length === 0) {
+    throw new Error(
+      `replay: bindings carry no recognized events columns for dl_id ${row.dl_id}`,
+    );
+  }
+  const placeholders = presentCols.map(() => "?").join(", ");
+  const values = presentCols.map((column) => {
+    const value = bindings[column];
+    return typeof value === "boolean"
+      ? value
+        ? 1
+        : 0
+      : (value as string | number | null);
+  });
+  const info = db
+    .prepare(
+      `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`,
+    )
+    .run(...values);
+  return Number(info.lastInsertRowid);
+}
+
+function rollbackAndRethrow(db: Database, error: unknown): never {
+  try {
+    db.run("ROLLBACK");
+  } catch {
+    // best-effort; the original failure stays authoritative
+  }
+  throw error;
+}
+
 export function recoverOneDeadLetter(db: Database): string | null {
   db.run("BEGIN IMMEDIATE");
-  let recoveredDlId: string | null = null;
   try {
     const row = db
       .prepare(
@@ -7749,14 +7932,7 @@ export function recoverOneDeadLetter(db: Database): string | null {
           ORDER BY dl_written_at ASC, dl_id ASC
           LIMIT 1`,
       )
-      .get() as {
-      dl_id: string;
-      bindings: string;
-      ts: number;
-      session_id: string;
-      hook_event: string;
-      pid: number | null;
-    } | null;
+      .get() as RecoverableDeadLetterRow | null;
     if (row === null) {
       db.run("COMMIT");
       return null;
@@ -7765,8 +7941,6 @@ export function recoverOneDeadLetter(db: Database): string | null {
     try {
       parsed = JSON.parse(row.bindings);
     } catch (err) {
-      // Unparseable bindings: throw so the transaction rolls back and the row
-      // stays `waiting` for an operator. The dl_id names the offending row.
       throw new Error(
         `replay: bindings JSON parse failed for dl_id ${row.dl_id}: ${
           err instanceof Error ? err.message : String(err)
@@ -7782,31 +7956,11 @@ export function recoverOneDeadLetter(db: Database): string | null {
         `replay: bindings is not a JSON object for dl_id ${row.dl_id}`,
       );
     }
-    const bindings = parsed as Record<string, unknown>;
-    completeSparseEventBindings(bindings);
-
-    // INSERT column list = events columns ∩ bindings keys. Unknown keys are
-    // dropped. The list is interpolated directly (INGEST_EVENTS_COLUMNS is a
-    // module constant, no wire text); values are bound positionally.
-    const presentCols = INGEST_EVENTS_COLUMNS.filter((c) =>
-      Object.hasOwn(bindings, c),
+    const replayedEventId = insertRecoveredDeadLetterEvent(
+      db,
+      row,
+      parsed as Record<string, unknown>,
     );
-    if (presentCols.length === 0) {
-      throw new Error(
-        `replay: bindings carry no recognized events columns for dl_id ${row.dl_id}`,
-      );
-    }
-    const placeholders = presentCols.map(() => "?").join(", ");
-    const values = presentCols.map((c) => {
-      const v = bindings[c];
-      // Booleans serialize as 0/1.
-      if (typeof v === "boolean") return v ? 1 : 0;
-      return v as string | number | null;
-    });
-    const insertSql = `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`;
-    const info = db.prepare(insertSql).run(...values);
-    const replayedEventId = Number(info.lastInsertRowid);
-
     db.prepare(
       `UPDATE dead_letters
           SET status = 'recovered',
@@ -7814,18 +7968,142 @@ export function recoverOneDeadLetter(db: Database): string | null {
               replayed_event_id = ?
         WHERE dl_id = ?`,
     ).run(Date.now() / 1000, replayedEventId, row.dl_id);
-
     db.run("COMMIT");
-    recoveredDlId = row.dl_id;
+    return row.dl_id;
   } catch (err) {
-    try {
-      db.run("ROLLBACK");
-    } catch {
-      // best-effort; the throw propagates
-    }
-    throw err;
+    rollbackAndRethrow(db, err);
   }
-  return recoveredDlId;
+}
+
+export function reclassifyPoisonDeadLetter(
+  db: Database,
+  dlId: string,
+): DeadLetterOperatorOutcome {
+  db.run("BEGIN IMMEDIATE");
+  try {
+    const row = db
+      .prepare(
+        `SELECT dl_id, bindings, ts, session_id, hook_event, pid, status
+           FROM dead_letters
+          WHERE dl_id = ?
+          LIMIT 1`,
+      )
+      .get(dlId) as (RecoverableDeadLetterRow & { status: string }) | null;
+    if (row === null) {
+      db.run("COMMIT");
+      return "refused_not_found";
+    }
+    if (row.status === DEAD_LETTER_RESOLVED_STATUS) {
+      db.run("COMMIT");
+      return "refused_already_resolved";
+    }
+    if (row.status !== "poison") {
+      db.run("COMMIT");
+      return "refused_not_poison";
+    }
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(row.bindings);
+    } catch {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    if (
+      envelope === null ||
+      typeof envelope !== "object" ||
+      Array.isArray(envelope) ||
+      typeof (envelope as Record<string, unknown>).raw !== "string"
+    ) {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    const parsed = parseEventLogLine(
+      (envelope as Record<string, unknown>).raw as string,
+    );
+    if (parsed === null) {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    const replayedEventId = insertRecoveredDeadLetterEvent(
+      db,
+      row,
+      parsed.bindings,
+    );
+    db.prepare(
+      `UPDATE dead_letters
+          SET status = 'recovered',
+              recovered_at = ?,
+              replayed_event_id = ?,
+              source_file = NULL
+        WHERE dl_id = ?`,
+    ).run(Date.now() / 1000, replayedEventId, row.dl_id);
+    db.run("COMMIT");
+    return "reclassified";
+  } catch (err) {
+    rollbackAndRethrow(db, err);
+  }
+}
+
+export function resolvePoisonDeadLetter(
+  db: Database,
+  dlId: string,
+  callerSession: string,
+  reason: string,
+  force: boolean,
+  nowSec = Date.now() / 1000,
+): DeadLetterOperatorOutcome {
+  if (!force || callerSession.length === 0 || reason.trim().length === 0) {
+    throw new Error("resolve: force, acting identity, and reason are required");
+  }
+  db.run("BEGIN IMMEDIATE");
+  try {
+    const row = db
+      .prepare("SELECT status, bindings FROM dead_letters WHERE dl_id = ?")
+      .get(dlId) as { status: string; bindings: string } | null;
+    if (row === null) {
+      db.run("COMMIT");
+      return "refused_not_found";
+    }
+    if (row.status === DEAD_LETTER_RESOLVED_STATUS) {
+      db.run("COMMIT");
+      return "refused_already_resolved";
+    }
+    if (row.status !== "poison") {
+      db.run("COMMIT");
+      return "refused_not_poison";
+    }
+    let auditBindings: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(row.bindings) as unknown;
+      auditBindings =
+        parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : { raw_bindings: row.bindings };
+    } catch {
+      auditBindings = { raw_bindings: row.bindings };
+    }
+    auditBindings.resolved_by = callerSession;
+    auditBindings.resolve_reason = reason.trim();
+    auditBindings.resolved_force = true;
+    auditBindings.resolved_at = nowSec;
+    db.prepare(
+      `UPDATE dead_letters
+          SET status = ?,
+              recovered_at = ?,
+              replayed_event_id = NULL,
+              bindings = ?
+        WHERE dl_id = ? AND status = 'poison'`,
+    ).run(
+      DEAD_LETTER_RESOLVED_STATUS,
+      nowSec,
+      JSON.stringify(auditBindings),
+      dlId,
+    );
+    db.run("COMMIT");
+    return "resolved";
+  } catch (err) {
+    rollbackAndRethrow(db, err);
+  }
 }
 
 /**
@@ -9208,6 +9486,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     fences: DispatchClearFences,
     recoverable = false,
     allowUnfoldedIncident = false,
+    audit?: DispatchClearAudit,
   ): boolean {
     return appendFencedDispatchClear({
       db,
@@ -9230,7 +9509,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $agent_id: null,
           $agent_type: null,
           $stop_hook_active: null,
-          $data: JSON.stringify({ verb, id, ...fences }),
+          // The operator clear path stamps its audit trail (acting identity +
+          // whether force overrode the liveness fence) into the event data; the
+          // fold ({@link extractDispatchClearedPayload}) never reads these fields,
+          // so they are audit-only and re-fold byte-identically. Internal sweeps
+          // pass no audit and keep their historical data shape unchanged.
+          $data: buildDispatchClearedData(verb, id, fences, audit),
           $subagent_agent_id: null,
           $spawn_name: null,
           $start_time: null,
@@ -9357,6 +9641,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     sw.onmessage = (
       ev: MessageEvent<
         | ReplayRequestMessage
+        | ResolveDeadLetterRequestMessage
         | SetAutopilotPausedRequestMessage
         | RetryDispatchRequestMessage
         | SetAutopilotModeRequestMessage
@@ -9422,6 +9707,40 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           reply = {
             type: "replay-result",
             id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "resolve-dead-letter-request") {
+        let reply: ResolveDeadLetterResultMessage;
+        try {
+          const outcome =
+            msg.request.op === "reclassify"
+              ? reclassifyPoisonDeadLetter(db, msg.request.dl_id)
+              : resolvePoisonDeadLetter(
+                  db,
+                  msg.request.dl_id,
+                  msg.request.caller_session,
+                  msg.request.reason,
+                  msg.request.force,
+                );
+          reply = {
+            type: "resolve-dead-letter-result",
+            id: msg.id,
+            ok: true,
+            outcome,
+          };
+          if (outcome === "reclassified") {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          reply = {
+            type: "resolve-dead-letter-result",
+            id: msg.id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
           };
@@ -10041,22 +10360,96 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       if (msg.kind === "retry-dispatch-request") {
         // Append a `DispatchCleared` synthetic event so the reducer's fold arm
-        // DELETEs the matching `dispatch_failures` row on the next drain. The
-        // wire `verb` / `dispatch_id` are validated handler-side; main treats
-        // both as opaque payload tokens.
+        // DELETEs the matching `dispatch_failures` row on the next drain — BUT
+        // never behind a live worker's back. The operator clear first fences on
+        // claimant liveness (producer-side, never in a fold): a bound, unreleased
+        // claim whose worker probes live or uncertain refuses with a typed
+        // outcome instead of the old silent `ok:true`; `--force` lifts only that
+        // liveness gate. The attempt-identity CAS inside
+        // `appendFencedDispatchClear` stays load-bearing (force included), so a
+        // fenced no-op reports `refused_identity` rather than false success.
         const id = msg.id;
         let reply: RetryDispatchResultMessage;
         try {
-          // The wire `verb` / `dispatch_id` are validated handler-side; main treats
-          // both as opaque payload tokens.
-          mintDispatchClearedEvent(
-            msg.verb,
-            msg.dispatch_id,
-            dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+          const claim = db
+            .query(
+              "SELECT state, bound_at, session_id FROM dispatch_claims WHERE verb = ? AND id = ?",
+            )
+            .get(msg.verb, msg.dispatch_id) as {
+            state: string;
+            bound_at: number | null;
+            session_id: string | null;
+          } | null;
+          // Recycle-safe process probe for the claimant. An absent session,
+          // job, or process witness is `inconclusive` (refuse on uncertainty),
+          // never a false `gone`. Evaluated lazily — an unbound clear never
+          // spawns a probe.
+          const probeLiveness = (): RecordedProcessIdentityVerdict => {
+            const sid = claim?.session_id;
+            if (sid == null || sid.length === 0) return "inconclusive";
+            const job = db
+              .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+              .get(sid) as {
+              pid: number | null;
+              start_time: string | null;
+            } | null;
+            if (
+              job == null ||
+              job.pid == null ||
+              job.start_time == null ||
+              job.start_time.length === 0
+            ) {
+              return "inconclusive";
+            }
+            return recordedProcessIdentity(job.pid, job.start_time);
+          };
+          const decision = decideDispatchClearLiveness(
+            claim ?? undefined,
+            msg.force,
+            probeLiveness,
           );
-          wakePending = true;
-          pumpWakes();
-          reply = { type: "retry-dispatch-result", id, ok: true };
+          if (decision.kind === "refuse-live") {
+            reply = {
+              type: "retry-dispatch-result",
+              id,
+              ok: false,
+              outcome: "refused_live",
+              error:
+                `refused_live: ${msg.verb}::${msg.dispatch_id} is bound to a live ` +
+                `dispatch claim${claim?.session_id ? ` (session ${claim.session_id})` : ""}; ` +
+                "pass --force to override the liveness refusal (the attempt-identity fence still applies).",
+            };
+          } else {
+            const applied = mintDispatchClearedEvent(
+              msg.verb,
+              msg.dispatch_id,
+              dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+              false,
+              false,
+              { forced: msg.force, caller_session: msg.caller_session },
+            );
+            if (applied) {
+              wakePending = true;
+              pumpWakes();
+              reply = {
+                type: "retry-dispatch-result",
+                id,
+                ok: true,
+                outcome: "cleared",
+              };
+            } else {
+              reply = {
+                type: "retry-dispatch-result",
+                id,
+                ok: false,
+                outcome: "refused_identity",
+                error:
+                  `refused_identity: the dispatch attempt for ${msg.verb}::${msg.dispatch_id} ` +
+                  "changed at the write site (a newer attempt re-minted the claim); " +
+                  "--force does not override an identity mismatch — re-read state and retry.",
+              };
+            }
+          }
         } catch (err) {
           reply = {
             type: "retry-dispatch-result",
@@ -15504,8 +15897,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         );
       }
       // Dead-letter retention (resurrection-safe): prune fully-recovered aged
-      // sealed files (unlink-FIRST, rows second) + row-only recovered/poison
-      // tails. Its own try so a prune failure is non-fatal AND leaves the
+      // sealed files (unlink-FIRST, rows second) + row-only terminal tails. Its
+      // own try so a prune failure is non-fatal AND leaves the
       // compaction checkpoint gate below untouched — a DB error here must not
       // forfeit the WAL checkpoint the NULL/DELETE passes just earned. Successful
       // deletions DO count toward the gate (reclaimed dead_letters pages want the
@@ -15515,7 +15908,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         deleted += dlPrune.prunedRows;
         if (dlPrune.prunedRows > 0) {
           console.error(
-            `[keeperd] retention: pruned ${dlPrune.prunedRows} recovered/poison dead-letter row(s) across ${dlPrune.prunedFiles} sealed file(s)`,
+            `[keeperd] retention: pruned ${dlPrune.prunedRows} recovered/terminal dead-letter row(s) across ${dlPrune.prunedFiles} sealed file(s)`,
           );
         }
       } catch (err) {

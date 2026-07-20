@@ -73,6 +73,7 @@ function makeHarness(): Harness {
     handlers: {
       board: mkHandler("board"),
       jobs: mkHandler("jobs"),
+      "dead-letter": mkHandler("dead-letter"),
       git: mkHandler("git"),
       autopilot: mkHandler("autopilot"),
       builds: mkHandler("builds"),
@@ -220,6 +221,7 @@ describe("cli/keeper dispatch", () => {
   test("isSubcommand narrows correctly", () => {
     expect(isSubcommand("board")).toBe(true);
     expect(isSubcommand("jobs")).toBe(true);
+    expect(isSubcommand("dead-letter")).toBe(true);
     expect(isSubcommand("git")).toBe(true);
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);

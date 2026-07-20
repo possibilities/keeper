@@ -752,10 +752,9 @@ export interface ReducerState {
  * exhausts retry. The rows record events that NEVER MADE IT into the log, so a
  * from-scratch re-fold MUST NOT touch `dead_letters`.
  *
- * The {@link status} transition `waiting → recovered` happens only inside the
- * replay verb, which appends a real `events` row from {@link bindings} and
- * stamps {@link recovered_at} + {@link replayed_event_id} in ONE
- * `BEGIN IMMEDIATE`. No other transitions.
+ * Waiting rows replay into `recovered`. Poison rows either re-classify through
+ * the current parser into that same recovery path or become audited `resolved`
+ * terminal rows through the operator verb.
  */
 export interface DeadLetter {
   /**
@@ -785,21 +784,11 @@ export interface DeadLetter {
    * parameters and runs the same insert.
    */
   bindings: Record<string, string | number | boolean | null>;
-  /**
-   * `'waiting'` until the replay verb flips it to `'recovered'` (the only
-   * transition). The descriptor's `defaultFilter: { status: 'waiting' }` scopes
-   * the default page to the unrecovered backlog.
-   */
-  status: "waiting" | "recovered";
-  /**
-   * Unix-seconds when the replay flipped this row. NULL while {@link status} is
-   * `'waiting'`; populates with {@link replayed_event_id} on replay.
-   */
+  /** Lifecycle state for replay, poison handling, and terminal retention. */
+  status: "waiting" | "poison" | "recovered" | "resolved" | "birth-stuck";
+  /** Unix-seconds when replay or operator resolve made the row terminal. */
   recovered_at: number | null;
-  /**
-   * `events.id` of the appended real event on replay. NULL while {@link status}
-   * is `'waiting'`.
-   */
+  /** `events.id` of an appended real event; null for non-replay terminals. */
   replayed_event_id: number | null;
   /** Per-pid NDJSON file path the row was imported from. Nullable. */
   source_file: string | null;

@@ -65,7 +65,14 @@ import {
   readGitProjectionFloor,
   resolveSockPath,
 } from "./db";
-import type { RetryDispatchVerb } from "./dispatch-command";
+import type {
+  DeadLetterOperatorOutcome,
+  DeadLetterOperatorRequest,
+} from "./dead-letter";
+import type {
+  DispatchClearOutcome,
+  RetryDispatchVerb,
+} from "./dispatch-command";
 import type { NormalizedFableFocusInput } from "./fable-focus";
 import { unseededGatedRoots } from "./gated-roots";
 import { memoizedGitToplevel } from "./git-toplevel";
@@ -214,6 +221,20 @@ export interface ReplayResultMessage {
   error?: string;
 }
 
+export interface ResolveDeadLetterRequestMessage {
+  kind: "resolve-dead-letter-request";
+  id: string;
+  request: DeadLetterOperatorRequest;
+}
+
+export interface ResolveDeadLetterResultMessage {
+  type: "resolve-dead-letter-result";
+  id: string;
+  ok: boolean;
+  outcome?: DeadLetterOperatorOutcome;
+  error?: string;
+}
+
 /**
  * Worker→main request bridge for `set_autopilot_paused`. Main flips its
  * in-memory `paused` flag (boots-paused, never persisted) AND relays a
@@ -251,6 +272,12 @@ export interface RetryDispatchRequestMessage {
   /** The keeper plan id (epic id for `close`; task id for `work`). Handler-validated
    *  non-empty; main treats it as an opaque token. */
   dispatch_id: string;
+  /** Break-glass: override the claimant-liveness fence ONLY. The attempt-identity
+   *  CAS at the write site stays load-bearing under force. */
+  force: boolean;
+  /** The acting operator identity, stamped into the audit trail of an appended
+   *  clear. Null when the CLI could not resolve a session. */
+  caller_session: string | null;
 }
 
 /** Main→worker reply paired with {@link RetryDispatchRequestMessage}. */
@@ -259,6 +286,9 @@ export interface RetryDispatchResultMessage {
   id: string;
   ok: boolean;
   error?: string;
+  /** The typed clear verdict — present on every non-error reply so the CLI shows
+   *  cleared / refused_live / refused_identity instead of a bare `ok`. */
+  outcome?: DispatchClearOutcome;
 }
 
 /**
@@ -1975,8 +2005,8 @@ function dispatchRpc(
 /**
  * Drive an async RPC handler to completion and ship the result frame.
  * Pulled out of `dispatchRpc` for readability — the sync path is the
- * 99% case (the only async RPC today is `replay_dead_letter`), and
- * inlining a Promise chain in the middle of the synchronous switch
+ * 99% synchronous framing path, while the main-writer bridge RPCs use this
+ * helper. Inlining a Promise chain in the middle of the synchronous switch
  * obscured the sync-path control flow.
  *
  * Failure modes that map to `rpc_failed` here:
@@ -3878,10 +3908,31 @@ function main(): void {
     conflict?: boolean;
     note?: string;
   };
+  /** The `retry_dispatch` bridge resolution — the `SimpleResolution` shape plus
+   *  the typed clear `outcome` so the handler threads refused_live /
+   *  refused_identity through to the CLI instead of a bare `ok`. */
+  type RetryDispatchResolution = {
+    ok: boolean;
+    error?: string;
+    outcome?: DispatchClearOutcome;
+  };
+  type ResolveDeadLetterResolution = {
+    ok: boolean;
+    error?: string;
+    outcome?: DeadLetterOperatorOutcome;
+  };
   const pendingReplays = new Map<
     string,
     {
       resolve: (r: ReplayResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  const pendingDeadLetterResolutions = new Map<
+    string,
+    {
+      resolve: (r: ResolveDeadLetterResolution) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -3900,7 +3951,7 @@ function main(): void {
   const pendingRetryDispatch = new Map<
     string,
     {
-      resolve: (r: SimpleResolution) => void;
+      resolve: (r: RetryDispatchResolution) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -3971,6 +4022,29 @@ function main(): void {
         } satisfies ReplayRequestMessage);
       });
     },
+    resolveDeadLetter(
+      request: DeadLetterOperatorRequest,
+    ): Promise<ResolveDeadLetterResolution> {
+      return new Promise<ResolveDeadLetterResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingDeadLetterResolutions.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingDeadLetterResolutions.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "resolve-dead-letter-request",
+          id: reqId,
+          request,
+        } satisfies ResolveDeadLetterRequestMessage);
+      });
+    },
     setAutopilotPaused(paused: boolean): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();
@@ -3995,8 +4069,10 @@ function main(): void {
     retryDispatch(
       verb: RetryDispatchVerb,
       dispatch_id: string,
-    ): Promise<SimpleResolution> {
-      return new Promise<SimpleResolution>((resolve, reject) => {
+      force: boolean,
+      caller_session: string | null,
+    ): Promise<RetryDispatchResolution> {
+      return new Promise<RetryDispatchResolution>((resolve, reject) => {
         const reqId = crypto.randomUUID();
         const timer = setTimeout(() => {
           if (pendingRetryDispatch.delete(reqId)) {
@@ -4014,6 +4090,8 @@ function main(): void {
           id: reqId,
           verb,
           dispatch_id,
+          force,
+          caller_session,
         } satisfies RetryDispatchRequestMessage);
       });
     },
@@ -4274,6 +4352,7 @@ function main(): void {
         | KickMessage
         | BootCompleteMessage
         | ReplayResultMessage
+        | ResolveDeadLetterResultMessage
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
         | SetAutopilotModeResultMessage
@@ -4321,6 +4400,18 @@ function main(): void {
         return;
       }
       if (
+        (msg as ResolveDeadLetterResultMessage).type ===
+        "resolve-dead-letter-result"
+      ) {
+        const r = msg as ResolveDeadLetterResultMessage;
+        const entry = pendingDeadLetterResolutions.get(r.id);
+        if (!entry) return;
+        pendingDeadLetterResolutions.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, outcome: r.outcome, error: r.error });
+        return;
+      }
+      if (
         (msg as SetAutopilotPausedResultMessage).type ===
         "set-autopilot-paused-result"
       ) {
@@ -4340,7 +4431,7 @@ function main(): void {
         if (!entry) return;
         pendingRetryDispatch.delete(r.id);
         clearTimeout(entry.timer);
-        entry.resolve({ ok: r.ok, error: r.error });
+        entry.resolve({ ok: r.ok, error: r.error, outcome: r.outcome });
         return;
       }
       if (

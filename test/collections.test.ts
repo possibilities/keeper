@@ -37,6 +37,7 @@ import {
   liveKeyExpr,
   liveKeyOf,
   PENDING_DISPATCHES_DESCRIPTOR,
+  POISON_DEAD_LETTERS_DESCRIPTOR,
   REGISTRY,
   SCHEDULED_TASKS_DESCRIPTOR,
   SUBAGENT_INVOCATIONS_DESCRIPTOR,
@@ -1588,6 +1589,12 @@ test("DEAD_LETTERS_DESCRIPTOR: descriptor shape and registry registration (fn-64
   });
   // defaultFilter scopes to `waiting` so the board warn-count tracks backlog.
   expect(DEAD_LETTERS_DESCRIPTOR.defaultFilter).toEqual({ status: "waiting" });
+  expect(getCollection("poison_dead_letters")).toBe(
+    POISON_DEAD_LETTERS_DESCRIPTOR,
+  );
+  expect(POISON_DEAD_LETTERS_DESCRIPTOR.defaultFilter).toEqual({
+    status: "poison",
+  });
   // bindings is the only JSON column.
   expect(DEAD_LETTERS_DESCRIPTOR.jsonColumns.has("bindings")).toBe(true);
   expect(DEAD_LETTERS_DESCRIPTOR.jsonColumns.size).toBe(1);
@@ -1640,6 +1647,18 @@ test("dead_letters defaultFilter: recovered rows excluded from default runQuery 
     "{}",
     "recovered",
   );
+  db.query(
+    `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "dl-poison-1",
+    "poison",
+    "PoisonLine",
+    1004.0,
+    1005.0,
+    '{"raw":"bad"}',
+    "poison",
+  );
   // Default query — no explicit filter — should see only the waiting row.
   const res = asResult(
     runQuery(db, 0, { type: "query", collection: "dead_letters" }),
@@ -1656,6 +1675,12 @@ test("dead_letters defaultFilter: recovered rows excluded from default runQuery 
   );
   expect(res2.total).toBe(1);
   expect(String(res2.rows[0]?.dl_id)).toBe("dl-recv-1");
+  const poison = asResult(
+    runQuery(db, 0, { type: "query", collection: "poison_dead_letters" }),
+  );
+  expect(poison.total).toBe(1);
+  expect(String(poison.rows[0]?.dl_id)).toBe("dl-poison-1");
+  expect(DEAD_LETTERS_DESCRIPTOR.defaultFilter).toEqual({ status: "waiting" });
   db.close();
 });
 

@@ -26,6 +26,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -40,7 +41,11 @@ import {
   writeBirthRecord,
 } from "../src/birth-record";
 import type { EventsIngestContext } from "../src/daemon";
-import { drainToCompletion, scanBirthDir } from "../src/daemon";
+import {
+  BIRTH_STUCK_STATUS,
+  drainToCompletion,
+  scanBirthDir,
+} from "../src/daemon";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -125,6 +130,57 @@ function readBackstopRecords(logPath: string): Record<string, unknown>[] {
     .split("\n")
     .filter((l) => l.trim().length > 0)
     .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+type BirthDeadLetterRow = {
+  dl_id: string;
+  status: string;
+  hook_event: string;
+  session_id: string;
+  pid: number | null;
+  bindings: string;
+  source_file: string | null;
+};
+
+function birthDeadLetterRows(
+  db: ReturnType<typeof freshMemDb>["db"],
+): BirthDeadLetterRow[] {
+  return db
+    .query(
+      `SELECT dl_id, status, hook_event, session_id, pid, bindings, source_file
+         FROM dead_letters
+        ORDER BY dl_id ASC`,
+    )
+    .all() as BirthDeadLetterRow[];
+}
+
+function expectBirthStuckRow(
+  row: BirthDeadLetterRow,
+  full: string,
+  record: BirthRecord,
+): void {
+  expect(row.status).toBe(BIRTH_STUCK_STATUS);
+  expect(row.hook_event).toBe("StuckBirthRecord");
+  expect(row.session_id).toBe(record.session_id);
+  expect(row.pid).toBe(record.pid);
+  expect(row.source_file).toBe(full);
+  expect(row.dl_id).toBe(`birth-stuck:${full}`);
+  const bindings = JSON.parse(row.bindings) as {
+    file: string;
+    record: BirthRecord;
+  };
+  expect(bindings.file).toBe(full);
+  expect(bindings.record.session_id).toBe(record.session_id);
+  expect(bindings.record.cwd).toBe(record.cwd);
+  expect(bindings.record.pid).toBe(record.pid);
+}
+
+function soleNewRecordPath(): string {
+  const records = pendingRecords();
+  expect(records.length).toBe(1);
+  const name = records[0];
+  if (name === undefined) throw new Error("expected one new birth record");
+  return join(birthDir, "new", name);
 }
 
 test("scanBirthDir mints a synthetic SessionStart that folds to a tracked jobs row (harness, title, backend coords, resume_target)", () => {
@@ -411,7 +467,7 @@ test("terminal owner between promotion and grant withholds paid-process authorit
   scanBirthDir(db, birthDir);
 
   expect(sessionStartCount(db, owned.session_id)).toBe(0);
-  expect(existsSync(intentPath)).toBe(true);
+  expect(existsSync(intentPath)).toBe(false);
   expect(
     consumeProviderLegGrant(birthDir, {
       leg_launch_id: "leg-withheld-1",
@@ -419,6 +475,11 @@ test("terminal owner between promotion and grant withholds paid-process authorit
       wrapper_dispatch_attempt_id: 77,
     }),
   ).toBe(false);
+  const rows = birthDeadLetterRows(db);
+  expect(rows.length).toBe(1);
+  const row = rows[0];
+  if (row === undefined) throw new Error("expected one birth-stuck row");
+  expectBirthStuckRow(row, intentPath, owned);
   db.close();
 });
 
@@ -498,6 +559,55 @@ test("a superseded exact owner never receives a provider grant", () => {
       wrapper_dispatch_attempt_id: 88,
     }),
   ).toBe(false);
+  expect(birthDeadLetterRows(db)).toEqual([]);
+  db.close();
+});
+
+test("a waiting owned birth parks as birth-stuck only after the dead-pid grace", () => {
+  const { db } = freshMemDb();
+  const record = makeBirthRecord({
+    session_id: "wait-stuck-provider",
+    pid: 9_876_543,
+    start_time: "linux:9876543",
+    dispatch_attempt_id: null,
+    leg_launch_id: "leg-wait-stuck-1",
+    wrapper_job_id: "wrapper-not-folded-yet",
+    wrapper_dispatch_attempt_id: 99,
+    launcher_pid: LIVE_PID,
+    launcher_start_time: "linux:400",
+  });
+  writeBirthRecord(birthDir, record);
+  const full = soleNewRecordPath();
+
+  scanBirthDir(db, birthDir);
+
+  expect(sessionStartCount(db, record.session_id)).toBe(0);
+  expect(birthDeadLetterRows(db)).toEqual([]);
+  expect(existsSync(full)).toBe(true);
+
+  const old = new Date(Date.now() - 10 * 60_000);
+  utimesSync(full, old, old);
+  scanBirthDir(db, birthDir);
+
+  let rows = birthDeadLetterRows(db);
+  expect(rows.length).toBe(1);
+  let row = rows[0];
+  if (row === undefined) throw new Error("expected one birth-stuck row");
+  expectBirthStuckRow(row, full, record);
+  expect(existsSync(full)).toBe(false);
+
+  writeBirthRecord(birthDir, record);
+  const replayFull = soleNewRecordPath();
+  expect(replayFull).toBe(full);
+  utimesSync(replayFull, old, old);
+  scanBirthDir(db, birthDir);
+
+  rows = birthDeadLetterRows(db);
+  expect(rows.length).toBe(1);
+  row = rows[0];
+  if (row === undefined) throw new Error("expected one birth-stuck row");
+  expectBirthStuckRow(row, full, record);
+  expect(existsSync(replayFull)).toBe(false);
   db.close();
 });
 

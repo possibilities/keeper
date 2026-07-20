@@ -37,6 +37,7 @@ import {
 export const SUBCOMMANDS = [
   "board",
   "jobs",
+  "dead-letter",
   "git",
   "autopilot",
   "builds",
@@ -571,6 +572,7 @@ export async function main(): Promise<void> {
   const handlers: Record<Subcommand, SubcommandHandler> = {
     board: async (argv) => (await import("./board")).main(argv),
     jobs: async (argv) => (await import("./jobs")).main(argv),
+    "dead-letter": async (argv) => (await import("./dead-letter")).main(argv),
     git: async (argv) => (await import("./git")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
     builds: async (argv) => (await import("./builds")).main(argv),

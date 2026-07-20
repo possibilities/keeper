@@ -29,7 +29,7 @@ import {
 } from "./protocol";
 import type { Verdict } from "./readiness";
 import { collapseSubagentsByName } from "./readiness-client";
-import type { ScheduledTask, SubagentInvocation } from "./types";
+import type { DeadLetter, ScheduledTask, SubagentInvocation } from "./types";
 
 // ---------------------------------------------------------------------------
 // Iconized pill core
@@ -609,8 +609,11 @@ function bucketForToken(token: string): PillBucket | undefined {
   if (bucket === undefined && token.startsWith("task-repo:")) {
     bucket = "warn";
   }
-  // `dead-letter:N` banner pill → warn ("things to fix right now").
-  if (bucket === undefined && token.startsWith("dead-letter:")) {
+  // Dead-letter banner pills → warn ("things to fix right now").
+  if (
+    bucket === undefined &&
+    (token.startsWith("dead-letter:") || token.startsWith("poison:"))
+  ) {
     bucket = "warn";
   }
   // `running:sub-agent-stale` → warn (distinct from fresh
@@ -697,23 +700,112 @@ export function epicHeaderLabel(
 // ---------------------------------------------------------------------------
 
 /**
- * Render the persistent `[dead-letter:N]` warn pill for the banner status
- * line. `N` is the native waiting-row count from the `dead_letters`
- * collection (descriptor `defaultFilter: { status: "waiting" }`); zero
- * returns an empty string so the banner drops the pill cleanly when there
- * is no backlog. A `null` / negative input also collapses to empty —
- * defensive against a malformed snapshot. The returned string is plain
- * text; the banner colorizer applies `warn` (yellow) via the
- * `dead-letter:*` prefix branch in {@link colorizePillsInLine}.
- *
- * Module-level + exported so `test/board.test.ts` can assert the pill
- * shape without standing up the subscribe loop.
+ * Render persistent waiting and poison dead-letter warn pills for the banner.
+ * Waiting remains the native `dead_letters` count; poison comes from its
+ * distinct collection and carries bounded `global` or producer-evidence scope
+ * context. Empty inputs drop both pills cleanly. The returned string is plain
+ * text; the banner colorizer applies `warn` (yellow).
  */
-export function renderDeadLetterPill(waitingCount: number): string {
-  if (!Number.isFinite(waitingCount) || waitingCount <= 0) {
-    return "";
+export interface PoisonDeadLetterSummary {
+  count: number;
+  global: number;
+  scoped: number;
+  scopes: readonly string[];
+}
+
+const POISON_SCOPE_TEXT_LIMIT = 96;
+const POISON_SCOPE_LIST_LIMIT = 3;
+
+function boundedPoisonScope(value: string): string {
+  let printable = "";
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    printable +=
+      code <= 0x1f ||
+      (code >= 0x7f && code <= 0x9f) ||
+      char === "[" ||
+      char === "]"
+        ? " "
+        : char;
   }
-  return pill(`dead-letter:${waitingCount}`);
+  const safe = printable.replace(/\s+/g, " ").trim();
+  return safe.length <= POISON_SCOPE_TEXT_LIMIT
+    ? safe
+    : `${safe.slice(0, POISON_SCOPE_TEXT_LIMIT - 1)}…`;
+}
+
+function poisonScopeContext(
+  row: DeadLetter,
+  jobs?: ReadonlyMap<string, { cwd?: unknown }>,
+): string | null {
+  const bindings = row.bindings;
+  if (
+    bindings !== null &&
+    typeof bindings === "object" &&
+    !Array.isArray(bindings) &&
+    Object.hasOwn(bindings, "mutation_path") &&
+    typeof bindings.mutation_path === "string" &&
+    bindings.mutation_path.startsWith("/") &&
+    !bindings.mutation_path.includes("\0")
+  ) {
+    const session =
+      typeof row.session_id === "string" &&
+      row.session_id !== "" &&
+      row.session_id !== "poison" &&
+      row.session_id !== "unknown"
+        ? `session:${boundedPoisonScope(row.session_id)} `
+        : "";
+    return `${session}path:${boundedPoisonScope(bindings.mutation_path)}`;
+  }
+  const cwd = jobs?.get(row.session_id)?.cwd;
+  if (typeof cwd === "string" && cwd.startsWith("/") && !cwd.includes("\0")) {
+    return `session:${boundedPoisonScope(row.session_id)} worktree:${boundedPoisonScope(cwd)}`;
+  }
+  return null;
+}
+
+export function summarizePoisonDeadLetters(
+  rows: readonly DeadLetter[],
+  jobs?: ReadonlyMap<string, { cwd?: unknown }>,
+): PoisonDeadLetterSummary {
+  let global = 0;
+  let scoped = 0;
+  const contexts = new Set<string>();
+  for (const row of rows) {
+    const context = poisonScopeContext(row, jobs);
+    if (context === null) {
+      global += 1;
+    } else {
+      scoped += 1;
+      contexts.add(context);
+    }
+  }
+  const scopes = [
+    ...(global > 0 ? ["global"] : []),
+    ...[...contexts].sort().slice(0, POISON_SCOPE_LIST_LIMIT),
+  ];
+  const hidden =
+    contexts.size - Math.min(contexts.size, POISON_SCOPE_LIST_LIMIT);
+  if (hidden > 0) {
+    scopes.push(`+${hidden} scoped`);
+  }
+  return { count: rows.length, global, scoped, scopes };
+}
+
+export function renderDeadLetterPill(
+  waitingCount: number,
+  poisonRows: readonly DeadLetter[] = [],
+  jobs?: ReadonlyMap<string, { cwd?: unknown }>,
+): string {
+  const parts: string[] = [];
+  if (Number.isFinite(waitingCount) && waitingCount > 0) {
+    parts.push(pill(`dead-letter:${waitingCount}`));
+  }
+  const poison = summarizePoisonDeadLetters(poisonRows, jobs);
+  if (poison.count > 0) {
+    parts.push(pill(`poison:${poison.count} scope:${poison.scopes.join("|")}`));
+  }
+  return parts.join(" ");
 }
 
 // ---------------------------------------------------------------------------

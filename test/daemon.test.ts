@@ -39,6 +39,7 @@ import type {
   TimeoutResult,
   ToolchainFingerprint,
 } from "../src/baseline-store";
+import type { RecordedProcessIdentityVerdict } from "../src/commit-work/process-identity";
 import {
   ALL_WORKERS,
   AUDIT_READY_ORCHESTRATOR_GRACE_MS,
@@ -49,6 +50,7 @@ import {
   appendFencedDispatchClear,
   appendRestartLedgerLine,
   auditReadyEscalationDecision,
+  BIRTH_STUCK_STATUS,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
   BLOCK_OWNER_GRACE_MS,
@@ -68,6 +70,7 @@ import {
   buildBaselineRepairCandidates,
   buildBlockHumanNotifyBody,
   buildDeconflictHumanNotifyBody,
+  buildDispatchClearedData,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
   buildSharedCheckoutPageBody,
@@ -90,6 +93,7 @@ import {
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
+  decideDispatchClearLiveness,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
@@ -161,11 +165,13 @@ import {
   readRestartLedger,
   readSpillDocument,
   readTaskBlockedReason,
+  reclassifyPoisonDeadLetter,
   recoverOneDeadLetter,
   repairCheckoutDirty,
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolvePoisonDeadLetter,
   resolveProbeArming,
   routeBlockedCategory,
   runBlockEscalationSweep,
@@ -3630,6 +3636,176 @@ function seedDeadLetter(
   );
 }
 
+function seedPoisonDeadLetter(
+  db: ReturnType<typeof openDb>["db"],
+  opts: {
+    dl_id: string;
+    ts: number;
+    bindings: Record<string, unknown>;
+    source_file?: string | null;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, 'poison', 'PoisonLine', ?, ?, 44, ?, 'poison', NULL, NULL, ?)`,
+  ).run(
+    opts.dl_id,
+    opts.ts,
+    opts.ts + 1,
+    JSON.stringify(opts.bindings),
+    opts.source_file ?? null,
+  );
+}
+
+test("reclassifyPoisonDeadLetter replays current-parser raw with the original ts and re-folds byte-identically", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:fossil",
+    ts: 1_700_000_123,
+    source_file: "/events/44.ndjson",
+    bindings: {
+      raw: JSON.stringify({
+        bindings: {
+          ts: 9_999_999_999,
+          session_id: "fossil-session",
+          pid: 44,
+          hook_event: "SessionStart",
+          event_type: "lifecycle",
+          data: "{}",
+          cwd: "/repo",
+        },
+      }),
+      file: "/events/44.ndjson",
+    },
+  });
+
+  expect(reclassifyPoisonDeadLetter(db, "poison:fossil")).toBe("reclassified");
+  const event = db
+    .query(
+      "SELECT id, ts, session_id, hook_event FROM events WHERE session_id = 'fossil-session'",
+    )
+    .get() as {
+    id: number;
+    ts: number;
+    session_id: string;
+    hook_event: string;
+  };
+  expect(event).toEqual({
+    id: 1,
+    ts: 1_700_000_123,
+    session_id: "fossil-session",
+    hook_event: "SessionStart",
+  });
+  expect(
+    db
+      .query(
+        "SELECT status, replayed_event_id, source_file FROM dead_letters WHERE dl_id = 'poison:fossil'",
+      )
+      .get(),
+  ).toEqual({
+    status: "recovered",
+    replayed_event_id: 1,
+    source_file: null,
+  });
+
+  drainToCompletion(db);
+  const firstProjection = db
+    .query("SELECT * FROM jobs WHERE job_id = 'fossil-session'")
+    .get() as Record<string, unknown>;
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
+  drainToCompletion(db);
+  const refoldedProjection = db
+    .query("SELECT * FROM jobs WHERE job_id = 'fossil-session'")
+    .get() as Record<string, unknown>;
+  expect(refoldedProjection).toEqual(firstProjection);
+  db.close();
+});
+
+test("reclassifyPoisonDeadLetter returns still_poison without mutating an unclassifiable row", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:genuine",
+    ts: 77,
+    bindings: { raw: "not current-parser input", file: "/events/44.ndjson" },
+  });
+  const before = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'poison:genuine'")
+    .get() as Record<string, unknown>;
+  expect(reclassifyPoisonDeadLetter(db, "poison:genuine")).toBe("still_poison");
+  const after = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'poison:genuine'")
+    .get() as Record<string, unknown>;
+  expect(after).toEqual(before);
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n,
+  ).toBe(0);
+  db.close();
+});
+
+test("resolvePoisonDeadLetter writes a bounded audit and refuses double-resolution idempotently", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:resolve",
+    ts: 88,
+    bindings: { raw: "bad", file: "/events/44.ndjson" },
+  });
+  expect(
+    resolvePoisonDeadLetter(
+      db,
+      "poison:resolve",
+      "operator-session",
+      "  inspected and accepted  ",
+      true,
+      1_700_000_500,
+    ),
+  ).toBe("resolved");
+  const resolved = db
+    .query(
+      "SELECT status, recovered_at, replayed_event_id, bindings FROM dead_letters WHERE dl_id = 'poison:resolve'",
+    )
+    .get() as {
+    status: string;
+    recovered_at: number;
+    replayed_event_id: number | null;
+    bindings: string;
+  };
+  expect(resolved.status).toBe("resolved");
+  expect(resolved.recovered_at).toBe(1_700_000_500);
+  expect(resolved.replayed_event_id).toBeNull();
+  expect(JSON.parse(resolved.bindings)).toEqual({
+    raw: "bad",
+    file: "/events/44.ndjson",
+    resolved_by: "operator-session",
+    resolve_reason: "inspected and accepted",
+    resolved_force: true,
+    resolved_at: 1_700_000_500,
+  });
+
+  expect(
+    resolvePoisonDeadLetter(
+      db,
+      "poison:resolve",
+      "other-operator",
+      "replace audit",
+      true,
+      1_800_000_000,
+    ),
+  ).toBe("refused_already_resolved");
+  expect(
+    db
+      .query(
+        "SELECT status, recovered_at, replayed_event_id, bindings FROM dead_letters WHERE dl_id = 'poison:resolve'",
+      )
+      .get(),
+  ).toEqual(resolved);
+  db.close();
+});
+
 test("recoverOneDeadLetter appends a real events row + flips dead_letters to recovered, in one transaction", () => {
   const { db } = freshMemDb();
   // Seed one SessionStart dead-letter — the dropped-incident scenario.
@@ -3964,14 +4140,19 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
 
 /**
  * Insert one `dead_letters` row in an arbitrary lifecycle state — the recovered
- * / poison seeds the retention prune consumes (`seedDeadLetter` only ever writes
- * `waiting`). `bindings` is irrelevant to the prune, so a fixed `'{}'` suffices.
+ * and terminal seeds the retention prune consumes. `bindings` is irrelevant to
+ * the prune, so a fixed `'{}'` suffices.
  */
 function seedDlRow(
   db: ReturnType<typeof openDb>["db"],
   opts: {
     dl_id: string;
-    status: "waiting" | "recovered" | "poison";
+    status:
+      | "waiting"
+      | "recovered"
+      | "poison"
+      | "resolved"
+      | typeof BIRTH_STUCK_STATUS;
     dl_written_at: number;
     recovered_at?: number | null;
     source_file?: string | null;
@@ -4100,15 +4281,14 @@ test("pruneRecoveredDeadLetters: a LIVE-pid file is skipped even when fully reco
   db.close();
 });
 
-test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, fresh kept); events-log file NEVER unlinked", () => {
+test("pruneRecoveredDeadLetters: unresolved poison is retained; resolved rows age on resolution time without unlinking events logs", () => {
   const { db } = freshMemDb();
   const dlDir = mkdtempSync(join(tmpDir, "dl-"));
   const eventsLogDir = mkdtempSync(join(tmpDir, "el-"));
   const eventsLogFile = join(eventsLogDir, "777.ndjson");
   writeFileSync(eventsLogFile, "poison-bytes\n");
-  // Poison rows point source_file at an events-log file (the ingester owns it).
   seedDlRow(db, {
-    dl_id: "p-old",
+    dl_id: "p-unresolved",
     status: "poison",
     dl_written_at: DL_AGED_SEC,
     recovered_at: null,
@@ -4116,10 +4296,18 @@ test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, 
     pid: 777,
   });
   seedDlRow(db, {
-    dl_id: "p-new",
-    status: "poison",
-    dl_written_at: DL_FRESH_SEC,
-    recovered_at: null,
+    dl_id: "r-old",
+    status: "resolved",
+    dl_written_at: DL_AGED_SEC - 100,
+    recovered_at: DL_AGED_SEC,
+    source_file: eventsLogFile,
+    pid: 777,
+  });
+  seedDlRow(db, {
+    dl_id: "r-new",
+    status: "resolved",
+    dl_written_at: DL_AGED_SEC - 100,
+    recovered_at: DL_FRESH_SEC,
     source_file: eventsLogFile,
     pid: 777,
   });
@@ -4132,10 +4320,48 @@ test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, 
   expect(res.prunedRows).toBe(1);
   expect(res.prunedFiles).toBe(0);
   expect(existsSync(eventsLogFile)).toBe(true);
+  const remaining = db
+    .query("SELECT dl_id FROM dead_letters ORDER BY dl_id")
+    .all() as { dl_id: string }[];
+  expect(remaining.map((row) => row.dl_id)).toEqual(["p-unresolved", "r-new"]);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: birth-stuck rows age on dl_written_at without unlinking source files", () => {
+  const { db } = freshMemDb();
+  const dlDir = mkdtempSync(join(tmpDir, "dl-"));
+  const birthSourceDir = mkdtempSync(join(tmpDir, "births-"));
+  const birthFile = join(birthSourceDir, "9876543.json");
+  writeFileSync(birthFile, "birth-record\n");
+  seedDlRow(db, {
+    dl_id: "bs-old",
+    status: BIRTH_STUCK_STATUS,
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: null,
+    source_file: birthFile,
+    pid: 9_876_543,
+  });
+  seedDlRow(db, {
+    dl_id: "bs-new",
+    status: BIRTH_STUCK_STATUS,
+    dl_written_at: DL_FRESH_SEC,
+    recovered_at: null,
+    source_file: birthFile,
+    pid: 9_876_543,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dlDir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedRows).toBe(1);
+  expect(res.prunedFiles).toBe(0);
+  expect(existsSync(birthFile)).toBe(true);
   const remaining = db.query("SELECT dl_id FROM dead_letters").all() as {
     dl_id: string;
   }[];
-  expect(remaining.map((r) => r.dl_id)).toEqual(["p-new"]);
+  expect(remaining.map((r) => r.dl_id)).toEqual(["bs-new"]);
   db.close();
 });
 
@@ -5320,6 +5546,212 @@ test("retry_dispatch append-point snapshot binds the current incident and newest
     expected_attempt_id: 81,
     expected_instance_event_id: 71,
   });
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// decideDispatchClearLiveness — the operator dispatch-clear liveness fence.
+// Pure decision, driven with seeded claim rows + a pid probe seam (PROBE
+// verdicts mirror `recordedProcessIdentity`).
+// ---------------------------------------------------------------------------
+
+const BOUND_CLAIM = { state: "bound", bound_at: 123 } as const;
+// A probe that fails the test if it is ever consulted — proves the lazy
+// short-circuit (unbound / forced paths never spawn a process probe).
+const PROBE_NEVER = (): RecordedProcessIdentityVerdict => {
+  throw new Error("liveness probe must not be consulted on this path");
+};
+
+test("decideDispatchClearLiveness: an absent / released / unbound claim clears without probing", () => {
+  // No claim at all.
+  expect(decideDispatchClearLiveness(undefined, false, PROBE_NEVER)).toEqual({
+    kind: "clear",
+  });
+  // A released claim protects nothing live.
+  expect(
+    decideDispatchClearLiveness(
+      { state: "released", bound_at: 123 },
+      false,
+      PROBE_NEVER,
+    ),
+  ).toEqual({ kind: "clear" });
+  // Acquired-but-not-yet-bound: no worker occupies it.
+  expect(
+    decideDispatchClearLiveness(
+      { state: "acquired", bound_at: null },
+      false,
+      PROBE_NEVER,
+    ),
+  ).toEqual({ kind: "clear" });
+});
+
+test("decideDispatchClearLiveness: a bound claim refuses on a live OR uncertain probe (over-refusal is the safe side)", () => {
+  expect(
+    decideDispatchClearLiveness(BOUND_CLAIM, false, () => "matching"),
+  ).toEqual({ kind: "refuse-live" });
+  // Uncertain (reused pid / unreadable identity / missing witness) refuses too.
+  expect(
+    decideDispatchClearLiveness(BOUND_CLAIM, false, () => "inconclusive"),
+  ).toEqual({ kind: "refuse-live" });
+});
+
+test("decideDispatchClearLiveness: a bound claim clears ONLY when the claimant probes provably gone", () => {
+  expect(decideDispatchClearLiveness(BOUND_CLAIM, false, () => "gone")).toEqual(
+    { kind: "clear" },
+  );
+});
+
+test("decideDispatchClearLiveness: --force lifts the liveness gate before any probe runs", () => {
+  // Force short-circuits ahead of the probe — a live bound claim clears, and
+  // the probe is never consulted.
+  expect(decideDispatchClearLiveness(BOUND_CLAIM, true, PROBE_NEVER)).toEqual({
+    kind: "clear",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDispatchClearedData — audit trail in the DispatchCleared event data,
+// stored byte-identically for re-fold.
+// ---------------------------------------------------------------------------
+
+test("buildDispatchClearedData: internal sweeps keep the historical shape; an operator clear stamps the audit trail", () => {
+  const fences = { expected_attempt_id: 41, expected_instance_event_id: 51 };
+  // No audit → the pre-fence shape, unchanged byte-for-byte.
+  expect(
+    JSON.parse(buildDispatchClearedData("work", "fn-1-foo.1", fences)),
+  ).toEqual({
+    verb: "work",
+    id: "fn-1-foo.1",
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+  });
+  // Operator clear → the acting identity + forced flag ride alongside.
+  expect(
+    JSON.parse(
+      buildDispatchClearedData("work", "fn-1-foo.1", fences, {
+        forced: true,
+        caller_session: "work",
+      }),
+    ),
+  ).toEqual({
+    verb: "work",
+    id: "fn-1-foo.1",
+    expected_attempt_id: 41,
+    expected_instance_event_id: 51,
+    forced: true,
+    caller_session: "work",
+  });
+});
+
+test("audit-carrying DispatchCleared folds byte-identically to a plain one (audit fields are re-fold-inert)", () => {
+  const fences = { expected_attempt_id: 41, expected_instance_event_id: 51 };
+  // Two DBs, identical seeded failure rows; one clear carries the operator audit
+  // trail, the other the internal-sweep shape. The fold reads only verb/id/fence
+  // fields, so both must delete the row identically — the audit never perturbs
+  // the deterministic-replayed projection.
+  const seedFailure = (db: ReturnType<typeof freshMemDb>["db"]): void => {
+    db.query(
+      `INSERT INTO dispatch_failures
+         (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+          attempt_id, instance_event_id)
+       VALUES ('work', 'fn-1-foo.1', 'failure', '/repo', 1, 51, 1, 1, 41, 51)`,
+    ).run();
+  };
+  const seedClear = (
+    db: ReturnType<typeof freshMemDb>["db"],
+    data: string,
+  ): void => {
+    db.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, data)
+         VALUES (1, 'work::fn-1-foo.1', NULL, 'DispatchCleared', 'dispatch_failures', ?)`,
+      [data],
+    );
+  };
+  const failuresLeft = (db: ReturnType<typeof freshMemDb>["db"]): number =>
+    (
+      db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+        n: number;
+      }
+    ).n;
+
+  const withAudit = freshMemDb().db;
+  seedFailure(withAudit);
+  const auditData = buildDispatchClearedData("work", "fn-1-foo.1", fences, {
+    forced: true,
+    caller_session: "work",
+  });
+  seedClear(withAudit, auditData);
+  drainToCompletion(withAudit);
+
+  const plain = freshMemDb().db;
+  seedFailure(plain);
+  seedClear(plain, buildDispatchClearedData("work", "fn-1-foo.1", fences));
+  drainToCompletion(plain);
+
+  // Both clears deleted the row; the audit shape changed nothing.
+  expect(failuresLeft(withAudit)).toBe(0);
+  expect(failuresLeft(plain)).toBe(0);
+  // The audit event's data survives verbatim in the log — re-fold reads the same
+  // bytes, so the audit trail replays byte-identically.
+  const storedData = (
+    withAudit
+      .query(
+        "SELECT data FROM events WHERE hook_event = 'DispatchCleared' LIMIT 1",
+      )
+      .get() as { data: string }
+  ).data;
+  expect(storedData).toBe(auditData);
+  withAudit.close();
+  plain.close();
+});
+
+test("regression: an internal orphan sweep clearing a stale failure row never deletes a live bound attempt's mint gate", () => {
+  const { db } = freshMemDb();
+  const verb = "work";
+  // A leading-dot / path token is un-retryable by the wire validator, so the
+  // orphan sweep is the ONLY producer that can clear it — an internal sweep, not
+  // the operator surface. It matches no distress-key skip, so it IS swept.
+  const id = "../evil";
+  const key = `${verb}::${id}`;
+  // The stale failure row records the OLD attempt (41).
+  db.query(
+    `INSERT INTO dispatch_failures
+       (verb, id, reason, dir, ts, last_event_id, created_at, updated_at,
+        attempt_id, instance_event_id)
+     VALUES (?, ?, 'orphaned', NULL, 1, 51, 1, 1, 41, 51)`,
+  ).run(verb, id);
+  // A LIVE newer attempt (99) has re-bound the same key and owns the mint gate.
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, acquired_at, bound_at,
+        last_event_id, updated_at)
+     VALUES (?, ?, 99, 'bound', 'sess-live', 1, 2, 61, 2)`,
+  ).run(verb, id);
+  upsertDispatchMintGate(db, key, 99, 61);
+
+  // Drive the REAL orphan sweep through the exact fenced-append CAS every clear
+  // (operator + internal) routes through. The append is a no-op stand-in for the
+  // folded DispatchCleared event.
+  let appends = 0;
+  const swept = gcUnretryableDispatchFailures(db, (v, i, fences) => {
+    appendFencedDispatchClear({
+      db,
+      verb: v,
+      id: i,
+      fences,
+      append: () => {
+        appends++;
+      },
+    });
+  });
+
+  // The sweep processed the stale row (fences pinned the OLD attempt 41)...
+  expect(swept).toBe(1);
+  // ...but the CAS re-snapshot saw the live attempt 99 own the key, so it
+  // refused: no event appended, and the live mint gate is intact. No
+  // double-dispatch window opens behind the live worker.
+  expect(appends).toBe(0);
+  expect(readDispatchMintGate(db, key)).toBe(99);
   db.close();
 });
 

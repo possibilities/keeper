@@ -234,6 +234,22 @@ export const USAGE_FLAGS = [
   FLAG_HELP,
 ] as const satisfies readonly FlagDescriptor[];
 
+export const DEAD_LETTER_FLAGS = [
+  FLAG_SOCK,
+  {
+    name: "reason",
+    type: "string",
+    summary: "Resolve audit reason (required by resolve)",
+  },
+  {
+    name: "force",
+    type: "boolean",
+    default: false,
+    summary: "Confirm the audited poison resolve",
+  },
+  FLAG_HELP_DEFAULTED,
+] as const satisfies readonly FlagDescriptor[];
+
 /** `keeper git` adds `--project-dir` to the viewer trio. */
 export const GIT_FLAGS = [
   FLAG_SOCK,
@@ -652,6 +668,35 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_daemon: true,
     requires_tty: false,
     flags: VIEWER_FLAGS,
+  },
+  {
+    name: "dead-letter",
+    summary: "Re-classify or audited-resolve one poison row",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: true,
+    requires_tty: false,
+    flags: DEAD_LETTER_FLAGS,
+    verbs: [
+      {
+        name: "reclassify",
+        summary: "Re-parse one poison row with the current parser",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: true,
+        requires_tty: false,
+        flags: [FLAG_SOCK, FLAG_HELP_DEFAULTED],
+      },
+      {
+        name: "resolve",
+        summary: "Force-resolve one poison row with an audit reason",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: true,
+        requires_tty: false,
+        flags: DEAD_LETTER_FLAGS,
+      },
+    ],
   },
   {
     name: "git",

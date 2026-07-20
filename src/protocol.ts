@@ -387,7 +387,7 @@ export interface DurableAwaitCondition {
 
 export type DurableAwaitConditionSpec = readonly DurableAwaitCondition[];
 
-/** Wire payload for the eighth mutating RPC. */
+/** Wire payload for the durable-await mutating RPC. */
 export type RequestAwaitRpcParams =
   | {
       op: "request";

@@ -867,16 +867,127 @@ describe("readOwnershipClaims", () => {
     ]);
   });
 
-  test("fails closed on unclassifiable poison dead-letter evidence", () => {
+  test("scopes evidence-bearing poison and keeps raw poison globally blocking", () => {
     const { db } = openDb(dbPath, { migrate: false });
     db.run(
       `INSERT INTO dead_letters
          (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
-       VALUES ('poison-event', 'poison', 'PoisonEventLogRecord', 1, 2, 444,
+       VALUES ('poison-scoped', 'scoped-session', 'PostToolUse', 1, 2, 444,
+               '{"session_id":"scoped-session","hook_event":"PostToolUse","tool_name":"Edit","mutation_path":"/repo/poison.ts"}',
+               'poison')`,
+    );
+    db.close();
+
+    expect(readClaims("/repo")).toBeNull();
+    expect(readClaims("/other")).toEqual([]);
+
+    const reopened = openDb(dbPath, { migrate: false });
+    reopened.db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+       VALUES ('poison-global', 'poison', 'PoisonLine', 3, 4, 445,
+               '{"raw":"unclassifiable","file":"/state/events-log/445.ndjson"}',
+               'poison')`,
+    );
+    reopened.db.close();
+
+    expect(readClaims("/repo")).toBeNull();
+    expect(readClaims("/other")).toBeNull();
+  });
+
+  test("does not scope poison from self-reported event data", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+       VALUES ('poison-self-report', 'attacker', 'PoisonLine', 1, 2, 444,
+               '{"hook_event":"PostToolUse","tool_name":"Edit","cwd":"/repo","data":"{\\"tool_input\\":{\\"file_path\\":\\"/repo/claimed.ts\\"}}"}',
+               'poison')`,
+    );
+    db.close();
+
+    expect(readClaims("/repo")).toBeNull();
+    expect(readClaims("/other")).toBeNull();
+  });
+
+  test("scopes poison through a producer-known session worktree", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO jobs (job_id, created_at, state, cwd, updated_at)
+       VALUES ('scoped-session', 1, 'stopped', '/repo', 1)`,
+    );
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+       VALUES ('poison-session', 'scoped-session', 'PoisonLine', 1, 2, 444,
                '{"raw":"unclassifiable"}', 'poison')`,
     );
     db.close();
-    expect(readClaims()).toBeNull();
+
+    expect(readClaims("/repo")).toBeNull();
+    expect(readClaims("/other")).toEqual([]);
+  });
+
+  test("the database dead-letter gate treats every non-blocking terminal status as clear", () => {
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+       VALUES ('resolved-row', 'poison', 'PoisonLine', 1, 2, 444,
+               '{"raw":"bad"}', 'resolved'),
+              ('birth-stuck-row', 'birth', 'BirthStuck', 1, 3, 445,
+               '{"raw":"birth"}', 'birth-stuck')`,
+    );
+    db.close();
+    expect(readClaims()).toEqual([]);
+  });
+
+  test("the on-disk dead-letter gate ignores records whose rows carry every non-blocking terminal status", () => {
+    const records = [
+      serializeDeadLetterRecord({
+        dl_id: "resolved-disk",
+        session_id: "resolved-session",
+        hook_event: "PostToolUse",
+        ts: 1,
+        dl_written_at: 2,
+        pid: 444,
+        bindings: {
+          session_id: "resolved-session",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          mutation_path: "/repo/resolved.ts",
+        },
+      }),
+      serializeDeadLetterRecord({
+        dl_id: "birth-stuck-disk",
+        session_id: "birth-session",
+        hook_event: "PostToolUse",
+        ts: 3,
+        dl_written_at: 4,
+        pid: 444,
+        bindings: {
+          session_id: "birth-session",
+          hook_event: "PostToolUse",
+          tool_name: "Write",
+          mutation_path: "/repo/birth.ts",
+        },
+      }),
+    ].join("");
+    const file = join(deadLetterDir, "444.ndjson");
+    writeFileSync(file, records);
+    const { db } = openDb(dbPath, { migrate: false });
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+          status, source_file)
+       VALUES ('resolved-disk', 'resolved-session', 'PostToolUse', 1, 2, 444,
+               '{}', 'resolved', ?),
+              ('birth-stuck-disk', 'birth-session', 'PostToolUse', 3, 4, 444,
+               '{}', 'birth-stuck', ?)`,
+      [file, file],
+    );
+    db.close();
+    expect(readClaims()).toEqual([]);
   });
 
   test("fails closed while an exact mutation waits in the dead-letter channel", () => {
