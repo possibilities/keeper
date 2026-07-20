@@ -54,6 +54,11 @@ function claudeObservation(): Observation {
         measuredAtMs: NOW,
         windows: [
           {
+            key: "session",
+            utilization: 0.21,
+            resetsAt: new Date(NOW + 4 * 60 * 60_000).toISOString(),
+          },
+          {
             key: "week",
             utilization: 0.44,
             resetsAt: new Date(NOW + 2 * 24 * 60 * 60_000).toISOString(),
@@ -124,13 +129,44 @@ describe("usage observation view", () => {
 
     expect(text).toContain("[claude] fresh 0s");
     expect(text).toContain("Claude 1  [issue] · relogin-required");
+    expect(text).toContain("Claude 2  measured 0s");
     expect(text).toContain("weekly");
     expect(text).toContain("Fable");
     expect(text).toContain("[codex] fresh 0s");
     expect(text).toContain("Codex 1");
+    expect(text).not.toContain("Codex 1  measured");
     expect(text).toContain("GPT-5.3-Codex-Spark");
     expect(text).toContain("38%");
     expect(text).toContain("5%");
+  });
+
+  test("renders admitted Claude meters with old and clock-skewed Measurement provenance", () => {
+    const target = paths();
+    const claude = claudeObservation();
+    const route = claude.routes[0];
+    if (route === undefined) throw new Error("invalid Claude fixture");
+    route.measuredAtMs = NOW - 3 * 60 * 60_000;
+    writeObservationSidecar(target.claude, claude);
+    writeCodexObservationSidecar(target.codex, codexObservation());
+
+    let snapshot = loadUsageSnapshot(target, NOW);
+    expect(snapshot.claude.status).toBe("ok");
+    expect(snapshot.claude.accounts[1]).toMatchObject({
+      status: "ok",
+      measuredAtMs: NOW - 3 * 60 * 60_000,
+    });
+    let text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("Claude 2  measured 3h");
+    expect(text).not.toContain("Claude 2  [stale]");
+    expect(text).toContain("weekly");
+    expect(text).toContain("Fable");
+
+    route.measuredAtMs = NOW + 60_000;
+    writeObservationSidecar(target.claude, claude);
+    snapshot = loadUsageSnapshot(target, NOW);
+    expect(snapshot.claude.accounts[1]?.status).toBe("ok");
+    text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("Claude 2  measured clock skew");
   });
 
   test("disambiguates two windows carried by one named Codex meter", () => {
@@ -183,10 +219,15 @@ describe("usage observation view", () => {
     writeHealthySidecars(target);
     snapshot = loadUsageSnapshot(target, NOW + 6 * 60_000);
     expect(snapshot.claude.status).toBe("stale");
+    expect(snapshot.claude.accounts[1]?.status).toBe("stale");
     expect(snapshot.codex.status).toBe("stale");
+    const text = renderUsageLines(snapshot).join("\n");
+    expect(text).toContain("[claude] [stale] · 6m");
+    expect(text).toContain("Claude 2  [stale] · measured 6m");
+    expect(text).toContain("Fable");
   });
 
-  test("heartbeat timestamps repaint locally without forging data changes", () => {
+  test("age and countdown timestamps repaint without forging semantic changes", () => {
     const target = paths();
     writeHealthySidecars(target);
     const first = loadUsageSnapshot(target, NOW);
@@ -196,10 +237,18 @@ describe("usage observation view", () => {
       claude: { ...first.claude, observedAtMs: NOW + 1_000 },
       codex: { ...first.codex, observedAtMs: NOW + 1_000 },
     };
-    expect(usageSemanticFingerprint(heartbeat)).toBe(
+    const repaintOnly = structuredClone(heartbeat);
+    const repaintAccount = repaintOnly.claude.accounts[1];
+    const repaintMeter = repaintAccount?.meters[0];
+    if (!repaintAccount || !repaintMeter) {
+      throw new Error("invalid repaint snapshot");
+    }
+    repaintAccount.measuredAtMs = NOW - 3 * 60 * 60_000;
+    repaintMeter.resetAtMs = NOW + 4 * 24 * 60 * 60_000;
+    expect(usageSemanticFingerprint(repaintOnly)).toBe(
       usageSemanticFingerprint(first),
     );
-    const changed = structuredClone(heartbeat);
+    const changed = structuredClone(repaintOnly);
     const changedMeter = changed.codex.accounts[0]?.meters[0];
     if (!changedMeter) throw new Error("invalid changed snapshot");
     changedMeter.usedPercent = 39;

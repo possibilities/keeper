@@ -9,7 +9,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Observation } from "../src/account-observation";
+import {
+  type Observation,
+  writeObservationSidecar,
+} from "../src/account-observation";
+import { selectRoute } from "../src/account-router";
+import {
+  OBSERVATION_SCHEMA_VERSION,
+  observationSidecarPath,
+} from "../src/account-routing-config";
 import {
   buildCurrentResetFableFocus,
   effectiveFableFocus,
@@ -21,13 +29,15 @@ import {
 
 const NOW = Date.parse("2026-07-18T12:00:00.000Z");
 const RESET = "2026-07-20T23:59:59.000Z";
+const OLD_MEASUREMENT = NOW - 3 * 60 * 60_000;
 
 function observation(
   overrides: Partial<Observation> = {},
   utilization = 0.75,
+  measuredAtMs = NOW,
 ): Observation {
   return {
-    schema_version: 6,
+    schema_version: OBSERVATION_SCHEMA_VERSION,
     observed_at_ms: NOW,
     health: "ok",
     routes: [
@@ -35,7 +45,7 @@ function observation(
         id: "claude-swap:2",
         kind: "managed",
         slot: 2,
-        measuredAtMs: NOW,
+        measuredAtMs,
         windows: [
           { key: "session", utilization: 0.1, resetsAt: RESET },
           { key: "week", utilization: 0.2, resetsAt: RESET },
@@ -149,6 +159,68 @@ test("policy identity and set timestamp derive only from event data", () => {
   ).toBeNull();
 });
 
+test("old-measurement focus falls back on removal and resumes the durable target", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-fable-focus-routing-"));
+  const target = observation({}, 0.75, OLD_MEASUREMENT).routes[0];
+  if (target === undefined) throw new Error("expected target route");
+  const alternate: Observation["routes"][number] = {
+    id: "claude-swap:3",
+    kind: "managed",
+    slot: 3,
+    measuredAtMs: NOW,
+    windows: [
+      { key: "session", utilization: 0.1, resetsAt: RESET },
+      { key: "week", utilization: 0.1, resetsAt: RESET },
+      { key: "model:Fable", utilization: 0.2, resetsAt: RESET },
+    ],
+  };
+  const available = observation({
+    routes: [target, alternate],
+    claude_accounts: {
+      count: 2,
+      ordinals: { "claude-swap:2": 0, "claude-swap:3": 1 },
+    },
+    account_issues: {},
+  });
+  const removed = observation({
+    routes: [alternate],
+    claude_accounts: {
+      count: 2,
+      ordinals: { "claude-swap:2": 0, "claude-swap:3": 1 },
+    },
+    account_issues: { "claude-swap:2": "relogin-required" },
+  });
+  const durablePolicy = policy({ kind: "permanent" });
+  const deps = {
+    stateDir: dir,
+    nowMs: NOW,
+    model: "fable",
+    focusDelivery: { available: true as const, policy: durablePolicy },
+  };
+  try {
+    writeObservationSidecar(observationSidecarPath(dir), available);
+    expect(selectRoute(deps)).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "fable-focus" },
+    });
+
+    writeObservationSidecar(observationSidecarPath(dir), removed);
+    expect(selectRoute({ ...deps, nowMs: NOW + 1 })).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:3", reason: "fable-focus-fallback" },
+    });
+
+    writeObservationSidecar(observationSidecarPath(dir), available);
+    expect(selectRoute({ ...deps, nowMs: NOW + 2 })).toMatchObject({
+      ok: true,
+      selection: { id: "claude-swap:2", reason: "fable-focus" },
+    });
+    expect(deps.focusDelivery.policy).toBe(durablePolicy);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("permanent and absolute policies evaluate with a half-open deadline", () => {
   expect(
     effectiveFableFocus(
@@ -197,19 +269,29 @@ test("invalid policy input is visible and never treated as active", () => {
   });
 });
 
-test("cycle-end completes on matching fresh full utilization or its fixed boundary", () => {
+test("cycle-end uses fresh Capacity and matching resets despite old Measurement age", () => {
   const cycle = policy({ kind: "cycle-end", reset_at: RESET });
   expect(
     effectiveFableFocus(
       { available: true, policy: cycle },
-      observation({}, 0.99),
+      observation({}, 0.99, OLD_MEASUREMENT),
       NOW,
     ).state,
+  ).toBe("active");
+  const mismatched = observation({}, 1, OLD_MEASUREMENT);
+  const mismatchedWindow = mismatched.routes[0]?.windows.find(
+    (window) => window.key === "model:Fable",
+  );
+  if (mismatchedWindow === undefined) throw new Error("expected Fable window");
+  mismatchedWindow.resetsAt = "2026-07-21T23:59:59.000Z";
+  expect(
+    effectiveFableFocus({ available: true, policy: cycle }, mismatched, NOW)
+      .state,
   ).toBe("active");
   expect(
     effectiveFableFocus(
       { available: true, policy: cycle },
-      observation({}, 1),
+      observation({}, 1, OLD_MEASUREMENT),
       NOW,
     ).state,
   ).toBe("completed");
@@ -226,9 +308,15 @@ test("cycle-end completes on matching fresh full utilization or its fixed bounda
   ).toBe("completed");
 });
 
-test("current-reset construction refuses stale, elapsed, and mismatched observations", () => {
+test("current-reset admits old Measurement evidence but refuses stale, elapsed, and mismatched resets", () => {
+  const admittedOldMeasurement = observation({}, 0.75, OLD_MEASUREMENT);
   expect(
-    buildCurrentResetFableFocus("claude-swap:2", observation(), NOW, RESET),
+    buildCurrentResetFableFocus(
+      "claude-swap:2",
+      admittedOldMeasurement,
+      NOW,
+      RESET,
+    ),
   ).toEqual({
     ok: true,
     focus: {
@@ -258,7 +346,7 @@ test("current-reset construction refuses stale, elapsed, and mismatched observat
   expect(
     buildCurrentResetFableFocus(
       "claude-swap:2",
-      observation(),
+      admittedOldMeasurement,
       NOW,
       "2026-07-21T23:59:59Z",
     ),
