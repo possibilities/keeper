@@ -138,6 +138,10 @@ function passingReport(): LiveProofReport {
           restored: true,
         },
       ],
+      alias_health: [
+        { alias: "keeper-codex-a", status: "healthy" },
+        { alias: "keeper-codex-b", status: "healthy" },
+      ],
       restoration: { required: true, completed: true },
       artifact_scan: {
         status: "clean",
@@ -197,6 +201,10 @@ function proofInput(
       LIVE_PROOF_CLAUSES.map((clause) => [clause, !drop.has(clause)]),
     ) as LiveProofReport["clauses"],
     routes,
+    alias_health: [
+      { alias: "keeper-codex-a", status: "exhausted" as const },
+      { alias: "keeper-codex-b", status: "healthy" as const },
+    ],
     restoration: { required: true, completed: true },
     artifact_scan: {
       status: "clean",
@@ -404,7 +412,7 @@ describe("degraded single-alias verdict", () => {
     });
   });
 
-  test("no degraded marker when quota faults span both session roles", () => {
+  test("no degraded marker when observer health names no single healthy alias", () => {
     const routes: LiveProofReport["routes"] = [
       {
         session_role: "root",
@@ -423,10 +431,12 @@ describe("degraded single-alias verdict", () => {
         restored: true,
       },
     ];
-    const report = collectLiveProof(
-      proofInput(["native_fallback", "transport_isolation"], routes),
-      EXPECTED,
-    );
+    const input = proofInput(["native_fallback", "transport_isolation"], routes);
+    input.alias_health = [
+      { alias: "keeper-codex-a", status: "healthy" },
+      { alias: "keeper-codex-b", status: "healthy" },
+    ];
+    const report = collectLiveProof(input, EXPECTED);
     expect(report.verdict).toBe("incomplete");
     expect(report.degraded).toBeNull();
   });
@@ -644,6 +654,7 @@ describe("proof artifact sanitation and persistence", () => {
     expect(Object.keys(JSON.parse(readFileSync(path, "utf8"))).sort()).toEqual(
       [
         "alias_binding",
+        "alias_health",
         "alias_roles",
         "artifact_scan",
         "clauses",

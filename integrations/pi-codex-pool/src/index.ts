@@ -172,6 +172,10 @@ class ProofEvidence {
   private readonly completedAliases = new Map<string, string[]>();
   private readonly refreshedAliases = new Set<string>();
   private observerArtifact: string | null = null;
+  aliasHealth: Array<{
+    alias: string;
+    status: "healthy" | "exhausted" | "unavailable";
+  }> = [];
   private rootSessionId: string | null = null;
   private compatDelegateUsed = false;
   private activeRoutes = 0;
@@ -297,6 +301,22 @@ class ProofEvidence {
 
   observed(rendered: string): void {
     this.observerArtifact = rendered;
+    try {
+      const parsed = JSON.parse(rendered) as {
+        aliases?: Array<{ alias?: unknown; usage?: { status?: unknown } }>;
+      };
+      this.aliasHealth = (parsed.aliases ?? []).flatMap((entry) => {
+        const status = entry.usage?.status;
+        return typeof entry.alias === "string" &&
+          (status === "healthy" ||
+            status === "exhausted" ||
+            status === "unavailable")
+          ? [{ alias: entry.alias, status }]
+          : [];
+      });
+    } catch {
+      this.aliasHealth = [];
+    }
   }
 
   beginNativeFallback(): void {
@@ -947,6 +967,7 @@ export function installCodexPool(
         transcript,
         clauses,
         routes: reportRoutes,
+        alias_health: evidence?.aliasHealth ?? [],
         restoration: {
           required: evidence?.restorationRequired(reportRoutes) ?? false,
           completed: evidence?.restorationCompleted(reportRoutes) ?? false,

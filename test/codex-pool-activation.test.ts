@@ -154,6 +154,10 @@ function passingReport(): LiveProofReport {
         restored: true,
       },
     ],
+    alias_health: [
+      { alias: "keeper-codex-a", status: "exhausted" },
+      { alias: "keeper-codex-b", status: "healthy" },
+    ],
     restoration: { required: true, completed: true },
     artifact_scan: {
       status: "clean",

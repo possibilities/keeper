@@ -135,6 +135,10 @@ export interface LiveProofReport {
     substantive_output: boolean;
     restored: boolean;
   }>;
+  alias_health: Array<{
+    alias: string;
+    status: "healthy" | "exhausted" | "unavailable";
+  }>;
   restoration: {
     required: boolean;
     completed: boolean;
@@ -182,6 +186,7 @@ const REPORT_KEYS = [
   "transcript",
   "clauses",
   "routes",
+  "alias_health",
   "restoration",
   "artifact_scan",
   "verdict",
@@ -368,6 +373,23 @@ function schemaShape(input: unknown): {
       ) ||
       typeof route.substantive_output !== "boolean" ||
       typeof route.restored !== "boolean"
+    ) {
+      return { unknown };
+    }
+  }
+  const aliasHealth = top.alias_health;
+  if (!Array.isArray(aliasHealth) || aliasHealth.length > 8) {
+    return { unknown };
+  }
+  for (const rawEntry of aliasHealth) {
+    const entry = record(rawEntry);
+    if (!entry) return { unknown };
+    unknown ||= hasUnknownKeys(entry, ["alias", "status"]);
+    if (
+      !hasExactKeys(entry, ["alias", "status"]) ||
+      !isOpaqueAlias(entry.alias) ||
+      !seenAliases.has(String(entry.alias)) ||
+      !["healthy", "exhausted", "unavailable"].includes(String(entry.status))
     ) {
       return { unknown };
     }
@@ -700,6 +722,10 @@ export function collectLiveProof(
       substantive_output: route.substantive_output,
       restored: route.restored,
     })),
+    alias_health: input.alias_health.map((entry) => ({
+      alias: entry.alias,
+      status: entry.status,
+    })),
     restoration: {
       required: input.restoration.required,
       completed: input.restoration.completed,
@@ -717,18 +743,20 @@ export function collectLiveProof(
   report.verdict = classifyWithoutDeclaredVerdict(report, expected, reasons);
   if (report.verdict === "incomplete") {
     const transcriptClauses = clausesFromProofTranscript(report.transcript);
-    const faulted = new Set<string>();
-    for (const route of report.routes) {
-      if (route.failure_class !== "quota") continue;
-      const first = route.aliases[0];
-      if (first !== undefined) faulted.add(first);
-    }
-    const healthyCandidates = report.alias_roles
-      .map((entry) => entry.alias)
-      .filter((alias) => !faulted.has(alias));
+    const health = new Map(
+      report.alias_health.map((entry) => [entry.alias, entry.status]),
+    );
+    const roleAliases = report.alias_roles.map((entry) => entry.alias);
+    const healthyAliases = roleAliases.filter(
+      (alias) => health.get(alias) === "healthy",
+    );
+    const unhealthyAliases = roleAliases.filter((alias) => {
+      const status = health.get(alias);
+      return status !== undefined && status !== "healthy";
+    });
     const pinnedAlias =
-      faulted.size >= 1 && healthyCandidates.length === 1
-        ? healthyCandidates[0]
+      healthyAliases.length === 1 && unhealthyAliases.length >= 1
+        ? healthyAliases[0]
         : null;
     if (pinnedAlias === undefined || pinnedAlias === null) return report;
     const candidate: DegradedProofVerdict = {
