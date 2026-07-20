@@ -46,7 +46,10 @@ import {
   ATTRIBUTION_FLOOR_PATH,
   ATTRIBUTION_FLOOR_SESSION_ID,
 } from "../git-attribution-floor";
-import { hasOrderedTerminalProof } from "../lifecycle-terminal-proof";
+import {
+  hasOrderedTerminalProof,
+  TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL,
+} from "../lifecycle-terminal-proof";
 import type { GitRunner } from "./git-exec";
 import { isUuid } from "./identity";
 import {
@@ -1059,9 +1062,6 @@ function unresolvedDeadLetterEvidence(
     return null;
   }
 }
-
-const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
-  "'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest', 'Notification'";
 
 /**
  * Read folded claims plus exact tool mutations newer than the root's last Git

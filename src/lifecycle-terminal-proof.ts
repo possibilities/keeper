@@ -1,3 +1,6 @@
+export const TERMINAL_PROOF_LIFECYCLE_HOOKS_SQL =
+  "'SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd', 'Killed', 'RateLimited', 'ApiError', 'InputRequest', 'Notification'";
+
 export interface OrderedTerminalProofInput {
   mutationEventId: number | null;
   state: string | null;
