@@ -46,5 +46,5 @@ task still resets; the finished-worker done path lands with evidence. Named gate
 - [ ] Suites green via named gates
 
 ## Done summary
-
+unblock now retains in_progress for a live-or-terminal-unproven claimant, sharing commit-work's ordered lifecycle terminal-proof helper (extracted to src/lifecycle-terminal-proof.ts); a terminally proven dead claimant still resets to todo, closing the park->unblock->done recovery loop without an operator claim/done ritual.
 ## Evidence
