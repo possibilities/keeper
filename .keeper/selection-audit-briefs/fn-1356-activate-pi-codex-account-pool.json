@@ -1,0 +1,44 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 0,
+        "deletions": 0,
+        "files_changed": 0,
+        "insertions": 0
+      },
+      "done_summary": "Added a human-authorized degraded single-alias activation mode: a proven-degraded-single-alias proof verdict that waives only the quota-dead alias's structurally-unsatisfiable legs (native_fallback, transport_isolation) behind genuine quota evidence, activation gated behind an explicit --authorize-degraded flag pinned to the healthy alias and surfaced as active-degraded, with a full proven report upgrading to active and clearing the marker. ADR 0090 amended and install.md documents the ritual.",
+      "input_hash": "b1424997bf24ac27f5197110e35625f852f219dbc141e0a7b0608de7b2bbd4a9",
+      "model": "opus",
+      "spec_chars": 4699,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** integrations/pi-codex-pool/src/proof.ts, integrations/pi-codex-pool/src/index.ts, src/codex-pool-activation.ts, src/agent/main.ts, docs/install.md, docs/adr/, integrations/pi-codex-pool/test/, test/\n\n### Approach\n\nThe 13-clause proof gate assumes both enrolled aliases can serve; a quota-depleted alias makes `transport_isolation` and `native_fallback` structurally unsatisfiable \u2014 yet the pool's entire value in exactly that state is routing to the healthy alias (live specimen: report at ~/.config/keeper/codex-pool/live-proof.json, 11/13 clauses evidenced, the two unmet clauses are precisely the failover legs the quota-dead account refused; the human authorized this carve-out that night). Add a human-authorized DEGRADED activation mode: when a proof run's only unmet clauses are those whose evidence requires the quota-dead alias to serve (interruption cause classified as a quota fault), the report may classify `proven-degraded-single-alias`, recording exactly which clauses were waived and the classified cause. The activation validator accepts that verdict ONLY with an explicit operator authorization flag naming the degraded verdict; it activates routing pinned to the healthy alias and surfaces the state loudly (`active-degraded` in status and accounts check \u2014 never presented as balanced operation). A subsequent FULL proven report at quota recovery upgrades activation to full active and clears the degraded marker. Nothing about the degraded path is implicit: no flag, no degraded activation; any unmet clause not caused by the quota-dead alias refuses the degraded verdict outright.\n\n**CRITICAL LANE NOTE \u2014 read before any source edit:** the fn-1356 epic lane predates fn-1378, so the proof machinery this task edits DOES NOT EXIST on the stale lane tree. First verify your worktree HEAD has been freshened with local default (`git merge-base --is-ancestor c1f897457 HEAD` must succeed); if it fails, the base-freshness producer has not yet merged default into the epic base \u2014 park DEPENDENCY_BLOCKED naming the missing freshness merge. Never edit the stale tree and never verify producer-existence claims against it.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required** (read before coding):\n- integrations/pi-codex-pool/src/proof.ts \u2014 the verdict classifier the degraded verdict extends\n- integrations/pi-codex-pool/src/index.ts \u2014 orchestrator fault classification, interruption handling, writeProofReport\n- src/codex-pool-activation.ts and the activate command in src/agent/main.ts \u2014 the validator that must gate the degraded verdict behind the explicit flag\n- docs/install.md proof/activation ritual section \u2014 where the degraded ritual is documented\n- docs/adr/0090-keeper-managed-pi-codex-account-pool.md \u2014 the lineage the amendment extends\n\n### Risks\n\n- This deliberately weakens a safety gate: the waiver must be impossible to trip implicitly \u2014 explicit flag, recorded verdict, loud status, or nothing\n- Degraded routing must never claim balanced operation or hide which alias serves\n- The upgrade path must require a genuinely full proven report \u2014 no partial upgrade\n\n### Test notes\n\nPure classifier tests: quota-fault-only unmet clauses \u2192 degraded-eligible; any other unmet clause \u2192 refuse. Validator tests: degraded report without the flag refuses; with the flag activates pinned + degraded-marked. Status/check render the degraded state. A full proven report clears it. Named gates only.\n\n## Acceptance\n\n- [ ] A proof run whose only unmet clauses stem from the quota-dead alias can classify `proven-degraded-single-alias` recording waived clauses and cause; any non-quota unmet clause refuses the degraded verdict\n- [ ] Activation accepts a degraded report ONLY with an explicit operator authorization flag, pins routing to the healthy alias, and surfaces `active-degraded` loudly in status and accounts check\n- [ ] A subsequent full proven report upgrades to full active and clears the degraded marker\n- [ ] docs/install.md documents the degraded ritual, an ADR amendment records the human decision and the safety trade, and all touched suites are green via named gates\n\n## Done summary\nAdded a human-authorized degraded single-alias activation mode: a proven-degraded-single-alias proof verdict that waives only the quota-dead alias's structurally-unsatisfiable legs (native_fallback, transport_isolation) behind genuine quota evidence, activation gated behind an explicit --authorize-degraded flag pinned to the healthy alias and surfaced as active-degraded, with a full proven report upgrading to active and clearing the marker. ADR 0090 amended and install.md documents the ritual.\n## Evidence\n",
+      "task_id": "fn-1356-activate-pi-codex-account-pool.3",
+      "tier": "xhigh",
+      "title": "Authorize degraded single-alias pool activation"
+    }
+  ],
+  "created_at": "2026-07-20T04:57:26.592000Z",
+  "epic_id": "fn-1356-activate-pi-codex-account-pool",
+  "excluded_tasks": [
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1356-activate-pi-codex-account-pool.1"
+    },
+    {
+      "reason": "no-sidecar-cell",
+      "task_id": "fn-1356-activate-pi-codex-account-pool.2"
+    }
+  ],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "b1424997bf24ac27f5197110e35625f852f219dbc141e0a7b0608de7b2bbd4a9",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
