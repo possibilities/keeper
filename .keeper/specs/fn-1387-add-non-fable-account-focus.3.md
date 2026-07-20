@@ -63,5 +63,5 @@ The new off row is visible before activation, making absence of policy explicit.
 - [ ] Named board, clipboard, view-shell, and live-shell tests pass.
 
 ## Done summary
-
+Added the Non-Fable focus peer section to the board's semantic header, projected independently from autopilot_state and joined with its own non-Fable capacity inspection; live, snapshot, frame, sidecar, and clipboard-copy paths carry the same view model, with board/clipboard/view-shell/live-shell fixtures updated at wide/narrow widths.
 ## Evidence
