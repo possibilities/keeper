@@ -65,6 +65,7 @@ import {
   type ReleaseRecord,
   type RequestReleaseConflict,
   type RequestReleasePointer,
+  requestReleaseConflictsForPath,
   type SurfaceDiscoveryDeps,
   type SurfaceDiscoveryResult,
   summarizeReceiptLag,
@@ -830,6 +831,7 @@ function selectedForeignConflicts(
       for (const session of sessions) {
         requestReleaseConflicts.push({
           claimantSessionId: session,
+          worktree: surface.worktree,
           path,
           decline: pathClaims.find(
             (claim) =>
@@ -869,6 +871,7 @@ function requestReleaseFromRejections(
     for (const session of rejection.conflicting_sessions ?? []) {
       conflicts.push({
         claimantSessionId: session,
+        worktree: surface.worktree,
         path: rejection.path,
         decline: claims.find(
           (claim) =>
@@ -879,6 +882,26 @@ function requestReleaseFromRejections(
         )?.releaseDecline,
       });
     }
+  }
+  return buildRequestReleasePointer(conflicts, identity, SAMPLE_LIMIT);
+}
+
+function requestReleaseFromAmbiguous(
+  surface: SurfaceDiscoveryResult,
+  identity: string | null,
+): RequestReleasePointer | undefined {
+  const conflicts: RequestReleaseConflict[] = [];
+  for (const path of surface.ambiguous) {
+    const claims = surface.claimsByPath.get(path) ?? [];
+    const blockers = unsafeForeignSessions(claims, identity);
+    conflicts.push(
+      ...requestReleaseConflictsForPath(
+        surface.worktree,
+        path,
+        claims,
+        blockers.conflicts,
+      ),
+    );
   }
   return buildRequestReleasePointer(conflicts, identity, SAMPLE_LIMIT);
 }
@@ -1665,6 +1688,7 @@ async function runAttempt(
         identity,
         result: result("commit-work-result", "ownership_ambiguous", false, {
           identity,
+          request_release: requestReleaseFromAmbiguous(surface, identity),
           selection: selectionEnvelope(surface, identity),
           surface: surface.summary,
         }),

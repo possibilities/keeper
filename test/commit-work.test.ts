@@ -3144,6 +3144,7 @@ describe("commit-work: cooperative claim release", () => {
     expect(rejection?.request_release?.requester_session_id).toBe(PEER);
     expect(rejection?.request_release?.claimants[0]).toMatchObject({
       claimant_session_id: HOLDER,
+      worktree: "/repo",
       paths: ["shared/a.txt"],
       release_argv: [
         "keeper",
@@ -3151,6 +3152,8 @@ describe("commit-work: cooperative claim release", () => {
         "release",
         "--session-id",
         HOLDER,
+        "--worktree",
+        "/repo",
         "--",
         "shared/a.txt",
       ],
@@ -3161,6 +3164,41 @@ describe("commit-work: cooperative claim release", () => {
     expect(rejection?.request_release?.requester_protocol).toContain(
       "never signal a live peer",
     );
+  });
+
+  test("multi-ambiguous refusal carries a worktree-bound release pointer", async () => {
+    const path = "shared/a.txt";
+    const { d } = deps({
+      files: [path],
+      rules: successRules({ stagedNames: [path] }),
+    });
+    const { code, stdout } = await runForTest(
+      ["feat: ambiguous ownership", "--session-id", "s1"],
+      {
+        ...d,
+        readClaims: () => [liveHolderClaim(path)],
+        classifyClaim: (claim) => claim.liveness,
+      },
+    );
+    expect(code).toBe(1);
+    const env = JSON.parse(stdout);
+    expect(env.outcome).toBe("ownership_ambiguous");
+    expect(firstReleaseClaimant(env)).toMatchObject({
+      claimant_session_id: HOLDER,
+      worktree: "/repo",
+      paths: [path],
+      release_argv: [
+        "keeper",
+        "session",
+        "release",
+        "--session-id",
+        HOLDER,
+        "--worktree",
+        "/repo",
+        "--",
+        path,
+      ],
+    });
   });
 
   test("commit-work adoption refusal carries the claimant pointer and bounded paths", async () => {
@@ -3500,6 +3538,58 @@ describe("session release verb", () => {
     expect(env.error.code).toBe("session_identity_unproven");
   });
 
+  test("refuses a wrong-repo invocation with no bound live claim", async () => {
+    const cap = captureSink();
+    let readWorktree: string | null = null;
+    const deps: ReleaseDeps = {
+      sink: cap.sink,
+      env: {},
+      cwd: "/wrong-repo",
+      dir: "/unused",
+      gitToplevel: () => "/wrong-repo",
+      readAuthority: () => RELEASE_AUTHORITY,
+      descendsFrom: async () => true,
+      readClaims: (worktree) => {
+        readWorktree = worktree;
+        return [];
+      },
+    };
+    await releaseMain(["shared/a.txt", "--session-id", HOLDER], deps);
+    expect(cap.code()).toBe(1);
+    const env = cap.body() as {
+      ok: boolean;
+      error: { code: string; message: string };
+    };
+    expect(readWorktree as unknown).toBe("/wrong-repo");
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe("no_live_owned_claims");
+    expect(env.error.message).toContain("/wrong-repo");
+  });
+
+  test("refuses a --worktree that differs from the invoking git worktree", async () => {
+    const cap = captureSink();
+    const deps: ReleaseDeps = {
+      sink: cap.sink,
+      env: {},
+      cwd: "/repo/subdir",
+      dir: "/unused",
+      gitToplevel: () => "/repo",
+      readAuthority: () => RELEASE_AUTHORITY,
+      descendsFrom: async () => true,
+      readClaims: () => {
+        throw new Error("claims must not be read after a worktree mismatch");
+      },
+    };
+    await releaseMain(
+      ["shared/a.txt", "--session-id", HOLDER, "--worktree", "/other-repo"],
+      deps,
+    );
+    expect(cap.code()).toBe(1);
+    const env = cap.body() as { ok: boolean; error: { code: string } };
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe("worktree_mismatch");
+  });
+
   test("a proven session writes an identity-bound record the reader honors", async () => {
     const dir = mkdtempSync(join(tmpdir(), "keeper-release-verb-"));
     const worktree = mkdtempSync(join(tmpdir(), "keeper-release-tree-"));
@@ -3513,14 +3603,23 @@ describe("session release verb", () => {
         gitToplevel: () => worktree,
         readAuthority: () => RELEASE_AUTHORITY,
         descendsFrom: async () => true,
+        readClaims: () => [liveHolderClaim("shared/a.txt")],
       };
-      await releaseMain(["shared/a.txt", "--session-id", HOLDER], deps);
+      await releaseMain(
+        ["shared/a.txt", "--session-id", HOLDER, "--worktree", worktree],
+        deps,
+      );
       expect(cap.code()).toBe(0);
       const env = cap.body() as {
         ok: boolean;
-        data: { released: string[]; database_written: boolean };
+        data: {
+          worktree: string;
+          released: string[];
+          database_written: boolean;
+        };
       };
       expect(env.ok).toBe(true);
+      expect(env.data.worktree).toBe(worktree);
       expect(env.data.released).toEqual(["shared/a.txt"]);
       expect(env.data.database_written).toBe(false);
 
