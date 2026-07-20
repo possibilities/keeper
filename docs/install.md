@@ -200,6 +200,11 @@ commands take their native passthrough path, and Pi started outside Keeper recei
 pool environment. The loaded pi-subagents checkout stays on the fork's live integration lineage; upstream
 proposal branches belong in separate checkouts and never replace that loaded tree.
 
+The installer also links the package's `keeper-pi-codex-observe` executable onto PATH (`bun link` against
+`integrations/pi-codex-pool`, the same mechanism it uses for the `keeper` CLI itself), so a Keeper-marked
+environment can produce a fresh routing observation. A durable `KEEPER_PI_CODEX_OBSERVER_BIN` override
+skips the link and is used verbatim instead.
+
 The companion affects only `openai-codex`. Non-Codex providers keep Pi's native path. Root and inherited
 pi-subagents child requests share the Provider wrapper but select independently by session id. A session
 keeps its healthy opaque alias. One logical Provider call may move to one different alias only after a
