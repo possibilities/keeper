@@ -5866,16 +5866,22 @@ export const SERVE_LAG_P99_THRESHOLD_MS = 1_000;
 /**
  * Consecutive breaching intervals before a busy-wedge escalates. Requiring N in a
  * row (not one spike) keeps a transient GC pause or a heavy-but-finite fold from
- * tripping a false restart.
+ * tripping a false restart. Sized to outlast a finite retention/backfill grind
+ * burst on a multi-GB event store (several minutes of elevated p99) while still
+ * catching a permanently busy-spinning main; a restart is costlier than the lag
+ * it would clear — the successor boot re-walks the same store cold and the
+ * recycle orphans live workers.
  */
-export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 3;
+export const SERVE_LAG_MAX_CONSECUTIVE_BREACHES = 6;
 /**
  * Boot grace: the watchdog never escalates within this window of arming. The serve
  * workers may still be binding and no probe has landed yet, so the arm-time baseline
- * would otherwise read as instantly stale. Generous — a healthy boot binds both
- * sockets and answers the first probes well inside it.
+ * would otherwise read as instantly stale. Sized to cover a cold boot's catchup on
+ * a multi-GB event store — fold backlog and retention walks keep MAIN legitimately
+ * hot for minutes after the sockets bind, and escalating inside that window kills a
+ * healthy recovering boot and hands the next one an even larger backlog.
  */
-export const SERVE_WATCHDOG_BOOT_GRACE_MS = 60_000;
+export const SERVE_WATCHDOG_BOOT_GRACE_MS = 300_000;
 /**
  * Consecutive FAILED real-read attempts (per socket) before accept-stall escalates.
  * Attempt-counting replaces the old wall-clock age so a laptop suspend/resume gap
