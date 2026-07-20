@@ -1,0 +1,24 @@
+{
+  "cells": [
+    {
+      "confidence": 0.79,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "Pure mechanical extraction of an existing SQL constant into a shared module with two verbatim import swaps and inline-copy deletions across three explicitly named files; unambiguous no-behavioral-change acceptance makes it Spark-reliable, and the byte-consistency invariant is preserved mechanically (not intelligence-bound), so the opus/security gate does not fire; medium band fits a multi-file mechanical refactor.",
+      "task_id": "fn-1384-share-terminal-proof-lifecycle-hook-sql.1",
+      "tier": "medium"
+    }
+  ],
+  "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "created_at": "2026-07-20T11:57:56.313000Z",
+  "epic_id": "fn-1384-share-terminal-proof-lifecycle-hook-sql",
+  "input_hash": "4b3c5a78cd23938fd22d007da37cd1af7b78d6a160b0c700890265e0f6846578",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 1262246520,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"1\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"Pure mechanical extraction of an existing SQL constant into a shared module with two verbatim import swaps and inline-copy deletions across three explicitly named files; unambiguous no-behavioral-change acceptance makes it Spark-reliable, and the byte-consistency invariant is preserved mechanically (not intelligence-bound), so the opus/security gate does not fire; medium band fits a multi-file mechanical refactor.\",\"confidence\":0.79}]}\n"
+}
