@@ -127,11 +127,9 @@ import {
   countAbsentBlobs,
   DEFAULT_RETENTION_BATCH_SIZE,
   DEFAULT_RETENTION_MAX_BATCHES,
-  deleteColdTmuxFocusRows,
-  deleteNoopSnapshotRows,
   reclaimableFreelistBytes,
   reclaimableLogStep,
-  retainColdPayloads,
+  runYieldingRetentionPass,
 } from "./compaction";
 import {
   type NativeCrashBootIdentityWindow,
@@ -17150,47 +17148,43 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // step-latch below emits the pool size ONLY on a fresh 100MB step crossing — an
   // unconditional per-pass line would grow the very server.stderr this epic bounds.
   let lastLoggedReclaimStep = 0;
-  function runRetentionPass(): void {
-    if (shuttingDown) return;
+  let retentionRunning = false;
+  async function runRetentionPass(): Promise<void> {
+    if (shuttingDown || retentionRunning) return;
+    retentionRunning = true;
+    await runRetentionPassUnlocked().finally(() => {
+      retentionRunning = false;
+    });
+  }
+
+  async function runRetentionPassUnlocked(): Promise<void> {
     let shed = 0;
     let deleted = 0;
     try {
-      const result = retainColdPayloads(db);
-      shed = result.shed;
+      const eventRetention = await runYieldingRetentionPass(db, {
+        shouldContinue: () => !shuttingDown,
+      });
+      if (!eventRetention) return;
+
+      const { bodies, noopSnapshots, tmuxFocus } = eventRetention;
+      shed = bodies.shed;
+      deleted = noopSnapshots.deleted + tmuxFocus.deleted;
       if (shed > 0) {
         console.error(
-          `[keeperd] retention: shed ${shed} cold body/bodies in ${result.batches} batch(es), reclaimed ${result.reclaimedPages} page(s) (watermark id<=${result.coldWatermark}, cursor<${result.cursor}${result.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: shed ${shed} cold body/bodies in ${bodies.batches} batch(es), reclaimed ${bodies.reclaimedPages} page(s) (watermark id<=${bodies.coldWatermark}, cursor<${bodies.cursor}${bodies.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Row-growth bound (fn-934.5): physically DELETE cold rows of the no-op-arm
-      // snapshot classes — the body-NULL pass above reclaims body bytes but never
-      // the per-row overhead. PROVEN re-fold-safe for these three classes ONLY
-      // (their fold arms are no-ops and they carry no producer-scanned column);
-      // the predicate is pinned to that set by a guarding test so it can't widen.
-      // Same writable-connection / paced / cursor-gated discipline as the NULL
-      // pass — and it runs in keeper's OWN writer process (a separate process + a
-      // long reader would pin the WAL during the delete).
-      const del = deleteNoopSnapshotRows(db);
-      deleted = del.deleted;
-      if (deleted > 0) {
+      if (noopSnapshots.deleted > 0) {
         console.error(
-          `[keeperd] retention: deleted ${deleted} cold no-op-snapshot row(s) in ${del.batches} batch(es), reclaimed ${del.reclaimedPages} page(s) (watermark id<=${del.coldWatermark}, cursor<${del.cursor}${del.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: deleted ${noopSnapshots.deleted} cold no-op-snapshot row(s) in ${noopSnapshots.batches} batch(es), reclaimed ${noopSnapshots.reclaimedPages} page(s) (watermark id<=${noopSnapshots.coldWatermark}, cursor<${noopSnapshots.cursor}${noopSnapshots.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Row-growth bound for the epic fn-952 `TmuxClientFocusSnapshot` tail —
-      // active window/session navigation logs a slow trickle of focus snapshots.
-      // Re-fold-safe for an INDEPENDENT reason from the no-op classes: the focus
-      // fold writes ONLY the `tmux_client_focus` LIVE-ONLY singleton and the rows
-      // carry no producer-scanned column, so deleting a cold one leaves every
-      // deterministic projection byte-identical (its own SAFE+NECESSARY pair pins
-      // this). A SEPARATELY-NAMED predicate, never folded into the no-op set.
-      const focusDel = deleteColdTmuxFocusRows(db);
-      deleted += focusDel.deleted;
-      if (focusDel.deleted > 0) {
+      if (tmuxFocus.deleted > 0) {
         console.error(
-          `[keeperd] retention: deleted ${focusDel.deleted} cold tmux-focus row(s) in ${focusDel.batches} batch(es), reclaimed ${focusDel.reclaimedPages} page(s) (watermark id<=${focusDel.coldWatermark}, cursor<${focusDel.cursor}${focusDel.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: deleted ${tmuxFocus.deleted} cold tmux-focus row(s) in ${tmuxFocus.batches} batch(es), reclaimed ${tmuxFocus.reclaimedPages} page(s) (watermark id<=${tmuxFocus.coldWatermark}, cursor<${tmuxFocus.cursor}${tmuxFocus.moreLikely ? ", more remain" : ""})`,
         );
       }
+
       // Dead-letter retention (resurrection-safe): prune fully-recovered aged
       // sealed files (unlink-FIRST, rows second) + row-only terminal tails. Its
       // own try so a prune failure is non-fatal AND leaves the
@@ -17283,9 +17277,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Schedule the retention pass on its own slack heartbeat. Stored so shutdown
-  // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn.
+  // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn;
+  // each transaction yields a turn before the next one.
   const retentionTimer = setInterval(() => {
-    runRetentionPass();
+    void runRetentionPass();
   }, RETENTION_INTERVAL_MS);
 
   // Producer-side historical `mutation_path` backfill pass (fn-836.3). Fills the

@@ -375,6 +375,64 @@ interface ColdScanMutationResult {
 
 type ColdScanMutation = "null-body" | "delete-row";
 
+export interface YieldingRetentionBatchResult {
+  /** Transactions executed by this step; the yielding driver accepts at most one. */
+  batches: number;
+  /** Whether the same surface still has cold history below its current ceiling. */
+  moreLikely: boolean;
+}
+
+export interface YieldingRetentionBatchOptions {
+  /** Maximum one-transaction steps in this event-loop turn sequence. */
+  maxBatches?: number;
+  /** Event-loop yield seam. Tests inject a deterministic observer. */
+  yieldTurn?: () => Promise<void>;
+  /** Cancellation seam checked before every transaction. */
+  shouldContinue?: () => boolean;
+}
+
+/**
+ * Run one retention surface as one-transaction steps, yielding to the event loop
+ * between them. Releasing SQLite's writer lock protects external producers;
+ * yielding separately lets MAIN service worker-bridged control RPCs while a
+ * historical retention backlog advances.
+ */
+function defaultRetentionYieldTurn(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+export async function runYieldingRetentionBatches<
+  T extends YieldingRetentionBatchResult,
+>(step: () => T, options: YieldingRetentionBatchOptions = {}): Promise<T[]> {
+  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
+  if (!Number.isSafeInteger(maxBatches) || maxBatches < 0) {
+    throw new RangeError("maxBatches must be a safe non-negative integer");
+  }
+  const yieldTurn = options.yieldTurn ?? defaultRetentionYieldTurn;
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  const results: T[] = [];
+
+  for (let i = 0; i < maxBatches && shouldContinue(); i++) {
+    const result = step();
+    if (
+      !Number.isSafeInteger(result.batches) ||
+      result.batches < 0 ||
+      result.batches > 1
+    ) {
+      throw new Error(
+        "yielding retention step must execute at most one transaction",
+      );
+    }
+    results.push(result);
+    if (result.batches === 0 || !result.moreLikely || i + 1 >= maxBatches) {
+      break;
+    }
+    await yieldTurn();
+  }
+
+  return results;
+}
+
 function readMetaValue(db: Database, key: string): string | null {
   const row = db.query("SELECT value FROM meta WHERE key = ?").get(key) as {
     value: string;
@@ -897,6 +955,100 @@ function deleteColdRowsByPredicate(
     reclaimedPages: result.reclaimedPages,
     moreLikely: result.moreLikely,
   };
+}
+
+export interface YieldingRetentionPassOptions extends RetentionOptions {
+  /** Event-loop yield seam. Defaults to `setImmediate`. */
+  yieldTurn?: () => Promise<void>;
+  /** Cancellation seam checked between transactions and surfaces. */
+  shouldContinue?: () => boolean;
+}
+
+export interface YieldingRetentionPassResult {
+  bodies: RetentionResult;
+  noopSnapshots: DeleteResult;
+  tmuxFocus: DeleteResult;
+}
+
+function aggregateRetentionResults(
+  results: RetentionResult[],
+): RetentionResult | null {
+  const last = results.at(-1);
+  if (!last) return null;
+  return {
+    ...last,
+    shed: results.reduce((sum, item) => sum + item.shed, 0),
+    batches: results.reduce((sum, item) => sum + item.batches, 0),
+    reclaimedPages: results.reduce((sum, item) => sum + item.reclaimedPages, 0),
+  };
+}
+
+function aggregateDeleteResults(results: DeleteResult[]): DeleteResult | null {
+  const last = results.at(-1);
+  if (!last) return null;
+  return {
+    ...last,
+    deleted: results.reduce((sum, item) => sum + item.deleted, 0),
+    batches: results.reduce((sum, item) => sum + item.batches, 0),
+    reclaimedPages: results.reduce((sum, item) => sum + item.reclaimedPages, 0),
+  };
+}
+
+/**
+ * Advance all three event-retention surfaces, one transaction per event-loop
+ * turn. A yield also separates surfaces when one reaches its ceiling in a
+ * single transaction. Returns `null` when shutdown cancellation interrupts the
+ * pass, leaving each committed scan watermark ready for the next heartbeat.
+ */
+export async function runYieldingRetentionPass(
+  db: Database,
+  options: YieldingRetentionPassOptions = {},
+): Promise<YieldingRetentionPassResult | null> {
+  const {
+    maxBatches = DEFAULT_RETENTION_MAX_BATCHES,
+    yieldTurn = defaultRetentionYieldTurn,
+    shouldContinue = () => true,
+    ...retentionOptions
+  } = options;
+  const driverOptions: YieldingRetentionBatchOptions = {
+    maxBatches,
+    yieldTurn,
+    shouldContinue,
+  };
+  const stepOptions: RetentionOptions = {
+    ...retentionOptions,
+    maxBatches: 1,
+  };
+
+  const bodyResults = await runYieldingRetentionBatches(
+    () => retainColdPayloads(db, stepOptions),
+    driverOptions,
+  );
+  if (!shouldContinue()) return null;
+  await yieldTurn();
+  if (!shouldContinue()) return null;
+
+  const noopResults = await runYieldingRetentionBatches(
+    () => deleteNoopSnapshotRows(db, stepOptions),
+    driverOptions,
+  );
+  if (!shouldContinue()) return null;
+  await yieldTurn();
+  if (!shouldContinue()) return null;
+
+  const focusResults = await runYieldingRetentionBatches(
+    () => deleteColdTmuxFocusRows(db, stepOptions),
+    driverOptions,
+  );
+  if (!shouldContinue()) return null;
+  await yieldTurn();
+  if (!shouldContinue()) return null;
+
+  const bodies = aggregateRetentionResults(bodyResults);
+  const noopSnapshots = aggregateDeleteResults(noopResults);
+  const tmuxFocus = aggregateDeleteResults(focusResults);
+  if (!bodies || !noopSnapshots || !tmuxFocus) return null;
+  return { bodies, noopSnapshots, tmuxFocus };
 }
 
 /** Current freelist page count — the pool `incremental_vacuum` drains. */

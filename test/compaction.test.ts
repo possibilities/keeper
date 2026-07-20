@@ -40,6 +40,8 @@ import {
   reclaimableFreelistBytes,
   reclaimableLogStep,
   retainColdPayloads,
+  runYieldingRetentionBatches,
+  runYieldingRetentionPass,
 } from "../src/compaction";
 import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
@@ -696,6 +698,51 @@ test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across 
     incrementalVacuumPages: 0,
   });
   expect(result2.shed).toBe(15);
+});
+
+test("yielding retention gives control RPCs a turn between one-transaction steps", async () => {
+  const trace: string[] = [];
+  let step = 0;
+
+  const results = await runYieldingRetentionBatches(
+    () => {
+      step += 1;
+      trace.push(`batch-${step}`);
+      return { batches: 1, moreLikely: step < 3 };
+    },
+    {
+      yieldTurn: async () => {
+        trace.push("yield");
+      },
+    },
+  );
+
+  expect(results).toHaveLength(3);
+  expect(trace).toEqual(["batch-1", "yield", "batch-2", "yield", "batch-3"]);
+});
+
+test("yielding retention pass applies the batch cap independently to all three surfaces", async () => {
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "SessionStart" });
+  }
+  db.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
+  let yields = 0;
+
+  const result = await runYieldingRetentionPass(db, {
+    batchSize: 1,
+    maxBatches: 2,
+    scanBatchSize: 1,
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+    yieldTurn: async () => {
+      yields += 1;
+    },
+  });
+
+  expect(result?.bodies.batches).toBe(2);
+  expect(result?.noopSnapshots.batches).toBe(2);
+  expect(result?.tmuxFocus.batches).toBe(2);
+  expect(yields).toBe(6);
 });
 
 test("retention persists bounded primary-key progress across a keep-only history prefix", () => {
