@@ -329,8 +329,7 @@ export const FRAMES_FLAGS = [
     name: "view",
     type: "string",
     default: "board",
-    summary:
-      "Viewer to stream: board|jobs|git|autopilot|builds (default board)",
+    summary: "Viewer to stream: board|jobs|git|autopilot (default board)",
   },
   {
     name: "for",
@@ -808,16 +807,6 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
         flags: [],
       },
     ],
-  },
-  {
-    name: "builds",
-    summary:
-      "Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)",
-    visibility: "public",
-    mutates: false,
-    requires_daemon: true,
-    requires_tty: false,
-    flags: VIEWER_FLAGS,
   },
   {
     name: "usage",

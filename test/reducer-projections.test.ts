@@ -31,11 +31,8 @@ import {
 import {
   __resetEpicIndexMemoForTest,
   applyEvent,
-  type BuildSnapshotPayload,
   drain,
   eventTsToIso,
-  extractBuildSnapshot,
-  serializeBuildSnapshot,
 } from "../src/reducer";
 import type { Event } from "../src/types";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
@@ -9643,213 +9640,23 @@ test("fn-836.3 idx_events_mutation_path serves the flipped file-attribution scan
   expect(details.some((d) => /^SCAN events\b/.test(d.trim()))).toBe(false);
 });
 
-// ---------------------------------------------------------------------------
-// Schema v64 (fn-781 task .1) — `builds` reducer projection. The server-side
-// builds-worker mints `BuildSnapshot` (UPSERT) / `BuildDeleted` (tombstone)
-// synthetic events from the buildbot REST API; they fold purely (no
-// `Date.now`, no liveness re-probe) into the `builds` table keyed by builder
-// NAME (`event.session_id`). `updated_at` is the event `ts`. A from-scratch
-// re-fold (rewind cursor, DELETE FROM builds, re-drain) MUST reproduce the
-// table byte-identically.
-// ---------------------------------------------------------------------------
-
-const RUNNING_BUILD: BuildSnapshotPayload = {
-  builder_id: 7,
-  build_number: 42,
-  complete: 0,
-  results: null,
-  state_string: "building",
-  started_at: 1_700_000_000,
-  complete_at: null,
-};
-
-const FINISHED_BUILD: BuildSnapshotPayload = {
-  builder_id: 7,
-  build_number: 42,
-  complete: 1,
-  results: 0,
-  state_string: "build successful",
-  started_at: 1_700_000_000,
-  complete_at: 1_700_000_300,
-};
-
-function buildSnapshotEvent(
-  project: string,
-  payload: BuildSnapshotPayload,
-): number {
-  return insertEvent({
+test("retired build events advance the cursor without creating jobs", () => {
+  const snapshotId = insertEvent({
     hook_event: "BuildSnapshot",
-    session_id: project,
-    data: serializeBuildSnapshot(payload),
+    session_id: "retired-builder",
+    data: JSON.stringify({ build_number: 1 }),
   });
-}
-
-function buildDeletedEvent(project: string): number {
-  return insertEvent({
+  const deletedId = insertEvent({
     hook_event: "BuildDeleted",
-    session_id: project,
+    session_id: "retired-builder",
   });
-}
 
-function getBuild(project: string) {
-  return db.query("SELECT * FROM builds WHERE project = ?").get(project) as {
-    project: string;
-    builder_id: number | null;
-    build_number: number | null;
-    complete: number | null;
-    results: number | null;
-    state_string: string | null;
-    started_at: number | null;
-    complete_at: number | null;
-    last_event_id: number;
-    updated_at: number;
-  } | null;
-}
-
-test("serializeBuildSnapshot → extractBuildSnapshot round-trips every payload field", () => {
-  // fn-651 contract pin: each projection-meaningful field must survive
-  // serializer → event.data → extractor identically, or it folds NULL forever.
-  const eventId = buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  const ev = db
-    .query("SELECT * FROM events WHERE id = ?")
-    .get(eventId) as Event;
-  expect(extractBuildSnapshot(ev)).toEqual(FINISHED_BUILD);
-
-  // Running shape (results / complete_at NULL) round-trips too.
-  const runId = buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  const runEv = db
-    .query("SELECT * FROM events WHERE id = ?")
-    .get(runId) as Event;
-  expect(extractBuildSnapshot(runEv)).toEqual(RUNNING_BUILD);
-});
-
-test("extractBuildSnapshot folds malformed / empty / partial blobs null-safely", () => {
-  // Empty + malformed data → null (the fold no-ops, never throws).
-  const emptyEv = { id: 1, ts: 1, session_id: "x", data: "" } as Event;
-  expect(extractBuildSnapshot(emptyEv)).toBeNull();
-  const badEv = { id: 1, ts: 1, session_id: "x", data: "{not json" } as Event;
-  expect(extractBuildSnapshot(badEv)).toBeNull();
-  // A partial blob folds the absent fields to null rather than poisoning.
-  const partialEv = {
-    id: 1,
-    ts: 1,
-    session_id: "x",
-    data: JSON.stringify({ build_number: 9 }),
-  } as Event;
-  expect(extractBuildSnapshot(partialEv)).toEqual({
-    builder_id: null,
-    build_number: 9,
-    complete: null,
-    results: null,
-    state_string: null,
-    started_at: null,
-    complete_at: null,
-  });
-});
-
-test("BuildSnapshot UPSERTs a running builds row keyed by builder name and advances the cursor", () => {
-  const eventId = buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  expect(drainAll()).toBe(1);
-  const row = getBuild("acme-ci");
-  expect(row).not.toBeNull();
-  expect(row?.project).toBe("acme-ci");
-  expect(row?.builder_id).toBe(7);
-  expect(row?.build_number).toBe(42);
-  expect(row?.complete).toBe(0);
-  // Running build → results NULL, complete_at NULL.
-  expect(row?.results).toBeNull();
-  expect(row?.complete_at).toBeNull();
-  expect(row?.state_string).toBe("building");
-  expect(row?.started_at).toBe(1_700_000_000);
-  expect(row?.last_event_id).toBe(eventId);
-  // updated_at is the event ts (never a wall-clock read).
-  const eventTs = (
-    db.query("SELECT ts FROM events WHERE id = ?").get(eventId) as {
-      ts: number;
-    }
-  ).ts;
-  expect(row?.updated_at).toBe(eventTs);
-  expect(getCursor()).toBe(eventId);
-});
-
-test("a build emits exactly two folds (start, finish): the finished BuildSnapshot UPSERTs the same row", () => {
-  buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  const finishId = buildSnapshotEvent("acme-ci", FINISHED_BUILD);
   expect(drainAll()).toBe(2);
-  // Still ONE row (UPSERT keyed on builder NAME, not build number).
-  const count = db
-    .query("SELECT COUNT(*) AS n FROM builds WHERE project = 'acme-ci'")
-    .get() as { n: number };
-  expect(count.n).toBe(1);
-  const row = getBuild("acme-ci");
-  expect(row?.complete).toBe(1);
-  expect(row?.results).toBe(0);
-  expect(row?.state_string).toBe("build successful");
-  expect(row?.complete_at).toBe(1_700_000_300);
-  expect(row?.last_event_id).toBe(finishId);
-});
-
-test("BuildDeleted tombstones the builds row keyed by the same builder name", () => {
-  buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  drainAll();
-  expect(getBuild("acme-ci")).not.toBeNull();
-  const delId = buildDeletedEvent("acme-ci");
-  expect(drainAll()).toBe(1);
-  expect(getBuild("acme-ci")).toBeNull();
-  // The tombstone still advanced the cursor.
-  expect(getCursor()).toBe(delId);
-});
-
-test("a malformed BuildSnapshot blob no-ops with the cursor still advanced", () => {
-  const eventId = insertEvent({
-    hook_event: "BuildSnapshot",
-    session_id: "acme-ci",
-    data: "{ not valid json",
-  });
-  expect(drainAll()).toBe(1);
-  // No row written, but the cursor advanced past the malformed event.
-  expect(getBuild("acme-ci")).toBeNull();
-  expect(getCursor()).toBe(eventId);
-});
-
-test("a BuildSnapshot with an empty builder name no-ops with the cursor advanced", () => {
-  const eventId = insertEvent({
-    hook_event: "BuildSnapshot",
-    session_id: "",
-    data: serializeBuildSnapshot(FINISHED_BUILD),
-  });
-  expect(drainAll()).toBe(1);
-  const count = db.query("SELECT COUNT(*) AS n FROM builds").get() as {
-    n: number;
-  };
-  expect(count.n).toBe(0);
-  expect(getCursor()).toBe(eventId);
-});
-
-test("builds is re-fold deterministic: rewind + DELETE + re-drain reproduces it byte-for-byte", () => {
-  buildSnapshotEvent("acme-ci", RUNNING_BUILD);
-  buildSnapshotEvent("acme-ci", FINISHED_BUILD);
-  buildSnapshotEvent("widget-build", RUNNING_BUILD);
-  buildDeletedEvent("widget-build");
-  buildSnapshotEvent("gizmo-build", FINISHED_BUILD);
-  drainAll();
-
-  const before = db
-    .query("SELECT * FROM builds ORDER BY project")
-    .all() as unknown[];
-  // acme-ci finished + gizmo-build finished survive; widget-build tombstoned.
-  expect(before.length).toBe(2);
-
-  // Rewind cursor + wipe the projection + re-drain on the same connection. The
-  // re-folded rows must equal the pre-rewind rows byte-for-byte (pure function
-  // of the event log; updated_at derives from event.ts, no wall-clock).
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM builds");
-  drainAll();
-  const after = db
-    .query("SELECT * FROM builds ORDER BY project")
-    .all() as unknown[];
-  expect(after).toEqual(before);
+  expect(getCursor()).toBe(deletedId);
+  expect(snapshotId).toBeLessThan(deletedId);
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

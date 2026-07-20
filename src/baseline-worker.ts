@@ -24,8 +24,8 @@
  *
  * ## Poll loop + containment (the keystone safety property)
  *
- * `setTimeout`-after-completion with an in-flight skip flag (the builds-worker
- * archetype), runner concurrency ONE. EVERY failure — a checkout that cannot
+ * `setTimeout`-after-completion with an in-flight skip flag, runner concurrency
+ * ONE. EVERY failure — a checkout that cannot
  * resolve the sha, a crashed or timed-out suite — is caught inside the loop and
  * folded into an infra-error / timeout leaf a reader can never mistake for
  * green. Nothing escapes to main's onerror/fatalExit: a red or flaky suite must

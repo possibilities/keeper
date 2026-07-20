@@ -854,43 +854,6 @@ export const PROVIDER_LEG_OWNERSHIP_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `builds` descriptor — one row per registered buildbot builder, keyed by
- * builder NAME (`project`). A reducer projection produced by synthetic
- * `BuildSnapshot` / `BuildDeleted` events; the `keeper builds` dashboard
- * subscribes over the socket. All scalar columns (no JSON). `version:
- * 'last_event_id'` so the diff fires on every fold; default sort is stable by
- * pk so the dashboard renders builders alphabetically.
- */
-export const BUILDS_DESCRIPTOR: CollectionDescriptor = {
-  name: "builds",
-  table: "builds",
-  columns: [
-    "project",
-    "builder_id",
-    "build_number",
-    "complete",
-    "results",
-    "state_string",
-    "started_at",
-    "complete_at",
-    "last_event_id",
-    "updated_at",
-  ],
-  pk: "project",
-  version: "last_event_id",
-  sortable: new Set([
-    "project",
-    "build_number",
-    "results",
-    "last_event_id",
-    "updated_at",
-  ]),
-  defaultSort: { column: "project", dir: "asc" },
-  filters: { project: "project" },
-  jsonColumns: new Set(),
-};
-
-/**
  * The `block_escalations` descriptor (fn-941) — the daemon block-escalation
  * producer's escalate-once LATCH, one row per blocked plan task keyed by
  * `(epic_id, task_id)`. A reducer projection (re-fold rebuilds it
@@ -1102,7 +1065,6 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [DISPATCH_CLAIMS_DESCRIPTOR.name, DISPATCH_CLAIMS_DESCRIPTOR],
   [PROVIDER_LEG_OWNERSHIP_DESCRIPTOR.name, PROVIDER_LEG_OWNERSHIP_DESCRIPTOR],
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
-  [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
   [BLOCK_ESCALATIONS_DESCRIPTOR.name, BLOCK_ESCALATIONS_DESCRIPTOR],
   [HANDOFFS_DESCRIPTOR.name, HANDOFFS_DESCRIPTOR],
   [AWAITS_DESCRIPTOR.name, AWAITS_DESCRIPTOR],
@@ -1138,7 +1100,6 @@ export const QUERY_READ_ALLOWLIST: ReadonlySet<string> = new Set([
   "pending_dispatches",
   "dispatch_claims",
   "armed_epics",
-  "builds",
   "block_escalations",
   "handoffs",
   "awaits",

@@ -649,6 +649,31 @@ test("v120: a pre-retirement DB with real usage/profiles rows drops both tables 
   db2.close();
 });
 
+test("v140 retires the builds projection and does not resurrect it on reopen", () => {
+  const pre = new Database(dbPath, { create: true });
+  pre.run("CREATE TABLE builds (project TEXT PRIMARY KEY)");
+  pre.run("INSERT INTO builds (project) VALUES ('keeper')");
+  pre.close();
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const { db } = openDb(dbPath);
+    const hasBuilds = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'builds'",
+      )
+      .get();
+    expect(hasBuilds ?? null).toBeNull();
+    expect(
+      (
+        db
+          .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+          .get() as { value: string }
+      ).value,
+    ).toBe(String(SCHEMA_VERSION));
+    db.close();
+  }
+});
+
 test("openDb adds nullable escalation_instance to jobs + instance_event_id to dispatch_failures, no DEFAULT (fn-1171 task .2)", () => {
   // The v113→v114 step binds an escalation session to its block instance:
   // `jobs.escalation_instance` (the bound instance id) and

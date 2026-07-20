@@ -76,7 +76,6 @@ function makeHarness(): Harness {
       "dead-letter": mkHandler("dead-letter"),
       git: mkHandler("git"),
       autopilot: mkHandler("autopilot"),
-      builds: mkHandler("builds"),
       usage: mkHandler("usage"),
       frames: mkHandler("frames"),
       dash: mkHandler("dash"),
@@ -226,7 +225,6 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("git")).toBe(true);
     expect(isSubcommand("usage")).toBe(true);
     expect(isSubcommand("autopilot")).toBe(true);
-    expect(isSubcommand("builds")).toBe(true);
     expect(isSubcommand("dash")).toBe(true);
     expect(isSubcommand("status")).toBe(true);
     expect(isSubcommand("daemon")).toBe(true);
