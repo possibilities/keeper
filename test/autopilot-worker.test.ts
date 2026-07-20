@@ -13128,27 +13128,26 @@ test("recoverWorktrees: a task-scoped live claim plus MERGE_HEAD protects the la
   ).toBe(false);
 });
 
-test("recoverWorktrees: interrupted MERGE_HEAD in a lane defers visibly without abort or prune", async () => {
+test("fn-959.7 recoverWorktrees: interrupted MERGE_HEAD in a lane with NO live claim → abort + prune", async () => {
+  // The tri-state's dead/absent-claim arm: nothing owns this lane, so its
+  // MERGE_HEAD is crash residue and the self-heal reclaims it.
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
   const { run, calls } = makeRecoveryGit({
     worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
     mergeHeadAt: new Set([lane]),
-    epicBases: [],
+    epicBases: [], // no done-but-unmerged work in this scenario
   });
   const outcome = await recoverWorktrees(["/repo"], async () => false, run);
   expect(outcome.failures).toEqual([]);
-  expect(outcome.maintenanceDeferrals).toEqual([
-    {
-      path: lane,
-      reason: expect.stringContaining("MERGE_HEAD is present"),
-    },
-  ]);
+  // The lane's stale merge was aborted, and the repo's worktrees pruned once.
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
-    false,
+    true,
   );
   expect(
     calls.some((c) => c.cwd === "/repo" && c.args.startsWith("worktree prune")),
-  ).toBe(false);
+  ).toBe(true);
+  // An unclaimed lane is never "held" — nothing to report as deferred.
+  expect(outcome.maintenanceDeferrals ?? []).toEqual([]);
 });
 
 test("fn-959.7 recoverWorktrees: no MERGE_HEAD → no abort, no prune", async () => {
@@ -13206,25 +13205,133 @@ test("recoverWorktrees: a healthy lane ON its own branch classifies resolved, ne
   expect(outcome.laneResolved ?? []).toContain(lane);
 });
 
-test("recoverWorktrees: a mid-merge lane is held before any abort attempt", async () => {
+test("fn-1123.2 recoverWorktrees: a hard abort-failed lane mid-merge surfaces as an IMMEDIATE wedge", async () => {
+  // The lane is UNCLAIMED and mid-merge AND its guarded abort keeps failing — git
+  // cannot clear it. Pass-1 records its own abort failure; the lane readiness
+  // re-probe then sees the surviving MERGE_HEAD and surfaces an IMMEDIATE
+  // (un-graced) wedge for the distress. The live-lane hold must NEVER swallow this:
+  // an unclaimed lane is not held, so the escalation still fires.
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
-  const { run, calls } = makeRecoveryGit({
+  const { run } = makeRecoveryGit({
     worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
     mergeHeadAt: new Set([lane]),
-    abortFailsAt: new Set([lane]),
+    abortFailsAt: new Set([lane]), // the guarded abort fails → residue survives
     epicBases: [],
   });
   const outcome = await recoverWorktrees(["/repo"], async () => false, run);
-  expect(outcome.maintenanceDeferrals?.[0]?.reason).toContain(
-    "MERGE_HEAD is present",
-  );
-  expect(outcome.laneWedged ?? []).toEqual([]);
-  expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
-    false,
-  );
+  const laneObs = outcome.laneWedged?.find((w) => w.path === lane);
+  expect(laneObs).toBeDefined();
+  expect(laneObs?.immediate).toBe(true);
+  expect(laneObs?.reason.startsWith("abort-failed")).toBe(true);
 });
 
-test("recoverWorktrees: pass 1 ignores a non-keeper lane and only probes the keeper lane", async () => {
+test("recoverWorktrees: a LIVE claim over an abort-failed lane holds it and still never suppresses a later wedge", async () => {
+  // The hold's boundary: while the claim is live the lane is untouched and no wedge
+  // is minted (the owner's merge is the work). The instant the claim is gone the
+  // SAME lane escalates — the hold defers the escalation, it does not delete it.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-foo-B";
+  const gitFor = () =>
+    makeRecoveryGit({
+      worktreeList: `worktree /repo\nHEAD x\nbranch refs/heads/main\n\nworktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2\n\n`,
+      mergeHeadAt: new Set([lane]),
+      abortFailsAt: new Set([lane]),
+      epicBases: [],
+    });
+  const held = gitFor();
+  const heldOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    held.run,
+    undefined,
+    async () => false,
+    () => false,
+    undefined,
+    () => false,
+    undefined,
+    createLaneMaintenanceProbe(
+      new Map(),
+      new Map([["work::fn-1-foo.2", makeLaneClaim({ dir: lane })]]),
+      new Set(),
+    ),
+  );
+  expect(heldOutcome.laneWedged ?? []).toEqual([]);
+  expect(
+    held.calls.some((c) => c.cwd === lane && c.args === "merge --abort"),
+  ).toBe(false);
+  expect(heldOutcome.maintenanceDeferrals?.[0]?.reason).toContain(
+    "live dispatch claim",
+  );
+
+  const released = gitFor();
+  const releasedOutcome = await recoverWorktrees(
+    ["/repo"],
+    async () => false,
+    released.run,
+  );
+  expect(
+    releasedOutcome.laneWedged?.find((w) => w.path === lane)?.immediate,
+  ).toBe(true);
+});
+
+test("lane maintenance deferral logging latches once per episode and re-arms after the hold lifts", async () => {
+  // A held lane rides a level-triggered loop the owner's own job updates keep
+  // ticking, so the reason is logged ONCE per episode — not once per cycle — and
+  // the latch re-arms only after the lane stops deferring.
+  const lane = "/repo.worktrees/keeper-epic-fn-1-latch-B";
+  const probe = createLaneMaintenanceProbe(
+    new Map(),
+    new Map([
+      ["work::fn-1-latch.2", makeLaneClaim({ id: "fn-1-latch.2", dir: lane })],
+    ]),
+    new Set(),
+  );
+  // A FRESH git fixture per sweep — each sweep sees the same on-disk situation, so
+  // only the latch can explain a suppressed line.
+  const sweep = (laneProbe?: LaneMaintenanceProbe) =>
+    recoverWorktrees(
+      ["/repo"],
+      async () => false,
+      makeRecoveryGit({
+        worktreeList:
+          "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+          `worktree ${lane}\nHEAD y\nbranch refs/heads/keeper/epic/fn-1-latch--fn-1-latch.2\n\n`,
+        mergeHeadAt: new Set([lane]),
+        epicBases: [],
+      }).run,
+      undefined,
+      async () => false,
+      () => false,
+      undefined,
+      () => false,
+      undefined,
+      laneProbe,
+    );
+
+  const lines: string[] = [];
+  const originalError = console.error;
+  console.error = (...args) => lines.push(args.map(String).join(" "));
+  try {
+    await sweep(probe); // episode 1 opens → logs
+    await sweep(probe); // same episode, same reason → silent
+    await sweep(undefined); // hold lifts → episode ends
+    await sweep(probe); // episode 2 → logs again
+  } finally {
+    console.error = originalError;
+  }
+
+  expect(
+    lines.filter(
+      (line) => line.includes(lane) && line.includes("live dispatch claim"),
+    ),
+  ).toHaveLength(2);
+});
+
+test("fn-972 BUG 4 recoverWorktrees: pass-1 skips a non-keeper `.claude/worktrees` lane, still recovers the keeper lane", async () => {
+  // Pass-1 enumerates ALL registered linked worktrees; a FOREIGN lane (another
+  // tool's `.claude/worktrees/<name>` on a non-`keeper/epic/*` branch) is never
+  // keeper's to abort-merge, and if its dir vanished the `git` spawn against that
+  // cwd would ENOENT. Filter to keeper lanes: touch the keeper lane, never the
+  // foreign one.
   const keeperLane = "/repo.worktrees/keeper-epic-fn-1-foo";
   const foreignLane = "/home/me/proj/.claude/worktrees/some-feature";
   const { run, calls } = makeRecoveryGit({
@@ -13241,20 +13348,16 @@ test("recoverWorktrees: pass 1 ignores a non-keeper lane and only probes the kee
     run,
   );
   expect(failures).toEqual([]);
-  expect(
-    calls.some(
-      (c) =>
-        c.cwd === keeperLane &&
-        c.args === "rev-parse --verify --quiet MERGE_HEAD",
-    ),
-  ).toBe(true);
+  // The keeper lane's interrupted merge WAS aborted (keeper lanes still recover).
   expect(
     calls.some((c) => c.cwd === keeperLane && c.args === "merge --abort"),
-  ).toBe(false);
+  ).toBe(true);
+  // The foreign lane was NEVER touched — zero git spawns against its cwd, so a
+  // vanished foreign dir can't ENOENT the recovery sweep.
   expect(calls.some((c) => c.cwd === foreignLane)).toBe(false);
 });
 
-test("recoverWorktrees: a live resolver and MERGE_HEAD both hold the lane with a visible reason", async () => {
+test("fn-1095 recoverWorktrees: pass-1 SKIPS the abort for a lane whose epic has a LIVE resolver (scoped exclusion, no global pause)", async () => {
   // An autonomous merge-resolver (`resolve::fn-1-foo`) is mid-`git merge` in the
   // epic's base worktree — MERGE_HEAD is set BY DESIGN, not by a crash. Recover
   // must NOT abort it (that would race the resolver out from under its own
@@ -13279,22 +13382,29 @@ test("recoverWorktrees: a live resolver and MERGE_HEAD both hold the lane with a
     (epicId) => epicId === "fn-1-foo",
   );
   expect(outcome.failures).toEqual([]);
+  // The resolver's lane was left ALONE — no abort raced its in-progress merge —
+  // and the hold is visible rather than a silent skip.
   expect(
     outcome.maintenanceDeferrals?.find((d) => d.path === resolvingLane)?.reason,
   ).toContain("live resolver");
-  expect(outcome.maintenanceDeferrals?.map((d) => d.path)).toEqual([
-    resolvingLane,
-    idleLane,
-  ]);
   expect(
     calls.some((c) => c.cwd === resolvingLane && c.args === "merge --abort"),
   ).toBe(false);
+  // Every OTHER epic still recovers normally — the exclusion is per-epic, not
+  // global — and an unheld lane reports no deferral.
   expect(
     calls.some((c) => c.cwd === idleLane && c.args === "merge --abort"),
-  ).toBe(false);
+  ).toBe(true);
+  expect(outcome.maintenanceDeferrals?.map((d) => d.path)).toEqual([
+    resolvingLane,
+  ]);
 });
 
-test("recoverWorktrees: a crashed resolver's MERGE_HEAD remains held for manual or owner-led recovery", async () => {
+test("fn-1095 recoverWorktrees: pass-1 recovers a crashed resolver's lane once its resolver is NO LONGER live (auto-lift, no durable pause)", async () => {
+  // The crash edge: a resolver that died mid-merge leaves a real stale MERGE_HEAD.
+  // Its `resolve::<epic>` job has reaped, so `hasActiveResolver` reports false and
+  // recover reclaims the lane — the exclusion auto-lifts, so a dead resolver
+  // strands NOTHING (no durable board-wide pause). Default predicate = no resolver.
   const lane = "/repo.worktrees/keeper-epic-fn-1-foo";
   const { run, calls } = makeRecoveryGit({
     worktreeList:
@@ -13305,11 +13415,9 @@ test("recoverWorktrees: a crashed resolver's MERGE_HEAD remains held for manual 
   });
   const outcome = await recoverWorktrees(["/repo"], async () => false, run);
   expect(outcome.failures).toEqual([]);
-  expect(outcome.maintenanceDeferrals?.[0]?.reason).toContain(
-    "MERGE_HEAD is present",
-  );
+  expect(outcome.maintenanceDeferrals ?? []).toEqual([]);
   expect(calls.some((c) => c.cwd === lane && c.args === "merge --abort")).toBe(
-    false,
+    true,
   );
 });
 

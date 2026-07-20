@@ -230,6 +230,7 @@ import {
   baselineScratchPathFor,
   type EpicLaneBranchSet,
   epicIdFromKeeperLaneEntry,
+  abortInterruptedMerge as gitAbortInterruptedMerge,
   backupThenForceRemoveWorktree as gitBackupThenForceRemoveWorktree,
   baseMergeLockPath as gitBaseMergeLockPath,
   branchExists as gitBranchExists,
@@ -753,24 +754,19 @@ export function createLaneMaintenanceProbe(
         };
       }
       if (job.state === "stopped") {
-        if (livePaneIds === null) {
-          return {
-            kind: "defer",
-            reason: boundedLaneMaintenanceReason(
-              `liveness probe inconclusive for claimed session ${label} on ${lanePath}`,
-            ),
-          };
-        }
-        const paneId = job.backend_exec_pane_id;
-        if (paneId !== null && paneId !== "" && livePaneIds.has(paneId)) {
-          return {
-            kind: "defer",
-            reason: boundedLaneMaintenanceReason(
-              `live claimed session ${label} holds ${lanePath}`,
-            ),
-          };
-        }
-        continue;
+        // The ONE centralized stopped-job liveness rule (`null` panes → assume
+        // live), shared with the occupancy gate and the dirty-attribution pass
+        // rather than forked here. `null` panes stay a DISTINCT reason: the hold
+        // is fail-closed on an unavailable probe, not a witnessed live owner.
+        if (!isStoppedJobLive(job, livePaneIds)) continue;
+        return {
+          kind: "defer",
+          reason: boundedLaneMaintenanceReason(
+            livePaneIds === null
+              ? `liveness probe inconclusive for claimed session ${label} on ${lanePath}`
+              : `live claimed session ${label} holds ${lanePath}`,
+          ),
+        };
       }
       return {
         kind: "defer",
@@ -797,6 +793,68 @@ function probeLaneMaintenance(
         `liveness probe inconclusive for ${normalizeLanePath(target.path)}: ${errMsg(err)}`,
       ),
     };
+  }
+}
+
+/**
+ * Per-(pass, lane) latch for lane-maintenance deferral logging, keyed
+ * `<pass>\0<normalized lane path>` → the last reason logged. A held lane rides a
+ * `data_version`-level-triggered loop the live owner's OWN job updates keep
+ * ticking, so an unlatched line would repeat per pass per cycle for the whole
+ * hold. One line per EPISODE instead: {@link logLaneMaintenanceDeferralOnce}
+ * emits only when the reason is new or changed, and
+ * {@link pruneLaneMaintenanceDeferralLatch} ends the episode by dropping the keys
+ * a sweep did not re-defer, so a later hold reports afresh. Live-only process
+ * state — never a fold read, never persisted.
+ */
+const laneMaintenanceDeferralLatch = new Map<string, string>();
+
+function laneMaintenanceDeferralKey(pass: string, path: string): string {
+  return `${pass}\0${normalizeLanePath(path)}`;
+}
+
+function logLaneMaintenanceDeferralOnce(
+  pass: string,
+  path: string,
+  reason: string,
+  seen?: Set<string>,
+  // The recover sweep's reasons already carry their own `<pass>: <path> — ` head;
+  // pass the formed line so it is not prefixed twice.
+  message?: string,
+): void {
+  const key = laneMaintenanceDeferralKey(pass, path);
+  seen?.add(key);
+  if (laneMaintenanceDeferralLatch.get(key) === reason) return;
+  laneMaintenanceDeferralLatch.set(key, reason);
+  console.error(
+    `[autopilot-worker] ${boundedLaneMaintenanceReason(message ?? `${pass}: ${reason}`)}`,
+  );
+}
+
+/** The reconcile-cycle passes that hold a lane; the recover sweep owns its own. */
+const CYCLE_LANE_DEFERRAL_PASSES = [
+  "worktree-base-refresh-deferred",
+  "worktree-provision-deferred",
+  "worktree-sink-provision-deferred",
+  "worktree-finalize-deferred",
+] as const;
+
+/** The recover sweep's single deferral pass namespace. */
+const RECOVER_LANE_DEFERRAL_PASS = "worktree-maintenance-deferred";
+
+/**
+ * End every episode in `passes` whose (pass, lane) key was NOT re-deferred this
+ * sweep, so the next hold on that lane logs once again.
+ */
+function pruneLaneMaintenanceDeferralLatch(
+  passes: readonly string[],
+  seen: ReadonlySet<string>,
+): void {
+  for (const key of [...laneMaintenanceDeferralLatch.keys()]) {
+    const pass = key.slice(0, key.indexOf("\0"));
+    if (passes.includes(pass) && !seen.has(key)) {
+      laneMaintenanceDeferralLatch.delete(key);
+    }
   }
 }
 
@@ -1286,10 +1344,16 @@ export interface WorktreeDriver {
    * sweep). Two idempotent passes over LIVE git, never a window-bounded projection
    * read, so a restart between an epic-done and its merge-to-default cannot orphan
    * the work:
-   *  1. INTERRUPTED MERGE HOLD: every registered linked lane is probed for
-   *     `MERGE_HEAD`. A present or inconclusive probe defers with a bounded reason;
-   *     maintenance never aborts a merge in a lane. A live lane claim also excludes
-   *     every later maintenance mutation in that worktree.
+   *  1. INTERRUPTED MERGE, TRI-STATE: every registered linked lane is probed for a
+   *     live claim. A LIVE (or inconclusive) claim HOLDS the lane — its `MERGE_HEAD`
+   *     is the owner's own merge, so maintenance defers with a bounded reason and
+   *     mutates nothing, and the hold also excludes every later maintenance mutation
+   *     in that worktree. A DEAD or absent claim leaves crash residue instead:
+   *     `git merge --abort` → `git worktree prune --expire now`, so the next cycle
+   *     re-runs the merge from a clean state (level-triggered retry, no in-process
+   *     self-heal). An abort that FAILS records `worktree-recover-abort-failed` and
+   *     its surviving `MERGE_HEAD` surfaces as an IMMEDIATE lane wedge — a hold
+   *     never suppresses that escalation.
    *  2. DONE-BUT-UNMERGED BACKSTOP: enumerate `keeper/epic/<id>` base branches
    *     from git; for each whose epic `isEpicDone` reports done but whose base is
    *     NOT yet an ancestor of the resolved default branch, merge it to default +
@@ -5316,6 +5380,9 @@ export async function runReconcileCycle(
         return p;
       }
     });
+  // (pass, lane) keys this cycle deferred — the episode-latch's seen set, pruned
+  // once the cycle's mutating passes settle.
+  const laneDeferralsSeen = new Set<string>();
   // The live-attributed dirty set for a launch's base lane worktree, keyed the SAME
   // way the snapshot built the map (realpath + trailing-slash normalized). `null` ⇒
   // do-not-discard (an OFF-mode launch with no geometry, or a failed attribution
@@ -5398,8 +5465,11 @@ export async function runReconcileCycle(
         taskId: null,
       });
       if (hold.kind === "defer") {
-        console.error(
-          `[autopilot-worker] ${boundedLaneMaintenanceReason(`worktree-base-refresh-deferred: ${hold.reason}`)}`,
+        logLaneMaintenanceDeferralOnce(
+          "worktree-base-refresh-deferred",
+          basePath,
+          hold.reason,
+          laneDeferralsSeen,
         );
         continue;
       }
@@ -5500,8 +5570,11 @@ export async function runReconcileCycle(
         taskId: plan.verb === "work" ? plan.id : null,
       });
       if (hold.kind === "defer") {
-        console.error(
-          `[autopilot-worker] ${boundedLaneMaintenanceReason(`worktree-provision-deferred: ${hold.reason}`)}`,
+        logLaneMaintenanceDeferralOnce(
+          "worktree-provision-deferred",
+          plan.worktree.assignment.worktreePath,
+          hold.reason,
+          laneDeferralsSeen,
         );
         continue;
       }
@@ -5893,8 +5966,11 @@ export async function runReconcileCycle(
       });
       if (sinkHold.kind === "defer") {
         provisionFailed.add(`${closeKeyEpicId(sink)}\0${sink.repoDir}`);
-        console.error(
-          `[autopilot-worker] ${boundedLaneMaintenanceReason(`worktree-sink-provision-deferred: ${sinkHold.reason}`)}`,
+        logLaneMaintenanceDeferralOnce(
+          "worktree-sink-provision-deferred",
+          sink.assignment.worktreePath,
+          sinkHold.reason,
+          laneDeferralsSeen,
         );
         continue;
       }
@@ -5955,8 +6031,11 @@ export async function runReconcileCycle(
         taskId: null,
       });
       if (finalizeHold.kind === "defer") {
-        console.error(
-          `[autopilot-worker] ${boundedLaneMaintenanceReason(`worktree-finalize-deferred: ${finalizeHold.reason}`)}`,
+        logLaneMaintenanceDeferralOnce(
+          "worktree-finalize-deferred",
+          info.assignment.worktreePath,
+          finalizeHold.reason,
+          laneDeferralsSeen,
         );
         continue;
       }
@@ -6004,6 +6083,12 @@ export async function runReconcileCycle(
       }
     }
   }
+  // A lane this cycle stopped deferring ends its episode, so a LATER hold on the
+  // same lane reports afresh instead of staying silent behind the latch.
+  pruneLaneMaintenanceDeferralLatch(
+    CYCLE_LANE_DEFERRAL_PASSES,
+    laneDeferralsSeen,
+  );
 }
 
 /**
@@ -7989,10 +8074,12 @@ async function recoverSharedCheckoutMidMerge(
  * test. Pure of keeper.db / folds / the wall clock — it reads ONLY live git plus
  * the injected `isEpicDone` done-ness probe.
  *
- * Pass 1 (interrupted-merge hold): every linked lane under each repo is checked
- * for `MERGE_HEAD`; a present or inconclusive probe is reported and left untouched.
- * The SHARED MAIN checkout — not a lane — keeps its separate
- * {@link recoverSharedCheckoutMidMerge} crash-recovery policy.
+ * Pass 1 (interrupted-merge, tri-state): every linked lane under each repo is
+ * probed for a live claim. A LIVE or inconclusive claim holds the lane — reported
+ * and left untouched. A DEAD or absent claim takes the crash self-heal: abort the
+ * merge, then prune the repo's worktree admin entries; an abort failure is recorded
+ * and re-surfaces below as an IMMEDIATE wedge. The SHARED MAIN checkout — not a
+ * lane — keeps its separate {@link recoverSharedCheckoutMidMerge} policy.
  *
  * Pass 2 (done-but-unmerged backstop): every `keeper/epic/<id>` base branch in
  * each repo whose epic `isEpicDone` reports done but whose base is NOT yet an
@@ -8019,9 +8106,13 @@ export async function recoverWorktrees(
   epicPresentAndNotDone: (epicId: string) => Promise<boolean> = () =>
     Promise.resolve(true),
   // Per-epic exclusion: true while an autonomous merge-resolver (`resolve::<epic>`)
-  // is LIVE for the lane's epic. Gates shared-checkout recovery and pass-2's
-  // base→default merge so maintenance never races that resolver. Defaults to
-  // "no resolver" so every existing caller (and the OFF path) is byte-identical. A
+  // is LIVE for the lane's epic. Holds pass-1's lane abort (that MERGE_HEAD is the
+  // resolver's deliberate in-progress merge, not crash residue) and gates
+  // shared-checkout recovery plus pass-2's base→default merge, so maintenance never
+  // races that resolver. It AUTO-LIFTS the instant the resolver job reaps (clean exit
+  // OR crash) — a dead resolver strands nothing, and the lane recovers next cycle.
+  // Defaults to "no resolver" so every existing caller (and the OFF path) is
+  // byte-identical. A
   // retargeted content conflict now dispatches a resolver for a DONE epic, so pass-2
   // must skip re-attempting the same merge while that resolver is live.
   hasActiveResolver: (epicId: string) => boolean = () => false,
@@ -8143,6 +8234,7 @@ export async function recoverWorktrees(
       });
       continue;
     }
+    let prunedThisRepo = false;
     // Lane worktree paths pass-3 tears down this repo — the lane pre-merge readiness
     // probe below SKIPS them (they are already recorded `resolved`), so a torn-down
     // lane is never re-probed on a vanished path and mis-classified wedged.
@@ -8172,21 +8264,48 @@ export async function recoverWorktrees(
           reason: `live resolver resolve::${identity.epicId} holds ${normalizeLanePath(entry.path)}`,
         };
       }
+      // TRI-STATE, never a blanket hold on MERGE_HEAD.
+      //  (1) LIVE (or inconclusive) claim → HOLD. That MERGE_HEAD is the owner's
+      //      own in-progress merge; aborting it races the owner out from under
+      //      itself. Defer visibly and mutate nothing.
+      //  (2) DEAD or absent claim → the residue is a crash, not work in flight:
+      //      take the pre-existing sole-owned abort self-heal (keeper lanes only,
+      //      already filtered above) so the next cycle re-merges from a clean tree.
+      //  (3) The abort FAILING → a `worktree-recover-abort-failed` failure here,
+      //      and the surviving MERGE_HEAD surfaces below as the IMMEDIATE
+      //      `worktree-lane-wedge` escalation. A hold NEVER suppresses that.
       if (hold.kind === "defer") {
         laneHoldByPath.set(normalizeLanePath(entry.path), hold.reason);
-      }
-      const mergeHead = await gitProbeLaneMergeHead(entry.path, run);
-      if (mergeHead !== "absent") {
-        const mergeReason =
-          mergeHead === "present"
-            ? "MERGE_HEAD is present; maintenance never aborts an in-progress lane merge"
-            : "MERGE_HEAD probe was inconclusive; maintenance defers fail-closed";
+        const mergeHead = await gitProbeLaneMergeHead(entry.path, run);
         noteMaintenanceDeferral(
           entry.path,
-          hold.kind === "defer"
-            ? `${hold.reason}; ${mergeReason}`
-            : mergeReason,
+          mergeHead === "absent"
+            ? hold.reason
+            : `${hold.reason}; ${
+                mergeHead === "present"
+                  ? "MERGE_HEAD is present; maintenance never aborts a live owner's in-progress lane merge"
+                  : "MERGE_HEAD probe was inconclusive; maintenance defers fail-closed"
+              }`,
         );
+        continue;
+      }
+      try {
+        const aborted = await gitAbortInterruptedMerge(entry.path, run);
+        if (aborted) {
+          // Prune ONCE per repo after the first abort — a `merge --abort` can
+          // leave the admin entry healthy, but pruning clears any stale orphan a
+          // crash left so the next `ensureWorktree` re-adds cleanly.
+          if (!prunedThisRepo) {
+            await gitPruneWorktrees(repo, run);
+            prunedThisRepo = true;
+          }
+        }
+      } catch (err) {
+        failures.push({
+          epicId: null,
+          reason: `worktree-recover-abort-failed: ${entry.path} — ${errMsg(err)}`,
+          dir: repo,
+        });
       }
     }
 
@@ -8781,10 +8900,11 @@ export async function recoverWorktrees(
     // cooled / paused. Reuses pass-1's `entries` (no extra list spawn) and skips the
     // lanes pass-3 tore down. Wrapped so a producer git error never wedges the cycle.
     try {
-      const maintenanceHeldPaths = new Set([
-        ...laneHoldByPath.keys(),
-        ...maintenanceDeferralByPath.keys(),
-      ]);
+      // ONLY a live-owner hold suppresses the re-classify — a held lane's open row
+      // persists unchanged until the hold lifts. Every UNHELD surface keeps both
+      // the mint and the positive-evidence clear, so an abort-failed residue or a
+      // teardown-skipped lane still surfaces its wedge instead of going quiet.
+      const maintenanceHeldPaths = new Set(laneHoldByPath.keys());
       const probe = await probeLaneBaseReadiness(
         repo,
         entries,
@@ -8818,9 +8938,20 @@ export async function recoverWorktrees(
   const maintenanceDeferrals = [...maintenanceDeferralByPath].map(
     ([path, reason]) => ({ path, reason }),
   );
+  const recoverDeferralsSeen = new Set<string>();
   for (const deferral of maintenanceDeferrals) {
-    console.error(`[autopilot-worker] ${deferral.reason}`);
+    logLaneMaintenanceDeferralOnce(
+      RECOVER_LANE_DEFERRAL_PASS,
+      deferral.path,
+      deferral.reason,
+      recoverDeferralsSeen,
+      deferral.reason,
+    );
   }
+  pruneLaneMaintenanceDeferralLatch(
+    [RECOVER_LANE_DEFERRAL_PASS],
+    recoverDeferralsSeen,
+  );
   return {
     failures,
     escalations,
@@ -8838,12 +8969,18 @@ export async function recoverWorktrees(
  * per-lane `wedged` (still not losslessly-mergeable) + `resolved` (ready) observations
  * keyed by lane PATH — the recover-pass feed for the lane-wedge grace tracker + the
  * verb-agnostic reason-scoped clear. Reuses pass-1's already-fetched `entries` (no
- * second `git worktree list` spawn) and skips lanes held by maintenance or removed by
- * pass 3. Producer-only live-git READS,
- * never a fold; NEVER throws past here (a spawn error DEFERS the repo's lanes).
+ * second `git worktree list` spawn — the readiness of each lane is re-read LIVE per
+ * path, so a lane pass-1 aborted reads clean here) and SKIPS `prunedLanePaths` (a
+ * pass-3 teardown already recorded them `resolved`) plus `maintenanceHeldPaths` (a
+ * LIVE owner holds the lane; its open row persists unchanged until the hold lifts).
+ * Every UNHELD lane is still classified, so neither the mint nor the clear is
+ * suppressed. Producer-only live-git READS, never a fold; NEVER throws past here (a
+ * spawn error DEFERS the repo's lanes).
  *
- * Classification per keeper lane (active claims and in-progress merges are skipped):
- *  - `mid-merge` found after a prior absent probe → `immediate` wedge.
+ * Classification per keeper lane (a live-owner-held or active-resolver lane is
+ * skipped — its MERGE_HEAD is a deliberate in-progress merge, not a wedge):
+ *  - `mid-merge` surviving pass-1's abort → `immediate` wedge (a hard `abort-failed`:
+ *    git could not clear it), mints distress AT ONCE (matching finalize's precedent).
  *  - tracked-`dirty` / `off-branch` → graced wedge (a base a human must hand-resolve).
  *  - clean+on-branch but carrying UNTRACKED work product → graced wedge: the
  *    would-clobber class {@link mergeReadiness} ignores (`--untracked-files=no`),
@@ -8901,10 +9038,13 @@ async function probeLaneBaseReadiness(
       continue;
     }
     if (ready.kind === "mid-merge") {
+      // Survived pass-1's guarded abort → git could not clear it: a hard wedge. A
+      // lane a LIVE owner holds never reaches here (it is skipped above), so this
+      // is crash residue no one is working, never a healthy in-progress merge.
       wedged.push({
         path: entry.path,
-        reason: `maintenance-deferred: ${entry.path} is mid-merge (MERGE_HEAD=${ready.mergeHead})`,
-        immediate: false,
+        reason: `abort-failed: ${entry.path} is mid-merge (MERGE_HEAD=${ready.mergeHead}) and could not be cleared`,
+        immediate: true,
       });
       continue;
     }
