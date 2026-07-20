@@ -509,15 +509,20 @@ function focusDeadline(value: string, now: number, timeZone: string): string {
   if (!Number.isFinite(deadlineMs) || !Number.isFinite(now)) {
     return value;
   }
-  const local = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  }).format(deadlineMs);
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "short",
+    })
+      .formatToParts(deadlineMs)
+      .map(({ type, value }) => [type, value]),
+  );
+  const local = `${parts.month} ${parts.day}, ${parts.year} at ${parts.hour}:${parts.minute} ${parts.dayPeriod} ${parts.timeZoneName}`;
   const distance = focusDeadlineDistance(deadlineMs, now);
   const relative =
     deadlineMs > now

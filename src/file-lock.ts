@@ -49,8 +49,8 @@ const LOCK_UN = 8;
 const F_SETFD = 2;
 const FD_CLOEXEC = 1;
 
-// errno values we branch on; stable across darwin/linux.
-const EWOULDBLOCK = 35; // == EAGAIN on darwin; flock(LOCK_NB) on a held lock
+// flock(LOCK_NB) reports contention with a platform-specific errno.
+const EWOULDBLOCK = process.platform === "darwin" ? 35 : 11;
 
 const LE = true; // both supported targets are little-endian
 
