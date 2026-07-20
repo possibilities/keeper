@@ -61,5 +61,5 @@ Documentation lands with the feature. Live activation remains a post-land operat
 - [ ] Documented commands match generated help, links resolve, and documentation lint passes.
 
 ## Done summary
-
+Consolidated README and docs/install.md around independent Fable/Non-Fable Account focuses (stable route vs display ordinal, precedence, fallback, delivery health, lifetimes, guarded activation runbook) and unified problem-codes.md diagnostics across both focus scopes.
 ## Evidence
