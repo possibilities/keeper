@@ -390,6 +390,19 @@ function matchesBindings(
 ): boolean {
   return (
     state.revision === bindings.revision &&
+    matchesOperationalBindings(state, bindings)
+  );
+}
+
+// Route-time reads compare only the operational identity the proof attests
+// (pool config, alias roles, alias list). The stored revision is provenance,
+// re-pinned by each activation — comparing it live would flip the pool to
+// native on every repo commit, and the plan ledger commits continuously.
+function matchesOperationalBindings(
+  state: CodexPoolActivationState,
+  bindings: CodexPoolBindings,
+): boolean {
+  return (
     state.config_binding === bindings.config_binding &&
     state.alias_binding === bindings.alias_binding &&
     JSON.stringify(state.aliases) === JSON.stringify(bindings.aliases)
@@ -465,7 +478,7 @@ export function effectiveCodexPoolActivation(
       state: null,
     };
   }
-  if (!matchesBindings(state, bindings)) {
+  if (!matchesOperationalBindings(state, bindings)) {
     return {
       mode: "native",
       problem_code: "activation-binding-stale",

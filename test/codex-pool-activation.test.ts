@@ -608,7 +608,7 @@ describe("Codex pool workflow operations", () => {
     );
   });
 
-  test("changed revision, configuration, or aliases cannot retain active status", () => {
+  test("changed configuration or aliases cannot retain active status", () => {
     const store = new MemoryStore();
     store.activation = {
       schema_version: 1,
@@ -620,7 +620,6 @@ describe("Codex pool workflow operations", () => {
       updated_at_ms: NOW,
     };
     for (const changed of [
-      { ...BINDINGS, revision: "f".repeat(40) },
       { ...BINDINGS, config_binding: "f".repeat(64) },
       { ...BINDINGS, aliases: ["keeper-codex-a"] },
     ]) {
@@ -629,5 +628,32 @@ describe("Codex pool workflow operations", () => {
         problem_code: "activation-binding-stale",
       });
     }
+  });
+
+  test("a repo commit after activation retains effective status — revision is provenance, not a route-time binding", () => {
+    const store = new MemoryStore();
+    store.activation = {
+      schema_version: 1,
+      mode: "active-degraded",
+      revision: REVISION,
+      config_binding: CONFIG_BINDING,
+      alias_binding: ALIAS_BINDING,
+      aliases: ["keeper-codex-a", "keeper-codex-b"],
+      degraded: {
+        cause: "quota",
+        waived_clauses: ["native_fallback", "transport_isolation"],
+        pinned_alias: "keeper-codex-b",
+      },
+      updated_at_ms: NOW,
+    };
+    expect(
+      effectiveCodexPoolActivation(store, {
+        ...BINDINGS,
+        revision: "f".repeat(40),
+      }),
+    ).toMatchObject({
+      mode: "active-degraded",
+      problem_code: null,
+    });
   });
 });
