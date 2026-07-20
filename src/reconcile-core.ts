@@ -1579,6 +1579,8 @@ export interface WorktreeRecoveryOutcome {
    */
   laneWedged?: { path: string; reason: string; immediate: boolean }[];
   laneResolved?: string[];
+  /** Bounded reasons for lane mutations deferred by a live claim or merge hold. */
+  maintenanceDeferrals?: { path: string; reason: string }[];
   /** Page-once recover-pass lane teardown distress actions. */
   laneTeardownDistress?: {
     action: "mint" | "clear";

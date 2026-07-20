@@ -47,6 +47,7 @@ import {
   isLinkedWorktree,
   isLinkedWorktreePure,
   isWorktreeDepPlant,
+  keeperLaneIdentity,
   LANE_DIRT_INDEX_MAX_BYTES,
   type LockAcquirer,
   listEpicLaneBranches,
@@ -263,7 +264,7 @@ test("isKeeperLaneEntry: a keeper base/rib branch → true; a foreign or detache
   expect(isKeeperLaneEntry(entry({ branch: null }))).toBe(false);
 });
 
-test("fn-1095 epicIdFromKeeperLaneEntry: recovers the epic id from a base OR a rib, null for non-lanes", () => {
+test("keeper lane identity recovers the epic and optional task from a base or rib", () => {
   // A base lane → the whole tail is the epic id.
   expect(
     epicIdFromKeeperLaneEntry(
@@ -271,11 +272,17 @@ test("fn-1095 epicIdFromKeeperLaneEntry: recovers the epic id from a base OR a r
     ),
   ).toBe("fn-1-foo");
   // A rib lane (`<epic_id>--<task_id>`) → split on the FIRST `--`.
+  const rib = entry({
+    branch: "refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2",
+  });
+  expect(epicIdFromKeeperLaneEntry(rib)).toBe("fn-1-foo");
+  expect(keeperLaneIdentity(rib)).toEqual({
+    epicId: "fn-1-foo",
+    taskId: "fn-1-foo.2",
+  });
   expect(
-    epicIdFromKeeperLaneEntry(
-      entry({ branch: "refs/heads/keeper/epic/fn-1-foo--fn-1-foo.2" }),
-    ),
-  ).toBe("fn-1-foo");
+    keeperLaneIdentity(entry({ branch: "refs/heads/keeper/epic/fn-1-foo" })),
+  ).toEqual({ epicId: "fn-1-foo", taskId: null });
   // A short branch (no `refs/heads/` prefix) is handled the same way.
   expect(
     epicIdFromKeeperLaneEntry(entry({ branch: "keeper/epic/fn-9-bar" })),
