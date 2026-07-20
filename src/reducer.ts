@@ -4314,6 +4314,12 @@ function foldDispatchFailed(db: Database, event: Event): void {
        -- the deconflict/resolve corroboration reads to pin the instance), so a
        -- re-emit of the still-open row must NOT re-mint it — only a clear + fresh
        -- INSERT opens a new instance.
+       -- The claim columns (claim_session_id / claim_pid / claim_start_time /
+       -- claimed_at) are absent from BOTH the INSERT column list (so a
+       -- fresh incident opens unclaimed at their NULL default) and this SET clause,
+       -- so a live owner's claim survives a re-failure of the SAME open incident
+       -- instance — same preservation contract as the once-markers. Only an
+       -- IncidentReleased fold or a clear + fresh INSERT drops the claim.
        updated_at = excluded.updated_at`,
     [
       payload.verb,
@@ -4418,6 +4424,241 @@ function foldDispatchCleared(db: Database, event: Event): void {
       ],
     );
   }
+}
+
+/**
+ * Pre-flattened `IncidentClaimed` synthetic event payload. The daemon
+ * incident-claim producer mints this after validating that a spool-requested
+ * claim's claimant is a live, verifiable session — so the fold records the claim
+ * WITHOUT re-probing liveness. `(claimPid, claimStartTime)` is the recycle-safe
+ * process generation the producer's dead-claimant expiry pass re-probes; `ts` is
+ * the claim freshness. Fenced by `instanceEventId` so a claim only attaches to the
+ * exact open incident instance it was minted against.
+ */
+interface IncidentClaimedPayload {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+  ts: number;
+}
+
+/**
+ * Pre-flattened `IncidentReleased` synthetic event payload. The producer
+ * mints this on a session's self-release OR on positive dead-claimant evidence
+ * (its expiry pass). The session id plus process generation fence the clear to
+ * the exact recorded claim, so a stale expiry cannot clobber a resumed owner's
+ * fresh generation between the producer's read and the release fold.
+ */
+interface IncidentReleasedPayload {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+}
+
+/**
+ * Parse an `IncidentClaimed` event payload. Returns null on any structural miss
+ * ({@link foldIncidentClaimed} folds null to a safe no-op); NEVER throws. Strict:
+ * `verb` / `id` / `claim_session_id` valid non-empty identities,
+ * `instance_event_id` a positive safe integer, `claim_pid` a positive safe
+ * integer, `ts` finite, and `claim_start_time` non-empty. A producer must refuse
+ * a claim whose process generation cannot be verified; null is reserved for the
+ * unclaimed projection state.
+ */
+function extractIncidentClaimedPayload(
+  event: Event,
+): IncidentClaimedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    if (parsed.verb !== "work" && parsed.verb !== "close") {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    const ref = parsePlanRef(parsed.id);
+    if (
+      (parsed.verb === "work" && ref?.kind !== "task") ||
+      (parsed.verb === "close" && ref?.kind !== "epic")
+    ) {
+      return null;
+    }
+    if (
+      typeof parsed.claim_session_id !== "string" ||
+      parsed.claim_session_id.length === 0
+    ) {
+      return null;
+    }
+    const instanceEventId = parseDispatchAttempt(parsed.instance_event_id);
+    if (instanceEventId == null) {
+      return null;
+    }
+    if (
+      typeof parsed.claim_pid !== "number" ||
+      !Number.isSafeInteger(parsed.claim_pid) ||
+      parsed.claim_pid <= 0
+    ) {
+      return null;
+    }
+    if (typeof parsed.ts !== "number" || !Number.isFinite(parsed.ts)) {
+      return null;
+    }
+    if (
+      typeof parsed.claim_start_time !== "string" ||
+      parsed.claim_start_time.length === 0
+    ) {
+      return null;
+    }
+    const claimStartTime = parsed.claim_start_time;
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      instanceEventId,
+      claimSessionId: parsed.claim_session_id,
+      claimPid: parsed.claim_pid,
+      claimStartTime,
+      ts: parsed.ts,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse IncidentClaimed payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Parse an `IncidentReleased` event payload. Returns null on any structural miss
+ * ({@link foldIncidentReleased} folds null to a safe no-op); NEVER throws.
+ */
+function extractIncidentReleasedPayload(
+  event: Event,
+): IncidentReleasedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Record<string, unknown>;
+    if (parsed.verb !== "work" && parsed.verb !== "close") {
+      return null;
+    }
+    if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+      return null;
+    }
+    const ref = parsePlanRef(parsed.id);
+    if (
+      (parsed.verb === "work" && ref?.kind !== "task") ||
+      (parsed.verb === "close" && ref?.kind !== "epic")
+    ) {
+      return null;
+    }
+    if (
+      typeof parsed.claim_session_id !== "string" ||
+      parsed.claim_session_id.length === 0
+    ) {
+      return null;
+    }
+    const instanceEventId = parseDispatchAttempt(parsed.instance_event_id);
+    if (instanceEventId == null) {
+      return null;
+    }
+    if (
+      typeof parsed.claim_pid !== "number" ||
+      !Number.isSafeInteger(parsed.claim_pid) ||
+      parsed.claim_pid <= 0 ||
+      typeof parsed.claim_start_time !== "string" ||
+      parsed.claim_start_time.length === 0
+    ) {
+      return null;
+    }
+    return {
+      verb: parsed.verb,
+      id: parsed.id,
+      instanceEventId,
+      claimSessionId: parsed.claim_session_id,
+      claimPid: parsed.claim_pid,
+      claimStartTime: parsed.claim_start_time,
+    };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse IncidentReleased payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `IncidentClaimed` event — records the owning session's claim
+ * on the sticky incident row identified by `(verb, id)` AND fenced on
+ * `instance_event_id`, so a claim can only attach to the exact open incident
+ * instance the producer minted it against (a cleared-and-re-minted incident carries
+ * a fresh `instance_event_id` no stale claim matches). Records the claimant identity
+ * (`claim_session_id`), the recycle-safe process generation (`claim_pid`,
+ * `claim_start_time`), and the claim freshness (`claimed_at = payload.ts`). Reads
+ * ONLY the payload (no wall-clock / fs / liveness probe — the producer already
+ * validated), so re-fold stays byte-deterministic. The UPDATE no-ops on a missing /
+ * cleared / re-minted row (the clear-before-claim race). Malformed → safe no-op.
+ */
+function foldIncidentClaimed(db: Database, event: Event): void {
+  const payload = extractIncidentClaimedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET claim_session_id = ?, claim_pid = ?, claim_start_time = ?,
+            claimed_at = ?
+      WHERE verb = ? AND id = ? AND instance_event_id = ?`,
+    [
+      payload.claimSessionId,
+      payload.claimPid,
+      payload.claimStartTime,
+      payload.ts,
+      payload.verb,
+      payload.id,
+      payload.instanceEventId,
+    ],
+  );
+}
+
+/**
+ * Fold one synthetic `IncidentReleased` event — clears the claim on the sticky
+ * incident row, fenced on `instance_event_id` and the complete expected claimant
+ * generation (`claim_session_id`, `claim_pid`, `claim_start_time`). A harness
+ * resume reuses its session id with a fresh process generation, so the generation
+ * fence prevents an expiry minted for the old process from clearing the resumed
+ * owner's live claim. Reads ONLY the payload, so re-fold stays byte-deterministic.
+ * NEVER deletes the row — only `DispatchCleared` (`retry_dispatch`) does.
+ * Malformed → safe no-op.
+ */
+function foldIncidentReleased(db: Database, event: Event): void {
+  const payload = extractIncidentReleasedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `UPDATE dispatch_failures
+        SET claim_session_id = NULL, claim_pid = NULL,
+            claim_start_time = NULL, claimed_at = NULL
+      WHERE verb = ? AND id = ? AND instance_event_id = ?
+        AND claim_session_id = ? AND claim_pid = ? AND claim_start_time = ?`,
+    [
+      payload.verb,
+      payload.id,
+      payload.instanceEventId,
+      payload.claimSessionId,
+      payload.claimPid,
+      payload.claimStartTime,
+    ],
+  );
 }
 
 /**
@@ -11860,6 +12101,10 @@ export function applyEvent(
       foldDispatchFailed(db, event);
     } else if (event.hook_event === "DispatchCleared") {
       foldDispatchCleared(db, event);
+    } else if (event.hook_event === "IncidentClaimed") {
+      foldIncidentClaimed(db, event);
+    } else if (event.hook_event === "IncidentReleased") {
+      foldIncidentReleased(db, event);
     } else if (event.hook_event === "Dispatched") {
       foldDispatched(db, event);
     } else if (event.hook_event === "DispatchExpired") {

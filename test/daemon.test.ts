@@ -108,6 +108,8 @@ import {
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
+  INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
+  type IncidentClaimSweepDeps,
   isTransientBusyError,
   KEEPERD_LAUNCHD_LABEL,
   launchTimesMatch,
@@ -171,6 +173,7 @@ import {
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
   runDeconflictHumanNotifySweep,
+  runIncidentClaimSweep,
   runMergeEscalationSweep,
   runNativeCrashAttributionProbe,
   runRepairEscalationSweep,
@@ -4906,7 +4909,7 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `boot_catchup_stats.fold_work_ms` column (fn-1313, the full-replay
   // projection's pace-free rate) — an additive ALTER on that same operational
   // singleton, never fold-touched, so NO cursor rewind.
-  expect(SCHEMA_VERSION).toBe(137);
+  expect(SCHEMA_VERSION).toBe(138);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -5450,6 +5453,475 @@ test("pending-dispatch sweep telemetry round-trips to the sidecar; empty sweep b
   expect(rollups[0]?.class).toBe("timeout");
   expect(rollups[0]?.fires_total).toBe(2);
   expect(rollups[0]?.rescues_total).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Incident claim producer
+// ---------------------------------------------------------------------------
+
+type IncidentSpoolEntry = ReturnType<
+  IncidentClaimSweepDeps["readRequests"]
+>[number];
+
+function incidentSpoolEntry(
+  action: "claim" | "release",
+  overrides: Partial<IncidentSpoolEntry["request"]> = {},
+): IncidentSpoolEntry {
+  return {
+    path: `/spool/${action}-${overrides.id ?? "fn-3-incident.1"}.json`,
+    request: {
+      schema_version: 1,
+      action,
+      verb: "work",
+      id: "fn-3-incident.1",
+      instance_event_id: 41,
+      claimant_session_id: "session-new",
+      requested_at: 1_700_000_000_000,
+      ...overrides,
+    },
+  };
+}
+
+function incidentSweepDeps(
+  overrides: Partial<IncidentClaimSweepDeps> = {},
+): IncidentClaimSweepDeps {
+  return {
+    readRequests: () => [],
+    removeRequest: () => {},
+    lookupIncident: () => ({
+      instanceEventId: 41,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    }),
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    mintClaimed: () => {},
+    mintReleased: () => {},
+    selectClaimed: () => [],
+    now: () => 1_700_000_001,
+    ...overrides,
+  };
+}
+
+test("incident claim sweep mints one claim for a live verified claimant and removes the request", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result).toEqual({
+    claimed: 1,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  });
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "work",
+      id: "fn-3-incident.1",
+      instanceEventId: 41,
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+      ts: 1_700_000_001,
+    },
+  ]);
+});
+
+test("incident claim sweep refuses dead and unverifiable claimants", () => {
+  for (const verification of [
+    null,
+    { pid: 4242, startTime: "proc:4242:1", live: false },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        verifyClaimant: () => verification,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.refused).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep verifies the claimant against the owning verb and id", () => {
+  const entry = incidentSpoolEntry("claim");
+  const seen: string[][] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      verifyClaimant: (sessionId, verb, id) => {
+        seen.push([sessionId, verb, id]);
+        return null;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(seen).toEqual([["session-new", "work", "fn-3-incident.1"]]);
+});
+
+test("incident claim sweep discards missing and mismatched incident fences as stale", () => {
+  for (const incident of [
+    null,
+    {
+      instanceEventId: 42,
+      claimSessionId: null,
+      claimPid: null,
+      claimStartTime: null,
+    },
+  ]) {
+    const entry = incidentSpoolEntry("claim");
+    const removed: string[] = [];
+    let mints = 0;
+    const result = runIncidentClaimSweep(
+      incidentSweepDeps({
+        readRequests: () => [entry],
+        removeRequest: (path) => removed.push(path),
+        lookupIncident: () => incident,
+        mintClaimed: () => {
+          mints += 1;
+        },
+      }),
+    );
+    expect(result.stale).toBe(1);
+    expect(result.claimed).toBe(0);
+    expect(mints).toBe(0);
+    expect(removed).toEqual([entry.path]);
+  }
+});
+
+test("incident claim sweep refuses takeover while a different claimant is still live", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: () => true,
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep permits takeover after positive evidence that the prior claimant died", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-dead",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      probeClaimantLive: (pid) => pid !== 3131,
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.refused).toBe(0);
+  expect(minted).toHaveLength(1);
+});
+
+test("incident claim sweep mints one fenced release and removes the request", () => {
+  const entry = incidentSpoolEntry("release", {
+    verb: "close",
+    id: "fn-3-incident-close",
+    claimant_session_id: "session-owner",
+  });
+  const removed: string[] = [];
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintReleased: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.released).toBe(1);
+  expect(removed).toEqual([entry.path]);
+  expect(minted).toEqual([
+    {
+      verb: "close",
+      id: "fn-3-incident-close",
+      instanceEventId: 41,
+      claimSessionId: "session-owner",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    },
+  ]);
+});
+
+test("incident release refuses a dead or non-owning claimant", () => {
+  const entry = incidentSpoolEntry("release", {
+    claimant_session_id: "session-owner",
+  });
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      verifyClaimant: () => null,
+      mintReleased: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(result.released).toBe(0);
+  expect(mints).toBe(0);
+});
+
+test("incident claim sweep consumes duplicate claims without growing the event log", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.stale).toBe(1);
+  expect(result.claimed).toBe(0);
+  expect(mints).toBe(0);
+  expect(removed).toEqual([entry.path]);
+});
+
+test("incident claim sweep coalesces duplicate spooled tuples before projection refresh", () => {
+  const first = incidentSpoolEntry("claim");
+  const second = {
+    ...incidentSpoolEntry("claim"),
+    path: "/spool/duplicate.json",
+  };
+  const removed: string[] = [];
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [first, second],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(result.stale).toBe(1);
+  expect(mints).toBe(1);
+  expect(removed).toEqual([first.path, second.path]);
+});
+
+test("incident claim sweep refreshes a resumed claimant's process generation", () => {
+  const entry = incidentSpoolEntry("claim");
+  const minted: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-new",
+        claimPid: 3131,
+        claimStartTime: "proc:3131:1",
+      }),
+      mintClaimed: (payload) => {
+        minted.push(payload);
+      },
+    }),
+  );
+
+  expect(result.claimed).toBe(1);
+  expect(minted).toEqual([
+    expect.objectContaining({
+      claimSessionId: "session-new",
+      claimPid: 4242,
+      claimStartTime: "proc:4242:1",
+    }),
+  ]);
+});
+
+test("incident claim sweep preserves requests when the synthetic mint fails", () => {
+  const entry = incidentSpoolEntry("claim");
+  const removed: string[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      mintClaimed: () => false,
+    }),
+  );
+
+  expect(result.claimed).toBe(0);
+  expect(removed).toEqual([]);
+});
+
+test("incident claim sweep refuses takeover when the recorded holder generation is unverifiable", () => {
+  const entry = incidentSpoolEntry("claim");
+  let mints = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-current",
+        claimPid: null,
+        claimStartTime: null,
+      }),
+      mintClaimed: () => {
+        mints += 1;
+      },
+    }),
+  );
+
+  expect(result.refused).toBe(1);
+  expect(mints).toBe(0);
+});
+
+test("incident claim expiry releases dead claimants and leaves live claimants alone", () => {
+  const released: unknown[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      selectClaimed: () => [
+        {
+          verb: "work",
+          id: "fn-4-dead.1",
+          instanceEventId: 50,
+          claimSessionId: "session-dead",
+          claimPid: 5000,
+          claimStartTime: "proc:5000:1",
+        },
+        {
+          verb: "close",
+          id: "fn-5-live",
+          instanceEventId: 60,
+          claimSessionId: "session-live",
+          claimPid: 6000,
+          claimStartTime: "proc:6000:1",
+        },
+      ],
+      probeClaimantLive: (pid) => pid === 6000,
+      mintReleased: (payload) => {
+        released.push(payload);
+      },
+    }),
+  );
+
+  expect(result.expired).toBe(1);
+  expect(released).toEqual([
+    {
+      verb: "work",
+      id: "fn-4-dead.1",
+      instanceEventId: 50,
+      claimSessionId: "session-dead",
+      claimPid: 5000,
+      claimStartTime: "proc:5000:1",
+    },
+  ]);
+});
+
+test("incident claim sweep isolates a throwing request and continues processing siblings", () => {
+  const broken = incidentSpoolEntry("claim", { id: "fn-6-broken.1" });
+  const healthy = incidentSpoolEntry("claim", { id: "fn-7-healthy.1" });
+  const removed: string[] = [];
+  const minted: string[] = [];
+  const results: ReturnType<typeof runIncidentClaimSweep>[] = [];
+
+  expect(() => {
+    results.push(
+      runIncidentClaimSweep(
+        incidentSweepDeps({
+          readRequests: () => [broken, healthy],
+          removeRequest: (path) => removed.push(path),
+          lookupIncident: (_verb, id) => {
+            if (id === "fn-6-broken.1") throw new Error("fixture failure");
+            return {
+              instanceEventId: 41,
+              claimSessionId: null,
+              claimPid: null,
+              claimStartTime: null,
+            };
+          },
+          mintClaimed: (payload) => {
+            minted.push(payload.id);
+          },
+        }),
+      ),
+    );
+  }).not.toThrow();
+
+  expect(results[0]?.claimed).toBe(1);
+  expect(minted).toEqual(["fn-7-healthy.1"]);
+  expect(removed).toEqual([healthy.path]);
+});
+
+test("INCIDENT_CLAIM_SWEEP_INTERVAL_MS is a prompt positive cadence", () => {
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBe(3_000);
+  expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBeGreaterThan(0);
 });
 
 // ---------------------------------------------------------------------------

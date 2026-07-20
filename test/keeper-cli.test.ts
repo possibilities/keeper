@@ -95,6 +95,7 @@ function makeHarness(): Harness {
       resume: mkHandler("resume"),
       "show-job": mkHandler("show-job"),
       "escalation-brief": mkHandler("escalation-brief"),
+      incident: mkHandler("incident"),
       plan: mkHandler("plan"),
       prompt: mkHandler("prompt"),
       projects: mkHandler("projects"),

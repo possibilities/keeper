@@ -59,6 +59,7 @@ export const SUBCOMMANDS = [
   "resume",
   "show-job",
   "escalation-brief",
+  "incident",
   "plan",
   "prompt",
   "projects",
@@ -594,6 +595,7 @@ export async function main(): Promise<void> {
     "show-job": async (argv) => (await import("./show-job")).main(argv),
     "escalation-brief": async (argv) =>
       (await import("./escalation-brief")).main(argv),
+    incident: async (argv) => (await import("./incident")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
     prompt: async (argv) => (await import("./prompt")).main(argv),
     projects: async (argv) => (await import("./projects")).main(argv),

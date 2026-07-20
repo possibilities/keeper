@@ -35,6 +35,7 @@ import {
   fakeDirtyPaths,
   firstJsonPayload,
   gitInit,
+  fakeCommand as installCommandFake,
   parseCliOutput,
   runCli,
   scaffoldEpic,
@@ -68,6 +69,20 @@ describe("claim happy path + brief schema", () => {
       nTasks: 1,
     });
     const taskId = taskIds[0] as string;
+    const keeper = installCommandFake("keeper", {
+      stdout: JSON.stringify({
+        ok: true,
+        kind: "deconflict",
+        incident: {
+          conflict: {
+            instance_event_id: 71,
+            attempt_id: 12,
+            claim: null,
+          },
+          grant_ref: "/state/grants/grant-work.json",
+        },
+      }),
+    });
 
     const r = runCli(["claim", taskId, "--project", proj.root], {
       cwd: proj.root,
@@ -90,6 +105,16 @@ describe("claim happy path + brief schema", () => {
     expect("dispatched_model" in payload).toBe(false);
     expect("dispatched_tier" in payload).toBe(false);
     expect("dispatch_constraint" in payload).toBe(false);
+    expect(payload.incident).toEqual({
+      incident_id: `work::${taskId}`,
+      kind: "deconflict",
+      instance_event_id: 71,
+      attempt_id: 12,
+      brief_ref: `work::${taskId}`,
+      grant_ref: "/state/grants/grant-work.json",
+      claim: null,
+    });
+    expect(keeper.calls()).toEqual([["escalation-brief", `work::${taskId}`]]);
 
     const resumed = runCli(["worker", "resume", taskId], {
       cwd: proj.root,

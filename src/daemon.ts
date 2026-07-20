@@ -108,6 +108,7 @@ import {
   ownerTupleFromBirthRecord,
   parseBirthIntent,
   parseBirthRecord,
+  probeChildStartTime,
   writeProviderLegGrant,
 } from "./birth-record";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
@@ -260,6 +261,11 @@ import type {
   HandoffOutboundMessage,
   HandoffWorkerData,
 } from "./handoff-worker";
+import {
+  readSpool as readIncidentClaimSpool,
+  removeRequest as removeIncidentClaimRequest,
+  type SpooledRequest as SpooledIncidentClaimRequest,
+} from "./incident-claim-store";
 import {
   type AgentbotPageAbsenceLogLatch,
   type AgentbotPageOutcome,
@@ -1326,6 +1332,15 @@ export const BLOCK_ESCALATION_SWEEP_INTERVAL_MS = 60_000;
 
 /** Cadence for the Pi resume-target repair sweep. */
 export const PI_RESUME_REPAIR_SWEEP_INTERVAL_MS = 5_000;
+
+/**
+ * Cadence for the incident-claim producer sweep. A session claims a
+ * merge incident and then proceeds, so the claim wants prompt (few-second, not
+ * minute) round-trip visibility; the sweep is cheap (a spool readdir + point
+ * reads + at most one liveness probe per request), and the dead-claimant expiry
+ * pass it also runs is not latency-sensitive.
+ */
+export const INCIDENT_CLAIM_SWEEP_INTERVAL_MS = 3_000;
 
 /**
  * The ONE blocked category that does NOT escalate to the planner: a
@@ -4309,6 +4324,323 @@ export async function runResolverDispatchSweep(
     // no-op and the row stays re-sweepable next tick.
     deps.mintAttempted(row.id, outcome);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Incident-claim producer (owner-mediated merge integration).
+// ---------------------------------------------------------------------------
+//
+// A live owning session pulls a merge incident and records its ownership through
+// the SAME spool-request contract as the
+// suite-baseline store: the session writes ONE request leaf, THIS producer
+// validates claimant liveness and mints the synthetic `IncidentClaimed` /
+// `IncidentReleased` event, the fold records the claim. No socket, no RPC, no
+// session DB write. The liveness probe lives ONLY here in the producer, never in
+// a fold, so a re-fold never re-probes a process.
+
+/** The incident row facts the producer reads to fence a claim/release: the sticky
+ *  row's `instance_event_id` and its CURRENT claim (all null when unclaimed). */
+export interface IncidentRowFacts {
+  instanceEventId: number | null;
+  claimSessionId: string | null;
+  claimPid: number | null;
+  claimStartTime: string | null;
+}
+
+/** What the producer learns about a would-be claimant from its owning `jobs`
+ *  row + a liveness probe. A missing/mismatched owner tuple or process generation
+ *  is unverifiable and the request is refused. */
+export interface ClaimantLiveness {
+  pid: number;
+  /** The claimant's RECORDED start_time (the recycle-safe generation). */
+  startTime: string;
+  /** True iff the pid is alive AND its live start_time exactly matches. */
+  live: boolean;
+}
+
+/** A claimed incident row the expiry pass re-probes. */
+export interface ClaimedIncidentRow {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string | null;
+}
+
+/** The `IncidentClaimed` mint payload the producer hands the writable connection. */
+export interface IncidentClaimMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+  ts: number;
+}
+
+/** The `IncidentReleased` mint payload (self-release or dead-claimant expiry). */
+export interface IncidentReleaseMint {
+  verb: string;
+  id: string;
+  instanceEventId: number;
+  claimSessionId: string;
+  claimPid: number;
+  claimStartTime: string;
+}
+
+export interface IncidentClaimSweepDeps {
+  /** Read the spool (fail-open empty when absent). */
+  readRequests: () => SpooledIncidentClaimRequest[];
+  /** Unlink a processed / discarded request (idempotent). */
+  removeRequest: (path: string) => void;
+  /** Read the sticky incident row's fence + current claim, or null when absent. */
+  lookupIncident: (verb: string, id: string) => IncidentRowFacts | null;
+  /** Resolve the owning job tuple and liveness-probe the would-be claimant;
+   *  null when the session is not this incident's owner or is unverifiable. */
+  verifyClaimant: (
+    sessionId: string,
+    verb: string,
+    id: string,
+  ) => ClaimantLiveness | null;
+  /** Positive-evidence liveness probe of a RECORDED (pid, start_time): false ONLY
+   *  on positive evidence of death (pid gone, or start_time recycled). */
+  probeClaimantLive: (pid: number, startTime: string | null) => boolean;
+  /** Mint `IncidentClaimed`; explicit false means the write failed and the
+   *  request must remain spooled. */
+  mintClaimed: (p: IncidentClaimMint) => unknown;
+  /** Mint `IncidentReleased`; explicit false means the write failed and the
+   *  request/expiry remains retryable. */
+  mintReleased: (p: IncidentReleaseMint) => unknown;
+  /** Every currently-claimed incident row (for the dead-claimant expiry pass). */
+  selectClaimed: () => ClaimedIncidentRow[];
+  /** Unix-seconds clock for the claim freshness stamp. */
+  now: () => number;
+  /** Warn sink for non-fatal diagnostics. */
+  noteLine?: (line: string) => void;
+}
+
+/** What one sweep did — surfaced for the daemon.test seam, never a wire value. */
+export interface IncidentClaimSweepResult {
+  claimed: number;
+  released: number;
+  refused: number;
+  stale: number;
+  expired: number;
+}
+
+/**
+ * Run one incident-claim producer sweep. Two passes:
+ *
+ *  1. REQUESTS — for each spooled request, fence it against the live incident row
+ *     (the row must still exist AND carry the request's `instance_event_id`; a
+ *     cleared / re-minted incident discards the request as stale). A CLAIM mints
+ *     `IncidentClaimed` ONLY when the claimant verifies live AND the row is not
+ *     already held by a DIFFERENT live or unverifiable claimant (a positively
+ *     dead prior holder is taken over); an unverifiable / dead new claimant is
+ *     REFUSED. A RELEASE mints only for the recorded holder. Duplicate claims and
+ *     releases are consumed without growing the event log. A failed mint leaves
+ *     its request spooled for retry.
+ *
+ *  2. EXPIRY — for each currently-claimed row, re-probe the RECORDED claimant
+ *     `(pid, start_time)`; on positive evidence of death, mint `IncidentReleased`
+ *     so stale ownership does not survive its process generation.
+ *
+ * NEVER throws — every request is guarded so one malformed entry cannot abort the
+ * sweep. The mint + probe live ONLY here (never reachable from `applyEvent`), so a
+ * re-fold never re-fires a mint or re-probes a process.
+ */
+export function runIncidentClaimSweep(
+  deps: IncidentClaimSweepDeps,
+): IncidentClaimSweepResult {
+  const note = deps.noteLine ?? (() => {});
+  const result: IncidentClaimSweepResult = {
+    claimed: 0,
+    released: 0,
+    refused: 0,
+    stale: 0,
+    expired: 0,
+  };
+  // A successful mint is immediately folded in production, but keep the
+  // request contract idempotent even when a test/custom mint seam delays its
+  // projection update until after this batch.
+  const fulfilledRequests = new Set<string>();
+
+  let requests: SpooledIncidentClaimRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: incident-claim spool read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    requests = [];
+  }
+
+  for (const { path, request } of requests) {
+    try {
+      const requestKey = JSON.stringify([
+        request.action,
+        request.verb,
+        request.id,
+        request.instance_event_id,
+        request.claimant_session_id,
+      ]);
+      if (fulfilledRequests.has(requestKey)) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+      const incident = deps.lookupIncident(request.verb, request.id);
+      // The incident is gone (cleared) or re-minted under a fresh fence — the
+      // request can never attach to it. Discard it as stale.
+      if (
+        incident == null ||
+        incident.instanceEventId == null ||
+        incident.instanceEventId !== request.instance_event_id
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Both actions require the exact owning job tuple and a live,
+      // generation-verifiable process. A pid without an exact start-time match
+      // is not authority to mutate the incident.
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.verb,
+        request.id,
+      );
+      if (claimant == null || !claimant.live) {
+        note(
+          `# incident-claim refused ${request.verb}::${request.id}: claimant ` +
+            `${request.claimant_session_id} is dead or unverifiable`,
+        );
+        result.refused += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      if (request.action === "release") {
+        // A duplicate/non-owner release is an idempotent stale request, not a
+        // synthetic no-op event. Snapshot the complete recorded generation so a
+        // delayed release cannot clear the same session after it resumes.
+        if (
+          incident.claimSessionId !== request.claimant_session_id ||
+          incident.claimPid == null ||
+          incident.claimStartTime == null
+        ) {
+          result.stale += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+        const minted = deps.mintReleased({
+          verb: request.verb,
+          id: request.id,
+          instanceEventId: incident.instanceEventId,
+          claimSessionId: request.claimant_session_id,
+          claimPid: incident.claimPid,
+          claimStartTime: incident.claimStartTime,
+        });
+        if (minted === false) continue;
+        fulfilledRequests.add(requestKey);
+        result.released += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // Same incident + same claimant + same process generation is already
+      // satisfied. A resumed claimant with a fresh generation re-stamps the
+      // claim below so expiry never releases it using the dead prior process.
+      if (
+        incident.claimSessionId === request.claimant_session_id &&
+        incident.claimPid === claimant.pid &&
+        incident.claimStartTime === claimant.startTime
+      ) {
+        result.stale += 1;
+        deps.removeRequest(path);
+        continue;
+      }
+
+      // A different holder can be replaced ONLY on positive evidence of death.
+      // Missing generation facts are inconclusive and therefore refuse takeover.
+      if (
+        incident.claimSessionId != null &&
+        incident.claimSessionId !== request.claimant_session_id
+      ) {
+        if (
+          incident.claimPid == null ||
+          deps.probeClaimantLive(incident.claimPid, incident.claimStartTime)
+        ) {
+          note(
+            `# incident-claim refused ${request.verb}::${request.id}: already ` +
+              `held by live or unverifiable claimant ${incident.claimSessionId}`,
+          );
+          result.refused += 1;
+          deps.removeRequest(path);
+          continue;
+        }
+      }
+
+      const minted = deps.mintClaimed({
+        verb: request.verb,
+        id: request.id,
+        instanceEventId: incident.instanceEventId,
+        claimSessionId: request.claimant_session_id,
+        claimPid: claimant.pid,
+        claimStartTime: claimant.startTime,
+        ts: deps.now(),
+      });
+      if (minted === false) continue;
+      fulfilledRequests.add(requestKey);
+      result.claimed += 1;
+      deps.removeRequest(path);
+    } catch (err) {
+      // Defense-in-depth: a surprise throw for ONE request records nothing and
+      // moves on — the request stays spooled for the next tick.
+      note(
+        `# warn: incident-claim request ${request.verb}::${request.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Expiry pass — a dead claimant's claim expires on positive evidence of death.
+  let claimed: ClaimedIncidentRow[];
+  try {
+    claimed = deps.selectClaimed();
+  } catch (err) {
+    note(
+      `# warn: incident-claim expiry read threw (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    claimed = [];
+  }
+  for (const row of claimed) {
+    try {
+      if (deps.probeClaimantLive(row.claimPid, row.claimStartTime)) continue;
+      if (row.claimStartTime == null) continue;
+      const minted = deps.mintReleased({
+        verb: row.verb,
+        id: row.id,
+        instanceEventId: row.instanceEventId,
+        claimSessionId: row.claimSessionId,
+        claimPid: row.claimPid,
+        claimStartTime: row.claimStartTime,
+      });
+      if (minted !== false) result.expired += 1;
+    } catch (err) {
+      note(
+        `# warn: incident-claim expiry for ${row.verb}::${row.id} threw ` +
+          `(non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -12985,6 +13317,151 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
+   * Mint one synthetic `IncidentClaimed` event onto the writable connection
+   * — the ONLY write path into the `dispatch_failures` claim columns. The
+   * producer has already validated the claimant is live and verifiable; the fold
+   * records the claim WITHOUT re-probing. The row `(verb, id)` rides the entity-key
+   * overload on `session_id` so a re-fold correlates it WITHOUT re-parsing `data`;
+   * the full payload rides `data` for the strict fold parser. NON-FATAL on insert
+   * failure — the next sweep re-attempts (the request stays spooled until minted).
+   */
+  function mintIncidentClaimedEvent(p: IncidentClaimMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentClaimed",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+          ts: p.ts,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    // The event is durable now. A drain failure must NOT report mint failure —
+    // leaving the request spooled would insert a duplicate on every retry.
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentClaimed drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Mint one synthetic `IncidentReleased` event onto the writable connection
+   * — clears the claim on a self-release OR positive dead-claimant
+   * evidence (the producer's expiry pass). Sibling of {@link
+   * mintIncidentClaimedEvent}; the fold's claimant-fence no-ops a stale release.
+   * NON-FATAL on insert failure — the next expiry sweep re-attempts.
+   */
+  function mintIncidentReleasedEvent(p: IncidentReleaseMint): boolean {
+    try {
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: `${p.verb}::${p.id}`,
+        $pid: null,
+        $hook_event: "IncidentReleased",
+        $event_type: "dispatch_failures",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({
+          verb: p.verb,
+          id: p.id,
+          instance_event_id: p.instanceEventId,
+          claim_session_id: p.claimSessionId,
+          claim_pid: p.claimPid,
+          claim_start_time: p.claimStartTime,
+        }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $plan_op: null,
+        $plan_target: null,
+        $plan_epic_id: null,
+        $plan_task_id: null,
+        $plan_subject_present: null,
+        $config_dir: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $plan_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+        $worktree: null,
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased insert threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+    wakePending = true;
+    try {
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] IncidentReleased drain threw after insert (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return true;
+  }
+
+  /**
    * Mint the sticky repair-latch `DispatchFailed` on the `repair::<repo-token>` key —
    * the durable `dispatch_failures` row (verb `repair`, id the token) escalation-brief
    * reads and the once-page / once-dispatch markers hang on. Rides its OWN thin closure
@@ -15354,6 +15831,143 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }, BLOCK_ESCALATION_SWEEP_INTERVAL_MS)
     : null;
 
+  // Incident-claim producer. Validates a session's spooled claim/release
+  // against the live incident row + claimant liveness and mints the synthetic
+  // `IncidentClaimed` / `IncidentReleased` event; also expires a dead claimant's
+  // claim on positive evidence. It never launches a worker (unlike the resolver /
+  // deconflict sweeps), so it is NOT pause-gated — a live session must be able to
+  // claim, and a dead claimant's lock must be able to expire, regardless of the
+  // autopilot pause banner. The probe (`pidAlive` + `probeChildStartTime`) lives
+  // ONLY here in the producer, never in a fold.
+  function verifyIncidentClaimant(
+    sessionId: string,
+    verb: string,
+    id: string,
+  ): ClaimantLiveness | null {
+    const row = db
+      .query(
+        "SELECT pid, start_time, plan_verb, plan_ref FROM jobs WHERE job_id = ?",
+      )
+      .get(sessionId) as {
+      pid: number | null;
+      start_time: string | null;
+      plan_verb: string | null;
+      plan_ref: string | null;
+    } | null;
+    if (
+      row == null ||
+      row.plan_verb !== verb ||
+      row.plan_ref !== id ||
+      row.pid == null ||
+      row.start_time == null
+    ) {
+      // The session must be the incident's exact owning verb/ref and carry a
+      // recorded process generation; every mismatch is unverifiable authority.
+      return null;
+    }
+    if (!pidAlive(row.pid)) {
+      return { pid: row.pid, startTime: row.start_time, live: false };
+    }
+    const probed = probeChildStartTime(row.pid);
+    if (probed == null) {
+      // A live pid without a readable generation could be recycled. Refuse.
+      return null;
+    }
+    return {
+      pid: row.pid,
+      startTime: row.start_time,
+      live: probed === row.start_time,
+    };
+  }
+  function probeIncidentClaimantLive(
+    pid: number,
+    startTime: string | null,
+  ): boolean {
+    if (!pidAlive(pid)) return false;
+    if (startTime != null) {
+      const probed = probeChildStartTime(pid);
+      if (probed != null && probed !== startTime) return false;
+    }
+    return true;
+  }
+  function runIncidentClaimSweepTick(): void {
+    if (shuttingDown) return;
+    runIncidentClaimSweep({
+      readRequests: () => readIncidentClaimSpool(),
+      removeRequest: (path) => removeIncidentClaimRequest(path),
+      lookupIncident: (verb, id) => {
+        const row = db
+          .query(
+            `SELECT reason, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures WHERE verb = ? AND id = ?`,
+          )
+          .get(verb, id) as {
+          reason: string;
+          instance_event_id: number | null;
+          claim_session_id: string | null;
+          claim_pid: number | null;
+          claim_start_time: string | null;
+        } | null;
+        if (row == null || !isMergeEscalationReason(row.reason)) return null;
+        return {
+          instanceEventId: row.instance_event_id,
+          claimSessionId: row.claim_session_id,
+          claimPid: row.claim_pid,
+          claimStartTime: row.claim_start_time,
+        };
+      },
+      verifyClaimant: (sessionId, verb, id) =>
+        verifyIncidentClaimant(sessionId, verb, id),
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      mintClaimed: (p) => mintIncidentClaimedEvent(p),
+      mintReleased: (p) => mintIncidentReleasedEvent(p),
+      selectClaimed: () => {
+        const rows = db
+          .query(
+            `SELECT verb, id, instance_event_id, claim_session_id, claim_pid,
+                    claim_start_time
+               FROM dispatch_failures
+              WHERE claim_session_id IS NOT NULL AND claim_pid IS NOT NULL
+                AND instance_event_id IS NOT NULL`,
+          )
+          .all() as Array<{
+          verb: string;
+          id: string;
+          instance_event_id: number;
+          claim_session_id: string;
+          claim_pid: number;
+          claim_start_time: string | null;
+        }>;
+        return rows.map((r) => ({
+          verb: r.verb,
+          id: r.id,
+          instanceEventId: r.instance_event_id,
+          claimSessionId: r.claim_session_id,
+          claimPid: r.claim_pid,
+          claimStartTime: r.claim_start_time,
+        }));
+      },
+      now: () => Date.now() / 1000,
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  // Main owns this spool producer regardless of the optional worker selector:
+  // claim/release is a daemon data surface, not an autopilot-worker actuation.
+  // This also lets a server-only diagnostic boot expire a provably-dead owner.
+  const incidentClaimSweepTimer = setInterval(() => {
+    try {
+      runIncidentClaimSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] incident-claim sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
+
   // Pi resume-target repair producer. Heals a live pi job whose recorded
   // resume target names no on-disk artifact by disk-anchoring a same-cwd session
   // via the same confidence gate `keeper tabs repair` reports with.
@@ -16617,6 +17231,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     if (resolverDispatchSweepTimer !== null) {
       clearInterval(resolverDispatchSweepTimer);
+    }
+    if (incidentClaimSweepTimer !== null) {
+      clearInterval(incidentClaimSweepTimer);
     }
     if (piResumeRepairSweepTimer !== null) {
       clearInterval(piResumeRepairSweepTimer);

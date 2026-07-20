@@ -4486,7 +4486,6 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
     },
   },
   {
-    // Provisional tail version; fan-in renumbers this singleton ladder entry.
     version: 137,
     kind: "additive",
     apply: (ctx) => {
@@ -4496,6 +4495,41 @@ export const SCHEMA_STEPS: readonly SchemaStep[] = [
         "owner_redispatch_attempts",
         "INTEGER NOT NULL DEFAULT 0",
       );
+    },
+  },
+  {
+    // Incident-claim columns on `dispatch_failures`. A live
+    // owning session pulls a merge incident and claims it (spool → producer →
+    // `IncidentClaimed` fold); the claim records the claimant identity, its
+    // recycle-safe process generation `(pid, start_time)`, and the claim event ts
+    // (freshness). Cleared by an `IncidentReleased` fold (self-release or a
+    // producer-driven dead-claimant expiry). All four nullable, NO DEFAULT (a
+    // DEFAULT poisons the NULL=unclaimed invariant and breaks re-fold byte-identity)
+    // and PRESERVED across the `DispatchFailed` UPSERT re-emit exactly like the
+    // sibling once-markers (`merge_escalated_at` / `resolver_dispatched_at` /
+    // `human_notified_at` / `instance_event_id`), so a live owner's claim survives a
+    // re-failure of the same open incident instance. Kept OUT of the
+    // CREATE_DISPATCH_FAILURES literal (mirrors every prior marker add), appended
+    // here so column order is fresh-vs-migrated identical. Plain additive ALTER — no
+    // cursor rewind (the fold that writes them reads only the payload + event.ts).
+    // Provisional tail version; fan-in renumbers this singleton ladder entry.
+    version: 138,
+    kind: "additive",
+    apply: (ctx) => {
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "claim_session_id",
+        "TEXT",
+      );
+      addColumnIfMissing(ctx.db, "dispatch_failures", "claim_pid", "INTEGER");
+      addColumnIfMissing(
+        ctx.db,
+        "dispatch_failures",
+        "claim_start_time",
+        "TEXT",
+      );
+      addColumnIfMissing(ctx.db, "dispatch_failures", "claimed_at", "REAL");
     },
   },
 ];
@@ -4518,7 +4552,7 @@ export const SCHEMA_VERSION = SCHEMA_STEPS[SCHEMA_STEPS.length - 1].version;
  * The schema is a singleton resource; this line is its lock file.
  */
 export const SCHEMA_FINGERPRINT =
-  "v137:10674ec48efce92fc6f8c3b516e4b46ece73044986aa43516fdbf0a7f522fdc3";
+  "v138:d0cf783b36d251999f4b70a4b3795bce1dff8b3d79ee938daecb0bf3ed4e4cb0";
 
 /**
  * Compute the live schema fingerprint: sha256 over the sorted `sqlite_master`

@@ -17,10 +17,12 @@ export interface ExecResult {
 }
 
 /** Options for an external-command run. `env` overrides the inherited
- * environment (realExec passes process.env by default to reach a caller-mutated
- * PATH). */
+ * environment; timeout/output caps make read helpers fail closed instead of
+ * letting a wedged or noisy child pin the plan verb. */
 export interface ExecOptions {
   env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  maxBufferBytes?: number;
 }
 
 /** The external-command surface verbs perform. A real implementation shells the
@@ -37,6 +39,10 @@ export const realExec: PlanExec = {
     try {
       const proc = Bun.spawnSync([command, ...argv], {
         env: opts?.env ?? process.env,
+        ...(opts?.timeoutMs !== undefined ? { timeout: opts.timeoutMs } : {}),
+        ...(opts?.maxBufferBytes !== undefined
+          ? { maxBuffer: opts.maxBufferBytes }
+          : {}),
       });
       return {
         exitCode: proc.exitCode,

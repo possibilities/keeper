@@ -752,6 +752,56 @@ test("openDb adds nullable Dispatch attempt owners to failures and mint gates", 
   db.close();
 });
 
+test("openDb adds nullable incident claim identity, generation, and freshness columns", () => {
+  const { db } = openDb(":memory:");
+  const columns = db.prepare("PRAGMA table_info(dispatch_failures)").all() as {
+    name: string;
+    type: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  expect(
+    columns.slice(-4).map(({ name, type, notnull, dflt_value }) => ({
+      name,
+      type,
+      notnull,
+      dflt_value,
+    })),
+  ).toEqual([
+    {
+      name: "claim_session_id",
+      type: "TEXT",
+      notnull: 0,
+      dflt_value: null,
+    },
+    { name: "claim_pid", type: "INTEGER", notnull: 0, dflt_value: null },
+    {
+      name: "claim_start_time",
+      type: "TEXT",
+      notnull: 0,
+      dflt_value: null,
+    },
+    { name: "claimed_at", type: "REAL", notnull: 0, dflt_value: null },
+  ]);
+
+  db.prepare(
+    "INSERT INTO dispatch_failures (verb, id, reason, ts, last_event_id, created_at, updated_at) VALUES ('close', 'fn-claim-zero', 'r', 1, 1, 1, 1)",
+  ).run();
+  expect(
+    db
+      .prepare(
+        "SELECT claim_session_id, claim_pid, claim_start_time, claimed_at FROM dispatch_failures WHERE verb = 'close' AND id = 'fn-claim-zero'",
+      )
+      .get(),
+  ).toEqual({
+    claim_session_id: null,
+    claim_pid: null,
+    claim_start_time: null,
+    claimed_at: null,
+  });
+  db.close();
+});
+
 test("openDb adds nullable harness + resume_target to BOTH events and jobs (fn-1103 task .3)", () => {
   // The v106->v107 step adds the two multi-harness columns to both surfaces:
   // events via the FIVE-place lockstep (CREATE literal + migration append), jobs
@@ -3378,7 +3428,7 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // pace-free fold-work rate the full-replay projection derives from) — an
   // additive ALTER on that operational singleton, not a touch of the epics
   // SHAPE this test pins.
-  expect(SCHEMA_VERSION).toBe(137);
+  expect(SCHEMA_VERSION).toBe(138);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

@@ -487,6 +487,23 @@ export const TABS_REPAIR_FLAGS = [
   { name: "db", type: "string", summary: "keeper.db path override" },
 ] as const satisfies readonly FlagDescriptor[];
 
+/** `keeper incident claim|release` flags — the incident is named by a positional
+ *  dispatch key (`work::<taskId>` / `close::<epicId>`); `--instance` carries the
+ *  sticky row's fencing `instance_event_id`. */
+export const INCIDENT_CLAIM_FLAGS = [
+  FLAG_HELP,
+  {
+    name: "instance",
+    type: "string",
+    summary: "The incident's fencing instance_event_id (from its brief)",
+  },
+  {
+    name: "session-id",
+    type: "string",
+    summary: "Override the calling session's tracked identity",
+  },
+] as const satisfies readonly FlagDescriptor[];
+
 /** `keeper tabs dump` flags. */
 export const TABS_DUMP_FLAGS = [
   {
@@ -1666,6 +1683,39 @@ export const NATIVE_COMMANDS: readonly CommandDescriptor[] = [
     requires_tty: false,
     format_modes: ["json"],
     flags: [FLAG_HELP],
+  },
+  {
+    name: "incident",
+    summary:
+      "Claim or release a merge incident from the owning session (spool round-trip)",
+    visibility: "public",
+    mutates: true,
+    requires_daemon: false,
+    requires_tty: false,
+    format_modes: ["json"],
+    flags: [FLAG_HELP],
+    verbs: [
+      {
+        name: "claim",
+        summary: "Spool a claim on an incident for the calling session",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: INCIDENT_CLAIM_FLAGS,
+      },
+      {
+        name: "release",
+        summary: "Spool a release of the calling session's incident claim",
+        visibility: "public",
+        mutates: true,
+        requires_daemon: false,
+        requires_tty: false,
+        format_modes: ["json"],
+        flags: INCIDENT_CLAIM_FLAGS,
+      },
+    ],
   },
   {
     // Verbs OMITTED by design: `cli/keeper.ts` merges the live set from
