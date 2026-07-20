@@ -114,6 +114,7 @@ Usage:
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
                                   [--output <path>] [--resume <name-or-id>]
+                                  [--x-codex-pool-proof-window=arm]
                                   [--control <path> --control-owner <json>]
                                     Launch, wait, and capture in one process;
                                     emit the uniform run-capture JSON envelope.
@@ -140,7 +141,9 @@ Usage:
                                     timed_out leaves the Partner resident and
                                     resumable, never reaped. The one-shot
                                     panel-leg posture; a plain run stays resident
-                                    without it.
+                                    without it. To arm a Codex pool proof window, run
+                                    \`keeper agent run pi --x-codex-pool-proof-window=arm <prompt>\`;
+                                    it requires a fresh managed Pi session.
   keeper agent wait <handle> [--stop-timeout <dur>]
                                     Wait + capture on an existing handle; emit
                                     the same uniform envelope.
@@ -267,6 +270,7 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                   [--system-file <path> | --system <text>]
                                   [--preset <name>] [--session <name>]
                                   [--output <path>]
+                                  [--x-codex-pool-proof-window=arm]
                                         Launch <cli> detached, wait for its stop,
                                         and capture the final message — all in one
                                         process. --read-only prepends a read-only
@@ -284,7 +288,10 @@ Blocking run-and-capture verbs (one uniform schema-versioned JSON envelope):
                                         --x-tmux-session, NOT the transcript id);
                                         --output atomically writes the SAME envelope
                                         to <path> (temp+rename) on every outcome, in
-                                        addition to stdout.
+                                        addition to stdout. To arm a Codex pool
+                                        proof window, run \`keeper agent run pi
+                                        --x-codex-pool-proof-window=arm <prompt>\`;
+                                        it requires a fresh managed Pi session.
                                         Emits the uniform envelope
                                         {schema_version, agent, handle,
                                         transcript_path, resume_target, message,

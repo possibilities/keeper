@@ -75,7 +75,9 @@ import {
   sendBusArtifact,
 } from "../bus-artifact";
 import {
+  type CodexObservationRefreshFailureState,
   makeCodexBoundedRunner,
+  readCodexObservationRefreshFailureState,
   refreshCodexObservationIfStale,
 } from "../codex-account-observation-refresh";
 import {
@@ -288,7 +290,9 @@ export interface CodexSessionRoutingInspection {
     health: PiCodexPoolExtensionResolution["health"];
     problem_code: PiCodexPoolExtensionResolution["problem_code"];
   };
-  capacity: CodexRoutingInspection;
+  capacity: CodexRoutingInspection & {
+    refresh_failure_state?: CodexObservationRefreshFailureState | null;
+  };
 }
 
 export type CodexPoolOperatorOperation =
@@ -641,7 +645,12 @@ function productionCodexSessionInspection(
   env: NodeJS.ProcessEnv,
 ): CodexSessionRoutingInspection {
   const companion = resolvePiCodexPoolExtension();
-  const capacity = inspectCodexRouting();
+  const capacity = {
+    ...inspectCodexRouting(),
+    refresh_failure_state: readCodexObservationRefreshFailureState(
+      resolveCodexAccountRoutingRoot(),
+    ),
+  };
   const launch = productionCodexPoolLaunchContext(env);
   return {
     activation: {
@@ -1706,7 +1715,15 @@ async function runRunCaptureSubcommand(
   deps: MainDeps,
   rest: string[],
 ): Promise<never> {
-  const parsed = parseRunArgs(rest);
+  const proofWindowRequest = consumeCodexPoolProofWindowFlag(rest);
+  if (proofWindowRequest.error !== null) {
+    deps.writeErr(`agent: ${proofWindowRequest.error}\n`);
+    return emitRunCapture(
+      deps,
+      buildRunCaptureEnvelope({ outcome: "bad_args" }),
+    );
+  }
+  const parsed = parseRunArgs(proofWindowRequest.remainingArgs);
   if (!parsed.ok) {
     deps.writeErr(`agent: ${parsed.error}\n`);
     return emitRunCapture(
@@ -1722,6 +1739,12 @@ async function runRunCaptureSubcommand(
       buildRunCaptureEnvelope({ outcome: "bad_args" }),
       parsed.output,
     );
+  if (proofWindowRequest.armed && (agent !== "pi" || parsed.resume !== null)) {
+    deps.writeErr(
+      "agent: --x-codex-pool-proof-window=arm requires a fresh managed Pi session.\n",
+    );
+    return runBadArgs();
+  }
   // RESUME: `agent run <cli> "<ask>" --resume <name-or-id>` continues a prior
   // partner conversation instead of a fresh launch. It is a wholly separate path
   // — resolve the target, run the refuse-live / harness-match / cwd checks, then
@@ -1819,6 +1842,7 @@ async function runRunCaptureSubcommand(
               model: parsed.model ?? undefined,
               effort: parsed.effort ?? undefined,
               session: parsed.session ?? undefined,
+              codexPoolProofWindow: proofWindowRequest.armed || undefined,
               name: parsed.name ?? undefined,
             },
             stopTimeoutMs: parsed.stopTimeoutMs,
@@ -3114,10 +3138,15 @@ function runAccountsCheck(deps: MainDeps, json: boolean): never {
         `fable-left=${c.fable_remaining === null ? "none" : c.fable_remaining.toFixed(3)}\n`,
     );
   }
+  const refreshFailure = codex.capacity.refresh_failure_state;
+  const refreshFailureText =
+    refreshFailure === undefined || refreshFailure === null
+      ? "none"
+      : `count=${refreshFailure.consecutive_failures} last=${refreshFailure.last_failure_class ?? "none"}@${refreshFailure.last_failure_at_ms ?? "none"}`;
   deps.write(
     `codex session routing: activation=${codex.activation.mode} ` +
       `companion=${codex.companion.health} capacity=${codex.capacity.health} ` +
-      `fresh=${codex.capacity.fresh}\n`,
+      `fresh=${codex.capacity.fresh} refresh-failures=${refreshFailureText}\n`,
   );
   if (codex.activation.mode === "active-degraded") {
     deps.write(

@@ -16,6 +16,7 @@ import {
   type CodexRefreshLock,
   codexObserverSubprocessEnvironment,
   observeCodexOnce,
+  readCodexObservationRefreshFailureState,
   refreshCodexObservationIfStale,
 } from "../src/codex-account-observation-refresh";
 
@@ -180,6 +181,49 @@ describe("refreshCodexObservationIfStale", () => {
     expect(
       readCodexObservationSidecar(codexObservationSidecarPath(dir)),
     ).toEqual(stale);
+  });
+
+  test("records consecutive failed attempts and resets after a success", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "codex-refresh-"));
+    roots.push(dir);
+    const runner: CodexExactArgvRunner = async () => ({
+      code: 0,
+      stdout: "not-json",
+    });
+    const deps = {
+      stateDir: dir,
+      runner,
+      nowMs: () => NOW,
+      maxAgeMs: 100,
+      observerArgv: ARGV,
+      tryAcquireLock: () => held(),
+    };
+
+    await refreshCodexObservationIfStale(deps);
+    expect(readCodexObservationRefreshFailureState(dir)).toEqual({
+      schema_version: 1,
+      consecutive_failures: 1,
+      last_failure_class: "parse",
+      last_failure_at_ms: NOW,
+    });
+
+    await refreshCodexObservationIfStale(deps);
+    expect(readCodexObservationRefreshFailureState(dir)).toMatchObject({
+      consecutive_failures: 2,
+      last_failure_class: "parse",
+      last_failure_at_ms: NOW,
+    });
+
+    await refreshCodexObservationIfStale({
+      ...deps,
+      runner: async () => outcome(),
+    });
+    expect(readCodexObservationRefreshFailureState(dir)).toEqual({
+      schema_version: 1,
+      consecutive_failures: 0,
+      last_failure_class: null,
+      last_failure_at_ms: null,
+    });
   });
 
   test("double-check under the lock observes another publisher", async () => {
