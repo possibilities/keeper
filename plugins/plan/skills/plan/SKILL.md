@@ -427,7 +427,7 @@ Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Des
 
 **Durable-behavioral specs — the template determines what every future worker receives, and a spec sits in the DAG for days before one reads it, so write for that lag.** `### Approach` states the behavioral contract (interfaces, invariants, the observable outcome) and the *why* — it orients, it is not a diff recipe. `## Acceptance` is the checkable + exhaustive bar the worker's completion criteria consume: each item an observable outcome — an interface exists, a contract holds, a suite is green — independently verifiable **without reading the diff**. **Never cite `file:line` in Acceptance** — paths drift while the spec waits and a line-number criterion rots into a false checkbox; `file:line` lives only in `### Investigation targets`, planner-verified at authoring time, cheap to re-verify, and carrying the staleness caveat so a worker re-checks before relying.
 
-**Every Acceptance item must be verifiable from the lane the worker runs in — never from the live deployed daemon.** A task fans in only to the epic base lane; base→main deploy happens at close-finalize, so no task can observe its own fix running in production, and an acceptance line that demands the LIVE daemon exercise the epic's own not-yet-finalized code (live-host stability after the fix, a production measurement confounded by the fix being undeployed) is structurally unverifiable mid-epic — it stamps done against harness evidence while prod is unchanged, or escalates BLOCKED on a trap the worker cannot clear. Spec such work as harness/code-level acceptance the worker CAN verify (a unit/integration proof the code path behaves) plus an explicit operator post-deploy step, or sequence the live check as a follow-up epic that runs after finalize; live-deployed-daemon verification belongs to the operator/await layer, never task acceptance.
+**Every Acceptance item must be verifiable from the lane the worker runs in — never from the live deployed daemon.** A task fans in only to the epic base lane; base→main deploy happens at close-finalize, so no task can observe its own fix running in production, and an acceptance line that demands the LIVE daemon exercise the epic's own not-yet-finalized code (live-host stability after the fix, a production measurement confounded by the fix being undeployed) is structurally unverifiable mid-epic — it stamps done against harness evidence while prod is unchanged, or escalates BLOCKED on a trap the worker cannot clear. Spec harness/code-level proof the worker CAN verify. Live restart, install, or observation stays in the operator layer: every matching refresh is a required epic `## Operator post-land` action, and an invoking Hack session may additionally fulfill it through a `landed` await. It never belongs in task Acceptance or behind a `complete` gate.
 
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
@@ -444,6 +444,12 @@ Which `### H3s` appear at each depth follows the 3b task-depth mapping; `### Des
 ### 5g. Assemble the epic spec markdown (cognitive)
 
 References task ordinals in Early proof point (name the ordinal before scaffold mints the full id). Which H2s appear is driven by 3b (epic-depth mapping). Becomes `epic.spec` in the YAML.
+
+**The daemon runtime action is depth-independent.** Classify the final post-decomposition task scopes. Resolve each task's target (`target_repo`, or the epic's primary repo) to its owning repository root; only a root containing `scripts/daemon-load-roots.txt` is Keeper, so foreign repositories and roots missing the manifest do not trigger. Normalize every `Files:` scope relative to that root, collapsing `.` / `..` segments and repeated separators without escaping the root; directory scopes cover descendants, files match exactly, and globs cover their repo-relative matches. The refresh surfaces are the manifest's non-comment roots plus `package.json`, `bun.lock`, `scripts/install.sh`, and `plist/**`; editing the manifest itself always matches. Treat intersection symmetrically: a planned scope matches when it contains a refresh surface or a refresh surface contains it.
+
+On every match, append `## Operator post-land` with `- Required after this epic lands: run \`<command>\` from the Keeper repo root. Report a refresh failure separately from the landed commit.` This is a durable required action, not evidence that the refresh ran. Choose `bash scripts/install.sh` when the relevant final Keeper scopes intersect the dependency/install/registration surfaces `package.json`, `bun.lock`, `scripts/install.sh`, or `plist/**`; reserve the evidence-backed `keeper daemon restart` for ordinary resident source. Direct Plan and Plan invoked by Hack both emit the section. When Hack supplies positive wait-then-act ownership, it may additionally arm `keeper:await landed <epic>` to fulfill the documented action; the section remains the source of truth. Never duplicate the action in task Acceptance, Quick commands, or Rollout, and never gate it on `complete`. When no refresh surface matches, omit the section.
+
+On refine, `refine-context` omits task routing, so resolve every existing task with `keeper plan resolve-task <task_id> --project <owning_project_root>` and classify its returned `target_repo`; classify newly planned tasks from their explicit/default target. Recompute the section from those final post-delta scopes, including a task-targeted refine, and rewrite it whenever its presence or command changes.
 
 Template (STANDARD — add/remove H2s per 3b):
 
@@ -675,7 +681,7 @@ On the refine path, append:
 Scouts: ran {<name>, …}; skipped {<name>: <reason>, …}
 ```
 
-Omit the `ran {}` side if zero ran; omit `skipped {}` if none were skipped. No menu, no follow-up prompts.
+Omit the `ran {}` side if zero ran; omit `skipped {}` if none were skipped. For both create and refine, a refresh match appends `Runtime action: Operator post-land — <command>.` When invoking Hack supplied positive wait-then-act ownership, also append `Hack owns a landed await to fulfill this action.` Phase 8 adds no tool call, never executes the action, and never presents the durable section as proof of refresh. No menu, no follow-up prompts.
 
 ---
 
@@ -730,7 +736,7 @@ Three ticks, biased by **what's changing**, not the full spec:
 
 ### R5a. Epic route — decide the delta
 
-Reason about four changes against the fetched state: **new tasks**, **existing-spec rewrites**, **dep-graph changes**, **epic-spec changes** (Overview / Quick commands / Acceptance / Early proof point / References re-derived to final state). Declare the delta in one short paragraph before writing, and **pin a short delta string** (≤60 chars, imperative, no trailing period) for Phase 8 — e.g. `add task .2, rewire deps, rewrite epic spec`.
+Reason about four changes against the fetched state: **new tasks**, **existing-spec rewrites**, **dep-graph changes**, **epic-spec changes** (Overview / Quick commands / Acceptance / Early proof point / References plus the depth-independent `## Operator post-land` rule re-derived to final state). Declare the delta in one short paragraph before writing, and **pin a short delta string** (≤60 chars, imperative, no trailing period) for Phase 8 — e.g. `add task .2, rewire deps, rewrite epic spec`.
 
 ### R5b. Epic route — apply the delta
 
@@ -767,7 +773,7 @@ YAML_EOF
 
 ### R5c. Task route — rewrite the single spec
 
-Re-derive the task spec (5e template) incorporating `refine_note`, carrying forward untouched sections. Express as a one-entry `rewrite_specs` delta against the parent epic (strip the `.M` suffix for `<epic_id>`):
+Re-derive the task spec (5e template) incorporating `refine_note`, carrying forward untouched sections. Re-run 5g's daemon runtime-action rule whenever this rewrite changes `Files:`; if recomputation changes the section's presence or selected refresh command, include a full `epic.spec` rewrite in the same delta so `## Operator post-land` is added, updated, or removed correctly. Otherwise express the change as a one-entry `rewrite_specs` delta against the parent epic (strip the `.M` suffix for `<epic_id>`):
 
 ```bash
 keeper plan refine-apply <epic_id> --file - <<'YAML_EOF'
@@ -777,7 +783,7 @@ rewrite_specs:
 YAML_EOF
 ```
 
-Task route never touches the epic spec or other tasks. **Pin a short `refine_note` summary** (≤60 chars, imperative) for Phase 8.
+Task route touches no other task and touches the epic spec only for the runtime-action update above. **Pin a short `refine_note` summary** (≤60 chars, imperative) for Phase 8.
 
 After R5b or R5c, run **R6** below, then jump to **Phase 7 (Validate)**.
 

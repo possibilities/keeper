@@ -316,6 +316,12 @@ itself a Claude Code task ("do a full review", "implement the next
 task", "commit"), invoke whatever tools are appropriate for it. If it's a
 shell command, run it via Bash.
 
+**Pin a documented daemon runtime action at arm time.** When Hack owns a post-land await that fulfills epic `## Operator post-land`:
+
+1. Arm `keeper await landed <epic>`—never `complete`—and pin the exact documented command at arm time.
+2. On `met`, re-read the epic's final documented action before acting. If the pinned command is `keeper daemon restart` but the final section requires `bash scripts/install.sh`, run the stronger installer and report that drift. If the installer was pinned, run it even when the final section says restart; never downgrade an installer pinned at arm time. Otherwise run the pinned command.
+3. Run from the Keeper repo root and report landing and refresh separately. `met` proves the epic landed on the default branch, not that refresh succeeded; a failed refresh leaves the landed commit landed.
+
 On any `failed`, surface the terminal line to the user verbatim and ask
 how they want to proceed — do NOT silently run the follow-up.
 
