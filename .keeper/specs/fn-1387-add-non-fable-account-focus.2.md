@@ -73,5 +73,5 @@ Supply the guarded command and proof output, but never mutate live host policy f
 - [ ] Named router, agent command, dispatch, descriptor, harness, and status tests pass.
 
 ## Done summary
-
+Extended the route-decision boundary, CLI, and status/board views to honor an independent Non-Fable Account focus alongside the existing Fable focus, with full precedence, fallback, and guarded-activation test coverage.
 ## Evidence
