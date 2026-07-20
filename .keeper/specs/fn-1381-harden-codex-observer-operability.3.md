@@ -49,5 +49,5 @@ docs and any agent-help text agree on the direct form).
 - [ ] Focused tests covering the chosen fix pass
 
 ## Done summary
-
+Consumed the codex-pool proof-window launcher flag before generic run-arg parsing so keeper agent run pi --x-codex-pool-proof-window=arm reaches the launch argv; restricted to a fresh managed Pi launch and reused the existing launch-scoped proof-window plumbing. Docs and CLI help now agree on one canonical arming form; added focused tests covering forwarding, rejection of arbitrary --x flags, and docs/help agreement.
 ## Evidence
