@@ -29,12 +29,10 @@ Give sessions a pull-based incident surface and a claim primitive. The claim and
 
 In-process: envelope carries the incident for a synthetic sticky row; claim spool round-trip mints exactly one synthetic event per request; stale/dead-claimant claims expire; claim columns survive the dispatch-failure UPSERT. Fold determinism suites stay green.
 ## Acceptance
-
-- [ ] Claim and close-preflight envelopes surface a nullable incident with fenced identities, brief ref, and grant ref, sourced from existing sticky rows
+- [ ] Claim and close-preflight envelopes surface a nullable incident with fenced identities, brief ref, and grant ref, sourced from existing sticky rows via a bounded read-only keeper-CLI read — no plan-plugin DB import, no new dispatch-time injection
 - [ ] Sessions can claim and release an incident through a spool-validated synthetic-event round-trip with no new RPC surface and no session DB write
-- [ ] A live claim excludes the recover abort and base-freshness refresh for its surface; a dead claimant's claim expires on positive evidence
+- [ ] The fold records claim state (claimant identity, generation, freshness) on the incident row; the producer refuses claims from dead or unverifiable claimants; a dead claimant's recorded claim expires on positive evidence
 - [ ] Brief lookup by incident id works read-only; all touched suites green via named gates
-
 ## Done summary
 
 ## Evidence
