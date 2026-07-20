@@ -1,6 +1,17 @@
 import { describe, expect, test } from "bun:test";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { CredentialVault, MemoryCredentialStorage } from "../src/auth.ts";
 import {
+  loadInstalledCodexOAuth,
   observePool,
   renderObserverEnvelope,
   runObserverCommand,
@@ -73,6 +84,70 @@ function usage(usedPercent: number) {
   };
 }
 
+function makeSandbox(): string {
+  return mkdtempSync(join(tmpdir(), "codex-pool-observer-"));
+}
+
+function writeCatalogSource(path: string, marker: string): void {
+  writeFileSync(
+    path,
+    `export function builtinProviders() {
+  return [{
+    id: "openai-codex",
+    auth: {
+      oauth: {
+        name: ${JSON.stringify(marker)},
+        async login() { throw new Error("unused-login"); },
+        async refresh(credential) { return credential; },
+        async toAuth() { return {}; }
+      }
+    }
+  }];
+}
+`,
+    "utf8",
+  );
+}
+
+function writePackageCatalog(packageRoot: string, marker: string): string {
+  const catalogDir = join(
+    packageRoot,
+    "node_modules",
+    "@earendil-works",
+    "pi-ai",
+    "dist",
+    "providers",
+  );
+  mkdirSync(catalogDir, { recursive: true });
+  const catalogPath = join(catalogDir, "all.js");
+  writeCatalogSource(catalogPath, marker);
+  return catalogPath;
+}
+
+function writeDirectCatalog(catalogDir: string, marker: string): string {
+  mkdirSync(catalogDir, { recursive: true });
+  const catalogPath = join(catalogDir, "all.js");
+  writeCatalogSource(catalogPath, marker);
+  return catalogPath;
+}
+
+function fakeObserverModuleUrl(packageRoot: string): string {
+  const observerPath = join(packageRoot, "src", "observer.ts");
+  mkdirSync(dirname(observerPath), { recursive: true });
+  writeFileSync(observerPath, "", "utf8");
+  return pathToFileURL(observerPath).href;
+}
+
+function writePiExecutablePackage(packageRoot: string, marker: string): string {
+  writePackageCatalog(packageRoot, marker);
+  const binDir = join(packageRoot, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const piPath = join(binDir, "pi");
+  writeFileSync(piPath, "#!/bin/sh\nexit 0\n", "utf8");
+  chmodSync(piPath, 0o755);
+  return binDir;
+}
+
 describe("Codex usage observer", () => {
   test("keeps the executable inert and sanitized outside a Keeper marker", async () => {
     const outputs: string[] = [];
@@ -88,6 +163,177 @@ describe("Codex usage observer", () => {
         reason: "pool-unavailable",
       }),
     ]);
+  });
+
+  test("loads codex oauth from an explicit catalog override before other candidates", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const overrideDir = join(sandbox, "override-providers");
+      writeDirectCatalog(overrideDir, "env-override");
+      const packageRoot = join(sandbox, "observer-package");
+      writePackageCatalog(packageRoot, "package-relative");
+      const pathBin = writePiExecutablePackage(
+        join(sandbox, "path-package"),
+        "path-fallback",
+      );
+
+      const oauth = await loadInstalledCodexOAuth(
+        { KEEPER_PI_CODEX_CATALOG_DIR: overrideDir, PATH: pathBin },
+        { moduleUrl: fakeObserverModuleUrl(packageRoot) },
+      );
+
+      expect(oauth.name).toBe("env-override");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("runs with an explicit catalog override without a PATH pi executable", async () => {
+    const sandbox = makeSandbox();
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(sandbox, "agent");
+    try {
+      const overrideDir = join(sandbox, "override-providers");
+      writeDirectCatalog(overrideDir, "env-command");
+      const outputs: string[] = [];
+      const code = await runObserverCommand(
+        {
+          KEEPER_JOB_ID: "job-1",
+          KEEPER_PI_CODEX_CATALOG_DIR: overrideDir,
+          KEEPER_PI_CODEX_POOL_ALIASES: JSON.stringify(["keeper-codex-a"]),
+          PATH: join(sandbox, "empty-bin"),
+        },
+        (output) => outputs.push(output),
+        {
+          catalogResolver: {
+            moduleUrl: fakeObserverModuleUrl(join(sandbox, "observer-package")),
+          },
+        },
+      );
+      const parsed = JSON.parse(outputs[0] ?? "{}") as {
+        schema_version?: unknown;
+        status?: unknown;
+        aliases?: { alias?: unknown; usage?: { status?: unknown } }[];
+        truncated?: unknown;
+      };
+
+      expect(code).toBe(0);
+      expect(outputs).toHaveLength(1);
+      expect(parsed.schema_version).toBe(1);
+      expect(parsed.status).toBeUndefined();
+      expect(parsed.truncated).toBe(false);
+      expect(parsed.aliases?.map((entry) => entry.alias)).toEqual([
+        "keeper-codex-a",
+      ]);
+      expect(parsed.aliases?.[0]?.usage?.status).toBe("unavailable");
+    } finally {
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("loads codex oauth relative to the observer package before PATH fallback", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const packageRoot = join(sandbox, "observer-package");
+      writePackageCatalog(packageRoot, "package-relative");
+      const pathBin = writePiExecutablePackage(
+        join(sandbox, "path-package"),
+        "path-fallback",
+      );
+
+      const oauth = await loadInstalledCodexOAuth(
+        {
+          KEEPER_PI_CODEX_CATALOG_DIR: join(sandbox, "missing-override"),
+          PATH: pathBin,
+        },
+        { moduleUrl: fakeObserverModuleUrl(packageRoot) },
+      );
+
+      expect(oauth.name).toBe("package-relative");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("loads codex oauth from a home nvm pi install without PATH pi", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const home = join(sandbox, "home");
+      const piPackageRoot = join(
+        home,
+        ".nvm",
+        "versions",
+        "node",
+        "v24.16.0",
+        "lib",
+        "node_modules",
+        "@earendil-works",
+        "pi-coding-agent",
+      );
+      writePackageCatalog(piPackageRoot, "home-nvm");
+
+      const oauth = await loadInstalledCodexOAuth(
+        { HOME: home, PATH: join(sandbox, "empty-bin") },
+        { moduleUrl: fakeObserverModuleUrl(join(sandbox, "observer-package")) },
+      );
+
+      expect(oauth.name).toBe("home-nvm");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("loads codex oauth through the legacy PATH pi fallback last", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const observerRoot = join(sandbox, "observer-package");
+      const pathBin = writePiExecutablePackage(
+        join(sandbox, "path-package"),
+        "path-fallback",
+      );
+
+      const oauth = await loadInstalledCodexOAuth(
+        { PATH: pathBin },
+        { moduleUrl: fakeObserverModuleUrl(observerRoot) },
+      );
+
+      expect(oauth.name).toBe("path-fallback");
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  test("emits the bounded unavailable envelope when the whole catalog chain misses", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const outputs: string[] = [];
+      const code = await runObserverCommand(
+        { KEEPER_JOB_ID: "job-1", PATH: join(sandbox, "empty-bin") },
+        (output) => outputs.push(output),
+        {
+          catalogResolver: {
+            moduleUrl: fakeObserverModuleUrl(join(sandbox, "observer-package")),
+            exists: () => false,
+          },
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(outputs).toEqual([
+        JSON.stringify({
+          schema_version: 1,
+          status: "unavailable",
+          reason: "pool-unavailable",
+        }),
+      ]);
+    } finally {
+      rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 
   test("normalizes two independent aliases without crossing the observer boundary", async () => {

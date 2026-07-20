@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -20,6 +20,27 @@ export const OBSERVER_SCHEMA_VERSION = 1;
 const OBSERVER_TIMEOUT_MS = 8_000;
 const MAX_USAGE_BODY_BYTES = 128 * 1024;
 const MAX_OBSERVER_OUTPUT_BYTES = 16 * 1024;
+const PI_AI_CATALOG_RELATIVE_PATH = [
+  "node_modules",
+  "@earendil-works",
+  "pi-ai",
+  "dist",
+  "providers",
+  "all.js",
+] as const;
+const PI_AI_PACKAGE_CATALOG_RELATIVE_PATH = [
+  "dist",
+  "providers",
+  "all.js",
+] as const;
+const PI_CODING_AGENT_CATALOG_RELATIVE_PATH = [
+  "node_modules",
+  "@earendil-works",
+  "pi-coding-agent",
+  ...PI_AI_CATALOG_RELATIVE_PATH,
+] as const;
+const PACKAGE_RELATIVE_PARENT_LIMIT = 6;
+const NVM_VERSION_CANDIDATE_LIMIT = 16;
 
 export interface ObserverEnvelope {
   schema_version: 1;
@@ -196,44 +217,210 @@ export function renderObserverEnvelope(envelope: ObserverEnvelope): string {
   return fallback;
 }
 
-async function loadInstalledCodexOAuth(
+type CatalogImport = (specifier: string) => Promise<unknown>;
+
+export interface CodexOAuthCatalogResolverOptions {
+  moduleUrl?: string;
+  exists?: (path: string) => boolean;
+  realpath?: (path: string) => string;
+  listDirectories?: (path: string) => string[];
+  importModule?: CatalogImport;
+}
+
+interface CatalogProvider {
+  id: string;
+  auth?: { oauth?: CanonicalOAuth };
+}
+
+interface CatalogModule {
+  builtinProviders?: () => CatalogProvider[];
+}
+
+const defaultCatalogImport = new Function(
+  "specifier",
+  "return import(specifier)",
+) as CatalogImport;
+
+function pushUnique(values: string[], value: string): void {
+  if (!values.includes(value)) values.push(value);
+}
+
+function defaultListDirectories(path: string): string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function pushPackageManagerCatalogCandidates(
+  candidates: string[],
+  packageManagerRoot: string,
+): void {
+  pushUnique(candidates, join(packageManagerRoot, ...PI_AI_CATALOG_RELATIVE_PATH));
+  pushUnique(
+    candidates,
+    join(packageManagerRoot, ...PI_CODING_AGENT_CATALOG_RELATIVE_PATH),
+  );
+}
+
+function explicitCatalogCandidates(directory: string): string[] {
+  const root = resolve(directory);
+  const candidates: string[] = [];
+  pushUnique(candidates, join(root, "all.js"));
+  pushUnique(candidates, join(root, ...PI_AI_CATALOG_RELATIVE_PATH));
+  pushUnique(candidates, join(root, ...PI_AI_PACKAGE_CATALOG_RELATIVE_PATH));
+  return candidates;
+}
+
+function packageRelativeCatalogCandidates(
+  moduleUrl: string,
+  realpath: (path: string) => string,
+): string[] {
+  let modulePath: string;
+  try {
+    modulePath = fileURLToPath(moduleUrl);
+  } catch {
+    return [];
+  }
+
+  const modulePaths: string[] = [];
+  pushUnique(modulePaths, modulePath);
+  try {
+    pushUnique(modulePaths, realpath(modulePath));
+  } catch {
+    // The unresolved module path is still enough for fixture and checkout layouts.
+  }
+
+  const candidates: string[] = [];
+  for (const path of modulePaths) {
+    let directory = dirname(path);
+    for (let index = 0; index < PACKAGE_RELATIVE_PARENT_LIMIT; index += 1) {
+      pushPackageManagerCatalogCandidates(candidates, directory);
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  }
+  return candidates;
+}
+
+function nvmVersionParts(name: string): [number, number, number] | undefined {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(name);
+  if (!match) return undefined;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function compareNvmVersionsDescending(left: string, right: string): number {
+  const leftParts = nvmVersionParts(left);
+  const rightParts = nvmVersionParts(right);
+  if (leftParts && rightParts) {
+    for (let index = 0; index < leftParts.length; index += 1) {
+      const difference = rightParts[index] - leftParts[index];
+      if (difference !== 0) return difference;
+    }
+  }
+  if (leftParts) return -1;
+  if (rightParts) return 1;
+  return left.localeCompare(right);
+}
+
+function homePackageCatalogCandidates(
   env: NodeJS.ProcessEnv,
-): Promise<CanonicalOAuth> {
-  const candidates = (env.PATH ?? "")
-    .split(delimiter)
-    .filter((entry) => entry.length > 0)
-    .map((entry) => join(entry, "pi"));
-  for (const candidate of candidates) {
+  listDirectories: (path: string) => string[],
+): string[] {
+  const home = env.HOME?.trim();
+  if (!home) return [];
+
+  const candidates: string[] = [];
+  pushPackageManagerCatalogCandidates(
+    candidates,
+    join(home, ".bun", "install", "global"),
+  );
+
+  const nvmVersionsRoot = join(home, ".nvm", "versions", "node");
+  for (const version of listDirectories(nvmVersionsRoot)
+    .sort(compareNvmVersionsDescending)
+    .slice(0, NVM_VERSION_CANDIDATE_LIMIT)) {
+    pushPackageManagerCatalogCandidates(
+      candidates,
+      join(nvmVersionsRoot, version, "lib"),
+    );
+  }
+  return candidates;
+}
+
+function pathCatalogCandidates(
+  env: NodeJS.ProcessEnv,
+  exists: (path: string) => boolean,
+  realpath: (path: string) => string,
+): string[] {
+  const candidates: string[] = [];
+  for (const entry of (env.PATH ?? "").split(delimiter)) {
+    if (entry.length === 0) continue;
     try {
-      if (!existsSync(candidate)) continue;
-      const cliPath = realpathSync(candidate);
+      const candidate = join(entry, "pi");
+      if (!exists(candidate)) continue;
+      const cliPath = realpath(candidate);
       const packageRoot = dirname(dirname(cliPath));
-      const catalogPath = join(
-        packageRoot,
-        "node_modules",
-        "@earendil-works",
-        "pi-ai",
-        "dist",
-        "providers",
-        "all.js",
-      );
-      if (!existsSync(catalogPath)) continue;
-      const importModule = new Function(
-        "specifier",
-        "return import(specifier)",
-      ) as (specifier: string) => Promise<unknown>;
-      const catalog = (await importModule(pathToFileURL(catalogPath).href)) as {
-        builtinProviders?: () => Array<{
-          id: string;
-          auth: { oauth?: CanonicalOAuth };
-        }>;
-      };
-      const oauth = catalog
-        .builtinProviders?.()
-        .find((provider) => provider.id === "openai-codex")?.auth.oauth;
-      if (oauth) return oauth;
+      pushUnique(candidates, join(packageRoot, ...PI_AI_CATALOG_RELATIVE_PATH));
     } catch {
       // Try the next trusted executable location without exposing diagnostics.
+    }
+  }
+  return candidates;
+}
+
+export function codexOAuthCatalogCandidates(
+  env: NodeJS.ProcessEnv,
+  options: CodexOAuthCatalogResolverOptions = {},
+): string[] {
+  const exists = options.exists ?? existsSync;
+  const realpath = options.realpath ?? realpathSync;
+  const listDirectories = options.listDirectories ?? defaultListDirectories;
+  const candidates: string[] = [];
+  const explicitDirectory = env.KEEPER_PI_CODEX_CATALOG_DIR?.trim();
+  if (explicitDirectory) {
+    for (const candidate of explicitCatalogCandidates(explicitDirectory)) {
+      pushUnique(candidates, candidate);
+    }
+  }
+  for (const candidate of packageRelativeCatalogCandidates(
+    options.moduleUrl ?? import.meta.url,
+    realpath,
+  )) {
+    pushUnique(candidates, candidate);
+  }
+  for (const candidate of homePackageCatalogCandidates(env, listDirectories)) {
+    pushUnique(candidates, candidate);
+  }
+  for (const candidate of pathCatalogCandidates(env, exists, realpath)) {
+    pushUnique(candidates, candidate);
+  }
+  return candidates;
+}
+
+export async function loadInstalledCodexOAuth(
+  env: NodeJS.ProcessEnv,
+  options: CodexOAuthCatalogResolverOptions = {},
+): Promise<CanonicalOAuth> {
+  const exists = options.exists ?? existsSync;
+  const importModule = options.importModule ?? defaultCatalogImport;
+  for (const catalogPath of codexOAuthCatalogCandidates(env, options)) {
+    try {
+      if (!exists(catalogPath)) continue;
+      const catalog = (await importModule(
+        pathToFileURL(catalogPath).href,
+      )) as CatalogModule;
+      const oauth = catalog
+        .builtinProviders?.()
+        .find((provider) => provider.id === "openai-codex")?.auth?.oauth;
+      if (oauth) return oauth;
+    } catch {
+      // Try the next trusted catalog location without exposing diagnostics.
     }
   }
   throw new Error("native-codex-oauth-unavailable");
@@ -247,10 +434,15 @@ function unavailableCommandEnvelope(): string {
   });
 }
 
+export interface ObserverCommandOptions {
+  catalogResolver?: CodexOAuthCatalogResolverOptions;
+}
+
 export async function runObserverCommand(
   env: NodeJS.ProcessEnv = process.env,
   writeOutput: (output: string) => void = (output) =>
     process.stdout.write(`${output}\n`),
+  options: ObserverCommandOptions = {},
 ): Promise<number> {
   if ((env.KEEPER_JOB_ID ?? "").trim() === "") {
     writeOutput(unavailableCommandEnvelope());
@@ -258,7 +450,7 @@ export async function runObserverCommand(
   }
   try {
     const aliases = aliasesFromEnvironment(env.KEEPER_PI_CODEX_POOL_ALIASES);
-    const oauth = await loadInstalledCodexOAuth(env);
+    const oauth = await loadInstalledCodexOAuth(env, options.catalogResolver);
     const vault = new CredentialVault(
       new FileCredentialStorage(),
       (credential, signal) => oauth.refresh(credential, signal),
