@@ -38,5 +38,5 @@ Pure classifier tests: quota-fault-only unmet clauses → degraded-eligible; any
 - [ ] docs/install.md documents the degraded ritual, an ADR amendment records the human decision and the safety trade, and all touched suites are green via named gates
 
 ## Done summary
-
+Added a human-authorized degraded single-alias activation mode: a proven-degraded-single-alias proof verdict that waives only the quota-dead alias's structurally-unsatisfiable legs (native_fallback, transport_isolation) behind genuine quota evidence, activation gated behind an explicit --authorize-degraded flag pinned to the healthy alias and surfaced as active-degraded, with a full proven report upgrading to active and clearing the marker. ADR 0090 amended and install.md documents the ritual.
 ## Evidence

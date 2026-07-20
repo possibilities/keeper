@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Authorize degraded single-alias pool activation",
-  "updated_at": "2026-07-20T03:25:10.646000Z"
+  "updated_at": "2026-07-20T04:12:52.109000Z",
+  "worker_done_at": "2026-07-20T04:12:52.109000Z"
 }
