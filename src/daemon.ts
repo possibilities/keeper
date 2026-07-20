@@ -184,6 +184,7 @@ import {
   defaultPlanPrompt,
   type EscalationVerb,
   isRetryableDispatchKey,
+  type RetryDispatchVerb,
 } from "./dispatch-command";
 import {
   BUS_DEGRADED_DISTRESS_ID,
@@ -697,6 +698,88 @@ export function decideDispatchClearLiveness(
   return probeLiveness() === "gone"
     ? { kind: "clear" }
     : { kind: "refuse-live" };
+}
+
+export function probeDispatchClearClaimLiveness(
+  claim: { session_id: string | null } | undefined,
+  job: { pid: number | null; start_time: string | null } | null | undefined,
+  recordedProcessIdentityFn: (
+    pid: number,
+    startTime: string,
+  ) => RecordedProcessIdentityVerdict = recordedProcessIdentity,
+): RecordedProcessIdentityVerdict {
+  const sid = claim?.session_id;
+  if (sid == null || sid.length === 0) return "inconclusive";
+  if (
+    job == null ||
+    job.pid == null ||
+    job.start_time == null ||
+    job.start_time.length === 0
+  ) {
+    return "inconclusive";
+  }
+  return recordedProcessIdentityFn(job.pid, job.start_time);
+}
+
+function buildRetryDispatchRefusedLiveError(
+  verb: RetryDispatchVerb,
+  dispatchId: string,
+  claimSessionId: string | null | undefined,
+): string {
+  return (
+    `refused_live: ${verb}::${dispatchId} is bound to a live ` +
+    `dispatch claim${claimSessionId ? ` (session ${claimSessionId})` : ""}; ` +
+    "pass --force to override the liveness refusal (the attempt-identity fence still applies)."
+  );
+}
+
+function buildRetryDispatchRefusedIdentityError(
+  verb: RetryDispatchVerb,
+  dispatchId: string,
+): string {
+  return (
+    `refused_identity: the dispatch attempt for ${verb}::${dispatchId} ` +
+    "changed at the write site (a newer attempt re-minted the claim); " +
+    "--force does not override an identity mismatch — re-read state and retry."
+  );
+}
+
+export function buildRetryDispatchResultMessage(args: {
+  id: string;
+  verb: RetryDispatchVerb;
+  dispatchId: string;
+  claimSessionId: string | null | undefined;
+  decision: DispatchClearLivenessDecision;
+  applied: boolean;
+}): RetryDispatchResultMessage {
+  if (args.decision.kind === "refuse-live") {
+    return {
+      type: "retry-dispatch-result",
+      id: args.id,
+      ok: false,
+      outcome: "refused_live",
+      error: buildRetryDispatchRefusedLiveError(
+        args.verb,
+        args.dispatchId,
+        args.claimSessionId,
+      ),
+    };
+  }
+  if (args.applied) {
+    return {
+      type: "retry-dispatch-result",
+      id: args.id,
+      ok: true,
+      outcome: "cleared",
+    };
+  }
+  return {
+    type: "retry-dispatch-result",
+    id: args.id,
+    ok: false,
+    outcome: "refused_identity",
+    error: buildRetryDispatchRefusedIdentityError(args.verb, args.dispatchId),
+  };
 }
 
 /**
@@ -10380,75 +10463,44 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             bound_at: number | null;
             session_id: string | null;
           } | null;
-          // Recycle-safe process probe for the claimant. An absent session,
-          // job, or process witness is `inconclusive` (refuse on uncertainty),
-          // never a false `gone`. Evaluated lazily — an unbound clear never
-          // spawns a probe.
           const probeLiveness = (): RecordedProcessIdentityVerdict => {
             const sid = claim?.session_id;
-            if (sid == null || sid.length === 0) return "inconclusive";
-            const job = db
-              .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
-              .get(sid) as {
-              pid: number | null;
-              start_time: string | null;
-            } | null;
-            if (
-              job == null ||
-              job.pid == null ||
-              job.start_time == null ||
-              job.start_time.length === 0
-            ) {
-              return "inconclusive";
-            }
-            return recordedProcessIdentity(job.pid, job.start_time);
+            const job =
+              sid == null || sid.length === 0
+                ? null
+                : (db
+                    .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+                    .get(sid) as {
+                    pid: number | null;
+                    start_time: string | null;
+                  } | null);
+            return probeDispatchClearClaimLiveness(claim ?? undefined, job);
           };
           const decision = decideDispatchClearLiveness(
             claim ?? undefined,
             msg.force,
             probeLiveness,
           );
-          if (decision.kind === "refuse-live") {
-            reply = {
-              type: "retry-dispatch-result",
-              id,
-              ok: false,
-              outcome: "refused_live",
-              error:
-                `refused_live: ${msg.verb}::${msg.dispatch_id} is bound to a live ` +
-                `dispatch claim${claim?.session_id ? ` (session ${claim.session_id})` : ""}; ` +
-                "pass --force to override the liveness refusal (the attempt-identity fence still applies).",
-            };
-          } else {
-            const applied = mintDispatchClearedEvent(
-              msg.verb,
-              msg.dispatch_id,
-              dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
-              false,
-              false,
-              { forced: msg.force, caller_session: msg.caller_session },
-            );
-            if (applied) {
-              wakePending = true;
-              pumpWakes();
-              reply = {
-                type: "retry-dispatch-result",
-                id,
-                ok: true,
-                outcome: "cleared",
-              };
-            } else {
-              reply = {
-                type: "retry-dispatch-result",
-                id,
-                ok: false,
-                outcome: "refused_identity",
-                error:
-                  `refused_identity: the dispatch attempt for ${msg.verb}::${msg.dispatch_id} ` +
-                  "changed at the write site (a newer attempt re-minted the claim); " +
-                  "--force does not override an identity mismatch — re-read state and retry.",
-              };
-            }
+          reply = buildRetryDispatchResultMessage({
+            id,
+            verb: msg.verb,
+            dispatchId: msg.dispatch_id,
+            claimSessionId: claim?.session_id,
+            decision,
+            applied:
+              decision.kind !== "refuse-live" &&
+              mintDispatchClearedEvent(
+                msg.verb,
+                msg.dispatch_id,
+                dispatchClearFencesAtAppend(db, msg.verb, msg.dispatch_id),
+                false,
+                false,
+                { forced: msg.force, caller_session: msg.caller_session },
+              ),
+          });
+          if (reply.ok) {
+            wakePending = true;
+            pumpWakes();
           }
         } catch (err) {
           reply = {

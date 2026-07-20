@@ -73,6 +73,7 @@ import {
   buildDispatchClearedData,
   buildPendingDispatchSweepRecords,
   buildResolverBrief,
+  buildRetryDispatchResultMessage,
   buildSharedCheckoutPageBody,
   buildSharedDirtyObservation,
   buildWorkMergeHumanNotifyBody,
@@ -143,6 +144,7 @@ import {
   prewarmWatcherAddon,
   probeAuditOrchestrator,
   probeBlockOwner,
+  probeDispatchClearClaimLiveness,
   probeReplyProvesLife,
   probeSettleStep,
   pruneRecoveredDeadLetters,
@@ -5606,6 +5608,117 @@ test("decideDispatchClearLiveness: --force lifts the liveness gate before any pr
   // the probe is never consulted.
   expect(decideDispatchClearLiveness(BOUND_CLAIM, true, PROBE_NEVER)).toEqual({
     kind: "clear",
+  });
+});
+
+test("probeDispatchClearClaimLiveness: missing claimant evidence refuses live and a gone witness clears", () => {
+  const boundClaim = { state: "bound", bound_at: 123 };
+  const cases: Array<{
+    claim: { session_id: string | null };
+    job: { pid: number | null; start_time: string | null } | null;
+    probe: RecordedProcessIdentityVerdict;
+    decision: "refuse-live" | "clear";
+    recorded?: () => RecordedProcessIdentityVerdict;
+  }> = [
+    {
+      claim: { session_id: null },
+      job: null,
+      probe: "inconclusive",
+      decision: "refuse-live",
+    },
+    {
+      claim: { session_id: "" },
+      job: { pid: 11, start_time: "linux:1" },
+      probe: "inconclusive",
+      decision: "refuse-live",
+    },
+    {
+      claim: { session_id: "sess-absent" },
+      job: null,
+      probe: "inconclusive",
+      decision: "refuse-live",
+    },
+    {
+      claim: { session_id: "sess-pid" },
+      job: { pid: null, start_time: "linux:1" },
+      probe: "inconclusive",
+      decision: "refuse-live",
+    },
+    {
+      claim: { session_id: "sess-start" },
+      job: { pid: 42, start_time: "" },
+      probe: "inconclusive",
+      decision: "refuse-live",
+    },
+    {
+      claim: { session_id: "sess-gone" },
+      job: { pid: 42, start_time: "linux:1" },
+      probe: "gone",
+      decision: "clear",
+      recorded: () => "gone",
+    },
+  ];
+  for (const testCase of cases) {
+    const probe = probeDispatchClearClaimLiveness(
+      testCase.claim,
+      testCase.job,
+      testCase.recorded ??
+        (() => "inconclusive" as RecordedProcessIdentityVerdict),
+    );
+    expect(probe).toBe(testCase.probe);
+    expect(decideDispatchClearLiveness(boundClaim, false, () => probe)).toEqual(
+      { kind: testCase.decision },
+    );
+  }
+});
+
+test("buildRetryDispatchResultMessage: refused_live, refused_identity, and cleared replies are explicit", () => {
+  expect(
+    buildRetryDispatchResultMessage({
+      id: "req-live",
+      verb: "work",
+      dispatchId: "fn-1-foo.3",
+      claimSessionId: "sess-live",
+      decision: { kind: "refuse-live" },
+      applied: false,
+    }),
+  ).toMatchObject({
+    type: "retry-dispatch-result",
+    id: "req-live",
+    ok: false,
+    outcome: "refused_live",
+    error: expect.stringContaining("session sess-live"),
+  });
+  expect(
+    buildRetryDispatchResultMessage({
+      id: "req-identity",
+      verb: "work",
+      dispatchId: "fn-1-foo.3",
+      claimSessionId: "sess-live",
+      decision: { kind: "clear" },
+      applied: false,
+    }),
+  ).toMatchObject({
+    type: "retry-dispatch-result",
+    id: "req-identity",
+    ok: false,
+    outcome: "refused_identity",
+    error: expect.stringContaining("changed at the write site"),
+  });
+  expect(
+    buildRetryDispatchResultMessage({
+      id: "req-clear",
+      verb: "work",
+      dispatchId: "fn-1-foo.3",
+      claimSessionId: null,
+      decision: { kind: "clear" },
+      applied: true,
+    }),
+  ).toEqual({
+    type: "retry-dispatch-result",
+    id: "req-clear",
+    ok: true,
+    outcome: "cleared",
   });
 });
 
