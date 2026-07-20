@@ -64,5 +64,5 @@ the internal-sweep non-interference invariant.
 - [ ] The stale-attempts operator recovery text states the self-refusal contract
 
 ## Done summary
-
+Confirmed the already-committed operator dispatch-clear liveness fence (commit 77110d640): retry_dispatch now producer-side probes claimant liveness before appending DispatchCleared, refuses live/uncertain claims with a typed refused_live outcome (never silent ok:true), --force lifts only that gate while the attempt-identity CAS still returns refused_identity on a stale attempt, audits acting identity + forced flag into re-fold-inert event data, and a regression test proves the internal orphan sweep never deletes a live bound attempt's mint gate. problem-codes.md's stale_attempts recovery text now states the self-refusal contract. Verified via an independent provider-leg run: targeted tests (daemon/rpc-handlers/autopilot) 610 passed, 0 failed; full suite 12,381 passed, 38 skipped, 0 failed.
 ## Evidence
