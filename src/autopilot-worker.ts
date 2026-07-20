@@ -143,6 +143,8 @@ import {
   type TmuxPaneOps,
 } from "./exec-backend";
 import { localBranchExists, memoizedNullableGitToplevel } from "./git-toplevel";
+import { readTrunkLeaseLeaf } from "./grant-leaf";
+import { keeperStateDir } from "./keeper-state-dir";
 import { loadProviderEquivalenceSnapshot } from "./provider-equivalence";
 import {
   findLongUnknownMonitorOccupants,
@@ -264,6 +266,7 @@ import {
   isKeeperLaneEntry,
   keeperLaneIdentity,
   type LockAcquirer,
+  type MergeReadiness,
   provisionScratchWorktree,
   removeScratchWorktree,
   shortBranchName,
@@ -1142,7 +1145,7 @@ export interface ConfirmRunningDeps {
    * launch field is inert and dispatch is byte-identical to today). PRESENT in
    * worktree mode: `runReconcileCycle` calls it to provision a lane worktree,
    * prepare any pending fan-in integration, assert HEAD, and — after a closer
-   * reaches done — merge the epic base into the default branch + push + tear down.
+   * reaches done — verify owner integration, push, and tear the lanes down.
    * Every method shells git
    * on the target repo (a producer side effect); none touches keeper.db or a fold.
    * Injected so the fast tier drives the same code paths with a fake.
@@ -1151,7 +1154,7 @@ export interface ConfirmRunningDeps {
   /**
    * The MAIN-projection done-ness probe ({@link isEpicDoneById} bound to
    * the reconciler's read-only connection), threaded into `worktree.finalizeEpic`
-   * so finalize merges a lane ONLY when its epic is done in the projection. The
+   * so finalize pushes and retires a lane ONLY when its epic is done in the projection. The
    * closer writes `done` to the PRIMARY repo, so the projection — not a lane-read —
    * is the authority; this rejects a crashed closer that finished without `done`.
    * Mirrors the same probe the recover glue passes into `worktree.recover`.
@@ -1168,10 +1171,9 @@ export interface ConfirmRunningDeps {
   ): Promise<CloseRecoveryStampResult>;
   /**
    * The merge-suite gate probe threaded into `worktree.finalizeEpic` (the {@link
-   * isEpicDone} precedent): given a PROSPECTIVE lane→default merged commit, run the
+   * isEpicDone} precedent): given the owner-integrated local-default commit, run the
    * fast suite against it in a scratch worktree and return green / red / cannot-run.
-   * OPTIONAL — omitted (fake-deps reconcile tests, which finalize via a fake driver)
-   * makes finalize skip the gate and merge as before. Production wires {@link
+   * OPTIONAL — omitted makes finalize skip the gate. Production wires {@link
    * runMergeSuiteGate}; the fast/slow finalize-gate tests inject a fake to drive the
    * three verdicts purely.
    */
@@ -1284,24 +1286,21 @@ export interface WorktreeDriver {
       }
   >;
   /**
-   * After the epic closer reaches done: merge the epic base branch into the repo's
-   * resolved default branch (sequential pairwise, pushed once), then tear the lane
-   * worktrees down. Returns `{ ok: true }` on a clean merge-and-teardown.
+   * After the epic closer reaches done: prove the epic base is contained in the
+   * resolved local default, verify the shared checkout, push once, then tear the
+   * lane worktrees down. Returns `{ ok: true }` on clean verified teardown.
    *
    * `isEpicDone` is the MAIN-projection done-ness probe ({@link isEpicDoneById}),
-   * threaded in the same way recover takes it: finalize merges ONLY when the epic
+   * threaded in the same way recover takes it: finalize tears down ONLY when the epic
    * is done in the projection (the closer wrote `done` to the PRIMARY repo, never
    * the lane), which rejects a crashed closer that finished but never committed
    * `done`. The lane-ahead half of the gate is the shared merge routine's
    * `not-ahead` check.
    *
-   * `runMergeSuite` (fn-1204) is the merge-suite gate probe: BEFORE local default
-   * advances, the prospective merged commit's fast suite runs on a scratch worktree.
-   * Green proceeds to the existing merge+push; red parks a VISIBLE sticky (no
-   * `retry` — local default never advances, nothing pushed); a gate that cannot run
-   * degrades to a retry-skip. OMITTED → the gate is skipped and finalize merges as
-   * before (the fake-driver reconcile tests and the direct degrade tests that never
-   * inject it).
+   * `runMergeSuite` is the merge-suite gate probe: before origin advances, the
+   * integrated local-default commit's fast suite runs on a scratch worktree. Green
+   * proceeds to push; red parks a VISIBLE sticky with nothing pushed; a gate that
+   * cannot run degrades to a retry-skip. OMITTED skips the gate.
    *
    * A failure is one of two kinds, distinguished by `retry`:
    *  - `{ ok: false, reason }` (no `retry`) — a GENUINE block (a content merge
@@ -5947,8 +5946,7 @@ export async function runReconcileCycle(
   }
 
   // Worktree-finalize pass. For each epic whose closer reached done this
-  // cycle, merge the epic base into the resolved default branch (pushing once) and
-  // tear the lanes down. Runs AFTER the launch loop (the closer that landed the
+  // cycle, verify the owner-integrated local default, push once, and tear the lanes down. Runs AFTER the launch loop (the closer that landed the
   // close commit on `keeper/epic/<id>` is already gone — the cap-1 lane + the
   // readiness gate guarantee no agent is live in the base when this fires). Driven
   // from THIS producer step (not the recent-done reap window) so it never depends
@@ -6199,9 +6197,9 @@ async function runWorktreeProducerStep(
  *
  * Provision: ensure the node's worktree exists off its deterministic parent tip,
  * preserve the lossless-clean/readiness guard for the first pending fan-in, and
- * return its manifest without merging. Finalize: merge the epic base
- * into the resolved default branch (in the MAIN worktree), push once, tear the
- * lanes down. assertOnDefaultBranch: `currentBranch(cwd) === resolveDefaultBranch`.
+ * return its manifest without merging. Finalize verifies owner integration in the
+ * shared checkout, pushes once, and tears the lanes down. assertOnDefaultBranch:
+ * `currentBranch(cwd) === resolveDefaultBranch`.
  */
 type FanInAssemblyProbe =
   | { kind: "assembled" }
@@ -6259,6 +6257,8 @@ export function createWorktreeDriver(
   // records the dir into its in-memory latch, which the per-cycle probe then watches +
   // escalates. Omitted (fake-deps / direct-call tests) → a no-op, byte-identical merge.
   onResyncSkipped?: (repoDir: string) => void,
+  ownerMediatedFinalize = false,
+  recoverMergeSuite?: MergeSuiteProbe,
 ): WorktreeDriver {
   // Merge-suite gate memo (fn-1204), keyed by the prospective merged-commit OID: a
   // TERMINAL verdict (green/red) is cached so a parked epic's finalize retries never
@@ -6534,221 +6534,218 @@ export function createWorktreeDriver(
             `worktree-finalize-pending-integration: could not prove ${assembly.sourceBranch} is integrated into ${baseBranch} — ${assembly.detail}`,
           );
         }
-        // Merge-suite gate (fn-1204): BEFORE local default advances, test the
-        // PROSPECTIVE lane→default merge result's fast suite on a scratch worktree, so
-        // a lost-update merge (two individually-green sides whose merged tree fails the
-        // suite — a semantic conflict git cannot see) never lands red trunk. ONLY a
-        // merge that would actually introduce new content is gated: an already-merged
-        // base (ancestor of local default) has no new tree and falls straight through
-        // to the idempotent merge/teardown below. The prospective merged commit is the
-        // SAME deterministic OID {@link mergeLaneBaseIntoDefault} will advance to, so
-        // the suite runs on exactly the tree that lands. A conflict / plumbing degrade
-        // is NOT gated here — it falls through so the shared merge routine surfaces its
-        // own discriminant (a conflict sticky, an unsupported retry-skip) unchanged.
-        // Omitting `runMergeSuite` skips the gate entirely (merges as before).
-        if (
-          runMergeSuite !== undefined &&
-          !(await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run))
-        ) {
-          const prospect = await computeProspectiveMerge(
+        if (!ownerMediatedFinalize) {
+          if (
+            runMergeSuite !== undefined &&
+            !(await gitIsAncestorOf(repoDir, baseBranch, defaultBranch, run))
+          ) {
+            const prospect = await computeProspectiveMerge(
+              repoDir,
+              baseBranch,
+              defaultBranch,
+              run,
+            );
+            if (prospect.kind === "computed") {
+              let verdict = mergeSuiteMemo.get(prospect.newValue);
+              if (verdict === undefined) {
+                const runsPlanSuite = await mergeIntroducesPlanChange(
+                  repoDir,
+                  prospect.defaultTip,
+                  prospect.newValue,
+                  run,
+                );
+                const runsSmokeGate = await mergeIntroducesLoadSurfaceChange(
+                  repoDir,
+                  prospect.defaultTip,
+                  prospect.newValue,
+                  run,
+                );
+                verdict = await runMergeSuite({
+                  repoDir,
+                  mergedCommit: prospect.newValue,
+                  runsPlanSuite,
+                  runsSmokeGate,
+                });
+                if (verdict.kind !== "cannot-run") {
+                  mergeSuiteMemo.set(prospect.newValue, verdict);
+                }
+              }
+              if (verdict.kind === "red") {
+                return {
+                  ok: false,
+                  reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the prospective merge of ${baseBranch} into ${defaultBranch} in ${repoDir} (merged commit ${prospect.newValue}) — ${verdict.detail}`,
+                };
+              }
+              if (verdict.kind === "cannot-run") {
+                return retrySkip(
+                  `worktree-finalize-suite-gate-unavailable: the merge-suite gate for ${baseBranch} into ${defaultBranch} in ${repoDir} could not run (${verdict.detail}) — deferring the base merge until the gate can run`,
+                );
+              }
+            }
+          }
+          const merge = await mergeLaneBaseIntoDefault(
             repoDir,
             baseBranch,
             defaultBranch,
             run,
+            acquireLock,
+            () => onResyncSkipped?.(repoDir),
           );
-          if (prospect.kind === "computed") {
-            let verdict = mergeSuiteMemo.get(prospect.newValue);
-            if (verdict === undefined) {
-              // Merged packages the gate must cover: the root fast suite always, plus
-              // the plan suite when the merge introduces changes under `plugins/plan`,
-              // plus the named daemon smoke gate (ADR 0073, fn-1309) when the merge
-              // touches the daemon Load surface.
-              const runsPlanSuite = await mergeIntroducesPlanChange(
-                repoDir,
-                prospect.defaultTip,
-                prospect.newValue,
-                run,
+          switch (merge.kind) {
+            case "off-branch":
+              return retrySkip(
+                `worktree-finalize-off-branch: ${repoDir} HEAD is ${merge.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
               );
-              const runsSmokeGate = await mergeIntroducesLoadSurfaceChange(
-                repoDir,
-                prospect.defaultTip,
-                prospect.newValue,
-                run,
+            case "dirty":
+              return retrySkip(
+                `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
               );
-              verdict = await runMergeSuite({
-                repoDir,
-                mergedCommit: prospect.newValue,
-                runsPlanSuite,
-                runsSmokeGate,
-              });
-              // Cache only a TERMINAL verdict — a cannot-run is transient (a scratch
-              // hiccup) and MUST recompute next cycle, never latch a parked epic.
-              if (verdict.kind !== "cannot-run") {
-                mergeSuiteMemo.set(prospect.newValue, verdict);
-              }
-            }
-            if (verdict.kind === "red") {
-              // A VISIBLE non-retry sticky (mirrors the non-ff arm): local default
-              // never advanced and nothing was pushed, so the desync producer sees
-              // nothing. Cleared by `retry_dispatch` once an operator reconciles the
-              // semantic conflict. The reason keys the row on WORKTREE_FINALIZE_ID_PREFIX
-              // (via the producer's per-repo finalize key) exactly like non-ff.
+            case "mid-merge":
+              return retrySkip(
+                `worktree-finalize-mid-merge: ${repoDir} is mid-merge (owner=${merge.owner}, autostash=${merge.autostash}, MERGE_HEAD=${merge.mergeHead}) — skipping the base merge of ${baseBranch} until the checkout is clean (${merge.owner === "keeper" ? "the recover pass aborts keeper-owned residue" : "foreign/ambiguous residue is never auto-aborted"})`,
+              );
+            case "abort-failed":
               return {
                 ok: false,
-                reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the prospective merge of ${baseBranch} into ${defaultBranch} in ${repoDir} (merged commit ${prospect.newValue}) — ${verdict.detail}`,
+                reason: `worktree-finalize-abort-failed: the guarded git merge --abort left ${repoDir} mid-merge while merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
               };
-            }
-            if (verdict.kind === "cannot-run") {
-              // A gate that could not produce a verdict (scratch provision / install /
-              // suite crash / timeout) degrades to a NON-sticky retry-skip — never a
-              // silent push, never a permanent silent block.
+            case "would-clobber":
               return retrySkip(
-                `worktree-finalize-suite-gate-unavailable: the merge-suite gate for ${baseBranch} into ${defaultBranch} in ${repoDir} could not run (${verdict.detail}) — deferring the base merge until the gate can run`,
+                `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
               );
-            }
-            // green → fall through to the merge+push below.
+            case "non-ff":
+              return {
+                ok: false,
+                reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`,
+              };
+            case "not-turn-key":
+              return retrySkip(
+                `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
+              );
+            case "push-timeout":
+              return retrySkip(
+                `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying the push next cycle`,
+              );
+            case "push-unconfirmed":
+              return retrySkip(
+                `worktree-finalize-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${baseBranch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+              );
+            case "lock-timeout":
+              return retrySkip(
+                `worktree-finalize-lock-timeout: could not acquire the commit-work lock for ${repoDir} within the deadline (a concurrent holder, no fetch/rebase/force) — deferring the base merge until the lock frees`,
+              );
+            case "local-timeout":
+              return retrySkip(
+                `worktree-finalize-local-timeout: a local git op merging ${baseBranch} into ${defaultBranch} in ${repoDir} timed out (a blocking git hook, no fetch/rebase/force) — retrying the base merge next cycle`,
+              );
+            case "conflict":
+              return {
+                ok: false,
+                reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
+                conflictedFiles: merge.conflictedFiles,
+              };
+            case "push-failed":
+              return {
+                ok: false,
+                reason: `worktree-finalize-push-failed: ${merge.detail}`,
+              };
+            case "cas-stale":
+              return retrySkip(
+                `worktree-finalize-cas-stale: refs/heads/${defaultBranch} advanced concurrently while merging ${baseBranch} (update-ref CAS mismatch, no fetch/rebase/force) — retrying the base merge next cycle`,
+              );
+            case "merge-tree-unsupported":
+              return retrySkip(
+                `worktree-finalize-merge-tree-unsupported: git < 2.38 has no \`merge-tree --write-tree\` for the working-tree-free base merge of ${baseBranch} into ${defaultBranch} in ${repoDir} — retrying next cycle`,
+              );
+            case "plumbing-failed":
+              return {
+                ok: false,
+                reason: `worktree-finalize-plumbing-failed: merging ${baseBranch} into ${defaultBranch} in ${repoDir} — ${merge.detail}`,
+              };
+            case "not-ahead":
+            case "merged":
+              break;
+            default:
+              assertNever(merge);
           }
-          // A non-`computed` prospect (conflict / merge-tree-unsupported / timeout /
-          // plumbing-failed) is NOT gated: fall through so mergeLaneBaseIntoDefault
-          // re-derives and surfaces its own MergeLaneResult discriminant.
-        }
-        // The base merge lands IN THE MAIN worktree (the repo dir is the human's
-        // shared checkout) via the ONE shared {@link mergeLaneBaseIntoDefault}
-        // routine. It degrades — NEVER stomps WIP or fights an in-flight
-        // merge/rebase: a dirty / off-branch / would-clobber / non-turn-key
-        // shared checkout is a clean SKIP-AND-RETRY (a DISTINCT, non-`worktree-recover*`
-        // reason so the recover auto-clear never touches it, AND `retry: true` so no
-        // sticky DispatchFailed — never an un-clearable close). A genuine
-        // divergent-content conflict, a push failure, OR an origin-ahead non-ff
-        // stays a loud VISIBLE sticky block (an operator reconciles origin).
-        // `not-ahead`/`merged` fall through to teardown (an already-merged base
-        // still tears its lanes down — the idempotent resume).
-        const merge = await mergeLaneBaseIntoDefault(
-          repoDir,
-          baseBranch,
-          defaultBranch,
-          run,
-          acquireLock,
-          () => onResyncSkipped?.(repoDir),
-        );
-        switch (merge.kind) {
-          case "off-branch":
-            return retrySkip(
-              `worktree-finalize-off-branch: ${repoDir} HEAD is ${merge.head}, expected ${defaultBranch} — skipping the base merge until the checkout returns to the default branch`,
-            );
-          case "dirty":
-            return retrySkip(
-              `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping the base merge until it is clean — ${merge.detail}`,
-            );
-          case "mid-merge":
-            // A merge is IN FLIGHT on the shared checkout (the wedge, no longer folded
-            // into dirty). A retry-skip (no sticky) that NAMES the residue (owner +
-            // MERGE_HEAD): the recover pass self-heals a keeper-owned one via its
-            // guarded abort next cycle, and a foreign/ambiguous one waits for the human
-            // — either way finalize retries once the checkout is clean.
-            return retrySkip(
-              `worktree-finalize-mid-merge: ${repoDir} is mid-merge (owner=${merge.owner}, autostash=${merge.autostash}, MERGE_HEAD=${merge.mergeHead}) — skipping the base merge of ${baseBranch} until the checkout is clean (${merge.owner === "keeper" ? "the recover pass aborts keeper-owned residue" : "foreign/ambiguous residue is never auto-aborted"})`,
-            );
-          case "abort-failed":
-            // The guarded `git merge --abort` ITSELF failed, leaving the checkout
-            // mid-merge — a real wedge that will NOT self-clear, so a VISIBLE sticky
-            // (no `retry: true`) an operator resolves, mirroring the conflict arm.
-            return {
-              ok: false,
-              reason: `worktree-finalize-abort-failed: the guarded git merge --abort left ${repoDir} mid-merge while merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
-            };
-          case "would-clobber":
-            return retrySkip(
-              `worktree-finalize-would-clobber: merging ${baseBranch} into ${defaultBranch} would overwrite untracked file(s) in ${repoDir} — ${merge.paths.join(", ")} — skipping the base merge until the path(s) are cleared`,
-            );
-          case "non-ff":
-            // Origin is AHEAD of local default (a genuine non-fast-forward) — the
-            // shared checkout cannot land the merge without a human reconciling
-            // origin (no fetch/rebase/force on the shared tree). UNLIKE the transient
-            // environment skips above, this needs operator attention, so mint a
-            // VISIBLE sticky DispatchFailed (no `retry: true`). The reason stays
-            // `worktree-finalize-*` (OUTSIDE the `worktree-recover` auto-clear prefix)
-            // so the level-triggered clear never silently dismisses an origin-ahead
-            // block.
-            return {
-              ok: false,
-              reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`,
-            };
-          case "not-turn-key":
-            return retrySkip(
-              `worktree-finalize-push-not-turn-key: ${describePushNotReady(merge.reason)} — skipping the base merge + push until the push is turn-key (no fetch/rebase/force)`,
-            );
-          case "push-timeout":
-            return retrySkip(
-              `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying the push next cycle`,
-            );
-          case "push-unconfirmed":
-            return retrySkip(
-              `worktree-finalize-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${baseBranch} (no fetch/rebase/force) — deferring teardown until origin settles`,
-            );
-          case "lock-timeout":
-            // The bounded commit-work flock could not be taken within its deadline
-            // (a concurrent holder). A TRANSIENT skip — retry next cycle, never a
-            // freeze, never a teardown on an un-merged base. `worktree-finalize-*`
-            // (OUTSIDE the recover auto-clear prefix), `retry: true` so no sticky.
-            return retrySkip(
-              `worktree-finalize-lock-timeout: could not acquire the commit-work lock for ${repoDir} within the deadline (a concurrent holder, no fetch/rebase/force) — deferring the base merge until the lock frees`,
-            );
-          case "local-timeout":
-            // A local merge git op timed out — almost always a blocking git hook.
-            // TRANSIENT skip-retry, NEVER mistaken for a content conflict.
-            return retrySkip(
-              `worktree-finalize-local-timeout: a local git op merging ${baseBranch} into ${defaultBranch} in ${repoDir} timed out (a blocking git hook, no fetch/rebase/force) — retrying the base merge next cycle`,
-            );
-          case "conflict":
-            return {
-              ok: false,
-              reason: `worktree-finalize-conflict: merging ${baseBranch} into ${defaultBranch} — ${merge.stderr}`,
-              conflictedFiles: merge.conflictedFiles,
-            };
-          case "push-failed":
-            return {
-              ok: false,
-              reason: `worktree-finalize-push-failed: ${merge.detail}`,
-            };
-          case "cas-stale":
-            // The compare-and-swap ref advance found a stale `<old>` — a CONCURRENT
-            // local advance of default moved the ref (or the ref lock was contended).
-            // A TRANSIENT retry-skip (no sticky) OUTSIDE the recover auto-clear prefix;
-            // next cycle re-derives the merge off the advanced default tip.
-            return retrySkip(
-              `worktree-finalize-cas-stale: refs/heads/${defaultBranch} advanced concurrently while merging ${baseBranch} (update-ref CAS mismatch, no fetch/rebase/force) — retrying the base merge next cycle`,
-            );
-          case "merge-tree-unsupported":
-            // `git merge-tree --write-tree` needs git >= 2.38; an older git cannot run
-            // the working-tree-free merge. A TRANSIENT retry-skip (never a boot fatal —
-            // worktree mode is default-off) in case git is upgraded.
-            return retrySkip(
-              `worktree-finalize-merge-tree-unsupported: git < 2.38 has no \`merge-tree --write-tree\` for the working-tree-free base merge of ${baseBranch} into ${defaultBranch} in ${repoDir} — retrying next cycle`,
-            );
-          case "plumbing-failed":
-            // An UNEXPECTED plumbing git failure (a merge-tree hard error > 1, a
-            // commit-tree failure, an unparseable OID, an invalid ref name) — NOT a
-            // content conflict and NOT transient. A VISIBLE sticky (no `retry: true`)
-            // an operator reconciles, mirroring the conflict / push-failed arms.
-            return {
-              ok: false,
-              reason: `worktree-finalize-plumbing-failed: merging ${baseBranch} into ${defaultBranch} in ${repoDir} — ${merge.detail}`,
-            };
-          case "not-ahead":
-          case "merged":
-            break; // already merged / just merged → fall through to teardown below
-          default: {
-            // Compile-time exhaustiveness guard so a future MergeLaneResult kind can
-            // NEVER silently fall through to lane teardown on an un-merged base (the
-            // silent-strand class). The runtime arm is unreachable while the union is
-            // fully handled; a new kind surfaces as a VISIBLE sticky rather than a
-            // stranded teardown.
-            const _exhaustive: never = merge;
-            return {
-              ok: false,
-              reason: `worktree-finalize-unhandled-merge-kind: ${(_exhaustive as MergeLaneResult).kind} merging ${baseBranch} into ${defaultBranch} in ${repoDir}`,
-            };
+        } else {
+          const integrated = await verifyAndPushOwnerIntegration(
+            repoDir,
+            baseBranch,
+            defaultBranch,
+            run,
+            acquireLock,
+            runMergeSuite,
+            mergeSuiteMemo,
+          );
+          switch (integrated.kind) {
+            case "ready":
+              break;
+            case "not-integrated":
+              return retrySkip(
+                `worktree-finalize-awaiting-owner-integration: ${baseBranch} is not an ancestor of ${defaultBranch}; a live closer must integrate it under the per-repo trunk lease`,
+              );
+            case "integration-inconclusive":
+              return retrySkip(
+                `worktree-finalize-integration-inconclusive: could not prove ${baseBranch} is an ancestor of ${defaultBranch} (exit ${integrated.exitCode}); refusing push and teardown`,
+              );
+            case "off-branch":
+              return retrySkip(
+                `worktree-finalize-off-branch: ${repoDir} HEAD is ${integrated.head}, expected ${defaultBranch} — skipping push and teardown until the checkout returns to the default branch`,
+              );
+            case "dirty":
+              return retrySkip(
+                `worktree-finalize-dirty-checkout: ${repoDir} has a dirty working tree — skipping push and teardown until it is clean — ${integrated.detail}`,
+              );
+            case "mid-merge":
+              return retrySkip(
+                `worktree-finalize-mid-merge: ${repoDir} is mid-merge (owner=${integrated.owner}, autostash=${integrated.autostash}, MERGE_HEAD=${integrated.mergeHead}) — skipping push and teardown until the checkout is clean (${integrated.owner === "keeper" ? "the recover pass aborts keeper-owned residue" : "foreign/ambiguous residue is never auto-aborted"})`,
+              );
+            case "would-clobber":
+              return retrySkip(
+                `worktree-finalize-would-clobber: ${repoDir} has untracked path collisions — ${integrated.paths.join(", ")} — skipping push and teardown`,
+              );
+            case "tip-drift":
+              return retrySkip(
+                `worktree-finalize-cas-stale: refs/heads/${defaultBranch} advanced after the merge-suite verdict — re-grading before any push`,
+              );
+            case "lock-timeout":
+              return retrySkip(
+                `worktree-finalize-lock-timeout: could not acquire the commit-work lock for ${repoDir} within the deadline — deferring push and teardown`,
+              );
+            case "suite-red":
+              return {
+                ok: false,
+                reason: `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repoDir} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`,
+              };
+            case "suite-unavailable":
+              return retrySkip(
+                `worktree-finalize-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repoDir} could not run (${integrated.detail}) — deferring the push until the gate can run`,
+              );
+            case "non-ff":
+              return {
+                ok: false,
+                reason: `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`,
+              };
+            case "not-turn-key":
+              return retrySkip(
+                `worktree-finalize-push-not-turn-key: ${describePushNotReady(integrated.reason)} — skipping push and teardown until the push is turn-key (no fetch/rebase/force)`,
+              );
+            case "push-timeout":
+              return retrySkip(
+                `worktree-finalize-push-timeout: pushing ${defaultBranch} to origin timed out (a transient stall, no fetch/rebase/force) — retrying next cycle`,
+              );
+            case "push-failed":
+              return {
+                ok: false,
+                reason: `worktree-finalize-push-failed: ${integrated.detail}`,
+              };
+            case "push-unconfirmed":
+              return retrySkip(
+                `worktree-finalize-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${baseBranch} (no fetch/rebase/force) — deferring teardown until origin settles`,
+              );
+            default:
+              assertNever(integrated);
           }
         }
         // Logical merge is independent of resource destruction. A live or
@@ -6915,6 +6912,9 @@ export function createWorktreeDriver(
         epicHasOccupyingJob,
         laneTeardown,
         laneMaintenanceProbe,
+        ownerMediatedFinalize,
+        recoverMergeSuite,
+        mergeSuiteMemo,
       );
     },
   };
@@ -7022,6 +7022,7 @@ export async function pushDefaultToOrigin(
   repo: string,
   defaultBranch: string,
   run: WorktreeGitRunner,
+  expectedTip?: string,
 ): Promise<PushDefaultResult> {
   // HEAD-safety FIRST. Under `push.default=simple` a no-refspec push targets the
   // CURRENT HEAD's upstream, not `defaultBranch`; off-default it would push the
@@ -7042,15 +7043,33 @@ export async function pushDefaultToOrigin(
   }
   // Cached-ref non-ff precheck second: block ONLY a PROVEN non-fast-forward; an
   // `"unknown"` unresolved origin/<default> defers to the turn-key verdict above.
-  if (
-    (await gitRemotePushFastForwardable(repo, defaultBranch, run)) ===
-    "non-fast-forwardable"
-  ) {
-    return { kind: "non-ff" };
+  if (expectedTip === undefined) {
+    if (
+      (await gitRemotePushFastForwardable(repo, defaultBranch, run)) ===
+      "non-fast-forwardable"
+    ) {
+      return { kind: "non-ff" };
+    }
+  } else {
+    const remoteRef = originDefaultRef(defaultBranch);
+    const exists = await run(["rev-parse", "--verify", "--quiet", remoteRef], {
+      cwd: repo,
+      timeoutMs: GIT_LOCAL_TIMEOUT_MS,
+    });
+    if (
+      exists.code === 0 &&
+      !(await gitIsAncestorOf(repo, remoteRef, expectedTip, run))
+    ) {
+      return { kind: "non-ff" };
+    }
   }
-  // Branch-explicit refspec (belt-and-suspenders with the HEAD assertion): push
-  // `<default>` to origin regardless of `push.default`.
-  const push = await run(["push", "origin", defaultBranch], {
+  // An owner-verified push names the tested OID explicitly, so even a non-cooperating
+  // local ref writer in the final probe→push window cannot publish untested content.
+  const refspec =
+    expectedTip === undefined
+      ? defaultBranch
+      : `${expectedTip}:refs/heads/${defaultBranch}`;
+  const push = await run(["push", "origin", refspec], {
     cwd: repo,
     env: {
       GIT_TERMINAL_PROMPT: "0",
@@ -7065,6 +7084,118 @@ export async function pushDefaultToOrigin(
     return { kind: "push-failed", detail: (push.stdout + push.stderr).trim() };
   }
   return { kind: "pushed" };
+}
+
+type OwnerIntegratedTeardownResult =
+  | { kind: "ready"; mergedCommit: string }
+  | { kind: "not-integrated" }
+  | { kind: "integration-inconclusive"; exitCode: number }
+  | Exclude<MergeReadiness, { kind: "ready" }>
+  | { kind: "tip-drift" }
+  | { kind: "lock-timeout" }
+  | { kind: "suite-red"; mergedCommit: string; detail: string }
+  | { kind: "suite-unavailable"; detail: string }
+  | Exclude<PushDefaultResult, { kind: "pushed" }>
+  | { kind: "push-unconfirmed" };
+
+async function verifyAndPushOwnerIntegration(
+  repo: string,
+  baseBranch: string,
+  defaultBranch: string,
+  run: WorktreeGitRunner,
+  acquireLock: LockAcquirer | undefined,
+  runMergeSuite: MergeSuiteProbe | undefined,
+  mergeSuiteMemo?: Map<string, MergeSuiteVerdict>,
+): Promise<OwnerIntegratedTeardownResult> {
+  const ancestry = await run(
+    ["merge-base", "--is-ancestor", baseBranch, defaultBranch],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  if (ancestry.code === 1) return { kind: "not-integrated" };
+  if (ancestry.code !== 0) {
+    return { kind: "integration-inconclusive", exitCode: ancestry.code };
+  }
+  const ready = await gitMergeReadiness(repo, defaultBranch, run);
+  if (ready.kind !== "ready") return ready;
+  const mergedCommit = await revParseCommit(repo, defaultBranch, run);
+  if (mergedCommit === null) {
+    return {
+      kind: "suite-unavailable",
+      detail: `could not resolve the integrated ${defaultBranch} tip in ${repo}`,
+    };
+  }
+  if (runMergeSuite !== undefined) {
+    let verdict = mergeSuiteMemo?.get(mergedCommit);
+    if (verdict === undefined) {
+      verdict = await runMergeSuite({
+        repoDir: repo,
+        mergedCommit,
+        runsPlanSuite: await mergeIntroducesPlanChange(
+          repo,
+          originDefaultRef(defaultBranch),
+          mergedCommit,
+          run,
+        ),
+        runsSmokeGate: await mergeIntroducesLoadSurfaceChange(
+          repo,
+          originDefaultRef(defaultBranch),
+          mergedCommit,
+          run,
+        ),
+      });
+      if (verdict.kind !== "cannot-run") {
+        mergeSuiteMemo?.set(mergedCommit, verdict);
+      }
+    }
+    if (verdict.kind === "red") {
+      return {
+        kind: "suite-red",
+        mergedCommit,
+        detail: verdict.detail,
+      };
+    }
+    if (verdict.kind === "cannot-run") {
+      return { kind: "suite-unavailable", detail: verdict.detail };
+    }
+  }
+  const acquire = acquireLock ?? defaultCommitWorkLockAcquirer;
+  const lock = await acquire(await gitBaseMergeLockPath(repo, run));
+  if (lock === null) return { kind: "lock-timeout" };
+  try {
+    const lockedReady = await gitMergeReadiness(repo, defaultBranch, run);
+    if (lockedReady.kind !== "ready") return lockedReady;
+    const liveTip = await revParseCommit(repo, defaultBranch, run);
+    if (liveTip !== mergedCommit) return { kind: "tip-drift" };
+    const reprobe = await run(
+      ["merge-base", "--is-ancestor", baseBranch, defaultBranch],
+      { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+    );
+    if (reprobe.code === 1) return { kind: "not-integrated" };
+    if (reprobe.code !== 0) {
+      return { kind: "integration-inconclusive", exitCode: reprobe.code };
+    }
+    const pushed = await pushDefaultToOrigin(
+      repo,
+      defaultBranch,
+      run,
+      mergedCommit,
+    );
+    if (pushed.kind !== "pushed") return pushed;
+  } finally {
+    lock.release();
+  }
+  const confirmed = await run(
+    [
+      "merge-base",
+      "--is-ancestor",
+      baseBranch,
+      originDefaultRef(defaultBranch),
+    ],
+    { cwd: repo, timeoutMs: GIT_LOCAL_TIMEOUT_MS },
+  );
+  return confirmed.code === 0
+    ? { kind: "ready", mergedCommit }
+    : { kind: "push-unconfirmed" };
 }
 
 /**
@@ -8174,6 +8305,9 @@ export async function recoverWorktrees(
   epicHasOccupyingJob: (epicId: string) => boolean = () => false,
   laneTeardown?: LaneTeardownRecoveryOptions,
   laneMaintenanceProbe?: LaneMaintenanceProbe,
+  ownerMediatedIntegration = false,
+  runMergeSuite?: MergeSuiteProbe,
+  mergeSuiteMemo: Map<string, MergeSuiteVerdict> = new Map(),
 ): Promise<WorktreeRecoveryOutcome> {
   const failures: WorktreeRecoveryFailure[] = [];
   // TERMINAL content conflicts (routed to the bare `close::<epic>` merge-escalation
@@ -8369,6 +8503,18 @@ export async function recoverWorktrees(
       continue;
     }
 
+    let trunkLease: ReturnType<typeof readTrunkLeaseLeaf> = null;
+    try {
+      trunkLease = readTrunkLeaseLeaf(keeperStateDir(), repo);
+    } catch {
+      trunkLease = null;
+    }
+    const ownerActive = (epicId: string): boolean =>
+      hasActiveResolver(epicId) ||
+      (ownerMediatedIntegration &&
+        trunkLease?.active === true &&
+        trunkLease.epic_id === epicId);
+
     // Self-heal a mid-merge WEDGE in the shared MAIN checkout BEFORE pass-2 attempts
     // the base merge — a keeper-owned residue is aborted (flock-guarded) so pass-2
     // re-derives from a clean tree this very cycle; a foreign/ambiguous one is named
@@ -8379,7 +8525,7 @@ export async function recoverWorktrees(
         defaultBranch,
         run,
         acquireLock,
-        hasActiveResolver,
+        ownerActive,
       );
       if (midMerge !== null) {
         failures.push(midMerge);
@@ -8392,7 +8538,7 @@ export async function recoverWorktrees(
       });
     }
 
-    // --- Pass 2: merge any done-but-unmerged epic base into the default branch. ---
+    // --- Pass 2: finish push recovery for owner-integrated done bases. ---
     let bases: { branch: string; epicId: string }[];
     try {
       bases = await gitListEpicBaseBranches(repo, run);
@@ -8414,7 +8560,7 @@ export async function recoverWorktrees(
         //   absent       → authoritatively reaped (the pk-lookup bypasses every scope
         //                  / recency floor); the base no longer needs merging — record
         //                  a POSITIVE resolved observation and skip.
-        //   done         → attempt the merge (below).
+        //   done         → verify owner integration, then finish push recovery.
         const verdict = normalizeEpicVerdict(await isEpicDone(base.epicId));
         if (verdict === "open" || verdict === "inconclusive") {
           continue;
@@ -8427,11 +8573,81 @@ export async function recoverWorktrees(
         // conflict dispatched it for this now-done epic). Skip so pass-2 never races it
         // mid-`git merge`. The gated skip yields no
         // observation, so an open row is retained for free.
-        if (hasActiveResolver(base.epicId)) {
+        if (ownerActive(base.epicId)) {
           continue;
         }
-        // The ONE shared {@link mergeLaneBaseIntoDefault} routine, the same
-        // finalize drives. The merge runs in the MAIN worktree (the repo dir).
+        if (ownerMediatedIntegration && epicHasOccupyingJob(base.epicId)) {
+          continue;
+        }
+        if (ownerMediatedIntegration) {
+          const integrated = await verifyAndPushOwnerIntegration(
+            repo,
+            base.branch,
+            defaultBranch,
+            run,
+            acquireLock,
+            runMergeSuite,
+            mergeSuiteMemo,
+          );
+          if (integrated.kind === "ready") {
+            resolved.push({ epicId: base.epicId, dir: repo });
+            continue;
+          }
+          let reason: string;
+          switch (integrated.kind) {
+            case "not-integrated":
+              reason = `worktree-recover-awaiting-owner-integration: ${base.branch} is not an ancestor of ${defaultBranch}; a live closer must integrate it under the per-repo trunk lease`;
+              break;
+            case "integration-inconclusive":
+              reason = `worktree-recover-integration-inconclusive: could not prove ${base.branch} is an ancestor of ${defaultBranch} (exit ${integrated.exitCode}); refusing push and teardown`;
+              break;
+            case "off-branch":
+              reason = `worktree-recover-not-on-default: ${repo} HEAD is ${integrated.head}, expected ${defaultBranch} — deferring push and teardown`;
+              break;
+            case "dirty":
+              reason = `worktree-recover-dirty-checkout: ${repo} has a dirty working tree — deferring push and teardown — ${integrated.detail}`;
+              break;
+            case "mid-merge":
+              reason = `worktree-recover-mid-merge: ${repo} is mid-merge (owner=${integrated.owner}, autostash=${integrated.autostash}, MERGE_HEAD=${integrated.mergeHead}) — deferring push and teardown`;
+              break;
+            case "would-clobber":
+              reason = `worktree-recover-would-clobber: ${repo} has untracked path collisions — ${integrated.paths.join(", ")} — deferring push and teardown`;
+              break;
+            case "tip-drift":
+              reason = `worktree-recover-cas-stale: refs/heads/${defaultBranch} advanced after the merge-suite verdict — re-grading before any push`;
+              break;
+            case "lock-timeout":
+              reason = `worktree-recover-lock-timeout: could not acquire the commit-work lock for ${repo} — deferring push and teardown`;
+              break;
+            case "suite-red":
+              reason = `${WORKTREE_FINALIZE_SUITE_RED_REASON}: the fast suite failed against the integrated ${defaultBranch} in ${repo} (merged commit ${integrated.mergedCommit}) — ${integrated.detail}`;
+              break;
+            case "suite-unavailable":
+              reason = `worktree-recover-suite-gate-unavailable: the merge-suite gate for integrated ${defaultBranch} in ${repo} could not run (${integrated.detail}) — deferring push and teardown`;
+              break;
+            case "non-ff":
+              reason = `worktree-finalize-non-fast-forward: origin/${defaultBranch} is ahead of ${defaultBranch} — the shared checkout cannot fast-forward (no fetch/rebase/force); needs an operator to reconcile origin/${defaultBranch}`;
+              break;
+            case "not-turn-key":
+              reason = `worktree-recover-push-not-turn-key: ${describePushNotReady(integrated.reason)} — deferring push and teardown`;
+              break;
+            case "push-timeout":
+              reason = `worktree-recover-push-timeout: pushing ${defaultBranch} to origin timed out — deferring teardown`;
+              break;
+            case "push-failed":
+              reason = `worktree-recover-push-failed: ${integrated.detail}`;
+              break;
+            case "push-unconfirmed":
+              reason = `worktree-recover-push-unconfirmed: pushed ${defaultBranch} but origin/${defaultBranch} still does not contain ${base.branch} — deferring teardown`;
+              break;
+            default:
+              assertNever(integrated);
+          }
+          failures.push({ epicId: base.epicId, reason, dir: repo });
+          continue;
+        }
+
+        // Legacy mode retains the shared merge-and-push routine.
         // `not-ahead` is the idempotency skip (an already-merged base is an ancestor
         // of default). Every TRANSIENT degrade maps to a `worktree-recover-*` reason:
         // the recover prefix keeps the level-triggered auto-clear scope, so the block
@@ -8768,6 +8984,9 @@ export async function recoverWorktrees(
             run,
           ))
         ) {
+          if (ownerMediatedIntegration) {
+            continue;
+          }
           const pushed = await pushDefaultToOrigin(repo, defaultBranch, run);
           if (pushed.kind !== "pushed") {
             failures.push({
@@ -11139,9 +11358,15 @@ function main(): void {
     // guard hook does NOT fire here — this is the daemon producer shelling git
     // directly, not a plan-worker subagent's Bash. The desync seed sink records each
     // resync-skipped base merge into the in-memory latch the per-cycle probe watches.
-    worktree: createWorktreeDriver(gitExec, undefined, (repoDir) => {
-      desyncSeedDirs.add(repoDir);
-    }),
+    worktree: createWorktreeDriver(
+      gitExec,
+      undefined,
+      (repoDir) => {
+        desyncSeedDirs.add(repoDir);
+      },
+      true,
+      (a) => runMergeSuiteGate(a),
+    ),
     // The MAIN-projection done-ness probe finalize gates on (the closer
     // writes `done` to the PRIMARY repo, so the projection is the authority). The
     // same `isEpicDoneById` the recover glue threads into `worktree.recover`.

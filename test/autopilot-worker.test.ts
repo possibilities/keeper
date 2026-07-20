@@ -11370,6 +11370,9 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
         ? { code: 0, stdout: `${MG_MERGE_HEAD}\n`, stderr: "" }
         : { code: 1, stdout: "", stderr: "" };
     }
+    if (isInProgressPseudoRefProbe(args)) {
+      return { code: 1, stdout: "", stderr: "" };
+    }
     if (joined.startsWith("status --porcelain")) {
       // Inert for the catch-up gate (no longer clean-gated); kept for finalize teardown.
       return { code: 0, stdout: "", stderr: "" };
@@ -11406,7 +11409,10 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
           }
         : { code: 0, stdout: "", stderr: "" };
     }
-    if (joined === `push origin ${def}`) {
+    if (
+      joined === `push origin ${def}` ||
+      joined === `push origin ${MG_DEFAULT_TIP}:refs/heads/${def}`
+    ) {
       pushed = true;
       if (opts.pushTimeout) {
         return { code: GIT_SPAWN_TIMEOUT_CODE, stdout: "", stderr: "" };
@@ -11448,6 +11454,73 @@ function makeMergeGit(opts: MergeGitOpts = {}): {
   };
   return { run, cmds, calls };
 }
+
+test("owner-mediated finalize only verifies, gates, and pushes an already-integrated base", async () => {
+  const { run, cmds } = makeMergeGit({ baseAncestorOfDefault: true });
+  const { probe, calls } = makeSuiteProbe({ kind: "green" });
+  const result = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    true,
+    probe,
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+
+  expect(result).toEqual({ ok: true });
+  expect(calls).toEqual([
+    {
+      repoDir: "/repo",
+      mergedCommit: MG_DEFAULT_TIP,
+      runsPlanSuite: false,
+    },
+  ]);
+  expect(cmds.some((cmd) => cmd.startsWith("merge --no-edit"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("merge-tree"))).toBe(false);
+  expect(cmds.some((cmd) => cmd.startsWith("update-ref"))).toBe(false);
+  expect(cmds).toContain(`push origin ${MG_DEFAULT_TIP}:refs/heads/main`);
+});
+
+test("owner-mediated finalize re-grades when default drifts after the suite verdict", async () => {
+  const base = makeMergeGit({ baseAncestorOfDefault: true });
+  let defaultTipReads = 0;
+  const run: Parameters<typeof createWorktreeDriver>[0] = async (
+    args,
+    opts,
+  ) => {
+    if (
+      args.join(" ") ===
+      "rev-parse --verify --quiet --end-of-options refs/heads/main^{commit}"
+    ) {
+      defaultTipReads += 1;
+      if (defaultTipReads > 1) {
+        return {
+          code: 0,
+          stdout: "9999999999999999999999999999999999999999\n",
+          stderr: "",
+        };
+      }
+    }
+    return base.run(args, opts);
+  };
+  const { probe } = makeSuiteProbe({ kind: "green" });
+  const result = await createWorktreeDriver(
+    run,
+    () => ({ release() {} }),
+    undefined,
+    true,
+    probe,
+  ).finalizeEpic(makeFinalizeInfo(), async () => true, probe);
+
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.retry).toBe(true);
+    expect(result.reason).toStartWith("worktree-finalize-cas-stale:");
+  }
+  expect(base.cmds.some((cmd) => cmd.startsWith("push origin"))).toBe(false);
+  expect(base.cmds.some((cmd) => cmd.startsWith("worktree remove"))).toBe(
+    false,
+  );
+});
 
 test("fn-1140 mergeLaneBaseIntoDefault: a lock-timeout acquirer (null) → lock-timeout AFTER the merge is computed, NO ref advance, NO push", async () => {
   // The bounded flock acquirer times out (a null-returning acquirer). The plumbing
@@ -14376,6 +14449,48 @@ test("fn-993 recoverWorktrees pass-2: a lock-timeout acquirer (null) → worktre
   expect(calls.some((c) => c.args === `worktree remove ${basePath}`)).toBe(
     false,
   );
+});
+
+test("owner-mediated recovery never merges an unintegrated done base or retires its lane", async () => {
+  const base = "keeper/epic/fn-1-foo";
+  const basePath = "/repo.worktrees/keeper-epic-fn-1-foo";
+  const { run, calls, lock } = makeRecoveryGit({
+    worktreeList:
+      "worktree /repo\nHEAD x\nbranch refs/heads/main\n\n" +
+      `worktree ${basePath}\nHEAD z\nbranch refs/heads/${base}\n\n`,
+    mergeHeadAt: new Set(),
+    epicBases: [base],
+    defaultBranch: "main",
+    ancestors: new Set(),
+    repoHead: "main",
+  });
+  const outcome = await recoverWorktrees(
+    ["/repo"],
+    async () => true,
+    run,
+    lock,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+
+  expect(outcome.failures).toHaveLength(1);
+  expect(outcome.failures[0]?.reason).toStartWith(
+    "worktree-recover-awaiting-owner-integration:",
+  );
+  expect(calls.some((call) => call.args.startsWith("merge --no-edit"))).toBe(
+    false,
+  );
+  expect(calls.some((call) => call.args.startsWith("merge-tree"))).toBe(false);
+  expect(calls.some((call) => call.args.startsWith("update-ref"))).toBe(false);
+  expect(calls.some((call) => call.args.startsWith("push origin"))).toBe(false);
+  expect(
+    calls.some((call) => call.args === `worktree remove ${basePath}`),
+  ).toBe(false);
 });
 
 test("fn-993 recoverWorktrees pass-2: a local merge timeout (124) → worktree-recover-local-timeout (a recover reason), NOT conflict, NO push", async () => {

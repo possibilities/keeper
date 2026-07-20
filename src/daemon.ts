@@ -252,6 +252,17 @@ import type {
   GitWorkerMessage,
   NudgeVanishedSweepMessage,
 } from "./git-worker";
+import {
+  listTrunkLeaseLeaves,
+  readTrunkLeaseLeaf,
+  readTrunkLeaseRequests,
+  removeTrunkLeaseRequest,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  TRUNK_LEASE_TTL_MS,
+  type TrunkLeaseLeaf,
+  writeTrunkLeaseLeaf,
+} from "./grant-leaf";
 import { HANDOFF_DOC_MAX_BYTES } from "./handoff-contract";
 import { handoffSlugExists } from "./handoff-slug";
 import type {
@@ -3930,6 +3941,7 @@ export function selectPendingResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'close'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -4644,6 +4656,231 @@ export function runIncidentClaimSweep(
 }
 
 // ---------------------------------------------------------------------------
+// Trunk-integration lease producer.
+// ---------------------------------------------------------------------------
+
+export interface TrunkLeaseClaimant {
+  pid: number;
+  startTime: string;
+  live: boolean;
+}
+
+export interface TrunkLeaseRepoObservation {
+  repoRoot: string;
+  defaultBranch: string;
+  defaultTip: string;
+}
+
+export interface TrunkLeaseSweepDeps {
+  readRequests: () => SpooledTrunkLeaseRequest[];
+  removeRequest: (path: string) => void;
+  readLeases: () => TrunkLeaseLeaf[];
+  readLease: (repoRoot: string) => TrunkLeaseLeaf | null;
+  verifyClaimant: (
+    sessionId: string,
+    epicId: string,
+  ) => TrunkLeaseClaimant | null;
+  probeClaimantLive: (pid: number, startTime: string) => boolean;
+  observeRepo: (
+    request: SpooledTrunkLeaseRequest["request"],
+  ) => TrunkLeaseRepoObservation | null;
+  publishLease: (leaf: TrunkLeaseLeaf) => boolean;
+  probeResidue: (leaf: TrunkLeaseLeaf) => string | null;
+  recordResidue: (leaf: TrunkLeaseLeaf, detail: string) => void;
+  now: () => number;
+  ttlMs?: number;
+  noteLine?: (line: string) => void;
+}
+
+export interface TrunkLeaseSweepResult {
+  acquired: number;
+  released: number;
+  expired: number;
+  dead: number;
+  stale: number;
+  deferred: number;
+  residues: number;
+}
+
+/**
+ * Publish per-repo closer leases from the filesystem spool. Active leaves are
+ * released only by an exact fenced release or positive process-death evidence;
+ * expiry is diagnostic and never permits a live holder to be replaced. A release
+ * keeps the leaf as a tombstone, so the next acquisition increments that repo's
+ * token instead of recycling it after a daemon restart.
+ */
+export function runTrunkLeaseSweep(
+  deps: TrunkLeaseSweepDeps,
+): TrunkLeaseSweepResult {
+  const result: TrunkLeaseSweepResult = {
+    acquired: 0,
+    released: 0,
+    expired: 0,
+    dead: 0,
+    stale: 0,
+    deferred: 0,
+    residues: 0,
+  };
+  const note = deps.noteLine ?? (() => {});
+  const now = deps.now();
+  const ttlMs = deps.ttlMs ?? TRUNK_LEASE_TTL_MS;
+  const residueRecorded = new Set<string>();
+
+  let leases: TrunkLeaseLeaf[];
+  try {
+    leases = deps.readLeases();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease leaf scan threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    leases = [];
+  }
+  let fencingToken = leases.reduce(
+    (max, lease) => Math.max(max, lease.fencing_token),
+    0,
+  );
+  for (const lease of leases) {
+    if (!lease.active) continue;
+    try {
+      const residue = deps.probeResidue(lease);
+      if (residue !== null) {
+        deps.recordResidue(lease, residue);
+        residueRecorded.add(`${lease.repo_root}\0${lease.fencing_token}`);
+        result.residues += 1;
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease residue probe threw for ${lease.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    let live = true;
+    try {
+      live = deps.probeClaimantLive(
+        lease.claimant_pid,
+        lease.claimant_start_time,
+      );
+    } catch {
+      live = true;
+    }
+    if (live) continue;
+    if (deps.publishLease({ ...lease, active: false, expires_at: now })) {
+      result.dead += 1;
+    }
+  }
+
+  let requests: SpooledTrunkLeaseRequest[];
+  try {
+    requests = deps.readRequests();
+  } catch (err) {
+    note(
+      `# warn: trunk-lease spool read threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    requests = [];
+  }
+  for (const entry of requests) {
+    const request = entry.request;
+    try {
+      const current = deps.readLease(request.repo_root);
+      if (request.action === "release") {
+        if (
+          current === null ||
+          !current.active ||
+          current.epic_id !== request.epic_id ||
+          current.claimant_session_id !== request.claimant_session_id ||
+          current.fencing_token !== request.fencing_token
+        ) {
+          result.stale += 1;
+          deps.removeRequest(entry.path);
+          continue;
+        }
+        const residueKey = `${current.repo_root}\0${current.fencing_token}`;
+        if (!residueRecorded.has(residueKey)) {
+          try {
+            const residue = deps.probeResidue(current);
+            if (residue !== null) {
+              deps.recordResidue(current, residue);
+              residueRecorded.add(residueKey);
+              result.residues += 1;
+            }
+          } catch (err) {
+            note(
+              `# warn: trunk-lease release residue probe threw for ${current.repo_root} (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        if (deps.publishLease({ ...current, active: false, expires_at: now })) {
+          result.released += 1;
+          deps.removeRequest(entry.path);
+        }
+        continue;
+      }
+
+      const claimant = deps.verifyClaimant(
+        request.claimant_session_id,
+        request.epic_id,
+      );
+      if (claimant === null || !claimant.live) {
+        result.stale += 1;
+        deps.removeRequest(entry.path);
+        continue;
+      }
+      if (current?.active) {
+        const sameHolder =
+          current.epic_id === request.epic_id &&
+          current.claimant_session_id === request.claimant_session_id &&
+          current.claimant_pid === claimant.pid &&
+          current.claimant_start_time === claimant.startTime;
+        let holderLive = true;
+        try {
+          holderLive = deps.probeClaimantLive(
+            current.claimant_pid,
+            current.claimant_start_time,
+          );
+        } catch {
+          holderLive = true;
+        }
+        if (holderLive && !sameHolder) {
+          result.deferred += 1;
+          continue;
+        }
+      }
+      const observation = deps.observeRepo(request);
+      if (observation === null || observation.repoRoot !== request.repo_root) {
+        result.deferred += 1;
+        continue;
+      }
+      const token = Math.max(fencingToken, current?.fencing_token ?? 0) + 1;
+      fencingToken = token;
+      const leaf: TrunkLeaseLeaf = {
+        schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+        active: true,
+        epic_id: request.epic_id,
+        claimant_session_id: request.claimant_session_id,
+        claimant_pid: claimant.pid,
+        claimant_start_time: claimant.startTime,
+        acquisition_id: request.request_id,
+        repo_root: observation.repoRoot,
+        writable_root: observation.repoRoot,
+        source_branch: request.source_branch,
+        default_branch: observation.defaultBranch,
+        observed_default_tip: observation.defaultTip,
+        expires_at: now + ttlMs,
+        fencing_token: token,
+      };
+      if (deps.publishLease(leaf)) {
+        result.acquired += 1;
+        deps.removeRequest(entry.path);
+      }
+    } catch (err) {
+      note(
+        `# warn: trunk-lease request for ${request.repo_root} threw (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // fn-1240 — work-verb fan-in resolver + deconflict inputs (tier-2 stages 1–2)
 // ---------------------------------------------------------------------------
 //
@@ -4688,6 +4925,7 @@ export function selectPendingWorkResolverDispatches(
       `SELECT id, reason, dir FROM dispatch_failures
          WHERE verb = 'work'
            AND resolver_dispatched_at IS NULL
+           AND claim_session_id IS NULL
            AND reason IS NOT NULL
            AND instr(reason, ':') > 0
            AND substr(reason, 1, instr(reason, ':') - 1) = ?`,
@@ -14673,7 +14911,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'work' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -15800,7 +16038,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return (
             db
               .query(
-                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL LIMIT 1",
+                "SELECT 1 FROM dispatch_failures WHERE verb = 'close' AND id = ? AND resolver_dispatched_at IS NULL AND claim_session_id IS NULL LIMIT 1",
               )
               .get(id) != null
           );
@@ -15962,6 +16200,146 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch (err) {
       console.error(
         `[keeperd] incident-claim sweep tick threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, INCIDENT_CLAIM_SWEEP_INTERVAL_MS);
+
+  const trunkLeaseStateDir = keeperStateDir();
+  const runTrunkLeaseGit = (
+    args: string[],
+    cwd: string,
+  ): { code: number; stdout: string; stderr: string } => {
+    try {
+      const proc = Bun.spawnSync(["git", ...args], { cwd });
+      return {
+        code: proc.exitCode,
+        stdout: proc.stdout.toString(),
+        stderr: proc.stderr.toString(),
+      };
+    } catch (err) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+  const observeTrunkLeaseRepo = (
+    request: SpooledTrunkLeaseRequest["request"],
+  ): TrunkLeaseRepoObservation | null => {
+    let repoRoot: string;
+    try {
+      repoRoot = realpathSync(request.repo_root);
+    } catch {
+      return null;
+    }
+    if (repoRoot !== request.repo_root) return null;
+    const source = runTrunkLeaseGit(
+      [
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        `refs/heads/${request.source_branch}^{commit}`,
+      ],
+      repoRoot,
+    );
+    if (source.code !== 0) return null;
+    const symbolic = runTrunkLeaseGit(
+      ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+      repoRoot,
+    );
+    let defaultBranch =
+      symbolic.code === 0
+        ? symbolic.stdout.trim().replace(/^origin\//, "")
+        : "";
+    if (defaultBranch === "") {
+      for (const candidate of ["main", "master", "trunk"]) {
+        if (
+          runTrunkLeaseGit(
+            ["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`],
+            repoRoot,
+          ).code === 0
+        ) {
+          defaultBranch = candidate;
+          break;
+        }
+      }
+    }
+    if (defaultBranch === "") return null;
+    const tip = runTrunkLeaseGit(
+      ["rev-parse", "--verify", `refs/heads/${defaultBranch}^{commit}`],
+      repoRoot,
+    );
+    const defaultTip = tip.stdout.trim();
+    if (tip.code !== 0 || !/^[0-9a-f]{7,64}$/.test(defaultTip)) return null;
+    return { repoRoot, defaultBranch, defaultTip };
+  };
+  function runTrunkLeaseSweepTick(): void {
+    if (shuttingDown) return;
+    runTrunkLeaseSweep({
+      readRequests: () => readTrunkLeaseRequests(trunkLeaseStateDir),
+      removeRequest: (path) => removeTrunkLeaseRequest(path),
+      readLeases: () => listTrunkLeaseLeaves(trunkLeaseStateDir),
+      readLease: (repoRoot) => readTrunkLeaseLeaf(trunkLeaseStateDir, repoRoot),
+      verifyClaimant: (sessionId, epicId) => {
+        const claimant = verifyIncidentClaimant(sessionId, "close", epicId);
+        return claimant === null
+          ? null
+          : {
+              pid: claimant.pid,
+              startTime: claimant.startTime,
+              live: claimant.live,
+            };
+      },
+      probeClaimantLive: (pid, startTime) =>
+        probeIncidentClaimantLive(pid, startTime),
+      observeRepo: (request) => observeTrunkLeaseRepo(request),
+      publishLease: (leaf) => writeTrunkLeaseLeaf(trunkLeaseStateDir, leaf),
+      probeResidue: (leaf) => {
+        const mergeHead = runTrunkLeaseGit(
+          ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+          leaf.repo_root,
+        );
+        if (mergeHead.code !== 0) return null;
+        const oid = mergeHead.stdout.trim();
+        return oid === "" ? null : `MERGE_HEAD=${oid}`;
+      },
+      recordResidue: (leaf, detail) => {
+        const conflicts = runTrunkLeaseGit(
+          ["diff", "--name-only", "--diff-filter=U"],
+          leaf.repo_root,
+        );
+        handleDispatchFailedMint({
+          verb: "close",
+          id: leaf.epic_id,
+          reason:
+            `worktree-merge-conflict: merging ${leaf.source_branch} into ` +
+            `${leaf.default_branch} — trunk-integration owner ` +
+            `${leaf.claimant_session_id} left residue in ${leaf.repo_root} ` +
+            `(token=${leaf.fencing_token}, ${detail})`,
+          dir: leaf.repo_root,
+          conflictedFiles:
+            conflicts.code === 0
+              ? conflicts.stdout
+                  .split("\n")
+                  .map((path) => path.trim())
+                  .filter(Boolean)
+              : null,
+          ts: Date.now() / 1000,
+        });
+      },
+      now: () => Date.now(),
+      noteLine: (line) => console.error(`[keeperd] ${line}`),
+    });
+  }
+  const trunkLeaseSweepTimer = setInterval(() => {
+    try {
+      runTrunkLeaseSweepTick();
+    } catch (err) {
+      console.error(
+        `[keeperd] trunk-lease sweep tick threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -17235,6 +17613,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     if (incidentClaimSweepTimer !== null) {
       clearInterval(incidentClaimSweepTimer);
     }
+    clearInterval(trunkLeaseSweepTimer);
     if (piResumeRepairSweepTimer !== null) {
       clearInterval(piResumeRepairSweepTimer);
     }

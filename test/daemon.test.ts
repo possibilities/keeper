@@ -179,6 +179,7 @@ import {
   runRepairEscalationSweep,
   runResolverDispatchSweep,
   runSharedCheckoutPageSweep,
+  runTrunkLeaseSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -210,6 +211,7 @@ import {
   serializeSessionTelemetry,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
+  type TrunkLeaseSweepDeps,
   WAL_AUTOCHECKPOINT_PAGES,
   WORK_RESOLVER_LEASE_SEC,
   type WorkMergeHumanNotifySweepDeps,
@@ -254,6 +256,13 @@ import {
   readFableFocusLeaf,
   serializeFableFocusPolicy,
 } from "../src/fable-focus";
+import {
+  decideTrunkIntegrationFence,
+  type SpooledTrunkLeaseRequest,
+  TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+  TRUNK_LEASE_SCHEMA_VERSION,
+  type TrunkLeaseLeaf,
+} from "../src/grant-leaf";
 import {
   classifyAgentbotPageOutcome,
   resolveAgentbotBinaryPath,
@@ -5974,6 +5983,230 @@ test("incident claim sweep isolates a throwing request and continues processing 
 test("INCIDENT_CLAIM_SWEEP_INTERVAL_MS is a prompt positive cadence", () => {
   expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBe(3_000);
   expect(INCIDENT_CLAIM_SWEEP_INTERVAL_MS).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Trunk-integration lease producer
+// ---------------------------------------------------------------------------
+
+function trunkRequest(
+  action: "acquire" | "release",
+  repoRoot: string,
+  token: number | null = null,
+): SpooledTrunkLeaseRequest {
+  return {
+    path: `/spool/${action}-${repoRoot.slice(1)}.json`,
+    request: {
+      schema_version: TRUNK_LEASE_REQUEST_SCHEMA_VERSION,
+      action,
+      epic_id: "fn-1350-owner",
+      repo_root: repoRoot,
+      source_branch: "keeper/epic/fn-1350-owner",
+      claimant_session_id: "close-session",
+      request_id: "11111111111111111111111111111111",
+      fencing_token: token,
+      requested_at: 1_700_000_000_000,
+    },
+  };
+}
+
+function trunkLeaseSweepHarness(initialRequests: SpooledTrunkLeaseRequest[]) {
+  const requests = [...initialRequests];
+  const leases = new Map<string, TrunkLeaseLeaf>();
+  const removed: string[] = [];
+  const residues: Array<{ repo: string; detail: string }> = [];
+  const deps: TrunkLeaseSweepDeps = {
+    readRequests: () => [...requests],
+    removeRequest: (path) => {
+      removed.push(path);
+      const index = requests.findIndex((entry) => entry.path === path);
+      if (index >= 0) requests.splice(index, 1);
+    },
+    readLeases: () => [...leases.values()],
+    readLease: (repoRoot) => leases.get(repoRoot) ?? null,
+    verifyClaimant: () => ({
+      pid: 4242,
+      startTime: "proc:4242:1",
+      live: true,
+    }),
+    probeClaimantLive: () => true,
+    observeRepo: (request) => ({
+      repoRoot: request.repo_root,
+      defaultBranch: "main",
+      defaultTip:
+        request.repo_root === "/repo-a"
+          ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }),
+    publishLease: (leaf) => {
+      leases.set(leaf.repo_root, { ...leaf });
+      return true;
+    },
+    probeResidue: () => null,
+    recordResidue: (leaf, detail) =>
+      residues.push({ repo: leaf.repo_root, detail }),
+    now: () => 1_700_000_001_000,
+    ttlMs: 60_000,
+  };
+  return { requests, leases, removed, residues, deps };
+}
+
+test("trunk lease round-trip preserves per-repo monotonic fencing tokens", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  const first = h.leases.get("/repo-a");
+  expect(first).toMatchObject({
+    schema_version: TRUNK_LEASE_SCHEMA_VERSION,
+    active: true,
+    fencing_token: 1,
+    writable_root: "/repo-a",
+    observed_default_tip: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  expect(runTrunkLeaseSweep(h.deps).released).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+});
+
+test("trunk leases fence multi-repo groups independently", () => {
+  const h = trunkLeaseSweepHarness([
+    trunkRequest("acquire", "/repo-a"),
+    trunkRequest("acquire", "/repo-b"),
+  ]);
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(1);
+  expect(h.leases.get("/repo-b")?.fencing_token).toBe(2);
+  expect(h.leases.get("/repo-a")?.fencing_token).not.toBe(
+    h.leases.get("/repo-b")?.fencing_token,
+  );
+  expect(h.leases.get("/repo-a")?.observed_default_tip).not.toBe(
+    h.leases.get("/repo-b")?.observed_default_tip,
+  );
+});
+
+test("trunk integration fence defers inconclusive ancestry and tip drift", () => {
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "inconclusive",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "defer", reason: "ancestry-inconclusive" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "bbbbbbbb",
+    }),
+  ).toEqual({ kind: "defer", reason: "tip-drift" });
+  expect(
+    decideTrunkIntegrationFence({
+      leaseValid: true,
+      ancestry: "not-ancestor",
+      observedDefaultTip: "aaaaaaaa",
+      liveDefaultTip: "aaaaaaaa",
+    }),
+  ).toEqual({ kind: "merge" });
+});
+
+test("an expired live trunk lease remains authoritative and renews through a fresh fencing token", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+
+  const expired = runTrunkLeaseSweep(h.deps);
+  expect(expired).toMatchObject({ dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+    expires_at: 1,
+  });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  expect(runTrunkLeaseSweep(h.deps).acquired).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+    expires_at: 1_700_000_061_000,
+  });
+});
+
+test("an expired live holder cannot be replaced by another claimant", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  const first = h.leases.get("/repo-a");
+  if (first === undefined) throw new Error("expected acquired lease");
+  h.leases.set("/repo-a", { ...first, expires_at: 1 });
+  const rival = trunkRequest("acquire", "/repo-a");
+  rival.request.claimant_session_id = "rival-close-session";
+  h.requests.push(rival);
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.deferred).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    claimant_session_id: "close-session",
+    fencing_token: 1,
+  });
+});
+
+test("a live trunk owner retains its lease while merge residue becomes an incident", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=feedface";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result).toMatchObject({ residues: 1, dead: 0, released: 0 });
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 1,
+  });
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=feedface" },
+  ]);
+});
+
+test("dead trunk lease holder releases and records merge residue", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeClaimantLive = () => false;
+  h.deps.probeResidue = () => "MERGE_HEAD=deadbeef";
+
+  const result = runTrunkLeaseSweep(h.deps);
+  expect(result.dead).toBe(1);
+  expect(result.residues).toBe(1);
+  expect(h.leases.get("/repo-a")?.active).toBe(false);
+  expect(h.residues).toEqual([
+    { repo: "/repo-a", detail: "MERGE_HEAD=deadbeef" },
+  ]);
+});
+
+test("fenced release with residue routes one conflict receipt and stale release cannot clear a successor", () => {
+  const h = trunkLeaseSweepHarness([trunkRequest("acquire", "/repo-a")]);
+  runTrunkLeaseSweep(h.deps);
+  h.deps.probeResidue = () => "MERGE_HEAD=cafebabe";
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const released = runTrunkLeaseSweep(h.deps);
+  expect(released).toMatchObject({ released: 1, residues: 1 });
+
+  h.requests.push(trunkRequest("acquire", "/repo-a"));
+  runTrunkLeaseSweep(h.deps);
+  expect(h.leases.get("/repo-a")?.fencing_token).toBe(2);
+  h.requests.push(trunkRequest("release", "/repo-a", 1));
+  const stale = runTrunkLeaseSweep(h.deps);
+  expect(stale.stale).toBe(1);
+  expect(h.leases.get("/repo-a")).toMatchObject({
+    active: true,
+    fencing_token: 2,
+  });
 });
 
 // ---------------------------------------------------------------------------
