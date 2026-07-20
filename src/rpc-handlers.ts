@@ -8,9 +8,11 @@
  * - `replay_dead_letter` (no params) — ASYNC RPC. Asks main to recover ONE
  *   oldest `waiting` dead-letter row by appending the stored bindings back
  *   into the `events` log and flipping the row to `recovered`, all in one
- *   `BEGIN IMMEDIATE` transaction. (Schema v37 — see fn-643 task .4.) The
- *   actual work runs on main (the sole writer of the events log); this
- *   handler routes through the worker→main bridge.
+ *   `BEGIN IMMEDIATE` transaction. The actual work runs on main (the sole
+ *   writer of the events log); this handler routes through the worker→main
+ *   bridge.
+ * - `resolve_dead_letter` — ASYNC RPC. Re-classifies or force-resolves one
+ *   named poison row with bounded, audited parameters.
  * - `set_autopilot_paused` / `set_autopilot_mode` / `set_epic_armed` /
  *   `retry_dispatch` — the autopilot control plane (each round-trips through a
  *   synthetic event via the worker→main bridge).
@@ -38,6 +40,10 @@
 
 import { isAbsolute } from "node:path";
 import { parseTriple } from "./agent/triple";
+import type {
+  DeadLetterOperatorOutcome,
+  DeadLetterOperatorRequest,
+} from "./dead-letter";
 import {
   type DispatchClearOutcome,
   parseDispatchKey as parseDispatchKeyResult,
@@ -139,6 +145,110 @@ export async function replayDeadLetterHandler(
     // Normalize undefined → null so the wire value carries an explicit
     // sentinel for "nothing to replay" rather than dropping the field.
     recovered_dl_id: result.recovered_dl_id ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// `resolve_dead_letter`
+// ---------------------------------------------------------------------------
+
+const DEAD_LETTER_ID_MAX_BYTES = 4096;
+const DEAD_LETTER_ACTOR_MAX_BYTES = 256;
+const DEAD_LETTER_REASON_MAX_BYTES = 1024;
+
+function boundedNonEmptyString(
+  value: unknown,
+  field: string,
+  maxBytes: number,
+): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    Buffer.byteLength(value, "utf8") > maxBytes ||
+    value.includes("\0")
+  ) {
+    throw new BadParamsError(
+      `resolve_dead_letter: \`${field}\` must be a non-empty UTF-8 string of at most ${maxBytes} bytes without NUL`,
+    );
+  }
+  return value;
+}
+
+function validateResolveDeadLetterParams(
+  params: unknown,
+): DeadLetterOperatorRequest {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "resolve_dead_letter: params must be an object with `op` and `dl_id`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (obj.op !== "reclassify" && obj.op !== "resolve") {
+    throw new BadParamsError(
+      "resolve_dead_letter: `op` must be one of reclassify|resolve",
+    );
+  }
+  const dlId = boundedNonEmptyString(
+    obj.dl_id,
+    "dl_id",
+    DEAD_LETTER_ID_MAX_BYTES,
+  );
+  const known =
+    obj.op === "reclassify"
+      ? new Set(["op", "dl_id"])
+      : new Set(["op", "dl_id", "caller_session", "reason", "force"]);
+  const stray = Object.keys(obj).filter((key) => !known.has(key));
+  if (stray.length > 0) {
+    throw new BadParamsError(
+      `resolve_dead_letter: unknown payload key(s): ${stray.join(", ")}`,
+    );
+  }
+  if (obj.op === "reclassify") {
+    return { op: "reclassify", dl_id: dlId };
+  }
+  if (obj.force !== true) {
+    throw new BadParamsError(
+      "resolve_dead_letter: poison resolve requires `force: true`",
+    );
+  }
+  return {
+    op: "resolve",
+    dl_id: dlId,
+    caller_session: boundedNonEmptyString(
+      obj.caller_session,
+      "caller_session",
+      DEAD_LETTER_ACTOR_MAX_BYTES,
+    ),
+    reason: boundedNonEmptyString(
+      obj.reason,
+      "reason",
+      DEAD_LETTER_REASON_MAX_BYTES,
+    ).trim(),
+    force: true,
+  };
+}
+
+export interface ResolveDeadLetterResult {
+  ok: true;
+  dl_id: string;
+  outcome: DeadLetterOperatorOutcome;
+}
+
+export async function resolveDeadLetterHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<ResolveDeadLetterResult> {
+  const request = validateResolveDeadLetterParams(params);
+  const result = await bridge.resolveDeadLetter(request);
+  if (!result.ok || result.outcome === undefined) {
+    throw new Error(
+      result.error ?? "resolve_dead_letter: main reported failure",
+    );
+  }
+  return {
+    ok: true,
+    dl_id: request.dl_id,
+    outcome: result.outcome,
   };
 }
 
@@ -1087,6 +1197,11 @@ const RPC_HANDLER_REGISTRATIONS = [
     method: "replay_dead_letter",
     kind: "async",
     handler: replayDeadLetterHandler,
+  },
+  {
+    method: "resolve_dead_letter",
+    kind: "async",
+    handler: resolveDeadLetterHandler,
   },
   {
     method: "set_autopilot_paused",

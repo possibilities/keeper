@@ -128,18 +128,23 @@ active Note.
 | `note_not_found`          | No Note matched the supplied id.                      | Choose an id from `keeper note list --state all` and retry.                               | yes (read-only) |
 | `notes_store_unavailable` | The independent notes.db could not be opened or read. | Check the private Keeper state directory and retry; the failed read did not mutate Notes. | yes (read-only) |
 
-## Autopilot control ops (`keeper autopilot pause|play|mode|arm|disarm|retry|config|worktree`)
+## Daemon control ops (`keeper autopilot …`, `keeper dead-letter reclassify|resolve`)
 
-Each control op round-trips one control RPC and rides the shared envelope. The
-daemon's echoed result value is `data` (ok:true, exit 0); a server rejection,
+Autopilot controls and dead-letter actions round-trip one control RPC and ride the shared envelope.
+`dead-letter reclassify` targets one poison row and may append one event; a still-unclassifiable
+payload returns `still_poison` without changing the row. `dead-letter resolve` requires `--force`
+plus `--reason` and records the acting session before returning `resolved`; a repeated resolve
+returns `refused_already_resolved` without replacing the audit.
+
+The daemon's echoed result value is `data` (ok:true, exit 0); a server rejection,
 transport fault, or unexpected frame is `ok:false` (exit 1) on stdout. A control
 RPC MUTATES, so the transport-failure recovery is mutate-aware (a pre-send
 connect failure is safe to retry; a mid-flight timeout may already have applied).
-CLI-usage errors (bad args) stay on stderr at exit 1, off the envelope.
+CLI-usage errors (bad args) stay on stderr at exit 2, off the envelope.
 
 | code                   | meaning                                                                           | recovery                                                                                                                                                                                  | retry-safe        |
 | ---------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| `rpc_unreachable`      | The daemon did not answer the control RPC over its socket.                        | Confirm the daemon is running. A pre-send connect failure is safe to retry; a mid-flight timeout may have applied — re-read state (`keeper autopilot` / `keeper status`) before retrying. | conditional       |
+| `rpc_unreachable`      | The daemon did not answer the control RPC over its socket.                        | Confirm the daemon is running. A pre-send connect failure is safe to retry; a mid-flight timeout may have applied — re-read state (`keeper autopilot`, `keeper status`, or the targeted `dead_letters` row) before retrying. | conditional       |
 | `rpc_rejected`         | The daemon rejected the RPC (its `error` frame code passes through when present). | Correct the request per the code, then retry — a rejected RPC did not mutate state.                                                                                                       | yes (not applied) |
 | `rpc_unexpected_frame` | The daemon returned a frame type the control path did not expect.                 | Retry; if it persists, confirm the daemon and CLI are the same version.                                                                                                                   | conditional       |
 

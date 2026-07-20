@@ -1,5 +1,9 @@
 import type { Database } from "bun:sqlite";
 import type {
+  DeadLetterOperatorOutcome,
+  DeadLetterOperatorRequest,
+} from "./dead-letter";
+import type {
   DispatchClearOutcome,
   RetryDispatchVerb,
 } from "./dispatch-command";
@@ -8,6 +12,7 @@ import type { RequestAwaitRpcParams } from "./protocol";
 
 export const RPC_METHODS = [
   "replay_dead_letter",
+  "resolve_dead_letter",
   "set_autopilot_paused",
   "set_autopilot_mode",
   "set_autopilot_config",
@@ -25,6 +30,11 @@ export interface ReplayBridge {
   replay(): Promise<{
     ok: boolean;
     recovered_dl_id?: string | null;
+    error?: string;
+  }>;
+  resolveDeadLetter(request: DeadLetterOperatorRequest): Promise<{
+    ok: boolean;
+    outcome?: DeadLetterOperatorOutcome;
     error?: string;
   }>;
   setAutopilotPaused(paused: boolean): Promise<{

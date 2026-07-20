@@ -35,7 +35,12 @@ import {
   openDb,
   resolveSockPath,
 } from "../db";
-import { parseDeadLetterLine, parseEventLogLine } from "../dead-letter";
+import {
+  DEAD_LETTER_TERMINAL_STATUSES,
+  isDeadLetterTerminalStatus,
+  parseDeadLetterLine,
+  parseEventLogLine,
+} from "../dead-letter";
 import { extractMutationPath } from "../derivers";
 import {
   ATTRIBUTION_FLOOR_PATH,
@@ -812,16 +817,22 @@ function unresolvedDeadLetterEvidence(
         .query(
           `SELECT bindings, session_id, status
              FROM dead_letters
-            WHERE status != 'recovered'
+            WHERE status NOT IN (?, ?, ?)
             LIMIT ?`,
         )
-        .all(RECEIPT_RECORD_LIMIT + 1) as Array<{
+        .all(
+          ...DEAD_LETTER_TERMINAL_STATUSES,
+          RECEIPT_RECORD_LIMIT + 1,
+        ) as Array<{
         bindings: unknown;
         session_id: unknown;
         status: unknown;
       }>;
       if (unresolved.length > RECEIPT_RECORD_LIMIT) return null;
       for (const row of unresolved) {
+        if (isDeadLetterTerminalStatus(row.status)) {
+          continue;
+        }
         // Poison means the original event could not be classified at all. Its
         // parked `{raw,…}` envelope cannot prove which session/path it touched,
         // so terminal adoption must fail closed globally until an operator
@@ -921,6 +932,13 @@ function unresolvedDeadLetterEvidence(
               row?.status === "recovered" &&
               typeof row.replayed_event_id === "number" &&
               Number.isSafeInteger(row.replayed_event_id);
+            if (
+              row !== null &&
+              isDeadLetterTerminalStatus(row.status) &&
+              row.status !== "recovered"
+            ) {
+              continue;
+            }
             if (row !== null && !recovered && row.status !== "waiting") {
               blockingMutation = true;
               continue;

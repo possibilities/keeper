@@ -165,11 +165,13 @@ import {
   readRestartLedger,
   readSpillDocument,
   readTaskBlockedReason,
+  reclassifyPoisonDeadLetter,
   recoverOneDeadLetter,
   repairCheckoutDirty,
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolvePoisonDeadLetter,
   resolveProbeArming,
   routeBlockedCategory,
   runBlockEscalationSweep,
@@ -3634,6 +3636,176 @@ function seedDeadLetter(
   );
 }
 
+function seedPoisonDeadLetter(
+  db: ReturnType<typeof openDb>["db"],
+  opts: {
+    dl_id: string;
+    ts: number;
+    bindings: Record<string, unknown>;
+    source_file?: string | null;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, 'poison', 'PoisonLine', ?, ?, 44, ?, 'poison', NULL, NULL, ?)`,
+  ).run(
+    opts.dl_id,
+    opts.ts,
+    opts.ts + 1,
+    JSON.stringify(opts.bindings),
+    opts.source_file ?? null,
+  );
+}
+
+test("reclassifyPoisonDeadLetter replays current-parser raw with the original ts and re-folds byte-identically", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:fossil",
+    ts: 1_700_000_123,
+    source_file: "/events/44.ndjson",
+    bindings: {
+      raw: JSON.stringify({
+        bindings: {
+          ts: 9_999_999_999,
+          session_id: "fossil-session",
+          pid: 44,
+          hook_event: "SessionStart",
+          event_type: "lifecycle",
+          data: "{}",
+          cwd: "/repo",
+        },
+      }),
+      file: "/events/44.ndjson",
+    },
+  });
+
+  expect(reclassifyPoisonDeadLetter(db, "poison:fossil")).toBe("reclassified");
+  const event = db
+    .query(
+      "SELECT id, ts, session_id, hook_event FROM events WHERE session_id = 'fossil-session'",
+    )
+    .get() as {
+    id: number;
+    ts: number;
+    session_id: string;
+    hook_event: string;
+  };
+  expect(event).toEqual({
+    id: 1,
+    ts: 1_700_000_123,
+    session_id: "fossil-session",
+    hook_event: "SessionStart",
+  });
+  expect(
+    db
+      .query(
+        "SELECT status, replayed_event_id, source_file FROM dead_letters WHERE dl_id = 'poison:fossil'",
+      )
+      .get(),
+  ).toEqual({
+    status: "recovered",
+    replayed_event_id: 1,
+    source_file: null,
+  });
+
+  drainToCompletion(db);
+  const firstProjection = db
+    .query("SELECT * FROM jobs WHERE job_id = 'fossil-session'")
+    .get() as Record<string, unknown>;
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
+  drainToCompletion(db);
+  const refoldedProjection = db
+    .query("SELECT * FROM jobs WHERE job_id = 'fossil-session'")
+    .get() as Record<string, unknown>;
+  expect(refoldedProjection).toEqual(firstProjection);
+  db.close();
+});
+
+test("reclassifyPoisonDeadLetter returns still_poison without mutating an unclassifiable row", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:genuine",
+    ts: 77,
+    bindings: { raw: "not current-parser input", file: "/events/44.ndjson" },
+  });
+  const before = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'poison:genuine'")
+    .get() as Record<string, unknown>;
+  expect(reclassifyPoisonDeadLetter(db, "poison:genuine")).toBe("still_poison");
+  const after = db
+    .query("SELECT * FROM dead_letters WHERE dl_id = 'poison:genuine'")
+    .get() as Record<string, unknown>;
+  expect(after).toEqual(before);
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n,
+  ).toBe(0);
+  db.close();
+});
+
+test("resolvePoisonDeadLetter writes a bounded audit and refuses double-resolution idempotently", () => {
+  const { db } = freshMemDb();
+  seedPoisonDeadLetter(db, {
+    dl_id: "poison:resolve",
+    ts: 88,
+    bindings: { raw: "bad", file: "/events/44.ndjson" },
+  });
+  expect(
+    resolvePoisonDeadLetter(
+      db,
+      "poison:resolve",
+      "operator-session",
+      "  inspected and accepted  ",
+      true,
+      1_700_000_500,
+    ),
+  ).toBe("resolved");
+  const resolved = db
+    .query(
+      "SELECT status, recovered_at, replayed_event_id, bindings FROM dead_letters WHERE dl_id = 'poison:resolve'",
+    )
+    .get() as {
+    status: string;
+    recovered_at: number;
+    replayed_event_id: number | null;
+    bindings: string;
+  };
+  expect(resolved.status).toBe("resolved");
+  expect(resolved.recovered_at).toBe(1_700_000_500);
+  expect(resolved.replayed_event_id).toBeNull();
+  expect(JSON.parse(resolved.bindings)).toEqual({
+    raw: "bad",
+    file: "/events/44.ndjson",
+    resolved_by: "operator-session",
+    resolve_reason: "inspected and accepted",
+    resolved_force: true,
+    resolved_at: 1_700_000_500,
+  });
+
+  expect(
+    resolvePoisonDeadLetter(
+      db,
+      "poison:resolve",
+      "other-operator",
+      "replace audit",
+      true,
+      1_800_000_000,
+    ),
+  ).toBe("refused_already_resolved");
+  expect(
+    db
+      .query(
+        "SELECT status, recovered_at, replayed_event_id, bindings FROM dead_letters WHERE dl_id = 'poison:resolve'",
+      )
+      .get(),
+  ).toEqual(resolved);
+  db.close();
+});
+
 test("recoverOneDeadLetter appends a real events row + flips dead_letters to recovered, in one transaction", () => {
   const { db } = freshMemDb();
   // Seed one SessionStart dead-letter — the dropped-incident scenario.
@@ -3975,7 +4147,12 @@ function seedDlRow(
   db: ReturnType<typeof openDb>["db"],
   opts: {
     dl_id: string;
-    status: "waiting" | "recovered" | "poison" | typeof BIRTH_STUCK_STATUS;
+    status:
+      | "waiting"
+      | "recovered"
+      | "poison"
+      | "resolved"
+      | typeof BIRTH_STUCK_STATUS;
     dl_written_at: number;
     recovered_at?: number | null;
     source_file?: string | null;
@@ -4104,15 +4281,14 @@ test("pruneRecoveredDeadLetters: a LIVE-pid file is skipped even when fully reco
   db.close();
 });
 
-test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, fresh kept); events-log file NEVER unlinked", () => {
+test("pruneRecoveredDeadLetters: unresolved poison is retained; resolved rows age on resolution time without unlinking events logs", () => {
   const { db } = freshMemDb();
   const dlDir = mkdtempSync(join(tmpDir, "dl-"));
   const eventsLogDir = mkdtempSync(join(tmpDir, "el-"));
   const eventsLogFile = join(eventsLogDir, "777.ndjson");
   writeFileSync(eventsLogFile, "poison-bytes\n");
-  // Poison rows point source_file at an events-log file (the ingester owns it).
   seedDlRow(db, {
-    dl_id: "p-old",
+    dl_id: "p-unresolved",
     status: "poison",
     dl_written_at: DL_AGED_SEC,
     recovered_at: null,
@@ -4120,10 +4296,18 @@ test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, 
     pid: 777,
   });
   seedDlRow(db, {
-    dl_id: "p-new",
-    status: "poison",
-    dl_written_at: DL_FRESH_SEC,
-    recovered_at: null,
+    dl_id: "r-old",
+    status: "resolved",
+    dl_written_at: DL_AGED_SEC - 100,
+    recovered_at: DL_AGED_SEC,
+    source_file: eventsLogFile,
+    pid: 777,
+  });
+  seedDlRow(db, {
+    dl_id: "r-new",
+    status: "resolved",
+    dl_written_at: DL_AGED_SEC - 100,
+    recovered_at: DL_FRESH_SEC,
     source_file: eventsLogFile,
     pid: 777,
   });
@@ -4136,10 +4320,10 @@ test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, 
   expect(res.prunedRows).toBe(1);
   expect(res.prunedFiles).toBe(0);
   expect(existsSync(eventsLogFile)).toBe(true);
-  const remaining = db.query("SELECT dl_id FROM dead_letters").all() as {
-    dl_id: string;
-  }[];
-  expect(remaining.map((r) => r.dl_id)).toEqual(["p-new"]);
+  const remaining = db
+    .query("SELECT dl_id FROM dead_letters ORDER BY dl_id")
+    .all() as { dl_id: string }[];
+  expect(remaining.map((row) => row.dl_id)).toEqual(["p-unresolved", "r-new"]);
   db.close();
 });
 

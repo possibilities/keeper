@@ -160,7 +160,16 @@ import {
   selectWorldRev,
   truncateEphemeralProjections,
 } from "./db";
-import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
+import {
+  BIRTH_STUCK_STATUS,
+  DEAD_LETTER_RESOLVED_STATUS,
+  type DeadLetterOperatorOutcome,
+  parseDeadLetterLine,
+  parseEventLogLine,
+} from "./dead-letter";
+
+export { BIRTH_STUCK_STATUS } from "./dead-letter";
+
 import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
@@ -354,6 +363,8 @@ import {
   type RequestAwaitResultMessage,
   type RequestHandoffRequestMessage,
   type RequestHandoffResultMessage,
+  type ResolveDeadLetterRequestMessage,
+  type ResolveDeadLetterResultMessage,
   type RetryDispatchRequestMessage,
   type RetryDispatchResultMessage,
   type ServeHealthMessage,
@@ -5816,8 +5827,6 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
  */
 export const DEAD_LETTER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-export const BIRTH_STUCK_STATUS = "birth-stuck";
-
 /**
  * Injectable knobs for {@link pruneRecoveredDeadLetters} — defaulted so the
  * daemon caller passes none, overridable so the pass body is drivable
@@ -5889,14 +5898,16 @@ function pidFromDeadLetterFile(filePath: string): number | null {
  *    skips them) and swept next pass (the file is gone, `unlinkSync` ENOENT is a
  *    no-op, the delete still runs).
  *  - ROW-ONLY (no file to resurrect them): `recovered` rows with `source_file
- *    IS NULL` (age on `recovered_at`) and terminal parked rows (age on
- *    `dl_written_at`). Their producers have already retired or advanced past the
- *    source, so the ROW deletes with no re-ingest and the file is NEVER touched.
+ *    IS NULL` (age on `recovered_at`), operator-resolved poison rows (age on
+ *    `recovered_at`), and birth-stuck rows (age on `dl_written_at`). Their
+ *    producers have already retired or advanced past the source, so the ROW
+ *    deletes with no re-ingest and the file is NEVER touched. Unresolved poison
+ *    rows never age out behind the operator's back.
  *    Paced (≤500 rows/batch, ≤20 batches) so the writer lock never starves a
  *    concurrent hook INSERT.
  *
  * The `status='waiting'` warn pill is unaffected — this prune removes only
- * `recovered` and terminal parked rows. Never throws for a single-file unlink error
+ * non-blocking terminal rows. Never throws for a single-file unlink error
  * (per-file non-fatal, mirroring events-log cleanup); a DB-level error propagates
  * to the caller's non-fatal retention try.
  */
@@ -5975,7 +5986,8 @@ export function pruneRecoveredDeadLetters(
     `SELECT dl_id FROM dead_letters
       WHERE (status = 'recovered' AND source_file IS NULL
              AND recovered_at IS NOT NULL AND recovered_at <= ?)
-         OR (status IN ('poison', ?) AND dl_written_at <= ?)
+         OR (status = ? AND recovered_at IS NOT NULL AND recovered_at <= ?)
+         OR (status = ? AND dl_written_at <= ?)
       LIMIT ?`,
   );
   const deleteByIds = db.prepare(
@@ -5983,6 +5995,8 @@ export function pruneRecoveredDeadLetters(
   );
   for (let i = 0; i < DEFAULT_RETENTION_MAX_BATCHES; i++) {
     const idRows = selectRowOnlyBatch.all(
+      cutoffSec,
+      DEAD_LETTER_RESOLVED_STATUS,
       cutoffSec,
       BIRTH_STUCK_STATUS,
       cutoffSec,
@@ -7857,9 +7871,58 @@ export async function runProviderLegCascadeSweep(
  * the events log stays untouched, and the next replay retries it. A recovered
  * row is never picked again (`WHERE status='waiting'` filters it out).
  */
+interface RecoverableDeadLetterRow {
+  dl_id: string;
+  bindings: string;
+  ts: number;
+  session_id: string;
+  hook_event: string;
+  pid: number | null;
+}
+
+function insertRecoveredDeadLetterEvent(
+  db: Database,
+  row: RecoverableDeadLetterRow,
+  bindings: Record<string, unknown>,
+): number {
+  bindings.ts = row.ts;
+  completeSparseEventBindings(bindings);
+  const presentCols = INGEST_EVENTS_COLUMNS.filter((column) =>
+    Object.hasOwn(bindings, column),
+  );
+  if (presentCols.length === 0) {
+    throw new Error(
+      `replay: bindings carry no recognized events columns for dl_id ${row.dl_id}`,
+    );
+  }
+  const placeholders = presentCols.map(() => "?").join(", ");
+  const values = presentCols.map((column) => {
+    const value = bindings[column];
+    return typeof value === "boolean"
+      ? value
+        ? 1
+        : 0
+      : (value as string | number | null);
+  });
+  const info = db
+    .prepare(
+      `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`,
+    )
+    .run(...values);
+  return Number(info.lastInsertRowid);
+}
+
+function rollbackAndRethrow(db: Database, error: unknown): never {
+  try {
+    db.run("ROLLBACK");
+  } catch {
+    // best-effort; the original failure stays authoritative
+  }
+  throw error;
+}
+
 export function recoverOneDeadLetter(db: Database): string | null {
   db.run("BEGIN IMMEDIATE");
-  let recoveredDlId: string | null = null;
   try {
     const row = db
       .prepare(
@@ -7869,14 +7932,7 @@ export function recoverOneDeadLetter(db: Database): string | null {
           ORDER BY dl_written_at ASC, dl_id ASC
           LIMIT 1`,
       )
-      .get() as {
-      dl_id: string;
-      bindings: string;
-      ts: number;
-      session_id: string;
-      hook_event: string;
-      pid: number | null;
-    } | null;
+      .get() as RecoverableDeadLetterRow | null;
     if (row === null) {
       db.run("COMMIT");
       return null;
@@ -7885,8 +7941,6 @@ export function recoverOneDeadLetter(db: Database): string | null {
     try {
       parsed = JSON.parse(row.bindings);
     } catch (err) {
-      // Unparseable bindings: throw so the transaction rolls back and the row
-      // stays `waiting` for an operator. The dl_id names the offending row.
       throw new Error(
         `replay: bindings JSON parse failed for dl_id ${row.dl_id}: ${
           err instanceof Error ? err.message : String(err)
@@ -7902,31 +7956,11 @@ export function recoverOneDeadLetter(db: Database): string | null {
         `replay: bindings is not a JSON object for dl_id ${row.dl_id}`,
       );
     }
-    const bindings = parsed as Record<string, unknown>;
-    completeSparseEventBindings(bindings);
-
-    // INSERT column list = events columns ∩ bindings keys. Unknown keys are
-    // dropped. The list is interpolated directly (INGEST_EVENTS_COLUMNS is a
-    // module constant, no wire text); values are bound positionally.
-    const presentCols = INGEST_EVENTS_COLUMNS.filter((c) =>
-      Object.hasOwn(bindings, c),
+    const replayedEventId = insertRecoveredDeadLetterEvent(
+      db,
+      row,
+      parsed as Record<string, unknown>,
     );
-    if (presentCols.length === 0) {
-      throw new Error(
-        `replay: bindings carry no recognized events columns for dl_id ${row.dl_id}`,
-      );
-    }
-    const placeholders = presentCols.map(() => "?").join(", ");
-    const values = presentCols.map((c) => {
-      const v = bindings[c];
-      // Booleans serialize as 0/1.
-      if (typeof v === "boolean") return v ? 1 : 0;
-      return v as string | number | null;
-    });
-    const insertSql = `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`;
-    const info = db.prepare(insertSql).run(...values);
-    const replayedEventId = Number(info.lastInsertRowid);
-
     db.prepare(
       `UPDATE dead_letters
           SET status = 'recovered',
@@ -7934,18 +7968,142 @@ export function recoverOneDeadLetter(db: Database): string | null {
               replayed_event_id = ?
         WHERE dl_id = ?`,
     ).run(Date.now() / 1000, replayedEventId, row.dl_id);
-
     db.run("COMMIT");
-    recoveredDlId = row.dl_id;
+    return row.dl_id;
   } catch (err) {
-    try {
-      db.run("ROLLBACK");
-    } catch {
-      // best-effort; the throw propagates
-    }
-    throw err;
+    rollbackAndRethrow(db, err);
   }
-  return recoveredDlId;
+}
+
+export function reclassifyPoisonDeadLetter(
+  db: Database,
+  dlId: string,
+): DeadLetterOperatorOutcome {
+  db.run("BEGIN IMMEDIATE");
+  try {
+    const row = db
+      .prepare(
+        `SELECT dl_id, bindings, ts, session_id, hook_event, pid, status
+           FROM dead_letters
+          WHERE dl_id = ?
+          LIMIT 1`,
+      )
+      .get(dlId) as (RecoverableDeadLetterRow & { status: string }) | null;
+    if (row === null) {
+      db.run("COMMIT");
+      return "refused_not_found";
+    }
+    if (row.status === DEAD_LETTER_RESOLVED_STATUS) {
+      db.run("COMMIT");
+      return "refused_already_resolved";
+    }
+    if (row.status !== "poison") {
+      db.run("COMMIT");
+      return "refused_not_poison";
+    }
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(row.bindings);
+    } catch {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    if (
+      envelope === null ||
+      typeof envelope !== "object" ||
+      Array.isArray(envelope) ||
+      typeof (envelope as Record<string, unknown>).raw !== "string"
+    ) {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    const parsed = parseEventLogLine(
+      (envelope as Record<string, unknown>).raw as string,
+    );
+    if (parsed === null) {
+      db.run("COMMIT");
+      return "still_poison";
+    }
+    const replayedEventId = insertRecoveredDeadLetterEvent(
+      db,
+      row,
+      parsed.bindings,
+    );
+    db.prepare(
+      `UPDATE dead_letters
+          SET status = 'recovered',
+              recovered_at = ?,
+              replayed_event_id = ?,
+              source_file = NULL
+        WHERE dl_id = ?`,
+    ).run(Date.now() / 1000, replayedEventId, row.dl_id);
+    db.run("COMMIT");
+    return "reclassified";
+  } catch (err) {
+    rollbackAndRethrow(db, err);
+  }
+}
+
+export function resolvePoisonDeadLetter(
+  db: Database,
+  dlId: string,
+  callerSession: string,
+  reason: string,
+  force: boolean,
+  nowSec = Date.now() / 1000,
+): DeadLetterOperatorOutcome {
+  if (!force || callerSession.length === 0 || reason.trim().length === 0) {
+    throw new Error("resolve: force, acting identity, and reason are required");
+  }
+  db.run("BEGIN IMMEDIATE");
+  try {
+    const row = db
+      .prepare("SELECT status, bindings FROM dead_letters WHERE dl_id = ?")
+      .get(dlId) as { status: string; bindings: string } | null;
+    if (row === null) {
+      db.run("COMMIT");
+      return "refused_not_found";
+    }
+    if (row.status === DEAD_LETTER_RESOLVED_STATUS) {
+      db.run("COMMIT");
+      return "refused_already_resolved";
+    }
+    if (row.status !== "poison") {
+      db.run("COMMIT");
+      return "refused_not_poison";
+    }
+    let auditBindings: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(row.bindings) as unknown;
+      auditBindings =
+        parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : { raw_bindings: row.bindings };
+    } catch {
+      auditBindings = { raw_bindings: row.bindings };
+    }
+    auditBindings.resolved_by = callerSession;
+    auditBindings.resolve_reason = reason.trim();
+    auditBindings.resolved_force = true;
+    auditBindings.resolved_at = nowSec;
+    db.prepare(
+      `UPDATE dead_letters
+          SET status = ?,
+              recovered_at = ?,
+              replayed_event_id = NULL,
+              bindings = ?
+        WHERE dl_id = ? AND status = 'poison'`,
+    ).run(
+      DEAD_LETTER_RESOLVED_STATUS,
+      nowSec,
+      JSON.stringify(auditBindings),
+      dlId,
+    );
+    db.run("COMMIT");
+    return "resolved";
+  } catch (err) {
+    rollbackAndRethrow(db, err);
+  }
 }
 
 /**
@@ -9483,6 +9641,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     sw.onmessage = (
       ev: MessageEvent<
         | ReplayRequestMessage
+        | ResolveDeadLetterRequestMessage
         | SetAutopilotPausedRequestMessage
         | RetryDispatchRequestMessage
         | SetAutopilotModeRequestMessage
@@ -9548,6 +9707,40 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           reply = {
             type: "replay-result",
             id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "resolve-dead-letter-request") {
+        let reply: ResolveDeadLetterResultMessage;
+        try {
+          const outcome =
+            msg.request.op === "reclassify"
+              ? reclassifyPoisonDeadLetter(db, msg.request.dl_id)
+              : resolvePoisonDeadLetter(
+                  db,
+                  msg.request.dl_id,
+                  msg.request.caller_session,
+                  msg.request.reason,
+                  msg.request.force,
+                );
+          reply = {
+            type: "resolve-dead-letter-result",
+            id: msg.id,
+            ok: true,
+            outcome,
+          };
+          if (outcome === "reclassified") {
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          reply = {
+            type: "resolve-dead-letter-result",
+            id: msg.id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
           };

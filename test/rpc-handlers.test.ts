@@ -30,6 +30,7 @@ import {
   replayDeadLetterHandler,
   requestAwaitHandler,
   requestHandoffHandler,
+  resolveDeadLetterHandler,
   retryDispatchHandler,
   setAutopilotConfigHandler,
   setAutopilotModeHandler,
@@ -92,10 +93,11 @@ test("RPC runtime exports the exact server-worker error constructors", () => {
   expect(ServerSlugConflictError).toBe(SlugConflictError);
 });
 
-test("RPC installation supplies the authoritative eight methods", () => {
+test("RPC installation supplies the authoritative nine methods", () => {
   const registry = createRpcRegistry();
   const expectedMethods = [
     "replay_dead_letter",
+    "resolve_dead_letter",
     "set_autopilot_paused",
     "set_autopilot_mode",
     "set_autopilot_config",
@@ -172,6 +174,9 @@ function stubBridge(
     },
     // Not exercised by the replay-dead-letter handler tests; satisfies
     // the fn-661/fn-751-extended interface without affecting these test cases.
+    async resolveDeadLetter() {
+      return { ok: true, outcome: "still_poison" };
+    },
     async setAutopilotPaused() {
       return { ok: true };
     },
@@ -249,6 +254,110 @@ test("replay_dead_letter throws a generic message when ok:false carries no error
   expect(replayDeadLetterHandler(undefined, bridge)).rejects.toThrow(
     /main reported failure/,
   );
+});
+
+test("resolve_dead_letter forwards one bounded reclassification request", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  const calls: unknown[] = [];
+  bridge.resolveDeadLetter = async (request) => {
+    calls.push(request);
+    return { ok: true, outcome: "reclassified" };
+  };
+  await expect(
+    resolveDeadLetterHandler({ op: "reclassify", dl_id: "poison:one" }, bridge),
+  ).resolves.toEqual({
+    ok: true,
+    dl_id: "poison:one",
+    outcome: "reclassified",
+  });
+  expect(calls).toEqual([{ op: "reclassify", dl_id: "poison:one" }]);
+});
+
+test("resolve_dead_letter forwards the force-resolve audit fields", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  const calls: unknown[] = [];
+  bridge.resolveDeadLetter = async (request) => {
+    calls.push(request);
+    return { ok: true, outcome: "resolved" };
+  };
+  await expect(
+    resolveDeadLetterHandler(
+      {
+        op: "resolve",
+        dl_id: "poison:two",
+        caller_session: "operator",
+        reason: "  inspected invalid receipt  ",
+        force: true,
+      },
+      bridge,
+    ),
+  ).resolves.toEqual({
+    ok: true,
+    dl_id: "poison:two",
+    outcome: "resolved",
+  });
+  expect(calls).toEqual([
+    {
+      op: "resolve",
+      dl_id: "poison:two",
+      caller_session: "operator",
+      reason: "inspected invalid receipt",
+      force: true,
+    },
+  ]);
+});
+
+test("resolve_dead_letter rejects unforced, unaudited, extra-key, and oversized requests", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  const bad = [
+    null,
+    { op: "resolve", dl_id: "x", caller_session: "op", reason: "why" },
+    {
+      op: "resolve",
+      dl_id: "x",
+      caller_session: "",
+      reason: "why",
+      force: true,
+    },
+    {
+      op: "resolve",
+      dl_id: "x",
+      caller_session: "op",
+      reason: " ",
+      force: true,
+    },
+    { op: "reclassify", dl_id: "x", force: true },
+    { op: "reclassify", dl_id: "x".repeat(4097) },
+  ];
+  for (const params of bad) {
+    expect(resolveDeadLetterHandler(params, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("resolve_dead_letter preserves typed idempotent refusal outcomes", async () => {
+  const { bridge } = stubBridge({ ok: true });
+  bridge.resolveDeadLetter = async () => ({
+    ok: true,
+    outcome: "refused_already_resolved",
+  });
+  await expect(
+    resolveDeadLetterHandler(
+      {
+        op: "resolve",
+        dl_id: "poison:done",
+        caller_session: "operator",
+        reason: "already inspected",
+        force: true,
+      },
+      bridge,
+    ),
+  ).resolves.toEqual({
+    ok: true,
+    dl_id: "poison:done",
+    outcome: "refused_already_resolved",
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -345,6 +454,9 @@ function autopilotStubBridge(opts: {
   const bridge: ReplayBridge = {
     async replay() {
       return { ok: true, recovered_dl_id: null };
+    },
+    async resolveDeadLetter() {
+      return { ok: true, outcome: "still_poison" };
     },
     async setAutopilotPaused(paused) {
       state.setPausedCalls.push(paused);

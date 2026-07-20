@@ -227,9 +227,10 @@ describe("server-worker RPC composition", () => {
     });
   });
 
-  test("boot gating rejects all eight mutating RPCs before invoking handlers", () => {
+  test("boot gating rejects all nine mutating RPCs before invoking handlers", () => {
     const methods = [
       "replay_dead_letter",
+      "resolve_dead_letter",
       "set_autopilot_paused",
       "set_autopilot_mode",
       "set_autopilot_config",

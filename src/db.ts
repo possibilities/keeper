@@ -5722,10 +5722,10 @@ const CREATE_EPIC_DEP_EDGES_INDEXES = [
  * the per-pid NDJSON files the hook writes on a dropped INSERT, never folded.
  * Records events that NEVER MADE IT into the event log, so a from-scratch
  * re-fold MUST NOT touch it. `dl_id` (the hook-generated UUID) is the import
- * idempotency key. The replay verb is the only `waiting → recovered` path: it
- * appends a real event from the saved `bindings` (re-using the dropped event's
- * `ts`) and flips status + stamps `recovered_at`/`replayed_event_id` in ONE
- * transaction.
+ * idempotency key. Replay appends a real event from saved `bindings` and marks
+ * the row recovered in one transaction. Poison rows either re-classify through
+ * the current parser into that same recovery path or receive an audited
+ * operator-resolved terminal status.
  */
 const CREATE_DEAD_LETTERS = `
 CREATE TABLE IF NOT EXISTS dead_letters (

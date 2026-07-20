@@ -66,6 +66,10 @@ import {
   resolveSockPath,
 } from "./db";
 import type {
+  DeadLetterOperatorOutcome,
+  DeadLetterOperatorRequest,
+} from "./dead-letter";
+import type {
   DispatchClearOutcome,
   RetryDispatchVerb,
 } from "./dispatch-command";
@@ -214,6 +218,20 @@ export interface ReplayResultMessage {
   id: string;
   ok: boolean;
   recovered_dl_id?: string | null;
+  error?: string;
+}
+
+export interface ResolveDeadLetterRequestMessage {
+  kind: "resolve-dead-letter-request";
+  id: string;
+  request: DeadLetterOperatorRequest;
+}
+
+export interface ResolveDeadLetterResultMessage {
+  type: "resolve-dead-letter-result";
+  id: string;
+  ok: boolean;
+  outcome?: DeadLetterOperatorOutcome;
   error?: string;
 }
 
@@ -1987,8 +2005,8 @@ function dispatchRpc(
 /**
  * Drive an async RPC handler to completion and ship the result frame.
  * Pulled out of `dispatchRpc` for readability — the sync path is the
- * 99% case (the only async RPC today is `replay_dead_letter`), and
- * inlining a Promise chain in the middle of the synchronous switch
+ * 99% synchronous framing path, while the main-writer bridge RPCs use this
+ * helper. Inlining a Promise chain in the middle of the synchronous switch
  * obscured the sync-path control flow.
  *
  * Failure modes that map to `rpc_failed` here:
@@ -3898,10 +3916,23 @@ function main(): void {
     error?: string;
     outcome?: DispatchClearOutcome;
   };
+  type ResolveDeadLetterResolution = {
+    ok: boolean;
+    error?: string;
+    outcome?: DeadLetterOperatorOutcome;
+  };
   const pendingReplays = new Map<
     string,
     {
       resolve: (r: ReplayResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  const pendingDeadLetterResolutions = new Map<
+    string,
+    {
+      resolve: (r: ResolveDeadLetterResolution) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
     }
@@ -3989,6 +4020,29 @@ function main(): void {
           kind: "replay-request",
           id: reqId,
         } satisfies ReplayRequestMessage);
+      });
+    },
+    resolveDeadLetter(
+      request: DeadLetterOperatorRequest,
+    ): Promise<ResolveDeadLetterResolution> {
+      return new Promise<ResolveDeadLetterResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingDeadLetterResolutions.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingDeadLetterResolutions.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "resolve-dead-letter-request",
+          id: reqId,
+          request,
+        } satisfies ResolveDeadLetterRequestMessage);
       });
     },
     setAutopilotPaused(paused: boolean): Promise<SimpleResolution> {
@@ -4298,6 +4352,7 @@ function main(): void {
         | KickMessage
         | BootCompleteMessage
         | ReplayResultMessage
+        | ResolveDeadLetterResultMessage
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
         | SetAutopilotModeResultMessage
@@ -4342,6 +4397,18 @@ function main(): void {
           recovered_dl_id: r.recovered_dl_id,
           error: r.error,
         });
+        return;
+      }
+      if (
+        (msg as ResolveDeadLetterResultMessage).type ===
+        "resolve-dead-letter-result"
+      ) {
+        const r = msg as ResolveDeadLetterResultMessage;
+        const entry = pendingDeadLetterResolutions.get(r.id);
+        if (!entry) return;
+        pendingDeadLetterResolutions.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, outcome: r.outcome, error: r.error });
         return;
       }
       if (
