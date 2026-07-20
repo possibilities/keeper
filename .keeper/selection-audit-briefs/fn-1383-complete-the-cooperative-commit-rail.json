@@ -1,0 +1,95 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 58,
+        "files_changed": 7,
+        "insertions": 502
+      },
+      "done_summary": "Added a sanctioned free-form operator commit path: the plan commit-guard now admits a main-context keeper commit-work --task-id call from the session holding the exact task's live claim marker, and commit-work mints the mechanical Task: trailer for that claim without requiring a bound work job. Raw git, subagent laundering, KEEPER_PLAN_GUARD_BYPASS, and forged trailers stay denied; the ritual is documented in docs/problem-codes.md and plugins/plan/README.md.",
+      "input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+      "model": "opus",
+      "spec_chars": 3054,
+      "spec_md": "## Description\n\n**Size:** M\n**Files:** plugins/plan/plugin/hooks/commit-guard.ts, cli/commit-work.ts, plugins/plan/src/vcs.ts, docs/\n\n### Approach\n\nThe plan commit-guard hard-denies main-context commit-work while a task is\n`in_progress_uncommitted` (commit-guard.ts:40,52 \u2014 passes only when `agent_id` is\npresent), and even when an operator can commit, attribution is impossible: a\nhand-written `Task:` trailer returns `forbidden_trailer` (cli/commit-work.ts:1358),\n`--task-id` requires a bound work job (:1279), and `commitsForTask` greps exactly\nthat mechanical trailer (plugins/plan/src/vcs.ts:399-445) \u2014 so close-preflight's\ncommit set omits operator remediation commits entirely (live specimen: fn-1379.1's\nd4187d86b+921b4de0d invisible to the close). Give the free-form operator shape a\nsanctioned path: guard admission keyed on the operator session's own live claim of\nthe exact task (never a blanket main-context allow), and an attribution route that\nmints the mechanical trailer for that claimed task without requiring a bound work\njob. Laundering through a subagent and KEEPER_PLAN_GUARD_BYPASS stay forbidden;\nthe guard's fail-closed posture for unclaimed main-context commits is preserved.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/plugin/hooks/commit-guard.ts:40,52 \u2014 the deny predicate and the agent_id pass\n- cli/commit-work.ts:1279,1358 \u2014 the --task-id bound-job requirement and forbidden_trailer rejection\n- plugins/plan/src/vcs.ts:399-445 \u2014 commitsForTask trailer grep (the attribution consumer)\n- ~/docs/keeper-phase2-backlog.md entries #66 (both layers) \u2014 the two live specimens and the phase-13 operator's correct refusal\n\n### Risks\n\n- The admission must not weaken the guard for arbitrary main-context sessions \u2014 key it on a live, exact-task claim, nothing broader\n- Hook rules: commit-guard is a plan-plugin hook \u2014 no bun:sqlite/src/db.ts imports; envelope-deny only, always exit 0\n\n### Test notes\n\nGuard tests: unclaimed main-context deny preserved; claimed-exact-task operator admitted;\ntrailer minted matches commitsForTask's grep; forged trailer still rejected. Named gates only.\n\n## Acceptance\n\n- [ ] An operator session with a live claim of task T lands a commit through commit-work that close-preflight attributes to T (commitsForTask finds it)\n- [ ] A main-context commit without that claim is still denied; hand-written Task: trailers are still rejected\n- [ ] Docs name the sanctioned operator ritual; guard + attribution suites green via named gates\n\n## Done summary\nAdded a sanctioned free-form operator commit path: the plan commit-guard now admits a main-context keeper commit-work --task-id call from the session holding the exact task's live claim marker, and commit-work mints the mechanical Task: trailer for that claim without requiring a bound work job. Raw git, subagent laundering, KEEPER_PLAN_GUARD_BYPASS, and forged trailers stay denied; the ritual is documented in docs/problem-codes.md and plugins/plan/README.md.\n## Evidence\n",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.1",
+      "tier": "xhigh",
+      "title": "Sanction operator landing and attribution"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "high",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 18,
+        "files_changed": 4,
+        "insertions": 264
+      },
+      "done_summary": "Validated session-release worktree binding (claim-existence check + --worktree mismatch refusal) and attached a worktree-bound request_release pointer to commit-work's multi_ambiguous refusal.",
+      "input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+      "model": "sonnet",
+      "spec_chars": 2360,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** cli/session.ts, src/commit-work/surface.ts\n\n### Approach\n\nTwo truth gaps in the cooperative-release rail. (1) `keeper session release` derives\nthe worktree from the INVOKING cwd's git toplevel (cli/session.ts:349) with no\nclaim-existence check \u2014 a cross-repo release canonicalizes the path inside the wrong\nrepo and reports ok:true while the real claim stays live (live cost: mike's greenlit\ndotfiles commit blocked ~50 min). Validate that a named path actually carries a claim\nunder the derived worktree, accept an explicit `--worktree` and refuse a mismatch,\nand keep the success envelope naming the bound worktree. (2) commit-work's\n`multi_ambiguous` refusal suppresses the `request_release` pointer \u2014 it is built only\nin the `ownership_conflict` arms (src/commit-work/surface.ts:2483-2486,2519-2522,\nnever at :2570) \u2014 leaving blocked peers with no named claimant exactly when the rail\nwould work. Attach the pointer (with each claim's worktree) to `multi_ambiguous`.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required** (read before coding):\n- cli/session.ts:349,406 \u2014 worktree derivation and the success envelope\n- src/commit-work/surface.ts:2483-2486,2519-2522,2570 \u2014 where request_release is built and where it is missing\n- ~/docs/keeper-phase2-backlog.md #67 and #62 (residual paragraph) \u2014 the live specimens\n\n### Risks\n\n- Release must stay claimant-self-proof-gated \u2014 this task adds validation, never widens who may release\n- The pointer on multi_ambiguous must name claimants truthfully (the #62 primary fix landed lifecycle-tail terminal proof \u2014 reuse it, don't re-derive)\n\n### Test notes\n\nRelease: wrong-repo invocation refuses with the mismatch named; right-repo releases; envelope\ncarries worktree. Surface: multi_ambiguous envelope carries request_release with worktree. Named gates.\n\n## Acceptance\n\n- [ ] A release naming a path with no claim in the bound worktree refuses loudly (no ok-reporting no-op); `--worktree` mismatch refuses\n- [ ] `multi_ambiguous` refusals carry request_release with each claim's worktree\n- [ ] Suites green via named gates\n\n## Done summary\nValidated session-release worktree binding (claim-existence check + --worktree mismatch refusal) and attached a worktree-bound request_release pointer to commit-work's multi_ambiguous refusal.\n## Evidence\n",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.2",
+      "tier": "high",
+      "title": "Make the release rail bind and point truthfully"
+    },
+    {
+      "assigned_model": "sonnet",
+      "assigned_tier": "xhigh",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 41,
+        "files_changed": 4,
+        "insertions": 210
+      },
+      "done_summary": "unblock now retains in_progress for a live-or-terminal-unproven claimant, sharing commit-work's ordered lifecycle terminal-proof helper (extracted to src/lifecycle-terminal-proof.ts); a terminally proven dead claimant still resets to todo, closing the park->unblock->done recovery loop without an operator claim/done ritual.",
+      "input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+      "model": "sonnet",
+      "spec_chars": 2511,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/plan/src/verbs/unblock.ts, plugins/plan/src/verbs/done.ts\n\n### Approach\n\n`runUnblock` unconditionally writes `status:\"todo\"` (plugins/plan/src/verbs/unblock.ts:57-63),\nso the AUDIT_READY park \u2192 supervisor unblock cycle loses in_progress and the finished\nworker's `plan done` refuses (`not in_progress, status: todo`) \u2014 the phase-14-proven\nrecovery (unblock \u2192 claim \u2192 done from the repo vantage) burns operator time every\noccurrence. Fix the state machine at one of the two sanctioned points: unblock\npreserves/restores `in_progress` when the claimant session is live-or-recent, or\n`done` accepts a todo task carrying a same-session landed commit + audit receipt\n(plugins/plan/src/verbs/done.ts:121,255-296 currently writes done with no such path).\nPick the narrower change that keeps `done`'s evidence discipline intact \u2014 never a\nblanket todo-accepts-done.\n\n**RE-VERIFY AT CLAIM TIME against fn-1352 (retire-escalation-sessions):** that epic\nreshapes block/unblock surfaces; if it has landed or is in flight on these files,\npark DEPENDENCY_BLOCKED naming the overlap instead of racing it.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required** (read before coding):\n- plugins/plan/src/verbs/unblock.ts:57-63 \u2014 the unconditional todo write\n- plugins/plan/src/verbs/done.ts:121,255-296 \u2014 the status gate and evidence write\n- ~/docs/keeper-phase2-backlog.md #70 \u2014 the fn-4.3 live specimen and the proven recovery\n\n### Risks\n\n- Plans are READ-ONLY from the daemon side; these are plan-CLI verbs \u2014 keep the fix in the verbs, no new RPC\n- Do not let a stale claim resurrect in_progress for a dead claimant (reuse the lifecycle-tail terminal proof semantics)\n\n### Test notes\n\nVerb tests: unblock of a live-claimant in_progress task preserves progress; unblock of a dead-claimant\ntask still resets; the finished-worker done path lands with evidence. Named gates.\n\n## Acceptance\n\n- [ ] The park \u2192 unblock \u2192 done cycle completes without an operator claim/done ritual, and evidence discipline is preserved\n- [ ] A dead-claimant unblock still resets to todo\n- [ ] Suites green via named gates\n\n## Done summary\nunblock now retains in_progress for a live-or-terminal-unproven claimant, sharing commit-work's ordered lifecycle terminal-proof helper (extracted to src/lifecycle-terminal-proof.ts); a terminally proven dead claimant still resets to todo, closing the park->unblock->done recovery loop without an operator claim/done ritual.\n## Evidence\n",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.3",
+      "tier": "xhigh",
+      "title": "Unblock preserves the claimant's progress"
+    },
+    {
+      "assigned_model": "opus",
+      "assigned_tier": "medium",
+      "config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 1,
+        "files_changed": 2,
+        "insertions": 66
+      },
+      "done_summary": "Added a bounded bus classifier so a marked wrapped cell may run keeper bus chat send (send-only cooperative-release notice) while every other keeper bus verb stays denied; wrapped-guard suite covers allow/deny cases.",
+      "input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+      "model": "opus",
+      "spec_chars": 2076,
+      "spec_md": "## Description\n\n**Size:** S\n**Files:** plugins/keeper/plugin/hooks/wrapped-guard.ts\n\n### Approach\n\nThe wrapped-cell keeper allowlist is `{agent,session,commit-work,baseline}`\n(plugins/keeper/plugin/hooks/wrapped-guard.ts:329-334) \u2014 `bus` is absent, so a\nwrapped worker whose commit-work refusal names a foreign claimant cannot send the\n`keeper bus chat send` cooperative-release notice its own envelope (and the wrapped\nworker template, worker-implement-wrapped.md:78) prescribes; its only move is\nburning the attempt on DEPENDENCY_BLOCKED. Admit the BOUNDED send-only form:\n`keeper bus chat send <target> <message>` (which is `send_only:true` by contract and\nnever joins the live registry) \u2014 never `bus watch` or any subscribing verb. Keep the\nguard's fail-closed posture for everything else.\n\n### Investigation targets\n\n*Verify before relying \u2014 the repo moves.*\n\n**Required** (read before coding):\n- plugins/keeper/plugin/hooks/wrapped-guard.ts:329-334 \u2014 the allowlist\n- plugins/plan/... worker-implement-wrapped.md:78 \u2014 the template line telling the worker to send the notice\n- CLAUDE.md hook rules \u2014 wrapped-guard FAILS CLOSED when marked; a bus send MUST NOT establish bus presence\n\n### Risks\n\n- Allow ONLY the send verb shape \u2014 a watch/subscribe from a wrapped cell would violate the single-watcher bus contract\n- Hook rules: no new imports beyond node:* + the sanctioned dep-free src modules; envelope-deny, exit 0\n\n### Test notes\n\nGuard tests: `bus chat send` allowed under KEEPER_WRAPPED_CELL; `bus watch` and other bus verbs still denied;\nnon-bus deny behavior unchanged. Named gates (the wrapped-guard suite).\n\n## Acceptance\n\n- [ ] A marked wrapped cell can run `keeper bus chat send` (send-only) and every other bus verb remains denied\n- [ ] Wrapped-guard suite green via its named gate; fail-closed posture unchanged\n\n## Done summary\nAdded a bounded bus classifier so a marked wrapped cell may run keeper bus chat send (send-only cooperative-release notice) while every other keeper bus verb stays denied; wrapped-guard suite covers allow/deny cases.\n## Evidence\n",
+      "task_id": "fn-1383-complete-the-cooperative-commit-rail.4",
+      "tier": "medium",
+      "title": "Let wrapped cells send the release notice"
+    }
+  ],
+  "created_at": "2026-07-20T11:57:50.959000Z",
+  "epic_id": "fn-1383-complete-the-cooperative-commit-rail",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "e25a324bf07c0da4907c9c0d1da473e08fa7b22bffe1eb773c9f57005cb43c93",
+  "selection_input_hash": "e61350117aca146510d2b126cf598ad319d2f735e28d912e17ff3b5f03805cce",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
