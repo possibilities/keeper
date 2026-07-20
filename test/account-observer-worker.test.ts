@@ -123,7 +123,7 @@ describe("AccountObserver", () => {
         nowMs: () => NOW_MS,
         uniform: (lo, hi) => {
           expect(lo).toBe(0);
-          expect(hi).toBe(5_000);
+          expect(hi).toBe(30_000);
           return hi;
         },
         sleep: async (ms) => {
@@ -141,7 +141,7 @@ describe("AccountObserver", () => {
       });
       await observer.run();
       expect(calls).toHaveLength(1);
-      expect(sleepDurations).toEqual([35_000]);
+      expect(sleepDurations).toEqual([210_000]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

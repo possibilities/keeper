@@ -27,8 +27,8 @@ export const KEEPER_ACCOUNT_ROUTE_ENV = "KEEPER_ACCOUNT_ROUTE";
 /** Optional zero-based display position in the ordered cswap inventory. */
 export const KEEPER_ACCOUNT_ORDINAL_ENV = "KEEPER_ACCOUNT_ORDINAL";
 
-/** Bound every external CLI call. */
-export const SUBPROCESS_TIMEOUT_MS = 15_000;
+/** Bound every external CLI call beyond cswap's refresh + usage request path. */
+export const SUBPROCESS_TIMEOUT_MS = 30_000;
 
 /** Refuse oversized provider output instead of parsing a truncation. */
 export const MAX_OUTPUT_BYTES = 262_144;
@@ -45,11 +45,11 @@ export const OBSERVATION_FRESHNESS_CEILING_MS = 5 * 60_000;
 /** Maximum age of one account's usage measurement. */
 export const ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS = 10 * 60_000;
 
-/** Base interval between observer cycles. */
-export const OBSERVE_INTERVAL_MS = 30_000;
+/** Base interval between observer cycles, aligned with cswap's provider floor. */
+export const OBSERVE_INTERVAL_MS = 3 * 60_000;
 
 /** Uniform jitter added to each observer sleep. */
-export const OBSERVE_JITTER_MS = 5_000;
+export const OBSERVE_JITTER_MS = 30_000;
 
 /** Short-lived launch reservation lifetime. */
 export const RESERVATION_TTL_MS = 90_000;

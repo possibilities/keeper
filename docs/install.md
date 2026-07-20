@@ -71,8 +71,11 @@ installation and sends a best-effort `notifyctl` alert rather than installing un
 `uv`, a failed sync, or a failed installation is nonfatal to Keeper's non-Claude surfaces, but Claude
 remains unavailable until `cswap` works and at least one account is registered.
 
-The daemon publishes one private Capacity observation from each completed `cswap list --json` response;
-only a fresh observation supplies routing or focus-setup advice. claude-swap owns each row's `usageStatus`,
+The daemon samples `cswap list --json` no faster than the provider-safe three-minute floor, adds jitter after
+each completed cycle, and publishes one private Capacity observation from each completed response; only a
+fresh observation supplies routing or
+focus-setup advice. Concurrent surfaces share claude-swap's persisted request claims and poll plans, so
+repainting inventory cannot bypass provider backoff. claude-swap owns each row's `usageStatus`,
 raw quota values, bounded provider account category, and explicit capacity multiplier, including its
 last-good and backoff policy. Keeper admits only `usageStatus: ok`
 routes with valid provenance, required session and weekly windows, and remaining raw quota; Fable work
