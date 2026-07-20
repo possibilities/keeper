@@ -50,6 +50,7 @@ import {
   appendFencedDispatchClear,
   appendRestartLedgerLine,
   auditReadyEscalationDecision,
+  BIRTH_STUCK_STATUS,
   BLOCK_ESCALATION_SKIP_CATEGORY,
   BLOCK_ESCALATION_SWEEP_INTERVAL_MS,
   BLOCK_OWNER_GRACE_MS,
@@ -3967,14 +3968,14 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
 
 /**
  * Insert one `dead_letters` row in an arbitrary lifecycle state — the recovered
- * / poison seeds the retention prune consumes (`seedDeadLetter` only ever writes
- * `waiting`). `bindings` is irrelevant to the prune, so a fixed `'{}'` suffices.
+ * and terminal seeds the retention prune consumes. `bindings` is irrelevant to
+ * the prune, so a fixed `'{}'` suffices.
  */
 function seedDlRow(
   db: ReturnType<typeof openDb>["db"],
   opts: {
     dl_id: string;
-    status: "waiting" | "recovered" | "poison";
+    status: "waiting" | "recovered" | "poison" | typeof BIRTH_STUCK_STATUS;
     dl_written_at: number;
     recovered_at?: number | null;
     source_file?: string | null;
@@ -4139,6 +4140,44 @@ test("pruneRecoveredDeadLetters: poison rows age on dl_written_at (aged delete, 
     dl_id: string;
   }[];
   expect(remaining.map((r) => r.dl_id)).toEqual(["p-new"]);
+  db.close();
+});
+
+test("pruneRecoveredDeadLetters: birth-stuck rows age on dl_written_at without unlinking source files", () => {
+  const { db } = freshMemDb();
+  const dlDir = mkdtempSync(join(tmpDir, "dl-"));
+  const birthSourceDir = mkdtempSync(join(tmpDir, "births-"));
+  const birthFile = join(birthSourceDir, "9876543.json");
+  writeFileSync(birthFile, "birth-record\n");
+  seedDlRow(db, {
+    dl_id: "bs-old",
+    status: BIRTH_STUCK_STATUS,
+    dl_written_at: DL_AGED_SEC,
+    recovered_at: null,
+    source_file: birthFile,
+    pid: 9_876_543,
+  });
+  seedDlRow(db, {
+    dl_id: "bs-new",
+    status: BIRTH_STUCK_STATUS,
+    dl_written_at: DL_FRESH_SEC,
+    recovered_at: null,
+    source_file: birthFile,
+    pid: 9_876_543,
+  });
+
+  const res = pruneRecoveredDeadLetters(db, dlDir, {
+    now: DL_NOW_MS,
+    isPidAlive: PROBE_DEAD,
+  });
+
+  expect(res.prunedRows).toBe(1);
+  expect(res.prunedFiles).toBe(0);
+  expect(existsSync(birthFile)).toBe(true);
+  const remaining = db.query("SELECT dl_id FROM dead_letters").all() as {
+    dl_id: string;
+  }[];
+  expect(remaining.map((r) => r.dl_id)).toEqual(["bs-new"]);
   db.close();
 });
 

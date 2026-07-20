@@ -5811,10 +5811,12 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 /**
  * Age window a `dead_letters` row must exceed before the retention prune removes
  * it — 7 days, matching the reclaim/backup sidecar retention horizon. The gate
- * compares against `recovered_at` (recovered rows) or `dl_written_at` (poison
- * rows), both stored as unix SECONDS (`Date.now() / 1000`).
+ * compares against `recovered_at` (recovered rows) or `dl_written_at`
+ * (terminal row-only statuses), both stored as unix SECONDS (`Date.now() / 1000`).
  */
 export const DEAD_LETTER_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export const BIRTH_STUCK_STATUS = "birth-stuck";
 
 /**
  * Injectable knobs for {@link pruneRecoveredDeadLetters} — defaulted so the
@@ -5887,15 +5889,14 @@ function pidFromDeadLetterFile(filePath: string): number | null {
  *    skips them) and swept next pass (the file is gone, `unlinkSync` ENOENT is a
  *    no-op, the delete still runs).
  *  - ROW-ONLY (no file to resurrect them): `recovered` rows with `source_file
- *    IS NULL` (age on `recovered_at`) and `poison` rows (age on `dl_written_at`
- *    — poison park leaves `recovered_at` NULL). Poison rows' `source_file` points
- *    at an EVENTS-LOG file the ingester solely owns; its durable byte-offset
- *    already advanced past the poison line, so the ROW deletes with no re-ingest
- *    and the file is NEVER touched. Paced (≤500 rows/batch, ≤20 batches) so the
- *    writer lock never starves a concurrent hook INSERT.
+ *    IS NULL` (age on `recovered_at`) and terminal parked rows (age on
+ *    `dl_written_at`). Their producers have already retired or advanced past the
+ *    source, so the ROW deletes with no re-ingest and the file is NEVER touched.
+ *    Paced (≤500 rows/batch, ≤20 batches) so the writer lock never starves a
+ *    concurrent hook INSERT.
  *
  * The `status='waiting'` warn pill is unaffected — this prune removes only
- * `recovered`/`poison` rows. Never throws for a single-file unlink error
+ * `recovered` and terminal parked rows. Never throws for a single-file unlink error
  * (per-file non-fatal, mirroring events-log cleanup); a DB-level error propagates
  * to the caller's non-fatal retention try.
  */
@@ -5974,7 +5975,7 @@ export function pruneRecoveredDeadLetters(
     `SELECT dl_id FROM dead_letters
       WHERE (status = 'recovered' AND source_file IS NULL
              AND recovered_at IS NOT NULL AND recovered_at <= ?)
-         OR (status = 'poison' AND dl_written_at <= ?)
+         OR (status IN ('poison', ?) AND dl_written_at <= ?)
       LIMIT ?`,
   );
   const deleteByIds = db.prepare(
@@ -5983,6 +5984,7 @@ export function pruneRecoveredDeadLetters(
   for (let i = 0; i < DEFAULT_RETENTION_MAX_BATCHES; i++) {
     const idRows = selectRowOnlyBatch.all(
       cutoffSec,
+      BIRTH_STUCK_STATUS,
       cutoffSec,
       DEFAULT_RETENTION_BATCH_SIZE,
     ) as { dl_id: string }[];
@@ -6945,16 +6947,34 @@ export function resolvePiResumeRepairs(
   return repairs;
 }
 
+function emitBirthParkBackstop(
+  ctx: EventsIngestContext | undefined,
+  full: string,
+  dlId: string,
+  status: string,
+): void {
+  if (ctx === undefined) {
+    return;
+  }
+  const now = Date.now();
+  ctx.counters.bump("birth-ingest-poison", "timeout", true);
+  appendBackstopRecord(
+    buildTimeoutRecord({
+      backstop: "birth-ingest-poison",
+      worker: "main",
+      rescued: true,
+      now,
+      stalenessMs: null,
+      detail: { file: full, dl_id: dlId, status },
+    }),
+    ctx.backstopLogPath,
+  );
+}
+
 /**
- * Park a birth record that cannot be folded — a malformed (poison) record, or a
- * stale one whose mint perpetually throws — as a `dead_letters` row with
- * status='poison' (replay's `WHERE status='waiting'` skips it). Deterministic
- * `dl_id` keyed on the file path → `ON CONFLICT DO NOTHING` idempotent.
- * `ts`/`dl_written_at` are scan wall-clock (dead_letters is an operational
- * sidecar, never folded). Returns `true` when the row is durably parked (the
- * caller then retires the file); `false` on a transient DB error (the caller
- * LEAVES the file for the next scan). Emits one `birth-ingest-poison` backstop
- * record when the sink is wired.
+ * Park malformed birth bytes as a poison row. The parked payload stays bounded;
+ * replay skips every non-`waiting` status, and the deterministic `dl_id` keeps
+ * repeated scans idempotent.
  */
 function parkPoisonBirth(
   db: Database,
@@ -6989,30 +7009,58 @@ function parkPoisonBirth(
     );
     return false;
   }
-  if (ctx !== undefined) {
-    ctx.counters.bump("birth-ingest-poison", "timeout", true);
-    appendBackstopRecord(
-      buildTimeoutRecord({
-        backstop: "birth-ingest-poison",
-        worker: "main",
-        rescued: true,
-        now: Date.now(),
-        stalenessMs: null,
-        detail: { file: full, dl_id: dlId },
-      }),
-      ctx.backstopLogPath,
-    );
-  }
+  emitBirthParkBackstop(ctx, full, dlId, "poison");
   return true;
 }
 
-/** Grace before a mint-failing birth record is eligible for dead-pid GC. A
- *  transient write failure deserves several retries; only a record aged past
- *  this AND whose pid is provably dead is parked. */
+const BIRTH_STUCK_HOOK_EVENT = "StuckBirthRecord";
+
+function parkStuckBirth(
+  db: Database,
+  full: string,
+  record: BirthRecord,
+  ctx?: EventsIngestContext,
+): boolean {
+  const dlId = `birth-stuck:${full}`;
+  const nowSec = Date.now() / 1000;
+  try {
+    db.run(
+      `INSERT INTO dead_letters
+         (dl_id, session_id, hook_event, ts, dl_written_at, pid,
+          bindings, status, recovered_at, replayed_event_id, source_file)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+       ON CONFLICT(dl_id) DO NOTHING`,
+      [
+        dlId,
+        record.session_id,
+        BIRTH_STUCK_HOOK_EVENT,
+        birthEventTs(record),
+        nowSec,
+        record.pid,
+        JSON.stringify({ record, file: full }),
+        BIRTH_STUCK_STATUS,
+        full,
+      ],
+    );
+  } catch (err) {
+    console.error(
+      `[keeperd] births stuck-park failed for ${full}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+  emitBirthParkBackstop(ctx, full, dlId, BIRTH_STUCK_STATUS);
+  return true;
+}
+
+/** Grace before a parseable birth record is eligible for dead-pid GC. A
+ *  transient write or wait state deserves several retries; only a record aged
+ *  past this AND whose pid is provably dead is parked. */
 const BIRTH_STUCK_GRACE_MS = 5 * 60_000;
 
 /**
- * Bound the births tree against a record whose mint PERPETUALLY throws: once the
+ * Bound the births tree against a parseable record that cannot mint: once the
  * file has aged past {@link BIRTH_STUCK_GRACE_MS} AND its recorded pid is
  * provably dead (nothing left to track — a live pid still deserves a retry so
  * the session eventually appears), park it to `dead_letters` and retire it. A
@@ -7033,7 +7081,7 @@ function gcStuckBirthRecord(
   if (ageMs < BIRTH_STUCK_GRACE_MS || pidAlive(record.pid)) {
     return;
   }
-  if (parkPoisonBirth(db, full, JSON.stringify(record), record.pid, ctx)) {
+  if (parkStuckBirth(db, full, record, ctx)) {
     retireBirthFile(full);
   }
 }
@@ -7059,7 +7107,7 @@ function gcStuckBirthRecord(
  * A read that ENOENTs (the file vanished — a concurrent scan retired it) is
  * SKIPPED, never parked. NEVER THROWS out of the scan: every recoverable error
  * is swallowed to stderr so one bad file never wedges boot or the message loop.
- * When `ctx` is absent, poison records are STILL parked; only the backstop
+ * When `ctx` is absent, parked records are STILL written; only the backstop
  * record is skipped. MUST run on `db` = main's WRITER connection.
  */
 export function scanBirthDir(
@@ -7151,10 +7199,11 @@ export function scanBirthDir(
         continue;
       }
       if (grantStatus === "deny") {
-        // Keep the promoted identity as fail-closed evidence. A terminal or
-        // superseded owner can never become grantable, and the dead-shim GC
-        // eventually bounds the stranded record without creating authority.
-        gcStuckBirthRecord(db, full, record, ctx);
+        // A denied owner can never become grantable, so retire the record under
+        // its classifiable terminal status immediately.
+        if (parkStuckBirth(db, full, record, ctx)) {
+          retireBirthFile(full);
+        }
         continue;
       }
       if (committed && owner !== null && shouldIssueGrant) {
@@ -15655,8 +15704,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         );
       }
       // Dead-letter retention (resurrection-safe): prune fully-recovered aged
-      // sealed files (unlink-FIRST, rows second) + row-only recovered/poison
-      // tails. Its own try so a prune failure is non-fatal AND leaves the
+      // sealed files (unlink-FIRST, rows second) + row-only terminal tails. Its
+      // own try so a prune failure is non-fatal AND leaves the
       // compaction checkpoint gate below untouched — a DB error here must not
       // forfeit the WAL checkpoint the NULL/DELETE passes just earned. Successful
       // deletions DO count toward the gate (reclaimed dead_letters pages want the
@@ -15666,7 +15715,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         deleted += dlPrune.prunedRows;
         if (dlPrune.prunedRows > 0) {
           console.error(
-            `[keeperd] retention: pruned ${dlPrune.prunedRows} recovered/poison dead-letter row(s) across ${dlPrune.prunedFiles} sealed file(s)`,
+            `[keeperd] retention: pruned ${dlPrune.prunedRows} recovered/terminal dead-letter row(s) across ${dlPrune.prunedFiles} sealed file(s)`,
           );
         }
       } catch (err) {
