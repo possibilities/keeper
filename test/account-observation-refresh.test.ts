@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -65,7 +65,10 @@ function observation(observedAtMs: number): Observation {
         id: "claude-swap:2",
         kind: "managed",
         slot: 2,
-        windows: [{ key: "session", utilization: 0.2, resetsAt: null }],
+        windows: [
+          { key: "session", utilization: 0.2, resetsAt: null },
+          { key: "week", utilization: 0.3, resetsAt: null },
+        ],
         measuredAtMs: observedAtMs,
       },
     ],
@@ -90,6 +93,32 @@ describe("observeOnce", () => {
 });
 
 describe("refreshObservationIfStale", () => {
+  test("replaces a sidecar from the prior admission schema", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
+    try {
+      writeFileSync(
+        observationSidecarPath(dir),
+        `${JSON.stringify({ ...observation(NOW), schema_version: 6 })}\n`,
+      );
+      expect(readObservationSidecar(observationSidecarPath(dir))).toBeNull();
+      const { runner, calls } = recordingRunner();
+      const result = await refreshObservationIfStale({
+        stateDir: dir,
+        runner,
+        nowMs: () => NOW,
+        maxAgeMs: 100,
+        tryAcquireLock: () => held(),
+      });
+      expect(calls).toEqual([cswapListArgv()]);
+      expect(result?.schema_version).toBe(7);
+      expect(readObservationSidecar(observationSidecarPath(dir))).toEqual(
+        result,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("fresh sidecar skips lock acquisition and provider calls", async () => {
     const dir = mkdtempSync(join(tmpdir(), "acct-refresh-"));
     try {

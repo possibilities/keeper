@@ -58,7 +58,6 @@ export type AccountObservationIssue =
   | "api-key"
   | "account-unavailable"
   | "missing-freshness"
-  | "measurement-stale"
   | "missing-windows"
   | "malformed-scoped-windows";
 
@@ -173,6 +172,19 @@ function statusIssue(status: unknown): AccountObservationIssue {
   }
 }
 
+function statusDiagnostic(status: unknown): string {
+  switch (status) {
+    case "relogin_required":
+    case "token_expired":
+    case "keychain_unavailable":
+    case "no_credentials":
+    case "api_key":
+      return status;
+    default:
+      return "unavailable";
+  }
+}
+
 function emptyInventory(
   health: ObservationHealth,
   note: string,
@@ -188,14 +200,13 @@ function emptyInventory(
 
 /**
  * Parse the managed inventory. Every valid slot keeps its stable display ordinal,
- * while only fresh `usageStatus:"ok"` rows carrying quota windows become launch
+ * while only `usageStatus:"ok"` rows carrying required quota windows become launch
  * candidates. The active slot is retained as an ordinary managed route: Keeper
  * always launches through `cswap run`, including claude-swap's same-account path.
  */
 export function parseCswapList(
   outcome: ProviderRunOutcome,
   nowMs: number,
-  freshnessCeilingMs: number,
 ): CswapInventory {
   if (outcome.code === null) {
     return emptyInventory("absent", "cswap: unavailable");
@@ -208,10 +219,7 @@ export function parseCswapList(
     return emptyInventory("error", "cswap: reported error");
   }
   if (parsed.schemaVersion !== CSWAP_SUPPORTED_SCHEMA_MAJOR) {
-    return emptyInventory(
-      "unsupported",
-      `cswap: unsupported schema ${String(parsed.schemaVersion)}`,
-    );
+    return emptyInventory("unsupported", "cswap: unsupported schema");
   }
   if (!Array.isArray(parsed.accounts)) {
     return emptyInventory("unsupported", "cswap: no accounts array");
@@ -244,7 +252,7 @@ export function parseCswapList(
       }
     }
 
-    const parsedRow = parseCswapAccount(row, nowMs, freshnessCeilingMs);
+    const parsedRow = parseCswapAccount(row, nowMs);
     if (parsedRow.note) notes.push(parsedRow.note);
     const rowSlot = isRecord(row) ? row.number : null;
     const rowRouteId =
@@ -278,7 +286,6 @@ export function parseCswapList(
 function parseCswapAccount(
   row: unknown,
   nowMs: number,
-  freshnessCeilingMs: number,
 ): { route?: Route; note?: string; issue?: AccountObservationIssue } {
   if (!isRecord(row)) return { note: "cswap: non-object row" };
   const slot = row.number;
@@ -287,7 +294,7 @@ function parseCswapAccount(
   }
   if (row.usageStatus !== CSWAP_ROUTEABLE_STATUS) {
     return {
-      note: `cswap: slot ${slot} not routeable (${String(row.usageStatus)})`,
+      note: `cswap: slot ${slot} not routeable (${statusDiagnostic(row.usageStatus)})`,
       issue: statusIssue(row.usageStatus),
     };
   }
@@ -298,13 +305,6 @@ function parseCswapAccount(
       issue: "missing-freshness",
     };
   }
-  const ageMs = nowMs - measuredAtMs;
-  if (ageMs < 0 || ageMs > freshnessCeilingMs) {
-    return {
-      note: `cswap: slot ${slot} measurement stale`,
-      issue: "measurement-stale",
-    };
-  }
   const parsedWindows = parseCswapWindows(row.usage);
   if (parsedWindows.scopedMalformed) {
     return {
@@ -313,9 +313,12 @@ function parseCswapAccount(
     };
   }
   const { windows } = parsedWindows;
-  if (windows.length === 0) {
+  if (
+    !windows.some((window) => window.key === "session") ||
+    !windows.some((window) => window.key === "week")
+  ) {
     return {
-      note: `cswap: slot ${slot} has no windows`,
+      note: `cswap: slot ${slot} has no required windows`,
       issue: "missing-windows",
     };
   }
@@ -338,7 +341,8 @@ function cswapMeasuredAtMs(
   if (fetched !== null) return fetched;
   const age = row.usageAgeSeconds;
   if (typeof age === "number" && Number.isFinite(age) && age >= 0) {
-    return nowMs - age * 1000;
+    const measuredAtMs = nowMs - age * 1000;
+    return Number.isFinite(measuredAtMs) ? measuredAtMs : null;
   }
   return null;
 }
@@ -546,7 +550,6 @@ function isAccountObservationIssue(
     value === "api-key" ||
     value === "account-unavailable" ||
     value === "missing-freshness" ||
-    value === "measurement-stale" ||
     value === "missing-windows" ||
     value === "malformed-scoped-windows"
   );
@@ -586,11 +589,16 @@ function validateRoute(data: unknown): Route | null {
     return null;
   }
   const windows: NormalizedWindow[] = [];
+  const windowKeys = new Set<string>();
   for (const raw of data.windows) {
     const window = validateWindow(raw);
     if (window === null) return null;
+    const normalizedKey = window.key.toLowerCase();
+    if (windowKeys.has(normalizedKey)) return null;
+    windowKeys.add(normalizedKey);
     windows.push(window);
   }
+  if (!windowKeys.has("session") || !windowKeys.has("week")) return null;
   return {
     id: data.id,
     kind: "managed",
@@ -604,9 +612,7 @@ function validateWindow(data: unknown): NormalizedWindow | null {
   if (
     !isRecord(data) ||
     typeof data.key !== "string" ||
-    !/^(?:session|week|spend|model:[A-Za-z0-9][A-Za-z0-9 ._+:/()-]{0,63})$/u.test(
-      data.key,
-    ) ||
+    !isValidWindowKey(data.key) ||
     typeof data.utilization !== "number" ||
     !Number.isFinite(data.utilization) ||
     data.utilization < 0 ||
@@ -623,6 +629,17 @@ function validateWindow(data: unknown): NormalizedWindow | null {
     utilization: data.utilization,
     resetsAt,
   };
+}
+
+function isValidWindowKey(key: string): boolean {
+  if (key === "session" || key === "week" || key === "spend") return true;
+  if (!key.startsWith("model:")) return false;
+  const name = key.slice("model:".length);
+  return (
+    name === name.trim() &&
+    name.length <= 64 &&
+    /^[A-Za-z0-9][A-Za-z0-9 ._+:/()-]*$/u.test(name)
+  );
 }
 
 function isObservationHealth(value: unknown): value is ObservationHealth {
@@ -645,7 +662,7 @@ export function isObservationFresh(
   return ageMs >= 0 && maxAgeMs >= 0 && ageMs <= maxAgeMs;
 }
 
-/** Revalidate one route at use time so a fresh sidecar cannot extend old usage. */
+/** Classify Measurement age for diagnostics without changing route admission. */
 export function isRouteMeasurementFresh(
   route: Route,
   nowMs: number,

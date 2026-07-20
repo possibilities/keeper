@@ -67,12 +67,15 @@ Claude launches require [claude-swap](https://github.com/realiti4/claude-swap). 
 non-Claude surfaces, but Claude remains unavailable until `cswap` works and at least one account is
 registered.
 
-The daemon publishes one private, freshness-bounded Capacity observation from `cswap list --json`. A
-route must have fresh `usageStatus: ok` data plus remaining session and weekly quota; Fable work also
-requires remaining Fable quota. Unknown, stale, malformed, signed-out, exhausted, or otherwise unusable
-routes are excluded rather than treated as spare capacity. A successful managed launch always runs through
-`cswap run <slot> --share-history -- <claude arguments...>`; missing or stale inventory and zero eligible
-routes fail before Claude starts.
+The daemon publishes one private Capacity observation from each completed `cswap list --json` response;
+only a fresh observation supplies routing or focus-setup advice. claude-swap owns each row's `usageStatus`
+and raw quota values, including its last-good and backoff policy. Keeper admits only `usageStatus: ok`
+routes with valid provenance, required session and weekly windows, and remaining raw quota; Fable work
+also requires remaining Fable quota. Per-account Measurement age is diagnostic provenance shown by
+`keeper usage`, never a second eligibility gate. A fresh non-`ok` row removes the route immediately, while
+unknown, malformed, signed-out, exhausted, or otherwise unusable routes remain excluded. Every managed
+launch runs through `cswap run <slot> --share-history -- <claude arguments...>`; stale Capacity inventory
+and zero eligible routes fail before Claude starts.
 
 #### Routing model
 
@@ -109,11 +112,14 @@ A focus lifetime is one of:
 
 Use the read-only account check for Capacity observation health, candidate Account routes, and the
 ordinary route choice; it records no Launch reservation. Use the focus view for durable policy, effective
-state, target, lifetime, fallback, and delivery diagnostic. Both are PII-free.
+state, target, lifetime, fallback, and delivery diagnostic. `keeper usage` renders the admitted raw meters:
+the source age is whole-snapshot Capacity freshness, while each Claude account's `measured` age is
+provenance only. These surfaces are PII-free.
 
 ```sh
 keeper agent accounts check --json
 keeper agent accounts fable-focus show --json
+keeper usage
 keeper status --json
 keeper board
 ```

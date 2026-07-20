@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import {
   isObservationFresh,
-  isRouteMeasurementFresh,
   type Observation,
   readObservationSidecar,
 } from "./account-observation";
@@ -10,7 +9,6 @@ import {
   codexObservationSidecarPath,
   OBSERVATION_FRESHNESS_CEILING_MS,
   observationSidecarPath,
-  ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
   resolveAccountRoutingRoot,
   resolveCodexAccountRoutingRoot,
 } from "./account-routing-config";
@@ -48,6 +46,7 @@ export interface UsageAccount {
   sourceId: string;
   status: UsageAccountStatus;
   detail: string | null;
+  measuredAtMs: number | null;
   meters: UsageMeter[];
 }
 
@@ -132,19 +131,16 @@ function buildClaudeSource(
         sourceId: routeId,
         status: "issue",
         detail: issue ?? "account unavailable",
+        measuredAtMs: null,
         meters: [],
       };
     }
-    const routeFresh = isRouteMeasurementFresh(
-      route,
-      nowMs,
-      ROUTE_MEASUREMENT_FRESHNESS_CEILING_MS,
-    );
     return {
       id: `Claude ${ordinal + 1}`,
       sourceId: routeId,
-      status: status === "stale" || !routeFresh ? "stale" : "ok",
+      status: status === "stale" ? "stale" : "ok",
       detail: null,
+      measuredAtMs: route.measuredAtMs,
       meters: route.windows.map((window) => ({
         key: window.key,
         label: claudeMeterLabel(window.key),
@@ -238,6 +234,7 @@ function buildCodexSource(
         sourceId: alias.alias,
         status,
         detail,
+        measuredAtMs: null,
         meters: alias.windows.map((window, meterIndex) =>
           codexMeter(
             window,
@@ -330,10 +327,15 @@ function sourceHeading(source: UsageSource, nowMs: number): string {
   return `[${source.provider}] [${source.status}]${detail}${ageSuffix}`;
 }
 
-function accountSuffix(account: UsageAccount): string {
-  if (account.status === "ok") return "";
-  const detail = account.detail === null ? "" : ` · ${account.detail}`;
-  return `  [${account.status}]${detail}`;
+function accountSuffix(account: UsageAccount, nowMs: number): string {
+  const parts: string[] = [];
+  if (account.status !== "ok") {
+    parts.push(`[${account.status}]`);
+    if (account.detail !== null) parts.push(account.detail);
+  }
+  const measurementAge = ageText(account.measuredAtMs, nowMs);
+  if (measurementAge !== "") parts.push(`measured ${measurementAge}`);
+  return parts.length === 0 ? "" : `  ${parts.join(" · ")}`;
 }
 
 function renderSource(source: UsageSource, nowMs: number): string[] {
@@ -353,7 +355,7 @@ function renderSource(source: UsageSource, nowMs: number): string[] {
   );
   for (const [accountIndex, account] of source.accounts.entries()) {
     if (accountIndex > 0) lines.push("");
-    lines.push(`  ${account.id}${accountSuffix(account)}`);
+    lines.push(`  ${account.id}${accountSuffix(account, nowMs)}`);
     for (const meter of account.meters) {
       const label = boundedLabel(meter.label, "meter").slice(0, labelWidth);
       const reset =
@@ -377,7 +379,7 @@ export function renderUsageLines(snapshot: UsageSnapshot): string[] {
   ];
 }
 
-/** Fingerprint only provider semantics; heartbeat timestamps repaint locally. */
+/** Fingerprint only provider semantics; age and countdown timestamps repaint locally. */
 export function usageSemanticFingerprint(snapshot: UsageSnapshot): string {
   const source = (value: UsageSource) => ({
     provider: value.provider,

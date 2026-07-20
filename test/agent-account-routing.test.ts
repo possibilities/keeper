@@ -468,7 +468,7 @@ describe("keeper agent accounts fable-focus", () => {
     }
   });
 
-  test("absolute, cycle-end, and guarded current-reset setters preserve stable route identity", async () => {
+  test("focus setters preserve stable routes with old measurement provenance", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "keeper-focus-lifetimes-"));
     const now = Date.parse("2026-07-18T00:00:00Z");
     const resetAt = "2026-07-18T01:00:00.900Z";
@@ -483,7 +483,7 @@ describe("keeper agent accounts fable-focus", () => {
             id: "claude-swap:2",
             kind: "managed",
             slot: 2,
-            measuredAtMs: now,
+            measuredAtMs: Date.parse("2001-01-01T00:00:00Z"),
             windows: [
               { key: "session", utilization: 0.2, resetsAt: null },
               { key: "week", utilization: 0.3, resetsAt: null },

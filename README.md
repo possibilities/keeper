@@ -13,10 +13,11 @@ single DB. Every agent session feeds an append-only event log; a long-running da
 - **Autopilot** — a reconciler dispatches plan work to managed workers, with worktree
   lanes, merge handling, and escalation; Harness activity, Dispatch claims, and exact
   Resource holds remain independently observable and recoverable
-- **Account routing** — Claude launches use process-bound claude-swap Account routes;
-  Keeper-launched Pi sessions load a separate Codex companion for root/child session
-  routing, with native fallback and proof-gated activation. `keeper agent accounts check
-  --json` reports both without reading credentials; see the
+- **Account routing** — Claude launches use process-bound claude-swap Account routes from
+  a fresh Capacity observation. claude-swap owns `usageStatus` and raw quota values;
+  per-account Measurement age remains provenance in `keeper usage`, not an eligibility
+  gate. Keeper-launched Pi sessions use a separate, proof-gated Codex companion.
+  `keeper agent accounts check --json` reports both without reading credentials; see the
   [routing operations guide](./docs/install.md#pi-codex-account-pool)
 - **Fable focus** — a durable, PII-free Account route preference for Fable work,
   inspectable through account checks, `keeper status`, and `keeper board`; see the
