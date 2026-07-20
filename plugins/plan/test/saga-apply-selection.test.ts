@@ -12,7 +12,7 @@
 // selector's own artifact — never a value re-derived by the verb under test.
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -41,11 +41,15 @@ beforeEach(() => {
   project = getProject();
 });
 
-function run(args: string[], opts: { input?: string } = {}) {
+function run(
+  args: string[],
+  opts: { input?: string; env?: Record<string, string> } = {},
+) {
   return runCli(args, {
     cwd: project.root,
     home: project.home,
     input: opts.input,
+    env: opts.env,
   });
 }
 
@@ -79,15 +83,87 @@ function errDetails(output: string): string[] {
     .details as string[];
 }
 
+function nonSparkCell(
+  taskId: string,
+  tier: string,
+  model = "opus",
+  opts: {
+    rationale?: string;
+    confidence?: number;
+    sparkExclusion?: string;
+  } = {},
+): Record<string, unknown> {
+  return {
+    task_id: taskId,
+    tier,
+    model,
+    rationale: opts.rationale ?? "not a Spark fit",
+    confidence: opts.confidence ?? 0.8,
+    spark_fit: false,
+    spark_exclusion: opts.sparkExclusion ?? "spark-not-on-axis",
+  };
+}
+
+function sparkCell(
+  taskId: string,
+  tier = "high",
+  opts: { rationale?: string; confidence?: number } = {},
+): Record<string, unknown> {
+  return {
+    task_id: taskId,
+    tier,
+    model: "gpt-5.3-codex-spark",
+    rationale: opts.rationale ?? "fixed-shape Spark fit",
+    confidence: opts.confidence ?? 0.84,
+    spark_fit: true,
+    spark_exclusion: null,
+  };
+}
+
+const CLAUDE_AND_PI_MATRIX = readFileSync(
+  join(import.meta.dir, "fixtures", "matrix-claude-and-pi.yaml"),
+  "utf-8",
+);
+
+function writeMatrixEnv(
+  name: string,
+  matrixYaml: string,
+): Record<string, string> {
+  const dir = join(project.home, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "matrix.yaml"), matrixYaml, "utf-8");
+  return { KEEPER_CONFIG_DIR: dir };
+}
+
+function sparkMatrixEnv(): Record<string, string> {
+  return writeMatrixEnv("spark-matrix", CLAUDE_AND_PI_MATRIX);
+}
+
+function restrictedSparkMatrixEnv(): Record<string, string> {
+  return writeMatrixEnv(
+    "restricted-spark-matrix",
+    CLAUDE_AND_PI_MATRIX.replace(
+      "      - openai-codex/gpt-5.3-codex-spark",
+      "      - id: openai-codex/gpt-5.3-codex-spark\n" +
+        "        efforts: [low, medium, high]",
+    ),
+  );
+}
+
 /** Build + write the live brief through the real selection-brief verb; returns
  * its {config_hash, input_hash, shuffle_seed} for the provenance-pinning
  * assertions (the selector's own artifact, not re-derived by apply-selection). */
-function makeLiveBrief(epicId: string): {
+function makeLiveBrief(
+  epicId: string,
+  env?: Record<string, string>,
+): {
   configHash: string;
   inputHash: string;
   shuffleSeed: number;
 } {
-  const r = run(["selection-brief", epicId, "--project", project.root]);
+  const r = run(["selection-brief", epicId, "--project", project.root], {
+    env,
+  });
   expect(r.code).toBe(0);
   const payload = parseCliOutput(r.output);
   return {
@@ -108,14 +184,13 @@ describe("apply-selection guided live", () => {
 
     const verdict = JSON.stringify({
       cells: [
-        {
-          task_id: taskIds[0],
-          tier: "high",
-          model: "sonnet",
+        nonSparkCell(taskIds[0] as string, "high", "sonnet", {
           rationale: "task 1 is subtle",
           confidence: 0.9,
-        },
-        { task_id: taskIds[1], tier: "max", model: "opus" },
+        }),
+        nonSparkCell(taskIds[1] as string, "max", "opus", {
+          rationale: "task 2 is not Spark",
+        }),
       ],
     });
 
@@ -156,10 +231,14 @@ describe("apply-selection guided live", () => {
       model: "sonnet",
       rationale: "task 1 is subtle",
       confidence: 0.9,
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
       label_source: "heuristic-guided",
     });
     expect(cells[1]?.label_source).toBe("heuristic-guided");
-    expect(cells[1]?.rationale).toBeNull();
+    expect(cells[1]?.rationale).toBe("task 2 is not Spark");
+    expect(cells[1]?.spark_fit).toBe(false);
+    expect(cells[1]?.spark_exclusion).toBe("spark-not-on-axis");
 
     // Exactly one auto-commit carrying the cells AND the sidecar.
     expect(gitLogCount(project.root)).toBe(before + 1);
@@ -172,7 +251,7 @@ describe("apply-selection guided live", () => {
     const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
     makeLiveBrief(epicId);
     const inner = JSON.stringify({
-      cells: [{ task_id: taskIds[0], tier: "high", model: "opus" }],
+      cells: [nonSparkCell(taskIds[0] as string, "high")],
     });
     const fenced = `\`\`\`json\n${inner}\n\`\`\`\n`;
     const r = run(["apply-selection", epicId, "--file", "-"], {
@@ -183,6 +262,45 @@ describe("apply-selection guided live", () => {
     expect(readTask(taskIds[0] as string).tier).toBe("high");
     // The raw (pre-strip) text is preserved verbatim in the sidecar.
     expect(readSidecar(epicId).verdict_raw).toBe(fenced);
+  });
+
+  test("Spark selection requires fit=true/exclusion=null and persists the evidence", () => {
+    const env = sparkMatrixEnv();
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1, env });
+    makeLiveBrief(epicId, env);
+    const verdict = JSON.stringify({
+      cells: [sparkCell(taskIds[0] as string)],
+    });
+
+    const r = run(["apply-selection", epicId, "--file", "-"], {
+      input: verdict,
+      env,
+    });
+    expect(r.code).toBe(0);
+    expect(readTask(taskIds[0] as string).model).toBe("gpt-5.3-codex-spark");
+    const cell = (readSidecar(epicId).cells as Record<string, unknown>[])[0];
+    expect(cell?.spark_fit).toBe(true);
+    expect(cell?.spark_exclusion).toBeNull();
+  });
+
+  test("rejects a Spark effort absent from that task's exact candidate_cells", () => {
+    const env = restrictedSparkMatrixEnv();
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1, env });
+    makeLiveBrief(epicId, env);
+
+    const r = run(["apply-selection", epicId, "--file", "-"], {
+      input: JSON.stringify({
+        cells: [sparkCell(taskIds[0] as string, "xhigh")],
+      }),
+      env,
+    });
+
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("verdict_invalid");
+    expect(errDetails(r.output).some((d) => d.includes("candidate"))).toBe(
+      true,
+    );
+    expect(existsSync(sidecarPath(epicId))).toBe(false);
   });
 });
 
@@ -269,6 +387,36 @@ function taskCell(taskId: string): { tier: string; model: string } {
 }
 
 describe("apply-selection guided follow-up", () => {
+  test("rejects a Spark effort absent from follow-up task candidate_cells before staging", () => {
+    const env = restrictedSparkMatrixEnv();
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1, env });
+    markAllDone(project.root, taskIds);
+    const hash = emptySetHash();
+    seedBrief(project.root, epicId, hash);
+    seedVerdict(project.root, epicId, hash, 1);
+    seedFollowupYaml(project.root, epicId, 1);
+
+    const brief = run(
+      ["selection-brief", epicId, "--from-followup", "--project", project.root],
+      { env },
+    );
+    expect(brief.code).toBe(0);
+
+    const r = run(
+      ["apply-selection", epicId, "--from-followup", "--file", "-"],
+      { input: JSON.stringify({ cells: [sparkCell("1", "xhigh")] }), env },
+    );
+
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("verdict_invalid");
+    expect(errDetails(r.output).some((d) => d.includes("candidate"))).toBe(
+      true,
+    );
+    expect(existsSync(briefFilePath(epicId, "followup-verdict.json"))).toBe(
+      false,
+    );
+  });
+
   test("staged verdict round-trips through close-finalize; follow-up tasks born selected", () => {
     // A done epic with a 2-cluster verdict + a 2-task followup document.
     const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
@@ -292,8 +440,8 @@ describe("apply-selection guided follow-up", () => {
     // Apply the ordinal verdict → stage the follow-up verdict document.
     const verdict = JSON.stringify({
       cells: [
-        { task_id: "1", tier: "high", model: "sonnet", rationale: "subtle" },
-        { task_id: "2", tier: "max", model: "opus" },
+        nonSparkCell("1", "high", "sonnet", { rationale: "subtle" }),
+        nonSparkCell("2", "max", "opus", { rationale: "not Spark" }),
       ],
     });
     const before = gitLogCount(project.root);
@@ -316,12 +464,17 @@ describe("apply-selection guided follow-up", () => {
       string,
       unknown
     >;
-    expect(doc.schema_version).toBe(1);
+    expect(doc.schema_version).toBe(2);
     expect((doc.cells as Record<string, unknown>)["1"]).toMatchObject({
       tier: "high",
       model: "sonnet",
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
     });
     expect((doc.selection as Record<string, unknown>).harness).toBe("subagent");
+    expect((doc.selection as Record<string, unknown>).spark_axis_present).toBe(
+      false,
+    );
 
     // Real in-process close-finalize consumes the staged path — no degrade.
     const cf = runCli(
@@ -346,6 +499,14 @@ describe("apply-selection guided follow-up", () => {
       model: "sonnet",
     });
     expect(taskCell(`${newEpicId}.2`)).toEqual({ tier: "max", model: "opus" });
+    const side = readSidecar(newEpicId);
+    const sideCells = side.cells as Record<string, unknown>[];
+    expect(side.outcome).toBe("completed");
+    expect(sideCells[0]).toMatchObject({
+      task_id: `${newEpicId}.1`,
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
+    });
   });
 });
 
@@ -380,9 +541,10 @@ describe("apply-selection --degraded", () => {
     expect(sc.input_hash).toBe(pins.inputHash);
     expect(sc.shuffle_seed).toBeNull();
     expect(sc.verdict_raw).toBeNull();
-    expect((sc.cells as Record<string, unknown>[])[0]?.label_source).toBe(
-      "heuristic-default",
-    );
+    const degradedCell = (sc.cells as Record<string, unknown>[])[0];
+    expect(degradedCell?.label_source).toBe("heuristic-default");
+    expect(degradedCell?.spark_fit).toBeNull();
+    expect(degradedCell?.spark_exclusion).toBeNull();
   });
 
   test("with no brief on disk: hashes fall back to the `unavailable` sentinel", () => {
@@ -395,9 +557,10 @@ describe("apply-selection --degraded", () => {
     expect(sc.outcome).toBe("degraded:no-selector");
     expect(sc.config_hash).toBe("unavailable");
     expect(sc.input_hash).toBe("unavailable");
-    expect((sc.cells as Record<string, unknown>[])[0]?.label_source).toBe(
-      "heuristic-default",
-    );
+    const degradedCell = (sc.cells as Record<string, unknown>[])[0];
+    expect(degradedCell?.label_source).toBe("heuristic-default");
+    expect(degradedCell?.spark_fit).toBeNull();
+    expect(degradedCell?.spark_exclusion).toBeNull();
   });
 
   test("rejects --degraded combined with --from-followup", () => {
@@ -450,7 +613,7 @@ describe("apply-selection verdict_invalid", () => {
     makeLiveBrief(epicId);
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "high", model: "opus" }],
+        cells: [nonSparkCell(taskIds[0] as string, "high")],
         selection: { harness: "evil", model: "evil", config_hash: "x" },
       }),
     });
@@ -468,7 +631,7 @@ describe("apply-selection verdict_invalid", () => {
     makeLiveBrief(epicId);
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "bogus", model: "opus" }],
+        cells: [nonSparkCell(taskIds[0] as string, "bogus")],
       }),
     });
     expect(r.code).toBe(1);
@@ -483,7 +646,7 @@ describe("apply-selection verdict_invalid", () => {
     makeLiveBrief(epicId);
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "high", model: "opus" }],
+        cells: [nonSparkCell(taskIds[0] as string, "high")],
       }),
     });
     expect(r.code).toBe(1);
@@ -494,6 +657,44 @@ describe("apply-selection verdict_invalid", () => {
       ),
     ).toBe(true);
   });
+
+  test("Spark evidence contradictions are collected before any write", () => {
+    const env = sparkMatrixEnv();
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1, env });
+    makeLiveBrief(epicId, env);
+    const bad = {
+      ...sparkCell(taskIds[0] as string),
+      spark_fit: false,
+      spark_exclusion: "fixed-shape-too-large",
+      extra: "nope",
+    };
+    const r = run(["apply-selection", epicId, "--file", "-"], {
+      input: JSON.stringify({ cells: [bad] }),
+      env,
+    });
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("verdict_invalid");
+    const details = errDetails(r.output);
+    expect(details.some((d) => d.includes("unknown key `extra`"))).toBe(true);
+    expect(details.some((d) => d.includes("spark_fit` true"))).toBe(true);
+    expect(details.some((d) => d.includes("spark_exclusion` null"))).toBe(true);
+    expect(existsSync(sidecarPath(epicId))).toBe(false);
+  });
+
+  test("Spark absent from the brief axis rejects Spark evidence with an axis reason", () => {
+    const { epicId, taskIds } = scaffoldEpic(project, { nTasks: 1 });
+    makeLiveBrief(epicId);
+    const r = run(["apply-selection", epicId, "--file", "-"], {
+      input: JSON.stringify({ cells: [sparkCell(taskIds[0] as string)] }),
+    });
+    expect(r.code).toBe(1);
+    expect(errCode(r.output)).toBe("verdict_invalid");
+    const details = errDetails(r.output);
+    expect(details.some((d) => d.includes("not a candidate"))).toBe(true);
+    expect(
+      details.some((d) => d.includes("Spark is not on the brief axis")),
+    ).toBe(true);
+  });
 });
 
 describe("apply-selection brief_missing", () => {
@@ -502,7 +703,7 @@ describe("apply-selection brief_missing", () => {
     // No selection-brief run.
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "high", model: "opus" }],
+        cells: [nonSparkCell(taskIds[0] as string, "high")],
       }),
     });
     expect(r.code).toBe(1);
@@ -520,7 +721,7 @@ describe("apply-selection brief_missing", () => {
 
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
-        cells: [{ task_id: taskIds[0], tier: "high", model: "opus" }],
+        cells: [nonSparkCell(taskIds[0] as string, "high")],
       }),
     });
     expect(r.code).toBe(1);
@@ -541,8 +742,8 @@ describe("apply-selection cell_invalid", () => {
     const r = run(["apply-selection", epicId, "--file", "-"], {
       input: JSON.stringify({
         cells: [
-          { task_id: taskIds[0], tier: "high", model: "opus" },
-          { task_id: taskIds[1], tier: "max", model: "opus" },
+          nonSparkCell(taskIds[0] as string, "high"),
+          nonSparkCell(taskIds[1] as string, "max"),
         ],
       }),
     });

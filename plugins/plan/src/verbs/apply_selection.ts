@@ -15,9 +15,10 @@
 // GUIDED (default): read the selector's raw JSON from stdin (`--file -`; a single
 // optional ```json fenced block is tolerated so a Task return pipes verbatim),
 // then validate in layers, collect-all:
-//   - shape: a `cells:` list of {task_id, tier, model, rationale?, confidence?};
-//     unknown top-level keys and an error-shaped {"error": ...} return fail here
-//     (verdict_invalid).
+//   - shape: a `cells:` list of exact {task_id, tier, model, rationale,
+//     confidence, spark_fit, spark_exclusion}; unknown or missing fields,
+//     inconsistent Spark evidence, unknown top-level keys, and an error-shaped
+//     {"error": ...} return fail here (verdict_invalid).
 //   - brief: locate `.keeper/state/selections/<epic>/brief.json` (or
 //     followup-brief.json under --from-followup), assert its `from_followup` flag
 //     matches the invocation (brief_missing on absence / mismatch).
@@ -58,7 +59,13 @@ import {
   type ProjectContext,
   resolveProject,
 } from "../project.ts";
-import { SELECTION_SCHEMA_VERSION } from "../selection_sidecar.ts";
+import {
+  FOLLOWUP_VERDICT_SCHEMA_VERSION,
+  isSparkExclusionReason,
+  SPARK_EXCLUSION_REASONS,
+  SPARK_MODEL,
+  type SparkExclusionReason,
+} from "../selection_sidecar.ts";
 import { hasDataDir } from "../state_path.ts";
 import { atomicWriteRaw, serializeStateJson } from "../store.ts";
 import { readPayloadCapped, SubmitError } from "../submit_common.ts";
@@ -94,8 +101,10 @@ interface VerdictCell {
   taskId: string;
   tier: string;
   model: string;
-  rationale: string | null;
-  confidence: number | string | null;
+  rationale: string;
+  confidence: number;
+  sparkFit: boolean;
+  sparkExclusion: SparkExclusionReason | null;
 }
 
 export function runApplySelection(args: ApplySelectionArgs): number {
@@ -270,7 +279,13 @@ export function runApplySelection(args: ApplySelectionArgs): number {
   };
 
   if (fromFollowup) {
-    return stageFollowupVerdict(epicId, ctx, shape.cells, provenance);
+    return stageFollowupVerdict(
+      epicId,
+      ctx,
+      shape.cells,
+      provenance,
+      briefShape.sparkOnAxis,
+    );
   }
 
   // ------------------------------------------------------------------
@@ -282,6 +297,8 @@ export function runApplySelection(args: ApplySelectionArgs): number {
     model: c.model,
     rationale: c.rationale,
     confidence: c.confidence,
+    sparkFit: c.sparkFit,
+    sparkExclusion: c.sparkExclusion,
     labelSource: "heuristic-guided",
   }));
   const effective = effectiveMatrix();
@@ -352,6 +369,8 @@ function runDegraded(
           model: typeof def.model === "string" ? def.model : "",
           rationale: null,
           confidence: null,
+          sparkFit: null,
+          sparkExclusion: null,
           labelSource: "heuristic-default",
         };
       });
@@ -370,6 +389,7 @@ function stageFollowupVerdict(
   ctx: ProjectContext,
   cells: readonly VerdictCell[],
   provenance: SelectionCoreProvenance,
+  sparkAxisPresent: boolean,
 ): number {
   const cellMap: Record<string, Record<string, unknown>> = {};
   for (const c of cells) {
@@ -378,10 +398,12 @@ function stageFollowupVerdict(
       model: c.model,
       rationale: c.rationale,
       confidence: c.confidence,
+      spark_fit: c.sparkFit,
+      spark_exclusion: c.sparkExclusion,
     };
   }
   const doc = {
-    schema_version: SELECTION_SCHEMA_VERSION,
+    schema_version: FOLLOWUP_VERDICT_SCHEMA_VERSION,
     cells: cellMap,
     selection: {
       harness: provenance.harness,
@@ -391,6 +413,7 @@ function stageFollowupVerdict(
       shuffle_seed: provenance.shuffleSeed,
       outcome: provenance.outcome,
       verdict_raw: provenance.verdictRaw,
+      spark_axis_present: sparkAxisPresent,
     },
   };
   const verdictPath = selectionBriefPath(
@@ -435,8 +458,9 @@ function stripJsonFence(text: string): string {
 }
 
 /** Shape-validate the parsed verdict (collect-all): a top-level object whose ONLY
- * key is `cells` (a list of {task_id, tier, model, rationale?, confidence?}). An
- * error-shaped `{"error": ...}` return and any other unknown top-level key fail. */
+ * key is `cells` (a list of exact {task_id, tier, model, rationale, confidence,
+ * spark_fit, spark_exclusion}). An error-shaped `{"error": ...}` return, any
+ * unknown key, any missing key, and model/Spark-evidence inconsistency fail. */
 function parseVerdictShape(
   parsed: unknown,
 ):
@@ -469,6 +493,15 @@ function parseVerdictShape(
   if (cellsNode.length === 0) {
     details.push("`cells` must be non-empty");
   }
+  const allowedCellKeys = new Set([
+    "task_id",
+    "tier",
+    "model",
+    "rationale",
+    "confidence",
+    "spark_fit",
+    "spark_exclusion",
+  ]);
   for (let idx = 0; idx < cellsNode.length; idx += 1) {
     const prefix = `cells #${idx + 1}`;
     const entry = cellsNode[idx];
@@ -476,6 +509,17 @@ function parseVerdictShape(
       details.push(`${prefix}: must be an object`);
       continue;
     }
+    for (const key of Object.keys(entry)) {
+      if (!allowedCellKeys.has(key)) {
+        details.push(`${prefix}: unknown key \`${key}\``);
+      }
+    }
+    for (const key of allowedCellKeys) {
+      if (!(key in entry)) {
+        details.push(`${prefix}: missing required key \`${key}\``);
+      }
+    }
+
     const tidRaw = entry.task_id;
     let taskId = "";
     if (typeof tidRaw !== "string" || tidRaw.trim() === "") {
@@ -497,28 +541,83 @@ function parseVerdictShape(
     } else {
       model = modelRaw;
     }
-    let rationale: string | null = null;
-    if (entry.rationale !== null && entry.rationale !== undefined) {
-      if (typeof entry.rationale !== "string") {
-        details.push(`${prefix}: \`rationale\` must be a string when present`);
-      } else {
-        rationale = entry.rationale;
-      }
+
+    const rationaleRaw = entry.rationale;
+    let rationale = "";
+    if (typeof rationaleRaw !== "string" || rationaleRaw.trim() === "") {
+      details.push(`${prefix}: \`rationale\` must be a non-empty string`);
+    } else {
+      rationale = rationaleRaw;
     }
-    let confidence: number | string | null = null;
-    if (entry.confidence !== null && entry.confidence !== undefined) {
-      if (
-        typeof entry.confidence === "number" ||
-        typeof entry.confidence === "string"
-      ) {
-        confidence = entry.confidence;
-      } else {
+
+    const confidenceRaw = entry.confidence;
+    let confidence = 0;
+    if (
+      typeof confidenceRaw !== "number" ||
+      !Number.isFinite(confidenceRaw) ||
+      confidenceRaw < 0 ||
+      confidenceRaw > 1
+    ) {
+      details.push(`${prefix}: \`confidence\` must be a number from 0 to 1`);
+    } else {
+      confidence = confidenceRaw;
+    }
+
+    const sparkFitRaw = entry.spark_fit;
+    let sparkFit = false;
+    if (typeof sparkFitRaw !== "boolean") {
+      details.push(`${prefix}: \`spark_fit\` must be a boolean`);
+    } else {
+      sparkFit = sparkFitRaw;
+    }
+
+    const sparkExclusionRaw = entry.spark_exclusion;
+    let sparkExclusion: SparkExclusionReason | null = null;
+    if (sparkExclusionRaw !== null) {
+      if (!isSparkExclusionReason(sparkExclusionRaw)) {
         details.push(
-          `${prefix}: \`confidence\` must be a number or string when present`,
+          `${prefix}: \`spark_exclusion\` must be null or one of ${SPARK_EXCLUSION_REASONS_FOR_MESSAGE}`,
         );
+      } else {
+        sparkExclusion = sparkExclusionRaw;
       }
     }
-    cells.push({ taskId, tier, model, rationale, confidence });
+
+    if (typeof modelRaw === "string" && typeof sparkFitRaw === "boolean") {
+      if (model === SPARK_MODEL) {
+        if (sparkFit !== true) {
+          details.push(
+            `${prefix}: selecting ${SPARK_MODEL} requires \`spark_fit\` true`,
+          );
+        }
+        if (sparkExclusionRaw !== null) {
+          details.push(
+            `${prefix}: selecting ${SPARK_MODEL} requires \`spark_exclusion\` null`,
+          );
+        }
+      } else {
+        if (sparkFit !== false) {
+          details.push(
+            `${prefix}: non-Spark selections require \`spark_fit\` false`,
+          );
+        }
+        if (sparkExclusionRaw === null) {
+          details.push(
+            `${prefix}: non-Spark selections require a \`spark_exclusion\` reason`,
+          );
+        }
+      }
+    }
+
+    cells.push({
+      taskId,
+      tier,
+      model,
+      rationale,
+      confidence,
+      sparkFit,
+      sparkExclusion,
+    });
   }
 
   return details.length > 0
@@ -526,16 +625,19 @@ function parseVerdictShape(
     : { kind: "ok", cells };
 }
 
+const SPARK_EXCLUSION_REASONS_FOR_MESSAGE = SPARK_EXCLUSION_REASONS.join(", ");
+
 /** The brief fields apply-selection validates against: the expected task-id
  * coverage set + the candidate {model, tier} axes. */
 interface BriefShape {
   taskIds: string[];
-  models: string[];
-  efforts: string[];
+  candidateCellsByTask: Map<string, Set<string>>;
+  sparkOnAxis: boolean;
 }
 
-/** Extract the coverage set + axes from a loaded brief, or null when either is
- * absent / malformed (a corrupt brief the caller surfaces as brief_missing). */
+/** Extract the coverage set + each task's exact candidate cells from a loaded
+ * brief, or null when either is absent / malformed (a corrupt brief the caller
+ * surfaces as brief_missing). */
 function readBriefShape(brief: Record<string, unknown>): BriefShape | null {
   if (
     !Array.isArray(brief.tasks) ||
@@ -544,37 +646,60 @@ function readBriefShape(brief: Record<string, unknown>): BriefShape | null {
   ) {
     return null;
   }
-  const taskIds: string[] = [];
-  for (const t of brief.tasks) {
-    if (isPlainObject(t) && typeof t.task_id === "string") {
-      taskIds.push(t.task_id);
-    }
-  }
   const models = brief.models.filter((m): m is string => typeof m === "string");
   const efforts = brief.efforts.filter(
     (e): e is string => typeof e === "string",
   );
-  if (taskIds.length === 0 || models.length === 0 || efforts.length === 0) {
+  if (models.length === 0 || efforts.length === 0) {
     return null;
   }
-  return { taskIds, models, efforts };
+  const taskIds: string[] = [];
+  const candidateCellsByTask = new Map<string, Set<string>>();
+  let sparkOnAxis = false;
+  for (const t of brief.tasks) {
+    if (
+      !isPlainObject(t) ||
+      typeof t.task_id !== "string" ||
+      !Array.isArray(t.candidate_cells)
+    ) {
+      return null;
+    }
+    const candidates = new Set<string>();
+    for (const raw of t.candidate_cells) {
+      if (
+        !isPlainObject(raw) ||
+        typeof raw.model !== "string" ||
+        typeof raw.tier !== "string"
+      ) {
+        return null;
+      }
+      candidates.add(`${raw.model}::${raw.tier}`);
+      if (raw.model === SPARK_MODEL) {
+        sparkOnAxis = true;
+      }
+    }
+    if (candidates.size === 0) {
+      return null;
+    }
+    taskIds.push(t.task_id);
+    candidateCellsByTask.set(t.task_id, candidates);
+  }
+  if (taskIds.length === 0) {
+    return null;
+  }
+  return { taskIds, candidateCellsByTask, sparkOnAxis };
 }
 
 /** Validate the verdict cells against the brief (collect-all): each cell's
- * {model, tier} must be a candidate cell (model x effort), each task_id must be in
- * the brief's coverage set with no duplicates, and every brief task must be
- * covered exactly once. */
+ * {model, tier} must be in that task's exact candidate_cells list, each task_id
+ * must be in the brief's coverage set with no duplicates, every brief task must
+ * be covered exactly once, and Spark-fit evidence must match whether Spark is on
+ * the brief axis. */
 function validateAgainstBrief(
   cells: readonly VerdictCell[],
   brief: BriefShape,
 ): string[] {
   const expected = new Set(brief.taskIds);
-  const candidates = new Set<string>();
-  for (const model of brief.models) {
-    for (const tier of brief.efforts) {
-      candidates.add(`${model}::${tier}`);
-    }
-  }
   const errors: string[] = [];
   const seen = new Set<string>();
   for (let idx = 0; idx < cells.length; idx += 1) {
@@ -586,10 +711,27 @@ function validateAgainstBrief(
       errors.push(`${prefix}: duplicate cell for task ${c.taskId}`);
     }
     seen.add(c.taskId);
-    if (!candidates.has(`${c.model}::${c.tier}`)) {
+    const candidates = brief.candidateCellsByTask.get(c.taskId);
+    if (candidates !== undefined && !candidates.has(`${c.model}::${c.tier}`)) {
       errors.push(
         `${prefix}: {tier: ${c.tier}, model: ${c.model}} is not a candidate ` +
-          "cell in the brief",
+          "cell for that task in the brief",
+      );
+    }
+    if (!brief.sparkOnAxis) {
+      if (c.sparkFit !== false || c.sparkExclusion !== "spark-not-on-axis") {
+        errors.push(
+          `${prefix}: Spark is not on the brief axis, so \`spark_fit\` must be false and ` +
+            "`spark_exclusion` must be `spark-not-on-axis`",
+        );
+      }
+    } else if (
+      c.model !== SPARK_MODEL &&
+      c.sparkExclusion === "spark-not-on-axis"
+    ) {
+      errors.push(
+        `${prefix}: Spark is on the brief axis, so non-Spark selections need a ` +
+          "specific `spark_exclusion` other than `spark-not-on-axis`",
       );
     }
   }

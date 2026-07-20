@@ -203,6 +203,8 @@ export function runAssignCells(args: AssignCellsArgs): number {
       model,
       rationale,
       confidence,
+      sparkFit: null,
+      sparkExclusion: null,
       labelSource,
     });
   }

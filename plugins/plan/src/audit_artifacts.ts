@@ -25,7 +25,8 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { SELECTION_SCHEMA_VERSION } from "./selection_sidecar.ts";
+import { computeSelectionInputHash } from "./selection_input_hash.ts";
+import { FOLLOWUP_VERDICT_SCHEMA_VERSION } from "./selection_sidecar.ts";
 import { resolveDataDirOrDefault } from "./state_path.ts";
 import { atomicWriteRaw, nowIso, serializeStateJson } from "./store.ts";
 import { SELECTION_BRIEF_SCHEMA_VERSION } from "./verbs/selection_brief.ts";
@@ -413,9 +414,9 @@ export function closePhaseResume(
 
   let followupInputHash: string;
   try {
-    followupInputHash = createHash("sha256")
-      .update(readFileSync(followup))
-      .digest("hex");
+    followupInputHash = computeSelectionInputHash(
+      readFileSync(followup, "utf-8"),
+    );
   } catch {
     return {
       ...unfinished("satisfied"),
@@ -430,7 +431,7 @@ export function closePhaseResume(
   );
   const selectionVerdictDoc = safeReadArtifact(
     selectionVerdict,
-    SELECTION_SCHEMA_VERSION,
+    FOLLOWUP_VERDICT_SCHEMA_VERSION,
   );
   const selectionProvenance =
     selectionVerdictDoc?.selection !== null &&
@@ -442,8 +443,8 @@ export function closePhaseResume(
     artifactHasKnownSchema(selectionBriefDoc, SELECTION_BRIEF_SCHEMA_VERSION) &&
     selectionBriefDoc.from_followup === true &&
     selectionBriefDoc.input_hash === followupInputHash &&
-    artifactHasKnownSchema(selectionVerdictDoc, SELECTION_SCHEMA_VERSION) &&
-    selectionProvenance?.input_hash === followupInputHash;
+    selectionVerdictHasExactSchema(selectionVerdictDoc) &&
+    hasFollowupSelectionProvenance(selectionProvenance, followupInputHash);
 
   return {
     audit: "satisfied",
@@ -478,6 +479,55 @@ function artifactHasKnownSchema(
     artifact.schema_version >= 1 &&
     artifact.schema_version <= ceiling
   );
+}
+
+function selectionVerdictHasExactSchema(
+  artifact: Record<string, unknown> | null,
+): artifact is Record<string, unknown> {
+  return artifact?.schema_version === FOLLOWUP_VERDICT_SCHEMA_VERSION;
+}
+
+function hasFollowupSelectionProvenance(
+  provenance: Record<string, unknown> | null,
+  inputHash: string,
+): boolean {
+  if (provenance === null) {
+    return false;
+  }
+  const requiredStrings = [
+    "harness",
+    "model",
+    "config_hash",
+    "input_hash",
+    "outcome",
+  ];
+  for (const key of requiredStrings) {
+    const value = provenance[key];
+    if (typeof value !== "string" || value.trim() === "") {
+      return false;
+    }
+  }
+  if (provenance.input_hash !== inputHash) {
+    return false;
+  }
+  if (!("shuffle_seed" in provenance)) {
+    return false;
+  }
+  const shuffleSeed = provenance.shuffle_seed;
+  if (
+    shuffleSeed !== null &&
+    !(typeof shuffleSeed === "number" && Number.isInteger(shuffleSeed))
+  ) {
+    return false;
+  }
+  if (!("verdict_raw" in provenance)) {
+    return false;
+  }
+  const verdictRaw = provenance.verdict_raw;
+  if (verdictRaw !== null && typeof verdictRaw !== "string") {
+    return false;
+  }
+  return typeof provenance.spark_axis_present === "boolean";
 }
 
 /** Coerce an unknown `commits` field to a CommitGroup[] the hash accepts —

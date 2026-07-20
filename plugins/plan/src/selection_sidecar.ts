@@ -2,8 +2,9 @@
 //
 // A schema-versioned, git-committed JSON capturing everything the model-effort
 // selector saw and set for one epic's cells: the applied {tier, model,
-// rationale, confidence, label_source} per task plus the selector's own
-// provenance block (harness/model, config + input hashes, shuffle seed, outcome,
+// rationale, confidence, spark_fit, spark_exclusion, label_source} per task plus
+// the selector's own provenance block (harness/model, config + input hashes,
+// shuffle seed, outcome,
 // raw verdict). It is the transitional dataset — label_source-tagged,
 // hash-anchored — that heuristic-guided selection generates until historical
 // usage data can replace the heuristics.
@@ -31,12 +32,38 @@ import { atomicWriteJson } from "./store.ts";
 /** Selection-sidecar schema version. Integer, starts at 1; additive-only within
  * a version so a later reader tolerates an older sidecar. */
 export const SELECTION_SCHEMA_VERSION = 1;
+export const FOLLOWUP_VERDICT_SCHEMA_VERSION = 2;
+
+export const SPARK_MODEL = "gpt-5.3-codex-spark";
+
+export const SPARK_EXCLUSION_REASONS = [
+  "spark-not-on-axis",
+  "fixed-shape-too-large",
+  "open-ended-diagnosis",
+  "cross-module-discovery",
+  "contract-or-security-design",
+  "ambiguous-or-judgment-heavy",
+  "subtle-invariant-reasoning",
+  "long-trajectory",
+] as const;
+
+export type SparkExclusionReason = (typeof SPARK_EXCLUSION_REASONS)[number];
+
+export function isSparkExclusionReason(
+  value: unknown,
+): value is SparkExclusionReason {
+  return (
+    typeof value === "string" &&
+    (SPARK_EXCLUSION_REASONS as readonly string[]).includes(value)
+  );
+}
 
 /** The data-dir-relative directory holding per-epic selection sidecars. */
 export const SELECTIONS_DIRNAME = "selections";
 
 /** One applied cell in the sidecar: the {tier, model} set on a task plus the
- * selector's per-cell provenance (rationale / confidence / label_source). */
+ * selector's per-cell provenance (rationale / confidence / Spark-fit evidence /
+ * label_source). */
 export interface SidecarCell {
   task_id: string;
   tier: string;
@@ -46,6 +73,11 @@ export interface SidecarCell {
   /** The selector's confidence signal, stored opaque (number or string), or
    * null when omitted. */
   confidence: number | string | null;
+  /** Selector-stated Spark fit. Null only on degraded/manual/legacy paths. */
+  spark_fit: boolean | null;
+  /** Closed Spark exclusion reason. Null when Spark is selected, or on
+   * degraded/manual/legacy paths. */
+  spark_exclusion: SparkExclusionReason | null;
   /** Dataset-era tag — e.g. `heuristic-guided` for a real selection,
    * `heuristic-default` for a degrade that stamped the mechanical default. */
   label_source: string;

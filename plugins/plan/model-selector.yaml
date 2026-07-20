@@ -35,8 +35,9 @@ usage: |
   nameable intelligence-bound reason. When uncertain on the model axis, bounded
   well-specified work resolves to a GPT tier and open-ended or judgment-heavy
   work resolves to sonnet. Among reliable GPT fits, apply the hand-tuned Spark
-  preference before the generic lightest-fitting-tier rule; when uncertain on
-  the effort axis for mechanical work, resolve to the lower band.
+  preference only to small, reversible, fixed-shape edits across a few explicitly
+  named files; when uncertain on the effort axis for mechanical work, resolve to
+  the lower band.
 
 # HUMAN-OWNED binding routing policy — the highest-precedence tie-break, carried
 # verbatim in every selector brief. NOT authored or refreshed by the
@@ -53,18 +54,24 @@ hand_tuned: |
   greenfield shaping, or delicate in-repo idiom matching. The burden of proof
   is on opus. Choose opus ONLY on a concrete, nameable intelligence-bound
   reason: a novel algorithm or design, a cross-cutting multi-file architectural
-  cascade, a subtle correctness or security invariant, or long-horizon
-  planning. Security- or correctness-critical work is a hard opus gate that
-  overrides the GPT-first default regardless of size. For work that clears those
-  Claude/opus gates, apply the Spark burn preference: `gpt-5.3-codex-spark` has
-  independent, non-conserved quota. When its capability guidance says it can
-  reliably complete the task, choose it ahead of every other model that could
-  also complete the task. This ranks models after the capability gate; it never
-  widens that gate. Otherwise continue normal best-fit routing. Anti-anchor
-  clause: spec length and difficulty adjectives are not difficulty — a short spec
-  can be intelligence-bound and a long spec mechanical. Model and effort are
-  independent axes: cranking a cheaper tier's effort is not a substitute for a
-  more capable model.
+  cascade, a task that must derive, adjudicate, or validate a subtle correctness
+  or security invariant, or long-horizon planning. Mechanical implementation or
+  deterministic verification of an already-specified invariant follows ordinary
+  capability routing. For work that clears those Claude/opus gates, apply the
+  Spark burn preference: `gpt-5.3-codex-spark` has independent, non-conserved
+  quota. It fits small, reversible, fixed-shape edits across a few explicitly
+  named files, including routine navigation, deterministic verification, and
+  mechanical implementation/verification of an already-specified contract,
+  schema, wire, or correctness invariant. It excludes open-ended diagnosis,
+  cross-module discovery or reasoning, contract or security design, ambiguous or
+  subtle contract/security reasoning, ambiguous acceptance, taste, judgment, and long
+  trajectories or context needs. When Spark fits, choose it ahead of every
+  other model that could also complete the task. This ranks models after the
+  capability gate; it never widens that gate. Otherwise continue normal best-fit
+  routing. Anti-anchor clause: spec length and difficulty adjectives are not
+  difficulty — a short spec can be intelligence-bound and a long spec mechanical.
+  Model and effort are independent axes: cranking a cheaper tier's effort is not
+  a substitute for a more capable model.
 
 # Provenance for the efforts guidance blocks as a whole — the effort axis has no
 # per-value research cache, so one review stamp covers the set. OPTIONAL and
@@ -118,13 +125,14 @@ models:
   opus: |
     keeper's highest-capability worker tier — the exception, not the default.
     Strengths: long-horizon autonomous execution, contract-shaped reasoning where
-    a wrong abstraction propagates, novel algorithm and design work, subtle
-    correctness and security invariants, and strong bug-finding that tells a flake
-    from a real failure. Weaknesses: under-reaches for subagents / memory / search
-    / custom tools unless the prompt names when to use them, and narrates and
-    deliberates more than the prior generation. When to pick: only on a concrete,
-    nameable intelligence-bound reason per the hand_tuned policy — otherwise
-    route down per hand_tuned.
+    a wrong abstraction propagates, novel algorithm and design work, tasks that
+    must derive/adjudicate/validate subtle correctness or security invariants, and
+    strong bug-finding that tells a flake from a real failure. Weaknesses: under-reaches
+    for subagents / memory / search / custom tools unless the prompt names when to
+    use them, and narrates and deliberates more than the prior generation. When to
+    pick: only on a concrete, nameable intelligence-bound reason per the
+    hand_tuned policy — mechanical implementation or deterministic verification of
+    an already-specified invariant follows ordinary capability routing.
   sonnet: |
     The implementation workhorse for judgment-heavy work: near-top-tier quality
     on bounded coding and agentic work, with every effort band available, and
@@ -210,15 +218,18 @@ models:
     bounded task needs more reasoning, terra when it grows past one surface.
   gpt-5.3-codex-spark: |
     A fast, lightweight coding model tuned for quick, tightly-scoped edits.
-    Strengths: snappy single-file changes, straight test additions, mechanical
-    refactors, and literal execution of an unambiguous spec that leaves no design
-    choice. Weaknesses: a lower reasoning ceiling than the heavier tiers —
-    multi-file design, cross-module reasoning, and ambiguous acceptance
-    under-resolve here, and it holds less context across a long agentic loop. When
-    to pick: small, reversible, near-mechanical work with a fully-specified
-    acceptance. When to avoid: anything needing investigation, contract-shaped
-    reasoning, or judgment spanning more than one surface — route those up to a
-    higher-capability model.
+    Strengths: snappy fixed-shape changes across one or a few explicitly named
+    files, straight test additions, mechanical refactors, routine navigation, and
+    deterministic verification of an already-specified assertion or contract.
+    Weaknesses: a lower reasoning ceiling than the heavier tiers — open-ended
+    diagnosis, cross-module discovery or reasoning, contract/security design,
+    ambiguous acceptance, taste/judgment, subtle contract/security reasoning, and long
+    agentic loops under-resolve here. When to pick: small, reversible,
+    fixed-shape work with a fully-specified acceptance and no design choice,
+    including mechanical implementation/verification of an already-specified
+    contract, schema, wire, or correctness invariant. When to avoid: open-ended diagnosis,
+    contract or security design, subtle invariant reasoning, or unbounded
+    cross-surface judgment.
 
 # Research provenance map: per configured model, the references/ cache file
 # (path relative to the plan plugin root) and its sha256. The drift gate asserts
@@ -244,7 +255,7 @@ research:
       sha256: 5b7494c21726a3bd74fa10b5aa7d09c78cc903b66da515b7d26c1b73e529292a
   gpt-5.3-codex-spark:
     reference: skills/model-guidance/references/gpt-5.3-codex-spark.md
-    sha256: 8d96568042e989b09297cc4ab91040a92643c5a7b01a6cd69e974716b39b98cc
+    sha256: d4ca949c53757528abb21c24aadf9c57c5027b7627044c791de7601ebe6b19c4
     card:
       reference: skills/model-guidance/references/cards/gpt-5.3-codex-spark.md
       sha256: b2d909a0616523cbc0ec4ef47e9bbc6c039bf72fbfc4bcacdcee6c632b4a8f32

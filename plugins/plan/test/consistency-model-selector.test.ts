@@ -140,7 +140,7 @@ describe("on-disk selector config", () => {
     expect(lower).toContain("anti-anchor");
   });
 
-  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the Spark-first capability gate", () => {
+  test("no route-up / keep-opus default phrasing remains, and both config and agent prompt carry the Spark fit gate", () => {
     const config = loadModelSelectorConfig(
       join(PLAN_ROOT, "model-selector.yaml"),
     );
@@ -172,17 +172,80 @@ describe("on-disk selector config", () => {
       expect(configProse).not.toContain(phrase);
       expect(agentLower).not.toContain(phrase);
     }
-    // Positive: both surfaces state the burden-of-proof rule, the Spark-first
-    // capability gate, and the anti-anchor clause.
+    // Positive: both surfaces state the burden-of-proof rule, the ordinary
+    // routing carve-out for already-specified invariants, the Spark fit/exclusion
+    // gate, and the anti-anchor clause.
     const handTuned = prose(config.hand_tuned);
     expect(handTuned).toContain("burden of proof");
     expect(handTuned).toContain("gpt-5.3-codex-spark");
+    expect(handTuned).toContain("already-specified invariant");
+    expect(handTuned).toContain("fixed-shape");
+    expect(handTuned).toContain("open-ended diagnosis");
     expect(handTuned).toContain("never widens");
     expect(agentLower).toContain("burden of proof");
     expect(agentLower).toContain("intelligence-bound");
     expect(agentLower).toContain("gpt-5.3-codex-spark");
+    expect(agentLower).toContain("already-specified invariant");
+    expect(agentLower).toContain("fixed-shape");
+    expect(agentLower).toContain("open-ended diagnosis");
     expect(agentLower).toContain("never widens");
     expect(agentLower).toContain("not difficulty");
+  });
+
+  test("Spark guidance permits mechanical contract verification but excludes design reasoning", () => {
+    const config = loadModelSelectorConfig(
+      join(PLAN_ROOT, "model-selector.yaml"),
+    );
+    const agentPrompt = prose(
+      readFileSync(
+        join(PLAN_ROOT, "template/agents/model-selector.md.tmpl"),
+        "utf-8",
+      ),
+    );
+    const reference = prose(
+      readFileSync(
+        join(
+          PLAN_ROOT,
+          "skills/model-guidance/references/gpt-5.3-codex-spark.md",
+        ),
+        "utf-8",
+      ),
+    );
+    for (const rawBlock of [
+      prose(config.hand_tuned),
+      prose(config.models["gpt-5.3-codex-spark"] ?? ""),
+      agentPrompt,
+      reference,
+    ]) {
+      const block = rawBlock.replaceAll(
+        "contract/security",
+        "contract or security",
+      );
+      expect(block).toContain("mechanical implementation/verification");
+      expect(block).toContain("already-specified contract");
+      expect(block).toContain("contract or security design");
+      expect(block).toContain("subtle contract or security reasoning");
+    }
+  });
+
+  test("agent output contract requires Spark-fit fields and the closed exclusion vocabulary", () => {
+    const agentPrompt = prose(
+      readFileSync(
+        join(PLAN_ROOT, "template/agents/model-selector.md.tmpl"),
+        "utf-8",
+      ),
+    );
+    expect(agentPrompt).toContain("spark_fit");
+    expect(agentPrompt).toContain("spark_exclusion");
+    expect(agentPrompt).toContain("spark-not-on-axis");
+    expect(agentPrompt).toContain("fixed-shape-too-large");
+    expect(agentPrompt).toContain("open-ended-diagnosis");
+    expect(agentPrompt).toContain("cross-module-discovery");
+    expect(agentPrompt).toContain("contract-or-security-design");
+    expect(agentPrompt).toContain("ambiguous-or-judgment-heavy");
+    expect(agentPrompt).toContain("subtle-invariant-reasoning");
+    expect(agentPrompt).toContain("long-trajectory");
+    expect(agentPrompt).toContain("use `spark-not-on-axis` only when");
   });
 
   test("state mode classifies every model fresh and every effort present", () => {

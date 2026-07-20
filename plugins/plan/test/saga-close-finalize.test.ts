@@ -210,8 +210,17 @@ function seedFreshResumeReceipts(
     selectionVerdict,
     `${JSON.stringify(
       {
-        schema_version: 1,
-        cells: { "1": { tier: "high", model: "sonnet" } },
+        schema_version: 2,
+        cells: {
+          "1": {
+            tier: "high",
+            model: "sonnet",
+            rationale: "fixture non-Spark selection",
+            confidence: 0.8,
+            spark_fit: false,
+            spark_exclusion: "spark-not-on-axis",
+          },
+        },
         selection: {
           harness: "subagent",
           model: "plan:model-selector",
@@ -220,6 +229,7 @@ function seedFreshResumeReceipts(
           shuffle_seed: 17,
           outcome: "completed",
           verdict_raw: "fixture",
+          spark_axis_present: false,
         },
       },
       null,
@@ -791,24 +801,52 @@ function sidecar(root: string, epicId: string): Record<string, unknown> | null {
   return JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>;
 }
 
+function nonSparkVerdictCell(
+  tier: string,
+  model = "opus",
+  opts: { rationale?: string; confidence?: number } = {},
+): Record<string, unknown> {
+  return {
+    tier,
+    model,
+    rationale: opts.rationale ?? "not a Spark fit",
+    confidence: opts.confidence ?? 0.8,
+    spark_fit: false,
+    spark_exclusion: "spark-not-on-axis",
+  };
+}
+
 // Write a selection-verdict JSON file the CLI reads via --selection-verdict.
 function writeVerdict(
   root: string,
+  epicId: string,
   cells: Record<string, Record<string, unknown>>,
+  opts: {
+    schemaVersion?: unknown;
+    omitSparkAxisPresent?: boolean;
+    sparkAxisPresent?: unknown;
+    inputHash?: string;
+  } = {},
 ): string {
   const p = join(root, "_selection_verdict.json");
+  const followupText = readFileSync(followupPath(root, epicId), "utf-8");
+  const selection: Record<string, unknown> = {
+    harness: "claude",
+    model: "sonnet",
+    config_hash: "cfg-hash",
+    input_hash:
+      opts.inputHash ?? createHash("sha256").update(followupText).digest("hex"),
+    shuffle_seed: 42,
+    outcome: "completed",
+    verdict_raw: "picked cells",
+  };
+  if (!opts.omitSparkAxisPresent) {
+    selection.spark_axis_present = opts.sparkAxisPresent ?? false;
+  }
   const doc = {
-    schema_version: 1,
+    schema_version: opts.schemaVersion ?? 2,
     cells,
-    selection: {
-      harness: "claude",
-      model: "sonnet",
-      config_hash: "cfg-hash",
-      input_hash: "in-hash",
-      shuffle_seed: 42,
-      outcome: "completed",
-      verdict_raw: "picked cells",
-    },
+    selection,
   };
   writeFileSync(p, `${JSON.stringify(doc)}\n`, "utf-8");
   return p;
@@ -825,11 +863,33 @@ function keptOrdinals(n: number): Array<Record<string, unknown>> {
 
 describe("close-finalize selection pre-selection", () => {
   const getProj = withProject("planctl-cf-select-");
+  const claudeAndPiMatrix = readFileSync(
+    join(import.meta.dir, "fixtures", "matrix-claude-and-pi.yaml"),
+    "utf-8",
+  );
+
+  function restrictedSparkMatrixEnv(proj: {
+    home: string;
+  }): Record<string, string> {
+    const dir = join(proj.home, "restricted-spark-matrix");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "matrix.yaml"),
+      claudeAndPiMatrix.replace(
+        "      - openai-codex/gpt-5.3-codex-spark",
+        "      - id: openai-codex/gpt-5.3-codex-spark\n" +
+          "        efforts: [low, medium, high]",
+      ),
+      "utf-8",
+    );
+    return { KEEPER_CONFIG_DIR: dir };
+  }
 
   function finalizeWithVerdict(
     proj: { root: string; home: string },
     epicId: string,
     verdictPath: string,
+    env?: Record<string, string>,
   ): { code: number; env: Record<string, unknown> } {
     const r = runCli(
       [
@@ -840,7 +900,7 @@ describe("close-finalize selection pre-selection", () => {
         "--selection-verdict",
         verdictPath,
       ],
-      { cwd: proj.root, home: proj.home },
+      { cwd: proj.root, home: proj.home, env },
     );
     return { code: r.code, env: parseCliOutput(r.output) };
   }
@@ -854,14 +914,15 @@ describe("close-finalize selection pre-selection", () => {
       "Guided select",
     );
     seedFollowupYaml(proj.root, epicId, epicId, 2);
-    const vp = writeVerdict(proj.root, {
-      "1": {
-        tier: "high",
-        model: "sonnet",
+    const inputHash = createHash("sha256")
+      .update(readFileSync(followupPath(proj.root, epicId), "utf-8"))
+      .digest("hex");
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": nonSparkVerdictCell("high", "sonnet", {
         rationale: "task 1 is subtle",
         confidence: 0.9,
-      },
-      "2": { tier: "max", model: "opus" },
+      }),
+      "2": nonSparkVerdictCell("max", "opus"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);
@@ -887,7 +948,7 @@ describe("close-finalize selection pre-selection", () => {
     expect(s.outcome).toBe("completed");
     expect(s.selector).toEqual({ harness: "claude", model: "sonnet" });
     expect(s.config_hash).toBe("cfg-hash");
-    expect(s.input_hash).toBe("in-hash");
+    expect(s.input_hash).toBe(inputHash);
     const sCells = s.cells as Array<Record<string, unknown>>;
     expect(sCells).toHaveLength(2);
     expect(sCells[0]).toMatchObject({
@@ -895,12 +956,16 @@ describe("close-finalize selection pre-selection", () => {
       tier: "high",
       model: "sonnet",
       rationale: "task 1 is subtle",
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
       label_source: "heuristic-guided",
     });
     expect(sCells[1]).toMatchObject({
       task_id: `${newEpicId}.2`,
       tier: "max",
       model: "opus",
+      spark_fit: false,
+      spark_exclusion: "spark-not-on-axis",
       label_source: "heuristic-guided",
     });
 
@@ -916,6 +981,40 @@ describe("close-finalize selection pre-selection", () => {
       ),
     ) as Record<string, unknown>;
     expect(newDef.last_validated_at).not.toBeNull();
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("mismatched follow-up input hash degrades without applying guided cells", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Mismatched follow-up hash",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(
+      proj.root,
+      epicId,
+      { "1": nonSparkVerdictCell("high", "sonnet") },
+      { inputHash: "different-follow-up-document-hash" },
+    );
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-input-hash-mismatch");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
     expect(epicStatus(proj.root, epicId)).toBe("done");
   });
 
@@ -950,6 +1049,8 @@ describe("close-finalize selection pre-selection", () => {
       task_id: `${newEpicId}.1`,
       tier: "medium",
       model: "opus",
+      spark_fit: null,
+      spark_exclusion: null,
       label_source: "heuristic-default",
     });
 
@@ -971,8 +1072,9 @@ describe("close-finalize selection pre-selection", () => {
       "Bad cell",
     );
     seedFollowupYaml(proj.root, epicId, epicId, 1);
-    const vp = writeVerdict(proj.root, {
-      "1": { tier: "ultra", model: "sonnet" }, // "ultra" is not a configured effort
+    const vp = writeVerdict(proj.root, epicId, {
+      // "ultra" is not a configured effort, but the cell shape is otherwise exact.
+      "1": nonSparkVerdictCell("ultra", "sonnet"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);
@@ -987,9 +1089,138 @@ describe("close-finalize selection pre-selection", () => {
     const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
     expect(s.outcome).toBe("degraded:verdict-cell-out-of-axis");
     expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
       label_source: "heuristic-default",
     });
     expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("ragged matrix rejects a staged Spark effort unsupported by that model", () => {
+    const proj = getProj();
+    const env = restrictedSparkMatrixEnv(proj);
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Restricted Spark close",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": {
+        tier: "xhigh",
+        model: "gpt-5.3-codex-spark",
+        rationale: "Spark cannot render this effort",
+        confidence: 0.7,
+        spark_fit: true,
+        spark_exclusion: null,
+      },
+    });
+
+    const { code, env: result } = finalizeWithVerdict(proj, epicId, vp, env);
+    expect(code).toBe(0);
+    expect(result.outcome).toBe("closed_with_followup");
+    const newEpicId = result.new_epic_id as string;
+    expect(taskCell(proj.root, `${newEpicId}.1`)).toEqual({
+      tier: "medium",
+      model: "opus",
+    });
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-cell-out-of-axis");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
+  });
+
+  test("legacy v1 follow-up verdict degrades even with v2 Spark fields", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Legacy v1 selection verdict",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(
+      proj.root,
+      epicId,
+      { "1": nonSparkVerdictCell("high", "sonnet") },
+      { schemaVersion: 1 },
+    );
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-schema-legacy");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
+  });
+
+  test("missing or invalid v2 Spark axis provenance degrades", () => {
+    for (const [title, opts] of [
+      ["missing", { omitSparkAxisPresent: true }],
+      ["invalid", { sparkAxisPresent: "yes" }],
+    ] as const) {
+      const proj = getProj();
+      const { epicId } = doneEpic(
+        proj,
+        1,
+        { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+        `Bad Spark axis ${title}`,
+      );
+      seedFollowupYaml(proj.root, epicId, epicId, 1);
+      const vp = writeVerdict(
+        proj.root,
+        epicId,
+        { "1": nonSparkVerdictCell("high", "sonnet") },
+        opts,
+      );
+
+      const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+      expect(code).toBe(0);
+      expect(env.outcome).toBe("closed_with_followup");
+      const newEpicId = env.new_epic_id as string;
+      const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+      expect(s.outcome).toBe("degraded:verdict-provenance-invalid");
+      expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+        spark_fit: null,
+        spark_exclusion: null,
+        label_source: "heuristic-default",
+      });
+    }
+  });
+
+  test("malformed follow-up verdict missing Spark fields degrades, never rejects finalize", () => {
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: emptySetHash(), decisions: keptOrdinals(1) },
+      "Legacy selection verdict",
+    );
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": { tier: "high", model: "sonnet" },
+    });
+
+    const { code, env } = finalizeWithVerdict(proj, epicId, vp);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    const s = sidecar(proj.root, newEpicId) as Record<string, unknown>;
+    expect(s.outcome).toBe("degraded:verdict-cell-shape-invalid");
+    expect((s.cells as Array<Record<string, unknown>>)[0]).toMatchObject({
+      spark_fit: null,
+      spark_exclusion: null,
+      label_source: "heuristic-default",
+    });
   });
 
   test("adopt path runs no selection even with a verdict supplied", () => {
@@ -1014,8 +1245,8 @@ describe("close-finalize selection pre-selection", () => {
     fDef.created_by_close_of = epicId;
     writeFileSync(fPath, JSON.stringify(fDef), "utf-8");
     seedFollowupYaml(proj.root, epicId, epicId, 1);
-    const vp = writeVerdict(proj.root, {
-      "1": { tier: "high", model: "sonnet" },
+    const vp = writeVerdict(proj.root, epicId, {
+      "1": nonSparkVerdictCell("high", "sonnet"),
     });
 
     const { code, env } = finalizeWithVerdict(proj, epicId, vp);

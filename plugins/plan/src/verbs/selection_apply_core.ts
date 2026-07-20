@@ -35,6 +35,7 @@ import {
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
   type SidecarAuditPolicy,
+  type SparkExclusionReason,
   selectionSidecarPath,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
@@ -48,14 +49,17 @@ import {
 import { parseYamlInput, readYamlBytes } from "../yaml_input.ts";
 
 /** A cell resolved for the write: the {tier, model} to set on a task plus the
- * selector's per-cell provenance (rationale / confidence / label_source). Axis /
- * membership / coverage may still be re-checked in-lock by the caller. */
+ * selector's per-cell provenance (rationale / confidence / Spark-fit evidence /
+ * label_source). Axis / membership / coverage may still be re-checked in-lock by
+ * the caller. */
 export interface SelectionCoreCell {
   taskId: string;
   tier: string;
   model: string;
   rationale: string | null;
   confidence: number | string | null;
+  sparkFit: boolean | null;
+  sparkExclusion: SparkExclusionReason | null;
   labelSource: string;
 }
 
@@ -293,6 +297,8 @@ export function landSelectionCells(opts: {
           model: c.model,
           rationale: c.rationale,
           confidence: c.confidence,
+          spark_fit: c.sparkFit,
+          spark_exclusion: c.sparkExclusion,
           label_source: c.labelSource,
         })),
         audit_policy: auditPolicy,

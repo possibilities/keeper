@@ -43,7 +43,7 @@
 // delegation calls bun's OWN ported runEpicClose / runScaffold with stdout
 // captured (never a subprocess of itself).
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   existsSync,
   readdirSync,
@@ -85,17 +85,22 @@ import {
 import { resolveEpicGlobally } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
+import { effectiveMatrix } from "../host_matrix.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { buildPlanInvocationReadonly } from "../invocation.ts";
-import { configuredEfforts, configuredModels } from "../models.ts";
 import {
   contextForRoot,
   type ProjectContext,
   resolveProject,
 } from "../project.ts";
+import { computeSelectionInputHash } from "../selection_input_hash.ts";
 import {
+  FOLLOWUP_VERDICT_SCHEMA_VERSION,
+  isSparkExclusionReason,
   SELECTION_SCHEMA_VERSION,
   type SelectionSidecar,
+  SPARK_MODEL,
+  type SparkExclusionReason,
   writeSelectionSidecar,
 } from "../selection_sidecar.ts";
 import { resolvePlanSessionId } from "../session_id.ts";
@@ -1474,8 +1479,10 @@ function emitOutcome(
 interface VerdictCell {
   tier: string;
   model: string;
-  rationale: string | null;
-  confidence: number | string | null;
+  rationale: string;
+  confidence: number;
+  sparkFit: boolean;
+  sparkExclusion: SparkExclusionReason | null;
 }
 
 /** The selector's own provenance block, shape-mirroring the sidecar's. */
@@ -1486,6 +1493,7 @@ interface SelectionProvenance {
   shuffleSeed: number | null;
   outcome: string;
   verdictRaw: string | null;
+  sparkAxisPresent: boolean;
 }
 
 /** The verdict-load result: a guided selection (all cells in-axis + full
@@ -1533,7 +1541,7 @@ function loadSelectionVerdict(
   followupText: string,
   taskCount: number | null,
 ): SelectionResult {
-  const followupHash = sha256(followupText);
+  const followupHash = computeSelectionInputHash(followupText);
   const degrade = (reason: string): SelectionResult => ({
     kind: "degraded",
     reason,
@@ -1559,7 +1567,13 @@ function loadSelectionVerdict(
     return degrade("verdict-not-object");
   }
   const sv = parsed.schema_version;
-  if (typeof sv === "number" && sv > SELECTION_SCHEMA_VERSION) {
+  if (typeof sv !== "number" || !Number.isInteger(sv)) {
+    return degrade("verdict-schema-invalid");
+  }
+  if (sv < FOLLOWUP_VERDICT_SCHEMA_VERSION) {
+    return degrade("verdict-schema-legacy");
+  }
+  if (sv > FOLLOWUP_VERDICT_SCHEMA_VERSION) {
     return degrade("verdict-schema-too-new");
   }
   if (!isPlainObject(parsed.cells)) {
@@ -1572,13 +1586,25 @@ function loadSelectionVerdict(
   if (provenance === null) {
     return degrade("verdict-provenance-invalid");
   }
+  if (provenance.inputHash !== followupHash) {
+    return degrade("verdict-input-hash-mismatch");
+  }
   if (taskCount === null) {
     return degrade("followup-unparseable");
   }
 
-  const efforts = configuredEfforts();
-  const models = configuredModels();
+  const effective = effectiveMatrix();
+  const models = effective.models;
+  const sparkAxisPresent = provenance.sparkAxisPresent;
   const cells = new Map<number, VerdictCell>();
+  const allowedCellKeys = new Set([
+    "tier",
+    "model",
+    "rationale",
+    "confidence",
+    "spark_fit",
+    "spark_exclusion",
+  ]);
   for (const [key, raw] of Object.entries(parsed.cells)) {
     if (!/^[1-9][0-9]*$/.test(key)) {
       return degrade("verdict-cell-key-invalid");
@@ -1586,20 +1612,77 @@ function loadSelectionVerdict(
     if (!isPlainObject(raw)) {
       return degrade("verdict-cell-not-object");
     }
+    for (const rawKey of Object.keys(raw)) {
+      if (!allowedCellKeys.has(rawKey)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+    }
+    for (const requiredKey of allowedCellKeys) {
+      if (!(requiredKey in raw)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+    }
     const tier = raw.tier;
     const model = raw.model;
-    if (typeof tier !== "string" || !efforts.includes(tier)) {
-      return degrade("verdict-cell-out-of-axis");
-    }
     if (typeof model !== "string" || !models.includes(model)) {
       return degrade("verdict-cell-out-of-axis");
     }
-    const rationale = typeof raw.rationale === "string" ? raw.rationale : null;
-    const confidence =
-      typeof raw.confidence === "number" || typeof raw.confidence === "string"
-        ? raw.confidence
-        : null;
-    cells.set(Number.parseInt(key, 10), { tier, model, rationale, confidence });
+    if (
+      typeof tier !== "string" ||
+      !effective.effortsFor(model).includes(tier)
+    ) {
+      return degrade("verdict-cell-out-of-axis");
+    }
+    const rationale = raw.rationale;
+    if (typeof rationale !== "string" || rationale.trim() === "") {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const confidence = raw.confidence;
+    if (
+      typeof confidence !== "number" ||
+      !Number.isFinite(confidence) ||
+      confidence < 0 ||
+      confidence > 1
+    ) {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const sparkFit = raw.spark_fit;
+    if (typeof sparkFit !== "boolean") {
+      return degrade("verdict-cell-shape-invalid");
+    }
+    const sparkExclusionRaw = raw.spark_exclusion;
+    let sparkExclusion: SparkExclusionReason | null = null;
+    if (sparkExclusionRaw !== null) {
+      if (!isSparkExclusionReason(sparkExclusionRaw)) {
+        return degrade("verdict-cell-shape-invalid");
+      }
+      sparkExclusion = sparkExclusionRaw;
+    }
+    if (model === SPARK_MODEL) {
+      if (sparkFit !== true || sparkExclusion !== null) {
+        return degrade("verdict-cell-spark-inconsistent");
+      }
+    } else if (sparkFit !== false || sparkExclusion === null) {
+      return degrade("verdict-cell-spark-inconsistent");
+    }
+    if (!sparkAxisPresent) {
+      if (sparkFit !== false || sparkExclusion !== "spark-not-on-axis") {
+        return degrade("verdict-cell-spark-axis-mismatch");
+      }
+    } else if (
+      model !== SPARK_MODEL &&
+      sparkExclusion === "spark-not-on-axis"
+    ) {
+      return degrade("verdict-cell-spark-axis-mismatch");
+    }
+    cells.set(Number.parseInt(key, 10), {
+      tier,
+      model,
+      rationale,
+      confidence,
+      sparkFit,
+      sparkExclusion,
+    });
   }
 
   // Full-set coverage: exactly the ordinals 1..taskCount, no gaps or extras.
@@ -1617,7 +1700,8 @@ function loadSelectionVerdict(
 
 /** Validate the verdict's `selection:` provenance block — harness, model,
  * config_hash, input_hash, outcome as non-empty strings; shuffle_seed an integer
- * or absent; verdict_raw a string or absent. Returns null on any violation. */
+ * or absent; verdict_raw a string or absent; spark_axis_present a required
+ * boolean. Returns null on any violation. */
 function parseSelectionProvenance(
   sel: Record<string, unknown>,
 ): SelectionProvenance | null {
@@ -1657,6 +1741,11 @@ function parseSelectionProvenance(
       return null;
     }
   }
+  const sap = sel.spark_axis_present;
+  if (typeof sap !== "boolean") {
+    return null;
+  }
+  const sparkAxisPresent = sap;
   return {
     selector: { harness, model },
     configHash,
@@ -1664,6 +1753,7 @@ function parseSelectionProvenance(
     shuffleSeed,
     outcome,
     verdictRaw,
+    sparkAxisPresent,
   };
 }
 
@@ -1776,6 +1866,8 @@ function writeCloseSelectionSidecar(
           model: m.model,
           rationale: c?.rationale ?? null,
           confidence: c?.confidence ?? null,
+          spark_fit: c?.sparkFit ?? null,
+          spark_exclusion: c?.sparkExclusion ?? null,
           label_source: "heuristic-guided",
         };
       }),
@@ -1797,15 +1889,13 @@ function writeCloseSelectionSidecar(
         model: m.model,
         rationale: null,
         confidence: null,
+        spark_fit: null,
+        spark_exclusion: null,
         label_source: "heuristic-default",
       })),
     };
   }
   writeSelectionSidecar(dataDir, sidecar);
-}
-
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

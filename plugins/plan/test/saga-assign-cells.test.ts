@@ -223,11 +223,16 @@ describe("assign-cells happy path", () => {
       model: "opus",
       rationale: "needs strong reasoning",
       confidence: 0.9,
+      spark_fit: null,
+      spark_exclusion: null,
       label_source: "heuristic-guided",
     });
-    // Omitted rationale/confidence default to null (stable key set).
+    // Omitted rationale/confidence default to null, and manual assign-cells does
+    // not fabricate selector Spark-fit evidence.
     expect(cells[1]?.rationale).toBeNull();
     expect(cells[1]?.confidence).toBeNull();
+    expect(cells[1]?.spark_fit).toBeNull();
+    expect(cells[1]?.spark_exclusion).toBeNull();
   });
 
   test("cells + sidecar land in ONE auto-commit", () => {
@@ -299,6 +304,8 @@ describe("assign-cells happy path", () => {
     expect(r.code).toBe(0);
     const cell = (readSidecar(epicId).cells as Record<string, unknown>[])[0];
     expect(cell?.label_source).toBe("heuristic-guided");
+    expect(cell?.spark_fit).toBeNull();
+    expect(cell?.spark_exclusion).toBeNull();
   });
 
   test("a string-valued confidence round-trips opaque into the sidecar", () => {
@@ -315,6 +322,8 @@ describe("assign-cells happy path", () => {
     expect(r.code).toBe(0);
     const cell = (readSidecar(epicId).cells as Record<string, unknown>[])[0];
     expect(cell?.confidence).toBe("high");
+    expect(cell?.spark_fit).toBeNull();
+    expect(cell?.spark_exclusion).toBeNull();
   });
 
   test("reads the cell set from stdin (--file -)", () => {
@@ -602,9 +611,10 @@ describe("assign-cells degrade + re-select", () => {
     const sc = readSidecar(epicId);
     expect(sc.outcome).toBe("degraded:selector-error");
     expect(sc.verdict_raw).toBeNull();
-    expect((sc.cells as Record<string, unknown>[])[0]?.label_source).toBe(
-      "heuristic-default",
-    );
+    const degradedCell = (sc.cells as Record<string, unknown>[])[0];
+    expect(degradedCell?.label_source).toBe("heuristic-default");
+    expect(degradedCell?.spark_fit).toBeNull();
+    expect(degradedCell?.spark_exclusion).toBeNull();
     // Value is unchanged (still the default), but the run is captured as data.
     expect(readTask(taskIds[0] as string).tier).toBe("medium");
   });
