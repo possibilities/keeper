@@ -76,6 +76,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { BACKFILL_WATERMARK_KEY } from "./backfill-mutation-path";
 import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
 
 /**
@@ -96,6 +97,13 @@ export const RECENT_RETENTION_MARGIN = 5_000;
  * hook's `busy_timeout`.
  */
 export const DEFAULT_RETENTION_BATCH_SIZE = 500;
+
+/**
+ * Existing event rows inspected per writable batch, relative to the mutation
+ * ceiling. The scan is a primary-key seek over this bounded window; the
+ * matching UPDATE/DELETE still affects at most `batchSize` rows.
+ */
+export const DEFAULT_RETENTION_SCAN_FACTOR = 4;
 
 /**
  * Max batches per pass. Caps a single timer-scheduled pass at
@@ -316,6 +324,11 @@ export interface RetentionOptions {
   /** Max batches this pass. Defaults to {@link DEFAULT_RETENTION_MAX_BATCHES}. */
   maxBatches?: number;
   /**
+   * Existing rows inspected per batch. Defaults to `batchSize *
+   * DEFAULT_RETENTION_SCAN_FACTOR`; the mutation remains capped at `batchSize`.
+   */
+  scanBatchSize?: number;
+  /**
    * Recent-window margin. Defaults to {@link RECENT_RETENTION_MARGIN}. Exposed
    * for tests that need a tiny window over a small seeded event log.
    */
@@ -340,12 +353,215 @@ export interface RetentionResult {
   cursor: number;
   /** Pages returned to the file tail by per-batch `incremental_vacuum`. */
   reclaimedPages: number;
-  /**
-   * `true` when a full `maxBatches` ran AND the last batch was full — i.e. more
-   * cold shed-class bodies likely remain and the caller may schedule a follow-up
-   * pass sooner than the next slack tick.
-   */
+  /** `true` while the persisted scan watermark remains below this pass's ceiling. */
   moreLikely: boolean;
+}
+
+const BODY_SCAN_PROGRESS_KEY = "retention_body_scan_progress";
+const NOOP_DELETE_SCAN_PROGRESS_KEY = "retention_noop_delete_scan_progress";
+const FOCUS_DELETE_SCAN_PROGRESS_KEY = "retention_focus_delete_scan_progress";
+
+interface StoredScanProgress {
+  signature: string;
+  watermark: number;
+}
+
+interface ColdScanMutationResult {
+  moved: number;
+  batches: number;
+  reclaimedPages: number;
+  moreLikely: boolean;
+}
+
+type ColdScanMutation = "null-body" | "delete-row";
+
+function readMetaValue(db: Database, key: string): string | null {
+  const row = db.query("SELECT value FROM meta WHERE key = ?").get(key) as {
+    value: string;
+  } | null;
+  return row?.value ?? null;
+}
+
+/**
+ * Read one persisted scan position. The predicate itself is the signature, so a
+ * predicate edit automatically restarts the bounded scan instead of silently
+ * skipping rows newly admitted by the new class gate.
+ */
+function readScanProgress(
+  db: Database,
+  key: string,
+  signature: string,
+): number {
+  const raw = readMetaValue(db, key);
+  if (raw == null) return 0;
+  try {
+    const parsed = JSON.parse(raw) as Partial<StoredScanProgress>;
+    if (
+      parsed.signature === signature &&
+      typeof parsed.watermark === "number" &&
+      Number.isSafeInteger(parsed.watermark) &&
+      parsed.watermark >= 0
+    ) {
+      return parsed.watermark;
+    }
+  } catch {
+    // A malformed operational memo restarts the scan from zero; event data is
+    // never skipped on an unreadable optimization record.
+  }
+  return 0;
+}
+
+/**
+ * Advance one retention/delete surface through bounded primary-key windows.
+ * Each transaction mutates at most `batchSize` matching rows and atomically
+ * persists the highest fully-examined event id. `NOT INDEXED` is deliberate:
+ * SQLite otherwise expands the class predicate through hook-event indexes and
+ * sorts the full historical match set before honoring LIMIT.
+ */
+function mutateColdRowsByScan(
+  db: Database,
+  options: RetentionOptions,
+  input: {
+    idCeiling: number;
+    predicate: string;
+    progressKey: string;
+    signature: string;
+    mutation: ColdScanMutation;
+  },
+): ColdScanMutationResult {
+  const batchSize = options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE;
+  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
+  const requestedScanBatchSize =
+    options.scanBatchSize ?? batchSize * DEFAULT_RETENTION_SCAN_FACTOR;
+  const scanBatchSize = Math.max(batchSize, requestedScanBatchSize);
+  for (const [name, value, allowZero] of [
+    ["batchSize", batchSize, false],
+    ["maxBatches", maxBatches, true],
+    ["scanBatchSize", scanBatchSize, false],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < (allowZero ? 0 : 1)) {
+      throw new RangeError(
+        `${name} must be a safe ${allowZero ? "non-negative" : "positive"} integer`,
+      );
+    }
+  }
+
+  let scanWatermark = readScanProgress(db, input.progressKey, input.signature);
+  if (scanWatermark >= input.idCeiling || maxBatches === 0) {
+    return {
+      moved: 0,
+      batches: 0,
+      reclaimedPages: 0,
+      moreLikely: scanWatermark < input.idCeiling,
+    };
+  }
+
+  const selectWindow = db.prepare(
+    `SELECT COUNT(*) AS n, MAX(id) AS max_id
+       FROM (
+         SELECT id FROM events NOT INDEXED
+          WHERE id > ? AND id <= ?
+          ORDER BY id ASC
+          LIMIT ?
+       )`,
+  );
+  const selectEligible = db.prepare(
+    `SELECT id FROM events NOT INDEXED
+      WHERE id > ? AND id <= ?
+        AND (${input.predicate})
+      ORDER BY id ASC
+      LIMIT ?`,
+  );
+  const mutateWindow = db.prepare(
+    input.mutation === "null-body"
+      ? `UPDATE events SET data = NULL
+          WHERE id > ? AND id <= ?
+            AND (${input.predicate})`
+      : `DELETE FROM events
+          WHERE id > ? AND id <= ?
+            AND (${input.predicate})`,
+  );
+  const writeProgress = db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  );
+
+  let moved = 0;
+  let batches = 0;
+  let reclaimedPages = 0;
+
+  for (let i = 0; i < maxBatches && scanWatermark < input.idCeiling; i++) {
+    const window = selectWindow.get(
+      scanWatermark,
+      input.idCeiling,
+      scanBatchSize,
+    ) as { n: number; max_id: number | null };
+    if (window.n === 0 || window.max_id == null) {
+      scanWatermark = input.idCeiling;
+      db.transaction(() => {
+        writeProgress.run(
+          input.progressKey,
+          JSON.stringify({
+            signature: input.signature,
+            watermark: scanWatermark,
+          }),
+        );
+      }).immediate();
+      break;
+    }
+
+    const candidateEnd =
+      window.n < scanBatchSize ? input.idCeiling : window.max_id;
+    const eligible = selectEligible.all(
+      scanWatermark,
+      candidateEnd,
+      batchSize,
+    ) as Array<{ id: number }>;
+    const progressEnd =
+      eligible.length === batchSize
+        ? (eligible[eligible.length - 1] as { id: number }).id
+        : candidateEnd;
+    if (progressEnd <= scanWatermark) {
+      throw new Error(
+        "retention scan failed to advance its primary-key window",
+      );
+    }
+
+    let changed = 0;
+    db.transaction(() => {
+      changed = mutateWindow.run(scanWatermark, progressEnd).changes;
+      if (changed !== eligible.length) {
+        throw new Error(
+          `retention scan mutation mismatch: selected ${eligible.length}, changed ${changed}`,
+        );
+      }
+      writeProgress.run(
+        input.progressKey,
+        JSON.stringify({ signature: input.signature, watermark: progressEnd }),
+      );
+    }).immediate();
+
+    scanWatermark = progressEnd;
+    moved += changed;
+    batches += 1;
+
+    const incrementalVacuumPages =
+      options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES;
+    if (changed > 0 && incrementalVacuumPages > 0) {
+      const pages = incrementalVacuumPages;
+      const before = freelistPageCount(db);
+      db.run(`PRAGMA incremental_vacuum(${pages})`);
+      const after = freelistPageCount(db);
+      reclaimedPages += Math.max(0, before - after);
+    }
+  }
+
+  return {
+    moved,
+    batches,
+    reclaimedPages,
+    moreLikely: scanWatermark < input.idCeiling,
+  };
 }
 
 /**
@@ -403,18 +619,10 @@ export function retainColdPayloads(
   db: Database,
   options: RetentionOptions = {},
 ): RetentionResult {
-  const batchSize = options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE;
-  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
   const recentRetentionMargin =
     options.recentRetentionMargin ?? RECENT_RETENTION_MARGIN;
-  const incrementalVacuumPages =
-    options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES;
-
   const coldWatermark = computeColdWatermark(db, recentRetentionMargin);
   const cursor = readFoldCursor(db);
-  // Nothing is eligible when the watermark or cursor floors at/below the first
-  // row. The eligibility id ceiling is `min(coldWatermark, cursor - 1)`: at or
-  // below the cold window AND strictly below the fold cursor.
   const idCeiling = Math.min(coldWatermark, cursor - 1);
   if (idCeiling <= 0) {
     return {
@@ -427,66 +635,25 @@ export function retainColdPayloads(
     };
   }
 
-  // One prepared statement set, reused across batches. The SELECT picks the next
-  // cold shed-class batch by id; the UPDATE NULLs `data` for the SAME ids. Both
-  // share the `id <= ceiling AND data IS NOT NULL AND <shed predicate>` cold
-  // predicate so a row the SELECT picked is exactly the row the UPDATE clears —
-  // internally consistent within the single transaction.
-  const selectBatch = db.prepare(
-    `SELECT id FROM events
-      WHERE id <= ?
-        AND data IS NOT NULL
-        AND ${RETENTION_SHED_PREDICATE}
-      ORDER BY id ASC
-      LIMIT ?`,
-  );
-  const nullBodies = db.prepare(
-    `UPDATE events SET data = NULL
-      WHERE id IN (SELECT value FROM json_each(?))`,
-  );
-
-  let shed = 0;
-  let batches = 0;
-  let reclaimedPages = 0;
-  let lastBatchFull = false;
-
-  for (let i = 0; i < maxBatches; i++) {
-    const idRows = selectBatch.all(idCeiling, batchSize) as { id: number }[];
-    if (idRows.length === 0) break;
-    const ids = idRows.map((r) => r.id);
-    const idsJson = JSON.stringify(ids);
-
-    // ONE atomic transaction per batch. `.immediate()` grabs the writer lock at
-    // BEGIN so the UPDATE can't lose the upgrade-to-writer race to a concurrent
-    // hook write and surface a partial SQLITE_BUSY half-way through (same fix as
-    // `migrate()`/`applyEvent`).
-    db.transaction(() => {
-      nullBodies.run(idsJson);
-    }).immediate();
-
-    shed += ids.length;
-    batches += 1;
-    lastBatchFull = ids.length === batchSize;
-
-    // Return freed overflow pages to the file tail in a bounded chunk — OUTSIDE
-    // the batch transaction (incremental_vacuum cannot run inside one), and
-    // never one unbounded call (it would materialize the whole freelist into
-    // cache → WAL). A no-op on a DB not born with auto_vacuum=INCREMENTAL.
-    if (incrementalVacuumPages > 0) {
-      const before = freelistPageCount(db);
-      db.run(`PRAGMA incremental_vacuum(${incrementalVacuumPages})`);
-      const after = freelistPageCount(db);
-      reclaimedPages += Math.max(0, before - after);
-    }
-  }
+  // A backfill-watermark change resets this scan signature. A mutation row that
+  // becomes retention-eligible after its path is promoted is therefore revisited
+  // instead of being stranded behind an optimization watermark.
+  const backfillWatermark = readMetaValue(db, BACKFILL_WATERMARK_KEY) ?? "";
+  const result = mutateColdRowsByScan(db, options, {
+    idCeiling,
+    predicate: `data IS NOT NULL AND (${RETENTION_SHED_PREDICATE})`,
+    progressKey: BODY_SCAN_PROGRESS_KEY,
+    signature: `${RETENTION_SHED_PREDICATE}\nbackfill=${backfillWatermark}`,
+    mutation: "null-body",
+  });
 
   return {
-    shed,
-    batches,
+    shed: result.moved,
+    batches: result.batches,
     coldWatermark,
     cursor,
-    reclaimedPages,
-    moreLikely: batches === maxBatches && lastBatchFull,
+    reclaimedPages: result.reclaimedPages,
+    moreLikely: result.moreLikely,
   };
 }
 
@@ -495,8 +662,8 @@ export interface DrainOptions extends RetentionOptions {
    * Hard ceiling on catch-up passes, a runaway guard. Each pass NULLs up to
    * `maxBatches * batchSize` rows, so `maxPasses` bounds the whole drain at
    * `maxPasses * maxBatches * batchSize` rows. Defaults
-   * {@link DEFAULT_DRAIN_MAX_PASSES}. The loop normally STOPS earlier — the first
-   * pass that sheds nothing means the cold backlog is drained.
+   * {@link DEFAULT_DRAIN_MAX_PASSES}. The loop stops once the persisted scan
+   * reaches the current cold/cursor ceiling, including across keep-only gaps.
    */
   maxPasses?: number;
   /**
@@ -518,10 +685,9 @@ export interface DrainResult {
   /** Total overflow pages returned to the file tail across every pass. */
   reclaimedPages: number;
   /**
-   * `true` when the loop stopped on the `maxPasses` runaway guard while the last
-   * pass still shed rows — i.e. the backlog may not be fully drained. `false`
-   * (the steady case) means a pass shed nothing, so the cold tail is fully
-   * drained.
+   * `true` when the loop stopped on the `maxPasses` runaway guard before a
+   * terminal, fully-scanned pass. `false` means the cold scan reached its current
+   * cursor/watermark ceiling.
    */
   hitPassCap: boolean;
 }
@@ -530,9 +696,9 @@ export interface DrainResult {
  * Max catch-up passes a single {@link drainColdPayloads} call runs before
  * surrendering to the runaway guard. Sized so the default
  * `maxPasses * maxBatches * batchSize` ceiling (1000 * 200 * 500 = 100M rows)
- * dwarfs any realistic historical backlog — the loop always stops earlier on a
- * shed-nothing pass. It exists only so a logic bug (a row that re-selects
- * forever) cannot spin unbounded.
+ * dwarfs any realistic historical backlog — the loop stops once the persisted
+ * scan reaches the cold/cursor ceiling. The guard prevents a progress bug from
+ * spinning unbounded.
  */
 export const DEFAULT_DRAIN_MAX_PASSES = 1_000;
 
@@ -551,14 +717,15 @@ export const DEFAULT_DRAIN_MAX_BATCHES = 200;
  * NULLing the entire cold shed-class backlog in ≤`batchSize`-row transactions.
  * For the OPERATOR catch-up after a predicate widening (fn-837) — the
  * steady-state 300s timer (≤`DEFAULT_RETENTION_MAX_BATCHES` batches/pass) would
- * take hours to drain a ~600k-row historical backlog. This loops the SAME paced
- * pass with an elevated per-pass batch cap until a pass sheds nothing.
+ * take hours to drain a ~600k-row historical backlog. This loops the same paced
+ * scan with an elevated per-pass batch cap until its persisted watermark reaches
+ * the cold/cursor ceiling.
  *
- * Idempotent + resumable BY CONSTRUCTION: each pass re-derives the cold/cursor
- * window and selects only `data IS NOT NULL` rows, so already-shed rows are
- * skipped and a re-run (or a resume after an interrupted run) simply continues
- * from where the freelist stands. NEVER a single giant UPDATE — every tx stays
- * ≤`batchSize` rows so the writer lock is released between batches.
+ * Idempotent + resumable by construction: each transaction advances the scan
+ * watermark atomically with its body updates, so a re-run continues from the
+ * highest fully-examined id. Already-shed rows cannot match `data IS NOT NULL`.
+ * Every transaction stays ≤`batchSize` mutations so the writer lock is released
+ * between batches.
  *
  * Runs on a WRITABLE connection OUTSIDE any fold (same contract as
  * {@link retainColdPayloads}). Does NOT checkpoint the WAL or run the offline
@@ -573,6 +740,7 @@ export function drainColdPayloads(
   const passOptions: RetentionOptions = {
     batchSize: options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE,
     maxBatches: options.maxBatches ?? DEFAULT_DRAIN_MAX_BATCHES,
+    scanBatchSize: options.scanBatchSize,
     recentRetentionMargin:
       options.recentRetentionMargin ?? RECENT_RETENTION_MARGIN,
     incrementalVacuumPages:
@@ -593,11 +761,12 @@ export function drainColdPayloads(
     reclaimedPages += result.reclaimedPages;
     options.onPass?.(result, pass);
 
-    // A pass that shed nothing means the cold backlog is fully drained — stop.
-    if (result.shed === 0) break;
-    // Last allowed pass still shed rows: the runaway guard tripped. The caller
-    // re-runs (idempotent) to finish, but flag it so a wrapper can warn.
-    if (pass === maxPasses) hitPassCap = true;
+    // A zero-mutation pass is terminal only once its bounded scan reached the
+    // current ceiling; keep-only gaps still advance and continue.
+    if (result.shed === 0 && !result.moreLikely) break;
+    // Preserve a final zero-mutation observation after the last mutating pass.
+    // Callers use that terminal pass as proof the scan is fully drained.
+    if (pass === maxPasses) hitPassCap = result.moreLikely;
   }
 
   return { shed, batches, passes, reclaimedPages, hitPassCap };
@@ -614,11 +783,7 @@ export interface DeleteResult {
   cursor: number;
   /** Pages returned to the file tail by per-batch `incremental_vacuum`. */
   reclaimedPages: number;
-  /**
-   * `true` when a full `maxBatches` ran AND the last batch was full — i.e. more
-   * cold no-op-snapshot rows likely remain and the caller may schedule a
-   * follow-up pass sooner than the next slack tick.
-   */
+  /** `true` while the persisted scan watermark remains below this pass's ceiling. */
   moreLikely: boolean;
 }
 
@@ -692,17 +857,10 @@ function deleteColdRowsByPredicate(
   predicate: string,
   options: RetentionOptions = {},
 ): DeleteResult {
-  const batchSize = options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE;
-  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
   const recentRetentionMargin =
     options.recentRetentionMargin ?? RECENT_RETENTION_MARGIN;
-  const incrementalVacuumPages =
-    options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES;
-
   const coldWatermark = computeColdWatermark(db, recentRetentionMargin);
   const cursor = readFoldCursor(db);
-  // Same eligibility ceiling as the NULL pass: `min(coldWatermark, cursor - 1)`
-  // — at or below the cold window AND strictly below the fold cursor.
   const idCeiling = Math.min(coldWatermark, cursor - 1);
   if (idCeiling <= 0) {
     return {
@@ -715,66 +873,29 @@ function deleteColdRowsByPredicate(
     };
   }
 
-  // One prepared statement set, reused across batches. The SELECT picks the next
-  // cold matching batch by id; the DELETE removes the SAME ids. Both share the
-  // `id <= ceiling AND <predicate>` filter so a row the SELECT picked is exactly
-  // the row the DELETE removes. The explicit {@link RETENTION_KEEP_CLASS_PREDICATE}
-  // is AND-NOTed in as a DEFENSIVE backstop: no current delete predicate matches
-  // `TmuxTopologySnapshot`, but the hard exclusion guarantees a future delete-set
-  // widen can never physically remove restore's source-of-truth row.
-  const selectBatch = db.prepare(
-    `SELECT id FROM events
-      WHERE id <= ?
-        AND (${predicate})
-        AND NOT (${RETENTION_KEEP_CLASS_PREDICATE})
-      ORDER BY id ASC
-      LIMIT ?`,
-  );
-  const deleteRows = db.prepare(
-    `DELETE FROM events
-      WHERE id IN (SELECT value FROM json_each(?))`,
-  );
-
-  let deleted = 0;
-  let batches = 0;
-  let reclaimedPages = 0;
-  let lastBatchFull = false;
-
-  for (let i = 0; i < maxBatches; i++) {
-    const idRows = selectBatch.all(idCeiling, batchSize) as { id: number }[];
-    if (idRows.length === 0) break;
-    const ids = idRows.map((r) => r.id);
-    const idsJson = JSON.stringify(ids);
-
-    // ONE atomic transaction per batch. `.immediate()` grabs the writer lock at
-    // BEGIN so the DELETE can't lose the upgrade-to-writer race to a concurrent
-    // hook write (same fix as `retainColdPayloads`/`migrate()`).
-    db.transaction(() => {
-      deleteRows.run(idsJson);
-    }).immediate();
-
-    deleted += ids.length;
-    batches += 1;
-    lastBatchFull = ids.length === batchSize;
-
-    // Return freed pages to the file tail in a bounded chunk — OUTSIDE the batch
-    // transaction (incremental_vacuum cannot run inside one), never one unbounded
-    // call. A no-op on a DB not born with auto_vacuum=INCREMENTAL.
-    if (incrementalVacuumPages > 0) {
-      const before = freelistPageCount(db);
-      db.run(`PRAGMA incremental_vacuum(${incrementalVacuumPages})`);
-      const after = freelistPageCount(db);
-      reclaimedPages += Math.max(0, before - after);
-    }
-  }
+  // The positive keep predicate stays in the executable gate even though neither
+  // current delete class matches it. The signature covers the complete gate, so
+  // changing either side restarts the bounded scan automatically.
+  const executablePredicate = `(${predicate}) AND NOT (${RETENTION_KEEP_CLASS_PREDICATE})`;
+  const progressKey =
+    predicate === TMUX_FOCUS_DELETE_PREDICATE
+      ? FOCUS_DELETE_SCAN_PROGRESS_KEY
+      : NOOP_DELETE_SCAN_PROGRESS_KEY;
+  const result = mutateColdRowsByScan(db, options, {
+    idCeiling,
+    predicate: executablePredicate,
+    progressKey,
+    signature: executablePredicate,
+    mutation: "delete-row",
+  });
 
   return {
-    deleted,
-    batches,
+    deleted: result.moved,
+    batches: result.batches,
     coldWatermark,
     cursor,
-    reclaimedPages,
-    moreLikely: batches === maxBatches && lastBatchFull,
+    reclaimedPages: result.reclaimedPages,
+    moreLikely: result.moreLikely,
   };
 }
 

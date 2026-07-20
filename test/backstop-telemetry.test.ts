@@ -27,7 +27,6 @@ import {
   BackstopCounters,
   BackstopRateLimiter,
   type BackstopRecord,
-  buildMissedWakeRecord,
 } from "../src/backstop-telemetry";
 import { resolveBackstopLogPath } from "../src/db";
 

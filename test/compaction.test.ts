@@ -26,6 +26,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BACKFILL_WATERMARK_KEY } from "../src/backfill-mutation-path";
 import {
   computeColdWatermark,
   countAbsentBlobs,
@@ -697,6 +698,107 @@ test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across 
   expect(result2.shed).toBe(15);
 });
 
+test("retention persists bounded primary-key progress across a keep-only history prefix", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 40; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
+  const mutationId = insertMutation("/repo/late.ts");
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  // One batch may inspect only ten existing rows. The late mutation must NOT be
+  // found by a whole-history class-index scan on this first pass.
+  const first = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 1,
+    scanBatchSize: 10,
+    maxBatches: 1,
+    incrementalVacuumPages: 0,
+  });
+  expect(first.shed).toBe(0);
+  expect(first.batches).toBe(1);
+  expect(first.moreLikely).toBe(true);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).not.toBeNull();
+
+  // The catch-up loop continues across zero-mutation windows, reaches the late
+  // row, and records a terminal fully-scanned pass.
+  const drained = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 1,
+    scanBatchSize: 10,
+    maxBatches: 1,
+    maxPasses: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(drained.shed).toBe(1);
+  expect(drained.hitPassCap).toBe(false);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+});
+
+test("retention revisits a row when mutation-path backfill progress changes", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  const mutationId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/later.ts" } }),
+    mutation_path: null,
+  });
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  const beforeBackfill = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    scanBatchSize: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(beforeBackfill.shed).toBe(0);
+  expect(beforeBackfill.moreLikely).toBe(false);
+
+  // Mirror the backfill's atomic column + watermark advance. The watermark is
+  // part of the body-scan signature, so this newly eligible row cannot remain
+  // stranded behind the persisted retention cursor.
+  db.transaction(() => {
+    db.run("UPDATE events SET mutation_path = ? WHERE id = ?", [
+      "/repo/later.ts",
+      mutationId,
+    ]);
+    db.run(
+      `INSERT INTO meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [BACKFILL_WATERMARK_KEY, String(mutationId)],
+    );
+  }).immediate();
+
+  const afterBackfill = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    scanBatchSize: 10,
+    incrementalVacuumPages: 0,
+  });
+  expect(afterBackfill.shed).toBe(1);
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(mutationId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+});
+
 test("retention shrinks the inline footprint; per-batch incremental_vacuum reclaims on an INCREMENTAL DB", () => {
   // A minimal DB born with auto_vacuum=INCREMENTAL so incremental_vacuum actually
   // returns freed overflow pages (the .4 reclaimDb bakes this into the live file).
@@ -715,6 +817,7 @@ test("retention shrinks the inline footprint; per-batch incremental_vacuum recla
   idb.run(
     "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
   );
+  idb.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
 
   // Seed 40 shed-class mutation rows with bodies large enough to spill onto
@@ -1067,6 +1170,7 @@ test("deleteNoopSnapshotRows reclaims freed pages via per-batch incremental_vacu
   idb.run(
     "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
   );
+  idb.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
   idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
 
   // 40 no-op-snapshot rows with bodies large enough to spill onto overflow pages.
