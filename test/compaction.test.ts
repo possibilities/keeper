@@ -43,6 +43,10 @@ import {
   runYieldingRetentionBatches,
   runYieldingRetentionPass,
 } from "../src/compaction";
+import {
+  createMaintenanceTimeBudget,
+  MAIN_MAINTENANCE_TICK_BUDGET_MS,
+} from "../src/maintenance-budget";
 import { __resetEpicIndexMemoForTest, drain } from "../src/reducer";
 import { bindGitObservationWatermark } from "./helpers/git-event-payload";
 import { freshMemDb } from "./helpers/template-db";
@@ -721,6 +725,86 @@ test("yielding retention gives control RPCs a turn between one-transaction steps
   expect(trace).toEqual(["batch-1", "yield", "batch-2", "yield", "batch-3"]);
 });
 
+test("wall-clock budget stops an oversized retention chain and the next tick resumes its durable watermark", async () => {
+  const ids = Array.from({ length: 5 }, (_, i) =>
+    insertMutation(`/repo/budget-${i}.ts`),
+  );
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+  const projectionsBefore = projectionSnapshot();
+
+  let now = 0;
+  const firstTick = await runYieldingRetentionBatches(
+    () => {
+      const result = retainColdPayloads(db, {
+        recentRetentionMargin: 0,
+        batchSize: 2,
+        scanBatchSize: 2,
+        maxBatches: 1,
+        incrementalVacuumPages: 0,
+      });
+      now += MAIN_MAINTENANCE_TICK_BUDGET_MS + 1;
+      return result;
+    },
+    {
+      maxBatches: 20,
+      budget: createMaintenanceTimeBudget({ now: () => now }),
+      yieldTurn: async () => {},
+    },
+  );
+
+  expect(firstTick).toHaveLength(1);
+  expect(firstTick[0]?.shed).toBe(2);
+  expect(
+    ids.map(
+      (id) =>
+        (
+          db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+            data: string | null;
+          }
+        ).data === null,
+    ),
+  ).toEqual([true, true, false, false, false]);
+
+  now = 1_000;
+  const secondTick = await runYieldingRetentionBatches(
+    () =>
+      retainColdPayloads(db, {
+        recentRetentionMargin: 0,
+        batchSize: 2,
+        scanBatchSize: 2,
+        maxBatches: 1,
+        incrementalVacuumPages: 0,
+      }),
+    {
+      maxBatches: 20,
+      budget: createMaintenanceTimeBudget({ now: () => now }),
+      yieldTurn: async () => {},
+    },
+  );
+
+  expect(secondTick.reduce((sum, result) => sum + result.shed, 0)).toBe(3);
+  expect(
+    ids.map(
+      (id) =>
+        (
+          db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+            data: string | null;
+          }
+        ).data === null,
+    ),
+  ).toEqual([true, true, true, true, true]);
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  __resetEpicIndexMemoForTest(db);
+  drainAll();
+  expect(projectionSnapshot()).toEqual(projectionsBefore);
+});
+
 test("yielding retention pass applies the batch cap independently to all three surfaces", async () => {
   for (let i = 0; i < 3; i++) {
     insertEvent({ hook_event: "SessionStart" });
@@ -742,7 +826,33 @@ test("yielding retention pass applies the batch cap independently to all three s
   expect(result?.bodies.batches).toBe(2);
   expect(result?.noopSnapshots.batches).toBe(2);
   expect(result?.tmuxFocus.batches).toBe(2);
+  expect(result?.budgetExhausted).toBe(false);
   expect(yields).toBe(6);
+});
+
+test("one retention budget is shared across body shed and cold-row compaction", async () => {
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "SessionStart" });
+  }
+  db.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
+  let now = 0;
+
+  const result = await runYieldingRetentionPass(db, {
+    batchSize: 1,
+    maxBatches: 3,
+    scanBatchSize: 1,
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+    budget: createMaintenanceTimeBudget({ now: () => now }),
+    yieldTurn: async () => {
+      now += MAIN_MAINTENANCE_TICK_BUDGET_MS + 1;
+    },
+  });
+
+  expect(result?.bodies.batches).toBe(1);
+  expect(result?.noopSnapshots.batches).toBe(0);
+  expect(result?.tmuxFocus.batches).toBe(0);
+  expect(result?.budgetExhausted).toBe(true);
 });
 
 test("retention persists bounded primary-key progress across a keep-only history prefix", () => {

@@ -78,6 +78,11 @@
 import type { Database } from "bun:sqlite";
 import { BACKFILL_WATERMARK_KEY } from "./backfill-mutation-path";
 import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
+import {
+  createMaintenanceTimeBudget,
+  type MaintenanceTimeBudget,
+  runBudgetedMaintenanceLoop,
+} from "./maintenance-budget";
 
 /**
  * Keep the most-recent N events' bodies inline UNCONDITIONALLY, regardless of
@@ -385,6 +390,8 @@ export interface YieldingRetentionBatchResult {
 export interface YieldingRetentionBatchOptions {
   /** Maximum one-transaction steps in this event-loop turn sequence. */
   maxBatches?: number;
+  /** Shared wall-clock budget checked between transactions. */
+  budget?: MaintenanceTimeBudget;
   /** Event-loop yield seam. Tests inject a deterministic observer. */
   yieldTurn?: () => Promise<void>;
   /** Cancellation seam checked before every transaction. */
@@ -397,40 +404,15 @@ export interface YieldingRetentionBatchOptions {
  * yielding separately lets MAIN service worker-bridged control RPCs while a
  * historical retention backlog advances.
  */
-function defaultRetentionYieldTurn(): Promise<void> {
-  return new Promise<void>((resolve) => setImmediate(resolve));
-}
-
 export async function runYieldingRetentionBatches<
   T extends YieldingRetentionBatchResult,
 >(step: () => T, options: YieldingRetentionBatchOptions = {}): Promise<T[]> {
-  const maxBatches = options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES;
-  if (!Number.isSafeInteger(maxBatches) || maxBatches < 0) {
-    throw new RangeError("maxBatches must be a safe non-negative integer");
-  }
-  const yieldTurn = options.yieldTurn ?? defaultRetentionYieldTurn;
-  const shouldContinue = options.shouldContinue ?? (() => true);
-  const results: T[] = [];
-
-  for (let i = 0; i < maxBatches && shouldContinue(); i++) {
-    const result = step();
-    if (
-      !Number.isSafeInteger(result.batches) ||
-      result.batches < 0 ||
-      result.batches > 1
-    ) {
-      throw new Error(
-        "yielding retention step must execute at most one transaction",
-      );
-    }
-    results.push(result);
-    if (result.batches === 0 || !result.moreLikely || i + 1 >= maxBatches) {
-      break;
-    }
-    await yieldTurn();
-  }
-
-  return results;
+  return runBudgetedMaintenanceLoop(step, {
+    maxBatches: options.maxBatches ?? DEFAULT_RETENTION_MAX_BATCHES,
+    budget: options.budget,
+    yieldTurn: options.yieldTurn,
+    shouldContinue: options.shouldContinue,
+  });
 }
 
 function readMetaValue(db: Database, key: string): string | null {
@@ -958,6 +940,8 @@ function deleteColdRowsByPredicate(
 }
 
 export interface YieldingRetentionPassOptions extends RetentionOptions {
+  /** Shared wall-clock budget checked between transactions and surfaces. */
+  budget?: MaintenanceTimeBudget;
   /** Event-loop yield seam. Defaults to `setImmediate`. */
   yieldTurn?: () => Promise<void>;
   /** Cancellation seam checked between transactions and surfaces. */
@@ -968,6 +952,7 @@ export interface YieldingRetentionPassResult {
   bodies: RetentionResult;
   noopSnapshots: DeleteResult;
   tmuxFocus: DeleteResult;
+  budgetExhausted: boolean;
 }
 
 function aggregateRetentionResults(
@@ -994,6 +979,23 @@ function aggregateDeleteResults(results: DeleteResult[]): DeleteResult | null {
   };
 }
 
+function deferredDeleteResult(
+  reference: RetentionResult | DeleteResult,
+): DeleteResult {
+  return {
+    deleted: 0,
+    batches: 0,
+    coldWatermark: reference.coldWatermark,
+    cursor: reference.cursor,
+    reclaimedPages: 0,
+    moreLikely: true,
+  };
+}
+
+function defaultRetentionYieldTurn(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 /**
  * Advance all three event-retention surfaces, one transaction per event-loop
  * turn. A yield also separates surfaces when one reaches its ceiling in a
@@ -1006,12 +1008,14 @@ export async function runYieldingRetentionPass(
 ): Promise<YieldingRetentionPassResult | null> {
   const {
     maxBatches = DEFAULT_RETENTION_MAX_BATCHES,
+    budget = createMaintenanceTimeBudget(),
     yieldTurn = defaultRetentionYieldTurn,
     shouldContinue = () => true,
     ...retentionOptions
   } = options;
   const driverOptions: YieldingRetentionBatchOptions = {
     maxBatches,
+    budget,
     yieldTurn,
     shouldContinue,
   };
@@ -1024,7 +1028,17 @@ export async function runYieldingRetentionPass(
     () => retainColdPayloads(db, stepOptions),
     driverOptions,
   );
-  if (!shouldContinue()) return null;
+  const bodies = aggregateRetentionResults(bodyResults);
+  if (!bodies || !shouldContinue()) return null;
+  if (budget.exhausted()) {
+    const deferred = deferredDeleteResult(bodies);
+    return {
+      bodies,
+      noopSnapshots: deferred,
+      tmuxFocus: deferred,
+      budgetExhausted: true,
+    };
+  }
   await yieldTurn();
   if (!shouldContinue()) return null;
 
@@ -1032,6 +1046,16 @@ export async function runYieldingRetentionPass(
     () => deleteNoopSnapshotRows(db, stepOptions),
     driverOptions,
   );
+  const noopSnapshots =
+    aggregateDeleteResults(noopResults) ?? deferredDeleteResult(bodies);
+  if (budget.exhausted()) {
+    return {
+      bodies,
+      noopSnapshots,
+      tmuxFocus: deferredDeleteResult(noopSnapshots),
+      budgetExhausted: true,
+    };
+  }
   if (!shouldContinue()) return null;
   await yieldTurn();
   if (!shouldContinue()) return null;
@@ -1040,15 +1064,18 @@ export async function runYieldingRetentionPass(
     () => deleteColdTmuxFocusRows(db, stepOptions),
     driverOptions,
   );
+  const tmuxFocus =
+    aggregateDeleteResults(focusResults) ?? deferredDeleteResult(noopSnapshots);
   if (!shouldContinue()) return null;
-  await yieldTurn();
+  if (!budget.exhausted()) await yieldTurn();
   if (!shouldContinue()) return null;
 
-  const bodies = aggregateRetentionResults(bodyResults);
-  const noopSnapshots = aggregateDeleteResults(noopResults);
-  const tmuxFocus = aggregateDeleteResults(focusResults);
-  if (!bodies || !noopSnapshots || !tmuxFocus) return null;
-  return { bodies, noopSnapshots, tmuxFocus };
+  return {
+    bodies,
+    noopSnapshots,
+    tmuxFocus,
+    budgetExhausted: budget.exhausted(),
+  };
 }
 
 /** Current freelist page count — the pool `incremental_vacuum` drains. */

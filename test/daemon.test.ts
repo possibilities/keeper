@@ -125,6 +125,7 @@ import {
   type MergeEscalationOutcome,
   type MergeEscalationSweepDeps,
   type MergeHumanNotifiedOutcome,
+  MUTATION_PATH_BACKFILL_INTERVAL_MS,
   matchCrashReportToBoot,
   mergeConflictBaseCheckout,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
@@ -157,6 +158,7 @@ import {
   qualifyCrashLoopBootTimestamps,
   RESTART_LEDGER_CAP,
   RESTART_LEDGER_REASON_MAX_LEN,
+  RETENTION_INTERVAL_MS,
   type RepairCandidate,
   type RepairCandidateDropClass,
   type RepairEscalationSweepDeps,
@@ -195,6 +197,7 @@ import {
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  SERVE_LAG_P99_THRESHOLD_MS,
   SERVE_PROBE_MAX_FAIL_STREAK,
   SERVE_REPORT_MUTE_THRESHOLD_MS,
   SERVE_STARVATION_MAX_BREACH_STREAK,
@@ -281,6 +284,7 @@ import {
   resolveAgentbotBinaryPath,
   sendAgentbotPage,
 } from "../src/integrity-probe";
+import { MAIN_MAINTENANCE_TICK_BUDGET_MS } from "../src/maintenance-budget";
 import { MAX_LINE_LENGTH, type Row } from "../src/protocol";
 import type {
   ReconcileSnapshot,
@@ -1544,6 +1548,30 @@ const SWD_STARVATION_BREACH = {
   ourFault: true,
   sampleCount: 100,
 } as const;
+
+test("main maintenance budget cannot span a busy-lag breach streak", () => {
+  const budgetedBreachWindows = Math.ceil(
+    (MAIN_MAINTENANCE_TICK_BUDGET_MS + SERVE_LAG_P99_THRESHOLD_MS) /
+      SERVE_WATCHDOG_INTERVAL_MS,
+  );
+  const maintenanceIntervalMs = Math.min(
+    RETENTION_INTERVAL_MS,
+    MUTATION_PATH_BACKFILL_INTERVAL_MS,
+  );
+  const cleanWindowsBeforeNextMaintenance =
+    Math.floor(maintenanceIntervalMs / SERVE_WATCHDOG_INTERVAL_MS) -
+    budgetedBreachWindows;
+
+  expect(MAIN_MAINTENANCE_TICK_BUDGET_MS).toBeLessThan(
+    SERVE_LAG_P99_THRESHOLD_MS,
+  );
+  expect(budgetedBreachWindows).toBeLessThan(
+    SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  );
+  expect(cleanWindowsBeforeNextMaintenance).toBeGreaterThanOrEqual(
+    SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
+  );
+});
 
 test("decideServeLivenessWatchdog: healthy — live probes, no lag, fresh report → ok", () => {
   expect(swd().verdict).toEqual({ kind: "ok" });

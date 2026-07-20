@@ -50,6 +50,11 @@
 
 import type { Database } from "bun:sqlite";
 import { MUTATION_TOOL_SQL_PREDICATE } from "./derivers";
+import {
+  createMaintenanceTimeBudget,
+  type MaintenanceTimeBudget,
+  runBudgetedMaintenanceLoop,
+} from "./maintenance-budget";
 
 /** `meta` key for the crash-safe resume watermark (highest processed id). */
 export const BACKFILL_WATERMARK_KEY = "mutation_path_backfill_watermark";
@@ -89,6 +94,16 @@ export interface BackfillResult {
    * sooner than the next slack tick.
    */
   moreLikely: boolean;
+}
+
+export interface YieldingBackfillOptions extends BackfillOptions {
+  budget?: MaintenanceTimeBudget;
+  yieldTurn?: () => Promise<void>;
+  shouldContinue?: () => boolean;
+}
+
+export interface YieldingBackfillResult extends BackfillResult {
+  budgetExhausted: boolean;
 }
 
 /**
@@ -214,6 +229,31 @@ export function backfillMutationPath(
     batches,
     watermark,
     moreLikely: batches === maxBatches && lastBatchFull,
+  };
+}
+
+export async function runYieldingMutationPathBackfill(
+  db: Database,
+  options: YieldingBackfillOptions = {},
+): Promise<YieldingBackfillResult | null> {
+  const {
+    batchSize = DEFAULT_BACKFILL_BATCH_SIZE,
+    maxBatches = DEFAULT_BACKFILL_MAX_BATCHES,
+    budget = createMaintenanceTimeBudget(),
+    yieldTurn,
+    shouldContinue,
+  } = options;
+  const results = await runBudgetedMaintenanceLoop(
+    () => backfillMutationPath(db, { batchSize, maxBatches: 1 }),
+    { maxBatches, budget, yieldTurn, shouldContinue },
+  );
+  const last = results.at(-1);
+  if (!last) return null;
+  return {
+    ...last,
+    scanned: results.reduce((sum, item) => sum + item.scanned, 0),
+    batches: results.reduce((sum, item) => sum + item.batches, 0),
+    budgetExhausted: budget.exhausted(),
   };
 }
 

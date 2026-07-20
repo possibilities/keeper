@@ -78,9 +78,8 @@ import type {
   AwaitWorkerData,
 } from "./await-worker";
 import {
-  backfillMutationPath,
-  DEFAULT_BACKFILL_MAX_BATCHES,
   isMutationPathBackfillComplete,
+  runYieldingMutationPathBackfill,
 } from "./backfill-mutation-path";
 import {
   appendBackstopRecord,
@@ -130,7 +129,6 @@ import {
   DEFAULT_RETENTION_MAX_BATCHES,
   reclaimableFreelistBytes,
   reclaimableLogStep,
-  runYieldingRetentionBatches,
   runYieldingRetentionPass,
 } from "./compaction";
 import {
@@ -296,6 +294,7 @@ import {
 } from "./integrity-probe";
 import { buildLauncherArgvPrefix } from "./keeper-agent-path";
 import { keeperStateDir } from "./keeper-state-dir";
+import { createMaintenanceTimeBudget } from "./maintenance-budget";
 import type {
   BackupResultMessage,
   MaintenanceLogMessage,
@@ -17169,12 +17168,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     let shed = 0;
     let deleted = 0;
     try {
+      const budget = createMaintenanceTimeBudget();
       const eventRetention = await runYieldingRetentionPass(db, {
+        budget,
         shouldContinue: () => !shuttingDown,
       });
       if (!eventRetention) return;
 
-      const { bodies, noopSnapshots, tmuxFocus } = eventRetention;
+      const { bodies, noopSnapshots, tmuxFocus, budgetExhausted } =
+        eventRetention;
       shed = bodies.shed;
       deleted = noopSnapshots.deleted + tmuxFocus.deleted;
       if (shed > 0) {
@@ -17192,6 +17194,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           `[keeperd] retention: deleted ${tmuxFocus.deleted} cold tmux-focus row(s) in ${tmuxFocus.batches} batch(es), reclaimed ${tmuxFocus.reclaimedPages} page(s) (watermark id<=${tmuxFocus.coldWatermark}, cursor<${tmuxFocus.cursor}${tmuxFocus.moreLikely ? ", more remain" : ""})`,
         );
       }
+      if (budgetExhausted || budget.exhausted()) return;
 
       // Dead-letter retention (resurrection-safe): prune fully-recovered aged
       // sealed files (unlink-FIRST, rows second) + row-only terminal tails. Its
@@ -17318,24 +17321,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function runMutationPathBackfillPassUnlocked(): Promise<void> {
     let scanned = 0;
     try {
-      const results = await runYieldingRetentionBatches(
-        () => backfillMutationPath(db, { maxBatches: 1 }),
-        {
-          maxBatches: DEFAULT_BACKFILL_MAX_BATCHES,
-          shouldContinue: () => !shuttingDown,
-        },
-      );
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (shuttingDown) return;
-      const result = results.at(-1);
+      const budget = createMaintenanceTimeBudget();
+      const result = await runYieldingMutationPathBackfill(db, {
+        budget,
+        shouldContinue: () => !shuttingDown,
+      });
       if (!result) return;
-      scanned = results.reduce((sum, item) => sum + item.scanned, 0);
-      const batches = results.reduce((sum, item) => sum + item.batches, 0);
+      scanned = result.scanned;
+      const batches = result.batches;
       if (scanned > 0) {
         console.error(
           `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
+      if (result.budgetExhausted || budget.exhausted()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (shuttingDown || budget.exhausted()) return;
       // Self-disable once a bounded pass reaches the historical tail and the
       // completion gate proves no inline body still yields an unstamped path.
       // A full final batch defers this probe to the next heartbeat rather than
