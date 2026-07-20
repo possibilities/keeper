@@ -79,6 +79,7 @@ import type {
 } from "./await-worker";
 import {
   backfillMutationPath,
+  DEFAULT_BACKFILL_MAX_BATCHES,
   isMutationPathBackfillComplete,
 } from "./backfill-mutation-path";
 import {
@@ -129,6 +130,7 @@ import {
   DEFAULT_RETENTION_MAX_BATCHES,
   reclaimableFreelistBytes,
   reclaimableLogStep,
+  runYieldingRetentionBatches,
   runYieldingRetentionPass,
 } from "./compaction";
 import {
@@ -17298,22 +17300,41 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // off the body). Once complete the pass self-disables (one-shot historical
   // fill); steady-state rows arrive already-stamped via the forward path.
   let backfillDone = false;
-  function runMutationPathBackfillPass(): void {
-    if (shuttingDown || backfillDone) return;
+  let backfillRunning = false;
+  async function runMutationPathBackfillPass(): Promise<void> {
+    if (shuttingDown || backfillDone || backfillRunning) return;
+    backfillRunning = true;
+    await runMutationPathBackfillPassUnlocked().finally(() => {
+      backfillRunning = false;
+    });
+  }
+
+  async function runMutationPathBackfillPassUnlocked(): Promise<void> {
     let scanned = 0;
     try {
-      const result = backfillMutationPath(db);
-      scanned = result.scanned;
+      const results = await runYieldingRetentionBatches(
+        () => backfillMutationPath(db, { maxBatches: 1 }),
+        {
+          maxBatches: DEFAULT_BACKFILL_MAX_BATCHES,
+          shouldContinue: () => !shuttingDown,
+        },
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (shuttingDown) return;
+      const result = results.at(-1);
+      if (!result) return;
+      scanned = results.reduce((sum, item) => sum + item.scanned, 0);
+      const batches = results.reduce((sum, item) => sum + item.batches, 0);
       if (scanned > 0) {
         console.error(
-          `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${result.batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Self-disable once the historical tail is provably exhausted — the
-      // completion gate counts ONLY rows whose body still yields an unstamped
-      // file_path, so a legitimately-NULL row (malformed / no file_path) never
-      // keeps it running. After this the forward path keeps new rows stamped.
-      if (isMutationPathBackfillComplete(db)) {
+      // Self-disable once a bounded pass reaches the historical tail and the
+      // completion gate proves no inline body still yields an unstamped path.
+      // A full final batch defers this probe to the next heartbeat rather than
+      // placing a whole-history scan directly after the last transaction.
+      if (!result.moreLikely && isMutationPathBackfillComplete(db)) {
         backfillDone = true;
         clearInterval(mutationPathBackfillTimer);
         if (scanned > 0) {
@@ -17351,9 +17372,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Schedule the backfill on its own slack heartbeat. Stored so shutdown can
   // `clearInterval` it (and so the self-disable on completion can clear it).
-  // Fires on the MAIN THREAD against the writable connection.
+  // Fires on the MAIN THREAD against the writable connection, yielding between
+  // transactions and before the completion scan.
   const mutationPathBackfillTimer = setInterval(() => {
-    runMutationPathBackfillPass();
+    void runMutationPathBackfillPass();
   }, MUTATION_PATH_BACKFILL_INTERVAL_MS);
 
   // Steady-state WAL checkpoint cadence, independent of retention (whose PASSIVE

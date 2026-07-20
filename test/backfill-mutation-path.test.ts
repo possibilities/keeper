@@ -20,6 +20,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BACKFILL_SELECT_BATCH_SQL,
   BACKFILL_WATERMARK_KEY,
   backfillMutationPath,
   isMutationPathBackfillComplete,
@@ -99,6 +100,16 @@ test("readBackfillWatermark is 0 before any pass; advances after a pass", () => 
     db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
   ).m;
   expect(readBackfillWatermark(db)).toBe(maxId);
+});
+
+test("backfill batch selection seeks the primary key without sorting cold history", () => {
+  const plan = db
+    .query(`EXPLAIN QUERY PLAN ${BACKFILL_SELECT_BATCH_SQL}`)
+    .all(0, 500) as Array<{ detail: string }>;
+  const details = plan.map((row) => row.detail).join("\n");
+
+  expect(details).toContain("USING INTEGER PRIMARY KEY");
+  expect(details).not.toContain("TEMP B-TREE");
 });
 
 test("backfill fills mutation_path from inline events.data; non-mutation rows untouched", () => {

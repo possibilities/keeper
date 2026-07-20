@@ -99,6 +99,17 @@ export interface BackfillResult {
 const MUTATION_TOOL_PREDICATE = MUTATION_TOOL_SQL_PREDICATE;
 
 /**
+ * Forward-seeking batch selector. `NOT INDEXED` prevents SQLite from expanding
+ * the hook/tool OR through secondary indexes and sorting cold history for LIMIT.
+ */
+export const BACKFILL_SELECT_BATCH_SQL = `SELECT id FROM events NOT INDEXED
+  WHERE id > ?
+    AND ${MUTATION_TOOL_PREDICATE}
+    AND mutation_path IS NULL
+  ORDER BY id ASC
+  LIMIT ?`;
+
+/**
  * The guarded extract over `events.data` (post-shed there is no side table to
  * COALESCE). `CASE WHEN json_valid(e.data) THEN json_extract(e.data, ...) END`:
  * a malformed body folds to NULL instead of throwing, byte-identical to the old
@@ -145,19 +156,15 @@ export function backfillMutationPath(
   let watermark = readBackfillWatermark(db);
 
   // Select the next batch of mutation-row ids strictly above the watermark.
+  // `NOT INDEXED` keeps this as one forward primary-key seek: the hook/tool OR
+  // predicate's secondary indexes would otherwise materialize and sort the
+  // entire historical match set before LIMIT, starving MAIN on a cold tail.
   // `mutation_path IS NULL` skips the forward-path rows task .2 already filled
   // (so a re-deployed daemon doesn't re-touch them), while the watermark skips
   // the done-null tail (malformed / no-file_path rows whose column legitimately
   // stays NULL). Reads only `events` (the body extract below also reads only the
   // inline `events.data` — post-shed there is no side table).
-  const selectBatch = db.prepare(
-    `SELECT id FROM events
-      WHERE id > ?
-        AND ${MUTATION_TOOL_PREDICATE}
-        AND mutation_path IS NULL
-      ORDER BY id ASC
-      LIMIT ?`,
-  );
+  const selectBatch = db.prepare(BACKFILL_SELECT_BATCH_SQL);
 
   // UPDATE the batch's `mutation_path` from the guarded extract over the inline
   // `events.data` body (post-shed: no `event_blobs` side table to COALESCE). A
