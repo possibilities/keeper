@@ -59,5 +59,5 @@ pill renders scope context.
 - [ ] The problem-codes poison row documents meaning and recovery via the lifecycle verbs
 
 ## Done summary
-
+Scoped trusted evidence-bearing poison dead-letter rows to their session worktree (foreign-worktree commits proceed), kept unscopable rows globally blocking, added a distinct poison_dead_letters collection with bounded blocking-scope context on needs-human and the board pill, and documented the poison problem code's recovery via the reclassify/resolve verbs.
 ## Evidence
