@@ -325,7 +325,8 @@ const BUN_EVAL_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
  *  surface (`agent`), the close-out (`commit-work`, task-bound `plan done` or
  *  AUDIT_READY self-park), and the reads it
  *  orients on (`plan` reads, `session` state, `baseline`). None of these author
- *  source. Every other keeper subcommand is denied. */
+ *  source. Every other keeper subcommand is denied except the separately
+ *  shape-checked send-only `bus` notice. */
 const WRAPPED_KEEPER_SUBCOMMANDS = new Set([
   "agent",
   "session",
@@ -605,6 +606,14 @@ function wrappedPlanViolation(
     index += 1;
   }
   return null;
+}
+
+function wrappedBusViolation(tokens: string[]): string | null {
+  return tokens.length === 6 &&
+    tokens[2] === "chat" &&
+    tokens[3] === "send"
+    ? null
+    : "wrapped `keeper bus` permits only `keeper bus chat send <target> <message>`";
 }
 
 function runGateExcerpt(token: string | undefined): string {
@@ -952,6 +961,7 @@ function classifyWrappedExecutable(
     }
     if (sub === "plan") return wrappedPlanViolation(tokens, context);
     if (sub === "agent") return wrappedAgentViolation(tokens, context);
+    if (sub === "bus") return wrappedBusViolation(tokens);
     if (WRAPPED_KEEPER_SUBCOMMANDS.has(sub)) return null;
     return `\`keeper ${sub}\` is not on the wrapped-worker allowlist (permitted: agent, session, bounded plan reads/done/AUDIT_READY block, commit-work, baseline)`;
   }
