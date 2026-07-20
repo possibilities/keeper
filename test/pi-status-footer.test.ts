@@ -16,6 +16,7 @@ import {
   type PiFooterTheme,
   renderPiMonitorLine,
   renderPiStatusFooter,
+  resolvePiAccountLabel,
   resolvePiVersion,
 } from "../plugins/keeper/pi-extension/status-footer";
 
@@ -35,11 +36,35 @@ describe("Pi keeper status footer", () => {
           effort: "xhigh",
           version: "0.80.6",
           network: false,
+          account: "codex-2",
         },
         plainTheme,
         200,
       ),
-    ).toBe("13 ∕ keeper ∕ main ∕ +309−9 ∕ claude opus 4.8 ∕ xhigh ∕ 0.80.6");
+    ).toBe(
+      "13 ∕ keeper ∕ main ∕ +309−9 ∕ claude opus 4.8 ∕ xhigh ∕ 0.80.6 ∕ codex-2",
+    );
+  });
+
+  test("renders the selected Codex pool position without exposing its alias", () => {
+    const env = {
+      KEEPER_PI_CODEX_POOL_MODE: "active",
+      KEEPER_PI_CODEX_POOL_ALIASES: '["opaque-primary","opaque-alternate"]',
+      KEEPER_PI_CODEX_POOL_INITIAL_ALIAS: "opaque-alternate",
+    };
+    expect(resolvePiAccountLabel(env)).toBe("codex-2");
+    expect(
+      resolvePiAccountLabel({
+        ...env,
+        KEEPER_PI_CODEX_POOL_INITIAL_ALIAS: "unknown",
+      }),
+    ).toBe("");
+    expect(
+      resolvePiAccountLabel({
+        ...env,
+        KEEPER_PI_CODEX_POOL_MODE: "native",
+      }),
+    ).toBe("");
   });
 
   test("shows only the running Monitor count below the statusline", () => {
@@ -67,6 +92,7 @@ describe("Pi keeper status footer", () => {
         effort: "high",
         version: "pi",
         network: false,
+        account: "",
       },
       plainTheme,
       12,
@@ -88,6 +114,7 @@ describe("Pi keeper status footer", () => {
         effort: "high",
         version: "pi",
         network: false,
+        account: "",
       },
       plainTheme,
       8,

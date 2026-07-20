@@ -120,10 +120,12 @@ describe("statusline render", () => {
       }),
     );
 
-    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} c2`)).toBe(true);
+    expect(plain.endsWith(`2.1.204 ${NETWORK_GLYPH} ${SEP} claude-2`)).toBe(
+      true,
+    );
   });
 
-  test("renders one-based account positions from validated inventory ordinals, never route slots", () => {
+  test("renders one-based Claude account positions from validated inventory ordinals, never route slots", () => {
     for (const [ordinal, position] of [
       ["0", "1"],
       ["1", "2"],
@@ -140,8 +142,8 @@ describe("statusline render", () => {
           runGit: fakeGit("keeper"),
         }),
       );
-      expect(plain.endsWith(`2.1.204 ${SEP} c${position}`)).toBe(true);
-      expect(plain).not.toContain("c99");
+      expect(plain.endsWith(`2.1.204 ${SEP} claude-${position}`)).toBe(true);
+      expect(plain).not.toContain("claude-99");
     }
   });
 
@@ -164,7 +166,7 @@ describe("statusline render", () => {
     );
     expect(plain.endsWith("2.1.204")).toBe(true);
     expect(plain).not.toContain("multi-claude-2");
-    expect(plain).not.toContain("c2");
+    expect(plain).not.toContain("claude-2");
   });
 
   test("help is a non-empty machine-command description", () => {

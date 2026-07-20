@@ -10,6 +10,10 @@ const SEP = " ∕ ";
 const ANSI_SGR_PATTERN = `${String.fromCharCode(27)}\\[[0-9;]*m`;
 const ANSI_SGR_GLOBAL = new RegExp(ANSI_SGR_PATTERN, "g");
 const ANSI_SGR_PREFIX = new RegExp(`^${ANSI_SGR_PATTERN}`);
+const CODEX_POOL_MODE_ENV = "KEEPER_PI_CODEX_POOL_MODE";
+const CODEX_POOL_ALIASES_ENV = "KEEPER_PI_CODEX_POOL_ALIASES";
+const CODEX_POOL_INITIAL_ALIAS_ENV = "KEEPER_PI_CODEX_POOL_INITIAL_ALIAS";
+const CODEX_POOL_MAX_ALIASES = 8;
 
 export interface PiFooterTheme {
   fg(color: string, text: string): string;
@@ -65,6 +69,7 @@ interface FooterRenderInput extends FooterState {
   model: string;
   effort: string;
   network: boolean;
+  account: string;
 }
 
 function compactPlanId(planId: string): string {
@@ -86,6 +91,30 @@ export function compactPiKeeperLane(branch: string): string {
   const suffix = taskId.match(/\.(\d+)$/)?.[1];
   if (suffix !== undefined) return `${LANE_GLYPH} ${compactEpic}.${suffix}`;
   return `${LANE_GLYPH} ${compactEpic}--${compactPlanId(taskId)}`;
+}
+
+export function resolvePiAccountLabel(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env[CODEX_POOL_MODE_ENV] !== "active") return "";
+  const initialAlias = (env[CODEX_POOL_INITIAL_ALIAS_ENV] ?? "").trim();
+  const rawAliases = (env[CODEX_POOL_ALIASES_ENV] ?? "").trim();
+  if (initialAlias === "" || rawAliases === "") return "";
+  try {
+    const aliases = JSON.parse(rawAliases) as unknown;
+    if (
+      !Array.isArray(aliases) ||
+      aliases.length === 0 ||
+      aliases.length > CODEX_POOL_MAX_ALIASES ||
+      aliases.some((alias) => typeof alias !== "string")
+    ) {
+      return "";
+    }
+    const position = aliases.indexOf(initialAlias);
+    return position === -1 ? "" : `codex-${position + 1}`;
+  } catch {
+    return "";
+  }
 }
 
 function stripAnsi(value: string): string {
@@ -188,6 +217,7 @@ export function renderPiStatusFooter(
     .filter(Boolean)
     .join(" ");
   if (tail !== "") parts.push(theme.fg("dim", tail));
+  if (input.account !== "") parts.push(theme.fg("dim", input.account));
   return truncateAnsi(parts.join(theme.fg("dim", SEP)), width);
 }
 
@@ -397,6 +427,7 @@ export function installPiStatusFooter(
                 network: (process.env.ANTHROPIC_BASE_URL ?? "").startsWith(
                   "http://127.0.0.1:",
                 ),
+                account: resolvePiAccountLabel(),
               },
               theme,
               width,
