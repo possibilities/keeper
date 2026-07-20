@@ -7,7 +7,7 @@
     "fn-1389-scale-event-store-maintenance-off-the"
   ],
   "id": "fn-1391-drop-redundant-stall-probe-from-ingest",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-20T22:27:44.458000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-20T21:05:09.279000Z"
+  "updated_at": "2026-07-20T22:27:44.458000Z"
 }
