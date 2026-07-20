@@ -36,7 +36,9 @@ import {
 import { BackstopCounters } from "../src/backstop-telemetry";
 import type { EventLogReadFs, EventsIngestContext } from "../src/daemon";
 import {
+  decideEventsIngestStallDistress,
   INGEST_EVENTS_COLUMNS,
+  probeEventsLogBacklog,
   readEventLogUnreadRange,
   recoverOneDeadLetter,
   scanEventsLogDir,
@@ -144,6 +146,91 @@ test("scanEventsLogDir ingests each NDJSON line as an events row", () => {
   }
 
   db.close();
+});
+
+test("events-log backlog probe sees unread bytes and clears after scan catches up", () => {
+  const { db } = freshMemDb();
+  mkdirSync(eventsLogDir, { recursive: true });
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  const line = serializeEventLogRecord(makeRecord("lag-probe"));
+  writeFileSync(file, line);
+
+  const before = probeEventsLogBacklog(db, eventsLogDir);
+  expect(before).toEqual({
+    files: 1,
+    bytes: Buffer.byteLength(line),
+    readable: true,
+  });
+
+  scanEventsLogDir(db, eventsLogDir);
+
+  expect(probeEventsLogBacklog(db, eventsLogDir)).toEqual({
+    files: 0,
+    bytes: 0,
+    readable: true,
+  });
+  db.close();
+});
+
+test("events ingest stall distress mints after the threshold and level-clears when caught up", () => {
+  let state = { backlogSinceMs: null as number | null };
+  const thresholdMs = 1_000;
+  const backlog = { files: 1, bytes: 20, readable: true };
+
+  let decision = decideEventsIngestStallDistress({
+    state,
+    backlog,
+    nowMs: 10_000,
+    thresholdMs,
+    distressOpen: false,
+  });
+  expect(decision.action).toEqual({ kind: "none" });
+  state = decision.state;
+
+  decision = decideEventsIngestStallDistress({
+    state,
+    backlog,
+    nowMs: 10_999,
+    thresholdMs,
+    distressOpen: false,
+  });
+  expect(decision.action).toEqual({ kind: "none" });
+  state = decision.state;
+
+  decision = decideEventsIngestStallDistress({
+    state,
+    backlog,
+    nowMs: 11_000,
+    thresholdMs,
+    distressOpen: false,
+  });
+  expect(decision.action).toEqual({
+    kind: "mint",
+    reason:
+      "events-ingest-stalled: unread events-log backlog files=1 bytes=20 age=1s",
+    tsSec: 11,
+  });
+  state = decision.state;
+
+  decision = decideEventsIngestStallDistress({
+    state,
+    backlog,
+    nowMs: 12_000,
+    thresholdMs,
+    distressOpen: true,
+  });
+  expect(decision.action).toEqual({ kind: "none" });
+  state = decision.state;
+
+  decision = decideEventsIngestStallDistress({
+    state,
+    backlog: { files: 0, bytes: 0, readable: true },
+    nowMs: 12_001,
+    thresholdMs,
+    distressOpen: true,
+  });
+  expect(decision.action).toEqual({ kind: "clear" });
+  expect(decision.state).toEqual({ backlogSinceMs: null });
 });
 
 test("a canonical Pi mutation receipt lands its sparse mutation_path", () => {
@@ -279,6 +366,73 @@ test("scanEventsLogDir is exactly-once — a re-scan inserts no duplicate rows",
     .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
     .get(file) as { offset: number } | null;
   expect(offRow).not.toBeNull();
+
+  db.close();
+});
+
+test("events-log backlog probe and stall distress mint/clear on unread bytes", () => {
+  const { db } = freshMemDb();
+  mkdirSync(eventsLogDir, { recursive: true });
+
+  const line = serializeEventLogRecord(makeRecord("aaa"));
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, line);
+  const unreadBytes = Buffer.byteLength(line, "utf8");
+
+  const backlog = probeEventsLogBacklog(db, eventsLogDir);
+  expect(backlog).toEqual({ files: 1, bytes: unreadBytes, readable: true });
+
+  const initial = decideEventsIngestStallDistress({
+    state: { backlogSinceMs: null },
+    backlog,
+    nowMs: 1_000,
+    thresholdMs: 30_000,
+    distressOpen: false,
+  });
+  expect(initial).toEqual({
+    state: { backlogSinceMs: 1_000 },
+    action: { kind: "none" },
+  });
+
+  const stalled = decideEventsIngestStallDistress({
+    state: initial.state,
+    backlog,
+    nowMs: 31_000,
+    thresholdMs: 30_000,
+    distressOpen: false,
+  });
+  expect(stalled).toEqual({
+    state: { backlogSinceMs: 1_000 },
+    action: {
+      kind: "mint",
+      reason: `events-ingest-stalled: unread events-log backlog files=1 bytes=${unreadBytes} age=30s`,
+      tsSec: 31,
+    },
+  });
+
+  const alreadyOpen = decideEventsIngestStallDistress({
+    state: stalled.state,
+    backlog,
+    nowMs: 61_000,
+    thresholdMs: 30_000,
+    distressOpen: true,
+  });
+  expect(alreadyOpen.action).toEqual({ kind: "none" });
+
+  scanEventsLogDir(db, eventsLogDir);
+  const caughtUp = probeEventsLogBacklog(db, eventsLogDir);
+  expect(caughtUp).toEqual({ files: 0, bytes: 0, readable: true });
+  const cleared = decideEventsIngestStallDistress({
+    state: alreadyOpen.state,
+    backlog: caughtUp,
+    nowMs: 62_000,
+    thresholdMs: 30_000,
+    distressOpen: true,
+  });
+  expect(cleared).toEqual({
+    state: { backlogSinceMs: null },
+    action: { kind: "clear" },
+  });
 
   db.close();
 });

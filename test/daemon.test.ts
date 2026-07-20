@@ -100,6 +100,7 @@ import {
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
   decideServeBusDistress,
+  decideServeLagAttributionLog,
   decideServeLivenessWatchdog,
   dispatchClearFencesAtAppend,
   dispatchEscalationSession,
@@ -196,6 +197,8 @@ import {
   runTrunkLeaseSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
+  SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
+  SERVE_LAG_ATTRIBUTION_LOG_STREAK,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
   SERVE_LAG_P99_THRESHOLD_MS,
   SERVE_PROBE_MAX_FAIL_STREAK,
@@ -253,6 +256,9 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  EVENTS_INGEST_STALL_DISTRESS_ID,
+  EVENTS_INGEST_STALL_DISTRESS_REASON,
+  EVENTS_INGEST_STALL_DISTRESS_VERB,
   LANE_WEDGE_DISTRESS_ID_PREFIX,
   MONITOR_SLOT_WEDGE_DISTRESS_ID_PREFIX,
   PAGING_CHANNEL_DOWN_DISTRESS_ID,
@@ -724,6 +730,25 @@ test("gcUnretryableDispatchFailures: bus-degraded is producer-owned until its pr
     BUS_DEGRADED_DISTRESS_VERB,
     BUS_DEGRADED_DISTRESS_ID,
     BUS_DEGRADED_DISTRESS_REASON,
+  );
+
+  const cleared: { verb: string; id: string }[] = [];
+  expect(
+    gcUnretryableDispatchFailures(db, (verb, id) => cleared.push({ verb, id })),
+  ).toBe(0);
+  expect(cleared).toEqual([]);
+  db.close();
+});
+
+test("gcUnretryableDispatchFailures: events-ingest-stalled is producer-owned until backlog clears", () => {
+  const { db } = freshMemDb();
+  db.prepare(
+    `INSERT INTO dispatch_failures (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, 100, 20, 100, 100)`,
+  ).run(
+    EVENTS_INGEST_STALL_DISTRESS_VERB,
+    EVENTS_INGEST_STALL_DISTRESS_ID,
+    EVENTS_INGEST_STALL_DISTRESS_REASON,
   );
 
   const cleared: { verb: string; id: string }[] = [];
@@ -1695,6 +1720,33 @@ test("decideServeLivenessWatchdog: busy-but-not-wedged — lag breached fewer th
       { lagBreachStreak: SERVE_LAG_MAX_CONSECUTIVE_BREACHES - 2 },
     ).verdict,
   ).toEqual({ kind: "ok" });
+});
+
+test("decideServeLagAttributionLog: streak reaching 3 emits one bounded active-work line", () => {
+  let state = { ...SERVE_LAG_ATTRIBUTION_INITIAL_STATE };
+  const lines: string[] = [];
+  for (const streak of [1, 2, SERVE_LAG_ATTRIBUTION_LOG_STREAK, 4, 5]) {
+    const result = decideServeLagAttributionLog({
+      state,
+      lagBreachStreak: streak,
+      lagP99Ms: 1234.4,
+      activeWork: "maintenance:mutation_path_backfill",
+    });
+    state = result.state;
+    if (result.line !== null) lines.push(result.line);
+  }
+  expect(lines).toEqual([
+    "[keeperd] serve-liveness watchdog: busy-lag breach streak=3 active_work=maintenance:mutation_path_backfill lag_p99_ms=1234",
+  ]);
+
+  const reset = decideServeLagAttributionLog({
+    state,
+    lagBreachStreak: 0,
+    lagP99Ms: 5,
+    activeWork: null,
+  });
+  expect(reset.line).toBeNull();
+  expect(reset.state.emittedForCurrentStreak).toBe(false);
 });
 
 test("decideServeLivenessWatchdog: serve-report-mute — no report within the staleness bound (main's arrival clock)", () => {

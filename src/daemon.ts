@@ -194,8 +194,12 @@ import {
   CRASH_LOOP_DISTRESS_ID,
   CRASH_LOOP_DISTRESS_REASON,
   CRASH_LOOP_DISTRESS_VERB,
+  EVENTS_INGEST_STALL_DISTRESS_ID,
+  EVENTS_INGEST_STALL_DISTRESS_REASON,
+  EVENTS_INGEST_STALL_DISTRESS_VERB,
   isBusDegradedDistressKey,
   isDupEpicNumberDistressKey,
+  isEventsIngestStallDistressKey,
   isLaneTeardownDistressKey,
   isLaneWedgeDistressKey,
   isMergeEscalationReason,
@@ -910,6 +914,9 @@ export function gcUnretryableDispatchFailures(
     if (isBusDegradedDistressKey(row.verb, row.id)) {
       continue;
     }
+    if (isEventsIngestStallDistressKey(row.verb, row.id)) {
+      continue;
+    }
     // A missing agentbot channel is producer-owned and clears only after a page
     // succeeds, never through the retry-dispatch wire.
     if (isPagingChannelDownDistressKey(row.verb, row.id)) {
@@ -1074,6 +1081,7 @@ export const DISPATCH_MINT_GATE_EVICT_MS = DISPATCH_MINT_GATE_WINDOW_MS * 5;
  * near-free when the dir is unchanged.
  */
 export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
+export const EVENTS_INGEST_STALL_THRESHOLD_MS = 30_000;
 
 /**
  * Heartbeat cadence (ms) for the producer-side retention pass (fn-836.5). Runs
@@ -6010,6 +6018,48 @@ export const SERVE_WATCHDOG_INITIAL_STATE: ServeWatchdogTriggerState = {
   lastTickMonoMs: null,
 };
 
+export const SERVE_LAG_ATTRIBUTION_LOG_STREAK = 3;
+
+export interface ServeLagAttributionLogState {
+  emittedForCurrentStreak: boolean;
+}
+
+export const SERVE_LAG_ATTRIBUTION_INITIAL_STATE: ServeLagAttributionLogState =
+  {
+    emittedForCurrentStreak: false,
+  };
+
+function boundedActiveWorkLabel(activeWork: string | null): string {
+  const raw = activeWork ?? "none";
+  const safe = raw.replace(/[^A-Za-z0-9_.:-]+/g, "_").slice(0, 80);
+  return safe.length > 0 ? safe : "unknown";
+}
+
+export function decideServeLagAttributionLog(inputs: {
+  state: ServeLagAttributionLogState;
+  lagBreachStreak: number;
+  lagP99Ms: number;
+  activeWork: string | null;
+}): { state: ServeLagAttributionLogState; line: string | null } {
+  if (inputs.lagBreachStreak < SERVE_LAG_ATTRIBUTION_LOG_STREAK) {
+    return {
+      state: { emittedForCurrentStreak: false },
+      line: null,
+    };
+  }
+  if (inputs.state.emittedForCurrentStreak) {
+    return { state: inputs.state, line: null };
+  }
+  return {
+    state: { emittedForCurrentStreak: true },
+    line:
+      "[keeperd] serve-liveness watchdog: busy-lag breach " +
+      `streak=${inputs.lagBreachStreak} ` +
+      `active_work=${boundedActiveWorkLabel(inputs.activeWork)} ` +
+      `lag_p99_ms=${Math.round(inputs.lagP99Ms)}`,
+  };
+}
+
 /** A probe streak advances on a dead read and resets on a live/unarmed one. */
 function nextProbeFailStreak(prev: number, outcome: ProbeTickOutcome): number {
   return outcome === "dead" ? prev + 1 : 0;
@@ -7427,6 +7477,105 @@ export function scanEventsLogDir(
       }
     }
   }
+}
+
+export interface EventsLogBacklog {
+  files: number;
+  bytes: number;
+  readable: boolean;
+}
+
+export interface EventsIngestStallState {
+  backlogSinceMs: number | null;
+}
+
+export type EventsIngestStallAction =
+  | { kind: "none" }
+  | { kind: "mint"; reason: string; tsSec: number }
+  | { kind: "clear" };
+
+export function probeEventsLogBacklog(
+  db: Database,
+  dir: string,
+): EventsLogBacklog {
+  if (!existsSync(dir)) {
+    return { files: 0, bytes: 0, readable: true };
+  }
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { files: 0, bytes: 0, readable: false };
+  }
+  const readOffsetStmt = db.prepare(
+    "SELECT offset FROM event_ingest_offsets WHERE path = ? AND inode = ?",
+  );
+  let files = 0;
+  let bytes = 0;
+  let readable = true;
+  for (const name of names) {
+    if (!name.endsWith(".ndjson")) continue;
+    const full = join(dir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch {
+      readable = false;
+      continue;
+    }
+    if (!st.isFile()) continue;
+    const offRow = readOffsetStmt.get(full, st.ino) as {
+      offset: number;
+    } | null;
+    const offset = offRow ? offRow.offset : 0;
+    const startOffset = st.size < offset ? 0 : offset;
+    if (st.size <= startOffset) continue;
+    files += 1;
+    bytes = Math.min(Number.MAX_SAFE_INTEGER, bytes + (st.size - startOffset));
+  }
+  return { files, bytes, readable };
+}
+
+function boundedEventsIngestStallReason(
+  backlog: EventsLogBacklog,
+  ageMs: number,
+): string {
+  const ageSec = Math.max(0, Math.floor(ageMs / 1000));
+  const files = Math.min(backlog.files, 9999);
+  const bytes = Math.min(backlog.bytes, 9_999_999_999);
+  return `${EVENTS_INGEST_STALL_DISTRESS_REASON}: unread events-log backlog files=${files} bytes=${bytes} age=${ageSec}s`;
+}
+
+export function decideEventsIngestStallDistress(inputs: {
+  state: EventsIngestStallState;
+  backlog: EventsLogBacklog;
+  nowMs: number;
+  thresholdMs: number;
+  distressOpen: boolean;
+}): { state: EventsIngestStallState; action: EventsIngestStallAction } {
+  if (!inputs.backlog.readable) {
+    return { state: inputs.state, action: { kind: "none" } };
+  }
+  const hasBacklog = inputs.backlog.files > 0 && inputs.backlog.bytes > 0;
+  if (!hasBacklog) {
+    return {
+      state: { backlogSinceMs: null },
+      action: inputs.distressOpen ? { kind: "clear" } : { kind: "none" },
+    };
+  }
+  const backlogSinceMs = inputs.state.backlogSinceMs ?? inputs.nowMs;
+  const ageMs = Math.max(0, inputs.nowMs - backlogSinceMs);
+  if (ageMs >= inputs.thresholdMs && !inputs.distressOpen) {
+    return {
+      state: { backlogSinceMs },
+      action: {
+        kind: "mint",
+        reason: boundedEventsIngestStallReason(inputs.backlog, ageMs),
+        tsSec: inputs.nowMs / 1000,
+      },
+    };
+  }
+  return { state: { backlogSinceMs }, action: { kind: "none" } };
 }
 
 /**
@@ -9661,7 +9810,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     counters: mainBackstopCounters,
     backstopLogPath,
   };
-
   const eventsLogDir = resolveEventsLogDir();
   // The events-ingest worker subscribes ONCE at spawn and goes inert with NO
   // retry if the dir is absent. `mkdir` it HERE — before the boot scan AND the
@@ -9840,6 +9988,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let serveWatchdogState: ServeWatchdogTriggerState = {
     ...SERVE_WATCHDOG_INITIAL_STATE,
   };
+  let serveLagAttributionLogState: ServeLagAttributionLogState = {
+    ...SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
+  };
   // Freshest serve-health report from the server worker, stamped with MAIN's OWN
   // monotonic arrival clock (never the worker's timestamps — a starved worker's
   // own stamps are late by construction). `null` until the first report lands.
@@ -9879,6 +10030,68 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // `pumpWakes` captures this via closure to `kick` the server after a drain; the
   // `?.` tolerates the null window (and a server-less boot).
   let serverWorker: Worker | null = null;
+  let activeMainWork: string | null = null;
+  let activeWorkThisLagWindow: string | null = null;
+
+  async function withActiveMainWork<T>(
+    label: string,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    const previous = activeMainWork;
+    activeMainWork = label;
+    activeWorkThisLagWindow = label;
+    try {
+      return await body();
+    } finally {
+      activeMainWork = previous;
+    }
+  }
+
+  let eventsIngestStallState: EventsIngestStallState = {
+    backlogSinceMs: null,
+  };
+
+  function runEventsIngestStallDistressStep(): void {
+    const backlog = probeEventsLogBacklog(db, eventsLogDir);
+    const row = db
+      .query(
+        "SELECT instance_event_id FROM dispatch_failures WHERE verb = ? AND id = ? LIMIT 1",
+      )
+      .get(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        EVENTS_INGEST_STALL_DISTRESS_ID,
+      ) as { instance_event_id: number | null } | null;
+    const decision = decideEventsIngestStallDistress({
+      state: eventsIngestStallState,
+      backlog,
+      nowMs: Date.now(),
+      thresholdMs: EVENTS_INGEST_STALL_THRESHOLD_MS,
+      distressOpen: row !== null,
+    });
+    eventsIngestStallState = decision.state;
+    if (decision.action.kind === "mint") {
+      mintDaemonDistress(
+        EVENTS_INGEST_STALL_DISTRESS_VERB,
+        EVENTS_INGEST_STALL_DISTRESS_ID,
+        decision.action.reason,
+        decision.action.tsSec,
+      );
+    } else if (decision.action.kind === "clear") {
+      if (
+        mintDispatchClearedEvent(
+          EVENTS_INGEST_STALL_DISTRESS_VERB,
+          EVENTS_INGEST_STALL_DISTRESS_ID,
+          {
+            expected_attempt_id: null,
+            expected_instance_event_id: row?.instance_event_id ?? null,
+          },
+        )
+      ) {
+        wakePending = true;
+        pumpWakes();
+      }
+    }
+  }
 
   /**
    * Process the wake signal. The re-entrancy guard (`draining`) ensures we never
@@ -12566,6 +12779,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // daemon. Log and continue — the next watcher event retries the ingest.
         console.error(
           `[keeperd] events-log live ingest threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      try {
+        runEventsIngestStallDistressStep();
+      } catch (err) {
+        console.error(
+          `[keeperd] events-log stall probe threw (non-fatal): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -17113,6 +17335,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
+    try {
+      runEventsIngestStallDistressStep();
+    } catch (err) {
+      console.error(
+        `[keeperd] events-log stall probe threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     // fn-1103: the births tree rides the SAME fallback tick (own guard so a
     // birth-scan throw never skips the wake). The watcher hint is the fast path;
     // this poll guarantees every record lands within one interval even if the
@@ -17163,7 +17394,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function runRetentionPass(): Promise<void> {
     if (shuttingDown || retentionRunning) return;
     retentionRunning = true;
-    await runRetentionPassUnlocked().finally(() => {
+    await withActiveMainWork("maintenance:retention", () =>
+      runRetentionPassUnlocked(),
+    ).finally(() => {
       retentionRunning = false;
     });
   }
@@ -17338,7 +17571,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   async function runMutationPathBackfillPass(): Promise<void> {
     if (shuttingDown || backfillDone || backfillRunning) return;
     backfillRunning = true;
-    await runMutationPathBackfillPassUnlocked().finally(() => {
+    await withActiveMainWork("maintenance:mutation_path_backfill", () =>
+      runMutationPathBackfillPassUnlocked(),
+    ).finally(() => {
       backfillRunning = false;
     });
   }
@@ -18166,6 +18401,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         maxStarvationBreachStreak: SERVE_STARVATION_MAX_BREACH_STREAK,
       });
       serveWatchdogState = state;
+      const lagAttribution = decideServeLagAttributionLog({
+        state: serveLagAttributionLogState,
+        lagBreachStreak: state.lagBreachStreak,
+        lagP99Ms,
+        activeWork: activeMainWork ?? activeWorkThisLagWindow,
+      });
+      serveLagAttributionLogState = lagAttribution.state;
+      activeWorkThisLagWindow = null;
+      if (lagAttribution.line !== null) {
+        console.error(lagAttribution.line);
+      }
 
       // The bus-only degradation is a producer-owned level trigger. Read-before-
       // mint plus the pending latch makes a persistent outage one row, while a

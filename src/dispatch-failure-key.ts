@@ -194,9 +194,23 @@ export const BUS_DEGRADED_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
 export const BUS_DEGRADED_DISTRESS_ID = "bus-degraded";
 export const BUS_DEGRADED_DISTRESS_REASON = "bus-degraded";
 
+export const EVENTS_INGEST_STALL_DISTRESS_VERB = CRASH_LOOP_DISTRESS_VERB;
+export const EVENTS_INGEST_STALL_DISTRESS_ID = "events-ingest-stalled";
+export const EVENTS_INGEST_STALL_DISTRESS_REASON = "events-ingest-stalled";
+
 /** True iff `(verb, id)` is the producer-owned bus-degraded distress key. */
 export function isBusDegradedDistressKey(verb: string, id: string): boolean {
   return verb === BUS_DEGRADED_DISTRESS_VERB && id === BUS_DEGRADED_DISTRESS_ID;
+}
+
+export function isEventsIngestStallDistressKey(
+  verb: string,
+  id: string,
+): boolean {
+  return (
+    verb === EVENTS_INGEST_STALL_DISTRESS_VERB &&
+    id === EVENTS_INGEST_STALL_DISTRESS_ID
+  );
 }
 
 /** True iff `(verb, id)` is the producer-owned paging-channel distress key. */
@@ -620,6 +634,7 @@ export type DispatchFailureDisplayKind =
   | "parked-launch"
   | "crash-loop"
   | "native-crash"
+  | "events-ingest-stalled"
   | "shared-wedge"
   | "shared-dirty"
   | "shared-desync"
@@ -656,6 +671,10 @@ export const DISPATCH_FAILURE_DISPLAY_RULES: ReadonlyArray<{
   { prefix: PARKED_LAUNCH_REASON_PREFIX, kind: "parked-launch" },
   { prefix: CRASH_LOOP_DISTRESS_REASON, kind: "crash-loop" },
   { prefix: REPEATED_NATIVE_CRASH_DISTRESS_REASON, kind: "native-crash" },
+  {
+    prefix: EVENTS_INGEST_STALL_DISTRESS_REASON,
+    kind: "events-ingest-stalled",
+  },
   { prefix: SHARED_WEDGE_DISTRESS_REASON, kind: "shared-wedge" },
   { prefix: SHARED_DIRTY_DISTRESS_REASON, kind: "shared-dirty" },
   // Prefix-disjoint from the wedge/dirty siblings (`shared-checkout-desync` diverges at
