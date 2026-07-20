@@ -159,7 +159,41 @@ function passingReport(): LiveProofReport {
       scanned_bytes: 700,
       finding_classes: [],
     },
+    degraded: null,
     verdict: "proven",
+  };
+}
+
+function degradedReport(): LiveProofReport {
+  const report = clone(passingReport());
+  for (const clause of ["native_fallback", "transport_isolation"] as const) {
+    report.clauses[clause] = false;
+    const entry = report.transcript.find((e) => e.clause === clause);
+    if (!entry) throw new Error("missing-transcript-fixture");
+    entry.evidence = [];
+  }
+  report.degraded = {
+    cause: "quota",
+    waived_clauses: ["native_fallback", "transport_isolation"],
+  };
+  report.verdict = "proven-degraded-single-alias";
+  return report;
+}
+
+function degradedState(): CodexPoolActivationState {
+  return {
+    schema_version: 1,
+    mode: "active-degraded",
+    revision: REVISION,
+    config_binding: CONFIG_BINDING,
+    alias_binding: ALIAS_BINDING,
+    aliases: ["keeper-codex-a", "keeper-codex-b"],
+    degraded: {
+      cause: "quota",
+      waived_clauses: ["native_fallback", "transport_isolation"],
+      pinned_alias: "keeper-codex-a",
+    },
+    updated_at_ms: NOW,
   };
 }
 
@@ -398,6 +432,108 @@ describe("Codex pool proof-gated activation", () => {
       problem_code: null,
     });
     expect(store.transaction).toBe(false);
+  });
+});
+
+describe("Codex pool degraded single-alias activation", () => {
+  const DEGRADED_AUTH = {
+    degraded_verdict: "proven-degraded-single-alias" as const,
+  };
+
+  test("refuses a degraded report without the explicit operator flag", () => {
+    const store = new MemoryStore();
+    store.report = degradedReport();
+    const outcome = activateCodexPool(deps(store));
+    expect(outcome).toMatchObject({
+      ok: false,
+      state: "native",
+      problem_code: "proof-degraded-unauthorized",
+      proof: { verdict: "proven-degraded-single-alias" },
+    });
+    expect(store.writes).toEqual([]);
+    expect(store.transaction).toBe(false);
+  });
+
+  test("activates pinned to the healthy alias and degraded-marked with the flag", () => {
+    const store = new MemoryStore();
+    store.report = degradedReport();
+    const outcome = activateCodexPool(deps(store), undefined, DEGRADED_AUTH);
+    expect(outcome).toMatchObject({
+      ok: true,
+      state: "active-degraded",
+      problem_code: null,
+      proof: { verdict: "proven-degraded-single-alias" },
+    });
+    const written = store.writes.at(-1);
+    expect(written?.mode).toBe("active-degraded");
+    expect(written?.degraded).toEqual({
+      cause: "quota",
+      waived_clauses: ["native_fallback", "transport_isolation"],
+      pinned_alias: "keeper-codex-a",
+    });
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active-degraded",
+      problem_code: null,
+    });
+    expect(codexPoolStatus(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-degraded",
+      problem_code: null,
+    });
+    expect(verifyCodexPool(deps(store))).toMatchObject({
+      ok: true,
+      state: "active-degraded",
+    });
+  });
+
+  test("degraded activation still rolls back on immediate verification failure", () => {
+    const store = new MemoryStore();
+    store.report = degradedReport();
+    const outcome = activateCodexPool(
+      deps(store, { verify: () => false }),
+      undefined,
+      DEGRADED_AUTH,
+    );
+    expect(outcome).toMatchObject({
+      ok: false,
+      state: "native",
+      problem_code: "rollback-complete",
+    });
+    expect((store.activation as CodexPoolActivationState).mode).toBe("native");
+    expect((store.activation as CodexPoolActivationState).degraded).toBeNull();
+    expect(store.transaction).toBe(false);
+  });
+
+  test("a full proven report upgrades a degraded activation and clears the marker", () => {
+    const store = new MemoryStore();
+    store.activation = degradedState();
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active-degraded",
+    });
+    store.report = passingReport();
+    const outcome = activateCodexPool(deps(store));
+    expect(outcome).toMatchObject({
+      ok: true,
+      state: "active",
+      problem_code: null,
+      proof: { verdict: "proven" },
+    });
+    const written = store.writes.at(-1);
+    expect(written?.mode).toBe("active");
+    expect(written?.degraded).toBeNull();
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "active",
+      problem_code: null,
+    });
+  });
+
+  test("a persisted active-degraded state without a marker cannot stay active", () => {
+    const store = new MemoryStore();
+    store.activation = { ...degradedState(), degraded: null };
+    expect(effectiveCodexPoolActivation(store, BINDINGS)).toMatchObject({
+      mode: "native",
+      problem_code: "activation-config-invalid",
+    });
   });
 });
 

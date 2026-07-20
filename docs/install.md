@@ -288,6 +288,39 @@ Removing the companion `-e` source or leaving activation native also restores or
 Runtime pool failures after a successful activation remain visible native fallbacks; they do not alter the
 fail-closed proof gate.
 
+### Degraded single-alias activation (human-authorized)
+
+When one enrolled account is quota-depleted, the full proof cannot pass: `transport_isolation` and
+`native_fallback` structurally require the second alias to serve, and a quota-dead account refuses those
+legs. That is precisely the state where pooling's value is routing to the healthy alias. A proof run whose
+**only** unmet clauses are those two — with the interruption classified as a quota fault and a route
+recording a genuine quota failure — classifies `proven-degraded-single-alias`, recording exactly which
+clauses were waived and the cause. Any other unmet clause makes the run genuinely incomplete, never
+degraded.
+
+Enroll the **surviving** account as the primary alias (the first entry in `KEEPER_PI_CODEX_POOL_ALIASES`,
+`keeper-codex-a` by default) and the quota-dead account as the alternate; degraded activation pins routing
+to the primary and immediate verification refuses any other pin. Degraded activation is never implicit — it
+requires the explicit flag naming the degraded verdict, and without it a degraded report is refused with
+`proof-degraded-unauthorized`:
+
+```sh
+keeper agent accounts codex-pool proof verdict --json   # proven-degraded-single-alias
+keeper agent accounts codex-pool activate \
+  --authorize-degraded=proven-degraded-single-alias --json
+keeper agent accounts codex-pool status --json          # state=active-degraded
+keeper agent accounts check                             # activation=active-degraded, DEGRADED single-alias
+```
+
+The active pool routes only through the pinned healthy alias and surfaces `active-degraded` loudly in
+`status` and `accounts check`; it never presents balanced operation. When the quota recovers, run a fresh
+**full** proof and activate normally — a genuine `proven` report upgrades the pool to full `active` and
+clears the degraded marker. A partial or still-degraded report never upgrades.
+
+```sh
+keeper agent accounts codex-pool activate --json        # full proven → active, degraded marker cleared
+```
+
 ### Reload trigger
 
 `install.sh` reloads keeperd only when the daemon's **load surface** changed — not on every commit.

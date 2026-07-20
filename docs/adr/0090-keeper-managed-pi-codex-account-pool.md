@@ -60,3 +60,20 @@ activation.
 
 The accepted end state keeps bare Pi unauthenticated for Codex by design. Keeper-launched Pi, loaded with
 the companion, is the Codex path.
+
+## Amendment — human-authorized degraded single-alias activation
+
+When one enrolled alias is quota-depleted the `transport_isolation` and `native_fallback` clauses become structurally
+unsatisfiable — their evidence needs the second alias to serve a distinct route and the pool-exhaustion fallback leg,
+which a quota-dead account refuses — yet that is exactly when the pool routes every session to the surviving alias. A
+proof run whose only unmet clauses are those quota-waivable legs, with the interruption classified as a quota fault and
+a recorded quota route failure, may classify `proven-degraded-single-alias`, recording the waived clauses and cause. Any
+other unmet clause, or an absent quota failure, refuses the verdict.
+
+The activation validator accepts a degraded verdict only behind an explicit operator flag naming that
+verdict; absent the flag the report is refused. Degraded activation pins routing to the single healthy
+primary alias, verifies that pin against live routing before publishing, and surfaces `active-degraded`
+loudly in status and the account diagnostic — never balanced operation. A later full `proven` report upgrades
+the pool to `active` and clears the marker. This deliberately weakens the fail-closed gate; the safety trade
+is that the waiver cannot be tripped implicitly — explicit flag, recorded verdict, and a loud degraded
+surface, or the pool stays native.
