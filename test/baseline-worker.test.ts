@@ -123,16 +123,22 @@ test("classifyRun: non-zero exit with a fail-count but no parsed ids is still 'f
   );
 });
 
-test("classifyRun: non-zero exit with NO failure signal is 'crashed' (never green)", () => {
-  // A compile error / bail: bun exits non-zero, prints no `(fail)` line, no summary.
+test("classifyRun: a non-zero empty-digest exit is load-suspect", () => {
   const parsed = parseGateOutput("error: Cannot find module './missing'");
-  expect(classifyRun(1, parsed)).toBe("crashed");
+  expect(classifyRun(1, parsed)).toBe("load-suspect");
+});
+
+test("classifyRun: a deadline kill is load-suspect unless it names a failing test", () => {
+  expect(classifyRun(124, parseGateOutput(""), true)).toBe("load-suspect");
+  expect(classifyRun(124, parseGateOutput(BUN_FAIL_OUTPUT), true)).toBe(
+    "failed",
+  );
 });
 
 test("shouldRetry only fires for a failed run", () => {
   expect(shouldRetry("failed")).toBe(true);
   expect(shouldRetry("clean")).toBe(false);
-  expect(shouldRetry("crashed")).toBe(false);
+  expect(shouldRetry("load-suspect")).toBe(false);
 });
 
 // ── outcome derivation (composed with the store's deriveResult) ──────────────
@@ -166,8 +172,8 @@ test("finalOutcome: a clean run 1 derives green", () => {
   expect(derive("clean", null).status).toBe("green");
 });
 
-test("finalOutcome: a crashed run 1 derives infra-error:spawn, never green", () => {
-  const res = derive("crashed", null);
+test("finalOutcome: a load-suspect run 1 derives infra-error:spawn, never green", () => {
+  const res = derive("load-suspect", null);
   expect(res.status).toBe("infra-error");
   if (res.status !== "infra-error") throw new Error("unreachable");
   expect(res.kind).toBe("spawn");
@@ -200,11 +206,15 @@ test("finalOutcome: fail-then-fail keeps the test a hard failure", () => {
   expect(byId.get("B")).toBe(true); // failed then absent → flaky
 });
 
-test("finalOutcome: a crashed RETRY does not dilute run 1's real failures to flaky", () => {
+test("finalOutcome: a load-suspect retry does not dilute run 1's real failures to flaky", () => {
   // The inconclusive retry is dropped; run1's A stands alone as a hard failure.
   const outcome = finalOutcome(
     { run: runOf(1, ["A"]), cls: "failed", detail: "" },
-    { run: runOf(124, []), cls: "crashed", detail: "retry timed out" },
+    {
+      run: runOf(124, []),
+      cls: "load-suspect",
+      detail: "retry timed out",
+    },
   );
   const res = deriveResult({ ...DERIVE_BASE, outcome });
   expect(res.status).toBe("suite-red");

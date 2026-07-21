@@ -137,10 +137,10 @@ export interface ParsedGate {
 
 /**
  * How one completed suite run classifies. `clean` is the ONLY green-eligible
- * class; `crashed` (a non-zero exit with no test-failure signal — a compile error
- * or a bail) is an infra failure, never an empty "ran" that could fold to green.
+ * class; `load-suspect` (a deadline kill or non-zero exit with no test-failure
+ * signal) is an infra failure, never an empty "ran" that could fold to green.
  */
-export type RunClass = "clean" | "failed" | "crashed";
+export type RunClass = "clean" | "failed" | "load-suspect";
 
 /** One classified run plus its raw {@link SuiteRun} and a crash/infra detail. */
 export interface RunRecord {
@@ -237,17 +237,22 @@ function lastCount(output: string, re: RegExp): number | null {
 }
 
 /**
- * Classify one completed (non-timeout) run. Exit 0 is the ONLY green-eligible
- * class; a non-zero exit WITH a failing-test signal is a real suite failure; a
- * non-zero exit with NO failing-test signal is a crash/bail (infra), never an
- * empty "ran" that {@link deriveResult} could fold to green. PURE.
+ * Classify one completed run. Exit 0 is the ONLY green-eligible class; a
+ * non-zero exit WITH a failing-test signal is a real suite failure. A deadline
+ * kill or non-zero exit with NO failing-test signal is load-suspect, never an
+ * empty "ran" that {@link deriveResult} could fold to green. A failure signal
+ * wins over the deadline flag so a named red test is never load-suspect. PURE.
  */
-export function classifyRun(exitCode: number, parsed: ParsedGate): RunClass {
-  if (exitCode === 0) return "clean";
+export function classifyRun(
+  exitCode: number,
+  parsed: ParsedGate,
+  timedOut = false,
+): RunClass {
+  if (exitCode === 0 && !timedOut) return "clean";
   if (parsed.failingTests.length > 0 || (parsed.failCount ?? 0) > 0) {
     return "failed";
   }
-  return "crashed";
+  return "load-suspect";
 }
 
 /** A failed run is retried once at the same sha to derive flaky-suspect marks. PURE. */
@@ -257,17 +262,17 @@ export function shouldRetry(cls: RunClass): boolean {
 
 /**
  * Fold run 1 and its optional retry into the outcome {@link deriveResult}
- * classifies. A clean run 1 is green; a crashed run 1 is infra:spawn; a failed
- * run 1 carries BOTH runs so fail-then-pass at the same sha derives flaky, UNLESS
- * the retry crashed/timed out — then run 1's real failures stand alone as hard
- * failures rather than being diluted to flaky by an inconclusive retry. PURE.
+ * classifies. A clean run 1 is green; a load-suspect run 1 is infra:spawn; a
+ * failed run 1 carries BOTH runs so fail-then-pass at the same sha derives flaky,
+ * UNLESS the retry is load-suspect — then run 1's real failures stand alone as
+ * hard failures rather than being diluted by an inconclusive retry. PURE.
  */
 export function finalOutcome(
   run1: RunRecord,
   run2: RunRecord | null,
 ): BaselineOutcome {
   if (run1.cls === "clean") return { kind: "ran", runs: [run1.run] };
-  if (run1.cls === "crashed") {
+  if (run1.cls === "load-suspect") {
     return {
       kind: "infra",
       infra: "spawn",
@@ -275,7 +280,7 @@ export function finalOutcome(
     };
   }
   // run1 failed.
-  if (run2 === null || run2.cls === "crashed") {
+  if (run2 === null || run2.cls === "load-suspect") {
     return { kind: "ran", runs: [run1.run] };
   }
   return { kind: "ran", runs: [run1.run, run2.run] };
@@ -619,9 +624,7 @@ async function computeBaseline(
         if (opts.isShuttingDown()) return false;
         const parsed2 = parseGateOutput(raw2.output);
         const suiteRun2 = toSuiteRun(raw2, parsed2);
-        const cls2: RunClass = raw2.timedOut
-          ? "crashed"
-          : classifyRun(raw2.exitCode, parsed2);
+        const cls2 = classifyRun(raw2.exitCode, parsed2, raw2.timedOut);
         outcome = finalOutcome(
           { run: suiteRun1, cls: "failed", detail: "" },
           {
