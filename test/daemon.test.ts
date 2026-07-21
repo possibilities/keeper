@@ -55,6 +55,7 @@ import {
   appendDurableRestartBoot,
   appendFencedDispatchClear,
   appendRestartLedgerLine,
+  appendServeHealthReportSample,
   auditReadyEscalationDecision,
   BIRTH_STUCK_STATUS,
   BLOCK_ESCALATION_SKIP_CATEGORY,
@@ -92,17 +93,20 @@ import {
   checkKeeperAgentPresence,
   classifyBaselineForRepair,
   classifyEscalationOutcome,
+  classifyExitVerdict,
   classifyRestartProvenance,
   classifyWorkResolverOutcome,
   collapseRestartLedger,
   compactRestartLedger,
   countLiveEscalationSessions,
+  createExitAttributionRecorder,
   DEAD_LETTER_RETENTION_MS,
   type DeconflictHumanNotifySweepDeps,
   DISPATCH_MINT_GATE_EVICT_MS,
   DISPATCH_MINT_GATE_WINDOW_MS,
   decideCrashLoop,
   decideDispatchClearLiveness,
+  decideExitAttribution,
   decideGitSeedWatchdog,
   decidePagingChannelDistress,
   decideRepeatedNativeCrash,
@@ -114,14 +118,17 @@ import {
   drainToCompletion,
   type EscalationDispatchDeps,
   type EscalationDispatchOutcome,
+  type ExitAttributionRecord,
   effectiveBlockEscalationRepo,
   epicHasLiveUnblock,
   escalationCheckoutOccupiedBy,
   escalationSessionLiveFor,
+  findOsMemoryKillEvidence,
   foldBootIntoRestartLedger,
   GIT_SEED_MAX_RESEED_ATTEMPTS,
   GIT_SEED_STUCK_THRESHOLD_MS,
   gcUnretryableDispatchFailures,
+  HARD_KILL_EXIT_ATTRIBUTION_REASON,
   INCIDENT_CLAIM_SWEEP_INTERVAL_MS,
   type IncidentClaimSweepDeps,
   type IncidentOwnerPageSweepDeps,
@@ -138,7 +145,9 @@ import {
   MUTATION_PATH_BACKFILL_INTERVAL_MS,
   maintenanceEpicTitle,
   matchCrashReportToBoot,
+  matchOperatorReloadAttribution,
   mergeConflictBaseCheckout,
+  OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   type PendingBlockEscalation,
@@ -183,7 +192,10 @@ import {
   type RestartBootLine,
   type RestartLedgerLine,
   type RestartProvenance,
+  readExitAttribution,
+  readOperatorReloadAttribution,
   readRestartLedger,
+  readServeHealthHistory,
   readSpillDocument,
   readTaskBlockedReason,
   reclassifyPoisonDeadLetter,
@@ -192,8 +204,11 @@ import {
   repairReasonFor,
   repairTipBaselineGreen,
   resolveEscalationJobsFor,
+  resolveExitAttributionPath,
+  resolveOperatorReloadAttributionPath,
   resolvePoisonDeadLetter,
   resolveProbeArming,
+  resolveServeHealthHistoryPath,
   routeBlockedCategory,
   runBlockEscalationSweep,
   runBlockHumanNotifySweep,
@@ -208,6 +223,7 @@ import {
   runTrunkLeaseSweep,
   runWorkMergeHumanNotifySweep,
   SERVE_CLOCK_JUMP_FACTOR,
+  SERVE_HEALTH_HISTORY_MAX_REPORTS,
   SERVE_LAG_ATTRIBUTION_INITIAL_STATE,
   SERVE_LAG_ATTRIBUTION_LOG_STREAK,
   SERVE_LAG_MAX_CONSECUTIVE_BREACHES,
@@ -218,6 +234,7 @@ import {
   SERVE_WATCHDOG_BOOT_GRACE_MS,
   SERVE_WATCHDOG_INITIAL_STATE,
   SERVE_WATCHDOG_INTERVAL_MS,
+  type ServeHealthHistory,
   type ServeWatchdogTriggerState,
   SHARED_BASE_BROKEN_CATEGORY,
   type SharedCheckoutNotifiedOutcome,
@@ -239,6 +256,7 @@ import {
   selectWorkerNames,
   serializeRestartLedgerLine,
   serializeSessionTelemetry,
+  shouldEnrichPriorExitAttribution,
   shouldEscalateBlockedCategory,
   shouldEscalateMergeConflict,
   type TrunkLeaseSweepDeps,
@@ -248,6 +266,7 @@ import {
   withBootDrainCheckpointTuning,
   workLaneBusyForResolver,
   writeRestartLedger,
+  writeServeHealthHistory,
 } from "../src/daemon";
 import {
   clearDispatchMintGate,
@@ -2440,6 +2459,41 @@ test("parseRestartLedgerLine: a native-crash enrich line needs no fatal reason a
   });
 });
 
+test("parseRestartLedgerLine: parses a typed verdict + bounds its evidence, ignores an invalid verdict kind", () => {
+  expect(
+    parseRestartLedgerLine(
+      JSON.stringify({
+        kind: "enrich",
+        boot_id: "abc",
+        ts: 1400,
+        reason: "jetsam killing process 999",
+        verdict: "os-memory-kill",
+        verdict_evidence: "x".repeat(1_000),
+      }),
+    ),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "abc",
+    ts: 1400,
+    reason: "jetsam killing process 999",
+    verdict: "os-memory-kill",
+    verdict_evidence: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+  });
+  // An unrecognized verdict kind is dropped (defensive parse), but the line
+  // stays valid on its `reason` alone.
+  expect(
+    parseRestartLedgerLine(
+      JSON.stringify({
+        kind: "enrich",
+        boot_id: "abc",
+        ts: 1400,
+        reason: "boom",
+        verdict: "not-a-real-verdict",
+      }),
+    ),
+  ).toEqual({ kind: "enrich", boot_id: "abc", ts: 1400, reason: "boom" });
+});
+
 test("parseRestartLedgerLine: a torn / partial trailing line folds to null (never corrupts)", () => {
   expect(parseRestartLedgerLine('{"kind":"boot","boot_id":"a","ts')).toBeNull();
   expect(parseRestartLedgerLine("")).toBeNull();
@@ -2621,6 +2675,42 @@ test("collapse + compact restart ledger preserve fatal and native-crash enrich f
     reason: "watchdog",
     died_at_ms: 1100,
     native_crash_report_id: "incident-mixed",
+  });
+});
+
+test("collapse + compact restart ledger carry a typed verdict forward, later write wins", () => {
+  const lines: RestartLedgerLine[] = [
+    bootLine("mixed", 1000, "launchd", null),
+    {
+      kind: "enrich",
+      boot_id: "mixed",
+      ts: 1200,
+      reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+      verdict: "no-evidence",
+      verdict_evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+    },
+    {
+      kind: "enrich",
+      boot_id: "mixed",
+      ts: 1400,
+      reason: "jetsam killing process 999",
+      verdict: "os-memory-kill",
+      verdict_evidence: "jetsam killing process 999",
+    },
+  ];
+  const collapsed = collapseRestartLedger(lines);
+  expect(collapsed[0]).toMatchObject({
+    reason: "jetsam killing process 999",
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 999",
+  });
+  expect(
+    collapseRestartLedger(
+      compactRestartLedger(lines, { nowMs: 2000, windowMs: 2000, cap: 10 }),
+    )[0],
+  ).toMatchObject({
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 999",
   });
 });
 
@@ -3189,6 +3279,407 @@ test("readRestartLedger / writeRestartLedger: NDJSON round-trip through a real f
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("exit-attribution records each soft exit path once with a bounded synced leaf", () => {
+  const stateDir = join(tmpDir, "state");
+  const restartLedgerPath = join(stateDir, "restart-ledger.json");
+  const cases: Array<{
+    name: string;
+    attribution: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+    expected: Omit<ExitAttributionRecord, "boot_id" | "ts">;
+  }> = [
+    {
+      name: "fatal",
+      attribution: { kind: "fatal_exit", reason: "x".repeat(1_000) },
+      expected: {
+        kind: "fatal_exit",
+        reason: "x".repeat(RESTART_LEDGER_REASON_MAX_LEN),
+      },
+    },
+    {
+      name: "uncaught",
+      attribution: { kind: "uncaught_exception", reason: "uncaught" },
+      expected: { kind: "uncaught_exception", reason: "uncaught" },
+    },
+    {
+      name: "rejection",
+      attribution: { kind: "unhandled_rejection", reason: "rejected" },
+      expected: { kind: "unhandled_rejection", reason: "rejected" },
+    },
+    {
+      name: "term",
+      attribution: { kind: "signal", signal: "SIGTERM" },
+      expected: { kind: "signal", signal: "SIGTERM" },
+    },
+    {
+      name: "int",
+      attribution: { kind: "signal", signal: "SIGINT" },
+      expected: { kind: "signal", signal: "SIGINT" },
+    },
+    {
+      name: "hup",
+      attribution: { kind: "signal", signal: "SIGHUP" },
+      expected: { kind: "signal", signal: "SIGHUP" },
+    },
+    {
+      name: "clean",
+      attribution: { kind: "clean_shutdown" },
+      expected: { kind: "clean_shutdown" },
+    },
+  ];
+
+  expect(resolveExitAttributionPath(restartLedgerPath)).toBe(
+    join(stateDir, "exit-attribution.json"),
+  );
+  for (const { name, attribution, expected } of cases) {
+    const path = join(stateDir, `${name}.json`);
+    const recorder = createExitAttributionRecorder({
+      bootId: `boot-${name}`,
+      path,
+      nowMs: () => 123,
+    });
+    recorder.record(attribution);
+    recorder.record({ kind: "clean_shutdown" });
+    expect(readExitAttribution(path)).toEqual({
+      boot_id: `boot-${name}`,
+      ts: 123,
+      ...expected,
+    });
+    expect(readFileSync(path, "utf8").endsWith("\n")).toBe(true);
+  }
+});
+
+test("decideExitAttribution prefers operator, then the leaf, then native evidence, then OS memory kill, then hard kill", () => {
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 10,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+  const nativeCrash = {
+    native_crash_signal: "SIGSEGV",
+    native_crash_report_id: "report-prior",
+  };
+  const operatorReload = {
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 15,
+  };
+  const osMemoryKill = { reason: "jetsam killing process 123" };
+
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: leaf,
+      nativeCrash,
+      operatorReload,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "install.sh launchctl-reload",
+    verdict: "operator",
+    verdict_evidence: "install.sh launchctl-reload",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: leaf,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "signal: SIGTERM",
+    verdict: "signal",
+    verdict_evidence: "signal: SIGTERM",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    ...nativeCrash,
+    verdict: "signal",
+    verdict_evidence: "native crash: SIGSEGV",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash: null,
+      osMemoryKill,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: "jetsam killing process 123",
+    verdict: "os-memory-kill",
+    verdict_evidence: "jetsam killing process 123",
+  });
+  expect(
+    decideExitAttribution({
+      bootId: "prior",
+      ts: 20,
+      exitAttribution: null,
+      nativeCrash: null,
+    }),
+  ).toEqual({
+    kind: "enrich",
+    boot_id: "prior",
+    ts: 20,
+    reason: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+    verdict: "no-evidence",
+    verdict_evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  });
+});
+
+test("classifyExitVerdict: watchdog vs. generic soft-exit-leaf reasons", () => {
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "serve-liveness-watchdog: busy-lag lag-breaches=3/3",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "watchdog",
+    evidence: "serve-liveness-watchdog: busy-lag lag-breaches=3/3",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "git-seed-watchdog: surface stuck after 3 re-seed attempt(s)",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "watchdog",
+    evidence: "git-seed-watchdog: surface stuck after 3 re-seed attempt(s)",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: {
+        boot_id: "b",
+        ts: 1,
+        kind: "fatal_exit",
+        reason: "single-instance admission refused",
+      },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "soft-exit-leaf",
+    evidence: "single-instance admission refused",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: { boot_id: "b", ts: 1, kind: "clean_shutdown" },
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "soft-exit-leaf",
+    evidence: "exit attribution: clean_shutdown",
+  });
+  expect(
+    classifyExitVerdict({
+      exitAttribution: null,
+      nativeCrash: null,
+      operatorReload: null,
+      osMemoryKill: null,
+    }),
+  ).toEqual({
+    kind: "no-evidence",
+    evidence: HARD_KILL_EXIT_ATTRIBUTION_REASON,
+  });
+});
+
+test("findOsMemoryKillEvidence: matches a real jetsam-kill line naming the pid, ignores background noise and other pids", () => {
+  const window = { pid: 56332, startedAtMs: 0, diedAtMs: 1_000 };
+  // Ambient runningboardd chatter that mentions jetsam constantly but never kills.
+  const noise = [
+    "2026-07-20 16:15:28 runningboardd: [jetsam] memorystatus_control error: MEMORYSTATUS_CMD_CONVERT_MEMLIMIT_MB(-1) returned -1 22 (Invalid argument)",
+    "2026-07-20 16:15:28 runningboardd: [anon<bun>(501):56332] is not RunningBoard jetsam managed.",
+    "2026-07-20 16:15:28 runningboardd: [anon<bun>(501):56332] Ignoring jetsam update because this process is not memory-managed",
+  ].join("\n");
+  expect(findOsMemoryKillEvidence(noise, window)).toBeNull();
+  expect(findOsMemoryKillEvidence("", window)).toBeNull();
+
+  // A real kill line naming a DIFFERENT pid must not match this boot's window.
+  const otherPid =
+    "2026-07-20 16:15:30 kernel: memorystatus_kill_process: killing pid 99999 [bun] (jetsam) - highwater";
+  expect(findOsMemoryKillEvidence(otherPid, window)).toBeNull();
+
+  const realKill =
+    "2026-07-20 16:15:30 kernel: memorystatus_kill_process: killing pid 56332 [bun] (jetsam) - highwater, reason: highwater";
+  expect(findOsMemoryKillEvidence(`${noise}\n${realKill}`, window)).toEqual({
+    reason: realKill,
+  });
+
+  const lowSwap =
+    "2026-07-20 16:15:30 kernel: low swap: killing largest process with pid 56332 (bun) to reclaim memory";
+  expect(findOsMemoryKillEvidence(lowSwap, window)).toEqual({
+    reason: lowSwap,
+  });
+
+  const bounded = `2026-07-20 kernel: jetsam killing pid 56332 ${"x".repeat(500)}`;
+  const result = findOsMemoryKillEvidence(bounded, window);
+  expect(result?.reason.length).toBeLessThanOrEqual(
+    OS_MEMORY_KILL_EVIDENCE_MAX_LEN,
+  );
+});
+
+test("resolveOperatorReloadAttributionPath: sibling of the restart ledger, never the exit-attribution leaf", () => {
+  const restartLedgerPath = join(tmpDir, "restart-ledger.json");
+  expect(resolveOperatorReloadAttributionPath(restartLedgerPath)).toBe(
+    join(tmpDir, "install-reload-attribution.json"),
+  );
+});
+
+test("readOperatorReloadAttribution: reads install.sh's leaf, fails closed on missing/malformed", () => {
+  const path = join(tmpDir, "install-reload-attribution.json");
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+  writeFileSync(
+    path,
+    `${JSON.stringify({
+      schema_version: 1,
+      source: "install.sh",
+      action: "launchctl-reload",
+      ts_ms: 12_345,
+      fingerprint: "abc",
+    })}\n`,
+  );
+  expect(readOperatorReloadAttribution(path)).toEqual({
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 12_345,
+  });
+  writeFileSync(path, "not json");
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+  writeFileSync(path, JSON.stringify({ source: "install.sh" }));
+  expect(readOperatorReloadAttribution(path)).toBeNull();
+});
+
+test("matchOperatorReloadAttribution: only explains a death whose stamp falls inside the dying boot's own lifetime", () => {
+  const attribution = {
+    source: "install.sh",
+    action: "launchctl-reload",
+    ts: 1_000,
+  };
+  expect(
+    matchOperatorReloadAttribution(attribution, {
+      startedAtMs: 500,
+      diedAtMs: 1_500,
+    }),
+  ).toEqual(attribution);
+  expect(
+    matchOperatorReloadAttribution(attribution, {
+      startedAtMs: 1_100,
+      diedAtMs: 1_500,
+    }),
+  ).toBeNull();
+  expect(
+    matchOperatorReloadAttribution(null, { startedAtMs: 0, diedAtMs: 1 }),
+  ).toBeNull();
+});
+
+test("serve-health history: bounded ring buffer, durable round trip, and resolved sibling path", () => {
+  const restartLedgerPath = join(tmpDir, "restart-ledger.json");
+  expect(resolveServeHealthHistoryPath(restartLedgerPath)).toBe(
+    join(tmpDir, "serve-health-history.json"),
+  );
+  let history: ServeHealthHistory = { boot_id: "boot-1", reports: [] };
+  for (let i = 0; i < SERVE_HEALTH_HISTORY_MAX_REPORTS + 5; i += 1) {
+    history = appendServeHealthReportSample(history, {
+      ts: i,
+      rss_bytes: 1_000_000 + i,
+    });
+  }
+  expect(history.reports.length).toBe(SERVE_HEALTH_HISTORY_MAX_REPORTS);
+  // Oldest samples drop first; the ring buffer keeps the most recent tail.
+  expect(history.reports[0].ts).toBe(5);
+  expect(history.reports.at(-1)?.ts).toBe(SERVE_HEALTH_HISTORY_MAX_REPORTS + 4);
+
+  const path = join(tmpDir, "serve-health-history.json");
+  expect(readServeHealthHistory(path)).toBeNull();
+  writeServeHealthHistory(path, history);
+  expect(readServeHealthHistory(path)).toEqual(history);
+});
+
+test("prior exit attribution skips boots already attributed in the restart ledger", () => {
+  const prior = {
+    ...bootLine("prior", 1, "launchd", null),
+    pid: 1,
+    start_time: "darwin:2025-01-01T00:00:00.000Z",
+  };
+  const leaf: ExitAttributionRecord = {
+    boot_id: "prior",
+    ts: 2,
+    kind: "signal",
+    signal: "SIGTERM",
+  };
+
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, reason: "clean shutdown" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: { ...prior, native_crash_signal: "SIGSEGV" },
+      exitAttribution: leaf,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(false);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: leaf,
+      allowHardKillFallback: false,
+    }),
+  ).toBe(true);
+  expect(
+    shouldEnrichPriorExitAttribution({
+      priorBoot: prior,
+      exitAttribution: null,
+      allowHardKillFallback: true,
+    }),
+  ).toBe(true);
 });
 
 test("appendRestartLedgerLine: appends one line without overwriting existing content", () => {
