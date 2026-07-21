@@ -2759,6 +2759,48 @@ describe("pooled Codex stream", () => {
     expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
   });
 
+  test("retries a rejected cached continuation once on the same alias", async () => {
+    const apiKeys: Array<string | undefined> = [];
+    const pooled = createPooledCodexStream(
+      {
+        vault: new CredentialVault(
+          new MemoryCredentialStorage(credentials()),
+          async (credential) => credential,
+          () => 100,
+        ),
+        routes: routeState(),
+        warn: () => {},
+        nativeDelegate: () => stream([]) as any,
+        delegate: (_model, _context, options) => {
+          apiKeys.push(options?.apiKey);
+          return apiKeys.length === 1
+            ? (stream([
+                { type: "start", partial: message() },
+                {
+                  type: "error",
+                  reason: "error",
+                  error: message(
+                    "error",
+                    "Codex error: Previous response with id 'resp_stale' not found.",
+                  ),
+                },
+              ]) as any)
+            : (stream([
+                { type: "start", partial: message() },
+                { type: "done", reason: "stop", message: message() },
+              ]) as any);
+        },
+      },
+      MODEL as any,
+      CONTEXT as any,
+      { sessionId: "stale-continuation-session" },
+    );
+
+    const events = await collect(pooled);
+    expect(apiKeys).toEqual(["fake-access-a", "fake-access-a"]);
+    expect(events.map((event: any) => event.type)).toEqual(["start", "done"]);
+  });
+
   test("keeps the retried alias sticky when its second attempt overflows context", async () => {
     const aliases = ["keeper-codex-a", "keeper-codex-b"];
     const routes = new PoolRouteState(

@@ -181,14 +181,23 @@ function retryable(failureClass: PoolFailureClass): boolean {
   return ["quota", "rate", "auth", "transport", "other"].includes(failureClass);
 }
 
+function staleCodexContinuationFailure(message: string): boolean {
+  return /previous response with id ['"][^'"\r\n]{1,256}['"] not found/i.test(
+    message,
+  );
+}
+
 function shouldRetrySameAlias(
   failureClass: PoolFailureClass,
+  failureMessage: string,
   delegatedAttempts: number,
   routes: PoolRouteState,
   quotaScope: CodexQuotaScope,
   excluded: ReadonlySet<string>,
 ): boolean {
-  if (failureClass !== "transport" || delegatedAttempts >= 2) return false;
+  if (delegatedAttempts >= 2) return false;
+  if (staleCodexContinuationFailure(failureMessage)) return true;
+  if (failureClass !== "transport") return false;
   try {
     return !routes.hasEligibleRoute(quotaScope, excluded);
   } catch {
@@ -723,7 +732,8 @@ export function createPooledCodexStream(
           }
           if (event.type === "error") {
             const reason = event.reason === "aborted" ? "aborted" : "error";
-            const failureClass = classifyPoolFailure(failureMessage(event));
+            const upstreamFailureMessage = failureMessage(event);
+            const failureClass = classifyPoolFailure(upstreamFailureMessage);
             lastFailure = failureClass;
             lastErrorMessage = event.error;
             if (reason === "aborted" || options?.signal?.aborted) {
@@ -756,6 +766,7 @@ export function createPooledCodexStream(
               if (
                 shouldRetrySameAlias(
                   failureClass,
+                  upstreamFailureMessage,
                   delegatedAttempts,
                   deps.routes,
                   quotaScope,
@@ -771,7 +782,7 @@ export function createPooledCodexStream(
               deps,
               { sessionId, alias, attempt: delegatedAttempts },
               failureClass,
-              failureMessage(event),
+              upstreamFailureMessage,
             );
             output.push(
               sanitizedErrorEvent(model, "error", failureClass, event.error),
@@ -794,6 +805,7 @@ export function createPooledCodexStream(
             !exposedSubstantive &&
             shouldRetrySameAlias(
               lastFailure,
+              "",
               delegatedAttempts,
               deps.routes,
               quotaScope,
@@ -814,9 +826,8 @@ export function createPooledCodexStream(
           }
         }
       } catch (error) {
-        const failureClass = classifyPoolFailure(
-          error instanceof Error ? error.message : "",
-        );
+        const caughtMessage = error instanceof Error ? error.message : "";
+        const failureClass = classifyPoolFailure(caughtMessage);
         lastFailure = failureClass;
         deps.routes.recordFailure(sessionId, alias, failureClass, quotaScope);
         excluded.add(alias);
@@ -824,6 +835,7 @@ export function createPooledCodexStream(
           !exposedSubstantive &&
           shouldRetrySameAlias(
             failureClass,
+            caughtMessage,
             delegatedAttempts,
             deps.routes,
             quotaScope,
