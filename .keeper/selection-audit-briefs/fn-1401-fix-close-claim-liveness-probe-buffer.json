@@ -1,0 +1,35 @@
+{
+  "auditable_tasks": [
+    {
+      "assigned_model": "gpt-5.3-codex-spark",
+      "assigned_tier": "medium",
+      "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+      "constraint": null,
+      "diff_stats": {
+        "commit_count": 1,
+        "deletions": 2,
+        "files_changed": 2,
+        "insertions": 94
+      },
+      "done_summary": "Uncapped the darwin close-claim probe's maxBuffer so a long-argv holder resolves alive/dead instead of falling through to the 24h stale bound; added a regression test with a 48KB-argv holder.",
+      "input_hash": "4d71139242910f51fc8a88e748efb3a778bf5e4c53cae1d12092f9d8db456fb5",
+      "model": "gpt-5.3-codex-spark",
+      "spec_chars": 1696,
+      "spec_md": "## Description\n\nFixes finding F1 (with F3's test concern merged in). In\n`plugins/plan/src/session_markers.ts`, `readProcessStartTime` runs the\ndarwin probe `spawnSync(\"ps\", [\"-ww\",\"-p\",<pid>,\"-o\",\"lstart=,args=\"], { ...,\nmaxBuffer: 4096 })`. `args=` streams the target's full command line, so a\nlong-argv holder (keeper-spawned workers reach ~26KB argv on-host) overflows\nthe 4096-byte buffer, `spawnSync` sets `error`, the function returns null,\nand `probeHolderLiveness` reports \"unknown\" \u2014 which `readRivalCloseClaims`\ndefers to the 24h stale bound instead of detecting a dead/recycled holder.\n\nThe sibling probe in `src/seed-sweep.ts` runs the identical\n`ps -ww -p <pid> -o lstart=,args=` with NO `maxBuffer` cap; `bus-worker.ts`\nuses a bounded reader. `splitArgsLstart` consumes only the fixed-width\n24-char `lstart` and discards `args`, so raising or removing the cap is safe.\n\nFiles:\n- `plugins/plan/src/session_markers.ts` (`readProcessStartTime` darwin branch)\n- the session-markers test file covering the probe seam (regression guard below)\n\n## Acceptance\n\n- [ ] `readProcessStartTime` no longer returns null for a live process solely\n      because its argv exceeds 4096 bytes; buffering matches `seed-sweep.ts`.\n- [ ] A regression test drives the probe (or its seam) with a long-argv holder\n      and asserts liveness resolves to alive/dead rather than deferring to the\n      24h stale bound.\n- [ ] Existing close-claim arbitration and kill-path tests stay green.\n\n## Done summary\nUncapped the darwin close-claim probe's maxBuffer so a long-argv holder resolves alive/dead instead of falling through to the 24h stale bound; added a regression test with a 48KB-argv holder.\n## Evidence\n",
+      "task_id": "fn-1401-fix-close-claim-liveness-probe-buffer.1",
+      "tier": "medium",
+      "title": "Raise darwin start-time probe buffer"
+    }
+  ],
+  "created_at": "2026-07-21T19:26:57.297000Z",
+  "epic_id": "fn-1401-fix-close-claim-liveness-probe-buffer",
+  "excluded_tasks": [],
+  "primary_repo": "/Users/mike/code/keeper",
+  "schema_version": 2,
+  "selection_config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "selection_input_hash": "4d71139242910f51fc8a88e748efb3a778bf5e4c53cae1d12092f9d8db456fb5",
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  }
+}
