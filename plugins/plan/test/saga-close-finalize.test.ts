@@ -47,6 +47,7 @@ import {
   integrateRepoUnderLease,
   type TrunkGitResult,
   type TrunkIntegrationDeps,
+  type TrunkLeaseRequestResult,
 } from "../src/verbs/close_finalize.ts";
 import {
   armInProgressOp,
@@ -1886,6 +1887,10 @@ interface FakeTrunkDepsOptions {
   releaseOk?: boolean;
   /** acquireLock() returns null (lock contention) when false. */
   lockOk?: boolean;
+  /** Overrides requestLease's result for a given attempt (0-based). Returning
+   * {ok:false, reason} exercises TRUNK_LEASE_REQUEST_FAILED / TRUNK_LEASE_PENDING;
+   * undefined falls through to the default always-succeeding mint. */
+  requestLeaseResult?: (attempt: number) => TrunkLeaseRequestResult | undefined;
   /** OPTIONAL merge-suite gate probe (ADR 0102). Omitted → the plan CLI skips
    * the gate (the daemon owns the authoritative one). */
   runMergeSuite?: TrunkIntegrationDeps["runMergeSuite"];
@@ -1929,6 +1934,13 @@ function makeFakeTrunkDeps(opts: FakeTrunkDepsOptions): {
     ) => {
       const currentAttempt = attempt;
       attempt += 1;
+      const scripted = opts.requestLeaseResult?.(currentAttempt);
+      if (scripted !== undefined) {
+        if (scripted.ok) {
+          lastLease = scripted.lease;
+        }
+        return scripted;
+      }
       const lease = opts.leaseFor
         ? opts.leaseFor(currentAttempt)
         : baseLeaseFor({
@@ -2406,6 +2418,45 @@ describe("integrateRepoUnderLease saga (private scratch worktree)", () => {
 
     expect(result.code).toBe(1);
     expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_RELEASE_FAILED");
+    expect(releasedLeases.length).toBe(1);
+  });
+
+  test("a lease request the daemon could not publish exits TRUNK_LEASE_REQUEST_FAILED", () => {
+    const { deps } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      requestLeaseResult: () => ({ ok: false, reason: "request_failed" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_REQUEST_FAILED");
+  });
+
+  test("a lease request left pending past the bounded wait exits TRUNK_LEASE_PENDING", () => {
+    const { deps } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      requestLeaseResult: () => ({ ok: false, reason: "pending" }),
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe("TRUNK_LEASE_PENDING");
+  });
+
+  test("commit-work lock contention exits TRUNK_INTEGRATION_LOCK_TIMEOUT, releasing the lease", () => {
+    const { deps, releasedLeases } = makeFakeTrunkDeps({
+      git: trunkFlowGit(),
+      lockOk: false,
+    });
+
+    const result = runIntegrate(deps);
+
+    expect(result.code).toBe(1);
+    expect(trunkErrorCode(result.stdout)).toBe(
+      "TRUNK_INTEGRATION_LOCK_TIMEOUT",
+    );
     expect(releasedLeases.length).toBe(1);
   });
 });
