@@ -29,5 +29,6 @@ beside each touched surface.
 - [ ] No hook imports the marker helper; lint gates stay green.
 
 ## Done summary
-
+Cleared dead close-claim markers on kill paths and made close-claim arbitration probe holder liveness; operator-adopted from terminal leg b0fca477 after a TOOLING_FAILURE attribution park.
 ## Evidence
+- Commits: df078d9f7cb96d3709af66a5a57f46cc608a6f59
