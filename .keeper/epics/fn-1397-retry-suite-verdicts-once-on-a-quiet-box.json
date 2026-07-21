@@ -1,0 +1,18 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-07-21T07:21:57.971000Z",
+  "depends_on_epics": [
+    "fn-1393-treat-a-missing-suite-gate-as-pass-with"
+  ],
+  "id": "fn-1397-retry-suite-verdicts-once-on-a-quiet-box",
+  "last_validated_at": null,
+  "primary_repo": "/Users/mike/code/keeper",
+  "snippets": [],
+  "status": "open",
+  "title": "Retry suite verdicts once on a quiet box",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-07-21T07:21:57.971000Z"
+}
