@@ -133,7 +133,7 @@ describe("provider shim pre-exec gate", () => {
     };
     h.deps.awaitProviderLegGrantFn = async () => {
       waited = true;
-      return true;
+      return "granted";
     };
     const priorTitle = process.title;
     try {
@@ -145,13 +145,15 @@ describe("provider shim pre-exec gate", () => {
     expect(h.spawned).toEqual([]);
   });
 
-  test("daemon-down timeout holds the shim inert and exits without paid work", async () => {
+  test("daemon-down timeout holds the shim inert, retires its own birth, and exits without paid work", async () => {
     const h = makeHarness({
       argv: ["pi", "--x-no-confirm", "work"],
       rawArgv: true,
       env: OWNER_ENV,
     });
-    h.deps.awaitProviderLegGrantFn = async () => false;
+    const retired: string[] = [];
+    h.deps.awaitProviderLegGrantFn = async () => "timeout";
+    h.deps.retireBirthRecordFn = (p) => retired.push(p);
     const priorTitle = process.title;
     try {
       expect(await expectExit(main(h.deps))).toBe(1);
@@ -160,6 +162,33 @@ describe("provider shim pre-exec gate", () => {
     }
     expect(h.birthRecords).toHaveLength(1);
     expect(h.spawned).toEqual([]);
+    // A dead-at-gate leg settles its OWN promoted birth record so the ~5min
+    // stuck-birth GC never mints a fossil for it.
+    expect(retired).toEqual([h.birthRecords[0]?.intentPath]);
+  });
+
+  test("a structural admission refusal parks terminal — no exec, and settles its own birth", async () => {
+    const h = makeHarness({
+      argv: ["pi", "--x-no-confirm", "work"],
+      rawArgv: true,
+      env: OWNER_ENV,
+    });
+    const retired: string[] = [];
+    // `refused` is the daemon's positive terminal-deny signal (the promoted birth
+    // was cleared without a grant). The shim must park terminally, never exec.
+    h.deps.awaitProviderLegGrantFn = async () => "refused";
+    h.deps.retireBirthRecordFn = (p) => retired.push(p);
+    h.deps.execProviderLegFn = () => {
+      throw new Error("exec must not be reached on a refusal");
+    };
+    const priorTitle = process.title;
+    try {
+      expect(await expectExit(main(h.deps))).toBe(1);
+    } finally {
+      process.title = priorTitle;
+    }
+    expect(h.spawned).toEqual([]);
+    expect(retired).toEqual([h.birthRecords[0]?.intentPath]);
   });
 
   test("a grant reaches only the pid-preserving exec seam", async () => {
@@ -168,7 +197,7 @@ describe("provider shim pre-exec gate", () => {
       rawArgv: true,
       env: OWNER_ENV,
     });
-    h.deps.awaitProviderLegGrantFn = async () => true;
+    h.deps.awaitProviderLegGrantFn = async () => "granted";
     const execCapture: { command: string[] | null } = { command: null };
     h.deps.execProviderLegFn = (command) => {
       execCapture.command = command;
@@ -184,7 +213,52 @@ describe("provider shim pre-exec gate", () => {
     expect(h.spawned).toEqual([]);
   });
 
-  test("the bounded poll returns false-equivalent timeout without a daemon", async () => {
+  test("the bounded poll returns a timeout while the birth record persists (transient re-wait, no early exit)", async () => {
+    let now = 0;
+    let consumes = 0;
+    const verdict = await awaitProviderLegGrant(
+      {
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+        },
+        consume: () => {
+          consumes += 1;
+          return false;
+        },
+        // The daemon keeps the birth record while it re-probes a transient lag, so
+        // the shim RE-WAITS the same handle to the deadline rather than bailing.
+        birthPresent: () => true,
+      },
+      125,
+    );
+    expect(verdict).toBe("timeout");
+    expect(consumes).toBeGreaterThan(1);
+  });
+
+  test("a retired birth record with no grant is a positive terminal refusal — the poll stops early", async () => {
+    let now = 0;
+    let polls = 0;
+    const verdict = await awaitProviderLegGrant(
+      {
+        now: () => now,
+        sleep: async (ms) => {
+          now += ms;
+          polls += 1;
+        },
+        consume: () => false,
+        // The daemon cleared the promoted birth without granting: a structural
+        // deny that can never heal by waiting.
+        birthPresent: () => false,
+      },
+      10_000,
+    );
+    expect(verdict).toBe("refused");
+    // Stops on the FIRST observation — never burns the (30s-scale) timeout.
+    expect(polls).toBe(0);
+  });
+
+  test("a grant observed in the same tick a birth is retired still reads as granted", async () => {
     let now = 0;
     const verdict = await awaitProviderLegGrant(
       {
@@ -192,11 +266,14 @@ describe("provider shim pre-exec gate", () => {
         sleep: async (ms) => {
           now += ms;
         },
-        consume: () => false,
+        // consume() is checked first, so the daemon's write-grant-then-retire order
+        // never lets the retire window be misread as a refusal.
+        consume: () => true,
+        birthPresent: () => false,
       },
       125,
     );
-    expect(verdict).toBe(false);
+    expect(verdict).toBe("granted");
   });
 
   test("the shim command signature is never classified as a parked shell", () => {

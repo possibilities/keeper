@@ -60,7 +60,9 @@ import {
   PROVIDER_LEG_SHIM_PROCESS_TITLE,
   PROVIDER_LEG_WRAPPER_ATTEMPT_ENV,
   PROVIDER_LEG_WRAPPER_JOB_ID_ENV,
+  type ProviderLegGateOutcome,
   parseProviderLegLaunchCarrier,
+  retireBirthRecord,
   writeBirthIntent,
 } from "../birth-record";
 import {
@@ -411,11 +413,18 @@ export interface MainDeps {
     pid: number,
     intentPath: string,
   ) => void;
-  /** Optional deterministic seam for the owned-leg pre-exec grant wait. */
+  /** Optional deterministic seam for the owned-leg pre-exec grant wait. Returns
+   *  the cause-split outcome so the shim keeps re-waiting a transient lag on the
+   *  SAME handle but parks terminally the moment the daemon denies admission. */
   awaitProviderLegGrantFn?: (
     birthRoot: string,
     owner: BirthOwnerTuple,
-  ) => Promise<boolean>;
+    intentPath: string,
+  ) => Promise<ProviderLegGateOutcome>;
+  /** Optional seam for retiring this leg's own birth record after a terminal gate
+   *  death. Defaults to {@link retireBirthRecord}; injected so a test can observe
+   *  the settle without a real maildir. */
+  retireBirthRecordFn?: (intentPath: string) => void;
   /** Optional deterministic seam for the final pid-preserving provider exec. */
   execProviderLegFn?: (command: string[], env: Record<string, string>) => never;
   tmuxBin: string;
@@ -4794,15 +4803,29 @@ export async function main(deps: MainDeps): Promise<never> {
         providerGate.carrier.wrapper_dispatch_attempt_id,
     };
     const birthRoot = birthRootFromIntentPath(armedBirth.intentPath);
-    const granted = deps.awaitProviderLegGrantFn
-      ? await deps.awaitProviderLegGrantFn(birthRoot, owner)
+    const outcome = deps.awaitProviderLegGrantFn
+      ? await deps.awaitProviderLegGrantFn(
+          birthRoot,
+          owner,
+          armedBirth.intentPath,
+        )
       : await awaitProviderLegGrant({
           now: () => Date.now(),
           sleep: (ms) => Bun.sleep(ms),
           consume: () => consumeProviderLegGrant(birthRoot, owner),
+          birthPresent: () => existsSync(armedBirth.intentPath),
         });
-    if (!granted) {
-      deps.writeErr("Error: provider-leg grant timed out before exec.\n");
+    if (outcome !== "granted") {
+      // A terminal gate death — a structural deny (`refused`) or a lag that never
+      // resolved within this shim's life (`timeout`). Settle our own birth record
+      // now so the ~5min stuck-birth GC never mints a fossil for it, then park with
+      // one bounded, attributed line. A `refused` never re-waits or relaunches.
+      (deps.retireBirthRecordFn ?? retireBirthRecord)(armedBirth.intentPath);
+      deps.writeErr(
+        outcome === "refused"
+          ? `Error: provider-leg admission refused before exec (leg ${owner.leg_launch_id}, wrapper attempt ${owner.wrapper_dispatch_attempt_id}).\n`
+          : `Error: provider-leg grant timed out before exec (leg ${owner.leg_launch_id}, wrapper attempt ${owner.wrapper_dispatch_attempt_id}).\n`,
+      );
       return deps.exit(1);
     }
     for (const key of [

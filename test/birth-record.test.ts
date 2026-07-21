@@ -41,6 +41,7 @@ import {
   promoteBirthIntent,
   publishBirthIntent,
   resolveBirthDir,
+  retireBirthRecord,
   serializeBirthIntent,
   serializeBirthRecord,
   writeBirthIntent,
@@ -281,7 +282,41 @@ describe("owned provider-leg birth gate", () => {
           },
           75,
         ),
-      ).toBe(false);
+      ).toBe("timeout");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("retireBirthRecord unlinks a promoted record and is idempotent on an already-gone one", async () => {
+    const dir = tempDir();
+    try {
+      const owner = {
+        leg_launch_id: "leg-retire-1",
+        wrapper_job_id: "work::fn-retire.1",
+        wrapper_dispatch_attempt_id: 7,
+      };
+      const ownedDraft: BirthRecordDraft = {
+        ...DRAFT,
+        ...owner,
+        launcher_pid: 900,
+        launcher_start_time: "linux:100",
+      };
+      const ownedRecord: BirthRecord = {
+        ...ownedDraft,
+        pid: 901,
+        start_time: "linux:101",
+      };
+      const intentPath = writeBirthIntent(dir, ownedDraft, 900);
+      promoteBirthIntent(intentPath, ownedRecord);
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(intentPath)).toBe(true);
+
+      retireBirthRecord(intentPath);
+      expect(existsSync(intentPath)).toBe(false);
+      // A second settle over the already-gone record is a benign no-op (the daemon
+      // may have cleared it first) — never throws.
+      expect(() => retireBirthRecord(intentPath)).not.toThrow();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -7652,6 +7652,7 @@ test("a live owner's DUPLICATE claim is an idempotent no-op and NEVER rotates th
       },
       rotateGrant: () => {
         rotations += 1;
+        return "rotated";
       },
     }),
   );
@@ -7680,13 +7681,69 @@ test("an explicit rotate request routes to the grant-rotation seam, fenced to th
       mintClaimed: () => {
         mints += 1;
       },
-      rotateGrant: (verb, id, instanceEventId, claimSessionId) =>
-        rotated.push([verb, id, instanceEventId, claimSessionId]),
+      rotateGrant: (verb, id, instanceEventId, claimSessionId) => {
+        rotated.push([verb, id, instanceEventId, claimSessionId]);
+        return "rotated";
+      },
     }),
   );
   expect(mints).toBe(0);
   expect(result.rotated).toBe(1);
   expect(rotated).toEqual([["work", "fn-3-incident.1", 41, "session-owner"]]);
+});
+
+test("a rotation that returns retry leaves the request spooled and is not counted as rotated", () => {
+  const entry = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  const removed: string[] = [];
+  let attempts = 0;
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      // A failed retirement/publish — the rotation could not complete this pass.
+      rotateGrant: () => {
+        attempts += 1;
+        return "retry";
+      },
+    }),
+  );
+  expect(attempts).toBe(1);
+  // The request stays spooled (never removed) so recovery does not wait for a
+  // fresh explicit intent, and it is not counted a rotation.
+  expect(removed).toEqual([]);
+  expect(result.rotated).toBe(0);
+});
+
+test("a rotation that returns no-target consumes the request without counting a rotation retry", () => {
+  const entry = incidentSpoolEntry("rotate", {
+    claimant_session_id: "session-owner",
+  });
+  const removed: string[] = [];
+  const result = runIncidentClaimSweep(
+    incidentSweepDeps({
+      readRequests: () => [entry],
+      removeRequest: (path) => removed.push(path),
+      lookupIncident: () => ({
+        instanceEventId: 41,
+        claimSessionId: "session-owner",
+        claimPid: 4242,
+        claimStartTime: "proc:4242:1",
+      }),
+      // Nothing to grant against — a re-intent would find the same absence, so
+      // the request is consumed rather than retried forever.
+      rotateGrant: () => "no-target",
+    }),
+  );
+  expect(removed).toEqual([entry.path]);
+  expect(result.rotated).toBe(1);
 });
 
 test("a rotate request from a session that is NOT the current holder is stale and never rotates", () => {
@@ -7706,6 +7763,7 @@ test("a rotate request from a session that is NOT the current holder is stale an
       }),
       rotateGrant: () => {
         rotations += 1;
+        return "rotated";
       },
     }),
   );
@@ -7731,6 +7789,7 @@ test("a stale-fenced rotate publishes no grant: the rotation seam never fires", 
       }),
       rotateGrant: () => {
         rotations += 1;
+        return "rotated";
       },
     }),
   );
@@ -7759,7 +7818,9 @@ test("incident grant publish then rotate: resolve retired, deconflict published,
     expect(stage1[0]?.writable_root).toBe(root);
 
     now += 1;
-    rotateIncidentGrantToDeconflict(deps, "close", "fn-2-x", 88, "sess-c");
+    expect(
+      rotateIncidentGrantToDeconflict(deps, "close", "fn-2-x", 88, "sess-c"),
+    ).toBe("rotated");
     const stage2 = liveFor(now);
     expect(stage2).toHaveLength(1);
     expect(stage2[0]?.role).toBe("deconflict");
@@ -7782,6 +7843,54 @@ test("incident grant publish then rotate: resolve retired, deconflict published,
     expect(stage2[0]?.fencing_token ?? 0).toBeGreaterThan(
       stage1[0]?.fencing_token ?? 0,
     );
+  });
+});
+
+test("rotateIncidentGrantToDeconflict returns no-target when there is no merge-escalation row", () => {
+  withGrantsDir((grantsDir) => {
+    let now = 10_000;
+    const deps: IncidentGrantDeps = {
+      grantsDir,
+      // No merge-escalation row/dir to grant against.
+      rowFacts: () => null,
+      now: () => now,
+    };
+    publishIncidentResolveGrant(deps, "close", "fn-6-nt", 5, "sess-nt");
+    now += 1;
+    expect(
+      rotateIncidentGrantToDeconflict(deps, "close", "fn-6-nt", 5, "sess-nt"),
+    ).toBe("no-target");
+  });
+});
+
+test("rotateIncidentGrantToDeconflict returns retry when the deconflict publish fails", () => {
+  withGrantsDir((grantsDir, root) => {
+    let now = 10_000;
+    // A live resolve leaf whose retire confirms, but the deconflict publish fails:
+    // the transition could not complete, so the request must stay retryable.
+    const realDeps = incidentGrantDepsFor(grantsDir, root, () => now);
+    publishIncidentResolveGrant(realDeps, "close", "fn-7-rt", 9, "sess-rt");
+    now += 1;
+    let calls = 0;
+    const failingPublish: IncidentGrantDeps = {
+      ...realDeps,
+      now: () => now,
+      // Retire (first calls) confirm true; the deconflict publish (last call) fails.
+      writeLeaf: (dir, leaf) => {
+        calls += 1;
+        return leaf.role === "deconflict" ? false : writeGrantLeaf(dir, leaf);
+      },
+    };
+    expect(
+      rotateIncidentGrantToDeconflict(
+        failingPublish,
+        "close",
+        "fn-7-rt",
+        9,
+        "sess-rt",
+      ),
+    ).toBe("retry");
+    expect(calls).toBeGreaterThan(0);
   });
 });
 
@@ -7903,6 +8012,7 @@ test("a duplicate rotate request in one sweep fires the rotation seam exactly on
       }),
       rotateGrant: () => {
         rotations += 1;
+        return "rotated";
       },
     }),
   );

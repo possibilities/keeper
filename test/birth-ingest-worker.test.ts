@@ -40,10 +40,15 @@ import {
   writeBirthIntent,
   writeBirthRecord,
 } from "../src/birth-record";
-import type { EventsIngestContext } from "../src/daemon";
+import type {
+  EventsIngestContext,
+  ProviderLegGrantWaitCause,
+} from "../src/daemon";
 import {
   BIRTH_STUCK_STATUS,
+  decideProviderLegGrantWaitLog,
   drainToCompletion,
+  providerLegGrantStatus,
   scanBirthDir,
 } from "../src/daemon";
 import { freshMemDb } from "./helpers/template-db";
@@ -764,4 +769,169 @@ test("scanBirthDir re-fold parity: the birth-minted SessionStart events row is b
   expect(stripId(minted)).toEqual(stripId(direct));
 
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// providerLegGrantStatus — cause-split classification. The prior single JOIN
+// collapsed every non-grant state into a bare `wait`; the split names WHY while
+// preserving every grant/wait/deny routing decision. Seed the exact claim/job
+// state directly (deterministic, no fold) and assert the typed verdict.
+// ---------------------------------------------------------------------------
+
+const OWNED_LEG_OVERRIDES = {
+  session_id: "grant-status-leg",
+  dispatch_attempt_id: null,
+  leg_launch_id: "leg-status-1",
+  wrapper_job_id: "wrapper-status-1",
+  wrapper_dispatch_attempt_id: 700,
+  launcher_pid: LIVE_PID,
+  launcher_start_time: "linux:700",
+} satisfies Partial<BirthRecord>;
+
+function seedWrapperJob(
+  db: ReturnType<typeof freshMemDb>["db"],
+  state: string,
+): void {
+  db.query(
+    `INSERT INTO jobs (job_id, state, created_at, updated_at, last_event_id)
+     VALUES ('wrapper-status-1', ?, 1, 1, 1)`,
+  ).run(state);
+}
+
+function seedWrapperClaim(
+  db: ReturnType<typeof freshMemDb>["db"],
+  state: string,
+  sessionId: string | null,
+): void {
+  db.query(
+    `INSERT INTO dispatch_claims
+       (verb, id, attempt_id, state, session_id, legacy_unfenced,
+        acquired_at, bound_at, last_event_id, updated_at)
+     VALUES ('work', 'fn-status.1', 700, ?, ?, 0, 1, 2, 1, 2)`,
+  ).run(state, sessionId);
+}
+
+test("providerLegGrantStatus: no wrapper job row yet is a transient wrapper-unfolded wait", () => {
+  const { db } = freshMemDb();
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "wrapper-unfolded",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: wrapper folded but the exact attempt has no claim is a claim-absent wait", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "claim-absent",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: an acquired-but-unbound claim is a claim-unbound wait", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "acquired", null);
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "wait",
+    cause: "claim-unbound",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: a claim bound to the exact wrapper session grants", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({ decision: "grant" });
+  db.close();
+});
+
+test("providerLegGrantStatus: a claim bound to a DIFFERENT session denies claim-foreign", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "working");
+  seedWrapperClaim(db, "bound", "someone-else");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "claim-foreign",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: an ended wrapper job denies wrapper-terminal", () => {
+  const { db } = freshMemDb();
+  seedWrapperJob(db, "ended");
+  seedWrapperClaim(db, "bound", "wrapper-status-1");
+  const record = makeBirthRecord(OWNED_LEG_OVERRIDES);
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "wrapper-terminal",
+  });
+  db.close();
+});
+
+test("providerLegGrantStatus: an incomplete owner tuple denies owner-incomplete", () => {
+  const { db } = freshMemDb();
+  // A legacy/non-owned birth (no leg_launch_id) carries no owner tuple.
+  const record = makeBirthRecord({ session_id: "legacy-presence" });
+  expect(providerLegGrantStatus(db, record)).toEqual({
+    decision: "deny",
+    cause: "owner-incomplete",
+  });
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// decideProviderLegGrantWaitLog — ONE bounded visibility line per (leg, cause)
+// transition, never once per poll.
+// ---------------------------------------------------------------------------
+
+test("decideProviderLegGrantWaitLog: one line per (leg, cause) transition, none per repeat poll", () => {
+  const memo = new Map<string, ProviderLegGrantWaitCause>();
+  const leg = {
+    legLaunchId: "leg-x",
+    wrapperJobId: "work::fn-9.1",
+    wrapperAttemptId: 42,
+  };
+  const lines: string[] = [];
+  // A poll sequence: same cause repeats (no re-log), then transitions.
+  for (const cause of [
+    "wrapper-unfolded",
+    "wrapper-unfolded",
+    "claim-absent",
+    "claim-absent",
+    "claim-unbound",
+  ] as const) {
+    const line = decideProviderLegGrantWaitLog(memo, leg, cause);
+    if (line !== null) lines.push(line);
+  }
+  expect(lines).toEqual([
+    "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause wrapper-unfolded",
+    "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause claim-absent",
+    "[keeperd] provider-leg grant wait: leg leg-x wrapper work::fn-9.1 attempt 42 cause claim-unbound",
+  ]);
+});
+
+test("decideProviderLegGrantWaitLog: distinct legs each get their own transition line", () => {
+  const memo = new Map<string, ProviderLegGrantWaitCause>();
+  const a = decideProviderLegGrantWaitLog(
+    memo,
+    { legLaunchId: "leg-a", wrapperJobId: "w", wrapperAttemptId: 1 },
+    "wrapper-unfolded",
+  );
+  const b = decideProviderLegGrantWaitLog(
+    memo,
+    { legLaunchId: "leg-b", wrapperJobId: "w", wrapperAttemptId: 2 },
+    "wrapper-unfolded",
+  );
+  expect(a).not.toBeNull();
+  expect(b).not.toBeNull();
+  expect(a).not.toBe(b);
 });

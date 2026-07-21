@@ -3741,14 +3741,16 @@ export interface IncidentClaimSweepDeps {
    *  spool delivery, CLI retry, owner reorientation) NEVER rotates authority. It
    *  rotates the escalation grant from the resolve leg to the deconflict leg;
    *  duplicate rotate requests are idempotent (the rotation itself short-circuits
-   *  on a live deconflict leaf). Optional so a release-only / diagnostic caller need
-   *  not wire grant rotation. */
+   *  on a live deconflict leaf). Returns a typed outcome: `retry` leaves the
+   *  request spooled (a failed retirement/publish stays recoverable without a fresh
+   *  intent); `rotated`/`no-target` consume it. Optional so a release-only /
+   *  diagnostic caller need not wire grant rotation. */
   rotateGrant?: (
     verb: string,
     id: string,
     instanceEventId: number,
     claimSessionId: string,
-  ) => void;
+  ) => IncidentGrantRotationOutcome;
   /** Every currently-claimed incident row (for the dead-claimant expiry pass). */
   selectClaimed: () => ClaimedIncidentRow[];
   /** Unix-seconds clock for the claim freshness stamp. */
@@ -3905,12 +3907,16 @@ export function runIncidentClaimSweep(
           deps.removeRequest(path);
           continue;
         }
-        deps.rotateGrant?.(
+        const rotation = deps.rotateGrant?.(
           request.verb,
           request.id,
           incident.instanceEventId,
           request.claimant_session_id,
         );
+        // A failed rotation (`retry`) leaves the request SPOOLED so recovery does
+        // not wait for a fresh explicit intent — mirroring the mint retry path. An
+        // absent handler (diagnostic caller) consumes as before.
+        if (rotation === "retry") continue;
         fulfilledRequests.add(requestKey);
         result.rotated += 1;
         deps.removeRequest(path);
@@ -4188,6 +4194,19 @@ export function publishIncidentResolveGrant(
   if (!published) note(`# incident-grant ${key}: resolve leaf publish failed`);
 }
 
+/**
+ * The outcome of one rotation attempt, so the incident-claim sweep knows whether
+ * to consume the spool request or leave it retryable:
+ *  - `rotated` — the deconflict leg is live (freshly published, or already live —
+ *    idempotent). The request is fulfilled.
+ *  - `no-target` — no merge-escalation row/dir to grant against; nothing more to
+ *    rotate. Consume the request (a re-intent would find the same absence).
+ *  - `retry` — the transition could NOT complete this pass (a live resolve leaf
+ *    would not positively retire, or the deconflict publish failed). Leave the
+ *    request spooled so recovery does not wait for a fresh explicit intent.
+ */
+export type IncidentGrantRotationOutcome = "rotated" | "no-target" | "retry";
+
 /** Rotate the escalation grant from the resolve leg to the deconflict leg — the
  *  handler for the owner's EXPLICIT decline-receipt intent (the spool `rotate`
  *  action). POSITIVE-RETIREMENT INVARIANT: every LIVE resolve leaf is retired with
@@ -4195,17 +4214,18 @@ export function publishIncidentResolveGrant(
  *  gone — BEFORE the deconflict leaf is published, so the escalation brief's
  *  SINGULAR grant advertiser never sees two live leaves for one incident. When a
  *  live resolve leaf cannot be positively retired, the rotation STOPS visibly with
- *  one bounded reason line, leaves the incident resolve-only, and defers to the
- *  next fenced rotation intent. Idempotent (a live deconflict leaf short-circuits).
- *  A missing / already-expired resolve leg publishes deconflict directly — the
- *  fenced rotation intent is authority for the transition. */
+ *  one bounded reason line, leaves the incident resolve-only, and returns `retry`
+ *  so the request stays spooled for the next sweep. Idempotent (a live deconflict
+ *  leaf short-circuits). A missing / already-expired resolve leg publishes
+ *  deconflict directly — the fenced rotation intent is authority for the
+ *  transition. */
 export function rotateIncidentGrantToDeconflict(
   deps: IncidentGrantDeps,
   verb: string,
   id: string,
   instanceEventId: number,
   claimSessionId: string,
-): void {
+): IncidentGrantRotationOutcome {
   const note = deps.noteLine ?? (() => {});
   const writeLeaf = deps.writeLeaf ?? writeGrantLeaf;
   const key = `${verb}::${id}`;
@@ -4220,7 +4240,7 @@ export function rotateIncidentGrantToDeconflict(
   if (
     leaves.some((leaf) => leaf.role === "deconflict" && nowMs < leaf.expires_at)
   ) {
-    return;
+    return "rotated";
   }
   // Retire EVERY LIVE resolve leaf with POSITIVE confirmation before publishing
   // deconflict. An already-expired resolve leaf is retired by TTL (the reaper
@@ -4258,7 +4278,7 @@ export function rotateIncidentGrantToDeconflict(
       note(
         `# incident-grant ${key}: could not retire the live resolve leaf — leaving resolve-only, deconflict deferred to the next rotation intent`,
       );
-      return;
+      return "retry";
     }
   }
   const facts = deps.rowFacts(verb, id);
@@ -4266,7 +4286,7 @@ export function rotateIncidentGrantToDeconflict(
     note(
       `# incident-grant ${key}: rotate found no merge-escalation row/dir — resolve retired, no deconflict grant`,
     );
-    return;
+    return "no-target";
   }
   const grant = buildIncidentGrant("deconflict", {
     verb,
@@ -4292,7 +4312,9 @@ export function rotateIncidentGrantToDeconflict(
     note(
       `# incident-grant ${key}: retired resolve, deconflict leaf publish failed`,
     );
+    return "retry";
   }
+  return "rotated";
 }
 
 /** Expire both escalation legs for one incident on the owning session's release,
@@ -6131,6 +6153,14 @@ export const INGEST_EVENTS_COLUMNS = [
 export type EventsIngestContext = {
   counters: BackstopCounters;
   backstopLogPath: string;
+  /**
+   * Per-leg last-logged provider-leg grant-wait cause. The birth scan consults +
+   * updates it through {@link decideProviderLegGrantWaitLog} so a waiting owned
+   * birth emits ONE `[keeperd]` line per (leg, cause) transition, never once per
+   * scan. Absent in unit tests that do not assert the transition log; when absent
+   * the wait branch stays silent (unchanged pre-split behavior).
+   */
+  providerLegGrantWaitLog?: Map<string, ProviderLegGrantWaitCause>;
 };
 
 /**
@@ -6891,12 +6921,37 @@ function insertBirthSessionStart(db: Database, record: BirthRecord): void {
   );
 }
 
-type ProviderLegGrantStatus = "grant" | "wait" | "deny";
+/**
+ * WHY an owned birth cannot be granted YET, but may still become grantable — the
+ * three level-triggered lag states the birth scan re-probes each cycle. Each is a
+ * DISTINCT cause the visibility line surfaces so a stuck leg names what it waits on.
+ */
+export type ProviderLegGrantWaitCause =
+  | "wrapper-unfolded" // no wrapper job row yet — its fold is behind the birth scan
+  | "claim-absent" // wrapper folded but carries no claim for this exact attempt
+  | "claim-unbound"; // claim acquired, the wrapper SessionStart bind has not folded
 
-function providerLegGrantStatus(
+/** WHY an owned birth can NEVER be granted — a terminal, non-recoverable state. */
+export type ProviderLegGrantDenyCause =
+  | "owner-incomplete" // the record is missing part of its immutable owner tuple
+  | "wrapper-terminal" // the wrapper attempt ended/killed or is legacy-unfenced
+  | "claim-foreign"; // the claim is bound to a different session / non-grantable
+
+export type ProviderLegGrantVerdict =
+  | { decision: "grant" }
+  | { decision: "wait"; cause: ProviderLegGrantWaitCause }
+  | { decision: "deny"; cause: ProviderLegGrantDenyCause };
+
+/**
+ * Classify an owned birth's grant readiness AND surface WHY. Probes the claim and
+ * the wrapper job separately (the prior single JOIN collapsed every non-grant
+ * state into a bare `wait`): the split preserves EVERY grant/wait/deny routing
+ * decision but distinguishes the lag causes so the wait branch is no longer silent.
+ */
+export function providerLegGrantStatus(
   db: Database,
   record: BirthRecord,
-): ProviderLegGrantStatus {
+): ProviderLegGrantVerdict {
   const owner = ownerTupleFromBirthRecord(record);
   if (
     owner === null ||
@@ -6904,40 +6959,82 @@ function providerLegGrantStatus(
     record.launcher_pid === undefined ||
     record.launcher_start_time === undefined
   ) {
-    return "deny";
+    return { decision: "deny", cause: "owner-incomplete" };
   }
-  const row = db
+  const claim = db
     .query(
-      `SELECT j.state AS wrapper_state, c.state AS claim_state,
-              c.session_id, c.legacy_unfenced
-         FROM dispatch_claims c
-         JOIN jobs j ON j.job_id = ?
-        WHERE c.attempt_id = ?`,
+      `SELECT state AS claim_state, session_id, legacy_unfenced
+         FROM dispatch_claims WHERE attempt_id = ?`,
     )
-    .get(owner.wrapper_job_id, owner.wrapper_dispatch_attempt_id) as {
-    wrapper_state: string;
+    .get(owner.wrapper_dispatch_attempt_id) as {
     claim_state: string;
     session_id: string | null;
     legacy_unfenced: number;
   } | null;
-  // The wrapper SessionStart and claim bind can still be behind the birth scan;
-  // a superseded exact attempt is equally non-authoritative and remains inert.
-  if (row === null) {
-    return "wait";
+  const job = db
+    .query("SELECT state AS wrapper_state FROM jobs WHERE job_id = ?")
+    .get(owner.wrapper_job_id) as { wrapper_state: string } | null;
+  // Both the wrapper's own fold and its claim bind can lag the births channel;
+  // each lag is a distinct, re-probed cause, never a permanent verdict.
+  if (job === null) {
+    return { decision: "wait", cause: "wrapper-unfolded" };
+  }
+  if (claim === null) {
+    // The wrapper folded but its exact attempt carries no claim — superseded,
+    // released, or never acquired. Non-authoritative; a later scan rechecks and
+    // the dead-pid GC bounds a permanently stranded record.
+    return { decision: "wait", cause: "claim-absent" };
   }
   if (
-    row.wrapper_state === "ended" ||
-    row.wrapper_state === "killed" ||
-    row.legacy_unfenced !== 0
+    job.wrapper_state === "ended" ||
+    job.wrapper_state === "killed" ||
+    claim.legacy_unfenced !== 0
   ) {
-    return "deny";
+    return { decision: "deny", cause: "wrapper-terminal" };
   }
-  if (row.claim_state === "acquired") {
-    return "wait";
+  if (claim.claim_state === "acquired") {
+    return { decision: "wait", cause: "claim-unbound" };
   }
-  return row.claim_state === "bound" && row.session_id === owner.wrapper_job_id
-    ? "grant"
-    : "deny";
+  return claim.claim_state === "bound" &&
+    claim.session_id === owner.wrapper_job_id
+    ? { decision: "grant" }
+    : { decision: "deny", cause: "claim-foreign" };
+}
+
+/**
+ * One bounded `[keeperd]` visibility line for a provider-leg grant-wait
+ * transition, or `null` when the cause is unchanged since the last logged one for
+ * this leg (so the line fires once per (leg, cause) transition, NEVER once per
+ * poll). Mutates `memo` in place — the caller clears a leg via
+ * {@link clearProviderLegGrantWaitLog} the moment it settles (grant/deny) so the
+ * memo stays bounded to legs still waiting. Pure over `(memo, leg, cause)`.
+ */
+export function decideProviderLegGrantWaitLog(
+  memo: Map<string, ProviderLegGrantWaitCause>,
+  leg: {
+    legLaunchId: string;
+    wrapperJobId: string;
+    wrapperAttemptId: number;
+  },
+  cause: ProviderLegGrantWaitCause,
+): string | null {
+  if (memo.get(leg.legLaunchId) === cause) {
+    return null;
+  }
+  memo.set(leg.legLaunchId, cause);
+  return (
+    `[keeperd] provider-leg grant wait: leg ${leg.legLaunchId} ` +
+    `wrapper ${leg.wrapperJobId} attempt ${leg.wrapperAttemptId} cause ${cause}`
+  );
+}
+
+/** Drop a settled leg from the grant-wait log memo so it never leaks a per-leg
+ *  entry past the leg's own wait window. */
+export function clearProviderLegGrantWaitLog(
+  memo: Map<string, ProviderLegGrantWaitCause> | undefined,
+  legLaunchId: string,
+): void {
+  memo?.delete(legLaunchId);
 }
 
 function providerLegBirthAlreadyMinted(
@@ -7320,12 +7417,11 @@ export function scanBirthDir(
       const owner = ownerTupleFromBirthRecord(record);
       let committed = false;
       let shouldIssueGrant = false;
-      let grantStatus: ProviderLegGrantStatus | null = null;
+      let verdict: ProviderLegGrantVerdict | null = null;
       db.run("BEGIN IMMEDIATE");
       try {
-        grantStatus =
-          owner === null ? null : providerLegGrantStatus(db, record);
-        if (grantStatus === "wait" || grantStatus === "deny") {
+        verdict = owner === null ? null : providerLegGrantStatus(db, record);
+        if (verdict?.decision === "wait" || verdict?.decision === "deny") {
           db.run("ROLLBACK");
         } else {
           const duplicateOwnedBirth =
@@ -7354,19 +7450,48 @@ export function scanBirthDir(
           }`,
         );
       }
-      if (grantStatus === "wait") {
-        // The owner fold may still be catching up. Keep the promoted identity
-        // visible so a later scan can recheck it without launching paid work.
+      if (verdict?.decision === "wait") {
+        // The owner fold may still be catching up. Surface the DISTINCT lag cause
+        // once per transition, then keep the promoted identity visible so a later
+        // scan can recheck it without launching paid work.
+        if (owner !== null && ctx?.providerLegGrantWaitLog !== undefined) {
+          const line = decideProviderLegGrantWaitLog(
+            ctx.providerLegGrantWaitLog,
+            {
+              legLaunchId: owner.leg_launch_id,
+              wrapperJobId: owner.wrapper_job_id,
+              wrapperAttemptId: owner.wrapper_dispatch_attempt_id,
+            },
+            verdict.cause,
+          );
+          if (line !== null) {
+            console.error(line);
+          }
+        }
         gcStuckBirthRecord(db, full, record, ctx);
         continue;
       }
-      if (grantStatus === "deny") {
+      if (verdict?.decision === "deny") {
         // A denied owner can never become grantable, so retire the record under
         // its classifiable terminal status immediately.
+        if (owner !== null) {
+          clearProviderLegGrantWaitLog(
+            ctx?.providerLegGrantWaitLog,
+            owner.leg_launch_id,
+          );
+        }
         if (parkStuckBirth(db, full, record, ctx)) {
           retireBirthFile(full);
         }
         continue;
+      }
+      if (owner !== null) {
+        // The leg settled into a grant this scan: it will never re-enter the wait
+        // branch, so drop its memo entry.
+        clearProviderLegGrantWaitLog(
+          ctx?.providerLegGrantWaitLog,
+          owner.leg_launch_id,
+        );
       }
       if (committed && owner !== null && shouldIssueGrant) {
         try {
@@ -9083,6 +9208,7 @@ function startDaemonWithExitAttribution(
   const eventsIngestCtx: EventsIngestContext = {
     counters: mainBackstopCounters,
     backstopLogPath,
+    providerLegGrantWaitLog: new Map(),
   };
   const eventsLogDir = resolveEventsLogDir();
   // The events-ingest worker subscribes ONCE at spawn and goes inert with NO

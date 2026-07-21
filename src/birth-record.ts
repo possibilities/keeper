@@ -604,25 +604,69 @@ export function consumeProviderLegGrant(
   return true;
 }
 
+/**
+ * The bounded gate wait's cause-split outcome:
+ *  - `granted` — the exact one-use grant appeared and was consumed; exec.
+ *  - `refused` — the daemon cleared the promoted birth record without granting
+ *    (a terminal deny: a superseded/foreign/ended owner). Structural — no claim
+ *    will ever bind, so the shim stops early instead of burning the whole timeout.
+ *  - `timeout` — the deadline elapsed while the birth record was still present (a
+ *    lag state — `wrapper-unfolded`/`claim-absent`/`claim-unbound` — that never
+ *    resolved before the shim's own life ran out).
+ */
+export type ProviderLegGateOutcome = "granted" | "refused" | "timeout";
+
 export interface ProviderLegGrantWaitDeps {
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   consume: () => boolean;
+  /**
+   * Whether this leg's own promoted birth record is still on disk. The daemon
+   * retires it on EVERY terminal settle (grant retires it too, but a grant is
+   * consumed above first), so `false` here with no grant is a positive terminal
+   * DENY signal — the shim need not wait out the timeout. Optional: when absent,
+   * the wait degrades to the pre-split bounded poll (timeout-or-grant only).
+   */
+  birthPresent?: () => boolean;
 }
 
-/** Hold the inert shim until one exact grant appears or the bounded timeout ends. */
+/**
+ * Hold the inert shim until one exact grant appears, the daemon terminally denies
+ * it (its birth record cleared), or the bounded timeout ends. Re-waits the SAME
+ * handle for every transient lag; stops early ONLY on a positively terminal deny.
+ */
 export async function awaitProviderLegGrant(
   deps: ProviderLegGrantWaitDeps,
   timeoutMs = PROVIDER_LEG_GRANT_TIMEOUT_MS,
-): Promise<boolean> {
+): Promise<ProviderLegGateOutcome> {
   const deadline = deps.now() + timeoutMs;
   while (deps.now() < deadline) {
     if (deps.consume()) {
-      return true;
+      return "granted";
+    }
+    // consume() is checked first, so a grant (which the daemon writes BEFORE
+    // retiring the birth) is never misread as a deny in the retire window.
+    if (deps.birthPresent !== undefined && !deps.birthPresent()) {
+      return "refused";
     }
     await deps.sleep(PROVIDER_LEG_GRANT_POLL_MS);
   }
-  return deps.consume();
+  return deps.consume() ? "granted" : "timeout";
+}
+
+/**
+ * Retire a leg's own promoted birth record — an idempotent, ENOENT-tolerant
+ * unlink. A shim that observed a terminal gate death (deny or timeout) settles its
+ * record immediately so no `~5min` stuck-birth GC fossil is minted for an already
+ * attributed, explained death (a grant/deny already unlinked it daemon-side, so
+ * the common case is a benign no-op). NEVER throws.
+ */
+export function retireBirthRecord(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone (daemon-cleared, or never promoted) — nothing to settle.
+  }
 }
 
 export function birthRootFromIntentPath(intentPath: string): string {
