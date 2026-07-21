@@ -1,0 +1,81 @@
+{
+  "audit_policy": {
+    "flagged_task_ids": [],
+    "reason": null,
+    "status": "applied"
+  },
+  "cells": [
+    {
+      "confidence": 0.93,
+      "label_source": "heuristic-guided",
+      "model": "opus",
+      "rationale": "The cross-cutting shell refactor must preserve a subtle human-versus-Frames retention invariant across many coupled runtime and test surfaces.",
+      "spark_exclusion": "subtle-invariant-reasoning",
+      "spark_fit": false,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.1",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.9,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "This is a substantial but explicitly specified multi-file extraction spanning readiness composition, deterministic presentation, CLI registration, and Frames integration.",
+      "spark_exclusion": "fixed-shape-too-large",
+      "spark_fit": false,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.2",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.89,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.6-terra",
+      "rationale": "The bounded presentation rewrite has clear acceptance but requires careful projection, total ordering, malformed-data handling, and interaction removal.",
+      "spark_exclusion": "fixed-shape-too-large",
+      "spark_fit": false,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.3",
+      "tier": "high"
+    },
+    {
+      "confidence": 0.91,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.5",
+      "rationale": "Two substantial viewer refactors must coordinate deterministic serializers while preserving control, subscription, sidecar, and Frames behavior.",
+      "spark_exclusion": "fixed-shape-too-large",
+      "spark_fit": false,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.4",
+      "tier": "xhigh"
+    },
+    {
+      "confidence": 0.94,
+      "label_source": "heuristic-guided",
+      "model": "gpt-5.3-codex-spark",
+      "rationale": "The two-file tmux topology change is small, reversible, explicitly shaped, and covered by deterministic exact-argv tests.",
+      "spark_exclusion": null,
+      "spark_fit": true,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.5",
+      "tier": "medium"
+    },
+    {
+      "confidence": 0.92,
+      "label_source": "heuristic-guided",
+      "model": "sonnet",
+      "rationale": "Audience-specific documentation and prompt guidance require wording judgment and careful distinction between human viewers and machine control surfaces.",
+      "spark_exclusion": "ambiguous-or-judgment-heavy",
+      "spark_fit": false,
+      "task_id": "fn-1403-simplify-dashboard-viewer-surfaces.6",
+      "tier": "high"
+    }
+  ],
+  "config_hash": "996828c793f1636847133d231d8642c0d08012fdb70f92b42f87e1618a2707c9",
+  "created_at": "2026-07-21T22:33:25.242000Z",
+  "epic_id": "fn-1403-simplify-dashboard-viewer-surfaces",
+  "input_hash": "dad58f7ad69dc606a4d0cfd52d335975b949f032277b2a64f0690f7b41adce2d",
+  "outcome": "completed",
+  "schema_version": 1,
+  "selector": {
+    "harness": "subagent",
+    "model": "plan:model-selector"
+  },
+  "shuffle_seed": 3671428986,
+  "verdict_raw": "{\"cells\":[{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.1\",\"tier\":\"xhigh\",\"model\":\"opus\",\"rationale\":\"The cross-cutting shell refactor must preserve a subtle human-versus-Frames retention invariant across many coupled runtime and test surfaces.\",\"confidence\":0.93,\"spark_fit\":false,\"spark_exclusion\":\"subtle-invariant-reasoning\"},{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.2\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"This is a substantial but explicitly specified multi-file extraction spanning readiness composition, deterministic presentation, CLI registration, and Frames integration.\",\"confidence\":0.9,\"spark_fit\":false,\"spark_exclusion\":\"fixed-shape-too-large\"},{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.3\",\"tier\":\"high\",\"model\":\"gpt-5.6-terra\",\"rationale\":\"The bounded presentation rewrite has clear acceptance but requires careful projection, total ordering, malformed-data handling, and interaction removal.\",\"confidence\":0.89,\"spark_fit\":false,\"spark_exclusion\":\"fixed-shape-too-large\"},{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.4\",\"tier\":\"xhigh\",\"model\":\"gpt-5.5\",\"rationale\":\"Two substantial viewer refactors must coordinate deterministic serializers while preserving control, subscription, sidecar, and Frames behavior.\",\"confidence\":0.91,\"spark_fit\":false,\"spark_exclusion\":\"fixed-shape-too-large\"},{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.5\",\"tier\":\"medium\",\"model\":\"gpt-5.3-codex-spark\",\"rationale\":\"The two-file tmux topology change is small, reversible, explicitly shaped, and covered by deterministic exact-argv tests.\",\"confidence\":0.94,\"spark_fit\":true,\"spark_exclusion\":null},{\"task_id\":\"fn-1403-simplify-dashboard-viewer-surfaces.6\",\"tier\":\"high\",\"model\":\"sonnet\",\"rationale\":\"Audience-specific documentation and prompt guidance require wording judgment and careful distinction between human viewers and machine control surfaces.\",\"confidence\":0.92,\"spark_fit\":false,\"spark_exclusion\":\"ambiguous-or-judgment-heavy\"}]}\n"
+}
