@@ -7,7 +7,7 @@
     "fn-1352-retire-escalation-sessions"
   ],
   "id": "fn-1400-exempt-block-incidents-from-boot-orphan",
-  "last_validated_at": null,
+  "last_validated_at": "2026-07-21T18:04:05.210000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "snippets": [],
   "status": "open",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-07-21T18:04:04.526000Z"
+  "updated_at": "2026-07-21T18:04:05.210000Z"
 }
