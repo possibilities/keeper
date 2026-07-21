@@ -620,8 +620,10 @@ export async function supervise(ctx: {
   let attempts = 0;
   while (!ctx.isStopping()) {
     // Connect gate — no live tmux job ⇒ nothing to observe (and never hold the
-    // server alive). Poll until one appears.
-    const jobs = readJobs(ctx.db);
+    // server alive). Poll until one appears. Reads through the injectable
+    // `ctx.readJobs` seam (production wires it to `readJobs(db)`) so tests drive
+    // the whole loop with a synthetic jobs fixture and no real db connection.
+    const jobs = ctx.readJobs();
     if (!hasLiveTmuxJob(jobs)) {
       ctx.postLiveness();
       await sleep(ctx.gatePollMs, ctx.isStopping);

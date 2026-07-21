@@ -795,12 +795,12 @@ describe("supervise — reconnect-cap degradation", () => {
                 } else if (command.startsWith("list-clients")) {
                   h.pushStdout(
                     replyBlock(commandNumber, [
-                      "/dev/ttys001\\t0\\t120\\t10\\tmain",
+                      "/dev/ttys001\t0\t120\t10\tmain",
                     ]),
                   );
                 } else if (command.startsWith("list-panes")) {
                   h.pushStdout(
-                    replyBlock(commandNumber, ["1\\t1\\t7\\t%70\\tmain"]),
+                    replyBlock(commandNumber, ["1\t1\t7\t%70\tmain"]),
                   );
                 }
               });
@@ -808,7 +808,7 @@ describe("supervise — reconnect-cap degradation", () => {
             })();
             successfulChild = child;
             child.pushStdout(
-              "%begin 0 0 1\\n%session-changed $1 main\\n%end 0 0 1\\n",
+              "%begin 0 0 1\n%session-changed $1 main\n%end 0 0 1\n",
             );
             return child.child;
           }
