@@ -10,5 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Raise darwin start-time probe buffer",
-  "updated_at": "2026-07-21T19:06:12.669000Z"
+  "updated_at": "2026-07-21T19:17:17.027000Z",
+  "worker_done_at": null
 }
